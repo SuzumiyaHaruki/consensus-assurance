@@ -1,0 +1,103 @@
+import argparse
+import fcntl
+import json
+import os
+import sys
+from pathlib import Path
+import yaml
+from consensus_assurance.core.config import Config, locate_repo
+from consensus_assurance.core.types import uid
+from consensus_assurance.consensus.inquiry import INQUIRY
+from consensus_assurance.registry import assemble
+from consensus_assurance.workflow.engine import Engine
+from consensus_assurance.adapters.storage.files import Store, write_json
+from consensus_assurance.adapters.runners.process import ProcessRunner
+from consensus_assurance.reporting.chinese import render_report
+
+
+def load_config(path=None, overrides=None):
+    data = yaml.safe_load(Path(path).read_text()) or {} if path else {}
+    if not isinstance(data, dict):
+        raise ValueError("Configuration must be an object")
+    for name in ("repo_path", "runs_dir", "tlc_jar", "fixture"):
+        if data.get(name):
+            p = Path(data[name]).expanduser()
+            if not p.is_absolute():
+                p = (Path(path).resolve().parent if path else Path.cwd()) / p
+            data[name] = str(p.resolve())
+    data.update({k: v for k, v in (overrides or {}).items() if v is not None})
+    if not data.get("tlc_jar") and os.environ.get("TLC_JAR"):
+        data["tlc_jar"] = os.environ["TLC_JAR"]
+    return Config.model_validate(data)
+
+
+def resolve_run(value, runs_dir):
+    candidate = Path(value).expanduser()
+    if candidate.is_dir():
+        return candidate.resolve()
+    candidate = Path(runs_dir) / value
+    if not candidate.is_dir():
+        raise FileNotFoundError("Run directory not found: " + str(candidate))
+    return candidate.resolve()
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description="共识义务驱动的局部实现审计；默认自主发现目标")
+    sub = parser.add_subparsers(dest="command", required=True)
+    for name in ("doctor", "run", "inspect", "plan"):
+        p = sub.add_parser(name)
+        p.add_argument("--config"); p.add_argument("--repo")
+        p.add_argument("--agent-backend", choices=["codex", "mock"])
+        p.add_argument("--tlc-jar"); p.add_argument("--runs-dir")
+        p.add_argument("--goal", help="可选定向问题；默认不指定目标")
+    for name in ("resume", "report"):
+        p = sub.add_parser(name); p.add_argument("--run", required=True)
+        p.add_argument("--runs-dir", default="runs")
+    args = parser.parse_args(argv)
+    try:
+        if args.command in {"resume", "report"}:
+            root = resolve_run(args.run, args.runs_dir)
+            state = Store(root).load()
+            if args.command == "report":
+                print(render_report(state, root)); return 0
+            config = Config.model_validate(state.config)
+        else:
+            config = load_config(args.config, {"agent_backend": args.agent_backend, "tlc_jar": args.tlc_jar,
+                "runs_dir": args.runs_dir, "directed_question": args.goal})
+            root = Path(config.runs_dir).expanduser().resolve() / uid()
+            root.mkdir(parents=True, exist_ok=False)
+        implementation, agent, verifier, knowledge = assemble(config)
+        if args.command == "doctor":
+            runner = ProcessRunner(root)
+            results = {"agent": agent.probe(runner), "verifier": verifier.probe(runner)}
+            for result in results.values():
+                result["checks"] = [c.model_dump(mode="json") for c in result["checks"]]
+            results["implementation"] = runner.run(implementation.version_command(), root, "implementation_probe", "environment", 10).model_dump(mode="json")
+            write_json(root / "doctor.json", results)
+            print(f"环境诊断已保存：{root / 'doctor.json'}")
+            return 0 if all(results[k]["available"] for k in ("agent", "verifier")) else 2
+        if args.command == "inspect":
+            from consensus_assurance.adapters.storage.snapshot import capture
+            repo = locate_repo(args.repo, config.repo_path)
+            snapshot = capture(repo)
+            write_json(root / "snapshot.json", snapshot)
+            print(f"目标快照已保存：{root / 'snapshot.json'}"); return 0
+        engine = Engine(config, root, implementation, agent, verifier, knowledge, INQUIRY)
+        with (root / ".run.lock").open("w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            if args.command == "resume":
+                state = engine.resume()
+            else:
+                repo = locate_repo(args.repo, config.repo_path)
+                state = engine.start(repo, plan_only=args.command == "plan")
+            report = render_report(state, root)
+        print(f"运行模式：{state.mode}；报告：{report}")
+        print(f"停止原因：{state.stop_reason}")
+        return 0 if state.stop_reason.startswith(("No pending", "Plan generated")) else 2
+    except (ValueError, FileNotFoundError, BlockingIOError, OSError) as exc:
+        print(f"无法继续：{exc}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
