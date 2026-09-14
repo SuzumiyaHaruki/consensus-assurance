@@ -139,8 +139,12 @@ class CodexAgent:
         if result_path.exists():
             result_path.write_text(redact(raw))
         try:
-            return check, response_type.model_validate(wire_value(json.loads(raw), response_type.model_json_schema(), decode=True))
+            decoded = wire_value(json.loads(raw), response_type.model_json_schema(), decode=True)
+            write_json(directory / "decoded-response.json", decoded)
+            return check, response_type.model_validate(decoded)
         except ValueError as exc:
+            if hasattr(exc, "errors"):
+                write_json(directory / "validation-details.json", exc.errors(include_url=False, include_context=False))
             (directory / "validation-error.txt").write_text(str(exc))
             check.status = ExecutionStatus.ERROR
             check.reason = "Structured agent output is invalid"
@@ -171,9 +175,12 @@ class MockAgent:
         check = runner.run([sys.executable, "-c", "print('explicit mock fixture playback')"], directory, "agent", snapshot_id, timeout)
         check.origin = Origin.MOCK; check.tool_version = "mock/2"
         write_json(directory / "response.json", item)
+        write_json(directory / "decoded-response.json", item)
         try:
             return check, response_type.model_validate(item)
         except ValueError as exc:
+            if hasattr(exc, "errors"):
+                write_json(directory / "validation-details.json", exc.errors(include_url=False, include_context=False))
             check.status = ExecutionStatus.ERROR; check.reason = "Structured agent output is invalid"
             (directory / "validation-error.txt").write_text(str(exc))
             return check, None

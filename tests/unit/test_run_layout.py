@@ -51,8 +51,8 @@ def test_semantic_validation_failure_is_saved_with_specific_reason(tmp_path, pre
                 raise ValueError('Binding b_capture: literal symbol is absent')
             return self.ask('read', ReadingPlan, {}, reject)
     root = tmp_path / 'audit'
-    with pytest.raises(Blocked, match='repair limit reached: Binding b_capture'):
+    with pytest.raises(Blocked, match='Cannot localize.*Binding b_capture'):
         CheckValidation(config, root, *assemble(config), INQUIRY).start(repo)
     errors = list((root / 'agent').glob('*/graph-validation-error.txt'))
-    assert len(errors) == 2
+    assert len(errors) == 1
     assert all('b_capture' in p.read_text() for p in errors)

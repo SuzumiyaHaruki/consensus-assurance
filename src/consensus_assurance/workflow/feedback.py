@@ -36,7 +36,7 @@ def apply_feedback(state, unit, current, feedback):
         if not any(c.id in current_claims and current_claims[c.id].description == feedback.old_judgment and c.description == feedback.new_judgment for c in feedback.patch.claims):
             raise ValueError("F2 old/new judgments must identify an actual claim revision")
         changed = apply_patch(state, feedback.patch, semantic=True)
-        affected = [m.id for m in state.models if changed & (set(m.binding_ids) | {c.claim_id for c in m.checkers})]
+        affected = [m.id for m in state.models if changed & (set(m.binding_ids) | {c.claim_id for c in m.checkers} | set(m.graph_versions))]
         before["old_judgment"] = feedback.old_judgment
         result, step = None, "understand"
     elif feedback.kind == "F3":

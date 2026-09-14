@@ -56,4 +56,12 @@ execute(MODE, emit)
     monitor=EventMonitor(id='ack-monitor',checker_id=checker,event='returned',identity_fields=['operation','participant','context'],assertion=Comparison(field='state.accepted' if mode=='memory' else 'state.persisted',value=True),binding_ids=['ack-code'],grounding=basis,applicability_conditions=[Comparison(field='metadata.mode',value=mode)])
     bundle=Bundle(description='Controlled acknowledgement semantics',behavior=behavior,properties=properties,constants='',checkers=[CheckerSpec(invariant='MemoryAck',claim_id='memory',scope=scope),CheckerSpec(invariant='DurableAck',claim_id='durable',scope=scope)],initial_state='No acceptance, durability or response',variables=['accepted','persisted','returned'],actions=['accept','return','persist'],constraints=[ConstraintSource(constraint='Return precedes persistence in actual fixture',source_kind='code_observation',source_ids=['ack-code'],justification='Calls observe before setting persisted')],scope=scope,observation=ObservationMap(fields=[FieldProjection(model_field=f,raw_field=f) for f in fields],required_events=['initial','accepted','returned','persisted'],description='Actual mutable state snapshots'),harness=Harness(kind='python',source=harness,description='Calls the actual synthetic service',prerequisite_events=[],prerequisites=prereqs,semantic_changes=[],legality=basis,legal_conditions=[Comparison(field='metadata.fault',value='none')]),uncertainties=[],monitors=[monitor])
     if mode=='memory': bundle.checkers=[bundle.checkers[0]]
+    properties = [ObservableProperty(checker_id=c.invariant, trigger=Comparison(field='state.returned',value=True),
+        assertion=Comparison(field='state.accepted' if c.invariant=='MemoryAck' else 'state.persisted',value=True), description='Controlled response implication') for c in bundle.checkers]
+    bundle.observable_properties = properties
+    monitor.property = next(p for p in properties if p.checker_id==checker)
+    monitor.conditions = [monitor.property.trigger]
+    if not partial:
+        from consensus_assurance.adapters.verifiers.observable import properties_source
+        bundle.properties = properties_source(properties,bundle.observation)
     return state,unit,bundle

@@ -8,20 +8,21 @@ from consensus_assurance.core.proposals import Discovery, Bundle, Feedback, Grap
 from consensus_assurance.core.types import (Analysis, Assessment, Calibration, CheckRun, Evidence, ExecutionStatus,
     Finding, Investigation, Origin, Relation, Scope, uid, PendingAction, Record, Capability)
 from consensus_assurance.ports.interfaces import AgentBackend, ImplementationAdapter, VerifierBackend
-from .prompts import render
+from . import discovery
 from consensus_assurance.adapters.runners.process import ProcessRunner, output
 from consensus_assurance.adapters.runners.experiment import run_experiment, extract_events, prerequisites
 from consensus_assurance.adapters.storage.files import Store, write_json, digest
 from consensus_assurance.adapters.storage.snapshot import capture
-from .materials import catalogue, initial_materials, add_reads, ReadingPlan
 from .graph import apply_discovery, select_unit, apply_patch
-from .artifacts import save_bundle
+from .artifacts import save_bundle, validate_bundle
+from .modeling import validate_build_reply, obligation_progress
+from .investigation import feedback_context, validate_feedback, validate_replay
 from .budget import BudgetTracker, BudgetExhausted
 from .feedback import apply_feedback
 
 
-class Blocked(RuntimeError):
-    pass
+from .errors import Blocked
+from .agent_tasks import ask as ask_agent
 
 
 class Engine:
@@ -214,108 +215,16 @@ class Engine:
                 "original_characters":len(raw),"truncated":len(raw)>bound,"stdout_path":check.stdout,"stderr_path":check.stderr}
 
     def ask(self, kind, response_type, context, validator=None):
-        if not self.agent.mock and not self.config.allow_agent_materials:
-            raise Blocked("Agent material transmission disabled by configuration; no repository payload was sent")
-        original = kind
-        last_error = "Unknown validation error"
-        for attempt in range(self.config.budget.repeated_error_revisions + 1):
-            directory = self.root / "agent" / (uid()+"-"+original)
-            prompt = render(kind,context,self.inquiry if original in {"read","discover","F3","targeted_read","graph_patch"} else "")
-            payload = self.action("agent:"+original,"agent_calls",
-                lambda:self.agent.analyze(self.runner,prompt,directory,self.state.snapshot.id,self.budget.timeout(),response_type),
-                {"prompt":prompt,"response_type":response_type.__name__})
-            check = CheckRun.model_validate(payload[0])
-            response = response_type.model_validate(payload[1]) if payload[1] is not None else None
-            self.record(check)
-            if response is not None:
-                try:
-                    if validator: validator(response)
-                    return response,check
-                except ValueError as exc:
-                    last_error = str(exc)
-                    (Path(check.cwd) / "graph-validation-error.txt").write_text(last_error)
-                    context={"task":original,"previous_response":response.model_dump(mode="json"),"validation_error":str(exc),"original_context":context}
-            elif check.reason == "Structured agent output is invalid":
-                raw_path = Path(check.cwd)/"raw-response.txt"
-                error_path = Path(check.cwd)/"validation-error.txt"
-                context={"task":original,"validation_error":error_path.read_text() if error_path.exists() else check.reason,
-                    "raw_output":raw_path.read_text()[:self.config.budget.error_context_chars] if raw_path.exists() else "", "original_context":context}
-            else:
-                raise Blocked(f"Agent blocked: {check.status.value}; {check.reason}")
-            last_error = context.get("validation_error", last_error)
-            if self.state.pending_action:
-                self.state.action_history.append(self.state.pending_action.model_copy(deep=True)); self.state.pending_action=None
-            kind="retry"
-        raise Blocked("Structured response repair limit reached: " + last_error)
+        return ask_agent(self,kind,response_type,context,validator)
 
     def context(self, unit=None):
-        result = {"materials": [m.model_dump(mode="json") for m in self.state.materials],
-            "capabilities": [c.model_dump(mode="json") for c in self.state.capabilities],
-            "parameters": self.config.parameters, "remaining_seconds": self.budget.remaining(),
-            "directed_question": self.config.directed_question,
-            "snapshot_id": self.state.snapshot.id, "harness_kind": self.implementation.harness_kind,
-            "harness_instructions": self.implementation.harness_instructions}
-        if unit:
-            ids = {b.file for b in self.state.bindings if b.id in unit.binding_ids}
-            ids |= {m.file for m in self.state.materials if any(m.id in c.source_ids for c in self.state.claims if c.id in unit.goal_ids+unit.obligation_ids)}
-            recent = set(self.state.reading_history[-1]["added_material_ids"]) if self.state.reading_history else set()
-            result["materials"] = [m.model_dump(mode="json") for m in self.state.materials if m.file in ids or m.id in recent]
-            result.update({"unit": unit.model_dump(mode="json"), "claims": [c.model_dump(mode="json") for c in self.state.claims],
-                "bindings": [b.model_dump(mode="json") for b in self.state.bindings if b.id in unit.binding_ids],
-                "relations": [e.model_dump(mode="json") for e in self.state.relations]})
-        return result
+        return discovery.context(self,unit)
 
     def discover(self):
-        source = self.root / "source"
-        if "materials" not in self.state.completed_steps:
-            self.state.materials = initial_materials(source, self.state.snapshot, self.config.budget, self.knowledge)
-            inventory = catalogue(source, self.state.snapshot,self.implementation)
-            write_json(self.root / "catalogue.json", inventory)
-            plan, _ = self.ask("read", ReadingPlan, {"catalogue": inventory, "initial_materials": [m.model_dump(mode="json") for m in self.state.materials]})
-            add_reads(self.state, source, plan, self.config.budget)
-            write_json(self.root / "materials.json", [m.model_dump(mode="json") for m in self.state.materials])
-            self.state.completed_steps.append("materials"); self.advance("discover")
-        if "discovery" not in self.state.completed_steps:
-            proposal, check = self.ask("discover", Discovery, self.context(), lambda p: apply_discovery(self.state, p))
-            path = self.root / f"discovery-v{self.state.graph_version}.json"
-            write_json(path, proposal); self.state.discovery_path = str(path)
-            if not self.state.units and proposal.reading_requests:
-                self.targeted_read(None, "Insufficient material for grounded discovery", requests=proposal.reading_requests)
-            self.state.completed_steps.append("discovery"); self.advance("select")
+        return discovery.discover(self)
 
     def targeted_read(self, unit, gap, relation_ids=None, requests=None):
-        source = self.root/"source"
-        if self.state.targeted_gap is None:
-            self.budget.take("targeted_reads")
-            self.state.targeted_gap={"gap":gap,"related_ids":unit.obligation_ids if unit else [],
-                "relation_ids":relation_ids or [],"stage":"read","new_material_ids":[]}
-            self.checkpoint("targeted_gap_recorded")
-        task=self.state.targeted_gap
-        if task["stage"] == "read":
-            if requests:
-                reading=ReadingPlan.model_validate({"requests":requests,"rationale":gap,"related_ids":task["related_ids"],"gap":gap})
-            else:
-                reading,_=self.ask("targeted_read",ReadingPlan,{"gap":task,"catalogue":catalogue(source,self.state.snapshot,self.implementation),
-                    "already_read":[{"id":m.id,"file":m.file,"start":m.start_line,"end":m.end_line} for m in self.state.materials],
-                    "relevant_bindings":[b.model_dump() for b in self.state.bindings if unit and b.id in unit.binding_ids]})
-            reading.related_ids=task["related_ids"]; reading.gap=gap
-            task["new_material_ids"]=add_reads(self.state,source,reading,self.config.budget)
-            task["stage"]="patch"
-            if self.state.pending_action: self.state.action_history.append(self.state.pending_action); self.state.pending_action=None
-            self.checkpoint("targeted_materials_read")
-        if not task["new_material_ids"]:
-            self.state.targeted_gap=None
-            raise Blocked("Targeted reading found no new usable range; dependency remains unexplained: " + gap)
-        patch,_=self.ask("graph_patch",GraphPatch,{"gap":task,
-            "new_materials":[m.model_dump(mode="json") for m in self.state.materials if m.id in task["new_material_ids"]],
-            "claims":[c.model_dump(mode="json") for c in self.state.claims],"bindings":[b.model_dump(mode="json") for b in self.state.bindings],
-            "relations":[e.model_dump(mode="json") for e in self.state.relations if e.source in {c.id for c in self.state.claims}],
-            "units":[u.model_dump(mode="json") for u in self.state.units]},lambda p:apply_patch(self.state,p))
-        write_json(self.root/"materials.json",[m.model_dump(mode="json") for m in self.state.materials])
-        self.state.targeted_gap=None
-        if self.state.pending_action: self.state.action_history.append(self.state.pending_action); self.state.pending_action=None
-        self.checkpoint("targeted_graph_patch_applied")
-        return patch
+        return discovery.targeted_read(self,unit,gap,relation_ids,requests)
 
     def experiment(self, model, bundle, replay=False):
         if not self.config.allow_experiments:
@@ -368,7 +277,23 @@ class Engine:
         self.checkpoint("model_search_recorded")
         return check
 
+    def save_model(self, unit, bundle, previous=None, reason="Initial generation"):
+        key = self.state.pending_action.id if self.state.pending_action else None
+        if key is None:
+            raise Blocked("Model commit requires a persisted generation action")
+        model = save_bundle(self.root, self.state, unit, bundle, self.implementation, previous, reason, transaction_key=key)
+        self.model_commit_hook(model)
+        return model
+
+    def model_commit_hook(self, model):
+        """Interruption test seam after durable model files, before state registration."""
+
     def finish_unit(self, unit, status="checked"):
+        old = set(unit.obligation_checks)
+        unit.obligation_checks, unit.remaining_obligation_ids = obligation_progress(self.state, unit)
+        if status == "checked" and unit.remaining_obligation_ids:
+            status = "partial" if set(unit.obligation_checks) != old else "blocked"
+            self.state.gaps.append("Unfinished obligations in " + unit.id + ": " + ", ".join(unit.remaining_obligation_ids))
         unit.status=status
         self.state.active_unit_id=None; self.state.active_model_id=None; self.state.active_finding_id=None
         self.advance("select")
@@ -390,10 +315,10 @@ class Engine:
                 context=self.context(unit)
                 if previous:
                     context.update(previous_bundle=json.loads(Path(previous.bundle_path).read_text()),scope_delta={"before":previous.scope.model_dump(),"after":unit.scope.model_dump(),"added_bindings":list(set(unit.binding_ids)-set(previous.binding_ids)),"boundary_changes":unit.boundary_changes})
-                reply,_=self.ask("F3" if unit.previous_id else "build",BuildReply,context)
+                reply,_=self.ask("F3" if unit.previous_id else "build",BuildReply,context, lambda p: validate_build_reply(self.state,unit,p,self.implementation))
                 if reply.bundle is None:
                     self.targeted_read(unit,reply.gap,requests=reply.requests); self.advance("build"); continue
-                model=save_bundle(self.root,self.state,unit,reply.bundle,self.implementation,previous)
+                model=self.save_model(unit,reply.bundle,previous)
                 self.state.active_model_id=model.id
                 if self.state.first_model_seconds is None: self.budget.sync(); self.state.first_model_seconds=self.state.elapsed_seconds
                 self.advance("experiment" if self.config.allow_experiments else "search")
@@ -444,10 +369,9 @@ class Engine:
             elif phase=="replay_plan":
                 if not self.config.allow_experiments: raise Blocked("Candidate replay disabled by experiment permission")
                 search=next(c for c in self.state.checks if c.id==finding.check_id)
-                plan,_=self.ask("replay",ReplayPlan,{**self.context(unit),"bundle":bundle.model_dump(mode="json"),"finding":finding.model_dump(mode="json"),"candidate_trace":self.error_context(search)})
-                if plan.checker_id!=finding.checker_id: raise Blocked("Replay plan targets another checker")
-                revised=bundle.model_copy(deep=True); revised.harness=plan.harness
-                new=save_bundle(self.root,self.state,unit,revised,self.implementation,model,"Initial candidate experiment plan; not F4")
+                plan,_=self.ask("replay",ReplayPlan,{**self.context(unit),"bundle":bundle.model_dump(mode="json"),"finding":finding.model_dump(mode="json"),"candidate_trace":self.error_context(search)}, lambda p: validate_replay(self.state,unit,bundle,finding,p,self.implementation))
+                revised=validate_replay(self.state,unit,bundle,finding,plan,self.implementation)
+                new=self.save_model(unit,revised,model,"Initial candidate experiment and observation plan; not F4")
                 self.state.active_model_id=new.id; self.advance("replay")
             elif phase=="assess":
                 record=assess_execution(self.state,model,bundle,experiment,calibration,finding,extract_events(experiment))
@@ -457,12 +381,8 @@ class Engine:
                 else: self.advance("diagnose")
             elif phase in {"feedback_F1","feedback_F4","diagnose"}:
                 kind=phase.removeprefix("feedback_")
-                context={**self.context(unit),"bundle":bundle.model_dump(mode="json"),"model_id":model.id,
-                    "calibration":calibration.model_dump(mode="json") if calibration else None,
-                    "experiment":self.error_context(experiment) if experiment else None,"events":extract_events(experiment) if experiment else [],
-                    "finding":finding.model_dump(mode="json") if finding else None,
-                    "last_assessment":self.state.monitor_results[-1] if self.state.monitor_results else None}
-                f,_=self.ask(kind,Feedback,context)
+                context=feedback_context(self,unit,model,bundle,experiment,calibration,finding)
+                f,_=self.ask(kind,Feedback,context,lambda p:validate_feedback(self.state,unit,bundle,p,self.implementation,kind))
                 if f.requests:
                     self.targeted_read(unit,f.rationale,requests=f.requests); self.advance(phase); continue
                 if f.kind=="unresolved":
@@ -477,22 +397,18 @@ class Engine:
                 elif f.kind=="F3":
                     self.state.active_unit_id=None; self.state.active_model_id=None; self.advance("select"); return
                 elif updated:
-                    new=save_bundle(self.root,self.state,unit,updated,self.implementation,model,f.kind+" revision")
+                    new=self.save_model(unit,updated,model,f.kind+" revision")
                     self.state.active_model_id=new.id
                     self.advance("replay" if f.kind=="F4" or finding else "experiment")
                 else: self.finish_unit(unit,"blocked"); return
             elif phase=="technical_repair":
                 self.budget.take("technical_repairs")
                 failure=next(c for c in self.state.checks if c.id==self.state.pending_feedback["check_id"])
-                reply,_=self.ask("technical",BuildReply,{**self.context(unit),"bundle":bundle.model_dump(mode="json"),"failure":self.error_context(failure)})
+                reply,_=self.ask("technical",BuildReply,{**self.context(unit),"bundle":bundle.model_dump(mode="json"),"failure":self.error_context(failure)}, lambda p: validate_build_reply(self.state,unit,p,self.implementation,bundle,self.state.pending_feedback["technical_phase"]))
                 if reply.bundle is None:
                     self.targeted_read(unit,reply.gap,requests=reply.requests); self.advance("technical_repair"); continue
                 repaired=reply.bundle
-                if repaired.checker_specs()!=bundle.checker_specs() or repaired.scope!=bundle.scope:
-                    raise Blocked("Technical repair changed property scope or attribution")
-                if self.state.pending_feedback["technical_phase"]!="search" and (repaired.behavior!=bundle.behavior or repaired.properties!=bundle.properties):
-                    raise Blocked("Compilation repair cannot change model semantics")
-                new=save_bundle(self.root,self.state,unit,repaired,self.implementation,model,"Bounded technical repair; no semantic attribution")
+                new=self.save_model(unit,repaired,model,"Bounded technical repair; no semantic attribution")
                 self.state.active_model_id=new.id
                 self.advance("replay" if finding else "experiment" if self.config.allow_experiments else "search")
             else: raise Blocked("Unknown checkpoint action: "+phase)
@@ -523,8 +439,9 @@ class Engine:
                     active=next(u for u in self.state.units if u.id==self.state.active_unit_id)
                     self.process_unit(active)
                     continue
-                if not any(u.status == "pending" for u in self.state.units):
-                    self.state.stop_reason = "No pending executable audit units; unresolved gaps remain"
+                if not any(u.status in {"pending", "partial"} for u in self.state.units):
+                    missing = [u.id + ": " + ", ".join(u.remaining_obligation_ids) for u in self.state.units if u.remaining_obligation_ids and u.status != "revised"]
+                    self.state.stop_reason = "Unfinished obligations remain without an executable next step: " + "; ".join(missing) if missing else "No pending executable audit units; unresolved gaps remain"
                     break
                 if self.state.usage.get("audit_units", 0) >= self.config.budget.audit_units:
                     raise BudgetExhausted("Audit-unit budget exhausted")

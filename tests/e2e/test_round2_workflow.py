@@ -186,3 +186,32 @@ def test_initial_replay_then_F4_and_attribution_continue(tmp_path,tlc,interrupt_
     assert not state.monitor_results[-1]['confirmed']  # Fixture agent provenance remains mock.
     assert all(e.applicability=='current' for e in state.evidence)
     assert any(p.name.endswith('-diagnose') for p in (root/'agent').iterdir())
+
+
+@pytest.mark.real
+def test_model_files_written_before_state_checkpoint_resume_same_generation(tmp_path,tlc,prepared):
+    repo,fixture=deferred_fixture(tmp_path,prepared[3])
+    config=Config(implementation='toy',agent_backend='mock',fixture=str(fixture),tlc_jar=os.environ['TLC_JAR'])
+    config.budget.audit_units=3
+    root=tmp_path/'model-commit-resume'
+    class Interrupted(Engine):
+        crashed=False
+        def model_commit_hook(self,model):
+            self.crashed=True
+            raise RuntimeError('Model files complete; state still references generation action')
+        def checkpoint(self,event):
+            if not self.crashed:
+                super().checkpoint(event)
+    with pytest.raises(RuntimeError):
+        Interrupted(config,root,*assemble(config),INQUIRY).start(repo)
+    before=Store(root).load()
+    assert not before.models and (root/'models/v1/commit.json').exists()
+    commit=json.loads((root/'models/v1/commit.json').read_text())
+    calls=before.usage['agent_calls']
+    state=Engine(config,root,*assemble(config),INQUIRY).resume()
+    assert state.stop_reason.startswith('No pending'),state.stop_reason
+    assert state.models[0].id==commit['model']['id']
+    assert len([m for m in state.models if m.version==1])==1
+    assert state.usage['agent_calls']==calls+3
+    prompts=[p.read_text() for p in (root/'agent').glob('*/prompt.txt')]
+    assert any('scope_delta' in p and 'Split actions at actual interruptible boundaries' in p and 'Use MODULE Behavior' in p for p in prompts)

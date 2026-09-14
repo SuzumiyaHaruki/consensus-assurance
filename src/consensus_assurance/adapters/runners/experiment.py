@@ -85,7 +85,7 @@ def extract_events(check):
 
 def prerequisites(events, ordered):
     if ordered and not isinstance(ordered[0],str):
-        from consensus_assurance.workflow.observations import match_prerequisites
+        from consensus_assurance.core.events import match_prerequisites
         result = match_prerequisites(events,ordered)
         return result["status"] == "matched", result["reason"]
     names = [e["event"] for e in events]

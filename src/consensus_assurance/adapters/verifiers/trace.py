@@ -14,6 +14,9 @@ def tla_value(value):
         return str(value)
     if isinstance(value, str):
         return json.dumps(value, ensure_ascii=True)
+    if isinstance(value, list):
+        if len(value) > 1000: raise ValueError("Observation history exceeds the finite projection bound")
+        return "<<" + ", ".join(tla_value(v) for v in value) + ">>"
     if isinstance(value, dict) and value:
         if not all(re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*", k) for k in value):
             raise ValueError("Observation fields must be TLA identifiers")
@@ -27,7 +30,7 @@ def project(events, mapping):
     if not set(mapping.required_events) <= {e["event"] for e in events}:
         raise ValueError("Required events were not observed")
     projected = []
-    from consensus_assurance.workflow.observations import field, MISSING
+    from consensus_assurance.core.events import field, MISSING
     for event in events:
         if "state" not in event and all(f.source == "state" for f in mapping.fields):
             continue

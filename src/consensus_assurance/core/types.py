@@ -290,10 +290,13 @@ class AuditUnit(Record):
     scope: Scope
     rationale: str
     goal_observable: bool = False
-    status: Literal["pending", "selected", "checked", "blocked", "revised"] = "pending"
+    status: Literal["pending", "selected", "checked", "partial", "blocked", "revised"] = "pending"
     previous_id: str | None = None
     version: int = 1
     boundary_changes: list[str] = []
+    obligation_checks: dict[str, list[str]] = {}
+    remaining_obligation_ids: list[str] = []
+    recheck_reasons: list[str] = []
 
 
 class Calibration(Record):
@@ -362,6 +365,7 @@ class Analysis(Record):
     first_model_seconds: float | None = None
     parent_run: str | None = None
     pending_feedback: dict | None = None
+    pending_output_repair: dict | None = None
     graph_version: int = 0
     graph_history: list[dict] = []
     reading_history: list[dict] = []
@@ -417,4 +421,14 @@ class Analysis(Record):
                     item.stale_reason = reason
                 elif isinstance(item, Calibration):
                     item.status = "stale"
+        if not historical:
+            affected_units = {m.unit_id for m in self.models if m.id in model_ids}
+            for unit in self.units:
+                if unit.id in affected_units:
+                    if reason not in unit.recheck_reasons:
+                        unit.recheck_reasons.append(reason)
+                    unit.obligation_checks = {}
+                    unit.remaining_obligation_ids = list(unit.obligation_ids)
+                    if unit.status in {"checked", "partial", "blocked"}:
+                        unit.status = "pending"
         # Executions and their original outcomes never change.

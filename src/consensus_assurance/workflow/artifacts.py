@@ -1,50 +1,25 @@
 import re
+import json
+import os
 from pathlib import Path
-from consensus_assurance.core.types import ModelArtifact, Origin
+from consensus_assurance.core.types import ModelArtifact, Origin, uid
 from consensus_assurance.adapters.storage.files import digest, write_json
 
-SAFE_MODULES = {"Naturals", "Integers", "Sequences", "FiniteSets", "Bags", "Reals", "Behavior"}
+from consensus_assurance.adapters.verifiers.tla_syntax import tla_code, validate_tla
 
 
-def tla_code(source):
-    """Remove strings and nested comments while preserving line structure for validation."""
-    out, i, depth, quoted = [], 0, 0, False
-    while i < len(source):
-        pair = source[i:i+2]
-        c = source[i]
-        if depth:
-            if pair == "(*": depth += 1; out.extend("  "); i += 2; continue
-            if pair == "*)": depth -= 1; out.extend("  "); i += 2; continue
-            out.append("\n" if c == "\n" else " "); i += 1; continue
-        if quoted:
-            if ord(c) == 92 and i+1<len(source): out.extend("  "); i += 2; continue
-            if c == '"': quoted=False
-            out.append("\n" if c == "\n" else " "); i += 1; continue
-        if pair == "(*": depth=1; out.extend("  "); i += 2; continue
-        if pair == "\\*":
-            end=source.find("\n",i)
-            if end<0: end=len(source)
-            out.extend(" "*(end-i)); i=end; continue
-        if c == '"': quoted=True; out.append(" "); i += 1; continue
-        out.append(c); i += 1
-    if depth or quoted: raise ValueError("Unterminated TLA comment or string")
-    return "".join(out)
+def materialize_bundle(bundle):
+    if bundle.properties == "GENERATE_FROM_OBSERVABLE_PROPERTIES":
+        from consensus_assurance.adapters.verifiers.observable import properties_source
+        if not bundle.observable_properties:
+            raise ValueError("Shared property generation requires nonempty observable_properties")
+        bundle = bundle.model_copy(deep=True)
+        bundle.properties = properties_source(bundle.observable_properties, bundle.observation)
+    return bundle
 
 
-def validate_tla(source, module):
-    code = tla_code(source)
-    if not re.search(r"-+ MODULE " + module + r" -+", code):
-        raise ValueError("Unexpected TLA module name")
-    if re.search(r"\b(?:INSTANCE|LOCAL|ASSUME|Java|IOUtils|Json|CSV)\b",code):
-        raise ValueError("Unsupported module feature; external overrides and assumptions are not accepted")
-    if re.search(r"\b[A-Za-z_]\w*\s*!\s*[A-Za-z_]\w*",code) or re.search(r"!(?!\s*[\[.])",code):
-        raise ValueError("Module-qualified operators are not allowed; EXCEPT updates are supported")
-    for match in re.finditer(r"\bEXTENDS\s+([A-Za-z_]\w*(?:\s*,\s*[A-Za-z_]\w*)*)",code):
-        modules = {m.strip() for m in match[1].split(",")}
-        if not modules <= SAFE_MODULES: raise ValueError("Unapproved TLA module dependency")
-
-
-def save_bundle(root, state, unit, bundle, implementation, previous=None, reason="Initial generation"):
+def validate_bundle(state, unit, bundle, implementation):
+    bundle = materialize_bundle(bundle)
     specs = bundle.checker_specs()
     checked_ids = {c.claim_id for c in specs}
     invariants = [c.invariant for c in specs]
@@ -73,8 +48,36 @@ def save_bundle(root, state, unit, bundle, implementation, previous=None, reason
             raise ValueError("Model constraint cites an unknown source")
         if constraint.source_kind == "code_observation" and not set(constraint.source_ids) & set(unit.binding_ids):
             raise ValueError("Code-derived transition constraint must cite a selected binding")
+    return specs
+
+
+def save_bundle(root, state, unit, bundle, implementation, previous=None, reason="Initial generation", transaction_key=None):
+    bundle = materialize_bundle(bundle)
+    specs = validate_bundle(state, unit, bundle, implementation)
+    invariants = [c.invariant for c in specs]
+    checked_ids = {c.claim_id for c in specs}
+    root = Path(root)
+    if transaction_key:
+        for manifest in (root / "models").glob("v*/commit.json"):
+            saved = json.loads(manifest.read_text())
+            if saved["transaction_key"] != transaction_key:
+                continue
+            if saved["bundle"] != bundle.model_dump(mode="json") or saved["unit_id"] != unit.id or saved["previous_id"] != (previous.id if previous else None):
+                raise ValueError("Model commit input differs from the pending action")
+            model = ModelArtifact.model_validate(saved["model"])
+            if any(not Path(path).is_file() or digest(Path(path).read_bytes()) != expected for path, expected in model.artifact_digests.items()):
+                raise ValueError("Committed model files are incomplete or changed")
+            if not any(m.id == model.id for m in state.models):
+                state.models.append(model)
+            return model
     version = 1 + max([m.version for m in state.models] or [0])
     folder = root / "models" / f"v{version}"
+    destination = folder
+    if transaction_key:
+        folder = root / "models" / (".pending-" + transaction_key)
+        if folder.exists():
+            # Preserve partial bytes as an abandoned attempt, then rebuild the same commit.
+            folder.rename(folder.with_name(folder.name + "-incomplete-" + uid()))
     folder.mkdir(parents=True, exist_ok=False)
     behavior, checker, cfg = folder / "Behavior.tla", folder / "Properties.tla", folder / "Properties.cfg"
     behavior.write_text(bundle.behavior); checker.write_text(bundle.properties)
@@ -90,5 +93,15 @@ def save_bundle(root, state, unit, bundle, implementation, previous=None, reason
         extension_schema={"type": "object", "description": "Tool-specific TLA metadata; constants are saved verbatim"}, extension_version="2",
         unit_id=unit.id, checker_path=str(checker), mapping_path=str(mapping), harness_path=str(harness), bundle_path=str(proposal),
         artifact_digests=artifacts, checkers=specs, graph_versions={x.id:x.version for x in [*state.claims,*state.bindings,*state.relations] if x.id in set(checked_ids)|set(unit.binding_ids)|set(unit.relation_ids)}, previous_id=previous.id if previous else None, revision_reason=reason)
+    if transaction_key:
+        old_folder = str(folder)
+        payload = model.model_dump(mode="json")
+        for key in ("path", "config_path", "checker_path", "mapping_path", "harness_path", "bundle_path"):
+            payload[key] = payload[key].replace(old_folder, str(destination), 1)
+        payload["artifact_digests"] = {path.replace(old_folder, str(destination), 1): value for path, value in payload["artifact_digests"].items()}
+        model = ModelArtifact.model_validate(payload)
+        write_json(folder / "commit.json", {"transaction_key": transaction_key, "unit_id": unit.id,
+            "previous_id": previous.id if previous else None, "bundle": bundle.model_dump(mode="json"), "model": model.model_dump(mode="json")})
+        os.rename(folder, destination)
     state.models.append(model)
     return model

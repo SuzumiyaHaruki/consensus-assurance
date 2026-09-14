@@ -24,7 +24,7 @@ class BindingDraft(Record):
     id: str
     claim_id: str
     material_id: str
-    symbol: str = Field(description="One literal symbol spelling present in the referenced excerpt. Use runFSM, not Raft.runFSM when the source declares func (r *Raft) runFSM. Do not combine multiple symbols; use separate bindings.")
+    symbol: str = Field(description="One literal symbol spelling present in the referenced excerpt. Qualified names are allowed only when literally present. Do not combine multiple symbols; use separate bindings.")
     start_line: int
     end_line: int
     description: str
@@ -93,6 +93,24 @@ class EventRequirement(Record):
     conditions: list[Comparison] = []
 
 
+class ObservableProperty(Record):
+    checker_id: str
+    kind: Literal["event_assertion", "stable_support"] = "event_assertion"
+    trigger: Comparison
+    assertion: Comparison
+    identity_fields: list[str] = []
+    history_field: str | None = None
+    description: str
+
+
+class ObservationChange(Record):
+    change_index: int = Field(ge=0)
+    start_line: int = Field(ge=1)
+    end_line: int = Field(ge=1)
+    binding_ids: list[str] = Field(min_length=1)
+    rationale: str
+
+
 class EventMonitor(Record):
     id: str
     checker_id: str
@@ -103,6 +121,7 @@ class EventMonitor(Record):
     binding_ids: list[str]
     grounding: Grounding
     applicability_conditions: list[Comparison] = []
+    property: ObservableProperty | None = None
 
 
 
@@ -116,6 +135,7 @@ class Harness(Record):
     prerequisites: list[EventRequirement] = []
     legality: Grounding = Grounding()
     legal_conditions: list[Comparison] = []
+    observation_changes: list[ObservationChange] = []
 
 
 
@@ -136,6 +156,7 @@ class Bundle(Record):
     uncertainties: list[str]
     checkers: list[CheckerSpec] = []
     monitors: list[EventMonitor] = []
+    observable_properties: list[ObservableProperty] = []
 
     def checker_specs(self):
         if self.checkers:
@@ -159,6 +180,8 @@ class GraphPatch(Record):
 
 class ReplayPlan(Record):
     harness: Harness
+    monitors: list[EventMonitor] | None = None
+    observation: ObservationMap | None = None
     checker_id: str
     rationale: str
 
@@ -166,7 +189,7 @@ class ReplayPlan(Record):
 class BuildReply(Record):
     bundle: Bundle | None
     gap: str
-    requests: list[dict[str, str | int]] = []
+    requests: list[ReadRequest] = []
 
 
 class Feedback(Record):
@@ -182,4 +205,4 @@ class Feedback(Record):
     old_judgment: str = ""
     new_judgment: str = ""
     grounding: Grounding = Grounding()
-    requests: list[dict[str, str | int]] = []
+    requests: list[ReadRequest] = []

@@ -37,11 +37,18 @@ def test_multiple_invariants_are_attributed_individually(tlc,tmp_path,reversed_o
 
 
 @pytest.mark.real
-@pytest.mark.parametrize('mode,partial,confirm',[('memory',False,False),('durable',False,True),('conflict',False,False),('durable',True,False)])
-def test_actual_contract_and_observation_determine_confirmation(tlc,tmp_path,mode,partial,confirm):
+@pytest.mark.parametrize('mode,partial,confirm,variant',[('memory',False,False,'plain'),('durable',False,True,'plain'),('conflict',False,False,'plain'),('durable',True,False,'plain'),('durable',False,True,'reviewed_observation'),('durable',False,False,'wrong_monitor')])
+def test_actual_contract_and_observation_determine_confirmation(tlc,tmp_path,mode,partial,confirm,variant):
     verifier,runner=tlc
     repo=tmp_path/'repo';shutil.copytree(ROOT/'fixtures/ack_service',repo)
     state,unit,bundle=setup_ack(repo,mode,partial)
+    if variant=='wrong_monitor':
+        bundle.monitors[0].assertion=Comparison(field='state.accepted',value=False)
+    if variant=='reviewed_observation':
+        from consensus_assurance.core.proposals import ObservationChange
+        line=next(i for i,l in enumerate(bundle.harness.source.splitlines(),1) if "print('CA_EVENT '" in l)
+        bundle.harness.semantic_changes=['Add actual event printing']
+        bundle.harness.observation_changes=[ObservationChange(change_index=0,start_line=line,end_line=line,binding_ids=['ack-code'],rationale='Only serial event formatting and output in this scoped experiment')]
     model=save_bundle(runner.root,state,unit,bundle,ToyImplementation())
     workspace=runner.root/'workspace';shutil.copytree(repo,workspace)
     (workspace/'assurance_generated.py').write_text(bundle.harness.source)
@@ -66,6 +73,7 @@ def test_actual_contract_and_observation_determine_confirmation(tlc,tmp_path,mod
     assert (finding.level=='implementation_obligation') is confirm
     if mode=='memory': assert record['properties'][0]['outcome']=='holds'
     if partial: assert record['properties'][0]['outcome']=='unknown'
+    if variant=='wrong_monitor': assert any('differs' in x for x in record['properties'][0]['limitations'])
     if confirm:
         # Missing any required association or applicability condition prevents upgrade.
         for missing in ['snapshot','correlation','legality','calibration']:

@@ -65,7 +65,7 @@ def apply_discovery(state, proposal):
 
 
 def select_unit(state):
-    pending = [u for u in state.units if u.status == "pending"]
+    pending = [u for u in state.units if u.status in {"pending", "partial"}]
     if not pending:
         return None
     # Prefer a pending producer of a required boundary over its consumer.
