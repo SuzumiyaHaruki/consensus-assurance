@@ -13,6 +13,11 @@ class ToyImplementation:
     def read_only_roots(self):
         return []
     def parse_test_result(self, check, text):
+        if any(message in text for message in ("SyntaxError:", "ModuleNotFoundError:", "ImportError:")):
+            from consensus_assurance.core.types import ExecutionStatus
+            check.status = ExecutionStatus.ERROR
+            check.reason = "Harness syntax or import error"
+            return
         check.outcome = "tests_passed" if check.exit_code == 0 else "tests_failed"
 
     def identify(self, repo):
@@ -26,3 +31,9 @@ class ToyImplementation:
     def capabilities(self, check):
         return [Capability(name="counter_execution", status="probe_confirmed" if check.outcome == "tests_passed" else "unavailable",
             check_id=check.id, description="Actual finite counter execution; not a production consensus protocol")]
+
+    def required_inputs(self, repo):
+        return ["counter.py"]
+
+    def symbol_hints(self, file, lines):
+        return []

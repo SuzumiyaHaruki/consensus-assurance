@@ -19,9 +19,13 @@ class Budget(Record):
     material_chunks: int = Field(default=40, ge=1)
     audit_units: int = Field(default=2, ge=1)
 
+    targeted_reads: int = Field(default=3, ge=0)
+    technical_repairs: int = Field(default=2, ge=0)
+    error_context_chars: int = Field(default=16000, ge=1000)
+
 
 class Config(Record):
-    protocol: str = "raft"
+    protocol: str = "none"
     implementation: str = "hashicorp_raft"
     repo_path: str | None = None
     agent_backend: str = "codex"

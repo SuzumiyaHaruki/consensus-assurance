@@ -98,7 +98,7 @@ def test_F1_repaired_behavior_recalibrates_same_property(tlc, prepared):
 @pytest.mark.real
 def test_F2_normative_revision_executes_new_checker(tlc, prepared):
     from consensus_assurance.workflow.feedback import apply_feedback
-    from consensus_assurance.core.proposals import Feedback, Discovery
+    from consensus_assurance.core.proposals import Feedback, Discovery, GraphPatch
     verifier, runner = tlc
     _, state, correct, responses = prepared
     overstrong = correct.model_copy(deep=True)
@@ -110,6 +110,12 @@ def test_F2_normative_revision_executes_new_checker(tlc, prepared):
     graph = Discovery.model_validate(responses[1])
     graph.claims[1].description = 'The documented boundary is the supplied capacity, including capacity itself'
     correction = Feedback(kind='F2',rationale='The old checker excluded the documented capacity value',evidence_ids=['README.md:1:5'],target_ids=['step_obligation'],relation_ids=[],new_basis='The fixture documents reaching capacity before reset; the old strict boundary was unsupported',graph=graph,bundle=None)
+    correction.graph = None
+    correction.patch = GraphPatch(claims=[graph.claims[1]],expected_versions={graph.claims[1].id:1},rationale=correction.new_basis)
+    correction.old_judgment = state.claims[1].description
+    correction.new_judgment = graph.claims[1].description
+    correction.grounding = graph.claims[1].grounding.model_copy(deep=True)
+    correction.grounding.unresolved = []
     apply_feedback(state,state.units[0],overstrong,correction)
     new_model = save_bundle(runner.root,state,state.units[0],correct,ToyImplementation(),old_model,'F2 normative correction')
     new_check = verifier.check(runner,new_model,20)

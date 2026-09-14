@@ -1,6 +1,18 @@
 from consensus_assurance.core.types import Claim, Binding, Relation, AuditUnit, uid
 
 
+def validate_grounding(basis, materials, binding_ids):
+    if not basis.derivation.strip() or not basis.applicability.strip():
+        raise ValueError("A derivation and implementation applicability are required, not a source file kind")
+    references = set(basis.behavior_ids + basis.expectation_ids)
+    if not references or not references <= set(materials):
+        raise ValueError("Grounding must reference actually read materials")
+    if not set(basis.binding_ids) <= set(binding_ids):
+        raise ValueError("Grounding references unavailable code bindings")
+    if not basis.expectation_ids and len(set(basis.binding_ids)) < 2:
+        raise ValueError("Derived responsibilities without a direct expectation need producer and consumer bindings")
+
+
 def apply_discovery(state, proposal):
     materials = {m.id: m for m in state.materials}
     ids = [c.id for c in proposal.claims] + [b.id for b in proposal.bindings]
@@ -8,12 +20,12 @@ def apply_discovery(state, proposal):
     if len(ids + relation_ids) != len(set(ids + relation_ids)):
         raise ValueError("Duplicate graph identifiers")
     claims, bindings = [], []
+    all_binding_ids = {b.id for b in proposal.bindings}
     for c in proposal.claims:
         if not set(c.source_ids) <= materials.keys():
             raise ValueError("Claim references unread material")
-        if c.kind in {"goal", "obligation"} and all(materials[i].kind == "code_observation" for i in c.source_ids):
-            raise ValueError("Required behavior needs a source beyond code observations")
-        claims.append(Claim(**c.model_dump(), source="Agent candidate from attributed materials"))
+        validate_grounding(c.grounding, materials, all_binding_ids)
+        claims.append(Claim(**c.model_dump(), source="Candidate derived from attributed implementation responsibilities"))
     for b in proposal.bindings:
         if b.claim_id not in {c.id for c in claims} or b.material_id not in materials:
             raise ValueError("Binding references an unknown claim or material")
@@ -22,7 +34,7 @@ def apply_discovery(state, proposal):
             raise ValueError("Binding range is outside the read code snapshot")
         excerpt = "\n".join(m.text.splitlines()[b.start_line-m.start_line:b.end_line-m.start_line+1])
         if b.symbol not in excerpt:
-            raise ValueError("Bound symbol is absent from the referenced code")
+            raise ValueError(f"Binding {b.id}: literal symbol {b.symbol!r} is absent from {m.file}:{b.start_line}-{b.end_line}; use one spelling present in the excerpt and separate bindings for multiple symbols")
         bindings.append(Binding(id=b.id, claim_id=b.claim_id, file=m.file, symbol=b.symbol,
             start_line=b.start_line, end_line=b.end_line, snapshot_id=state.snapshot.id,
             content_digest=m.content_digest, basis="agent_inference", description=b.description,
@@ -31,6 +43,7 @@ def apply_discovery(state, proposal):
     for edge in proposal.relations:
         if edge.source not in ids or edge.target not in ids:
             raise ValueError("Relation endpoint does not exist")
+        validate_grounding(edge.grounding, materials, all_binding_ids)
         relations.append(Relation(**edge.model_dump()))
     units = []
     for u in proposal.units:
@@ -41,12 +54,14 @@ def apply_discovery(state, proposal):
         if not set(u.binding_ids) <= {b.id for b in bindings} or not set(u.relation_ids) <= set(relation_ids):
             raise ValueError("Audit unit references missing bindings or relations")
         relevant = [e for e in relations if e.id in u.relation_ids]
-        if not any(e.source in u.goal_ids and e.target in u.obligation_ids for e in relevant):
+        if any(b.claim_id not in u.obligation_ids + u.goal_ids for b in bindings if b.id in u.binding_ids):
+            raise ValueError("Audit unit contains a binding unrelated to its claims")
+        if not any(e.source in u.goal_ids and e.target in u.obligation_ids and e.kind in {"depends_all", "supports", "alternative"} for e in relevant):
             raise ValueError("Audit unit must reference a goal-to-obligation relationship")
         units.append(AuditUnit(**u.model_dump()))
     state.claims, state.bindings, state.relations, state.units = claims, bindings, relations, units
     state.graph_version += 1
-    state.gaps.extend(proposal.conflicts + proposal.unexplored)
+    state.gaps.extend(proposal.conflicts + proposal.unexplored + proposal.gaps)
 
 
 def select_unit(state):
@@ -91,6 +106,59 @@ def expand_unit(state, unit, relation_ids):
     expanded.binding_ids = binding_ids; expanded.obligation_ids = obligation_ids
     expanded.relation_ids = list(dict.fromkeys(unit.relation_ids + relation_ids))
     expanded.scope.description += "; expanded to explain dependency producers: " + ", ".join(relation_ids)
+    expanded.boundary_changes = ["Included producer bindings: " + ", ".join(b for b in binding_ids if b not in unit.binding_ids),
+        "Prior external boundary assumptions must be reconsidered; inclusion does not establish the guarantee"]
     expanded.rationale = "Dependency-driven expansion; regenerate state semantics, actions and observation mapping"
     unit.status = "revised"; state.units.insert(0, expanded)
     return expanded
+
+
+def apply_patch(state, patch, semantic=False):
+    """Validate an incremental update on a copy, then preserve superseded object versions."""
+    from consensus_assurance.core.proposals import Discovery, ClaimDraft, BindingDraft, RelationDraft, UnitDraft
+    current = {x.id: x for x in [*state.claims, *state.bindings, *state.relations, *state.units]}
+    for key, version in patch.expected_versions.items():
+        if key not in current or current[key].version != version:
+            raise ValueError("Graph patch version does not match the current object")
+    replacements = [*patch.claims, *patch.bindings, *patch.relations, *patch.units]
+    for obj in replacements:
+        if obj.id in current and obj.id not in patch.expected_versions:
+            raise ValueError("Replacing an object requires its expected version")
+        if obj.id in current and hasattr(obj, "kind") and obj.kind in {"goal", "obligation", "assumption"} and not semantic:
+            old = current[obj.id]
+            if obj.description != old.description or obj.scope != old.scope or obj.grounding != old.grounding:
+                raise ValueError("Changing claim semantics requires F2; dependency additions do not")
+    def merge(old, changes, convert):
+        values = {x.id: convert(x) for x in old}
+        values.update({x.id:x for x in changes})
+        return list(values.values())
+    def binding(x):
+        material = next((m for m in state.materials if m.file == x.file and m.start_line <= x.start_line <= x.end_line <= m.end_line), None)
+        if not material:
+            raise ValueError("Old binding no longer has its source material")
+        return BindingDraft(id=x.id,claim_id=x.claim_id,material_id=material.id,symbol=x.symbol,start_line=x.start_line,end_line=x.end_line,description=x.description,pending=x.pending)
+    claims = merge(state.claims,patch.claims,lambda x: ClaimDraft(**{k:v for k,v in x.model_dump().items() if k in ClaimDraft.model_fields}))
+    bindings = merge(state.bindings,patch.bindings,binding)
+    # Evidence edges are retained separately; they are not agent graph declarations.
+    internal = [e for e in state.relations if e.source in current and e.target in current]
+    external = [e for e in state.relations if e not in internal]
+    relations = merge(internal,patch.relations,lambda x: RelationDraft(**{k:v for k,v in x.model_dump().items() if k in RelationDraft.model_fields}))
+    units = merge(state.units,patch.units,lambda x: UnitDraft(**{k:v for k,v in x.model_dump().items() if k in UnitDraft.model_fields}))
+    trial = state.model_copy(deep=True)
+    apply_discovery(trial,Discovery(understanding="Incremental graph update",claims=claims,bindings=bindings,relations=relations,units=units,conflicts=[],unexplored=[],selection_rationale=patch.rationale,gaps=patch.gaps))
+    changed = {x.id for x in replacements}
+    for kind in ("claims","bindings","relations","units"):
+        values = getattr(trial,kind)
+        for index,item in enumerate(values):
+            if item.id in current:
+                old = current[item.id]
+                if item.id not in changed:
+                    values[index] = old
+                else:
+                    item.version = old.version + 1
+                    state.graph_history.append({"kind":kind,"id":old.id,"version":old.version,"record":old.model_dump(mode="json"),"reason":patch.rationale})
+        setattr(state,kind,values)
+    state.relations.extend(external)
+    state.graph_version += 1
+    state.gaps.extend(patch.gaps)
+    return changed

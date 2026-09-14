@@ -46,3 +46,9 @@ class HashicorpRaft:
             check_id=check.id, description="Package build and selected existing tests; not a full suite or scheduling probe"),
             Capability(name="precise_schedule_replay", status="unavailable", check_id=None,
             description="No pre-established deterministic asynchronous or crash schedule control; generated experiments must demonstrate prerequisites")]
+
+    def required_inputs(self, repo):
+        return ["go.mod"]
+
+    def symbol_hints(self, file, lines):
+        return []

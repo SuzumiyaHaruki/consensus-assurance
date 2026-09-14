@@ -25,7 +25,7 @@ def test_default_no_goal_F3_new_artifacts_and_recalibration(tmp_path, tlc, prepa
     assert len(state.models) == 2 and [r.kind for r in state.revisions] == ["F3"]
     assert state.models[0].binding_ids != state.models[1].binding_ids
     assert state.models[0].mapping_path != state.models[1].mapping_path
-    assert state.calibrations[0].status == "stale" and state.calibrations[1].status == "compatible"
+    assert state.calibrations[0].status == "compatible" and state.calibrations[0].applicability == "historical_scope" and state.calibrations[1].status == "compatible"
     assert all(e.level == "framework_test" and e.assessment != Assessment.SUPPORTED for e in state.evidence)
     assert before.files == capture(repo).files
     assert main(["report", "--run", str(root)]) == 0

@@ -63,6 +63,43 @@ class Scope(Record):
     parameters: dict[str, Any] = {}
 
 
+class Grounding(Record):
+    behavior_ids: list[str] = []
+    expectation_ids: list[str] = []
+    binding_ids: list[str] = []
+    derivation: str = ""
+    applicability: str = ""
+    unresolved: list[str] = []
+    conflicts: list[str] = []
+    alternatives: list[str] = []
+
+
+class CheckerSpec(Record):
+    invariant: str
+    claim_id: str
+    scope: Scope
+
+
+class CheckerResult(Record):
+    invariant: str
+    claim_id: str
+    scope: Scope
+    outcome: Literal["holds", "violated", "unknown"] = "unknown"
+    reason: str = "Not independently completed"
+
+
+class PendingAction(Record):
+    id: str = Field(default_factory=uid)
+    kind: str
+    unit_id: str | None = None
+    model_id: str | None = None
+    finding_id: str | None = None
+    status: Literal["planned", "running", "completed", "outcome_unknown"] = "planned"
+    input_path: str | None = None
+    check_ids: list[str] = []
+
+
+
 class Claim(Record):
     id: str
     kind: Literal["goal", "obligation", "assumption"]
@@ -73,6 +110,8 @@ class Claim(Record):
     pending: list[str] = []
     assessment: Assessment = Assessment.UNASSESSED
     candidate: bool = True
+    grounding: Grounding = Grounding()
+    version: int = 1
 
 
 class Binding(Record):
@@ -88,6 +127,7 @@ class Binding(Record):
     description: str
     pending: list[str] = []
     excerpt: str
+    version: int = 1
 
     @model_validator(mode="after")
     def ordered_range(self):
@@ -131,13 +171,15 @@ class ModelArtifact(Record):
     harness_path: str = ""
     bundle_path: str = ""
     artifact_digests: dict[str, str] = {}
+    checkers: list[CheckerSpec] = []
+    graph_versions: dict[str, int] = {}
 
 
 class CheckRun(Record):
     id: str = Field(default_factory=uid)
     action: str
     status: ExecutionStatus = ExecutionStatus.NOT_SCHEDULED
-    outcome: Literal["holds", "counterexample", "tests_passed", "tests_failed", "unknown", "not_applicable"] = "unknown"
+    outcome: Literal["holds", "counterexample", "deadlock", "tests_passed", "tests_failed", "unknown", "not_applicable"] = "unknown"
     origin: Origin = Origin.EXECUTED
     command: list[str] = []
     cwd: str
@@ -155,6 +197,9 @@ class CheckRun(Record):
     input_versions: dict[str, str] = {}
     reused: bool = False
     search_statistics: dict[str, str] = {}
+    violated_invariant: str | None = None
+    checker_results: list[CheckerResult] = []
+    pending_action_id: str | None = None
 
     def transition(self, status: ExecutionStatus):
         allowed = {ExecutionStatus.NOT_SCHEDULED: {ExecutionStatus.RUNNING, ExecutionStatus.TOOL_MISSING, ExecutionStatus.CANCELLED},
@@ -177,6 +222,9 @@ class Evidence(Record):
     assessment: Assessment
     stale_reason: str | None = None
     calibration_id: str | None = None
+    checker_id: str | None = None
+    claim_version: int | None = None
+    applicability: Literal["current", "historical_scope", "recheck_required"] = "current"
 
 
 class Finding(Record):
@@ -191,6 +239,10 @@ class Finding(Record):
     investigation_notes: list[str] = []
     replay_check_id: str | None = None
     level: Literal["model_candidate", "implementation_obligation", "implementation_goal"] = "model_candidate"
+    checker_id: str | None = None
+    claim_version: int | None = None
+    confirmation_path: str | None = None
+    applicability: Literal["current", "historical_scope", "recheck_required"] = "current"
 
 
 class Relation(Record):
@@ -202,6 +254,8 @@ class Relation(Record):
     confirmed: bool = False
     rationale: str
     pending: list[str] = []
+    grounding: Grounding = Grounding()
+    version: int = 1
 
 
 class Snapshot(Record):
@@ -213,6 +267,8 @@ class Snapshot(Record):
     files: dict[str, str]
     excluded: list[str]
     created_at: str = Field(default_factory=now)
+    readable_files: list[str] | None = None
+    exclusion_reasons: dict[str, str] = {}
 
 
 class Material(Record):
@@ -236,6 +292,8 @@ class AuditUnit(Record):
     goal_observable: bool = False
     status: Literal["pending", "selected", "checked", "blocked", "revised"] = "pending"
     previous_id: str | None = None
+    version: int = 1
+    boundary_changes: list[str] = []
 
 
 class Calibration(Record):
@@ -249,6 +307,7 @@ class Calibration(Record):
     reason: str
     origin: Origin
     scope: str = "Finite observed traces only; no equivalence proof"
+    applicability: Literal["current", "historical_scope", "recheck_required"] = "current"
 
 
 class Revision(Record):
@@ -272,7 +331,7 @@ class Capability(Record):
 
 
 class Analysis(Record):
-    schema_version: str = "1"
+    schema_version: str = "2"
     id: str = Field(default_factory=uid)
     mode: Literal["real", "mock"]
     analysis_mode: Literal["autonomous", "directed", "regression"] = "autonomous"
@@ -304,6 +363,19 @@ class Analysis(Record):
     parent_run: str | None = None
     pending_feedback: dict | None = None
     graph_version: int = 0
+    graph_history: list[dict] = []
+    reading_history: list[dict] = []
+    unread_ranges: dict[str, list[list[int]]] = {}
+    guidance: list[dict] = []
+    active_unit_id: str | None = None
+    active_model_id: str | None = None
+    active_finding_id: str | None = None
+    next_action: str = "select"
+    pending_action: PendingAction | None = None
+    action_history: list[PendingAction] = []
+    targeted_gap: dict | None = None
+    monitor_results: list[dict] = []
+
 
 
     def add_evidence(self, evidence: Evidence):
@@ -331,3 +403,18 @@ class Analysis(Record):
         for c in self.claims:
             if c.assessment != Assessment.UNASSESSED:
                 c.assessment = Assessment.STALE
+
+
+    def affect(self, model_ids, reason, historical=False):
+        model_ids = set(model_ids)
+        for item in [*self.evidence, *self.calibrations, *self.findings]:
+            if item.model_id not in model_ids:
+                continue
+            item.applicability = "historical_scope" if historical else "recheck_required"
+            if not historical:
+                if isinstance(item, Evidence):
+                    item.assessment = Assessment.STALE
+                    item.stale_reason = reason
+                elif isinstance(item, Calibration):
+                    item.status = "stale"
+        # Executions and their original outcomes never change.

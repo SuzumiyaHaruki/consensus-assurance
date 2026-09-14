@@ -1,7 +1,7 @@
 import copy
 import pytest
 from consensus_assurance.core.types import AuditUnit, CheckRun, ExecutionStatus, Calibration, Origin
-from consensus_assurance.core.proposals import Discovery, Feedback
+from consensus_assurance.core.proposals import Discovery, Feedback, GraphPatch
 from consensus_assurance.workflow.graph import apply_discovery, select_unit, expand_unit
 from consensus_assurance.workflow.feedback import apply_feedback
 
@@ -60,10 +60,16 @@ def test_F2_requires_normative_basis_and_invalidates(prepared):
     f = feedback(state, "F2", graph=revised, new_basis="The document assigns normalization to the caller")
     with pytest.raises(ValueError): apply_feedback(state, state.units[0], bundle, f)
     f.evidence_ids = ["README.md:1:5"]
+    f.graph = None
+    f.patch = GraphPatch(claims=[revised.claims[1]],expected_versions={revised.claims[1].id:1},rationale=f.new_basis)
+    f.old_judgment = state.claims[1].description
+    f.new_judgment = revised.claims[1].description
+    f.grounding = revised.claims[1].grounding.model_copy(deep=True)
+    f.grounding.unresolved = []
     state.calibrations.append(Calibration(model_id="old", experiment_check_id="observed", mapping_path="mapping", trace_path="trace", status="compatible", reason="Previous match", origin=Origin.MOCK))
     apply_feedback(state, state.units[0], bundle, f)
     assert state.graph_version == 2
-    assert state.calibrations[0].status == "stale"
+    assert state.calibrations[0].status == "compatible"  # Unrelated historical calibration survives.
     assert state.revisions[-1].return_step == "understand"
 
 
@@ -83,5 +89,5 @@ def test_fake_binding_and_normative_inference_rejected(prepared):
     graph.bindings[0].symbol = "nonexistent_symbol"
     with pytest.raises(ValueError): apply_discovery(state, graph)
     graph = Discovery.model_validate(responses[1])
-    graph.claims[0].source_ids = ["counter.py:1:10"]
+    graph.claims[0].grounding.derivation = ""
     with pytest.raises(ValueError): apply_discovery(state, graph)

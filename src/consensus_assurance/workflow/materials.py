@@ -5,25 +5,25 @@ from consensus_assurance.core.types import Material, Record
 from consensus_assurance.adapters.storage.files import digest
 
 
-class ReadRequest(Record):
-    file: str
-    start_line: int = Field(ge=1)
-    end_line: int = Field(ge=1)
-    reason: str
+from consensus_assurance.core.proposals import ReadRequest
 
 
 class ReadingPlan(Record):
     requests: list[ReadRequest] = Field(max_length=12)
     rationale: str
+    related_ids: list[str] = []
+    gap: str = ""
 
 
-def catalogue(repo, snapshot):
+def catalogue(repo, snapshot, adapter=None):
     entries = []
-    for rel in sorted(snapshot.files):
+    for rel in sorted(snapshot.readable_files if snapshot.readable_files is not None else snapshot.files):
         path = repo / rel
         lines = path.read_text(errors="replace").splitlines()
         symbols = [{"line": i+1, "declaration": line[:180]} for i, line in enumerate(lines)
                    if re.match(r"^(?:func |type |def |class )", line)]
+        if adapter and hasattr(adapter,"symbol_hints"):
+            symbols.extend(adapter.symbol_hints(rel, lines))
         entries.append({"file": rel, "lines": len(lines), "symbols": symbols[:100]})
     return entries
 
@@ -39,7 +39,7 @@ def material_kind(path, text):
 
 
 def read_material(repo, snapshot, request):
-    if request.file not in snapshot.files:
+    if request.file not in snapshot.files or (snapshot.readable_files is not None and request.file not in snapshot.readable_files):
         raise ValueError("Requested file is not in the sanitized snapshot")
     lines = (repo / request.file).read_text().splitlines()
     if request.end_line < request.start_line or request.end_line > len(lines):
@@ -52,7 +52,7 @@ def read_material(repo, snapshot, request):
 
 def initial_materials(repo, snapshot, budget, knowledge):
     result, count = [], 0
-    for rel in sorted(snapshot.files, key=lambda f: (not f.endswith((".md", ".rst")), len(f), f)):
+    for rel in sorted(snapshot.readable_files if snapshot.readable_files is not None else snapshot.files, key=lambda f: (not f.endswith((".md", ".rst")), len(f), f)):
         if len(result) >= min(8, budget.material_chunks):
             break
         lines = (repo / rel).read_text().splitlines()
@@ -63,7 +63,7 @@ def initial_materials(repo, snapshot, budget, knowledge):
         if count + len(item.text) > budget.material_chars // 3:
             continue
         result.append(item); count += len(item.text)
-    if knowledge:
+    if knowledge and len(result) < budget.material_chunks and count + len(knowledge) <= budget.material_chars:
         result.append(Material(id="protocol-knowledge", file="protocol-knowledge", start_line=1, end_line=len(knowledge.splitlines()),
             kind="protocol_candidate", text=knowledge, content_digest=digest(knowledge.encode())))
     return result
@@ -71,6 +71,7 @@ def initial_materials(repo, snapshot, budget, knowledge):
 
 def add_reads(state, repo, reading, budget):
     chars = sum(len(m.text) for m in state.materials)
+    new_ids = []
     for req in reading.requests:
         item = read_material(repo, state.snapshot, req)
         if item.id in {m.id for m in state.materials}:
@@ -78,5 +79,21 @@ def add_reads(state, repo, reading, budget):
         if len(state.materials) >= budget.material_chunks or chars + len(item.text) > budget.material_chars:
             state.gaps.append("Material reading budget reached; requested range remains unexplored: " + item.id)
             continue
-        state.materials.append(item); chars += len(item.text)
-    state.unexplored = [f for f in state.snapshot.files if f not in {m.file for m in state.materials}]
+        state.materials.append(item); chars += len(item.text); new_ids.append(item.id)
+    state.unread_ranges = {}
+    for file in state.snapshot.readable_files if state.snapshot.readable_files is not None else state.snapshot.files:
+        try:
+            length = len((repo / file).read_text().splitlines())
+        except UnicodeDecodeError:
+            continue
+        covered = sorted((m.start_line,m.end_line) for m in state.materials if m.file==file)
+        cursor, missing = 1, []
+        for start,end in covered:
+            if cursor < start: missing.append([cursor,start-1])
+            cursor = max(cursor,end+1)
+        if cursor <= length: missing.append([cursor,length])
+        if missing: state.unread_ranges[file] = missing
+    state.unexplored = list(state.unread_ranges)
+    state.reading_history.append({"related_ids":reading.related_ids,"gap":reading.gap,"rationale":reading.rationale,
+        "requests":[q.model_dump() for q in reading.requests],"added_material_ids":new_ids})
+    return new_ids

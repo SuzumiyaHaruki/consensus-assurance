@@ -7,7 +7,7 @@ from consensus_assurance.adapters.agents.backend import render
 from consensus_assurance.reporting.chinese import render_report
 
 
-@pytest.mark.parametrize("kind", ["read", "discover", "build", "retry", "diagnose", "F1", "F2", "F3", "F4"])
+@pytest.mark.parametrize("kind", ["read", "discover", "build", "retry", "diagnose", "F1", "F2", "F3", "F4", "targeted_read", "graph_patch", "replay", "technical"])
 def test_rendered_instructions_english_and_quoted_unicode_retained(kind):
     context = {"file": "/tmp/测试/实现.go", "quotation": "实现的原始说明", "reason": "Observe a missing dependency"}
     result = render(kind, context)

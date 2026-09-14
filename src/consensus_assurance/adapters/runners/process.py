@@ -13,6 +13,7 @@ class ProcessRunner:
         self.root = root.resolve()
         self.root.mkdir(parents=True, exist_ok=True)
         self.deadline = None
+        self.active_action_id = None
 
     def run(self, command: list[str], cwd: Path, action: str, snapshot_id: str,
             timeout: float = 60, stdin: str | None = None, env: dict | None = None) -> CheckRun:
@@ -25,7 +26,7 @@ class ProcessRunner:
         if not cwd.is_relative_to(self.root):
             raise ValueError("Execution directory must be inside the run directory")
         cwd.mkdir(parents=True, exist_ok=True)
-        run = CheckRun(action=action, command=command, cwd=str(cwd), snapshot_id=snapshot_id)
+        run = CheckRun(action=action, command=command, cwd=str(cwd), snapshot_id=snapshot_id, pending_action_id=self.active_action_id)
         logs = self.root / "logs" / run.id
         logs.mkdir(parents=True)
         run.transition(ExecutionStatus.RUNNING)

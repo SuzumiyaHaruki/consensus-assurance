@@ -1,4 +1,6 @@
 import argparse
+import re
+from datetime import datetime
 import fcntl
 import json
 import os
@@ -6,7 +8,6 @@ import sys
 from pathlib import Path
 import yaml
 from consensus_assurance.core.config import Config, locate_repo
-from consensus_assurance.core.types import uid
 from consensus_assurance.consensus.inquiry import INQUIRY
 from consensus_assurance.registry import assemble
 from consensus_assurance.workflow.engine import Engine
@@ -41,6 +42,22 @@ def resolve_run(value, runs_dir):
     return candidate.resolve()
 
 
+def create_run_directory(config, command):
+    parent = Path(config.runs_dir).expanduser().resolve()
+    parent.mkdir(parents=True, exist_ok=True)
+    label = re.sub(r"[^A-Za-z0-9_-]+", "-", config.implementation).strip("-")[:64] or "implementation"
+    mode = "mock" if config.agent_backend == "mock" else "real"
+    name = f"{datetime.now().astimezone():%Y-%m-%d_%H-%M-%S}-{label}-{mode}-{command}"
+    for number in range(10000):
+        root = parent / (name if number == 0 else f"{name}-{number + 1}")
+        try:
+            root.mkdir(exist_ok=False)
+            return root
+        except FileExistsError:
+            continue
+    raise FileExistsError("Too many run directories with the same timestamp")
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description="共识义务驱动的局部实现审计；默认自主发现目标")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -53,6 +70,8 @@ def main(argv=None):
     for name in ("resume", "report"):
         p = sub.add_parser(name); p.add_argument("--run", required=True)
         p.add_argument("--runs-dir", default="runs")
+        if name == "resume":
+            p.add_argument("--action-timeout", type=float, help="调整后续单动作超时（秒）；保留总预算和已用次数")
     args = parser.parse_args(argv)
     try:
         if args.command in {"resume", "report"}:
@@ -64,8 +83,7 @@ def main(argv=None):
         else:
             config = load_config(args.config, {"agent_backend": args.agent_backend, "tlc_jar": args.tlc_jar,
                 "runs_dir": args.runs_dir, "directed_question": args.goal})
-            root = Path(config.runs_dir).expanduser().resolve() / uid()
-            root.mkdir(parents=True, exist_ok=False)
+            root = create_run_directory(config, args.command)
         implementation, agent, verifier, knowledge = assemble(config)
         if args.command == "doctor":
             runner = ProcessRunner(root)
@@ -86,7 +104,7 @@ def main(argv=None):
         with (root / ".run.lock").open("w") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             if args.command == "resume":
-                state = engine.resume()
+                state = engine.resume(action_timeout=args.action_timeout)
             else:
                 repo = locate_repo(args.repo, config.repo_path)
                 state = engine.start(repo, plan_only=args.command == "plan")

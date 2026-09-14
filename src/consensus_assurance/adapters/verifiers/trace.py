@@ -27,16 +27,17 @@ def project(events, mapping):
     if not set(mapping.required_events) <= {e["event"] for e in events}:
         raise ValueError("Required events were not observed")
     projected = []
+    from consensus_assurance.workflow.observations import field, MISSING
     for event in events:
-        if "state" not in event:
+        if "state" not in event and all(f.source == "state" for f in mapping.fields):
             continue
-        if not isinstance(event["state"], dict):
-            raise ValueError("Invalid observed state")
         state = {}
-        for field in mapping.fields:
-            if field.raw_field not in event["state"]:
-                raise ValueError("Key observation is missing: " + field.raw_field)
-            state[field.model_field] = event["state"][field.raw_field]
+        for projection in mapping.fields:
+            prefix = "" if projection.source == "event" else projection.source + "."
+            value = field(event,prefix+projection.raw_field)
+            if value is MISSING:
+                raise ValueError("Key observation is missing: " + prefix+projection.raw_field)
+            state[projection.model_field] = value
         tla_value(state)
         projected.append(state)
     if len(projected) < 2:
@@ -86,7 +87,7 @@ def calibrate(verifier, runner, model, bundle, experiment, timeout):
     shutil.copyfile(Path(model.path).parent / "Behavior.tla", folder / "Behavior.tla")
     cfg = folder / "Calibration.cfg"
     cfg.write_text("INIT CInit\nNEXT CNext\nINVARIANT TraceNotAccepted\nCHECK_DEADLOCK FALSE\n" + ("CONSTANTS\n" + bundle.constants + "\n" if bundle.constants.strip() else ""))
-    adapted = model.model_copy(update={"path": str(source), "config_path": str(cfg)})
+    adapted = model.model_copy(update={"path": str(source), "config_path": str(cfg), "checkers": []})
     check = verifier.check(runner, adapted, timeout)
     check.action = "trace_calibration"; check.origin = experiment.origin
     check.artifacts.extend([str(trace_path), str(folder / "projected.json"), model.mapping_path])
