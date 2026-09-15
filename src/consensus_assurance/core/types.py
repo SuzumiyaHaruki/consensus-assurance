@@ -88,6 +88,9 @@ class Responsibility(Record):
 
 
 class InquiryTask(Record):
+    context_receipt_id: str | None = None
+    context_dependencies: dict = {}
+    read_plan_id: str | None = None
     repair_session: dict | None = None
     resolution_issue_ids: list[str] = []
     id: str = Field(default_factory=uid)
@@ -122,6 +125,8 @@ class SemanticCheck(Record):
 
 
 class SemanticReview(Record):
+    context_receipt_id: str | None = None
+    context_dependencies: dict = {}
     id: str = Field(default_factory=uid)
     task_id: str
     check_id: str
@@ -531,6 +536,12 @@ class Capability(Record):
 
 
 class Analysis(Record):
+    read_plans: dict[str, dict] = {}
+    material_allocations: list[dict] = []
+    task_attachments: dict[str, list[str]] = {}
+    packet_receipts: list[dict] = []
+    file_index: dict[str, dict] = {}
+    trigger_retry_tasks: list[dict] = []
     framework_revision: str | None = None
     framework_stage: str = "new_run"
     repair_sessions: dict[str, dict] = {}

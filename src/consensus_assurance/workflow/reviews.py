@@ -2,10 +2,7 @@
 from consensus_assurance.core.types import ReviewIssue
 
 
-def required_aspects(obj):
-    kind=getattr(obj,'kind',None)
-    if hasattr(obj,'bundle_path'):return {'checker_correspondence'}
-    return {'applicability','decomposition'} if kind=='obligation' else {'applicability'} if kind in {'goal','assumption'} else {'decomposition'}
+from .review_contract import required_aspects, target_contract
 
 
 def material_closure(state, ids):
@@ -45,6 +42,9 @@ def valid_supersession(state,review,task):
     if not set(task.material_ids)<=set(review.material_ids):return False
     for id,version in task.target_versions.items():
         if id not in objects or review.target_versions.get(id)!=version:return False
+        if review.context_receipt_id:
+            contract=target_contract(state,objects[id])
+            if review.context_dependencies.get(id,{}).get('dependency_versions')!=contract['dependency_versions'] or not set(contract['required_material_ids'])<=set(review.material_ids):return False
         items=[i for i in review.items if i.target_id==id and i.status=='no_issue_found' and not i.limitations]
         if not required_aspects(objects[id])<={i.aspect for i in items}:return False
     return bool(task.target_versions)
@@ -55,7 +55,7 @@ def validate_resolutions(state, task, reply):
     if reply.resolves_issue_ids or reply.supersedes_task_ids:
         if not reply.resolution_rationale.strip():raise ValueError('Explicit resolution requires attributed rationale')
     current={x.id:x.version for x in [*state.claims,*state.bindings,*state.relations,*state.units,*state.models]}
-    review=SemanticReview(task_id=task.id,check_id='validation',unit_id=task.unit_id,unit_version=task.unit_version,model_id=task.model_id,target_versions={i:current[i] for i in task.target_ids},material_ids=task.material_ids or [m.id for m in state.materials],items=reply.items,origin='agent',supersedes_task_ids=reply.supersedes_task_ids)
+    review=SemanticReview(task_id=task.id,check_id='validation',unit_id=task.unit_id,unit_version=task.unit_version,model_id=task.model_id,target_versions={i:current[i] for i in task.target_ids},material_ids=task.material_ids if task.context_receipt_id else task.material_ids or [m.id for m in state.materials],context_receipt_id=task.context_receipt_id,context_dependencies=task.context_dependencies,items=reply.items,origin='agent',supersedes_task_ids=reply.supersedes_task_ids)
     for id in reply.supersedes_task_ids:
         old=next((t for t in state.inquiry_tasks if t.id==id),None)
         if old is None or not valid_supersession(state,review,old):raise ValueError('Superseding review does not cover the old task scope, versions and aspects')
@@ -102,8 +102,10 @@ def readiness(state,unit):
     reviews=[];missing=[];disputed=[]
     for id in ids:
         obj=objects[id]
+        dependency=target_contract(state,obj)
+        needed=set(dependency['required_material_ids'])
         for aspect in required_aspects(obj):
-            candidates=[r for r in state.semantic_reviews if r.target_versions.get(id)==obj.version and materials<=set(r.material_ids) and any(i.target_id==id and i.aspect==aspect for i in r.items)]
+            candidates=[r for r in state.semantic_reviews if r.target_versions.get(id)==obj.version and needed<=set(r.material_ids) and all(r.context_dependencies.get(id,{}).get('dependency_versions',dependency['dependency_versions']).get(k)==v for k,v in dependency['dependency_versions'].items()) and any(i.target_id==id and i.aspect==aspect for i in r.items)]
             if not candidates:missing.append(id+':'+aspect);continue
             review=candidates[-1];reviews.append(review.id)
             if any(i.target_id==id and i.aspect==aspect and (i.status!='no_issue_found' or i.limitations) for i in review.items):disputed.append(id+':'+aspect)

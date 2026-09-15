@@ -66,7 +66,8 @@ class CoverageAgent(MockAgent):
             items=[];revision=None;exploration=[]
             for obj in context['target_objects']:
                 source_ids=obj.get('source_ids') or obj.get('grounding',{}).get('behavior_ids') or [context['materials'][0]['id']]
-                aspect='applicability' if obj.get('kind') in {'goal','obligation','assumption'} else 'checker_correspondence' if obj.get('path') else 'decomposition'
+                contract=next(c for c in context['review_contract'] if c['target_id']==obj['id'])
+                aspect=contract['required_aspects'][0]
                 status='no_issue_found';explanation='Actual supplied responsibilities agree with the scoped candidate; this is not a proof'
                 if obj.get('description')=='Return in memory mode requires persistence':
                     status='revision_needed';explanation='service_notes.md explicitly promises acceptance in memory mode, not persistence'
@@ -79,9 +80,9 @@ class CoverageAgent(MockAgent):
                     exploration=[{'reason':'Investigate the counter-to-result handoff even though the local invariant held','responsibility_ids':['delivery'],'requests':[request]}]
                 items.append({'target_id':obj['id'],'aspect':aspect,'status':status,'source_ids':source_ids,'explanation':explanation,'alternatives':'Different configured completion contracts can have different responsibilities','counterexample_reasoning':'A local counter bound alone cannot establish a returned-result contract','limitations':[]})
             for obj in context['target_objects']:
-                if obj.get('kind')=='obligation':
-                    original=next(i for i in items if i['target_id']==obj['id'])
-                    items.append({**original,'aspect':'decomposition'})
+                contract=next(c for c in context['review_contract'] if c['target_id']==obj['id'])
+                original=next(i for i in items if i['target_id']==obj['id'])
+                for aspect in contract['required_aspects'][1:]:items.append({**original,'aspect':aspect})
             resolved=[issue['id'] for issue in context.get('open_issues',[]) if any(i['target_id']==issue['target_id'] and i['aspect']==issue['aspect'] and i['status']=='no_issue_found' for i in items)]
             response={'items':items,'revision':revision,'exploration_requests':exploration,'limitations':[],'resolves_issue_ids':resolved,'resolution_rationale':'The corrected current configuration and cited materials address the prior interpretation' if resolved else ''}
         elif name=='BuildReply':

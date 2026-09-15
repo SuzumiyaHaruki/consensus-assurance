@@ -60,6 +60,45 @@ def progress_lines(state):
         "", "若 agent 回复完成而目标发现仍未被接受，不能把该回复视为已成立的关系图。历史记录未保存具体拒绝原因时，报告不补造原因。"]
 
 
+def resource_lines(state):
+    from consensus_assurance.core.config import Config
+    from consensus_assurance.workflow.materials import material_usage,material_allowance
+    cfg=Config.model_validate(state.config)
+    used=material_usage(state);breadth=material_allowance(state,cfg.budget,'breadth');depth=material_allowance(state,cfg.budget,'depth')
+    stages={}
+    for check in state.checks:
+        key=check.parameters.get('agent_task','agent') if check.action=='agent' else check.action
+        stage=stages.setdefault(key,{'calls':0,'seconds':0.0,'timed':0})
+        stage['calls']+=not check.reused
+        if check.started_at and check.ended_at and not check.reused:
+            stage['seconds']+=(datetime.fromisoformat(check.ended_at)-datetime.fromisoformat(check.started_at)).total_seconds();stage['timed']+=1
+    builds=[c for c in state.checks if c.action=='agent' and c.parameters.get('agent_task') in {'build','F3'}]
+    accepted=0
+    import json
+    for check in builds:
+        path=Path(check.cwd)/'accepted-response.json'
+        if path.is_file():
+            try:accepted+=isinstance(json.loads(path.read_text()).get('bundle'),dict)
+            except (ValueError,OSError):pass
+    lines=['','## 材料、上下文与实际产物','','字符口径为唯一源代码逻辑行（含一个换行分隔符），不等于每次发送量、token 或费用。未提供 token 数据时不推算账单。',
+        f"唯一材料 {used['unique_chars']}/{cfg.budget.material_chars} 字符；区间并集 {used['unique_chunks']}/{cfg.budget.material_chunks}。广度当前可分配 {breadth['available_chars']}、为深度保留 {breadth['reserved_for_other_chars']}；深度可分配 {depth['available_chars']}、为广度保留 {depth['reserved_for_other_chars']}。",
+        f"建模类执行记录 {len(builds)}；受理且非空 Bundle 回复 {accepted}；落盘模型版本 {len(state.models)}；实际性质搜索记录 {sum(c.action=='model_check' and not c.reused for c in state.checks)}（触达与校准另列）。",
+        '', '| 阶段 | 新调用记录 | 已记录时长（秒） |', '| --- | --- | --- |']
+    for name,item in stages.items():lines.append(f"| {name} | {item['calls']} | {item['seconds']:.2f}（{item['timed']} 条有起止时间） |")
+    deferred=[(id,item) for id,p in state.read_plans.items() for item in p['items'] if item['status']=='deferred']
+    for id,item in deferred:
+        q=item['request'];lines.append(f"延期读取 `{id}`：{q['file']}:{q['start_line']}–{q['end_line']}；预计新增 {item['new_chars']} 字符；{item['reason']}")
+    cached=sum(len(h.get('reattached_material_ids',[])) for h in state.reading_history)
+    lines += [f"缓存复用/重附加记录 {cached} 个；部分重叠只计增量。完整逐项状态及申请原文见 state.json 的 read_plans。",'', '| 任务/包 | 状态 | prompt 字符/字节 | wire schema 字符 | 材料重复出现/省略数 |','| --- | --- | --- | --- | --- |']
+    for p in state.packet_receipts:
+        lines.append(f"| {p['kind']}/{p['id'][:8]} | {p['status']} | {p['prompt_chars']}/{p['prompt_bytes']} | {p['wire_schema_chars']} | {p['duplicate_material_occurrences']}/{len(p['omitted_material_ids'])} |")
+    if not state.packet_receipts:lines.append('历史运行没有任务发送 receipt；不补造输入统计。')
+    interface=sum(any(d['code'].startswith('review_') for d in session.get('resolved_diagnostics',[])+session.get('diagnostics',[])) for session in state.repair_sessions.values())
+    lines.append(f"复核接口修复会话 {interface}；实际 F2 语义修订 {sum(r.kind=='F2' and r.status=='applied' for r in state.revisions)}。二者不互相替代。")
+    for task in state.trigger_retry_tasks:lines.append(f"触达任务 {task['model_id']}/{task['requirement_id']}：{task['status']}；尝试 {len(task['attempts'])} 次；{task['reason']}")
+    return lines
+
+
 def inquiry_lines(state):
     def text(value):
         return str(value).replace("|", "\\|").replace("\n", " ")
@@ -221,6 +260,7 @@ def render_report(state, root):
               f"首个已保存模型前耗时：{state.first_model_seconds if state.first_model_seconds is not None else '尚无模型'}；模型仍须通过实际工具检查。",
               f"审计单元 {len(state.units)}；范围扩展 {sum(x.kind == 'F3' for x in state.revisions)}；语义修订 {len(state.revisions)}；校准 {len(state.calibrations)}。",
               "完整命令、时间、版本与制品关联见 [state.json](state.json)，历史检查点见 `history/`，事件见 [events.jsonl](events.jsonl)。", ""]
+    lines += resource_lines(state)
     first = next((c for c in state.checks if c.action == "model_check" and c.status == ExecutionStatus.COMPLETED), None)
     if first and first.started_at:
         seconds = (datetime.fromisoformat(first.started_at) - datetime.fromisoformat(state.created_at)).total_seconds()

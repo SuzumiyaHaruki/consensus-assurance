@@ -95,7 +95,8 @@ def test_error_cycle_cannot_refresh_global_attempt_limit(tmp_path,prepared):
     repo,e,_=make(tmp_path,prepared,[candidate()])
     # The same field group keeps changing but never reaches the required values.
     from consensus_assurance.adapters.agents.backend import MockAgent
-    responses=[candidate(),patch('/requests/0/start_line',3),patch('/requests/0/start_line',2)]
+    original=candidate();original['requests'][0]['end_line']=4
+    responses=[original,patch('/requests/0/start_line',3),patch('/requests/0/start_line',2)]
     Path(e.config.fixture).write_text(json.dumps(responses));e.agent=MockAgent(e.config.fixture)
     with pytest.raises(Blocked):e.start(repo)
     assert e.state.pending_output_repair['attempt']==2

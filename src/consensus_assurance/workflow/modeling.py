@@ -57,7 +57,8 @@ def obligation_progress(state, unit):
             points=unit.coverage_intent+(unit.audit_question.points if unit.audit_question else [])
             if any(claim in p.claim_ids and not any(p.id in r.point_ids and (not p.sequence_required or bool(r.sequence)) for r in requirements) for p in points):complete=False
             reach=[r for r in state.reachability_results if r.model_id==model.id and r.search_fingerprint==model.search_fingerprint]
-            if any(not any(x.requirement_id==r.id and x.status=='reachable' for x in reach) for r in requirements):complete=False
+            latest={x.requirement_id:x for x in reach}
+            if any(r.id not in latest or latest[r.id].status!='reachable' for r in requirements):complete=False
             if not result or result.outcome not in {'holds','violated'}:complete=False
             else:ids.append(check.id)
         if complete:covered[claim]=list(dict.fromkeys(ids))

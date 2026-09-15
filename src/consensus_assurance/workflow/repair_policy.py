@@ -6,6 +6,12 @@ from consensus_assurance.core.types import Material
 
 
 def validate_representation(before,after,targets,context):
+    # Interface repairs may add an aspect but cannot erase a substantive opinion.
+    if any(t['path']=='/items' or t['path'].startswith('/items/') for t in targets):
+        for item in before.get('items',[]):
+            if item.get('status')!='no_issue_found' or item.get('limitations'):
+                if item not in after.get('items',[]):raise ValueError('Interface repair must retain prior negative analysis, sources and limitations unchanged; append the required analysis')
+        if before.get('revision')!=after.get('revision'):raise ValueError('Interface repair cannot change a semantic revision')
     roots={}
     for target in targets:
         route=parts(target['path'])

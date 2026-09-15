@@ -107,6 +107,7 @@ def test_resume_retries_failed_discovery_and_reuses_completed_reading(tmp_path, 
     failure_path = root / 'actions' / action.id / 'result.json'
     failure_bytes = failure_path.read_bytes()
     material_ids = [m.id for m in stopped.materials]
+    reading_records = list(stopped.reading_history)
     class PlanOnly(Engine):
         def execute(self, probed=False, plan_only=False):
             return super().execute(probed=probed, plan_only=True)
@@ -114,7 +115,8 @@ def test_resume_retries_failed_discovery_and_reuses_completed_reading(tmp_path, 
     assert resumed.stop_reason.startswith('Plan generated'), resumed.stop_reason
     assert resumed.usage['agent_calls'] == 3
     assert [m.id for m in resumed.materials] == material_ids
-    assert len(resumed.reading_history) == 1
+    assert resumed.reading_history == reading_records
+    assert {h['plan_id'] for h in resumed.reading_history} == {'automatic-survey','initial-reading'}
     assert resumed.claims
     assert failure_path.read_bytes() == failure_bytes
     assert any(a.id == action.id for a in resumed.action_history)

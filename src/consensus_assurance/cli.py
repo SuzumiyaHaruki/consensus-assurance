@@ -10,7 +10,7 @@ import yaml
 from consensus_assurance.core.config import Config, locate_repo
 from consensus_assurance.consensus.inquiry import INQUIRY
 from consensus_assurance.registry import assemble
-from consensus_assurance.workflow.engine import Engine
+from consensus_assurance.workflow.engine import Engine, FRAMEWORK_REVISION
 from consensus_assurance.adapters.storage.files import Store, write_json
 from consensus_assurance.adapters.runners.process import ProcessRunner
 from consensus_assurance.reporting.chinese import render_report
@@ -115,7 +115,7 @@ def main(argv=None):
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             if args.command == "resume":
                 state = engine.resume(action_timeout=args.action_timeout,repair_attempts=args.repair_attempts)
-                if state.framework_revision!="round6":
+                if state.framework_revision!=FRAMEWORK_REVISION:
                     print(state.stop_reason);return 2
             else:
                 repo = locate_repo(args.repo, config.repo_path)

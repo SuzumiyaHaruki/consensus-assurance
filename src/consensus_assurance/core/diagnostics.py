@@ -4,6 +4,7 @@ from .types import Record
 
 
 class Diagnostic(Record):
+    details: dict = {}
     code: str
     category: Literal['format','location','association','material','semantic','tool','internal']
     task: str = ''

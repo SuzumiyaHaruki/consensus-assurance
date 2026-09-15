@@ -63,3 +63,7 @@ TLC_JAR="$PWD/.tools/tla2tools.jar" .venv/bin/consensus-assurance run \
 ```
 
 沿用用户现有 Codex 路径和认证，不更换账户。配置没有 directed_question，protocol 为 none；总 agent_calls 仍为 20，总时长 2400 秒。修复总次数 4、每问题重复失败上限 1、无进展/循环阈值 2；这些不是额外赠送的调用，全部占用原总预算。依赖、工具或语义无法继续时如实受阻。旧 2026-09-15 失败运行不直接覆盖恢复，新运行会生成独立时间目录。
+
+## 第七轮待执行入口
+
+当前入口以 [第七轮复核与材料闭环](第七轮复核与材料闭环.md) 和 `configs/targets/hashicorp_raft.round7.yaml` 为准。旧各轮配置保留历史身份。本轮已执行 estimate 核对路径与有限预算；没有启动新的真实分析。先检查代码，再明确材料发送与隔离执行权限，随后使用该文档末尾命令创建本地授权配置。仍不预设快照、提交或选举目标。

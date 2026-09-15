@@ -82,8 +82,11 @@ def apply_replacements(value, targets, repair):
     for replacement in repair.replacements:
         route=parts(replacement.path); parent=result
         for key in route[:-1]: parent=parent[int(key)] if isinstance(parent,list) else parent[key]
-        key=int(route[-1]) if isinstance(parent,list) else route[-1]
-        parent[key]=json.loads(replacement.value_json)
+        if isinstance(parent,list) and route[-1]=='-':
+            parent.append(json.loads(replacement.value_json))
+        else:
+            key=int(route[-1]) if isinstance(parent,list) else route[-1]
+            parent[key]=json.loads(replacement.value_json)
     return result
 
 
@@ -167,6 +170,7 @@ def diagnostic_context(candidate,diagnostics,context,limit):
             for value in node.values():collect(value)
         elif isinstance(node,list):
             for value in node:collect(value)
+    collect(context)
     collect(candidate)
     pending=list(ids);visited=set()
     while pending:

@@ -3,7 +3,7 @@ import json
 from pathlib import Path
 from consensus_assurance.core.proposals import Discovery, GraphPatch
 from consensus_assurance.adapters.storage.files import write_json
-from .materials import catalogue, initial_materials, add_reads, ReadingPlan
+from .materials import catalogue, initial_materials, ReadingPlan, uid, material_allowance
 from .graph import apply_discovery, apply_patch, validate_patch
 from .errors import Blocked
 from . import inquiry
@@ -21,7 +21,7 @@ def context(engine, unit=None):
     if unit:
         from .reviews import material_closure
         wanted,closure=material_closure(engine.state,[unit.id])
-        wanted.update(engine.state.attached_material_ids)
+        wanted.update(engine.state.task_attachments.get('unit:'+unit.id,[]))
         result["materials"]=[m.model_dump(mode="json") for m in engine.state.materials if m.id in wanted]
         result["omitted_material_ids"]=[m.id for m in engine.state.materials if m.id not in wanted]
         result["semantic_reviews"]=[r.model_dump(mode="json") for r in engine.state.semantic_reviews if set(r.target_versions)&closure]
@@ -35,11 +35,17 @@ def context(engine, unit=None):
 def discover(engine):
     source = engine.root / "source"
     if "materials" not in engine.state.completed_steps:
-        engine.state.materials = initial_materials(source, engine.state.snapshot, engine.config.budget, engine.knowledge)
+        if not engine.state.materials and 'automatic-survey' not in engine.state.read_plans:
+            sample=initial_materials(source, engine.state.snapshot, engine.config.budget, engine.knowledge)
+            engine.read([{'file':m.file,'start_line':m.start_line,'end_line':m.end_line,'reason':'Automatic bounded survey'} for m in sample if m.kind!='protocol_candidate'],purpose='breadth',partial=True,plan_id='automatic-survey',charge=False)
+            for m in sample:
+                if m.kind=='protocol_candidate':engine.state.materials.append(m)
+            engine.checkpoint('initial_sample_recorded')
+        if not engine.state.materials and material_allowance(engine.state,engine.config.budget,"breadth")["available_chars"]==0:raise Blocked("No material capacity for a grounded initial plan; no agent request sent")
         inventory = catalogue(source, engine.state.snapshot,engine.implementation)
         write_json(engine.root / "catalogue.json", inventory)
         plan, _ = engine.ask("read", ReadingPlan, {"catalogue": inventory, "initial_materials": [m.model_dump(mode="json") for m in engine.state.materials]})
-        add_reads(engine.state, source, plan, engine.config.budget)
+        engine.read(plan.requests,purpose="breadth",partial=True,plan_id="initial-reading",related_ids=plan.related_ids,reason=plan.rationale,charge=False)
         write_json(engine.root / "materials.json", [m.model_dump(mode="json") for m in engine.state.materials])
         engine.state.completed_steps.append("materials"); engine.advance("discover")
     if "discovery" not in engine.state.completed_steps:
@@ -53,6 +59,12 @@ def discover(engine):
         def initial(proxy):
             apply_discovery(proxy.state,proposal)
             inquiry.initial_agenda(proxy,proposal)
+            from consensus_assurance.core.types import ReadRequest
+            for id,plan in proxy.state.read_plans.items():
+                if plan['purpose']=='breadth' and plan['status']!='complete':
+                    pending=[ReadRequest.model_validate(i['request']) for i in plan['items'] if i['status']=='deferred']
+                    task=inquiry.enqueue(proxy.state,'explore','Deferred initial material remains unexplored','deferred:'+id,requests=pending)
+                    task.stop_reason='Reserved local dependency capacity; original ranges preserved'
         commit_graph(engine,"discovery-"+check.id,proposal.model_dump(mode="json"),initial)
         path = engine.root / f"discovery-v{engine.state.graph_version}.json"
         write_json(path, proposal); engine.state.discovery_path = str(path)
@@ -61,26 +73,29 @@ def discover(engine):
 def targeted_read(engine, unit, gap, relation_ids=None, requests=None):
     source = engine.root/"source"
     if engine.state.targeted_gap is None:
-        engine.budget.take("targeted_reads")
-        engine.state.targeted_gap={"gap":gap,"related_ids":unit.obligation_ids if unit else [],
+        engine.state.targeted_gap={"plan_id":uid(),"requests":[q.model_dump(mode="json") if hasattr(q,"model_dump") else q for q in (requests or [])],"gap":gap,"related_ids":unit.obligation_ids if unit else [],
             "relation_ids":relation_ids or [],"stage":"read","new_material_ids":[]}
         engine.checkpoint("targeted_gap_recorded")
     task=engine.state.targeted_gap
     if task["stage"] == "read":
-        if requests:
-            reading=ReadingPlan.model_validate({"requests":requests,"rationale":gap,"related_ids":task["related_ids"],"gap":gap})
+        if task["requests"]:
+            reading=ReadingPlan.model_validate({"requests":task["requests"],"rationale":gap,"related_ids":task["related_ids"],"gap":gap})
         else:
             reading,_=engine.ask("targeted_read",ReadingPlan,{"gap":task,"catalogue":catalogue(source,engine.state.snapshot,engine.implementation),
                 "already_read":[{"id":m.id,"file":m.file,"start":m.start_line,"end":m.end_line} for m in engine.state.materials],
                 "relevant_bindings":[b.model_dump() for b in engine.state.bindings if unit and b.id in unit.binding_ids]})
         reading.related_ids=task["related_ids"]; reading.gap=gap
-        from .materials import obtain_materials
-        obtained=obtain_materials(engine.state,source,reading.requests,engine.config.budget,task['related_ids'],gap)
-        task["new_material_ids"]=obtained['added'];task['reattached_material_ids']=obtained['reattached']
-        task["stage"]="patch"
-        if engine.state.pending_action: engine.state.action_history.append(engine.state.pending_action);engine.state.pending_action=None
-        engine.checkpoint("targeted_materials_read")
-        if obtained['unavailable']:raise Blocked("Targeted material remains unavailable within the configured budget")
+        task['requests']=[q.model_dump(mode='json') for q in reading.requests]
+        engine.checkpoint('targeted_read_plan_saved')
+        receipt=engine.read(reading.requests,plan_id=task['plan_id'],related_ids=task['related_ids'],reason=gap)
+        task=engine.state.targeted_gap
+        task['receipt_id']=receipt['id'];task['unfulfilled']=[item for item in receipt['items'] if item['status']=='deferred']
+        task['new_material_ids']=list(dict.fromkeys(task.get('new_material_ids',[])+[id for item in receipt['items'] if item['status']=='acquired' for id in item['material_ids']]))
+        task['reattached_material_ids']=[id for item in receipt['items'] if item['status']=='cached' for id in item['material_ids']]
+        if task['unfulfilled']:
+            engine.checkpoint('targeted_read_deferred');raise Blocked('Required material remains deferred; resume the same reading plan before graph patch')
+        task['stage']='patch';inquiry.release_action(engine)
+        engine.checkpoint('targeted_materials_read')
     if not task["new_material_ids"]:
         if task.get('reattached_material_ids'):
             engine.state.targeted_gap=None;engine.checkpoint('existing_material_reattached');return None

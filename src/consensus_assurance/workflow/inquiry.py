@@ -138,12 +138,13 @@ def choose_task(engine):
 
 def task_context(engine,task):
     state=engine.state; available=objects(state)
-    seeds=set(task.target_ids)|({task.unit_id} if task.unit_id else set())
+    seeds=set(task.target_ids)
+    if task.kind=='explore' and task.unit_id:seeds.add(task.unit_id)
     for r in state.responsibilities:
         if r.id in task.responsibility_ids:seeds.update(r.claim_ids)
     wanted,closure=material_closure(state,seeds)
     wanted.update(task.added_material_ids)
-    wanted.update(state.attached_material_ids)
+    wanted.update(state.task_attachments.get('inquiry:'+task.id,[]))
     wanted.update(task.material_ids)
     for issue in state.review_issues:
         if (issue.target_id in closure or issue.id in task.resolution_issue_ids) and not issue.resolved_by:wanted.update(issue.source_ids)
@@ -154,16 +155,16 @@ def task_context(engine,task):
     selected=[m for m in state.materials if m.id in wanted]
     task.material_ids=[m.id for m in selected]
     task.unit_version=next((u.version for u in state.units if u.id==task.unit_id),None)
-    result={'task':task.model_dump(mode='json'),'responsibilities':[r.model_dump(mode='json') for r in state.responsibilities],
+    result={'task':task.model_dump(mode='json',exclude={'context_receipt_id','context_dependencies'}),'responsibilities':[r.model_dump(mode='json') if task.kind=='explore' or r.id in task.responsibility_ids else {'id':r.id,'description':r.description,'claim_ids':r.claim_ids} for r in state.responsibilities],
         'materials':[m.model_dump(mode='json') for m in selected],
         'omitted_material_ids':[m.id for m in state.materials if m.id not in wanted],
-        'catalogue':catalogue(engine.root/'source',state.snapshot,engine.implementation),
-        'unread_ranges':state.unread_ranges,'remaining_seconds':engine.budget.remaining(),
+        'catalogue':catalogue(engine.root/'source',state.snapshot,engine.implementation) if task.kind=='explore' else [],
+        'unread_ranges':state.unread_ranges if task.kind=='explore' else {f:r for f,r in state.unread_ranges.items() if f in {m.file for m in selected}},'remaining_seconds':engine.budget.remaining(),
         'target_objects':[available[i].model_dump(mode='json') for i in task.target_ids if i in available],
-        'claims':[c.model_dump(mode='json') if c.id in closure else {'id':c.id,'kind':c.kind,'description':c.description,'version':c.version} for c in state.claims],
-        'bindings':[b.model_dump(mode='json') for b in state.bindings if b.id in closure],
-        'relations':[r.model_dump(mode='json') for r in state.relations if r.id in closure],
-        'units':[u.model_dump(mode='json') for u in state.units if u.id in closure],
+        'claims':[c.model_dump(mode='json') if c.id in closure else {'id':c.id,'kind':c.kind,'description':c.description,'version':c.version} for c in state.claims if c.id not in task.target_ids],
+        'bindings':[b.model_dump(mode='json') for b in state.bindings if b.id in closure and b.id not in task.target_ids],
+        'relations':[r.model_dump(mode='json') for r in state.relations if r.id in closure and r.id not in task.target_ids],
+        'units':[u.model_dump(mode='json') for u in state.units if u.id in closure and u.id not in task.target_ids],
         'open_issues':[i.model_dump(mode='json') for i in state.review_issues if (i.target_id in closure or i.id in task.resolution_issue_ids) and not i.resolved_by],
         'blocked_review_tasks':[t.model_dump(mode='json') for t in state.inquiry_tasks if t.kind=='review' and t.status=='blocked' and not t.superseded_by and set(t.target_ids)<=set(task.target_ids)],
         'cost_estimate':cost_estimate(engine)}
@@ -189,19 +190,11 @@ def validate_exploration(state,reply):
 
 
 def validate_review(state,task,reply):
-    validate_resolutions(state,task,reply)
     available=objects(state); material_ids=set(task.material_ids) or {m.id for m in state.materials}
     if any(i not in available or available[i].version!=v for i,v in task.target_versions.items()):raise ValueError("Review target version changed since task execution started")
-    if {i.target_id for i in reply.items} != set(task.target_ids):
-        raise ValueError('Review must account for each requested object, without unrelated approvals')
-    if len({(i.target_id,i.aspect) for i in reply.items}) != len(reply.items):
-        raise ValueError('Duplicate semantic review aspect for an object')
-    for target_id in task.target_ids:
-        obj=available.get(target_id)
-        kind=getattr(obj,'kind',None)
-        required={'checker_correspondence'} if hasattr(obj,'bundle_path') else {'applicability','decomposition'} if kind=='obligation' else {'applicability'} if kind in {'goal','assumption'} else {'decomposition'}
-        if not required <= {i.aspect for i in reply.items if i.target_id==target_id}:
-            raise ValueError('Review omitted a required semantic aspect for '+target_id)
+    from .review_contract import validate_contract
+    validate_contract(state,task,reply)
+    validate_resolutions(state,task,reply)
     for item in reply.items:
         if item.target_id not in available or not set(item.source_ids)<=material_ids:
             raise ValueError('Semantic review cites an unavailable object or material')
@@ -234,16 +227,16 @@ def process_task(engine, task):
         state.inquiry_selections.append({'task_id':task.id,'kind':task.kind,'reason':task.reason,'trigger':task.trigger,'planned_target_versions':planned_versions,'execution_target_versions':task.target_versions})
         engine.checkpoint('inquiry_task_started')
     if task.stage=='read':
-        engine.budget.take('targeted_reads')
-        added=add_reads(state,engine.root/'source',ReadingPlan(requests=task.requests,rationale=task.reason,related_ids=task.target_ids+task.responsibility_ids,gap=task.reason),engine.config.budget)
-        task.added_material_ids.extend(added)
-        requested={q.file+':'+str(q.start_line)+':'+str(q.end_line) for q in task.requests}
-        if not requested<={m.id for m in state.materials}:
-            raise Blocked('Requested inquiry material could not be obtained within the material budget')
-        task.added_material_ids=list(dict.fromkeys(task.added_material_ids+sorted(requested)))
+        if not task.read_plan_id:
+            from consensus_assurance.core.types import uid
+            task.read_plan_id=uid();engine.checkpoint('inquiry_read_plan_saved')
+        receipt=engine.read(task.requests,purpose='breadth' if task.kind=='explore' else 'depth',partial=task.kind=='explore',plan_id=task.read_plan_id,related_ids=task.target_ids+task.responsibility_ids,reason=task.reason)
+        task=next(t for t in state.inquiry_tasks if t.id==task.id)
+        task.added_material_ids=list(dict.fromkeys(task.added_material_ids+[id for item in receipt['items'] if item['status']!='deferred' for id in item['material_ids']]))
+        if receipt['status']!='complete':
+            raise Blocked('Requested inquiry material is deferred within its protected allowance; unmet requests remain in the receipt')
         task.stage='analyze';release_action(engine)
-        write_json(engine.root/'materials.json',[m.model_dump(mode='json') for m in state.materials])
-        engine.checkpoint('inquiry_materials_read')
+        write_json(engine.root/'materials.json',[m.model_dump(mode='json') for m in state.materials]);engine.checkpoint('inquiry_materials_read')
     if task.repair_session and not state.pending_output_repair:state.pending_output_repair=task.repair_session
     context=task_context(engine,task)
     if task.kind=='explore':
@@ -252,7 +245,7 @@ def process_task(engine, task):
             old={m['id'] for m in context['materials']}
             if all(q.file+':'+str(q.start_line)+':'+str(q.end_line) in old for q in reply.requests):
                 raise Blocked('Exploration repeated already available ranges without producing a new interpretation')
-            task.requests=reply.requests;task.stage='read';release_action(engine);engine.checkpoint('inquiry_reading_requested');return
+            task.requests=reply.requests;task.read_plan_id=None;task.stage='read';release_action(engine);engine.checkpoint('inquiry_reading_requested');return
     else:
         reply,check=engine.ask('semantic_review',ReviewReply,context,lambda p:validate_review(state,task,p))
     from .transactions import commit_graph
@@ -374,7 +367,7 @@ def apply_task_response(engine,task_id,reply,check):
             if set(task.added_material_ids)&{source for c in state.claims if c.id in unit.goal_ids+unit.obligation_ids for source in c.source_ids}:
                 review_unit(engine,unit,'exploration_materials:'+task.id)
     else:
-        review=SemanticReview(task_id=task.id,check_id=check.id,unit_id=task.unit_id,unit_version=task.unit_version,model_id=task.model_id,target_versions=versions,material_ids=task.material_ids or [m.id for m in state.materials],items=reply.items,origin='mock' if engine.agent.mock else 'agent',supersedes_task_ids=reply.supersedes_task_ids,resolves_issue_ids=reply.resolves_issue_ids,resolution_rationale=reply.resolution_rationale)
+        review=SemanticReview(context_receipt_id=task.context_receipt_id,context_dependencies=task.context_dependencies,task_id=task.id,check_id=check.id,unit_id=task.unit_id,unit_version=task.unit_version,model_id=task.model_id,target_versions=versions,material_ids=task.material_ids if task.context_receipt_id else task.material_ids or [m.id for m in state.materials],items=reply.items,origin='mock' if engine.agent.mock else 'agent',supersedes_task_ids=reply.supersedes_task_ids,resolves_issue_ids=reply.resolves_issue_ids,resolution_rationale=reply.resolution_rationale)
         if reply.revision:
             ids_before=set(objects(state))
             engine.budget.take("revisions")
@@ -423,6 +416,7 @@ def cost_estimate(engine):
     units=[u for u in engine.state.units if u.status in {'pending','partial','selected'}]
     available=max(0,engine.config.budget.agent_calls-engine.state.usage.get('agent_calls',0))
     lower=len(tasks)+len(units)
-    return {'pending_inquiries':len(tasks),'pending_units':len(units),'minimum_agent_calls':lower,
+    from .materials import material_allowance
+    return {'material_allocation':{p:material_allowance(engine.state,engine.config.budget,p) for p in ('breadth','depth')},'pending_inquiries':len(tasks),'pending_units':len(units),'minimum_agent_calls':lower,
         'remaining_agent_calls':available,'fits_minimum':lower<=available,
         'limitations':['Lower bound only: excludes retries, additional reading, model repair, replay and tool latency; not a price or token bill']}

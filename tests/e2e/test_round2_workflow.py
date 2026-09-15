@@ -45,7 +45,7 @@ def test_F3_reads_new_producer_then_generates_and_checks_new_scope(tmp_path,tlc,
     assert len(state.models)==2
     initial=json.loads(Path(state.discovery_path).read_text())
     assert all(b['id']!='input_binding' for b in initial['bindings'])
-    read=next(h for h in state.reading_history if h['gap'])
+    read=next(h for h in state.reading_history if h['related_ids']==['step_obligation'])
     assert read['added_material_ids']==['upstream_support.py:1:2']
     assert read['related_ids']==['step_obligation']
     assert state.models[0].binding_ids==['step_binding']

@@ -25,6 +25,9 @@ from .errors import Blocked
 from .agent_tasks import ask as ask_agent
 
 
+FRAMEWORK_REVISION = "round7"
+
+
 class Engine:
     def __init__(self, config: Config, root: Path, implementation: ImplementationAdapter,
                  agent: AgentBackend, verifier: VerifierBackend, knowledge: str, inquiry: str):
@@ -53,7 +56,7 @@ class Engine:
         snapshot = capture(repo, self.root / "source")
         missing = [f for f in self.implementation.required_inputs(repo) if f not in snapshot.files] if hasattr(self.implementation,"required_inputs") else []
         if missing: raise ValueError("Required build inputs could not be safely copied: " + ", ".join(missing))
-        self.state = Analysis(framework_revision="round6", mode="mock" if self.agent.mock else "real", config=self.config.model_dump(mode="json"), snapshot=snapshot)
+        self.state = Analysis(framework_revision=FRAMEWORK_REVISION, mode="mock" if self.agent.mock else "real", config=self.config.model_dump(mode="json"), snapshot=snapshot)
         self.state.guidance = [{"source":"consensus/inquiry.py","text":self.inquiry}, {"source":"configured_reference","text":self.knowledge}]
         self.state.analysis_mode = "regression" if self.agent.mock else ("directed" if self.config.directed_question else "autonomous")
         self.state.elapsed_seconds = time.monotonic() - started
@@ -71,7 +74,7 @@ class Engine:
         self.state = self.store.load()
         self.budget = BudgetTracker(self.config.budget, self.state)
         self.runner.deadline = time.monotonic() + self.budget.remaining()
-        if self.state.framework_revision!="round6":
+        if self.state.framework_revision!=FRAMEWORK_REVISION:
             self.state.stop_reason="Framework revision differs or was not recorded; preserve this historical run and use an explicit offline migration/subrun"
             return self.state
         current = capture(Path(self.state.snapshot.repo))
@@ -323,6 +326,13 @@ class Engine:
             self.record(receipt)
         return model
 
+    def read_commit_hook(self,stage,receipt):
+        """Interruption seam around the atomic material receipt commit."""
+
+    def read(self,requests,**kwargs):
+        from .materials import execute_read
+        return execute_read(self,requests,**kwargs)
+
     def graph_commit_hook(self,key):
         """Interruption seam after semantic manifest, before state checkpoint."""
 
@@ -349,10 +359,27 @@ class Engine:
     def check_triggers(self,model,bundle):
         from consensus_assurance.core.types import ReachabilityResult
         for req in bundle.reachability:
-            if any(r.model_id==model.id and r.requirement_id==req.id for r in self.state.reachability_results):continue
-            result=self.action("reachability:"+req.id,"reachability_checks",lambda:self.verifier.reachability(self.runner,model,bundle,req,self.budget.timeout()),{"model_id":model.id,"requirement_id":req.id})
-            self.state.reachability_results.append(ReachabilityResult.model_validate(result[0]));self.record(CheckRun.model_validate(result[1]))
-            self.advance("triggers")
+            while True:
+                prior=[r for r in self.state.reachability_results if r.model_id==model.id and r.requirement_id==req.id and r.search_fingerprint==model.search_fingerprint]
+                if prior and prior[-1].status in {'reachable','unreachable'}:break
+                last=next((c for c in self.state.checks if prior and c.id==prior[-1].check_id),None)
+                retryable=not prior or (last is not None and last.status.value in {'timeout','error'})
+                allowed=retryable and len(prior)<=self.config.budget.trigger_retries
+                task=next((t for t in self.state.trigger_retry_tasks if t['model_id']==model.id and t['requirement_id']==req.id and t['search_fingerprint']==model.search_fingerprint),None)
+                if task is None:
+                    task={'model_id':model.id,'requirement_id':req.id,'search_fingerprint':model.search_fingerprint,'attempts':[]}
+                    self.state.trigger_retry_tasks.append(task)
+                task['status']='pending' if allowed else 'blocked'
+                task['reason']='Bounded retry of incomplete tool execution' if allowed else 'Retry limit reached or failure needs a tool/input change'
+                if not allowed:break
+                self.checkpoint('trigger_attempt_pending')
+                result=self.action("reachability:"+req.id,"reachability_checks",lambda:self.verifier.reachability(self.runner,model,bundle,req,self.budget.timeout()),{"model_id":model.id,"requirement":req.model_dump(mode='json'),"search_fingerprint":model.search_fingerprint,"attempt":len(prior)+1})
+                record=ReachabilityResult.model_validate(result[0]);check=CheckRun.model_validate(result[1])
+                if not any(r.check_id==record.check_id for r in self.state.reachability_results):self.state.reachability_results.append(record)
+                if check.id not in task['attempts']:task['attempts'].append(check.id)
+                task['status']=record.status
+                self.record(check)
+                self.advance("triggers")
 
     def finish_unit(self, unit, status="checked"):
         unit.coverage_limitations=coverage_limitations(self.state,unit)

@@ -17,8 +17,12 @@ class Budget(Record):
 
     experiments: int = Field(default=4, ge=0)
     calibration_checks: int = Field(default=8, ge=0)
-    material_chars: int = Field(default=120000, ge=1000)
-    material_chunks: int = Field(default=40, ge=1)
+    material_chars: int = Field(default=120000, ge=0)
+    context_chars: int = Field(default=180000, ge=1000)
+    depth_material_reserve: float = Field(default=0.35, ge=0, le=0.5)
+    breadth_material_reserve: float = Field(default=0.20, ge=0, le=0.5)
+    trigger_retries: int = Field(default=1, ge=0)
+    material_chunks: int = Field(default=40, ge=0)
     audit_units: int = Field(default=2, ge=0)
 
     targeted_reads: int = Field(default=3, ge=0)
