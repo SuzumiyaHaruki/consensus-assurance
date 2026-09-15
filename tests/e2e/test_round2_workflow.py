@@ -140,7 +140,9 @@ def test_initial_replay_then_F4_and_attribution_continue(tmp_path,tlc,interrupt_
     goal=obligation.model_copy(update={'id':'ack_goal','kind':'goal','description':'Returned operations satisfy the selected configuration guarantee'})
     claims=[ClaimDraft(**{k:v for k,v in c.model_dump().items() if k in ClaimDraft.model_fields}) for c in [goal,obligation]]
     code=source_state.materials[0]
-    binding=BindingDraft(id='ack-code',claim_id='durable',material_id=code.id,symbol='execute',start_line=1,end_line=code.end_line,description='Actual acceptance and return ordering',pending=[])
+    import ast
+    declaration=next(n for n in ast.parse(code.text).body if isinstance(n,ast.FunctionDef) and n.name=='execute')
+    binding=BindingDraft(id='ack-code',claim_id='durable',material_id=code.id,symbol='execute',start_line=declaration.lineno,end_line=declaration.end_lineno,description='Actual acceptance and return ordering',pending=[])
     edge=RelationDraft(id='supports_ack',source='ack_goal',target='durable',kind='depends_all',group=None,rationale='Return guarantee depends on the configured durability responsibility',pending=[],grounding=basis)
     u=UnitDraft(id='ack',goal_ids=['ack_goal'],obligation_ids=['durable'],binding_ids=['ack-code'],relation_ids=['supports_ack'],scope=unit.scope,rationale='Fixture candidate selection',goal_observable=False)
     graph=Discovery(understanding='Controlled fixture',claims=claims,bindings=[binding],relations=[edge],units=[u],conflicts=[],unexplored=[],selection_rationale='Check the configured response responsibility')

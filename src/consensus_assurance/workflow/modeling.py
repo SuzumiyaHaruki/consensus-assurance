@@ -23,7 +23,12 @@ def validate_build_reply(state, unit, reply, implementation, current=None, phase
         raise ValueError('Return a model or focused reading requests, not both')
     validate_bundle(state, unit, reply.bundle, implementation)
     if current is not None:
-        validate_technical_repair(current, reply.bundle, phase)
+        if reply.encoding_revision and phase=='search':
+            previous=next((m for m in state.models if m.id==reply.encoding_revision.old_model_id),None)
+            if previous is None:raise ValueError('Encoding repair references an unavailable original model')
+            from .encoding import validate_encoding
+            validate_encoding(state,previous,current,reply.bundle,reply.encoding_revision)
+        else:validate_technical_repair(current, reply.bundle, phase)
 
 
 def obligation_progress(state, unit):
@@ -50,7 +55,7 @@ def obligation_progress(state, unit):
             result=next((r for r in check.checker_results if r.invariant==spec.invariant and r.claim_id==claim and r.scope==spec.scope),None) if valid else None
             requirements=[r for r in model.reachability_requirements if claim in r.claim_ids]
             points=unit.coverage_intent+(unit.audit_question.points if unit.audit_question else [])
-            if any(claim in p.claim_ids and not any(p.id in r.point_ids for r in requirements) for p in points):complete=False
+            if any(claim in p.claim_ids and not any(p.id in r.point_ids and (not p.sequence_required or bool(r.sequence)) for r in requirements) for p in points):complete=False
             reach=[r for r in state.reachability_results if r.model_id==model.id and r.search_fingerprint==model.search_fingerprint]
             if any(not any(x.requirement_id==r.id and x.status=='reachable' for x in reach) for r in requirements):complete=False
             if not result or result.outcome not in {'holds','violated'}:complete=False
@@ -64,7 +69,7 @@ def coverage_limitations(state,unit):
     models=[m for m in state.models if m.unit_id==unit.id]
     if not unit.audit_question:limits.append('Audit question is not structured; effective interaction coverage is unestablished')
     for point in unit.coverage_intent+(unit.audit_question.points if unit.audit_question else []):
-        if not any(point.id in r.point_ids for m in models for r in m.reachability_requirements):
+        if not any(point.id in r.point_ids and (not point.sequence_required or bool(r.sequence)) for m in models for r in m.reachability_requirements):
             limits.append('No executable trigger requirement covers point '+point.id)
     for model in models:
         for req in model.reachability_requirements:

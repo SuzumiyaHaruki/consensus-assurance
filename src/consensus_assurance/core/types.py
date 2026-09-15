@@ -26,6 +26,7 @@ class ReadRequest(Record):
 
 
 class CoveragePoint(Record):
+    sequence_required: bool = False
     id: str
     phase: Literal["establish", "maintain", "use", "handoff", "recover", "other"]
     source_ids: list[str] = Field(min_length=1)
@@ -48,6 +49,8 @@ class AuditQuestion(Record):
 
 
 class ReachabilityRequirement(Record):
+    sequence: list[str] = []
+    identity_operator: str | None = None
     id: str
     operator: str
     claim_ids: list[str] = Field(min_length=1)
@@ -85,6 +88,8 @@ class Responsibility(Record):
 
 
 class InquiryTask(Record):
+    repair_session: dict | None = None
+    resolution_issue_ids: list[str] = []
     id: str = Field(default_factory=uid)
     kind: Literal["explore", "review"]
     reason: str
@@ -134,6 +139,7 @@ class SemanticReview(Record):
 
 
 class ReviewIssue(Record):
+    needs_recheck: bool = False
     id: str = Field(default_factory=uid)
     review_id: str
     target_id: str
@@ -146,6 +152,8 @@ class ReviewIssue(Record):
     reason: str
     task_ids: list[str] = []
     resolved_by: str | None = None
+    resolution_model_id: str | None = None
+    resolution_checks: list[str] = []
 
 
 class ExecutionStatus(str, Enum):
@@ -219,6 +227,8 @@ class CheckerResult(Record):
 
 
 class PendingAction(Record):
+    inquiry_id: str | None = None
+    logical_input: dict = {}
     id: str = Field(default_factory=uid)
     kind: str
     unit_id: str | None = None
@@ -244,9 +254,55 @@ class Claim(Record):
     version: int = 1
 
 
-class Binding(Record):
-    id: str
+class CodeAnchor(Record):
+    kind: Literal["declaration", "interface_member", "callsite"] = "declaration"
+    material_id: str
+    start_line: int = Field(ge=1)
+    end_line: int = Field(ge=1)
+    symbol: str
+
+
+class BindingAssociation(Record):
     claim_id: str
+    source_ids: list[str]
+    rationale: str
+
+
+class CodeUse(Record):
+    binding_id: str
+    role: Literal["direct", "input", "support", "environment", "handoff"]
+    claim_ids: list[str] = Field(min_length=1)
+    relation_ids: list[str] = []
+    source_ids: list[str] = Field(min_length=1)
+    rationale: str
+    unverified: list[str] = []
+
+
+class AssociatedCode(Record):
+    associations: list[BindingAssociation] = Field(min_length=1)
+    anchor: CodeAnchor | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def migrate_single_claim(cls,value):
+        if isinstance(value,dict) and "claim_id" in value:
+            value=dict(value);legacy=value.pop("claim_id")
+            imported=[{"claim_id":legacy,"source_ids":[value["material_id"]] if value.get("material_id") else [],"rationale":"Imported single-claim mapping; applicability still requires review"}]
+            if "associations" in value and [a.get("claim_id") if isinstance(a,dict) else a.claim_id for a in value["associations"]]!=[legacy]:
+                raise ValueError("Legacy and current binding associations conflict")
+            value.setdefault("associations",imported)
+        return value
+
+    @property
+    def claim_id(self):
+        # Read-only compatibility for historical single-claim consumers.
+        if len(self.associations)!=1:raise ValueError("Binding has multiple associations; use associations")
+        return self.associations[0].claim_id
+
+
+class Binding(AssociatedCode):
+    material_id: str | None = None
+    id: str
     file: str
     symbol: str
     start_line: int = Field(ge=1)
@@ -435,6 +491,7 @@ class AuditUnit(Record):
     recheck_reasons: list[str] = []
     semantic_readiness: dict[str, Any] = {}
     audit_question: AuditQuestion | None = None
+    code_uses: list[CodeUse] = []
     coverage_intent: list[CoveragePoint] = []
     coverage_limitations: list[str] = []
 
@@ -474,6 +531,10 @@ class Capability(Record):
 
 
 class Analysis(Record):
+    framework_revision: str | None = None
+    framework_stage: str = "new_run"
+    repair_sessions: dict[str, dict] = {}
+    attached_material_ids: list[str] = []
     schema_version: str = "2"
     id: str = Field(default_factory=uid)
     mode: Literal["real", "mock"]

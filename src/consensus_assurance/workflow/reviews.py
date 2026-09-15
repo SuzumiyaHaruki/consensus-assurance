@@ -17,6 +17,13 @@ def material_closure(state, ids):
         visited.add(id);obj=objects.get(id)
         if obj is None:continue
         wanted.update(getattr(obj,'source_ids',[]))
+        if hasattr(obj,'source') and hasattr(obj,'target'):todo.extend([obj.source,obj.target])
+        for association in getattr(obj,'associations',[]):
+            todo.append(association.claim_id);wanted.update(association.source_ids)
+        for use in getattr(obj,'code_uses',[]):
+            todo.extend(use.claim_ids+use.relation_ids);wanted.update(use.source_ids)
+        anchor=getattr(obj,'anchor',None)
+        if anchor:wanted.add(anchor.material_id)
         question=getattr(obj,'audit_question',None)
         if question:wanted.update(question.source_ids)
         for point in getattr(obj,'coverage_intent',[])+(question.points if question else []):wanted.update(point.source_ids)
@@ -55,7 +62,18 @@ def validate_resolutions(state, task, reply):
     for id in reply.resolves_issue_ids:
         issue=next((i for i in state.review_issues if i.id==id and i.resolved_by is None),None)
         if issue is None:raise ValueError('Resolution references an unavailable open issue')
-        matching=[i for i in reply.items if i.target_id==issue.target_id and i.aspect==issue.aspect and i.status=='no_issue_found' and not i.limitations]
+        if issue.needs_recheck and not any(c.model_id==task.model_id and c.action=='model_check' and c.status.value=='completed' and c.outcome in {'holds','counterexample'} and c.search_fingerprint==next((m.search_fingerprint for m in state.models if m.id==task.model_id),None) for c in state.checks):raise ValueError('Encoding issue resolution requires an actual matching model recheck')
+        resolution_target=issue.target_id
+        if issue.id in task.resolution_issue_ids and issue.model_id!=task.model_id:
+            from .encoding import issue_models
+            from pathlib import Path
+            model=next((m for m in state.models if m.id==task.model_id),None)
+            old=issue_models(state,issue,model) if model else None
+            checks=[c for c in state.checks if model and c.model_id==model.id and c.action=='model_check' and c.status.value=='completed' and c.search_fingerprint==model.search_fingerprint and c.outcome in {'holds','counterexample'}]
+            if not old or Path(old.path).read_text()==Path(model.path).read_text() or not checks:
+                raise ValueError('Old checker issue needs a related changed encoding and actual current search; harness-only or unrelated models cannot resolve it')
+            resolution_target=model.id
+        matching=[i for i in reply.items if i.target_id==resolution_target and i.aspect==issue.aspect and i.status=='no_issue_found' and not i.limitations]
         if not matching or not any(set(issue.source_ids)<=set(i.source_ids) for i in matching):
             raise ValueError('Resolution must address the specific prior issue and its material evidence')
         if issue.model_id and task.model_id!=issue.model_id:
@@ -67,7 +85,9 @@ def record_dispositions(state,review,reply,followup_ids):
     for old in state.inquiry_tasks:
         if valid_supersession(state,review,old):old.superseded_by=review.id
     for issue in state.review_issues:
-        if issue.id in reply.resolves_issue_ids:issue.resolved_by=review.id
+        if issue.id in reply.resolves_issue_ids:
+            issue.resolved_by=review.id;issue.resolution_model_id=review.model_id
+            issue.resolution_checks=[c.id for c in state.checks if c.model_id==review.model_id and c.action=='model_check']
     for item in reply.items:
         if item.status=='no_issue_found' and not item.limitations:continue
         disposition='reading' if reply.requests else 'revision' if reply.revision else 'investigation' if followup_ids else 'blocked'

@@ -3,6 +3,7 @@ import copy
 import json
 import re
 from pydantic import Field
+from consensus_assurance.core.types import ReadRequest
 from consensus_assurance.core.types import Record
 
 
@@ -12,7 +13,9 @@ class Replacement(Record):
 
 
 class OutputRepair(Record):
-    replacements: list[Replacement] = Field(min_length=1, max_length=24)
+    replacements: list[Replacement] = Field(default_factory=list, max_length=24)
+    requests: list[ReadRequest] = Field(default_factory=list,max_length=12)
+    change_request: str = ""
     rationale: str
 
 
@@ -107,3 +110,85 @@ def repair_context(original, targets, context, limit):
         result={'objects':[], 'materials':[], 'omitted_material_ids':list(wanted),
             'source_limit':'Related objects exceed the context budget; only the reported fields are supplied'}
     return result
+
+
+def diagnostic_targets(value,diagnostics,limit):
+    """Resolve typed paths, including graph drafts nested in feedback and build replies."""
+    def prefix_for(node,d):
+        if isinstance(node,dict):
+            for name in ('bindings','units','claims','relations'):
+                if any(isinstance(x,dict) and x.get('id') in d.object_ids for x in node.get(name,[]) if isinstance(node.get(name),list)):
+                    return []
+            for key,child in node.items():
+                found=prefix_for(child,d)
+                if found is not None:return [key]+found
+        return None
+    result=[]
+    for diagnostic in diagnostics:
+        prefix=prefix_for(value,diagnostic) or []
+        for path in diagnostic.paths:
+            relative=parts(path)
+            if len(relative)>=2 and relative[0] in {'bindings','units','claims','relations'}:
+                node=value
+                for key in prefix:node=node[key]
+                matches=[i for i,obj in enumerate(node.get(relative[0],[])) if obj.get('id') in diagnostic.object_ids]
+                if not matches:continue
+                relative[1]=str(matches[0])
+            route=prefix+relative;current=value;exists=True
+            for key in route:
+                try:current=current[int(key)] if isinstance(current,list) else current[key]
+                except (ValueError,KeyError,IndexError,TypeError):exists=False;current=None;break
+            item={'path':pointer(route),'exists':exists,'current_value':current}
+            if item not in result:result.append(item)
+    if len(json.dumps(result,ensure_ascii=False))>limit:raise ValueError('Repair target set exceeds bounded context; preserve candidate and request smaller scope')
+    return result
+
+
+def all_materials(context):
+    found={}
+    def walk(value):
+        if isinstance(value,dict):
+            if {'id','file','text','start_line','end_line'}<=set(value):found[value['id']]=value
+            else:
+                for key,v in value.items():
+                    if key not in {'raw_output','prompt'}:walk(v)
+        elif isinstance(value,list):
+            for item in value:walk(item)
+    walk(context)
+    return list(found.values())
+
+
+def diagnostic_context(candidate,diagnostics,context,limit):
+    """Follow explicit referenced objects; never arbitrary graph connectedness."""
+    ids={id for d in diagnostics for id in d.object_ids};wanted={id for d in diagnostics for id in d.material_ids};objects=[];index={}
+    def collect(node):
+        if isinstance(node,dict):
+            if isinstance(node.get('id'),str):index[node['id']]=node
+            for value in node.values():collect(value)
+        elif isinstance(node,list):
+            for value in node:collect(value)
+    collect(candidate)
+    pending=list(ids);visited=set()
+    while pending:
+        id=pending.pop()
+        if id in visited or id not in index:continue
+        visited.add(id);obj=index[id];objects.append(obj)
+        wanted.update(obj.get('source_ids',[]))
+        if obj.get('material_id'):wanted.add(obj['material_id'])
+        anchor=obj.get('anchor') or {}
+        if anchor.get('material_id'):wanted.add(anchor['material_id'])
+        basis=obj.get('grounding',{});wanted.update(basis.get('behavior_ids',[])+basis.get('expectation_ids',[]))
+        if 'source' in obj and 'target' in obj:pending.extend(basis.get('binding_ids',[]))
+        for key in ['goal_ids','obligation_ids','binding_ids','relation_ids']:pending.extend(obj.get(key,[]))
+        for key in ['source','target','claim_id']:
+            if obj.get(key) in index:pending.append(obj[key])
+        for association in obj.get('associations',[]):pending.append(association['claim_id']);wanted.update(association.get('source_ids',[]))
+        for use in obj.get('code_uses',[]):pending.extend(use.get('claim_ids',[])+use.get('relation_ids',[]));wanted.update(use.get('source_ids',[]))
+    selected=[];omitted=[]
+    priority={id:i for i,id in enumerate(id for d in diagnostics for id in d.material_ids)}
+    for material in sorted(all_materials(context),key=lambda m:priority.get(m['id'],len(priority))):
+        if material['id'] not in wanted:continue
+        if len(json.dumps({'objects':objects,'materials':selected+[material]},ensure_ascii=False))<=limit:selected.append(material)
+        else:omitted.append(material['id'])
+    if len(json.dumps(objects,ensure_ascii=False))>limit:objects=[]
+    return {'objects':objects,'materials':selected,'omitted_material_ids':sorted(set(omitted)|(wanted-{m['id'] for m in selected})), 'source_limit':'Omitted material is not available in this request; ask to attach or read it'}

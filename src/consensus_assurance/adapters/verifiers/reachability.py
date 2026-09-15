@@ -13,8 +13,18 @@ def check_requirement(verifier,runner,model,bundle,requirement,timeout):
     shutil.copyfile(Path(model.path).parent/'Behavior.tla',directory/'Behavior.tla')
     source=directory/'Reachability.tla'
     source.write_text('---- MODULE Reachability ----\nEXTENDS Behavior\nTriggerNotReached == ~('+requirement.operator+')\n====\n')
+    init,next_action='Init','Next'
+    if requirement.sequence:
+        count=len(requirement.sequence);identity=requirement.identity_operator
+        steps=requirement.sequence
+        initial=f"CovInit == Init /\\ progress \\in {{0, IF {steps[0]} THEN 1 ELSE 0}} /\\ owner = {identity}"
+        transitions=["UNCHANGED <<progress, owner>>"]
+        for index,predicate in enumerate(steps):
+            transitions.append(f"(/\\ progress = {index} /\\ {predicate}' /\\ progress' = {index+1} /\\ "+(f"owner' = {identity}'" if index==0 else f"owner = {identity}' /\\ UNCHANGED owner")+")")
+        source.write_text('---- MODULE Reachability ----\nEXTENDS Behavior, Naturals\nVARIABLE progress, owner\n'+initial+'\nCovNext == Next /\\ (\n'+"\n \\/ ".join(transitions)+')\nTriggerNotReached == progress < '+str(count)+'\n====\n')
+        init,next_action='CovInit','CovNext'
     cfg=directory/'Reachability.cfg'
-    cfg.write_text('INIT Init\nNEXT Next\nCHECK_DEADLOCK FALSE\n'+('CONSTANTS\n'+bundle.constants+'\n' if bundle.constants.strip() else '')+'INVARIANT TriggerNotReached\n')
+    cfg.write_text('INIT '+init+'\nNEXT '+next_action+'\nCHECK_DEADLOCK FALSE\n'+('CONSTANTS\n'+bundle.constants+'\n' if bundle.constants.strip() else '')+'INVARIANT TriggerNotReached\n')
     adapted=model.model_copy(update={'path':str(source),'config_path':str(cfg),'checkers':[]})
     check=verifier.check(runner,adapted,timeout);check.action='reachability'
     check.parameters={'requirement_id':requirement.id,'operator':requirement.operator}

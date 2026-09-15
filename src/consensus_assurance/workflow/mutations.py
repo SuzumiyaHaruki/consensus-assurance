@@ -33,7 +33,7 @@ def write_set(state,patch):
             new_data=new.model_dump(mode='json')
             if name=='bindings':
                 material=next((m for m in state.materials if m.file==old.file and m.start_line<=old.start_line<=old.end_line<=m.end_line),None)
-                old_data['material_id']=material.id if material else None
+                old_data['material_id']=old_data.get('material_id') or (material.id if material else None)
             for field,value in new_data.items():
                 if field=='id':continue
                 if canonical(old_data.get(field))!=canonical(value):

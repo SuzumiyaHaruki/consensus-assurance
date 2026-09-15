@@ -1,5 +1,8 @@
 from consensus_assurance.core.types import Claim, Binding, Relation, AuditUnit, uid
 from .mutations import adopt, write_set
+from .associations import claim_ids, relevant_use
+from .graph_diagnostics import require_graph
+from .locations import locate
 
 
 def validate_grounding(basis, materials, binding_ids):
@@ -15,6 +18,7 @@ def validate_grounding(basis, materials, binding_ids):
 
 
 def apply_discovery(state, proposal):
+    require_graph(state,proposal)
     count = sum(len(getattr(proposal,name)) for name in ("claims","bindings","relations","units"))
     if count > state.config.get("budget",{}).get("graph_objects",1000):
         raise ValueError("Configured aggregate graph resource budget exceeded")
@@ -31,15 +35,17 @@ def apply_discovery(state, proposal):
         validate_grounding(c.grounding, materials, all_binding_ids)
         claims.append(Claim(**c.model_dump(), source="Candidate derived from attributed implementation responsibilities"))
     for b in proposal.bindings:
-        if b.claim_id not in {c.id for c in claims} or b.material_id not in materials:
+        if not claim_ids(b)<={c.id for c in claims} or b.material_id not in materials:
             raise ValueError("Binding references an unknown claim or material")
         m = materials[b.material_id]
         if m.file not in state.snapshot.files or not m.start_line <= b.start_line <= b.end_line <= m.end_line:
             raise ValueError("Binding range is outside the read code snapshot")
         excerpt = "\n".join(m.text.splitlines()[b.start_line-m.start_line:b.end_line-m.start_line+1])
-        if b.symbol not in excerpt:
-            raise ValueError(f"Binding {b.id}: literal symbol {b.symbol!r} is absent from {m.file}:{b.start_line}-{b.end_line}; use one spelling present in the excerpt and separate bindings for multiple symbols")
-        bindings.append(Binding(id=b.id, claim_id=b.claim_id, file=m.file, symbol=b.symbol,
+        anchor,_=locate(b,materials)
+        associations=[a.model_copy(update={'source_ids':a.source_ids or [b.material_id]}) for a in b.associations]
+        for association in associations:
+            if not set(association.source_ids)<=set(materials) or not association.rationale.strip():raise ValueError("Code association lacks actual material and rationale")
+        bindings.append(Binding(id=b.id, material_id=b.material_id, associations=associations, anchor=anchor,file=m.file, symbol=b.symbol,
             start_line=b.start_line, end_line=b.end_line, snapshot_id=state.snapshot.id,
             content_digest=m.content_digest, basis="agent_inference", description=b.description,
             pending=b.pending, excerpt=excerpt))
@@ -58,7 +64,7 @@ def apply_discovery(state, proposal):
         if not set(u.binding_ids) <= {b.id for b in bindings} or not set(u.relation_ids) <= set(relation_ids):
             raise ValueError("Audit unit references missing bindings or relations")
         relevant = [e for e in relations if e.id in u.relation_ids]
-        if any(b.claim_id not in u.obligation_ids + u.goal_ids for b in bindings if b.id in u.binding_ids):
+        if any(not relevant_use(u,b,relations,materials) for b in bindings if b.id in u.binding_ids):
             raise ValueError("Audit unit contains a binding unrelated to its claims")
         if not any(e.source in u.goal_ids and e.target in u.obligation_ids and e.kind in {"depends_all", "supports", "alternative", "conditional_on"} for e in relevant):
             raise ValueError("Audit unit must reference a goal-to-obligation relationship")
@@ -108,8 +114,8 @@ def expand_unit(state, unit, relation_ids):
         if edge.source not in reachable:
             raise ValueError("F3 dependency must originate in the current scope")
         reachable.add(edge.target)
-    reachable.update(b.claim_id for b in state.bindings if b.id in reachable)
-    added = [b.id for b in state.bindings if b.id in reachable or b.claim_id in reachable]
+    reachable.update(c for b in state.bindings if b.id in reachable for c in claim_ids(b))
+    added = [b.id for b in state.bindings if b.id in reachable or bool(claim_ids(b)&reachable)]
     binding_ids = list(dict.fromkeys(unit.binding_ids + added))
     obligation_ids = list(dict.fromkeys(unit.obligation_ids + [c.id for c in state.claims if c.kind == "obligation" and c.id in reachable]))
     if binding_ids == unit.binding_ids and obligation_ids == unit.obligation_ids:
@@ -164,10 +170,10 @@ def _apply_patch(state, patch, semantic=False):
         values.update({x.id:x for x in changes})
         return list(values.values())
     def binding(x):
-        material = next((m for m in state.materials if m.file == x.file and m.start_line <= x.start_line <= x.end_line <= m.end_line), None)
+        material = next((m for m in state.materials if (x.material_id is None or m.id==x.material_id) and m.file == x.file and m.start_line <= x.start_line <= x.end_line <= m.end_line), None)
         if not material:
             raise ValueError("Old binding no longer has its source material")
-        return BindingDraft(id=x.id,claim_id=x.claim_id,material_id=material.id,symbol=x.symbol,start_line=x.start_line,end_line=x.end_line,description=x.description,pending=x.pending)
+        return BindingDraft(id=x.id,associations=x.associations,anchor=x.anchor,material_id=material.id,symbol=x.symbol,start_line=x.start_line,end_line=x.end_line,description=x.description,pending=x.pending)
     claims = merge(state.claims,patch.claims,lambda x: ClaimDraft(**{k:v for k,v in x.model_dump().items() if k in ClaimDraft.model_fields}))
     bindings = merge(state.bindings,patch.bindings,binding)
     # Evidence edges are retained separately; they are not agent graph declarations.

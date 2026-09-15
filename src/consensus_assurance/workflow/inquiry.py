@@ -90,7 +90,10 @@ def review_unit(engine, unit, trigger, model=None):
     for start in range(0,len(ids),12):
         part=ids[start:start+12]
         versions=':'.join(x+'@'+str(getattr(available[x],'version',1)) for x in part)
-        enqueue(engine.state,'review','Recheck applicability, necessity, sufficiency, alternative mechanisms and checker meaning from actual materials',trigger+':'+versions,target_ids=part,unit_id=unit.id,model_id=model.id if model else None)
+        task=enqueue(engine.state,'review','Recheck applicability, necessity, sufficiency, alternative mechanisms and checker meaning from actual materials',trigger+':'+versions,target_ids=part,unit_id=unit.id,model_id=model.id if model else None)
+        if model:
+            from .encoding import issue_models
+            task.resolution_issue_ids=[i.id for i in engine.state.review_issues if not i.resolved_by and i.aspect=='checker_correspondence' and issue_models(engine.state,i,model)]
 
 
 def material_reviews(engine, unit, added):
@@ -140,9 +143,10 @@ def task_context(engine,task):
         if r.id in task.responsibility_ids:seeds.update(r.claim_ids)
     wanted,closure=material_closure(state,seeds)
     wanted.update(task.added_material_ids)
+    wanted.update(state.attached_material_ids)
     wanted.update(task.material_ids)
     for issue in state.review_issues:
-        if issue.target_id in closure and not issue.resolved_by:wanted.update(issue.source_ids)
+        if (issue.target_id in closure or issue.id in task.resolution_issue_ids) and not issue.resolved_by:wanted.update(issue.source_ids)
     if task.kind=='explore':
         for role in state.responsibilities:
             if not task.responsibility_ids or role.id in task.responsibility_ids:wanted.update(role.source_ids)
@@ -160,13 +164,14 @@ def task_context(engine,task):
         'bindings':[b.model_dump(mode='json') for b in state.bindings if b.id in closure],
         'relations':[r.model_dump(mode='json') for r in state.relations if r.id in closure],
         'units':[u.model_dump(mode='json') for u in state.units if u.id in closure],
-        'open_issues':[i.model_dump(mode='json') for i in state.review_issues if i.target_id in closure and not i.resolved_by],
+        'open_issues':[i.model_dump(mode='json') for i in state.review_issues if (i.target_id in closure or i.id in task.resolution_issue_ids) and not i.resolved_by],
         'blocked_review_tasks':[t.model_dump(mode='json') for t in state.inquiry_tasks if t.kind=='review' and t.status=='blocked' and not t.superseded_by and set(t.target_ids)<=set(task.target_ids)],
         'cost_estimate':cost_estimate(engine)}
     if task.model_id:
         model=next((m for m in state.models if m.id==task.model_id),None)
         if model:
             result['bundle']=json.loads(Path(model.bundle_path).read_text())
+            result['prior_issue_models']=[{'issue_id':i.id,'model_id':old.id,'bundle':json.loads(Path(old.bundle_path).read_text()),'current_model_id':model.id} for i in state.review_issues if i.id in task.resolution_issue_ids for old in state.models if old.id==i.model_id]
             result['checker_executions']=[engine.error_context(c) for c in state.checks if c.model_id==model.id and c.action=='model_check']
             result['reachability']=[r.model_dump(mode='json') for r in state.reachability_results if r.model_id==model.id]
     return result
@@ -239,6 +244,7 @@ def process_task(engine, task):
         task.stage='analyze';release_action(engine)
         write_json(engine.root/'materials.json',[m.model_dump(mode='json') for m in state.materials])
         engine.checkpoint('inquiry_materials_read')
+    if task.repair_session and not state.pending_output_repair:state.pending_output_repair=task.repair_session
     context=task_context(engine,task)
     if task.kind=='explore':
         reply,check=engine.ask('explore',ExplorationReply,context,lambda p:validate_exploration(state,p))
@@ -293,6 +299,8 @@ def semantic_limitations(state, model):
     latest={}
     for review in state.semantic_reviews:
         for item in review.items:
+            linked=[i for i in state.review_issues if i.review_id==review.id and i.target_id==item.target_id and i.aspect==item.aspect]
+            if linked and all(i.resolved_by for i in linked):continue
             if item.aspect=='checker_correspondence' and review.model_id and review.model_id not in lineage:continue
             if item.target_id not in relevant or item.target_id not in available:continue
             if review.target_versions.get(item.target_id)!=getattr(available[item.target_id],'version',1):continue
@@ -395,7 +403,7 @@ def apply_task_response(engine,task_id,reply,check):
         register_requests(state,reply.exploration_requests,task.id)
         record_dispositions(state,review,reply,[t.id for t in state.inquiry_tasks if t.id not in followup_before])
         state.gaps.extend(reply.limitations)
-    task.check_id=check.id;task.status='completed';task.stage='done';state.active_inquiry_id=None
+    task.repair_session=None;task.check_id=check.id;task.status='completed';task.stage='done';state.active_inquiry_id=None
     state.last_work_kind=task.kind;release_action(engine)
 
 
@@ -403,7 +411,9 @@ def queue_handoffs(engine):
     state=engine.state
     for role in state.responsibilities:
         for edge in role.handoffs:
-            if edge.covered_by_unit_ids or edge.no_separate_check_reason:continue
+            from .handoffs import handoff_status
+            disposition=handoff_status(state,role,edge)
+            if disposition['assignments']:continue
             enqueue(state,'explore','Investigate the unassigned handoff: '+edge.description,
                 'handoff:'+role.id+'->'+edge.target_id+'@'+str(role.version),[role.id,edge.target_id])
 

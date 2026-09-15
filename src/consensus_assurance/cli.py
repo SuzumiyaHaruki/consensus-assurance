@@ -71,6 +71,7 @@ def main(argv=None):
         p = sub.add_parser(name); p.add_argument("--run", required=True)
         p.add_argument("--runs-dir", default="runs")
         if name == "resume":
+            p.add_argument("--repair-attempts",type=int,help="显式调整任务总修复上限；不重置已用次数或单问题失败记录")
             p.add_argument("--action-timeout", type=float, help="调整后续单动作超时（秒）；保留总预算和已用次数")
     args = parser.parse_args(argv)
     try:
@@ -113,7 +114,9 @@ def main(argv=None):
         with (root / ".run.lock").open("w") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             if args.command == "resume":
-                state = engine.resume(action_timeout=args.action_timeout)
+                state = engine.resume(action_timeout=args.action_timeout,repair_attempts=args.repair_attempts)
+                if state.framework_revision!="round6":
+                    print(state.stop_reason);return 2
             else:
                 repo = locate_repo(args.repo, config.repo_path)
                 state = engine.start(repo, plan_only=args.command == "plan")

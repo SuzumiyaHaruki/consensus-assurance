@@ -51,18 +51,16 @@ def validate_bundle(state, unit, bundle, implementation):
     if len({r.id for r in bundle.reachability})!=len(bundle.reachability):raise ValueError("Duplicate reachability requirement")
     points=unit.coverage_intent+(unit.audit_question.points if unit.audit_question else [])
     for requirement in bundle.reachability:
-        if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*",requirement.operator) or not re.search(r"\b"+requirement.operator+r"\s*==",tla_code(bundle.behavior)):
-            raise ValueError("Reachability requires an actual named Behavior operator")
+        names=requirement.sequence+([requirement.identity_operator] if requirement.identity_operator else []) if requirement.sequence else [requirement.operator]
+        if requirement.sequence and (len(requirement.sequence)<2 or not requirement.identity_operator):raise ValueError("Sequential reachability requires at least two predicates and an explicit identity operator")
+        for name in names:
+            if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*",name) or not re.search(r"\b"+name+r"\s*==",tla_code(bundle.behavior)):
+                raise ValueError("Reachability requires an actual named Behavior operator")
         if not requirement.claim_ids or not set(requirement.point_ids)<={p.id for p in points}:raise ValueError("Reachability must link claims and known audit question points")
-        if not set(requirement.claim_ids)<=checked_ids:
-            raise ValueError("Reachability requirement references an unchecked claim")
-    for spec in specs:
-        if spec.claim_id in unit.goal_ids:
-            mapping=next((g for g in bundle.goal_observations if g.claim_id==spec.claim_id),None)
-            if mapping is None or not mapping.required_participants or not mapping.required_events or not mapping.binding_ids or not set(mapping.binding_ids)<=set(unit.binding_ids):
-                raise ValueError("Goal checking needs explicit observed participants, events and code bindings")
-            from .graph import validate_grounding
-            validate_grounding(mapping.grounding,{m.id:m for m in state.materials},set(unit.binding_ids))
+        if not set(requirement.claim_ids)<=checked_ids:raise ValueError("Reachability requirement references an unchecked claim")
+    # Model-level goal expression does not require an implementation monitor.
+    for mapping in bundle.goal_observations:
+        if mapping.claim_id not in unit.goal_ids or not set(mapping.binding_ids)<=set(unit.binding_ids):raise ValueError("Goal observation references an unrelated goal or binding")
     return specs
 
 
@@ -100,6 +98,8 @@ def save_bundle(root, state, unit, bundle, implementation, previous=None, reason
     mapping, harness, proposal = folder / "mapping.json", folder / implementation.harness_filename, folder / "bundle.json"
     write_json(mapping, bundle.observation); harness.write_text(bundle.harness.source); write_json(proposal, bundle)
     artifacts = {str(p): digest(p.read_bytes()) for p in [behavior, checker, cfg, mapping, harness, proposal]}
+    from .inputs import semantic_ids
+    semantic_references=semantic_ids(state,unit)
     model = ModelArtifact(version=version, kind="implementation_abstraction", origin=Origin.MOCK if state.mode == "mock" else Origin.PRESET if state.analysis_mode == "regression" else Origin.AGENT,
         claim_id=specs[0].claim_id, snapshot_id=state.snapshot.id, path=str(checker), config_path=str(cfg),
         content_digest=digest(checker.read_bytes()), config_digest=digest(cfg.read_bytes()), scope=bundle.scope,
@@ -107,7 +107,7 @@ def save_bundle(root, state, unit, bundle, implementation, previous=None, reason
         properties=invariants, constraints=bundle.constraints, binding_ids=unit.binding_ids,
         extension_schema={"type": "object", "description": "Tool-specific TLA metadata; constants are saved verbatim"}, extension_version="2",
         unit_id=unit.id, checker_path=str(checker), mapping_path=str(mapping), harness_path=str(harness), bundle_path=str(proposal),
-        artifact_digests=artifacts, checkers=specs, graph_versions={x.id:x.version for x in [*state.claims,*state.bindings,*state.relations,*state.units] if x.id in set(unit.goal_ids+unit.obligation_ids+unit.binding_ids+unit.relation_ids+[unit.id])}, previous_id=previous.id if previous else None, revision_reason=reason)
+        artifact_digests=artifacts, checkers=specs, graph_versions={x.id:x.version for x in [*state.claims,*state.bindings,*state.relations,*state.units] if x.id in semantic_references}, previous_id=previous.id if previous else None, revision_reason=reason)
     from .inputs import search_inputs, fingerprint
     model.reachability_requirements=bundle.reachability
     model.search_inputs=search_inputs(state,unit,bundle,cfg.read_text())

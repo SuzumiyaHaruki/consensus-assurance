@@ -53,7 +53,7 @@ class Engine:
         snapshot = capture(repo, self.root / "source")
         missing = [f for f in self.implementation.required_inputs(repo) if f not in snapshot.files] if hasattr(self.implementation,"required_inputs") else []
         if missing: raise ValueError("Required build inputs could not be safely copied: " + ", ".join(missing))
-        self.state = Analysis(mode="mock" if self.agent.mock else "real", config=self.config.model_dump(mode="json"), snapshot=snapshot)
+        self.state = Analysis(framework_revision="round6", mode="mock" if self.agent.mock else "real", config=self.config.model_dump(mode="json"), snapshot=snapshot)
         self.state.guidance = [{"source":"consensus/inquiry.py","text":self.inquiry}, {"source":"configured_reference","text":self.knowledge}]
         self.state.analysis_mode = "regression" if self.agent.mock else ("directed" if self.config.directed_question else "autonomous")
         self.state.elapsed_seconds = time.monotonic() - started
@@ -64,12 +64,16 @@ class Engine:
         self.checkpoint("created")
         return self.execute(plan_only=plan_only)
 
-    def resume(self, action_timeout=None):
+    def resume(self, action_timeout=None, repair_attempts=None):
+        if repair_attempts is not None and (not isinstance(repair_attempts,int) or repair_attempts<0):raise ValueError("Repair attempt limit must be a nonnegative integer")
         if action_timeout is not None and (not math.isfinite(action_timeout) or action_timeout <= 0):
             raise ValueError("Action timeout must be a finite positive number")
         self.state = self.store.load()
         self.budget = BudgetTracker(self.config.budget, self.state)
         self.runner.deadline = time.monotonic() + self.budget.remaining()
+        if self.state.framework_revision!="round6":
+            self.state.stop_reason="Framework revision differs or was not recorded; preserve this historical run and use an explicit offline migration/subrun"
+            return self.state
         current = capture(Path(self.state.snapshot.repo))
         reasons = []
         changed_models = set()
@@ -94,6 +98,12 @@ class Engine:
             self.state.stop_reason = "Inputs changed; start a new run to avoid mixing evidence"
             self.checkpoint("resume_inputs_changed")
             return self.state
+        if repair_attempts is not None and repair_attempts!=self.config.budget.repair_attempts:
+            old=self.config.budget.repair_attempts
+            self.checkpoint("before_explicit_repair_budget_change")
+            data=self.config.model_dump(mode="json");data['budget']['repair_attempts']=repair_attempts
+            self.config=Config.model_validate(data);self.state.config=self.config.model_dump(mode='json');self.budget.limits=self.config.budget
+            self.checkpoint(f"repair_attempt_limit_changed:{old}:{repair_attempts}; usage and failures preserved")
         if action_timeout is not None and action_timeout != self.config.budget.action_timeout:
             old_timeout = self.config.budget.action_timeout
             self.checkpoint("before_resume_timeout_adjustment")
@@ -174,14 +184,17 @@ class Engine:
 
     def action(self, kind, resource, callback, inputs=None):
         pending = self.state.pending_action
-        if pending and pending.kind == kind and pending.unit_id == self.state.active_unit_id and pending.model_id == self.state.active_model_id:
-            result_path = self.root / "actions" / pending.id / "result.json"
-            if pending.status == "completed" and result_path.exists():
+        from .action_identity import stable_input
+        logical={'inputs':stable_input(inputs or {}),'inquiry_id':self.state.active_inquiry_id,'finding_id':self.state.active_finding_id}
+        if pending and pending.kind==kind and pending.unit_id==self.state.active_unit_id and pending.model_id==self.state.active_model_id and pending.finding_id==self.state.active_finding_id and pending.inquiry_id==self.state.active_inquiry_id:
+            result_path=self.root/'actions'/pending.id/'result.json'
+            original=Path(pending.input_path)
+            if pending.status=='completed' and result_path.exists() and original.is_file() and pending.logical_input==logical and stable_input(json.loads(original.read_text()))==logical['inputs']:
                 return json.loads(result_path.read_text())
         if pending:
             self.state.action_history.append(pending.model_copy(deep=True))
         self.budget.take(resource)
-        action = PendingAction(kind=kind,unit_id=self.state.active_unit_id,model_id=self.state.active_model_id,finding_id=self.state.active_finding_id)
+        action = PendingAction(inquiry_id=self.state.active_inquiry_id,logical_input=logical,kind=kind,unit_id=self.state.active_unit_id,model_id=self.state.active_model_id,finding_id=self.state.active_finding_id)
         directory = self.root / "actions" / action.id
         action.input_path = str(directory / "input.json")
         write_json(Path(action.input_path),inputs or {})
@@ -295,6 +308,11 @@ class Engine:
             raise Blocked("Model commit requires a persisted generation action")
         model = save_bundle(self.root, self.state, unit, bundle, self.implementation, previous, reason, transaction_key=key)
         self.model_commit_hook(model)
+        if previous and bundle.properties!=Bundle.model_validate_json(Path(previous.bundle_path).read_text()).properties and "Encoding" in reason:
+            from consensus_assurance.core.types import ReviewIssue
+            if not any(i.model_id==model.id and i.needs_recheck for i in self.state.review_issues):
+                sources=sorted({s for c in self.state.claims if c.id in {spec.claim_id for spec in model.checkers} for s in c.source_ids})
+                self.state.review_issues.append(ReviewIssue(review_id="encoding:"+model.id,target_id=model.id,target_version=model.version,aspect="checker_correspondence",model_id=model.id,source_ids=sources,explanation=reason,disposition="revision",reason="The new encoding needs actual rechecking and correspondence review",needs_recheck=True))
         from .inputs import reusable_search
         source=reusable_search(self.state,model)
         if source:
@@ -370,7 +388,13 @@ class Engine:
                 reply,_=self.ask("F3" if unit.previous_id else "build",BuildReply,context, lambda p: validate_build_reply(self.state,unit,p,self.implementation))
                 if reply.bundle is None:
                     self.targeted_read(unit,reply.gap,requests=reply.requests); self.advance("build"); continue
-                model=self.save_model(unit,reply.bundle,previous,"Continued scoped investigation after feedback" if previous else "Initial generation")
+                if previous:
+                    original=Bundle.model_validate_json(Path(previous.bundle_path).read_text())
+                    if reply.bundle.properties!=original.properties and reply.bundle.checker_specs()==original.checker_specs() and reply.bundle.scope==original.scope and all(previous.graph_versions.get(c.id)==c.version for c in self.state.claims if c.id in previous.graph_versions):
+                        if not reply.encoding_revision:raise Blocked("Changed checker encoding needs an attributed encoding_revision and correspondence review")
+                        from .encoding import validate_encoding
+                        validate_encoding(self.state,previous,original,reply.bundle,reply.encoding_revision)
+                model=self.save_model(unit,reply.bundle,previous,"Encoding correction: "+reply.encoding_revision.rationale if reply.encoding_revision else "Continued scoped investigation after feedback" if previous else "Initial generation")
                 self.state.active_model_id=model.id
                 if self.state.first_model_seconds is None: self.budget.sync(); self.state.first_model_seconds=self.state.elapsed_seconds
                 self.advance("experiment" if self.config.allow_experiments else "search")
@@ -425,7 +449,7 @@ class Engine:
                         self.state.gaps.append("Included bindings do not establish boundary guarantees; use scoped review or F1 action-granularity refinement: "+", ".join(r.id for r in unreviewed))
                     self.finish_unit(unit);return
                 edge=dependencies[0]
-                if not any(b.id==edge.target or b.claim_id==edge.target for b in self.state.bindings):
+                if not any(b.id==edge.target or any(a.claim_id==edge.target for a in b.associations) for b in self.state.bindings):
                     self.targeted_read(unit,edge.rationale,[edge.id])
                     edge=next(e for e in self.state.relations if e.id==edge.id)
                 self.budget.take("revisions")
@@ -484,13 +508,14 @@ class Engine:
                     self.advance("replay" if f.kind=="F4" or finding else "experiment")
                 else: self.finish_unit(unit,"blocked"); return
             elif phase=="technical_repair":
-                self.budget.take("technical_repairs")
+                if not self.state.pending_action or not self.state.pending_action.kind.startswith("agent:technical"):
+                    self.budget.take("technical_repairs")
                 failure=next(c for c in self.state.checks if c.id==self.state.pending_feedback["check_id"])
-                reply,_=self.ask("technical",BuildReply,{**self.context(unit),"bundle":bundle.model_dump(mode="json"),"failure":self.error_context(failure)}, lambda p: validate_build_reply(self.state,unit,p,self.implementation,bundle,self.state.pending_feedback["technical_phase"]))
+                reply,_=self.ask("technical",BuildReply,{**self.context(unit),"model_id":model.id,"semantic_versions":model.graph_versions,"bundle":bundle.model_dump(mode="json"),"failure":self.error_context(failure)}, lambda p: validate_build_reply(self.state,unit,p,self.implementation,bundle,self.state.pending_feedback["technical_phase"]))
                 if reply.bundle is None:
                     self.targeted_read(unit,reply.gap,requests=reply.requests); self.advance("technical_repair"); continue
                 repaired=reply.bundle
-                new=self.save_model(unit,repaired,model,"Bounded technical repair; no semantic attribution")
+                new=self.save_model(unit,repaired,model,"Encoding correction: "+reply.encoding_revision.rationale if reply.encoding_revision else "Bounded technical repair; no semantic attribution")
                 self.state.active_model_id=new.id
                 self.advance("replay" if finding else "experiment" if self.config.allow_experiments else "search")
             else: raise Blocked("Unknown checkpoint action: "+phase)
@@ -534,6 +559,8 @@ class Engine:
                             inquiry.process_task(self,task)
                         except (BudgetExhausted,Blocked,ValueError,OSError) as exc:
                             task.status="blocked";task.stop_reason=str(exc)
+                            current_task=next(t for t in self.state.inquiry_tasks if t.id==task.id)
+                            current_task.repair_session=self.state.pending_output_repair
                             self.state.active_inquiry_id=None;self.state.pending_output_repair=None
                             inquiry.release_action(self);self.state.gaps.append(str(exc))
                             self.checkpoint("inquiry_task_blocked")

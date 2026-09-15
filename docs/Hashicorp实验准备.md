@@ -48,3 +48,18 @@ TLC_JAR="$PWD/.tools/tla2tools.jar" .venv/bin/consensus-assurance run \
 ```
 
 沿用已有认证和账户；不自动购买额度。`20` 次 agent 调用是总上限，补读、复核和技术修复都消耗它，不能保证两个局部单元都完成；TLC 搜索 `3` 次、触发检查 `3` 次、后果规划 `1` 次，合计时长不超过 `2400` 秒。开始后应查看材料范围、实际选择的单元版本、未决语义、触发与校准状态，而不是只看工具是否完成。现场 Codex 路径与实际认证可用性仍需用户环境确认，本轮没有调用真实后端验证。
+
+## 第六轮待执行入口
+
+先检查 [第六轮验收](第六轮关联诊断与修复会话.md)。本轮只做本地回归和原回复离线播放，没有执行以下新自主运行。用户确认允许材料发送及隔离目标执行后，可使用：
+
+```bash
+cd /home/nitro/Desktop/consensus-assurance
+sed -e 's/^allow_agent_materials: false$/allow_agent_materials: true/' \
+    -e 's/^allow_experiments: false$/allow_experiments: true/' \
+    configs/targets/hashicorp_raft.round6.yaml > configs/targets/hashicorp_raft.round6.run.yaml
+TLC_JAR="$PWD/.tools/tla2tools.jar" .venv/bin/consensus-assurance run \
+    --config configs/targets/hashicorp_raft.round6.run.yaml
+```
+
+沿用用户现有 Codex 路径和认证，不更换账户。配置没有 directed_question，protocol 为 none；总 agent_calls 仍为 20，总时长 2400 秒。修复总次数 4、每问题重复失败上限 1、无进展/循环阈值 2；这些不是额外赠送的调用，全部占用原总预算。依赖、工具或语义无法继续时如实受阻。旧 2026-09-15 失败运行不直接覆盖恢复，新运行会生成独立时间目录。

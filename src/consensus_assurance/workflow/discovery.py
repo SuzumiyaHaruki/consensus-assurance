@@ -21,6 +21,7 @@ def context(engine, unit=None):
     if unit:
         from .reviews import material_closure
         wanted,closure=material_closure(engine.state,[unit.id])
+        wanted.update(engine.state.attached_material_ids)
         result["materials"]=[m.model_dump(mode="json") for m in engine.state.materials if m.id in wanted]
         result["omitted_material_ids"]=[m.id for m in engine.state.materials if m.id not in wanted]
         result["semantic_reviews"]=[r.model_dump(mode="json") for r in engine.state.semantic_reviews if set(r.target_versions)&closure]
@@ -73,13 +74,17 @@ def targeted_read(engine, unit, gap, relation_ids=None, requests=None):
                 "already_read":[{"id":m.id,"file":m.file,"start":m.start_line,"end":m.end_line} for m in engine.state.materials],
                 "relevant_bindings":[b.model_dump() for b in engine.state.bindings if unit and b.id in unit.binding_ids]})
         reading.related_ids=task["related_ids"]; reading.gap=gap
-        task["new_material_ids"]=add_reads(engine.state,source,reading,engine.config.budget)
+        from .materials import obtain_materials
+        obtained=obtain_materials(engine.state,source,reading.requests,engine.config.budget,task['related_ids'],gap)
+        task["new_material_ids"]=obtained['added'];task['reattached_material_ids']=obtained['reattached']
         task["stage"]="patch"
-        if engine.state.pending_action: engine.state.action_history.append(engine.state.pending_action); engine.state.pending_action=None
+        if engine.state.pending_action: engine.state.action_history.append(engine.state.pending_action);engine.state.pending_action=None
         engine.checkpoint("targeted_materials_read")
+        if obtained['unavailable']:raise Blocked("Targeted material remains unavailable within the configured budget")
     if not task["new_material_ids"]:
-        engine.state.targeted_gap=None
-        raise Blocked("Targeted reading found no new usable range; dependency remains unexplained: " + gap)
+        if task.get('reattached_material_ids'):
+            engine.state.targeted_gap=None;engine.checkpoint('existing_material_reattached');return None
+        raise Blocked("Targeted reading found no usable range; dependency remains unexplained: "+gap)
     patch,_=engine.ask("graph_patch",GraphPatch,{"gap":task,
         "new_materials":[m.model_dump(mode="json") for m in engine.state.materials if m.id in task["new_material_ids"]],
         "claims":[c.model_dump(mode="json") for c in engine.state.claims],"bindings":[b.model_dump(mode="json") for b in engine.state.bindings],

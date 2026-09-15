@@ -1,6 +1,6 @@
 from typing import Literal
 from pydantic import Field, model_validator
-from .types import Record, Scope, ConstraintSource, Grounding, CheckerSpec, ReadRequest, Responsibility, SemanticCheck, AuditQuestion, CoveragePoint, ReachabilityRequirement
+from .types import AssociatedCode, CodeUse, Record, Scope, ConstraintSource, Grounding, CheckerSpec, ReadRequest, Responsibility, SemanticCheck, AuditQuestion, CoveragePoint, ReachabilityRequirement
 
 
 class ClaimDraft(Record):
@@ -13,11 +13,10 @@ class ClaimDraft(Record):
     grounding: Grounding = Grounding()
 
 
-class BindingDraft(Record):
+class BindingDraft(AssociatedCode):
     id: str
-    claim_id: str
     material_id: str
-    symbol: str = Field(description="One literal symbol spelling present in the referenced excerpt. Qualified names are allowed only when literally present. Do not combine multiple symbols; use separate bindings.")
+    symbol: str = Field(description="Source symbol tied to a verified declaration, interface member or explicitly declared call-site anchor. The behavior range may be a narrow internal snippet. Do not substitute arbitrary words from the excerpt.")
     start_line: int
     end_line: int
     description: str
@@ -37,6 +36,7 @@ class RelationDraft(Record):
 
 class UnitDraft(Record):
     audit_question: AuditQuestion | None = None
+    code_uses: list[CodeUse] = []
     coverage_intent: list[CoveragePoint] = []
     id: str
     goal_ids: list[str]
@@ -150,7 +150,14 @@ class Harness(Record):
 
 
 
+class GoalWitnessEvent(Record):
+    participant: str
+    event: str
+
+
 class GoalObservation(Record):
+    identity_fields: list[str] = []
+    witness_events: list[GoalWitnessEvent] = []
     claim_id: str
     required_participants: list[str] = Field(min_length=1)
     required_events: list[str] = Field(min_length=1)
@@ -207,7 +214,14 @@ class ReplayPlan(Record):
     rationale: str
 
 
+class EncodingRevision(Record):
+    old_model_id: str
+    source_ids: list[str] = Field(min_length=1)
+    rationale: str
+
+
 class BuildReply(Record):
+    encoding_revision: EncodingRevision | None = None
     bundle: Bundle | None
     gap: str
     requests: list[ReadRequest] = []
@@ -215,7 +229,7 @@ class BuildReply(Record):
 
 class JudgmentChange(Record):
     target_id: str
-    field: Literal["description", "scope", "grounding", "source", "target", "kind", "group", "rationale", "pending", "source_ids", "claim_id", "material_id", "symbol", "start_line", "end_line", "goal_ids", "obligation_ids", "binding_ids", "relation_ids", "goal_observable", "audit_question", "coverage_intent"]
+    field: Literal["description", "scope", "grounding", "source", "target", "kind", "group", "rationale", "pending", "source_ids", "claim_id", "material_id", "symbol", "start_line", "end_line", "goal_ids", "obligation_ids", "binding_ids", "relation_ids", "goal_observable", "audit_question", "coverage_intent", "associations", "anchor", "code_uses"]
     old_value_json: str
     new_value_json: str
 

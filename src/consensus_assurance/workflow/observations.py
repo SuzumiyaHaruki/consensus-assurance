@@ -51,10 +51,6 @@ def assess_execution(state, model, bundle, experiment, calibration, finding, eve
     spec = specs.get(finding.checker_id)
     claim = next((c for c in state.claims if spec and c.id == spec.claim_id),None)
     bases = [bundle.harness.legality] + ([claim.grounding] if claim else [])
-    if claim and claim.kind=='goal':
-        mapping=next((g for g in bundle.goal_observations if g.claim_id==claim.id),None)
-        if mapping is None or not set(mapping.required_participants)<={e.get('participant') for e in events} or not set(mapping.required_events)<={e.get('event') for e in events}:
-            limitations.append('Goal participants/events were not fully observed; a local trace cannot stand for a cluster goal')
     if not claim: limitations.append('Checker claim is unavailable')
     elif claim.pending: limitations.extend(claim.pending)
     if claim and (finding.claim_id != claim.id or model.graph_versions.get(claim.id) != claim.version):
@@ -97,6 +93,14 @@ def assess_execution(state, model, bundle, experiment, calibration, finding, eve
         # A fully observed witness must belong to the actual correlated prerequisite operation.
         if result['witness_indices'] and not set(result['witness_indices']) <= set(prerequisite['matched_indices']):
             local.append('Violation witness is not part of the correlated counterexample execution')
+        if claim and claim.kind=='goal':
+            mapping=next((g for g in bundle.goal_observations if g.claim_id==claim.id),None)
+            local.extend(goal_witness_limitations(mapping,events,result['witness_indices']))
+            if mapping:
+                try:validate_grounding(mapping.grounding,materials,bindings)
+                except ValueError as exc:local.append(str(exc))
+                local.extend(mapping.grounding.unresolved+mapping.grounding.conflicts)
+                if not mapping.binding_ids or not set(mapping.binding_ids)<=set(model.binding_ids):local.append('Goal observation mapping lacks selected source bindings')
         result['limitations']=local
         if result['outcome']=='violated' and not local and not limitations: confirmed=result
     if not results: limitations.append('No supported monitor for this checker; trace compatibility is not property violation')
@@ -139,3 +143,15 @@ def monitor_support(events, monitor):
         'outcome':'violated' if violations else 'unknown' if missing or not seen else 'holds',
         'witness_indices':sorted(set(violations)), 'missing_indices':missing,
         'reason':'Compare effective support objects for the same observed identity/context across ordered events'}
+
+
+def goal_witness_limitations(mapping,events,indices):
+    if mapping is None or not mapping.identity_fields or not mapping.witness_events:
+        return ['Goal witness lacks explicit correlated participants, events and identity fields']
+    limitations=[]
+    for index in indices:
+        witness=events[index];ids=[field(witness,key) for key in mapping.identity_fields]
+        matched=[e for e in events[:index+1] if all(field(e,k)==v and v is not MISSING for k,v in zip(mapping.identity_fields,ids))]
+        if any(not any(e.get('participant')==r.participant and e.get('event')==r.event for e in matched) for r in mapping.witness_events):limitations.append('Goal events do not belong to the actual violating operation/context history')
+        if not set(mapping.required_participants)<={r.participant for r in mapping.witness_events} or not set(mapping.required_events)<={r.event for r in mapping.witness_events}:limitations.append('Goal witness plan does not account for its declared observation requirements')
+    return limitations

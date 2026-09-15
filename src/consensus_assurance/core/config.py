@@ -8,6 +8,8 @@ class Budget(Record):
     agent_calls: int = Field(default=8, ge=0)
     model_checks: int = Field(default=4, ge=0)
     revisions: int = Field(default=3, ge=0)
+    repair_attempts: int = Field(default=4, ge=0)
+    repair_stagnation: int = Field(default=2, ge=1)
     repeated_error_revisions: int = Field(default=1, ge=0)
     replays: int = Field(default=1, ge=0)
     action_timeout: float = Field(default=120, gt=0)

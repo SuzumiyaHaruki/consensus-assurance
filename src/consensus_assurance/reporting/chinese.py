@@ -69,7 +69,9 @@ def inquiry_lines(state):
     for r in state.responsibilities:
         lines.append("| "+" | ".join(text(x) for x in [r.id+"："+r.description,', '.join(r.source_ids),', '.join(r.claim_ids) or '尚未形成目标/义务','；'.join(r.questions) or '当前未列出问题；不代表没有遗漏'])+" |")
         for handoff in r.handoffs:
-            lines.append(f"| 交接候选 {text(r.id)} → {text(handoff.target_id)} | {text(handoff.source_ids)} | {text(handoff.description)} | 仍需结合具体职责与局部证据调查 |")
+            from consensus_assurance.workflow.handoffs import handoff_status
+            disposition=handoff_status(state,r,handoff)
+            lines.append(f"| 交接候选 {text(r.id)} → {text(handoff.target_id)} | {text(handoff.source_ids)} | {text(handoff.description)} | {text(disposition)}；分配不等于完成覆盖 |")
     if not state.responsibilities: lines.append("尚未形成有来源的职责概览。")
     lines += ["", "| 后续任务 | 类型 | 状态/步骤 | 原因与阻塞 |", "| --- | --- | --- | --- |"]
     for task in state.inquiry_tasks:
@@ -140,6 +142,14 @@ def render_report(state, root):
         lines += [f"单元 `{unit.id}` 逐项执行进度：{unit.obligation_checks}；尚待检查：{unit.remaining_obligation_ids or ([c for c in unit.obligation_ids if c not in unit.obligation_checks] if unit.status != 'checked' else [])}。已检查仅指记录范围内的 checker，不代表义务整体成立。"]
         if unit.recheck_reasons:
             lines += [f"重验任务 `{unit.id}`：{'；'.join(unit.recheck_reasons)}；调度状态 `{unit.status}`。"]
+    lines += ["", "## 候选修复会话", "", "原始候选、当前版本、修复 patch 与问题计数分开保存；调用完成不等于候选或语义已接受。"]
+    for session in state.repair_sessions.values():
+        lines.append(f"会话 `{session['id']}`：{session.get('status')}；候选版本 {session['version']}；修复调用 {session['attempt']}；原始候选 {link(session['original_path'])}；当前候选 {link(session['current_path'])}；问题 {session.get('error','')}。")
+        lines.append(f"诊断及材料：{session.get('diagnostics',[])}；重复失败：{session.get('problem_failures',{})}；显式范围/语义计划：{session.get('proposed_change','无')}。")
+    for binding in state.bindings:
+        lines.append(f"代码位置 `{binding.id}`：{binding.file}:{binding.start_line}–{binding.end_line}；锚点 {binding.anchor}；候选职责关联 {[a.claim_id for a in binding.associations]}。")
+    for unit in state.units:
+        if unit.code_uses:lines.append(f"单元 `{unit.id}` 的代码用途：{[u.model_dump(mode='json') for u in unit.code_uses]}；支撑用途不计为已检查义务。")
     lines += ["", "## 实验能力与执行", "", "| 能力 | 状态 | 执行依据 |", "| --- | --- | --- |"]
     for cap in state.capabilities:
         lines.append(f"| {cap.name} | {cap.status} | {cap.check_id or '无执行确认'}：{cap.description} |")
@@ -202,6 +212,7 @@ def render_report(state, root):
     if not state.revisions:
         lines.append("本次没有实际应用的语义修订；工具错误不冒充 F1—F4。")
     lines += ["", "## 未决事项与停止原因", "", f"停止原因（原文）：{state.stop_reason}",
+        f"控制器格式：{state.framework_revision or '历史运行未记录'}；阶段：{state.framework_stage}。",
         f"恢复位置：探索/复核任务 `{state.active_inquiry_id}`；单元 `{state.active_unit_id}`，模型 `{state.active_model_id}`，反例 `{state.active_finding_id}`，下一动作 `{state.next_action}`。"]
     lines += [f"- {gap}" for gap in dict.fromkeys(state.gaps)]
     lines += ["- 活性、公平性、最终同步及未纳入的交互，不从有限安全性检查推断成立。",

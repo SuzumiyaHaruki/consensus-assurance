@@ -110,3 +110,18 @@ def add_reads(state, repo, reading, budget):
     state.reading_history.append({"related_ids":reading.related_ids,"gap":reading.gap,"rationale":reading.rationale,
         "requests":[q.model_dump() for q in reading.requests],"added_material_ids":new_ids})
     return new_ids
+
+
+def obtain_materials(state,repo,requests,budget,related_ids=(),reason='Requested context'):
+    """Return new, reattached, and unavailable ranges without conflating their provenance."""
+    old={m.id for m in state.materials};attached=[];missing=[]
+    for request in requests:
+        request=ReadRequest.model_validate(request)
+        existing=next((m for m in state.materials if m.file==request.file and m.start_line<=request.start_line<=request.end_line<=m.end_line),None)
+        if existing:attached.append(existing.id)
+        else:missing.append(request)
+    added=add_reads(state,repo,ReadingPlan(requests=missing,rationale=reason,related_ids=list(related_ids),gap=reason),budget) if missing else []
+    unavailable=[q.model_dump(mode='json') for q in missing if not any(m.file==q.file and m.start_line<=q.start_line<=q.end_line<=m.end_line for m in state.materials)]
+    state.attached_material_ids=list(dict.fromkeys(state.attached_material_ids+attached+added))
+    state.reading_history.append({'related_ids':list(related_ids),'gap':reason,'rationale':reason,'requests':[ReadRequest.model_validate(q).model_dump(mode='json') for q in requests], 'added_material_ids':[], 'reattached_material_ids':attached,'unavailable':unavailable})
+    return {'added':added,'reattached':attached,'unavailable':unavailable}
