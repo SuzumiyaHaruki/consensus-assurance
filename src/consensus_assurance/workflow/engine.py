@@ -25,7 +25,7 @@ from .errors import Blocked
 from .agent_tasks import ask as ask_agent
 
 
-FRAMEWORK_REVISION = "round7"
+FRAMEWORK_REVISION = "round8"
 
 
 class Engine:
@@ -40,6 +40,18 @@ class Engine:
 
     def checkpoint(self, event):
         self.budget.sync()
+        from consensus_assurance.core.types import now
+        observed={
+            'initial_graph':'discovery' in self.state.completed_steps,
+            'scope_adopted':any(x['status']=='accepted' for x in self.state.scope_updates.values()),
+            'scope_ready':any(u.semantic_readiness.get('status')=='reviewed' for u in self.state.units),
+            'model_registered':bool(self.state.models),
+            'model_tool_execution':any(c.action=='model_check' and c.started_at for c in self.state.checks),
+            'completed_search':any(c.action=='model_check' and c.status.value=='completed' and c.outcome in {'holds','counterexample'} for c in self.state.checks),
+            'calibration_recorded':bool(self.state.calibrations),
+            'implementation_evidence':any(e.level=='implementation_test' and e.origin.value=='executed' for e in self.state.evidence)}
+        for key,seen in observed.items():
+            if seen:self.state.milestones.setdefault(key,now())
         self.store.save(self.state, event)
         write_json(self.root / "graph.json", {"version": self.state.graph_version,
             "claims": [x.model_dump(mode="json") for x in self.state.claims],
@@ -240,8 +252,8 @@ class Engine:
     def discover(self):
         return discovery.discover(self)
 
-    def targeted_read(self, unit, gap, relation_ids=None, requests=None):
-        return discovery.targeted_read(self,unit,gap,relation_ids,requests)
+    def targeted_read(self, unit, gap, relation_ids=None, requests=None, update_required=True):
+        return discovery.targeted_read(self,unit,gap,relation_ids,requests,update_required)
 
     def experiment(self, model, bundle, replay=False):
         if not self.config.allow_experiments:
@@ -389,6 +401,7 @@ class Engine:
             status = "partial" if set(unit.obligation_checks) != old else "blocked"
             self.state.gaps.append("Unfinished obligations in " + unit.id + ": " + ", ".join(unit.remaining_obligation_ids))
         unit.status=status
+        if status=="checked":self.state.deferred_units.pop(unit.id,None)
         self.state.active_unit_id=None; self.state.active_model_id=None; self.state.active_finding_id=None
         self.advance("select")
 
@@ -405,6 +418,10 @@ class Engine:
             calibration=next((c for c in reversed(self.state.calibrations) if experiment and c.experiment_check_id==experiment.id),None)
             finding=next((f for f in self.state.findings if f.id==self.state.active_finding_id),None)
             if phase=="build":
+                if self.state.targeted_gap:
+                    task=self.state.targeted_gap
+                    self.targeted_read(unit,task["gap"],task.get("relation_ids"),task.get("requests"))
+                    self.advance("build");continue
                 if not inquiry.prepare_selected(self,unit):return
                 previous=model or next((m for m in reversed(self.state.models) if m.unit_id==unit.previous_id),None)
                 if previous is None and (unit.recheck_reasons or unit.obligation_checks):
@@ -414,7 +431,7 @@ class Engine:
                     context.update(previous_bundle=json.loads(Path(previous.bundle_path).read_text()),scope_delta={"before":previous.scope.model_dump(),"after":unit.scope.model_dump(),"added_bindings":list(set(unit.binding_ids)-set(previous.binding_ids)),"boundary_changes":unit.boundary_changes})
                 reply,_=self.ask("F3" if unit.previous_id else "build",BuildReply,context, lambda p: validate_build_reply(self.state,unit,p,self.implementation))
                 if reply.bundle is None:
-                    self.targeted_read(unit,reply.gap,requests=reply.requests); self.advance("build"); continue
+                    self.targeted_read(unit,reply.gap,requests=reply.requests,update_required=reply.reading_purpose=="dependency"); self.advance("build"); continue
                 if previous:
                     original=Bundle.model_validate_json(Path(previous.bundle_path).read_text())
                     if reply.bundle.properties!=original.properties and reply.bundle.checker_specs()==original.checker_specs() and reply.bundle.scope==original.scope and all(previous.graph_versions.get(c.id)==c.version for c in self.state.claims if c.id in previous.graph_versions):
@@ -468,7 +485,7 @@ class Engine:
                 self.check_triggers(model,bundle)
                 self.advance("expand")
             elif phase=="expand":
-                dependencies=[e for e in self.state.relations if e.source in unit.obligation_ids and e.kind=="boundary" and e.target not in unit.obligation_ids+unit.binding_ids]
+                dependencies=[e for e in self.state.relations if e.source in unit.obligation_ids and e.kind=="boundary" and e.target not in unit.obligation_ids+unit.binding_ids and not any(e.target in {a.claim_id for a in b.associations} for b in self.state.bindings if b.id in unit.binding_ids)]
                 if not dependencies:
                     unreviewed=[r for r in self.state.relations if r.source in unit.obligation_ids and r.kind in {"boundary","conditional_on"} and (r.pending or r.grounding.unresolved)]
                     if unreviewed:
@@ -540,7 +557,7 @@ class Engine:
                 failure=next(c for c in self.state.checks if c.id==self.state.pending_feedback["check_id"])
                 reply,_=self.ask("technical",BuildReply,{**self.context(unit),"model_id":model.id,"semantic_versions":model.graph_versions,"bundle":bundle.model_dump(mode="json"),"failure":self.error_context(failure)}, lambda p: validate_build_reply(self.state,unit,p,self.implementation,bundle,self.state.pending_feedback["technical_phase"]))
                 if reply.bundle is None:
-                    self.targeted_read(unit,reply.gap,requests=reply.requests); self.advance("technical_repair"); continue
+                    self.targeted_read(unit,reply.gap,requests=reply.requests,update_required=reply.reading_purpose=="dependency"); self.advance("technical_repair"); continue
                 repaired=reply.bundle
                 new=self.save_model(unit,repaired,model,"Encoding correction: "+reply.encoding_revision.rationale if reply.encoding_revision else "Bounded technical repair; no semantic attribution")
                 self.state.active_model_id=new.id

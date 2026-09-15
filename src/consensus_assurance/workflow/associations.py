@@ -13,7 +13,7 @@ def support_path(unit,use,binding,relations):
         for id,r in selected.items():
             if r.source in reached and r.kind in {'boundary','depends_all','conditional_on'}:
                 reached.add(r.target);used.add(id)
-    return used==set(selected) and bool(claim_ids(binding)&set(use.claim_ids)&reached)
+    return used==set(selected) and bool(claim_ids(binding)&set(use.claim_ids)) and (binding.id in reached or bool(claim_ids(binding)&set(use.claim_ids)&reached))
 
 
 def relevant_use(unit,binding,relations,materials):

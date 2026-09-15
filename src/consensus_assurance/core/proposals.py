@@ -221,6 +221,7 @@ class EncodingRevision(Record):
 
 
 class BuildReply(Record):
+    reading_purpose: Literal["dependency", "context"] = Field(default="dependency", description="context only requests material attachment; dependency requires grounded scope reconnection before building")
     encoding_revision: EncodingRevision | None = None
     bundle: Bundle | None
     gap: str
@@ -260,7 +261,18 @@ class ExplorationReply(Record):
     limitations: list[str]
 
 
+class IssueResolution(Record):
+    issue_id: str
+    target_version: int
+    original_question: str = Field(description="The exact stored issue explanation; preserve stable problem identity")
+    source_ids: list[str] = Field(min_length=1)
+    rationale: str = Field(description="Why actual evidence answers this specific issue; describing current behavior alone is insufficient")
+    residual_issue_ids: list[str] = Field(description="Other independent open issues that remain; never the resolved issue or its unresolved children")
+    scope_limitations: list[str] = Field(description="Independent boundaries retained by the related review item")
+
+
 class ReviewReply(Record):
+    resolutions: list[IssueResolution] = []
     resolves_issue_ids: list[str] = []
     supersedes_task_ids: list[str] = []
     resolution_rationale: str = ""

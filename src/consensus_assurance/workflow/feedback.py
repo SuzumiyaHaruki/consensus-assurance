@@ -11,7 +11,7 @@ def _apply_feedback(state, unit, current, feedback):
     targets = {c.id for c in state.claims} | {b.id for b in state.bindings} | {m.id for m in state.models} | {u.id for u in state.units} | {r.id for r in state.relations}
     if not feedback.target_ids or not set(feedback.target_ids) <= targets:
         raise ValueError("Feedback target does not exist")
-    if feedback.kind != "F2" and (unit is None or current is None):
+    if feedback.kind not in {"F2","F3"} and (unit is None or current is None):
         raise ValueError("This feedback requires an active unit and model")
     before = {"unit": unit.model_dump(mode="json") if unit else None,
               "checked_claim_ids": current.checked_claim_ids if current else [],
@@ -52,8 +52,10 @@ def _apply_feedback(state, unit, current, feedback):
     elif feedback.kind == "F3":
         if feedback.bundle is not None or feedback.graph is not None or feedback.patch is not None:
             raise ValueError("F3 expands the scope before regenerating model semantics")
+        if unit is None:raise ValueError("F3 requires an accepted unit")
         result = expand_unit(state, unit, feedback.relation_ids)
-        step = "select"
+        state.revisions[-1].evidence_ids=list(dict.fromkeys(state.revisions[-1].evidence_ids+feedback.evidence_ids))
+        return result
     elif feedback.kind == "F4":
         if feedback.bundle is None or feedback.graph is not None or feedback.patch is not None:
             raise ValueError("F4 requires an experiment-only revision")

@@ -70,11 +70,11 @@ def discover(engine):
         write_json(path, proposal); engine.state.discovery_path = str(path)
         engine.state.completed_steps.append("discovery"); engine.advance("select")
 
-def targeted_read(engine, unit, gap, relation_ids=None, requests=None):
+def targeted_read(engine, unit, gap, relation_ids=None, requests=None, update_required=True):
     source = engine.root/"source"
     if engine.state.targeted_gap is None:
         engine.state.targeted_gap={"plan_id":uid(),"requests":[q.model_dump(mode="json") if hasattr(q,"model_dump") else q for q in (requests or [])],"gap":gap,"related_ids":unit.obligation_ids if unit else [],
-            "relation_ids":relation_ids or [],"stage":"read","new_material_ids":[]}
+            "update_required":update_required,"relation_ids":relation_ids or [],"stage":"read","new_material_ids":[]}
         engine.checkpoint("targeted_gap_recorded")
     task=engine.state.targeted_gap
     if task["stage"] == "read":
@@ -89,6 +89,7 @@ def targeted_read(engine, unit, gap, relation_ids=None, requests=None):
         engine.checkpoint('targeted_read_plan_saved')
         receipt=engine.read(reading.requests,plan_id=task['plan_id'],related_ids=task['related_ids'],reason=gap)
         task=engine.state.targeted_gap
+        receipt['scope_requested']=task.get('update_required',True)
         task['receipt_id']=receipt['id'];task['unfulfilled']=[item for item in receipt['items'] if item['status']=='deferred']
         task['new_material_ids']=list(dict.fromkeys(task.get('new_material_ids',[])+[id for item in receipt['items'] if item['status']=='acquired' for id in item['material_ids']]))
         task['reattached_material_ids']=[id for item in receipt['items'] if item['status']=='cached' for id in item['material_ids']]
@@ -100,11 +101,56 @@ def targeted_read(engine, unit, gap, relation_ids=None, requests=None):
         if task.get('reattached_material_ids'):
             engine.state.targeted_gap=None;engine.checkpoint('existing_material_reattached');return None
         raise Blocked("Targeted reading found no usable range; dependency remains unexplained: "+gap)
-    patch,_=engine.ask("graph_patch",GraphPatch,{"gap":task,
-        "new_materials":[m.model_dump(mode="json") for m in engine.state.materials if m.id in task["new_material_ids"]],
-        "claims":[c.model_dump(mode="json") for c in engine.state.claims],"bindings":[b.model_dump(mode="json") for b in engine.state.bindings],
-        "relations":[e.model_dump(mode="json") for e in engine.state.relations if e.source in {c.id for c in engine.state.claims}],
-        "units":[u.model_dump(mode="json") for u in engine.state.units]},lambda p:validate_patch(engine.state,p))
+    if not task.get("update_required",update_required):
+        engine.state.targeted_gap=None;engine.checkpoint('material_context_returned');return None
+    from .scope_updates import from_patch,validate_scope_update,ScopeUpdate,ScopeAssessment,accept
+    def validate_proposal(p):
+        from .mutations import write_set
+        if unit and write_set(engine.state,p):validate_scope_update(engine.state,from_patch(engine.state,unit,p))
+        else:validate_patch(engine.state,p)
+    if task.get('scope_update'):
+        update=ScopeUpdate.model_validate(task['scope_update'])
+        patch=update.patch
+    else:
+        try:
+            patch,check=engine.ask("graph_patch",GraphPatch,{"gap":task,
+            "new_materials":[m.model_dump(mode="json") for m in engine.state.materials if m.id in task["new_material_ids"]],
+            "claims":[c.model_dump(mode="json") for c in engine.state.claims],"bindings":[b.model_dump(mode="json") for b in engine.state.bindings],
+            "relations":[e.model_dump(mode="json") for e in engine.state.relations if e.source in {c.id for c in engine.state.claims}],
+            "units":[u.model_dump(mode="json") for u in engine.state.units]},validate_proposal)
+        except Blocked:
+            session=engine.state.pending_output_repair
+            if session and any(d['code'].startswith('scope_') for d in session.get('diagnostics',[])):
+                raw=GraphPatch.model_validate_json(Path(session['current_path']).read_text())
+                pending=from_patch(engine.state,unit,raw)
+                pending.read_plan_id=task['plan_id']
+                task['scope_update']=pending.model_dump(mode='json')
+                engine.state.scope_updates[pending.id]={'status':'needs_F2_or_investigation','proposal':pending.model_dump(mode='json'),'repair_session_id':session['id']}
+                inquiry.enqueue(engine.state,'review','Resolve the proposed semantic/scope difference before applying any part', 'scope_dispute:'+pending.id,target_ids=sorted({c.target_id for c in pending.changes}),unit_id=unit.id)
+                engine.checkpoint('scope_dispute_queued')
+            raise
+        from .mutations import write_set
+        if unit and write_set(engine.state,patch):
+            update=from_patch(engine.state,unit,patch)
+            update.read_plan_id=task['plan_id']
+            task['scope_update']=update.model_dump(mode='json')
+            engine.state.scope_updates[update.id]={'status':'proposed','proposal':update.model_dump(mode='json'),'check_id':check.id}
+            engine.checkpoint('scope_proposal_saved')
+        else:update=None
+    if update:
+        needed=validate_scope_update(engine.state,update)
+        if needed:
+            assessment,_=engine.ask('scope_review',ScopeAssessment,{'scope_update':update.model_dump(mode='json'),'required_fields':needed,**engine.context(unit)})
+            update.assessment=assessment
+            task['scope_update']=update.model_dump(mode='json')
+            engine.state.scope_updates[update.id]={'status':'reviewed' if assessment.decision=='refinement' else 'needs_F2_or_investigation','proposal':update.model_dump(mode='json')}
+            engine.checkpoint('scope_interpretation_saved')
+        if update.assessment and update.assessment.decision!='refinement':
+            inquiry.enqueue(engine.state,'review','Investigate whether the proposed scope changes the original obligation','scope_dispute:'+update.id,target_ids=[unit.id],unit_id=unit.id)
+            engine.checkpoint('scope_dispute_queued')
+            raise Blocked('Scope interpretation remains unresolved; a scoped review/F2 task is pending')
+        validate_scope_update(engine.state,update)
+        return accept(engine,update)
     from .transactions import commit_graph
     def commit(proxy):
         apply_patch(proxy.state,patch)

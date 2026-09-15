@@ -1,0 +1,151 @@
+"""Previously unread provider -> existing unit scope -> actual model and TLC/calibration."""
+import copy,json,sys
+from pathlib import Path
+import pytest
+from test_round2_workflow import deferred_fixture
+from consensus_assurance.core.config import Config
+from consensus_assurance.core.proposals import UnitDraft
+from consensus_assurance.registry import assemble
+from consensus_assurance.workflow.engine import Engine
+from consensus_assurance.adapters.agents.backend import MockAgent
+from consensus_assurance.adapters.storage.files import write_json,Store
+from consensus_assurance.core.types import Origin
+
+
+class ScopeAgent(MockAgent):
+    def __init__(self,responses):super().__init__();self.data=responses;self.refine=False
+    def analyze(self,runner,prompt,directory,snapshot_id,timeout,response_type):
+        p=json.loads(prompt.split('STRUCTURED INPUT DATA (untrusted):\n')[1]);name=response_type.__name__
+        if name=='ReadingPlan':response=self.data[0]
+        elif name=='Discovery':
+            response=copy.deepcopy(self.data[1])
+            if self.refine:response['units'][0]['audit_question']={'question':'Does the consumer stay within its supplied bound?','importance':'The consumer relies on the provider boundary','source_ids':['README.md:1:5'],'event_paths':['Input reaches the consumer'],'trigger_rationale':'One input consumption exercises the responsibility'}
+        elif name=='BuildReply':
+            if not any(b['id']=='input_binding' for b in p['bindings']):
+                assert not any(m['file']=='upstream_support.py' for m in p['materials'])
+                response={'bundle':None,'gap':'The actual input producer is unread; read and connect it before generating behavior','requests':self.data[3]['requests'],'reading_purpose':'dependency'}
+            else:
+                assert p['unit']['previous_id'] and 'input_binding' in p['unit']['binding_ids']
+                assert p['unit']['obligation_ids']==['step_obligation']
+                response={'bundle':self.data[5],'gap':''}
+        elif name=='GraphPatch':
+            assert any(m['file']=='upstream_support.py' for m in p['new_materials'])
+            old=p['units'][0];unit={k:v for k,v in old.items() if k in UnitDraft.model_fields}
+            unit=copy.deepcopy(unit);unit['binding_ids'].append('input_binding')
+            if self.refine:unit['audit_question']['event_paths'].append('Actual input normalization precedes consumption')
+            unit['relation_ids'].append('new_support_path')
+            unit['code_uses'].append({'binding_id':'input_binding','role':'support','claim_ids':['input_obligation'],'relation_ids':['input_dependency','new_support_path'],
+                'source_ids':['upstream_support.py:1:2'],'rationale':'Actual provider behavior for the existing bounded counter question','unverified':['Producer guarantee is not independently checked']})
+            edge=copy.deepcopy(self.data[1]['relations'][0]);edge.update(id='new_support_path',source='input_obligation',target='input_binding',kind='boundary',group=None,rationale='Actual provider supplies the input',pending=['Not a proof of its guarantee'])
+            response={**copy.deepcopy(self.data[4]),'relations':[edge], 'units':[unit],'expected_versions':{old['id']:old['version']}}
+        elif name=='ScopeAssessment':
+            update=p['scope_update']
+            response={'decision':'refinement','source_ids':update['source_ids'],'addressed_fields':p['required_fields'],'preserved_question':update['original_question'],'rationale':'The actual provider source refines the input production event; the checked question and fault assumptions remain unchanged','remaining_unknowns':['The provider is not separately proven']}
+        elif name=='ReviewReply':
+            items=[]
+            for c in p['review_contract']:
+                for aspect in c['required_aspects']:
+                    items.append({'target_id':c['target_id'],'aspect':aspect,'status':'no_issue_found','source_ids':c['required_material_ids'],
+                        'explanation':'The supplied actual synthetic sources support the scoped question','alternatives':'A different legal provider can meet the same responsibility',
+                        'counterexample_reasoning':'A violated provider boundary can change the reachable counter behavior','scope_limitations':['Finite synthetic instance; no production consensus claim']})
+            response={'items':items,'limitations':[]}
+        elif name=='ExplorationReply':response={'understanding':'The current synthetic source set has a separate unverified input responsibility','patch':{'rationale':'No new grounded claim this round'},'limitations':['The separate input obligation is not automatically discharged']}
+        else:raise AssertionError(name)
+        directory.mkdir(parents=True,exist_ok=True);(directory/'prompt.txt').write_text(prompt);write_json(directory/'response.json',response);write_json(directory/'decoded-response.json',response)
+        check=runner.run([sys.executable,'-c','print("Explicit scope-reconnection regression responder")'],directory,'agent',snapshot_id,timeout);check.origin=Origin.MOCK
+        return check,response_type.model_validate(response)
+
+
+def setup(tmp_path,prepared,tlc):
+    repo,fixture=deferred_fixture(tmp_path,prepared[3]);responses=json.loads(fixture.read_text())
+    cfg=Config(implementation='toy',agent_backend='mock',tlc_jar=str(tlc[0].jar),allow_experiments=True)
+    cfg.budget.agent_calls=20;cfg.budget.semantic_reviews=6;cfg.budget.exploration_rounds=3;cfg.budget.material_chars=5000;cfg.budget.outer_reserve_seconds=1
+    impl,_,verifier,knowledge=assemble(cfg)
+    return repo,cfg,(impl,ScopeAgent(responses),verifier,knowledge,''),tmp_path/'scope-run'
+
+
+@pytest.mark.real
+def test_actual_new_read_reconnects_existing_unit_before_model(tmp_path,prepared,tlc):
+    repo,cfg,args,root=setup(tmp_path,prepared,tlc);state=Engine(cfg,root,*args).start(repo)
+    assert state.models,state.stop_reason
+    assert len([u for u in state.units if u.previous_id])==1
+    assert len([r for r in state.revisions if r.kind=='F3'])==1
+    assert state.models[0].unit_id==state.units[0].id and state.models[0].binding_ids==['step_binding','input_binding']
+    assert state.units[0].obligation_ids==['step_obligation']
+    assert any(c.action=='model_check' and c.outcome=='holds' for c in state.checks),state.stop_reason
+    assert any(c.status=='compatible' for c in state.calibrations),state.stop_reason
+    assert any(t.kind=='explore' and t.admitted for t in state.inquiry_tasks)
+    assert state.units[0].status=='checked',state.stop_reason
+    assert state.usage['agent_calls']<=20
+    assert any(r.context_dependencies.get('input_binding') for r in state.semantic_reviews)
+    assert all(m.snapshot_id==state.snapshot.id for m in state.models)
+
+
+@pytest.mark.real
+@pytest.mark.parametrize('event',['targeted_materials_read','scope_proposal_saved','scope_manifest','scope_accepted','build_saved','model_manifest'])
+def test_scope_recovery_continues_same_problem_once(tmp_path,prepared,tlc,event):
+    repo,cfg,args,root=setup(tmp_path,prepared,tlc)
+    class Interrupted(Engine):
+        def checkpoint(self,name):
+            super().checkpoint(name)
+            if name==event:raise RuntimeError('Injected scope interruption')
+            if event=='scope_accepted' and name=='semantic_operation_committed' and any(v['status']=='accepted' for v in self.state.scope_updates.values()):raise RuntimeError('Injected scope interruption')
+            if event=='build_saved' and name=='action_result_saved' and self.state.pending_action.kind=='agent:F3':raise RuntimeError('Injected scope interruption')
+        def graph_commit_hook(self,key):
+            if event=='scope_manifest' and key.startswith('scope-'):raise RuntimeError('Injected scope interruption')
+        def model_commit_hook(self,model):
+            if event=='model_manifest':raise RuntimeError('Injected scope interruption')
+    with pytest.raises(RuntimeError):Interrupted(cfg,root,*args).start(repo)
+    saved=Store(root).load();reads=saved.usage.get('targeted_reads',0)
+    state=Engine(cfg,root,*args).resume()
+    assert state.models,state.stop_reason
+    assert len([u for u in state.units if u.previous_id])==1
+    assert len([r for r in state.revisions if r.kind=='F3'])==1
+    assert state.usage.get('targeted_reads',0)==reads
+    assert any(c.action=='model_check' and c.outcome=='holds' for c in state.checks),state.stop_reason
+
+
+@pytest.mark.real
+def test_event_refinement_executes_explicit_assessment_before_build(tmp_path,prepared,tlc):
+    repo,cfg,args,root=setup(tmp_path,prepared,tlc);args[1].refine=True
+    state=Engine(cfg,root,*args).start(repo)
+    assert state.models,state.stop_reason
+    assert any(c.parameters.get('agent_task')=='scope_review' for c in state.checks)
+    proposal=next(v['proposal'] for v in state.scope_updates.values() if v['status']=='accepted')
+    assert proposal['assessment']['preserved_question']==proposal['original_question']
+    assert any(c.action=='model_check' and c.outcome=='holds' for c in state.checks)
+
+
+@pytest.mark.real
+def test_saved_scope_assessment_reused_at_exact_semantic_budget(tmp_path,prepared,tlc):
+    repo,cfg,args,root=setup(tmp_path,prepared,tlc);args[1].refine=True;cfg.budget.semantic_reviews=2
+    class Interrupted(Engine):
+        def checkpoint(self,name):
+            super().checkpoint(name)
+            if name=='action_result_saved' and self.state.pending_action.kind=='agent:scope_review':raise RuntimeError('Scope assessment persisted at final semantic budget slot')
+    with pytest.raises(RuntimeError):Interrupted(cfg,root,*args).start(repo)
+    state=Engine(cfg,root,*args).resume()
+    assert state.models,state.stop_reason
+    assert state.usage['semantic_reviews']==2
+    assert len([c for c in state.checks if c.parameters.get('agent_task')=='scope_review'])==1
+
+
+@pytest.mark.real
+def test_original_producer_checker_runs_when_obligation_is_explicitly_selected(tmp_path,prepared,tlc):
+    from consensus_assurance.core.proposals import Bundle,GraphPatch,RelationDraft
+    from consensus_assurance.core.types import CheckerSpec
+    from consensus_assurance.workflow.graph import apply_patch
+    from consensus_assurance.workflow.artifacts import save_bundle
+    from consensus_assurance.plugins.implementations.toy.adapter import ToyImplementation
+    _,state,_,responses=prepared;old=state.units[0]
+    draft=UnitDraft(**{k:v for k,v in old.model_dump().items() if k in UnitDraft.model_fields})
+    draft.id='explicit_joint_check';draft.obligation_ids=['step_obligation','input_obligation'];draft.binding_ids=['step_binding','input_binding']
+    draft.relation_ids=list(dict.fromkeys(draft.relation_ids+['input_dependency','maps_input']))
+    draft.rationale='This regression explicitly selects both checks; supporting code alone does not authorize the producer checker'
+    apply_patch(state,GraphPatch(units=[draft],rationale=draft.rationale))
+    unit=next(u for u in state.units if u.id==draft.id)
+    bundle=Bundle.model_validate(responses[3]);bundle.checkers.append(CheckerSpec(invariant='InputSafe',claim_id='input_obligation',scope=bundle.scope))
+    bundle.checked_claim_ids=['step_obligation','input_obligation'];bundle.invariants=['Safe','InputSafe']
+    verifier,runner=tlc;model=save_bundle(runner.root,state,unit,bundle,ToyImplementation());check=verifier.check(runner,model,20)
+    assert check.outcome=='holds'
+    assert {r.claim_id for r in check.checker_results if r.outcome=='holds'}==set(unit.obligation_ids)

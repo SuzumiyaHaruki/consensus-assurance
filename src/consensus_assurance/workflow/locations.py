@@ -30,6 +30,10 @@ def declarations(material):
         for pattern in patterns:
             for match in re.finditer(pattern,masked):
                 end_args=closing(masked,match.end()-1,'(',')');opening=masked.find('{',end_args)
+                # Anonymous return types contain braces before the function body.
+                cursor=end_args
+                while opening>=0 and re.search(r'\b(?:interface|struct)\s*$',masked[cursor:opening]):
+                    cursor=closing(masked,opening,'{','}');opening=masked.find('{',cursor)
                 if opening<0:continue
                 end=closing(masked,opening,'{','}')
                 result.append({'symbol':match[1],'start':line(match.start()+len(match[0])-len(match[0].lstrip())),'signature_end':line(opening),'end':line(end),'kind':'declaration'})
@@ -40,6 +44,20 @@ def declarations(material):
                 for method in re.finditer(r'(?m)^\s*(\w+)\s*\(',masked[opening+1:end-1]):
                     pos=opening+1+method.start()+len(method[0])-len(method[0].lstrip())
                     result.append({'symbol':method[1],'start':line(pos),'signature_end':line(pos),'end':line(end),'owner_start':start,'kind':'interface_member'})
+        # A named non-struct type may be followed by contiguous methods on that exact receiver.
+        for match in re.finditer(r'(?m)^[ \t]*type[ \t]+(\w+)[ \t]+([^\n]+)',masked):
+            if re.match(r'(?:struct|interface)\b',match[2]):continue
+            name=match[1];start=line(match.start());end_line=line(match.end())
+            cursor=match.end()
+            while cursor<len(masked):
+                following=re.match(r'\s*func\s*\(\s*\w+\s+\*?'+re.escape(name)+r'\s*\)\s*(\w+)\s*\(',masked[cursor:])
+                if not following:break
+                method_start=line(cursor+following.start()+len(following[0])-len(following[0].lstrip()))
+                method=next((d for d in result if d['symbol']==following[1] and d['start']==method_start and d['kind']=='declaration'),None)
+                if not method:break
+                end_line=method['end']
+                cursor=sum(len(x)+1 for x in masked.split('\n')[:end_line-offset])
+            result.append({'symbol':name,'start':start,'signature_end':line(match.end()),'end':end_line,'kind':'declaration'})
         # Call-site anchors record syntax only, not resolved callee behavior.
         for match in re.finditer(r'\b(\w+)\s*\(',masked):
             if any(d['start']==line(match.start()) and d['symbol']==match[1] for d in result):continue

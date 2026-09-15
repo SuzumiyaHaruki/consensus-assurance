@@ -148,16 +148,24 @@ def diagnostic_targets(value,diagnostics,limit):
 
 
 def all_materials(context):
-    found={}
+    found={};views={};descriptors=[]
     def walk(value):
         if isinstance(value,dict):
-            if {'id','file','text','start_line','end_line'}<=set(value):found[value['id']]=value
-            else:
-                for key,v in value.items():
-                    if key not in {'raw_output','prompt'}:walk(v)
+            if 'source_text_pool' in value:
+                for m in value['source_text_pool']:views[m['id']]=m
+            if {'id','file','start_line','end_line'}<=set(value):
+                if 'source_view_id' in value:descriptors.append(value)
+                elif 'text' in value and not value['id'].startswith('source-view-'):found[value['id']]=value
+            for k,v in value.items():
+                if k not in {'raw_output','prompt','text','source_text_pool'}:walk(v)
         elif isinstance(value,list):
-            for item in value:walk(item)
+            for v in value:walk(v)
     walk(context)
+    for m in descriptors:
+        view=views.get(m['source_view_id'])
+        if view and view['file']==m['file'] and view['start_line']<=m['start_line']<=m['end_line']<=view['end_line']:
+            material={k:v for k,v in m.items() if k!='source_view_id'}
+            material['text']='\n'.join(view['text'].split('\n')[m['start_line']-view['start_line']:m['end_line']-view['start_line']+1]);found[m['id']]=material
     return list(found.values())
 
 

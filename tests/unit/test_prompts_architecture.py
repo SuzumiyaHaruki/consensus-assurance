@@ -7,7 +7,7 @@ from consensus_assurance.adapters.agents.backend import render
 from consensus_assurance.reporting.chinese import render_report
 
 
-@pytest.mark.parametrize("kind", ["read", "discover", "build", "retry", "diagnose", "F1", "F2", "F3", "F4", "targeted_read", "graph_patch", "replay", "technical"])
+@pytest.mark.parametrize("kind", ["read", "discover", "build", "retry", "diagnose", "F1", "F2", "F3", "F4", "targeted_read", "graph_patch", "replay", "technical", "explore", "semantic_review", "consequence", "scope_review"])
 def test_rendered_instructions_english_and_quoted_unicode_retained(kind):
     context = {"file": "/tmp/测试/实现.go", "quotation": "实现的原始说明", "reason": "Observe a missing dependency"}
     result = render(kind, context)
@@ -27,7 +27,7 @@ def test_architecture_does_not_import_specific_plugins():
                     assert "plugins" not in (node.module or "")
                 if isinstance(node, ast.Import):
                     assert all("plugins" not in a.name for a in node.names)
-    for path in (root / "resources/prompts/en").glob("*.txt"):
+    for path in (root / "resources/prompts").glob("*.txt"):
         if path.name in {"task.txt", "revision.txt", "investigate.txt"}:
             continue
         assert "votedFor" not in path.read_text()

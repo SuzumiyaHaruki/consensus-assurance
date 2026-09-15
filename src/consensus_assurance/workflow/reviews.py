@@ -59,6 +59,12 @@ def validate_resolutions(state, task, reply):
     for id in reply.supersedes_task_ids:
         old=next((t for t in state.inquiry_tasks if t.id==id),None)
         if old is None or not valid_supersession(state,review,old):raise ValueError('Superseding review does not cover the old task scope, versions and aspects')
+    explicit={r.issue_id:r for r in reply.resolutions}
+    if len(explicit)!=len(reply.resolutions) or not set(explicit)<=set(reply.resolves_issue_ids):raise ValueError('Issue resolutions must uniquely refer to requested issue dispositions')
+    def fail(issue,message):
+        from consensus_assurance.core.diagnostics import DiagnosticError,Diagnostic
+        raise DiagnosticError([Diagnostic(code='issue_resolution_basis',category='format',object_ids=[issue.target_id],paths=['/resolutions','/resolves_issue_ids'],material_ids=issue.source_ids,
+            message=message,allowed=['representation','read'],details={'issue':issue.model_dump(mode='json'),'required':'Supply an issue-specific resolution with source evidence and independent residual issues, or retain this issue unresolved'})])
     for id in reply.resolves_issue_ids:
         issue=next((i for i in state.review_issues if i.id==id and i.resolved_by is None),None)
         if issue is None:raise ValueError('Resolution references an unavailable open issue')
@@ -73,9 +79,17 @@ def validate_resolutions(state, task, reply):
             if not old or Path(old.path).read_text()==Path(model.path).read_text() or not checks:
                 raise ValueError('Old checker issue needs a related changed encoding and actual current search; harness-only or unrelated models cannot resolve it')
             resolution_target=model.id
+        resolution=explicit.get(id)
         matching=[i for i in reply.items if i.target_id==resolution_target and i.aspect==issue.aspect and i.status=='no_issue_found' and not i.limitations]
-        if not matching or not any(set(issue.source_ids)<=set(i.source_ids) for i in matching):
-            raise ValueError('Resolution must address the specific prior issue and its material evidence')
+        if resolution:
+            if resolution.target_version!=issue.target_version or resolution.original_question!=issue.explanation or not resolution.rationale.strip():fail(issue,'The disposition must address the exact issue/version with attributed reasoning')
+            if not set(resolution.source_ids)<=set(task.material_ids or [m.id for m in state.materials]) or not set(issue.source_ids)<=set(resolution.source_ids):fail(issue,'Issue evidence is missing from the actual review context')
+            others={i.id:i for i in state.review_issues if not i.resolved_by}
+            if any(x not in others or x==id or others[x].parent_issue_id==id for x in resolution.residual_issue_ids):fail(issue,'An unresolved root or child cannot be renamed as an independent residual')
+            if any(issue.explanation.strip().casefold()==x.strip().casefold() for x in resolution.scope_limitations):fail(issue,'The unresolved original question cannot be relabeled as a scope boundary')
+            if not matching or not any(set(resolution.scope_limitations)<=set(i.scope_limitations) for i in matching):fail(issue,'Unresolved validity conditions still affect this judgment; retain them as issues rather than scope labels')
+        elif not matching or any(i.scope_limitations for i in matching) or not any(set(issue.source_ids)<=set(i.source_ids) for i in matching):
+            fail(issue,'Resolution must address the specific prior issue and its material evidence; independent boundaries need an explicit issue disposition')
         if issue.model_id and task.model_id!=issue.model_id:
             model=next((m for m in state.models if m.id==task.model_id),None)
             if model is None:raise ValueError('Checker issue resolution requires an explicit current model')
@@ -87,10 +101,15 @@ def record_dispositions(state,review,reply,followup_ids):
     for issue in state.review_issues:
         if issue.id in reply.resolves_issue_ids:
             issue.resolved_by=review.id;issue.resolution_model_id=review.model_id
+            issue.resolution_basis=next((r.model_dump(mode='json') for r in reply.resolutions if r.issue_id==issue.id),{'rationale':reply.resolution_rationale})
             issue.resolution_checks=[c.id for c in state.checks if c.model_id==review.model_id and c.action=='model_check']
     for item in reply.items:
         if item.status=='no_issue_found' and not item.limitations:continue
         disposition='reading' if reply.requests else 'revision' if reply.revision else 'investigation' if followup_ids else 'blocked'
+        prior=next((i for i in state.review_issues if not i.resolved_by and i.target_id==item.target_id and i.target_version==review.target_versions[item.target_id] and i.aspect==item.aspect and i.explanation==item.explanation),None)
+        if prior:
+            prior.source_ids=list(dict.fromkeys(prior.source_ids+item.source_ids))
+            prior.prior_review_ids=list(dict.fromkeys(prior.prior_review_ids+[review.id]));prior.task_ids=list(dict.fromkeys(prior.task_ids+followup_ids));continue
         state.review_issues.append(ReviewIssue(review_id=review.id,target_id=item.target_id,target_version=review.target_versions[item.target_id],aspect=item.aspect,model_id=review.model_id,source_ids=item.source_ids,explanation=item.explanation,disposition=disposition,task_ids=followup_ids,
             reason='Follow-up evidence or semantic review is required' if disposition!='blocked' else 'No actionable follow-up was supplied; the issue remains unresolved and requires planning'))
 

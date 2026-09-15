@@ -170,7 +170,7 @@ def material_allowance(state,budget,purpose):
     consumed=depth if purpose=='breadth' else breadth
     reserve=max(0,int(budget.material_chars*ratio)-consumed)
     reason='Protect finite '+('local dependency/review' if purpose=='breadth' else 'breadth exploration')+' capacity'
-    if purpose=='breadth' and 'discovery' in state.completed_steps and not any(u.status in {'pending','partial','selected'} for u in state.units):
+    if purpose=='breadth' and 'discovery' in state.completed_steps and not any(u.status in {'pending','partial','selected'} for u in state.units) and not state.deferred_units and not any(p['purpose']=='depth' and p['status']!='complete' for p in state.read_plans.values()):
         reserve=0;reason='No currently executable local unit; unused depth reserve may be borrowed'
     chunk_reserve=max(0,int(budget.material_chunks*ratio)-(sum(a.get('new_chunks',0) for a in state.material_allocations if a['purpose']=='depth') if purpose=='breadth' else max(0,used['unique_chunks']-sum(a.get('new_chunks',0) for a in state.material_allocations if a['purpose']=='depth'))))
     if reserve==0:chunk_reserve=0

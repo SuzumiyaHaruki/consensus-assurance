@@ -75,7 +75,7 @@ class CoverageAgent(MockAgent):
                     basis=changed.grounding.model_dump(mode='json')
                     revision={'kind':'F2','rationale':explanation,'evidence_ids':[note['id']],'target_ids':[obj['id']],'relation_ids':[],'new_basis':explanation,'graph':None,'bundle':None,
                         'patch':{'claims':[changed.model_dump(mode='json')],'expected_versions':{obj['id']:obj['version']},'rationale':explanation},'old_judgment':obj['description'],'new_judgment':changed.description,'grounding':basis,'changes':[{'target_id':obj['id'],'field':'description','old_value_json':json.dumps(obj['description']),'new_value_json':json.dumps(changed.description)}]}
-                if self.weak and context['task']['trigger'].startswith('after_search') and obj['id']=='step_obligation':
+                if self.weak and context['task']['trigger'].startswith('after_search') and bool(obj.get('bundle_path')):
                     status='disputed';explanation='The local bound holds but does not establish the delivery handoff responsibility'
                     exploration=[{'reason':'Investigate the counter-to-result handoff even though the local invariant held','responsibility_ids':['delivery'],'requests':[request]}]
                 items.append({'target_id':obj['id'],'aspect':aspect,'status':status,'source_ids':source_ids,'explanation':explanation,'alternatives':'Different configured completion contracts can have different responsibilities','counterexample_reasoning':'A local counter bound alone cannot establish a returned-result contract','limitations':[]})

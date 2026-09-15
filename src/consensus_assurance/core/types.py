@@ -88,6 +88,12 @@ class Responsibility(Record):
 
 
 class InquiryTask(Record):
+    admitted: bool = False
+    preparation_failures: int = 0
+    parent_task_id: str | None = None
+    child_task_ids: list[str] = []
+    requested_aspects: dict[str, list[str]] = {}
+    expected_contribution: str = ""
     context_receipt_id: str | None = None
     context_dependencies: dict = {}
     read_plan_id: str | None = None
@@ -114,6 +120,7 @@ class InquiryTask(Record):
 
 
 class SemanticCheck(Record):
+    scope_limitations: list[str] = Field(default_factory=list, description="Independent scope boundaries, not unresolved conditions needed for this judgment; never relabel contrary evidence here")
     target_id: str
     aspect: Literal["applicability", "decomposition", "checker_correspondence"]
     status: Literal["no_issue_found", "needs_reading", "disputed", "revision_needed"]
@@ -144,6 +151,9 @@ class SemanticReview(Record):
 
 
 class ReviewIssue(Record):
+    resolution_basis: dict = {}
+    prior_review_ids: list[str] = []
+    parent_issue_id: str | None = None
     needs_recheck: bool = False
     id: str = Field(default_factory=uid)
     review_id: str
@@ -536,6 +546,9 @@ class Capability(Record):
 
 
 class Analysis(Record):
+    scope_updates: dict[str, dict] = {}
+    milestones: dict[str, str] = {}
+    review_reuses: list[dict] = []
     read_plans: dict[str, dict] = {}
     material_allocations: list[dict] = []
     task_attachments: dict[str, list[str]] = {}

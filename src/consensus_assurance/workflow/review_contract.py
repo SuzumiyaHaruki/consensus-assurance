@@ -29,7 +29,17 @@ def target_contract(state,obj):
     materials,ids=material_closure(state,[obj.id])
     objects={o.id:o for o in [*state.claims,*state.bindings,*state.relations,*state.units,*state.models]}
     kind=category(obj)
-    return {'target_id':obj.id,'object_type':kind,'version':obj.version,'required_aspects':list(POLICY[kind]),
+    ranges={}
+    for m in state.materials:
+        if m.id in materials:ranges.setdefault((m.file,m.content_digest),set()).update(range(m.start_line,m.end_line+1))
+    source_ranges=[]
+    for (file,version),lines in sorted(ranges.items()):
+        chunks=[]
+        for line in sorted(lines):
+            if not chunks or line>chunks[-1][1]+1:chunks.append([line,line])
+            else:chunks[-1][1]=line
+        source_ranges.append({'file':file,'content_digest':version,'ranges':chunks})
+    return {'source_ranges':source_ranges,'target_id':obj.id,'object_type':kind,'version':obj.version,'required_aspects':list(POLICY[kind]),
         'questions':POLICY[kind],'optional_questions':OPTIONAL.get(kind,{}),
         'required_material_ids':sorted(materials),'dependency_versions':{id:objects[id].version for id in sorted(ids) if id in objects}}
 
@@ -53,6 +63,11 @@ def validate_contract(state,task,reply):
     for id in task.target_ids:
         if id not in objects:issue('review_unknown_target',id,'Requested target is no longer available');continue
         if not any(i.target_id==id for i in reply.items):issue('review_missing_target',id,'Review must account for each requested object');continue
-        missing=required_aspects(objects[id])-{i.aspect for i in reply.items if i.target_id==id}
+        required=set(task.requested_aspects.get(id,required_aspects(objects[id])))
+        missing=required-{i.aspect for i in reply.items if i.target_id==id}
         if missing:issue('review_missing_aspect',id,'Review omitted a required semantic aspect for '+id+': '+', '.join(sorted(missing)))
     if errors:raise DiagnosticError(errors)
+
+
+def same_basis(a,b):
+    return a.get('version')==b.get('version') and a.get('dependency_versions')==b.get('dependency_versions') and a.get('source_ranges')==b.get('source_ranges')

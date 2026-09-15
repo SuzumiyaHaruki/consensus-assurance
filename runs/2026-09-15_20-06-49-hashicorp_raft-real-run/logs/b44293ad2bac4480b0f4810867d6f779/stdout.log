@@ -1,0 +1,566 @@
+{
+  "claims": [
+    {
+      "id": "G_apply",
+      "kind": "goal",
+      "description": "Commands applied to the FSM and reported successfully to clients have the durable replication support required by the applicable cluster configuration.",
+      "source_ids": ["docs/apply.md:1:100", "api.go:803:907", "fsm.go:1:180", "commitment.go:1:104"],
+      "scope": {
+        "description": "The ordinary Apply path from log replication through commitment and FSM completion.",
+        "assumptions": [],
+        "excluded": ["No claim that an unsuccessful Apply had no effect", "User-initiated snapshot replacement semantics"],
+        "parameters": []
+      },
+      "pending": ["Establish configuration transition rules, durability contracts, and the complete commitment-to-FSM handoff."],
+      "grounding": {
+        "behavior_ids": ["api.go:803:907", "fsm.go:1:180", "commitment.go:1:104"],
+        "expectation_ids": ["docs/apply.md:1:100", "fsm.go:1:180"],
+        "binding_ids": ["B_recalculate", "B_appendEntries"],
+        "derivation": "The Apply documentation describes durable quorum commitment before FSM application, and FSM.Apply's interface comment states that application follows majority commitment. These statements supply an attributed expectation. The observed commitment calculator and follower acknowledgement path identify supporting responsibilities but do not establish the complete guarantee.",
+        "applicability": "Applies to ordinary command application. Voter selection, leader context, storage durability and completion correspondence must be established separately.",
+        "unresolved": ["The leader's dispatch and commit-consumption paths are unread.", "Storage backend guarantees and legal membership transitions are not established."],
+        "conflicts": [],
+        "alternatives": ["Snapshot transfer can establish replication progress when logs have been compacted."]
+      }
+    },
+    {
+      "id": "O_commit",
+      "kind": "obligation",
+      "description": "Within one commitment instance, each commit-index advance must be supported by a strict majority of the currently tracked voters' reported match indexes and must reach startIndex; match reports must not decrease stored progress and commitIndex must not decrease.",
+      "source_ids": ["commitment.go:1:104", "docs/apply.md:1:100"],
+      "scope": {
+        "description": "The commitment component's calculation over reported progress, including voter-map replacement.",
+        "assumptions": ["Operations obey the component's mutex discipline."],
+        "excluded": ["Truth and durability of match reports", "Legality of configuration changes", "Correct initialization of startIndex", "End-to-end Apply completion"],
+        "parameters": []
+      },
+      "pending": ["Historical support under membership changes remains outside this local obligation."],
+      "grounding": {
+        "behavior_ids": ["commitment.go:1:104"],
+        "expectation_ids": ["commitment.go:1:104", "docs/apply.md:1:100"],
+        "binding_ids": ["B_newCommitment", "B_setConfiguration", "B_match", "B_recalculate"],
+        "derivation": "The component comments explicitly assign it responsibility for monotonically advancing the leader's commit index from voter disk progress and identify startIndex as a prerequisite. Its callers consume the resulting index. The proposed check independently expresses that responsibility over reported values; it does not assume those reports represent durable storage.",
+        "applicability": "Directly applicable to newCommitment, match, setConfiguration and recalculate. An unchanged historical commitIndex need not acquire fresh support under every replacement voter map; this obligation constrains advances.",
+        "unresolved": ["Caller guarantees for startIndex and configuration sequencing are not established."],
+        "conflicts": [],
+        "alternatives": ["Previously achieved commitment can remain monotonic after configuration replacement without a new advance."]
+      }
+    },
+    {
+      "id": "O_replication_support",
+      "kind": "obligation",
+      "description": "Progress supplied to commitment must identify the reporting server and a prefix that agrees with the leader's log and satisfies the applicable persistence contract.",
+      "source_ids": ["commitment.go:1:104", "replication.go:202:298", "raft.go:1440:1584", "transport.go:1:74"],
+      "scope": {
+        "description": "Production of match progress from local writes, AppendEntries responses and snapshot catch-up.",
+        "assumptions": [],
+        "excluded": ["Byzantine peer behavior unless subsequently supported by a fault contract"],
+        "parameters": []
+      },
+      "pending": ["Read updateLastAppended and the local-write producer.", "Establish transport response correlation and storage failure semantics.", "Explore pipeline and snapshot progress updates."],
+      "grounding": {
+        "behavior_ids": ["replication.go:202:298", "raft.go:1440:1584"],
+        "expectation_ids": ["commitment.go:1:104", "docs/apply.md:1:100", "transport.go:1:74"],
+        "binding_ids": ["B_replicateTo", "B_appendEntries"],
+        "derivation": "commitment.match's comment requires disk agreement through the reported index. replicateTo consumes successful AppendEntries responses through updateLastAppended. appendEntries checks a preceding log term, handles conflicts and stores new entries before success. This producer-consumer dependency supports a candidate obligation, while the missing helper and backend contracts prevent treating the guarantee as established.",
+        "applicability": "Relevant wherever progress contributes to commitment. The supplied code establishes the ordinary RPC path only partially.",
+        "unresolved": ["The updateLastAppended call is not a resolved callee binding.", "Successful storage return has no supplied durability or partial-failure contract.", "Request construction and response identity guarantees are unread."],
+        "conflicts": ["appendEntries explicitly notes stale last-log state after successful truncation followed by failed StoreLogs; its subsequent consequences are unestablished."],
+        "alternatives": ["Snapshot installation supplies an alternative catch-up mechanism.", "Pipelined replication has a separate completion path."]
+      }
+    },
+    {
+      "id": "G_snapshot",
+      "kind": "goal",
+      "description": "Snapshot-based recovery preserves a coherent FSM prefix and corresponding Raft configuration when replacing compacted log history.",
+      "source_ids": ["README.md:1:100", "fsm.go:1:180", "snapshot.go:125:215", "api.go:631:708", "config.go:138:246"],
+      "scope": {
+        "description": "Automatic snapshot capture, publication, compaction and startup restoration.",
+        "assumptions": [],
+        "excluded": ["User-directed replacement of cluster state"],
+        "parameters": []
+      },
+      "pending": ["Establish snapshot capture metadata, store publication guarantees, compaction boundaries and recovery replay behavior."],
+      "grounding": {
+        "behavior_ids": ["snapshot.go:125:215", "api.go:631:708"],
+        "expectation_ids": ["README.md:1:100", "fsm.go:1:180", "config.go:138:246"],
+        "binding_ids": ["B_takeSnapshot", "B_restoreSnapshot"],
+        "derivation": "README describes restoration as equivalent to replay of the captured history. The FSM interface assigns capture and persistence responsibilities. takeSnapshot writes prefix and configuration metadata, while restoreSnapshot consumes it to suppress replay and initialize configuration. Their dependency makes metadata coherence externally significant.",
+        "applicability": "Default restoration and NoSnapshotRestoreOnStart require distinct treatment: the latter explicitly delegates FSM recovery to another mechanism while retaining metadata initialization.",
+        "unresolved": ["The external recovery obligation when NoSnapshotRestoreOnStart is enabled is not specified here.", "Actual snapshot-store durability is unread."],
+        "conflicts": [],
+        "alternatives": ["An application may recover its FSM through a separate mechanism under NoSnapshotRestoreOnStart."]
+      }
+    },
+    {
+      "id": "O_snapshot_publish",
+      "kind": "obligation",
+      "description": "takeSnapshot must reject a captured prefix older than the selected committed configuration and must not advertise its last-snapshot metadata or begin compaction before snapshot persistence and sink closure both succeed.",
+      "source_ids": ["snapshot.go:125:215", "configuration.go:129:310", "api.go:631:708"],
+      "scope": {
+        "description": "The snapshot coordinator's metadata compatibility guard and publication ordering.",
+        "assumptions": [],
+        "excluded": ["Accuracy of the supplied FSM prefix", "Historical correctness of the supplied committed configuration", "Backend durability after successful Close", "Correctness of compaction's deletion range"],
+        "parameters": []
+      },
+      "pending": ["Resolve the producer and storage contracts before extending this obligation to recoverability."],
+      "grounding": {
+        "behavior_ids": ["snapshot.go:125:215", "api.go:631:708"],
+        "expectation_ids": ["configuration.go:129:310", "fsm.go:1:180", "README.md:1:100"],
+        "binding_ids": ["B_takeSnapshot"],
+        "derivation": "The configurations comment explains that only two configurations are retained and a snapshot behind committedIndex cannot be represented. Recovery subsequently trusts the stored snapshot index and configuration. The coordinator's guard and persist/close ordering are therefore candidate obligations supporting that consumer, independently of whether its inputs and storage implementation are sound.",
+        "applicability": "Applies to the observed takeSnapshot path, including persistence and closure errors. It is a local ordering obligation, not a proof that a published snapshot is recoverable.",
+        "unresolved": ["SnapshotSink.Close and repeated-close behavior are unread.", "The snapshot future's index/term production is only partially supplied."],
+        "conflicts": [],
+        "alternatives": ["The coordinator can reject a snapshot and retain logs until a compatible FSM prefix is available."]
+      }
+    }
+  ],
+  "bindings": [
+    {
+      "associations": [{"claim_id": "O_commit", "source_ids": ["commitment.go:1:104"], "rationale": "Initializes voter progress and the first-index threshold for one commitment instance."}],
+      "anchor": {"kind": "declaration", "material_id": "commitment.go:1:104", "start_line": 35, "end_line": 35, "symbol": "newCommitment"},
+      "id": "B_newCommitment",
+      "material_id": "commitment.go:1:104",
+      "symbol": "newCommitment",
+      "start_line": 35,
+      "end_line": 48,
+      "description": "Creates zero-valued match indexes only for voters and retains supplied startIndex.",
+      "pending": ["Caller initialization and configuration validation are unread."]
+    },
+    {
+      "associations": [{"claim_id": "O_commit", "source_ids": ["commitment.go:1:104"], "rationale": "Replaces the voter set while retaining progress for surviving server IDs."}],
+      "anchor": {"kind": "declaration", "material_id": "commitment.go:1:104", "start_line": 53, "end_line": 53, "symbol": "setConfiguration"},
+      "id": "B_setConfiguration",
+      "material_id": "commitment.go:1:104",
+      "symbol": "setConfiguration",
+      "start_line": 53,
+      "end_line": 64,
+      "description": "Rebuilds the map under lock and recalculates commitment.",
+      "pending": ["The call site's membership transition eligibility is not established."]
+    },
+    {
+      "associations": [{"claim_id": "O_commit", "source_ids": ["commitment.go:1:104"], "rationale": "Filters progress reports by voter membership and strictly increasing index."}],
+      "anchor": {"kind": "declaration", "material_id": "commitment.go:1:104", "start_line": 77, "end_line": 77, "symbol": "match"},
+      "id": "B_match",
+      "material_id": "commitment.go:1:104",
+      "symbol": "match",
+      "start_line": 77,
+      "end_line": 84,
+      "description": "Updates a tracked voter's progress only when the report increases its stored index.",
+      "pending": ["The reported prefix's identity and durability are separate producer obligations."]
+    },
+    {
+      "associations": [{"claim_id": "O_commit", "source_ids": ["commitment.go:1:104"], "rationale": "Computes majority-supported progress and applies the advancement threshold."}],
+      "anchor": {"kind": "declaration", "material_id": "commitment.go:1:104", "start_line": 88, "end_line": 88, "symbol": "recalculate"},
+      "id": "B_recalculate",
+      "material_id": "commitment.go:1:104",
+      "symbol": "recalculate",
+      "start_line": 88,
+      "end_line": 104,
+      "description": "Sorts reported indexes, selects the strict-majority threshold, and advances only above the previous index and at or beyond startIndex.",
+      "pending": ["Notification delivery semantics are not included in the local arithmetic check."]
+    },
+    {
+      "associations": [{"claim_id": "O_replication_support", "source_ids": ["replication.go:202:298", "commitment.go:1:104"], "rationale": "Consumes a successful follower response at the progress-update boundary."}],
+      "anchor": {"kind": "declaration", "material_id": "replication.go:202:298", "start_line": 202, "end_line": 202, "symbol": "replicateTo"},
+      "id": "B_replicateTo",
+      "material_id": "replication.go:202:298",
+      "symbol": "replicateTo",
+      "start_line": 202,
+      "end_line": 294,
+      "description": "Constructs and sends AppendEntries, rejects newer response terms, processes success through updateLastAppended, and falls back to snapshots when a log is unavailable.",
+      "pending": ["Request construction, updateLastAppended and snapshot progress production remain unresolved callees."]
+    },
+    {
+      "associations": [{"claim_id": "O_replication_support", "source_ids": ["raft.go:1440:1584", "commitment.go:1:104"], "rationale": "Produces the follower acknowledgement consumed as replication support."}],
+      "anchor": {"kind": "declaration", "material_id": "raft.go:1440:1584", "start_line": 1440, "end_line": 1440, "symbol": "appendEntries"},
+      "id": "B_appendEntries",
+      "material_id": "raft.go:1440:1584",
+      "symbol": "appendEntries",
+      "start_line": 1440,
+      "end_line": 1580,
+      "description": "Checks term and preceding-log compatibility, truncates conflicts, stores new entries, processes configuration and commit updates, then reports success.",
+      "pending": ["StoreLogs and DeleteRange failure semantics are unread.", "Legal request construction and snapshot-aware last-index behavior remain open."]
+    },
+    {
+      "associations": [{"claim_id": "O_snapshot_publish", "source_ids": ["snapshot.go:125:215", "configuration.go:129:310"], "rationale": "Checks configuration-prefix compatibility and sequences persistence, publication and compaction."}],
+      "anchor": {"kind": "declaration", "material_id": "snapshot.go:125:215", "start_line": 125, "end_line": 125, "symbol": "takeSnapshot"},
+      "id": "B_takeSnapshot",
+      "material_id": "snapshot.go:125:215",
+      "symbol": "takeSnapshot",
+      "start_line": 162,
+      "end_line": 206,
+      "description": "Rejects a snapshot behind committedIndex; creates and persists a sink, checks Close, publishes last-snapshot metadata, then invokes compaction.",
+      "pending": ["Snapshot future, sink and compaction contracts require additional material."]
+    },
+    {
+      "associations": [{"claim_id": "G_snapshot", "source_ids": ["api.go:631:708", "README.md:1:100"], "rationale": "Shows why published snapshot metadata affects recovery and skipped replay."}],
+      "anchor": {"kind": "declaration", "material_id": "api.go:631:708", "start_line": 631, "end_line": 631, "symbol": "restoreSnapshot"},
+      "id": "B_restoreSnapshot",
+      "material_id": "api.go:631:708",
+      "symbol": "restoreSnapshot",
+      "start_line": 631,
+      "end_line": 675,
+      "description": "Selects a restorable snapshot, installs its applied and stable-snapshot indexes, and initializes committed and latest configurations.",
+      "pending": ["Snapshot listing order, startup replay and alternate FSM recovery need separate investigation."]
+    }
+  ],
+  "relations": [
+    {
+      "id": "R_apply_commit",
+      "source": "G_apply",
+      "target": "O_commit",
+      "kind": "depends_all",
+      "group": "apply_support",
+      "rationale": "Correct calculation over reported progress is one necessary component of the broader application guarantee.",
+      "pending": ["This relation does not make the local obligation sufficient for G_apply."],
+      "grounding": {
+        "behavior_ids": ["commitment.go:1:104"],
+        "expectation_ids": ["docs/apply.md:1:100", "fsm.go:1:180"],
+        "binding_ids": ["B_recalculate"],
+        "derivation": "The documented Apply path consumes advancement produced by the commitment component.",
+        "applicability": "Ordinary leader command commitment.",
+        "unresolved": ["The actual leader-loop handoff remains unread."],
+        "conflicts": [],
+        "alternatives": []
+      }
+    },
+    {
+      "id": "R_apply_replication",
+      "source": "G_apply",
+      "target": "O_replication_support",
+      "kind": "depends_all",
+      "group": "apply_support",
+      "rationale": "Numerically sufficient reports support durable application only if their underlying replication evidence is sound.",
+      "pending": [],
+      "grounding": {
+        "behavior_ids": ["raft.go:1440:1584", "replication.go:202:298"],
+        "expectation_ids": ["commitment.go:1:104", "docs/apply.md:1:100"],
+        "binding_ids": ["B_appendEntries", "B_replicateTo"],
+        "derivation": "The match contract interprets reports as disk agreement, and the ordinary replication path derives progress from follower success.",
+        "applicability": "Local and remote progress contributing to leader commitment.",
+        "unresolved": ["Local-write, pipeline and snapshot producers are not fully read."],
+        "conflicts": [],
+        "alternatives": ["Snapshot catch-up may replace ordinary log replication."]
+      }
+    },
+    {
+      "id": "R_commit_report_boundary",
+      "source": "O_commit",
+      "target": "O_replication_support",
+      "kind": "boundary",
+      "group": null,
+      "rationale": "The calculator consumes reported match indexes whose durable-prefix meaning is not established by its own implementation.",
+      "pending": ["Resolve producers before extending the local result to durable quorum support."],
+      "grounding": {
+        "behavior_ids": ["commitment.go:1:104", "replication.go:202:298"],
+        "expectation_ids": ["commitment.go:1:104"],
+        "binding_ids": ["B_match", "B_replicateTo"],
+        "derivation": "match checks voter membership and increasing numbers, while its comment assigns a stronger meaning to those numbers.",
+        "applicability": "All match reports used by the commitment component.",
+        "unresolved": ["Acknowledgement correlation and durability remain unverified."],
+        "conflicts": [],
+        "alternatives": ["Different producers may establish equivalent prefix support through logs or snapshots."]
+      }
+    },
+    {
+      "id": "R_snapshot_publish",
+      "source": "G_snapshot",
+      "target": "O_snapshot_publish",
+      "kind": "depends_all",
+      "group": "snapshot_recovery",
+      "rationale": "Recovery consumes the snapshot metadata whose compatibility and publication order the coordinator controls.",
+      "pending": ["Capture accuracy, durable storage and recovery replay remain additional obligations."],
+      "grounding": {
+        "behavior_ids": ["snapshot.go:125:215", "api.go:631:708"],
+        "expectation_ids": ["README.md:1:100", "configuration.go:129:310"],
+        "binding_ids": ["B_takeSnapshot", "B_restoreSnapshot"],
+        "derivation": "Publishing incompatible metadata or compacting before successful persistence could invalidate the history recovery expects to reconstruct.",
+        "applicability": "Automatic snapshot production consumed by startup recovery.",
+        "unresolved": ["The full recovery and compaction contracts are not supplied."],
+        "conflicts": [],
+        "alternatives": ["Rejected capture can defer compaction.", "Configured external FSM recovery changes the restoration boundary."]
+      }
+    }
+  ],
+  "units": [
+    {
+      "audit_question": {
+        "question": "Can any bounded sequence of match reports and voter-map replacements cause this commitment instance to advance without a strict majority of its current reported indexes or before startIndex, or cause stored progress to decrease?",
+        "importance": "The resulting index authorizes downstream command application. The component is small enough to investigate without deterministic network scheduling.",
+        "source_ids": ["commitment.go:1:104", "docs/apply.md:1:100"],
+        "participants": ["Leader commitment instance", "Local-write reporter", "Follower replication reporters", "Configuration updater"],
+        "objects": ["ServerID-keyed matchIndexes", "commitIndex", "startIndex", "Configuration"],
+        "contexts": ["One commitment instance", "Odd and even voter counts", "Voter addition and removal", "Duplicate, stale and nonvoter reports"],
+        "event_paths": ["newCommitment -> match -> recalculate", "newCommitment -> match -> setConfiguration -> recalculate"],
+        "points": [
+          {
+            "sequence_required": true,
+            "id": "P_commit_history",
+            "phase": "maintain",
+            "source_ids": ["commitment.go:1:104"],
+            "binding_ids": ["B_newCommitment", "B_match", "B_setConfiguration", "B_recalculate"],
+            "claim_ids": ["O_commit"],
+            "question": "Across one instance's ordered operations, does each advancement have sufficient current reported support and satisfy the threshold while preserving monotonic progress?",
+            "unknowns": ["Operation order must be correlated by commitment-instance identity and ServerID; no global rounds are established.", "Arbitrary setter sequences establish component behavior, not necessarily legal cluster histories."]
+          }
+        ],
+        "trigger_rationale": "Selected from the documented Apply dependency and the fully supplied commitment implementation; no historical defect is needed."
+      },
+      "code_uses": [
+        {"binding_id": "B_newCommitment", "role": "direct", "claim_ids": ["O_commit"], "relation_ids": [], "source_ids": ["commitment.go:1:104"], "rationale": "Establishes the state under examination.", "unverified": ["Caller-supplied startIndex semantics"]},
+        {"binding_id": "B_match", "role": "direct", "claim_ids": ["O_commit"], "relation_ids": [], "source_ids": ["commitment.go:1:104"], "rationale": "Implements progress admission and monotonic updates.", "unverified": ["Actual persistence represented by reports"]},
+        {"binding_id": "B_setConfiguration", "role": "direct", "claim_ids": ["O_commit"], "relation_ids": [], "source_ids": ["commitment.go:1:104"], "rationale": "Changes the calculation's voter set.", "unverified": ["Protocol eligibility of each configuration change"]},
+        {"binding_id": "B_recalculate", "role": "direct", "claim_ids": ["O_commit"], "relation_ids": [], "source_ids": ["commitment.go:1:104"], "rationale": "Produces the index advances checked locally.", "unverified": ["Notification delivery and downstream application"]}
+      ],
+      "coverage_intent": [],
+      "id": "U_commit",
+      "goal_ids": ["G_apply"],
+      "obligation_ids": ["O_commit"],
+      "binding_ids": ["B_newCommitment", "B_match", "B_setConfiguration", "B_recalculate"],
+      "relation_ids": ["R_apply_commit", "R_commit_report_boundary"],
+      "scope": {
+        "description": "Rank 1: bounded component investigation of commitment arithmetic and state transitions.",
+        "assumptions": ["Use serialized component operations or the actual mutex discipline."],
+        "excluded": ["Network schedules", "Crash durability", "Election safety", "Configuration-transition safety", "End-to-end successful Apply"],
+        "parameters": [{"key": "rank", "value_json": "1"}]
+      },
+      "rationale": "Highest-ranked feasible unit because its implementation is completely supplied, its responsibility directly supports Apply, and ordinary package tests can observe its state transitions. Any local result leaves report soundness and global configuration history unresolved.",
+      "goal_observable": false
+    },
+    {
+      "audit_question": {
+        "question": "Does takeSnapshot reject incompatible captured metadata and preserve persist-before-publication-before-compaction ordering through success and error paths?",
+        "importance": "Startup recovery trusts the published prefix to suppress replay and initialize membership, so a local ordering failure could undermine recovery.",
+        "source_ids": ["snapshot.go:125:215", "api.go:631:708", "configuration.go:129:310"],
+        "participants": ["Snapshot goroutine", "FSM goroutine", "Main goroutine", "Snapshot store", "Log store"],
+        "objects": ["Snapshot future", "Snapshot index and term", "Committed configuration and index", "Snapshot sink"],
+        "contexts": ["FSM capture lagging a configuration change", "Persist error", "Close error", "Successful publication"],
+        "event_paths": ["FSM capture -> configuration capture -> compatibility check -> Persist -> Close -> setLastSnapshot -> compactLogs"],
+        "points": [
+          {
+            "sequence_required": true,
+            "id": "P_snapshot_publish",
+            "phase": "handoff",
+            "source_ids": ["snapshot.go:125:215", "api.go:631:708"],
+            "binding_ids": ["B_takeSnapshot"],
+            "claim_ids": ["O_snapshot_publish"],
+            "question": "For the same takeSnapshot invocation and sink, do metadata acceptance and successful persistence/closure precede publication and compaction?",
+            "unknowns": ["Capture-future completion semantics and sink error contracts need additional reads.", "Correlate one invocation, its future and sink; do not infer ordering from independently reached points."]
+          }
+        ],
+        "trigger_rationale": "The observed snapshot producer and recovery consumer share metadata that controls which history remains available."
+      },
+      "code_uses": [
+        {
+          "binding_id": "B_takeSnapshot",
+          "role": "direct",
+          "claim_ids": ["O_snapshot_publish"],
+          "relation_ids": [],
+          "source_ids": ["snapshot.go:125:215"],
+          "rationale": "Contains the compatibility guard and publication ordering under examination.",
+          "unverified": ["FSM capture accuracy", "Configuration capture accuracy", "Sink durability", "Compaction deletion boundary"]
+        }
+      ],
+      "coverage_intent": [],
+      "id": "U_snapshot_publish",
+      "goal_ids": ["G_snapshot"],
+      "obligation_ids": ["O_snapshot_publish"],
+      "binding_ids": ["B_takeSnapshot"],
+      "relation_ids": ["R_snapshot_publish"],
+      "scope": {
+        "description": "Rank 2: coordinator ordering investigation after capture and sink contracts are read.",
+        "assumptions": [],
+        "excluded": ["Full crash recovery", "Application snapshot implementation correctness", "External FSM recovery correctness"],
+        "parameters": [{"key": "rank", "value_json": "2"}]
+      },
+      "rationale": "Significant producer-consumer interaction with a compact coordinator, but executable checking needs more interface and completion-path evidence than U_commit.",
+      "goal_observable": false
+    }
+  ],
+  "conflicts": [
+    "membership.md is explicitly a historical proposal. Its staging-first AddVoter plan differs from nextConfiguration, which constructs a Voter directly. The proposal cannot establish a current catch-up-before-voting requirement.",
+    "membership.md proposes GetConfiguration waiting for committed configuration, whereas the supplied API explicitly returns latest configuration, potentially uncommitted.",
+    "BatchingFSM's interface promises entries without gaps, while the visible batching path filters out LogBarrier entries. Whether 'gaps' refers to numeric log indexes or the eligible command/configuration stream remains unresolved.",
+    "appendEntries documents stale last-log metadata after truncation followed by StoreLogs failure. The snippet establishes an acknowledged inconsistency path, not a confirmed violation of G_apply."
+  ],
+  "unexplored": [
+    "Election acquisition, vote persistence, term persistence and candidate identity across protocol versions.",
+    "Leader dispatch, commit consumption, leadership loss and Apply future completion.",
+    "Membership-change admission, effective-configuration timing and recovery rollback.",
+    "Pipelined replication and snapshot-based match progress.",
+    "Barrier and VerifyLeader interactions with client reads.",
+    "Startup replay, snapshot installation and external FSM recovery."
+  ],
+  "gaps": [
+    "U_commit checks reported-support arithmetic only. It cannot discharge G_apply or O_replication_support.",
+    "No unit yet checks O_replication_support; the acknowledgement-to-progress handoff requires the actual helper, local-write producer and backend contracts.",
+    "U_snapshot_publish checks coordinator ordering only. Snapshot capture correctness, durable publication, compaction and recovery need separate obligations after inquiry.",
+    "The supplied test capability establishes package build and selected-test availability only. No actual audit test, calibration, correlated witness or reproduction is supplied.",
+    "Precise asynchronous and crash scheduling is unavailable; any later experiment requiring it must establish its prerequisites.",
+    "Broad inquiry has only 5635 characters and six chunks remaining. Exploration requests should be preflighted, with unfulfilled ranges retained visibly."
+  ],
+  "understanding": "The library exposes asynchronous Apply futures backed by leader replication, voter-index commitment and serialized FSM execution. Snapshot coordination connects captured FSM state and committed membership to compaction and startup replay. Membership, transport and recovery configuration alter these responsibilities. The graph contains two meaningful goals, three candidate obligations and two ranked local units; it is a partial investigation plan, not evidence of correctness.",
+  "selection_rationale": "Investigate U_commit first because the complete small component is available and its numerical state transitions are observable without network schedule control. Keep the broader Apply goal and unresolved replication producers explicit. U_snapshot_publish is second because its recovery significance is clear but its capture and storage interfaces remain incomplete. Election and membership interactions receive bounded inquiry rather than unsupported additional goals.",
+  "reading_requests": [
+    {
+      "file": "commitment_test.go",
+      "start_line": 1,
+      "end_line": 130,
+      "reason": "Inspect existing component setup and test assertions before designing an executable U_commit check. Assertions remain test expectations; they do not establish the required property."
+    },
+    {
+      "file": "replication.go",
+      "start_line": 580,
+      "end_line": 665,
+      "reason": "Locate the progress-update helper and nearby request construction in the bounded file tail. Resolve how successful requests become ServerID/index reports; if absent, retain the missing declaration rather than infer its body."
+    },
+    {
+      "file": "snapshot.go",
+      "start_line": 1,
+      "end_line": 95,
+      "reason": "Read snapshot metadata and store/sink interfaces to determine publication, listing and closure contracts before making U_snapshot_publish executable."
+    },
+    {
+      "file": "snapshot.go",
+      "start_line": 216,
+      "end_line": 278,
+      "reason": "Read the compaction continuation to identify the actual history-removal boundary and whether it needs a separate obligation."
+    }
+  ],
+  "responsibilities": [
+    {
+      "id": "RESP_apply",
+      "description": "Accept leader commands, expose asynchronous results and dispatch committed logs to client FSM implementations.",
+      "source_ids": ["api.go:803:907", "docs/apply.md:1:100", "fsm.go:1:180", "config.go:138:246"],
+      "entry_points": ["Apply", "ApplyLog", "Barrier"],
+      "claim_ids": ["G_apply", "O_commit"],
+      "handoffs": [
+        {
+          "covered_by_unit_ids": ["U_commit"],
+          "no_separate_check_reason": "",
+          "target_id": "RESP_replication",
+          "source_ids": ["docs/apply.md:1:100", "commitment.go:1:104", "replication.go:202:298"],
+          "description": "Replication progress feeds commitment used for application. U_commit covers only the consumer's arithmetic; the producer remains pending under O_replication_support."
+        }
+      ],
+      "questions": ["How does leader-loop commitment reach each matching future?", "How do batching and barrier filtering preserve ordering and response correspondence?"],
+      "applicability": "Ordinary Apply permits ambiguous effects after leadership loss. BatchApplyCh explicitly weakens timeout behavior, and BatchingFSM changes execution and response mapping.",
+      "version": 1
+    },
+    {
+      "id": "RESP_replication",
+      "description": "Produce follower acknowledgements and leader progress reports from log replication or snapshot catch-up.",
+      "source_ids": ["raft.go:1440:1584", "replication.go:202:298", "transport.go:1:74", "commitment.go:1:104"],
+      "entry_points": ["appendEntries", "replicateTo"],
+      "claim_ids": ["O_replication_support"],
+      "handoffs": [
+        {
+          "covered_by_unit_ids": [],
+          "no_separate_check_reason": "",
+          "target_id": "RESP_snapshot",
+          "source_ids": ["replication.go:202:298", "fsm.go:1:180"],
+          "description": "Missing log history triggers sendLatestSnapshot. The resulting progress and installed-prefix guarantee require separate exploration."
+        }
+      ],
+      "questions": ["Which storage outcomes justify success?", "How are RPC completion and progress correlated?", "What state survives truncation followed by storage failure?"],
+      "applicability": "Ordinary RPC replication is partly supplied. Pipelining, transport implementations and snapshot fallback remain separate paths.",
+      "version": 1
+    },
+    {
+      "id": "RESP_snapshot",
+      "description": "Capture FSM state, persist snapshot metadata and data, compact history and initialize recovery from a selected snapshot.",
+      "source_ids": ["snapshot.go:125:215", "api.go:631:708", "fsm.go:1:180", "config.go:138:246"],
+      "entry_points": ["takeSnapshot", "restoreSnapshot", "tryRestoreSingleSnapshot"],
+      "claim_ids": ["G_snapshot", "O_snapshot_publish"],
+      "handoffs": [
+        {
+          "covered_by_unit_ids": ["U_snapshot_publish"],
+          "no_separate_check_reason": "",
+          "target_id": "RESP_membership",
+          "source_ids": ["snapshot.go:125:215", "configuration.go:129:310", "api.go:631:708"],
+          "description": "Snapshot creation consumes committed configuration metadata; recovery installs it as committed and latest configuration. The local unit covers the index compatibility guard, leaving historical configuration correctness open."
+        }
+      ],
+      "questions": ["How are FSM capture index and term produced?", "What makes a closed sink recoverable?", "How does external FSM recovery align with snapshot metadata?"],
+      "applicability": "TrailingLogs affects retained history. NoSnapshotRestoreOnStart bypasses FSM restoration while still using snapshot metadata. Legacy snapshot versions use decoded peers.",
+      "version": 1
+    },
+    {
+      "id": "RESP_membership",
+      "description": "Construct validated configuration changes, retain latest and committed configurations and determine voting participation.",
+      "source_ids": ["configuration.go:129:310", "commitment.go:1:104", "api.go:803:907", "raft.go:1440:1584"],
+      "entry_points": ["nextConfiguration", "checkConfiguration", "GetConfiguration", "setConfiguration"],
+      "claim_ids": [],
+      "handoffs": [
+        {
+          "covered_by_unit_ids": ["U_commit"],
+          "no_separate_check_reason": "",
+          "target_id": "RESP_apply",
+          "source_ids": ["configuration.go:129:310", "commitment.go:1:104"],
+          "description": "Configuration determines the voter map used for commitment. U_commit covers map replacement mechanics only; serialization and activation of legal changes remain unexamined."
+        },
+        {
+          "covered_by_unit_ids": [],
+          "no_separate_check_reason": "",
+          "target_id": "RESP_election",
+          "source_ids": ["configuration.go:129:310", "raft.go:1603:1735"],
+          "description": "Vote handling consumes latest configuration to filter identified candidates by membership and voter status."
+        }
+      ],
+      "questions": ["Where is one-uncommitted-change sequencing enforced?", "When does a new configuration affect quorum calculations?", "Which current rules replace the historical staging proposal?"],
+      "applicability": "Current nextConfiguration and GetConfiguration behavior takes precedence as behavior evidence; historical proposal statements remain attributed unresolved expectations.",
+      "version": 1
+    },
+    {
+      "id": "RESP_election",
+      "description": "Filter vote requests using term, known-leader context, membership, log freshness and previously persisted candidate identity.",
+      "source_ids": ["raft.go:1603:1735", "config.go:138:246", "transport.go:1:74"],
+      "entry_points": ["requestVote"],
+      "claim_ids": [],
+      "handoffs": [],
+      "questions": ["What persistence and recovery guarantees protect the term/candidate record?", "How are candidate address bytes related to stable ServerID identity?", "Which election and transfer producers can generate accepted requests?"],
+      "applicability": "LeadershipTransfer bypasses the known-leader rejection. Missing request IDs skip membership checks for compatibility. Pre-vote is configurable and not inspected here.",
+      "version": 1
+    }
+  ],
+  "exploration_requests": [
+    {
+      "reason": "Resolve the partially supplied FSM completion and snapshot capture handoffs before extending either selected goal. Prioritize within the remaining breadth allowance.",
+      "responsibility_ids": ["RESP_apply", "RESP_snapshot"],
+      "requests": [
+        {
+          "file": "fsm.go",
+          "start_line": 181,
+          "end_line": 285,
+          "reason": "Read the rest of runFSM to establish batch future completion, snapshot index production, restoration and channel dispatch. This determines whether separate response-correspondence or capture obligations are warranted."
+        }
+      ]
+    },
+    {
+      "reason": "Give the unrepresented election persistence boundary a small initial inquiry without assuming crash-safety guarantees.",
+      "responsibility_ids": ["RESP_election"],
+      "requests": [
+        {
+          "file": "stable.go",
+          "start_line": 1,
+          "end_line": 18,
+          "reason": "Read the StableStore contract to identify what persistVote and recovery may assume. Any missing atomicity or durability guarantee remains open until its actual producer is read."
+        }
+      ]
+    },
+    {
+      "reason": "Clarify membership state production at the already observed follower handoff before deciding whether a new configuration-history unit is justified.",
+      "responsibility_ids": ["RESP_membership", "RESP_replication", "RESP_snapshot"],
+      "requests": [
+        {
+          "file": "raft.go",
+          "start_line": 1585,
+          "end_line": 1602,
+          "reason": "Read the omitted processConfigurationLogEntry definition between supplied handlers. Determine how appended entries update latest and committed configuration and refine the pending membership inquiry."
+        }
+      ]
+    }
+  ]
+}

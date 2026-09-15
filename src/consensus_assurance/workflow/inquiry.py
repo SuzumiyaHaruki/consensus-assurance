@@ -87,10 +87,26 @@ def review_unit(engine, unit, trigger, model=None):
     available=objects(engine.state)
     if trigger=="before_model" and readiness(engine.state,unit)["status"]=="reviewed":return
     ids=[x for x in dict.fromkeys(unit.goal_ids+unit.obligation_ids+unit.binding_ids+unit.relation_ids+[unit.id]+([model.id] if model else [])) if x in available]
+    from .review_contract import target_contract,same_basis
+    needed={};basis={}
+    for id in ids:
+        contract=target_contract(engine.state,available[id]);basis[id]=contract
+        for aspect in contract['required_aspects']:
+            previous=next((r for r in reversed(engine.state.semantic_reviews) if same_basis(r.context_dependencies.get(id,{}),contract) and any(i.target_id==id and i.aspect==aspect for i in r.items)),None)
+            if previous:
+                reuse={'unit_id':unit.id,'target_id':id,'aspect':aspect,'review_id':previous.id,'basis':contract,'reason':'Same scoped semantics and source ranges; old issues remain open'}
+                if reuse not in engine.state.review_reuses:engine.state.review_reuses.append(reuse)
+                continue
+            pending=next((t for t in engine.state.inquiry_tasks if t.kind=='review' and t.status in {'pending','running','blocked'} and id in t.target_ids and aspect in t.requested_aspects.get(id,contract['required_aspects']) and same_basis(t.context_dependencies.get(id,{}),contract)),None)
+            if pending:continue
+            needed.setdefault(id,[]).append(aspect)
+    ids=list(needed)
     for start in range(0,len(ids),12):
         part=ids[start:start+12]
         versions=':'.join(x+'@'+str(getattr(available[x],'version',1)) for x in part)
-        task=enqueue(engine.state,'review','Recheck applicability, necessity, sufficiency, alternative mechanisms and checker meaning from actual materials',trigger+':'+versions,target_ids=part,unit_id=unit.id,model_id=model.id if model else None)
+        task=enqueue(engine.state,'review','Review new semantic inputs, dependency evidence or checker correspondence',trigger+':'+versions,target_ids=part,unit_id=unit.id,model_id=model.id if model else None)
+        task.requested_aspects={id:needed[id] for id in part};task.context_dependencies={id:basis[id] for id in part}
+        task.expected_contribution='Resolve changed target/aspect inputs before continuing the selected audit problem'
         if model:
             from .encoding import issue_models
             task.resolution_issue_ids=[i.id for i in engine.state.review_issues if not i.resolved_by and i.aspect=='checker_correspondence' and issue_models(engine.state,i,model)]
@@ -125,6 +141,10 @@ def choose_task(engine):
     if needed:return needed[0]
     reviews=[t for t in pending if t.kind=='review']
     if reviews and engine.config.budget.audit_units==0:return reviews[0]
+    if state.active_unit_id and state.next_action in {'build','experiment','calibrate','search'}:
+        local=[t for t in reviews if t.unit_id==state.active_unit_id]
+        if local:return local[0]
+        return None
     exploration=[t for t in pending if t.kind=='explore']
     exploration.sort(key=lambda t:(not t.trigger.startswith('handoff:'), any(r.claim_ids for r in state.responsibilities if r.id in t.responsibility_ids), bool(t.requests), len(t.requests)))
     # Alternate breadth and review, allowing one local segment between completed inquiries.
@@ -150,16 +170,18 @@ def task_context(engine,task):
         if (issue.target_id in closure or issue.id in task.resolution_issue_ids) and not issue.resolved_by:wanted.update(issue.source_ids)
     if task.kind=='explore':
         for role in state.responsibilities:
-            if not task.responsibility_ids or role.id in task.responsibility_ids:wanted.update(role.source_ids)
+            if role.id in task.responsibility_ids:wanted.update(role.source_ids)
         wanted.update(m.id for m in state.materials if m.file.lower().endswith('readme.md'))
+    pending_scope=[u for u in state.scope_updates.values() if u['status']=='needs_F2_or_investigation' and u['proposal']['unit_id']==task.unit_id]
+    for p in pending_scope:wanted.update(p['proposal']['source_ids'])
     selected=[m for m in state.materials if m.id in wanted]
     task.material_ids=[m.id for m in selected]
     task.unit_version=next((u.version for u in state.units if u.id==task.unit_id),None)
-    result={'task':task.model_dump(mode='json',exclude={'context_receipt_id','context_dependencies'}),'responsibilities':[r.model_dump(mode='json') if task.kind=='explore' or r.id in task.responsibility_ids else {'id':r.id,'description':r.description,'claim_ids':r.claim_ids} for r in state.responsibilities],
+    result={'pending_scope_updates':pending_scope,'task':task.model_dump(mode='json',exclude={'context_receipt_id','context_dependencies','admitted','preparation_failures','child_task_ids'}),'responsibilities':[r.model_dump(mode='json') if r.id in task.responsibility_ids else {'id':r.id,'description':r.description,'claim_ids':r.claim_ids} for r in state.responsibilities],
         'materials':[m.model_dump(mode='json') for m in selected],
         'omitted_material_ids':[m.id for m in state.materials if m.id not in wanted],
-        'catalogue':catalogue(engine.root/'source',state.snapshot,engine.implementation) if task.kind=='explore' else [],
-        'unread_ranges':state.unread_ranges if task.kind=='explore' else {f:r for f,r in state.unread_ranges.items() if f in {m.file for m in selected}},'remaining_seconds':engine.budget.remaining(),
+        'catalogue':[],
+        'unread_ranges':{f:r for f,r in state.unread_ranges.items() if f in {m.file for m in selected}},'remaining_seconds':engine.budget.remaining(),
         'target_objects':[available[i].model_dump(mode='json') for i in task.target_ids if i in available],
         'claims':[c.model_dump(mode='json') if c.id in closure else {'id':c.id,'kind':c.kind,'description':c.description,'version':c.version} for c in state.claims if c.id not in task.target_ids],
         'bindings':[b.model_dump(mode='json') for b in state.bindings if b.id in closure and b.id not in task.target_ids],
@@ -167,7 +189,7 @@ def task_context(engine,task):
         'units':[u.model_dump(mode='json') for u in state.units if u.id in closure and u.id not in task.target_ids],
         'open_issues':[i.model_dump(mode='json') for i in state.review_issues if (i.target_id in closure or i.id in task.resolution_issue_ids) and not i.resolved_by],
         'blocked_review_tasks':[t.model_dump(mode='json') for t in state.inquiry_tasks if t.kind=='review' and t.status=='blocked' and not t.superseded_by and set(t.target_ids)<=set(task.target_ids)],
-        'cost_estimate':cost_estimate(engine)}
+        'cost_estimate':cost_estimate(engine),'overview_limit':'This compact index is not complete implementation coverage; request specific actual ranges before deriving new claims'}
     if task.model_id:
         model=next((m for m in state.models if m.id==task.model_id),None)
         if model:
@@ -222,7 +244,6 @@ def process_task(engine, task):
     if task.status=='pending':
         planned_versions=dict(task.target_versions)
         task.target_versions={i:objects(state)[i].version for i in task.target_ids if i in objects(state)}
-        engine.budget.take('exploration_rounds' if task.kind=='explore' else 'semantic_reviews')
         task.status='running';state.active_inquiry_id=task.id
         state.inquiry_selections.append({'task_id':task.id,'kind':task.kind,'reason':task.reason,'trigger':task.trigger,'planned_target_versions':planned_versions,'execution_target_versions':task.target_versions})
         engine.checkpoint('inquiry_task_started')
@@ -318,6 +339,7 @@ def resume_deferred(engine):
     if state.active_inquiry_id or state.active_unit_id:return
     if engine.budget.remaining()<=0 or state.usage.get('agent_calls',0)>=engine.config.budget.agent_calls:return
     for task in state.inquiry_tasks:
+        if task.child_task_ids:continue
         if task.status=='blocked' and not task.superseded_by and task.stop_reason and not task.stop_reason.startswith('Budget exhausted or disabled'):
             task.status='running';state.active_inquiry_id=task.id
             engine.checkpoint('explicit_resume_of_blocked_inquiry')
@@ -397,6 +419,7 @@ def apply_task_response(engine,task_id,reply,check):
         record_dispositions(state,review,reply,[t.id for t in state.inquiry_tasks if t.id not in followup_before])
         state.gaps.extend(reply.limitations)
     task.repair_session=None;task.check_id=check.id;task.status='completed';task.stage='done';state.active_inquiry_id=None
+    settle_parents(state)
     state.last_work_kind=task.kind;release_action(engine)
 
 
@@ -420,3 +443,27 @@ def cost_estimate(engine):
     return {'material_allocation':{p:material_allowance(engine.state,engine.config.budget,p) for p in ('breadth','depth')},'pending_inquiries':len(tasks),'pending_units':len(units),'minimum_agent_calls':lower,
         'remaining_agent_calls':available,'fits_minimum':lower<=available,
         'limitations':['Lower bound only: excludes retries, additional reading, model repair, replay and tool latency; not a price or token bill']}
+
+
+def split_context_task(engine,task):
+    if task.child_task_ids or task.preparation_failures>engine.config.budget.context_preparations:return []
+    if task.kind=='review' and len(task.target_ids)>1:
+        fields=task.target_ids;key='target_ids'
+    elif task.kind=='explore' and not task.responsibility_ids and len(engine.state.responsibilities)>1:
+        fields=[r.id for r in engine.state.responsibilities];key='responsibility_ids'
+    else:return []
+    middle=(len(fields)+1)//2;children=[]
+    for index,part in enumerate((fields[:middle],fields[middle:])):
+        child=enqueue(engine.state,task.kind,task.reason+'; bounded subtask '+str(index+1),task.id+':context_part:'+str(index),unit_id=task.unit_id,model_id=task.model_id,**{key:part})
+        child.parent_task_id=task.id;child.expected_contribution='Resolve this explicit part of the oversized parent; other parts remain pending'
+        children.append(child.id)
+    task.child_task_ids=children
+    return children
+
+
+def settle_parents(state):
+    tasks={t.id:t for t in state.inquiry_tasks}
+    for parent in state.inquiry_tasks:
+        if parent.child_task_ids and all(id in tasks and tasks[id].status=='completed' for id in parent.child_task_ids):
+            parent.status='completed';parent.stage='done'
+            parent.stop_reason='All explicit child tasks executed; semantic issues and scope limits remain in their individual records'

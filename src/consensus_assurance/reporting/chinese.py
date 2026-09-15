@@ -96,6 +96,17 @@ def resource_lines(state):
     interface=sum(any(d['code'].startswith('review_') for d in session.get('resolved_diagnostics',[])+session.get('diagnostics',[])) for session in state.repair_sessions.values())
     lines.append(f"复核接口修复会话 {interface}；实际 F2 语义修订 {sum(r.kind=='F2' and r.status=='applied' for r in state.revisions)}。二者不互相替代。")
     for task in state.trigger_retry_tasks:lines.append(f"触达任务 {task['model_id']}/{task['requirement_id']}：{task['status']}；尝试 {len(task['attempts'])} 次；{task['reason']}")
+    lines += ['', '## 范围接回、复核复用与里程碑', '', '里程碑是本次记录首次出现该事实的时间；缺失不是零耗时。离线、mock 与真实自主运行不合并比较。']
+    for name,value in state.milestones.items():lines.append(f'- {name}：{value}')
+    lines.append(f"同语义复核复用记录 {len(state.review_reuses)}；上下文准备失败 {state.usage.get('packet_preparation_failures',0)}；未发送包不消耗实际探索/复核轮数。")
+    acquired={id for id,p in state.read_plans.items() if p.get('scope_requested') and p['status']=='complete' and any(i['status']=='acquired' for i in p['items'])}
+    connected={u['proposal'].get('read_plan_id') for u in state.scope_updates.values() if u['status']=='accepted'} & acquired
+    lines.append(f"需接回且已取得新材料的计划 {len(acquired)}；已接回 {len(connected)}；连接率 {str(len(connected))+'/'+str(len(acquired)) if acquired else '无可计算分母/历史未记录'}。这不是语义通过率或系统覆盖率。")
+    sent=[p for p in state.packet_receipts if p['status'] in {'executed','accepted'} and not p.get('result_reused')]
+    lines.append(f"实际发送包中源正文累计 {sum(p.get('source_chars_sent',0) for p in sent)} 字符（跨调用重复发送会重复计入）；schema 累计 {sum(p.get('wire_schema_bytes',0) for p in sent)} 字节。无真实 token/账单字段时不换算费用。")
+    for id,update in state.scope_updates.items():lines.append(f"范围提案 {id}：{update['status']}；原单元 {update['proposal']['unit_id']}；新单元 {update.get('new_unit_id','尚未接回')}。")
+    for task in state.inquiry_tasks:
+        if task.child_task_ids:lines.append(f"分包父任务 {task.id}：子任务 {task.child_task_ids}；父状态 {task.status}，未执行子任务不计完成。")
     return lines
 
 
@@ -125,7 +136,8 @@ def inquiry_lines(state):
             version=review.target_versions.get(item.target_id)
             history='历史语义版本' if current.get(item.target_id)!=version else '当前对象版本'
             lines.append(f"| {text(item.target_id)} v{version}（{history}） | {aspects[item.aspect]} | {verdicts[item.status]} | {text(item.source_ids)}：{text(item.explanation)} |")
-            if item.limitations: lines.append(f"限制：{text(item.limitations)}")
+            if item.limitations: lines.append(f"未解决的有效性条件：{text(item.limitations)}")
+            if item.scope_limitations:lines.append(f"独立范围边界：{text(item.scope_limitations)}")
     for issue in state.review_issues:
         lines.append(f"复核问题 `{issue.id}`：{'由 '+issue.resolved_by+' 显式解决' if issue.resolved_by else '未决'}；处置 `{issue.disposition}`；后续 {issue.task_ids}；{issue.explanation}；{issue.reason}。")
     for task in state.inquiry_tasks:

@@ -67,3 +67,7 @@ TLC_JAR="$PWD/.tools/tla2tools.jar" .venv/bin/consensus-assurance run \
 ## 第七轮待执行入口
 
 当前入口以 [第七轮复核与材料闭环](第七轮复核与材料闭环.md) 和 `configs/targets/hashicorp_raft.round7.yaml` 为准。旧各轮配置保留历史身份。本轮已执行 estimate 核对路径与有限预算；没有启动新的真实分析。先检查代码，再明确材料发送与隔离执行权限，随后使用该文档末尾命令创建本地授权配置。仍不预设快照、提交或选举目标。
+
+## 第八轮待执行入口
+
+当前修复与配置以 [第八轮范围接回与验收](第八轮范围接回与验收.md) 和 `configs/targets/hashicorp_raft.round8.yaml` 为准。该配置不预选目标，保留原总调用、时间和材料额度；本轮只运行本地回归和离线接回，不启动真实目标链。先由用户检查，再确认材料发送和隔离执行权限。

@@ -18,6 +18,7 @@ class Budget(Record):
     experiments: int = Field(default=4, ge=0)
     calibration_checks: int = Field(default=8, ge=0)
     material_chars: int = Field(default=120000, ge=0)
+    context_preparations: int = Field(default=2, ge=1)
     context_chars: int = Field(default=180000, ge=1000)
     depth_material_reserve: float = Field(default=0.35, ge=0, le=0.5)
     breadth_material_reserve: float = Field(default=0.20, ge=0, le=0.5)

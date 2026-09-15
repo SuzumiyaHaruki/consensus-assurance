@@ -62,6 +62,8 @@ def ask(engine,kind,response_type,context,validator=None):
         if validator:validator(response)
     limit=engine.config.budget.error_context_chars
     while True:
+        import time
+        preparation_started=time.monotonic()
         if session:
             if session['attempt']>=engine.config.budget.repair_attempts or session.get('blocked'):
                 save_session(engine,session);raise Blocked('Structured response repair limit reached: '+session['error'])
@@ -81,13 +83,42 @@ def ask(engine,kind,response_type,context,validator=None):
             schema=OutputRepair
         else:request=context;schema=response_type
         directory=engine.root/'agent'/(uid()+'-'+kind)
-        prompt=render('retry' if session else kind,request,engine.inquiry if kind in {'read','discover','F3','targeted_read','graph_patch','explore','semantic_review'} else '')
+        from .task_packet import pool_sources
+        request=pool_sources(request)
+        prompt=render('retry' if session else kind,request,engine.inquiry if kind in {'read','discover','F3','targeted_read','graph_patch','explore','semantic_review','scope_review'} else '')
         sent=receipt(engine,kind,request,prompt,schema,review_task,repair=bool(session))
+        sent['preparation_seconds']=time.monotonic()-preparation_started
         if len(prompt)>engine.config.budget.context_chars:
             sent['status']='blocked_context_limit'
+            state.usage['packet_preparation_failures']=state.usage.get('packet_preparation_failures',0)+1
+            if review_task:
+                review_task.preparation_failures+=1
+                from .inquiry import split_context_task
+                sent['child_task_ids']=split_context_task(engine,review_task)
+            write_json(engine.root/'packets'/(sent['id']+'.json'),sent)
             engine.checkpoint('context_limit')
             raise Blocked('Required context exceeds context_chars; split the task or explicitly revise the limit; no payload sent')
-        payload=engine.action('agent:'+kind+(':repair' if session else ''),'agent_calls',lambda:engine.agent.analyze(engine.runner,prompt,directory,state.snapshot.id,engine.budget.timeout(),schema),{'prompt':prompt,'response_type':schema.__name__})
+        if review_task and not review_task.admitted:
+            resource='exploration_rounds' if review_task.kind=='explore' else 'semantic_reviews'
+            if state.usage.get(resource,0)>=getattr(engine.config.budget,resource):raise Blocked('Actual inquiry admission budget exhausted: '+resource)
+            if review_task.preparation_failures>=engine.config.budget.context_preparations:raise Blocked('Context preparation limit exhausted; no backend call sent')
+        from .action_identity import stable_input
+        pending=state.pending_action
+        saved_scope_result=bool(pending and pending.kind=='agent:scope_review' and pending.status=='completed' and pending.logical_input.get('inputs')==stable_input({'prompt':prompt,'response_type':schema.__name__}))
+        if kind=='scope_review' and not saved_scope_result and state.usage.get('semantic_reviews',0)>=engine.config.budget.semantic_reviews:raise Blocked('Scope interpretation review budget exhausted; the saved proposal remains pending')
+        invoked=False
+        def invoke():
+            nonlocal invoked
+            invoked=True
+            if review_task and not review_task.admitted:
+                engine.budget.take('exploration_rounds' if review_task.kind=='explore' else 'semantic_reviews')
+                review_task.admitted=True
+                engine.checkpoint('inquiry_backend_admitted')
+            elif kind=='scope_review':
+                engine.budget.take('semantic_reviews')
+            return engine.agent.analyze(engine.runner,prompt,directory,state.snapshot.id,engine.budget.timeout(),schema)
+        payload=engine.action('agent:'+kind+(':repair' if session else ''),'agent_calls',invoke,{'prompt':prompt,'response_type':schema.__name__})
+        sent['result_reused']=not invoked
         sent['status']='action_returned';sent['action_id']=state.pending_action.id if state.pending_action else None
         check=CheckRun.model_validate(payload[0]);sent['check_id']=check.id;sent['status']='reused_result' if any(p.get('check_id')==check.id for p in state.packet_receipts if p is not sent) else 'executed';write_json(engine.root/'packets'/(sent['id']+'.json'),sent);check.parameters['agent_task']=kind;engine.record(check);cwd=Path(check.cwd)
         raw=payload[1]
@@ -143,6 +174,11 @@ def ask(engine,kind,response_type,context,validator=None):
             response=response_type.model_validate(merged)
             validate(response)
             write_json(cwd/'accepted-response.json',response)
+            sent['status']='accepted';write_json(engine.root/'packets'/(sent['id']+'.json'),sent)
+            if getattr(response,'bundle',None) is not None:
+                from consensus_assurance.core.types import now
+                state.milestones.setdefault('bundle_accepted',now())
+            engine.checkpoint('agent_response_accepted')
             if session:
                 session['status']='accepted';session['accepted_check']=check.model_dump(mode='json');session['resolved_diagnostics']=session['diagnostics'];session['diagnostics']=[];session['error']='';session['version']+=1
                 session['current_path']=str(engine.root/'repair-sessions'/session['id']/f"candidate-{session['version']}.json")

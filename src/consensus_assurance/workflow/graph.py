@@ -106,33 +106,31 @@ def select_unit(state):
 
 
 def expand_unit(state, unit, relation_ids):
-    edges = [e for e in state.relations if e.id in relation_ids and e.kind in {"boundary", "depends_all", "conditional_on"}]
-    if len(edges) != len(set(relation_ids)) or not edges:
-        raise ValueError("F3 requires specific dependency relations")
-    reachable = set(unit.obligation_ids + unit.binding_ids)
-    for edge in edges:
-        if edge.source not in reachable:
-            raise ValueError("F3 dependency must originate in the current scope")
-        reachable.add(edge.target)
-    reachable.update(c for b in state.bindings if b.id in reachable for c in claim_ids(b))
-    added = [b.id for b in state.bindings if b.id in reachable or bool(claim_ids(b)&reachable)]
-    binding_ids = list(dict.fromkeys(unit.binding_ids + added))
-    obligation_ids = list(dict.fromkeys(unit.obligation_ids + [c.id for c in state.claims if c.kind == "obligation" and c.id in reachable]))
-    if binding_ids == unit.binding_ids and obligation_ids == unit.obligation_ids:
-        raise ValueError("F3 must add a concrete binding or related obligation; obtain missing material first")
-    expanded = unit.model_copy(deep=True)
-    expanded.id = uid(); expanded.previous_id = unit.id; expanded.status = "pending"
-    expanded.binding_ids = binding_ids; expanded.obligation_ids = obligation_ids
-    expanded.goal_observable=False
-    expanded.semantic_readiness={};expanded.obligation_checks={};expanded.remaining_obligation_ids=list(obligation_ids)
-    expanded.coverage_limitations=['New scope requires regenerated observation, trigger and semantic review records']
-    expanded.relation_ids = list(dict.fromkeys(unit.relation_ids + relation_ids))
-    expanded.scope.description += "; expanded to explain dependency producers: " + ", ".join(relation_ids)
-    expanded.boundary_changes = ["Included producer bindings: " + ", ".join(b for b in binding_ids if b not in unit.binding_ids),
-        "Prior external boundary assumptions must be reconsidered; inclusion does not establish the guarantee"]
-    expanded.rationale = "Dependency-driven expansion; regenerate state semantics, actions and observation mapping"
-    unit.status = "revised"; state.units.insert(0, expanded)
-    return expanded
+    from .scope_updates import from_patch,apply_scope_update
+    from consensus_assurance.core.proposals import GraphPatch,UnitDraft
+    from consensus_assurance.core.types import CodeUse
+    edges = sorted([e for e in state.relations if e.id in relation_ids and e.kind in {'boundary','depends_all','conditional_on'}],key=lambda e:e.id)
+    if len(edges)!=len(set(relation_ids)) or not edges:raise ValueError('F3 requires specific dependency relations')
+    reachable=set(unit.obligation_ids+unit.binding_ids);used=set()
+    while True:
+        fresh=[e for e in edges if e.source in reachable and e.id not in used]
+        if not fresh:break
+        for edge in fresh:reachable.add(edge.target);used.add(edge.id)
+    if used!={e.id for e in edges}:raise ValueError('F3 dependency must originate in the current scope; reversed or unrelated edges remain excluded')
+    added=sorted(b.id for b in state.bindings if b.id in reachable or claim_ids(b)&reachable)
+    draft=UnitDraft(**{k:v for k,v in unit.model_dump().items() if k in UnitDraft.model_fields})
+    draft.binding_ids=list(dict.fromkeys(unit.binding_ids+added));draft.relation_ids=list(dict.fromkeys(unit.relation_ids+sorted(used)))
+    if draft.binding_ids==unit.binding_ids:raise ValueError('F3 must add a concrete binding; use an explicit scope proposal to refine existing event granularity')
+    for id in added:
+        if id in unit.binding_ids:continue
+        binding=next(b for b in state.bindings if b.id==id)
+        ids=sorted(claim_ids(binding))
+        draft.code_uses.append(CodeUse(binding_id=id,role='support',claim_ids=ids,relation_ids=sorted(used),source_ids=list(dict.fromkeys(s for a in binding.associations for s in a.source_ids)),
+            rationale='Selected directed dependency supplies implementation context',unverified=['Including the producer does not check its responsibility or establish its guarantee']))
+    draft.rationale=unit.rationale+'; inspect the selected producer dependencies'
+    patch=GraphPatch(units=[draft],expected_versions={unit.id:unit.version},rationale='Included producer bindings through selected directed dependencies')
+    update=from_patch(state,unit,patch)
+    return apply_scope_update(state,update)
 
 
 def _apply_patch(state, patch, semantic=False):

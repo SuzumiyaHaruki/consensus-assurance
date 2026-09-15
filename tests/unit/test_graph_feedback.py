@@ -32,7 +32,8 @@ def test_F3_adds_actual_dependency_bindings(prepared):
     _, state, _, _ = prepared
     expanded = expand_unit(state, state.units[0], ["input_dependency"])
     assert expanded.binding_ids == ["step_binding", "input_binding"]
-    assert expanded.obligation_ids == ["step_obligation", "input_obligation"]
+    assert expanded.obligation_ids == ["step_obligation"]
+    assert any(u.binding_id=="input_binding" and u.role=="support" for u in expanded.code_uses)
     assert expanded.previous_id == "counter_unit"
     assert state.units[1].status == "revised"
 
