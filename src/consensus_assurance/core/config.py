@@ -17,10 +17,14 @@ class Budget(Record):
     calibration_checks: int = Field(default=8, ge=0)
     material_chars: int = Field(default=120000, ge=1000)
     material_chunks: int = Field(default=40, ge=1)
-    audit_units: int = Field(default=2, ge=1)
+    audit_units: int = Field(default=2, ge=0)
 
     targeted_reads: int = Field(default=3, ge=0)
     technical_repairs: int = Field(default=2, ge=0)
+    exploration_rounds: int = Field(default=3, ge=0)
+    semantic_reviews: int = Field(default=4, ge=0)
+    graph_objects: int = Field(default=1000, ge=1)
+    outer_reserve_seconds: float = Field(default=60, ge=0)
     error_context_chars: int = Field(default=16000, ge=1000)
 
 

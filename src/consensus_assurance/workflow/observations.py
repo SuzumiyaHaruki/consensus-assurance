@@ -31,7 +31,8 @@ def assess_execution(state, model, bundle, experiment, calibration, finding, eve
     prerequisite = match_prerequisites(events,bundle.harness.prerequisites)
     specs = {c.invariant:c for c in model.checkers}
     results = [monitor_events(events,m) for m in bundle.monitors if m.checker_id == finding.checker_id]
-    limitations = []
+    from .inquiry import semantic_limitations
+    limitations = semantic_limitations(state,model)
     from pathlib import Path
     from consensus_assurance.core.proposals import Bundle
     try:

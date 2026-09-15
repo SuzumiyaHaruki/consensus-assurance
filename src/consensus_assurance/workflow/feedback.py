@@ -1,3 +1,4 @@
+import json
 from consensus_assurance.core.types import Revision
 from .graph import apply_patch, expand_unit, validate_grounding
 
@@ -6,13 +7,19 @@ def apply_feedback(state, unit, current, feedback):
     known = {c.id for c in state.checks} | {c.id for c in state.calibrations} | {m.id for m in state.materials}
     if not set(feedback.evidence_ids) <= known or not feedback.evidence_ids:
         raise ValueError("Semantic feedback requires recorded evidence or material sources")
-    targets = {c.id for c in state.claims} | {b.id for b in state.bindings} | {m.id for m in state.models} | {u.id for u in state.units}
+    targets = {c.id for c in state.claims} | {b.id for b in state.bindings} | {m.id for m in state.models} | {u.id for u in state.units} | {r.id for r in state.relations}
     if not feedback.target_ids or not set(feedback.target_ids) <= targets:
         raise ValueError("Feedback target does not exist")
-    before = {"unit": unit.model_dump(mode="json"), "checked_claim_ids": current.checked_claim_ids,
-              "properties": current.properties, "scope": current.scope.model_dump(mode="json"),
-              "behavior": current.behavior, "observation": current.observation.model_dump(), "harness": current.harness.model_dump()}
-    affected = [m.id for m in state.models if m.unit_id == unit.id]
+    if feedback.kind != "F2" and (unit is None or current is None):
+        raise ValueError("This feedback requires an active unit and model")
+    before = {"unit": unit.model_dump(mode="json") if unit else None,
+              "checked_claim_ids": current.checked_claim_ids if current else [],
+              "properties": current.properties if current else None,
+              "scope": current.scope.model_dump(mode="json") if current else None,
+              "behavior": current.behavior if current else None,
+              "observation": current.observation.model_dump() if current else None,
+              "harness": current.harness.model_dump() if current else None}
+    affected = [m.id for m in state.models if unit and m.unit_id == unit.id]
     if feedback.kind == "F1":
         if feedback.bundle is None or feedback.graph is not None:
             raise ValueError("F1 revises behavior, mapping or environment only")
@@ -32,9 +39,33 @@ def apply_feedback(state, unit, current, feedback):
             return None
         if not set(feedback.evidence_ids) & set(feedback.grounding.behavior_ids + feedback.grounding.expectation_ids):
             raise ValueError("A failed trace alone cannot authorize a semantic weakening")
-        current_claims = {c.id:c for c in state.claims}
-        if not any(c.id in current_claims and current_claims[c.id].description == feedback.old_judgment and c.description == feedback.new_judgment for c in feedback.patch.claims):
-            raise ValueError("F2 old/new judgments must identify an actual claim revision")
+        originals = {obj.id:obj for obj in [*state.claims,*state.relations]}
+        replacements = {obj.id:obj for obj in [*feedback.patch.claims,*feedback.patch.relations]}
+        changed_fields = []
+        for target, new in replacements.items():
+            old = originals.get(target)
+            if old is None: continue
+            for field in ("description","scope","grounding","source","target","kind","group","rationale","pending"):
+                if hasattr(old,field) and hasattr(new,field) and getattr(old,field)!=getattr(new,field):
+                    changed_fields.append((target,field))
+        if not changed_fields:
+            raise ValueError("F2 must revise an existing claim, relationship or applicability condition")
+        if feedback.changes:
+            if {(c.target_id,c.field) for c in feedback.changes} != set(changed_fields):
+                raise ValueError("F2 changes must describe every altered semantic field")
+            for change in feedback.changes:
+                old=originals[change.target_id].model_dump(mode="json")[change.field]
+                new=replacements[change.target_id].model_dump(mode="json")[change.field]
+                if json.loads(change.old_value_json)!=old or json.loads(change.new_value_json)!=new:
+                    raise ValueError("F2 before/after values do not match the proposed semantic revision")
+        else:
+            matches = any((getattr(originals[key],field)==feedback.old_judgment and getattr(new,field)==feedback.new_judgment)
+                for key,new in replacements.items() if key in originals for field in ("description","rationale") if hasattr(new,field))
+            if not matches:
+                raise ValueError("F2 old/new judgments must identify an actual claim or relationship revision")
+        if not set(originals) & set(feedback.target_ids) & set(replacements):
+            raise ValueError("F2 target IDs must name an object actually revised")
+        before["semantic_objects"] = {key:originals[key].model_dump(mode="json") for key in replacements if key in originals}
         changed = apply_patch(state, feedback.patch, semantic=True)
         affected = [m.id for m in state.models if changed & (set(m.binding_ids) | {c.claim_id for c in m.checkers} | set(m.graph_versions))]
         before["old_judgment"] = feedback.old_judgment
@@ -59,10 +90,10 @@ def apply_feedback(state, unit, current, feedback):
     if feedback.kind != "F4":
         state.affect(affected, feedback.rationale, historical=feedback.kind == "F3")
     after = {"scope": result.scope.model_dump(mode="json") if hasattr(result, "scope") else {},
-             "unit_id": result.id if hasattr(result, "id") else unit.id,
+             "unit_id": result.id if hasattr(result, "id") else unit.id if unit else None,
              "graph_version": state.graph_version, "new_judgment": feedback.new_judgment,
              "grounding": feedback.grounding.model_dump(), "affected_model_ids": affected,
-             "property_changes": feedback.new_basis,
+             "property_changes": feedback.new_basis, "changes":[c.model_dump(mode="json") for c in feedback.changes],
              "behavior": feedback.bundle.behavior if feedback.bundle else None,
              "observation": feedback.bundle.observation.model_dump() if feedback.bundle else None,
              "harness": feedback.bundle.harness.model_dump() if feedback.bundle else None}

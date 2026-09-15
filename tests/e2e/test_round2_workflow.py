@@ -4,7 +4,7 @@ import os
 import shutil
 from pathlib import Path
 import pytest
-from consensus_assurance.core.config import Config
+from regression_support import fixture_config as Config
 from consensus_assurance.core.types import ExecutionStatus
 from consensus_assurance.registry import assemble
 from consensus_assurance.consensus.inquiry import INQUIRY

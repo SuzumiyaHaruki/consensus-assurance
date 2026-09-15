@@ -62,6 +62,7 @@ def test_F2_requires_normative_basis_and_invalidates(prepared):
     f.evidence_ids = ["README.md:1:5"]
     f.graph = None
     f.patch = GraphPatch(claims=[revised.claims[1]],expected_versions={revised.claims[1].id:1},rationale=f.new_basis)
+    f.target_ids = [revised.claims[1].id]
     f.old_judgment = state.claims[1].description
     f.new_judgment = revised.claims[1].description
     f.grounding = revised.claims[1].grounding.model_copy(deep=True)

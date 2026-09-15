@@ -32,7 +32,8 @@ def execution_summary(check):
             product = "结构化回复已返回；不代表关系图或模型已被接受"
         if (Path(check.cwd) / "graph-validation-error.txt").is_file():
             product = "回复已返回；后续工作流校验失败，见校验日志"
-        return "Agent 分析或修复", product, "不适用：生成候选分析，不是验证"
+        task={"explore":"职责覆盖探索", "semantic_review":"目标/义务/关系语义复核"}.get(check.parameters.get("agent_task"),"Agent 分析或修复")
+        return task, product, "不适用：生成候选分析，不是验证"
     if check.action == "trace_calibration":
         return "有限观测轨迹校准", "校准状态见下方模型记录", "轨迹兼容不等于性质成立或违反"
     if check.action in {"capability_probe", "experiment", "replay"}:
@@ -57,6 +58,36 @@ def progress_lines(state):
         "", "若 agent 回复完成而目标发现仍未被接受，不能把该回复视为已成立的关系图。历史记录未保存具体拒绝原因时，报告不补造原因。"]
 
 
+def inquiry_lines(state):
+    def text(value):
+        return str(value).replace("|", "\\|").replace("\n", " ")
+    lines=["", "## 职责覆盖与语义复核", "",
+        "材料读取、职责认识、语义复核和局部性质检查分别记录。职责概览由当前材料逐步形成，不是完备全集；不计算全系统覆盖率。复核暂未发现问题不等于形式证明，多个 agent 回复一致也不等于独立证据。", "",
+        "| 职责候选 | 来源 | 关联目标/义务 | 尚未解释 |", "| --- | --- | --- | --- |"]
+    for r in state.responsibilities:
+        lines.append("| "+" | ".join(text(x) for x in [r.id+"："+r.description,', '.join(r.source_ids),', '.join(r.claim_ids) or '尚未形成目标/义务','；'.join(r.questions) or '当前未列出问题；不代表没有遗漏'])+" |")
+        for handoff in r.handoffs:
+            lines.append(f"| 交接候选 {text(r.id)} → {text(handoff.target_id)} | {text(handoff.source_ids)} | {text(handoff.description)} | 仍需结合具体职责与局部证据调查 |")
+    if not state.responsibilities: lines.append("尚未形成有来源的职责概览。")
+    lines += ["", "| 后续任务 | 类型 | 状态/步骤 | 原因与阻塞 |", "| --- | --- | --- | --- |"]
+    for task in state.inquiry_tasks:
+        kind='扩展职责/交接覆盖' if task.kind=='explore' else '语义复核'
+        lines.append(f"| `{task.id[:8]}` | {kind} | {task.status}/{task.stage} | {text(task.reason)}；{text(task.stop_reason)} |")
+    current={x.id:getattr(x,'version',1) for x in [*state.claims,*state.relations,*state.models]}
+    verdicts={'no_issue_found':'本次范围内暂未发现语义问题','needs_reading':'需要补读','disputed':'解释仍有争议','revision_needed':'需要修订'}
+    aspects={'applicability':'适用性','decomposition':'义务及支撑关系','checker_correspondence':'checker 语义对应'}
+    lines += ["", "| 复核对象/版本 | 层面 | 判断 | 材料与推导 |", "| --- | --- | --- | --- |"]
+    for review in state.semantic_reviews:
+        for item in review.items:
+            version=review.target_versions.get(item.target_id)
+            history='历史语义版本' if current.get(item.target_id)!=version else '当前对象版本'
+            lines.append(f"| {text(item.target_id)} v{version}（{history}） | {aspects[item.aspect]} | {verdicts[item.status]} | {text(item.source_ids)}：{text(item.explanation)} |")
+            if item.limitations: lines.append(f"限制：{text(item.limitations)}")
+    if not state.semantic_reviews: lines.append("尚无已执行的语义复核；有来源的候选不因此变成已确认规范。")
+    lines += ["", "职责清单之外仍可能有未知遗漏。未复核对象、未执行义务和受阻任务保留原状态；局部模型通过不能消除它们。"]
+    return lines
+
+
 def render_report(state, root):
     root = Path(root)
     def link(path):
@@ -75,7 +106,7 @@ def render_report(state, root):
         f"快照：`{state.snapshot.id}`，纳入 {len(state.snapshot.files)} 个文件；读取 {len(state.materials)} 个材料片段，仍有未读范围的文件 {len(state.unexplored)} 个。完整清单见 [materials.json](materials.json)、[catalogue.json](catalogue.json) 和 [snapshot.json](snapshot.json)。",
         "候选集合不代表全部正确性要求；原始材料和机器分析字段保留英文或原文。", "", "## 目标、义务与选择依据", ""]
     insert_at = lines.index("## 分析输入与探索范围")
-    lines[insert_at:insert_at] = progress_lines(state) + [""]
+    lines[insert_at:insert_at] = progress_lines(state) + inquiry_lines(state) + [""]
     lines += ["领域引导采用同一流程；不使用‘完全无先验’或‘纯独立发现’标签。实际提供的引导与参考："]
     for guidance in state.guidance:
         lines += [f"- `{guidance['source']}`：{guidance['text'] or '未提供协议参考清单'}"]
@@ -154,7 +185,7 @@ def render_report(state, root):
     if not state.revisions:
         lines.append("本次没有实际应用的语义修订；工具错误不冒充 F1—F4。")
     lines += ["", "## 未决事项与停止原因", "", f"停止原因（原文）：{state.stop_reason}",
-        f"恢复位置：单元 `{state.active_unit_id}`，模型 `{state.active_model_id}`，反例 `{state.active_finding_id}`，下一动作 `{state.next_action}`。"]
+        f"恢复位置：探索/复核任务 `{state.active_inquiry_id}`；单元 `{state.active_unit_id}`，模型 `{state.active_model_id}`，反例 `{state.active_finding_id}`，下一动作 `{state.next_action}`。"]
     lines += [f"- {gap}" for gap in dict.fromkeys(state.gaps)]
     lines += ["- 活性、公平性、最终同步及未纳入的交互，不从有限安全性检查推断成立。",
               "- 当前实现不会仅凭 agent 声称或生成测试断言，将模型候选升级为已确认实现义务/目标违反；合法性与后果证据不足时保留未决。",

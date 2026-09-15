@@ -8,7 +8,7 @@ from consensus_assurance.core.proposals import Discovery, Bundle, Feedback, Grap
 from consensus_assurance.core.types import (Analysis, Assessment, Calibration, CheckRun, Evidence, ExecutionStatus,
     Finding, Investigation, Origin, Relation, Scope, uid, PendingAction, Record, Capability)
 from consensus_assurance.ports.interfaces import AgentBackend, ImplementationAdapter, VerifierBackend
-from . import discovery
+from . import discovery, inquiry
 from consensus_assurance.adapters.runners.process import ProcessRunner, output
 from consensus_assurance.adapters.runners.experiment import run_experiment, extract_events, prerequisites
 from consensus_assurance.adapters.storage.files import Store, write_json, digest
@@ -142,6 +142,7 @@ class Engine:
                 self.state.action_history.append(pending.model_copy(deep=True))
                 self.state.pending_action = None
                 self.checkpoint("blocked_agent_request_scheduled_for_retry")
+        if inquiry.enabled(self): inquiry.resume_deferred(self)
         self.checkpoint("resumed_history_reused_without_reexecution")
         return self.execute(probed=True)
 
@@ -312,16 +313,19 @@ class Engine:
             finding=next((f for f in self.state.findings if f.id==self.state.active_finding_id),None)
             if phase=="build":
                 previous=model or next((m for m in reversed(self.state.models) if m.unit_id==unit.previous_id),None)
+                if previous is None and (unit.recheck_reasons or unit.obligation_checks):
+                    previous=next((m for m in reversed(self.state.models) if m.unit_id==unit.id),None)
                 context=self.context(unit)
                 if previous:
                     context.update(previous_bundle=json.loads(Path(previous.bundle_path).read_text()),scope_delta={"before":previous.scope.model_dump(),"after":unit.scope.model_dump(),"added_bindings":list(set(unit.binding_ids)-set(previous.binding_ids)),"boundary_changes":unit.boundary_changes})
                 reply,_=self.ask("F3" if unit.previous_id else "build",BuildReply,context, lambda p: validate_build_reply(self.state,unit,p,self.implementation))
                 if reply.bundle is None:
                     self.targeted_read(unit,reply.gap,requests=reply.requests); self.advance("build"); continue
-                model=self.save_model(unit,reply.bundle,previous)
+                model=self.save_model(unit,reply.bundle,previous,"Continued scoped investigation after feedback" if previous else "Initial generation")
                 self.state.active_model_id=model.id
                 if self.state.first_model_seconds is None: self.budget.sync(); self.state.first_model_seconds=self.state.elapsed_seconds
                 self.advance("experiment" if self.config.allow_experiments else "search")
+                if inquiry.enabled(self): return
             elif phase in {"experiment","replay"}:
                 if not self.config.allow_experiments: raise Blocked("Target execution disabled")
                 experiment=self.experiment(model,bundle,replay=phase=="replay")
@@ -349,11 +353,14 @@ class Engine:
                 failed=next((f for f in reversed(self.state.findings) if f.check_id==check.id),None)
                 if check.outcome=="counterexample" and not failed:
                     raise Blocked("Reported invariant cannot be attributed to a configured claim; other properties remain unknown")
+                inquiry.after_search(self,unit,model,check)
+                self.state.last_work_kind="local"
                 if failed:
                     self.state.active_finding_id=failed.id; failed.stage=Investigation.REACHABILITY_PENDING
                     self.advance("replay_plan")
                 else:
                     self.advance("expand")
+                if inquiry.enabled(self): return
             elif phase=="expand":
                 dependencies=[e for e in self.state.relations if e.source in unit.obligation_ids and e.kind=="boundary" and e.target not in unit.obligation_ids+unit.binding_ids]
                 if not dependencies: self.finish_unit(unit); return
@@ -435,21 +442,58 @@ class Engine:
                 self.state.stop_reason = "Plan generated; modeling and checks not scheduled"
                 return self.state
             while True:
+                inquiry.clear_reserve(self)
+                can_inquire = inquiry.enabled(self) and (self.state.active_inquiry_id or (self.state.pending_action is None and self.state.pending_output_repair is None))
+                if can_inquire:
+                    candidate=next((u for u in self.state.units if u.id==self.state.active_unit_id),None) or next((u for u in self.state.units if u.status in {"pending","partial"}),None)
+                    if candidate and (not self.state.active_unit_id or self.state.next_action=="build"):
+                        inquiry.review_unit(self,candidate,"before_model")
+                    task=inquiry.choose_task(self)
+                    if task:
+                        try:
+                            inquiry.process_task(self,task)
+                        except (BudgetExhausted,Blocked,ValueError,OSError) as exc:
+                            task.status="blocked";task.stop_reason=str(exc)
+                            self.state.active_inquiry_id=None;self.state.pending_output_repair=None
+                            inquiry.release_action(self);self.state.gaps.append(str(exc))
+                            self.checkpoint("inquiry_task_blocked")
+                            if str(exc).startswith("Agent blocked:"): raise
+                        continue
                 if self.state.active_unit_id:
                     active=next(u for u in self.state.units if u.id==self.state.active_unit_id)
-                    self.process_unit(active)
+                    if inquiry.enabled(self): inquiry.reserve_for_inquiry(self)
+                    try:
+                        self.process_unit(active)
+                    except (BudgetExhausted,Blocked,ValueError,OSError) as exc:
+                        if not inquiry.enabled(self) or str(exc).startswith("Agent blocked:"): raise
+                        inquiry.pause_unit(self,str(exc))
                     continue
                 if not any(u.status in {"pending", "partial"} for u in self.state.units):
                     missing = [u.id + ": " + ", ".join(u.remaining_obligation_ids) for u in self.state.units if u.remaining_obligation_ids and u.status != "revised"]
                     self.state.stop_reason = "Unfinished obligations remain without an executable next step: " + "; ".join(missing) if missing else "No pending executable audit units; unresolved gaps remain"
+                    if inquiry.enabled(self) and any(t.status in {"blocked","pending","running"} for t in self.state.inquiry_tasks):
+                        self.state.stop_reason="Inquiry work remains incomplete; exploration or review is blocked by budget, evidence or capability"
+                    elif inquiry.enabled(self) and any(u.status=="blocked" for u in self.state.units):
+                        self.state.stop_reason="Local audit work remains blocked; inspect remaining obligations and deferred actions"
                     break
                 if self.state.usage.get("audit_units", 0) >= self.config.budget.audit_units:
+                    if inquiry.enabled(self):
+                        for candidate in self.state.units:
+                            if candidate.status in {"pending","partial"}:
+                                candidate.status="blocked";candidate.recheck_reasons.append("Audit-unit budget exhausted")
+                                candidate.obligation_checks,candidate.remaining_obligation_ids=obligation_progress(self.state,candidate)
+                        self.state.last_work_kind="local"
+                        continue
                     raise BudgetExhausted("Audit-unit budget exhausted")
                 unit = select_unit(self.state)
                 if unit is None:
                     self.state.stop_reason = "No pending executable audit units; unresolved gaps remain"
                     break
                 self.budget.take("audit_units"); self.state.active_unit_id=unit.id; self.checkpoint("relation_driven_selection")
+                if inquiry.enabled(self):
+                    self.state.next_action="select"
+                    self.state.last_work_kind="local"
+                    continue
                 self.process_unit(unit)
         except (BudgetExhausted, Blocked, ValueError, OSError) as exc:
             self.state.stop_reason = str(exc)

@@ -42,7 +42,10 @@ def test_code_derived_responsibilities_are_candidates(prepared):
     assert state.claims[1].candidate
     assert state.claims[1].grounding.unresolved
     c.grounding.binding_ids=['step_binding']
-    with pytest.raises(ValueError,match='producer and consumer'): apply_discovery(state,graph)
+    apply_discovery(state,graph)
+    assert state.claims[1].candidate
+    c.grounding.binding_ids=[]
+    with pytest.raises(ValueError,match='located implementation binding'): apply_discovery(state,graph)
 
 
 def test_document_id_does_not_establish_applicability(prepared):

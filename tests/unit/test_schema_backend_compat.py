@@ -78,7 +78,7 @@ def test_backend_schema_rejection_keeps_the_actual_diagnostic(tmp_path):
 @pytest.mark.parametrize("failure_status", [ExecutionStatus.ERROR, ExecutionStatus.TIMEOUT])
 def test_resume_retries_failed_discovery_and_reuses_completed_reading(tmp_path, prepared, failure_status):
     from consensus_assurance.consensus.inquiry import INQUIRY
-    from consensus_assurance.core.config import Config
+    from regression_support import fixture_config as Config
     from consensus_assurance.registry import assemble
     from consensus_assurance.workflow.engine import Engine
 
@@ -131,7 +131,7 @@ def test_resume_retries_failed_discovery_and_reuses_completed_reading(tmp_path, 
 
 @pytest.mark.parametrize('timeout', [0, -1, float('inf'), float('nan')])
 def test_resume_rejects_invalid_timeout_without_loading_or_running(tmp_path, timeout):
-    from consensus_assurance.core.config import Config
+    from regression_support import fixture_config as Config
     from consensus_assurance.workflow.engine import Engine
 
     engine = Engine(Config(), tmp_path, None, None, None, '', '')

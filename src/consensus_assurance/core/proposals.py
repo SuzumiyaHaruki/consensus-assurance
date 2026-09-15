@@ -1,13 +1,6 @@
 from typing import Literal
 from pydantic import Field, model_validator
-from .types import Record, Scope, ConstraintSource, Grounding, CheckerSpec
-
-
-class ReadRequest(Record):
-    file: str
-    start_line: int = Field(ge=1)
-    end_line: int = Field(ge=1)
-    reason: str
+from .types import Record, Scope, ConstraintSource, Grounding, CheckerSpec, ReadRequest, Responsibility, SemanticCheck
 
 
 class ClaimDraft(Record):
@@ -53,17 +46,33 @@ class UnitDraft(Record):
     goal_observable: bool
 
 
-class Discovery(Record):
+class GraphDraft(Record):
+    """Unbounded aggregate shape; batch limits belong to agent proposals."""
+    claims: list[ClaimDraft] = []
+    bindings: list[BindingDraft] = []
+    relations: list[RelationDraft] = []
+    units: list[UnitDraft] = []
+    conflicts: list[str] = []
+    unexplored: list[str] = []
+    gaps: list[str] = []
+
+
+class ExplorationRequest(Record):
+    reason: str
+    responsibility_ids: list[str] = []
+    requests: list[ReadRequest] = Field(default_factory=list, max_length=12)
+
+
+class Discovery(GraphDraft):
     understanding: str
     claims: list[ClaimDraft] = Field(default_factory=list, max_length=15)
     bindings: list[BindingDraft] = Field(default_factory=list, max_length=20)
     relations: list[RelationDraft] = Field(default_factory=list, max_length=30)
-    units: list[UnitDraft] = Field(default_factory=list, max_length=5, description="Ranked candidate audit units; relationships also affect selection")
-    conflicts: list[str]
-    unexplored: list[str]
+    units: list[UnitDraft] = Field(default_factory=list, max_length=5)
     selection_rationale: str
-    gaps: list[str] = []
-    reading_requests: list[ReadRequest] = Field(default_factory=list, max_length=12, description="Executable requests for actual file and line ranges; put unresolved search topics in gaps")
+    reading_requests: list[ReadRequest] = Field(default_factory=list, max_length=12)
+    responsibilities: list[Responsibility] = Field(default_factory=list, max_length=12)
+    exploration_requests: list[ExplorationRequest] = Field(default_factory=list, max_length=6)
 
 
 class FieldProjection(Record):
@@ -169,10 +178,10 @@ class Bundle(Record):
 
 
 class GraphPatch(Record):
-    claims: list[ClaimDraft] = []
-    bindings: list[BindingDraft] = []
-    relations: list[RelationDraft] = []
-    units: list[UnitDraft] = []
+    claims: list[ClaimDraft] = Field(default_factory=list,max_length=15)
+    bindings: list[BindingDraft] = Field(default_factory=list,max_length=20)
+    relations: list[RelationDraft] = Field(default_factory=list,max_length=30)
+    units: list[UnitDraft] = Field(default_factory=list,max_length=5)
     expected_versions: dict[str, int] = {}
     rationale: str
     gaps: list[str] = []
@@ -192,6 +201,13 @@ class BuildReply(Record):
     requests: list[ReadRequest] = []
 
 
+class JudgmentChange(Record):
+    target_id: str
+    field: Literal["description", "scope", "grounding", "source", "target", "kind", "group", "rationale", "pending"]
+    old_value_json: str
+    new_value_json: str
+
+
 class Feedback(Record):
     kind: Literal["F1", "F2", "F3", "F4", "unresolved"]
     rationale: str
@@ -202,7 +218,25 @@ class Feedback(Record):
     graph: Discovery | None
     bundle: Bundle | None
     patch: GraphPatch | None = None
+    changes: list[JudgmentChange] = []
     old_judgment: str = ""
     new_judgment: str = ""
     grounding: Grounding = Grounding()
     requests: list[ReadRequest] = []
+
+
+class ExplorationReply(Record):
+    understanding: str
+    requests: list[ReadRequest] = Field(default_factory=list,max_length=12)
+    responsibilities: list[Responsibility] = Field(default_factory=list,max_length=12)
+    patch: GraphPatch
+    exploration_requests: list[ExplorationRequest] = Field(default_factory=list,max_length=6)
+    limitations: list[str]
+
+
+class ReviewReply(Record):
+    items: list[SemanticCheck] = Field(min_length=1,max_length=30)
+    requests: list[ReadRequest] = Field(default_factory=list,max_length=12)
+    exploration_requests: list[ExplorationRequest] = Field(default_factory=list,max_length=6)
+    revision: Feedback | None = None
+    limitations: list[str]

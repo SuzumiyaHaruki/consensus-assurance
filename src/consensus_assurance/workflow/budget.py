@@ -11,6 +11,8 @@ class BudgetTracker:
         self.state = state
         self.started = time.monotonic()
         self.previous = state.elapsed_seconds
+        self.reserved_agent_calls = 0
+        self.reserved_seconds = 0
 
     def sync(self):
         self.state.elapsed_seconds = self.previous + time.monotonic() - self.started
@@ -20,6 +22,8 @@ class BudgetTracker:
         return max(0, self.limits.total_seconds - self.state.elapsed_seconds)
 
     def take(self, resource):
+        if resource == "agent_calls" and self.reserved_agent_calls and self.limits.agent_calls-self.state.usage.get(resource,0) <= self.reserved_agent_calls:
+            raise BudgetExhausted("Agent calls reserved for pending exploration or review")
         if self.remaining() <= 0 or self.state.usage.get(resource, 0) >= getattr(self.limits, resource):
             raise BudgetExhausted("Budget exhausted: " + resource)
         self.state.usage[resource] = self.state.usage.get(resource, 0) + 1
@@ -28,4 +32,7 @@ class BudgetTracker:
         remaining = self.remaining()
         if remaining <= 0:
             raise BudgetExhausted("Total runtime budget exhausted")
+        remaining -= self.reserved_seconds
+        if remaining <= 0:
+            raise BudgetExhausted("Runtime reserved for pending exploration or review")
         return min(remaining, self.limits.action_timeout)

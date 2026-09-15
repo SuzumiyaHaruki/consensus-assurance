@@ -9,11 +9,14 @@ def validate_grounding(basis, materials, binding_ids):
         raise ValueError("Grounding must reference actually read materials")
     if not set(basis.binding_ids) <= set(binding_ids):
         raise ValueError("Grounding references unavailable code bindings")
-    if not basis.expectation_ids and len(set(basis.binding_ids)) < 2:
-        raise ValueError("Derived responsibilities without a direct expectation need producer and consumer bindings")
+    if not basis.expectation_ids and not basis.binding_ids:
+        raise ValueError("Derived responsibilities need a located implementation binding; adequacy requires semantic review")
 
 
 def apply_discovery(state, proposal):
+    count = sum(len(getattr(proposal,name)) for name in ("claims","bindings","relations","units"))
+    if count > state.config.get("budget",{}).get("graph_objects",1000):
+        raise ValueError("Configured aggregate graph resource budget exceeded")
     materials = {m.id: m for m in state.materials}
     ids = [c.id for c in proposal.claims] + [b.id for b in proposal.bindings]
     relation_ids = [r.id for r in proposal.relations]
@@ -56,7 +59,7 @@ def apply_discovery(state, proposal):
         relevant = [e for e in relations if e.id in u.relation_ids]
         if any(b.claim_id not in u.obligation_ids + u.goal_ids for b in bindings if b.id in u.binding_ids):
             raise ValueError("Audit unit contains a binding unrelated to its claims")
-        if not any(e.source in u.goal_ids and e.target in u.obligation_ids and e.kind in {"depends_all", "supports", "alternative"} for e in relevant):
+        if not any(e.source in u.goal_ids and e.target in u.obligation_ids and e.kind in {"depends_all", "supports", "alternative", "conditional_on"} for e in relevant):
             raise ValueError("Audit unit must reference a goal-to-obligation relationship")
         units.append(AuditUnit(**u.model_dump()))
     state.claims, state.bindings, state.relations, state.units = claims, bindings, relations, units
@@ -115,18 +118,30 @@ def expand_unit(state, unit, relation_ids):
 
 def apply_patch(state, patch, semantic=False):
     """Validate an incremental update on a copy, then preserve superseded object versions."""
-    from consensus_assurance.core.proposals import Discovery, ClaimDraft, BindingDraft, RelationDraft, UnitDraft
+    from consensus_assurance.core.proposals import GraphDraft, ClaimDraft, BindingDraft, RelationDraft, UnitDraft
     current = {x.id: x for x in [*state.claims, *state.bindings, *state.relations, *state.units]}
     for key, version in patch.expected_versions.items():
         if key not in current or current[key].version != version:
             raise ValueError("Graph patch version does not match the current object")
     replacements = [*patch.claims, *patch.bindings, *patch.relations, *patch.units]
+    if len({obj.id for obj in replacements}) != len(replacements):
+        raise ValueError("Duplicate patch object identifiers")
+    for obj in patch.relations:
+        if obj.id in current and not semantic:
+            old = current[obj.id]
+            if any(getattr(obj,key) != getattr(old,key) for key in ("source","target","kind","group","rationale","grounding")) or not set(old.pending)<=set(obj.pending):
+                raise ValueError("Changing relationship semantics requires F2")
+    for obj in patch.units:
+        if obj.id in current and not semantic:
+            old=current[obj.id]
+            if obj.scope!=old.scope or not set(old.goal_ids)<=set(obj.goal_ids) or not set(old.obligation_ids)<=set(obj.obligation_ids):
+                raise ValueError("Ordinary patches cannot remove unit obligations or change scope; use attributed semantic revision or F3 expansion")
     for obj in replacements:
         if obj.id in current and obj.id not in patch.expected_versions:
             raise ValueError("Replacing an object requires its expected version")
         if obj.id in current and hasattr(obj, "kind") and obj.kind in {"goal", "obligation", "assumption"} and not semantic:
             old = current[obj.id]
-            if obj.description != old.description or obj.scope != old.scope or obj.grounding != old.grounding:
+            if obj.kind != old.kind or obj.description != old.description or obj.scope != old.scope or obj.grounding != old.grounding or not set(old.pending)<=set(obj.pending):
                 raise ValueError("Changing claim semantics requires F2; dependency additions do not")
     def merge(old, changes, convert):
         values = {x.id: convert(x) for x in old}
@@ -145,7 +160,7 @@ def apply_patch(state, patch, semantic=False):
     relations = merge(internal,patch.relations,lambda x: RelationDraft(**{k:v for k,v in x.model_dump().items() if k in RelationDraft.model_fields}))
     units = merge(state.units,patch.units,lambda x: UnitDraft(**{k:v for k,v in x.model_dump().items() if k in UnitDraft.model_fields}))
     trial = state.model_copy(deep=True)
-    apply_discovery(trial,Discovery(understanding="Incremental graph update",claims=claims,bindings=bindings,relations=relations,units=units,conflicts=[],unexplored=[],selection_rationale=patch.rationale,gaps=patch.gaps))
+    apply_discovery(trial,GraphDraft(claims=claims,bindings=bindings,relations=relations,units=units,gaps=patch.gaps))
     changed = {x.id for x in replacements}
     for kind in ("claims","bindings","relations","units"):
         values = getattr(trial,kind)

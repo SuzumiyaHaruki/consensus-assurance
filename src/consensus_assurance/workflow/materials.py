@@ -52,7 +52,20 @@ def read_material(repo, snapshot, request):
 
 def initial_materials(repo, snapshot, budget, knowledge):
     result, count = [], 0
-    for rel in sorted(snapshot.readable_files if snapshot.readable_files is not None else snapshot.files, key=lambda f: (not f.endswith((".md", ".rst")), len(f), f)):
+    available = sorted(snapshot.readable_files if snapshot.readable_files is not None else snapshot.files)
+    documents = [f for f in available if f.endswith((".md", ".rst"))]
+    documents.sort(key=lambda f: (Path(f).stem.lower() != "readme", len(Path(f).parts), f))
+    selected = documents[:2]
+    groups = {}
+    for file in available:
+        if file not in selected:
+            groups.setdefault(str(Path(file).parent), []).append(file)
+    # Mix actual directory areas rather than spending every initial slot on short documents.
+    while groups:
+        for directory in list(groups):
+            selected.append(groups[directory].pop(0))
+            if not groups[directory]: del groups[directory]
+    for rel in selected:
         if len(result) >= min(8, budget.material_chunks):
             break
         lines = (repo / rel).read_text().splitlines()

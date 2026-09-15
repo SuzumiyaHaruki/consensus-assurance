@@ -18,6 +18,72 @@ class Record(BaseModel):
     model_config = ConfigDict(extra="forbid", validate_assignment=True)
 
 
+class ReadRequest(Record):
+    file: str
+    start_line: int = Field(ge=1)
+    end_line: int = Field(ge=1)
+    reason: str
+
+
+class ResponsibilityHandoff(Record):
+    target_id: str
+    source_ids: list[str] = Field(min_length=1)
+    description: str
+
+
+class Responsibility(Record):
+    id: str
+    description: str
+    source_ids: list[str] = Field(min_length=1)
+    entry_points: list[str] = []
+    claim_ids: list[str] = []
+    handoffs: list[ResponsibilityHandoff] = []
+    questions: list[str] = []
+    applicability: str
+    version: int = 1
+
+
+class InquiryTask(Record):
+    id: str = Field(default_factory=uid)
+    kind: Literal["explore", "review"]
+    reason: str
+    trigger: str
+    responsibility_ids: list[str] = []
+    target_ids: list[str] = []
+    target_versions: dict[str, int] = {}
+    unit_id: str | None = None
+    model_id: str | None = None
+    requests: list[ReadRequest] = []
+    status: Literal["pending", "running", "completed", "blocked"] = "pending"
+    stage: Literal["read", "analyze", "done"] = "read"
+    added_material_ids: list[str] = []
+    stop_reason: str = ""
+    check_id: str | None = None
+
+
+class SemanticCheck(Record):
+    target_id: str
+    aspect: Literal["applicability", "decomposition", "checker_correspondence"]
+    status: Literal["no_issue_found", "needs_reading", "disputed", "revision_needed"]
+    source_ids: list[str] = Field(min_length=1)
+    explanation: str
+    alternatives: str
+    counterexample_reasoning: str
+    limitations: list[str] = []
+
+
+class SemanticReview(Record):
+    id: str = Field(default_factory=uid)
+    task_id: str
+    check_id: str
+    model_id: str | None = None
+    target_versions: dict[str, int]
+    material_ids: list[str]
+    items: list[SemanticCheck]
+    revision_id: str | None = None
+    origin: Literal["agent", "mock"]
+
+
 class ExecutionStatus(str, Enum):
     NOT_SCHEDULED = "not_scheduled"
     RUNNING = "running"
@@ -379,6 +445,15 @@ class Analysis(Record):
     action_history: list[PendingAction] = []
     targeted_gap: dict | None = None
     monitor_results: list[dict] = []
+    responsibilities: list[Responsibility] = []
+    responsibility_history: list[dict] = []
+    inquiry_tasks: list[InquiryTask] = []
+    semantic_reviews: list[SemanticReview] = []
+    active_inquiry_id: str | None = None
+    inquiry_selections: list[dict] = []
+    last_work_kind: str = "local"
+    deferred_units: dict[str, dict] = {}
+
 
 
 

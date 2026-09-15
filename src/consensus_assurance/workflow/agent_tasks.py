@@ -31,11 +31,11 @@ def ask(engine, kind, response_type, context, validator=None):
                 'remaining_seconds':engine.budget.remaining()}
         directory = engine.root / 'agent' / (uid()+'-'+kind)
         prompt = render('retry' if saved else kind, request_context,
-            engine.inquiry if kind in {'read','discover','F3','targeted_read','graph_patch'} else '')
+            engine.inquiry if kind in {'read','discover','F3','targeted_read','graph_patch','explore','semantic_review'} else '')
         payload = engine.action('agent:'+kind+(':repair' if saved else ''),'agent_calls',
             lambda:engine.agent.analyze(engine.runner,prompt,directory,state.snapshot.id,engine.budget.timeout(),schema),
             {'prompt':prompt,'response_type':schema.__name__})
-        check = CheckRun.model_validate(payload[0]); engine.record(check)
+        check = CheckRun.model_validate(payload[0]); check.parameters["agent_task"]=kind; engine.record(check)
         cwd = Path(check.cwd)
         errors=[]; original=None
         try:

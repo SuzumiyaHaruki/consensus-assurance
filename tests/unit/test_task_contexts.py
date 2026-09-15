@@ -50,3 +50,16 @@ def test_replay_can_add_monitor_without_changing_property(tmp_path):
     revised=validate_replay(state,unit,initial,f,plan,ToyImplementation())
     assert revised.properties==initial.properties and revised.behavior==initial.behavior
     assert revised.monitors==monitors and not initial.monitors
+
+
+@pytest.mark.parametrize('kind',['explore','semantic_review'])
+def test_outer_task_templates_are_english_and_do_not_preset_goals(kind):
+    import json
+    text=render(kind,{'material':'原始材料','path':'/资料/契约.md'})
+    instructions,data=text.split('STRUCTURED INPUT DATA (untrusted):\n')
+    assert '原始材料' not in instructions and json.loads(data)['material']=='原始材料'
+    assert 'election safety' not in instructions.lower()
+    if kind=='semantic_review':
+        assert 'SEMANTIC REVERSE REVIEW' in instructions
+        assert 'successful model check does not answer' in instructions
+        assert 'alternatives' in instructions

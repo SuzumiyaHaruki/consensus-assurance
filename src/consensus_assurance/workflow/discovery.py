@@ -6,6 +6,7 @@ from consensus_assurance.adapters.storage.files import write_json
 from .materials import catalogue, initial_materials, add_reads, ReadingPlan
 from .graph import apply_discovery, apply_patch
 from .errors import Blocked
+from . import inquiry
 
 
 def context(engine, unit=None):
@@ -13,7 +14,9 @@ def context(engine, unit=None):
         "capabilities": [c.model_dump(mode="json") for c in engine.state.capabilities],
         "parameters": engine.config.parameters, "remaining_seconds": engine.budget.remaining(),
         "directed_question": engine.config.directed_question,
-        "snapshot_id": engine.state.snapshot.id, "harness_kind": engine.implementation.harness_kind,
+        "snapshot_id": engine.state.snapshot.id,
+        "responsibilities":[r.model_dump(mode="json") for r in engine.state.responsibilities],
+        "semantic_reviews":[r.model_dump(mode="json") for r in engine.state.semantic_reviews], "harness_kind": engine.implementation.harness_kind,
         "harness_instructions": engine.implementation.harness_instructions}
     if unit:
         ids = {b.file for b in engine.state.bindings if b.id in unit.binding_ids}
@@ -36,11 +39,16 @@ def discover(engine):
         write_json(engine.root / "materials.json", [m.model_dump(mode="json") for m in engine.state.materials])
         engine.state.completed_steps.append("materials"); engine.advance("discover")
     if "discovery" not in engine.state.completed_steps:
-        proposal, check = engine.ask("discover", Discovery, engine.context(), lambda p: apply_discovery(engine.state, p))
+        def validate(proposal):
+            trial=engine.state.model_copy(deep=True)
+            apply_discovery(trial,proposal)
+            inquiry.register_responsibilities(trial,proposal.responsibilities)
+            inquiry.register_requests(trial,proposal.exploration_requests,'validation')
+        proposal, check = engine.ask("discover", Discovery, engine.context(), validate)
+        apply_discovery(engine.state,proposal)
+        inquiry.initial_agenda(engine,proposal)
         path = engine.root / f"discovery-v{engine.state.graph_version}.json"
         write_json(path, proposal); engine.state.discovery_path = str(path)
-        if not engine.state.units and proposal.reading_requests:
-            engine.targeted_read(None, "Insufficient material for grounded discovery", requests=proposal.reading_requests)
         engine.state.completed_steps.append("discovery"); engine.advance("select")
 
 def targeted_read(engine, unit, gap, relation_ids=None, requests=None):
@@ -72,6 +80,7 @@ def targeted_read(engine, unit, gap, relation_ids=None, requests=None):
         "relations":[e.model_dump(mode="json") for e in engine.state.relations if e.source in {c.id for c in engine.state.claims}],
         "units":[u.model_dump(mode="json") for u in engine.state.units]},lambda p:apply_patch(engine.state,p))
     write_json(engine.root/"materials.json",[m.model_dump(mode="json") for m in engine.state.materials])
+    inquiry.material_reviews(engine,unit,task["new_material_ids"])
     engine.state.targeted_gap=None
     if engine.state.pending_action: engine.state.action_history.append(engine.state.pending_action); engine.state.pending_action=None
     engine.checkpoint("targeted_graph_patch_applied")
