@@ -62,6 +62,10 @@ class TLCVerifier:
         self.available = available
         return {"available": available, "version": self.version, "checks": checks, "reason": "Ready" if available else self.version}
 
+    def reachability(self,runner,model,bundle,requirement,timeout):
+        from .reachability import check_requirement
+        return check_requirement(self,runner,model,bundle,requirement,timeout)
+
     def check(self, runner, model, timeout):
         directory = Path(model.path).parent
         if not getattr(self, "available", False):
@@ -82,6 +86,8 @@ class TLCVerifier:
         check.parameters = model.scope.parameters
         check.artifacts = [model.path, model.config_path]
         check.input_versions = model.artifact_digests
+        from .input_identity import execution_fingerprint
+        check.search_fingerprint = execution_fingerprint(model)
         parsed = parse(check)
         configured = configured_invariants(Path(model.config_path).read_text())
         parsed.checker_results = [CheckerResult(invariant=c.invariant,claim_id=c.claim_id,scope=c.scope,

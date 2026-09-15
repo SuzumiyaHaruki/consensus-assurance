@@ -15,8 +15,8 @@ from consensus_assurance.adapters.storage.files import Store, write_json, digest
 from consensus_assurance.adapters.storage.snapshot import capture
 from .graph import apply_discovery, select_unit, apply_patch
 from .artifacts import save_bundle, validate_bundle
-from .modeling import validate_build_reply, obligation_progress
-from .investigation import feedback_context, validate_feedback, validate_replay
+from .modeling import validate_build_reply, obligation_progress, coverage_limitations
+from .investigation import feedback_context, validate_feedback, validate_replay, consequence_needed, validate_consequence, record_consequence
 from .budget import BudgetTracker, BudgetExhausted
 from .feedback import apply_feedback
 
@@ -257,15 +257,26 @@ class Engine:
         return record
 
     def search(self, unit, model, bundle, calibration):
-        check=CheckRun.model_validate(self.action("model_search","model_checks",lambda:self.verifier.check(self.runner,model,self.budget.timeout()),{"model_id":model.id}))
+        from .inputs import reusable_search
+        source=reusable_search(self.state,model)
+        prior_reuse=next((c for c in reversed(self.state.checks) if c.model_id==model.id and c.action=="model_check" and c.reused_from and c.search_fingerprint==model.search_fingerprint),None)
+        if source:
+            check=source.model_copy(deep=True)
+            check.id=uid();check.model_id=model.id;check.reused=True;check.reused_from=source.id
+            check.input_versions=model.artifact_digests
+            check.reason="Explicit reuse of identical search inputs from " + source.id
+        elif prior_reuse:
+            check=prior_reuse
+        else:
+            check=CheckRun.model_validate(self.action("model_search","model_checks",lambda:self.verifier.check(self.runner,model,self.budget.timeout()),{"model_id":model.id}))
         check.origin=Origin.MOCK if self.state.mode=="mock" else Origin.EXECUTED
         self.record(check)
         for result in check.checker_results:
-            if result.outcome=="unknown" or check.status!=ExecutionStatus.COMPLETED: continue
+            if result.outcome=="unknown" or check.status!=ExecutionStatus.COMPLETED or check.search_fingerprint!=model.search_fingerprint: continue
             if any(e.check_id==check.id and e.checker_id==result.invariant for e in self.state.evidence): continue
             claim=next(c for c in self.state.claims if c.id==result.claim_id)
             evidence=Evidence(check_id=check.id,model_id=model.id,snapshot_id=model.snapshot_id,claim_id=result.claim_id,
-                origin=check.origin,level="framework_test" if self.state.mode=="mock" else "model",scope=result.scope,
+                search_fingerprint=check.search_fingerprint,origin=check.origin,level="framework_test" if self.state.mode=="mock" else "model",scope=result.scope,
                 assessment=Assessment.INCONCLUSIVE if self.state.mode=="mock" else Assessment.SUPPORTED if result.outcome=="holds" else Assessment.CHALLENGED,
                 calibration_id=calibration.id if calibration else None,checker_id=result.invariant,claim_version=claim.version,
                 description="Candidate property in its explicit scope; applicability unresolved: "+str(claim.grounding.unresolved+claim.grounding.conflicts)+"; calibration="+(calibration.status if calibration else "not_scheduled"))
@@ -284,12 +295,49 @@ class Engine:
             raise Blocked("Model commit requires a persisted generation action")
         model = save_bundle(self.root, self.state, unit, bundle, self.implementation, previous, reason, transaction_key=key)
         self.model_commit_hook(model)
+        from .inputs import reusable_search
+        source=reusable_search(self.state,model)
+        if source:
+            receipt=source.model_copy(deep=True)
+            receipt.id=uid();receipt.model_id=model.id;receipt.reused=True;receipt.reused_from=source.id
+            receipt.input_versions=model.artifact_digests
+            receipt.reason="Explicit reuse of identical search inputs from "+source.id
+            self.record(receipt)
         return model
+
+    def graph_commit_hook(self,key):
+        """Interruption seam after semantic manifest, before state checkpoint."""
+
+    def commit_feedback(self,unit,bundle,feedback):
+        from .transactions import commit_graph
+        check_id=self.state.pending_action.id if self.state.pending_action else feedback.evidence_ids[0]
+        key="feedback-"+check_id+"-"+feedback.kind+"-"+unit.id
+        def apply(proxy):
+            target=next(u for u in proxy.state.units if u.id==unit.id)
+            apply_feedback(proxy.state,target,bundle,feedback)
+            if feedback.kind=="F2" and proxy.state.revisions[-1].status=="applied":
+                proxy.state.active_model_id=None;proxy.state.active_finding_id=None;proxy.state.next_action="build"
+                inquiry.release_action(proxy)
+            elif feedback.kind=="F3":
+                proxy.state.active_unit_id=None;proxy.state.active_model_id=None;proxy.state.active_finding_id=None;proxy.state.next_action="select"
+                inquiry.release_action(proxy)
+        commit_graph(self,key,feedback.model_dump(mode="json"),apply)
+        if feedback.kind in {"F1","F4"}:return feedback.bundle
+        if feedback.kind=="F3":return next((u for u in self.state.units if u.previous_id==unit.id and u.status=="pending"),None)
 
     def model_commit_hook(self, model):
         """Interruption test seam after durable model files, before state registration."""
 
+    def check_triggers(self,model,bundle):
+        from consensus_assurance.core.types import ReachabilityResult
+        for req in bundle.reachability:
+            if any(r.model_id==model.id and r.requirement_id==req.id for r in self.state.reachability_results):continue
+            result=self.action("reachability:"+req.id,"reachability_checks",lambda:self.verifier.reachability(self.runner,model,bundle,req,self.budget.timeout()),{"model_id":model.id,"requirement_id":req.id})
+            self.state.reachability_results.append(ReachabilityResult.model_validate(result[0]));self.record(CheckRun.model_validate(result[1]))
+            self.advance("triggers")
+
     def finish_unit(self, unit, status="checked"):
+        unit.coverage_limitations=coverage_limitations(self.state,unit)
         old = set(unit.obligation_checks)
         unit.obligation_checks, unit.remaining_obligation_ids = obligation_progress(self.state, unit)
         if status == "checked" and unit.remaining_obligation_ids:
@@ -312,6 +360,7 @@ class Engine:
             calibration=next((c for c in reversed(self.state.calibrations) if experiment and c.experiment_check_id==experiment.id),None)
             finding=next((f for f in self.state.findings if f.id==self.state.active_finding_id),None)
             if phase=="build":
+                if not inquiry.prepare_selected(self,unit):return
                 previous=model or next((m for m in reversed(self.state.models) if m.unit_id==unit.previous_id),None)
                 if previous is None and (unit.recheck_reasons or unit.obligation_checks):
                     previous=next((m for m in reversed(self.state.models) if m.unit_id==unit.id),None)
@@ -341,6 +390,9 @@ class Engine:
                     self.state.pending_feedback={"return_after_repair":"replay" if phase=="replay_calibrate" else "experiment"}
                     self.advance("feedback_F1")
                 else:
+                    if calibration.status!="compatible":
+                        self.state.gaps.append("Calibration remains "+calibration.status+" for model "+model.id+"; subsequent search is exploratory")
+                        inquiry.review_unit(self,unit,"calibration_unresolved:"+calibration.id,model)
                     self.advance("assess" if phase=="replay_calibrate" else "search")
             elif phase=="search":
                 check=self.search(unit,model,bundle,calibration)
@@ -359,11 +411,19 @@ class Engine:
                     self.state.active_finding_id=failed.id; failed.stage=Investigation.REACHABILITY_PENDING
                     self.advance("replay_plan")
                 else:
-                    self.advance("expand")
+                    self.advance("triggers")
                 if inquiry.enabled(self): return
+            elif phase=="triggers":
+                self.check_triggers(model,bundle)
+                self.advance("expand")
             elif phase=="expand":
                 dependencies=[e for e in self.state.relations if e.source in unit.obligation_ids and e.kind=="boundary" and e.target not in unit.obligation_ids+unit.binding_ids]
-                if not dependencies: self.finish_unit(unit); return
+                if not dependencies:
+                    unreviewed=[r for r in self.state.relations if r.source in unit.obligation_ids and r.kind in {"boundary","conditional_on"} and (r.pending or r.grounding.unresolved)]
+                    if unreviewed:
+                        inquiry.review_unit(self,unit,"in_scope_guarantee")
+                        self.state.gaps.append("Included bindings do not establish boundary guarantees; use scoped review or F1 action-granularity refinement: "+", ".join(r.id for r in unreviewed))
+                    self.finish_unit(unit);return
                 edge=dependencies[0]
                 if not any(b.id==edge.target or b.claim_id==edge.target for b in self.state.bindings):
                     self.targeted_read(unit,edge.rationale,[edge.id])
@@ -371,7 +431,7 @@ class Engine:
                 self.budget.take("revisions")
                 check=next(c for c in reversed(self.state.checks) if c.action=="model_check" and c.model_id==model.id)
                 f=Feedback(kind="F3",rationale="Explain the unresolved boundary through its actual producer",evidence_ids=[check.id],target_ids=[unit.id],relation_ids=[edge.id],new_basis="",graph=None,bundle=None)
-                apply_feedback(self.state,unit,bundle,f)
+                self.commit_feedback(unit,bundle,f)
                 self.state.active_unit_id=None; self.state.active_model_id=None; self.advance("select"); return
             elif phase=="replay_plan":
                 if not self.config.allow_experiments: raise Blocked("Candidate replay disabled by experiment permission")
@@ -383,9 +443,24 @@ class Engine:
             elif phase=="assess":
                 record=assess_execution(self.state,model,bundle,experiment,calibration,finding,extract_events(experiment))
                 path=self.root/"findings"/finding.id/(experiment.id+".json"); write_json(path,record); finding.confirmation_path=str(path)
-                if record["confirmed"]: self.finish_unit(unit); return
+                if record["confirmed"]:
+                    if consequence_needed(unit,finding):self.advance("consequence_plan");continue
+                    self.finish_unit(unit);return
                 if record["prerequisites"]["status"]=="not_reached": self.advance("feedback_F4")
                 else: self.advance("diagnose")
+            elif phase=="consequence_plan":
+                from consensus_assurance.core.proposals import ConsequenceReply
+                from .transactions import commit_graph
+                if any(c['finding_id']==finding.id for c in self.state.consequences):
+                    self.finish_unit(unit);return
+                try:
+                    if not self.state.pending_action or not self.state.pending_action.kind.startswith("agent:consequence"):
+                        self.budget.take("consequence_investigations")
+                    reply,check=self.ask("consequence",ConsequenceReply,{**self.context(unit),"finding":finding.model_dump(mode="json"),"assessment":next((r for r in reversed(self.state.monitor_results) if r['finding_id']==finding.id),None)},lambda p:validate_consequence(self.state,unit,p))
+                    commit_graph(self,"consequence-"+check.id,reply.model_dump(mode="json"),lambda proxy:record_consequence(proxy,unit,finding,reply))
+                except (BudgetExhausted,Blocked,ValueError) as exc:
+                    record_consequence(self,unit,finding,reason=str(exc))
+                self.finish_unit(unit);return
             elif phase in {"feedback_F1","feedback_F4","diagnose"}:
                 kind=phase.removeprefix("feedback_")
                 context=feedback_context(self,unit,model,bundle,experiment,calibration,finding)
@@ -397,7 +472,7 @@ class Engine:
                 if kind in {"F1","F4"} and f.kind!=kind: raise Blocked("Feedback attempts to change a different semantic object")
                 self.budget.take("revisions")
                 old_version=self.state.graph_version
-                updated=apply_feedback(self.state,unit,bundle,f)
+                updated=self.commit_feedback(unit,bundle,f)
                 if f.kind=="F2":
                     if old_version==self.state.graph_version: self.finish_unit(unit,"blocked"); return
                     self.state.active_model_id=None; self.state.active_finding_id=None; self.advance("build")
@@ -445,8 +520,13 @@ class Engine:
                 inquiry.clear_reserve(self)
                 can_inquire = inquiry.enabled(self) and (self.state.active_inquiry_id or (self.state.pending_action is None and self.state.pending_output_repair is None))
                 if can_inquire:
-                    candidate=next((u for u in self.state.units if u.id==self.state.active_unit_id),None) or next((u for u in self.state.units if u.status in {"pending","partial"}),None)
-                    if candidate and (not self.state.active_unit_id or self.state.next_action=="build"):
+                    if not self.state.active_unit_id and self.state.usage.get("audit_units",0)<self.config.budget.audit_units:
+                        candidate=select_unit(self.state)
+                        if candidate:
+                            self.budget.take("audit_units");self.state.active_unit_id=candidate.id;self.state.next_action="build"
+                            self.checkpoint("actual_unit_selected_before_review")
+                    candidate=next((u for u in self.state.units if u.id==self.state.active_unit_id),None)
+                    if candidate and self.state.next_action in {"select","build"}:
                         inquiry.review_unit(self,candidate,"before_model")
                     task=inquiry.choose_task(self)
                     if task:

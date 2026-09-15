@@ -231,6 +231,8 @@ def test_conflicting_F2_does_not_turn_error_into_optimization(prepared):
     basis=changed.grounding.model_copy(deep=True);basis.unresolved=[];basis.conflicts=['The current interface still promises the stronger guarantee']
     f=Feedback(kind='F2',rationale='Proposed design tradeoff requires resolving contrary evidence',evidence_ids=['README.md:1:5'],target_ids=['step_obligation'],relation_ids=[],old_judgment=state.claims[1].description,new_judgment=changed.description,new_basis='Conflicting design notes',grounding=basis,patch=GraphPatch(claims=[changed],expected_versions={changed.id:1},rationale='Proposed change'),graph=None,bundle=None)
     before=state.claims[1].model_dump()
+    from regression_support import declared_changes
+    declared_changes(state,f)
     assert apply_feedback(state,state.units[0],bundle,f) is None
     assert state.claims[1].model_dump()==before
     assert state.revisions[-1].status=='unresolved'

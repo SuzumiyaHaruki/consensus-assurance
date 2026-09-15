@@ -1,12 +1,12 @@
 # consensus-assurance
 
-**Domain-assisted、implementation-grounded：领域引导、实现为据的共识义务驱动局部审计。** 只有一条领域引导流程，不增加盲测或解盲模式。方法是：**目标决定审计意义，义务决定检查重点，代码决定模型行为。**
+**Domain-assisted、implementation-grounded：领域引导、实现为据的共识义务驱动局部审计。** 只有一条领域引导流程，不增加盲测或解盲模式。方法是：**目标决定审计意义，义务决定检查重点，代码决定模型行为，证据限定结论范围。**
 
 最小实现包含材料读取、候选 G—O—C 关系生成、关系驱动选择、运行时模型/检查器/实验生成、真实轨迹的 TLC 可达性校准、有限模型搜索、F1—F4 修订与检查点恢复。关系图用于组织审计，不自动证明整个实现正确。
 
 当前状态：已经进行过一次用户启动的 HashiCorp 真实尝试，完成材料读取、返回快照相关候选，但因回复与代码绑定校验问题未完成 discovery 入图，尚未到达模型检查。见 [小规模实验结果分析](docs/小规模实验结果分析.md)。**真实自主审计闭环尚未验收通过。**
 
-当前流程增加了持续职责探索与语义复核：职责尚无 goal 时也能形成探索任务，局部检查通过后仍可复核问题是否过弱，关系和适用条件可在建模前后通过 F2 修订。它们与局部验证交替执行，不是多种运行模式。实现、预算和限制见 [第四轮覆盖与语义复核](docs/第四轮覆盖与语义复核.md)。Goal 可以覆盖多个义务，模型仍按局部范围检查；概览没有已知完备分母，不计算全系统覆盖率，也不把复核意见当作证明。
+当前流程增加了持续职责探索与语义复核：职责尚无 goal 时也能形成探索任务，局部检查通过后仍可复核问题是否过弱，关系和适用条件可在建模前后通过 F2 修订。它们与局部验证交替执行，不是多种运行模式。当前实现、预算和限制见 [第五轮边界闭环与验收](docs/第五轮边界闭环与验收.md)。第四轮记录保留其历史身份。Goal 可以覆盖多个义务，模型仍按局部范围检查；概览没有已知完备分母，不计算全系统覆盖率，也不把复核意见当作证明。
 
 [第一轮验收](docs/本次验收.md)、[第二轮验收](docs/第二轮修改与验收.md)、[第三轮审计修订](docs/第三轮审计修订与验收.md)及最终任务书是历史记录；其“尚未启动实验”等表述对应当时阶段。当前使用方式以本 README 和本轮说明为准。
 
@@ -91,6 +91,8 @@ experiments/                     每次实验的独立副本
 calibrations/                    原始事件、投影、TLC 轨迹约束模型
 logs/                            实际命令 stdout/stderr 与执行记录
 actions/                         执行前任务与实际结果，支持继续原动作
+graph-commits/                   语义变更的原子提交与幂等恢复记录
+reachability/                    辅助触发检查及其真实 TLC 输出
 history/ / events.jsonl           历史检查点与追加事件
 state.json / report.md            当前记录与中文报告
 ```
@@ -111,3 +113,17 @@ state.json / report.md            当前记录与中文报告
 项目仓库：[SuzumiyaHaruki/consensus-assurance](https://github.com/SuzumiyaHaruki/consensus-assurance)。本地运行制品、目标仓库副本、虚拟环境和 TLC 二进制不提交到 Git。
 
 覆盖实验准备配置：[hashicorp_raft.coverage.yaml](configs/targets/hashicorp_raft.coverage.yaml)。权限默认关闭；本轮没有运行该配置。
+
+## 第五轮检查后的受限实验准备
+
+本轮只执行框架和受控样例测试，没有启动新的 HashiCorp 自主分析。配置 [hashicorp_raft.round5.yaml](configs/targets/hashicorp_raft.round5.yaml) 不预设 goal，材料发送与目标执行默认关闭，沿用 20 次 agent 调用上限。
+
+先执行不调用后端、不读取代码内容的路径及预算估算：
+
+```bash
+.venv/bin/consensus-assurance estimate --config configs/targets/hashicorp_raft.round5.yaml
+```
+
+`estimate` 的调用数是计划下限，补读、修复、模型后复核及后果调查可能超出它；不会自动加预算。正式启动方式见 [实验准备](docs/Hashicorp实验准备.md)，先检查本轮代码，再决定材料发送和执行授权。
+
+报告区分原始 checker 结果、当前版本执行进度、触发可达性、未解决复核意见和未完成校准。`holds` 保留其有限模型含义；触发不可达时不能称为有效交互覆盖。确认局部义务违反后会记录后果调查、补偿机制候选或暂缓理由，不自动提升成目标违反。

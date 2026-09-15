@@ -116,6 +116,8 @@ def test_F2_normative_revision_executes_new_checker(tlc, prepared):
     correction.new_judgment = graph.claims[1].description
     correction.grounding = graph.claims[1].grounding.model_copy(deep=True)
     correction.grounding.unresolved = []
+    from regression_support import declared_changes
+    declared_changes(state,correction)
     apply_feedback(state,state.units[0],overstrong,correction)
     new_model = save_bundle(runner.root,state,state.units[0],correct,ToyImplementation(),old_model,'F2 normative correction')
     new_check = verifier.check(runner,new_model,20)

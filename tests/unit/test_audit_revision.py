@@ -52,7 +52,7 @@ def test_unchecked_obligation_remains_partial_and_schedulable(tmp_path,prepared)
     unit.obligation_ids.append('input_obligation')
     model=save_bundle(tmp_path,state,unit,bundle,ToyImplementation())
     spec=model.checkers[0]
-    check=CheckRun(action='model_check',status=ExecutionStatus.COMPLETED,outcome='holds',cwd=str(tmp_path),snapshot_id=state.snapshot.id,model_id=model.id,checker_results=[CheckerResult(invariant=spec.invariant,claim_id=spec.claim_id,scope=spec.scope,outcome='holds')])
+    check=CheckRun(action='model_check',status=ExecutionStatus.COMPLETED,outcome='holds',cwd=str(tmp_path),snapshot_id=state.snapshot.id,model_id=model.id,search_fingerprint=model.search_fingerprint,checker_results=[CheckerResult(invariant=spec.invariant,claim_id=spec.claim_id,scope=spec.scope,outcome='holds')])
     state.checks.append(check)
     engine=Engine(Config(),tmp_path,ToyImplementation(),None,None,'','')
     engine.state=state;engine.budget=BudgetTracker(Config().budget,state)
@@ -103,6 +103,9 @@ def test_f2_relation_dependency_requeues_unrelated_completed_unit(tmp_path,prepa
     patch=GraphPatch(claims=[changed],relations=[new_edge],expected_versions={claim.id:claim.version,edge.id:edge.version},rationale='Reconsider dependency')
     basis=claim.grounding.model_copy(deep=True);basis.unresolved=[];basis.conflicts=[]
     f=Feedback(kind='F2',rationale='Applicable contract changed',evidence_ids=claim.source_ids,target_ids=[claim.id],relation_ids=[],new_basis='New evidence reinterprets the contract',graph=None,bundle=None,patch=patch,old_judgment=claim.description,new_judgment=changed.description,grounding=basis)
+    from regression_support import declared_changes
+    f.target_ids.append(edge.id)
+    declared_changes(state,f)
     apply_feedback(state,unit,bundle,f)
     assert next(u for u in state.units if u.id=='other').status=='pending'
     assert next(u for u in state.units if u.id=='other').recheck_reasons

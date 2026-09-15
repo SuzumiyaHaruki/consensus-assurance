@@ -51,6 +51,10 @@ def assess_execution(state, model, bundle, experiment, calibration, finding, eve
     spec = specs.get(finding.checker_id)
     claim = next((c for c in state.claims if spec and c.id == spec.claim_id),None)
     bases = [bundle.harness.legality] + ([claim.grounding] if claim else [])
+    if claim and claim.kind=='goal':
+        mapping=next((g for g in bundle.goal_observations if g.claim_id==claim.id),None)
+        if mapping is None or not set(mapping.required_participants)<={e.get('participant') for e in events} or not set(mapping.required_events)<={e.get('event') for e in events}:
+            limitations.append('Goal participants/events were not fully observed; a local trace cannot stand for a cluster goal')
     if not claim: limitations.append('Checker claim is unavailable')
     elif claim.pending: limitations.extend(claim.pending)
     if claim and (finding.claim_id != claim.id or model.graph_versions.get(claim.id) != claim.version):

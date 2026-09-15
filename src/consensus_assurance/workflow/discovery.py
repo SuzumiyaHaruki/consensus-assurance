@@ -4,7 +4,7 @@ from pathlib import Path
 from consensus_assurance.core.proposals import Discovery, GraphPatch
 from consensus_assurance.adapters.storage.files import write_json
 from .materials import catalogue, initial_materials, add_reads, ReadingPlan
-from .graph import apply_discovery, apply_patch
+from .graph import apply_discovery, apply_patch, validate_patch
 from .errors import Blocked
 from . import inquiry
 
@@ -19,13 +19,16 @@ def context(engine, unit=None):
         "semantic_reviews":[r.model_dump(mode="json") for r in engine.state.semantic_reviews], "harness_kind": engine.implementation.harness_kind,
         "harness_instructions": engine.implementation.harness_instructions}
     if unit:
-        ids = {b.file for b in engine.state.bindings if b.id in unit.binding_ids}
-        ids |= {m.file for m in engine.state.materials if any(m.id in c.source_ids for c in engine.state.claims if c.id in unit.goal_ids+unit.obligation_ids)}
-        recent = set(engine.state.reading_history[-1]["added_material_ids"]) if engine.state.reading_history else set()
-        result["materials"] = [m.model_dump(mode="json") for m in engine.state.materials if m.file in ids or m.id in recent]
-        result.update({"obligation_progress": {"checked_scopes":unit.obligation_checks,"remaining":unit.remaining_obligation_ids or unit.obligation_ids}, "unit": unit.model_dump(mode="json"), "claims": [c.model_dump(mode="json") for c in engine.state.claims],
-            "bindings": [b.model_dump(mode="json") for b in engine.state.bindings if b.id in unit.binding_ids],
-            "relations": [e.model_dump(mode="json") for e in engine.state.relations]})
+        from .reviews import material_closure
+        wanted,closure=material_closure(engine.state,[unit.id])
+        result["materials"]=[m.model_dump(mode="json") for m in engine.state.materials if m.id in wanted]
+        result["omitted_material_ids"]=[m.id for m in engine.state.materials if m.id not in wanted]
+        result["semantic_reviews"]=[r.model_dump(mode="json") for r in engine.state.semantic_reviews if set(r.target_versions)&closure]
+        result.update({"obligation_progress":{"checked_scopes":unit.obligation_checks,"remaining":unit.remaining_obligation_ids or unit.obligation_ids},
+            "unit":unit.model_dump(mode="json"),
+            "claims":[c.model_dump(mode="json") if c.id in closure else {"id":c.id,"kind":c.kind,"description":c.description,"version":c.version} for c in engine.state.claims],
+            "bindings":[b.model_dump(mode="json") for b in engine.state.bindings if b.id in closure],
+            "relations":[e.model_dump(mode="json") for e in engine.state.relations if e.id in closure or e.source in closure]})
     return result
 
 def discover(engine):
@@ -45,8 +48,11 @@ def discover(engine):
             inquiry.register_responsibilities(trial,proposal.responsibilities)
             inquiry.register_requests(trial,proposal.exploration_requests,'validation')
         proposal, check = engine.ask("discover", Discovery, engine.context(), validate)
-        apply_discovery(engine.state,proposal)
-        inquiry.initial_agenda(engine,proposal)
+        from .transactions import commit_graph
+        def initial(proxy):
+            apply_discovery(proxy.state,proposal)
+            inquiry.initial_agenda(proxy,proposal)
+        commit_graph(engine,"discovery-"+check.id,proposal.model_dump(mode="json"),initial)
         path = engine.root / f"discovery-v{engine.state.graph_version}.json"
         write_json(path, proposal); engine.state.discovery_path = str(path)
         engine.state.completed_steps.append("discovery"); engine.advance("select")
@@ -78,10 +84,15 @@ def targeted_read(engine, unit, gap, relation_ids=None, requests=None):
         "new_materials":[m.model_dump(mode="json") for m in engine.state.materials if m.id in task["new_material_ids"]],
         "claims":[c.model_dump(mode="json") for c in engine.state.claims],"bindings":[b.model_dump(mode="json") for b in engine.state.bindings],
         "relations":[e.model_dump(mode="json") for e in engine.state.relations if e.source in {c.id for c in engine.state.claims}],
-        "units":[u.model_dump(mode="json") for u in engine.state.units]},lambda p:apply_patch(engine.state,p))
+        "units":[u.model_dump(mode="json") for u in engine.state.units]},lambda p:validate_patch(engine.state,p))
+    from .transactions import commit_graph
+    def commit(proxy):
+        apply_patch(proxy.state,patch)
+        target=next((u for u in proxy.state.units if unit and u.id==unit.id),None)
+        inquiry.material_reviews(proxy,target,proxy.state.targeted_gap["new_material_ids"])
+        proxy.state.targeted_gap=None
+        inquiry.release_action(proxy)
+    commit_graph(engine,"targeted-"+engine.state.pending_action.id,patch.model_dump(mode="json"),commit)
     write_json(engine.root/"materials.json",[m.model_dump(mode="json") for m in engine.state.materials])
-    inquiry.material_reviews(engine,unit,task["new_material_ids"])
-    engine.state.targeted_gap=None
-    if engine.state.pending_action: engine.state.action_history.append(engine.state.pending_action); engine.state.pending_action=None
     engine.checkpoint("targeted_graph_patch_applied")
     return patch

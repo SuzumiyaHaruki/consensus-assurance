@@ -34,6 +34,8 @@ def execution_summary(check):
             product = "回复已返回；后续工作流校验失败，见校验日志"
         task={"explore":"职责覆盖探索", "semantic_review":"目标/义务/关系语义复核"}.get(check.parameters.get("agent_task"),"Agent 分析或修复")
         return task, product, "不适用：生成候选分析，不是验证"
+    if check.action == "reachability":
+        return "审计问题触发可达性", "见触发记录；辅助反例只表示触发可达", "不属于协议违反证据"
     if check.action == "trace_calibration":
         return "有限观测轨迹校准", "校准状态见下方模型记录", "轨迹兼容不等于性质成立或违反"
     if check.action in {"capability_probe", "experiment", "replay"}:
@@ -73,7 +75,7 @@ def inquiry_lines(state):
     for task in state.inquiry_tasks:
         kind='扩展职责/交接覆盖' if task.kind=='explore' else '语义复核'
         lines.append(f"| `{task.id[:8]}` | {kind} | {task.status}/{task.stage} | {text(task.reason)}；{text(task.stop_reason)} |")
-    current={x.id:getattr(x,'version',1) for x in [*state.claims,*state.relations,*state.models]}
+    current={x.id:getattr(x,'version',1) for x in [*state.claims,*state.bindings,*state.units,*state.relations,*state.models]}
     verdicts={'no_issue_found':'本次范围内暂未发现语义问题','needs_reading':'需要补读','disputed':'解释仍有争议','revision_needed':'需要修订'}
     aspects={'applicability':'适用性','decomposition':'义务及支撑关系','checker_correspondence':'checker 语义对应'}
     lines += ["", "| 复核对象/版本 | 层面 | 判断 | 材料与推导 |", "| --- | --- | --- | --- |"]
@@ -83,6 +85,10 @@ def inquiry_lines(state):
             history='历史语义版本' if current.get(item.target_id)!=version else '当前对象版本'
             lines.append(f"| {text(item.target_id)} v{version}（{history}） | {aspects[item.aspect]} | {verdicts[item.status]} | {text(item.source_ids)}：{text(item.explanation)} |")
             if item.limitations: lines.append(f"限制：{text(item.limitations)}")
+    for issue in state.review_issues:
+        lines.append(f"复核问题 `{issue.id}`：{'由 '+issue.resolved_by+' 显式解决' if issue.resolved_by else '未决'}；处置 `{issue.disposition}`；后续 {issue.task_ids}；{issue.explanation}；{issue.reason}。")
+    for task in state.inquiry_tasks:
+        if task.superseded_by: lines.append(f"历史任务 `{task.id}` 已由复核 `{task.superseded_by}` 完整替代；保留原执行状态。")
     if not state.semantic_reviews: lines.append("尚无已执行的语义复核；有来源的候选不因此变成已确认规范。")
     lines += ["", "职责清单之外仍可能有未知遗漏。未复核对象、未执行义务和受阻任务保留原状态；局部模型通过不能消除它们。"]
     return lines
@@ -125,7 +131,12 @@ def render_report(state, root):
                   f"选择依据（原文）：{selection['rationale']}"]
     for unit in state.units:
         lines += ["", f"单元 `{unit.id}`：{unit.status}；{unit.rationale}", f"范围：{unit.scope.description}；能否表达目标后果：{unit.goal_observable}。"]
+    from consensus_assurance.workflow.modeling import coverage_limitations
     for unit in state.units:
+        if unit.audit_question:
+            lines += [f"审计问题：{unit.audit_question.question}；意义：{unit.audit_question.importance}；材料：{unit.audit_question.source_ids}。"]
+        lines += [f"建模前复核/探索性许可：{unit.semantic_readiness}。"]
+        lines += [f"有效交互覆盖限制（独立于原始 checker 结果）：{coverage_limitations(state,unit)}。"]
         lines += [f"单元 `{unit.id}` 逐项执行进度：{unit.obligation_checks}；尚待检查：{unit.remaining_obligation_ids or ([c for c in unit.obligation_ids if c not in unit.obligation_checks] if unit.status != 'checked' else [])}。已检查仅指记录范围内的 checker，不代表义务整体成立。"]
         if unit.recheck_reasons:
             lines += [f"重验任务 `{unit.id}`：{'；'.join(unit.recheck_reasons)}；调度状态 `{unit.status}`。"]
@@ -155,6 +166,10 @@ def render_report(state, root):
         if check.action == "model_check":
             for result in check.checker_results:
                 lines += [f"- `{result.invariant}` → `{result.claim_id}`：`{result.outcome}`；范围：{result.scope.description}；执行 `{check.id}`。"]
+    for check in state.checks:
+        if check.reused_from:lines.append(f"显式复用执行 `{check.id}` ← `{check.reused_from}`；匹配搜索输入 `{check.search_fingerprint}`；这不是再次执行工具。")
+    for result in state.reachability_results:
+        lines.append(f"触发 `{result.requirement_id}`：`{result.status}`；模型 `{result.model_id}`；实际执行 `{result.check_id}`；{result.reason}。不可达或未知不计有效交互覆盖，原始 holds 仍保留。")
     lines += ["", "## 模型、校准与证据范围", ""]
     if not state.models:
         lines.append("尚未生成并执行局部模型；没有模型层检查结论。")
@@ -180,6 +195,8 @@ def render_report(state, root):
             lines += [f"  实际观测、前提、合法性及性质判定：{link(f.confirmation_path)}；checker `{f.checker_id}`。"]
     for result in state.monitor_results:
         lines += [f"观测判定 `{result['finding_id']}`：前提 `{result['prerequisites']['status']}`；确认层级 `{result['level']}`；限制：{result['limitations']}。"]
+    for decision in state.consequences:
+        lines.append(f"义务→目标后果处置：发现 `{decision['finding_id']}`；`{decision['disposition']}`；{decision['reason']}；后续 {decision['task_ids']}；限制 {decision['limitations']}。")
     for revision in state.revisions:
         lines += [f"- {revision.kind}：{revision.rationale}；返回 `{revision.return_step}`；依赖 {revision.relation_ids}；状态 {revision.status}。"]
     if not state.revisions:

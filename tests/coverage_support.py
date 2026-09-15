@@ -53,6 +53,8 @@ class CoverageAgent(MockAgent):
             existing=any(c['id']=='delivery_goal' for c in context['claims'])
             if not have:
                 response={'understanding':'Missing another responsibility source','requests':[request],'responsibilities':[],'patch':{'rationale':'Read before proposing'},'limitations':[]}
+            elif not existing and note is None:
+                response={'understanding':'The retrieved producer alone cannot establish its configured responsibility','requests':[{'file':'service_notes.md','start_line':1,'end_line':2,'reason':'Read the actual configured completion contract'}],'patch':{'rationale':'Contract material missing'},'limitations':[]}
             elif not existing:
                 patch=delivery_graph(context)
                 role=next(r for r in context['responsibilities'] if r['id']=='delivery').copy()
@@ -63,7 +65,7 @@ class CoverageAgent(MockAgent):
         elif name=='ReviewReply':
             items=[];revision=None;exploration=[]
             for obj in context['target_objects']:
-                source_ids=obj.get('source_ids') or obj.get('grounding',{}).get('behavior_ids') or ['README.md:1:5']
+                source_ids=obj.get('source_ids') or obj.get('grounding',{}).get('behavior_ids') or [context['materials'][0]['id']]
                 aspect='applicability' if obj.get('kind') in {'goal','obligation','assumption'} else 'checker_correspondence' if obj.get('path') else 'decomposition'
                 status='no_issue_found';explanation='Actual supplied responsibilities agree with the scoped candidate; this is not a proof'
                 if obj.get('description')=='Return in memory mode requires persistence':
@@ -71,7 +73,7 @@ class CoverageAgent(MockAgent):
                     changed=ClaimDraft(**{k:v for k,v in obj.items() if k in ClaimDraft.model_fields});changed.description='Return in memory mode requires acceptance'
                     basis=changed.grounding.model_dump(mode='json')
                     revision={'kind':'F2','rationale':explanation,'evidence_ids':[note['id']],'target_ids':[obj['id']],'relation_ids':[],'new_basis':explanation,'graph':None,'bundle':None,
-                        'patch':{'claims':[changed.model_dump(mode='json')],'expected_versions':{obj['id']:obj['version']},'rationale':explanation},'old_judgment':obj['description'],'new_judgment':changed.description,'grounding':basis}
+                        'patch':{'claims':[changed.model_dump(mode='json')],'expected_versions':{obj['id']:obj['version']},'rationale':explanation},'old_judgment':obj['description'],'new_judgment':changed.description,'grounding':basis,'changes':[{'target_id':obj['id'],'field':'description','old_value_json':json.dumps(obj['description']),'new_value_json':json.dumps(changed.description)}]}
                 if self.weak and context['task']['trigger'].startswith('after_search') and obj['id']=='step_obligation':
                     status='disputed';explanation='The local bound holds but does not establish the delivery handoff responsibility'
                     exploration=[{'reason':'Investigate the counter-to-result handoff even though the local invariant held','responsibility_ids':['delivery'],'requests':[request]}]
@@ -80,7 +82,8 @@ class CoverageAgent(MockAgent):
                 if obj.get('kind')=='obligation':
                     original=next(i for i in items if i['target_id']==obj['id'])
                     items.append({**original,'aspect':'decomposition'})
-            response={'items':items,'revision':revision,'exploration_requests':exploration,'limitations':[]}
+            resolved=[issue['id'] for issue in context.get('open_issues',[]) if any(i['target_id']==issue['target_id'] and i['aspect']==issue['aspect'] and i['status']=='no_issue_found' for i in items)]
+            response={'items':items,'revision':revision,'exploration_requests':exploration,'limitations':[],'resolves_issue_ids':resolved,'resolution_rationale':'The corrected current configuration and cited materials address the prior interpretation' if resolved else ''}
         elif name=='BuildReply':
             response={'bundle':self.source_responses[2],'gap':''}
         else:

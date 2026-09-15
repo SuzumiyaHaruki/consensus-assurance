@@ -21,6 +21,8 @@ class Budget(Record):
 
     targeted_reads: int = Field(default=3, ge=0)
     technical_repairs: int = Field(default=2, ge=0)
+    reachability_checks: int = Field(default=3, ge=0)
+    consequence_investigations: int = Field(default=1, ge=0)
     exploration_rounds: int = Field(default=3, ge=0)
     semantic_reviews: int = Field(default=4, ge=0)
     graph_objects: int = Field(default=1000, ge=1)

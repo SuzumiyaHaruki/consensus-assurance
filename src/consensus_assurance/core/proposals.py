@@ -1,6 +1,6 @@
 from typing import Literal
 from pydantic import Field, model_validator
-from .types import Record, Scope, ConstraintSource, Grounding, CheckerSpec, ReadRequest, Responsibility, SemanticCheck
+from .types import Record, Scope, ConstraintSource, Grounding, CheckerSpec, ReadRequest, Responsibility, SemanticCheck, AuditQuestion, CoveragePoint, ReachabilityRequirement
 
 
 class ClaimDraft(Record):
@@ -36,6 +36,8 @@ class RelationDraft(Record):
 
 
 class UnitDraft(Record):
+    audit_question: AuditQuestion | None = None
+    coverage_intent: list[CoveragePoint] = []
     id: str
     goal_ids: list[str]
     obligation_ids: list[str] = Field(min_length=1)
@@ -148,7 +150,17 @@ class Harness(Record):
 
 
 
+class GoalObservation(Record):
+    claim_id: str
+    required_participants: list[str] = Field(min_length=1)
+    required_events: list[str] = Field(min_length=1)
+    binding_ids: list[str] = Field(min_length=1)
+    grounding: Grounding
+
+
 class Bundle(Record):
+    reachability: list[ReachabilityRequirement] = []
+    goal_observations: list[GoalObservation] = []
     description: str
     behavior: str = Field(min_length=1, description="TLA+ MODULE Behavior, with Init, Next, vars, and Obs; implementation behavior only")
     properties: str = Field(min_length=1, description="TLA+ MODULE Properties EXTENDS Behavior, defining obligation and optional goal invariants")
@@ -203,7 +215,7 @@ class BuildReply(Record):
 
 class JudgmentChange(Record):
     target_id: str
-    field: Literal["description", "scope", "grounding", "source", "target", "kind", "group", "rationale", "pending"]
+    field: Literal["description", "scope", "grounding", "source", "target", "kind", "group", "rationale", "pending", "source_ids", "claim_id", "material_id", "symbol", "start_line", "end_line", "goal_ids", "obligation_ids", "binding_ids", "relation_ids", "goal_observable", "audit_question", "coverage_intent"]
     old_value_json: str
     new_value_json: str
 
@@ -235,8 +247,21 @@ class ExplorationReply(Record):
 
 
 class ReviewReply(Record):
+    resolves_issue_ids: list[str] = []
+    supersedes_task_ids: list[str] = []
+    resolution_rationale: str = ""
     items: list[SemanticCheck] = Field(min_length=1,max_length=30)
     requests: list[ReadRequest] = Field(default_factory=list,max_length=12)
     exploration_requests: list[ExplorationRequest] = Field(default_factory=list,max_length=6)
     revision: Feedback | None = None
+    limitations: list[str]
+
+
+class ConsequenceReply(Record):
+    disposition: Literal["investigate", "obligation_only", "defer", "compensation_candidate"]
+    goal_ids: list[str]
+    rationale: str
+    source_ids: list[str] = Field(min_length=1)
+    requests: list[ReadRequest] = []
+    patch: GraphPatch | None = None
     limitations: list[str]

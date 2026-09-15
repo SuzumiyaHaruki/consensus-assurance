@@ -25,7 +25,48 @@ class ReadRequest(Record):
     reason: str
 
 
+class CoveragePoint(Record):
+    id: str
+    phase: Literal["establish", "maintain", "use", "handoff", "recover", "other"]
+    source_ids: list[str] = Field(min_length=1)
+    binding_ids: list[str] = []
+    claim_ids: list[str] = []
+    question: str
+    unknowns: list[str] = []
+
+
+class AuditQuestion(Record):
+    question: str
+    importance: str
+    source_ids: list[str] = Field(min_length=1)
+    participants: list[str] = []
+    objects: list[str] = []
+    contexts: list[str] = []
+    event_paths: list[str] = []
+    points: list[CoveragePoint] = []
+    trigger_rationale: str
+
+
+class ReachabilityRequirement(Record):
+    id: str
+    operator: str
+    claim_ids: list[str] = Field(min_length=1)
+    point_ids: list[str] = []
+    description: str
+
+
+class ReachabilityResult(Record):
+    model_id: str
+    requirement_id: str
+    check_id: str
+    status: Literal["reachable", "unreachable", "unknown"]
+    search_fingerprint: str
+    reason: str
+
+
 class ResponsibilityHandoff(Record):
+    covered_by_unit_ids: list[str] = []
+    no_separate_check_reason: str = ""
     target_id: str
     source_ids: list[str] = Field(min_length=1)
     description: str
@@ -59,6 +100,9 @@ class InquiryTask(Record):
     added_material_ids: list[str] = []
     stop_reason: str = ""
     check_id: str | None = None
+    unit_version: int | None = None
+    material_ids: list[str] = []
+    superseded_by: str | None = None
 
 
 class SemanticCheck(Record):
@@ -82,6 +126,26 @@ class SemanticReview(Record):
     items: list[SemanticCheck]
     revision_id: str | None = None
     origin: Literal["agent", "mock"]
+    unit_id: str | None = None
+    unit_version: int | None = None
+    supersedes_task_ids: list[str] = []
+    resolves_issue_ids: list[str] = []
+    resolution_rationale: str = ""
+
+
+class ReviewIssue(Record):
+    id: str = Field(default_factory=uid)
+    review_id: str
+    target_id: str
+    target_version: int
+    aspect: str
+    model_id: str | None = None
+    source_ids: list[str]
+    explanation: str
+    disposition: Literal["reading", "revision", "investigation", "blocked"]
+    reason: str
+    task_ids: list[str] = []
+    resolved_by: str | None = None
 
 
 class ExecutionStatus(str, Enum):
@@ -239,6 +303,9 @@ class ModelArtifact(Record):
     artifact_digests: dict[str, str] = {}
     checkers: list[CheckerSpec] = []
     graph_versions: dict[str, int] = {}
+    reachability_requirements: list[ReachabilityRequirement] = []
+    search_inputs: dict[str, Any] = {}
+    search_fingerprint: str = ""
 
 
 class CheckRun(Record):
@@ -266,6 +333,8 @@ class CheckRun(Record):
     violated_invariant: str | None = None
     checker_results: list[CheckerResult] = []
     pending_action_id: str | None = None
+    search_fingerprint: str = ""
+    reused_from: str | None = None
 
     def transition(self, status: ExecutionStatus):
         allowed = {ExecutionStatus.NOT_SCHEDULED: {ExecutionStatus.RUNNING, ExecutionStatus.TOOL_MISSING, ExecutionStatus.CANCELLED},
@@ -288,6 +357,7 @@ class Evidence(Record):
     assessment: Assessment
     stale_reason: str | None = None
     calibration_id: str | None = None
+    search_fingerprint: str = ""
     checker_id: str | None = None
     claim_version: int | None = None
     applicability: Literal["current", "historical_scope", "recheck_required"] = "current"
@@ -363,6 +433,10 @@ class AuditUnit(Record):
     obligation_checks: dict[str, list[str]] = {}
     remaining_obligation_ids: list[str] = []
     recheck_reasons: list[str] = []
+    semantic_readiness: dict[str, Any] = {}
+    audit_question: AuditQuestion | None = None
+    coverage_intent: list[CoveragePoint] = []
+    coverage_limitations: list[str] = []
 
 
 class Calibration(Record):
@@ -449,6 +523,10 @@ class Analysis(Record):
     responsibility_history: list[dict] = []
     inquiry_tasks: list[InquiryTask] = []
     semantic_reviews: list[SemanticReview] = []
+    review_issues: list[ReviewIssue] = []
+    reachability_results: list[ReachabilityResult] = []
+    consequences: list[dict[str, Any]] = []
+    applied_operations: dict[str, dict[str, Any]] = {}
     active_inquiry_id: str | None = None
     inquiry_selections: list[dict] = []
     last_work_kind: str = "local"

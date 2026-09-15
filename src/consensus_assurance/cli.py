@@ -61,7 +61,7 @@ def create_run_directory(config, command):
 def main(argv=None):
     parser = argparse.ArgumentParser(description="共识义务驱动的局部实现审计；默认自主发现目标")
     sub = parser.add_subparsers(dest="command", required=True)
-    for name in ("doctor", "run", "inspect", "plan"):
+    for name in ("doctor", "run", "inspect", "plan", "estimate"):
         p = sub.add_parser(name)
         p.add_argument("--config"); p.add_argument("--repo")
         p.add_argument("--agent-backend", choices=["codex", "mock"])
@@ -83,6 +83,15 @@ def main(argv=None):
         else:
             config = load_config(args.config, {"agent_backend": args.agent_backend, "tlc_jar": args.tlc_jar,
                 "runs_dir": args.runs_dir, "directed_question": args.goal})
+            if args.command == "estimate":
+                repo = locate_repo(args.repo, config.repo_path)
+                b = config.budget
+                minimum = 2 + b.audit_units + min(b.semantic_reviews, b.audit_units)
+                print(json.dumps({"仓库":str(repo),"材料发送":False,"执行目标代码":False,
+                    "agent调用上限":b.agent_calls,"粗略计划下限":minimum,
+                    "预算说明":"首轮阅读与发现各一次；每单元一次建模，启用时每单元至少一次复核。补读、其他复核、修复、实验与后果调查另需预算；不是账单。",
+                    "计划可能受限":minimum>b.agent_calls,"预算":b.model_dump(mode="json")},ensure_ascii=False,indent=2))
+                return 0
             root = create_run_directory(config, args.command)
         implementation, agent, verifier, knowledge = assemble(config)
         if args.command == "doctor":

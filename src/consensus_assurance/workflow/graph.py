@@ -1,4 +1,5 @@
 from consensus_assurance.core.types import Claim, Binding, Relation, AuditUnit, uid
+from .mutations import adopt, write_set
 
 
 def validate_grounding(basis, materials, binding_ids):
@@ -20,7 +21,7 @@ def apply_discovery(state, proposal):
     materials = {m.id: m for m in state.materials}
     ids = [c.id for c in proposal.claims] + [b.id for b in proposal.bindings]
     relation_ids = [r.id for r in proposal.relations]
-    if len(ids + relation_ids) != len(set(ids + relation_ids)):
+    if len(ids + relation_ids + [u.id for u in proposal.units]) != len(set(ids + relation_ids + [u.id for u in proposal.units])):
         raise ValueError("Duplicate graph identifiers")
     claims, bindings = [], []
     all_binding_ids = {b.id for b in proposal.bindings}
@@ -61,6 +62,14 @@ def apply_discovery(state, proposal):
             raise ValueError("Audit unit contains a binding unrelated to its claims")
         if not any(e.source in u.goal_ids and e.target in u.obligation_ids and e.kind in {"depends_all", "supports", "alternative", "conditional_on"} for e in relevant):
             raise ValueError("Audit unit must reference a goal-to-obligation relationship")
+        if state.mode=='real' and state.analysis_mode!='regression' and not u.audit_question:
+            raise ValueError("A generated audit unit needs a sourced audit_question, not a suspected bug")
+        points=u.coverage_intent+(u.audit_question.points if u.audit_question else [])
+        if u.audit_question and (not u.audit_question.question.strip() or not u.audit_question.importance.strip() or not set(u.audit_question.source_ids)<=set(materials)):
+            raise ValueError("Audit question lacks actual materials or significance")
+        for point in points:
+            if not set(point.source_ids)<=set(materials) or not set(point.binding_ids)<=set(u.binding_ids) or not set(point.claim_ids)<=set(u.goal_ids+u.obligation_ids):
+                raise ValueError("Coverage intent references unselected evidence or bindings")
         units.append(AuditUnit(**u.model_dump()))
     state.claims, state.bindings, state.relations, state.units = claims, bindings, relations, units
     state.graph_version += 1
@@ -99,6 +108,7 @@ def expand_unit(state, unit, relation_ids):
         if edge.source not in reachable:
             raise ValueError("F3 dependency must originate in the current scope")
         reachable.add(edge.target)
+    reachable.update(b.claim_id for b in state.bindings if b.id in reachable)
     added = [b.id for b in state.bindings if b.id in reachable or b.claim_id in reachable]
     binding_ids = list(dict.fromkeys(unit.binding_ids + added))
     obligation_ids = list(dict.fromkeys(unit.obligation_ids + [c.id for c in state.claims if c.kind == "obligation" and c.id in reachable]))
@@ -107,6 +117,9 @@ def expand_unit(state, unit, relation_ids):
     expanded = unit.model_copy(deep=True)
     expanded.id = uid(); expanded.previous_id = unit.id; expanded.status = "pending"
     expanded.binding_ids = binding_ids; expanded.obligation_ids = obligation_ids
+    expanded.goal_observable=False
+    expanded.semantic_readiness={};expanded.obligation_checks={};expanded.remaining_obligation_ids=list(obligation_ids)
+    expanded.coverage_limitations=['New scope requires regenerated observation, trigger and semantic review records']
     expanded.relation_ids = list(dict.fromkeys(unit.relation_ids + relation_ids))
     expanded.scope.description += "; expanded to explain dependency producers: " + ", ".join(relation_ids)
     expanded.boundary_changes = ["Included producer bindings: " + ", ".join(b for b in binding_ids if b not in unit.binding_ids),
@@ -116,9 +129,10 @@ def expand_unit(state, unit, relation_ids):
     return expanded
 
 
-def apply_patch(state, patch, semantic=False):
+def _apply_patch(state, patch, semantic=False):
     """Validate an incremental update on a copy, then preserve superseded object versions."""
     from consensus_assurance.core.proposals import GraphDraft, ClaimDraft, BindingDraft, RelationDraft, UnitDraft
+    writes=write_set(state,patch)
     current = {x.id: x for x in [*state.claims, *state.bindings, *state.relations, *state.units]}
     for key, version in patch.expected_versions.items():
         if key not in current or current[key].version != version:
@@ -143,6 +157,8 @@ def apply_patch(state, patch, semantic=False):
             old = current[obj.id]
             if obj.kind != old.kind or obj.description != old.description or obj.scope != old.scope or obj.grounding != old.grounding or not set(old.pending)<=set(obj.pending):
                 raise ValueError("Changing claim semantics requires F2; dependency additions do not")
+    if not semantic and writes:
+        raise ValueError("Changing existing graph semantics requires scoped F2; add candidates or use F3 for new scope")
     def merge(old, changes, convert):
         values = {x.id: convert(x) for x in old}
         values.update({x.id:x for x in changes})
@@ -161,7 +177,7 @@ def apply_patch(state, patch, semantic=False):
     units = merge(state.units,patch.units,lambda x: UnitDraft(**{k:v for k,v in x.model_dump().items() if k in UnitDraft.model_fields}))
     trial = state.model_copy(deep=True)
     apply_discovery(trial,GraphDraft(claims=claims,bindings=bindings,relations=relations,units=units,gaps=patch.gaps))
-    changed = {x.id for x in replacements}
+    changed = {id for id,field in writes}|{x.id for x in replacements if x.id not in current}
     for kind in ("claims","bindings","relations","units"):
         values = getattr(trial,kind)
         for index,item in enumerate(values):
@@ -174,6 +190,20 @@ def apply_patch(state, patch, semantic=False):
                     state.graph_history.append({"kind":kind,"id":old.id,"version":old.version,"record":old.model_dump(mode="json"),"reason":patch.rationale})
         setattr(state,kind,values)
     state.relations.extend(external)
-    state.graph_version += 1
+    if changed: state.graph_version += 1
     state.gaps.extend(patch.gaps)
+    return changed
+
+
+def validate_patch(state,patch,semantic=False):
+    trial=state.model_copy(deep=True)
+    _apply_patch(trial,patch,semantic)
+    return trial
+
+
+def apply_patch(state,patch,semantic=False):
+    existing={x.id for name in ('claims','bindings','relations','units') for x in getattr(state,name)}
+    changed={id for id,field in write_set(state,patch)}|{x.id for name in ('claims','bindings','relations','units') for x in getattr(patch,name) if x.id not in existing}
+    trial=validate_patch(state,patch,semantic)
+    adopt(state,trial)
     return changed

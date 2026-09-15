@@ -48,6 +48,21 @@ def validate_bundle(state, unit, bundle, implementation):
             raise ValueError("Model constraint cites an unknown source")
         if constraint.source_kind == "code_observation" and not set(constraint.source_ids) & set(unit.binding_ids):
             raise ValueError("Code-derived transition constraint must cite a selected binding")
+    if len({r.id for r in bundle.reachability})!=len(bundle.reachability):raise ValueError("Duplicate reachability requirement")
+    points=unit.coverage_intent+(unit.audit_question.points if unit.audit_question else [])
+    for requirement in bundle.reachability:
+        if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*",requirement.operator) or not re.search(r"\b"+requirement.operator+r"\s*==",tla_code(bundle.behavior)):
+            raise ValueError("Reachability requires an actual named Behavior operator")
+        if not requirement.claim_ids or not set(requirement.point_ids)<={p.id for p in points}:raise ValueError("Reachability must link claims and known audit question points")
+        if not set(requirement.claim_ids)<=checked_ids:
+            raise ValueError("Reachability requirement references an unchecked claim")
+    for spec in specs:
+        if spec.claim_id in unit.goal_ids:
+            mapping=next((g for g in bundle.goal_observations if g.claim_id==spec.claim_id),None)
+            if mapping is None or not mapping.required_participants or not mapping.required_events or not mapping.binding_ids or not set(mapping.binding_ids)<=set(unit.binding_ids):
+                raise ValueError("Goal checking needs explicit observed participants, events and code bindings")
+            from .graph import validate_grounding
+            validate_grounding(mapping.grounding,{m.id:m for m in state.materials},set(unit.binding_ids))
     return specs
 
 
@@ -92,7 +107,11 @@ def save_bundle(root, state, unit, bundle, implementation, previous=None, reason
         properties=invariants, constraints=bundle.constraints, binding_ids=unit.binding_ids,
         extension_schema={"type": "object", "description": "Tool-specific TLA metadata; constants are saved verbatim"}, extension_version="2",
         unit_id=unit.id, checker_path=str(checker), mapping_path=str(mapping), harness_path=str(harness), bundle_path=str(proposal),
-        artifact_digests=artifacts, checkers=specs, graph_versions={x.id:x.version for x in [*state.claims,*state.bindings,*state.relations] if x.id in set(checked_ids)|set(unit.binding_ids)|set(unit.relation_ids)}, previous_id=previous.id if previous else None, revision_reason=reason)
+        artifact_digests=artifacts, checkers=specs, graph_versions={x.id:x.version for x in [*state.claims,*state.bindings,*state.relations,*state.units] if x.id in set(unit.goal_ids+unit.obligation_ids+unit.binding_ids+unit.relation_ids+[unit.id])}, previous_id=previous.id if previous else None, revision_reason=reason)
+    from .inputs import search_inputs, fingerprint
+    model.reachability_requirements=bundle.reachability
+    model.search_inputs=search_inputs(state,unit,bundle,cfg.read_text())
+    model.search_fingerprint=fingerprint(model.search_inputs)
     if transaction_key:
         old_folder = str(folder)
         payload = model.model_dump(mode="json")

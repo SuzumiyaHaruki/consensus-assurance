@@ -68,6 +68,8 @@ def test_F2_requires_normative_basis_and_invalidates(prepared):
     f.grounding = revised.claims[1].grounding.model_copy(deep=True)
     f.grounding.unresolved = []
     state.calibrations.append(Calibration(model_id="old", experiment_check_id="observed", mapping_path="mapping", trace_path="trace", status="compatible", reason="Previous match", origin=Origin.MOCK))
+    from regression_support import declared_changes
+    declared_changes(state,f)
     apply_feedback(state, state.units[0], bundle, f)
     assert state.graph_version == 2
     assert state.calibrations[0].status == "compatible"  # Unrelated historical calibration survives.
