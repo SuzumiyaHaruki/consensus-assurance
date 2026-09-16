@@ -2,7 +2,7 @@
 from consensus_assurance.core.types import Record,uid,Revision
 from consensus_assurance.core.proposals import GraphPatch,UnitDraft,JudgmentChange
 from consensus_assurance.core.diagnostics import Diagnostic,DiagnosticError
-from .mutations import write_set,adopt,canonical
+from .mutations import write_set,adopt,canonical,classify_writes
 from pydantic import Field
 from typing import Literal
 import json
@@ -33,9 +33,6 @@ class ScopeUpdate(Record):
     assessment: ScopeAssessment | None = None
 
 
-FIELDS={'binding_ids','relation_ids','code_uses','audit_question','coverage_intent','rationale'}
-
-
 def question(unit):return unit.audit_question.question if unit.audit_question else unit.rationale
 
 
@@ -61,7 +58,7 @@ def validate_scope_update(state,update):
     if update.original_question!=question(unit) or update.goal_ids!=unit.goal_ids or update.obligation_ids!=unit.obligation_ids:reject(update,'scope_question_changed','Scope update must preserve the original question and checked claims',writes)
     declared={(c.target_id,c.field):(json.loads(c.old_value_json),json.loads(c.new_value_json)) for c in update.changes}
     if len(declared)!=len(update.changes) or canonical(declared_to_list(declared))!=canonical(declared_to_list(writes)):reject(update,'scope_diff_mismatch','Scope changes must describe the entire actual diff',writes)
-    if any(id!=unit.id or f not in FIELDS for id,f in writes):reject(update,'scope_requires_F2','Changed existing semantic objects or fault/configuration scope require scoped F2',writes)
+    if classify_writes(writes,unit.id)=='semantic_revision':reject(update,'scope_requires_F2','Changed existing semantic objects or fault/configuration scope require scoped F2',writes)
     if set(update.patch.expected_versions)!={unit.id} or update.patch.expected_versions[unit.id]!=unit.version:raise ValueError('Scope update requires exactly its source unit version')
     if len(update.patch.units)!=1 or update.patch.units[0].id!=unit.id:raise ValueError('Scope update must address one existing unit')
     draft=update.patch.units[0]
@@ -73,7 +70,15 @@ def validate_scope_update(state,update):
     refined={f for id,f in writes if f in {'audit_question','coverage_intent'}}
     if any(old!=new_uses[id] for id,old in old_uses.items()):refined.add('code_uses')
     from .graph import apply_patch
-    apply_patch(state.model_copy(deep=True),new_candidate_patch(state,update))
+    candidate=new_candidate_patch(state,update)
+    try:apply_patch(state.model_copy(deep=True),candidate)
+    except DiagnosticError as exc:
+        # Explicit provenance, not ID-prefix guessing or merged-array coordinates.
+        identities={candidate.units[0].id:update.unit_id}
+        for d in exc.diagnostics:
+            d.object_ids=[identities.get(id,id) for id in d.object_ids]
+            d.details['proposal_identity_map']=identities
+        raise
     if refined:
         a=update.assessment
         if a is None:return sorted(refined)

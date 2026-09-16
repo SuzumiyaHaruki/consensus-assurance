@@ -1,0 +1,1 @@
+Generate the selected implementation-grounded local model using the loaded modeling method and bundle interface. Return BuildReply with the Bundle, or bundle=null, a precise gap and focused reading requests. Preserve the selected goals and obligations.

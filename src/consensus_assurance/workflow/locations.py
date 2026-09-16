@@ -58,6 +58,13 @@ def declarations(material):
                 end_line=method['end']
                 cursor=sum(len(x)+1 for x in masked.split('\n')[:end_line-offset])
             result.append({'symbol':name,'start':start,'signature_end':line(match.end()),'end':end_line,'kind':'declaration'})
+        # Constants are source identities too; a named member anchors its whole
+        # declaration group, not neighboring type declarations.
+        for match in re.finditer(r'(?m)^[ \t]*const[ \t]*\(',masked):
+            end=closing(masked,match.end()-1,'(',')')
+            for member in re.finditer(r'(?m)^[ \t]*(\w+)[ \t]*(?:\w+[ \t]*)?(?:=|$)',masked[match.end():end-1]):
+                pos=match.end()+member.start()+len(member[0])-len(member[0].lstrip())
+                result.append({'symbol':member[1],'start':line(pos),'signature_end':line(pos),'end':line(end),'owner_start':line(match.start()),'kind':'declaration'})
         # Call-site anchors record syntax only, not resolved callee behavior.
         for match in re.finditer(r'\b(\w+)\s*\(',masked):
             if any(d['start']==line(match.start()) and d['symbol']==match[1] for d in result):continue

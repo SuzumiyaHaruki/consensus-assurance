@@ -218,7 +218,8 @@ def validate_review(state,task,reply):
     validate_contract(state,task,reply)
     validate_resolutions(state,task,reply)
     for item in reply.items:
-        if item.target_id not in available or not set(item.source_ids)<=material_ids:
+        from .sources import includes
+        if item.target_id not in available or not includes(state,item.source_ids,material_ids):
             raise ValueError('Semantic review cites an unavailable object or material')
         if not all(x.strip() for x in [item.explanation,item.alternatives,item.counterexample_reasoning]):
             raise ValueError('Semantic review needs material reasoning, alternatives and a reverse sufficiency check')

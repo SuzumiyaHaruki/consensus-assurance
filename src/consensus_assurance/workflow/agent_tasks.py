@@ -10,11 +10,7 @@ from .output_repair import OutputRepair,repair_targets,apply_replacements,diagno
 from .materials import validate_read_requests, attachment_key
 
 
-def save_session(engine,session):
-    engine.state.pending_output_repair=session
-    engine.state.repair_sessions[session['id']]=session
-    write_json(engine.root/'repair-sessions'/session['id']/'session.json',session)
-    engine.checkpoint('output_repair_pending')
+from .output_repair import save_session
 
 
 def diagnostics_for(exc,candidate,kind,version,limit):
@@ -38,6 +34,7 @@ def ask(engine,kind,response_type,context,validator=None):
     if session and session.get('read_plan_id') and session.get('read_requests'):
         obtained=engine.read(session['read_requests'],plan_id=session['read_plan_id'],related_ids=session.get('read_related_ids',[]),reason=session.get('read_rationale','Resume requested repair context'))
         if obtained['status']!='complete':save_session(engine,session);raise Blocked('Repair reading plan still has unmet ranges; no new agent call was sent')
+        session['requested_material_ids']=[id for i in obtained['items'] for id in i['material_ids'] if i['status']!='deferred']
         session.pop('read_plan_id')
         try:
             candidate=json.loads(Path(session['current_path']).read_text());response=response_type.model_validate(candidate)
@@ -73,7 +70,15 @@ def ask(engine,kind,response_type,context,validator=None):
             context={**context,'attached_materials':[m.model_dump(mode='json') for m in state.materials if m.id in state.task_attachments.get(attachment_key(state),[])]}
             active_diags=diags[:1]
             active_targets=diagnostic_targets(candidate,active_diags,limit) if active_diags[0].code not in {'schema_type','unclassified_validation'} else session['targets']
-            related=diagnostic_context(candidate,active_diags,context,limit)
+            context['repair_requested_material_ids']=session.get('requested_material_ids',[])
+            # Allocate requested source within the existing whole-packet ceiling;
+            # error_context_chars bounds diagnostic fields, not repeated old closures.
+            requested=[m for m in context['attached_materials'] if m['id'] in context['repair_requested_material_ids']]
+            source_room=min(engine.config.budget.context_chars//2,max(limit,sum(len(json.dumps(m,ensure_ascii=False)) for m in requested)+limit))
+            related=diagnostic_context(candidate,active_diags,context,source_room)
+            if related['required_materials_missing']:
+                session['error']='Explicitly requested source cannot fit this issue packet; a smaller range plan is required'
+                session['blocked']=True;save_session(engine,session);raise Blocked(session['error'])
             session['related_context']=related
             if not session['targets'] and not any('read' in d.allowed for d in diags):
                 save_session(engine,session);raise Blocked('Cannot localize an authorized mechanical repair; explicit semantic plan required: '+session['error'])
@@ -85,7 +90,7 @@ def ask(engine,kind,response_type,context,validator=None):
         directory=engine.root/'agent'/(uid()+'-'+kind)
         from .task_packet import pool_sources
         request=pool_sources(request)
-        prompt=render('retry' if session else kind,request,engine.inquiry if kind in {'read','discover','F3','targeted_read','graph_patch','explore','semantic_review','scope_review'} else '')
+        prompt=render('retry' if session else kind,request,engine.inquiry)
         sent=receipt(engine,kind,request,prompt,schema,review_task,repair=bool(session))
         sent['preparation_seconds']=time.monotonic()-preparation_started
         if len(prompt)>engine.config.budget.context_chars:
@@ -131,11 +136,12 @@ def ask(engine,kind,response_type,context,validator=None):
                     raw=json.loads(decoded.read_text()) if decoded.exists() else None
                 write_json(engine.root/'repair-sessions'/session['id']/f"patch-{session['attempt']}.json",{'check_id':check.id,'raw':raw})
                 patch=OutputRepair.model_validate(raw)
-                if patch.change_request:
+                if patch.change_request and not patch.draft_patch:
                     session['proposed_change']=patch.change_request
                     session['error']='Explicit semantic/scope plan requested: '+patch.change_request;session['blocked']=True
                     save_session(engine,session);raise Blocked(session['error'])
                 if patch.requests:
+                    if not any('read' in d.allowed for d in active_diags):raise ValueError('This diagnostic requires citation/metadata correction, not another source request')
                     if patch.replacements:raise ValueError('Read or attach material before returning replacements')
                     validate_read_requests(state,engine.root/'source',patch)
                     session.setdefault('read_plan_id',uid());session['read_requests']=[q.model_dump(mode='json') for q in patch.requests]
@@ -143,6 +149,14 @@ def ask(engine,kind,response_type,context,validator=None):
                     save_session(engine,session)
                     obtained=engine.read(patch.requests,plan_id=session['read_plan_id'],related_ids=[id for d in diags for id in d.object_ids],reason=patch.rationale)
                     if obtained['status']!='complete':save_session(engine,session);raise Blocked('Requested repair material is deferred; the original reading plan remains pending')
+                    session['requested_material_ids']=[id for i in obtained['items'] for id in i['material_ids'] if i['status']!='deferred']
+                    from .sources import ranges,all_materials
+                    provided=[{'file':file,'content_digest':version,'ranges':spans} for (file,version),spans in sorted(ranges(all_materials(related)).items())]
+                    progress={'candidate_version':session['version'],'diagnostics':session['diagnostics'],'actually_provided':provided}
+                    if progress==session.get('last_read_progress'):
+                        session['stagnation']=session.get('stagnation',0)+1
+                        if session['stagnation']>=engine.config.budget.repair_stagnation:session['blocked']=True
+                    session['last_read_progress']=progress
                     session.pop('read_plan_id',None)
                     session['read_requests']=[q.model_dump(mode='json') for q in patch.requests]
                     try:
@@ -155,10 +169,20 @@ def ask(engine,kind,response_type,context,validator=None):
                     session['status']='accepted_after_read';session['accepted_check']=check.model_dump(mode='json');session['resolved_diagnostics']=session['diagnostics'];session['diagnostics']=[];session['error']='';save_session(engine,session);state.pending_output_repair=None
                     write_json(cwd/'accepted-response.json',response)
                     return response,check
-                if not patch.replacements:raise ValueError('Repair needs replacements, material requests, or a change request')
-                merged=apply_replacements(candidate,active_targets,patch)
-                from .repair_policy import validate_representation
-                validate_representation(candidate,merged,active_targets,related)
+                if patch.draft_patch:
+                    if kind!='graph_patch' or patch.replacements or patch.binding_splits or patch.requests:raise ValueError('Explicit draft scope plan must be the sole graph_patch repair action')
+                    from .repair_policy import validate_draft_plan
+                    merged=patch.draft_patch.model_dump(mode='json')
+                    validate_draft_plan(candidate,merged)
+                    session.setdefault('draft_scope_plans',[]).append({'attempt':session['attempt'],'rationale':patch.rationale,'before':candidate,'after':merged,'review_required':'Regular scope and binding review before modeling; no normative change authorized'})
+                else:
+                    if not patch.replacements and not patch.binding_splits:raise ValueError('Repair needs replacements, source-backed draft splits, material requests, or a change request')
+                    merged=apply_replacements(candidate,active_targets,patch)
+                    from .repair_policy import validate_representation
+                    validate_representation(candidate,merged,active_targets,related)
+                    if patch.binding_splits:
+                        from .repair_policy import split_draft_bindings
+                        merged=split_draft_bindings(merged,patch,active_diags,related,{b.id for b in state.bindings})
                 session['patch_error']=None
             except ValueError as exc:
                 session['patch_error']={'message':str(exc),'raw_patch':raw,'diagnostics':[d.model_dump(mode='json') for d in getattr(exc,'diagnostics',[])]}

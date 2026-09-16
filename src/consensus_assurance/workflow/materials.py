@@ -243,8 +243,12 @@ def execute_read(engine,requests,*,purpose='depth',partial=False,plan_id=None,re
     engine.read_commit_hook('before_commit',receipt)
     payload={'requests':[q.model_dump(mode='json') for q in receipt.original_requests],'plan_id':plan_id,'purpose':purpose,'partial':partial}
     def commit(proxy):
-        if charge and previous is None:proxy.budget.take('targeted_reads')
+        acquired=any(i.status=='acquired' for i in receipt.items)
+        already_charged=previous and (previous.get('acquisition_charged') or 'acquisition_charged' not in previous)
+        if charge and acquired and not already_charged:proxy.budget.take('targeted_reads')
         apply_read(proxy.state,receipt,materials)
+        proxy.state.read_plans[plan_id]['acquisition_charged']=bool(already_charged or charge and acquired)
+        proxy.state.read_plans[plan_id]['accounting']='One quota unit per logical plan obtaining any new source; cached/deferred plans cost no source quota'
         refresh_unread(proxy.state,engine.root/'source')
     commit_graph(engine,'reading-'+plan_id+'-'+str(attempt),payload,commit)
     engine.read_commit_hook('after_receipt',receipt)
@@ -256,15 +260,6 @@ def add_reads(state,repo,reading,budget):
     apply_read(state,receipt,materials)
     refresh_unread(state,repo)
     return [id for item in receipt.items if item.status=='acquired' for id in item.material_ids]
-
-
-def obtain_materials(state,repo,requests,budget,related_ids=(),reason='Requested context'):
-    receipt,materials=plan_read(state,repo,requests,budget,related_ids=related_ids,reason=reason)
-    apply_read(state,receipt,materials)
-    refresh_unread(state,repo)
-    return {'added':[id for item in receipt.items if item.status=='acquired' for id in item.material_ids],
-        'reattached':[id for item in receipt.items if item.status=='cached' for id in item.material_ids],
-        'unavailable':[item.request.model_dump(mode='json') for item in receipt.items if item.status=='deferred']}
 
 
 def request_groups(value,path=''):

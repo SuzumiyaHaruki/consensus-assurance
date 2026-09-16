@@ -32,7 +32,13 @@ def _apply_feedback(state, unit, current, feedback):
             raise ValueError("F2 requires old/new judgments, attributed reasoning, and an incremental semantic patch")
         validate_changes(state,feedback)
         validate_grounding(feedback.grounding, {m.id:m for m in state.materials}, {b.id for b in state.bindings})
-        if feedback.grounding.conflicts or feedback.grounding.unresolved:
+        conditions=feedback.grounding.conflicts+feedback.grounding.unresolved
+        remaining=bool(conditions)
+        if feedback.condition_dispositions:
+            from .repair_policy import classify_conditions
+            classified=classify_conditions(state,conditions,feedback.condition_dispositions,feedback.evidence_ids)
+            remaining=any(c.applies_to=='current_judgment' for c in classified)
+        if remaining:
             state.gaps.append("F2 remains unresolved: conflicting or insufficient applicability evidence")
             state.revisions.append(Revision(kind="F2", rationale=feedback.rationale,
                 evidence_ids=feedback.evidence_ids, target_ids=feedback.target_ids, before=before,
@@ -74,6 +80,7 @@ def _apply_feedback(state, unit, current, feedback):
              "unit_id": result.id if hasattr(result, "id") else unit.id if unit else None,
              "graph_version": state.graph_version, "new_judgment": feedback.new_judgment,
              "grounding": feedback.grounding.model_dump(), "affected_model_ids": affected,
+             "condition_dispositions":[d.model_dump(mode="json") for d in feedback.condition_dispositions],
              "property_changes": feedback.new_basis, "changes":[c.model_dump(mode="json") for c in feedback.changes],
              "behavior": feedback.bundle.behavior if feedback.bundle else None,
              "observation": feedback.bundle.observation.model_dump() if feedback.bundle else None,

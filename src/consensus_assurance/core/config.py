@@ -26,7 +26,7 @@ class Budget(Record):
     material_chunks: int = Field(default=40, ge=0)
     audit_units: int = Field(default=2, ge=0)
 
-    targeted_reads: int = Field(default=3, ge=0)
+    targeted_reads: int = Field(default=3, ge=0, description="Maximum logical plans obtaining new source ranges; cached reattachments and fully deferred plans do not consume this quota. Agent calls remain separately bounded.")
     technical_repairs: int = Field(default=2, ge=0)
     reachability_checks: int = Field(default=3, ge=0)
     consequence_investigations: int = Field(default=1, ge=0)

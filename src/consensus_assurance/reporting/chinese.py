@@ -101,6 +101,14 @@ def resource_lines(state):
     lines.append(f"同语义复核复用记录 {len(state.review_reuses)}；上下文准备失败 {state.usage.get('packet_preparation_failures',0)}；未发送包不消耗实际探索/复核轮数。")
     acquired={id for id,p in state.read_plans.items() if p.get('scope_requested') and p['status']=='complete' and any(i['status']=='acquired' for i in p['items'])}
     connected={u['proposal'].get('read_plan_id') for u in state.scope_updates.values() if u['status']=='accepted'} & acquired
+    plans=list(state.read_plans.values())
+    source_plans=sum(any(i['status']=='acquired' for i in p['items']) for p in plans)
+    cache_plans=sum(bool(p['items']) and all(i['status']=='cached' for i in p['items']) for p in plans)
+    stalled=sum(s.get('stagnation',0) for s in state.repair_sessions.values())
+    lines.append(f"读取计划：当前 receipt 有新源 {source_plans}、纯缓存 {cache_plans}；修复无进展次数 {stalled}。round9 的 targeted_reads 按取得新源的逻辑计划计数，历史用量不重算；缓存发送仍消耗实际 agent 调用与时间。")
+    for packet in state.packet_receipts:
+        resources=packet.get('skill_resources')
+        if resources:lines.append(f"技能加载 `{packet['id']}`：版本 {resources['manifest_version']}，{resources['paths']}；仅以实际发送状态为准。")
     lines.append(f"需接回且已取得新材料的计划 {len(acquired)}；已接回 {len(connected)}；连接率 {str(len(connected))+'/'+str(len(acquired)) if acquired else '无可计算分母/历史未记录'}。这不是语义通过率或系统覆盖率。")
     sent=[p for p in state.packet_receipts if p['status'] in {'executed','accepted'} and not p.get('result_reused')]
     lines.append(f"实际发送包中源正文累计 {sum(p.get('source_chars_sent',0) for p in sent)} 字符（跨调用重复发送会重复计入）；schema 累计 {sum(p.get('wire_schema_bytes',0) for p in sent)} 字节。无真实 token/账单字段时不换算费用。")

@@ -27,7 +27,7 @@ def test_architecture_does_not_import_specific_plugins():
                     assert "plugins" not in (node.module or "")
                 if isinstance(node, ast.Import):
                     assert all("plugins" not in a.name for a in node.names)
-    for path in (root / "resources/prompts").glob("*.txt"):
+    for path in (root / "resources").rglob("*.md"):
         if path.name in {"task.txt", "revision.txt", "investigate.txt"}:
             continue
         assert "votedFor" not in path.read_text()

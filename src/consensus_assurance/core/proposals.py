@@ -165,7 +165,19 @@ class GoalObservation(Record):
     grounding: Grounding
 
 
+class ContextScenario(Record):
+    description: str = Field(min_length=1,description="Implementation-grounded context dimensions, support lifecycle and interruption boundaries; identify unknowns")
+    mode: Literal['local','cross_context']
+    binding_ids: list[str] = Field(min_length=1)
+    variables: list[str]
+    actions: list[str]
+    checker_ids: list[str]
+    reachability_ids: list[str]
+    excluded: list[str] = Field(description="Dimensions or histories not modeled, with implementation-specific reasons; not a guard")
+
+
 class Bundle(Record):
+    context_analysis: list[ContextScenario] = []
     reachability: list[ReachabilityRequirement] = []
     goal_observations: list[GoalObservation] = []
     description: str
@@ -235,7 +247,15 @@ class JudgmentChange(Record):
     new_value_json: str
 
 
+class ConditionDisposition(Record):
+    condition: str = Field(description="Exact prior conflict, unresolved condition or limitation; do not rename it")
+    applies_to: Literal['old_judgment','current_judgment','independent_scope']
+    rationale: str = Field(min_length=1, description="Explain the responsibility and range to which this condition applies, preserving counterevidence")
+    source_ids: list[str] = Field(min_length=1)
+
+
 class Feedback(Record):
+    condition_dispositions: list[ConditionDisposition] = []
     kind: Literal["F1", "F2", "F3", "F4", "unresolved"]
     rationale: str
     evidence_ids: list[str]
@@ -262,6 +282,7 @@ class ExplorationReply(Record):
 
 
 class IssueResolution(Record):
+    condition_dispositions: list[ConditionDisposition] = []
     issue_id: str
     target_version: int
     original_question: str = Field(description="The exact stored issue explanation; preserve stable problem identity")

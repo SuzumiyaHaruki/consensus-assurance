@@ -21,5 +21,5 @@ def relevant_use(unit,binding,relations,materials):
     direct=claim_ids(binding)&set(unit.goal_ids+unit.obligation_ids)
     if use is None:return bool(direct)
     if not set(use.claim_ids)<=claim_ids(binding) or not set(use.source_ids)<=set(materials) or not use.rationale.strip():return False
-    if use.role=='direct':return bool(set(use.claim_ids)&set(unit.goal_ids+unit.obligation_ids))
+    if use.role in {'direct','input','environment'} and set(use.claim_ids)<=set(unit.goal_ids+unit.obligation_ids):return bool(direct)
     return bool(use.unverified) and support_path(unit,use,binding,relations)

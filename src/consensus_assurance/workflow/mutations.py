@@ -55,3 +55,11 @@ def validate_changes(state, feedback, allowed_ids=None):
         if canonical(json.loads(change.old_value_json))!=canonical(before) or canonical(json.loads(change.new_value_json))!=canonical(after):
             raise ValueError('F2 declared values differ from the actual field changes')
     return writes
+
+
+SCOPE_FIELDS={'binding_ids','relation_ids','code_uses','audit_question','coverage_intent','rationale'}
+
+def classify_writes(writes,unit_id=None):
+    if not writes:return 'candidate_additions'
+    if unit_id and all(id==unit_id and field in SCOPE_FIELDS for id,field in writes):return 'scope_candidate'
+    return 'semantic_revision'

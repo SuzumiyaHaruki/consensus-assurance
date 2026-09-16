@@ -1,6 +1,7 @@
 """Finite reachability via an auxiliary negated-state invariant, never a protocol violation."""
 from pathlib import Path
 import shutil
+import re
 from consensus_assurance.core.types import ReachabilityResult, CheckRun, uid
 from .input_identity import execution_fingerprint
 
@@ -16,12 +17,18 @@ def check_requirement(verifier,runner,model,bundle,requirement,timeout):
     init,next_action='Init','Next'
     if requirement.sequence:
         count=len(requirement.sequence);identity=requirement.identity_operator
+        # Auxiliary state must not shadow real implementation variables/operators.
+        names=set(re.findall(r'[A-Za-z_][A-Za-z0-9_]*',bundle.behavior))
+        def fresh(base):
+            while base in names:base+='Aux'
+            names.add(base);return base
+        progress=fresh('CAReachProgress');owner=fresh('CAReachOwner')
         steps=requirement.sequence
-        initial=f"CovInit == Init /\\ progress \\in {{0, IF {steps[0]} THEN 1 ELSE 0}} /\\ owner = {identity}"
-        transitions=["UNCHANGED <<progress, owner>>"]
+        initial=f"CovInit == Init /\\ {progress} \\in {{0, IF {steps[0]} THEN 1 ELSE 0}} /\\ {owner} = {identity}"
+        transitions=[f"UNCHANGED <<{progress}, {owner}>>"]
         for index,predicate in enumerate(steps):
-            transitions.append(f"(/\\ progress = {index} /\\ {predicate}' /\\ progress' = {index+1} /\\ "+(f"owner' = {identity}'" if index==0 else f"owner = {identity}' /\\ UNCHANGED owner")+")")
-        source.write_text('---- MODULE Reachability ----\nEXTENDS Behavior, Naturals\nVARIABLE progress, owner\n'+initial+'\nCovNext == Next /\\ (\n'+"\n \\/ ".join(transitions)+')\nTriggerNotReached == progress < '+str(count)+'\n====\n')
+            transitions.append(f"(/\\ {progress} = {index} /\\ {predicate}' /\\ {progress}' = {index+1} /\\ "+(f"{owner}' = {identity}'" if index==0 else f"{owner} = {identity}' /\\ UNCHANGED {owner}")+")")
+        source.write_text('---- MODULE Reachability ----\nEXTENDS Behavior, Naturals\nVARIABLE '+progress+', '+owner+'\n'+initial+'\nCovNext == Next /\\ (\n'+"\n \\/ ".join(transitions)+')\nTriggerNotReached == '+progress+' < '+str(count)+'\n====\n')
         init,next_action='CovInit','CovNext'
     cfg=directory/'Reachability.cfg'
     cfg.write_text('INIT '+init+'\nNEXT '+next_action+'\nCHECK_DEADLOCK FALSE\n'+('CONSTANTS\n'+bundle.constants+'\n' if bundle.constants.strip() else '')+'INVARIANT TriggerNotReached\n')

@@ -58,6 +58,22 @@ def validate_bundle(state, unit, bundle, implementation):
                 raise ValueError("Reachability requires an actual named Behavior operator")
         if not requirement.claim_ids or not set(requirement.point_ids)<={p.id for p in points}:raise ValueError("Reachability must link claims and known audit question points")
         if not set(requirement.claim_ids)<=checked_ids:raise ValueError("Reachability requirement references an unchecked claim")
+    def context_error(message):
+        from consensus_assurance.core.diagnostics import Diagnostic,DiagnosticError
+        raise DiagnosticError([Diagnostic(code='context_mapping',category='association',object_ids=[unit.id],paths=['/bundle/context_analysis'],message=message,allowed=['representation','read'],
+            details={'variables':bundle.variables,'actions':bundle.actions,'checkers':[c.model_dump(mode='json') for c in specs],'reachability':[r.model_dump(mode='json') for r in bundle.reachability],
+                     'preservation':'Correct scenario correspondence only. Behavior, properties, selected obligations and fault scope cannot change in this repair.'})])
+    # A scenario names real executable artifacts, not just prose about a round.
+    for scenario in bundle.context_analysis:
+        if not set(scenario.binding_ids)<=set(unit.binding_ids):context_error('Context analysis cites code outside this unit')
+        if not scenario.actions or not set(scenario.actions)<=set(bundle.actions) or not set(scenario.variables)<=set(bundle.variables):context_error('Context analysis references unavailable behavior actions or variables')
+        if not scenario.checker_ids or not set(scenario.checker_ids)<=set(invariants):context_error('Context scenario requires configured checker correspondence')
+        requirements=[r for r in bundle.reachability if r.id in scenario.reachability_ids]
+        if len(requirements)!=len(set(scenario.reachability_ids)):context_error('Context scenario refers to absent reachability configuration')
+        if scenario.mode=='cross_context' and not any(r.sequence and r.identity_operator for r in requirements):context_error('Cross-context coverage needs a same-history identity-correlated trigger')
+        if scenario.mode=='cross_context' and not {c.claim_id for c in specs if c.invariant in scenario.checker_ids}<={id for r in requirements for id in r.claim_ids}:context_error('Joint-history trigger does not cover the scenario checker claims')
+        for name in scenario.actions:
+            if not re.search(r'\b'+re.escape(name)+r'\s*(?:\([^\n]*\))?\s*==',tla_code(bundle.behavior)):context_error('Context action has no actual Behavior definition')
     # Model-level goal expression does not require an implementation monitor.
     for mapping in bundle.goal_observations:
         if mapping.claim_id not in unit.goal_ids or not set(mapping.binding_ids)<=set(unit.binding_ids):raise ValueError("Goal observation references an unrelated goal or binding")

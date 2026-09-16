@@ -3,33 +3,17 @@ from consensus_assurance.core.types import ReviewIssue
 
 
 from .review_contract import required_aspects, target_contract
+from .sources import citation_status, includes
 
 
 def material_closure(state, ids):
     objects={x.id:x for x in [*state.claims,*state.bindings,*state.relations,*state.units,*state.models]}
-    wanted=set();visited=set();todo=list(ids)
-    while todo:
-        id=todo.pop()
-        if id in visited:continue
-        visited.add(id);obj=objects.get(id)
-        if obj is None:continue
-        wanted.update(getattr(obj,'source_ids',[]))
-        if hasattr(obj,'source') and hasattr(obj,'target'):todo.extend([obj.source,obj.target])
-        for association in getattr(obj,'associations',[]):
-            todo.append(association.claim_id);wanted.update(association.source_ids)
-        for use in getattr(obj,'code_uses',[]):
-            todo.extend(use.claim_ids+use.relation_ids);wanted.update(use.source_ids)
-        anchor=getattr(obj,'anchor',None)
-        if anchor:wanted.add(anchor.material_id)
-        question=getattr(obj,'audit_question',None)
-        if question:wanted.update(question.source_ids)
-        for point in getattr(obj,'coverage_intent',[])+(question.points if question else []):wanted.update(point.source_ids)
-        basis=getattr(obj,'grounding',None)
-        if basis:
-            wanted.update(basis.behavior_ids+basis.expectation_ids);todo.extend(basis.binding_ids)
-        todo.extend(getattr(obj,'binding_ids',[]));todo.extend(getattr(obj,'goal_ids',[]));todo.extend(getattr(obj,'obligation_ids',[]));todo.extend(getattr(obj,'relation_ids',[]))
+    from .sources import dependency_closure
+    wanted,visited=dependency_closure(objects,ids)
+    for id in visited:
+        obj=objects[id]
         if hasattr(obj,'file'):
-            wanted.update(m.id for m in state.materials if m.file==obj.file and m.start_line<=obj.end_line and m.end_line>=obj.start_line)
+            wanted.update(m.id for m in state.materials if m.file==obj.file and m.content_digest==obj.content_digest and m.start_line<=obj.end_line and m.end_line>=obj.start_line)
     return wanted,visited
 
 
@@ -39,12 +23,12 @@ def valid_supersession(state,review,task):
     if task.unit_id and task.unit_id!=review.unit_id:return False
     if task.unit_version is not None and task.unit_version!=review.unit_version:return False
     if task.model_id and task.model_id!=review.model_id:return False
-    if not set(task.material_ids)<=set(review.material_ids):return False
+    if not includes(state,task.material_ids,review.material_ids):return False
     for id,version in task.target_versions.items():
         if id not in objects or review.target_versions.get(id)!=version:return False
         if review.context_receipt_id:
             contract=target_contract(state,objects[id])
-            if review.context_dependencies.get(id,{}).get('dependency_versions')!=contract['dependency_versions'] or not set(contract['required_material_ids'])<=set(review.material_ids):return False
+            if review.context_dependencies.get(id,{}).get('dependency_versions')!=contract['dependency_versions'] or not includes(state,contract['required_material_ids'],review.material_ids):return False
         items=[i for i in review.items if i.target_id==id and i.status=='no_issue_found' and not i.limitations]
         if not required_aspects(objects[id])<={i.aspect for i in items}:return False
     return bool(task.target_versions)
@@ -61,10 +45,12 @@ def validate_resolutions(state, task, reply):
         if old is None or not valid_supersession(state,review,old):raise ValueError('Superseding review does not cover the old task scope, versions and aspects')
     explicit={r.issue_id:r for r in reply.resolutions}
     if len(explicit)!=len(reply.resolutions) or not set(explicit)<=set(reply.resolves_issue_ids):raise ValueError('Issue resolutions must uniquely refer to requested issue dispositions')
-    def fail(issue,message):
+    def fail(issue,message,code='issue_resolution_basis',sources=None):
         from consensus_assurance.core.diagnostics import DiagnosticError,Diagnostic
-        raise DiagnosticError([Diagnostic(code='issue_resolution_basis',category='format',object_ids=[issue.target_id],paths=['/resolutions','/resolves_issue_ids'],material_ids=issue.source_ids,
-            message=message,allowed=['representation','read'],details={'issue':issue.model_dump(mode='json'),'required':'Supply an issue-specific resolution with source evidence and independent residual issues, or retain this issue unresolved'})])
+        paths=['/resolutions','/resolves_issue_ids']
+        if code=='issue_citation_missing':paths=[f'/items/{n}/source_ids' for n,i in enumerate(reply.items) if i.target_id==issue.target_id and i.aspect==issue.aspect]
+        raise DiagnosticError([Diagnostic(code=code,category='format',object_ids=[issue.target_id],paths=paths,material_ids=sources if sources is not None else issue.source_ids,
+            message=message,allowed=['representation'] if code=='issue_citation_missing' else ['representation','read'],details={'issue':issue.model_dump(mode='json'),'required':'Supply an issue-specific resolution with source evidence and independent residual issues, or retain this issue unresolved'})])
     for id in reply.resolves_issue_ids:
         issue=next((i for i in state.review_issues if i.id==id and i.resolved_by is None),None)
         if issue is None:raise ValueError('Resolution references an unavailable open issue')
@@ -80,15 +66,31 @@ def validate_resolutions(state, task, reply):
                 raise ValueError('Old checker issue needs a related changed encoding and actual current search; harness-only or unrelated models cannot resolve it')
             resolution_target=model.id
         resolution=explicit.get(id)
-        matching=[i for i in reply.items if i.target_id==resolution_target and i.aspect==issue.aspect and i.status=='no_issue_found' and not i.limitations]
+        matching=[i for i in reply.items if i.target_id==resolution_target and i.aspect==issue.aspect and i.status=='no_issue_found']
         if resolution:
             if resolution.target_version!=issue.target_version or resolution.original_question!=issue.explanation or not resolution.rationale.strip():fail(issue,'The disposition must address the exact issue/version with attributed reasoning')
-            if not set(resolution.source_ids)<=set(task.material_ids or [m.id for m in state.materials]) or not set(issue.source_ids)<=set(resolution.source_ids):fail(issue,'Issue evidence is missing from the actual review context')
+            supplied=task.material_ids if task.context_receipt_id else task.material_ids or [m.id for m in state.materials]
+            status=citation_status(state,resolution.source_ids,supplied)
+            unknown=[id for id,v in status.items() if v=='unknown']
+            absent=[id for id,v in status.items() if v=='cached_not_provided']
+            if unknown:fail(issue,'Unknown citations need a source identity correction or actual acquisition', 'issue_unknown_source',unknown)
+            if absent:fail(issue,'Cited ranges are cached but were not supplied; attach them before evaluating this explanation', 'issue_context_not_provided',absent)
+            # Old gap citations remain in the issue. New evidence may answer it without
+            # repeating every old citation; exact question, rationale and counterevidence
+            # dispositions below still apply. Citation validity is not semantic proof.
+            if not any(includes(state,resolution.source_ids,i.source_ids) for i in matching):
+                fail(issue,'The matching analysis must cite the evidence used by its issue disposition', 'issue_citation_missing',resolution.source_ids)
             others={i.id:i for i in state.review_issues if not i.resolved_by}
             if any(x not in others or x==id or others[x].parent_issue_id==id for x in resolution.residual_issue_ids):fail(issue,'An unresolved root or child cannot be renamed as an independent residual')
             if any(issue.explanation.strip().casefold()==x.strip().casefold() for x in resolution.scope_limitations):fail(issue,'The unresolved original question cannot be relabeled as a scope boundary')
-            if not matching or not any(set(resolution.scope_limitations)<=set(i.scope_limitations) for i in matching):fail(issue,'Unresolved validity conditions still affect this judgment; retain them as issues rather than scope labels')
-        elif not matching or any(i.scope_limitations for i in matching) or not any(set(issue.source_ids)<=set(i.source_ids) for i in matching):
+            from .repair_policy import classify_conditions
+            remaining=list(dict.fromkeys(x for i in matching for x in i.limitations))
+            if remaining:
+                try:classified=classify_conditions(state,remaining,resolution.condition_dispositions,supplied)
+                except ValueError as exc:fail(issue,str(exc),'issue_residual_unclassified')
+                if any(c.applies_to!='independent_scope' for c in classified):fail(issue,'A condition still affects the current judgment; keep the issue open')
+            if not matching:fail(issue,'An issue disposition needs matching substantive analysis')
+        elif not matching or any(i.scope_limitations or i.limitations for i in matching) or not any(set(issue.source_ids)<=set(i.source_ids) for i in matching):
             fail(issue,'Resolution must address the specific prior issue and its material evidence; independent boundaries need an explicit issue disposition')
         if issue.model_id and task.model_id!=issue.model_id:
             model=next((m for m in state.models if m.id==task.model_id),None)
@@ -124,7 +126,7 @@ def readiness(state,unit):
         dependency=target_contract(state,obj)
         needed=set(dependency['required_material_ids'])
         for aspect in required_aspects(obj):
-            candidates=[r for r in state.semantic_reviews if r.target_versions.get(id)==obj.version and needed<=set(r.material_ids) and all(r.context_dependencies.get(id,{}).get('dependency_versions',dependency['dependency_versions']).get(k)==v for k,v in dependency['dependency_versions'].items()) and any(i.target_id==id and i.aspect==aspect for i in r.items)]
+            candidates=[r for r in state.semantic_reviews if r.target_versions.get(id)==obj.version and includes(state,needed,r.material_ids) and all(r.context_dependencies.get(id,{}).get('dependency_versions',dependency['dependency_versions']).get(k)==v for k,v in dependency['dependency_versions'].items()) and any(i.target_id==id and i.aspect==aspect for i in r.items)]
             if not candidates:missing.append(id+':'+aspect);continue
             review=candidates[-1];reviews.append(review.id)
             if any(i.target_id==id and i.aspect==aspect and (i.status!='no_issue_found' or i.limitations) for i in review.items):disputed.append(id+':'+aspect)

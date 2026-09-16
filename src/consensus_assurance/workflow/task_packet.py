@@ -58,7 +58,8 @@ def receipt(engine,kind,packet,prompt,schema,task=None,repair=False):
         if isinstance(value,list):return sum(source_size(v) for v in value)
         return 0
     ids=[m['id'] for m in materials if 'id' in m]
-    item={'id':uid(),'kind':kind,'task_id':task.id if task else engine.state.active_inquiry_id,'unit_id':engine.state.active_unit_id,
+    from .prompts import loaded_resources
+    item={'skill_resources':loaded_resources('retry' if repair else kind,packet),'id':uid(),'kind':kind,'task_id':task.id if task else engine.state.active_inquiry_id,'unit_id':engine.state.active_unit_id,
         'material_ids':list(dict.fromkeys(ids)),'materials':[{k:m.get(k) for k in ('id','file','start_line','end_line','content_digest')} for m in materials],
         'review_contract':packet.get('review_contract',[]),'omitted_material_ids':packet.get('omitted_material_ids',[]),
         'source_chars_sent':source_size(packet),'prompt_chars':len(prompt),'prompt_bytes':len(prompt.encode()),'wire_schema_bytes':len(json.dumps(wire,ensure_ascii=False,indent=2).encode()),'wire_schema_chars':len(json.dumps(wire,ensure_ascii=False,indent=2)),'schema_size_basis':'Exact prepared JSON file serialization; not backend token consumption',
@@ -67,6 +68,8 @@ def receipt(engine,kind,packet,prompt,schema,task=None,repair=False):
     if task:
         task.context_receipt_id=item['id'];task.material_ids=list(dict.fromkeys((task.material_ids if repair else [])+item['material_ids']))
         item['review_material_ids']=task.material_ids
+        item['prior_analysis_material_ids']=[id for id in task.material_ids if id not in item['material_ids']]
+        item['source_availability_note']='material_ids are sent now; prior_analysis_material_ids only support retained historical analysis, not new source observations'
     write_json(engine.root/'packets'/(item['id']+'.schema.json'),wire)
     write_json(engine.root/'packets'/(item['id']+'.json'),item)
     return item

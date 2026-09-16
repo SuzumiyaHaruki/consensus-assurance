@@ -5,6 +5,7 @@ import re
 from pydantic import Field
 from consensus_assurance.core.types import ReadRequest
 from consensus_assurance.core.types import Record
+from consensus_assurance.core.proposals import BindingDraft,GraphPatch
 
 
 class Replacement(Record):
@@ -12,7 +13,15 @@ class Replacement(Record):
     value_json: str = Field(description='JSON encoding of the replacement value, not a whole new response')
 
 
+class BindingSplit(Record):
+    path: str = Field(description="JSON pointer to one diagnosed, unaccepted binding")
+    bindings: list[BindingDraft] = Field(min_length=2,max_length=8,description="Complete replacement BindingDraft objects, each anchored in supplied code; preserve the entire original behavior range and associations")
+    rationale: str = Field(min_length=1)
+
+
 class OutputRepair(Record):
+    draft_patch: GraphPatch | None = Field(default=None, description="Explicit alternative scope/location proposal for a graph_patch draft; preserve existing claims, relations, checked obligations and fault scope. This is not a mechanical field replacement and is fully revalidated.")
+    binding_splits: list[BindingSplit] = Field(default_factory=list,max_length=4)
     replacements: list[Replacement] = Field(default_factory=list, max_length=24)
     requests: list[ReadRequest] = Field(default_factory=list,max_length=12)
     change_request: str = ""
@@ -90,31 +99,6 @@ def apply_replacements(value, targets, repair):
     return result
 
 
-def repair_context(original, targets, context, limit):
-    """Include located object context and complete relevant snippets, never a cut JSON prefix."""
-    objects=[]; wanted=set()
-    for target in targets:
-        route=parts(target['path'])
-        if len(route)>=2 and route[0] in {'claims','bindings','relations','units'}:
-            obj=original[route[0]][int(route[1])]
-            if obj not in objects: objects.append(obj)
-            if obj.get('material_id'):wanted.add(obj['material_id'])
-            wanted.update(obj.get('source_ids',[]))
-    available=context.get('materials',[])
-    selected=[]; omitted=[]
-    for material in available:
-        if wanted and material['id'] not in wanted: continue
-        if len(json.dumps({'objects':objects,'materials':selected+[material]},ensure_ascii=False))<=limit:
-            selected.append(material)
-        else: omitted.append(material['id'])
-    result={'objects':objects,'materials':selected,'omitted_material_ids':omitted,
-        'source_limit':'Omitted snippets are not available; do not infer their contents'}
-    if len(json.dumps(result,ensure_ascii=False))>limit:
-        result={'objects':[], 'materials':[], 'omitted_material_ids':list(wanted),
-            'source_limit':'Related objects exceed the context budget; only the reported fields are supplied'}
-    return result
-
-
 def diagnostic_targets(value,diagnostics,limit):
     """Resolve typed paths, including graph drafts nested in feedback and build replies."""
     def prefix_for(node,d):
@@ -147,26 +131,7 @@ def diagnostic_targets(value,diagnostics,limit):
     return result
 
 
-def all_materials(context):
-    found={};views={};descriptors=[]
-    def walk(value):
-        if isinstance(value,dict):
-            if 'source_text_pool' in value:
-                for m in value['source_text_pool']:views[m['id']]=m
-            if {'id','file','start_line','end_line'}<=set(value):
-                if 'source_view_id' in value:descriptors.append(value)
-                elif 'text' in value and not value['id'].startswith('source-view-'):found[value['id']]=value
-            for k,v in value.items():
-                if k not in {'raw_output','prompt','text','source_text_pool'}:walk(v)
-        elif isinstance(value,list):
-            for v in value:walk(v)
-    walk(context)
-    for m in descriptors:
-        view=views.get(m['source_view_id'])
-        if view and view['file']==m['file'] and view['start_line']<=m['start_line']<=m['end_line']<=view['end_line']:
-            material={k:v for k,v in m.items() if k!='source_view_id'}
-            material['text']='\n'.join(view['text'].split('\n')[m['start_line']-view['start_line']:m['end_line']-view['start_line']+1]);found[m['id']]=material
-    return list(found.values())
+from .sources import all_materials
 
 
 def diagnostic_context(candidate,diagnostics,context,limit):
@@ -180,27 +145,31 @@ def diagnostic_context(candidate,diagnostics,context,limit):
             for value in node:collect(value)
     collect(context)
     collect(candidate)
-    pending=list(ids);visited=set()
-    while pending:
-        id=pending.pop()
-        if id in visited or id not in index:continue
-        visited.add(id);obj=index[id];objects.append(obj)
-        wanted.update(obj.get('source_ids',[]))
-        if obj.get('material_id'):wanted.add(obj['material_id'])
-        anchor=obj.get('anchor') or {}
-        if anchor.get('material_id'):wanted.add(anchor['material_id'])
-        basis=obj.get('grounding',{});wanted.update(basis.get('behavior_ids',[])+basis.get('expectation_ids',[]))
-        if 'source' in obj and 'target' in obj:pending.extend(basis.get('binding_ids',[]))
-        for key in ['goal_ids','obligation_ids','binding_ids','relation_ids']:pending.extend(obj.get(key,[]))
-        for key in ['source','target','claim_id']:
-            if obj.get(key) in index:pending.append(obj[key])
-        for association in obj.get('associations',[]):pending.append(association['claim_id']);wanted.update(association.get('source_ids',[]))
-        for use in obj.get('code_uses',[]):pending.extend(use.get('claim_ids',[])+use.get('relation_ids',[]));wanted.update(use.get('source_ids',[]))
+    from .sources import dependency_closure
+    sources,visited=dependency_closure(index,ids);wanted.update(sources)
+    objects=[index[id] for id in sorted(visited)]
+    # Current explicit requests take precedence over a large historical object closure.
+    explicit=list(dict.fromkeys(context.get('repair_requested_material_ids',[])))
+    available={m['id']:m for m in all_materials(context)}
+    wanted.update(explicit)
+    direct=[o for o in objects if o.get('id') in ids]
+    objects=direct
     selected=[];omitted=[]
-    priority={id:i for i,id in enumerate(id for d in diagnostics for id in d.material_ids)}
-    for material in sorted(all_materials(context),key=lambda m:priority.get(m['id'],len(priority))):
-        if material['id'] not in wanted:continue
+    priority=list(dict.fromkeys(explicit+[id for d in diagnostics for id in d.material_ids]+sorted(wanted)))
+    for id in priority:
+        material=available.get(id)
+        if material is None:omitted.append(id);continue
         if len(json.dumps({'objects':objects,'materials':selected+[material]},ensure_ascii=False))<=limit:selected.append(material)
-        else:omitted.append(material['id'])
+        else:omitted.append(id)
     if len(json.dumps(objects,ensure_ascii=False))>limit:objects=[]
-    return {'objects':objects,'materials':selected,'omitted_material_ids':sorted(set(omitted)|(wanted-{m['id'] for m in selected})), 'source_limit':'Omitted material is not available in this request; ask to attach or read it'}
+    return {'objects':objects,'materials':selected,'omitted_material_ids':sorted(set(omitted)),
+        'required_material_ids':explicit,'required_materials_missing':[id for id in explicit if id not in {m['id'] for m in selected}],
+        'source_limit':'Omitted material is not available. Previously recorded analysis is evidence history, not a substitute for newly requested source.'}
+
+
+def save_session(engine,session):
+    from consensus_assurance.adapters.storage.files import write_json
+    engine.state.pending_output_repair=session
+    engine.state.repair_sessions[session['id']]=session
+    write_json(engine.root/'repair-sessions'/session['id']/'session.json',session)
+    engine.checkpoint('output_repair_pending')

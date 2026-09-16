@@ -1,0 +1,758 @@
+{
+  "understanding": "The supplied continuation establishes the missing leader-to-FSM path: leaderLoop samples the commitment index, selects committed inflight futures by log index, passes the last selected index and future map to processLogs, and removes those futures from inflight ownership. processLogs prepares ordered tuples, and runFSM applies them through single or filtered batch delivery before responding. This supports a bounded handoff audit, including command and response identity. It does not establish eventual application, replication durability, or end-to-end correctness.",
+  "requests": [],
+  "responsibilities": [
+    {
+      "id": "RESP_apply_commit",
+      "description": "Accept client commands, collect voter replication support and expose commitment for downstream application.",
+      "source_ids": [
+        "api.go:800:907",
+        "commitment.go:1:104",
+        "docs/apply.md:1:100",
+        "config.go:138:245"
+      ],
+      "entry_points": [
+        "Apply",
+        "ApplyLog",
+        "newCommitment",
+        "match",
+        "recalculate"
+      ],
+      "claim_ids": [
+        "G_apply",
+        "O_commit",
+        "O_fsm_handoff"
+      ],
+      "handoffs": [
+        {
+          "covered_by_unit_ids": [
+            "U_fsm_handoff"
+          ],
+          "no_separate_check_reason": "",
+          "target_id": "RESP_fsm",
+          "source_ids": [
+            "docs/apply.md:1:100",
+            "fsm.go:1:180"
+          ],
+          "description": "Commitment eventually permits FSM application and future completion. The producer-to-delivery path remains unrepresented; bounded FSM continuation reading is requested."
+        }
+      ],
+      "questions": [
+        "How are commitment instances and startIndex tied to leadership terms?",
+        "What actual path correlates a committed command with its future response?"
+      ],
+      "applicability": "Normal Apply processing; admission timeout and BatchApplyCh affect timing, and leadership-loss errors do not establish absence of effects.",
+      "version": 1
+    },
+    {
+      "id": "RESP_fsm",
+      "description": "Apply committed commands, correlate responses and capture application snapshots through single or batched FSM interfaces.",
+      "source_ids": [
+        "fsm.go:1:180",
+        "api.go:800:907",
+        "docs/README.md:1:100"
+      ],
+      "entry_points": [
+        "runFSM",
+        "FSM.Apply",
+        "BatchingFSM.ApplyBatch",
+        "FSM.Snapshot",
+        "Barrier"
+      ],
+      "claim_ids": [
+        "G_apply",
+        "O_fsm_handoff"
+      ],
+      "handoffs": [
+        {
+          "covered_by_unit_ids": [],
+          "no_separate_check_reason": "",
+          "target_id": "RESP_snapshot",
+          "source_ids": [
+            "fsm.go:1:180",
+            "snapshot.go:125:215"
+          ],
+          "description": "FSM capture must provide state and matching index and term. The producer is outside the supplied runFSM excerpt and needs bounded continuation reading."
+        }
+      ],
+      "questions": [
+        "How do filtered batch entries retain correct response correspondence?",
+        "What does the documented batch no-gaps statement mean when barriers are filtered?",
+        "How are capture indexes produced when configuration entries are not handled by ConfigurationStore?"
+      ],
+      "applicability": "Behavior depends on BatchingFSM and ConfigurationStore support. No batch-contiguity defect is asserted from the partial implementation.",
+      "version": 1
+    }
+  ],
+  "patch": {
+    "claims": [
+      {
+        "id": "O_fsm_handoff",
+        "kind": "obligation",
+        "description": "During normal leader command processing, delivery to the FSM must preserve the command selected under the sampled commitment frontier. A command's successful future completion must follow return of its corresponding FSM application call and expose that command's returned response, including when filtering entries for BatchingFSM.",
+        "source_ids": [
+          "docs/apply.md:1:100",
+          "api.go:800:907",
+          "raft.go:450:800",
+          "raft.go:801:880",
+          "raft.go:1180:1439",
+          "fsm.go:1:180",
+          "fsm.go:181:285",
+          "future.go:100:170"
+        ],
+        "scope": {
+          "description": "Safety of the leader commitment-consumption path from dispatched command futures through selection, tuple construction, FSM delivery and successful completion. Both single and batched FSM interfaces are included. Other log types are retained as filtering context.",
+          "assumptions": [
+            "Main-thread operations are serialized as described by the supplied implementation comments, while runFSM may interleave with that thread.",
+            "Channel behavior follows Go send, receive and ordering semantics; no synchronized rounds or empty-channel boundaries are assumed.",
+            "LogStore retrieval supplies the requested stored entry on success. Storage integrity and durability remain unverified external guarantees.",
+            "A conforming BatchingFSM returns one response per supplied entry in the same order, as its interface requires. Whether library routing preserves that correspondence is checked rather than assumed.",
+            "FSM methods are opaque application callbacks. A returned callback is an observable library boundary, not independent evidence that the application implemented its state transition correctly."
+          ],
+          "excluded": [
+            "Unconditional eventual application or future completion.",
+            "Follower AppendEntries delivery and snapshot installation.",
+            "Explicit user snapshot restoration and startup recovery.",
+            "Proof of replication durability, valid membership histories or commitment-report provenance.",
+            "A guarantee that an error future excludes later command effects.",
+            "Resolution of the BatchingFSM no-gaps wording or a complete Barrier audit."
+          ],
+          "parameters": {
+            "delivery_modes": [
+              "FSM.Apply",
+              "BatchingFSM.ApplyBatch"
+            ],
+            "correlation_fields": [
+              "local Raft instance",
+              "Log.Index",
+              "Log.Term",
+              "logFuture object identity"
+            ]
+          }
+        },
+        "pending": [
+          "Build and check an executable model of the actual producer-to-consumer sequence.",
+          "Review checker correspondence separately for commitment-frontier preservation and response association.",
+          "Establish commitment inputs through the existing O_commit dependency before interpreting this local check as evidence of committed replication support."
+        ],
+        "grounding": {
+          "behavior_ids": [
+            "raft.go:450:800",
+            "raft.go:801:880",
+            "raft.go:1180:1439",
+            "fsm.go:1:180",
+            "fsm.go:181:285",
+            "future.go:100:170"
+          ],
+          "expectation_ids": [
+            "docs/apply.md:1:100",
+            "api.go:800:907",
+            "fsm.go:1:180"
+          ],
+          "binding_ids": [
+            "B_handoff_dispatch",
+            "B_handoff_frontier",
+            "B_handoff_select",
+            "B_handoff_process",
+            "B_handoff_prepare",
+            "B_handoff_fsm_apply",
+            "B_handoff_batch_complete",
+            "B_handoff_fsm_receive"
+          ],
+          "derivation": "Apply promises a future for application, the FSM interface requires commitment before application and return of the callback value through ApplyFuture.Response, and BatchingFSM specifies positional response correspondence. Observed code supplies a concrete chain from indexed logFuture objects through an index-keyed map and commitTuple objects to callback invocation and future response. The obligation checks preservation across that chain; the observed implementation alone does not establish compliance.",
+          "applicability": "Applicable to normal leader-originated LogCommand futures. Filtered barriers, no-ops and configurations can affect routing and therefore remain behavioral context without becoming separately checked obligations.",
+          "unresolved": [
+            "Commitment accumulator guarantees remain conditional on its actual input producers and membership context.",
+            "The full future interface documentation is not supplied; this obligation relies on the explicit Apply and FSM interface statements and does not define a broader concurrent-reader contract.",
+            "Shutdown can leave queued work unapplied; this proposal makes no eventual-completion claim.",
+            "The BatchingFSM no-gaps statement and filtering behavior require a separate semantic judgment."
+          ],
+          "conflicts": [
+            "The logFuture structure comment describes waiting for commitment, while Apply and FSM interface statements describe application and application responses. This proposal attributes its stronger command-completion expectation to those public interface statements and preserves the comment discrepancy."
+          ],
+          "alternatives": [
+            "BatchingFSM can complete several commands after one callback returns; separate callback invocations per command are not required.",
+            "Entries without local futures can be loaded from LogStore, while locally dispatched commands retain their logFuture objects.",
+            "processLogs may complete ignored non-command entries directly. That branch is not automatically a violation of the command-specific obligation."
+          ]
+        }
+      }
+    ],
+    "bindings": [
+      {
+        "associations": [
+          {
+            "claim_id": "O_fsm_handoff",
+            "source_ids": [
+              "raft.go:1180:1439"
+            ],
+            "rationale": "Establishes the command's index, term and inflight future identity before commitment selection."
+          }
+        ],
+        "anchor": {
+          "kind": "declaration",
+          "material_id": "raft.go:1180:1439",
+          "start_line": 1244,
+          "end_line": 1283,
+          "symbol": "dispatchLogs"
+        },
+        "id": "B_handoff_dispatch",
+        "material_id": "raft.go:1180:1439",
+        "symbol": "dispatchLogs",
+        "start_line": 1247,
+        "end_line": 1276,
+        "description": "Assigns increasing indexes and the current term to future-owned logs, appends futures to inflight, stores the logs and reports local matching progress after successful storage.",
+        "pending": [
+          "Storage durability is not checked by this binding."
+        ]
+      },
+      {
+        "associations": [
+          {
+            "claim_id": "O_fsm_handoff",
+            "source_ids": [
+              "raft.go:450:800",
+              "commitment.go:1:104"
+            ],
+            "rationale": "Consumes the commitment accumulator's frontier used by subsequent inflight selection."
+          }
+        ],
+        "anchor": {
+          "kind": "declaration",
+          "material_id": "raft.go:450:800",
+          "start_line": 667,
+          "end_line": 667,
+          "symbol": "leaderLoop"
+        },
+        "id": "B_handoff_frontier",
+        "material_id": "raft.go:450:800",
+        "symbol": "leaderLoop",
+        "start_line": 785,
+        "end_line": 800,
+        "description": "Handles commit notification, samples the accumulator index, updates the Raft commit index and handles configuration commitment.",
+        "pending": [
+          "The sampled index's replication support is a directed dependency on O_commit, not established by this consumer."
+        ]
+      },
+      {
+        "associations": [
+          {
+            "claim_id": "O_fsm_handoff",
+            "source_ids": [
+              "raft.go:801:880"
+            ],
+            "rationale": "Maps selected committed log indexes to their actual futures and transfers completion ownership toward processLogs and runFSM."
+          }
+        ],
+        "anchor": {
+          "kind": "declaration",
+          "material_id": "raft.go:450:800",
+          "start_line": 667,
+          "end_line": 667,
+          "symbol": "leaderLoop"
+        },
+        "id": "B_handoff_select",
+        "material_id": "raft.go:801:880",
+        "symbol": "leaderLoop",
+        "start_line": 802,
+        "end_line": 830,
+        "description": "Selects an inflight prefix through commitIndex, constructs groupFutures, calls processLogs with lastIdxInGroup and removes the selected inflight elements afterward.",
+        "pending": []
+      },
+      {
+        "associations": [
+          {
+            "claim_id": "O_fsm_handoff",
+            "source_ids": [
+              "raft.go:1180:1439"
+            ],
+            "rationale": "Constructs the ordered delivery tuples and preserves the future associated with each selected log index."
+          }
+        ],
+        "anchor": {
+          "kind": "declaration",
+          "material_id": "raft.go:1180:1439",
+          "start_line": 1290,
+          "end_line": 1290,
+          "symbol": "processLogs"
+        },
+        "id": "B_handoff_process",
+        "material_id": "raft.go:1180:1439",
+        "symbol": "processLogs",
+        "start_line": 1290,
+        "end_line": 1357,
+        "description": "Traverses indexes beyond lastApplied, obtains entries from futures or storage, batches prepared tuples, sends them to fsmMutateCh or responds with shutdown errors, and advances lastApplied after processing.",
+        "pending": [
+          "lastApplied advancement records this processing path and must not be used as independent evidence that the asynchronous FSM callback has returned.",
+          "Storage fallback correctness is an explicit environment boundary."
+        ]
+      },
+      {
+        "associations": [
+          {
+            "claim_id": "O_fsm_handoff",
+            "source_ids": [
+              "raft.go:1180:1439"
+            ],
+            "rationale": "Determines which log types reach the FSM and whether command/future identity survives tuple preparation."
+          }
+        ],
+        "anchor": {
+          "kind": "declaration",
+          "material_id": "raft.go:1180:1439",
+          "start_line": 1360,
+          "end_line": 1360,
+          "symbol": "prepareLog"
+        },
+        "id": "B_handoff_prepare",
+        "material_id": "raft.go:1180:1439",
+        "symbol": "prepareLog",
+        "start_line": 1360,
+        "end_line": 1384,
+        "description": "Preserves log and future pointers for commands and barriers, conditionally forwards configurations and filters ignored entry types.",
+        "pending": []
+      },
+      {
+        "associations": [
+          {
+            "claim_id": "O_fsm_handoff",
+            "source_ids": [
+              "fsm.go:1:180"
+            ],
+            "rationale": "Implements single-entry application and batch filtering, invocation and positional response selection."
+          }
+        ],
+        "anchor": {
+          "kind": "declaration",
+          "material_id": "fsm.go:1:180",
+          "start_line": 86,
+          "end_line": 86,
+          "symbol": "runFSM"
+        },
+        "id": "B_handoff_fsm_apply",
+        "material_id": "fsm.go:1:180",
+        "symbol": "runFSM",
+        "start_line": 92,
+        "end_line": 180,
+        "description": "Single delivery defers response assignment and successful completion until callback processing returns. Batch delivery filters command/configuration entries, invokes ApplyBatch, checks response count and selects responses using the same filter.",
+        "pending": [
+          "Batch future assignment and completion continue in B_handoff_batch_complete.",
+          "The application owns correctness of callback results and compliance with positional response requirements."
+        ]
+      },
+      {
+        "associations": [
+          {
+            "claim_id": "O_fsm_handoff",
+            "source_ids": [
+              "fsm.go:181:285",
+              "fsm.go:1:180"
+            ],
+            "rationale": "Completes each batch tuple's actual future with the response selected by the preceding filter-aware loop."
+          }
+        ],
+        "anchor": {
+          "kind": "declaration",
+          "material_id": "fsm.go:1:180",
+          "start_line": 86,
+          "end_line": 86,
+          "symbol": "runFSM"
+        },
+        "id": "B_handoff_batch_complete",
+        "material_id": "fsm.go:181:285",
+        "symbol": "runFSM",
+        "start_line": 181,
+        "end_line": 186,
+        "description": "Assigns the selected response to req.future and calls respond(nil) after the batch callback has returned.",
+        "pending": []
+      },
+      {
+        "associations": [
+          {
+            "claim_id": "O_fsm_handoff",
+            "source_ids": [
+              "fsm.go:181:285",
+              "api.go:70:160"
+            ],
+            "rationale": "Connects actual fsmMutateCh receipt to batch processing in the FSM goroutine."
+          }
+        ],
+        "anchor": {
+          "kind": "declaration",
+          "material_id": "fsm.go:1:180",
+          "start_line": 86,
+          "end_line": 86,
+          "symbol": "runFSM"
+        },
+        "id": "B_handoff_fsm_receive",
+        "material_id": "fsm.go:181:285",
+        "symbol": "runFSM",
+        "start_line": 237,
+        "end_line": 263,
+        "description": "Receives mutation messages and dispatches commitTuple batches to applyBatch; the same loop also handles restore, snapshot and shutdown events.",
+        "pending": [
+          "Restore behavior is outside the selected unit's execution scope."
+        ]
+      }
+    ],
+    "relations": [
+      {
+        "id": "R_handoff_depends_commit",
+        "source": "O_fsm_handoff",
+        "target": "O_commit",
+        "kind": "depends_all",
+        "group": null,
+        "rationale": "The handoff consumes an accumulator-produced commit index. Preservation of that frontier can contribute to committed FSM delivery only if the producer provides the support described by O_commit under its own unresolved input conditions.",
+        "pending": [
+          "Neither the producer's guarantee nor its input provenance is assumed discharged by the handoff check."
+        ],
+        "grounding": {
+          "behavior_ids": [
+            "commitment.go:1:104",
+            "raft.go:450:800",
+            "raft.go:801:880"
+          ],
+          "expectation_ids": [
+            "docs/apply.md:1:100",
+            "fsm.go:1:180"
+          ],
+          "binding_ids": [
+            "B_commit_recalculate",
+            "B_handoff_frontier",
+            "B_handoff_select"
+          ],
+          "derivation": "recalculate advances the accumulator and notifies commitCh; leaderLoop samples that accumulator and selects inflight entries under the resulting index. This is a concrete producer-consumer dependency.",
+          "applicability": "Leader commitment consumption in normal command processing.",
+          "unresolved": [
+            "Report provenance, durability and admissible membership histories remain boundaries of O_commit."
+          ],
+          "conflicts": [],
+          "alternatives": [
+            "A local handoff check may preserve arbitrary supplied frontiers without establishing that those frontiers represent real commitment."
+          ]
+        }
+      },
+      {
+        "id": "R_handoff_supports_apply",
+        "source": "O_fsm_handoff",
+        "target": "G_apply",
+        "kind": "supports",
+        "group": null,
+        "rationale": "Preserving the selected committed command through delivery connects commitment production to the FSM event relevant to G_apply. Response association provides a command-specific completion witness but does not prove replication support.",
+        "pending": [
+          "Follower delivery, recovery and upstream support remain outside this unit."
+        ],
+        "grounding": {
+          "behavior_ids": [
+            "raft.go:801:880",
+            "raft.go:1180:1439",
+            "fsm.go:1:180",
+            "fsm.go:181:285"
+          ],
+          "expectation_ids": [
+            "docs/apply.md:1:100",
+            "fsm.go:1:180"
+          ],
+          "binding_ids": [
+            "B_handoff_select",
+            "B_handoff_process",
+            "B_handoff_fsm_apply",
+            "B_handoff_batch_complete"
+          ],
+          "derivation": "The existing goal concerns committed support for delivered commands. Checking preservation of command identity and the commitment frontier across the actual delivery path supplies one necessary contribution, without discharging the complete goal.",
+          "applicability": "Normal leader-originated command delivery only.",
+          "unresolved": [
+            "A full goal witness requires actual correlated replication support and FSM delivery in the same justified execution."
+          ],
+          "conflicts": [],
+          "alternatives": []
+        }
+      }
+    ],
+    "units": [
+      {
+        "audit_question": {
+          "question": "Does the leader commitment-to-FSM path preserve each selected command and its future, keeping delivery within the consumed commitment frontier and successful completion after the corresponding callback return with the correct response in both delivery modes?",
+          "importance": "Clients rely on Apply completion and response values for a particular command. A routing error could apply an unsupported command, associate a response with another command or signal application before the callback returns.",
+          "source_ids": [
+            "docs/apply.md:1:100",
+            "api.go:800:907",
+            "raft.go:450:800",
+            "raft.go:801:880",
+            "raft.go:1180:1439",
+            "fsm.go:1:180",
+            "fsm.go:181:285",
+            "future.go:100:170"
+          ],
+          "participants": [
+            "Leader main thread",
+            "Commitment accumulator",
+            "FSM goroutine",
+            "Application FSM",
+            "Client holding an Apply future"
+          ],
+          "objects": [
+            "Log",
+            "logFuture",
+            "Inflight list",
+            "groupFutures",
+            "commitTuple batch",
+            "Filtered sendLogs and responses"
+          ],
+          "contexts": [
+            "Local Raft instance and leadership context",
+            "Log index and term",
+            "Sampled commitment frontier",
+            "Single versus batched FSM",
+            "Configuration and barrier filtering",
+            "Asynchronous queued delivery"
+          ],
+          "event_paths": [
+            "dispatchLogs -> inflight selection under commitIndex -> processLogs -> prepareLog -> fsmMutateCh receive -> FSM callback return -> matching future response",
+            "Mixed tuple batch -> command/configuration filter -> ApplyBatch return -> filter-aware response association -> matching future completion"
+          ],
+          "points": [
+            {
+              "sequence_required": true,
+              "id": "CP_handoff_command_sequence",
+              "phase": "handoff",
+              "source_ids": [
+                "raft.go:1180:1439",
+                "raft.go:450:800",
+                "raft.go:801:880",
+                "fsm.go:1:180",
+                "fsm.go:181:285"
+              ],
+              "binding_ids": [
+                "B_handoff_dispatch",
+                "B_handoff_frontier",
+                "B_handoff_select",
+                "B_handoff_process",
+                "B_handoff_prepare",
+                "B_handoff_fsm_receive",
+                "B_handoff_fsm_apply",
+                "B_handoff_batch_complete"
+              ],
+              "claim_ids": [
+                "O_fsm_handoff"
+              ],
+              "question": "Can one history correlate dispatch, selection, delivery, callback return and successful completion for the same local Raft instance, Log.Index, Log.Term and logFuture object, including a batch with filtered entries?",
+              "unknowns": [
+                "Joint sequence reachability has not been checked.",
+                "No actual correlated implementation observations or executable trace checks are supplied.",
+                "The framework must not substitute independent point reachability or lastApplied advancement for callback completion."
+              ]
+            }
+          ],
+          "trigger_rationale": "The unassigned RESP_apply_commit to RESP_fsm handoff now has supplied producer-selection and consumer-continuation code sufficient to propose a bounded executable check."
+        },
+        "code_uses": [
+          {
+            "binding_id": "B_handoff_dispatch",
+            "role": "direct",
+            "claim_ids": [
+              "O_fsm_handoff"
+            ],
+            "relation_ids": [],
+            "source_ids": [
+              "raft.go:1180:1439"
+            ],
+            "rationale": "Models actual assignment and preservation of log/future identity before handoff.",
+            "unverified": [
+              "Durable storage semantics."
+            ]
+          },
+          {
+            "binding_id": "B_handoff_frontier",
+            "role": "direct",
+            "claim_ids": [
+              "O_fsm_handoff"
+            ],
+            "relation_ids": [],
+            "source_ids": [
+              "raft.go:450:800"
+            ],
+            "rationale": "Models the sampled frontier used by the consumer.",
+            "unverified": [
+              "Whether the sampled frontier has valid replication support."
+            ]
+          },
+          {
+            "binding_id": "B_handoff_select",
+            "role": "direct",
+            "claim_ids": [
+              "O_fsm_handoff"
+            ],
+            "relation_ids": [],
+            "source_ids": [
+              "raft.go:801:880"
+            ],
+            "rationale": "Models selection, index-to-future mapping and removal from inflight ownership.",
+            "unverified": []
+          },
+          {
+            "binding_id": "B_handoff_process",
+            "role": "direct",
+            "claim_ids": [
+              "O_fsm_handoff"
+            ],
+            "relation_ids": [],
+            "source_ids": [
+              "raft.go:1180:1439"
+            ],
+            "rationale": "Models ordered tuple production, batching and send-versus-shutdown behavior.",
+            "unverified": [
+              "Correctness of successful LogStore retrieval."
+            ]
+          },
+          {
+            "binding_id": "B_handoff_prepare",
+            "role": "direct",
+            "claim_ids": [
+              "O_fsm_handoff"
+            ],
+            "relation_ids": [],
+            "source_ids": [
+              "raft.go:1180:1439"
+            ],
+            "rationale": "Models actual entry-type filtering and pointer association.",
+            "unverified": []
+          },
+          {
+            "binding_id": "B_handoff_fsm_apply",
+            "role": "direct",
+            "claim_ids": [
+              "O_fsm_handoff"
+            ],
+            "relation_ids": [],
+            "source_ids": [
+              "fsm.go:1:180"
+            ],
+            "rationale": "Models callback invocation, filtered batch construction and response selection.",
+            "unverified": [
+              "Application callback correctness and BatchingFSM positional-contract compliance."
+            ]
+          },
+          {
+            "binding_id": "B_handoff_batch_complete",
+            "role": "direct",
+            "claim_ids": [
+              "O_fsm_handoff"
+            ],
+            "relation_ids": [],
+            "source_ids": [
+              "fsm.go:181:285",
+              "future.go:100:170"
+            ],
+            "rationale": "Models response assignment and successful completion for the selected future.",
+            "unverified": [
+              "A broader concurrent-client future-access contract is not checked."
+            ]
+          },
+          {
+            "binding_id": "B_handoff_fsm_receive",
+            "role": "direct",
+            "claim_ids": [
+              "O_fsm_handoff"
+            ],
+            "relation_ids": [],
+            "source_ids": [
+              "fsm.go:181:285",
+              "api.go:70:160"
+            ],
+            "rationale": "Models asynchronous mutation receipt and dispatch into application processing.",
+            "unverified": [
+              "No unconditional scheduling fairness or eventual receipt guarantee is asserted."
+            ]
+          },
+          {
+            "binding_id": "B_commit_recalculate",
+            "role": "input",
+            "claim_ids": [
+              "O_commit"
+            ],
+            "relation_ids": [
+              "R_handoff_depends_commit"
+            ],
+            "source_ids": [
+              "commitment.go:1:104"
+            ],
+            "rationale": "Identifies the selected directed producer of the consumed commitment frontier. O_commit is contextual input and is not a checked obligation of this unit.",
+            "unverified": [
+              "O_commit itself is not discharged by this unit.",
+              "Report provenance, durable replication and legal membership history."
+            ]
+          }
+        ],
+        "coverage_intent": [],
+        "id": "U_fsm_handoff",
+        "goal_ids": [
+          "G_apply"
+        ],
+        "obligation_ids": [
+          "O_fsm_handoff"
+        ],
+        "binding_ids": [
+          "B_handoff_dispatch",
+          "B_handoff_frontier",
+          "B_handoff_select",
+          "B_handoff_process",
+          "B_handoff_prepare",
+          "B_handoff_fsm_apply",
+          "B_handoff_batch_complete",
+          "B_handoff_fsm_receive",
+          "B_commit_recalculate"
+        ],
+        "relation_ids": [
+          "R_handoff_depends_commit",
+          "R_handoff_supports_apply"
+        ],
+        "scope": {
+          "description": "A bounded leader command-delivery safety check retaining actual asynchronous handoff, both FSM interfaces and entry filtering. Begin at dispatchLogs with initialized leader state and represent later callbacks and completion as separate events.",
+          "assumptions": [
+            "Main-thread state changes are serialized; FSM processing is independently scheduled.",
+            "Storage reads return the requested entry on success; storage and commitment provenance remain explicit unresolved boundaries.",
+            "Application callbacks satisfy their declared response-shape contract.",
+            "Correlation uses existing log index, term and future object identity within the local Raft instance."
+          ],
+          "excluded": [
+            "Explicit user restore, startup recovery and follower delivery.",
+            "Unconditional liveness and a general completion deadline.",
+            "Proof of O_commit or G_apply as a whole.",
+            "Full membership, Barrier and snapshot obligations."
+          ],
+          "parameters": {
+            "required_variants": [
+              "single FSM",
+              "batching FSM",
+              "multiple delivery batches",
+              "mixed command and filtered entries",
+              "queued work before completion"
+            ]
+          }
+        },
+        "rationale": "The newly supplied continuation closes the concrete producer-to-consumer mapping gap without requiring new source acquisition. One obligation checks the handoff while preserving commitment production as a directed, unverified dependency.",
+        "goal_observable": false
+      }
+    ],
+    "expected_versions": {
+      "G_apply": 1,
+      "O_commit": 1
+    },
+    "rationale": "Add one candidate obligation and one bounded unit for the previously unassigned commitment-to-FSM handoff. Existing claim meanings, assumptions and pending conditions remain unchanged. Responsibility entries retain version 1 and existing semantic text while adding the proposed claim and unit assignment.",
+    "gaps": [
+      "Assigning U_fsm_handoff represents planned checking, not completed coverage or proof of the handoff's eventual-delivery wording.",
+      "G_apply retains unresolved upstream replication, membership and durability dependencies.",
+      "The newly visible snapshot capture producer has not been connected to the snapshot consumer in this task.",
+      "Batch no-gaps wording, complete Barrier behavior and non-command completion expectations remain separate semantic questions.",
+      "No executable model, checker result, calibration or implementation reproduction is supplied."
+    ]
+  },
+  "exploration_requests": [],
+  "limitations": [
+    "This is a proposal based solely on supplied materials; no tools were called or code executed.",
+    "The unit requires same-history correlation of actual command and future identities. Separate event reachability cannot establish its ordered handoff.",
+    "The finite remaining call budget does not cover the 17 pending inquiries. This proposal adds no additional reading request and does not imply those inquiries are resolved.",
+    "Responsibility handoff descriptions and accepted claim pending text retain historical uncertainties; the additive unit assignment does not silently revise those semantic objects."
+  ]
+}

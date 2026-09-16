@@ -25,7 +25,7 @@ from .errors import Blocked
 from .agent_tasks import ask as ask_agent
 
 
-FRAMEWORK_REVISION = "round8"
+FRAMEWORK_REVISION = "round9"
 
 
 class Engine:
@@ -369,29 +369,8 @@ class Engine:
         """Interruption test seam after durable model files, before state registration."""
 
     def check_triggers(self,model,bundle):
-        from consensus_assurance.core.types import ReachabilityResult
-        for req in bundle.reachability:
-            while True:
-                prior=[r for r in self.state.reachability_results if r.model_id==model.id and r.requirement_id==req.id and r.search_fingerprint==model.search_fingerprint]
-                if prior and prior[-1].status in {'reachable','unreachable'}:break
-                last=next((c for c in self.state.checks if prior and c.id==prior[-1].check_id),None)
-                retryable=not prior or (last is not None and last.status.value in {'timeout','error'})
-                allowed=retryable and len(prior)<=self.config.budget.trigger_retries
-                task=next((t for t in self.state.trigger_retry_tasks if t['model_id']==model.id and t['requirement_id']==req.id and t['search_fingerprint']==model.search_fingerprint),None)
-                if task is None:
-                    task={'model_id':model.id,'requirement_id':req.id,'search_fingerprint':model.search_fingerprint,'attempts':[]}
-                    self.state.trigger_retry_tasks.append(task)
-                task['status']='pending' if allowed else 'blocked'
-                task['reason']='Bounded retry of incomplete tool execution' if allowed else 'Retry limit reached or failure needs a tool/input change'
-                if not allowed:break
-                self.checkpoint('trigger_attempt_pending')
-                result=self.action("reachability:"+req.id,"reachability_checks",lambda:self.verifier.reachability(self.runner,model,bundle,req,self.budget.timeout()),{"model_id":model.id,"requirement":req.model_dump(mode='json'),"search_fingerprint":model.search_fingerprint,"attempt":len(prior)+1})
-                record=ReachabilityResult.model_validate(result[0]);check=CheckRun.model_validate(result[1])
-                if not any(r.check_id==record.check_id for r in self.state.reachability_results):self.state.reachability_results.append(record)
-                if check.id not in task['attempts']:task['attempts'].append(check.id)
-                task['status']=record.status
-                self.record(check)
-                self.advance("triggers")
+        from .modeling import check_triggers
+        return check_triggers(self,model,bundle)
 
     def finish_unit(self, unit, status="checked"):
         unit.coverage_limitations=coverage_limitations(self.state,unit)

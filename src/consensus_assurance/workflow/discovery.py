@@ -30,6 +30,12 @@ def context(engine, unit=None):
             "claims":[c.model_dump(mode="json") if c.id in closure else {"id":c.id,"kind":c.kind,"description":c.description,"version":c.version} for c in engine.state.claims],
             "bindings":[b.model_dump(mode="json") for b in engine.state.bindings if b.id in closure],
             "relations":[e.model_dump(mode="json") for e in engine.state.relations if e.id in closure or e.source in closure]})
+        result['modeling_brief']={
+            'unit_id':unit.id,'unit_version':unit.version,'question':unit.audit_question.model_dump(mode='json') if unit.audit_question else unit.rationale,
+            'checked_claim_ids':unit.obligation_ids,'goal_ids':unit.goal_ids,'scope':unit.scope.model_dump(mode='json'),
+            'binding_ids':unit.binding_ids,'relation_ids':unit.relation_ids,
+            'remaining_conditions':unit.coverage_limitations+[x for use in unit.code_uses for x in use.unverified],
+            'basis':'Derived view of current G/O/C; referenced objects and actual source are in this packet, not a separate specification'}
     return result
 
 def discover(engine):
@@ -105,8 +111,8 @@ def targeted_read(engine, unit, gap, relation_ids=None, requests=None, update_re
         engine.state.targeted_gap=None;engine.checkpoint('material_context_returned');return None
     from .scope_updates import from_patch,validate_scope_update,ScopeUpdate,ScopeAssessment,accept
     def validate_proposal(p):
-        from .mutations import write_set
-        if unit and write_set(engine.state,p):validate_scope_update(engine.state,from_patch(engine.state,unit,p))
+        from .mutations import write_set,classify_writes
+        if unit and classify_writes(write_set(engine.state,p),unit.id)!='candidate_additions':validate_scope_update(engine.state,from_patch(engine.state,unit,p))
         else:validate_patch(engine.state,p)
     if task.get('scope_update'):
         update=ScopeUpdate.model_validate(task['scope_update'])
@@ -129,8 +135,8 @@ def targeted_read(engine, unit, gap, relation_ids=None, requests=None, update_re
                 inquiry.enqueue(engine.state,'review','Resolve the proposed semantic/scope difference before applying any part', 'scope_dispute:'+pending.id,target_ids=sorted({c.target_id for c in pending.changes}),unit_id=unit.id)
                 engine.checkpoint('scope_dispute_queued')
             raise
-        from .mutations import write_set
-        if unit and write_set(engine.state,patch):
+        from .mutations import write_set,classify_writes
+        if unit and classify_writes(write_set(engine.state,patch),unit.id)!='candidate_additions':
             update=from_patch(engine.state,unit,patch)
             update.read_plan_id=task['plan_id']
             task['scope_update']=update.model_dump(mode='json')
