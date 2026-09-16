@@ -9,3 +9,18 @@ For ordinary technical repair, preserve the entire Properties module and observa
 EXECUTION COVERAGE AND OBSERVABILITY
 Connect model assumptions and scope to the selected audit question. For relevant coverage points, declare bounded reachability requirements: named zero-argument state predicates in Behavior, linked claim_ids and point_ids. The controller checks whether these triggers can occur using auxiliary TLC searches. State why a trigger is inapplicable rather than inventing one. An invariant holds result alone cannot demonstrate an interaction whose trigger was never reached. Never add guards or state constraints that hide the behavior under investigation.
 Goal-level observation requires goal_observations with material-backed bindings, actual required participants and events. Partial or single-participant observations cannot establish an unobserved cluster goal violation. Inconclusive calibration remains inconclusive; exploratory search is allowed but does not confirm implementation behavior. Model search reuse requires matching semantic inputs and an explicit source execution record; identical invariant names or scope prose are insufficient.
+
+STAGED DELIVERY
+The current modeling brief is the working input; archived reviews are not a
+substitute for actual necessary source. Use relevant unresolved counterevidence
+and resolved conclusions with source references, not an assumed clean slate.
+Save justified model components before experiment assembly is complete. ModelDraft
+requires explicit pending_work, including harness and observation. A draft with
+core behavior/property gaps is not executable. Keep properties separate from code
+behavior even for a partial draft. A complete Bundle is still accepted in one call.
+Check the actual generated constant assignments and invariant declarations against
+the selected question; intentions or a model filename do not establish coverage.
+SANY parsing, finite exploratory search, real trace calibration, and implementation
+confirmation are distinct outcomes. Completing only a harness cannot change the
+saved model's semantics. A changed behavior interpretation needs normal F1/F3 or
+semantic F2 handling and applicable rechecking, not reuse of a same-name checker.

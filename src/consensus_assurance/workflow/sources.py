@@ -66,6 +66,7 @@ def dependency_closure(objects,seeds):
         if obj.get('material_id'):wanted.add(obj['material_id'])
         anchor=obj.get('anchor') or {}
         if anchor.get('material_id'):wanted.add(anchor['material_id'])
+        wanted.update(anchor.get('source_ids',[]))
         basis=obj.get('grounding') or {};wanted.update(basis.get('behavior_ids',[])+basis.get('expectation_ids',[]));todo.extend(basis.get('binding_ids',[]))
         for key in ['goal_ids','obligation_ids','binding_ids','relation_ids']:todo.extend(obj.get(key,[]))
         for key in ['source','target','claim_id']:
@@ -75,3 +76,25 @@ def dependency_closure(objects,seeds):
         question=obj.get('audit_question') or {};wanted.update(question.get('source_ids',[]))
         for point in obj.get('coverage_intent',[])+question.get('points',[]):wanted.update(point.get('source_ids',[]))
     return wanted,visited
+
+
+def source_views(materials):
+    """Merge only contiguous acquired lines of one file/version; retain original references."""
+    from consensus_assurance.core.types import Material
+    groups={}
+    for raw in materials:
+        m=Material.model_validate(raw) if isinstance(raw,dict) else raw
+        groups.setdefault((m.file,m.content_digest),[]).append(m)
+    result=[]
+    for (file,version),items in sorted(groups.items()):
+        lines={}
+        for m in items:
+            for n,text in enumerate(m.text.split('\n')[:m.end_line-m.start_line+1],m.start_line):
+                if n in lines and lines[n]!=text:raise ValueError('Conflicting source text at the same file/version/range')
+                lines[n]=text
+        for start,end in ranges(items)[(file,version)]:
+            contributors=[m for m in items if m.start_line<=end and m.end_line>=start]
+            view=Material(id='source-view-'+str(len(result)+1),file=file,content_digest=version,start_line=start,end_line=end,
+                text='\n'.join(lines[n] for n in range(start,end+1)),kind=contributors[0].kind)
+            result.append((view,contributors))
+    return result

@@ -1,6 +1,6 @@
 """Mechanical fixes cannot change selected questions or silently redirect code."""
 from .output_repair import all_materials,parts
-from .locations import declarations,contains,code_mask,locate
+from .locations import declarations,contains,code_mask,locate,location_evidence
 from consensus_assurance.core.proposals import BindingDraft
 from consensus_assurance.core.types import Material
 
@@ -29,11 +29,11 @@ def validate_representation(before,after,targets,context):
         old_material=next((m for m in materials if m.id==left.get('material_id')),None)
         new_material=next((m for m in materials if m.id==right.get('material_id')),None)
         if not old_material or not new_material or old_material.file!=new_material.file:raise ValueError('Location repair needs actually supplied material from the same intended file')
-        old_decls=[d for m in materials if m.file==old_material.file for d in declarations(m) if d['symbol']==left.get('symbol')]
-        verified,_=locate(BindingDraft.model_validate(right),{m.id:m for m in materials})
-        new_decls=[d for m in materials if verified and m.id==verified['material_id'] for d in declarations(m) if d['symbol']==right.get('symbol') and d['start']==verified['start_line'] and d['kind']==verified['kind']]
-        if not new_decls:raise ValueError('Replacement lacks a verified source declaration')
-        d=new_decls[0]
+        from .sources import source_views
+        old_decls=[d for m,_ in source_views(materials) if m.file==old_material.file and m.content_digest==old_material.content_digest for d in declarations(m) if d['symbol']==left.get('symbol')]
+        evidence,_=location_evidence(BindingDraft.model_validate(right),{m.id:m for m in materials})
+        if not evidence:raise ValueError('Replacement lacks a verified source declaration')
+        d=evidence['declaration'];new_material=evidence['view']
         if old_decls and not any(o['start']==d['start'] for o in old_decls):raise ValueError('Location repair redirects to another function; explicit scope revision required')
         if d['kind']!='callsite' and not contains(type('Range',(),left)(),new_material,d):raise ValueError('Original behavior does not belong to the corrected identity; scope plan required')
         changed=set(range(left['start_line'],left['end_line']+1))^set(range(right['start_line'],right['end_line']+1))
@@ -45,12 +45,26 @@ def validate_representation(before,after,targets,context):
                 raise ValueError('Behavior range changed beyond declaration or punctuation correction; explicit scope plan required')
 
 
-def classify_conditions(state,conditions,dispositions,provided):
-    """One policy for old counterevidence versus still-relevant current conditions."""
+def condition_records(conditions,owner,source_ids=(),target_id=None,version=None):
+    return [{'id':owner+'/condition/'+str(n+1),'text':text,'target_id':target_id,'version':version,'source_ids':list(source_ids)} for n,text in enumerate(dict.fromkeys(conditions))]
+
+
+def classify_conditions(state,conditions,dispositions,provided,*,records=None,paths=None,object_ids=()):
+    """One exact condition policy; IDs identify opinions, never make them true."""
     from .sources import includes
-    if len(dispositions)!=len({d.condition for d in dispositions}) or set(conditions)!={d.condition for d in dispositions}:
-        raise ValueError('Each exact condition needs its own attributed disposition; unspecified conditions remain unresolved')
-    for d in dispositions:
+    from consensus_assurance.core.diagnostics import Diagnostic,DiagnosticError
+    records=records or condition_records(conditions,'legacy',provided)
+    expected={r['id']:r for r in records};by_text={r['text']:r['id'] for r in records}
+    actual=[d.condition_id if d.condition_id else by_text.get(d.condition,'unknown:'+d.condition) for d in dispositions]
+    missing=sorted(set(expected)-set(actual));extra=sorted(set(actual)-set(expected));duplicates=sorted({id for id in actual if actual.count(id)>1})
+    if missing or extra or duplicates:
+        code='condition_duplicate' if duplicates else 'condition_extra' if extra else 'condition_missing'
+        raise DiagnosticError([Diagnostic(code=code,category='format',object_ids=list(object_ids),paths=paths or ['/condition_dispositions'],
+            material_ids=list(provided),message='Condition dispositions do not match the current candidate conditions',allowed=['representation'],
+            details={'expected_conditions':records,'current_dispositions':[d.model_dump(mode='json') for d in dispositions],
+                'missing':missing,'extra':extra,'duplicate':duplicates,'required_action':'Correct only these condition references and supply attributed dispositions. Do not erase negative analysis or read source merely to copy an ID.'})])
+    for d,id in zip(dispositions,actual):
+        if d.condition and d.condition!=expected[id]['text']:raise ValueError('Condition ID and text disagree')
         if not d.rationale.strip() or not includes(state,d.source_ids,provided):raise ValueError('Condition disposition lacks supplied source evidence')
     return dispositions
 

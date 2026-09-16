@@ -60,7 +60,25 @@ class TLCVerifier:
             available = False
             self.version = "TLC JAR missing; set tlc_jar or TLC_JAR"
         self.available = available
+        for check in checks:
+            if check.action=='verifier_probe':check.parameters['capability_available']=available
         return {"available": available, "version": self.version, "checks": checks, "reason": "Ready" if available else self.version}
+
+    def syntax(self, runner, model, timeout):
+        directory=Path(model.path).parent
+        if not getattr(self, 'available', False):
+            return CheckRun(action='model_syntax',cwd=str(directory),status=ExecutionStatus.TOOL_MISSING,
+                snapshot_id=model.snapshot_id,model_id=model.id,reason='Java or TLC JAR unavailable',tool_version=self.version)
+        check=runner.run(['java','-Xmx512m','-cp',str(self.jar),'tla2sany.SANY',str(model.path)],
+            directory,'model_syntax',model.snapshot_id,timeout)
+        check.model_id=model.id;check.tool_version=self.version;check.input_versions=model.artifact_digests
+        text=output(check)
+        if check.status==ExecutionStatus.COMPLETED:
+            if check.exit_code==0 and 'Semantic processing of module Properties' in text and not re.search(r'(?i)(?:errors?:|fatal error|parse error|lexical error|abort)',text):
+                check.outcome='not_applicable';check.reason='SANY parsed the saved modules; no property or implementation conclusion'
+            else:
+                check.status=ExecutionStatus.ERROR;check.reason='Model syntax error'
+        return check
 
     def reachability(self,runner,model,bundle,requirement,timeout):
         from .reachability import check_requirement

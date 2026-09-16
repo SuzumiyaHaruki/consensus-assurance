@@ -3,6 +3,7 @@ import json
 import os
 from pathlib import Path
 from consensus_assurance.core.types import ModelArtifact, Origin, uid
+from consensus_assurance.core.proposals import Bundle, ModelDraft
 from consensus_assurance.adapters.storage.files import digest, write_json
 
 from consensus_assurance.adapters.verifiers.tla_syntax import tla_code, validate_tla
@@ -10,6 +11,8 @@ from consensus_assurance.adapters.verifiers.tla_syntax import tla_code, validate
 
 def materialize_bundle(bundle):
     if bundle.properties == "GENERATE_FROM_OBSERVABLE_PROPERTIES":
+        if isinstance(bundle, ModelDraft):
+            raise ValueError("Observable property generation requires a complete observation map")
         from consensus_assurance.adapters.verifiers.observable import properties_source
         if not bundle.observable_properties:
             raise ValueError("Shared property generation requires nonempty observable_properties")
@@ -27,7 +30,7 @@ def validate_bundle(state, unit, bundle, implementation):
         raise ValueError("Checker claims must belong to the selected observable audit unit")
     if not set(unit.obligation_ids) & set(checked_ids):
         raise ValueError("Model must check a selected obligation")
-    if bundle.harness.kind != implementation.harness_kind:
+    if isinstance(bundle, Bundle) and bundle.harness.kind != implementation.harness_kind:
         raise ValueError("Harness kind is incompatible with the selected implementation adapter")
     validate_tla(bundle.behavior, "Behavior"); validate_tla(bundle.properties, "Properties")
     for name in ("Init", "Next", "vars", "Obs"):
@@ -60,7 +63,7 @@ def validate_bundle(state, unit, bundle, implementation):
         if not set(requirement.claim_ids)<=checked_ids:raise ValueError("Reachability requirement references an unchecked claim")
     def context_error(message):
         from consensus_assurance.core.diagnostics import Diagnostic,DiagnosticError
-        raise DiagnosticError([Diagnostic(code='context_mapping',category='association',object_ids=[unit.id],paths=['/bundle/context_analysis'],message=message,allowed=['representation','read'],
+        raise DiagnosticError([Diagnostic(code='context_mapping',category='association',object_ids=[unit.id],paths=['/draft/context_analysis' if isinstance(bundle,ModelDraft) else '/bundle/context_analysis'],message=message,allowed=['representation','read'],
             details={'variables':bundle.variables,'actions':bundle.actions,'checkers':[c.model_dump(mode='json') for c in specs],'reachability':[r.model_dump(mode='json') for r in bundle.reachability],
                      'preservation':'Correct scenario correspondence only. Behavior, properties, selected obligations and fault scope cannot change in this repair.'})])
     # A scenario names real executable artifacts, not just prose about a round.
@@ -112,17 +115,23 @@ def save_bundle(root, state, unit, bundle, implementation, previous=None, reason
     behavior.write_text(bundle.behavior); checker.write_text(bundle.properties)
     cfg.write_text("INIT Init\nNEXT Next\nCHECK_DEADLOCK FALSE\n" + ("CONSTANTS\n" + bundle.constants + "\n" if bundle.constants.strip() else "") + "INVARIANTS\n" + "\n".join(invariants) + "\n")
     mapping, harness, proposal = folder / "mapping.json", folder / implementation.harness_filename, folder / "bundle.json"
-    write_json(mapping, bundle.observation); harness.write_text(bundle.harness.source); write_json(proposal, bundle)
-    artifacts = {str(p): digest(p.read_bytes()) for p in [behavior, checker, cfg, mapping, harness, proposal]}
+    files = [behavior, checker, cfg, proposal]
+    complete = isinstance(bundle, Bundle)
+    if complete:
+        write_json(mapping, bundle.observation)
+        harness.write_text(bundle.harness.source)
+        files.extend([mapping, harness])
+    write_json(proposal, bundle)
+    artifacts = {str(p): digest(p.read_bytes()) for p in files}
     from .inputs import semantic_ids
     semantic_references=semantic_ids(state,unit)
-    model = ModelArtifact(version=version, kind="implementation_abstraction", origin=Origin.MOCK if state.mode == "mock" else Origin.PRESET if state.analysis_mode == "regression" else Origin.AGENT,
+    model = ModelArtifact(stage="complete" if complete else "model_only", pending_components=[] if complete else [p.component for p in bundle.pending_work], version=version, kind="implementation_abstraction", origin=Origin.MOCK if state.mode == "mock" else Origin.PRESET if state.analysis_mode == "regression" else Origin.AGENT,
         claim_id=specs[0].claim_id, snapshot_id=state.snapshot.id, path=str(checker), config_path=str(cfg),
         content_digest=digest(checker.read_bytes()), config_digest=digest(cfg.read_bytes()), scope=bundle.scope,
         initial_state=bundle.initial_state, variables=bundle.variables, actions=bundle.actions,
         properties=invariants, constraints=bundle.constraints, binding_ids=unit.binding_ids,
         extension_schema={"type": "object", "description": "Tool-specific TLA metadata; constants are saved verbatim"}, extension_version="2",
-        unit_id=unit.id, checker_path=str(checker), mapping_path=str(mapping), harness_path=str(harness), bundle_path=str(proposal),
+        unit_id=unit.id, checker_path=str(checker), mapping_path=str(mapping) if complete else "", harness_path=str(harness) if complete else "", bundle_path=str(proposal),
         artifact_digests=artifacts, checkers=specs, graph_versions={x.id:x.version for x in [*state.claims,*state.bindings,*state.relations,*state.units] if x.id in semantic_references}, previous_id=previous.id if previous else None, revision_reason=reason)
     from .inputs import search_inputs, fingerprint
     model.reachability_requirements=bundle.reachability
@@ -140,3 +149,8 @@ def save_bundle(root, state, unit, bundle, implementation, previous=None, reason
         os.rename(folder, destination)
     state.models.append(model)
     return model
+
+
+def load_model(model):
+    proposal = ModelDraft if model.stage == "model_only" else Bundle
+    return proposal.model_validate_json(Path(model.bundle_path).read_text())

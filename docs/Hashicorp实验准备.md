@@ -10,11 +10,11 @@
 cd /home/nitro/Desktop/consensus-assurance
 export TLC_JAR="$PWD/.tools/tla2tools.jar"
 .venv/bin/consensus-assurance inspect --repo /home/nitro/Desktop/hashicorp-raft
-.venv/bin/consensus-assurance estimate --config configs/targets/hashicorp_raft.round9.yaml
+.venv/bin/consensus-assurance estimate --config configs/targets/hashicorp_raft.worksets.yaml
 .venv/bin/consensus-assurance doctor
 ```
 
-`estimate` 是计划下限，不保证完成所有复核、补读和实验。默认有限配置保留 20 次 agent 调用、2 个审计单元、3 次模型检查、6 个新源读取计划、2400 秒；源码字符、发送上下文和工具次数分别计量。不会自动增加额度。
+`estimate` 是计划下限，不保证完成所有复核、补读和实验。默认有限配置保留 20 次 agent 调用、2 个审计单元、3 次模型工具动作（分阶段路径的 SANY 语法检查也占一次）、6 个新源读取计划、2400 秒；源码字符、发送上下文和工具次数分别计量。不会自动增加额度。这个额度优先验证首个合理局部问题能否产出模型并实际检查，不保证两个单元均完成。新配置权限默认关闭；本轮只准备，未执行。
 
 ## 明确授权后运行
 
@@ -27,14 +27,14 @@ export TLC_JAR="$PWD/.tools/tla2tools.jar"
 
 sed -e 's/^allow_agent_materials: false$/allow_agent_materials: true/' \
     -e 's/^allow_experiments: false$/allow_experiments: true/' \
-    configs/targets/hashicorp_raft.round9.yaml \
-    > configs/targets/hashicorp_raft.round9.run.yaml
+    configs/targets/hashicorp_raft.worksets.yaml \
+    > configs/targets/hashicorp_raft.worksets.run.yaml
 
 .venv/bin/consensus-assurance run \
-  --config configs/targets/hashicorp_raft.round9.run.yaml
+  --config configs/targets/hashicorp_raft.worksets.run.yaml
 ```
 
-`*.run.yaml` 不提交 Git；可复制示例并调整真实目标路径和预算，不应修改已保存运行的 config 来伪装恢复。配置文件名中的 round9 对应当前控制器配置，不是某个预设目标。
+`*.run.yaml` 不提交 Git；可复制示例并调整真实目标路径和预算，不应修改已保存运行的 config 来伪装恢复。`worksets` 配置对应当前工作集和分阶段模型实现，不指定目标。
 
 ## 查看与恢复
 

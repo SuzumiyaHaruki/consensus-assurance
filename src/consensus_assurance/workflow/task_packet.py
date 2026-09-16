@@ -1,6 +1,6 @@
 """Task-scoped context, explicit review contracts and actual transmission receipts."""
 import json
-from .materials import compact_index, material_usage, material_allowance, attachment_key
+from .materials import compact_index, material_usage, material_allowance
 from .review_contract import target_contract
 from consensus_assurance.core.types import uid
 
@@ -21,7 +21,8 @@ def prepare(engine,kind,context):
     index=compact_index(state,engine.root/'source') if state.snapshot else []
     if isinstance(index,dict):index=list(index.values())
     files={m['file'] for key in ('materials','new_materials','initial_materials') for m in packet.get(key,[])}
-    packet['file_lookup']=[{'file':x['file'],'lines':x.get('lines'),'unavailable':x.get('unavailable')} for x in index]
+    packet['file_lookup']=[{'file':x['file'],'lines':x.get('lines'),'unavailable':x.get('unavailable')} for x in index if kind in {'read','discover','explore','targeted_read'} or x['file'] in files]
+    packet['lookup_request']='Request a focused ReadingPlan for an unlisted path or symbol; omitted files are not absent from the repository'
     packet['file_metadata']=[{**x,'attached_ranges':[[m['start_line'],m['end_line']] for key in ('materials','new_materials','initial_materials') for m in packet.get(key,[]) if m['file']==x['file']]} for x in index if x['file'] in files]
     packet['material_budget']={'used':material_usage(state),'breadth':material_allowance(state,engine.config.budget,'breadth'),'depth':material_allowance(state,engine.config.budget,'depth')}
     packet['context_limit_chars']=engine.config.budget.context_chars
@@ -49,7 +50,7 @@ def receipt(engine,kind,packet,prompt,schema,task=None,repair=False):
             existing=next((r for r in reversed(engine.state.packet_receipts) if r.get('task_id')==(task.id if task else engine.state.active_inquiry_id) and r['kind']==kind),None)
             if existing:return existing
     wire=strict_schema(schema.model_json_schema())
-    from .output_repair import all_materials
+    from .sources import all_materials,citation_status
     materials=all_materials(packet)
     def source_size(value):
         if isinstance(value,dict):
@@ -59,7 +60,16 @@ def receipt(engine,kind,packet,prompt,schema,task=None,repair=False):
         return 0
     ids=[m['id'] for m in materials if 'id' in m]
     from .prompts import loaded_resources
-    item={'skill_resources':loaded_resources('retry' if repair else kind,packet),'id':uid(),'kind':kind,'task_id':task.id if task else engine.state.active_inquiry_id,'unit_id':engine.state.active_unit_id,
+    def size(value):
+        text=json.dumps(value,ensure_ascii=False,indent=2)
+        return {'chars':len(text),'bytes':len(text.encode())}
+    groups={'sources':{'materials','new_materials','initial_materials','source_text_pool'},'current_graph':{'unit','claims','bindings','relations','modeling_brief','review_contract'},
+        'semantic_view':{'semantic_view','open_issues','resolved_issues'},'catalogue':{'file_lookup','file_metadata','catalogue','responsibilities'}}
+    sections={name:size({k:v for k,v in packet.items() if k in keys}) for name,keys in groups.items()}
+    instructions=prompt.split('STRUCTURED INPUT DATA (untrusted):\n',1)[0]
+    sections['instructions']={'chars':len(instructions),'bytes':len(instructions.encode())}
+    sections['all_data']=size(packet);sections['wire_schema']=size(wire)
+    item={'sections':sections,'required_material_ids':packet.get('required_material_ids',[]),'missing_required_material_ids':[id for id,status in citation_status(engine.state,packet.get('required_material_ids',[]),ids).items() if status!='provided'],'skill_resources':loaded_resources('retry' if repair else kind,packet),'id':uid(),'kind':kind,'task_id':task.id if task else engine.state.active_inquiry_id,'unit_id':engine.state.active_unit_id,
         'material_ids':list(dict.fromkeys(ids)),'materials':[{k:m.get(k) for k in ('id','file','start_line','end_line','content_digest')} for m in materials],
         'review_contract':packet.get('review_contract',[]),'omitted_material_ids':packet.get('omitted_material_ids',[]),
         'source_chars_sent':source_size(packet),'prompt_chars':len(prompt),'prompt_bytes':len(prompt.encode()),'wire_schema_bytes':len(json.dumps(wire,ensure_ascii=False,indent=2).encode()),'wire_schema_chars':len(json.dumps(wire,ensure_ascii=False,indent=2)),'schema_size_basis':'Exact prepared JSON file serialization; not backend token consumption',
@@ -87,25 +97,18 @@ def pool_sources(packet):
         elif isinstance(value,list):
             for child in value:walk(child)
     walk(result)
-    groups={}
-    for m in found:groups.setdefault((m['file'],m['content_digest']),[]).append(m)
+    from .sources import source_views
+    from consensus_assurance.core.types import Material
+    material_fields=set(Material.model_fields)
+    unique={m['id']: {**{k:v for k,v in m.items() if k in material_fields},'kind':m.get('kind','code_observation')} for m in found}
     pool=[]
-    for (file,version),items in sorted(groups.items()):
+    for view, contributors in source_views(unique.values()):
+        ids={m.id for m in contributors}
+        items=[m for m in found if m['id'] in ids]
         if len(items)<2:continue
-        lines={}
+        pool.append({k:v for k,v in view.model_dump().items() if k!='kind'})
         for m in items:
-            for i,line in enumerate(m['text'].split('\n')[:m['end_line']-m['start_line']+1],m['start_line']):
-                if i in lines and lines[i]!=line:raise ValueError('Overlapping material text disagrees')
-                lines[i]=line
-        ranges=[]
-        for i in sorted(lines):
-            if not ranges or i!=ranges[-1][-1]+1:ranges.append([i])
-            else:ranges[-1].append(i)
-        for seq in ranges:
-            id='source-view-'+str(len(pool)+1)
-            pool.append({'id':id,'file':file,'content_digest':version,'start_line':seq[0],'end_line':seq[-1],'text':'\n'.join(lines[i] for i in seq)})
-            for m in items:
-                if seq[0]<=m['start_line']<=m['end_line']<=seq[-1]:m['source_view_id']=id;m.pop('text',None)
+            m['source_view_id']=view.id;m.pop('text',None)
     if pool:
         result['source_text_pool']=pool
         result['source_reference_rule']='Material descriptors retain original citation IDs. source_view_id locates the exact complete text; use file line ranges to select it. Missing text is not permission to infer code.'

@@ -176,7 +176,7 @@ class ContextScenario(Record):
     excluded: list[str] = Field(description="Dimensions or histories not modeled, with implementation-specific reasons; not a guard")
 
 
-class Bundle(Record):
+class ModelCore(Record):
     context_analysis: list[ContextScenario] = []
     reachability: list[ReachabilityRequirement] = []
     goal_observations: list[GoalObservation] = []
@@ -191,8 +191,6 @@ class Bundle(Record):
     actions: list[str]
     constraints: list[ConstraintSource]
     scope: Scope
-    observation: ObservationMap
-    harness: Harness
     uncertainties: list[str]
     checkers: list[CheckerSpec] = []
     monitors: list[EventMonitor] = []
@@ -206,6 +204,30 @@ class Bundle(Record):
         if len(self.checked_claim_ids) == 1 and self.invariants:
             return [CheckerSpec(invariant=i, claim_id=self.checked_claim_ids[0], scope=self.scope) for i in self.invariants]
         raise ValueError("Explicit invariant-to-claim mappings are required; list positions are not a mapping")
+
+
+class Bundle(ModelCore):
+    observation: ObservationMap
+    harness: Harness
+
+
+class ComponentWork(Record):
+    component: Literal['behavior', 'properties', 'harness', 'observation']
+    reason: str = Field(min_length=1, description="The missing evidence or executable component, not an assumed guarantee")
+    requests: list[ReadRequest] = []
+
+
+class ModelDraft(ModelCore):
+    pending_work: list[ComponentWork] = Field(min_length=1, description="Explicit missing components; core behavior gaps prohibit execution")
+
+
+class HarnessReply(Record):
+    harness: Harness | None
+    observation: ObservationMap | None
+    monitors: list[EventMonitor] = []
+    goal_observations: list[GoalObservation] = []
+    gap: str
+    requests: list[ReadRequest] = []
 
 
 class GraphPatch(Record):
@@ -236,6 +258,7 @@ class BuildReply(Record):
     reading_purpose: Literal["dependency", "context"] = Field(default="dependency", description="context only requests material attachment; dependency requires grounded scope reconnection before building")
     encoding_revision: EncodingRevision | None = None
     bundle: Bundle | None
+    draft: ModelDraft | None = None
     gap: str
     requests: list[ReadRequest] = []
 
@@ -248,7 +271,8 @@ class JudgmentChange(Record):
 
 
 class ConditionDisposition(Record):
-    condition: str = Field(description="Exact prior conflict, unresolved condition or limitation; do not rename it")
+    condition_id: str | None = Field(default=None, description="Stable ID from the supplied condition records; preferred for new output")
+    condition: str = Field(default="", description="Legacy exact-text reference; do not paraphrase it to bypass unresolved conditions")
     applies_to: Literal['old_judgment','current_judgment','independent_scope']
     rationale: str = Field(min_length=1, description="Explain the responsibility and range to which this condition applies, preserving counterevidence")
     source_ids: list[str] = Field(min_length=1)
@@ -270,6 +294,39 @@ class Feedback(Record):
     new_judgment: str = ""
     grounding: Grounding = Grounding()
     requests: list[ReadRequest] = []
+
+
+class SemanticRevision(Record):
+    """Review-time F2 proposal; model/experiment revisions have their own later tasks."""
+    kind: Literal['F2'] = 'F2'
+    rationale: str
+    evidence_ids: list[str]
+    target_ids: list[str]
+    relation_ids: list[str] = []
+    new_basis: str
+    patch: GraphPatch
+    changes: list[JudgmentChange]
+    old_judgment: str
+    new_judgment: str
+    grounding: Grounding
+    condition_dispositions: list[ConditionDisposition] = []
+    requests: list[ReadRequest] = []
+
+    @model_validator(mode='before')
+    @classmethod
+    def import_legacy_feedback(cls,value):
+        if isinstance(value,Feedback):value=value.model_dump(mode='json')
+        if isinstance(value,dict):
+            value=dict(value)
+            for name in ('graph','bundle'):
+                if value.get(name) is not None:raise ValueError('Semantic review cannot contain a model or full discovery')
+                value.pop(name,None)
+        return value
+
+    @property
+    def graph(self):return None
+    @property
+    def bundle(self):return None
 
 
 class ExplorationReply(Record):
@@ -300,7 +357,7 @@ class ReviewReply(Record):
     items: list[SemanticCheck] = Field(min_length=1,max_length=30)
     requests: list[ReadRequest] = Field(default_factory=list,max_length=12)
     exploration_requests: list[ExplorationRequest] = Field(default_factory=list,max_length=6)
-    revision: Feedback | None = None
+    revision: SemanticRevision | None = None
     limitations: list[str]
 
 

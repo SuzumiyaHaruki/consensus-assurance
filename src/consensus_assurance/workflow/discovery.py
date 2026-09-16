@@ -19,23 +19,9 @@ def context(engine, unit=None):
         "semantic_reviews":[r.model_dump(mode="json") for r in engine.state.semantic_reviews], "harness_kind": engine.implementation.harness_kind,
         "harness_instructions": engine.implementation.harness_instructions}
     if unit:
-        from .reviews import material_closure
-        wanted,closure=material_closure(engine.state,[unit.id])
-        wanted.update(engine.state.task_attachments.get('unit:'+unit.id,[]))
-        result["materials"]=[m.model_dump(mode="json") for m in engine.state.materials if m.id in wanted]
-        result["omitted_material_ids"]=[m.id for m in engine.state.materials if m.id not in wanted]
-        result["semantic_reviews"]=[r.model_dump(mode="json") for r in engine.state.semantic_reviews if set(r.target_versions)&closure]
-        result.update({"obligation_progress":{"checked_scopes":unit.obligation_checks,"remaining":unit.remaining_obligation_ids or unit.obligation_ids},
-            "unit":unit.model_dump(mode="json"),
-            "claims":[c.model_dump(mode="json") if c.id in closure else {"id":c.id,"kind":c.kind,"description":c.description,"version":c.version} for c in engine.state.claims],
-            "bindings":[b.model_dump(mode="json") for b in engine.state.bindings if b.id in closure],
-            "relations":[e.model_dump(mode="json") for e in engine.state.relations if e.id in closure or e.source in closure]})
-        result['modeling_brief']={
-            'unit_id':unit.id,'unit_version':unit.version,'question':unit.audit_question.model_dump(mode='json') if unit.audit_question else unit.rationale,
-            'checked_claim_ids':unit.obligation_ids,'goal_ids':unit.goal_ids,'scope':unit.scope.model_dump(mode='json'),
-            'binding_ids':unit.binding_ids,'relation_ids':unit.relation_ids,
-            'remaining_conditions':unit.coverage_limitations+[x for use in unit.code_uses for x in use.unverified],
-            'basis':'Derived view of current G/O/C; referenced objects and actual source are in this packet, not a separate specification'}
+        from .task_view import local_workset
+        result.pop('semantic_reviews')
+        result.update(local_workset(engine,unit))
     return result
 
 def discover(engine):

@@ -1,3 +1,4 @@
+from .artifacts import load_model
 import json
 import math
 import shutil
@@ -25,7 +26,7 @@ from .errors import Blocked
 from .agent_tasks import ask as ask_agent
 
 
-FRAMEWORK_REVISION = "round9"
+FRAMEWORK_REVISION = "worksets-v1"
 
 
 class Engine:
@@ -46,6 +47,8 @@ class Engine:
             'scope_adopted':any(x['status']=='accepted' for x in self.state.scope_updates.values()),
             'scope_ready':any(u.semantic_readiness.get('status')=='reviewed' for u in self.state.units),
             'model_registered':bool(self.state.models),
+            'model_draft_saved':any(m.stage=='model_only' for m in self.state.models),
+            'harness_ready':any(m.stage=='complete' for m in self.state.models),
             'model_tool_execution':any(c.action=='model_check' and c.started_at for c in self.state.checks),
             'completed_search':any(c.action=='model_check' and c.status.value=='completed' and c.outcome in {'holds','counterexample'} for c in self.state.checks),
             'calibration_recorded':bool(self.state.calibrations),
@@ -323,7 +326,7 @@ class Engine:
             raise Blocked("Model commit requires a persisted generation action")
         model = save_bundle(self.root, self.state, unit, bundle, self.implementation, previous, reason, transaction_key=key)
         self.model_commit_hook(model)
-        if previous and bundle.properties!=Bundle.model_validate_json(Path(previous.bundle_path).read_text()).properties and "Encoding" in reason:
+        if previous and bundle.properties!=load_model(previous).properties and "Encoding" in reason:
             from consensus_assurance.core.types import ReviewIssue
             if not any(i.model_id==model.id and i.needs_recheck for i in self.state.review_issues):
                 sources=sorted({s for c in self.state.claims if c.id in {spec.claim_id for spec in model.checkers} for s in c.source_ids})
@@ -392,10 +395,14 @@ class Engine:
             unit=next(u for u in self.state.units if u.id==self.state.active_unit_id)
             phase=self.state.next_action
             model=next((m for m in self.state.models if m.id==self.state.active_model_id),None)
-            bundle=Bundle.model_validate_json(Path(model.bundle_path).read_text()) if model else None
+            bundle=load_model(model) if model else None
             experiment=next((c for c in reversed(self.state.checks) if model and c.model_id==model.id and c.action in {"experiment","replay"}),None)
             calibration=next((c for c in reversed(self.state.calibrations) if experiment and c.experiment_check_id==experiment.id),None)
             finding=next((f for f in self.state.findings if f.id==self.state.active_finding_id),None)
+            if phase in {"model_syntax", "model_explore", "model_repair", "harness"}:
+                from .staged_model import proceed
+                proceed(self, unit, model, bundle, phase)
+                continue
             if phase=="build":
                 if self.state.targeted_gap:
                     task=self.state.targeted_gap
@@ -409,10 +416,16 @@ class Engine:
                 if previous:
                     context.update(previous_bundle=json.loads(Path(previous.bundle_path).read_text()),scope_delta={"before":previous.scope.model_dump(),"after":unit.scope.model_dump(),"added_bindings":list(set(unit.binding_ids)-set(previous.binding_ids)),"boundary_changes":unit.boundary_changes})
                 reply,_=self.ask("F3" if unit.previous_id else "build",BuildReply,context, lambda p: validate_build_reply(self.state,unit,p,self.implementation))
-                if reply.bundle is None:
+                if reply.bundle is None and reply.draft is None:
                     self.targeted_read(unit,reply.gap,requests=reply.requests,update_required=reply.reading_purpose=="dependency"); self.advance("build"); continue
+                if reply.draft is not None:
+                    model=self.save_model(unit,reply.draft,previous,"Staged local model; implementation experiment pending")
+                    self.state.active_model_id=model.id
+                    if self.state.first_model_seconds is None:self.budget.sync();self.state.first_model_seconds=self.state.elapsed_seconds
+                    self.advance("model_syntax")
+                    continue
                 if previous:
-                    original=Bundle.model_validate_json(Path(previous.bundle_path).read_text())
+                    original=load_model(previous)
                     if reply.bundle.properties!=original.properties and reply.bundle.checker_specs()==original.checker_specs() and reply.bundle.scope==original.scope and all(previous.graph_versions.get(c.id)==c.version for c in self.state.claims if c.id in previous.graph_versions):
                         if not reply.encoding_revision:raise Blocked("Changed checker encoding needs an attributed encoding_revision and correspondence review")
                         from .encoding import validate_encoding
@@ -565,6 +578,7 @@ class Engine:
                 self.state.stop_reason = "Plan generated; modeling and checks not scheduled"
                 return self.state
             while True:
+                inquiry.wake_changed(self)
                 inquiry.clear_reserve(self)
                 can_inquire = inquiry.enabled(self) and (self.state.active_inquiry_id or (self.state.pending_action is None and self.state.pending_output_repair is None))
                 if can_inquire:

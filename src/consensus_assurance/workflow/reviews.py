@@ -30,7 +30,7 @@ def valid_supersession(state,review,task):
             contract=target_contract(state,objects[id])
             if review.context_dependencies.get(id,{}).get('dependency_versions')!=contract['dependency_versions'] or not includes(state,contract['required_material_ids'],review.material_ids):return False
         items=[i for i in review.items if i.target_id==id and i.status=='no_issue_found' and not i.limitations]
-        if not required_aspects(objects[id])<={i.aspect for i in items}:return False
+        if not set(task.requested_aspects.get(id,required_aspects(objects[id])))<={i.aspect for i in items}:return False
     return bool(task.target_versions)
 
 
@@ -83,11 +83,23 @@ def validate_resolutions(state, task, reply):
             others={i.id:i for i in state.review_issues if not i.resolved_by}
             if any(x not in others or x==id or others[x].parent_issue_id==id for x in resolution.residual_issue_ids):fail(issue,'An unresolved root or child cannot be renamed as an independent residual')
             if any(issue.explanation.strip().casefold()==x.strip().casefold() for x in resolution.scope_limitations):fail(issue,'The unresolved original question cannot be relabeled as a scope boundary')
-            from .repair_policy import classify_conditions
+            from .repair_policy import classify_conditions,condition_records
             remaining=list(dict.fromkeys(x for i in matching for x in i.limitations))
             if remaining:
-                try:classified=classify_conditions(state,remaining,resolution.condition_dispositions,supplied)
-                except ValueError as exc:fail(issue,str(exc),'issue_residual_unclassified')
+                records=condition_records(remaining,task.id+'/'+resolution_target+'/'+issue.aspect,resolution.source_ids,resolution_target,current[resolution_target])
+                original={r['text']:r for r in issue.conditions}
+                records=[original.get(r['text'],r) for r in records]
+                index=reply.resolutions.index(resolution)
+                from consensus_assurance.core.diagnostics import DiagnosticError
+                try:
+                    classified=classify_conditions(state,remaining,resolution.condition_dispositions,supplied,records=records,
+                        paths=[f'/resolutions/{index}/condition_dispositions'],object_ids=[resolution_target])
+                except DiagnosticError as exc:
+                    for diagnostic in exc.diagnostics:
+                        diagnostic.details.update(issue=issue.model_dump(mode='json'),
+                            current_items=[{'path':f'/items/{n}','item':item.model_dump(mode='json')} for n,item in enumerate(reply.items) if item in matching],
+                            resolution_path=f'/resolutions/{index}')
+                    raise
                 if any(c.applies_to!='independent_scope' for c in classified):fail(issue,'A condition still affects the current judgment; keep the issue open')
             if not matching:fail(issue,'An issue disposition needs matching substantive analysis')
         elif not matching or any(i.scope_limitations or i.limitations for i in matching) or not any(set(issue.source_ids)<=set(i.source_ids) for i in matching):
@@ -112,7 +124,8 @@ def record_dispositions(state,review,reply,followup_ids):
         if prior:
             prior.source_ids=list(dict.fromkeys(prior.source_ids+item.source_ids))
             prior.prior_review_ids=list(dict.fromkeys(prior.prior_review_ids+[review.id]));prior.task_ids=list(dict.fromkeys(prior.task_ids+followup_ids));continue
-        state.review_issues.append(ReviewIssue(review_id=review.id,target_id=item.target_id,target_version=review.target_versions[item.target_id],aspect=item.aspect,model_id=review.model_id,source_ids=item.source_ids,explanation=item.explanation,disposition=disposition,task_ids=followup_ids,
+        from .repair_policy import condition_records
+        state.review_issues.append(ReviewIssue(conditions=condition_records(item.limitations,review.task_id+'/'+item.target_id+'/'+item.aspect,item.source_ids,item.target_id,review.target_versions[item.target_id]),review_id=review.id,target_id=item.target_id,target_version=review.target_versions[item.target_id],aspect=item.aspect,model_id=review.model_id,source_ids=item.source_ids,explanation=item.explanation,disposition=disposition,task_ids=followup_ids,
             reason='Follow-up evidence or semantic review is required' if disposition!='blocked' else 'No actionable follow-up was supplied; the issue remains unresolved and requires planning'))
 
 

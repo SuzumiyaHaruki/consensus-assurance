@@ -40,9 +40,12 @@ class PacketAgent(CoverageAgent):
             response={'items':items,'limitations':[]}
         elif name=='BuildReply' and not self.read_fault:
             self.read_fault=True
-            meta=next(m for m in packet['file_lookup'] if m['file']=='limits.py')
+            meta=next((m for m in packet['file_lookup'] if m['file']=='limits.py'),None)
+            assert meta or packet['lookup_request']
+            # Deliberately invalid synthetic request: an unlisted path must get actual EOF diagnostics too.
+            invalid_end=meta['lines']+1 if meta else 1000000
             response={'bundle':None,'gap':'Read the complete actual input normalization dependency',
-                'requests':[{'file':'limits.py','start_line':1,'end_line':meta['lines']+1,'reason':'Inspect the dependency before modeling'}]}
+                'requests':[{'file':'limits.py','start_line':1,'end_line':invalid_end,'reason':'Inspect the dependency before modeling'}]}
         elif name=='BuildReply':
             response={'bundle':json.loads(json.dumps(self.source_responses[2])),'gap':''}
             if self.negative:response['bundle']['properties']=response['bundle']['properties'].replace('value <= 3','value <= 2')

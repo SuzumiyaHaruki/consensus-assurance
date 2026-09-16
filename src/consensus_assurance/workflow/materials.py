@@ -219,6 +219,12 @@ def apply_read(state,receipt,new_materials):
     encoded=receipt.model_dump(mode='json');state.read_plans[receipt.id]=encoded
     attached=[id for item in receipt.items if item.status!='deferred' for id in item.material_ids]
     key=attachment_key(state);state.task_attachments[key]=list(dict.fromkeys(state.task_attachments.get(key,[])+attached))
+    task=next((t for t in state.inquiry_tasks if t.id==state.active_inquiry_id),None)
+    if task and task.unit_id:
+        unit=next((u for u in state.units if u.id==task.unit_id),None)
+        if unit and (task.unit_version is None or task.unit_version==unit.version):
+            owner='unit:'+unit.id
+            state.task_attachments[owner]=list(dict.fromkeys(state.task_attachments.get(owner,[])+attached))
     # Legacy inventory remains readable but no task packet uses it as an implicit attachment set.
     state.attached_material_ids=list(dict.fromkeys(state.attached_material_ids+attached))
     state.reading_history.append({'plan_id':receipt.id,'attempt':receipt.attempt,'related_ids':receipt.related_ids,'gap':receipt.reason,'rationale':receipt.reason,

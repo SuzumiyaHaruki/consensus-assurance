@@ -2,7 +2,7 @@ from consensus_assurance.core.types import Claim, Binding, Relation, AuditUnit, 
 from .mutations import adopt, write_set
 from .associations import claim_ids, relevant_use
 from .graph_diagnostics import require_graph
-from .locations import locate
+from .locations import location_evidence
 
 
 def validate_grounding(basis, materials, binding_ids):
@@ -38,10 +38,12 @@ def apply_discovery(state, proposal):
         if not claim_ids(b)<={c.id for c in claims} or b.material_id not in materials:
             raise ValueError("Binding references an unknown claim or material")
         m = materials[b.material_id]
-        if m.file not in state.snapshot.files or not m.start_line <= b.start_line <= b.end_line <= m.end_line:
+        evidence,error=location_evidence(b,materials)
+        if m.file not in state.snapshot.files or evidence is None:
             raise ValueError("Binding range is outside the read code snapshot")
-        excerpt = "\n".join(m.text.splitlines()[b.start_line-m.start_line:b.end_line-m.start_line+1])
-        anchor,_=locate(b,materials)
+        view=evidence["view"]
+        excerpt = "\n".join(view.text.splitlines()[b.start_line-view.start_line:b.end_line-view.start_line+1])
+        anchor=evidence["anchor"]
         associations=[a.model_copy(update={'source_ids':a.source_ids or [b.material_id]}) for a in b.associations]
         for association in associations:
             if not set(association.source_ids)<=set(materials) or not association.rationale.strip():raise ValueError("Code association lacks actual material and rationale")

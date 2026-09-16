@@ -4,7 +4,7 @@ import re
 
 
 def code_mask(text):
-    pattern=r'//[^\n]*|/\*[\s\S]*?\*/|\#[^\n]*|"(?:\\.|[^"\\])*"|\x27(?:\\.|[^\x27\\])*\x27|`[^`]*`'
+    pattern=r'//[^\n]*|/\*[\s\S]*?(?:\*/|$)|\#[^\n]*|"(?:\\.|[^"\\])*(?:"|$)|\x27(?:\\.|[^\x27\\])*(?:\x27|$)|`[^`]*(?:`|$)'
     return re.sub(pattern,lambda m:''.join('\n' if c=='\n' else ' ' for c in m[0]),text)
 
 
@@ -12,7 +12,11 @@ def closing(text,start,left,right):
     depth=1;cursor=start+1
     while cursor<len(text) and depth:
         depth+=(text[cursor]==left)-(text[cursor]==right);cursor+=1
-    return cursor
+    return cursor if depth==0 else None
+
+
+def extent(declaration):
+    return declaration["end"] if declaration["end"] is not None else declaration["known_end"]
 
 
 def declarations(material):
@@ -29,21 +33,25 @@ def declarations(material):
         patterns=[r'(?m)^\s*func\s+(?:\([^)]*\)\s*)?(\w+)\s*\(',r'(?m)^\s*(\w+)\s*:=\s*func\s*\(']
         for pattern in patterns:
             for match in re.finditer(pattern,masked):
-                end_args=closing(masked,match.end()-1,'(',')');opening=masked.find('{',end_args)
+                end_args=closing(masked,match.end()-1,'(',')')
+                if end_args is None:continue
+                opening=masked.find('{',end_args)
                 # Anonymous return types contain braces before the function body.
                 cursor=end_args
                 while opening>=0 and re.search(r'\b(?:interface|struct)\s*$',masked[cursor:opening]):
-                    cursor=closing(masked,opening,'{','}');opening=masked.find('{',cursor)
+                    cursor=closing(masked,opening,'{','}')
+                    if cursor is None:opening=-1;break
+                    opening=masked.find('{',cursor)
                 if opening<0:continue
                 end=closing(masked,opening,'{','}')
-                result.append({'symbol':match[1],'start':line(match.start()+len(match[0])-len(match[0].lstrip())),'signature_end':line(opening),'end':line(end),'kind':'declaration'})
+                result.append({'symbol':match[1],'start':line(match.start()+len(match[0])-len(match[0].lstrip())),'signature_end':line(opening),'end':line(end) if end is not None else None,'known_end':material.end_line,'closed':end is not None,'kind':'declaration'})
         for match in re.finditer(r'(?m)^\s*type\s+(\w+)\s+(interface|struct)\s*\{',masked):
             opening=match.end()-1;end=closing(masked,opening,'{','}');start=line(match.start()+len(match[0])-len(match[0].lstrip()))
-            result.append({'symbol':match[1],'start':start,'signature_end':line(opening),'end':line(end),'kind':'declaration'})
+            result.append({'symbol':match[1],'start':start,'signature_end':line(opening),'end':line(end) if end is not None else None,'known_end':material.end_line,'closed':end is not None,'kind':'declaration'})
             if match[2]=='interface':
-                for method in re.finditer(r'(?m)^\s*(\w+)\s*\(',masked[opening+1:end-1]):
+                for method in re.finditer(r'(?m)^\s*(\w+)\s*\(',masked[opening+1:(end-1 if end else len(masked))]):
                     pos=opening+1+method.start()+len(method[0])-len(method[0].lstrip())
-                    result.append({'symbol':method[1],'start':line(pos),'signature_end':line(pos),'end':line(end),'owner_start':start,'kind':'interface_member'})
+                    result.append({'symbol':method[1],'start':line(pos),'signature_end':line(pos),'end':line(end) if end else None,'known_end':material.end_line,'closed':end is not None,'owner_start':start,'kind':'interface_member'})
         # A named non-struct type may be followed by contiguous methods on that exact receiver.
         for match in re.finditer(r'(?m)^[ \t]*type[ \t]+(\w+)[ \t]+([^\n]+)',masked):
             if re.match(r'(?:struct|interface)\b',match[2]):continue
@@ -55,6 +63,7 @@ def declarations(material):
                 method_start=line(cursor+following.start()+len(following[0])-len(following[0].lstrip()))
                 method=next((d for d in result if d['symbol']==following[1] and d['start']==method_start and d['kind']=='declaration'),None)
                 if not method:break
+                if method['end'] is None:break
                 end_line=method['end']
                 cursor=sum(len(x)+1 for x in masked.split('\n')[:end_line-offset])
             result.append({'symbol':name,'start':start,'signature_end':line(match.end()),'end':end_line,'kind':'declaration'})
@@ -62,19 +71,19 @@ def declarations(material):
         # declaration group, not neighboring type declarations.
         for match in re.finditer(r'(?m)^[ \t]*const[ \t]*\(',masked):
             end=closing(masked,match.end()-1,'(',')')
-            for member in re.finditer(r'(?m)^[ \t]*(\w+)[ \t]*(?:\w+[ \t]*)?(?:=|$)',masked[match.end():end-1]):
+            for member in re.finditer(r'(?m)^[ \t]*(\w+)[ \t]*(?:\w+[ \t]*)?(?:=|$)',masked[match.end():(end-1 if end else len(masked))]):
                 pos=match.end()+member.start()+len(member[0])-len(member[0].lstrip())
-                result.append({'symbol':member[1],'start':line(pos),'signature_end':line(pos),'end':line(end),'owner_start':line(match.start()),'kind':'declaration'})
+                result.append({'symbol':member[1],'start':line(pos),'signature_end':line(pos),'end':line(end) if end else None,'known_end':material.end_line,'closed':end is not None,'owner_start':line(match.start()),'kind':'declaration'})
         # Call-site anchors record syntax only, not resolved callee behavior.
         for match in re.finditer(r'\b(\w+)\s*\(',masked):
             if any(d['start']==line(match.start()) and d['symbol']==match[1] for d in result):continue
             end=closing(masked,match.end()-1,'(',')')
-            result.append({'symbol':match[1],'start':line(match.start()),'signature_end':line(match.start()),'end':line(end),'kind':'callsite'})
+            if end is not None:result.append({'symbol':match[1],'start':line(match.start()),'signature_end':line(match.start()),'end':line(end),'closed':True,'kind':'callsite'})
     return result
 
 
 def contains(binding,material,declaration):
-    start=declaration.get('owner_start',declaration['start']);end=declaration['end']
+    start=declaration.get('owner_start',declaration['start']);end=extent(declaration)
     lines=code_mask(material.text).splitlines()
     def empty(a,b):return not ''.join(lines[max(0,a-material.start_line):max(0,b-material.start_line+1)]).strip()
     if binding.start_line<start and not empty(binding.start_line,start-1):return False
@@ -82,24 +91,57 @@ def contains(binding,material,declaration):
     return binding.end_line>=start and binding.start_line<=end
 
 
-def locate(binding,materials):
+def location_evidence(binding,materials):
+    from .sources import source_views
     material=materials.get(binding.material_id)
     if material is None:return None,'The behavior material has not been read'
     candidates=[]
-    for m in materials.values():
-        if m.file!=material.file or m.content_digest!=material.content_digest:continue
-        if m.start_line>binding.start_line or m.end_line<binding.end_line:continue
-        for d in declarations(m):
+    anchor_material=materials.get(binding.anchor.material_id) if binding.anchor else None
+    if binding.anchor and (anchor_material is None or anchor_material.file!=material.file or anchor_material.content_digest!=material.content_digest):
+        return None,'Anchor source is missing or belongs to a different file/version'
+    for view,contributors in source_views(materials.values()):
+        if view.file!=material.file or view.content_digest!=material.content_digest:continue
+        if not view.start_line<=binding.start_line<=binding.end_line<=view.end_line:continue
+        declarations_here=declarations(view)
+        for d in declarations_here:
             if d['symbol']!=binding.symbol:continue
             if d['kind']=='callsite' and (not binding.anchor or binding.anchor.kind!='callsite'):continue
-            contained=contains(binding,m,d)
-            if d['kind']=='callsite':
-                contained=binding.start_line<=d['start']<=d['end']<=binding.end_line and any(owner['kind']=='declaration' and owner['symbol']!=d['symbol'] and contains(binding,m,owner) for owner in declarations(m))
-            if contained:candidates.append((m,d))
-    if binding.anchor:
-        a=binding.anchor
-        candidates=[(m,d) for m,d in candidates if m.id==a.material_id and d['start']==a.start_line and d['signature_end']<=a.end_line<=d['end'] and a.symbol==binding.symbol and a.kind==d['kind']]
-    unique={(d['symbol'],d['start'],d['end'],d['kind']):(m,d) for m,d in candidates}
-    if len(unique)!=1:return None,'Declaration identity is missing, ambiguous, or does not contain the behavior range; read the declaration or propose an explicit location correction'
-    m,d=next(iter(unique.values()))
-    return {'material_id':m.id,'start_line':d['start'],'end_line':d['signature_end'],'symbol':d['symbol'],'kind':d['kind']},''
+            if not contains(binding,view,d):continue
+            if d['kind']=='callsite' and not any(o['kind']=='declaration' and o['symbol']!=d['symbol'] and contains(binding,view,o) for o in declarations_here):continue
+            if binding.anchor:
+                a=binding.anchor
+                if not (a.start_line==d['start'] and d['signature_end']<=a.end_line<=extent(d) and a.symbol==binding.symbol and a.kind==d['kind']):continue
+                if not anchor_material.start_line<=d['start']<=anchor_material.end_line:continue
+            declaration_source=anchor_material or next((m for m in contributors if m.start_line<=d['start']<=m.end_line),None)
+            if declaration_source is None:continue
+            used=[m.id for m in contributors if m.start_line<=max(binding.end_line,d['signature_end']) and m.end_line>=min(d['start'],binding.start_line)]
+            anchor={'material_id':declaration_source.id,'start_line':d['start'],'end_line':d['signature_end'],'symbol':d['symbol'],'kind':d['kind'],
+                    'source_ids':sorted(used),'boundary_complete':d.get('closed',True)}
+            candidates.append({'anchor':anchor,'declaration':d,'view':view})
+    identities={(x['declaration']['start'],x['declaration']['kind'],x['anchor']['material_id']):x for x in candidates}
+    if len(identities)!=1:return None,'Declaration identity is missing, ambiguous, or not proven by contiguous acquired source; verify the anchor line or read the missing interval'
+    return next(iter(identities.values())),''
+
+
+def locate(binding,materials):
+    evidence,error=location_evidence(binding,materials)
+    return (evidence['anchor'] if evidence else None),error
+
+
+def location_context(binding, materials):
+    """Explain candidates from the same contiguous source views used for acceptance."""
+    from .sources import source_views
+    m=materials.get(binding.material_id)
+    if m is None:return {'candidates':[], 'read_ranges':[]}
+    views=[(v,refs) for v,refs in source_views(materials.values()) if v.file==m.file and v.content_digest==m.content_digest]
+    candidates=[];sources=[]
+    for view,refs in views:
+        matches=[d for d in declarations(view) if d['symbol']==binding.symbol and d['kind']!='callsite']
+        for d in matches:
+            candidates.append(d)
+            sources.extend(r.id for r in refs if r.start_line<=max(d['signature_end'],binding.end_line) and r.end_line>=min(d['start'],binding.start_line))
+    return {'candidates':candidates, 'read_ranges':[[v.start_line,v.end_line] for v,_ in views],
+            'material_ids':sorted(set(sources+[m.id])), 'file':m.file,'content_digest':m.content_digest,
+            'requested_anchor':binding.anchor.model_dump(mode='json') if binding.anchor else None,
+            'behavior_range':[binding.start_line,binding.end_line],
+            'next_action':'Correct an anchored offset only with supplied declaration evidence; request any missing contiguous interval. Open prefix does not establish a complete function end.'}

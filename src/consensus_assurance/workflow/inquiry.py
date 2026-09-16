@@ -9,7 +9,7 @@ from .graph import apply_patch
 from .feedback import apply_feedback
 from .errors import Blocked
 from .budget import BudgetExhausted
-from .reviews import material_closure, readiness, validate_resolutions, record_dispositions, valid_supersession
+from .reviews import required_aspects, material_closure, readiness, validate_resolutions, record_dispositions, valid_supersession
 
 
 def enabled(engine):
@@ -188,7 +188,7 @@ def task_context(engine,task):
         'relations':[r.model_dump(mode='json') for r in state.relations if r.id in closure and r.id not in task.target_ids],
         'units':[u.model_dump(mode='json') for u in state.units if u.id in closure and u.id not in task.target_ids],
         'open_issues':[i.model_dump(mode='json') for i in state.review_issues if (i.target_id in closure or i.id in task.resolution_issue_ids) and not i.resolved_by],
-        'blocked_review_tasks':[t.model_dump(mode='json') for t in state.inquiry_tasks if t.kind=='review' and t.status=='blocked' and not t.superseded_by and set(t.target_ids)<=set(task.target_ids)],
+        'blocked_review_tasks':[{'id':t.id,'target_ids':t.target_ids,'target_versions':t.target_versions,'requested_aspects':t.requested_aspects,'model_id':t.model_id,'stop_reason':t.stop_reason} for t in state.inquiry_tasks if t.kind=='review' and t.status=='blocked' and not t.superseded_by and set(t.target_ids)<=set(task.target_ids)],
         'cost_estimate':cost_estimate(engine),'overview_limit':'This compact index is not complete implementation coverage; request specific actual ranges before deriving new claims'}
     if task.model_id:
         model=next((m for m in state.models if m.id==task.model_id),None)
@@ -280,7 +280,8 @@ def pause_unit(engine, reason):
     state=engine.state
     if state.active_unit_id:
         unit=next(u for u in state.units if u.id==state.active_unit_id)
-        state.deferred_units[unit.id]={'next_action':state.next_action,'model_id':state.active_model_id,'finding_id':state.active_finding_id,'reason':reason,
+        from .task_view import local_basis
+        state.deferred_units[unit.id]={'basis':local_basis(state,unit),'next_action':state.next_action,'model_id':state.active_model_id,'finding_id':state.active_finding_id,'reason':reason,
             'pending_feedback':state.pending_feedback,'pending_output_repair':state.pending_output_repair,'targeted_gap':state.targeted_gap}
         unit.status='blocked'
         from .modeling import obligation_progress
@@ -415,9 +416,15 @@ def apply_task_response(engine,task_id,reply,check):
                     state.active_model_id=None;state.active_finding_id=None;state.next_action='build'
         followup_before={t.id for t in state.inquiry_tasks}
         if reply.requests:
-            enqueue(state,'review','Follow up semantic interpretation with requested source material',task.id+':followup',target_ids=task.target_ids,unit_id=task.unit_id,model_id=task.model_id,requests=reply.requests)
+            focus=[i for i in reply.items if i.status!='no_issue_found' or i.limitations]
+            targets=list(dict.fromkeys(i.target_id for i in focus)) or task.target_ids
+            follow=enqueue(state,'review','Follow up only the unresolved aspects using the requested source',task.id+':followup',target_ids=targets,unit_id=task.unit_id,model_id=task.model_id,requests=reply.requests)
+            follow.requested_aspects={id:list(dict.fromkeys(i.aspect for i in focus if i.target_id==id)) or task.requested_aspects.get(id,list(required_aspects(objects(state)[id]))) for id in targets}
+            follow.resolution_issue_ids=[i.id for i in state.review_issues if not i.resolved_by and i.target_id in targets and i.aspect in follow.requested_aspects[i.target_id]]
         register_requests(state,reply.exploration_requests,task.id)
         record_dispositions(state,review,reply,[t.id for t in state.inquiry_tasks if t.id not in followup_before])
+        if reply.requests:
+            follow.resolution_issue_ids=[i.id for i in state.review_issues if not i.resolved_by and i.target_id in targets and i.aspect in follow.requested_aspects[i.target_id]]
         state.gaps.extend(reply.limitations)
     task.repair_session=None;task.check_id=check.id;task.status='completed';task.stage='done';state.active_inquiry_id=None
     settle_parents(state)
@@ -468,3 +475,19 @@ def settle_parents(state):
         if parent.child_task_ids and all(id in tasks and tasks[id].status=='completed' for id in parent.child_task_ids):
             parent.status='completed';parent.stage='done'
             parent.stop_reason='All explicit child tasks executed; semantic issues and scope limits remain in their individual records'
+
+
+def wake_changed(engine):
+    """Retry a paused stage only after a relevant dependency changed; budgets remain spent."""
+    from .task_view import local_basis
+    state=engine.state
+    if state.active_unit_id or state.active_inquiry_id or state.pending_action or state.pending_output_repair:return
+    for unit in state.units:
+        saved=state.deferred_units.get(unit.id)
+        if unit.status!='blocked' or not saved or not saved.get('basis'):continue
+        if saved['basis']==local_basis(state,unit):continue
+        if saved.get('pending_output_repair',{} ) and saved['pending_output_repair'].get('blocked'):continue
+        unit.status='selected';state.active_unit_id=unit.id;state.active_model_id=saved['model_id'];state.active_finding_id=saved['finding_id']
+        state.next_action=saved['next_action'];state.pending_feedback=saved.get('pending_feedback');state.targeted_gap=saved.get('targeted_gap')
+        state.pending_output_repair=saved.get('pending_output_repair')
+        engine.checkpoint('relevant_dependency_woke_local_stage');return True

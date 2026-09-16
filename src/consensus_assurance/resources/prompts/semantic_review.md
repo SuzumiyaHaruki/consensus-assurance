@@ -3,3 +3,12 @@ For resolvable semantic errors return an F2 revision with the actual old/new jud
 Use requests when actual additional ranges are needed; use exploration_requests for unrepresented responsibilities or handoffs and investigations that could distinguish competing interpretations. Unresolved readings must remain explicit. An F2 revision does not automatically validate the new judgment; it will be reviewed in its new version. Do not modify model behavior or supply a replacement Bundle in this task.
 
 Review only the requested aspects in review_contract. Reused judgments and open issues retain their identities; a different trigger name is not new evidence. Put unresolved conditions that affect this judgment in limitations or keep the related ReviewIssue open. scope_limitations are independent boundaries of the audit, not renamed counterarguments. When resolving one issue while other boundaries remain, provide an IssueResolution with its exact stored question/version, actual supporting sources, a specific explanation, independent residual_issue_ids and the retained scope_limitations. A root issue or unresolved child cannot resolve itself by moving to residuals. No-issue judgments are provisional, not correctness proofs. If pending_scope_updates is provided, inspect the actual diff before proposing F2; never silently accept part of a mixed change.
+
+Use supplied condition IDs in condition_dispositions. Conditions belong to their
+specific object/version and issue; do not treat all global limitations as this
+resolution's prerequisites. A diagnostic includes the current expected conditions,
+missing/extra/duplicate references and exact item paths. Correct metadata only
+when that is the problem, preserving negative analysis and independent limits.
+Newly expressed conditions without a supplied ID can use exact text for that first
+response; the controller records their identities. Never paraphrase an unresolved
+root into a harmless scope note to clear it.

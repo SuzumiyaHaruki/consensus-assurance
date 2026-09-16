@@ -20,6 +20,11 @@ PROBES = {
 def execution_summary(check):
     """Describe recorded outputs without promoting them to accepted analysis or proof."""
     complete = check.status == ExecutionStatus.COMPLETED and check.exit_code in (0, None)
+    if check.action=='model_syntax':
+        return '模型模块语法解析', ('SANY 解析完成；配置另由 TLC 检查' if check.status==ExecutionStatus.COMPLETED and check.outcome=='not_applicable' else '解析未完成，见原始诊断'), '不适用：未检查性质或实际轨迹'
+    if check.action=='verifier_probe' and 'capability_available' in check.parameters:
+        product='版本帮助已识别，工具可用' if check.parameters['capability_available'] else '工具能力检查未就绪'
+        return PROBES[check.action],product+'；命令退出码 '+str(check.exit_code),'不适用：未检查性质'
     if check.action in PROBES:
         product = "命令完成；版本或能力详情见原始输出" if complete else "环境检查未成功完成"
         return PROBES[check.action], product, "不适用：未检查性质"
@@ -82,7 +87,7 @@ def resource_lines(state):
             except (ValueError,OSError):pass
     lines=['','## 材料、上下文与实际产物','','字符口径为唯一源代码逻辑行（含一个换行分隔符），不等于每次发送量、token 或费用。未提供 token 数据时不推算账单。',
         f"唯一材料 {used['unique_chars']}/{cfg.budget.material_chars} 字符；区间并集 {used['unique_chunks']}/{cfg.budget.material_chunks}。广度当前可分配 {breadth['available_chars']}、为深度保留 {breadth['reserved_for_other_chars']}；深度可分配 {depth['available_chars']}、为广度保留 {depth['reserved_for_other_chars']}。",
-        f"建模类执行记录 {len(builds)}；受理且非空 Bundle 回复 {accepted}；落盘模型版本 {len(state.models)}；实际性质搜索记录 {sum(c.action=='model_check' and not c.reused for c in state.checks)}（触达与校准另列）。",
+        f"建模类执行记录 {len(builds)}；受理且非空 Bundle 回复 {accepted}；落盘模型版本 {len(state.models)}（仅模型阶段 {sum(m.stage=='model_only' for m in state.models)}，完整组件 {sum(m.stage=='complete' for m in state.models)}）；实际性质搜索记录 {sum(c.action=='model_check' and not c.reused for c in state.checks)}（触达与校准另列）。",
         '', '| 阶段 | 新调用记录 | 已记录时长（秒） |', '| --- | --- | --- |']
     for name,item in stages.items():lines.append(f"| {name} | {item['calls']} | {item['seconds']:.2f}（{item['timed']} 条有起止时间） |")
     deferred=[(id,item) for id,p in state.read_plans.items() for item in p['items'] if item['status']=='deferred']

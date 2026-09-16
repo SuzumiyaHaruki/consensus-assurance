@@ -4,7 +4,9 @@
 
 系统从仓库材料自主识别候选目标、义务与代码关系，交替执行覆盖探索、语义复核和有限局部检查。实现包括英文 agent 技能、受控代码实验、TLA+/TLC 搜索、轨迹校准、F1—F4 反馈及恢复。候选图不是整体正确性证明，也没有已知的全系统覆盖率分母。
 
-当前保留的真实运行见 [实验报告](runs/2026-09-16_13-58-11-hashicorp_raft-real-run/report.md)。框架回归、受控模型和历史回复播放不替代真实自主验收；目前真实目标的自主建模验证闭环仍未验收通过。
+当前保留的真实运行见 [实验报告](runs/2026-09-16_13-58-11-hashicorp_raft-real-run/report.md)。框架回归、受控模型和历史回复播放不替代真实自主验收；目前真实目标的自主建模验证闭环仍未验收通过。该归档实际完成候选图和两次后端建模请求，但没有有效模型；不能把预算早停解释为模型搜索成本。
+
+当前实现将任务工作集与完整审计历史分开，并允许先保存有据的模型、后补 harness。语法检查、探索性搜索、真实轨迹校准与实现确认分别记录。新增本地验收见 [工作集与阶段产物](docs/工作集与阶段产物.md)，不代表已重新完成 HashiCorp 自主实验。
 
 ## 安装与工具
 
@@ -40,7 +42,7 @@ TLC_JAR="$TLC_JAR" .venv/bin/python -m pytest -q
 
 ```bash
 .venv/bin/consensus-assurance inspect --repo "$HOME/Desktop/hashicorp-raft"
-.venv/bin/consensus-assurance estimate --config configs/targets/hashicorp_raft.round9.yaml
+.venv/bin/consensus-assurance estimate --config configs/targets/hashicorp_raft.worksets.yaml
 ```
 
 实际发送材料及隔离执行须有用户授权，命令与配置说明见 [HashiCorp 实验使用](docs/Hashicorp实验准备.md)。默认自主发现目标，`--goal` 仅为可选定向问题；`protocol: none` 不注入固定 Raft 性质清单。

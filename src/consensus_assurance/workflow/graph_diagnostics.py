@@ -1,6 +1,7 @@
 """Dependency-ordered, non-mutating candidate diagnostics."""
 from consensus_assurance.core.diagnostics import Diagnostic,DiagnosticError
-from .locations import locate
+from .locations import locate, location_context
+from .sources import covered
 from .associations import claim_ids,relevant_use
 
 
@@ -21,11 +22,13 @@ def diagnose_graph(state,proposal):
         if not ids<=set(claims) or b.material_id not in materials:
             emit('binding_reference','association',[b.id]+sorted(ids),[f'/bindings/{i}/associations',f'/bindings/{i}/material_id'],[b.material_id],'Binding references an unknown claim or material',['read','association']);continue
         m=materials[b.material_id]
-        if m.file not in state.snapshot.files or not m.start_line<=b.start_line<=b.end_line<=m.end_line:
+        if m.file not in state.snapshot.files or not covered(m.model_copy(update={'start_line':b.start_line,'end_line':b.end_line}),materials.values()):
             emit('behavior_range','location',[b.id],[f'/bindings/{i}/{f}' for f in ['symbol','material_id','anchor','start_line','end_line']],[m.id],'Binding range is outside the read code snapshot',['representation','read']);continue
         anchor,reason=locate(b,materials)
         if not anchor:
-            emit('declaration_identity','location',[b.id],[f'/bindings/{i}/{f}' for f in ['symbol','material_id','anchor','start_line','end_line']],[m.id],f'Binding {b.id}: literal symbol {b.symbol!r} has no verified declaration: '+reason,['representation','read'])
+            evidence=location_context(b,materials)
+            emit('declaration_identity','location',[b.id],[f'/bindings/{i}/{f}' for f in ['symbol','material_id','anchor','start_line','end_line']],evidence['material_ids'],f'Binding {b.id}: literal symbol {b.symbol!r} has no verified declaration: '+reason,['representation','read'])
+            issues[-1].details=evidence
     for i,r in enumerate(proposal.relations):
         if r.source not in set(claims)|set(bindings) or r.target not in set(claims)|set(bindings):
             emit('relation_endpoint','association',[r.id,r.source,r.target],[f'/relations/{i}'],r.grounding.behavior_ids+r.grounding.expectation_ids,'Relation endpoint does not exist; keep a reading gap instead of inventing an endpoint',['association','read'])

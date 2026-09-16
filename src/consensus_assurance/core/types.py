@@ -151,6 +151,7 @@ class SemanticReview(Record):
 
 
 class ReviewIssue(Record):
+    conditions: list[dict[str, Any]] = []
     resolution_basis: dict = {}
     prior_review_ids: list[str] = []
     parent_issue_id: str | None = None
@@ -270,6 +271,8 @@ class Claim(Record):
 
 
 class CodeAnchor(Record):
+    source_ids: list[str] = []
+    boundary_complete: bool | None = None
     kind: Literal["declaration", "interface_member", "callsite"] = "declaration"
     material_id: str
     start_line: int = Field(ge=1)
@@ -345,6 +348,8 @@ class ConstraintSource(Record):
 
 
 class ModelArtifact(Record):
+    stage: Literal["model_only", "complete"] = "complete"
+    pending_components: list[str] = []
     id: str = Field(default_factory=uid)
     version: int = Field(ge=1)
     kind: Literal["reference", "implementation_abstraction"]

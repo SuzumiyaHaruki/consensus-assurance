@@ -25,7 +25,7 @@ def test_archived_resolution_does_not_require_all_old_citations():
     t.material_ids=[m['id'] for m in all_materials(packet)]
     before=s.model_dump()
     with pytest.raises(ValueError) as caught:validate_resolutions(s,t,r)
-    assert caught.value.diagnostics[0].code=='issue_residual_unclassified'
+    assert caught.value.diagnostics[0].code=='condition_missing'
     # Offline supplement only: preserve all original opinions and classify residual scope.
     from consensus_assurance.core.proposals import ConditionDisposition
     for resolution in r.resolutions:

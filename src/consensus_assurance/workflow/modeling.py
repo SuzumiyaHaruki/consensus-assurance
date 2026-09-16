@@ -15,20 +15,29 @@ def validate_technical_repair(current, repaired, phase):
 
 
 def validate_build_reply(state, unit, reply, implementation, current=None, phase=None):
-    if reply.bundle is None:
+    if reply.bundle is not None and reply.draft is not None:
+        raise ValueError('Return one complete bundle or one staged model, not competing artifacts')
+    model=reply.draft or reply.bundle
+    if model is None:
         if not reply.gap.strip():
             raise ValueError('A missing model needs a concrete material or modeling gap')
         return
     if reply.requests:
-        raise ValueError('Return a model or focused reading requests, not both')
-    validate_bundle(state, unit, reply.bundle, implementation)
+        raise ValueError('Return a model or focused reading requests; stage missing-component requests under pending_work')
+    validate_bundle(state,unit,model,implementation)
+    if reply.draft is not None:
+        if not {'harness','observation'} <= {p.component for p in reply.draft.pending_work}:
+            raise ValueError('Model-only output must acknowledge missing harness and observation components')
+        from consensus_assurance.core.proposals import ModelDraft
+        if current is not None and not isinstance(current,ModelDraft):
+            raise ValueError('Technical repair cannot discard an existing harness or observation map')
     if current is not None:
         if reply.encoding_revision and phase=='search':
             previous=next((m for m in state.models if m.id==reply.encoding_revision.old_model_id),None)
             if previous is None:raise ValueError('Encoding repair references an unavailable original model')
             from .encoding import validate_encoding
-            validate_encoding(state,previous,current,reply.bundle,reply.encoding_revision)
-        else:validate_technical_repair(current, reply.bundle, phase)
+            validate_encoding(state,previous,current,model,reply.encoding_revision)
+        else:validate_technical_repair(current,model,phase)
 
 
 def obligation_progress(state, unit):

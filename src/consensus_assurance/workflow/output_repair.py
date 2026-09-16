@@ -55,8 +55,9 @@ def repair_targets(value, errors, reason, limit):
         for i,b in enumerate(value.get('bindings',[])):
             if b.get('id')==match[1]: paths.append(['bindings',i,'symbol'])
     if not paths and isinstance(value,dict):
-        prefix=['bundle'] if isinstance(value.get('bundle'),dict) else []
-        model=value.get('bundle',value)
+        key='bundle' if isinstance(value.get('bundle'),dict) else 'draft' if isinstance(value.get('draft'),dict) else None
+        prefix=[key] if key else []
+        model=value[key] if key else value
         if isinstance(model,dict):
             if any(x in reason for x in ['Behavior module','TLA module','module feature','module dependency']): paths.append(prefix+['behavior'])
             elif 'Checker declaration missing' in reason: paths.append(prefix+['properties'])
@@ -153,6 +154,8 @@ def diagnostic_context(candidate,diagnostics,context,limit):
     available={m['id']:m for m in all_materials(context)}
     wanted.update(explicit)
     direct=[o for o in objects if o.get('id') in ids]
+    for diagnostic in diagnostics:
+        if diagnostic.code.startswith('condition_') or diagnostic.code=='declaration_identity':direct.append({'current_condition_problem':diagnostic.details})
     objects=direct
     selected=[];omitted=[]
     priority=list(dict.fromkeys(explicit+[id for d in diagnostics for id in d.material_ids]+sorted(wanted)))
