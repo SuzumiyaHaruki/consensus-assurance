@@ -1,3 +1,14 @@
+VERIFICATION METHOD SELECTION
+TLA+ is a verification/search method, not the definition of success. When a direct
+executable trace can confirm or refute the selected obligation, describe that test
+first: legal prehistory, controlled events, observations and oracle. Prefer a local
+model when interleavings or state-space exploration are the hard part. Record the
+preferred next check in the existing question/brief; this advice does not create a
+new execution route or replace required TLC, experiment or evidence checks.
+Model behavior from code and properties from obligations. No result under finite
+test/model bounds establishes whole-system correctness; an agent judgment cannot
+replace actual execution, supported observation or calibration.
+
 MODELING METHOD
 Before generating actions, trace the selected obligation through concrete control flow. For each relevant state read/write, identify its source binding, owner, and persistence or recovery contract.
 Split actions at actual interruptible boundaries: blocking calls, channel operations, callbacks, lock release, and storage completion. Compare checks at start with checks at completion; ask whether identity, context, configuration, or inputs can change in between. Do not combine separated effects into an atomic action without evidence.

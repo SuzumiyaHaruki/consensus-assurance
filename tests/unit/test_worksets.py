@@ -94,7 +94,7 @@ def test_skill_routing_loads_actual_behavior_method_without_global_repair_ballas
         assert 'skills/consensus-analysis/references/behavior-obligations.md' in paths
         text=render(task,{'modeling_brief':{'unit_id':'synthetic'}})
         assert 'Semantic effect:' in text and 'A phase name does not' in text
-        assert 'Membership/weight change' in text and 'Semantic effect:' in text
+        assert 'Configuration/membership:' in text and 'Minimal discriminator:' in text
     assert 'skills/consensus-analysis/references/graph-repair.md' not in loaded_resources('build',{})['paths']
     assert 'responsibilities-and-behaviors.md' in ' '.join(loaded_resources('discover',{})['paths'])
     for task in manifest()['tasks']:

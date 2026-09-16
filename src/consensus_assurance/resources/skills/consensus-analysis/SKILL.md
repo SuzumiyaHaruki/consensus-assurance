@@ -1,10 +1,12 @@
 ---
 name: consensus-analysis
-description: Discover implementation-grounded goals, obligations and dependency questions from supplied source material.
+description: Implementation-grounded audit analysis of CFT consensus and replicated state machines; recover concrete behaviors and handoffs before deriving goals, obligations and audit questions.
 ---
 
-# consensus-analysis
+Recover actual activities and what they establish and consume. Historical bugs are
+optional evidence, never a prerequisite. Assume no fixed API, leader step-down,
+pre-election mechanism or storage design.
 
-Discover implementation-grounded goals, obligations and dependency questions from supplied source material.
-
-Use [guide.md](guide.md). Only controller-loaded references are available; links do not grant file access. Return the requested typed proposal; request missing source.
+Use [guide.md](guide.md) for the method. Only controller-loaded references are
+available; links do not grant file access. Return the requested typed proposal
+and request specific missing source through the shared reading service.

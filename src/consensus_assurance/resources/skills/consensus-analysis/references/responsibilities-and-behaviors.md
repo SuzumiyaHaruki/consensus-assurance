@@ -1,26 +1,26 @@
-# Responsibility and behavior survey
+# Thin CFT activity survey
 
-Use these four overlapping coverage views. They are not execution stages, a universal
-protocol specification, or a proven complete taxonomy. This project's A/B/C/D are
-not Specula's distributed/concurrent categories. Consult each applicable family;
-record grounded N/A, unlocated paths or deferred work instead of manufacturing goals.
-One behavior can serve multiple views without duplicating its graph objects.
+Default: Crash Fault Tolerant (CFT) consensus / replicated state machines.
+ABCD are overlapping coverage views, not stages or mandatory claims. Record
+relevant activities as grounded, N/A with basis, unknown or deferred, with entry
+points/roles, producers/consumers, shared state and handoffs. Responsibilities need not have Goals; avoid one model per activity.
 
-| View | Families to investigate from actual entry points |
+| View | Conditional activity vocabulary |
 | --- | --- |
-| A: Forming and learning decisions | Construct/send proposals; receive/evaluate proposals; produce/send support; collect support/form evidence; confirm/propagate/learn a decision |
-| B: Protocol control and participation | Trigger/enter a context; acquire/transfer/revoke a role; export/collect/install handoff information; propose/activate changes in membership, weight or identity rules |
-| C: Maintaining history, evidence and state | Update/save/publish protocol state; capture/persist/publish snapshots; transfer/recover/install history; truncate/reclaim/remove old state |
-| D: Connecting decisions to service effects | Validate/schedule/execute commands; correlate/return results; provide read/barrier guarantees; retry/cancel/roll back work |
+| A: Decision progression | Establish/propose; receive/evaluate replication or proposals; produce/consume support; aggregate and advance commit/decision; learn/propagate decisions |
+| B: Control and role/context | Timeout transitions where present; campaign/election; acquire/lose/transfer authority; membership activation; old in-flight work |
+| C: Durable history and recovery | Durable protocol state; normal-path persistence/truncation; snapshot capture/persist/publish; catch-up/install/recovery; compaction/reclamation |
+| D: Decision to service effects | Schedule/apply; batch filtering; response/Future correlation; reads/barriers; retry/cancel/restore |
 
-Move forward from these responsibilities to code mechanisms, then check backward
-from APIs, message handlers, timers, background tasks, callbacks, startup recovery
-and deletion paths. A directory sample does not establish responsibility coverage.
-There need not be a stable leader, a single log, a uniform quorum rule, one decision
-per round, or final decision before every speculative effect. Roles can overlap;
-phases can be pipelined. Derive the relevant execution and object contexts from code.
+Trace responsibilities to code and reverse-check APIs, message handlers, timers,
+background loops, storage callbacks, startup/recovery and deletion paths. Follow
+external adapters; include normal-path persistence.
+Supported, enabled and used-on-this-path differ. Roles and timeout names do not
+establish context changes. Do not require pre-election or automatic step-down on
+lost contact. Inspect actual authority-maintenance triggers/effects, or what
+maintains the relevant guarantee when that mechanism is absent.
 
-Choose a meaningful bounded question by importance, unexamined interactions,
-existing evidence, executable controls and cost. No historical issue or suspicious
-guard is required. Preserve other responsibilities as explicit work; do not demand
-17 goals, 17 models, or a reviewer call for each family before building one model.
+Include crash/restart, storage error/order, stale replies and asynchronous work;
+message delay/loss/duplicate/reorder only where the transport/fault model permits.
+Prioritize consequence, unexplained handoffs, evidence and cost; defer other work.
+Local arithmetic, report provenance and service delivery are distinct questions.

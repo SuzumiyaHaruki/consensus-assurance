@@ -6,7 +6,7 @@ Identify applicable dimensions independently: participant identity, operation/ob
 
 Trace support through production, send, receive, acceptance, retention and consumption. Explain which guarantee each event establishes, the code implementing it and which upstream contracts remain unchecked. Different participants may occupy different contexts concurrently.
 
-At a context change, retain outstanding requests, callbacks, messages and evidence unless actual code cancels, partitions or legally consumes them. An old operation may complete safely on its original object. Object or channel isolation can substitute for an explicit numeric-context comparison; missing a familiar guard alone is not a defect. Certificates may remain valid across context changes when the implementation permits it.
+At a context change, retain outstanding requests, callbacks, messages and evidence unless actual code cancels, partitions or legally consumes them. An old operation may complete safely on its original object. Object or channel isolation can substitute for an explicit numeric-context comparison; missing a familiar guard alone is not a defect. Previously established facts may remain valid across context changes when the implementation permits it.
 
 Separate in-context aggregation from replacement of the aggregation object or configuration. A monotonic update inside one object lifetime does not imply monotonic state across destruction and reconstruction. A phase name is not a lock or atomicity boundary. Split actions at observed queues, blocking calls, callbacks, lock release and persistence completion.
 
