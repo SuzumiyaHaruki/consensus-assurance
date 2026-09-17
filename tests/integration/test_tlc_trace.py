@@ -129,7 +129,9 @@ def test_F2_normative_revision_executes_new_checker(tlc, prepared):
 def test_F4_actual_async_order_is_checked(tmp_path):
     import sys
     from consensus_assurance.adapters.runners.process import ProcessRunner
-    from consensus_assurance.adapters.runners.experiment import extract_events, prerequisites
+    from consensus_assurance.adapters.runners.experiment import extract_events
+    from consensus_assurance.core.events import match_prerequisites
+    from consensus_assurance.core.proposals import EventRequirement
     runner = ProcessRunner(tmp_path)
     scripts = [
         "import threading,json; started=threading.Event();changed=threading.Event()\n"
@@ -145,5 +147,5 @@ def test_F4_actual_async_order_is_checked(tmp_path):
     for script in scripts:
         check = runner.run([sys.executable,'-c',script],tmp_path,'experiment','fixture',5)
         assert check.exit_code == 0
-        outcomes.append(prerequisites(extract_events(check),['started','context_changed','completed'])[0])
+        outcomes.append(match_prerequisites(extract_events(check),[EventRequirement(alias=e,event=e) for e in ['started','context_changed','completed']])['status']=='matched')
     assert outcomes == [True, False]

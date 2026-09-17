@@ -37,6 +37,9 @@ class CoveragePoint(Record):
 
 
 class AuditQuestion(Record):
+    disposition: Literal["explained_by_existing_mechanism", "concrete_suspicion", "needs_specific_evidence", "ready_for_check"] | None = None
+    preferred_check: Literal["source_review", "direct_test", "controlled_schedule", "local_model"] | None = None
+    requests: list[ReadRequest] = []
     question: str
     importance: str
     source_ids: list[str] = Field(min_length=1)
@@ -218,8 +221,8 @@ class Scope(Record):
 
 
 class Grounding(Record):
-    behavior_ids: list[str] = []
-    expectation_ids: list[str] = []
+    behavior_ids: list[str] = Field(default_factory=list, description="Exact IDs of acquired materials containing observed behavior; not invented behavior labels or Binding IDs")
+    expectation_ids: list[str] = Field(default_factory=list, description="Exact IDs of acquired materials supporting the expectation; not invented expectation labels. Explain normative applicability in derivation.")
     binding_ids: list[str] = []
     derivation: str = ""
     applicability: str = ""
@@ -289,8 +292,8 @@ class BindingAssociation(Record):
 class CodeUse(Record):
     binding_id: str
     role: Literal["direct", "input", "support", "environment", "handoff"]
-    claim_ids: list[str] = Field(min_length=1)
-    relation_ids: list[str] = []
+    claim_ids: list[str] = Field(min_length=1, description="Existing claims associated with this binding; contextual use does not add them to checked obligations")
+    relation_ids: list[str] = Field(default_factory=list, description="For support/handoff: selected directed dependency edges from checked obligations, not a goal mapping or a merely related edge")
     source_ids: list[str] = Field(min_length=1)
     rationale: str
     unverified: list[str] = []
@@ -341,6 +344,7 @@ class Binding(AssociatedCode):
 
 
 class ConstraintSource(Record):
+    binding_ids: list[str] = []
     constraint: str
     source_kind: Literal["code_observation", "document_statement", "model_assumption", "agent_inference"]
     source_ids: list[str]
@@ -384,7 +388,24 @@ class ModelArtifact(Record):
     search_fingerprint: str = ""
 
 
+class DirectCheckArtifact(Record):
+    id: str = Field(default_factory=uid)
+    version: int = 1
+    plan_path: str
+    harness_path: str
+    artifact_digests: dict[str, str]
+    snapshot_id: str
+    unit_id: str
+    claim_id: str
+    binding_ids: list[str]
+    graph_versions: dict[str, int]
+    origin: Origin
+    scope: Scope
+    operation_id: str
+
+
 class CheckRun(Record):
+    direct_check_id: str | None = None
     id: str = Field(default_factory=uid)
     action: str
     status: ExecutionStatus = ExecutionStatus.NOT_SCHEDULED
@@ -421,6 +442,7 @@ class CheckRun(Record):
 
 
 class Evidence(Record):
+    direct_check_id: str | None = None
     id: str = Field(default_factory=uid)
     check_id: str
     model_id: str | None
@@ -440,9 +462,10 @@ class Evidence(Record):
 
 
 class Finding(Record):
+    direct_check_id: str | None = None
     id: str = Field(default_factory=uid)
     claim_id: str
-    model_id: str
+    model_id: str | None = None
     check_id: str
     stage: Investigation = Investigation.MODEL_ONLY
     origin: Origin
@@ -450,11 +473,18 @@ class Finding(Record):
     trace_path: str
     investigation_notes: list[str] = []
     replay_check_id: str | None = None
-    level: Literal["model_candidate", "implementation_obligation", "implementation_goal"] = "model_candidate"
+    level: Literal["model_candidate", "implementation_candidate", "implementation_obligation", "implementation_goal"] = "model_candidate"
     checker_id: str | None = None
     claim_version: int | None = None
     confirmation_path: str | None = None
     applicability: Literal["current", "historical_scope", "recheck_required"] = "current"
+
+
+    @model_validator(mode="after")
+    def route_provenance(self):
+        if bool(self.model_id) == bool(self.direct_check_id):
+            raise ValueError("Finding needs exactly one model or direct-check provenance")
+        return self
 
 
 class Relation(Record):
@@ -551,6 +581,9 @@ class Capability(Record):
 
 
 class Analysis(Record):
+    direct_checks: list[DirectCheckArtifact] = []
+    active_direct_check_id: str | None = None
+    question_continuations: dict[str, dict] = {}
     scope_updates: dict[str, dict] = {}
     milestones: dict[str, str] = {}
     review_reuses: list[dict] = []
@@ -631,6 +664,10 @@ class Analysis(Record):
             raise ValueError("Evidence requires a completed execution")
         if evidence.snapshot_id != check.snapshot_id or evidence.model_id != check.model_id:
             raise ValueError("Evidence input association mismatch")
+        if evidence.direct_check_id != check.direct_check_id:
+            raise ValueError("Evidence direct-check association mismatch")
+        if evidence.direct_check_id and not any(d.id == evidence.direct_check_id and d.snapshot_id == evidence.snapshot_id for d in self.direct_checks):
+            raise ValueError("Evidence direct-check artifact is missing")
         if evidence.origin != check.origin:
             raise ValueError("Evidence origin mismatch")
         if evidence.calibration_id and not any(c.id == evidence.calibration_id and c.model_id == evidence.model_id for c in self.calibrations):

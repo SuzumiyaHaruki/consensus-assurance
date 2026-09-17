@@ -4,7 +4,6 @@ import pytest
 from consensus_assurance.core.config import Config
 from consensus_assurance.core.proposals import BuildReply
 from consensus_assurance.registry import assemble
-from consensus_assurance.consensus.inquiry import INQUIRY
 from consensus_assurance.workflow.engine import Engine
 from consensus_assurance.workflow.materials import ReadingPlan
 from consensus_assurance.workflow.output_repair import OutputRepair, Replacement, repair_targets, apply_replacements
@@ -41,10 +40,10 @@ def test_field_repair_is_executed_and_resumes_without_replacing_graph(tmp_path,p
             if interrupt and not self.interrupted and event=='action_result_saved' and self.state.pending_action.kind=='agent:read:repair':
                 self.interrupted=True
                 raise RuntimeError('After patch response before local merge')
-    engine=ReadingEngine(config,root,*assemble(config),INQUIRY)
+    engine=ReadingEngine(config,root,*assemble(config))
     if interrupt:
         with pytest.raises(RuntimeError):engine.start(repo)
-        engine=ReadingEngine(config,root,*assemble(config),INQUIRY);engine.interrupted=True
+        engine=ReadingEngine(config,root,*assemble(config));engine.interrupted=True
         response,_=engine.resume()
     else:response,_=engine.start(repo)
     assert response.rationale==original['rationale']
@@ -63,10 +62,34 @@ def test_invalid_build_artifact_is_repaired_before_commit(tmp_path,prepared):
         {'replacements':[{'path':'/bundle/behavior','value_json':json.dumps(valid)}],'rationale':'Restore the declared initial operator'}]))
     config=Config(implementation='toy',agent_backend='mock',fixture=str(fixture))
     from consensus_assurance.workflow.budget import BudgetTracker
-    engine=Engine(config,tmp_path/'audit',*assemble(config),INQUIRY);engine.state=state;engine.budget=BudgetTracker(config.budget,state)
+    engine=Engine(config,tmp_path/'audit',*assemble(config));engine.state=state;engine.budget=BudgetTracker(config.budget,state)
     unit=state.units[0]
     reply,_=engine.ask('build',BuildReply,{},lambda p:validate_build_reply(state,unit,p,engine.implementation))
     assert not (engine.root/'models').exists()
     model=engine.save_model(unit,reply.bundle)
     assert model.version==1 and len(state.models)==1
     assert (engine.root/'models/v1/commit.json').exists()
+
+
+def test_schema_reference_repair_receives_owner_and_dependency_context():
+    from consensus_assurance.core.proposals import Discovery
+    from consensus_assurance.core.diagnostics import Diagnostic
+    from consensus_assurance.workflow.output_repair import diagnostic_context
+    candidate={'patch':{'units':[{'id':'U','obligation_ids':['O'],'binding_ids':['B'],
+        'relation_ids':['R'],'code_uses':[{'binding_id':'B','claim_ids':[]}]}],
+        'bindings':[{'id':'B','associations':[{'claim_id':'O','source_ids':['source'],'rationale':'Existing association'}]}],
+        'claims':[{'id':'O','description':'Preserved obligation','source_ids':['source']}],
+        'relations':[{'id':'R','source':'O','target':'B'}],
+        'unrelated':[{'id':'X','description':'DO NOT SEND'}]}}
+    d=Diagnostic(code='schema_type',category='format',paths=['/patch/units/0/code_uses/0/claim_ids'],message='Empty reference',allowed=['representation'])
+    material={'id':'source','file':'service.go','start_line':1,'end_line':1,'content_digest':'fixture','text':'actual acquired code'}
+    result=diagnostic_context(candidate,[d],{'materials':[material]},4000)
+    assert {o['id'] for o in result['objects']}=={'U','O','B','R'}
+    assert result['materials']==[material]
+    assert candidate['patch']['units'][0]['code_uses'][0]['claim_ids']==[]
+    assert not result['required_objects_missing']
+    small=diagnostic_context(candidate,[d],{'materials':[material]},50)
+    assert small['required_objects_missing'] and not small['objects']
+    repair=OutputRepair(replacements=[Replacement(path='/patch/claims/0/description',value_json='"changed"')],rationale='Not authorized')
+    with pytest.raises(ValueError,match='unreported'):
+        apply_replacements(candidate,[{'path':d.paths[0]}],repair)

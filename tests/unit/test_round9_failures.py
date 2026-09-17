@@ -34,7 +34,8 @@ def test_archived_resolution_does_not_require_all_old_citations():
             rationale='The issue asks to locate the leader dispatch handoff; complete future/batch semantics and acceptance of a separate grounding revision remain open beyond that handoff') for x in item.limitations]
     validate_resolutions(s,t,r)
     from consensus_assurance.workflow.inquiry import validate_review
-    validate_review(s,t,r)
+    from consensus_assurance.workflow.history import import_question_changes
+    validate_review(s,t,import_question_changes(r))
     assert s.model_dump()==before
 
 

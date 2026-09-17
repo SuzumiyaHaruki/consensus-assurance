@@ -2,22 +2,16 @@
 from pathlib import Path
 import json
 from consensus_assurance.core.types import InquiryTask, SemanticReview
-from consensus_assurance.core.proposals import ExplorationReply, ReviewReply, Feedback
+from consensus_assurance.core.proposals import ExplorationReply, ReviewReply
 from consensus_assurance.adapters.storage.files import write_json
-from .materials import catalogue, add_reads, ReadingPlan
 from .graph import apply_patch
 from .feedback import apply_feedback
 from .errors import Blocked
-from .budget import BudgetExhausted
-from .reviews import required_aspects, material_closure, readiness, validate_resolutions, record_dispositions, valid_supersession
+from .reviews import required_aspects, material_closure, readiness, validate_resolutions, record_dispositions, valid_supersession, review_objects as objects
 
 
 def enabled(engine):
     return engine.config.budget.exploration_rounds > 0 or engine.config.budget.semantic_reviews > 0
-
-
-def objects(state):
-    return {o.id:o for o in [*state.claims,*state.bindings,*state.relations,*state.units,*state.models]}
 
 
 def enqueue(state, kind, reason, trigger, responsibility_ids=(), target_ids=(), unit_id=None, model_id=None, requests=()):
@@ -58,12 +52,14 @@ def register_responsibilities(state, candidates):
         else: state.responsibilities.append(new)
 
 
-def register_requests(state, requests, trigger):
+def register_requests(state, requests, trigger, unit_id=None):
     known={r.id for r in state.responsibilities}
     for i,request in enumerate(requests):
         if not set(request.responsibility_ids)<=known or not request.reason.strip():
             raise ValueError('Exploration request needs known responsibilities or a concrete system-wide gap')
-        enqueue(state,'explore',request.reason,trigger+':'+str(i),request.responsibility_ids,requests=request.requests)
+        unit=next((u for u in state.units if u.id==unit_id),None)
+        related=unit and (not request.responsibility_ids or any(r.id in request.responsibility_ids and set(r.claim_ids)&set(unit.goal_ids+unit.obligation_ids) for r in state.responsibilities))
+        enqueue(state,'explore',request.reason,trigger+':'+str(i),request.responsibility_ids,unit_id=unit_id if related else None,requests=request.requests)
 
 
 def initial_agenda(engine, proposal):
@@ -73,20 +69,16 @@ def initial_agenda(engine, proposal):
     if proposal.reading_requests:
         enqueue(state,'explore','Initial discovery requested additional material; existing units do not suppress it','initial_reading',requests=proposal.reading_requests)
     if not enabled(engine): return
-    queue_handoffs(engine)
     if engine.config.budget.audit_units == 0:
         for unit in state.units: review_unit(engine,unit,'candidate_semantics')
-    for r in state.responsibilities:
-        if not r.claim_ids or r.questions:
-            enqueue(state,'explore','Investigate an identified responsibility and its unexplained handoffs','responsibility:'+r.id+':'+str(r.version),[r.id])
-    enqueue(state,'explore','Survey responsibilities and interfaces outside the first selected direction; the overview is not an exhaustive specification','initial_breadth')
+    # Overview questions remain visible backlog; explicit requests remain queued.
 
 
 def review_unit(engine, unit, trigger, model=None):
     if not enabled(engine): return
     available=objects(engine.state)
     if trigger=="before_model" and readiness(engine.state,unit)["status"]=="reviewed":return
-    ids=[x for x in dict.fromkeys(unit.goal_ids+unit.obligation_ids+unit.binding_ids+unit.relation_ids+[unit.id]+([model.id] if model else [])) if x in available]
+    ids=[x for x in dict.fromkeys(unit.goal_ids+unit.obligation_ids+[unit.id]+([model.id] if model else [])+[i.target_id for i in engine.state.review_issues if not i.resolved_by and i.target_id in unit.binding_ids+unit.relation_ids]) if x in available]
     from .review_contract import target_contract,same_basis
     needed={};basis={}
     for id in ids:
@@ -123,7 +115,6 @@ def material_reviews(engine, unit, added):
 def after_search(engine, unit, model, check):
     if not enabled(engine):return
     review_unit(engine,unit,'after_search:'+check.id,model)
-    enqueue(engine.state,'explore','Revisit unrepresented responsibilities and interactions after a local search, including when no counterexample was found','after_local:'+check.id)
 
 
 def choose_task(engine):
@@ -136,24 +127,30 @@ def choose_task(engine):
         if state.usage.get(resource,0)>=getattr(engine.config.budget,resource):
             task.status='blocked';task.stop_reason='Budget exhausted or disabled: '+resource
     pending=[t for t in pending if t.status=='pending' and not t.superseded_by]
-    if not pending:return None
-    needed=[t for t in pending if t.kind=='review' and t.unit_id==state.active_unit_id and t.trigger.startswith('before_model')]
-    if needed:return needed[0]
-    reviews=[t for t in pending if t.kind=='review']
-    if reviews and engine.config.budget.audit_units==0:return reviews[0]
-    if state.active_unit_id and state.next_action in {'build','experiment','calibrate','search'}:
-        local=[t for t in reviews if t.unit_id==state.active_unit_id]
-        if local:return local[0]
-        return None
-    exploration=[t for t in pending if t.kind=='explore']
-    exploration.sort(key=lambda t:(not t.trigger.startswith('handoff:'), any(r.claim_ids for r in state.responsibilities if r.id in t.responsibility_ids), bool(t.requests), len(t.requests)))
-    # Alternate breadth and review, allowing one local segment between completed inquiries.
-    if state.last_work_kind=='explore' and reviews:return reviews[0]
-    if state.last_work_kind=='local' and exploration:return exploration[0]
-    if state.last_work_kind=='review' and (state.active_unit_id or any(u.status in {'pending','partial'} for u in state.units)):return None
-    if reviews:return reviews[0]
-    if state.last_work_kind=='explore' and any(u.status in {'pending','partial','selected'} for u in state.units):return None
-    return exploration[0] if exploration else None
+    if state.active_unit_id:
+        local=[t for t in pending if t.unit_id==state.active_unit_id]
+        # Executable checks precede generic inquiry; explicit selected reviews still run.
+        return next((t for t in local if t.kind=='review'),None)
+    focused=[t for t in pending if t.kind=='review' and t.unit_id in state.deferred_units]
+    if focused:return focused[0]
+    ready=any(u.status in {'pending','partial','selected'} and not (u.audit_question and u.audit_question.disposition=='explained_by_existing_mechanism') for u in state.units)
+    if ready and engine.config.budget.audit_units>state.usage.get('audit_units',0):return None
+    if pending:return sorted(pending,key=lambda t:t.kind!='review')[0]
+    if state.usage.get('exploration_rounds',0)<engine.config.budget.exploration_rounds:
+        # At most one task is promoted at a time, only when no local action remains.
+        roles=[r for r in state.responsibilities if (r.questions or r.handoffs or not r.claim_ids)
+            and not any(t.trigger=='backlog:'+r.id+':'+str(r.version) for t in state.inquiry_tasks)]
+        if roles:
+            role=roles[0]
+            return enqueue(state,'explore','Select one bounded question from the responsibility backlog',
+                'backlog:'+role.id+':'+str(role.version),[role.id])
+        if not state.inquiry_tasks:
+            return enqueue(state,'explore','Find a bounded question where no executable unit exists','initial_breadth')
+    return None
+
+
+def read_purpose(task):
+    return 'depth' if task.unit_id or task.kind=='review' else 'breadth'
 
 
 def task_context(engine,task):
@@ -177,19 +174,36 @@ def task_context(engine,task):
     selected=[m for m in state.materials if m.id in wanted]
     task.material_ids=[m.id for m in selected]
     task.unit_version=next((u.version for u in state.units if u.id==task.unit_id),None)
-    result={'pending_scope_updates':pending_scope,'task':task.model_dump(mode='json',exclude={'context_receipt_id','context_dependencies','admitted','preparation_failures','child_task_ids'}),'responsibilities':[r.model_dump(mode='json') if r.id in task.responsibility_ids else {'id':r.id,'description':r.description,'claim_ids':r.claim_ids} for r in state.responsibilities],
+    result={'pending_scope_updates':pending_scope,'task':task.model_dump(mode='json',exclude={'context_receipt_id','context_dependencies','admitted','preparation_failures','child_task_ids'}),'responsibilities':[r.model_dump(mode='json') for r in state.responsibilities if r.id in task.responsibility_ids],
         'materials':[m.model_dump(mode='json') for m in selected],
         'omitted_material_ids':[m.id for m in state.materials if m.id not in wanted],
         'catalogue':[],
         'unread_ranges':{f:r for f,r in state.unread_ranges.items() if f in {m.file for m in selected}},'remaining_seconds':engine.budget.remaining(),
-        'target_objects':[available[i].model_dump(mode='json') for i in task.target_ids if i in available],
-        'claims':[c.model_dump(mode='json') if c.id in closure else {'id':c.id,'kind':c.kind,'description':c.description,'version':c.version} for c in state.claims if c.id not in task.target_ids],
+        'target_objects':[available[i].model_dump(mode='json') for i in task.target_ids if i in available and i!=task.unit_id],
+        'claims':[c.model_dump(mode='json') for c in state.claims if c.id in closure and c.id not in task.target_ids],
         'bindings':[b.model_dump(mode='json') for b in state.bindings if b.id in closure and b.id not in task.target_ids],
         'relations':[r.model_dump(mode='json') for r in state.relations if r.id in closure and r.id not in task.target_ids],
-        'units':[u.model_dump(mode='json') for u in state.units if u.id in closure and u.id not in task.target_ids],
-        'open_issues':[i.model_dump(mode='json') for i in state.review_issues if (i.target_id in closure or i.id in task.resolution_issue_ids) and not i.resolved_by],
+        'units':[u.model_dump(mode='json') for u in state.units if u.id in closure and u.id not in task.target_ids and u.id!=task.unit_id],
+        'open_issues':[i.model_dump(mode='json',exclude_defaults=True,exclude_none=True) for i in state.review_issues if (i.target_id in closure or i.id in task.resolution_issue_ids) and not i.resolved_by],
         'blocked_review_tasks':[{'id':t.id,'target_ids':t.target_ids,'target_versions':t.target_versions,'requested_aspects':t.requested_aspects,'model_id':t.model_id,'stop_reason':t.stop_reason} for t in state.inquiry_tasks if t.kind=='review' and t.status=='blocked' and not t.superseded_by and set(t.target_ids)<=set(task.target_ids)],
-        'cost_estimate':cost_estimate(engine),'overview_limit':'This compact index is not complete implementation coverage; request specific actual ranges before deriving new claims'}
+        'overview_limit':'This compact index is not complete implementation coverage; request specific actual ranges before deriving new claims'}
+    if task.kind=='explore' and not task.responsibility_ids:
+        result['responsibilities']=[{'id':r.id,'description':r.description,'claim_ids':r.claim_ids,'version':r.version,'questions':r.questions,'source_ids':r.source_ids,'applicability':r.applicability} for r in state.responsibilities]
+        result['claims']=[{'id':c.id,'kind':c.kind,'description':c.description,'version':c.version} for c in state.claims]
+    if task.unit_id:
+        result['selected_unit']=available[task.unit_id].model_dump(mode='json')
+        from .task_view import semantic_view
+        result['semantic_view'],extra=semantic_view(state,closure)
+        result['semantic_view'].pop('open_issues')
+        result['semantic_view']['issue_reference_rule']='issue_ref/explanation_ref/source_ids_ref refer to the unchanged fields of open_issues by ID; alternatives and counterarguments remain on each judgment.'
+        wanted.update(extra)
+        result['materials']=[m.model_dump(mode='json') for m in state.materials if m.id in wanted]
+        result['required_material_ids']=sorted(wanted)
+        task.material_ids=[m['id'] for m in result['materials']]
+    for artifact in state.direct_checks:
+        if artifact.id in task.target_ids:
+            result['direct_check_plan']=json.loads(Path(artifact.plan_path).read_text())
+            result['actual_checks']=[engine.error_context(c) for c in state.checks if c.direct_check_id==artifact.id]
     if task.model_id:
         model=next((m for m in state.models if m.id==task.model_id),None)
         if model:
@@ -197,6 +211,7 @@ def task_context(engine,task):
             result['prior_issue_models']=[{'issue_id':i.id,'model_id':old.id,'bundle':json.loads(Path(old.bundle_path).read_text()),'current_model_id':model.id} for i in state.review_issues if i.id in task.resolution_issue_ids for old in state.models if old.id==i.model_id]
             result['checker_executions']=[engine.error_context(c) for c in state.checks if c.model_id==model.id and c.action=='model_check']
             result['reachability']=[r.model_dump(mode='json') for r in state.reachability_results if r.model_id==model.id]
+    if task.kind!='review':result['cost_estimate']=cost_estimate(engine)
     return result
 
 
@@ -252,7 +267,7 @@ def process_task(engine, task):
         if not task.read_plan_id:
             from consensus_assurance.core.types import uid
             task.read_plan_id=uid();engine.checkpoint('inquiry_read_plan_saved')
-        receipt=engine.read(task.requests,purpose='breadth' if task.kind=='explore' else 'depth',partial=task.kind=='explore',plan_id=task.read_plan_id,related_ids=task.target_ids+task.responsibility_ids,reason=task.reason)
+        receipt=engine.read(task.requests,purpose=read_purpose(task),partial=read_purpose(task)=='breadth',plan_id=task.read_plan_id,related_ids=task.target_ids+task.responsibility_ids+([task.unit_id] if task.unit_id else []),reason=task.reason)
         task=next(t for t in state.inquiry_tasks if t.id==task.id)
         task.added_material_ids=list(dict.fromkeys(task.added_material_ids+[id for item in receipt['items'] if item['status']!='deferred' for id in item['material_ids']]))
         if receipt['status']!='complete':
@@ -281,20 +296,20 @@ def pause_unit(engine, reason):
     if state.active_unit_id:
         unit=next(u for u in state.units if u.id==state.active_unit_id)
         from .task_view import local_basis
-        state.deferred_units[unit.id]={'basis':local_basis(state,unit),'next_action':state.next_action,'model_id':state.active_model_id,'finding_id':state.active_finding_id,'reason':reason,
+        state.deferred_units[unit.id]={'basis':local_basis(state,unit),'next_action':state.next_action,'model_id':state.active_model_id,'finding_id':state.active_finding_id,'direct_check_id':state.active_direct_check_id,'reason':reason,
             'pending_feedback':state.pending_feedback,'pending_output_repair':state.pending_output_repair,'targeted_gap':state.targeted_gap}
         unit.status='blocked'
         from .modeling import obligation_progress
         unit.obligation_checks,unit.remaining_obligation_ids=obligation_progress(state,unit)
     state.gaps.append(reason)
-    state.active_unit_id=None;state.active_model_id=None;state.active_finding_id=None
+    state.active_unit_id=None;state.active_model_id=None;state.active_finding_id=None;state.active_direct_check_id=None
     state.pending_output_repair=None;state.pending_feedback=None;state.targeted_gap=None
     release_action(engine);state.next_action='select';state.last_work_kind='local'
     engine.checkpoint('local_work_deferred_for_other_tasks')
 
 
 def reserve_for_inquiry(engine):
-    pending=[t for t in engine.state.inquiry_tasks if t.status=='pending' and engine.state.usage.get('exploration_rounds' if t.kind=='explore' else 'semantic_reviews',0)<getattr(engine.config.budget,'exploration_rounds' if t.kind=='explore' else 'semantic_reviews')]
+    pending=[t for t in engine.state.inquiry_tasks if t.status=='pending' and t.unit_id==engine.state.active_unit_id and engine.state.usage.get('exploration_rounds' if t.kind=='explore' else 'semantic_reviews',0)<getattr(engine.config.budget,'exploration_rounds' if t.kind=='explore' else 'semantic_reviews')]
     engine.budget.reserved_agent_calls=min(2,len(pending))
     engine.budget.reserved_seconds=engine.config.budget.outer_reserve_seconds if pending else 0
 
@@ -350,22 +365,19 @@ def resume_deferred(engine):
         saved=state.deferred_units.get(unit.id)
         if unit.status!='blocked' or not saved:continue
         unit.status='selected';state.active_unit_id=unit.id
-        state.active_model_id=saved['model_id'];state.active_finding_id=saved['finding_id']
+        state.active_model_id=saved['model_id'];state.active_finding_id=saved['finding_id'];state.active_direct_check_id=saved.get('direct_check_id')
         state.next_action=saved['next_action']
         state.pending_feedback=saved.get('pending_feedback')
         state.pending_output_repair=saved.get('pending_output_repair')
         state.targeted_gap=saved.get('targeted_gap')
         if unit.recheck_reasons:
-            state.active_model_id=None;state.active_finding_id=None;state.next_action='build'
+            state.active_model_id=None;state.active_direct_check_id=None;state.active_finding_id=None;state.next_action='select'
             state.pending_feedback=None;state.pending_output_repair=None;state.targeted_gap=None
         engine.checkpoint('explicit_resume_of_deferred_local_work')
         return
 
 
 def prepare_selected(engine,unit):
-    review_unit(engine,unit,'before_model')
-    pending=[t for t in engine.state.inquiry_tasks if t.kind=='review' and t.unit_id==unit.id and t.unit_version==unit.version and t.trigger.startswith('before_model') and t.status=='pending' and not t.superseded_by]
-    if pending and engine.state.usage.get('semantic_reviews',0)<engine.config.budget.semantic_reviews:return False
     unit.semantic_readiness=readiness(engine.state,unit)
     engine.checkpoint('selected_unit_semantic_readiness')
     return True
@@ -377,13 +389,8 @@ def apply_task_response(engine,task_id,reply,check):
     if task.kind=='explore':
         changed=apply_patch(state,reply.patch)
         register_responsibilities(state,reply.responsibilities)
-        register_requests(state,reply.exploration_requests,task.id)
+        register_requests(state,reply.exploration_requests,task.id,unit_id=task.unit_id)
         state.gaps.extend(reply.limitations)
-        queue_handoffs(engine)
-        for r in reply.responsibilities:
-            if not r.claim_ids or r.questions:
-                stored=next(x for x in state.responsibilities if x.id==r.id)
-                enqueue(state,'explore','Continue unexplained responsibility or handoff','responsibility:'+r.id+':'+str(stored.version),[r.id])
         material_reviews(engine,None,task.added_material_ids)
         for unit in state.units:
             if changed & set(unit.goal_ids+unit.obligation_ids+unit.relation_ids):
@@ -404,7 +411,7 @@ def apply_task_response(engine,task_id,reply,check):
             if state.revisions[-1].status=='applied' and state.active_unit_id:
                 active=next(u for u in state.units if u.id==state.active_unit_id)
                 if set(task.target_ids)&set(active.goal_ids+active.obligation_ids+active.relation_ids+active.binding_ids+[active.id]):
-                    state.active_model_id=None;state.active_finding_id=None;state.next_action='build'
+                    state.active_model_id=None;state.active_direct_check_id=None;state.active_finding_id=None;state.next_action='select'
             for candidate in state.units:
                 if set(task.target_ids)&set(candidate.goal_ids+candidate.obligation_ids+candidate.relation_ids+candidate.binding_ids+[candidate.id]):
                     review_unit(engine,candidate,'semantic_revision:'+review.revision_id)
@@ -413,7 +420,7 @@ def apply_task_response(engine,task_id,reply,check):
             if item.aspect=='checker_correspondence' and item.status in {'disputed','revision_needed'} and task.model_id:
                 state.affect([task.model_id],'Semantic review questions checker correspondence: '+item.explanation)
                 if state.active_model_id==task.model_id:
-                    state.active_model_id=None;state.active_finding_id=None;state.next_action='build'
+                    state.active_model_id=None;state.active_direct_check_id=None;state.active_finding_id=None;state.next_action='select'
         followup_before={t.id for t in state.inquiry_tasks}
         if reply.requests:
             focus=[i for i in reply.items if i.status!='no_issue_found' or i.limitations]
@@ -421,7 +428,7 @@ def apply_task_response(engine,task_id,reply,check):
             follow=enqueue(state,'review','Follow up only the unresolved aspects using the requested source',task.id+':followup',target_ids=targets,unit_id=task.unit_id,model_id=task.model_id,requests=reply.requests)
             follow.requested_aspects={id:list(dict.fromkeys(i.aspect for i in focus if i.target_id==id)) or task.requested_aspects.get(id,list(required_aspects(objects(state)[id]))) for id in targets}
             follow.resolution_issue_ids=[i.id for i in state.review_issues if not i.resolved_by and i.target_id in targets and i.aspect in follow.requested_aspects[i.target_id]]
-        register_requests(state,reply.exploration_requests,task.id)
+        register_requests(state,reply.exploration_requests,task.id,unit_id=task.unit_id)
         record_dispositions(state,review,reply,[t.id for t in state.inquiry_tasks if t.id not in followup_before])
         if reply.requests:
             follow.resolution_issue_ids=[i.id for i in state.review_issues if not i.resolved_by and i.target_id in targets and i.aspect in follow.requested_aspects[i.target_id]]
@@ -429,17 +436,6 @@ def apply_task_response(engine,task_id,reply,check):
     task.repair_session=None;task.check_id=check.id;task.status='completed';task.stage='done';state.active_inquiry_id=None
     settle_parents(state)
     state.last_work_kind=task.kind;release_action(engine)
-
-
-def queue_handoffs(engine):
-    state=engine.state
-    for role in state.responsibilities:
-        for edge in role.handoffs:
-            from .handoffs import handoff_status
-            disposition=handoff_status(state,role,edge)
-            if disposition['assignments']:continue
-            enqueue(state,'explore','Investigate the unassigned handoff: '+edge.description,
-                'handoff:'+role.id+'->'+edge.target_id+'@'+str(role.version),[role.id,edge.target_id])
 
 
 def cost_estimate(engine):
@@ -463,6 +459,10 @@ def split_context_task(engine,task):
     middle=(len(fields)+1)//2;children=[]
     for index,part in enumerate((fields[:middle],fields[middle:])):
         child=enqueue(engine.state,task.kind,task.reason+'; bounded subtask '+str(index+1),task.id+':context_part:'+str(index),unit_id=task.unit_id,model_id=task.model_id,**{key:part})
+        child.requested_aspects={id:aspects for id,aspects in task.requested_aspects.items() if id in child.target_ids}
+        child.resolution_issue_ids=[id for id in task.resolution_issue_ids if any(i.id==id and i.target_id in child.target_ids for i in engine.state.review_issues)]
+        child.added_material_ids=list(task.added_material_ids)
+        engine.state.task_attachments['inquiry:'+child.id]=list(engine.state.task_attachments.get('inquiry:'+task.id,[]))
         child.parent_task_id=task.id;child.expected_contribution='Resolve this explicit part of the oversized parent; other parts remain pending'
         children.append(child.id)
     task.child_task_ids=children
@@ -487,7 +487,34 @@ def wake_changed(engine):
         if unit.status!='blocked' or not saved or not saved.get('basis'):continue
         if saved['basis']==local_basis(state,unit):continue
         if saved.get('pending_output_repair',{} ) and saved['pending_output_repair'].get('blocked'):continue
-        unit.status='selected';state.active_unit_id=unit.id;state.active_model_id=saved['model_id'];state.active_finding_id=saved['finding_id']
+        unit.status='selected';state.active_unit_id=unit.id;state.active_model_id=saved['model_id'];state.active_finding_id=saved['finding_id'];state.active_direct_check_id=saved.get('direct_check_id')
         state.next_action=saved['next_action'];state.pending_feedback=saved.get('pending_feedback');state.targeted_gap=saved.get('targeted_gap')
         state.pending_output_repair=saved.get('pending_output_repair')
         engine.checkpoint('relevant_dependency_woke_local_stage');return True
+
+
+def split_model_context(engine, kind):
+    """A real oversized build can first resolve one independently reviewable dispute."""
+    state=engine.state
+    unit=next((u for u in state.units if u.id==state.active_unit_id),None)
+    if unit is None:return []
+    _,closure=material_closure(state,[unit.id])
+    disputed={i.target_id for i in state.review_issues if not i.resolved_by and i.target_id in closure}
+    priority=list(dict.fromkeys(unit.obligation_ids+unit.goal_ids+unit.binding_ids+unit.relation_ids+[unit.id]))
+    from .task_packet import prepare,pool_sources
+    from .prompts import render
+    children=[]
+    for id in [id for id in priority if id in disputed][:engine.config.budget.context_preparations]:
+        trigger='packet_dependency:'+kind+':'+unit.id+':'+str(unit.version)+':'+id
+        if any(t.trigger==trigger for t in state.inquiry_tasks):continue
+        task=enqueue(state,'review','Resolve the named current dispute before rebuilding an oversized verification workset',trigger,target_ids=[id],unit_id=unit.id)
+        task.resolution_issue_ids=[i.id for i in state.review_issues if i.target_id==id and not i.resolved_by]
+        task.requested_aspects={id:sorted({i.aspect for i in state.review_issues if i.id in task.resolution_issue_ids})}
+        packet,_=prepare(engine,'semantic_review',task_context(engine,task))
+        children.append(task.id)
+        if len(render('semantic_review',pool_sources(packet),engine.inquiry))<=engine.config.budget.context_chars:
+            task.expected_contribution='Address these exact issues with actual supplied sources; all other disputes remain pending'
+            break
+        task.status='blocked';task.stop_reason='Independent dispute packet still exceeds context_chars; no backend call sent'
+        task.preparation_failures+=1
+    return children

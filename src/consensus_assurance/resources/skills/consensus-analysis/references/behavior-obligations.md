@@ -121,6 +121,9 @@ contexts for variants, importance for consequence and trigger_rationale for the
 preferred check and minimal scenario. Coverage-point unknowns and unit limitations
 retain unresolved/excluded dependencies. Do not invent facts to fill a template.
 An older workset without this detail needs a named evidence request, not inferred
-protection. Dispositions are textual: explained_by_existing_mechanism,
-concrete_suspicion, needs_specific_evidence or ready_for_check. They do not add
-statuses, authorize semantic changes or bypass review and evidence checks.
+protection. Set AuditQuestion.disposition explicitly: explained_by_existing_mechanism,
+concrete_suspicion, needs_specific_evidence or ready_for_check. Set preferred_check to source_review, direct_test, controlled_schedule or local_model.
+For needs_specific_evidence provide exact requests or identify a named discriminator
+in already supplied material. Ready questions need a preferred_check and legal
+prehistory, observations and oracle in event_paths/points/trigger_rationale.
+These fields do not authorize semantic changes or bypass evidence checks.

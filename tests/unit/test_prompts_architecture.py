@@ -3,7 +3,7 @@ import json
 import re
 from pathlib import Path
 import pytest
-from consensus_assurance.adapters.agents.backend import render
+from consensus_assurance.workflow.prompts import render
 from consensus_assurance.reporting.chinese import render_report
 
 

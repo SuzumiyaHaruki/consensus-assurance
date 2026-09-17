@@ -1,10 +1,10 @@
 """Derived current worksets. Immutable audit records remain in state and raw artifacts."""
 import json
-from .reviews import material_closure
+from .reviews import material_closure, review_objects
 
 
 def semantic_view(state,ids):
-    objects={o.id:o for o in state.claims+state.bindings+state.relations+state.units+state.models}
+    objects=review_objects(state)
     issues=[i for i in state.review_issues if i.target_id in ids]
     tasks={t.id:t for t in state.inquiry_tasks}
     positive={};negative={};sources=set()
@@ -41,7 +41,19 @@ def semantic_view(state,ids):
                 'source_ids':i.resolution_basis.get('source_ids',i.source_ids),'remaining_scope':i.resolution_basis.get('scope_limitations',[])}
     records=list(positive.values())+list(negative.values())
     for r in records+open_issues+list(resolved.values()):sources.update(r['source_ids'])
-    return {'judgments':records,'open_issues':open_issues,'resolved':list(resolved.values()),
+    # The issue already carries the same attributed explanation and sources.
+    # Reference those exact fields, retaining alternatives and counterarguments.
+    for record in records:
+        linked=[i for i in issues if not i.resolved_by and i.review_id==record['review_id'] and i.target_id==record['target_id'] and i.aspect==record['aspect']]
+        if len(linked)==1:
+            issue=linked[0]
+            record['issue_ref']=issue.id
+            if record['explanation']==issue.explanation:
+                record.pop('explanation');record['explanation_ref']=issue.id
+            if record['source_ids']==issue.source_ids:
+                record.pop('source_ids');record['source_ids_ref']=issue.id
+    return {'issue_reference_rule':'explanation_ref/source_ids_ref point to the exact unchanged fields of open_issues by issue ID; all alternatives and counterarguments remain on the judgment',
+        'judgments':records,'open_issues':open_issues,'resolved':list(resolved.values()),
         'archive_access':'Request a focused review of a named issue/review to retrieve its archived reasoning; these are scoped opinions, not proof'},sources
 
 
@@ -71,8 +83,9 @@ def local_workset(engine,unit):
         'omitted_material_ids':[m.id for m in state.materials if m.id not in needed],
         'omission_reason':'Outside this unit, its selected dependency closure and current semantic issues; full history remains archived',
         'semantic_view':semantic,
-        'responsibilities':[{'id':r.id,'description':r.description,'claim_ids':r.claim_ids} for r in state.responsibilities],
+        'responsibilities':[{'id':r.id,'description':r.description,'claim_ids':r.claim_ids} for r in state.responsibilities if set(r.claim_ids)&ids],
         'unit':unit.model_dump(mode='json'),
+        'verification_continuation':state.question_continuations.get(unit.id,{}),
         'claims':[c.model_dump(mode='json') for c in state.claims if c.id in ids],
         'bindings':[b.model_dump(mode='json') for b in state.bindings if b.id in ids],
         'relations':[r.model_dump(mode='json') for r in state.relations if r.id in ids or r.id in unit.relation_ids],

@@ -6,7 +6,7 @@ from consensus_assurance.core.config import Config
 from consensus_assurance.core.types import SemanticCheck, SemanticReview, InquiryTask, Responsibility, ResponsibilityHandoff
 from consensus_assurance.core.proposals import ReviewReply, ClaimDraft, GraphPatch, JudgmentChange
 from consensus_assurance.workflow.reviews import record_dispositions, validate_resolutions, readiness
-from consensus_assurance.workflow.inquiry import enqueue, queue_handoffs, process_task, resume_deferred
+from consensus_assurance.workflow.inquiry import enqueue, initial_agenda, process_task, resume_deferred
 from consensus_assurance.workflow.feedback import apply_feedback
 from consensus_assurance.workflow.transactions import commit_graph
 from consensus_assurance.workflow.engine import Engine
@@ -85,13 +85,14 @@ def test_grounding_only_F2_changes_scope_without_rewriting_claim(prepared):
     assert 'serial configuration' in current.grounding.applicability
 
 
-def test_handoff_is_queued_even_when_both_responsibilities_have_goals(tmp_path,prepared):
+def test_handoff_stays_backlog_when_both_responsibilities_have_goals(tmp_path,prepared):
     _,state,_,_=prepared;engine=engine_for(tmp_path,state);source=state.materials[0].id
     state.responsibilities=[Responsibility(id='producer',description='Establish a bound',source_ids=[source],claim_ids=[state.claims[0].id],applicability='Serial fixture',handoffs=[ResponsibilityHandoff(target_id='consumer',description='Consumer relies on the input bound',source_ids=[source])]),Responsibility(id='consumer',description='Use the bound',source_ids=[source],claim_ids=[state.claims[1].id],applicability='Serial fixture')]
-    queue_handoffs(engine);queue_handoffs(engine)
-    assert len(state.inquiry_tasks)==1
-    assert state.inquiry_tasks[0].responsibility_ids==['producer','consumer']
-    assert 'handoff' in state.inquiry_tasks[0].trigger
+    from types import SimpleNamespace
+    proposal=SimpleNamespace(responsibilities=state.responsibilities,exploration_requests=[],reading_requests=[])
+    initial_agenda(engine,proposal);initial_agenda(engine,proposal)
+    assert not state.inquiry_tasks
+    assert state.responsibilities[0].handoffs[0].target_id=='consumer'
     assert all(not r.questions for r in state.responsibilities)
 
 

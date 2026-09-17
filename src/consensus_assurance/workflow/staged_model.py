@@ -1,5 +1,4 @@
 """Continue saved model components without inventing implementation observations."""
-from pathlib import Path
 from consensus_assurance.core.proposals import Bundle, HarnessReply, BuildReply
 from consensus_assurance.core.types import CheckRun, ExecutionStatus, now
 from .artifacts import validate_bundle

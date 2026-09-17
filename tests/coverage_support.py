@@ -49,6 +49,10 @@ class CoverageAgent(MockAgent):
                     {'id':'delivery','description':'Return configured results','source_ids':[note['id']],'claim_ids':[],'questions':['Actual result producer not yet read'],'applicability':'Memory configuration'}]
                 response['reading_requests']=[request]
         elif name=='ExplorationReply':
+            if context['responsibilities'] and not any(r['id']=='delivery' for r in context['responsibilities']):
+                response={'understanding':'This fixture has no further source interpretation for the selected responsibility','patch':{'rationale':'Retain the unresolved coverage backlog'},'limitations':['Not exhaustive']}
+                directory.mkdir(parents=True,exist_ok=True);write_json(directory/'response.json',response)
+                return runner.run([sys.executable,'-c','print("Scoped fixture exploration")'],directory,'agent',snapshot_id,timeout),response_type.model_validate(response)
             have=any(m['id']=='z_delivery.py:141:142' for m in context['materials'])
             existing=any(c['id']=='delivery_goal' for c in context['claims'])
             if not have:
@@ -64,7 +68,7 @@ class CoverageAgent(MockAgent):
                 response={'understanding':'The supplied regions have candidate coverage; other unknown duties remain possible','responsibilities':[],'patch':{'rationale':'No further supported additions in this bounded fixture'},'limitations':['No exhaustive coverage claim']}
         elif name=='ReviewReply':
             items=[];revision=None;exploration=[]
-            for obj in context['target_objects']:
+            for obj in context['target_objects']+([context['selected_unit']] if context.get('selected_unit',{}).get('id') in context['task']['target_ids'] else []):
                 source_ids=obj.get('source_ids') or obj.get('grounding',{}).get('behavior_ids') or [context['materials'][0]['id']]
                 contract=next(c for c in context['review_contract'] if c['target_id']==obj['id'])
                 aspect=contract['required_aspects'][0]
@@ -79,7 +83,7 @@ class CoverageAgent(MockAgent):
                     status='disputed';explanation='The local bound holds but does not establish the delivery handoff responsibility'
                     exploration=[{'reason':'Investigate the counter-to-result handoff even though the local invariant held','responsibility_ids':['delivery'],'requests':[request]}]
                 items.append({'target_id':obj['id'],'aspect':aspect,'status':status,'source_ids':source_ids,'explanation':explanation,'alternatives':'Different configured completion contracts can have different responsibilities','counterexample_reasoning':'A local counter bound alone cannot establish a returned-result contract','limitations':[]})
-            for obj in context['target_objects']:
+            for obj in context['target_objects']+([context['selected_unit']] if context.get('selected_unit',{}).get('id') in context['task']['target_ids'] else []):
                 contract=next(c for c in context['review_contract'] if c['target_id']==obj['id'])
                 original=next(i for i in items if i['target_id']==obj['id'])
                 for aspect in contract['required_aspects'][1:]:items.append({**original,'aspect':aspect})

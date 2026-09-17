@@ -46,7 +46,7 @@ def test_same_named_stronger_unexecuted_model_is_not_covered(tmp_path,prepared):
     assert spec.claim_id in missing and spec.claim_id not in checked
 
 
-def test_actual_dependency_selected_unit_is_reviewed_before_build(tmp_path,prepared):
+def test_actual_dependency_selected_unit_build_is_explicitly_exploratory(tmp_path,prepared):
     from consensus_assurance.core.config import Config
     from consensus_assurance.core.types import Relation
     from consensus_assurance.workflow.engine import Engine
@@ -71,7 +71,8 @@ def test_actual_dependency_selected_unit_is_reviewed_before_build(tmp_path,prepa
                 return ReviewReply(items=items,limitations=[]),CheckRun(action='agent',status=ExecutionStatus.COMPLETED,cwd=str(root),snapshot_id=state.snapshot.id)
             if kind=='build':
                 built.append(self.state.active_unit_id)
-                assert any('input_obligation' in r.target_versions for r in self.state.semantic_reviews)
+                assert self.state.units[-1].semantic_readiness['status']=='unreviewed'
+                assert not self.state.semantic_reviews
                 raise Blocked('End controlled selection test')
             raise AssertionError(kind)
     engine=ObserveBuild(config,root,*assemble(config),'');engine.state=state;engine.budget=BudgetTracker(config.budget,state)

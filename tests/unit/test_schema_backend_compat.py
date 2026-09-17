@@ -77,7 +77,6 @@ def test_backend_schema_rejection_keeps_the_actual_diagnostic(tmp_path):
 
 @pytest.mark.parametrize("failure_status", [ExecutionStatus.ERROR, ExecutionStatus.TIMEOUT])
 def test_resume_retries_failed_discovery_and_reuses_completed_reading(tmp_path, prepared, failure_status):
-    from consensus_assurance.consensus.inquiry import INQUIRY
     from regression_support import fixture_config as Config
     from consensus_assurance.registry import assemble
     from consensus_assurance.workflow.engine import Engine
@@ -99,7 +98,7 @@ def test_resume_retries_failed_discovery_and_reuses_completed_reading(tmp_path, 
             return super().analyze(runner, prompt, directory, snapshot_id, timeout, response_type)
     impl, _, verifier, knowledge = assemble(config)
     root = tmp_path / 'resume-schema'
-    stopped = Engine(config, root, impl, RejectFirstDiscovery(fixture), verifier, knowledge, INQUIRY).start(repo)
+    stopped = Engine(config, root, impl, RejectFirstDiscovery(fixture), verifier, knowledge).start(repo)
     assert stopped.completed_steps == ['capabilities', 'materials']
     assert stopped.usage['agent_calls'] == 2
     action = stopped.pending_action
@@ -111,7 +110,7 @@ def test_resume_retries_failed_discovery_and_reuses_completed_reading(tmp_path, 
     class PlanOnly(Engine):
         def execute(self, probed=False, plan_only=False):
             return super().execute(probed=probed, plan_only=True)
-    resumed = PlanOnly(config, root, impl, RejectFirstDiscovery(fixture), verifier, knowledge, INQUIRY).resume(action_timeout=600)
+    resumed = PlanOnly(config, root, impl, RejectFirstDiscovery(fixture), verifier, knowledge).resume(action_timeout=600)
     assert resumed.stop_reason.startswith('Plan generated'), resumed.stop_reason
     assert resumed.usage['agent_calls'] == 3
     assert [m.id for m in resumed.materials] == material_ids

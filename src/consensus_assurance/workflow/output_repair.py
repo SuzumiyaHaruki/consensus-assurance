@@ -24,7 +24,7 @@ class OutputRepair(Record):
     binding_splits: list[BindingSplit] = Field(default_factory=list,max_length=4)
     replacements: list[Replacement] = Field(default_factory=list, max_length=24)
     requests: list[ReadRequest] = Field(default_factory=list,max_length=12)
-    change_request: str = ""
+    change_request: str = Field(default="", description="Explicit stop for a semantic/scope decision, not a queued follow-up. Leave empty for material reads or permitted representation/association repairs; do not combine with those actions.")
     rationale: str
 
 
@@ -116,12 +116,15 @@ def diagnostic_targets(value,diagnostics,limit):
         prefix=prefix_for(value,diagnostic) or []
         for path in diagnostic.paths:
             relative=parts(path)
-            if len(relative)>=2 and relative[0] in {'bindings','units','claims','relations'}:
+            if len(relative)>=2 and relative[1]!='-' and relative[0] in {'bindings','units','claims','relations'}:
                 node=value
                 for key in prefix:node=node[key]
                 matches=[i for i,obj in enumerate(node.get(relative[0],[])) if obj.get('id') in diagnostic.object_ids]
                 if not matches:continue
-                relative[1]=str(matches[0])
+                current_index=int(relative[1]) if relative[1].isdigit() else -1
+                if current_index in matches:relative[1]=str(current_index)
+                elif len(matches)==1:relative[1]=str(matches[0])
+                else:raise ValueError('Ambiguous diagnostic object path; do not redirect a repair to another candidate object')
             route=prefix+relative;current=value;exists=True
             for key in route:
                 try:current=current[int(key)] if isinstance(current,list) else current[key]
@@ -146,6 +149,17 @@ def diagnostic_context(candidate,diagnostics,context,limit):
             for value in node:collect(value)
     collect(context)
     collect(candidate)
+    schema_ids=set()
+    for diagnostic in diagnostics:
+        if diagnostic.code!='schema_type':continue
+        for path in diagnostic.paths:
+            node=candidate;owner=None
+            for key in parts(path):
+                if isinstance(node,dict) and isinstance(node.get('id'),str):owner=node['id']
+                try:node=node[int(key)] if isinstance(node,list) else node[key]
+                except (ValueError,KeyError,IndexError,TypeError):break
+            if owner:schema_ids.add(owner)
+    ids.update(schema_ids)
     from .sources import dependency_closure
     sources,visited=dependency_closure(index,ids);wanted.update(sources)
     objects=[index[id] for id in sorted(visited)]
@@ -153,7 +167,8 @@ def diagnostic_context(candidate,diagnostics,context,limit):
     explicit=list(dict.fromkeys(context.get('repair_requested_material_ids',[])))
     available={m['id']:m for m in all_materials(context)}
     wanted.update(explicit)
-    direct=[o for o in objects if o.get('id') in ids]
+    include_dependencies=schema_ids or any(d.category in {'association','material'} for d in diagnostics)
+    direct=[o for o in objects if include_dependencies or o.get('id') in ids]
     for diagnostic in diagnostics:
         if diagnostic.code.startswith('condition_') or diagnostic.code=='declaration_identity':direct.append({'current_condition_problem':diagnostic.details})
     objects=direct
@@ -164,8 +179,11 @@ def diagnostic_context(candidate,diagnostics,context,limit):
         if material is None:omitted.append(id);continue
         if len(json.dumps({'objects':objects,'materials':selected+[material]},ensure_ascii=False))<=limit:selected.append(material)
         else:omitted.append(id)
-    if len(json.dumps(objects,ensure_ascii=False))>limit:objects=[]
-    return {'objects':objects,'materials':selected,'omitted_material_ids':sorted(set(omitted)),
+    missing_objects=[]
+    if len(json.dumps(objects,ensure_ascii=False))>limit:
+        missing_objects=[o['id'] for o in objects if 'id' in o]
+        objects=[]
+    return {'objects':objects,'required_objects_missing':missing_objects,'materials':selected,'omitted_material_ids':sorted(set(omitted)),
         'required_material_ids':explicit,'required_materials_missing':[id for id in explicit if id not in {m['id'] for m in selected}],
         'source_limit':'Omitted material is not available. Previously recorded analysis is evidence history, not a substitute for newly requested source.'}
 

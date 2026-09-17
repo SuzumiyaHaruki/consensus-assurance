@@ -52,7 +52,7 @@ def test_multiple_candidate_repairs_enter_review_and_real_model_check(tmp_path,p
     assert original['claims']==current['claims']
     assert original['units'][0]['scope']==current['units'][0]['scope']
     assert original['units'][0]['obligation_ids']==current['units'][0]['obligation_ids']
-    assert any(t.trigger.startswith('after_local:') for t in state.inquiry_tasks)
+    assert not any(t.trigger.startswith('after_local:') for t in state.inquiry_tasks)
 
 
 @pytest.mark.real

@@ -1,7 +1,6 @@
 import json
 import os
 import shutil
-import sys
 from pathlib import Path
 from consensus_assurance.core.types import ExecutionStatus, CheckRun
 from consensus_assurance.adapters.runners.process import output
@@ -39,11 +38,16 @@ def sandbox_command(command, workspace, mode, read_only_roots=()):
 
 
 def run_experiment(runner, command, workspace, snapshot_id, timeout, mode, action="experiment", adapter=None):
+    source=workspace.parent.parent.parent/'source'
+    input_manifest=None
+    if source.is_dir() and workspace.name=='workspace':
+        from consensus_assurance.adapters.storage.workspace_delta import save_delta
+        input_manifest=save_delta(source,workspace,snapshot_id)
     try:
         argv = sandbox_command(command, workspace, mode, adapter.read_only_roots() if adapter else ())
     except FileNotFoundError as exc:
         return CheckRun(action=action, cwd=str(workspace), snapshot_id=snapshot_id,
-            status=ExecutionStatus.TOOL_MISSING, reason=str(exc))
+            status=ExecutionStatus.TOOL_MISSING, reason=str(exc),artifacts=[str(input_manifest)] if input_manifest else [])
     check = runner.run(argv, workspace, action, snapshot_id, timeout, env=clean_environment(workspace, adapter))
     if check.status == ExecutionStatus.COMPLETED:
         text = output(check)
@@ -55,6 +59,8 @@ def run_experiment(runner, command, workspace, snapshot_id, timeout, mode, actio
             check.outcome = "tests_passed"
         else:
             check.outcome = "tests_failed"
+    if input_manifest:
+        check.artifacts.extend([str(input_manifest),str(save_delta(source,workspace,snapshot_id,phase='outcome'))])
     return check
 
 
@@ -81,18 +87,3 @@ def extract_events(check):
         except ValueError:
             events.append({"event": "invalid_observation", "raw": raw})
     return events
-
-
-def prerequisites(events, ordered):
-    if ordered and not isinstance(ordered[0],str):
-        from consensus_assurance.core.events import match_prerequisites
-        result = match_prerequisites(events,ordered)
-        return result["status"] == "matched", result["reason"]
-    names = [e["event"] for e in events]
-    cursor = 0
-    for required in ordered:
-        try:
-            cursor = names.index(required, cursor) + 1
-        except ValueError:
-            return False, "Required event order was not established: " + " -> ".join(ordered)
-    return True, "Required event order observed; legality still requires source and environment review"

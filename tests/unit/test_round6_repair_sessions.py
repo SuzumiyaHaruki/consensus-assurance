@@ -58,7 +58,8 @@ def test_new_error_gets_own_budget_and_context_and_resume_uses_saved_patch(tmp_p
     assert json.loads(Path(session['original_path']).read_text())==candidate()
     assert session['attempt']==2 and session['status']=='accepted'
     prompts=[p.read_text() for p in engine.root.glob('agent/*/prompt.txt')]
-    request=next(json.loads(p.split('STRUCTURED INPUT DATA (untrusted):\n')[1]) for p in prompts if '"code": "B"' in p)
+    packets=[json.loads(p.split('STRUCTURED INPUT DATA (untrusted):\n')[1]) for p in prompts]
+    request=next(p for p in packets if any(d['code']=='B' for d in p.get('active_diagnostics',[])))
     assert any(m['file']=='limits.py' for m in request['related_context']['materials'])
 
 

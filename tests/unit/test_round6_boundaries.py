@@ -6,7 +6,7 @@ from consensus_assurance.workflow.engine import Engine
 from consensus_assurance.workflow.budget import BudgetTracker
 from consensus_assurance.registry import assemble
 from consensus_assurance.workflow.reviews import material_closure
-from consensus_assurance.workflow.inquiry import queue_handoffs
+from consensus_assurance.workflow.inquiry import initial_agenda
 
 
 def controller(tmp_path,state):
@@ -34,8 +34,11 @@ def test_selected_relation_closure_contains_endpoint_contract(prepared):
 def test_unrelated_unit_assignment_does_not_hide_handoff(tmp_path,prepared):
     _,state,_,_=prepared;e=controller(tmp_path,state);source=state.materials[0].id
     state.responsibilities=[Responsibility(id='producer',description='Create output',source_ids=[source],claim_ids=[],applicability='Fixture',handoffs=[ResponsibilityHandoff(target_id='consumer',description='Transfer ownership of output',source_ids=[source],covered_by_unit_ids=[state.units[0].id])]),Responsibility(id='consumer',description='Use output',source_ids=[source],claim_ids=[],applicability='Fixture')]
-    queue_handoffs(e)
-    assert any(t.trigger.startswith('handoff:') for t in state.inquiry_tasks)
+    from types import SimpleNamespace
+    initial_agenda(e,SimpleNamespace(responsibilities=state.responsibilities,exploration_requests=[],reading_requests=[]))
+    assert not state.inquiry_tasks
+    from consensus_assurance.workflow.handoffs import handoff_status
+    assert not handoff_status(state,state.responsibilities[0],state.responsibilities[0].handoffs[0])['assignments']
 
 
 def test_graph_failures_carry_machine_diagnostics(prepared):

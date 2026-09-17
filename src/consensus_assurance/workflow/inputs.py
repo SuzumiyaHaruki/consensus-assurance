@@ -1,5 +1,4 @@
 """Search identity excludes experiments; code confirmation retains full artifact dependencies."""
-from consensus_assurance.adapters.verifiers.input_identity import fingerprint, execution_fingerprint
 
 
 def search_inputs(state, unit, bundle, config_text):

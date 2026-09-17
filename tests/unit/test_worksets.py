@@ -9,7 +9,6 @@ from consensus_assurance.plugins.implementations.hashicorp_raft.adapter import H
 from consensus_assurance.workflow.discovery import context
 from consensus_assurance.workflow.task_packet import prepare,pool_sources
 from consensus_assurance.workflow.prompts import render
-from consensus_assurance.consensus.inquiry import INQUIRY
 from test_round6_boundaries import controller
 
 ARCHIVE=Path(__file__).resolve().parents[2]/'runs/2026-09-16_13-58-11-hashicorp_raft-real-run'
@@ -22,7 +21,7 @@ def archived_engine(version):
 def test_archived_build_packet_fits_without_raising_limit(version):
     e=archived_engine(version);unit=next(u for u in e.state.units if u.id==e.state.active_unit_id)
     packet,_=prepare(e,'build',context(e,unit))
-    assert len(render('build',pool_sources(packet),INQUIRY))<e.config.budget.context_chars
+    assert len(render('build',pool_sources(packet)))<e.config.budget.context_chars
     assert 'semantic_reviews' not in packet or all('context_dependencies' not in r for r in packet['semantic_reviews'])
 
 

@@ -63,3 +63,20 @@ def test_outer_task_templates_are_english_and_do_not_preset_goals(kind):
         assert 'SEMANTIC REVERSE REVIEW' in instructions
         assert 'successful model check does not answer' in instructions
         assert 'alternatives' in instructions
+
+
+def test_discovery_packet_indexes_only_supplied_source(tmp_path,prepared):
+    from consensus_assurance.workflow.task_packet import prepare,pool_sources
+    from consensus_assurance.core.types import Material
+    _,state,_,_=prepared
+    engine=Engine(Config(),tmp_path,ToyImplementation(),None,None,'');engine.state=state
+    visible=Material(id='visible',file='nav.go',start_line=1,end_line=3,text='func (s *Store) save() {\n value++\n}',content_digest='fixture',kind='code_observation')
+    hidden=visible.model_copy(update={'id':'hidden','file':'hidden.go'})
+    state.materials.extend([visible,hidden])
+    packet,_=prepare(engine,'discover',{'materials':[visible.model_dump(mode='json')]})
+    entry=packet['source_declarations'][0]
+    assert entry['file']=='nav.go' and entry['material_ids']==['visible']
+    assert entry['declarations'][0]['symbol']=='Store.save'
+    assert 'Store.save' in render('discover',pool_sources(packet))
+    review,_=prepare(engine,'build',{'materials':[visible.model_dump(mode='json')]})
+    assert 'source_declarations' not in review

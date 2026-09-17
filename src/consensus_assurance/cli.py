@@ -8,7 +8,6 @@ import sys
 from pathlib import Path
 import yaml
 from consensus_assurance.core.config import Config, locate_repo
-from consensus_assurance.consensus.inquiry import INQUIRY
 from consensus_assurance.registry import assemble
 from consensus_assurance.workflow.engine import Engine, FRAMEWORK_REVISION
 from consensus_assurance.adapters.storage.files import Store, write_json
@@ -110,7 +109,7 @@ def main(argv=None):
             snapshot = capture(repo)
             write_json(root / "snapshot.json", snapshot)
             print(f"目标快照已保存：{root / 'snapshot.json'}"); return 0
-        engine = Engine(config, root, implementation, agent, verifier, knowledge, INQUIRY)
+        engine = Engine(config, root, implementation, agent, verifier, knowledge)
         with (root / ".run.lock").open("w") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             if args.command == "resume":

@@ -5,7 +5,6 @@ import pytest
 from coverage_support import CoverageAgent,add_coverage_materials
 from consensus_assurance.core.config import Config
 from consensus_assurance.registry import assemble
-from consensus_assurance.consensus.inquiry import INQUIRY
 from consensus_assurance.workflow.engine import Engine
 from consensus_assurance.adapters.storage.files import Store
 from consensus_assurance.reporting.chinese import render_report
@@ -19,7 +18,7 @@ def setup(tmp_path,prepared,wrong=False,weak=False,tlc=None):
     config.budget.targeted_reads=6;config.budget.outer_reserve_seconds=1
     root=tmp_path/'inquiry-run'
     impl,_,verifier,knowledge=assemble(config)
-    return repo,config,root,(impl,CoverageAgent(responses,wrong,weak),verifier,knowledge,INQUIRY)
+    return repo,config,root,(impl,CoverageAgent(responses,wrong,weak),verifier,knowledge)
 
 
 @pytest.mark.real
@@ -91,9 +90,9 @@ def test_no_units_still_explores_unrepresented_responsibilities(tmp_path,prepare
                 response.claims=[];response.bindings=[];response.relations=[];response.units=[]
                 for role in response.responsibilities:role.claim_ids=[]
             return check,response
-    impl,agent,verifier,knowledge,inquiry=args
+    impl,agent,verifier,knowledge=args
     agent=NoInitialGoals(prepared[3])
-    state=Engine(config,root,impl,agent,verifier,knowledge,inquiry).start(repo)
+    state=Engine(config,root,impl,agent,verifier,knowledge).start(repo)
     assert any(c.id=='delivery_goal' for c in state.claims),state.stop_reason
     assert any('z_delivery.py:141:142' in h['added_material_ids'] for h in state.reading_history)
     assert not state.models

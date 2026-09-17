@@ -1,16 +1,9 @@
 import json
 import re
-from importlib.resources import files
 from pathlib import Path
-from typing import Literal
-from pydantic import Field
-from consensus_assurance.core.types import Record, CheckRun, ExecutionStatus, Origin
+from consensus_assurance.core.types import CheckRun, ExecutionStatus, Origin
 from consensus_assurance.adapters.runners.process import output
 from consensus_assurance.adapters.storage.files import write_json, redact
-
-
-from consensus_assurance.workflow.prompts import render
-
 
 def strict_schema(schema):
     """Encode open dictionaries as explicit JSON-valued key entries, preserving their values."""

@@ -369,3 +369,30 @@ class ConsequenceReply(Record):
     requests: list[ReadRequest] = []
     patch: GraphPatch | None = None
     limitations: list[str]
+
+
+class QuestionReply(Record):
+    revision: SemanticRevision | None = None
+    question: AuditQuestion
+    explanation: str
+    requests: list[ReadRequest] = []
+    patch: GraphPatch | None = None
+
+
+class DirectCheckPlan(Record):
+    description: str
+    claim_id: str
+    scope: Scope
+    binding_ids: list[str] = Field(min_length=1)
+    harness: Harness
+    monitors: list[EventMonitor] = Field(min_length=1)
+    observable_properties: list[ObservableProperty] = Field(min_length=1, description="Direct route supports event_assertion only. Use literal trigger/assertion comparisons, shared identity_fields and matching monitor.property; history properties require a local_model fallback.")
+    uncertainties: list[str] = []
+
+
+class DirectCheckReply(Record):
+    reading_purpose: Literal["dependency", "context"] = "dependency"
+    plan: DirectCheckPlan | None = None
+    gap: str
+    requests: list[ReadRequest] = []
+    fallback: Literal["none", "source_review", "local_model"] = "none"

@@ -43,7 +43,9 @@ def execution_summary(check):
         return "审计问题触发可达性", "见触发记录；辅助反例只表示触发可达", "不属于协议违反证据"
     if check.action == "trace_calibration":
         return "有限观测轨迹校准", "校准状态见下方模型记录", "轨迹兼容不等于性质成立或违反"
-    if check.action in {"capability_probe", "experiment", "replay"}:
+    if check.action=='direct_check':
+        return '直接实现检查', '实际执行完成；性质判定见监视器记录' if complete else '执行失败或未完成，不能当作性质失败', '限于已观测前提和结果；不自动提升为目标结论'
+    if check.action in {"capability_probe", "experiment", "replay", "direct_check"}:
         task = "现有测试与实验能力探测" if check.action == "capability_probe" else "实现实验 / 重放"
         product = OUTCOME[check.outcome] if check.outcome != "unknown" else "执行未产生可判定的测试结果"
         return task, product, "仅限实际测试覆盖；不自动证明目标或确认违反"
@@ -58,6 +60,7 @@ def progress_lines(state):
         "| 阶段 | 已记录的进度 |", "| --- | --- |",
         f"| 材料阅读 | {'已完成首轮阅读' if 'materials' in state.completed_steps else '首轮阅读尚未完成'}；保存 {len(state.materials)} 个片段 |",
         f"| 目标、义务与代码关系 | {'发现结果已被工作流接受' if 'discovery' in state.completed_steps else '尚未完成发现结果的工作流接受'}；当前图有 {len(state.claims)} 项主张、{len(state.units)} 个审计单元 |",
+        f"| 直接实现检查 | 已保存 {len(state.direct_checks)} 个制品；完成 {sum(c.action=='direct_check' and c.status==ExecutionStatus.COMPLETED for c in state.checks)} 次执行；不等于整体性质成立 |",
         f"| 局部模型 | 已保存 {len(state.models)} 个模型版本；保存不代表检查通过 |",
         f"| 轨迹校准 | {len(state.calibrations)} 条校准记录；不等同于性质判定 |",
         f"| 模型搜索 | {len(checks)} 次执行记录；逐项结果见下方，未执行不计通过 |",
@@ -256,6 +259,8 @@ def render_report(state, root):
         for c in cal:
             lines += [f"校准：**{CALIBRATION[c.status]}**；适用性 `{c.applicability}`；{c.reason}。轨迹：{link(c.trace_path)}。",
                 "有限真实轨迹可解释不等于模型与实现完全等价；不能据此确认更大范围实现正确。"]
+    for artifact in state.direct_checks:
+        lines += ["", f"直接检查 `{artifact.id}`：义务 `{artifact.claim_id}`；计划 {link(artifact.plan_path)}；harness {link(artifact.harness_path)}；范围：{artifact.scope.description}。有限测试不证明整体义务或目标正确。"]
     for e in state.evidence:
         lines += ["", f"证据 `{e.id}`：{LEVEL[e.level]}，`{e.assessment.value}`；执行 `{e.check_id}`；关联主张 `{e.claim_id}` v{e.claim_version}；checker `{e.checker_id}`；适用性 `{e.applicability}`。",
             f"范围：{e.scope.description}；限制（原文）：{e.description}" + (f"；过期原因：{e.stale_reason}" if e.stale_reason else "")]
@@ -268,7 +273,7 @@ def render_report(state, root):
         if f.confirmation_path:
             lines += [f"  实际观测、前提、合法性及性质判定：{link(f.confirmation_path)}；checker `{f.checker_id}`。"]
     for result in state.monitor_results:
-        lines += [f"观测判定 `{result['finding_id']}`：前提 `{result['prerequisites']['status']}`；确认层级 `{result['level']}`；限制：{result['limitations']}。"]
+        lines += [f"观测判定 `{result.get('finding_id',result.get('direct_check_id','unknown'))}`：前提 `{result['prerequisites']['status']}`；确认层级 `{result['level']}`；限制：{result['limitations']}。"]
     for decision in state.consequences:
         lines.append(f"义务→目标后果处置：发现 `{decision['finding_id']}`；`{decision['disposition']}`；{decision['reason']}；后续 {decision['task_ids']}；限制 {decision['limitations']}。")
     for revision in state.revisions:

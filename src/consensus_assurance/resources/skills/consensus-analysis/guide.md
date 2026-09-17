@@ -67,7 +67,7 @@ its own review call. Preserve incomplete obligations and affected recheck work.
 
 ## Step 4: Close with an actionable audit question
 
-Use one of these textual dispositions, not a new state machine:
+Set AuditQuestion.disposition to one of these bounded analysis outcomes:
 
 - explained_by_existing_mechanism: cite the protection and the exact scope it explains.
 - concrete_suspicion: identify a legal path and the applicable relation it may violate.

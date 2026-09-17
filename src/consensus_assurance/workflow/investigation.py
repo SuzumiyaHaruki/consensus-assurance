@@ -1,5 +1,4 @@
 """Investigation input assembly and side-effect-free feedback acceptance."""
-from pathlib import Path
 from .feedback import apply_feedback
 from .artifacts import validate_bundle
 

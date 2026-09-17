@@ -6,8 +6,12 @@ from .review_contract import required_aspects, target_contract
 from .sources import citation_status, includes
 
 
+def review_objects(state):
+    return {o.id:o for o in state.claims+state.bindings+state.relations+state.units+state.models+state.direct_checks}
+
+
 def material_closure(state, ids):
-    objects={x.id:x for x in [*state.claims,*state.bindings,*state.relations,*state.units,*state.models]}
+    objects=review_objects(state)
     from .sources import dependency_closure
     wanted,visited=dependency_closure(objects,ids)
     for id in visited:
@@ -18,7 +22,7 @@ def material_closure(state, ids):
 
 
 def valid_supersession(state,review,task):
-    objects={x.id:x for x in [*state.claims,*state.bindings,*state.relations,*state.units,*state.models]}
+    objects=review_objects(state)
     if task.id not in review.supersedes_task_ids:return False
     if task.unit_id and task.unit_id!=review.unit_id:return False
     if task.unit_version is not None and task.unit_version!=review.unit_version:return False
@@ -38,7 +42,7 @@ def validate_resolutions(state, task, reply):
     from consensus_assurance.core.types import SemanticReview
     if reply.resolves_issue_ids or reply.supersedes_task_ids:
         if not reply.resolution_rationale.strip():raise ValueError('Explicit resolution requires attributed rationale')
-    current={x.id:x.version for x in [*state.claims,*state.bindings,*state.relations,*state.units,*state.models]}
+    current={x.id:x.version for x in [*state.claims,*state.bindings,*state.relations,*state.units,*state.models,*state.direct_checks]}
     review=SemanticReview(task_id=task.id,check_id='validation',unit_id=task.unit_id,unit_version=task.unit_version,model_id=task.model_id,target_versions={i:current[i] for i in task.target_ids},material_ids=task.material_ids if task.context_receipt_id else task.material_ids or [m.id for m in state.materials],context_receipt_id=task.context_receipt_id,context_dependencies=task.context_dependencies,items=reply.items,origin='agent',supersedes_task_ids=reply.supersedes_task_ids)
     for id in reply.supersedes_task_ids:
         old=next((t for t in state.inquiry_tasks if t.id==id),None)
@@ -131,7 +135,9 @@ def record_dispositions(state,review,reply,followup_ids):
 
 def readiness(state,unit):
     objects={x.id:x for x in [*state.claims,*state.bindings,*state.relations,*state.units]}
-    ids=set(unit.goal_ids+unit.obligation_ids+unit.binding_ids+unit.relation_ids+[unit.id])
+    ids=set(unit.goal_ids+unit.obligation_ids+[unit.id])
+    relevant=ids|set(unit.binding_ids+unit.relation_ids)
+    ids.update(i.target_id for i in state.review_issues if not i.resolved_by and i.target_id in relevant)
     materials,_=material_closure(state,ids)
     reviews=[];missing=[];disputed=[]
     for id in ids:
@@ -143,7 +149,7 @@ def readiness(state,unit):
             if not candidates:missing.append(id+':'+aspect);continue
             review=candidates[-1];reviews.append(review.id)
             if any(i.target_id==id and i.aspect==aspect and (i.status!='no_issue_found' or i.limitations) for i in review.items):disputed.append(id+':'+aspect)
-    disputed.extend(i.id for i in state.review_issues if i.target_id in ids and not i.resolved_by)
+    disputed.extend(i.id for i in state.review_issues if i.target_id in relevant and not i.resolved_by)
     return {'unit_version':unit.version,'target_versions':{id:objects[id].version for id in ids},'material_ids':sorted(materials),
         'review_ids':sorted(set(reviews)),'status':'unreviewed' if missing else 'disputed' if disputed else 'reviewed',
         'unresolved':missing+disputed,'purpose':unit.rationale,

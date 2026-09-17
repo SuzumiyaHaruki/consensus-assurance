@@ -45,12 +45,30 @@ def validate_bundle(state, unit, bundle, implementation):
             raise ValueError("Checker declaration missing")
     if re.search(r"(?im)^\s*(?:CONSTRAINT|ACTION_CONSTRAINT|INIT|NEXT|SPECIFICATION|INVARIANT|PROPERTY|VIEW|SYMMETRY|CHECK_DEADLOCK)\b|<-", bundle.constants):
         raise ValueError("Only constant assignments are permitted; no search filters or overrides")
-    known = {m.id for m in state.materials} | {b.id for b in state.bindings} | {c.id for c in state.claims}
-    for constraint in bundle.constraints:
-        if not set(constraint.source_ids) <= known:
-            raise ValueError("Model constraint cites an unknown source")
-        if constraint.source_kind == "code_observation" and not set(constraint.source_ids) & set(unit.binding_ids):
-            raise ValueError("Code-derived transition constraint must cite a selected binding")
+    from .sources import covered
+    from consensus_assurance.core.diagnostics import Diagnostic, DiagnosticError
+    materials={m.id for m in state.materials}
+    selected={b.id:b for b in state.bindings if b.id in unit.binding_ids}
+    for index,constraint in enumerate(bundle.constraints):
+        error=None
+        if not set(constraint.source_ids)<=materials:
+            error="Constraint source_ids must be actual material IDs"
+        elif not set(constraint.binding_ids)<=set(selected):
+            error="Constraint binding_ids must select existing unit bindings"
+        elif constraint.source_kind == "code_observation":
+            if not constraint.binding_ids:
+                error="Code observation requires selected binding_ids, separate from material source_ids"
+            elif not all(covered(selected[id],[m for m in state.materials if m.id in constraint.source_ids]) for id in constraint.binding_ids):
+                error="Constraint material sources must cover each selected binding material"
+        if error:
+            prefix='/draft' if isinstance(bundle,ModelDraft) else '/bundle'
+            raise DiagnosticError([Diagnostic(code='constraint_binding_citation',category='format',
+                object_ids=[unit.id]+unit.binding_ids,paths=[prefix+'/constraints/'+str(index)+'/source_ids',prefix+'/constraints/'+str(index)+'/binding_ids'],
+                material_ids=constraint.source_ids if set(constraint.source_ids)<=materials else [],
+                message=error,allowed=['representation'],details={'unit_binding_ids':unit.binding_ids,
+                    'selected_bindings':[b.model_dump(mode='json',exclude={'excerpt'}) for b in selected.values()],
+                    'constraint_path':prefix+'/constraints/'+str(index),
+                    'preservation':'Correct citation representation only; preserve behavior, property and scope'} )])
     if len({r.id for r in bundle.reachability})!=len(bundle.reachability):raise ValueError("Duplicate reachability requirement")
     points=unit.coverage_intent+(unit.audit_question.points if unit.audit_question else [])
     for requirement in bundle.reachability:
@@ -133,7 +151,8 @@ def save_bundle(root, state, unit, bundle, implementation, previous=None, reason
         extension_schema={"type": "object", "description": "Tool-specific TLA metadata; constants are saved verbatim"}, extension_version="2",
         unit_id=unit.id, checker_path=str(checker), mapping_path=str(mapping) if complete else "", harness_path=str(harness) if complete else "", bundle_path=str(proposal),
         artifact_digests=artifacts, checkers=specs, graph_versions={x.id:x.version for x in [*state.claims,*state.bindings,*state.relations,*state.units] if x.id in semantic_references}, previous_id=previous.id if previous else None, revision_reason=reason)
-    from .inputs import search_inputs, fingerprint
+    from .inputs import search_inputs
+    from consensus_assurance.adapters.verifiers.input_identity import fingerprint
     model.reachability_requirements=bundle.reachability
     model.search_inputs=search_inputs(state,unit,bundle,cfg.read_text())
     model.search_fingerprint=fingerprint(model.search_inputs)

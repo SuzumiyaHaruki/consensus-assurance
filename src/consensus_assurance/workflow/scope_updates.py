@@ -1,6 +1,6 @@
 """Reconnect grounded dependencies through F3 without authorizing normative changes."""
 from consensus_assurance.core.types import Record,uid,Revision
-from consensus_assurance.core.proposals import GraphPatch,UnitDraft,JudgmentChange
+from consensus_assurance.core.proposals import GraphPatch, JudgmentChange
 from consensus_assurance.core.diagnostics import Diagnostic,DiagnosticError
 from .mutations import write_set,adopt,canonical,classify_writes
 from pydantic import Field

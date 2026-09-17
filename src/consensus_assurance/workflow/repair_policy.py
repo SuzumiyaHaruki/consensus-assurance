@@ -1,6 +1,6 @@
 """Mechanical fixes cannot change selected questions or silently redirect code."""
 from .output_repair import all_materials,parts
-from .locations import declarations,contains,code_mask,locate,location_evidence
+from .locations import declarations,contains,code_mask,locate,location_evidence,matches_symbol
 from consensus_assurance.core.proposals import BindingDraft
 from consensus_assurance.core.types import Material
 
@@ -30,9 +30,9 @@ def validate_representation(before,after,targets,context):
         new_material=next((m for m in materials if m.id==right.get('material_id')),None)
         if not old_material or not new_material or old_material.file!=new_material.file:raise ValueError('Location repair needs actually supplied material from the same intended file')
         from .sources import source_views
-        old_decls=[d for m,_ in source_views(materials) if m.file==old_material.file and m.content_digest==old_material.content_digest for d in declarations(m) if d['symbol']==left.get('symbol')]
+        old_decls=[d for m,_ in source_views(materials) if m.file==old_material.file and m.content_digest==old_material.content_digest for d in declarations(m) if matches_symbol(d,left.get('symbol'))]
         evidence,_=location_evidence(BindingDraft.model_validate(right),{m.id:m for m in materials})
-        if not evidence:raise ValueError('Replacement lacks a verified source declaration')
+        if not evidence:raise ValueError('Replacement does not establish both declaration identity and behavior containment; an anchor-only edit cannot repair a cross-declaration behavior range')
         d=evidence['declaration'];new_material=evidence['view']
         if old_decls and not any(o['start']==d['start'] for o in old_decls):raise ValueError('Location repair redirects to another function; explicit scope revision required')
         if d['kind']!='callsite' and not contains(type('Range',(),left)(),new_material,d):raise ValueError('Original behavior does not belong to the corrected identity; scope plan required')
@@ -77,7 +77,6 @@ def split_draft_bindings(candidate,patch,diagnostics,context,accepted_ids):
     """
     import copy
     from .output_repair import parts
-    from .associations import claim_ids
     result=copy.deepcopy(candidate)
     materials={m['id']:Material.model_validate(m) for m in all_materials(context)}
     diagnosed={id for d in diagnostics if d.code=='declaration_identity' for id in d.object_ids}

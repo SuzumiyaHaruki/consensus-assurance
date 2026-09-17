@@ -1,5 +1,4 @@
 """Repository reading, candidate discovery and incremental dependency expansion."""
-import json
 from pathlib import Path
 from consensus_assurance.core.proposals import Discovery, GraphPatch
 from consensus_assurance.adapters.storage.files import write_json
@@ -10,18 +9,18 @@ from . import inquiry
 
 
 def context(engine, unit=None):
-    result = {"materials": [m.model_dump(mode="json") for m in engine.state.materials],
-        "capabilities": [c.model_dump(mode="json") for c in engine.state.capabilities],
+    result = {"capabilities": [c.model_dump(mode="json") for c in engine.state.capabilities],
         "parameters": engine.config.parameters, "remaining_seconds": engine.budget.remaining(),
         "directed_question": engine.config.directed_question,
         "snapshot_id": engine.state.snapshot.id,
-        "responsibilities":[r.model_dump(mode="json") for r in engine.state.responsibilities],
-        "semantic_reviews":[r.model_dump(mode="json") for r in engine.state.semantic_reviews], "harness_kind": engine.implementation.harness_kind,
+        "harness_kind": engine.implementation.harness_kind,
         "harness_instructions": engine.implementation.harness_instructions}
     if unit:
         from .task_view import local_workset
-        result.pop('semantic_reviews')
         result.update(local_workset(engine,unit))
+    else:
+        result.update({name:[item.model_dump(mode="json") for item in getattr(engine.state,name)]
+                       for name in ("materials","responsibilities","semantic_reviews")})
     return result
 
 def discover(engine):

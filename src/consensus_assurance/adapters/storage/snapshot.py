@@ -18,7 +18,7 @@ def git(repo: Path, *args):
         return None
 
 
-def capture(repo: Path, destination: Path | None = None) -> Snapshot:
+def capture(repo: Path, destination: Path | None = None, *, excluded_dirs=()) -> Snapshot:
     repo = repo.resolve()
     if destination and destination.resolve().is_relative_to(repo):
         raise ValueError("Snapshot destination must be outside the original repository")
@@ -27,7 +27,7 @@ def capture(repo: Path, destination: Path | None = None) -> Snapshot:
         kept = []
         for name in dirs:
             p = Path(folder) / name
-            if name in EXCLUDED_DIRS or p.is_symlink():
+            if name in EXCLUDED_DIRS or name in excluded_dirs or p.is_symlink():
                 excluded.append(str(p.relative_to(repo)))
             else:
                 kept.append(name)

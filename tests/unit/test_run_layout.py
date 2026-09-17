@@ -37,7 +37,6 @@ def test_read_request_schema_matches_reader():
 
 
 def test_semantic_validation_failure_is_saved_with_specific_reason(tmp_path, prepared):
-    from consensus_assurance.consensus.inquiry import INQUIRY
     from consensus_assurance.registry import assemble
     from consensus_assurance.workflow.engine import Engine, Blocked
 
@@ -52,7 +51,7 @@ def test_semantic_validation_failure_is_saved_with_specific_reason(tmp_path, pre
             return self.ask('read', ReadingPlan, {}, reject)
     root = tmp_path / 'audit'
     with pytest.raises(Blocked, match='Cannot localize.*Binding b_capture'):
-        CheckValidation(config, root, *assemble(config), INQUIRY).start(repo)
+        CheckValidation(config, root, *assemble(config)).start(repo)
     errors = list((root / 'agent').glob('*/graph-validation-error.txt'))
     assert len(errors) == 1
     assert all('b_capture' in p.read_text() for p in errors)

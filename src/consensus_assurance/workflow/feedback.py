@@ -1,4 +1,3 @@
-import json
 from consensus_assurance.core.types import Revision
 from .graph import apply_patch, expand_unit, validate_grounding
 from .mutations import adopt, validate_changes

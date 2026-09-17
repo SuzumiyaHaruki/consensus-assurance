@@ -12,3 +12,10 @@ A stable_support description compares the assertion.field object across effectiv
 Before requesting dependencies, consult file_lookup for exact line counts and file_metadata for previously read intervals. A range already in storage but omitted here may be requested for this task. Use material_budget.depth to plan a feasible dependency read. Reading material does not add it to the modeled scope automatically. If essential context cannot fit, state the specific gap and return a bounded request rather than inventing an environment guarantee.
 
 Use reading_purpose=context only when acquired or reattached material can be returned to this same task without changing graph meaning or selected code scope. Use dependency when actual new bindings or paths must be connected to the existing unit. An accepted dependency scope can precede any model; do not create a placeholder model for F3 eligibility. Include actual supporting behavior without treating its unverified guarantees as assumptions or automatically checking every associated obligation.
+
+ConstraintSource.source_ids contains only acquired material IDs. For
+source_kind=code_observation, provide separate nonempty binding_ids selected by
+this unit, and source_ids covering their actual material ranges. Other constraint
+kinds need their attributed sources/assumptions, not invented bindings. Citation
+repairs receive the selected bindings, anchors, associations and constraint path;
+do not request existing graph objects through source reading.

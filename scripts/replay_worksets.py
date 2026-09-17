@@ -7,7 +7,6 @@ from consensus_assurance.core.config import Config
 from consensus_assurance.core.proposals import BuildReply,BindingDraft,ReviewReply
 from consensus_assurance.adapters.storage.files import write_json
 from consensus_assurance.plugins.implementations.hashicorp_raft.adapter import HashicorpRaft
-from consensus_assurance.consensus.inquiry import INQUIRY
 from consensus_assurance.workflow.discovery import context
 from consensus_assurance.workflow.task_packet import prepare,pool_sources,receipt
 from consensus_assurance.workflow.prompts import render
@@ -34,7 +33,7 @@ def main():
         s=Analysis.model_validate_json((root/'history'/(version+'.json')).read_text())
         e=SimpleNamespace(state=s,root=root,config=Config.model_validate(s.config),implementation=HashicorpRaft(),budget=SimpleNamespace(remaining=lambda:1))
         unit=next(u for u in s.units if u.id==s.active_unit_id)
-        packet,_=prepare(e,'build',context(e,unit));packet=pool_sources(packet);prompt=render('build',packet,INQUIRY)
+        packet,_=prepare(e,'build',context(e,unit));packet=pool_sources(packet);prompt=render('build',packet)
         e.root=dest/packet_id;s.pending_action=None
         new=receipt(e,'build',packet,prompt,BuildReply)
         write_json(e.root/'rebuilt-packet.json',packet)

@@ -32,7 +32,7 @@ class PacketAgent(CoverageAgent):
             items=[]
             for c in packet['review_contract']:
                 for aspect in c['required_aspects']:
-                    fault=c['object_type']=='binding' and not self.review_fault
+                    fault=c['object_type']=='unit' and not self.review_fault
                     if fault:self.review_fault=True
                     items.append({'target_id':c['target_id'],'aspect':'applicability' if fault else aspect,'status':'disputed' if fault else 'no_issue_found',
                         'source_ids':c['required_material_ids'],'explanation':'An unresolved mapping caveat' if fault else 'The bounded synthetic responsibility has supporting source context',
@@ -61,9 +61,9 @@ class PacketAgent(CoverageAgent):
 def test_accepted_graph_review_and_read_repairs_reach_real_tlc(tmp_path,prepared,tlc,negative):
     repo,config,root,args=setup(tmp_path,prepared,tlc=tlc)
     config.budget.agent_calls=20;config.budget.material_chars=5000;config.budget.material_chunks=12
-    impl,_,verifier,knowledge,inquiry=args
+    impl,_,verifier,knowledge=args
     agent=PacketAgent(prepared[3],negative)
-    state=Engine(config,root,impl,agent,verifier,knowledge,inquiry).start(repo)
+    state=Engine(config,root,impl,agent,verifier,knowledge).start(repo)
     assert state.models,state.stop_reason
     assert any(c.action=='model_check' and c.outcome==('counterexample' if negative else 'holds') for c in state.checks),state.stop_reason
     assert {'delivery_goal','capacity_goal'}<={c.id for c in state.claims}

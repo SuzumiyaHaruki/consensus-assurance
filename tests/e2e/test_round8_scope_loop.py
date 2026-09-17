@@ -27,7 +27,11 @@ class ScopeAgent(MockAgent):
             else:
                 assert p['unit']['previous_id'] and 'input_binding' in p['unit']['binding_ids']
                 assert p['unit']['obligation_ids']==['step_obligation']
-                response={'bundle':self.data[5],'gap':''}
+                response={'bundle':copy.deepcopy(self.data[5]),'gap':''}
+                for constraint in response['bundle']['constraints']:
+                    selected=[b for b in p['bindings'] if b['id'] in constraint.get('binding_ids',[])]
+                    if selected:
+                        constraint['source_ids']=list(dict.fromkeys(m['id'] for b in selected for m in p['materials'] if m['file']==b['file'] and m['start_line']<=b['end_line'] and m['end_line']>=b['start_line']))
         elif name=='GraphPatch':
             assert any(m['file']=='upstream_support.py' for m in p['new_materials'])
             old=p['units'][0];unit={k:v for k,v in old.items() if k in UnitDraft.model_fields}
@@ -74,10 +78,10 @@ def test_actual_new_read_reconnects_existing_unit_before_model(tmp_path,prepared
     assert state.units[0].obligation_ids==['step_obligation']
     assert any(c.action=='model_check' and c.outcome=='holds' for c in state.checks),state.stop_reason
     assert any(c.status=='compatible' for c in state.calibrations),state.stop_reason
-    assert any(t.kind=='explore' and t.admitted for t in state.inquiry_tasks)
+    assert not any(t.trigger.startswith('after_local:') for t in state.inquiry_tasks)
     assert state.units[0].status=='checked',state.stop_reason
     assert state.usage['agent_calls']<=20
-    assert any(r.context_dependencies.get('input_binding') for r in state.semantic_reviews)
+    assert any('input_binding' in basis.get('dependency_versions',{}) for r in state.semantic_reviews for basis in r.context_dependencies.values())
     assert all(m.snapshot_id==state.snapshot.id for m in state.models)
 
 

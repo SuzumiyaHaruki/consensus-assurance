@@ -7,7 +7,8 @@ from consensus_assurance.core.types import ExecutionStatus
 from consensus_assurance.core.config import locate_repo
 from consensus_assurance.adapters.agents.backend import classify_failure
 from consensus_assurance.adapters.runners.process import ProcessRunner
-from consensus_assurance.adapters.runners.experiment import prerequisites
+from consensus_assurance.core.events import match_prerequisites
+from consensus_assurance.core.proposals import EventRequirement
 from consensus_assurance.adapters.storage.files import redact
 from consensus_assurance.adapters.storage.snapshot import capture
 
@@ -36,8 +37,9 @@ def test_process_group_cleanup(tmp_path):
 
 
 def test_actual_prerequisite_order():
-    assert prerequisites([{"event": x} for x in ["started", "context_changed", "completed"]], ["started", "context_changed", "completed"])[0]
-    assert not prerequisites([{"event": x} for x in ["context_changed", "started", "rejected"]], ["started", "context_changed", "completed"])[0]
+    required=[EventRequirement(alias=e,event=e) for e in ["started", "context_changed", "completed"]]
+    assert match_prerequisites([{"event": x} for x in ["started", "context_changed", "completed"]], required)["status"] == "matched"
+    assert not match_prerequisites([{"event": x} for x in ["context_changed", "started", "rejected"]], required)["status"] == "matched"
 
 
 def test_snapshot_preserves_dirty_code_and_excludes_sensitive_files(tmp_path):
@@ -108,9 +110,8 @@ def test_persistent_no_transmission_permission(tmp_path, prepared):
     from consensus_assurance.registry import assemble
     from consensus_assurance.workflow.engine import Engine, Blocked
     from consensus_assurance.core.proposals import Discovery
-    from consensus_assurance.consensus.inquiry import INQUIRY
     config = Config(implementation="toy", protocol="toy", allow_agent_materials=False)
-    engine = Engine(config, tmp_path / "private", *assemble(config), INQUIRY)
+    engine = Engine(config, tmp_path / "private", *assemble(config))
     with pytest.raises(Blocked, match="transmission disabled"):
         engine.ask("discover", Discovery, {"private_material": "never transmitted"})
     assert not (engine.root / "agent").exists()

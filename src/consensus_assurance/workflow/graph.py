@@ -1,20 +1,8 @@
-from consensus_assurance.core.types import Claim, Binding, Relation, AuditUnit, uid
+from consensus_assurance.core.types import Claim, Binding, Relation, AuditUnit
 from .mutations import adopt, write_set
-from .associations import claim_ids, relevant_use
-from .graph_diagnostics import require_graph
+from .associations import claim_ids, relevant_use, goal_links
+from .graph_diagnostics import require_graph, validate_grounding
 from .locations import location_evidence
-
-
-def validate_grounding(basis, materials, binding_ids):
-    if not basis.derivation.strip() or not basis.applicability.strip():
-        raise ValueError("A derivation and implementation applicability are required, not a source file kind")
-    references = set(basis.behavior_ids + basis.expectation_ids)
-    if not references or not references <= set(materials):
-        raise ValueError("Grounding must reference actually read materials")
-    if not set(basis.binding_ids) <= set(binding_ids):
-        raise ValueError("Grounding references unavailable code bindings")
-    if not basis.expectation_ids and not basis.binding_ids:
-        raise ValueError("Derived responsibilities need a located implementation binding; adequacy requires semantic review")
 
 
 def apply_discovery(state, proposal):
@@ -68,10 +56,13 @@ def apply_discovery(state, proposal):
         relevant = [e for e in relations if e.id in u.relation_ids]
         if any(not relevant_use(u,b,relations,materials) for b in bindings if b.id in u.binding_ids):
             raise ValueError("Audit unit contains a binding unrelated to its claims")
-        if not any(e.source in u.goal_ids and e.target in u.obligation_ids and e.kind in {"depends_all", "supports", "alternative", "conditional_on"} for e in relevant):
+        if not goal_links(u,relevant):
             raise ValueError("Audit unit must reference a goal-to-obligation relationship")
         if state.mode=='real' and state.analysis_mode!='regression' and not u.audit_question:
             raise ValueError("A generated audit unit needs a sourced audit_question, not a suspected bug")
+        if state.mode=='real' and state.analysis_mode!='regression' and state.framework_revision=='question-checks-v1':
+            from .direct_checks import validate_question
+            validate_question(u.audit_question)
         points=u.coverage_intent+(u.audit_question.points if u.audit_question else [])
         if u.audit_question and (not u.audit_question.question.strip() or not u.audit_question.importance.strip() or not set(u.audit_question.source_ids)<=set(materials)):
             raise ValueError("Audit question lacks actual materials or significance")
@@ -85,7 +76,8 @@ def apply_discovery(state, proposal):
 
 
 def select_unit(state):
-    pending = [u for u in state.units if u.status in {"pending", "partial"}]
+    pending = [u for u in state.units if u.status in {"pending", "partial"} and not (u.audit_question and u.audit_question.disposition=="explained_by_existing_mechanism")]
+    pending.sort(key=lambda u: bool(u.audit_question and u.audit_question.disposition not in {None,"ready_for_check"}))
     if not pending:
         return None
     # Prefer a pending producer of a required boundary over its consumer.

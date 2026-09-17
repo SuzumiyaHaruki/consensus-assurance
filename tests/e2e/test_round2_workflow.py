@@ -7,7 +7,6 @@ import pytest
 from regression_support import fixture_config as Config
 from consensus_assurance.core.types import ExecutionStatus
 from consensus_assurance.registry import assemble
-from consensus_assurance.consensus.inquiry import INQUIRY
 from consensus_assurance.workflow.engine import Engine
 from consensus_assurance.adapters.storage.files import Store
 
@@ -29,6 +28,8 @@ def deferred_fixture(tmp_path, responses):
     edge['grounding']['behavior_ids']=['upstream_support.py:1:2']
     patch={'bindings':[binding],'relations':[edge],'rationale':'Actual new producer code explains the dependency without changing the obligation'}
     expanded=copy.deepcopy(responses[3]);expanded['harness']['source']=expanded['harness']['source'].replace('from limits import','from upstream_support import')
+    for constraint in expanded['constraints']:
+        constraint['source_ids']=[id.replace('limits.py:', 'upstream_support.py:') for id in constraint['source_ids']]
     fixture=tmp_path/'responses.json'
     fixture.write_text(json.dumps([first,graph,responses[2],read,patch,expanded]))
     return repo,fixture
@@ -40,7 +41,7 @@ def test_F3_reads_new_producer_then_generates_and_checks_new_scope(tmp_path,tlc,
     config=Config(implementation='toy',agent_backend='mock',fixture=str(fixture),tlc_jar=os.environ['TLC_JAR'])
     config.budget.audit_units=3
     root=tmp_path/'audit'
-    state=Engine(config,root,*assemble(config),INQUIRY).start(repo)
+    state=Engine(config,root,*assemble(config)).start(repo)
     assert state.stop_reason.startswith('No pending'),state.stop_reason
     assert len(state.models)==2
     initial=json.loads(Path(state.discovery_path).read_text())
@@ -71,10 +72,10 @@ def test_interrupted_experiment_resumes_same_model_and_action(tmp_path,tlc,prepa
             if not self.interrupted and name==event and self.state.pending_action and self.state.pending_action.kind=='experiment':
                 self.interrupted=True
                 raise RuntimeError('Simulated controller interruption')
-    with pytest.raises(RuntimeError): Interrupted(config,root,*assemble(config),INQUIRY).start(repo)
+    with pytest.raises(RuntimeError): Interrupted(config,root,*assemble(config)).start(repo)
     before=Store(root).load()
     assert before.next_action=='experiment' and before.active_model_id
-    state=Engine(config,root,*assemble(config),INQUIRY).resume()
+    state=Engine(config,root,*assemble(config)).resume()
     assert state.stop_reason.startswith('No pending'),state.stop_reason
     assert len(state.models)==2 and state.models[0].id==before.active_model_id
     assert len([c for c in state.checks if c.action=='experiment'])==2
@@ -90,7 +91,7 @@ def test_experiments_false_prevents_probes_and_replay(tmp_path,prepared):
     repo=prepared[0]
     config=Config(implementation='toy',agent_backend='mock',allow_experiments=False)
     root=tmp_path/'disabled'
-    engine=Engine(config,root,*assemble(config),INQUIRY)
+    engine=Engine(config,root,*assemble(config))
     state=engine.start(repo)
     assert not any(c.action in {'capability_probe','experiment','replay'} for c in state.checks)
     assert not (root/'experiments').exists()
@@ -116,7 +117,7 @@ def test_compilation_failure_gets_actual_log_and_finite_repair(tmp_path,tlc,prep
                 check.status=ExecutionStatus.ERROR;check.reason='Harness import error'
     impl,agent,verifier,knowledge=assemble(config)
     root=tmp_path/'compile'
-    state=Engine(config,root,Adapter(),agent,verifier,knowledge,INQUIRY).start(prepared[0])
+    state=Engine(config,root,Adapter(),agent,verifier,knowledge).start(prepared[0])
     assert state.stop_reason.startswith('No pending'),state.stop_reason
     prompts=list((root/'agent').glob('*-technical/prompt.txt'))
     assert len(prompts)==1
@@ -172,12 +173,12 @@ def test_initial_replay_then_F4_and_attribution_continue(tmp_path,tlc,interrupt_
             super().checkpoint(event)
             if interrupt_plan and not self.interrupted and event=='action_result_saved' and self.state.pending_action and self.state.pending_action.kind=='agent:replay':
                 self.interrupted=True;raise RuntimeError('Interrupted after saving replay plan')
-    engine=Interrupted(config,root,impl,CorrelatedMock(fixture),verifier,knowledge,INQUIRY)
+    engine=Interrupted(config,root,impl,CorrelatedMock(fixture),verifier,knowledge)
     if interrupt_plan:
         with pytest.raises(RuntimeError): engine.start(repo)
         before=Store(root).load()
         assert before.active_finding_id and before.next_action=='replay_plan'
-        engine=Engine(config,root,impl,CorrelatedMock(fixture),verifier,knowledge,INQUIRY)
+        engine=Engine(config,root,impl,CorrelatedMock(fixture),verifier,knowledge)
         state=engine.resume()
     else: state=engine.start(repo)
     assert state.stop_reason.startswith('No pending'),state.stop_reason
@@ -205,12 +206,12 @@ def test_model_files_written_before_state_checkpoint_resume_same_generation(tmp_
             if not self.crashed:
                 super().checkpoint(event)
     with pytest.raises(RuntimeError):
-        Interrupted(config,root,*assemble(config),INQUIRY).start(repo)
+        Interrupted(config,root,*assemble(config)).start(repo)
     before=Store(root).load()
     assert not before.models and (root/'models/v1/commit.json').exists()
     commit=json.loads((root/'models/v1/commit.json').read_text())
     calls=before.usage['agent_calls']
-    state=Engine(config,root,*assemble(config),INQUIRY).resume()
+    state=Engine(config,root,*assemble(config)).resume()
     assert state.stop_reason.startswith('No pending'),state.stop_reason
     assert state.models[0].id==commit['model']['id']
     assert len([m for m in state.models if m.version==1])==1

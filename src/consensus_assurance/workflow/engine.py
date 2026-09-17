@@ -5,17 +5,17 @@ import shutil
 import time
 from pathlib import Path
 from consensus_assurance.core.config import Config
-from consensus_assurance.core.proposals import Discovery, Bundle, Feedback, GraphPatch, ReplayPlan, BuildReply
+from consensus_assurance.core.proposals import Feedback, ReplayPlan, BuildReply
 from consensus_assurance.core.types import (Analysis, Assessment, Calibration, CheckRun, Evidence, ExecutionStatus,
-    Finding, Investigation, Origin, Relation, Scope, uid, PendingAction, Record, Capability)
+    Finding, Investigation, Origin, Relation, uid, PendingAction, Record, Capability)
 from consensus_assurance.ports.interfaces import AgentBackend, ImplementationAdapter, VerifierBackend
 from . import discovery, inquiry
 from consensus_assurance.adapters.runners.process import ProcessRunner, output
-from consensus_assurance.adapters.runners.experiment import run_experiment, extract_events, prerequisites
+from consensus_assurance.adapters.runners.experiment import run_experiment, extract_events
 from consensus_assurance.adapters.storage.files import Store, write_json, digest
 from consensus_assurance.adapters.storage.snapshot import capture
-from .graph import apply_discovery, select_unit, apply_patch
-from .artifacts import save_bundle, validate_bundle
+from .graph import select_unit
+from .artifacts import save_bundle
 from .modeling import validate_build_reply, obligation_progress, coverage_limitations
 from .investigation import feedback_context, validate_feedback, validate_replay, consequence_needed, validate_consequence, record_consequence
 from .budget import BudgetTracker, BudgetExhausted
@@ -26,12 +26,12 @@ from .errors import Blocked
 from .agent_tasks import ask as ask_agent
 
 
-FRAMEWORK_REVISION = "worksets-v1"
+FRAMEWORK_REVISION = "question-checks-v1"
 
 
 class Engine:
     def __init__(self, config: Config, root: Path, implementation: ImplementationAdapter,
-                 agent: AgentBackend, verifier: VerifierBackend, knowledge: str, inquiry: str):
+                 agent: AgentBackend, verifier: VerifierBackend, knowledge: str, inquiry: str = ""):
         self.config, self.root = config, root.resolve()
         self.implementation, self.agent, self.verifier = implementation, agent, verifier
         self.knowledge, self.inquiry = knowledge, inquiry
@@ -41,6 +41,13 @@ class Engine:
 
     def checkpoint(self, event):
         self.budget.sync()
+        versions={o.id:o.version for o in self.state.claims+self.state.bindings+self.state.relations+self.state.units}
+        stale={a.id for a in self.state.direct_checks if any(versions.get(k)!=v for k,v in a.graph_versions.items())}
+        for evidence in self.state.evidence:
+            if evidence.direct_check_id in stale:
+                evidence.applicability='recheck_required';evidence.assessment=Assessment.STALE;evidence.stale_reason='Direct-check semantic inputs changed'
+        for finding in self.state.findings:
+            if finding.direct_check_id in stale:finding.applicability='recheck_required'
         from consensus_assurance.core.types import now
         observed={
             'initial_graph':'discovery' in self.state.completed_steps,
@@ -72,7 +79,9 @@ class Engine:
         missing = [f for f in self.implementation.required_inputs(repo) if f not in snapshot.files] if hasattr(self.implementation,"required_inputs") else []
         if missing: raise ValueError("Required build inputs could not be safely copied: " + ", ".join(missing))
         self.state = Analysis(framework_revision=FRAMEWORK_REVISION, mode="mock" if self.agent.mock else "real", config=self.config.model_dump(mode="json"), snapshot=snapshot)
-        self.state.guidance = [{"source":"consensus/inquiry.py","text":self.inquiry}, {"source":"configured_reference","text":self.knowledge}]
+        self.state.guidance = [{"source":"configured_reference","text":self.knowledge}]
+        if self.inquiry:
+            self.state.guidance.append({"source":"configured_inquiry","text":self.inquiry})
         self.state.analysis_mode = "regression" if self.agent.mock else ("directed" if self.config.directed_question else "autonomous")
         self.state.elapsed_seconds = time.monotonic() - started
         self.budget = BudgetTracker(self.config.budget, self.state)
@@ -105,6 +114,9 @@ class Engine:
                     reasons.append("Model, checker, mapping or harness artifact changed")
                     changed_models.add(model.id)
                     break
+        for artifact in self.state.direct_checks:
+            if any(not Path(p).is_file() or digest(Path(p).read_bytes())!=d for p,d in artifact.artifact_digests.items()):
+                reasons.append("Direct-check artifact changed")
         copied = capture(self.root / "source")
         if copied.files != self.state.snapshot.files:
             reasons.append("Preserved source copy changed")
@@ -272,7 +284,7 @@ class Engine:
             check.model_id=model.id; check.input_versions=model.artifact_digests
             check.tool_version=self.state.tools.get("implementation","unknown")
             check.origin=Origin.MOCK if self.state.mode=="mock" else Origin.EXECUTED
-            check.artifacts=[str(destination),model.mapping_path]
+            check.artifacts.extend([str(destination),model.mapping_path])
             return check
         check=CheckRun.model_validate(self.action("replay" if replay else "experiment","experiments",execute,{"model_id":model.id,"bundle_path":model.bundle_path}))
         self.record(check)
@@ -359,7 +371,7 @@ class Engine:
             target=next(u for u in proxy.state.units if u.id==unit.id)
             apply_feedback(proxy.state,target,bundle,feedback)
             if feedback.kind=="F2" and proxy.state.revisions[-1].status=="applied":
-                proxy.state.active_model_id=None;proxy.state.active_finding_id=None;proxy.state.next_action="build"
+                proxy.state.active_model_id=None;proxy.state.active_direct_check_id=None;proxy.state.active_finding_id=None;proxy.state.next_action="select"
                 inquiry.release_action(proxy)
             elif feedback.kind=="F3":
                 proxy.state.active_unit_id=None;proxy.state.active_model_id=None;proxy.state.active_finding_id=None;proxy.state.next_action="select"
@@ -376,7 +388,7 @@ class Engine:
         return check_triggers(self,model,bundle)
 
     def finish_unit(self, unit, status="checked"):
-        unit.coverage_limitations=coverage_limitations(self.state,unit)
+        unit.coverage_limitations=list(dict.fromkeys(unit.coverage_limitations+coverage_limitations(self.state,unit)))
         old = set(unit.obligation_checks)
         unit.obligation_checks, unit.remaining_obligation_ids = obligation_progress(self.state, unit)
         if status == "checked" and unit.remaining_obligation_ids:
@@ -385,20 +397,37 @@ class Engine:
         unit.status=status
         if status=="checked":self.state.deferred_units.pop(unit.id,None)
         self.state.active_unit_id=None; self.state.active_model_id=None; self.state.active_finding_id=None
+        self.state.active_direct_check_id=None
         self.advance("select")
 
     def process_unit(self, unit):
         from .observations import assess_execution
         self.state.active_unit_id=unit.id
-        if self.state.next_action=="select": self.advance("build")
+        if self.state.next_action=="select":
+            from .direct_checks import route
+            self.advance(route(unit))
         while self.state.active_unit_id:
             unit=next(u for u in self.state.units if u.id==self.state.active_unit_id)
             phase=self.state.next_action
+            if phase=='select':
+                from .direct_checks import route
+                self.advance(route(unit));continue
             model=next((m for m in self.state.models if m.id==self.state.active_model_id),None)
             bundle=load_model(model) if model else None
             experiment=next((c for c in reversed(self.state.checks) if model and c.model_id==model.id and c.action in {"experiment","replay"}),None)
             calibration=next((c for c in reversed(self.state.calibrations) if experiment and c.experiment_check_id==experiment.id),None)
             finding=next((f for f in self.state.findings if f.id==self.state.active_finding_id),None)
+            if phase in {'direct_check','direct_execute','direct_assess'}:
+                from .direct_checks import proceed
+                proceed(self,unit,phase)
+                if self.state.next_action=='direct_assess' and any(t.status=='pending' and t.unit_id==unit.id for t in self.state.inquiry_tasks):return
+                continue
+            if phase=='question':
+                from .direct_checks import continue_question
+                continue_question(self,unit);continue
+            if phase=='question_closed':
+                self.state.gaps.append('Scoped source explanation: '+unit.audit_question.trigger_rationale)
+                self.finish_unit(unit,'blocked');return
             if phase in {"model_syntax", "model_explore", "model_repair", "harness"}:
                 from .staged_model import proceed
                 proceed(self, unit, model, bundle, phase)
@@ -582,14 +611,13 @@ class Engine:
                 inquiry.clear_reserve(self)
                 can_inquire = inquiry.enabled(self) and (self.state.active_inquiry_id or (self.state.pending_action is None and self.state.pending_output_repair is None))
                 if can_inquire:
-                    if not self.state.active_unit_id and self.state.usage.get("audit_units",0)<self.config.budget.audit_units:
+                    focused_review=any(t.kind=="review" and t.status=="pending" and t.unit_id in self.state.deferred_units for t in self.state.inquiry_tasks)
+                    if not focused_review and not self.state.active_unit_id and self.state.usage.get("audit_units",0)<self.config.budget.audit_units:
                         candidate=select_unit(self.state)
                         if candidate:
-                            self.budget.take("audit_units");self.state.active_unit_id=candidate.id;self.state.next_action="build"
+                            self.budget.take("audit_units");self.state.active_unit_id=candidate.id;self.state.next_action="select"
                             self.checkpoint("actual_unit_selected_before_review")
                     candidate=next((u for u in self.state.units if u.id==self.state.active_unit_id),None)
-                    if candidate and self.state.next_action in {"select","build"}:
-                        inquiry.review_unit(self,candidate,"before_model")
                     task=inquiry.choose_task(self)
                     if task:
                         try:

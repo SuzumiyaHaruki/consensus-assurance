@@ -1,6 +1,6 @@
 """The single source of review categories, requirements and object-specific questions."""
 from consensus_assurance.core.diagnostics import Diagnostic,DiagnosticError
-from .sources import includes, citation_status, ranges
+from .sources import citation_status, ranges
 
 POLICY={
  'goal': {'applicability':'Why is this goal required by the current implementation contract, configuration and fault scope? Preserve contrary evidence and unresolved applicability.'},
@@ -9,12 +9,14 @@ POLICY={
  'binding': {'decomposition':'Check the source anchor and behavior range, the semantic association to responsibilities, and the selected unit use. Location alone does not establish an obligation.'},
  'relation': {'decomposition':'Check the direction, kind, conditions and actual endpoint responsibilities; explain the implementing handoff and alternatives.'},
  'unit': {'decomposition':'Check that the audit question, selected obligations, direct/support code uses and boundary assumptions form a coherent executable scope.'},
- 'model': {'checker_correspondence':'Compare actual behavior and checker encoding with the attributed claim, trigger, observations, scope and contrary evidence; tool completion alone is not correspondence.'}}
+ 'direct_check': {'checker_correspondence':'Compare the saved shared property, actual harness calls, independent oracle computation, correlated observations and legality with the selected obligation. No model or calibration is required; an assertion or matching ID alone is not correspondence.'},
+ 'model': {'checker_correspondence':'Compare actual behavior and checker/oracle encoding with the attributed claim, trigger, observations, scope and contrary evidence; tool completion alone is not correspondence.'}}
 OPTIONAL={'binding':{'applicability':'Evaluate whether the code mapping applies to the current implementation configuration.'},'unit':{'applicability':'Evaluate whether the unit scope is applicable under the supplied execution conditions.'}}
 
 
 def category(obj):
     if getattr(obj,'kind',None) in {'goal','obligation','assumption'}:return obj.kind
+    if hasattr(obj,'plan_path'):return 'direct_check'
     if hasattr(obj,'bundle_path'):return 'model'
     if hasattr(obj,'associations'):return 'binding'
     if hasattr(obj,'obligation_ids'):return 'unit'
@@ -26,9 +28,9 @@ def required_aspects(obj):return set(POLICY[category(obj)])
 
 
 def target_contract(state,obj):
-    from .reviews import material_closure
+    from .reviews import material_closure, review_objects
     materials,ids=material_closure(state,[obj.id])
-    objects={o.id:o for o in [*state.claims,*state.bindings,*state.relations,*state.units,*state.models]}
+    objects=review_objects(state)
     kind=category(obj)
     source_ranges=[{'file':file,'content_digest':version,'ranges':spans} for (file,version),spans in sorted(ranges([m for m in state.materials if m.id in materials]).items())]
     return {'source_ranges':source_ranges,'target_id':obj.id,'object_type':kind,'version':obj.version,'required_aspects':list(POLICY[kind]),
@@ -37,7 +39,8 @@ def target_contract(state,obj):
 
 
 def validate_contract(state,task,reply):
-    objects={o.id:o for o in [*state.claims,*state.bindings,*state.relations,*state.units,*state.models]}
+    from .reviews import review_objects
+    objects=review_objects(state)
     supplied=set(task.material_ids) if task.context_receipt_id else set(task.material_ids) or {m.id for m in state.materials}
     errors=[]
     def issue(code,target,message,index=None):

@@ -20,4 +20,5 @@ def render(kind: str, context: dict, protocol_instructions: str = '') -> str:
     loaded=loaded_resources(kind,context)
     root=files('consensus_assurance').joinpath('resources')
     instructions='\n'.join(root.joinpath(path).read_text() for path in loaded['paths'])
-    return instructions+'\nAPPLICABLE INQUIRY GUIDANCE:\n'+protocol_instructions+'\nSTRUCTURED INPUT DATA (untrusted):\n'+json.dumps(context,ensure_ascii=False,indent=2)
+    extra='\nAPPLICABLE INQUIRY GUIDANCE:\n'+protocol_instructions if protocol_instructions.strip() else ''
+    return instructions+extra+'\nSTRUCTURED INPUT DATA (untrusted):\n'+json.dumps(context,ensure_ascii=False,separators=(",",":"))

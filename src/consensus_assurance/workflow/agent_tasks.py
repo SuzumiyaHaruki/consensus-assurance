@@ -63,7 +63,9 @@ def ask(engine,kind,response_type,context,validator=None):
         preparation_started=time.monotonic()
         if session:
             if session['attempt']>=engine.config.budget.repair_attempts or session.get('blocked'):
-                save_session(engine,session);raise Blocked('Structured response repair limit reached: '+session['error'])
+                save_session(engine,session)
+                detail=(session.get('patch_error') or {}).get('message') or session['error']
+                raise Blocked('Structured response repair stopped after '+str(session['attempt'])+' attempts: '+detail)
             candidate=json.loads(Path(session['current_path']).read_text())
             diags=[Diagnostic.model_validate(d) for d in session['diagnostics']]
             context,_=prepare(engine,kind,context)
@@ -75,9 +77,13 @@ def ask(engine,kind,response_type,context,validator=None):
             # error_context_chars bounds diagnostic fields, not repeated old closures.
             requested=[m for m in context['attached_materials'] if m['id'] in context['repair_requested_material_ids']]
             source_room=min(engine.config.budget.context_chars//2,max(limit,sum(len(json.dumps(m,ensure_ascii=False)) for m in requested)+limit))
+            if active_diags[0].code=='schema_type' or active_diags[0].category in {'association','material'}:
+                # Reference fields need the owning object, dependency claims and source,
+                # while editable diagnostics remain bounded by error_context_chars.
+                source_room=engine.config.budget.context_chars//2
             related=diagnostic_context(candidate,active_diags,context,source_room)
-            if related['required_materials_missing']:
-                session['error']='Explicitly requested source cannot fit this issue packet; a smaller range plan is required'
+            if related['required_materials_missing'] or related['required_objects_missing']:
+                session['error']='Required repair objects or requested source cannot fit this issue packet; a smaller repair scope is required'
                 session['blocked']=True;save_session(engine,session);raise Blocked(session['error'])
             session['related_context']=related
             if not session['targets'] and not any('read' in d.allowed for d in diags):
@@ -100,6 +106,9 @@ def ask(engine,kind,response_type,context,validator=None):
                 review_task.preparation_failures+=1
                 from .inquiry import split_context_task
                 sent['child_task_ids']=split_context_task(engine,review_task)
+            elif not session and kind in {'build','F3'}:
+                from .inquiry import split_model_context
+                sent['child_task_ids']=split_model_context(engine,kind)
             write_json(engine.root/'packets'/(sent['id']+'.json'),sent)
             engine.checkpoint('context_limit')
             raise Blocked('Required context exceeds context_chars; split the task or explicitly revise the limit; no payload sent')

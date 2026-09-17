@@ -35,7 +35,7 @@ class RepairingScopeAgent(ScopeAgent):
         check,typed=super().analyze(runner,prompt,directory,snapshot_id,timeout,response_type)
         response=typed.model_dump(mode='json')
         if response_type.__name__=='ReviewReply' and not self.bad_review:
-            item=next((i for i in response['items'] if i['target_id']=='step_binding'),None)
+            item=next((i for i in response['items'] if i['target_id']==p.get('selected_unit',{}).get('id')),None)
             if item:
                 self.bad_review=True;item.update(aspect='checker_correspondence',status='disputed',explanation='The consumer boundary is grounded; the unseen producer still requires source inspection',limitations=['Upstream context is not yet explained'])
         if response_type.__name__=='GraphPatch':

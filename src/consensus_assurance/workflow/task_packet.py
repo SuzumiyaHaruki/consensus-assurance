@@ -24,6 +24,11 @@ def prepare(engine,kind,context):
     packet['file_lookup']=[{'file':x['file'],'lines':x.get('lines'),'unavailable':x.get('unavailable')} for x in index if kind in {'read','discover','explore','targeted_read'} or x['file'] in files]
     packet['lookup_request']='Request a focused ReadingPlan for an unlisted path or symbol; omitted files are not absent from the repository'
     packet['file_metadata']=[{**x,'attached_ranges':[[m['start_line'],m['end_line']] for key in ('materials','new_materials','initial_materials') for m in packet.get(key,[]) if m['file']==x['file']]} for x in index if x['file'] in files]
+    if kind in {'discover','explore','graph_patch'}:
+        from .locations import declaration_index
+        from .associations import graph_contract
+        packet['graph_contract']=graph_contract()
+        packet['source_declarations']=declaration_index([m for key in ('materials','new_materials') for m in packet.get(key,[])])
     packet['material_budget']={'used':material_usage(state),'breadth':material_allowance(state,engine.config.budget,'breadth'),'depth':material_allowance(state,engine.config.budget,'depth')}
     packet['context_limit_chars']=engine.config.budget.context_chars
     packet['reading_status']=[{'id':id,'status':p['status'],'unfulfilled':[i for i in p['items'] if i['status']=='deferred']} for id,p in state.read_plans.items() if p['status']!='complete' and (not task or id==task.read_plan_id)]

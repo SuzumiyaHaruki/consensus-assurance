@@ -3,8 +3,9 @@ TLA+ is a verification/search method, not the definition of success. When a dire
 executable trace can confirm or refute the selected obligation, describe that test
 first: legal prehistory, controlled events, observations and oracle. Prefer a local
 model when interleavings or state-space exploration are the hard part. Record the
-preferred next check in the existing question/brief; this advice does not create a
-new execution route or replace required TLC, experiment or evidence checks.
+preferred_check in the typed question: direct_test/controlled_schedule use the
+implementation-check route; local_model uses this method and the existing TLC,
+experiment and evidence checks.
 Model behavior from code and properties from obligations. No result under finite
 test/model bounds establishes whole-system correctness; an agent judgment cannot
 replace actual execution, supported observation or calibration.
