@@ -1,90 +1,26 @@
-# CFT implementation-grounded analysis
+# Implementation-grounded CFT audit
 
-Input: supplied code, attributed contracts/docs, configuration and the current
-workset. Output: a thin responsibility map and a bounded actionable question in
-existing G/O/C records. Default scope is Crash Fault Tolerant (CFT) consensus /
-replicated state machines. Prior protocol knowledge suggests questions, not claims.
-History may inform priority but neither a historical bug nor a supplied goal is
-required. These steps are a reasoning order, not new controller stages.
+## 1. Recover the boundary and ownership
+Use the catalogue, declarations and small source ranges to identify public APIs, message handlers, loops/timers, durable state, startup/recovery, configuration, application callbacks and completion paths. Prefer declaration-sized samples over whole-file reads. Recover actual contexts and external adapters, including constructor/factory/dependency injection. Distinguish supported, enabled and actually used variants; configuration need not be a flag. Role names are not semantics, and familiar optional mechanisms are not requirements.
 
-## Step 0: Recover the target profile
+## 2. Build the minimum seven-class understanding
+Return a single ConsensusAuditSpec. Each class needs applicability, a realization or boundary explanation, entry points and behavior/fact/handoff skeletons or named missing evidence. Unknown is acceptable and must be explicit. Applicable, externalized and not_applicable judgments need actual sources; externalized names the responsible interface/caller. Do not create one goal or model per class. Do not split a class into local function steps.
 
-Identify system boundary, roles actually present, actual term/epoch/round or
-operation contexts, storage/transport/application ownership and relevant optional
-mechanisms. Separate feature support, configured enablement and use on this path.
-Role names are not semantics: entering a candidate role need not advance a term.
-Do not normalize distinct contexts into one field. Missing a familiar mechanism
-is not itself a defect. Trace external adapters when they own a required effect.
+Reverse-check important catalogue/declaration entries: mapped, externalized, infrastructure, deferred with reason, or UNCLASSIFIED_PROTOCOL_RESPONSIBILITY. Never force an important unclassified behavior into a class. High-consequence omissions deserve bounded refinement before repeatedly deepening one direction. Ordinary unknowns remain inventory, not automatic tasks.
 
-Include crash/restart, persistence ordering/errors, timeout, stale/late work,
-concurrent instances and asynchronous completion. Delay/loss/duplicate/reorder
-belong only where the actual transport/fault model permits them. Configuration,
-snapshot, recovery, catch-up and commit-to-application paths are not optional
-happy-path omissions; mark their applicability and unresolved dependencies.
+## 3. Recover local behavior and semantic fact flow
+Use references/behavior-facts.md. Follow the actual branches, owners, asynchronous boundaries and producer/consumer dependencies. A behavior is one triggered semantic processing point, not an entire distributed scenario. Record a primary class and cross-activity effects rather than duplicate behaviors. Multiple producers/consumers, branch/merge, retries and cycles are valid.
 
-## Step 1: Build a thin activity map
+Inspect only interference capable of establishing, changing, replacing, deleting, invalidating or reinterpreting the selected fact between creation and use. Actively seek existing guards, ownership/isolation, context identity, serialization, persistence-before-publication, cancellation, later validation and recovery reconstruction. Explained suspicion should narrow or close; independent counterevidence stays visible.
 
-Use the loaded responsibilities-and-behaviors survey for overlapping ABCD coverage.
-Find actual admission/proposal, replication/support exchange, commit/decision,
-role maintenance, campaign, configuration, durable history, snapshot/recovery and
-application/read activities. This vocabulary is not a required module list.
-For each relevant activity record grounded, N/A (with basis), unknown or deferred,
-entry points/roles, producers/consumers and shared state or handoffs. Use existing
-Responsibility descriptions, applicability, questions and handoffs, not new enums.
-Check both responsibility-to-code and entry-point-to-responsibility coverage.
-Do not generate a Goal, Obligation or model for each activity.
+## 4. Derive and select a question
+Facts describe what the implementation establishes or consumes. Obligations state independently justified required relations: establishment, preservation, consumption, recovery or cross_activity_handoff. Keep normative source, implementation source, applicability and unresolved producer guarantees separate. Never copy a guard into an obligation or promote an unverified producer guarantee into an environment assumption.
 
-## Step 2: Deep-analyze one important path
+Select by system consequence, cross-activity importance, actual evidence, remaining gap after protections, verification cost and neglected coverage. Goal explains the system consequence. AuditQuestion references existing spec IDs and one lifecycle relation; it carries legal prehistory, event paths, known protection, uncertainty and a minimal discriminator. Fixed protocol properties and target-specific answer keys are forbidden.
 
-Select by system consequence, unexplained handoff, available evidence and cost,
-not merely by how small a local function is. Use the loaded behavior-obligations
-reference for the behavior template, conditional questions and interference rules.
-Recover checks, effects and branches before deriving a relation. Locate actual
-behavior ranges and definitions; one literal symbol per binding. A whole file or
-an anchored call site does not establish a callee's behavior.
+## 5. Obtain the smallest reliable evidence and integrate
+If applicability or required meaning is unclear, request source_review. Prefer direct_test for one reachable execution with a reliable oracle; controlled_schedule requires actual schedule control. Use local_model when systematic exploration of legal histories/interleavings is the hard part. TLA+ is a method, not success itself. Scope includes observable behavior, causes needed to interpret its effect, and actual interfering activities.
 
-Trace facts from establishment through maintenance to use. Seek alternate guards,
-ownership, serialization, deferred validation and recovery before retaining a
-suspicion. An unverified producer guarantee is a question, not an environment
-assumption. Expand only along the selected question's dependencies. Name the
-smallest missing range and how its answer would change the next check.
+After a check, reassess the seven-class ledger and next highest-value question. Refine descriptive ownership, applicability, behavior assignment, fact flow and handoffs from sources/evidence. Preserve previous spec versions. Changing accepted normative claims or a selected fact's meaning requires attributed F2; merely correcting implementation understanding does not. For a meaning change already used by a question, retain the old fact, introduce a sourced revised fact ID, then use an explicit F2 audit_question change to reconnect the existing unit. A descriptive refinement alone cannot reconnect accepted semantics. Never infer whole-activity or system correctness from finite execution/model bounds.
 
-## Step 3: Derive Goal and Obligation
-
-A Goal explains a meaningful system guarantee and consequence. An Obligation is
-a checkable relation required by that guarantee at an actual behavior or handoff.
-Keep normative/contract sources separate from implementation sources; include
-applicability, known protections and the unexplained producer/consumer boundary.
-An explicitly derived producer/consumer contract is admissible with its derivation;
-conflicting or unsupported expectations remain candidate judgments. Copying a
-current guard does not establish what should hold. Avoid vague "ensure safety"
-and do not invent a system Goal for every local detail.
-
-Keep Goal meaning broad enough to explain significance while selecting only the
-obligations and behavior necessary for this check. One behavior can raise several
-questions, several obligations can share a model, and a binding does not require
-its own review call. Preserve incomplete obligations and affected recheck work.
-
-## Step 4: Close with an actionable audit question
-
-Set AuditQuestion.disposition to one of these bounded analysis outcomes:
-
-- explained_by_existing_mechanism: cite the protection and the exact scope it explains.
-- concrete_suspicion: identify a legal path and the applicable relation it may violate.
-- needs_specific_evidence: name the missing fact/range and the decision it discriminates.
-- ready_for_check: specify legal prehistory, event relation, observations and oracle.
-
-Record the behavior and check plan in existing AuditQuestion question/event_paths,
-contexts and trigger_rationale; importance connects to Goal; source_ids, bindings
-and coverage points connect to actual ranges. Put exclusions in scope/coverage
-limitations and unresolved facts in point unknowns. Responsibility questions can
-retain explained or deferred work without manufacturing another audit unit.
-Important handoffs need linked units, a sourced reason no separate check is needed,
-or a bounded inquiry, even when both responsibilities already have goals.
-
-The next-stage task_view/modeling brief uses the compact handoff in the behavior
-reference, with the selected unit and sources included once. Keep full reasoning
-and raw reviews in the archive; retain relevant unresolved counterevidence and
-explicit resolutions in the current workset. Do not turn scope exclusions into
-resolution of a semantic dispute. Successful local checks still invite semantic
-review. A scoped result never discharges a whole Goal.
+Keep the complete spec and raw reviews in the archive; local worksets contain selected spec slices, G/O/code, actual source, open counterevidence and current result. Summaries are not substitute source. Stop with a coverage ledger, not a claim of completeness.

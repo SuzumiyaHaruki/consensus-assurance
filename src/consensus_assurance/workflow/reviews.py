@@ -33,7 +33,7 @@ def valid_supersession(state,review,task):
         if review.context_receipt_id:
             contract=target_contract(state,objects[id])
             if review.context_dependencies.get(id,{}).get('dependency_versions')!=contract['dependency_versions'] or not includes(state,contract['required_material_ids'],review.material_ids):return False
-        items=[i for i in review.items if i.target_id==id and i.status=='no_issue_found' and not i.limitations]
+        items=[i for i in review.items if i.target_id==id and i.status=='no_issue_found' and not i.limitations and not i.counterevidence]
         if not set(task.requested_aspects.get(id,required_aspects(objects[id])))<={i.aspect for i in items}:return False
     return bool(task.target_versions)
 
@@ -88,7 +88,7 @@ def validate_resolutions(state, task, reply):
             if any(x not in others or x==id or others[x].parent_issue_id==id for x in resolution.residual_issue_ids):fail(issue,'An unresolved root or child cannot be renamed as an independent residual')
             if any(issue.explanation.strip().casefold()==x.strip().casefold() for x in resolution.scope_limitations):fail(issue,'The unresolved original question cannot be relabeled as a scope boundary')
             from .repair_policy import classify_conditions,condition_records
-            remaining=list(dict.fromkeys(x for i in matching for x in i.limitations))
+            remaining=list(dict.fromkeys(x for i in matching for x in i.counterevidence+i.limitations if x not in resolution.scope_limitations or x in i.counterevidence))
             if remaining:
                 records=condition_records(remaining,task.id+'/'+resolution_target+'/'+issue.aspect,resolution.source_ids,resolution_target,current[resolution_target])
                 original={r['text']:r for r in issue.conditions}
@@ -106,7 +106,7 @@ def validate_resolutions(state, task, reply):
                     raise
                 if any(c.applies_to!='independent_scope' for c in classified):fail(issue,'A condition still affects the current judgment; keep the issue open')
             if not matching:fail(issue,'An issue disposition needs matching substantive analysis')
-        elif not matching or any(i.scope_limitations or i.limitations for i in matching) or not any(set(issue.source_ids)<=set(i.source_ids) for i in matching):
+        elif not matching or any(i.counterevidence or i.limitations for i in matching) or not any(set(issue.source_ids)<=set(i.source_ids) for i in matching):
             fail(issue,'Resolution must address the specific prior issue and its material evidence; independent boundaries need an explicit issue disposition')
         if issue.model_id and task.model_id!=issue.model_id:
             model=next((m for m in state.models if m.id==task.model_id),None)
@@ -122,14 +122,16 @@ def record_dispositions(state,review,reply,followup_ids):
             issue.resolution_basis=next((r.model_dump(mode='json') for r in reply.resolutions if r.issue_id==issue.id),{'rationale':reply.resolution_rationale})
             issue.resolution_checks=[c.id for c in state.checks if c.model_id==review.model_id and c.action=='model_check']
     for item in reply.items:
-        if item.status=='no_issue_found' and not item.limitations:continue
+        independent={x for r in reply.resolutions if r.issue_id in reply.resolves_issue_ids and any(i.id==r.issue_id and i.target_id==item.target_id and i.aspect==item.aspect for i in state.review_issues) for x in r.scope_limitations}
+        unresolved=[x for x in item.counterevidence+item.limitations if x not in independent or x in item.counterevidence]
+        if item.status=='no_issue_found' and not unresolved:continue
         disposition='reading' if reply.requests else 'revision' if reply.revision else 'investigation' if followup_ids else 'blocked'
-        prior=next((i for i in state.review_issues if not i.resolved_by and i.target_id==item.target_id and i.target_version==review.target_versions[item.target_id] and i.aspect==item.aspect and i.explanation==item.explanation),None)
+        prior=next((i for i in state.review_issues if not i.resolved_by and i.target_id==item.target_id and i.target_version==review.target_versions[item.target_id] and i.aspect==item.aspect and i.explanation==item.rationale),None)
         if prior:
             prior.source_ids=list(dict.fromkeys(prior.source_ids+item.source_ids))
             prior.prior_review_ids=list(dict.fromkeys(prior.prior_review_ids+[review.id]));prior.task_ids=list(dict.fromkeys(prior.task_ids+followup_ids));continue
         from .repair_policy import condition_records
-        state.review_issues.append(ReviewIssue(conditions=condition_records(item.limitations,review.task_id+'/'+item.target_id+'/'+item.aspect,item.source_ids,item.target_id,review.target_versions[item.target_id]),review_id=review.id,target_id=item.target_id,target_version=review.target_versions[item.target_id],aspect=item.aspect,model_id=review.model_id,source_ids=item.source_ids,explanation=item.explanation,disposition=disposition,task_ids=followup_ids,
+        state.review_issues.append(ReviewIssue(conditions=condition_records(unresolved,review.task_id+'/'+item.target_id+'/'+item.aspect,item.source_ids,item.target_id,review.target_versions[item.target_id]),review_id=review.id,target_id=item.target_id,target_version=review.target_versions[item.target_id],aspect=item.aspect,model_id=review.model_id,source_ids=item.source_ids,explanation=item.rationale,disposition=disposition,task_ids=followup_ids,
             reason='Follow-up evidence or semantic review is required' if disposition!='blocked' else 'No actionable follow-up was supplied; the issue remains unresolved and requires planning'))
 
 
@@ -148,7 +150,7 @@ def readiness(state,unit):
             candidates=[r for r in state.semantic_reviews if r.target_versions.get(id)==obj.version and includes(state,needed,r.material_ids) and all(r.context_dependencies.get(id,{}).get('dependency_versions',dependency['dependency_versions']).get(k)==v for k,v in dependency['dependency_versions'].items()) and any(i.target_id==id and i.aspect==aspect for i in r.items)]
             if not candidates:missing.append(id+':'+aspect);continue
             review=candidates[-1];reviews.append(review.id)
-            if any(i.target_id==id and i.aspect==aspect and (i.status!='no_issue_found' or i.limitations) for i in review.items):disputed.append(id+':'+aspect)
+            if any(i.target_id==id and i.aspect==aspect and (i.status!='no_issue_found' or i.limitations or i.counterevidence) for i in review.items):disputed.append(id+':'+aspect)
     disputed.extend(i.id for i in state.review_issues if i.target_id in relevant and not i.resolved_by)
     return {'unit_version':unit.version,'target_versions':{id:objects[id].version for id in ids},'material_ids':sorted(materials),
         'review_ids':sorted(set(reviews)),'status':'unreviewed' if missing else 'disputed' if disputed else 'reviewed',

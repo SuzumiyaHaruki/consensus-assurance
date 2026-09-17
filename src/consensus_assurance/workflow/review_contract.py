@@ -45,7 +45,7 @@ def validate_contract(state,task,reply):
     errors=[]
     def issue(code,target,message,index=None):
         contract=target_contract(state,objects[target]) if target in objects else {'target_id':target}
-        errors.append(Diagnostic(code=code,category='format',object_ids=[target],paths=['/items/-'] if code in {'review_missing_aspect','review_missing_target'} else ['/items/'+str(index)] if index is not None else ['/items'],material_ids=contract.get('required_material_ids',[]),
+        errors.append(Diagnostic(code=code,category='format',object_ids=[target],paths=['/items/'+str(index)] if index is not None else ['/items'],material_ids=contract.get('required_material_ids',[]),
             message=message,allowed=['representation','read'],details={'review_contract':contract,'item_index':index,'preservation':'Retain previous analysis, negative judgments, limitations and sources; add substantive required items rather than automatic approval'}))
     seen=set()
     for i,item in enumerate(reply.items):
@@ -56,14 +56,15 @@ def validate_contract(state,task,reply):
         if item.aspect not in set(POLICY[kind])|set(OPTIONAL.get(kind,{})):issue('review_wrong_aspect',item.target_id,'Aspect is not applicable to this object type under the supplied review contract',i)
         for source,status in citation_status(state,item.source_ids,supplied).items():
             if status!='provided':issue('review_unknown_source' if status=='unknown' else 'review_unavailable_source',item.target_id,'Citation '+source+': '+status+'; correct the reference or attach the actual range',i)
-    for id in task.target_ids:
-        if id not in objects:issue('review_unknown_target',id,'Requested target is no longer available');continue
-        if not any(i.target_id==id for i in reply.items):issue('review_missing_target',id,'Review must account for each requested object');continue
-        required=set(task.requested_aspects.get(id,required_aspects(objects[id])))
-        missing=required-{i.aspect for i in reply.items if i.target_id==id}
-        if missing:issue('review_missing_aspect',id,'Review omitted a required semantic aspect for '+id+': '+', '.join(sorted(missing)))
     if errors:raise DiagnosticError(errors)
 
 
 def same_basis(a,b):
     return a.get('version')==b.get('version') and a.get('dependency_versions')==b.get('dependency_versions') and a.get('source_ranges')==b.get('source_ranges')
+
+
+def missing_pairs(state,task,items):
+    from .reviews import review_objects
+    objects=review_objects(state)
+    return {id:sorted(missing) for id in task.target_ids if id in objects
+        if (missing:=set(task.requested_aspects.get(id,required_aspects(objects[id])))-{i.aspect for i in items if i.target_id==id})}

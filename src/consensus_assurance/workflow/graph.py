@@ -5,7 +5,7 @@ from .graph_diagnostics import require_graph, validate_grounding
 from .locations import location_evidence
 
 
-def apply_discovery(state, proposal):
+def apply_discovery(state, proposal, audit_spec=None):
     require_graph(state,proposal)
     count = sum(len(getattr(proposal,name)) for name in ("claims","bindings","relations","units"))
     if count > state.config.get("budget",{}).get("graph_objects",1000):
@@ -60,15 +60,11 @@ def apply_discovery(state, proposal):
             raise ValueError("Audit unit must reference a goal-to-obligation relationship")
         if state.mode=='real' and state.analysis_mode!='regression' and not u.audit_question:
             raise ValueError("A generated audit unit needs a sourced audit_question, not a suspected bug")
-        if state.mode=='real' and state.analysis_mode!='regression' and state.framework_revision=='question-checks-v1':
-            from .direct_checks import validate_question
-            validate_question(u.audit_question)
-        points=u.coverage_intent+(u.audit_question.points if u.audit_question else [])
         if u.audit_question and (not u.audit_question.question.strip() or not u.audit_question.importance.strip() or not set(u.audit_question.source_ids)<=set(materials)):
             raise ValueError("Audit question lacks actual materials or significance")
-        for point in points:
-            if not set(point.source_ids)<=set(materials) or not set(point.binding_ids)<=set(u.binding_ids) or not set(point.claim_ids)<=set(u.goal_ids+u.obligation_ids):
-                raise ValueError("Coverage intent references unselected evidence or bindings")
+        from .audit_spec import load, validate_question
+        spec=audit_spec or getattr(proposal,'audit_spec',None) or load(state)
+        if spec:validate_question(spec,u.audit_question)
         units.append(AuditUnit(**u.model_dump()))
     state.claims, state.bindings, state.relations, state.units = claims, bindings, relations, units
     state.graph_version += 1
@@ -77,7 +73,7 @@ def apply_discovery(state, proposal):
 
 def select_unit(state):
     pending = [u for u in state.units if u.status in {"pending", "partial"} and not (u.audit_question and u.audit_question.disposition=="explained_by_existing_mechanism")]
-    pending.sort(key=lambda u: bool(u.audit_question and u.audit_question.disposition not in {None,"ready_for_check"}))
+    pending.sort(key=lambda u: (-getattr(u.audit_question,'priority',0), bool(u.audit_question and u.audit_question.disposition not in {None,'ready_for_check'}), sum(bool(v.audit_question and u.audit_question and set(v.audit_question.activity_classes)&set(u.audit_question.activity_classes)) for v in state.units if v.status in {'checked','blocked'})))
     if not pending:
         return None
     # Prefer a pending producer of a required boundary over its consumer.
@@ -127,7 +123,7 @@ def expand_unit(state, unit, relation_ids):
     return apply_scope_update(state,update)
 
 
-def _apply_patch(state, patch, semantic=False):
+def _apply_patch(state, patch, semantic=False, audit_spec=None):
     """Validate an incremental update on a copy, then preserve superseded object versions."""
     from consensus_assurance.core.proposals import GraphDraft, ClaimDraft, BindingDraft, RelationDraft, UnitDraft
     writes=write_set(state,patch)
@@ -162,7 +158,9 @@ def _apply_patch(state, patch, semantic=False):
         values.update({x.id:x for x in changes})
         return list(values.values())
     def binding(x):
-        material = next((m for m in state.materials if (x.material_id is None or m.id==x.material_id) and m.file == x.file and m.start_line <= x.start_line <= x.end_line <= m.end_line), None)
+        # The cited fragment may be narrower than behavior; location_evidence below
+        # verifies declaration and behavior against contiguous same-version sources.
+        material = next((m for m in state.materials if (x.material_id is None or m.id==x.material_id) and m.file==x.file and m.content_digest==x.content_digest),None)
         if not material:
             raise ValueError("Old binding no longer has its source material")
         return BindingDraft(id=x.id,associations=x.associations,anchor=x.anchor,material_id=material.id,symbol=x.symbol,start_line=x.start_line,end_line=x.end_line,description=x.description,pending=x.pending)
@@ -174,7 +172,7 @@ def _apply_patch(state, patch, semantic=False):
     relations = merge(internal,patch.relations,lambda x: RelationDraft(**{k:v for k,v in x.model_dump().items() if k in RelationDraft.model_fields}))
     units = merge(state.units,patch.units,lambda x: UnitDraft(**{k:v for k,v in x.model_dump().items() if k in UnitDraft.model_fields}))
     trial = state.model_copy(deep=True)
-    apply_discovery(trial,GraphDraft(claims=claims,bindings=bindings,relations=relations,units=units,gaps=patch.gaps))
+    apply_discovery(trial,GraphDraft(claims=claims,bindings=bindings,relations=relations,units=units,gaps=patch.gaps),audit_spec)
     changed = {id for id,field in writes}|{x.id for x in replacements if x.id not in current}
     for kind in ("claims","bindings","relations","units"):
         values = getattr(trial,kind)
@@ -193,15 +191,15 @@ def _apply_patch(state, patch, semantic=False):
     return changed
 
 
-def validate_patch(state,patch,semantic=False):
+def validate_patch(state,patch,semantic=False,audit_spec=None):
     trial=state.model_copy(deep=True)
-    _apply_patch(trial,patch,semantic)
+    _apply_patch(trial,patch,semantic,audit_spec)
     return trial
 
 
-def apply_patch(state,patch,semantic=False):
+def apply_patch(state,patch,semantic=False,audit_spec=None):
     existing={x.id for name in ('claims','bindings','relations','units') for x in getattr(state,name)}
     changed={id for id,field in write_set(state,patch)}|{x.id for name in ('claims','bindings','relations','units') for x in getattr(patch,name) if x.id not in existing}
-    trial=validate_patch(state,patch,semantic)
+    trial=validate_patch(state,patch,semantic,audit_spec)
     adopt(state,trial)
     return changed

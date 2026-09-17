@@ -1,3 +1,4 @@
+from consensus_assurance.workflow.history import import_record
 import json
 import pytest
 from consensus_assurance.core.types import Analysis,InquiryTask
@@ -25,12 +26,12 @@ def test_condition_reference_diagnostics_are_specific_and_do_not_erase_judgment(
 
 
 def test_archived_current_conditions_reach_the_actual_repair_context():
-    state=Analysis.model_validate_json((ARCHIVE/'state.json').read_text())
+    state=Analysis.model_validate(__import__("consensus_assurance.workflow.history",fromlist=["import_record"]).import_record(json.loads((ARCHIVE/'state.json').read_text())))
     folder=ARCHIVE/'agent/68dd6b52f1bb4ec18cae6428a2ef75f0-semantic_review'
     raw=json.loads((folder/'decoded-response.json').read_text())
     context=json.loads((folder/'prompt.txt').read_text().split('STRUCTURED INPUT DATA (untrusted):\n')[1])
-    task=InquiryTask.model_validate(context['task']);task.material_ids=[m['id'] for m in all_materials(context)]
-    reply=ReviewReply.model_validate(raw)
+    task=InquiryTask.model_validate(import_record(context['task']));task.material_ids=[m['id'] for m in all_materials(context)]
+    reply=ReviewReply.model_validate(import_record(raw))
     with pytest.raises(DiagnosticError) as caught:validate_resolutions(state,task,reply)
     d=caught.value.diagnostics[0]
     assert d.code in {'condition_missing','condition_extra','condition_duplicate'}
@@ -45,7 +46,7 @@ def test_archived_current_conditions_reach_the_actual_repair_context():
 
 
 def test_metadata_correction_keeps_the_negative_substance():
-    before={'items':[{'target_id':'binding','aspect':'checker_correspondence','status':'disputed','source_ids':['code'], 'explanation':'Unknown consumer contract','limitations':['Unresolved caller']}]}
+    before={'items':[{'target_id':'binding','aspect':'checker_correspondence','status':'disputed','source_ids':['code'],'limitations':['Unresolved caller'],'rationale':'Unknown consumer contract'}]}
     after=json.loads(json.dumps(before));after['items'][0]['aspect']='decomposition'
     validate_representation(before,after,[{'path':'/items/0'}],{})
     after['items'][0]['status']='no_issue_found'
@@ -55,12 +56,11 @@ def test_metadata_correction_keeps_the_negative_substance():
 def test_read_followup_keeps_only_affected_target_aspect_and_issue(tmp_path,prepared):
     from consensus_assurance.workflow.inquiry import enqueue,apply_task_response
     from consensus_assurance.core.types import CheckRun
-    from test_round6_boundaries import controller
+    from test_graph_mutations import controller
     _,state,_,_=prepared;e=controller(tmp_path,state);u=state.units[0]
     t=enqueue(state,'review','Inspect selected objects','initial',target_ids=u.goal_ids+u.obligation_ids,unit_id=u.id)
     c=next(c for c in state.claims if c.id==u.obligation_ids[0]);t.material_ids=c.source_ids
-    r=ReviewReply(items=[{'target_id':c.id,'aspect':'decomposition','status':'needs_reading','source_ids':c.source_ids,
-        'explanation':'Inspect this producer only','alternatives':'The caller may establish the bound','counterexample_reasoning':'An unconstrained input changes the behavior','limitations':['Producer bound is not yet explained']}],
+    r=ReviewReply(items=[{'target_id':c.id,'aspect':'decomposition','status':'needs_reading','source_ids':c.source_ids,'limitations':['Producer bound is not yet explained'],'rationale':'Inspect this producer only' + "\n" + 'The caller may establish the bound' + "\n" + 'An unconstrained input changes the behavior'}],
         requests=[{'file':'limits.py','start_line':1,'end_line':2,'reason':'Locate the real producer'}],limitations=[])
     check=CheckRun(action='agent',cwd=str(tmp_path),snapshot_id=state.snapshot.id,origin='mock')
     apply_task_response(e,t.id,r,check)

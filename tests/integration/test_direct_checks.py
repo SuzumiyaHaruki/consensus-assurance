@@ -28,7 +28,7 @@ def setup(tmp_path,prepared,broken=False):
         binding.snapshot_id=state.snapshot.id;binding.content_digest=state.snapshot.files[binding.file]
         binding.excerpt='\n'.join((repo/binding.file).read_text().splitlines()[binding.start_line-1:binding.end_line])
     unit=state.units[0];unit.binding_ids=['step_binding']
-    basis=Grounding(behavior_ids=['counter.py:1:10'],expectation_ids=['README.md:1:5'],binding_ids=unit.binding_ids,derivation='Finite legal counter inputs must return within capacity',applicability='One local operation, legal initial value and positive capacity')
+    basis=Grounding(behavior_ids=['counter.py:1:10'],expectation_ids=[next(m.id for m in state.materials if m.file=='README.md')],binding_ids=unit.binding_ids,derivation='Finite legal counter inputs must return within capacity',applicability='One local operation, legal initial value and positive capacity')
     for claim in state.claims:
         claim.pending=[];claim.grounding=basis.model_copy(deep=True)
     unit.audit_question=AuditQuestion(question='Does one legal boundary call preserve the range?',importance='Bounded service result',source_ids=basis.behavior_ids+basis.expectation_ids,
@@ -65,7 +65,7 @@ def review(state,unit,artifact):
         if obj.id not in ids:continue
         contract=target_contract(state,obj)
         state.semantic_reviews.append(SemanticReview(task_id='controlled',check_id='controlled',target_versions={obj.id:obj.version},context_dependencies={obj.id:contract},
-            material_ids=contract['required_material_ids'],items=[SemanticCheck(target_id=obj.id,aspect=aspect,status='no_issue_found',source_ids=contract['required_material_ids'],explanation='Controlled fixture contract and direct oracle correspondence',alternatives='Scope excludes other contracts',counterexample_reasoning='The measured return can exceed the documented bound') for aspect in contract['required_aspects']],origin='mock'))
+            material_ids=contract['required_material_ids'],items=[SemanticCheck(target_id=obj.id,aspect=aspect,status='no_issue_found',source_ids=contract['required_material_ids'],rationale='Controlled fixture contract and direct oracle correspondence' + "\n" + 'Scope excludes other contracts' + "\n" + 'The measured return can exceed the documented bound') for aspect in contract['required_aspects']],origin='mock'))
 
 
 @pytest.mark.parametrize('broken',[False,True])
@@ -117,33 +117,46 @@ def test_controlled_schedule_has_typed_model_fallback(tmp_path,prepared):
     assert e.state.next_action=='build' and not e.state.direct_checks and not e.state.models
 
 
-def test_engine_reaches_direct_execution_without_breadth_or_model(tmp_path,prepared):
+@pytest.mark.parametrize('with_spec',[False,True])
+def test_engine_reaches_direct_execution_without_breadth_or_model(tmp_path,prepared,with_spec):
     e,u,p=setup(tmp_path,prepared)
     responses=prepared[3]
     discovery=Discovery.model_validate(responses[1]);discovery.units[0].audit_question=u.audit_question
+    if with_spec:
+        source='counter.py:1:10'
+        discovery.audit_spec=ConsensusAuditSpec(target_profile=TargetProfile(system_boundary='Explicit synthetic counter fixture',source_ids=[source]),
+            activities=[Activity(class_id='A'+str(i),applicability='applicable' if i==1 else 'not_applicable',purpose='Synthetic boundary',
+                realization_summary='Only local counter progression belongs to this fixture',entry_points=['step'] if i==1 else [],
+                behavior_ids=['step'] if i==1 else [],fact_ids=['result'] if i==1 else [],source_ids=[source],
+                coverage={'behavior':'recovered' if i==1 else 'unknown','fact':'partial' if i==1 else 'unknown','handoff':'unknown'}) for i in range(1,8)],
+            behaviors=[Behavior(id='step',primary_activity='A1',execution_owner='local caller',trigger='legal call',protocol_context='one operation',produces_fact_ids=['result'],source_ids=[source])],
+            facts=[Fact(id='result',meaning='Returned counter position',identity={'operation':'one'},established_by=['step'],validity_context='configured capacity',representation=['return value'],durability='Not a durable fixture',recovery='No recovery interface',source_ids=[source])],
+            coverage_summary=[Surface(entry_point='step',disposition='mapped',behavior_ids=['step'],reason='Actual fixture API',source_ids=[source])])
+        q=discovery.units[0].audit_question
+        q.activity_classes=['A1'];q.behavior_ids=['step'];q.fact_ids=['result'];q.obligation_relation_kind='establishment'
     other=discovery.units[0].model_copy(deep=True);other.id='other_question'
     other.audit_question.disposition='needs_specific_evidence';other.audit_question.preferred_check=None
     other.audit_question.requests=[ReadRequest(file='counter.py',start_line=1,end_line=2,reason='Another bounded discriminator')]
     discovery.units.insert(0,other)
-    discovery.responsibilities=[Responsibility(id='role'+str(n),description='Bounded activity '+str(n),source_ids=u.audit_question.source_ids,
-        questions=['Unanswered handoff'],applicability='Local fixture',handoffs=[ResponsibilityHandoff(target_id='role'+str((n+1)%4),source_ids=u.audit_question.source_ids,description='Unexamined dependency')]) for n in range(4)]
     from consensus_assurance.adapters.agents.backend import MockAgent
     from consensus_assurance.adapters.storage.files import write_json
     fixture=tmp_path/'direct-responses.json';write_json(fixture,[responses[0],discovery.model_dump(mode='json'),DirectCheckReply(plan=p,gap='').model_dump(mode='json')])
     config=e.config.model_copy(deep=True);config.agent_backend='mock';config.fixture=str(fixture)
     class StopAfterActualCheck(Engine):
-        def action(self,kind,resource,callback,inputs=None):
-            result=super().action(kind,resource,callback,inputs)
-            if kind=='direct_execute':raise RuntimeError('Stop after actual direct execution receipt')
-            return result
+        def record(self,check):
+            super().record(check)
+            if check.action=='direct_check':raise RuntimeError('Stop after actual direct execution receipt')
     impl,_,verifier,knowledge=assemble(config)
     engine=StopAfterActualCheck(config,tmp_path/'whole',impl,MockAgent(fixture),verifier,knowledge,'')
     with pytest.raises(RuntimeError,match='actual direct'):engine.start(prepared[0])
     assert engine.state.usage['agent_calls']==3  # read, discover, direct plan
     assert not engine.state.models and not engine.state.inquiry_tasks
-    assert len(engine.state.responsibilities)==4
     receipt=json.loads((engine.root/'actions'/engine.state.pending_action.id/'result.json').read_text())
     assert receipt['action']=='direct_check' and receipt['exit_code']==0
+    if with_spec:
+        from consensus_assurance.workflow.audit_spec import refinement_reason,coverage_ledger
+        assert len(coverage_ledger(engine.state))==7
+        assert 'Integrate actual check' in refinement_reason(engine.state)
 
 
 def test_exact_selected_reads_then_one_focused_continuation(tmp_path,prepared):
@@ -237,3 +250,26 @@ def test_direct_F4_keeps_failed_prerequisite_and_revision_history(tmp_path,prepa
     assert e.state.usage['revisions']==1 and e.state.usage['replays']==1
     assert e.state.monitor_results[0]['prerequisites']['status']=='not_reached'
     assert not e.state.models and not e.state.evidence
+
+
+def test_question_narrowing_preserves_structural_identity_and_counterevidence(tmp_path,prepared):
+    e,u,p=setup(tmp_path,prepared)
+    q=u.audit_question;q.disposition='concrete_suspicion';q.preferred_check='direct_test'
+    q.activity_classes=['A6'];q.behavior_ids=['producer'];q.fact_ids=['representation'];q.obligation_relation_kind='preservation'
+    q.counterevidence=['Consumer contract remains unverified'];q.unknowns=['Injected adapter applicability']
+    def ask(kind,response_type,context,validator=None):
+        narrowed=q.model_copy(deep=True);narrowed.question='Which consumer contract requires preserving this same representation?'
+        narrowed.importance='Consequences depend on the same original recovery contract'
+        narrowed.disposition='needs_specific_evidence';narrowed.preferred_check='source_review'
+        reply=QuestionReply(question=narrowed,explanation='Narrow applicability before executing')
+        validator(reply)
+        wrong=reply.model_copy(deep=True);wrong.question.fact_ids=['different_fact']
+        with pytest.raises(ValueError,match='structural'):validator(wrong)
+        wrong=reply.model_copy(deep=True);wrong.question.counterevidence=[]
+        with pytest.raises(ValueError,match='counterevidence'):validator(wrong)
+        return reply,CheckRun(action='agent',cwd=str(e.root),snapshot_id=e.state.snapshot.id)
+    e.ask=ask
+    from consensus_assurance.workflow.direct_checks import continue_question
+    continue_question(e,u)
+    assert e.state.units[0].audit_question.preferred_check=='source_review'
+    assert e.state.units[0].audit_question.counterevidence==q.counterevidence

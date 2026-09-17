@@ -2,11 +2,12 @@
 from pathlib import Path
 import json
 from consensus_assurance.core.types import InquiryTask, SemanticReview
-from consensus_assurance.core.proposals import ExplorationReply, ReviewReply
+from consensus_assurance.core.proposals import SpecRefinement, ReviewReply
 from consensus_assurance.adapters.storage.files import write_json
 from .graph import apply_patch
 from .feedback import apply_feedback
 from .errors import Blocked
+from .audit_spec import slice_for, source_ids
 from .reviews import required_aspects, material_closure, readiness, validate_resolutions, record_dispositions, valid_supersession, review_objects as objects
 
 
@@ -14,12 +15,12 @@ def enabled(engine):
     return engine.config.budget.exploration_rounds > 0 or engine.config.budget.semantic_reviews > 0
 
 
-def enqueue(state, kind, reason, trigger, responsibility_ids=(), target_ids=(), unit_id=None, model_id=None, requests=()):
-    signature=(kind,trigger,tuple(responsibility_ids),tuple(target_ids),unit_id,model_id)
+def enqueue(state, kind, reason, trigger, activity_classes=(), target_ids=(), unit_id=None, model_id=None, requests=()):
+    signature=(kind,trigger,tuple(activity_classes),tuple(target_ids),unit_id,model_id)
     for task in state.inquiry_tasks:
-        if signature==(task.kind,task.trigger,tuple(task.responsibility_ids),tuple(task.target_ids),task.unit_id,task.model_id):
+        if signature==(task.kind,task.trigger,tuple(task.activity_classes),tuple(task.target_ids),task.unit_id,task.model_id):
             return task
-    task=InquiryTask(kind=kind,reason=reason,trigger=trigger,responsibility_ids=list(responsibility_ids),target_ids=list(target_ids),unit_id=unit_id,model_id=model_id,requests=list(requests),stage='read' if requests else 'analyze')
+    task=InquiryTask(kind=kind,reason=reason,trigger=trigger,activity_classes=list(activity_classes),target_ids=list(target_ids),unit_id=unit_id,model_id=model_id,requests=list(requests),stage='read' if requests else 'analyze')
     task.target_versions={i:getattr(objects(state)[i],"version",1) for i in task.target_ids if i in objects(state)}
     unit=next((u for u in state.units if u.id==unit_id),None)
     task.unit_version=unit.version if unit else None
@@ -28,50 +29,9 @@ def enqueue(state, kind, reason, trigger, responsibility_ids=(), target_ids=(), 
     return task
 
 
-def register_responsibilities(state, candidates):
-    materials={m.id for m in state.materials}; claims={c.id for c in state.claims}
-    available={r.id for r in state.responsibilities}|{r.id for r in candidates}
-    if len({r.id for r in candidates})!=len(candidates): raise ValueError('Duplicate responsibility identifiers')
-    for r in candidates:
-        if r.id in objects(state):raise ValueError('Responsibility ID collides with a graph object')
-        if not r.description.strip() or not r.applicability.strip() or not set(r.source_ids)<=materials:
-            raise ValueError('Responsibility needs actual read sources and an applicability explanation')
-        if not set(r.claim_ids)<=claims: raise ValueError('Responsibility references unavailable claims')
-        for edge in r.handoffs:
-            if edge.target_id not in available or not set(edge.source_ids)<=materials or not edge.description.strip() or not set(edge.covered_by_unit_ids)<={u.id for u in state.units}:
-                raise ValueError('Responsibility handoff lacks a located target or source')
-    for candidate in candidates:
-        old=next((r for r in state.responsibilities if r.id==candidate.id),None)
-        new=candidate.model_copy(deep=True)
-        if old:
-            if candidate.version!=old.version: raise ValueError('Responsibility version differs from the current overview')
-            if old==candidate: continue
-            state.responsibility_history.append(old.model_dump(mode='json'))
-            new.version=old.version+1
-            state.responsibilities[state.responsibilities.index(old)]=new
-        else: state.responsibilities.append(new)
-
-
-def register_requests(state, requests, trigger, unit_id=None):
-    known={r.id for r in state.responsibilities}
-    for i,request in enumerate(requests):
-        if not set(request.responsibility_ids)<=known or not request.reason.strip():
-            raise ValueError('Exploration request needs known responsibilities or a concrete system-wide gap')
-        unit=next((u for u in state.units if u.id==unit_id),None)
-        related=unit and (not request.responsibility_ids or any(r.id in request.responsibility_ids and set(r.claim_ids)&set(unit.goal_ids+unit.obligation_ids) for r in state.responsibilities))
-        enqueue(state,'explore',request.reason,trigger+':'+str(i),request.responsibility_ids,unit_id=unit_id if related else None,requests=request.requests)
-
-
 def initial_agenda(engine, proposal):
-    state=engine.state
-    register_responsibilities(state,proposal.responsibilities)
-    register_requests(state,proposal.exploration_requests,'initial_request')
     if proposal.reading_requests:
-        enqueue(state,'explore','Initial discovery requested additional material; existing units do not suppress it','initial_reading',requests=proposal.reading_requests)
-    if not enabled(engine): return
-    if engine.config.budget.audit_units == 0:
-        for unit in state.units: review_unit(engine,unit,'candidate_semantics')
-    # Overview questions remain visible backlog; explicit requests remain queued.
+        enqueue(engine.state,'spec_refine','Close the selected minimum coverage or candidate dependency gap','initial_reading',requests=proposal.reading_requests)
 
 
 def review_unit(engine, unit, trigger, model=None):
@@ -123,7 +83,7 @@ def choose_task(engine):
         return next(t for t in state.inquiry_tasks if t.id==state.active_inquiry_id)
     pending=[t for t in state.inquiry_tasks if t.status=='pending' and not t.superseded_by]
     for task in pending:
-        resource='exploration_rounds' if task.kind=='explore' else 'semantic_reviews'
+        resource='exploration_rounds' if task.kind=='spec_refine' else 'semantic_reviews'
         if state.usage.get(resource,0)>=getattr(engine.config.budget,resource):
             task.status='blocked';task.stop_reason='Budget exhausted or disabled: '+resource
     pending=[t for t in pending if t.status=='pending' and not t.superseded_by]
@@ -134,18 +94,20 @@ def choose_task(engine):
     focused=[t for t in pending if t.kind=='review' and t.unit_id in state.deferred_units]
     if focused:return focused[0]
     ready=any(u.status in {'pending','partial','selected'} and not (u.audit_question and u.audit_question.disposition=='explained_by_existing_mechanism') for u in state.units)
-    if ready and engine.config.budget.audit_units>state.usage.get('audit_units',0):return None
+    from .audit_spec import refinement_reason
+    urgent=refinement_reason(state)
+    latest=next((c.id for c in reversed(state.checks) if c.action in {'direct_check','model_check'}),'initial')
+    closure='closure:'+str(state.audit_spec_version)+':'+latest
+    if urgent and not any(t.trigger==closure for t in state.inquiry_tasks):
+        return enqueue(state,'spec_refine',urgent,closure)
+    if ready and not urgent and engine.config.budget.audit_units>state.usage.get('audit_units',0):return None
     if pending:return sorted(pending,key=lambda t:t.kind!='review')[0]
     if state.usage.get('exploration_rounds',0)<engine.config.budget.exploration_rounds:
-        # At most one task is promoted at a time, only when no local action remains.
-        roles=[r for r in state.responsibilities if (r.questions or r.handoffs or not r.claim_ids)
-            and not any(t.trigger=='backlog:'+r.id+':'+str(r.version) for t in state.inquiry_tasks)]
-        if roles:
-            role=roles[0]
-            return enqueue(state,'explore','Select one bounded question from the responsibility backlog',
-                'backlog:'+role.id+':'+str(role.version),[role.id])
-        if not state.inquiry_tasks:
-            return enqueue(state,'explore','Find a bounded question where no executable unit exists','initial_breadth')
+        from .audit_spec import refinement_reason
+        reason=refinement_reason(state) or ('Select a bounded fact-lifecycle candidate after reverse coverage' if not ready else None)
+        trigger='spec:'+str(state.audit_spec_version)+':'+str(state.graph_version)
+        if reason and not any(t.trigger==trigger for t in state.inquiry_tasks):
+            return enqueue(state,'spec_refine',reason,trigger)
     return None
 
 
@@ -156,25 +118,25 @@ def read_purpose(task):
 def task_context(engine,task):
     state=engine.state; available=objects(state)
     seeds=set(task.target_ids)
-    if task.kind=='explore' and task.unit_id:seeds.add(task.unit_id)
-    for r in state.responsibilities:
-        if r.id in task.responsibility_ids:seeds.update(r.claim_ids)
+    if task.kind=='spec_refine' and task.unit_id:seeds.add(task.unit_id)
     wanted,closure=material_closure(state,seeds)
     wanted.update(task.added_material_ids)
     wanted.update(state.task_attachments.get('inquiry:'+task.id,[]))
     wanted.update(task.material_ids)
     for issue in state.review_issues:
         if (issue.target_id in closure or issue.id in task.resolution_issue_ids) and not issue.resolved_by:wanted.update(issue.source_ids)
-    if task.kind=='explore':
-        for role in state.responsibilities:
-            if role.id in task.responsibility_ids:wanted.update(role.source_ids)
+    if task.kind=='spec_refine':
+        from .audit_spec import slice_for, source_ids
+        view=slice_for(state,classes=task.activity_classes)
+        if view:
+            wanted.update(source_ids(view))
         wanted.update(m.id for m in state.materials if m.file.lower().endswith('readme.md'))
     pending_scope=[u for u in state.scope_updates.values() if u['status']=='needs_F2_or_investigation' and u['proposal']['unit_id']==task.unit_id]
     for p in pending_scope:wanted.update(p['proposal']['source_ids'])
     selected=[m for m in state.materials if m.id in wanted]
     task.material_ids=[m.id for m in selected]
     task.unit_version=next((u.version for u in state.units if u.id==task.unit_id),None)
-    result={'pending_scope_updates':pending_scope,'task':task.model_dump(mode='json',exclude={'context_receipt_id','context_dependencies','admitted','preparation_failures','child_task_ids'}),'responsibilities':[r.model_dump(mode='json') for r in state.responsibilities if r.id in task.responsibility_ids],
+    result={'pending_scope_updates':pending_scope,'task':task.model_dump(mode='json',exclude={'context_receipt_id','context_dependencies','admitted','preparation_failures','child_task_ids'}),'audit_spec':slice_for(state,classes=task.activity_classes) if task.kind=='spec_refine' else None,
         'materials':[m.model_dump(mode='json') for m in selected],
         'omitted_material_ids':[m.id for m in state.materials if m.id not in wanted],
         'catalogue':[],
@@ -187,8 +149,7 @@ def task_context(engine,task):
         'open_issues':[i.model_dump(mode='json',exclude_defaults=True,exclude_none=True) for i in state.review_issues if (i.target_id in closure or i.id in task.resolution_issue_ids) and not i.resolved_by],
         'blocked_review_tasks':[{'id':t.id,'target_ids':t.target_ids,'target_versions':t.target_versions,'requested_aspects':t.requested_aspects,'model_id':t.model_id,'stop_reason':t.stop_reason} for t in state.inquiry_tasks if t.kind=='review' and t.status=='blocked' and not t.superseded_by and set(t.target_ids)<=set(task.target_ids)],
         'overview_limit':'This compact index is not complete implementation coverage; request specific actual ranges before deriving new claims'}
-    if task.kind=='explore' and not task.responsibility_ids:
-        result['responsibilities']=[{'id':r.id,'description':r.description,'claim_ids':r.claim_ids,'version':r.version,'questions':r.questions,'source_ids':r.source_ids,'applicability':r.applicability} for r in state.responsibilities]
+    if task.kind=='spec_refine' and not task.activity_classes:
         result['claims']=[{'id':c.id,'kind':c.kind,'description':c.description,'version':c.version} for c in state.claims]
     if task.unit_id:
         result['selected_unit']=available[task.unit_id].model_dump(mode='json')
@@ -211,19 +172,21 @@ def task_context(engine,task):
             result['prior_issue_models']=[{'issue_id':i.id,'model_id':old.id,'bundle':json.loads(Path(old.bundle_path).read_text()),'current_model_id':model.id} for i in state.review_issues if i.id in task.resolution_issue_ids for old in state.models if old.id==i.model_id]
             result['checker_executions']=[engine.error_context(c) for c in state.checks if c.model_id==model.id and c.action=='model_check']
             result['reachability']=[r.model_dump(mode='json') for r in state.reachability_results if r.model_id==model.id]
-    if task.kind!='review':result['cost_estimate']=cost_estimate(engine)
+    if task.kind!='review':
+        from .audit_spec import coverage_ledger
+        result.update(cost_estimate=cost_estimate(engine),coverage_ledger=coverage_ledger(state),current_check_results=[engine.error_context(c) for c in state.checks if c.action in {'direct_check','model_check'}][-2:],evidence=[e.model_dump(mode='json') for e in state.evidence[-4:]])
     return result
 
 
-def validate_exploration(state,reply):
+def validate_spec_refinement(state,reply):
     if reply.requests:
         if reply.patch.claims or reply.patch.bindings or reply.patch.units or reply.patch.relations:
             raise ValueError('Read missing material before claiming a graph patch based on it')
         return
     trial=state.model_copy(deep=True)
-    apply_patch(trial,reply.patch)
-    register_responsibilities(trial,reply.responsibilities)
-    register_requests(trial,reply.exploration_requests,'validation')
+    apply_patch(trial,reply.patch,audit_spec=reply.audit_spec)
+    from .audit_spec import validate
+    if reply.audit_spec:validate(trial,reply.audit_spec)
 
 
 def validate_review(state,task,reply):
@@ -236,8 +199,7 @@ def validate_review(state,task,reply):
         from .sources import includes
         if item.target_id not in available or not includes(state,item.source_ids,material_ids):
             raise ValueError('Semantic review cites an unavailable object or material')
-        if not all(x.strip() for x in [item.explanation,item.alternatives,item.counterexample_reasoning]):
-            raise ValueError('Semantic review needs material reasoning, alternatives and a reverse sufficiency check')
+        if not item.rationale.strip():raise ValueError('Semantic review needs sourced reasoning')
     if reply.revision:
         if reply.revision.kind!='F2' or not set(reply.revision.target_ids)<=set(task.target_ids):
             raise ValueError('Review revisions must be F2 and target the reviewed semantic objects')
@@ -246,7 +208,6 @@ def validate_review(state,task,reply):
         trial=state.model_copy(deep=True)
         unit=next((u for u in trial.units if u.id==task.unit_id),None)
         apply_feedback(trial,unit,None,reply.revision)
-    register_requests(state.model_copy(deep=True),reply.exploration_requests,'validation')
 
 
 def release_action(engine):
@@ -267,7 +228,7 @@ def process_task(engine, task):
         if not task.read_plan_id:
             from consensus_assurance.core.types import uid
             task.read_plan_id=uid();engine.checkpoint('inquiry_read_plan_saved')
-        receipt=engine.read(task.requests,purpose=read_purpose(task),partial=read_purpose(task)=='breadth',plan_id=task.read_plan_id,related_ids=task.target_ids+task.responsibility_ids+([task.unit_id] if task.unit_id else []),reason=task.reason)
+        receipt=engine.read(task.requests,purpose=read_purpose(task),partial=read_purpose(task)=='breadth',plan_id=task.read_plan_id,related_ids=task.target_ids+task.activity_classes+([task.unit_id] if task.unit_id else []),reason=task.reason)
         task=next(t for t in state.inquiry_tasks if t.id==task.id)
         task.added_material_ids=list(dict.fromkeys(task.added_material_ids+[id for item in receipt['items'] if item['status']!='deferred' for id in item['material_ids']]))
         if receipt['status']!='complete':
@@ -276,8 +237,8 @@ def process_task(engine, task):
         write_json(engine.root/'materials.json',[m.model_dump(mode='json') for m in state.materials]);engine.checkpoint('inquiry_materials_read')
     if task.repair_session and not state.pending_output_repair:state.pending_output_repair=task.repair_session
     context=task_context(engine,task)
-    if task.kind=='explore':
-        reply,check=engine.ask('explore',ExplorationReply,context,lambda p:validate_exploration(state,p))
+    if task.kind=='spec_refine':
+        reply,check=engine.ask('spec_refine',SpecRefinement,context,lambda p:validate_spec_refinement(state,p))
         if reply.requests:
             old={m['id'] for m in context['materials']}
             if all(q.file+':'+str(q.start_line)+':'+str(q.end_line) in old for q in reply.requests):
@@ -309,7 +270,7 @@ def pause_unit(engine, reason):
 
 
 def reserve_for_inquiry(engine):
-    pending=[t for t in engine.state.inquiry_tasks if t.status=='pending' and t.unit_id==engine.state.active_unit_id and engine.state.usage.get('exploration_rounds' if t.kind=='explore' else 'semantic_reviews',0)<getattr(engine.config.budget,'exploration_rounds' if t.kind=='explore' else 'semantic_reviews')]
+    pending=[t for t in engine.state.inquiry_tasks if t.status=='pending' and t.unit_id==engine.state.active_unit_id and engine.state.usage.get('exploration_rounds' if t.kind=='spec_refine' else 'semantic_reviews',0)<getattr(engine.config.budget,'exploration_rounds' if t.kind=='spec_refine' else 'semantic_reviews')]
     engine.budget.reserved_agent_calls=min(2,len(pending))
     engine.budget.reserved_seconds=engine.config.budget.outer_reserve_seconds if pending else 0
 
@@ -339,8 +300,8 @@ def semantic_limitations(state, model):
             latest[key]=item
     result=[]
     for item in latest.values():
-        if item.status!='no_issue_found' or item.limitations:
-            result.append('Unresolved semantic review for '+item.target_id+': '+item.explanation)
+        if item.status!='no_issue_found' or item.limitations or item.counterevidence:
+            result.append('Unresolved semantic review for '+item.target_id+': '+item.rationale)
     for task in state.inquiry_tasks:
         if task.kind=='review' and task.status in {'pending','running','blocked'} and not task.superseded_by and not any(valid_supersession(state,r,task) for r in state.semantic_reviews) and any(i in relevant and i in available and task.target_versions.get(i)==getattr(available[i],'version',1) for i in task.target_ids):
             result.append('Relevant semantic review is unfinished: '+task.id)
@@ -386,17 +347,18 @@ def prepare_selected(engine,unit):
 def apply_task_response(engine,task_id,reply,check):
     state=engine.state;task=next(t for t in state.inquiry_tasks if t.id==task_id)
     versions={i:getattr(objects(state)[i],'version',1) for i in task.target_ids if i in objects(state)}
-    if task.kind=='explore':
-        changed=apply_patch(state,reply.patch)
-        register_responsibilities(state,reply.responsibilities)
-        register_requests(state,reply.exploration_requests,task.id,unit_id=task.unit_id)
+    if task.kind=='spec_refine':
+        changed=apply_patch(state,reply.patch,audit_spec=reply.audit_spec)
+        from .audit_spec import accept
+        if reply.audit_spec:accept(engine,reply.audit_spec)
+        state.completed_steps.extend('spec-reviewed:'+c.id for c in state.checks if c.action in {'direct_check','model_check'} and 'spec-reviewed:'+c.id not in state.completed_steps)
         state.gaps.extend(reply.limitations)
         material_reviews(engine,None,task.added_material_ids)
         for unit in state.units:
             if changed & set(unit.goal_ids+unit.obligation_ids+unit.relation_ids):
                 review_unit(engine,unit,"graph_growth:"+task.id)
             if set(task.added_material_ids)&{source for c in state.claims if c.id in unit.goal_ids+unit.obligation_ids for source in c.source_ids}:
-                review_unit(engine,unit,'exploration_materials:'+task.id)
+                review_unit(engine,unit,'spec_materials:'+task.id)
     else:
         review=SemanticReview(context_receipt_id=task.context_receipt_id,context_dependencies=task.context_dependencies,task_id=task.id,check_id=check.id,unit_id=task.unit_id,unit_version=task.unit_version,model_id=task.model_id,target_versions=versions,material_ids=task.material_ids if task.context_receipt_id else task.material_ids or [m.id for m in state.materials],items=reply.items,origin='mock' if engine.agent.mock else 'agent',supersedes_task_ids=reply.supersedes_task_ids,resolves_issue_ids=reply.resolves_issue_ids,resolution_rationale=reply.resolution_rationale)
         if reply.revision:
@@ -416,9 +378,18 @@ def apply_task_response(engine,task_id,reply,check):
                 if set(task.target_ids)&set(candidate.goal_ids+candidate.obligation_ids+candidate.relation_ids+candidate.binding_ids+[candidate.id]):
                     review_unit(engine,candidate,'semantic_revision:'+review.revision_id)
         state.semantic_reviews.append(review)
+        from .review_contract import missing_pairs
+        missing=missing_pairs(state,task,reply.items)
+        if missing and not task.trigger.endswith(':missing_aspects'):
+            follow=enqueue(state,'review','Supply only the missing target/aspect judgments',task.id+':missing_aspects',target_ids=list(missing),unit_id=task.unit_id,model_id=task.model_id)
+            follow.requested_aspects=missing
+            follow.context_dependencies=task.context_dependencies
+        elif missing:
+            task.status='blocked';task.stop_reason='Focused review still omitted required aspects'
+
         for item in reply.items:
             if item.aspect=='checker_correspondence' and item.status in {'disputed','revision_needed'} and task.model_id:
-                state.affect([task.model_id],'Semantic review questions checker correspondence: '+item.explanation)
+                state.affect([task.model_id],'Semantic review questions checker correspondence: '+item.rationale)
                 if state.active_model_id==task.model_id:
                     state.active_model_id=None;state.active_direct_check_id=None;state.active_finding_id=None;state.next_action='select'
         followup_before={t.id for t in state.inquiry_tasks}
@@ -428,12 +399,11 @@ def apply_task_response(engine,task_id,reply,check):
             follow=enqueue(state,'review','Follow up only the unresolved aspects using the requested source',task.id+':followup',target_ids=targets,unit_id=task.unit_id,model_id=task.model_id,requests=reply.requests)
             follow.requested_aspects={id:list(dict.fromkeys(i.aspect for i in focus if i.target_id==id)) or task.requested_aspects.get(id,list(required_aspects(objects(state)[id]))) for id in targets}
             follow.resolution_issue_ids=[i.id for i in state.review_issues if not i.resolved_by and i.target_id in targets and i.aspect in follow.requested_aspects[i.target_id]]
-        register_requests(state,reply.exploration_requests,task.id,unit_id=task.unit_id)
         record_dispositions(state,review,reply,[t.id for t in state.inquiry_tasks if t.id not in followup_before])
         if reply.requests:
             follow.resolution_issue_ids=[i.id for i in state.review_issues if not i.resolved_by and i.target_id in targets and i.aspect in follow.requested_aspects[i.target_id]]
         state.gaps.extend(reply.limitations)
-    task.repair_session=None;task.check_id=check.id;task.status='completed';task.stage='done';state.active_inquiry_id=None
+    task.repair_session=None;task.check_id=check.id;task.status='blocked' if task.stop_reason=='Focused review still omitted required aspects' else 'completed';task.stage='done';state.active_inquiry_id=None
     settle_parents(state)
     state.last_work_kind=task.kind;release_action(engine)
 
@@ -453,8 +423,6 @@ def split_context_task(engine,task):
     if task.child_task_ids or task.preparation_failures>engine.config.budget.context_preparations:return []
     if task.kind=='review' and len(task.target_ids)>1:
         fields=task.target_ids;key='target_ids'
-    elif task.kind=='explore' and not task.responsibility_ids and len(engine.state.responsibilities)>1:
-        fields=[r.id for r in engine.state.responsibilities];key='responsibility_ids'
     else:return []
     middle=(len(fields)+1)//2;children=[]
     for index,part in enumerate((fields[:middle],fields[middle:])):

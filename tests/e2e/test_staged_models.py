@@ -1,7 +1,7 @@
 """A saved uncalibrated model survives while actual experiment components are missing."""
 import copy,json,sys
 import pytest
-from test_round8_scope_loop import setup,ScopeAgent
+from test_scope_pipeline import setup,ScopeAgent
 from consensus_assurance.workflow.engine import Engine
 from consensus_assurance.adapters.storage.files import write_json,Store
 from consensus_assurance.core.types import Origin
@@ -78,12 +78,7 @@ class RepairingStagedAgent(StagedAgent):
         packet=json.loads(prompt.split('STRUCTURED INPUT DATA (untrusted):\n')[1])
         if response_type.__name__=='OutputRepair':
             diagnostic=packet['active_diagnostics'][0]
-            if diagnostic['code']=='review_missing_aspect':
-                c=diagnostic['details']['review_contract']
-                item={'target_id':c['target_id'],'aspect':c['required_aspects'][0],'status':'disputed','source_ids':c['required_material_ids'],
-                    'explanation':'Source is located, but the provider obligation is not independently proven','alternatives':'A different source may enforce the boundary','counterexample_reasoning':'The unchecked provider could violate its own guarantee','limitations':['Provider guarantee remains separately unverified']}
-                response={'replacements':[{'path':'/items/-','value_json':json.dumps(item)}],'rationale':'Complete the supplied contract while retaining the original negative opinion'}
-            elif diagnostic['code']=='declaration_identity':
+            if diagnostic['code']=='declaration_identity':
                 target=next(t for t in packet['repair_targets'] if t['path'].endswith('/anchor'))
                 current=copy.deepcopy(target['current_value']);decl=next(d for d in diagnostic['details']['candidates'] if d['kind']=='declaration')
                 current.update(start_line=decl['start'],end_line=decl['signature_end'])
@@ -98,7 +93,7 @@ class RepairingStagedAgent(StagedAgent):
             item=next((i for i in response.items if i.target_id==packet.get('selected_unit',{}).get('id')),None)
             if item:
                 self.review_fault=True;item.aspect='applicability';item.status='disputed'
-                item.explanation='Source is located, but the provider obligation is not independently proven'
+                item.rationale='Source is located, but the provider obligation is not independently proven'
                 item.limitations=['Provider guarantee remains separately unverified']
         if response_type.__name__=='GraphPatch':
             refs=['upstream_support.py:1:1','upstream_support.py:2:2']
@@ -130,5 +125,7 @@ def test_repairs_fragmented_new_source_scope_model_components_and_real_tools(tmp
     assert set(binding.anchor.source_ids)=={'upstream_support.py:1:1','upstream_support.py:2:2'}
     assert binding.anchor.start_line==1 and binding.start_line==1 and binding.end_line==2
     assert any(i.explanation=='Source is located, but the provider obligation is not independently proven' and not i.resolved_by for i in state.review_issues)
-    assert {s['task'] for s in state.repair_sessions.values() if s['status']=='accepted'}>={'semantic_review','graph_patch'}
+    assert {s['task'] for s in state.repair_sessions.values() if s['status']=='accepted'}=={'graph_patch'}
+    assert any(t.trigger.endswith(':missing_aspects') for t in state.inquiry_tasks)
+    assert any(t.kind=='spec_refine' and t.status=='completed' for t in state.inquiry_tasks)
     assert all(m.origin.value=='mock' for m in state.models)

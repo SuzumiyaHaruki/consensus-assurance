@@ -37,7 +37,7 @@ def execution_summary(check):
             product = "结构化回复已返回；不代表关系图或模型已被接受"
         if (Path(check.cwd) / "graph-validation-error.txt").is_file():
             product = "回复已返回；后续工作流校验失败，见校验日志"
-        task={"explore":"职责覆盖探索", "semantic_review":"目标/义务/关系语义复核"}.get(check.parameters.get("agent_task"),"Agent 分析或修复")
+        task={"spec_refine":"职责覆盖探索", "semantic_review":"目标/义务/关系语义复核"}.get(check.parameters.get("agent_task"),"Agent 分析或修复")
         return task, product, "不适用：生成候选分析，不是验证"
     if check.action == "reachability":
         return "审计问题触发可达性", "见触发记录；辅助反例只表示触发可达", "不属于协议违反证据"
@@ -129,19 +129,22 @@ def resource_lines(state):
 def inquiry_lines(state):
     def text(value):
         return str(value).replace("|", "\\|").replace("\n", " ")
-    lines=["", "## 职责覆盖与语义复核", "",
-        "材料读取、职责认识、语义复核和局部性质检查分别记录。职责概览由当前材料逐步形成，不是完备全集；不计算全系统覆盖率。复核暂未发现问题不等于形式证明，多个 agent 回复一致也不等于独立证据。", "",
-        "| 职责候选 | 来源 | 关联目标/义务 | 尚未解释 |", "| --- | --- | --- | --- |"]
-    for r in state.responsibilities:
-        lines.append("| "+" | ".join(text(x) for x in [r.id+"："+r.description,', '.join(r.source_ids),', '.join(r.claim_ids) or '尚未形成目标/义务','；'.join(r.questions) or '当前未列出问题；不代表没有遗漏'])+" |")
-        for handoff in r.handoffs:
-            from consensus_assurance.workflow.handoffs import handoff_status
-            disposition=handoff_status(state,r,handoff)
-            lines.append(f"| 交接候选 {text(r.id)} → {text(handoff.target_id)} | {text(handoff.source_ids)} | {text(handoff.description)} | {text(disposition)}；分配不等于完成覆盖 |")
-    if not state.responsibilities: lines.append("尚未形成有来源的职责概览。")
+    from consensus_assurance.workflow.audit_spec import load, coverage_ledger
+    spec=load(state)
+    lines=["", "## 七类活动理解与语义复核", "", "这是当前已发现实现面的审计账本，不是全部正确性要求的分母。理解、检查与证据分别记录。", "",
+        "| Activity | 适用性 | Behavior / Fact / Handoff 理解 | 义务 | 审计单元 | 证据 | 主要缺口 |", "| --- | --- | --- | --- | --- | --- | --- |"]
+    for row in coverage_ledger(state):
+        lines.append('| '+ ' | '.join(text(row[k]) for k in ('class_id','applicability','coverage','obligation_ids','unit_ids','evidence_ids','unknowns'))+' |')
+    if spec:
+        for surface in spec.unclassified+spec.coverage_summary:
+            if surface.disposition in {'deferred','UNCLASSIFIED_PROTOCOL_RESPONSIBILITY'}:
+                lines.append('未映射/未分类：'+text(surface.entry_point)+'；'+text(surface.reason))
+        for h in spec.handoffs:
+            lines.append('交接 '+h.id+'：'+h.producer_activity+' → '+h.consumer_activity+'；Fact '+h.fact_id+'；未决：'+text(h.unresolved_gap))
+    else:lines.append('此历史运行尚无七类审计规格；不从旧覆盖记录推断完整理解。')
     lines += ["", "| 后续任务 | 类型 | 状态/步骤 | 原因与阻塞 |", "| --- | --- | --- | --- |"]
     for task in state.inquiry_tasks:
-        kind='扩展职责/交接覆盖' if task.kind=='explore' else '语义复核'
+        kind='扩展职责/交接覆盖' if task.kind=='spec_refine' else '语义复核'
         lines.append(f"| `{task.id[:8]}` | {kind} | {task.status}/{task.stage} | {text(task.reason)}；{text(task.stop_reason)} |")
     current={x.id:getattr(x,'version',1) for x in [*state.claims,*state.bindings,*state.units,*state.relations,*state.models]}
     verdicts={'no_issue_found':'本次范围内暂未发现语义问题','needs_reading':'需要补读','disputed':'解释仍有争议','revision_needed':'需要修订'}
@@ -151,9 +154,9 @@ def inquiry_lines(state):
         for item in review.items:
             version=review.target_versions.get(item.target_id)
             history='历史语义版本' if current.get(item.target_id)!=version else '当前对象版本'
-            lines.append(f"| {text(item.target_id)} v{version}（{history}） | {aspects[item.aspect]} | {verdicts[item.status]} | {text(item.source_ids)}：{text(item.explanation)} |")
+            lines.append(f"| {text(item.target_id)} v{version}（{history}） | {aspects[item.aspect]} | {verdicts[item.status]} | {text(item.source_ids)}：{text(item.rationale)} |")
             if item.limitations: lines.append(f"未解决的有效性条件：{text(item.limitations)}")
-            if item.scope_limitations:lines.append(f"独立范围边界：{text(item.scope_limitations)}")
+            if item.limitations:lines.append(f"独立范围边界：{text(item.limitations)}")
     for issue in state.review_issues:
         lines.append(f"复核问题 `{issue.id}`：{'由 '+issue.resolved_by+' 显式解决' if issue.resolved_by else '未决'}；处置 `{issue.disposition}`；后续 {issue.task_ids}；{issue.explanation}；{issue.reason}。")
     for task in state.inquiry_tasks:

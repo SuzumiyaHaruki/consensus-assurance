@@ -52,7 +52,7 @@ def test_replay_can_add_monitor_without_changing_property(tmp_path):
     assert revised.monitors==monitors and not initial.monitors
 
 
-@pytest.mark.parametrize('kind',['explore','semantic_review'])
+@pytest.mark.parametrize('kind',['spec_refine','semantic_review'])
 def test_outer_task_templates_are_english_and_do_not_preset_goals(kind):
     import json
     text=render(kind,{'material':'原始材料','path':'/资料/契约.md'})

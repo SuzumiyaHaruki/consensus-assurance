@@ -34,40 +34,31 @@ class CoverageAgent(MockAgent):
         note=next((m for m in context.get('materials',[]) if m['file']=='service_notes.md'),None)
         request={'file':'z_delivery.py','start_line':141,'end_line':142,'reason':'Read the unexamined result delivery implementation'}
         if name=='ReadingPlan':
-            response={'requests':[{'file':'README.md','start_line':1,'end_line':5,'reason':'Read actual initial contract'}]+([request] if self.wrong else []),'rationale':'Initial fixture reading intentionally favors the counter region'}
+            response={'requests':[next(r for r in self.source_responses[0]['requests'] if r['file']=='README.md')]+([request] if self.wrong else []),'rationale':'Initial fixture reading intentionally favors the counter region'}
         elif name=='Discovery':
             if self.wrong:
                 graph=delivery_graph(context,True)
                 response={'understanding':'A deliberately misread candidate, to be corrected from actual material','selection_rationale':'Check the result contract',**graph.model_dump(mode='json')}
                 response.pop('expected_versions');response.pop('rationale')
-                response['responsibilities']=[{'id':'delivery','description':'Return configured results','source_ids':[note['id']],'claim_ids':['delivery_goal','delivery_obligation'],'applicability':'Current memory configuration'}]
             else:
                 response=json.loads(json.dumps(self.source_responses[1]))
                 response['relations']=[r for r in response['relations'] if r['id']!='input_dependency']
                 response['units'][0]['relation_ids'].remove('input_dependency')
-                response['responsibilities']=[{'id':'counter','description':'Maintain finite counter state','source_ids':['README.md:1:5'],'claim_ids':['capacity_goal','step_obligation'],'applicability':'Serial fixture calls'},
-                    {'id':'delivery','description':'Return configured results','source_ids':[note['id']],'claim_ids':[],'questions':['Actual result producer not yet read'],'applicability':'Memory configuration'}]
                 response['reading_requests']=[request]
-        elif name=='ExplorationReply':
-            if context['responsibilities'] and not any(r['id']=='delivery' for r in context['responsibilities']):
-                response={'understanding':'This fixture has no further source interpretation for the selected responsibility','patch':{'rationale':'Retain the unresolved coverage backlog'},'limitations':['Not exhaustive']}
-                directory.mkdir(parents=True,exist_ok=True);write_json(directory/'response.json',response)
-                return runner.run([sys.executable,'-c','print("Scoped fixture exploration")'],directory,'agent',snapshot_id,timeout),response_type.model_validate(response)
+        elif name=='SpecRefinement':
             have=any(m['id']=='z_delivery.py:141:142' for m in context['materials'])
             existing=any(c['id']=='delivery_goal' for c in context['claims'])
             if not have:
-                response={'understanding':'Missing another responsibility source','requests':[request],'responsibilities':[],'patch':{'rationale':'Read before proposing'},'limitations':[]}
+                response={'understanding':'Missing another responsibility source','requests':[request],'patch':{'rationale':'Read before proposing'},'limitations':[]}
             elif not existing and note is None:
                 response={'understanding':'The retrieved producer alone cannot establish its configured responsibility','requests':[{'file':'service_notes.md','start_line':1,'end_line':2,'reason':'Read the actual configured completion contract'}],'patch':{'rationale':'Contract material missing'},'limitations':[]}
             elif not existing:
                 patch=delivery_graph(context)
-                role=next(r for r in context['responsibilities'] if r['id']=='delivery').copy()
-                role.update(claim_ids=['delivery_goal','delivery_obligation'],questions=[],source_ids=[note['id'],'z_delivery.py:141:142'])
-                response={'understanding':'Another actual responsibility has now been read','responsibilities':[role],'patch':patch.model_dump(mode='json'),'limitations':['This fixture does not establish a complete system inventory']}
+                response={'understanding':'Another actual responsibility has now been read','patch':patch.model_dump(mode='json'),'limitations':['This fixture does not establish a complete system inventory']}
             else:
-                response={'understanding':'The supplied regions have candidate coverage; other unknown duties remain possible','responsibilities':[],'patch':{'rationale':'No further supported additions in this bounded fixture'},'limitations':['No exhaustive coverage claim']}
+                response={'understanding':'The supplied regions have candidate coverage; other unknown duties remain possible','patch':{'rationale':'No further supported additions in this bounded fixture'},'limitations':['No exhaustive coverage claim']}
         elif name=='ReviewReply':
-            items=[];revision=None;exploration=[]
+            items=[];revision=None
             for obj in context['target_objects']+([context['selected_unit']] if context.get('selected_unit',{}).get('id') in context['task']['target_ids'] else []):
                 source_ids=obj.get('source_ids') or obj.get('grounding',{}).get('behavior_ids') or [context['materials'][0]['id']]
                 contract=next(c for c in context['review_contract'] if c['target_id']==obj['id'])
@@ -81,14 +72,13 @@ class CoverageAgent(MockAgent):
                         'patch':{'claims':[changed.model_dump(mode='json')],'expected_versions':{obj['id']:obj['version']},'rationale':explanation},'old_judgment':obj['description'],'new_judgment':changed.description,'grounding':basis,'changes':[{'target_id':obj['id'],'field':'description','old_value_json':json.dumps(obj['description']),'new_value_json':json.dumps(changed.description)}]}
                 if self.weak and context['task']['trigger'].startswith('after_search') and bool(obj.get('bundle_path')):
                     status='disputed';explanation='The local bound holds but does not establish the delivery handoff responsibility'
-                    exploration=[{'reason':'Investigate the counter-to-result handoff even though the local invariant held','responsibility_ids':['delivery'],'requests':[request]}]
-                items.append({'target_id':obj['id'],'aspect':aspect,'status':status,'source_ids':source_ids,'explanation':explanation,'alternatives':'Different configured completion contracts can have different responsibilities','counterexample_reasoning':'A local counter bound alone cannot establish a returned-result contract','limitations':[]})
+                items.append({'target_id':obj['id'],'aspect':aspect,'status':status,'source_ids':source_ids,'limitations':[],'rationale':explanation + "\n" + 'Different configured completion contracts can have different responsibilities' + "\n" + 'A local counter bound alone cannot establish a returned-result contract'})
             for obj in context['target_objects']+([context['selected_unit']] if context.get('selected_unit',{}).get('id') in context['task']['target_ids'] else []):
                 contract=next(c for c in context['review_contract'] if c['target_id']==obj['id'])
                 original=next(i for i in items if i['target_id']==obj['id'])
                 for aspect in contract['required_aspects'][1:]:items.append({**original,'aspect':aspect})
             resolved=[issue['id'] for issue in context.get('open_issues',[]) if any(i['target_id']==issue['target_id'] and i['aspect']==issue['aspect'] and i['status']=='no_issue_found' for i in items)]
-            response={'items':items,'revision':revision,'exploration_requests':exploration,'limitations':[],'resolves_issue_ids':resolved,'resolution_rationale':'The corrected current configuration and cited materials address the prior interpretation' if resolved else ''}
+            response={'items':items,'revision':revision,'limitations':[],'resolves_issue_ids':resolved,'resolution_rationale':'The corrected current configuration and cited materials address the prior interpretation' if resolved else ''}
         elif name=='BuildReply':
             response={'bundle':self.source_responses[2],'gap':''}
         else:

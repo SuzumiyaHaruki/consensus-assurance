@@ -18,17 +18,19 @@ def strict_schema(schema):
         if not isinstance(node, dict):
             return node
         if node.get("type") == "object" and "properties" not in node:
-            return {"type":"array", "description":"Dictionary encoded as unique key/value_json entries; value_json contains a valid JSON value", "items":
-                {"type":"object","properties":{"key":{"type":"string"},"value_json":{"type":"string"}},
-                 "required":["key","value_json"],"additionalProperties":False}}
+            typed=isinstance(node.get("additionalProperties"),dict) and bool(node["additionalProperties"])
+            field="value" if typed else "value_json"
+            return {"type":"array", "description":node.get("description", "")+" Dictionary entries; keys must be unique. "+("Use typed values." if typed else "value_json encodes a JSON value."), "items":
+                {"type":"object","properties":{"key":visit({"type":"string",**node.get("propertyNames",{})}),field:visit(node["additionalProperties"]) if typed else {"type":"string"}},
+                 "required":["key",field],"additionalProperties":False}}
         out = {}
         for key, value in node.items():
             # Defaults are local model annotations, not constraints on wire values.
             # Preserve properties actually named "default" and literal enum/const data.
-            if key == "default":
+            if key in {"default", "x-controller-derived"}:
                 continue
             if key in maps and isinstance(value, dict):
-                out[key] = {name:visit(child) for name,child in value.items()}
+                out[key] = {name:visit(child) for name,child in value.items() if not (key=="properties" and child.get("x-controller-derived"))}
             elif key in children or key in alternatives:
                 out[key] = visit(value)
             else:
@@ -54,16 +56,18 @@ def wire_value(value, schema, decode=False, root=None):
                 return wire_value(value,item,decode,root)
         return value
     if schema.get("type") == "object" and "properties" not in schema:
+        typed=isinstance(schema.get("additionalProperties"),dict) and bool(schema["additionalProperties"])
+        field="value" if typed else "value_json"
         if decode:
-            if not isinstance(value,list) or any(not isinstance(x,dict) or set(x)!={"key","value_json"} for x in value):
+            if not isinstance(value,list) or any(not isinstance(x,dict) or set(x)!={"key",field} for x in value):
                 raise ValueError("Expected dictionary key/value_json entries")
-            if any(not isinstance(x["key"],str) or not isinstance(x["value_json"],str) for x in value):
+            if any(not isinstance(x["key"],str) or (not typed and not isinstance(x[field],str)) for x in value):
                 raise ValueError("Dictionary wire keys and JSON encodings must be strings")
             if len({x["key"] for x in value}) != len(value): raise ValueError("Duplicate dictionary key")
-            return {x["key"]:json.loads(x["value_json"]) for x in value}
-        return [{"key":k,"value_json":json.dumps(v,ensure_ascii=False)} for k,v in value.items()]
+            return {x["key"]:wire_value(x[field],schema["additionalProperties"],True,root) if typed else json.loads(x[field]) for x in value}
+        return [{"key":k,field:wire_value(v,schema["additionalProperties"],False,root) if typed else json.dumps(v,ensure_ascii=False)} for k,v in value.items()]
     if schema.get("type") == "object" and isinstance(value,dict):
-        return {k:wire_value(v,schema.get("properties",{}).get(k,{}),decode,root) for k,v in value.items()}
+        return {k:wire_value(v,schema.get("properties",{}).get(k,{}),decode,root) for k,v in value.items() if decode or not schema.get("properties",{}).get(k,{}).get("x-controller-derived")}
     if schema.get("type") == "array" and isinstance(value,list):
         return [wire_value(v,schema.get("items",{}),decode,root) for v in value]
     return value

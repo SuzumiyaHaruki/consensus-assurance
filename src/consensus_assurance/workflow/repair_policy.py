@@ -9,11 +9,28 @@ def validate_representation(before,after,targets,context):
     # Interface repairs may add an aspect but cannot erase a substantive opinion.
     if any(t['path']=='/items' or t['path'].startswith('/items/') for t in targets):
         for item in before.get('items',[]):
-            if item.get('status')!='no_issue_found' or item.get('limitations'):
-                semantic=lambda x:{k:v for k,v in x.items() if k not in {'target_id','aspect','source_ids'}}
+            if item.get('status')!='no_issue_found' or item.get('limitations') or item.get('counterevidence'):
+                semantic=lambda x:{k:x.get(k) for k in ('status','rationale','counterevidence','limitations')}
                 matches=[x for x in after.get('items',[]) if semantic(x)==semantic(item)]
                 if not matches:raise ValueError('Interface repair must retain prior negative analysis and limitations; only diagnosed metadata may change')
         if before.get('revision')!=after.get('revision'):raise ValueError('Interface repair cannot change a semantic revision')
+    # Citation repair cannot silently discard an asserted evidence dependency.
+    for target in targets:
+        route=parts(target['path'])
+        if route[-1] not in {'source_ids','expectation_ids'} and route[-2:]!=['grounding','behavior_ids']:continue
+        left=before;right=after
+        for key in route:
+            left=left[int(key)] if isinstance(left,list) else left[key]
+            right=right[int(key)] if isinstance(right,list) else right[key]
+        from .sources import covered
+        available={m['id']:m for m in all_materials(context)}
+        supplied=[available[id] for id in right if id in available]
+        for id in set(left)-set(right):
+            import re
+            if target.get('grounding_reference_repair') and id not in available and not re.fullmatch(r'.+:\d+:\d+',id) and supplied:continue
+            if id in target.get('citation_aliases',{}) and set(right)&set(target['citation_aliases'][id]):continue
+            if id not in available or not covered(available[id],supplied):
+                raise ValueError('Citation repair cannot discard evidence; acquire the missing range or request an explicit semantic decision')
     roots={}
     for target in targets:
         route=parts(target['path'])
@@ -129,5 +146,6 @@ def validate_draft_plan(before,after):
             b=new[id]
             fields=('associations','pending') if collection=='bindings' else ('goal_ids','obligation_ids','scope')
             if any(a.get(k)!=b.get(k) for k in fields):raise ValueError('Draft plan changes responsibility or fault scope')
-            if collection=='units' and (a.get('audit_question') or {}).get('question')!=(b.get('audit_question') or {}).get('question'):
+            from .audit_spec import IDENTITY
+            if collection=='units' and any((a.get('audit_question') or {}).get(k)!=(b.get('audit_question') or {}).get(k) for k in IDENTITY):
                 raise ValueError('Draft plan changes the audit question')

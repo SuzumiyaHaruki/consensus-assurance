@@ -1,10 +1,11 @@
+import json
 """Question-directed execution regressions, independent of target answer keys."""
 from types import SimpleNamespace
 from consensus_assurance.core.types import AuditQuestion, ConstraintSource
 from consensus_assurance.workflow import inquiry
 from consensus_assurance.workflow.artifacts import validate_bundle
 from consensus_assurance.core.proposals import Discovery
-from test_round6_boundaries import controller
+from test_graph_mutations import controller
 
 
 def test_typed_question_selects_direct_route(prepared):
@@ -40,7 +41,7 @@ def test_constraint_cites_material_and_selected_binding(prepared):
 
 def test_selected_exploration_dependency_uses_depth(tmp_path,prepared):
     _,state,_,_=prepared;e=controller(tmp_path,state);unit=state.units[0]
-    task=inquiry.enqueue(state,'explore','Selected producer discriminator','dependency',unit_id=unit.id)
+    task=inquiry.enqueue(state,'spec_refine','Selected producer discriminator','dependency',unit_id=unit.id)
     assert inquiry.read_purpose(task)=='depth'
 
 
@@ -119,7 +120,7 @@ def test_core_semantics_review_without_independent_binding_certificate(tmp_path,
         if obj.id not in targets:continue
         contract=target_contract(s,obj)
         s.semantic_reviews.append(SemanticReview(task_id='fixture',check_id='fixture',target_versions={obj.id:obj.version},context_dependencies={obj.id:contract},material_ids=contract['required_material_ids'],
-            items=[SemanticCheck(target_id=obj.id,aspect=a,status='no_issue_found',source_ids=contract['required_material_ids'],explanation='Scoped source basis',alternatives='Alternative ownership',counterexample_reasoning='A producer may not establish this fact') for a in contract['required_aspects']],origin='mock'))
+            items=[SemanticCheck(target_id=obj.id,aspect=a,status='no_issue_found',source_ids=contract['required_material_ids'],rationale='Scoped source basis' + "\n" + 'Alternative ownership' + "\n" + 'A producer may not establish this fact') for a in contract['required_aspects']],origin='mock'))
     assert readiness(s,u)['status']=='reviewed'
     s.review_issues.append(ReviewIssue(review_id='explicit',target_id=u.binding_ids[0],target_version=1,aspect='decomposition',source_ids=s.claims[0].source_ids,explanation='Association may hide an alternate branch',disposition='investigation',reason='Explicit dispute'))
     assert readiness(s,u)['status']!='reviewed'
@@ -136,7 +137,7 @@ def test_archived_oversized_review_targets_keep_current_unit_and_counterevidence
     from consensus_assurance.workflow.task_packet import prepare,pool_sources
     from consensus_assurance.workflow.prompts import render
     root=Path(__file__).resolve().parents[2]/'runs/2026-09-16_21-58-16-hashicorp_raft-real-run'
-    state=Analysis.model_validate_json((root/'state.json').read_text())
+    state=Analysis.model_validate(__import__("consensus_assurance.workflow.history",fromlist=["import_record"]).import_record(json.loads((root/'state.json').read_text())))
     old=next(p for p in state.packet_receipts if p['kind']=='semantic_review' and p['status']=='blocked_context_limit')
     task=next(t for t in state.inquiry_tasks if t.id==old['task_id']).model_copy(deep=True)
     task.target_ids=['B_setup_leader_state'];task.material_ids=[];task.context_receipt_id=None
@@ -157,7 +158,7 @@ def test_archived_F3_preflight_splits_one_actual_dispute_without_agent_call():
     from consensus_assurance.workflow.task_packet import prepare,pool_sources
     from consensus_assurance.workflow.prompts import render
     root=Path(__file__).resolve().parents[2]/'runs/2026-09-16_21-58-16-hashicorp_raft-real-run'
-    state=Analysis.model_validate_json((root/'history/9ceb2bdd25ca4feb961bedd0c8313906.json').read_text())
+    state=Analysis.model_validate(__import__("consensus_assurance.workflow.history",fromlist=["import_record"]).import_record(json.loads((root/'history/9ceb2bdd25ca4feb961bedd0c8313906.json').read_text())))
     state.active_inquiry_id=None;before=dict(state.usage);issues=state.review_issues[:]
     e=SimpleNamespace(state=state,root=root,config=Config.model_validate(state.config),inquiry='',budget=SimpleNamespace(remaining=lambda:0))
     children=inquiry.split_model_context(e,'F3')

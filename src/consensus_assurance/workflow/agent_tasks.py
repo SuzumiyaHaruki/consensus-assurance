@@ -26,6 +26,11 @@ def diagnostics_for(exc,candidate,kind,version,limit):
 def ask(engine,kind,response_type,context,validator=None):
     state=engine.state
     if not engine.agent.mock and not engine.config.allow_agent_materials:raise Blocked('Agent material transmission disabled by configuration; no repository payload was sent')
+    def register_citations(response):
+        from .sources import citation_ranges
+        refs=citation_ranges(response,state)
+        if refs:
+            engine.read([{k:v for k,v in ref.items() if k!='content_digest'} | {'reason':'Register an exact citation within already acquired source'} for ref in refs.values()],reason='Resolve covered citation ranges without new source acquisition')
     session=state.pending_output_repair
     if session and session.get('task')!=kind:raise Blocked('Another repair session is pending')
     if session and 'id' not in session:raise Blocked('Historical repair needs an explicit migrated child run; original artifacts preserved')
@@ -38,6 +43,7 @@ def ask(engine,kind,response_type,context,validator=None):
         session.pop('read_plan_id')
         try:
             candidate=json.loads(Path(session['current_path']).read_text());response=response_type.model_validate(candidate)
+            register_citations(response)
             validate_read_requests(state,engine.root/'source',response)
             if validator:validator(response)
         except ValueError as exc:
@@ -48,6 +54,7 @@ def ask(engine,kind,response_type,context,validator=None):
         state.pending_action=None;save_session(engine,session)
     if session and session.get('status') in {'accepted','accepted_after_read'} and session.get('accepted_check'):
         response=response_type.model_validate_json(Path(session['current_path']).read_text())
+        register_citations(response)
         validate_read_requests(state,engine.root/'source',response)
         if validator:validator(response)
         state.pending_output_repair=None
@@ -55,6 +62,10 @@ def ask(engine,kind,response_type,context,validator=None):
     from .task_packet import prepare, receipt
     context,review_task=prepare(engine,kind,context)
     def validate(response):
+        from .sources import validate_view_citations
+        from .task_packet import pool_sources
+        validate_view_citations(response,pool_sources(context))
+        register_citations(response)
         validate_read_requests(state,engine.root/"source",response)
         if validator:validator(response)
     limit=engine.config.budget.error_context_chars
@@ -71,6 +82,13 @@ def ask(engine,kind,response_type,context,validator=None):
             context,_=prepare(engine,kind,context)
             context={**context,'attached_materials':[m.model_dump(mode='json') for m in state.materials if m.id in state.task_attachments.get(attachment_key(state),[])]}
             active_diags=diags[:1]
+            if diags[0].code=='audit_spec_reference':
+                for d in diags[1:]:
+                    if len(active_diags)>=24:break
+                    if d.code!=diags[0].code or d.category!=diags[0].category:continue
+                    try:diagnostic_targets(candidate,active_diags+[d],limit)
+                    except ValueError:break
+                    active_diags.append(d)
             active_targets=diagnostic_targets(candidate,active_diags,limit) if active_diags[0].code not in {'schema_type','unclassified_validation'} else session['targets']
             context['repair_requested_material_ids']=session.get('requested_material_ids',[])
             # Allocate requested source within the existing whole-packet ceiling;
@@ -113,7 +131,7 @@ def ask(engine,kind,response_type,context,validator=None):
             engine.checkpoint('context_limit')
             raise Blocked('Required context exceeds context_chars; split the task or explicitly revise the limit; no payload sent')
         if review_task and not review_task.admitted:
-            resource='exploration_rounds' if review_task.kind=='explore' else 'semantic_reviews'
+            resource='exploration_rounds' if review_task.kind=='spec_refine' else 'semantic_reviews'
             if state.usage.get(resource,0)>=getattr(engine.config.budget,resource):raise Blocked('Actual inquiry admission budget exhausted: '+resource)
             if review_task.preparation_failures>=engine.config.budget.context_preparations:raise Blocked('Context preparation limit exhausted; no backend call sent')
         from .action_identity import stable_input
@@ -125,7 +143,7 @@ def ask(engine,kind,response_type,context,validator=None):
             nonlocal invoked
             invoked=True
             if review_task and not review_task.admitted:
-                engine.budget.take('exploration_rounds' if review_task.kind=='explore' else 'semantic_reviews')
+                engine.budget.take('exploration_rounds' if review_task.kind=='spec_refine' else 'semantic_reviews')
                 review_task.admitted=True
                 engine.checkpoint('inquiry_backend_admitted')
             elif kind=='scope_review':

@@ -66,8 +66,9 @@ def validate_scope_update(state,update):
     if not update.source_ids or not set(update.source_ids)<={m.id for m in state.materials}:raise ValueError('Scope update requires actually acquired sources')
     old_uses={u.binding_id:u for u in unit.code_uses};new_uses={u.binding_id:u for u in draft.code_uses}
     if any(id not in new_uses or old.role!=new_uses[id].role or old.claim_ids!=new_uses[id].claim_ids for id,old in old_uses.items()):reject(update,'scope_use_reinterpreted','Existing code roles and responsibility associations cannot be replaced by scope refinement',writes)
-    if unit.audit_question and (not draft.audit_question or draft.audit_question.question!=unit.audit_question.question):reject(update,'scope_question_changed','Replacing the audit question requires explicit semantic review',writes)
-    refined={f for id,f in writes if f in {'audit_question','coverage_intent'}}
+    from .audit_spec import IDENTITY
+    if unit.audit_question and (not draft.audit_question or any(getattr(draft.audit_question,k)!=getattr(unit.audit_question,k) for k in IDENTITY)):reject(update,'scope_question_changed','Replacing the audit question requires explicit semantic review',writes)
+    refined={f for id,f in writes if f in {'audit_question'}}
     if any(old!=new_uses[id] for id,old in old_uses.items()):refined.add('code_uses')
     from .graph import apply_patch
     candidate=new_candidate_patch(state,update)

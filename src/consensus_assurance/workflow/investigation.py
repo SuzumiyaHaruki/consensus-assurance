@@ -72,7 +72,7 @@ def record_consequence(engine, unit, finding, reply=None, reason=''):
     if reply and reply.patch:apply_patch(engine.state,reply.patch)
     tasks=[]
     if reply and reply.requests:
-        task=enqueue(engine.state,'explore','Investigate obligation-to-goal consequences and compensation: '+reply.rationale,'consequence:'+finding.id,target_ids=unit.goal_ids+unit.obligation_ids,unit_id=unit.id,model_id=finding.model_id,requests=reply.requests)
+        task=enqueue(engine.state,'spec_refine','Investigate obligation-to-goal consequences and compensation: '+reply.rationale,'consequence:'+finding.id,target_ids=unit.goal_ids+unit.obligation_ids,unit_id=unit.id,model_id=finding.model_id,requests=reply.requests)
         tasks.append(task.id)
     engine.state.consequences.append({'finding_id':finding.id,'goal_ids':reply.goal_ids if reply else unit.goal_ids,
         'disposition':reply.disposition if reply else 'defer','reason':reply.rationale if reply else reason,'source_ids':reply.source_ids if reply else [],'task_ids':tasks,

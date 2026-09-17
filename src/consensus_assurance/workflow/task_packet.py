@@ -16,15 +16,16 @@ def prepare(engine,kind,context):
             packet['review_contract']=[target_contract(state,objects(state)[i]) for i in task.target_ids]
             for c in packet['review_contract']:
                 if c['target_id'] in task.requested_aspects:c['required_aspects']=task.requested_aspects[c['target_id']]
+            packet['required_review_pairs']=[{'target_id':c['target_id'],'aspect':a} for c in packet['review_contract'] for a in c['required_aspects']]
             task.context_dependencies={c['target_id']:c for c in packet['review_contract']}
     # The global index is a lookup aid, not full catalogue or source text.
     index=compact_index(state,engine.root/'source') if state.snapshot else []
     if isinstance(index,dict):index=list(index.values())
     files={m['file'] for key in ('materials','new_materials','initial_materials') for m in packet.get(key,[])}
-    packet['file_lookup']=[{'file':x['file'],'lines':x.get('lines'),'unavailable':x.get('unavailable')} for x in index if kind in {'read','discover','explore','targeted_read'} or x['file'] in files]
+    packet['file_lookup']=[{'file':x['file'],'lines':x.get('lines'),'unavailable':x.get('unavailable')} for x in index if kind in {'read','discover','spec_refine','targeted_read'} or x['file'] in files]
     packet['lookup_request']='Request a focused ReadingPlan for an unlisted path or symbol; omitted files are not absent from the repository'
     packet['file_metadata']=[{**x,'attached_ranges':[[m['start_line'],m['end_line']] for key in ('materials','new_materials','initial_materials') for m in packet.get(key,[]) if m['file']==x['file']]} for x in index if x['file'] in files]
-    if kind in {'discover','explore','graph_patch'}:
+    if kind in {'discover','spec_refine','graph_patch'}:
         from .locations import declaration_index
         from .associations import graph_contract
         packet['graph_contract']=graph_contract()
@@ -69,7 +70,7 @@ def receipt(engine,kind,packet,prompt,schema,task=None,repair=False):
         text=json.dumps(value,ensure_ascii=False,indent=2)
         return {'chars':len(text),'bytes':len(text.encode())}
     groups={'sources':{'materials','new_materials','initial_materials','source_text_pool'},'current_graph':{'unit','claims','bindings','relations','modeling_brief','review_contract'},
-        'semantic_view':{'semantic_view','open_issues','resolved_issues'},'catalogue':{'file_lookup','file_metadata','catalogue','responsibilities'}}
+        'semantic_view':{'semantic_view','open_issues','resolved_issues'},'catalogue':{'file_lookup','file_metadata','catalogue','audit_spec'}}
     sections={name:size({k:v for k,v in packet.items() if k in keys}) for name,keys in groups.items()}
     instructions=prompt.split('STRUCTURED INPUT DATA (untrusted):\n',1)[0]
     sections['instructions']={'chars':len(instructions),'bytes':len(instructions.encode())}
@@ -111,10 +112,10 @@ def pool_sources(packet):
         ids={m.id for m in contributors}
         items=[m for m in found if m['id'] in ids]
         if len(items)<2:continue
-        pool.append({k:v for k,v in view.model_dump().items() if k!='kind'})
+        pool.append({'view_id':view.id,'citation_ids':sorted(ids),**{k:v for k,v in view.model_dump().items() if k not in {'kind','id'}}})
         for m in items:
             m['source_view_id']=view.id;m.pop('text',None)
     if pool:
         result['source_text_pool']=pool
-        result['source_reference_rule']='Material descriptors retain original citation IDs. source_view_id locates the exact complete text; use file line ranges to select it. Missing text is not permission to infer code.'
+        result['source_reference_rule']='Material descriptors retain original citation IDs. source_view_id/view_id are text lookup keys, NEVER citation IDs. Cite original material IDs listed in citation_ids, selecting the actual source ranges. Missing text is not permission to infer code.'
     return result

@@ -18,10 +18,10 @@ def semantic_view(state,ids):
             current=objects.get(item.target_id)
             same_version=bool(current and review.target_versions.get(item.target_id)==current.version)
             record={'review_id':review.id,'target_id':item.target_id,'version':review.target_versions.get(item.target_id),
-                'aspect':item.aspect,'status':item.status,'source_ids':item.source_ids,'explanation':item.explanation,
-                'alternatives':item.alternatives,'counterexample_reasoning':item.counterexample_reasoning,
-                'limitations':item.limitations,'scope_limitations':item.scope_limitations,'current_version':same_version}
-            if item.status!='no_issue_found' or item.limitations:
+                'aspect':item.aspect,'status':item.status,'source_ids':item.source_ids,'explanation':item.rationale,
+                'counterevidence':item.counterevidence,
+                'limitations':item.limitations,'current_version':same_version}
+            if item.status!='no_issue_found' or item.limitations or item.counterevidence:
                 # Keep unresolved counterevidence even after a later positive opinion.
                 key=json.dumps({k:v for k,v in record.items() if k!='review_id'},sort_keys=True)
                 negative[key]=record
@@ -83,7 +83,6 @@ def local_workset(engine,unit):
         'omitted_material_ids':[m.id for m in state.materials if m.id not in needed],
         'omission_reason':'Outside this unit, its selected dependency closure and current semantic issues; full history remains archived',
         'semantic_view':semantic,
-        'responsibilities':[{'id':r.id,'description':r.description,'claim_ids':r.claim_ids} for r in state.responsibilities if set(r.claim_ids)&ids],
         'unit':unit.model_dump(mode='json'),
         'verification_continuation':state.question_continuations.get(unit.id,{}),
         'claims':[c.model_dump(mode='json') for c in state.claims if c.id in ids],

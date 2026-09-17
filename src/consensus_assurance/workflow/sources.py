@@ -36,7 +36,7 @@ def all_materials(context):
     def walk(value):
         if isinstance(value,dict):
             if 'source_text_pool' in value:
-                for m in value['source_text_pool']:views[m['id']]=m
+                for m in value['source_text_pool']:views[m.get('view_id',m.get('id'))]=m
             if {'id','file','start_line','end_line'}<=set(value):
                 if 'source_view_id' in value:descriptors.append(value)
                 elif 'text' in value and not value['id'].startswith('source-view-'):found[value['id']]=value
@@ -68,13 +68,12 @@ def dependency_closure(objects,seeds):
         if anchor.get('material_id'):wanted.add(anchor['material_id'])
         wanted.update(anchor.get('source_ids',[]))
         basis=obj.get('grounding') or {};wanted.update(basis.get('behavior_ids',[])+basis.get('expectation_ids',[]));todo.extend(basis.get('binding_ids',[]))
-        for key in ['goal_ids','obligation_ids','binding_ids','relation_ids']:todo.extend(obj.get(key,[]))
-        for key in ['source','target','claim_id']:
+        for key in ['goal_ids','obligation_ids','binding_ids','relation_ids','behavior_ids','fact_ids','handoff_ids','produces_fact_ids','consumes_fact_ids','producer_behavior_ids','consumer_behavior_ids']:todo.extend(obj.get(key,[]))
+        for key in ['source','target','claim_id','fact_id']:
             if obj.get(key) in objects:todo.append(obj[key])
         for association in obj.get('associations',[]):todo.append(association['claim_id']);wanted.update(association.get('source_ids',[]))
         for use in obj.get('code_uses',[]):todo.extend(use.get('claim_ids',[])+use.get('relation_ids',[]));wanted.update(use.get('source_ids',[]))
         question=obj.get('audit_question') or {};wanted.update(question.get('source_ids',[]))
-        for point in obj.get('coverage_intent',[])+question.get('points',[]):wanted.update(point.get('source_ids',[]))
     return wanted,visited
 
 
@@ -98,3 +97,48 @@ def source_views(materials):
                 text='\n'.join(lines[n] for n in range(start,end+1)),kind=contributors[0].kind)
             result.append((view,contributors))
     return result
+
+
+def validate_view_citations(response, context):
+    """A text-view alias is not a source identity; require an explicit scoped correction."""
+    from consensus_assurance.core.diagnostics import Diagnostic, DiagnosticError
+    from .output_repair import pointer
+    views={v.get('view_id',v.get('id')):v for v in context.get('source_text_pool',[])}
+    materials=all_materials(context);diagnostics=[]
+    def walk(node, route=()):
+        if isinstance(node,dict):
+            for key,value in node.items():
+                citation=key in {'source_ids','expectation_ids','material_id'} or (key=='behavior_ids' and route and route[-1]=='grounding')
+                if citation:
+                    aliases=[v for v in (value if isinstance(value,list) else [value]) if isinstance(v,str) and v in views]
+                    if aliases:
+                        choices={a:[m['id'] for m in materials if m['file']==views[a]['file'] and m['content_digest']==views[a]['content_digest'] and views[a]['start_line']<=m['start_line']<=m['end_line']<=views[a]['end_line']] for a in aliases}
+                        diagnostics.append(Diagnostic(code='source_view_citation',category='material',paths=[pointer(route+(key,))],
+                            material_ids=list(dict.fromkeys(i for ids in choices.values() for i in ids)),allowed=['representation'],
+                            message='Text view aliases are not source IDs; select actual contributing ranges without inventing or broadening evidence',details={'alias_candidates':choices}))
+                walk(value,route+(key,))
+        elif isinstance(node,list):
+            for i,value in enumerate(node):walk(value,route+(i,))
+    walk(response.model_dump(mode='json'))
+    if diagnostics:raise DiagnosticError(diagnostics)
+
+
+def citation_ranges(response, state):
+    """Resolve only physical citations fully covered in the captured content version."""
+    import re
+    found={};known={m.id for m in state.materials}
+    def walk(node):
+        if isinstance(node,dict):
+            for key,value in node.items():
+                if key in {'source_ids','expectation_ids','material_id'}:
+                    for id in value if isinstance(value,list) else [value]:
+                        match=re.fullmatch(r'(.+):(\d+):(\d+)',id) if isinstance(id,str) else None
+                        if match and id not in known:
+                            file,start,end=match.groups();version=state.snapshot.files.get(file)
+                            ref=dict(file=file,start_line=int(start),end_line=int(end),content_digest=version)
+                            if version and 1<=ref['start_line']<=ref['end_line'] and covered(ref,state.materials):found[id]=ref
+                else:walk(value)
+        elif isinstance(node,list):
+            for value in node:walk(value)
+    walk(response.model_dump(mode='json'))
+    return found

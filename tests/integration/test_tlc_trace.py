@@ -109,7 +109,7 @@ def test_F2_normative_revision_executes_new_checker(tlc, prepared):
     assert old_check.outcome == 'counterexample'
     graph = Discovery.model_validate(responses[1])
     graph.claims[1].description = 'The documented boundary is the supplied capacity, including capacity itself'
-    correction = Feedback(kind='F2',rationale='The old checker excluded the documented capacity value',evidence_ids=['README.md:1:5'],target_ids=['step_obligation'],relation_ids=[],new_basis='The fixture documents reaching capacity before reset; the old strict boundary was unsupported',graph=graph,bundle=None)
+    correction = Feedback(kind='F2',rationale='The old checker excluded the documented capacity value',evidence_ids=[next(m.id for m in state.materials if m.file=='README.md')],target_ids=['step_obligation'],relation_ids=[],new_basis='The fixture documents reaching capacity before reset; the old strict boundary was unsupported',graph=graph,bundle=None)
     correction.graph = None
     correction.patch = GraphPatch(claims=[graph.claims[1]],expected_versions={graph.claims[1].id:1},rationale=correction.new_basis)
     correction.old_judgment = state.claims[1].description

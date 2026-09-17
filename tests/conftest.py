@@ -20,9 +20,12 @@ def prepared(tmp_path):
     repo = tmp_path / "repo"
     shutil.copytree(ROOT / "examples/toy_protocol", repo)
     snapshot = capture(repo)
-    config = Config(protocol="toy", implementation="toy", agent_backend="mock", fixture=str(ROOT / "tests/fixtures/toy_responses.json"))
+    from regression_support import toy_responses
+    responses = toy_responses(repo)
+    fixture = tmp_path / "toy_responses.json"
+    fixture.write_text(json.dumps(responses))
+    config = Config(protocol="toy", implementation="toy", agent_backend="mock", fixture=str(fixture))
     state = Analysis(mode="mock", config=config.model_dump(mode="json"), snapshot=snapshot)
-    responses = json.loads((ROOT / "tests/fixtures/toy_responses.json").read_text())
     state.materials = initial_materials(repo, snapshot, config.budget, "Toy fixture normative context")
     add_reads(state, repo, ReadingPlan.model_validate(responses[0]), config.budget)
     apply_discovery(state, Discovery.model_validate(responses[1]))

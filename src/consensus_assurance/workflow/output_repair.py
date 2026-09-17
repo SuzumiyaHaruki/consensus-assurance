@@ -38,7 +38,7 @@ def parts(path):
 
 
 def repair_targets(value, errors, reason, limit):
-    paths = []
+    paths = []; containers={}
     for error in errors:
         current, route = value, []
         for key in error.get('loc',[]):
@@ -49,7 +49,11 @@ def repair_targets(value, errors, reason, limit):
             elif isinstance(current,dict) and error.get('type')=='missing':
                 route.append(key); break
             else: break
-        if route: paths.append(route)
+        if route:
+            if '[key]' in error.get('loc',[]) or error.get('type')=='extra_forbidden':
+                parent=tuple(route[:-1])
+                if parent:containers.setdefault(parent,set()).add(route[-1]);route=route[:-1]
+            paths.append(route)
     match = re.search(r'Binding ([\w-]+): literal symbol',reason)
     if match and isinstance(value,dict):
         for i,b in enumerate(value.get('bindings',[])):
@@ -67,6 +71,10 @@ def repair_targets(value, errors, reason, limit):
             elif 'Only constant assignments' in reason: paths.append(prefix+['constants'])
             elif 'Feedback target' in reason: paths.append(['target_ids'])
             elif 'Semantic feedback requires' in reason: paths.append(['evidence_ids'])
+    for route in paths:
+        for parent,keys in containers.items():
+            if tuple(route[:len(parent)])==parent and len(route)>len(parent):keys.add(route[len(parent)])
+    paths=[r for r in paths if not any(tuple(r[:len(p)])==p and len(r)>len(p) for p in containers)]
     targets=[]
     for route in paths:
         path=pointer(route)
@@ -75,7 +83,11 @@ def repair_targets(value, errors, reason, limit):
         for key in route:
             try: current=current[key]
             except (KeyError,IndexError,TypeError): exists=False;current=None;break
-        targets.append({'path':path,'exists':exists,'current_value':current})
+        item={'path':path,'exists':exists,'current_value':current}
+        if tuple(route) in containers:
+            item['preserve_entries']={k:v for k,v in current.items() if k not in containers[tuple(route)]}
+            item['repair_kind']='invalid_dictionary_keys'
+        targets.append(item)
     if not targets:
         raise ValueError('Cannot localize the invalid fields for bounded repair; original output preserved: '+reason)
     if len(json.dumps(targets,ensure_ascii=False)) > limit:
@@ -86,8 +98,15 @@ def repair_targets(value, errors, reason, limit):
 def apply_replacements(value, targets, repair):
     allowed={t['path'] for t in targets}
     paths=[r.path for r in repair.replacements]
-    if len(set(paths))!=len(paths) or not set(paths)<=allowed:
-        raise ValueError('Repair touches duplicate or unreported fields')
+    if len(set(paths))!=len(paths):raise ValueError('Repair touches duplicate fields')
+    if not set(paths)<=allowed:raise ValueError('Repair touches unreported fields: '+', '.join(sorted(set(paths)-allowed)))
+    if any(a!=b and b.startswith(a+'/') for a in paths for b in paths):raise ValueError('Repair touches overlapping fields')
+    for replacement in repair.replacements:
+        target=next(t for t in targets if t['path']==replacement.path)
+        if target.get('repair_kind')=='invalid_dictionary_keys':
+            proposed=json.loads(replacement.value_json)
+            if not isinstance(proposed,dict) or any(k not in proposed or proposed[k]!=v for k,v in target['preserve_entries'].items()):
+                raise ValueError('Dictionary repair changed an undiagnosed entry')
     result=copy.deepcopy(value)
     for replacement in repair.replacements:
         route=parts(replacement.path); parent=result
@@ -130,6 +149,8 @@ def diagnostic_targets(value,diagnostics,limit):
                 try:current=current[int(key)] if isinstance(current,list) else current[key]
                 except (ValueError,KeyError,IndexError,TypeError):exists=False;current=None;break
             item={'path':pointer(route),'exists':exists,'current_value':current}
+            if diagnostic.code=='source_view_citation':item['citation_aliases']=diagnostic.details['alias_candidates']
+            if diagnostic.code=='grounding_reference':item['grounding_reference_repair']=True
             if item not in result:result.append(item)
     if len(json.dumps(result,ensure_ascii=False))>limit:raise ValueError('Repair target set exceeds bounded context; preserve candidate and request smaller scope')
     return result
@@ -143,7 +164,7 @@ def diagnostic_context(candidate,diagnostics,context,limit):
     ids={id for d in diagnostics for id in d.object_ids};wanted={id for d in diagnostics for id in d.material_ids};objects=[];index={}
     def collect(node):
         if isinstance(node,dict):
-            if isinstance(node.get('id'),str):index[node['id']]=node
+            if isinstance(node.get('id',node.get('class_id')),str):index[node.get('id',node.get('class_id'))]=node
             for value in node.values():collect(value)
         elif isinstance(node,list):
             for value in node:collect(value)
@@ -168,7 +189,7 @@ def diagnostic_context(candidate,diagnostics,context,limit):
     available={m['id']:m for m in all_materials(context)}
     wanted.update(explicit)
     include_dependencies=schema_ids or any(d.category in {'association','material'} for d in diagnostics)
-    direct=[o for o in objects if include_dependencies or o.get('id') in ids]
+    direct=[o for o in objects if include_dependencies or o.get('id',o.get('class_id')) in ids]
     for diagnostic in diagnostics:
         if diagnostic.code.startswith('condition_') or diagnostic.code=='declaration_identity':direct.append({'current_condition_problem':diagnostic.details})
     objects=direct

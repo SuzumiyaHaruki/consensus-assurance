@@ -63,8 +63,10 @@ def obligation_progress(state, unit):
                 valid=bool(source and source.search_fingerprint==check.search_fingerprint and source.status.value=='completed')
             result=next((r for r in check.checker_results if r.invariant==spec.invariant and r.claim_id==claim and r.scope==spec.scope),None) if valid else None
             requirements=[r for r in model.reachability_requirements if claim in r.claim_ids]
-            points=unit.coverage_intent+(unit.audit_question.points if unit.audit_question else [])
-            if any(claim in p.claim_ids and not any(p.id in r.point_ids and (not p.sequence_required or bool(r.sequence)) for r in requirements) for p in points):complete=False
+            from .audit_spec import reachability_refs
+            refs=reachability_refs(unit.audit_question)
+            if refs and not refs<=set().union(*(reachability_refs(r) for r in requirements)):complete=False
+            if unit.audit_question and unit.audit_question.obligation_relation_kind in {'preservation','recovery','cross_activity_handoff'} and not any(r.sequence and r.identity_operator for r in requirements):complete=False
             reach=[r for r in state.reachability_results if r.model_id==model.id and r.search_fingerprint==model.search_fingerprint]
             latest={x.requirement_id:x for x in reach}
             if any(r.id not in latest or latest[r.id].status!='reachable' for r in requirements):complete=False
@@ -78,9 +80,10 @@ def coverage_limitations(state,unit):
     limits=[]
     models=[m for m in state.models if m.unit_id==unit.id]
     if not unit.audit_question:limits.append('Audit question is not structured; effective interaction coverage is unestablished')
-    for point in unit.coverage_intent+(unit.audit_question.points if unit.audit_question else []):
-        if not any(point.id in r.point_ids and (not point.sequence_required or bool(r.sequence)) for m in models for r in m.reachability_requirements):
-            limits.append('No executable trigger requirement covers point '+point.id)
+    from .audit_spec import reachability_refs
+    for ref in reachability_refs(unit.audit_question):
+        if not any(ref in reachability_refs(r) for m in models for r in m.reachability_requirements):
+            limits.append('No executable trigger requirement covers reference '+ref)
     for model in models:
         import json
         from pathlib import Path

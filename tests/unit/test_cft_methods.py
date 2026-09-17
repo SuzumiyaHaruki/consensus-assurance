@@ -1,3 +1,4 @@
+from consensus_assurance.workflow.history import import_record
 """Offline method routing and handoff representation, not agent-quality evidence."""
 import json
 from pathlib import Path
@@ -10,15 +11,15 @@ from consensus_assurance.workflow.prompts import loaded_resources, render
 from test_worksets import ARCHIVE, archived_engine
 
 RESOURCES = Path(__file__).resolve().parents[2] / 'src/consensus_assurance/resources'
-SURVEY = 'skills/consensus-analysis/references/responsibilities-and-behaviors.md'
-BEHAVIOR = 'skills/consensus-analysis/references/behavior-obligations.md'
+SURVEY = 'skills/consensus-analysis/references/activity-classes.md'
+BEHAVIOR = 'skills/consensus-analysis/references/behavior-facts.md'
 GUIDE = 'skills/consensus-analysis/guide.md'
 
 
-@pytest.mark.parametrize('task', ['read', 'discover', 'explore', 'build', 'F1', 'F3', 'technical'])
+@pytest.mark.parametrize('task', ['read', 'discover', 'spec_refine', 'build', 'F1', 'F3', 'technical'])
 def test_controller_renders_selected_reference_bodies(task):
     paths = loaded_resources(task, {})['paths']
-    expected = [SURVEY] if task == 'read' else [SURVEY, BEHAVIOR] if task in {'discover', 'explore'} else [BEHAVIOR]
+    expected = [SURVEY] if task == 'read' else [SURVEY, BEHAVIOR] if task in {'discover', 'spec_refine'} else [BEHAVIOR]
     prompt = render(task, {})
     for path in expected:
         assert path in paths
@@ -26,13 +27,13 @@ def test_controller_renders_selected_reference_bodies(task):
     if task == 'read':
         assert GUIDE not in paths and BEHAVIOR not in paths
     retry = render('retry', {'original_task': task})
-    for path in expected:
+    for path in loaded_resources('retry',{'original_task':task})['paths']:
         assert (RESOURCES / path).read_text() in retry
 
 
 def test_default_methods_are_target_independent_and_review_stays_compact():
     methods = '\n'.join(p.read_text() for p in (RESOURCES / 'skills/consensus-analysis').rglob('*.md'))
-    assert 'Crash Fault Tolerant (CFT)' in methods
+    assert 'CFT' in methods
     for target_answer in ['HashiCorp', 'etcd', 'O_commit', 'O_append_evidence', 'O_fsm_handoff', 'processLogs']:
         assert target_answer not in methods
     for obsolete in ['Membership/weight', 'QC', 'threshold signature', 'global maximum', 'certificate']:
@@ -54,7 +55,7 @@ def test_default_methods_are_target_independent_and_review_stays_compact():
     ('external persistence adapter', 'capture -> adapter.persist -> publish -> restore', 'publication waits for adapter completion', 'direct test: adapter failure before publication; observe recovery consumer'),
 ])
 def test_conditional_variants_survive_existing_workset(tmp_path, prepared, variant, path, protection, check):
-    from test_round6_boundaries import controller
+    from test_graph_mutations import controller
     _, state, _, _ = prepared
     unit = state.units[0]
     question = unit.audit_question.model_copy(deep=True) if unit.audit_question else AuditQuestion(
@@ -75,7 +76,7 @@ def test_conditional_variants_survive_existing_workset(tmp_path, prepared, varia
 
 def latest_engine():
     e = archived_engine('b69d50c2a0ac4e20897e36c355f034ef')
-    e.state = Analysis.model_validate_json((ARCHIVE / 'state.json').read_text())
+    e.state = Analysis.model_validate(__import__("consensus_assurance.workflow.history",fromlist=["import_record"]).import_record(json.loads((ARCHIVE / 'state.json').read_text())))
     return e
 
 
@@ -140,14 +141,14 @@ def test_unaccepted_fsm_candidate_has_compact_behavior_handoff_preview():
         e.state.bindings.append(Binding(**b, file=m.file, snapshot_id=e.state.snapshot.id,
             content_digest=m.content_digest, basis='agent_inference', excerpt='\n'.join(m.text.splitlines()[b['start_line']-m.start_line:b['end_line']-m.start_line+1])))
     e.state.relations.extend(Relation(**r) for r in patch['relations'])
-    unit = AuditUnit(**patch['units'][0])
+    unit = AuditUnit(**import_record(patch['units'][0]))
     e.state.units.append(unit)
     question = unit.audit_question
-    original_unknowns = [p.unknowns[:] for p in question.points]
+    original_unknowns = question.unknowns[:]
     question.event_paths.append('Known protection: batch response selection reuses the input filter and assigns the response to the tuple future after callback return (fsm.go:145:186).')
     question.trigger_rationale = 'ready_for_check: direct test with mixed command/barrier tuples and distinct callback responses; block callback return, observe no early completion, then correlate each response with its original Future. No execution result is claimed.'
     packet = context(e, unit)
-    assert [p['unknowns'] for p in packet['unit']['audit_question']['points']] == original_unknowns
+    assert packet['unit']['audit_question']['unknowns'] == original_unknowns
     assert set(question.source_ids) <= set(packet['required_material_ids'])
     assert 'processLogs' in json.dumps(packet['unit']['audit_question']['event_paths'])
     assert question.trigger_rationale in render('build', packet)

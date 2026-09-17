@@ -12,11 +12,11 @@ EXCLUDED={'checks','tools','elapsed_seconds','created_at'}
 
 def commit_graph(engine,key,payload,callback):
     if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.:-]*',key) or '..' in key:raise ValueError('Invalid semantic operation ID')
+    path=engine.root/'graph-commits'/(key+'.json')
     recorded=engine.state.applied_operations.get(key)
     if recorded:
-        if recorded['input']!=payload:raise ValueError('Operation identity reused with different semantic input')
+        if json.loads(path.read_text())['input']!=payload:raise ValueError('Operation identity reused with different semantic input')
         return
-    path=engine.root/'graph-commits'/(key+'.json')
     if path.exists():
         operation=json.loads(path.read_text())
         if operation['input']!=payload:raise ValueError('Prepared semantic input differs')
@@ -25,7 +25,7 @@ def commit_graph(engine,key,payload,callback):
         proxy.budget=BudgetTracker(engine.config.budget,proxy.state)
         before=engine.state.model_dump(mode='json')
         callback(proxy)
-        proxy.state.applied_operations[key]={'input':payload}
+        proxy.state.applied_operations[key]={'path':str(path)}
         after=proxy.state.model_dump(mode='json')
         fields=[k for k in after if k not in EXCLUDED and before[k]!=after[k]]
         operation={'input':payload,'before':{k:before[k] for k in fields},'after':{k:after[k] for k in fields}}

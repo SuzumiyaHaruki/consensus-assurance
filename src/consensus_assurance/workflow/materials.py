@@ -91,22 +91,21 @@ def initial_materials(repo, snapshot, budget, knowledge):
     documents = [f for f in available if f.endswith((".md", ".rst"))]
     documents.sort(key=lambda f: (Path(f).stem.lower() != "readme", len(Path(f).parts), f))
     selected = documents[:2]
-    groups = {}
-    for file in available:
-        if file not in selected:
-            groups.setdefault(str(Path(file).parent), []).append(file)
-    # Mix actual directory areas rather than spending every initial slot on short documents.
-    while groups:
-        for directory in list(groups):
-            selected.append(groups[directory].pop(0))
-            if not groups[directory]: del groups[directory]
+    code=[f for f in available if f.endswith(('.go','.py','.rs','.java','.cc','.cpp','.h')) and 'test' not in Path(f).name.lower()]
+    hints=('api|client|future|service','rpc|transport|message','consensus|raft|paxos|node','storage|snapshot|log|history','recovery|restore|startup','config|member','fsm|apply|state')
+    for pattern in hints:
+        matches=[f for f in code if f not in selected and re.search(pattern,Path(f).stem,re.I)]
+        match=min(matches,key=lambda f:(len(Path(f).parts),not bool(re.fullmatch(pattern,Path(f).stem,re.I)),f)) if matches else None
+        if match:selected.append(match)
+    selected.extend(f for f in code if f not in selected)
+    selected.extend(f for f in available if f not in selected)
     for rel in selected:
         if len(result) >= min(8, budget.material_chunks):
             break
         lines = (repo / rel).read_text().splitlines()
         if not lines:
             continue
-        end = min(len(lines), 100)
+        end = min(len(lines), 80)
         item = read_material(repo, snapshot, ReadRequest(file=rel, start_line=1, end_line=end, reason="Initial repository survey"))
         if count + len(item.text) > budget.material_chars // 3:
             continue

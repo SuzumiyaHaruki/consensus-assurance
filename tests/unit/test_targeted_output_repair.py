@@ -93,3 +93,49 @@ def test_schema_reference_repair_receives_owner_and_dependency_context():
     repair=OutputRepair(replacements=[Replacement(path='/patch/claims/0/description',value_json='"changed"')],rationale='Not authorized')
     with pytest.raises(ValueError,match='unreported'):
         apply_replacements(candidate,[{'path':d.paths[0]}],repair)
+
+
+def test_recorded_invalid_keys_have_executable_bounded_container_repairs():
+    from consensus_assurance.core.proposals import Discovery
+    from pydantic import ValidationError
+    fixture=json.loads((Path(__file__).parents[1]/'fixtures/discovery_wire_failure.json').read_text())
+    original=fixture['candidate'];snapshot=json.dumps(original,sort_keys=True)
+    with pytest.raises(ValidationError) as failure:Discovery.model_validate(original)
+    targets=repair_targets(original,failure.value.errors(),str(failure.value),16000)
+    patch=OutputRepair.model_validate(fixture['attempted_repair'])
+    assert {r.path for r in patch.replacements}<={t['path'] for t in targets}
+    merged=apply_replacements(original,targets,patch)
+    candidate=Discovery.model_validate(merged)
+    assert candidate.units[0].audit_question.counterevidence==original['units'][0]['audit_question']['counterevidence']
+    assert merged['claims']==original['claims'] and merged['bindings']==original['bindings']
+    assert json.dumps(original,sort_keys=True)==snapshot
+    # Shape acceptance is not acceptance of the recorded producer guarantees.
+    assert candidate.audit_spec.facts[0].invalidators==original['audit_spec']['facts'][0]['invalidators']
+
+
+def test_dictionary_key_repair_preserves_undiagnosed_entries_and_siblings():
+    from typing import Literal
+    from consensus_assurance.core.types import Record
+    from pydantic import ValidationError
+    class Candidate(Record):
+        effects: dict[Literal['A1','A2'],str]
+        unknowns: list[str]
+    original={'effects':{'A1':'Known effect','feeds':['B2']},'unknowns':['Producer is unverified']}
+    with pytest.raises(ValidationError) as failure:Candidate.model_validate(original)
+    targets=repair_targets(original,failure.value.errors(),'invalid key',4000)
+    valid=OutputRepair(replacements=[Replacement(path='/effects',value_json=json.dumps({'A1':'Known effect','A2':'Sourced context effect'}))],rationale='Correct the dictionary shape')
+    result=apply_replacements(original,targets,valid);assert result['unknowns']==original['unknowns'];Candidate.model_validate(result)
+    bad=valid.model_copy(deep=True);bad.replacements[0].value_json='{"A2":"Changed"}'
+    with pytest.raises(ValueError,match='undiagnosed'):apply_replacements(original,targets,bad)
+    bad=valid.model_copy(deep=True);bad.replacements.append(Replacement(path='/unknowns',value_json='[]'))
+    with pytest.raises(ValueError,match='unreported'):apply_replacements(original,targets,bad)
+    bad=valid.model_copy(deep=True);bad.replacements.append(bad.replacements[0])
+    with pytest.raises(ValueError,match='duplicate'):apply_replacements(original,targets,bad)
+
+
+def test_source_repair_cannot_drop_a_dependency(prepared):
+    from consensus_assurance.workflow.repair_policy import validate_representation
+    _,state,_,_=prepared
+    code=next(m for m in state.materials if m.file=='counter.py');other=next(m for m in state.materials if m.file=='limits.py')
+    with pytest.raises(ValueError,match='cannot discard evidence'):
+        validate_representation({'source_ids':[code.id,other.id]}, {'source_ids':[other.id]}, [{'path':'/source_ids'}], {'materials':[m.model_dump(mode='json') for m in [code,other]]})

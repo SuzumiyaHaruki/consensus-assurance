@@ -12,9 +12,9 @@ from consensus_assurance.adapters.storage.snapshot import capture
 
 @pytest.mark.real
 def test_default_no_goal_F3_new_artifacts_and_recalibration(tmp_path, tlc, prepared):
-    repo, _, _, _ = prepared
+    repo, fixture_state, _, _ = prepared
     root = tmp_path / "full-run"
-    fixture = Path(__file__).resolve().parents[1] / "fixtures/toy_responses.json"
+    fixture = Path(fixture_state.config["fixture"])
     config = Config(protocol="toy", implementation="toy", agent_backend="mock", fixture=str(fixture), tlc_jar=os.environ["TLC_JAR"])
     config.budget.audit_units = 3
     impl, agent, verifier, knowledge = assemble(config)

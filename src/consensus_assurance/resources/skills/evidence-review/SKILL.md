@@ -1,6 +1,5 @@
 ---
-name: evidence-review
-description: Review semantic applicability, calibrate observations and investigate scoped tool evidence.
+name: evidence-review description: Review semantic applicability, calibrate observations and investigate scoped tool evidence.
 ---
 
 # evidence-review

@@ -60,7 +60,7 @@ def test_F2_requires_normative_basis_and_invalidates(prepared):
     revised.claims[1].description = "A refined obligation based on the documented caller responsibility"
     f = feedback(state, "F2", graph=revised, new_basis="The document assigns normalization to the caller")
     with pytest.raises(ValueError): apply_feedback(state, state.units[0], bundle, f)
-    f.evidence_ids = ["README.md:1:5"]
+    f.evidence_ids = [next(m.id for m in state.materials if m.file=='README.md')]
     f.graph = None
     f.patch = GraphPatch(claims=[revised.claims[1]],expected_versions={revised.claims[1].id:1},rationale=f.new_basis)
     f.target_ids = [revised.claims[1].id]

@@ -38,4 +38,5 @@ class Store:
             stream.write(json.dumps({"event": event, "state_version": event_id}, ensure_ascii=False) + "\n")
 
     def load(self) -> Analysis:
-        return Analysis.model_validate_json((self.root / "state.json").read_text())
+        from consensus_assurance.workflow.history import load_analysis
+        return load_analysis(self.root / "state.json")

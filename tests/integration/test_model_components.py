@@ -41,7 +41,7 @@ def test_missing_tools_and_core_dependencies_never_complete_a_draft(tmp_path,pre
     from consensus_assurance.adapters.runners.process import ProcessRunner
     from consensus_assurance.workflow.staged_model import proceed
     from consensus_assurance.workflow.errors import Blocked
-    from test_round6_boundaries import controller
+    from test_graph_mutations import controller
     _,state,bundle,_=prepared;draft=draft_of(bundle);impl=ToyImplementation()
     model=save_bundle(tmp_path/'models-run',state,state.units[0],draft,impl)
     missing=TLCVerifier(None).syntax(ProcessRunner(tmp_path/'runner'),model,1)

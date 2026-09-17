@@ -20,7 +20,13 @@ def context(engine, unit=None):
         result.update(local_workset(engine,unit))
     else:
         result.update({name:[item.model_dump(mode="json") for item in getattr(engine.state,name)]
-                       for name in ("materials","responsibilities","semantic_reviews")})
+                       for name in ("materials",)})
+    from .audit_spec import slice_for, source_ids
+    result["audit_spec"]=slice_for(engine.state,unit.audit_question if unit else None)
+    if result['audit_spec']:
+        ids=source_ids(result['audit_spec'])
+        present={m['id'] for m in result.get('materials',[])}
+        result.setdefault('materials',[]).extend(m.model_dump(mode='json') for m in engine.state.materials if m.id in ids-present)
     return result
 
 def discover(engine):
@@ -42,20 +48,17 @@ def discover(engine):
     if "discovery" not in engine.state.completed_steps:
         def validate(proposal):
             trial=engine.state.model_copy(deep=True)
+            from .audit_spec import validate
+            if proposal.audit_spec:validate(trial,proposal.audit_spec)
+            elif engine.state.analysis_mode!='regression':raise ValueError('Initial analysis requires a seven-class audit spec')
             apply_discovery(trial,proposal)
-            inquiry.register_responsibilities(trial,proposal.responsibilities)
-            inquiry.register_requests(trial,proposal.exploration_requests,'validation')
         proposal, check = engine.ask("discover", Discovery, engine.context(), validate)
         from .transactions import commit_graph
         def initial(proxy):
+            from .audit_spec import accept
+            if proposal.audit_spec:accept(proxy,proposal.audit_spec)
             apply_discovery(proxy.state,proposal)
             inquiry.initial_agenda(proxy,proposal)
-            from consensus_assurance.core.types import ReadRequest
-            for id,plan in proxy.state.read_plans.items():
-                if plan['purpose']=='breadth' and plan['status']!='complete':
-                    pending=[ReadRequest.model_validate(i['request']) for i in plan['items'] if i['status']=='deferred']
-                    task=inquiry.enqueue(proxy.state,'explore','Deferred initial material remains unexplored','deferred:'+id,requests=pending)
-                    task.stop_reason='Reserved local dependency capacity; original ranges preserved'
         commit_graph(engine,"discovery-"+check.id,proposal.model_dump(mode="json"),initial)
         path = engine.root / f"discovery-v{engine.state.graph_version}.json"
         write_json(path, proposal); engine.state.discovery_path = str(path)

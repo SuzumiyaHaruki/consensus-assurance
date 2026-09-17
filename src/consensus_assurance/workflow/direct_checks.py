@@ -20,8 +20,8 @@ def validate_question(question):
         raise ValueError('New autonomous units need a typed question disposition')
     if question.disposition=='ready_for_check' and question.preferred_check is None:
         raise ValueError('Ready question needs preferred_check')
-    if question.disposition=='needs_specific_evidence' and not question.requests and not any(p.unknowns for p in question.points):
-        raise ValueError('Evidence question needs exact requests or a named discriminator in point unknowns')
+    if question.disposition=='needs_specific_evidence' and not question.requests and not question.unknowns:
+        raise ValueError('Evidence question needs exact requests or a named discriminator in question unknowns')
     if question.preferred_check in {'direct_test','controlled_schedule'} and (not question.event_paths or not question.trigger_rationale.strip()):
         raise ValueError('Executable question needs legal event paths, observations and oracle rationale')
 
@@ -154,7 +154,7 @@ def assess(state,unit,artifact,plan,check,events):
     if readiness(state,unit)['status']!='reviewed':limitations.append('Selected question semantics remain exploratory')
     correspondence=[r for r in state.semantic_reviews if r.target_versions.get(artifact.id)==artifact.version and any(i.target_id==artifact.id and i.aspect=='checker_correspondence' and i.status=='no_issue_found' and not i.limitations for i in r.items)]
     if not correspondence:limitations.append('Direct oracle correspondence is unreviewed')
-    if semantics['open_issues'] or any(i['status']!='no_issue_found' or i['limitations'] for i in semantics['judgments']):limitations.append('Unresolved semantic counterevidence')
+    if semantics['open_issues'] or any(i['status']!='no_issue_found' or i['limitations'] or i.get('counterevidence') for i in semantics['judgments']):limitations.append('Unresolved semantic counterevidence')
     current={o.id:o.version for o in state.claims+state.bindings+state.relations+state.units+state.direct_checks}
     from .reviews import valid_supersession
     for task in state.inquiry_tasks:
@@ -280,12 +280,13 @@ def continue_question(engine,unit):
         if reply.patch and (reply.requests or reply.question.requests):raise ValueError('Acquire required source before applying a scope patch')
         validate_question(reply.question)
         old=q.model_dump();new=reply.question.model_dump()
-        for field_name in ('question','importance'):
-            if new[field_name]!=old[field_name]:raise ValueError('Question continuation preserves meaning; reinterpretation requires F2')
-        for field_name in ('source_ids','participants','objects','contexts','event_paths'):
-            if not set(old[field_name])<=set(new[field_name]):raise ValueError('Question continuation cannot erase existing scope or counterevidence')
-        for point in q.points:
-            if point not in reply.question.points:raise ValueError('Retain old coverage opinions; resolve individual issues through semantic review')
+        from .audit_spec import IDENTITY, load, validate_question as validate_spec_question
+        if any(new[key]!=old[key] for key in IDENTITY):
+            raise ValueError('Question structural meaning changed; use attributed F2 or scope reconnect')
+        if not set(q.counterevidence)<=set(reply.question.counterevidence) or not set(q.unknowns)<=set(reply.question.unknowns):
+            raise ValueError('Retain unresolved counterevidence; resolve individual issues through semantic review')
+        spec=load(state)
+        if spec:validate_spec_question(spec,reply.question)
         if reply.patch:
             if len(reply.patch.units)!=1 or reply.patch.units[0].audit_question!=reply.question:raise ValueError('Scope continuation must carry the same complete question on its reconnected unit')
             from .scope_updates import from_patch,validate_scope_update

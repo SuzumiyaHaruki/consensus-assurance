@@ -67,7 +67,7 @@ def test_unresolved_semantic_review_prevents_implementation_upgrade(prepared,tmp
     _,state,bundle,_=prepared
     model=save_bundle(tmp_path,state,state.units[0],bundle,ToyImplementation())
     claim=next(c for c in state.claims if c.id==model.claim_id)
-    state.semantic_reviews.append(SemanticReview(task_id='task',check_id='agent-review',target_versions={claim.id:claim.version},material_ids=claim.source_ids,origin='mock',items=[SemanticCheck(target_id=claim.id,aspect='applicability',status='disputed',source_ids=claim.source_ids,explanation='The selected configuration may promise a different result',alternatives='A weaker configured guarantee exists',counterexample_reasoning='A passing local checker does not resolve the configuration')]))
+    state.semantic_reviews.append(SemanticReview(task_id='task',check_id='agent-review',target_versions={claim.id:claim.version},material_ids=claim.source_ids,origin='mock',items=[SemanticCheck(target_id=claim.id,aspect='applicability',status='disputed',source_ids=claim.source_ids,rationale='The selected configuration may promise a different result' + "\n" + 'A weaker configured guarantee exists' + "\n" + 'A passing local checker does not resolve the configuration')]))
     assert any('Unresolved semantic review' in s for s in semantic_limitations(state,model))
     assert claim.assessment.value=='unassessed'
 
@@ -97,7 +97,7 @@ def test_checker_dispute_survives_a_new_replay_model_version(prepared,tmp_path):
     _,state,bundle,_=prepared
     first=save_bundle(tmp_path,state,state.units[0],bundle,ToyImplementation())
     second=save_bundle(tmp_path,state,state.units[0],bundle,ToyImplementation(),previous=first,reason='New experiment only')
-    item=SemanticCheck(target_id=first.id,aspect='checker_correspondence',status='disputed',source_ids=['README.md:1:5'],explanation='The antecedent may never trigger',alternatives='Inspect actual triggering paths',counterexample_reasoning='An unreachable trigger can make the checker vacuous')
+    item=SemanticCheck(target_id=first.id,aspect='checker_correspondence',status='disputed',source_ids=[next(m.id for m in state.materials if m.file=='README.md')],rationale='The antecedent may never trigger' + "\n" + 'Inspect actual triggering paths' + "\n" + 'An unreachable trigger can make the checker vacuous')
     state.semantic_reviews.append(SemanticReview(task_id='task',check_id='review',model_id=first.id,target_versions={first.id:first.version},material_ids=item.source_ids,origin='mock',items=[item]))
     assert any('antecedent' in s for s in semantic_limitations(state,second))
 

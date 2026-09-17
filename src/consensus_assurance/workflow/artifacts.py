@@ -70,14 +70,15 @@ def validate_bundle(state, unit, bundle, implementation):
                     'constraint_path':prefix+'/constraints/'+str(index),
                     'preservation':'Correct citation representation only; preserve behavior, property and scope'} )])
     if len({r.id for r in bundle.reachability})!=len(bundle.reachability):raise ValueError("Duplicate reachability requirement")
-    points=unit.coverage_intent+(unit.audit_question.points if unit.audit_question else [])
+    from .audit_spec import reachability_refs
+    selected_refs=reachability_refs(unit.audit_question)
     for requirement in bundle.reachability:
         names=requirement.sequence+([requirement.identity_operator] if requirement.identity_operator else []) if requirement.sequence else [requirement.operator]
         if requirement.sequence and (len(requirement.sequence)<2 or not requirement.identity_operator):raise ValueError("Sequential reachability requires at least two predicates and an explicit identity operator")
         for name in names:
             if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*",name) or not re.search(r"\b"+name+r"\s*==",tla_code(bundle.behavior)):
                 raise ValueError("Reachability requires an actual named Behavior operator")
-        if not requirement.claim_ids or not set(requirement.point_ids)<={p.id for p in points}:raise ValueError("Reachability must link claims and known audit question points")
+        if not requirement.claim_ids or not reachability_refs(requirement)<=selected_refs:raise ValueError("Reachability must link claims and selected behavior/fact/handoff references")
         if not set(requirement.claim_ids)<=checked_ids:raise ValueError("Reachability requirement references an unchecked claim")
     def context_error(message):
         from consensus_assurance.core.diagnostics import Diagnostic,DiagnosticError

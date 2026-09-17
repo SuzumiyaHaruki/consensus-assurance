@@ -9,12 +9,12 @@ from consensus_assurance.plugins.implementations.hashicorp_raft.adapter import H
 from consensus_assurance.workflow.discovery import context
 from consensus_assurance.workflow.task_packet import prepare,pool_sources
 from consensus_assurance.workflow.prompts import render
-from test_round6_boundaries import controller
+from test_graph_mutations import controller
 
 ARCHIVE=Path(__file__).resolve().parents[2]/'runs/2026-09-16_13-58-11-hashicorp_raft-real-run'
 
 def archived_engine(version):
-    state=Analysis.model_validate_json((ARCHIVE/'history'/(version+'.json')).read_text())
+    state=Analysis.model_validate(__import__("consensus_assurance.workflow.history",fromlist=["import_record"]).import_record(json.loads((ARCHIVE/'history'/(version+'.json')).read_text())))
     return SimpleNamespace(state=state,root=ARCHIVE,config=Config.model_validate(state.config),implementation=HashicorpRaft(),budget=SimpleNamespace(remaining=lambda:1))
 
 @pytest.mark.parametrize('version',['862b1f3d9ffe43b9a1a61e23f1f19b3e','b69d50c2a0ac4e20897e36c355f034ef'])
@@ -27,7 +27,7 @@ def test_archived_build_packet_fits_without_raising_limit(version):
 
 def test_mixed_history_projects_only_relevant_items_and_retains_counterevidence(tmp_path,prepared):
     _,s,_,_=prepared;e=controller(tmp_path,s);u=s.units[0];target=u.obligation_ids[0]
-    def item(id,status,text):return SemanticCheck(target_id=id,aspect='applicability',status=status,source_ids=s.claims[0].source_ids,explanation=text,alternatives='Alternate mechanism possible',counterexample_reasoning='Actual evidence is required')
+    def item(id,status,text):return SemanticCheck(target_id=id,aspect='applicability',status=status,source_ids=s.claims[0].source_ids,rationale=text + "\n" + 'Alternate mechanism possible' + "\n" + 'Actual evidence is required')
     before=len(json.dumps(context(e,u)))
     for n in range(50):
         s.semantic_reviews.append(SemanticReview(task_id='other',check_id='fixture',target_versions={target:1,'unrelated':1},material_ids=[],items=[item(target,'no_issue_found','Same scoped judgment'),item('unrelated','disputed','UNRELATED HISTORY '+str(n)+'x'*3000)],origin='mock'))
@@ -75,7 +75,7 @@ def test_deferred_wake_is_based_on_serializable_dependency_change(tmp_path,prepa
     e=controller(tmp_path,state);unit=state.units[0]
     state.active_unit_id=unit.id;state.next_action='build';unit.status='selected'
     pause_unit(e,'Cached necessary material not attached')
-    e.state=Analysis.model_validate_json(e.state.model_dump_json())
+    e.state=Analysis.model_validate(__import__("consensus_assurance.workflow.history",fromlist=["import_record"]).import_record(json.loads(e.state.model_dump_json())))
     e.budget.state=e.state
     assert not wake_changed(e)
     id=e.state.materials[-1].id
@@ -90,12 +90,13 @@ def test_skill_routing_loads_actual_behavior_method_without_global_repair_ballas
     from consensus_assurance.workflow.prompts import loaded_resources,manifest
     for task in ('build','F1','F3','technical','diagnose'):
         paths=loaded_resources(task,{})['paths']
-        assert 'skills/consensus-analysis/references/behavior-obligations.md' in paths
+        assert 'skills/consensus-analysis/references/behavior-facts.md' in paths
         text=render(task,{'modeling_brief':{'unit_id':'synthetic'}})
-        assert 'Semantic effect:' in text and 'A phase name does not' in text
-        assert 'Configuration/membership:' in text and 'Minimal discriminator:' in text
+        from importlib.resources import files
+        assert files('consensus_assurance').joinpath('resources/skills/consensus-analysis/references/behavior-facts.md').read_text() in text
+        assert 'Configuration:' in text and 'discriminator' in text
     assert 'skills/consensus-analysis/references/graph-repair.md' not in loaded_resources('build',{})['paths']
-    assert 'responsibilities-and-behaviors.md' in ' '.join(loaded_resources('discover',{})['paths'])
+    assert 'activity-classes.md' in ' '.join(loaded_resources('discover',{})['paths'])
     for task in manifest()['tasks']:
         assert 'STRUCTURED INPUT DATA' in render(task,{'original_task':'build'} if task=='retry' else {})
 

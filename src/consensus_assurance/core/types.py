@@ -2,6 +2,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Literal
+from typing_extensions import TypedDict
 from uuid import uuid4
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -25,15 +26,133 @@ class ReadRequest(Record):
     reason: str
 
 
-class CoveragePoint(Record):
-    sequence_required: bool = False
-    id: str
-    phase: Literal["establish", "maintain", "use", "handoff", "recover", "other"]
-    source_ids: list[str] = Field(min_length=1)
-    binding_ids: list[str] = []
-    claim_ids: list[str] = []
-    question: str
+ActivityClass = Literal["A1", "A2", "A3", "A4", "A5", "A6", "A7"]
+Lifecycle = Literal["establishment", "preservation", "consumption", "recovery", "cross_activity_handoff"]
+
+
+class TargetProfile(Record):
+    system_boundary: str
+    protocol_contexts: list[str] = []
+    external_interfaces: list[str] = []
+    ownership: list[str] = []
+    selection_injection: list[str] = []
+    variants: list[str] = []
+    source_ids: list[str] = []
     unknowns: list[str] = []
+
+
+class ActivityCoverage(TypedDict):
+    behavior: Literal["unknown", "partial", "recovered"]
+    fact: Literal["unknown", "partial", "recovered"]
+    handoff: Literal["unknown", "partial", "recovered"]
+
+
+class Activity(Record):
+    class_id: ActivityClass
+    applicability: Literal["applicable", "externalized", "not_applicable", "unknown"]
+    purpose: str
+    realization_summary: str
+    entry_points: list[str] = []
+    behavior_ids: list[str] = Field(default_factory=list, json_schema_extra={"x-controller-derived": True}, description="Derived from Behavior.primary_activity")
+    fact_ids: list[str] = []
+    handoff_ids: list[str] = []
+    variants: list[str] = []
+    unknowns: list[str] = []
+    source_ids: list[str] = []
+    coverage: ActivityCoverage
+
+
+class Behavior(Record):
+    id: str
+    primary_activity: ActivityClass
+    execution_owner: str
+    protocol_context: str
+    trigger: str
+    legal_preconditions: list[str] = []
+    implementation_guards: list[str] = []
+    reads: list[str] = []
+    writes: list[str] = []
+    durable_effects: list[str] = []
+    external_effects: list[str] = []
+    important_branches: list[str] = []
+    async_boundaries: list[str] = []
+    produces_fact_ids: list[str] = []
+    consumes_fact_ids: list[str] = []
+    cross_activity_effects: dict[ActivityClass, str] = Field(default_factory=dict, description="Activity ID to a concrete semantic effect description; not feeds, Behavior IDs or an inferred fact guarantee")
+    existing_protections: list[str] = []
+    source_ids: list[str] = Field(min_length=1)
+    unknowns: list[str] = []
+
+
+class Fact(Record):
+    id: str
+    meaning: str
+    identity: dict[str, str]
+    established_by: list[str] = Field(default_factory=list, json_schema_extra={"x-controller-derived": True}, description="Derived from Behavior.produces_fact_ids; never infer an unread producer")
+    consumed_by: list[str] = Field(default_factory=list, json_schema_extra={"x-controller-derived": True}, description="Derived from Behavior.consumes_fact_ids")
+    validity_context: str
+    representation: list[str]
+    invalidators: list[str] = Field(default_factory=list, description="Existing Behavior IDs only. Unread events or suspected invalidators belong in unknowns.")
+    reinterpreters: list[str] = Field(default_factory=list, description="Existing Behavior IDs only, not event descriptions or Activity IDs.")
+    durability: str
+    recovery: str
+    source_ids: list[str] = Field(min_length=1)
+    unknowns: list[str] = []
+
+
+class Handoff(Record):
+    id: str
+    fact_id: str
+    producer_activity: ActivityClass
+    consumer_activity: ActivityClass
+    producer_behavior_ids: list[str]
+    consumer_behavior_ids: list[str]
+    consumer_expectation: str
+    existing_protections: list[str] = []
+    unresolved_gap: str = ""
+    source_ids: list[str] = Field(min_length=1)
+
+
+class Surface(Record):
+    entry_point: str
+    disposition: Literal["mapped", "externalized", "infrastructure", "deferred", "UNCLASSIFIED_PROTOCOL_RESPONSIBILITY"]
+    behavior_ids: list[str] = []
+    reason: str
+    source_ids: list[str] = []
+    high_consequence: bool = False
+
+
+class ConsensusAuditSpec(Record):
+    version: int = 1
+    target_profile: TargetProfile
+    activities: list[Activity] = Field(min_length=7, max_length=7)
+    behaviors: list[Behavior] = []
+    facts: list[Fact] = []
+    handoffs: list[Handoff] = []
+    unclassified: list[Surface] = []
+    coverage_summary: list[Surface] = []
+
+    @model_validator(mode="before")
+    @classmethod
+    def derive_indexes(cls, value):
+        if not isinstance(value, dict):return value
+        import copy
+        value=copy.deepcopy(value)
+        behaviors=value.get('behaviors',[])
+        get=lambda x,k,default=None: x.get(k,default) if isinstance(x,dict) else getattr(x,k,default)
+        for a in value.get('activities',[]):
+            if isinstance(a,dict):a.setdefault('behavior_ids',[get(b,'id') for b in behaviors if get(b,'primary_activity')==a.get('class_id')])
+        for f in value.get('facts',[]):
+            if isinstance(f,dict):
+                for key,edge in [('established_by','produces_fact_ids'),('consumed_by','consumes_fact_ids')]:
+                    f.setdefault(key,[get(b,'id') for b in behaviors if f.get('id') in get(b,edge,[])])
+        return value
+
+    @model_validator(mode="after")
+    def seven_coordinates(self):
+        if {a.class_id for a in self.activities} != {"A1", "A2", "A3", "A4", "A5", "A6", "A7"}:
+            raise ValueError("Specify each of the seven activity classes exactly once")
+        return self
 
 
 class AuditQuestion(Record):
@@ -47,7 +166,14 @@ class AuditQuestion(Record):
     objects: list[str] = []
     contexts: list[str] = []
     event_paths: list[str] = []
-    points: list[CoveragePoint] = []
+    activity_classes: list[ActivityClass] = []
+    behavior_ids: list[str] = []
+    fact_ids: list[str] = []
+    handoff_ids: list[str] = []
+    obligation_relation_kind: Lifecycle | None = None
+    counterevidence: list[str] = []
+    unknowns: list[str] = []
+    priority: int = Field(default=0, ge=0, le=3, description="Consequence and handoff significance, justified in importance; not proof")
     trigger_rationale: str
 
 
@@ -57,7 +183,9 @@ class ReachabilityRequirement(Record):
     id: str
     operator: str
     claim_ids: list[str] = Field(min_length=1)
-    point_ids: list[str] = []
+    behavior_ids: list[str] = []
+    fact_ids: list[str] = []
+    handoff_ids: list[str] = []
     description: str
 
 
@@ -68,26 +196,6 @@ class ReachabilityResult(Record):
     status: Literal["reachable", "unreachable", "unknown"]
     search_fingerprint: str
     reason: str
-
-
-class ResponsibilityHandoff(Record):
-    covered_by_unit_ids: list[str] = []
-    no_separate_check_reason: str = ""
-    target_id: str
-    source_ids: list[str] = Field(min_length=1)
-    description: str
-
-
-class Responsibility(Record):
-    id: str
-    description: str
-    source_ids: list[str] = Field(min_length=1)
-    entry_points: list[str] = []
-    claim_ids: list[str] = []
-    handoffs: list[ResponsibilityHandoff] = []
-    questions: list[str] = []
-    applicability: str
-    version: int = 1
 
 
 class InquiryTask(Record):
@@ -103,10 +211,10 @@ class InquiryTask(Record):
     repair_session: dict | None = None
     resolution_issue_ids: list[str] = []
     id: str = Field(default_factory=uid)
-    kind: Literal["explore", "review"]
+    kind: Literal["spec_refine", "review"]
     reason: str
     trigger: str
-    responsibility_ids: list[str] = []
+    activity_classes: list[ActivityClass] = []
     target_ids: list[str] = []
     target_versions: dict[str, int] = {}
     unit_id: str | None = None
@@ -123,14 +231,12 @@ class InquiryTask(Record):
 
 
 class SemanticCheck(Record):
-    scope_limitations: list[str] = Field(default_factory=list, description="Independent scope boundaries, not unresolved conditions needed for this judgment; never relabel contrary evidence here")
     target_id: str
     aspect: Literal["applicability", "decomposition", "checker_correspondence"]
     status: Literal["no_issue_found", "needs_reading", "disputed", "revision_needed"]
     source_ids: list[str] = Field(min_length=1)
-    explanation: str
-    alternatives: str
-    counterexample_reasoning: str
+    rationale: str
+    counterevidence: list[str] = []
     limitations: list[str] = []
 
 
@@ -542,7 +648,6 @@ class AuditUnit(Record):
     semantic_readiness: dict[str, Any] = {}
     audit_question: AuditQuestion | None = None
     code_uses: list[CodeUse] = []
-    coverage_intent: list[CoveragePoint] = []
     coverage_limitations: list[str] = []
 
 
@@ -642,8 +747,8 @@ class Analysis(Record):
     action_history: list[PendingAction] = []
     targeted_gap: dict | None = None
     monitor_results: list[dict] = []
-    responsibilities: list[Responsibility] = []
-    responsibility_history: list[dict] = []
+    audit_spec_path: str | None = None
+    audit_spec_version: int = 0
     inquiry_tasks: list[InquiryTask] = []
     semantic_reviews: list[SemanticReview] = []
     review_issues: list[ReviewIssue] = []

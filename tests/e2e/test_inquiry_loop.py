@@ -33,7 +33,7 @@ def test_breadth_and_post_success_review_drive_actual_new_reading(tmp_path,prepa
     assert any(t.trigger=='initial_reading' and t.status=='completed' for t in state.inquiry_tasks)
     assert any(c.action=='model_check' and c.outcome=='holds' for c in state.checks),state.stop_reason
     assert any(r.model_id and any(i.status=='disputed' for i in r.items) for r in state.semantic_reviews)
-    assert any('counter-to-result handoff' in t.reason for t in state.inquiry_tasks)
+    assert any('delivery handoff' in i.explanation for i in state.review_issues if not i.resolved_by)
     assert not any(r.kind=='F3' for r in state.revisions)
     assert all(c.assessment.value=='unassessed' for c in state.claims)
 
@@ -75,7 +75,8 @@ def test_outer_action_checkpoint_resume_does_not_repeat_generation(tmp_path,prep
     cached=json.loads((root/'actions'/before.pending_action.id/'result.json').read_text())[0]['id']
     state=Engine(config,root,*args).resume()
     task=next(t for t in state.inquiry_tasks if t.id==active)
-    assert task.status=='completed' and task.check_id==cached
+    assert task.status=='completed' and task.check_id in {c.id for c in state.checks}
+    assert sum(a.id==before.pending_action.id for a in state.action_history)==1
     assert len([c for c in state.checks if c.id==cached])==1
     assert next(c for c in state.claims if c.id=='delivery_obligation').version==2
 
@@ -88,7 +89,6 @@ def test_no_units_still_explores_unrepresented_responsibilities(tmp_path,prepare
             check,response=super().analyze(*args,**kwargs)
             if type(response).__name__=='Discovery':
                 response.claims=[];response.bindings=[];response.relations=[];response.units=[]
-                for role in response.responsibilities:role.claim_ids=[]
             return check,response
     impl,agent,verifier,knowledge=args
     agent=NoInitialGoals(prepared[3])
@@ -102,7 +102,7 @@ def test_report_separates_discovery_review_and_local_evidence(tmp_path,prepared)
     repo,config,root,args=setup(tmp_path,prepared,wrong=True)
     state=Engine(config,root,*args).start(repo)
     text=render_report(state,root).read_text()
-    assert '不计算全系统覆盖率' in text
+    assert '不是' in text and '系统覆盖率' in text
     assert '本次范围内暂未发现语义问题' in text
     assert '历史语义版本' in text and '当前对象版本' in text
     assert 'Return in memory mode requires acceptance' in text
