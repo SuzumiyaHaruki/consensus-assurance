@@ -156,7 +156,7 @@ def test_exact_selected_reads_then_one_focused_continuation(tmp_path,prepared):
     q=u.audit_question;q.disposition='needs_specific_evidence';q.preferred_check=None
     q.requests=[ReadRequest(file='adapter.py',start_line=1,end_line=1,reason='Selected consumer ownership discriminator')]
     e.state.next_action='question';calls=[]
-    def ask(kind,response_type,context,validator=None):
+    def ask(kind,response_type,context,validator=None,**kwargs):
         calls.append(kind)
         assert any(m['file']=='adapter.py' for m in context['materials'])
         answered=q.model_copy(deep=True);answered.requests=[];answered.disposition='explained_by_existing_mechanism'
@@ -175,7 +175,7 @@ def test_exact_selected_reads_then_one_focused_continuation(tmp_path,prepared):
 def test_direct_violation_enters_separate_consequence_analysis(tmp_path,prepared):
     e,u,p=setup(tmp_path,prepared,True);a=save_plan(e,u,p,'consequence');review(e.state,u,a)
     execute(e,a,p);e.state.active_direct_check_id=a.id;e.state.next_action='direct_assess';calls=[]
-    def ask(kind,response_type,context,validator=None):
+    def ask(kind,response_type,context,validator=None,**kwargs):
         calls.append(kind)
         reply=ConsequenceReply(disposition='obligation_only',rationale='Only this local return is observed; wider goal consequences are unestablished',source_ids=u.audit_question.source_ids,limitations=['No correlated system-level witness'])
         if validator:validator(reply)
@@ -204,7 +204,7 @@ def test_source_continuation_uses_existing_attributed_F2(tmp_path,prepared):
         patch=GraphPatch(claims=[draft],expected_versions={claim.id:claim.version},rationale='Explicit semantic refinement'),
         changes=[JudgmentChange(target_id=claim.id,field='description',old_value_json=json.dumps(claim.description),new_value_json=json.dumps(draft.description))],
         old_judgment=claim.description,new_judgment=draft.description,grounding=claim.grounding)
-    def ask(kind,response_type,context,validator=None):
+    def ask(kind,response_type,context,validator=None,**kwargs):
         response=QuestionReply(question=u.audit_question,explanation='Explicit F2 before another check',revision=revision)
         if validator:validator(response)
         return response,CheckRun(action='agent',cwd=str(e.root),snapshot_id=e.state.snapshot.id)
@@ -229,7 +229,7 @@ def test_direct_F4_keeps_failed_prerequisite_and_revision_history(tmp_path,prepa
     proceed(e,u,'direct_assess')
     assert e.state.pending_feedback['kind']=='F4'
     fixed=p.model_copy(deep=True);fixed.harness.prerequisites[0].event='admitted'
-    def ask(kind,response_type,context,validator=None):
+    def ask(kind,response_type,context,validator=None,**kwargs):
         reply=DirectCheckReply(plan=fixed,gap='')
         if validator:validator(reply)
         return reply,CheckRun(action='agent',cwd=str(e.root),snapshot_id=e.state.snapshot.id)
@@ -247,7 +247,7 @@ def test_question_narrowing_preserves_structural_identity_and_counterevidence(tm
     q=u.audit_question;q.disposition='concrete_suspicion';q.preferred_check='direct_test'
     q.activity_classes=['A6'];q.behavior_ids=['producer'];q.fact_ids=['representation'];q.obligation_relation_kind='preservation'
     q.counterevidence=['Consumer contract remains unverified'];q.unknowns=['Injected adapter applicability']
-    def ask(kind,response_type,context,validator=None):
+    def ask(kind,response_type,context,validator=None,**kwargs):
         narrowed=q.model_copy(deep=True);narrowed.question='Which consumer contract requires preserving this same representation?'
         narrowed.importance='Consequences depend on the same original recovery contract'
         narrowed.disposition='needs_specific_evidence';narrowed.preferred_check='source_review'

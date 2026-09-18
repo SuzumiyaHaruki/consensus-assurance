@@ -107,11 +107,13 @@ def choose_task(engine):
 
 
 def read_purpose(task):
-    return 'depth' if task.unit_id or task.kind=='review' else 'breadth'
+    return 'depth' if task.candidate_id or task.unit_id or task.kind=='review' else 'breadth'
 
 
 def task_context(engine,task):
     state=engine.state; available=objects(state)
+    candidate=next((c for c in state.question_candidates if c.id==task.candidate_id),None)
+    focus=candidate.question if candidate else None
     seeds=set(task.target_ids)
     if task.kind=='spec_refine' and task.unit_id:seeds.add(task.unit_id)
     wanted,closure=material_closure(state,seeds)
@@ -122,7 +124,7 @@ def task_context(engine,task):
         if (issue.target_id in closure or issue.id in task.resolution_issue_ids) and not issue.resolved_by:wanted.update(issue.source_ids)
     if task.kind=='spec_refine':
         from .audit_spec import slice_for, source_ids
-        view=slice_for(state,classes=task.activity_classes)
+        view=slice_for(state,focus,classes=task.activity_classes)
         if view and not task.diagnostics:
             wanted.update(source_ids(view))
         wanted.update(m.id for m in state.materials if m.file.lower().endswith('readme.md'))
@@ -138,7 +140,7 @@ def task_context(engine,task):
     selected=[m for m in state.materials if m.id in wanted]
     task.material_ids=[m.id for m in selected]
     task.unit_version=next((u.version for u in state.units if u.id==task.unit_id),None)
-    result={'pending_scope_updates':pending_scope,'task':task.model_dump(mode='json',exclude={'context_receipt_id','context_dependencies','admitted','preparation_failures','child_task_ids'}),'audit_spec':slice_for(state,classes=task.activity_classes) if task.kind=='spec_refine' else None,
+    result={'pending_scope_updates':pending_scope,'task':task.model_dump(mode='json',exclude={'context_receipt_id','context_dependencies','admitted','preparation_failures','child_task_ids'}),'audit_spec':slice_for(state,focus,classes=task.activity_classes) if task.kind=='spec_refine' else None,
         'materials':[m.model_dump(mode='json') for m in selected],
         'omitted_material_ids':[m.id for m in state.materials if m.id not in wanted],
         'catalogue':[],
@@ -151,6 +153,9 @@ def task_context(engine,task):
         'open_issues':[i.model_dump(mode='json',exclude_defaults=True,exclude_none=True) for i in state.review_issues if (i.target_id in closure or i.id in task.resolution_issue_ids) and not i.resolved_by],
         'blocked_review_tasks':[{'id':t.id,'target_ids':t.target_ids,'target_versions':t.target_versions,'requested_aspects':t.requested_aspects,'model_id':t.model_id,'stop_reason':t.stop_reason} for t in state.inquiry_tasks if t.kind=='review' and t.status=='blocked' and not t.superseded_by and set(t.target_ids)<=set(task.target_ids)],
         'overview_limit':'This compact index is not complete implementation coverage; request specific actual ranges before deriving new claims'}
+    if focus:
+        result['selected_question']=focus.model_dump(mode='json')
+        result['source_receipt']=state.read_plans.get(task.read_plan_id)
     if task.kind=='spec_refine' and not task.activity_classes:
         result['claims']=[{'id':c.id,'kind':c.kind,'description':c.description,'version':c.version} for c in state.claims]
     if draft:result.update(draft_audit_spec=draft,diagnostics=active,remaining_issue_groups=[[d['object_ids'] for d in group] for group in groups[1:]])
@@ -230,7 +235,7 @@ def process_task(engine, task):
         receipt=engine.read(task.requests,purpose=read_purpose(task),partial=read_purpose(task)=='breadth',plan_id=task.read_plan_id,related_ids=task.target_ids+task.activity_classes+([task.unit_id] if task.unit_id else []),reason=task.reason)
         task=next(t for t in state.inquiry_tasks if t.id==task.id)
         task.added_material_ids=list(dict.fromkeys(task.added_material_ids+[id for item in receipt['items'] if item['status']!='deferred' for id in item['material_ids']]))
-        if receipt['status']!='complete':
+        if receipt['status']!='complete' and not task.candidate_id:
             raise Blocked('Requested inquiry material is deferred within its protected allowance; unmet requests remain in the receipt')
         task.stage='analyze';release_action(engine)
         write_json(engine.root/'materials.json',[m.model_dump(mode='json') for m in state.materials]);engine.checkpoint('inquiry_materials_read')
@@ -238,7 +243,7 @@ def process_task(engine, task):
     context=task_context(engine,task)
     if task.kind=='spec_refine':
         from .audit_spec import SpecIssue
-        try:reply,check=engine.ask('spec_refine',SpecRefinement,context,lambda p:validate_spec_refinement(state,p))
+        try:reply,check=engine.ask('spec_refine',SpecRefinement,context,lambda p:validate_spec_refinement(state,p),purpose=read_purpose(task))
         except SpecIssue as exc:
             task.draft_path=exc.draft_path;task.diagnostics=[d.model_dump(mode='json') for d in exc.diagnostics]
             task.status='pending';task.admitted=False;state.active_inquiry_id=None

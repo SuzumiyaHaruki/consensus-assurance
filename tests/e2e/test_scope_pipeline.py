@@ -30,7 +30,8 @@ class ScopeAgent(MockAgent):
             else:
                 assert p['unit']['previous_id'] and 'input_binding' in p['unit']['binding_ids']
                 assert p['unit']['obligation_ids']==['step_obligation']
-                response={'bundle':copy.deepcopy(self.data[5]),'gap':''}
+                from regression_support import fixture_reachability
+                response={'bundle':fixture_reachability(self.data[5]),'gap':''}
                 for constraint in response['bundle']['constraints']:
                     selected=[b for b in p['bindings'] if b['id'] in constraint.get('binding_ids',[])]
                     if selected:

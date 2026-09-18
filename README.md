@@ -2,9 +2,9 @@
 
 **领域引导、实现为据的 CFT 义务审计。** 从 Activity、Behavior、Fact 理解实现，推导 Obligation 和有界 AuditQuestion，由 Evidence 限定结论范围。
 
-系统先从仓库材料恢复七类 Activity 及 Behavior/Fact 整体规格，再推导候选义务与代码关系，按当前问题优先取得关键材料、执行直接检查或局部模型，并保留有限覆盖探索和语义复核。实现包括英文 agent 技能、受控代码实验、TLA+/TLC 搜索、轨迹校准、F1—F4 反馈及恢复。候选图不是整体正确性证明，也没有已知的全系统覆盖率分母。
+系统先从仓库材料恢复七类 Activity 及 Behavior/Fact 整体规格，再选中结构化问题，补读后解释关闭或推导义务与代码关系，按当前问题优先取得关键材料、执行直接检查或局部模型，并保留有限覆盖探索和语义复核。实现包括英文 agent 技能、受控代码实验、TLA+/TLC 搜索、轨迹校准、F1—F4 反馈及恢复。候选图不是整体正确性证明，也没有已知的全系统覆盖率分母。
 
-当前保留的真实运行见 [实验报告](runs/2026-09-18_10-29-33-hashicorp_raft-real-run/report.md)。本次使用 3 次 agent 调用、426.98 秒，描述性规格已受理，义务推导因关系引用合同与诊断缺口受阻；0 个受理审计单元、模型、TLC 性质搜索或性质证据。当前工作区已对齐该图合同并完成离线重放；原运行仍是失败记录，不能视为 HashiCorp 缺陷或新版本自主验收。
+当前保留的真实运行见 [实验报告](runs/2026-09-18_13-43-11-hashicorp_raft-real-run/report.md)。本次使用 9 次 agent 调用、756.11 秒，AuditSpec 已受理，选中候选的补读已正确使用 depth；快照候选仍缺错误传播责任的适用合同依据，尚无受理义务、审计单元或性质证据。框架未接受“无明确下一读取范围的证据不足”作为候选延期结果，误入语义修复后整轮停止，候选仍记录为 active。这是尚未修复的候选收敛缺口，不是已确认的 HashiCorp 缺陷。原归档保留失败状态。
 
 当前实现将任务工作集与完整审计历史分开，并允许先保存有据的模型、后补 harness。语法检查、探索性搜索、真实轨迹校准与实现确认分别记录。当前方法见 [审计方法](docs/审计方法.md)，不代表已重新完成 HashiCorp 自主实验。
 
@@ -81,4 +81,4 @@ TLC_JAR="$TLC_JAR" .venv/bin/python -m pytest -q
 
 项目仓库：[SuzumiyaHaruki/consensus-assurance](https://github.com/SuzumiyaHaruki/consensus-assurance)。
 
-当前版本为 `obligation-audit-v2`：描述性 discovery 与单主要义务 derive 分开，理解错误通过 spec_refine 重整。完整流程和证据边界见 [审计方法](docs/审计方法.md)，选定失败及清理记录见 [运行索引](runs/README.md)。
+当前版本为 `selected-question-v3`：描述性 discovery 之后先选结构化 AuditQuestion，再补读、解释关闭或升级为一个主要义务；实际理解错误才通过 spec_refine 重整。完整流程和证据边界见 [审计方法](docs/审计方法.md)，选定失败及清理记录见 [运行索引](runs/README.md)。

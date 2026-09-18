@@ -152,6 +152,22 @@ class AuditQuestion(Record):
     trigger_rationale: str
 
 
+class QuestionCandidate(Record):
+    """Controller continuation; semantic content lives only in AuditQuestion."""
+    id: str = Field(default_factory=uid)
+    question: AuditQuestion
+    history: list[AuditQuestion] = []
+    check_ids: list[str] = []
+    status: Literal["active", "explained", "escalated", "blocked"] = "active"
+    stage: Literal["read", "analyze"] = "analyze"
+    read_plan_id: str | None = None
+    material_ids: list[str] = []
+    spec_task_ids: list[str] = []
+    stagnation: int = 0
+    stop_reason: str = ""
+    obligation_id: str | None = None
+
+
 class ReachabilityRequirement(Record):
     sequence: list[str] = []
     identity_operator: str | None = None
@@ -173,6 +189,7 @@ class ReachabilityResult(Record):
 
 
 class InquiryTask(Record):
+    candidate_id: str | None = None
     draft_path: str | None = None
     diagnostics: list[dict] = []
     admitted: bool = False
@@ -650,6 +667,7 @@ class Capability(Record):
 
 
 class Analysis(Record):
+    question_candidates: list[QuestionCandidate] = []
     direct_checks: list[DirectCheckArtifact] = []
     active_direct_check_id: str | None = None
     question_continuations: dict[str, dict] = {}

@@ -42,7 +42,7 @@ def test_recorded_derivation_contract_to_source_review(tmp_path,debt):
         from consensus_assurance.core.proposals import DescriptiveIssue,SpecRefinement
         reply.descriptive_issues=[DescriptiveIssue(object_ids=['B5' if debt=='selected' else 'B6'],source_ids=reply.obligation.source_ids,reason='Restore the source-backed protections omitted from the selected behavior' if debt=='selected' else 'Recheck the unrelated decomposition against actual source')]
     validate_derivation(state,reply);accepted=accept_derivation(engine,reply,'offline-recorded')
-    tasks=[t for t in engine.state.inquiry_tasks if t.trigger.startswith('derive-issue:')]
+    tasks=[t for t in engine.state.inquiry_tasks if t.kind=='spec_refine' and t.diagnostics]
     assert bool(tasks)==bool(debt)
     if debt=='selected':
         assert not accepted and not engine.state.units

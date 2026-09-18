@@ -149,6 +149,15 @@ def test_initial_replay_then_F4_and_attribution_continue(tmp_path,tlc,interrupt_
     binding=BindingDraft(id='ack-code',claim_id='durable',material_id=code.id,symbol='execute',start_line=declaration.lineno,end_line=declaration.end_lineno,description='Actual acceptance and return ordering',pending=[])
     edge=RelationDraft(id='supports_ack',source='ack_goal',target='durable',kind='depends_all',group=None,rationale='Return guarantee depends on the configured durability responsibility',pending=[],grounding=basis)
     u=UnitDraft(id='ack',obligation_ids=['durable'],binding_ids=['ack-code'],relation_ids=[],scope=unit.scope,rationale='Fixture candidate selection',)
+    from consensus_assurance.core.types import AuditQuestion,ReachabilityRequirement
+    from regression_support import descriptive_inventory
+    description=descriptive_inventory(code.id)
+    description.audit_spec.behaviors[0].trigger='Return the accepted operation'
+    description.audit_spec.facts[0].meaning='The selected operation has returned'
+    description.audit_spec.facts[0].representation=['returned']
+    u.audit_question=AuditQuestion(question='Does return establish the configured durability guarantee?',importance='Client durability expectation',source_ids=[code.id],activity_classes=['A1'],behavior_ids=['fixture_step'],fact_ids=['fixture_value'],obligation_relation_kind='establishment',trigger_rationale='Inspect the actual return effect')
+    bundle.behavior=bundle.behavior.replace('vars ==','AckReturned == returned\nvars ==',1)
+    bundle.reachability=[ReachabilityRequirement(id='returned',operator='AckReturned',claim_ids=['durable'],behavior_ids=['fixture_step'],fact_ids=['fixture_value'],description='An actual operation reaches return')]
     graph=GraphDraft(claims=claims,bindings=[binding],relations=[],units=[u],conflicts=[],unexplored=[],)
     missed=bundle.harness.model_copy(deep=True)
     missed.prerequisites[0].event='not_observed_setup'
@@ -157,7 +166,7 @@ def test_initial_replay_then_F4_and_attribution_continue(tmp_path,tlc,interrupt_
     fix=Feedback(kind='F4',rationale='The requested setup event never occurred; correlate the actual acceptance and response',evidence_ids=['placeholder'],target_ids=['placeholder'],relation_ids=[],new_basis='',graph=None,bundle=corrected)
     unresolved=Feedback(kind='unresolved',rationale='Explicit mock cannot confirm implementation correctness',evidence_ids=[],target_ids=[],relation_ids=[],new_basis='',graph=None,bundle=None)
     fixture=tmp_path/'replay-responses.json'
-    fixture.write_text(json.dumps([{'requests':[],'rationale':'Initial files contain the complete fixture'},graph.model_dump(mode='json'),bundle.model_dump(mode='json'),replay.model_dump(mode='json'),fix.model_dump(mode='json'),unresolved.model_dump(mode='json')]))
+    fixture.write_text(json.dumps([{'requests':[],'rationale':'Initial files contain the complete fixture'},description.model_dump(mode='json'),graph.model_dump(mode='json'),bundle.model_dump(mode='json'),replay.model_dump(mode='json'),fix.model_dump(mode='json'),unresolved.model_dump(mode='json')]))
     config=Config(implementation='toy',agent_backend='mock',fixture=str(fixture),tlc_jar=os.environ['TLC_JAR'])
     config.budget.replays=2;config.budget.experiments=4
     class CorrelatedMock(MockAgent):
@@ -184,7 +193,12 @@ def test_initial_replay_then_F4_and_attribution_continue(tmp_path,tlc,interrupt_
         engine=Engine(config,root,impl,CorrelatedMock(fixture),verifier,knowledge)
         state=engine.resume()
     else: state=engine.start(repo)
-    assert state.stop_reason.startswith('No pending'),state.stop_reason
+    # A structured question cannot be declared complete from the counterexample
+    # replay alone: this path has no independent model-trigger search.
+    assert state.stop_reason.startswith('Unfinished obligations remain'),state.stop_reason
+    assert not state.reachability_results
+    from consensus_assurance.workflow.modeling import obligation_progress
+    assert obligation_progress(state,state.units[0])[1]==['durable']
     assert len([c for c in state.checks if c.action=='replay'])==2
     assert [r.kind for r in state.revisions]==['F4']
     assert [r['prerequisites']['status'] for r in state.monitor_results]==['not_reached','matched']

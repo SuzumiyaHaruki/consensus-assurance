@@ -62,7 +62,7 @@ def test_actual_dependency_selected_unit_build_is_explicitly_exploratory(tmp_pat
     config=Config(implementation='toy',agent_backend='mock',allow_experiments=False);config.budget.exploration_rounds=0;config.budget.semantic_reviews=4;config.budget.audit_units=1
     built=[]
     class ObserveBuild(Engine):
-        def ask(self,kind,response_type,context,validator=None):
+        def ask(self,kind,response_type,context,validator=None,**kwargs):
             if kind=='semantic_review':
                 items=[]
                 for obj in context['target_objects']:

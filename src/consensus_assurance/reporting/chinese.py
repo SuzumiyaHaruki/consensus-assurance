@@ -205,6 +205,17 @@ def render_report(state, root):
     for history in state.reading_history:
         if history['gap']:
             lines += [f"定向补读：{history['gap']}；关联 {history['related_ids']}；实际新增片段 {history['added_material_ids']}。"]
+    lines += ['', '## 候选问题与已有保护', '', '候选解释是有来源的分析判断，不是性质证据或协议正确性证明。']
+    if not state.question_candidates:
+        lines.append('历史未记录结构化候选问题。' if state.framework_revision!='selected-question-v3' else '尚未记录结构化候选问题。')
+    for candidate in state.question_candidates:
+        q=candidate.question
+        lines += [f"- 候选 `{candidate.id}`：Fact {q.fact_ids}；生命周期 {q.obligation_relation_kind}；状态 {candidate.status} / {q.disposition}。",
+            f"  问题：{q.question}；意义：{q.importance}。",
+            f"  适用上下文：{q.contexts}；事件路径：{q.event_paths}；来源：{q.source_ids}。",
+            f"  已有保护/反证：{q.counterevidence}；剩余判别与限制：{q.unknowns}。",
+            f"  选择/缩窄依据：{q.trigger_rationale}；历史问题版本：{len(candidate.history)}。",
+            f"  升级义务：{candidate.obligation_id or '未生成'}；候选结论或受阻原因：{candidate.stop_reason or '继续获取证据'}。"]
     lines += inquiry_lines(state)
     lines += ['', '## 未受理草稿分析']
     import json

@@ -49,17 +49,18 @@ def tlc(tmp_path):
 def verification_fixture_inventory(monkeypatch):
     """Materialize the descriptive step in scripted downstream fixture playback."""
     from consensus_assurance.adapters.agents.backend import MockAgent
-    from regression_support import descriptive_inventory,bounded_derivation
+    from regression_support import descriptive_inventory,bounded_derivation,fixture_reachability
     original=MockAgent.__init__
     def initialize(self,fixture=None):
         original(self,fixture)
-        responses=[]
+        responses=[];structured=False
         for reply in self.responses:
             if isinstance(reply,dict) and reply.get('units') and 'claims' in reply and 'expected_versions' not in reply and len(self.responses)>1 and 'requests' in self.responses[0]:
                 if len(responses)==1 and 'requests' in responses[0]:
                     source=reply['claims'][0]['source_ids'][0]
                     responses.append(descriptive_inventory(source).model_dump(mode='json'))
-                response=bounded_derivation(reply);responses.extend([response,response])
+                response=bounded_derivation(reply);structured=response['audit_question']['fact_ids']==['fixture_value'];responses.extend([response,response])
+            elif structured and isinstance(reply,dict) and 'behavior' in reply:responses.append(fixture_reachability(reply))
             else:responses.append(reply)
         self.responses=responses
     monkeypatch.setattr(MockAgent,'__init__',initialize)

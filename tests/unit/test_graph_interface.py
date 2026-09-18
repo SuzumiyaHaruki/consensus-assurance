@@ -27,6 +27,9 @@ def test_saved_draft_repairs_multiple_reference_errors_with_existing_budget(tmp_
     class CandidateOnly(Engine):
         def execute(self,**kwargs):
             self.state.materials=source.materials;self.state.analysis_mode='regression'
+            from regression_support import descriptive_inventory
+            from consensus_assurance.workflow.audit_spec import accept
+            accept(self,descriptive_inventory(source.materials[0].id).audit_spec)
             return self.ask('derive',Derivation,{'materials':[m.model_dump(mode='json') for m in source.materials]},lambda p:validate_derivation(self.state,p))
     engine=CandidateOnly(cfg,tmp_path/'run',*assemble(cfg));result,_=engine.start(repo)
     assert result.model_dump(mode='json')==correct and engine.state.usage['agent_calls']==2

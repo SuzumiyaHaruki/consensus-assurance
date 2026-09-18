@@ -23,8 +23,9 @@ def diagnostics_for(exc,candidate,kind,version,limit):
     return [Diagnostic(code='schema_type' if errors else 'unclassified_validation',category='format' if errors else 'semantic',task=kind,candidate_version=version,paths=[t['path'] for t in targets],message=str(exc),allowed=['representation'] if targets else ['stop'])],targets
 
 
-def ask(engine,kind,response_type,context,validator=None):
+def ask(engine,kind,response_type,context,validator=None,*,purpose="depth"):
     state=engine.state
+    context={**context,'read_purpose':purpose}
     if not engine.agent.mock and not engine.config.allow_agent_materials:raise Blocked('Agent material transmission disabled by configuration; no repository payload was sent')
     def register_citations(response):
         from .sources import citation_ranges
@@ -34,17 +35,17 @@ def ask(engine,kind,response_type,context,validator=None):
     session=state.pending_output_repair
     if session and session.get('task')!=kind:raise Blocked('Another repair session is pending')
     if session and 'id' not in session:raise Blocked('Historical repair needs an explicit migrated child run; original artifacts preserved')
-    logical_task={'unit_id':state.active_unit_id,'model_id':state.active_model_id,'finding_id':state.active_finding_id,'inquiry_id':state.active_inquiry_id}
+    logical_task={'unit_id':state.active_unit_id,'model_id':state.active_model_id,'finding_id':state.active_finding_id,'inquiry_id':state.active_inquiry_id,'candidate_id':next((c.id for c in state.question_candidates if c.status=='active'),None)}
     if session and session.get('logical_task',logical_task)!=logical_task:raise Blocked('The repair session belongs to another logical task')
     if session and session.get('read_plan_id') and session.get('read_requests'):
-        obtained=engine.read(session['read_requests'],plan_id=session['read_plan_id'],related_ids=session.get('read_related_ids',[]),reason=session.get('read_rationale','Resume requested repair context'))
+        obtained=engine.read(session['read_requests'],purpose=purpose,plan_id=session['read_plan_id'],related_ids=session.get('read_related_ids',[]),reason=session.get('read_rationale','Resume requested repair context'))
         if obtained['status']!='complete':save_session(engine,session);raise Blocked('Repair reading plan still has unmet ranges; no new agent call was sent')
         session['requested_material_ids']=[id for i in obtained['items'] for id in i['material_ids'] if i['status']!='deferred']
         session.pop('read_plan_id')
         try:
             candidate=json.loads(Path(session['current_path']).read_text());response=response_type.model_validate(candidate)
             register_citations(response)
-            validate_read_requests(state,engine.root/'source',response)
+            validate_read_requests(state,engine.root/'source',response,purpose=purpose)
             if validator:validator(response)
         except ValueError as exc:
             diags,targets=diagnostics_for(exc,candidate,kind,session['version'],engine.config.budget.error_context_chars)
@@ -55,7 +56,7 @@ def ask(engine,kind,response_type,context,validator=None):
     if session and session.get('status') in {'accepted','accepted_after_read'} and session.get('accepted_check'):
         response=response_type.model_validate_json(Path(session['current_path']).read_text())
         register_citations(response)
-        validate_read_requests(state,engine.root/'source',response)
+        validate_read_requests(state,engine.root/'source',response,purpose=purpose)
         if validator:validator(response)
         state.pending_output_repair=None
         return response,CheckRun.model_validate(session['accepted_check'])
@@ -66,7 +67,7 @@ def ask(engine,kind,response_type,context,validator=None):
         from .task_packet import pool_sources
         validate_view_citations(response,pool_sources(context))
         register_citations(response)
-        validate_read_requests(state,engine.root/"source",response)
+        validate_read_requests(state,engine.root/"source",response,purpose=purpose)
         if validator:validator(response)
     limit=engine.config.budget.error_context_chars
     while True:
@@ -170,11 +171,11 @@ def ask(engine,kind,response_type,context,validator=None):
                 if patch.requests:
                     if not any('read' in d.allowed for d in active_diags):raise ValueError('This diagnostic requires citation/metadata correction, not another source request')
                     if patch.replacements:raise ValueError('Read or attach material before returning replacements')
-                    validate_read_requests(state,engine.root/'source',patch)
+                    validate_read_requests(state,engine.root/'source',patch,purpose=purpose)
                     session.setdefault('read_plan_id',uid());session['read_requests']=[q.model_dump(mode='json') for q in patch.requests]
                     session['read_check']=check.model_dump(mode='json');session['read_related_ids']=[id for d in diags for id in d.object_ids];session['read_rationale']=patch.rationale
                     save_session(engine,session)
-                    obtained=engine.read(patch.requests,plan_id=session['read_plan_id'],related_ids=[id for d in diags for id in d.object_ids],reason=patch.rationale)
+                    obtained=engine.read(patch.requests,purpose=purpose,plan_id=session['read_plan_id'],related_ids=[id for d in diags for id in d.object_ids],reason=patch.rationale)
                     if obtained['status']!='complete':save_session(engine,session);raise Blocked('Requested repair material is deferred; the original reading plan remains pending')
                     session['requested_material_ids']=[id for i in obtained['items'] for id in i['material_ids'] if i['status']!='deferred']
                     from .sources import ranges,all_materials

@@ -180,7 +180,8 @@ def material_allowance(state,budget,purpose):
 
 
 def attachment_key(state):
-    return 'inquiry:'+state.active_inquiry_id if state.active_inquiry_id else 'unit:'+state.active_unit_id if state.active_unit_id else 'discovery'
+    candidate=next((c for c in state.question_candidates if c.status=='active'),None)
+    return 'inquiry:'+state.active_inquiry_id if state.active_inquiry_id else 'unit:'+state.active_unit_id if state.active_unit_id else 'candidate:'+candidate.id if candidate else 'discovery'
 
 
 def plan_read(state,repo,requests,budget,*,purpose='depth',partial=False,plan_id=None,related_ids=(),reason='Read requested material'):
@@ -279,22 +280,22 @@ def request_groups(value,path=''):
         for i,child in enumerate(value):yield from request_groups(child,path+'/'+str(i))
 
 
-def validate_read_requests(state,repo,response):
-    errors=[]
+def validate_read_requests(state,repo,response,*,purpose):
+    from consensus_assurance.core.config import Config
+    errors=[];paths=[];cached=material_lines(state);projected=dict(cached)
     for path,requests in request_groups(response):
+        if not requests:continue
+        paths.append(path)
         try:
-            rows=preflight(state,repo,requests,path)
-            if isinstance(response,ReadingPlan):
-                from consensus_assurance.core.config import Config
-                budget=Config.model_validate(state.config).budget
-                cached=material_lines(state);projected=dict(cached)
-                for req,info,lines in rows:
-                    projected.update({(info['content_digest'],req.file,n):lines[n-1] for n in range(req.start_line,req.end_line+1)})
-                cost=usage_of(projected)['unique_chars']-usage_of(cached)['unique_chars']
-                allowance=material_allowance(state,budget,'breadth' if not state.audit_spec_path else 'depth')
-                if cost>allowance['available_chars']:
-                    errors.append(Diagnostic(code='reading_plan_budget',category='material',paths=[path],message='Re-plan within the actual unique source allowance; preserve semantic priority',allowed=['representation'],details={'projected_new_chars':cost,**allowance}))
+            for req,info,lines in preflight(state,repo,requests,path):
+                projected.update({(info['content_digest'],req.file,n):lines[n-1] for n in range(req.start_line,req.end_line+1)})
         except DiagnosticError as exc:errors.extend(exc.diagnostics)
+    if paths and not errors:
+        allowance=material_allowance(state,Config.model_validate(state.config).budget,purpose)
+        cost=usage_of(projected)['unique_chars']-usage_of(cached)['unique_chars']
+        chunks=usage_of(projected)['unique_chunks']-usage_of(cached)['unique_chunks']
+        if cost>allowance['available_chars'] or chunks>allowance['available_chunks']:
+            errors.append(Diagnostic(code='reading_plan_budget',category='material',paths=paths,message='Re-plan within the actual unique source allowance; preserve semantic priority',allowed=['representation'],details={'projected_new_chars':cost,'projected_new_chunks':chunks,**allowance}))
     if errors:raise DiagnosticError(errors)
 
 

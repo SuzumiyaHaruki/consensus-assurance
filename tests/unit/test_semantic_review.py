@@ -172,7 +172,7 @@ def test_missing_aspect_is_one_focused_call_not_whole_response_repair(tmp_path,p
     _,state,_,_=prepared;e=controller(tmp_path,state)
     task=enqueue(state,'review','Review candidate relation','focused',target_ids=[state.claims[1].id])
     calls=[]
-    def ask(kind,response_type,context,validator=None):
+    def ask(kind,response_type,context,validator=None,**kwargs):
         packet,_=prepare(e,kind,context)
         calls.append(packet['required_review_pairs'])
         response=respond(packet)

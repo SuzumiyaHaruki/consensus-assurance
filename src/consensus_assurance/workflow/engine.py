@@ -26,7 +26,7 @@ from .errors import Blocked
 from .agent_tasks import ask as ask_agent
 
 
-FRAMEWORK_REVISION = "obligation-audit-v2"
+FRAMEWORK_REVISION = "selected-question-v3"
 
 
 class Engine:
@@ -262,8 +262,8 @@ class Engine:
         return {"check_id":check.id,"status":check.status.value,"reason":check.reason,"text":text,
                 "original_characters":len(raw),"truncated":len(raw)>bound,"stdout_path":check.stdout,"stderr_path":check.stderr}
 
-    def ask(self, kind, response_type, context, validator=None):
-        return ask_agent(self,kind,response_type,context,validator)
+    def ask(self, kind, response_type, context, validator=None, *, purpose="depth"):
+        return ask_agent(self,kind,response_type,context,validator,purpose=purpose)
 
     def context(self, unit=None):
         return discovery.context(self,unit)

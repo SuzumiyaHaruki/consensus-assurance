@@ -41,7 +41,7 @@ def discover(engine):
         if not engine.state.materials and material_allowance(engine.state,engine.config.budget,"breadth")["available_chars"]==0:raise Blocked("No material capacity for a grounded initial plan; no agent request sent")
         inventory = catalogue(source, engine.state.snapshot,engine.implementation)
         write_json(engine.root / "catalogue.json", inventory)
-        plan, _ = engine.ask("read", ReadingPlan, {"catalogue": inventory, "initial_materials": [m.model_dump(mode="json") for m in engine.state.materials]})
+        plan, _ = engine.ask("read", ReadingPlan, {"catalogue": inventory, "initial_materials": [m.model_dump(mode="json") for m in engine.state.materials]},purpose="breadth")
         engine.read(plan.requests,purpose="breadth",partial=True,plan_id="initial-reading",related_ids=plan.related_ids,reason=plan.rationale,charge=False)
         write_json(engine.root / "materials.json", [m.model_dump(mode="json") for m in engine.state.materials])
         engine.state.completed_steps.append("materials"); engine.advance("discover")
@@ -50,7 +50,7 @@ def discover(engine):
         pending=next((t for t in engine.state.inquiry_tasks if t.kind=='spec_refine' and t.draft_path and t.status!='completed'),None)
         if not pending and not engine.state.audit_spec_path:
             try:
-                proposal,check=engine.ask('discover',Discovery,engine.context(),lambda p:validate(engine.state,p.audit_spec))
+                proposal,check=engine.ask('discover',Discovery,engine.context(),lambda p:validate(engine.state,p.audit_spec),purpose='breadth')
                 accept(engine,proposal.audit_spec)
                 if proposal.reading_requests:inquiry.enqueue(engine.state,'spec_refine','Resolve decisive understanding gaps','initial-reads',requests=proposal.reading_requests)
             except SpecIssue as exc:
@@ -66,13 +66,27 @@ def discover(engine):
         engine.state.completed_steps.append('discovery');engine.advance('select')
 
 
+def active_candidate(state):
+    return next((c for c in state.question_candidates if c.status=='active'),None)
+
+
 def derive_context(engine):
     from .locations import declaration_index
-    packet=context(engine)
-    packet['source_declarations']=declaration_index(packet['materials'])
-    packet['materials']=[m for m in packet['materials'] if m['file'].lower().endswith(('.md','.rst'))]
-    packet['existing_objects']=[{'id':o.id,'version':o.version} for name in ('claims','bindings','relations','units') for o in getattr(engine.state,name)]
-    packet['recent_evidence']=[{'claim_id':e.claim_id,'assessment':str(e.assessment),'level':e.level} for e in engine.state.evidence[-8:]]
+    from .audit_spec import slice_for,source_ids
+    state=engine.state;candidate=active_candidate(state)
+    if candidate:
+        view=slice_for(state,candidate.question)
+        wanted=source_ids(view)|set(candidate.question.source_ids+candidate.material_ids)
+        packet={'audit_spec':view,'selected_question':candidate.question.model_dump(mode='json'),
+            'candidate_id':candidate.id,'materials':[m.model_dump(mode='json') for m in state.materials if m.id in wanted],
+            'required_material_ids':sorted(wanted),'source_receipt':state.read_plans.get(candidate.read_plan_id),
+            'remaining_seconds':engine.budget.remaining()}
+    else:
+        packet=context(engine)
+        packet['source_declarations']=declaration_index(packet['materials'])
+        packet['materials']=[m for m in packet['materials'] if m['file'].lower().endswith(('.md','.rst'))]
+    packet['candidate_dispositions']=[{'id':c.id,'fact_ids':c.question.fact_ids,'lifecycle':c.question.obligation_relation_kind,'question':c.question.question,'status':c.status,'reason':c.stop_reason} for c in state.question_candidates if c.status!='active'] if not candidate else []
+    packet['existing_objects']=[{'id':o.id,'version':o.version} for name in ('claims','bindings','relations','units') for o in getattr(state,name)]
     packet['source_rule']='Inventory and declaration metadata are selection aids, not source verification. Request exact code before relying on its implementation semantics.'
     return packet
 
@@ -96,8 +110,27 @@ def validate_derivation(state,reply):
     for i,issue in enumerate(reply.descriptive_issues):
         if not set(issue.object_ids)<=objects or not set(issue.source_ids)<=known or not issue.reason.strip():
             issues.append(Diagnostic(code='descriptive_issue',category='material',object_ids=issue.object_ids,paths=[f'/descriptive_issues/{i}'],material_ids=sorted(known&set(issue.source_ids)),message='Describe an existing inventory object issue with acquired source and reason',allowed=['representation','read']))
-    if not reply.obligation and not (reply.reading_requests or reply.descriptive_issues):
-        issues.append(Diagnostic(code='derivation_empty',category='semantic',paths=['/obligation'],message='Select an obligation, request decisive source or identify an inventory issue',allowed=['read','semantic_revision']))
+    from .audit_spec import validate_question
+    q=reply.audit_question;current=active_candidate(state)
+    try:
+        if spec is None:raise ValueError('An accepted inventory is required')
+        validate_question(spec,q)
+        if not set(q.source_ids)<=known:raise ValueError('Question sources must be acquired')
+        if not q.question.strip() or not q.trigger_rationale.strip():raise ValueError('State the discriminator and selection reason')
+        if current and (q.fact_ids!=current.question.fact_ids or q.obligation_relation_kind!=current.question.obligation_relation_kind):
+            raise ValueError('Finish the current candidate before selecting another fact or lifecycle')
+        if not current and any(c.question.fact_ids==q.fact_ids and c.question.obligation_relation_kind==q.obligation_relation_kind and c.status in {'explained','blocked'} for c in state.question_candidates):
+            raise ValueError('This candidate already has a disposition; select another fact or lifecycle')
+        if reply.obligation and q.disposition=='explained_by_existing_mechanism':raise ValueError('Explained candidates close without an obligation')
+        if not reply.obligation:
+            if reply.bindings or reply.dependencies or reply.context_claims:raise ValueError('A pre-obligation candidate cannot create graph objects')
+            reads=reply.reading_requests+q.requests
+            if reads and q.preferred_check!='source_review':raise ValueError('Candidate source acquisition uses source_review')
+            if q.disposition=='explained_by_existing_mechanism':
+                if reads or not q.counterevidence:raise ValueError('Explained candidates need sourced protections and no pending reads')
+            elif not reads and not reply.descriptive_issues:raise ValueError('Request decisive source, identify a descriptive issue, or explain the suspicion')
+    except ValueError as exc:
+        issues.append(Diagnostic(code='derivation_question',category='semantic',paths=['/audit_question'],message=str(exc),allowed=['read','semantic_revision']))
     if reply.obligation and (reply.obligation.kind!='obligation' or not reply.bindings):
         issues.append(Diagnostic(code='derivation_primary',category='association',object_ids=[reply.obligation.id],paths=['/obligation','/bindings'],message='A primary obligation requires its actual code bindings',allowed=['association','read']))
     existing={o.id for name in ('claims','bindings','relations','units') for o in getattr(state,name)}
@@ -135,65 +168,137 @@ def validate_derivation(state,reply):
 
 def accept_derivation(engine,reply,check_id):
     from .transactions import commit_graph
-    from .audit_spec import load
+    from consensus_assurance.core.types import QuestionCandidate
     validate_derivation(engine.state,reply)
-    q=reply.audit_question;selected=set(q.behavior_ids+q.fact_ids) if q else set()
-    blocking=False
-    for issue in reply.descriptive_issues:
-        task=inquiry.enqueue(engine.state,'spec_refine',issue.reason,'derive-issue:'+check_id+':'+','.join(issue.object_ids))
-        task.draft_path=engine.state.audit_spec_path
-        task.diagnostics=[{'code':'audit_spec_semantics','category':'semantic','object_ids':issue.object_ids,'material_ids':issue.source_ids,'message':issue.reason,'allowed':['read','semantic_revision']}]
-        blocking|=bool(selected&set(issue.object_ids)) or not reply.obligation
-    if blocking:
-        engine.checkpoint('selected_inventory_refinement_required');return False
-    if not reply.obligation:
-        inquiry.enqueue(engine.state,'spec_refine',reply.selection_rationale,'derive-reads:'+check_id,requests=reply.reading_requests)
-        return False
-    patch=derivation_graph(reply)
     def commit(proxy):
-        apply_patch(proxy.state,patch)
-        unit=next(u for u in proxy.state.units if u.id==patch.units[0].id)
-        if reply.reading_requests:
-            unit.audit_question.requests=list({(r.file,r.start_line,r.end_line):r for r in unit.audit_question.requests+reply.reading_requests}.values())
+        state=proxy.state;candidate=active_candidate(state);q=reply.audit_question.model_copy(deep=True)
+        if candidate:
+            candidate.history.append(candidate.question.model_copy(deep=True))
+            for field in ('counterevidence','unknowns','source_ids'):
+                setattr(q,field,list(dict.fromkeys(getattr(candidate.question,field)+getattr(q,field))))
+            candidate.question=q
+        else:
+            candidate=QuestionCandidate(question=q);state.question_candidates.append(candidate)
+        candidate.check_ids.append(check_id)
+        selected=set(q.behavior_ids+q.fact_ids)
+        candidate.spec_task_ids=[]
+        for issue in reply.descriptive_issues:
+            task=inquiry.enqueue(state,'spec_refine',issue.reason,check_id+':'+','.join(issue.object_ids))
+            task.draft_path=state.audit_spec_path
+            task.diagnostics=[{'code':'audit_spec_semantics','category':'semantic','object_ids':issue.object_ids,'material_ids':issue.source_ids,'message':issue.reason,'allowed':['read','semantic_revision']}]
+            if selected&set(issue.object_ids):
+                task.candidate_id=candidate.id;candidate.spec_task_ids.append(task.id)
+        requests=list({(r.file,r.start_line,r.end_line):r for r in reply.reading_requests+q.requests}.values())
+        q.requests=requests
+        if candidate.spec_task_ids:
+            candidate.stage='read' if requests else 'analyze'
+            if requests:candidate.read_plan_id=uid()
+            return
+        if not reply.obligation:
+            if q.disposition=='explained_by_existing_mechanism':
+                candidate.status='explained';candidate.stop_reason=reply.selection_rationale
+            else:
+                candidate.stage='read';candidate.read_plan_id=uid()
+            return
+        patch=derivation_graph(reply);patch.units[0].audit_question=q
+        apply_patch(state,patch)
+        unit=next(u for u in state.units if u.id==patch.units[0].id)
+        candidate.status='escalated';candidate.obligation_id=reply.obligation.id
         inquiry.review_unit(proxy,unit,'derived:'+check_id)
-        proxy.state.completed_steps.append('derived-spec:'+str(proxy.state.audit_spec_version))
+        state.completed_steps.append('derived-spec:'+str(state.audit_spec_version))
     path=engine.root/f'derivation-{check_id}.json';write_json(path,reply);engine.state.derivation_path=str(path)
     engine.checkpoint('derivation_candidate_prepared')
     commit_graph(engine,'derive-'+check_id,reply.model_dump(mode='json'),commit)
-    return True
+    return any(c.obligation_id==reply.obligation.id for c in engine.state.question_candidates) if reply.obligation else False
+
+
+def continue_candidate(engine,candidate):
+    """Resume only this question's source work and selected inventory corrections."""
+    state=engine.state
+    for id in candidate.spec_task_ids:
+        task=next(t for t in state.inquiry_tasks if t.id==id)
+        while task.status not in {'completed','blocked'}:
+            try:inquiry.process_task(engine,task)
+            except Blocked as exc:
+                task=next(t for t in state.inquiry_tasks if t.id==id)
+                task.status='blocked';task.stop_reason=str(exc);task.repair_session=state.pending_output_repair
+                state.pending_output_repair=None;state.active_inquiry_id=None
+                inquiry.release_action(engine);engine.checkpoint('selected_inventory_correction_blocked')
+            task=next(t for t in state.inquiry_tasks if t.id==id)
+        candidate=active_candidate(state)
+        if task.status=='blocked':
+            candidate.status='blocked';candidate.stop_reason=task.stop_reason;return
+    if candidate.spec_task_ids:
+        from .audit_spec import load,validate_question
+        try:validate_question(load(state),candidate.question)
+        except ValueError as exc:
+            candidate.status='blocked';candidate.stop_reason='Inventory correction requires explicit question reconnection: '+str(exc)
+            engine.checkpoint('candidate_reconnection_required');return
+        candidate.spec_task_ids=[]
+    if candidate.stage!='read':return
+    receipt=engine.read(candidate.question.requests,purpose='depth',partial=True,plan_id=candidate.read_plan_id,
+        related_ids=candidate.question.fact_ids+candidate.question.behavior_ids,reason=candidate.question.question)
+    candidate=active_candidate(state)
+    from .sources import includes
+    attached=[id for i in receipt['items'] if i['status']!='deferred' for id in i['material_ids']]
+    progress=any(i['status']=='acquired' for i in receipt['items']) or not includes(state,attached,candidate.material_ids)
+    candidate.material_ids=list(dict.fromkeys(candidate.material_ids+attached))
+    candidate.stagnation=0 if progress else candidate.stagnation+1
+    candidate.stage='analyze'
+    if candidate.stagnation>=max(1,engine.config.budget.repair_stagnation):
+        candidate.status='blocked';candidate.stop_reason='Repeated source requests provided no new source to this question; receipts retain deferred ranges'
+    inquiry.release_action(engine);engine.checkpoint('candidate_source_receipt_saved')
+
+
+def ask_derivation(engine,packet):
+    try:
+        return engine.ask('derive',Derivation,packet,lambda p:validate_derivation(engine.state,p),purpose='depth')
+    except Blocked:
+        session=engine.state.pending_output_repair
+        if not session or not session.get('diagnostics') or any(d['code']!='reading_plan_budget' for d in session['diagnostics']):raise
+        candidate=active_candidate(engine.state)
+        if candidate is None:
+            reply=Derivation.model_validate_json(Path(session['current_path']).read_text())
+            validate_derivation(engine.state,reply)
+            # Preserve a valid selected focus even when its first source plan cannot fit.
+            if reply.obligation:raise
+            accept_derivation(engine,reply,session['id'])
+            candidate=active_candidate(engine.state)
+        candidate.status='blocked';candidate.stop_reason='Source replanning exhausted; repair session '+session['id']+' retains unmet requests'
+        engine.state.pending_output_repair=None;inquiry.release_action(engine)
+        engine.checkpoint('candidate_budget_replanning_exhausted')
+        return None,None
 
 
 def derive(engine):
     if 'derived-spec:'+str(engine.state.audit_spec_version) in engine.state.completed_steps:return
     if engine.state.derivation_path:
-        import json
         path=Path(engine.state.derivation_path);check_id=path.stem.removeprefix('derivation-')
         if 'derive-'+check_id not in engine.state.applied_operations:
             if accept_derivation(engine,Derivation.model_validate_json(path.read_text()),check_id):return
-    packet=derive_context(engine)
     while True:
-        proposal,check=engine.ask('derive',Derivation,packet,lambda p:validate_derivation(engine.state,p))
-        # Before accepting source-dependent claims, supply the exact selected code.
-        from .sources import dependency_closure
-        graph=derivation_graph(proposal)
-        objects={x.id:x for name in ('claims','bindings','relations','units') for x in getattr(graph,name)}
-        required,_=dependency_closure(objects,objects)
-        supplied={m['id'] for m in packet['materials']}
-        missing=[m for m in engine.state.materials if m.id in required-supplied]
-        if proposal.obligation and missing:
-            packet['materials'].extend(m.model_dump(mode='json') for m in missing)
-            packet['candidate_for_source_review']=proposal.model_dump(mode='json')
-            packet['required_material_ids']=sorted(required);continue
-        if accept_derivation(engine,proposal,check.id):return
-        # Selected descriptive issues must close before retrying normative derivation.
-        selected=set(proposal.audit_question.behavior_ids+proposal.audit_question.fact_ids) if proposal.audit_question else set()
-        pending=[t.id for t in engine.state.inquiry_tasks if t.status=='pending' and (t.trigger=='derive-reads:'+check.id or t.trigger.startswith('derive-issue:'+check.id+':') and (not proposal.obligation or any(selected&set(d['object_ids']) for d in t.diagnostics)))]
-        for id in pending:
-            while True:
-                task=next(t for t in engine.state.inquiry_tasks if t.id==id)
-                if task.status=='completed':break
-                inquiry.process_task(engine,task)
+        candidate=active_candidate(engine.state)
+        if candidate:continue_candidate(engine,candidate)
         packet=derive_context(engine)
+        proposal,check=ask_derivation(engine,packet)
+        if proposal is None:continue
+        # Cached source still needs actual transmission before semantic acceptance.
+        from .sources import dependency_closure
+        while proposal.obligation or proposal.audit_question.disposition=='explained_by_existing_mechanism':
+            graph=derivation_graph(proposal)
+            objects={x.id:x for name in ('claims','bindings','relations','units') for x in getattr(graph,name)}
+            required,_=dependency_closure(objects,objects)
+            required.update(proposal.audit_question.source_ids)
+            supplied={m['id'] for m in packet['materials']}
+            missing=[m for m in engine.state.materials if m.id in required-supplied]
+            if not missing:break
+            packet['materials'].extend(m.model_dump(mode='json') for m in missing)
+            packet['candidate_for_source_review']=proposal.model_dump(mode='json');packet['required_material_ids']=sorted(required)
+            proposal,check=ask_derivation(engine,packet)
+            if proposal is None:break
+        if proposal is None:continue
+        if accept_derivation(engine,proposal,check.id):return
+        inquiry.release_action(engine);engine.checkpoint('candidate_continuation_saved')
 
 
 def targeted_read(engine, unit, gap, relation_ids=None, requests=None, update_required=True):
