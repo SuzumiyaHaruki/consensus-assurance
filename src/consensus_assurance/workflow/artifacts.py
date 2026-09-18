@@ -78,7 +78,7 @@ def validate_bundle(state, unit, bundle, implementation):
         for name in names:
             if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*",name) or not re.search(r"\b"+name+r"\s*==",tla_code(bundle.behavior)):
                 raise ValueError("Reachability requires an actual named Behavior operator")
-        if not requirement.claim_ids or not reachability_refs(requirement)<=selected_refs:raise ValueError("Reachability must link claims and selected behavior/fact/handoff references")
+        if not requirement.claim_ids or not reachability_refs(requirement)<=selected_refs:raise ValueError("Reachability must link claims and selected behavior/fact references")
         if not set(requirement.claim_ids)<=checked_ids:raise ValueError("Reachability requirement references an unchecked claim")
     def context_error(message):
         from consensus_assurance.core.diagnostics import Diagnostic,DiagnosticError
@@ -98,7 +98,7 @@ def validate_bundle(state, unit, bundle, implementation):
             if not re.search(r'\b'+re.escape(name)+r'\s*(?:\([^\n]*\))?\s*==',tla_code(bundle.behavior)):context_error('Context action has no actual Behavior definition')
     # Model-level consequence expression does not require an implementation monitor.
     for mapping in bundle.consequence_observations:
-        if mapping.claim_id not in unit.obligation_ids or not set(mapping.binding_ids)<=set(unit.binding_ids):raise ValueError("Consequence observation references an unbroader obligation or binding")
+        if mapping.claim_id not in unit.obligation_ids or not set(mapping.binding_ids)<=set(unit.binding_ids):raise ValueError("Consequence observation references an unselected obligation or binding")
     return specs
 
 

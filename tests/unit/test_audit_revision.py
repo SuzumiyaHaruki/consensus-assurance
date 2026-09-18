@@ -88,10 +88,10 @@ def test_model_commit_refuses_changed_inputs(tmp_path,prepared):
         save_bundle(tmp_path,state,state.units[0],changed,ToyImplementation(),transaction_key='action1')
 
 
-def test_f2_relation_dependency_requeues_unrelated_completed_unit(tmp_path,prepared):
+def test_f2_relation_dependency_requeues_unrelated_completed_unit(tmp_path,dependency_prepared):
     from consensus_assurance.workflow.feedback import apply_feedback
     from consensus_assurance.core.proposals import GraphPatch, ClaimDraft, RelationDraft
-    _,state,bundle,_=prepared
+    _,state,bundle,_=dependency_prepared
     unit=state.units[0];model=save_bundle(tmp_path,state,unit,bundle,ToyImplementation())
     other=unit.model_copy(deep=True);other.id='other';other.status='checked';state.units.append(other)
     other_model=model.model_copy(deep=True);other_model.id='other-model';other_model.unit_id='other';other_model.binding_ids=[];other_model.checkers=[]
@@ -109,6 +109,7 @@ def test_f2_relation_dependency_requeues_unrelated_completed_unit(tmp_path,prepa
     apply_feedback(state,unit,bundle,f)
     assert next(u for u in state.units if u.id=='other').status=='pending'
     assert next(u for u in state.units if u.id=='other').recheck_reasons
+
 
 
 def test_later_bundle_cannot_hide_an_unfinished_checker_of_same_obligation(tmp_path,prepared):

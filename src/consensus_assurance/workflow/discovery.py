@@ -66,26 +66,134 @@ def discover(engine):
         engine.state.completed_steps.append('discovery');engine.advance('select')
 
 
-def derive(engine):
-    from .audit_spec import load,validate_question
-    def validate(proposal):
-        if len(proposal.units)>1:raise ValueError('Derive one bounded audit unit')
-        for unit in proposal.units:
-            if len(unit.obligation_ids)!=1:raise ValueError('An autonomous unit checks one primary obligation')
-            if engine.state.analysis_mode!='regression':validate_question(load(engine.state),unit.audit_question)
-        trial=engine.state.model_copy(deep=True)
-        from .graph import validate_patch
-        validate_patch(trial,GraphPatch(**{k:v for k,v in proposal.model_dump().items() if k in GraphPatch.model_fields},rationale=proposal.selection_rationale))
-    proposal,check=engine.ask('derive',Derivation,engine.context(),validate)
+def derive_context(engine):
+    from .locations import declaration_index
+    packet=context(engine)
+    packet['source_declarations']=declaration_index(packet['materials'])
+    packet['materials']=[m for m in packet['materials'] if m['file'].lower().endswith(('.md','.rst'))]
+    packet['existing_objects']=[{'id':o.id,'version':o.version} for name in ('claims','bindings','relations','units') for o in getattr(engine.state,name)]
+    packet['recent_evidence']=[{'claim_id':e.claim_id,'assessment':str(e.assessment),'level':e.level} for e in engine.state.evidence[-8:]]
+    packet['source_rule']='Inventory and declaration metadata are selection aids, not source verification. Request exact code before relying on its implementation semantics.'
+    return packet
+
+
+def derivation_graph(reply):
+    from consensus_assurance.core.proposals import UnitDraft
+    units=[]
+    if reply.obligation:
+        units=[UnitDraft(id='unit-'+reply.obligation.id,obligation_ids=[reply.obligation.id],binding_ids=[b.id for b in reply.bindings],
+            relation_ids=[r.id for r in reply.dependencies],scope=reply.obligation.scope,audit_question=reply.audit_question,rationale=reply.selection_rationale)]
+    return GraphPatch(claims=([reply.obligation] if reply.obligation else [])+reply.context_claims,bindings=reply.bindings,
+        relations=reply.dependencies,units=units,rationale=reply.selection_rationale)
+
+
+def validate_derivation(state,reply):
+    from consensus_assurance.core.diagnostics import Diagnostic,DiagnosticError
+    from .audit_spec import load
+    spec=load(state);known={m.id for m in state.materials}
+    objects={o.id for o in spec.behaviors+spec.facts}|{a.class_id for a in spec.activities} if spec else set()
+    issues=[]
+    for i,issue in enumerate(reply.descriptive_issues):
+        if not set(issue.object_ids)<=objects or not set(issue.source_ids)<=known or not issue.reason.strip():
+            issues.append(Diagnostic(code='descriptive_issue',category='material',object_ids=issue.object_ids,paths=[f'/descriptive_issues/{i}'],material_ids=sorted(known&set(issue.source_ids)),message='Describe an existing inventory object issue with acquired source and reason',allowed=['representation','read']))
+    if not reply.obligation and not (reply.reading_requests or reply.descriptive_issues):
+        issues.append(Diagnostic(code='derivation_empty',category='semantic',paths=['/obligation'],message='Select an obligation, request decisive source or identify an inventory issue',allowed=['read','semantic_revision']))
+    if reply.obligation and (reply.obligation.kind!='obligation' or not reply.bindings):
+        issues.append(Diagnostic(code='derivation_primary',category='association',object_ids=[reply.obligation.id],paths=['/obligation','/bindings'],message='A primary obligation requires its actual code bindings',allowed=['association','read']))
+    existing={o.id for name in ('claims','bindings','relations','units') for o in getattr(state,name)}
+    candidates=[('/obligation',reply.obligation)]+[(f'/{name}/{i}',o) for name in ('bindings','dependencies','context_claims') for i,o in enumerate(getattr(reply,name))]
+    for path,obj in candidates:
+        if obj and obj.id in existing:
+            issues.append(Diagnostic(code='existing_graph_identity',category='semantic',object_ids=[obj.id],paths=[path],material_ids=sorted(known&set(getattr(obj,'source_ids',[]))),message='Derivation adds candidates; existing semantic objects require attributed F2 rather than replacement',allowed=['read','semantic_revision']))
+    if issues:raise DiagnosticError(issues)
+    if not reply.obligation:return
+    selected=set(reply.audit_question.behavior_ids+reply.audit_question.fact_ids) if reply.audit_question else set()
+    if any(selected&set(i.object_ids) for i in reply.descriptive_issues):return
+    try:validate_patch(state,derivation_graph(reply))
+    except DiagnosticError as exc:
+        patch=derivation_graph(reply)
+        merged={name:list(dict.fromkeys([o.id for o in getattr(state,name)]+[o.id for o in getattr(patch,name)])) for name in ('claims','bindings','relations','units')}
+        locations={o.id:path for path,o in candidates if o}
+        locations.update({u.id:'/audit_question' for u in patch.units})
+        for d in exc.diagnostics:
+            d.object_ids=list(dict.fromkeys(reply.obligation.id if id in {u.id for u in patch.units} else id for id in d.object_ids))
+            def wire(path):
+                if path in {'/claims','/units','/relations'}:return {'/claims':'/obligation','/units':'/audit_question','/relations':'/dependencies'}[path]
+                parts=path.split('/')
+                if len(parts)>2 and parts[1] in merged and parts[2].isdigit():
+                    owner=merged[parts[1]][int(parts[2])]
+                    if owner in locations and parts[1]!='units':return locations[owner]+('/'+'/'.join(parts[3:]) if parts[3:] else '')
+                if path.startswith('/claims/0'):return path.replace('/claims/0','/obligation',1)
+                if path.startswith('/claims/'):
+                    parts=path.split('/');parts[1]='context_claims';parts[2]=str(int(parts[2])-1);return '/'.join(parts)
+                if path.startswith('/units/'):
+                    return '/audit_question' if '/audit_question' in path else '/dependencies' if '/relation_ids' in path else '/bindings'
+                return path.replace('/relations','/dependencies',1)
+            d.paths=list(dict.fromkeys(wire(path) for path in d.paths))
+        raise
+
+
+def accept_derivation(engine,reply,check_id):
     from .transactions import commit_graph
-    patch=GraphPatch(**{k:v for k,v in proposal.model_dump().items() if k in GraphPatch.model_fields},rationale=proposal.selection_rationale)
-    commit_graph(engine,'derive-'+check.id,proposal.model_dump(mode='json'),lambda proxy:apply_patch(proxy.state,patch))
-    if proposal.reading_requests:inquiry.enqueue(engine.state,'spec_refine','Resolve selected obligation source gaps','derive:'+check.id,requests=proposal.reading_requests)
-    for unit in engine.state.units:
-        if unit.id in {u.id for u in proposal.units}:inquiry.review_unit(engine,unit,'derived:'+check.id)
-    engine.state.completed_steps.append('derived-spec:'+str(engine.state.audit_spec_version))
-    path=engine.root/f'derivation-{check.id}.json'
-    write_json(path,proposal);engine.state.derivation_path=str(path)
+    from .audit_spec import load
+    validate_derivation(engine.state,reply)
+    q=reply.audit_question;selected=set(q.behavior_ids+q.fact_ids) if q else set()
+    blocking=False
+    for issue in reply.descriptive_issues:
+        task=inquiry.enqueue(engine.state,'spec_refine',issue.reason,'derive-issue:'+check_id+':'+','.join(issue.object_ids))
+        task.draft_path=engine.state.audit_spec_path
+        task.diagnostics=[{'code':'audit_spec_semantics','category':'semantic','object_ids':issue.object_ids,'material_ids':issue.source_ids,'message':issue.reason,'allowed':['read','semantic_revision']}]
+        blocking|=bool(selected&set(issue.object_ids)) or not reply.obligation
+    if blocking:
+        engine.checkpoint('selected_inventory_refinement_required');return False
+    if not reply.obligation:
+        inquiry.enqueue(engine.state,'spec_refine',reply.selection_rationale,'derive-reads:'+check_id,requests=reply.reading_requests)
+        return False
+    patch=derivation_graph(reply)
+    def commit(proxy):
+        apply_patch(proxy.state,patch)
+        unit=next(u for u in proxy.state.units if u.id==patch.units[0].id)
+        if reply.reading_requests:
+            unit.audit_question.requests=list({(r.file,r.start_line,r.end_line):r for r in unit.audit_question.requests+reply.reading_requests}.values())
+        inquiry.review_unit(proxy,unit,'derived:'+check_id)
+        proxy.state.completed_steps.append('derived-spec:'+str(proxy.state.audit_spec_version))
+    path=engine.root/f'derivation-{check_id}.json';write_json(path,reply);engine.state.derivation_path=str(path)
+    engine.checkpoint('derivation_candidate_prepared')
+    commit_graph(engine,'derive-'+check_id,reply.model_dump(mode='json'),commit)
+    return True
+
+
+def derive(engine):
+    if 'derived-spec:'+str(engine.state.audit_spec_version) in engine.state.completed_steps:return
+    if engine.state.derivation_path:
+        import json
+        path=Path(engine.state.derivation_path);check_id=path.stem.removeprefix('derivation-')
+        if 'derive-'+check_id not in engine.state.applied_operations:
+            if accept_derivation(engine,Derivation.model_validate_json(path.read_text()),check_id):return
+    packet=derive_context(engine)
+    while True:
+        proposal,check=engine.ask('derive',Derivation,packet,lambda p:validate_derivation(engine.state,p))
+        # Before accepting source-dependent claims, supply the exact selected code.
+        from .sources import dependency_closure
+        graph=derivation_graph(proposal)
+        objects={x.id:x for name in ('claims','bindings','relations','units') for x in getattr(graph,name)}
+        required,_=dependency_closure(objects,objects)
+        supplied={m['id'] for m in packet['materials']}
+        missing=[m for m in engine.state.materials if m.id in required-supplied]
+        if proposal.obligation and missing:
+            packet['materials'].extend(m.model_dump(mode='json') for m in missing)
+            packet['candidate_for_source_review']=proposal.model_dump(mode='json')
+            packet['required_material_ids']=sorted(required);continue
+        if accept_derivation(engine,proposal,check.id):return
+        # Selected descriptive issues must close before retrying normative derivation.
+        selected=set(proposal.audit_question.behavior_ids+proposal.audit_question.fact_ids) if proposal.audit_question else set()
+        pending=[t.id for t in engine.state.inquiry_tasks if t.status=='pending' and (t.trigger=='derive-reads:'+check.id or t.trigger.startswith('derive-issue:'+check.id+':') and (not proposal.obligation or any(selected&set(d['object_ids']) for d in t.diagnostics)))]
+        for id in pending:
+            while True:
+                task=next(t for t in engine.state.inquiry_tasks if t.id==id)
+                if task.status=='completed':break
+                inquiry.process_task(engine,task)
+        packet=derive_context(engine)
 
 
 def targeted_read(engine, unit, gap, relation_ids=None, requests=None, update_required=True):

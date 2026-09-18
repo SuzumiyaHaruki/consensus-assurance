@@ -43,7 +43,7 @@ def test_source_preserving_binding_split(case):
     parts=[original.model_copy(update={'id':symbol,'symbol':symbol,'start_line':a,'end_line':b}) for symbol,a,b in [('first',1,2),('second',4,5)]]
     patch=OutputRepair(binding_splits=[{'path':case if case.startswith('/') else '/bindings/0','bindings':parts,'rationale':'Keep both actual declarations'}],rationale='Representation only')
     if case=='lost_source':patch.binding_splits[0].bindings[0].end_line=1
-    raw={'bindings':[original.model_dump(mode='json')],'units':[{'binding_ids':['whole'],'code_uses':[]}]}
+    raw={'bindings':[original.model_dump(mode='json')],'units':[{'binding_ids':['whole']}]}
     diagnostics=[Diagnostic(code='declaration_identity',category='location',object_ids=['whole'],message='Multiple declarations',allowed=['representation'])]
     context={'materials':[material.model_dump(mode='json')]}
     if case!='valid':

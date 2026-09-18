@@ -91,8 +91,8 @@ def local_workset(engine,unit):
         'obligation_progress':{'checked_scopes':unit.obligation_checks,'remaining':unit.remaining_obligation_ids or unit.obligation_ids},
         'modeling_brief':{'unit_id':unit.id,'version':unit.version,'question_ref':unit.id,'obligation_ids':unit.obligation_ids,
             'scope_ref':unit.id,'code_refs':unit.binding_ids,'relationship_refs':unit.relation_ids,
-            'remaining_conditions':unit.coverage_limitations+[x for use in unit.code_uses for x in use.unverified],
-            'basis':'Derived current G/O/C view; complete referenced objects and required source are included once'}}
+            'remaining_conditions':unit.coverage_limitations+[x for b in state.bindings if b.id in unit.binding_ids for x in b.pending]+[x for r in state.relations if r.id in unit.relation_ids for x in r.pending+r.grounding.unresolved],
+            'basis':'Derived current obligation and code view; complete referenced objects and required source are included once'}}
 
 
 def local_basis(state,unit):

@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 from consensus_assurance.core.config import Config
 from consensus_assurance.core.types import Analysis
-from consensus_assurance.core.proposals import Bundle, Derivation
+from consensus_assurance.core.proposals import Bundle, GraphDraft
 from consensus_assurance.adapters.storage.snapshot import capture
 from consensus_assurance.workflow.materials import initial_materials, add_reads, ReadingPlan
 from consensus_assurance.workflow.graph import apply_graph
@@ -28,7 +28,7 @@ def prepared(tmp_path):
     state = Analysis(mode="mock", analysis_mode="regression", config=config.model_dump(mode="json"), snapshot=snapshot)
     state.materials = initial_materials(repo, snapshot, config.budget, "Toy fixture normative context")
     add_reads(state, repo, ReadingPlan.model_validate(responses[0]), config.budget)
-    apply_graph(state, Derivation.model_validate(responses[1]))
+    apply_graph(state, GraphDraft.model_validate(responses[1]))
     return repo, state, Bundle.model_validate(responses[2]), responses
 
 
@@ -49,11 +49,24 @@ def tlc(tmp_path):
 def verification_fixture_inventory(monkeypatch):
     """Materialize the descriptive step in scripted downstream fixture playback."""
     from consensus_assurance.adapters.agents.backend import MockAgent
-    from regression_support import descriptive_inventory
+    from regression_support import descriptive_inventory,bounded_derivation
     original=MockAgent.__init__
     def initialize(self,fixture=None):
         original(self,fixture)
-        if len(self.responses)>1 and 'requests' in self.responses[0] and self.responses[1].get('claims'):
-            source=self.responses[1]['claims'][0]['source_ids'][0]
-            self.responses.insert(1,descriptive_inventory(source).model_dump(mode='json'))
+        responses=[]
+        for reply in self.responses:
+            if isinstance(reply,dict) and reply.get('units') and 'claims' in reply and 'expected_versions' not in reply and len(self.responses)>1 and 'requests' in self.responses[0]:
+                if len(responses)==1 and 'requests' in responses[0]:
+                    source=reply['claims'][0]['source_ids'][0]
+                    responses.append(descriptive_inventory(source).model_dump(mode='json'))
+                response=bounded_derivation(reply);responses.extend([response,response])
+            else:responses.append(reply)
+        self.responses=responses
     monkeypatch.setattr(MockAgent,'__init__',initialize)
+
+
+@pytest.fixture
+def dependency_prepared(prepared):
+    from regression_support import add_dependency
+    add_dependency(prepared[1],prepared[3])
+    return prepared

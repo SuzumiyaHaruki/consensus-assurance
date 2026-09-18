@@ -29,5 +29,4 @@ def semantic_ids(state,unit):
     ids.update(a.claim_id for b in state.bindings if b.id in unit.binding_ids for a in b.associations)
     for r in state.relations:
         if r.id in unit.relation_ids:ids.update([r.source,r.target])
-    for use in unit.code_uses:ids.update(use.claim_ids+use.relation_ids)
     return ids

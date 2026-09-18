@@ -105,15 +105,15 @@ from consensus_assurance.plugins.implementations.toy.adapter import ToyImplement
 
 
 @pytest.mark.parametrize('extra',['claim','relation','unit','binding'])
-def test_actual_write_set_rejects_every_unreviewed_object(prepared,extra):
-    _,state,bundle,_=prepared;a,b=state.claims[1:3]
+def test_actual_write_set_rejects_every_unreviewed_object(dependency_prepared,extra):
+    _,state,bundle,_=dependency_prepared;a,b=state.claims[1:3]
     f=revision_for(state,[a.id])
     if extra=='claim':f.patch.claims.append(ClaimDraft(**{k:v for k,v in b.model_dump().items() if k in ClaimDraft.model_fields}).model_copy(update={'description':'Weakened unrelated B'}))
     if extra=='relation':
-        old=state.relations[0];f.patch.relations=[RelationDraft(**{k:v for k,v in old.model_dump().items() if k in RelationDraft.model_fields}).model_copy(update={'kind':'alternative'})]
+        old=state.relations[0];f.patch.relations=[RelationDraft(**{k:v for k,v in old.model_dump().items() if k in RelationDraft.model_fields}).model_copy(update={'kind':'conditional_on'})]
     if extra=='unit':
-        old=state.units[0];old.obligation_ids.append(b.id)
-        f.patch.units=[UnitDraft(**{k:v for k,v in old.model_dump().items() if k in UnitDraft.model_fields}).model_copy(update={'obligation_ids':[a.id]})]
+        old=state.units[0]
+        f.patch.units=[UnitDraft(**{k:v for k,v in old.model_dump().items() if k in UnitDraft.model_fields}).model_copy(update={'obligation_ids':[b.id]})]
     if extra=='binding':
         old=state.bindings[0];m=next(m for m in state.materials if m.file==old.file and m.start_line<=old.start_line<=old.end_line<=m.end_line)
         f.patch.bindings=[BindingDraft(id=old.id,claim_id=b.id,material_id=m.id,symbol=old.symbol,start_line=old.start_line,end_line=old.end_line,description=old.description,pending=old.pending)]
@@ -124,6 +124,7 @@ def test_actual_write_set_rejects_every_unreviewed_object(prepared,extra):
     before=state.model_dump()
     with pytest.raises(ValueError,match='write set'):apply_feedback(state,state.units[0],bundle,f)
     assert state.model_dump()==before
+
 
 
 def test_cross_type_collision_and_incomplete_changes_are_atomic(prepared):
@@ -213,25 +214,10 @@ def test_same_action_kind_cannot_consume_other_input(tmp_path,prepared):
     assert state.usage['agent_calls']==2
 
 
-def test_selected_relation_closure_contains_endpoint_contract(prepared):
-    _,state,_,_=prepared
+def test_selected_relation_closure_contains_endpoint_contract(dependency_prepared):
+    _,state,_,_=dependency_prepared
     m=Material(id='upstream-contract',file='notes.md',start_line=1,end_line=1,kind='document_statement',text='The provider accepts only bounded inputs',content_digest='fixture')
     state.materials.append(m);state.claims[2].source_ids.append(m.id)
     relation=next(r for r in state.relations if r.target==state.claims[2].id)
     materials,_=material_closure(state,[relation.id])
     assert m.id in materials
-
-
-
-
-def test_graph_failures_carry_machine_diagnostics(prepared):
-    from consensus_assurance.core.proposals import Derivation
-    from consensus_assurance.workflow.graph import apply_graph
-    _,state,_,responses=prepared
-    p=Derivation.model_validate(responses[1]);p.bindings[0].symbol='DoesNotExist'
-    p.units[0].binding_ids.append(p.bindings[-1].id)
-    before=state.model_dump()
-    with pytest.raises(ValueError) as caught:apply_graph(state,p)
-    assert hasattr(caught.value,'diagnostics')
-    assert len(caught.value.diagnostics)>=2
-    assert state.model_dump()==before

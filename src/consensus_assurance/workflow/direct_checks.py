@@ -9,7 +9,7 @@ from consensus_assurance.adapters.storage.files import write_json, digest
 from consensus_assurance.adapters.storage.snapshot import capture
 from consensus_assurance.adapters.runners.experiment import run_experiment, extract_events
 from .errors import Blocked
-from .graph import validate_grounding
+from .graph_diagnostics import validate_grounding
 from .observations import monitor_events
 from .instrumentation import observation_change_limitations
 from .reviews import readiness

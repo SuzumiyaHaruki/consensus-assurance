@@ -3,11 +3,12 @@ import json
 from pathlib import Path
 import pytest
 from consensus_assurance.core.config import Config
-from consensus_assurance.core.proposals import (Derivation, GraphPatch, Comparison, EventRequirement, EventMonitor,
+from consensus_assurance.core.proposals import (GraphDraft, GraphPatch, Comparison, EventRequirement, EventMonitor,
     ObservationMap, FieldProjection, Feedback)
 from consensus_assurance.core.types import Grounding, Scope, CheckRun, ExecutionStatus, Calibration, Origin
 from consensus_assurance.registry import assemble
-from consensus_assurance.workflow.graph import apply_graph, apply_patch, validate_grounding
+from consensus_assurance.workflow.graph import apply_graph, apply_patch
+from consensus_assurance.workflow.graph_diagnostics import validate_grounding
 from consensus_assurance.workflow.artifacts import validate_tla
 from consensus_assurance.workflow.observations import match_prerequisites, monitor_events
 from consensus_assurance.workflow.materials import ReadingPlan, ReadRequest, add_reads, catalogue
@@ -26,13 +27,13 @@ def test_default_has_inquiry_without_property_list():
 
 def test_empty_discovery_is_admissible(prepared):
     _,state,_,_=prepared
-    apply_graph(state,Derivation(understanding='Insufficient material',conflicts=[],unexplored=['Producer'],selection_rationale='Do not invent an obligation',gaps=['Contract unavailable']))
+    apply_graph(state,GraphDraft(conflicts=[],unexplored=['Producer'],gaps=['Contract unavailable']))
     assert not state.claims and not state.units and 'Contract unavailable' in state.gaps
 
 
 def test_code_derived_responsibilities_are_candidates(prepared):
     _,state,_,responses=prepared
-    graph=Derivation.model_validate(responses[1])
+    graph=GraphDraft.model_validate(responses[1])
     c=graph.claims[1]
     c.source_ids=['counter.py:1:10','limits.py:1:2']
     c.grounding=Grounding(behavior_ids=c.source_ids,binding_ids=['step_binding','input_binding'],
@@ -48,27 +49,15 @@ def test_code_derived_responsibilities_are_candidates(prepared):
     with pytest.raises(ValueError,match='located implementation binding'): apply_graph(state,graph)
 
 
-def test_document_id_does_not_establish_applicability(prepared):
-    _,state,_,responses=prepared
-    graph=Derivation.model_validate(responses[1])
-    graph.claims[0].grounding=Grounding(expectation_ids=[next(m.id for m in state.materials if m.file=='README.md')])
-    with pytest.raises(ValueError,match='derivation'): apply_graph(state,graph)
 
 
-def test_relation_and_binding_local_consistency(prepared):
-    _,state,_,responses=prepared
-    graph=Derivation.model_validate(responses[1])
-    graph.units[0].binding_ids.append('input_binding')
-    with pytest.raises(ValueError,match='unrelated'): apply_graph(state,graph)
-    graph=Derivation.model_validate(responses[1])
-    graph.relations[0].grounding.expectation_ids=['missing']
-    with pytest.raises(ValueError,match='actually read'): apply_graph(state,graph)
+
 
 
 def test_patch_keeps_object_versions_and_unrelated_claims(prepared):
     _,state,_,responses=prepared
     current=state.claims[1]
-    changed=Derivation.model_validate(responses[1]).claims[1]
+    changed=GraphDraft.model_validate(responses[1]).claims[1]
     changed.description='Refined responsibility under the same documented configuration'
     patch=GraphPatch(claims=[changed],expected_versions={changed.id:1},rationale='New interpretation')
     with pytest.raises(ValueError,match='F2'): apply_patch(state,patch)
@@ -223,7 +212,7 @@ def test_F1_changes_only_related_calibration(prepared,tmp_path):
 def test_conflicting_F2_does_not_turn_error_into_optimization(prepared):
     from consensus_assurance.workflow.feedback import apply_feedback
     _,state,bundle,responses=prepared
-    changed=Derivation.model_validate(responses[1]).claims[1]
+    changed=GraphDraft.model_validate(responses[1]).claims[1]
     changed.description='A weaker proposed obligation'
     basis=changed.grounding.model_copy(deep=True);basis.unresolved=[];basis.conflicts=['The current interface still promises the stronger guarantee']
     f=Feedback(kind='F2',rationale='Proposed design tradeoff requires resolving contrary evidence',evidence_ids=[next(m.id for m in state.materials if m.file=='README.md')],target_ids=['step_obligation'],relation_ids=[],old_judgment=state.claims[1].description,new_judgment=changed.description,new_basis='Conflicting design notes',grounding=basis,patch=GraphPatch(claims=[changed],expected_versions={changed.id:1},rationale='Proposed change'),graph=None,bundle=None)

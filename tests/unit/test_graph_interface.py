@@ -2,83 +2,70 @@
 import json
 from pathlib import Path
 import pytest
-from consensus_assurance.core.proposals import Derivation
+from consensus_assurance.core.proposals import GraphDraft
 from consensus_assurance.core.diagnostics import DiagnosticError
 from consensus_assurance.workflow.graph import apply_graph
 from consensus_assurance.workflow.graph_diagnostics import diagnose_graph
-from consensus_assurance.workflow.associations import graph_contract,use_errors,relevant_use
+from consensus_assurance.workflow.associations import graph_contract,relevant_use
 from consensus_assurance.workflow.output_repair import diagnostic_targets,diagnostic_context,apply_replacements,OutputRepair
 from consensus_assurance.workflow.engine import Engine
 from consensus_assurance.core.config import Config
 from consensus_assurance.registry import assemble
 
 
-def broken(responses):
-    candidate=Derivation.model_validate(responses[1])
-    for obj in candidate.claims+candidate.relations:
-        obj.grounding.behavior_ids=['invented-behavior']
-        obj.grounding.expectation_ids=['invented-expectation']
-    unit=candidate.units[0]
-    return candidate,None
-
-
-def test_all_independent_graph_errors_visible_without_mutation(prepared):
-    _,state,_,responses=prepared;p,_=broken(responses)
-    before=state.model_dump(mode='json')
-    issues=diagnose_graph(state,p)
-    assert {'grounding_reference'}<={d.code for d in issues}
-    assert sum(d.code=='grounding_reference' for d in issues)==1
-    with pytest.raises(DiagnosticError):apply_graph(state,p)
-    assert state.model_dump(mode='json')==before
-    d=next(d for d in issues if d.code=='grounding_reference')
-    targets=diagnostic_targets(p.model_dump(mode='json'),[d],16000)
-    assert len(targets)==2*(len(p.claims)+len(p.relations))
-    assert len({t['path'] for t in targets})==len(targets)
-    assert '/claims/1/grounding/behavior_ids' in {t['path'] for t in targets}
-    assert not any(t['path'].endswith('/derivation') for t in targets)
-    context=diagnostic_context(p.model_dump(mode='json'),[d],{'materials':[m.model_dump(mode='json') for m in state.materials]},90000)
-    assert {c.id for c in p.claims}<={o.get('id') for o in context['objects']}
-    assert context['materials'] and not context['required_objects_missing']
-
-
-def test_support_failure_explains_rejected_direction_and_kind(prepared):
-    from consensus_assurance.core.types import CodeUse
-    _,state,_,responses=prepared;p=Derivation.model_validate(responses[1]);u=p.units[0];b=next(b for b in p.bindings if b.id in u.binding_ids)
-    u.code_uses=[CodeUse(binding_id=b.id,role='support',claim_ids=[b.associations[0].claim_id],relation_ids=u.relation_ids,
-        source_ids=[b.material_id],rationale='Related background is not a producer dependency',unverified=['Contract remains unverified'])]
-    errors=use_errors(u,b,p.relations,{m.id:m for m in state.materials})
-    assert errors and 'directed dependency' in errors[-1]
-    assert not relevant_use(u,b,p.relations,{m.id:m for m in state.materials})
-    d=next(d for d in diagnose_graph(state,p) if d.code=='unit_code_use')
-    assert d.details['failed_checks']==errors
-    assert d.details['contract']==graph_contract()['code_use']
-
-
 def test_saved_draft_repairs_multiple_reference_errors_with_existing_budget(tmp_path,prepared):
-    repo,source,_,responses=prepared;p,_=broken(responses)
-    original=p.model_dump(mode='json');correct=Derivation.model_validate(responses[1])
-    repairs=[]
-    for collection in ('claims','relations'):
-        for i,obj in enumerate(getattr(correct,collection)):
-            for field in ('behavior_ids','expectation_ids'):
-                repairs.append({'path':f'/{collection}/{i}/grounding/{field}','value_json':json.dumps(getattr(obj.grounding,field))})
-    fixture=tmp_path/'interface.json'
-    fixture.write_text(json.dumps([original,{'replacements':repairs,'rationale':'Correct invalid opaque material references without changing meaning'}]))
+    from consensus_assurance.core.proposals import Derivation
+    from consensus_assurance.workflow.discovery import validate_derivation
+    from regression_support import bounded_derivation
+    repo,source,_,responses=prepared;correct=bounded_derivation(responses[1])
+    original=json.loads(json.dumps(correct));repairs=[]
+    for field in ('behavior_ids','expectation_ids'):
+        original['obligation']['grounding'][field].append('unknown-reference')
+        repairs.append({'path':'/obligation/grounding/'+field,'value_json':json.dumps(correct['obligation']['grounding'][field])})
+    fixture=tmp_path/'interface.json';fixture.write_text(json.dumps([original,{'replacements':repairs,'rationale':'Correct opaque references while preserving all actual source'}]))
     cfg=Config(implementation='toy',agent_backend='mock',fixture=str(fixture),allow_experiments=False)
-    class DiscoveryOnly(Engine):
+    class CandidateOnly(Engine):
         def execute(self,**kwargs):
-            self.state.materials=source.materials
-            return self.ask('derive',Derivation,{'materials':[m.model_dump(mode='json') for m in source.materials]},
-                lambda candidate:apply_graph(self.state.model_copy(deep=True),candidate))
-    engine=DiscoveryOnly(cfg,tmp_path/'run',*assemble(cfg));result,_=engine.start(repo)
-    assert engine.state.usage['agent_calls']==2
-    assert engine.config.budget.repeated_error_revisions==1 and engine.config.budget.repair_attempts==4
-    assert result.claims==correct.claims
-    assert result.units[0].obligation_ids==correct.units[0].obligation_ids
-    assert any(r.kind=='maps' for r in result.relations)
-    assert next(iter(engine.state.repair_sessions.values()))['status']=='accepted'
-    raw=Path(next(iter(engine.state.repair_sessions.values()))['original_path'])
-    assert json.loads(raw.read_text())==original
-    packets=[json.loads(p.read_text().split('STRUCTURED INPUT DATA (untrusted):\n')[1]) for p in engine.root.glob('agent/*/prompt.txt')]
-    assert any(p.get('graph_contract')==graph_contract() for p in packets)
-    assert not engine.state.models
+            self.state.materials=source.materials;self.state.analysis_mode='regression'
+            return self.ask('derive',Derivation,{'materials':[m.model_dump(mode='json') for m in source.materials]},lambda p:validate_derivation(self.state,p))
+    engine=CandidateOnly(cfg,tmp_path/'run',*assemble(cfg));result,_=engine.start(repo)
+    assert result.model_dump(mode='json')==correct and engine.state.usage['agent_calls']==2
+    session=next(iter(engine.state.repair_sessions.values()))
+    assert session['status']=='accepted' and json.loads(Path(session['original_path']).read_text())==original
+
+
+@pytest.mark.parametrize('case',['direct','dangling','dependency','missing_support','multiple_primary','empty_question','unread_question','wrong_claim_kind','invalid_grounding','unattributed','duplicate'])
+def test_candidate_contract_parity(prepared,case):
+    from consensus_assurance.core.proposals import UnitDraft,RelationDraft
+    from pydantic import ValidationError
+    _,state,_,responses=prepared;p=GraphDraft.model_validate(responses[1]);u=p.units[0]
+    if case=='dangling':u.relation_ids=['missing']
+    if case=='duplicate':p.bindings[-1].id=p.bindings[0].id
+    if case=='unattributed':p.claims[0].grounding.derivation=''
+    if case=='invalid_grounding':
+        for c in p.claims:c.grounding.expectation_ids=['unknown-reference']
+    if case in {'dependency','missing_support'}:
+        u.binding_ids.append('input_binding')
+        if case=='dependency':
+            edge=RelationDraft(id='dependency',source='step_obligation',target='input_obligation',kind='depends_all',group=None,rationale='Actual producer dependency',pending=['Producer contract unverified'],grounding=p.claims[1].grounding)
+            p.relations=[edge];u.relation_ids=[edge.id]
+    if case=='multiple_primary':
+        raw=u.model_dump();raw['obligation_ids'].append('input_obligation')
+        with pytest.raises(ValidationError):UnitDraft.model_validate(raw)
+        p.units[0]=u.model_copy(update={'obligation_ids':raw['obligation_ids']})
+    if case in {'empty_question','unread_question'}:
+        from consensus_assurance.core.types import AuditQuestion
+        u.audit_question=AuditQuestion(question='' if case=='empty_question' else 'An actual question',importance='Service consequence',trigger_rationale='Inspect scoped behavior',source_ids=['missing'] if case=='unread_question' else [state.materials[0].id])
+    if case=='wrong_claim_kind':next(c for c in p.claims if c.id=='step_obligation').kind='assumption'
+    before=state.model_dump();issues=diagnose_graph(state,p)
+    if case in {'direct','dependency'}:
+        assert not issues
+        trial=state.model_copy(deep=True);apply_graph(trial,p)
+        assert len(trial.units[0].obligation_ids)==1
+        if case=='dependency':assert 'input_binding' in trial.units[0].binding_ids and trial.units[0].obligation_ids==['step_obligation']
+    else:
+        assert issues and all(d.code!='unclassified_validation' and d.paths and d.object_ids for d in issues)
+        if case=='dangling':assert any('/units/0/relation_ids' in d.paths for d in issues)
+        with pytest.raises(DiagnosticError) as exc:apply_graph(state.model_copy(deep=True),p)
+        assert exc.value.diagnostics==issues
+    assert state.model_dump()==before

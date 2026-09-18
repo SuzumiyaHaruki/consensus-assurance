@@ -57,7 +57,7 @@ def validate_changes(state, feedback, allowed_ids=None):
     return writes
 
 
-SCOPE_FIELDS={'binding_ids','relation_ids','code_uses','audit_question','rationale'}
+SCOPE_FIELDS={'binding_ids','relation_ids','audit_question','rationale'}
 
 def classify_writes(writes,unit_id=None):
     if not writes:return 'candidate_additions'

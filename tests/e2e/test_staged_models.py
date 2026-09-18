@@ -97,8 +97,6 @@ class RepairingStagedAgent(StagedAgent):
                 item.limitations=['Provider guarantee remains separately unverified']
         if response_type.__name__=='GraphPatch':
             refs=['upstream_support.py:1:1','upstream_support.py:2:2']
-            for use in response.units[0].code_uses:
-                if use.binding_id=='input_binding':use.source_ids=refs
             for edge in response.relations:
                 edge.grounding.behavior_ids=[x for x in edge.grounding.behavior_ids if x!='upstream_support.py:1:2']+refs
         write_json(directory/'response.json',response);write_json(directory/'decoded-response.json',response)

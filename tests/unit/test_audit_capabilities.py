@@ -94,9 +94,11 @@ def test_R8_selected_archive_is_view_only(tmp_path):
     from consensus_assurance.workflow.history import load_analysis
     from consensus_assurance.reporting.chinese import render_report
     from consensus_assurance.workflow.engine import FRAMEWORK_REVISION
-    root=Path(__file__).resolve().parents[2]/'runs/2026-09-18_10-29-33-hashicorp_raft-real-run'
+    archive=Path(__file__).resolve().parents[2]/'tests/fixtures/recorded_derivation_20260918'
+    import shutil
+    root=tmp_path/'archive';shutil.copytree(archive,root)
     state=load_analysis(root/'state.json')
-    assert state.framework_revision==FRAMEWORK_REVISION and state.audit_spec_path and not state.claims and not state.evidence
+    assert state.framework_revision!=FRAMEWORK_REVISION and state.audit_spec_path and not state.claims and not state.evidence
     report=render_report(state,root).read_text()
     assert '候选修复会话' in report and 'Audit unit references missing bindings or relations' in report
     state=state.model_copy(deep=True);state.framework_revision='historical-test-revision'

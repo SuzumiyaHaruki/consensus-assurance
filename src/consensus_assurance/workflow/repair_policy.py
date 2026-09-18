@@ -131,7 +131,6 @@ def split_draft_bindings(candidate,patch,diagnostics,context,accepted_ids):
         parent['bindings'][index:index+1]=[b.model_dump(mode='json') for b in drafts]
         for unit in parent.get('units',[]):
             unit['binding_ids']=[id for x in unit['binding_ids'] for id in ([b.id for b in drafts] if x==old['id'] else [x])]
-            unit['code_uses']=[{**use,'binding_id':b.id} for use in unit.get('code_uses',[]) for b in (drafts if use['binding_id']==old['id'] else [type('Identity',(),{'id':use['binding_id']})()])]
     return result
 
 

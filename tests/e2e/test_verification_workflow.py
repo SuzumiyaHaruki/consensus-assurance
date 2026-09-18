@@ -20,11 +20,14 @@ def deferred_fixture(tmp_path, responses):
     for i in range(10): (repo/f'guide{i}.py').write_text('# Supplemental independent source sample.\n')
     first=copy.deepcopy(responses[0]);first['requests']=[q for q in first['requests'] if q['file']!='limits.py']
     graph=copy.deepcopy(responses[1])
+    basis=copy.deepcopy(graph['claims'][1]['grounding'])
+    dependency={'id':'input_dependency','source':'step_obligation','target':'input_obligation','kind':'boundary','group':None,'rationale':'Actual consumer depends on producer input','pending':['Producer guarantee unverified'],'grounding':basis}
+    graph['relations']=[dependency];graph['units'][0]['relation_ids']=['input_dependency']
     graph['bindings']=[b for b in graph['bindings'] if b['id']!='input_binding']
     graph['relations']=[e for e in graph['relations'] if e['id']!='maps_input']
     read={'requests':[{'file':'upstream_support.py','start_line':1,'end_line':2,'reason':'Read actual producer of the unexplained boundary'}],'rationale':'Consumer needs a positive effective capacity','related_ids':['step_obligation'],'gap':'Input producer not yet read'}
     binding=copy.deepcopy(responses[1]['bindings'][1]);binding['material_id']='upstream_support.py:1:2'
-    edge=next(copy.deepcopy(e) for e in responses[1]['relations'] if e['id']=='maps_input')
+    edge=copy.deepcopy(dependency);edge.update(id='producer_location',source='input_obligation',target='input_binding')
     edge['grounding']['behavior_ids']=['upstream_support.py:1:2']
     patch={'bindings':[binding],'relations':[edge],'rationale':'Actual new producer code explains the dependency without changing the obligation'}
     expanded=copy.deepcopy(responses[3]);expanded['harness']['source']=expanded['harness']['source'].replace('from limits import','from upstream_support import')
@@ -104,7 +107,7 @@ def test_experiments_false_prevents_probes_and_replay(tmp_path,prepared):
 def test_compilation_failure_gets_actual_log_and_finite_repair(tmp_path,tlc,prepared):
     responses=copy.deepcopy(prepared[3])
     responses[1]['relations']=[e for e in responses[1]['relations'] if e['id']!='input_dependency']
-    responses[1]['units'][0]['relation_ids'].remove('input_dependency')
+    responses[1]['units'][0]['relation_ids']=[]
     original=copy.deepcopy(responses[2]);broken=copy.deepcopy(original)
     broken['harness']['source']='import missing_round2_fixture_module\n'
     fixture=tmp_path/'compile.json';fixture.write_text(json.dumps([responses[0],responses[1],broken,original]))
@@ -130,7 +133,7 @@ def test_compilation_failure_gets_actual_log_and_finite_repair(tmp_path,tlc,prep
 @pytest.mark.parametrize('interrupt_plan',[False,True])
 def test_initial_replay_then_F4_and_attribution_continue(tmp_path,tlc,interrupt_plan):
     from ack_support import ROOT as TESTS, setup_ack
-    from consensus_assurance.core.proposals import Derivation, ClaimDraft, BindingDraft, RelationDraft, UnitDraft, ReplayPlan, Feedback
+    from consensus_assurance.core.proposals import GraphDraft, ClaimDraft, BindingDraft, RelationDraft, UnitDraft, ReplayPlan, Feedback
     from consensus_assurance.adapters.agents.backend import MockAgent
     from consensus_assurance.core.types import Claim, Grounding
     repo=tmp_path/'ack-repo';shutil.copytree(TESTS/'fixtures/ack_service',repo)
@@ -145,8 +148,8 @@ def test_initial_replay_then_F4_and_attribution_continue(tmp_path,tlc,interrupt_
     declaration=next(n for n in ast.parse(code.text).body if isinstance(n,ast.FunctionDef) and n.name=='execute')
     binding=BindingDraft(id='ack-code',claim_id='durable',material_id=code.id,symbol='execute',start_line=declaration.lineno,end_line=declaration.end_lineno,description='Actual acceptance and return ordering',pending=[])
     edge=RelationDraft(id='supports_ack',source='ack_goal',target='durable',kind='depends_all',group=None,rationale='Return guarantee depends on the configured durability responsibility',pending=[],grounding=basis)
-    u=UnitDraft(id='ack',obligation_ids=['durable'],binding_ids=['ack-code'],relation_ids=['supports_ack'],scope=unit.scope,rationale='Fixture candidate selection',)
-    graph=Derivation(understanding='Controlled fixture',claims=claims,bindings=[binding],relations=[edge],units=[u],conflicts=[],unexplored=[],selection_rationale='Check the configured response responsibility')
+    u=UnitDraft(id='ack',obligation_ids=['durable'],binding_ids=['ack-code'],relation_ids=[],scope=unit.scope,rationale='Fixture candidate selection',)
+    graph=GraphDraft(claims=claims,bindings=[binding],relations=[],units=[u],conflicts=[],unexplored=[],)
     missed=bundle.harness.model_copy(deep=True)
     missed.prerequisites[0].event='not_observed_setup'
     replay=ReplayPlan(harness=missed,checker_id='DurableAck',rationale='Initial candidate experiment with an unmet prerequisite')

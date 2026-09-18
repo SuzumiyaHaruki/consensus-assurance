@@ -4,7 +4,7 @@ from types import SimpleNamespace
 from consensus_assurance.core.types import AuditQuestion, ConstraintSource
 from consensus_assurance.workflow import inquiry
 from consensus_assurance.workflow.artifacts import validate_bundle
-from consensus_assurance.core.proposals import Derivation
+from consensus_assurance.core.proposals import GraphDraft
 from test_graph_mutations import controller
 
 
@@ -20,8 +20,8 @@ def test_typed_question_selects_direct_route(prepared):
 
 def test_thin_overview_does_not_enqueue_generic_exploration(tmp_path,prepared):
     _,state,_,responses=prepared;e=controller(tmp_path,state)
-    proposal=Derivation.model_validate(responses[1])
-    inquiry.enqueue(e.state,'spec_refine','Read selected dependency','initial_reading',requests=proposal.reading_requests)
+    proposal=GraphDraft.model_validate(responses[1])
+    inquiry.enqueue(e.state,'spec_refine','Read selected dependency','initial_reading',requests=[])
     assert not any(t.trigger=='initial_breadth' or t.trigger.startswith(('responsibility:','handoff:')) for t in state.inquiry_tasks)
 
 
@@ -128,47 +128,8 @@ def test_core_semantics_review_without_independent_binding_certificate(tmp_path,
     assert any(u.binding_ids[0] in t.target_ids for t in s.inquiry_tasks)
 
 
-def test_archived_oversized_review_targets_keep_current_unit_and_counterevidence():
-    import json
-    from pathlib import Path
-    from consensus_assurance.core.types import Analysis
-    from consensus_assurance.core.config import Config
-    from consensus_assurance.plugins.implementations.hashicorp_raft.adapter import HashicorpRaft
-    from consensus_assurance.workflow.task_packet import prepare,pool_sources
-    from consensus_assurance.workflow.prompts import render
-    root=Path(__file__).resolve().parents[2]/'runs/2026-09-16_21-58-16-hashicorp_raft-real-run'
-    state=Analysis.model_validate(__import__("consensus_assurance.workflow.history",fromlist=["import_record"]).import_record(json.loads((root/'state.json').read_text())))
-    old=next(p for p in state.packet_receipts if p['kind']=='semantic_review' and p['status']=='blocked_context_limit')
-    task=next(t for t in state.inquiry_tasks if t.id==old['task_id']).model_copy(deep=True)
-    task.target_ids=['B_setup_leader_state'];task.material_ids=[];task.context_receipt_id=None
-    state.inquiry_tasks=[task];state.active_inquiry_id=task.id
-    e=SimpleNamespace(state=state,root=root,config=Config.model_validate(state.config),implementation=HashicorpRaft(),budget=SimpleNamespace(remaining=lambda:0))
-    packet=inquiry.task_context(e,task);ready,_=prepare(e,'semantic_review',packet)
-    assert packet['selected_unit']['version']==2 and packet['selected_unit']['code_uses']
-    assert old['prompt_chars']>e.config.budget.context_chars
-    assert len(render('semantic_review',pool_sources(ready)))<e.config.budget.context_chars
-    relevant={i.id for i in state.review_issues if i.target_id in {'B_setup_leader_state','O_append_support'} and not i.resolved_by}
-    assert relevant<={i['id'] for i in packet['open_issues']}
 
 
-def test_archived_F3_preflight_splits_one_actual_dispute_without_agent_call():
-    from pathlib import Path
-    from consensus_assurance.core.types import Analysis
-    from consensus_assurance.core.config import Config
-    from consensus_assurance.workflow.task_packet import prepare,pool_sources
-    from consensus_assurance.workflow.prompts import render
-    root=Path(__file__).resolve().parents[2]/'runs/2026-09-16_21-58-16-hashicorp_raft-real-run'
-    state=Analysis.model_validate(__import__("consensus_assurance.workflow.history",fromlist=["import_record"]).import_record(json.loads((root/'history/9ceb2bdd25ca4feb961bedd0c8313906.json').read_text())))
-    state.active_inquiry_id=None;before=dict(state.usage);issues=state.review_issues[:]
-    e=SimpleNamespace(state=state,root=root,config=Config.model_validate(state.config),inquiry='',budget=SimpleNamespace(remaining=lambda:0))
-    children=inquiry.split_model_context(e,'F3')
-    assert len(children)==1 and state.usage==before and state.review_issues==issues
-    task=next(t for t in state.inquiry_tasks if t.id==children[0])
-    assert task.target_ids==['O_append_support'] and not task.admitted
-    packet,_=prepare(e,'semantic_review',inquiry.task_context(e,task))
-    assert packet['selected_unit']['code_uses']
-    assert len(render('semantic_review',pool_sources(packet)))<e.config.budget.context_chars
-    assert not any(i.resolved_by for i in issues if i.id in task.resolution_issue_ids)
 
 
 def test_experiment_archives_inputs_separately_from_runtime_outputs(tmp_path):

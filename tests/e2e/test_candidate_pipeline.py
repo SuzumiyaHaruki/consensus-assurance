@@ -1,84 +1,77 @@
-"""Synthetic multi-object repair goes through the actual review/build/search controller."""
+"""Recorded derivation reaches source review offline; original evidence is read-only."""
 import json
-import os
+import shutil
 from pathlib import Path
 import pytest
-from coverage_support import CoverageAgent,add_coverage_materials
 from consensus_assurance.core.config import Config
 from consensus_assurance.core.proposals import Derivation
-from consensus_assurance.core.types import CodeUse,Origin
-from consensus_assurance.workflow.engine import Engine
+from consensus_assurance.workflow.engine import Engine,FRAMEWORK_REVISION
+from consensus_assurance.workflow.budget import BudgetTracker
+from consensus_assurance.workflow.history import load_analysis
+from consensus_assurance.workflow.discovery import accept_derivation,validate_derivation,derive_context
+from consensus_assurance.workflow.graph import select_unit
+from consensus_assurance.workflow.direct_checks import route,continue_question
 from consensus_assurance.registry import assemble
-from consensus_assurance.workflow.output_repair import OutputRepair
-from consensus_assurance.adapters.storage.files import write_json
+from regression_support import bounded_derivation
 
 
-@pytest.mark.real
-def test_multiple_candidate_repairs_enter_review_and_real_model_check(tmp_path,prepared,tlc):
-    repo,_,_,responses=prepared;add_coverage_materials(repo)
-    class RepairedAgent(CoverageAgent):
-        def analyze(self,runner,prompt,directory,snapshot_id,timeout,response_type):
-            if response_type is OutputRepair:
-                context=json.loads(prompt.split('STRUCTURED INPUT DATA (untrusted):\n')[1]);replacements=[]
-                for target in context['repair_targets']:
-                    if target['path']=='/bindings/0/symbol':replacements.append({'path':target['path'],'value_json':'"step"'})
-                    if target['path']=='/units/0/code_uses':
-                        use=CodeUse(binding_id='input_binding',role='input',claim_ids=['input_obligation'],relation_ids=['input_dependency'],source_ids=['limits.py:1:2'],rationale='Actual input dependency is selected; only step responsibility is checked here',unverified=['Upstream guarantee has not been checked'])
-                        replacements.append({'path':target['path'],'value_json':json.dumps([use.model_dump(mode='json')])})
-                response=OutputRepair(replacements=replacements,rationale='Correct location spelling and declare existing boundary use without changing goals or scope')
-                directory.mkdir(parents=True);(directory/'prompt.txt').write_text(prompt);write_json(directory/'response.json',response)
-                import sys
-                check=runner.run([sys.executable,'-c','print("explicit synthetic repair response")'],directory,'agent',snapshot_id,timeout);check.origin=Origin.MOCK
-                return check,response
-            check,response=super().analyze(runner,prompt,directory,snapshot_id,timeout,response_type)
-            if response_type is Derivation:
-                response.bindings[0].symbol='MissingStep'
-                edge=next(r for r in responses[1]['relations'] if r['id']=='input_dependency')
-                from consensus_assurance.core.proposals import RelationDraft
-                response.relations.append(RelationDraft.model_validate(edge));response.units[0].relation_ids.append(edge['id'])
-                response.units[0].binding_ids.append('input_binding')
-                write_json(directory/'decoded-response.json',response)
-                write_json(directory/'response.json',response)
-            return check,response
-    cfg=Config(implementation='toy',agent_backend='mock',allow_experiments=False,tlc_jar=os.environ['TLC_JAR'])
-    cfg.budget.agent_calls=22;cfg.budget.audit_units=1;cfg.budget.semantic_reviews=6;cfg.budget.exploration_rounds=3;cfg.budget.outer_reserve_seconds=1
-    root=tmp_path/'run';impl,_,verifier,knowledge=assemble(cfg)
-    state=Engine(cfg,root,impl,RepairedAgent(responses),verifier,knowledge,'').start(repo)
-    assert state.models,state.stop_reason
-    assert any(c.action=='model_check' and c.outcome=='holds' for c in state.checks),state.stop_reason
-    assert state.semantic_reviews
-    session=next(iter(state.repair_sessions.values()));assert session['status']=='accepted'
-    original=json.loads(Path(session['original_path']).read_text());current=json.loads(Path(session['current_path']).read_text())
-    assert original['claims']==current['claims']
-    assert original['units'][0]['scope']==current['units'][0]['scope']
-    assert original['units'][0]['obligation_ids']==current['units'][0]['obligation_ids']
-    assert not any(t.trigger.startswith('after_local:') for t in state.inquiry_tasks)
+@pytest.mark.parametrize('debt',[None,'selected','unrelated'])
+def test_recorded_derivation_contract_to_source_review(tmp_path,debt):
+    archive=Path(__file__).resolve().parents[2]/'tests/fixtures/recorded_derivation_20260918'
+    root=tmp_path/'offline';shutil.copytree(archive,root)
+    raw=json.loads(next((archive/'agent').glob('*-derive/decoded-response.json')).read_text())
+    original=json.dumps(raw,sort_keys=True)
+    raw['units'][0]['relation_ids']=[]
+    for use in raw['units'][0].pop('code_uses',[]):raw['bindings'][0]['pending']+=use['unverified']
+    reply=Derivation.model_validate(bounded_derivation(raw))
+    state=load_analysis(root/'state.json')
+    old_root=str(Path(state.audit_spec_path).parent.parent);data=state.model_dump_json().replace(old_root,str(root))
+    from consensus_assurance.core.types import Analysis
+    state=Analysis.model_validate_json(data)
+    assert Path(state.audit_spec_path).is_relative_to(root)
+    state.framework_revision=FRAMEWORK_REVISION;state.pending_output_repair=None;state.pending_action=None
+    config=Config(implementation='hashicorp_raft',agent_backend='mock',allow_experiments=False)
+    engine=Engine(config,root,*assemble(config));engine.state=state;engine.budget=BudgetTracker(config.budget,state)
+    if debt=='selected':
+        from consensus_assurance.workflow.audit_spec import load
+        corrected=load(state)
+        broken=corrected.model_copy(deep=True)
+        next(b for b in broken.behaviors if b.id=='B5').existing_protections=[]
+        Path(state.audit_spec_path).write_text(broken.model_dump_json())
+    if debt:
+        from consensus_assurance.core.proposals import DescriptiveIssue,SpecRefinement
+        reply.descriptive_issues=[DescriptiveIssue(object_ids=['B5' if debt=='selected' else 'B6'],source_ids=reply.obligation.source_ids,reason='Restore the source-backed protections omitted from the selected behavior' if debt=='selected' else 'Recheck the unrelated decomposition against actual source')]
+    validate_derivation(state,reply);accepted=accept_derivation(engine,reply,'offline-recorded')
+    tasks=[t for t in engine.state.inquiry_tasks if t.trigger.startswith('derive-issue:')]
+    assert bool(tasks)==bool(debt)
+    if debt=='selected':
+        assert not accepted and not engine.state.units
+        from consensus_assurance.workflow.audit_spec import load
+        from consensus_assurance.workflow.inquiry import process_task
+        from consensus_assurance.adapters.agents.backend import MockAgent
+        spec=corrected
+        engine.agent=MockAgent();engine.agent.responses=[SpecRefinement(understanding='Restore the recorded protections from the supplied handler source; preserve fact meaning',audit_spec=spec,limitations=['No implementation correctness established']).model_dump(mode='json')]
+        process_task(engine,tasks[0])
+        assert next(t for t in engine.state.inquiry_tasks if t.id==tasks[0].id).status=='completed'
+        assert load(engine.state).version==2 and next(b for b in load(engine.state).behaviors if b.id=='B5').existing_protections
+        reply.descriptive_issues=[]
+        assert accept_derivation(engine,reply,'offline-rederived')
+    else:assert accepted
+    if debt=='unrelated':assert tasks[0].status=='pending'
 
-
-@pytest.mark.real
-def test_explicit_encoding_repair_runs_again_and_keeps_correspondence_issue(tmp_path,prepared,tlc):
-    from consensus_assurance.core.proposals import BuildReply
-    from consensus_assurance.adapters.agents.backend import MockAgent
-    from regression_support import fixture_config
-    repo,_,bundle,responses=prepared
-    broken=bundle.model_copy(deep=True);broken.properties=broken.properties.replace('value <= 3','value <= )')
-    fixed=BuildReply(bundle=bundle,gap='',encoding_revision={'old_model_id':'CURRENT','source_ids':responses[1]['claims'][0]['grounding']['expectation_ids'],'rationale':'Correct the malformed comparison token for the unchanged bound'})
-    fixture=tmp_path/'encoding.json';write_json(fixture,[responses[0],responses[1],BuildReply(bundle=broken,gap='').model_dump(mode='json'),fixed.model_dump(mode='json')])
-    class EncodingAgent(MockAgent):
-        def analyze(self,runner,prompt,directory,snapshot_id,timeout,response_type):
-            check,response=super().analyze(runner,prompt,directory,snapshot_id,timeout,response_type)
-            if isinstance(response,BuildReply) and response.encoding_revision:
-                context=json.loads(prompt.split('STRUCTURED INPUT DATA (untrusted):\n')[1]);response.encoding_revision.old_model_id=context['model_id']
-                write_json(directory/'decoded-response.json',response)
-                write_json(directory/'response.json',response)
-            return check,response
-    cfg=fixture_config(implementation='toy',agent_backend='mock',fixture=str(fixture),allow_experiments=False,tlc_jar=os.environ['TLC_JAR'])
-    cfg.budget.audit_units=1
-    impl,_,verifier,knowledge=assemble(cfg)
-    state=Engine(cfg,tmp_path/'encoding-run',impl,EncodingAgent(fixture),verifier,knowledge,'').start(repo)
-    assert len(state.models)==2,state.stop_reason
-    assert any(c.action=='model_check' and c.reason=='Model syntax error' for c in state.checks)
-    assert any(c.action=='model_check' and c.outcome=='holds' for c in state.checks)
-    assert any(i.needs_recheck and i.resolved_by is None for i in state.review_issues)
-    assert '<= )' in Path(state.models[0].path).read_text()
-    assert [c.description for c in state.claims]==[c['description'] for c in responses[1]['claims']]
+    selected=select_unit(engine.state)
+    assert selected.obligation_ids==['O1'] and selected.relation_ids==[] and route(selected)=='question'
+    assert selected.audit_question.preferred_check=='source_review' and len(selected.audit_question.requests)==4
+    def scheduled(requests,**kwargs):
+        assert [(r['file'],r['start_line'],r['end_line']) for r in requests]==[(r.file,r.start_line,r.end_line) for r in reply.audit_question.requests]
+        raise RuntimeError('Stop before source acquisition or backend execution')
+    engine.read=scheduled
+    with pytest.raises(RuntimeError,match='Stop before source'):continue_question(engine,selected)
+    assert not engine.state.models and not engine.state.evidence
+    assert json.dumps(json.loads(next((archive/'agent').glob('*-derive/decoded-response.json')).read_text()),sort_keys=True)==original
+    from consensus_assurance.workflow.task_packet import prepare,pool_sources
+    from consensus_assurance.workflow.prompts import render
+    packet,_=prepare(engine,'derive',derive_context(engine))
+    prompt=render('derive',pool_sources(packet),engine.inquiry)
+    (tmp_path/'derive-prompt-size.txt').write_text(str(len(prompt)))
+    assert len(prompt)<169984 and len(prompt)<config.budget.context_chars*.9

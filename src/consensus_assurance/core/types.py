@@ -148,7 +148,7 @@ class AuditQuestion(Record):
     obligation_relation_kind: Lifecycle | None = None
     counterevidence: list[str] = []
     unknowns: list[str] = []
-    priority: int = Field(default=0, ge=0, le=3, description="Consequence and handoff significance, justified in importance; not proof")
+    priority: int = Field(default=0, ge=0, le=3, description="System consequence and audit significance, justified in importance; not proof")
     trigger_rationale: str
 
 
@@ -371,15 +371,6 @@ class BindingAssociation(Record):
     rationale: str
 
 
-class CodeUse(Record):
-    binding_id: str
-    role: Literal["direct", "input", "support", "environment", "handoff"]
-    claim_ids: list[str] = Field(min_length=1, description="Existing claims associated with this binding; contextual use does not add them to checked obligations")
-    relation_ids: list[str] = Field(default_factory=list, description="For support/handoff: selected directed dependency edges from checked obligations, not a unselected mapping or a merely related edge")
-    source_ids: list[str] = Field(min_length=1)
-    rationale: str
-    unverified: list[str] = []
-
 
 class AssociatedCode(Record):
     associations: list[BindingAssociation] = Field(min_length=1)
@@ -573,7 +564,7 @@ class Relation(Record):
     id: str = Field(default_factory=uid)
     source: str
     target: str
-    kind: Literal["depends_all", "alternative", "supports", "challenges", "maps", "revises", "conditional_on", "boundary"]
+    kind: Literal["depends_all", "supports", "challenges", "revises", "conditional_on", "boundary"]
     group: str | None = None
     confirmed: bool = False
     rationale: str
@@ -621,7 +612,6 @@ class AuditUnit(Record):
     recheck_reasons: list[str] = []
     semantic_readiness: dict[str, Any] = {}
     audit_question: AuditQuestion | None = None
-    code_uses: list[CodeUse] = []
     coverage_limitations: list[str] = []
 
 

@@ -1,6 +1,6 @@
 from typing import Literal
 from pydantic import Field, model_validator
-from .types import AssociatedCode, CodeUse, Record, Scope, ConstraintSource, Grounding, CheckerSpec, ReadRequest, ConsensusAuditSpec, SemanticCheck, AuditQuestion, ReachabilityRequirement
+from .types import AssociatedCode, Record, Scope, ConstraintSource, Grounding, CheckerSpec, ReadRequest, ConsensusAuditSpec, SemanticCheck, AuditQuestion, ReachabilityRequirement
 
 
 class ClaimDraft(Record):
@@ -27,7 +27,7 @@ class RelationDraft(Record):
     id: str
     source: str
     target: str
-    kind: Literal["depends_all", "alternative", "supports", "maps", "conditional_on", "boundary"]
+    kind: Literal["depends_all", "conditional_on", "boundary"]
     group: str | None
     rationale: str
     pending: list[str]
@@ -36,11 +36,10 @@ class RelationDraft(Record):
 
 class UnitDraft(Record):
     audit_question: AuditQuestion | None = None
-    code_uses: list[CodeUse] = []
     id: str
-    obligation_ids: list[str] = Field(min_length=1)
+    obligation_ids: list[str] = Field(min_length=1, max_length=1)
     binding_ids: list[str] = Field(min_length=1)
-    relation_ids: list[str] = Field(min_length=1)
+    relation_ids: list[str] = Field(default_factory=list)
     scope: Scope
     rationale: str
 
@@ -62,11 +61,21 @@ class Discovery(Record):
     reading_requests: list[ReadRequest] = Field(default_factory=list, max_length=8)
 
 
-class Derivation(GraphDraft):
-    understanding: str
+class DescriptiveIssue(Record):
+    object_ids: list[str] = Field(min_length=1)
+    source_ids: list[str] = Field(min_length=1)
+    reason: str
+
+
+class Derivation(Record):
+    obligation: ClaimDraft | None = None
+    bindings: list[BindingDraft] = []
+    dependencies: list[RelationDraft] = []
+    context_claims: list[ClaimDraft] = []
+    audit_question: AuditQuestion | None = None
     selection_rationale: str
     reading_requests: list[ReadRequest] = Field(default_factory=list, max_length=8)
-    units: list[UnitDraft] = Field(default_factory=list, max_length=1)
+    descriptive_issues: list[DescriptiveIssue] = []
 
 
 class FieldProjection(Record):
@@ -257,7 +266,7 @@ class BuildReply(Record):
 
 class JudgmentChange(Record):
     target_id: str
-    field: Literal["description", "scope", "grounding", "source", "target", "kind", "group", "rationale", "pending", "source_ids", "claim_id", "material_id", "symbol", "start_line", "end_line",  "obligation_ids", "binding_ids", "relation_ids", "audit_question", "associations", "anchor", "code_uses"]
+    field: Literal["description", "scope", "grounding", "source", "target", "kind", "group", "rationale", "pending", "source_ids", "claim_id", "material_id", "symbol", "start_line", "end_line",  "obligation_ids", "binding_ids", "relation_ids", "audit_question", "associations", "anchor"]
     old_value_json: str
     new_value_json: str
 

@@ -72,21 +72,21 @@ def test_invalid_build_artifact_is_repaired_before_commit(tmp_path,prepared):
 
 
 def test_schema_reference_repair_receives_owner_and_dependency_context():
-    from consensus_assurance.core.proposals import Derivation
+    from consensus_assurance.core.proposals import GraphDraft
     from consensus_assurance.core.diagnostics import Diagnostic
     from consensus_assurance.workflow.output_repair import diagnostic_context
     candidate={'patch':{'units':[{'id':'U','obligation_ids':['O'],'binding_ids':['B'],
-        'relation_ids':['R'],'code_uses':[{'binding_id':'B','claim_ids':[]}]}],
+        'relation_ids':['R'],'obligation_ids':[]}],
         'bindings':[{'id':'B','associations':[{'claim_id':'O','source_ids':['source'],'rationale':'Existing association'}]}],
         'claims':[{'id':'O','description':'Preserved obligation','source_ids':['source']}],
         'relations':[{'id':'R','source':'O','target':'B'}],
         'unrelated':[{'id':'X','description':'DO NOT SEND'}]}}
-    d=Diagnostic(code='schema_type',category='format',paths=['/patch/units/0/code_uses/0/claim_ids'],message='Empty reference',allowed=['representation'])
+    d=Diagnostic(code='schema_type',category='format',paths=['/patch/units/0/obligation_ids'],message='Empty reference',allowed=['representation'])
     material={'id':'source','file':'service.go','start_line':1,'end_line':1,'content_digest':'fixture','text':'actual acquired code'}
     result=diagnostic_context(candidate,[d],{'materials':[material]},4000)
     assert {o['id'] for o in result['objects']}=={'U','O','B','R'}
     assert result['materials']==[material]
-    assert candidate['patch']['units'][0]['code_uses'][0]['claim_ids']==[]
+    assert candidate['patch']['units'][0]['obligation_ids']==[]
     assert not result['required_objects_missing']
     small=diagnostic_context(candidate,[d],{'materials':[material]},50)
     assert small['required_objects_missing'] and not small['objects']

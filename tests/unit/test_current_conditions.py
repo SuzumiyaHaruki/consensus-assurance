@@ -7,7 +7,6 @@ from consensus_assurance.core.diagnostics import DiagnosticError
 from consensus_assurance.workflow.repair_policy import classify_conditions,condition_records,validate_representation
 from consensus_assurance.workflow.output_repair import diagnostic_context,diagnostic_targets,all_materials
 from consensus_assurance.workflow.reviews import validate_resolutions
-from test_worksets import ARCHIVE
 
 
 @pytest.mark.parametrize('shape,code',[('missing','condition_missing'),('extra','condition_extra'),('duplicate','condition_duplicate')])
@@ -25,24 +24,6 @@ def test_condition_reference_diagnostics_are_specific_and_do_not_erase_judgment(
     assert classify_conditions(state,[r['text'] for r in records],[item],[id],records=records)==[item]
 
 
-def test_archived_current_conditions_reach_the_actual_repair_context():
-    state=Analysis.model_validate(__import__("consensus_assurance.workflow.history",fromlist=["import_record"]).import_record(json.loads((ARCHIVE/'state.json').read_text())))
-    folder=ARCHIVE/'agent/68dd6b52f1bb4ec18cae6428a2ef75f0-semantic_review'
-    raw=json.loads((folder/'decoded-response.json').read_text())
-    context=json.loads((folder/'prompt.txt').read_text().split('STRUCTURED INPUT DATA (untrusted):\n')[1])
-    task=InquiryTask.model_validate(import_record(context['task']));task.material_ids=[m['id'] for m in all_materials(context)]
-    reply=ReviewReply.model_validate(import_record(raw))
-    with pytest.raises(DiagnosticError) as caught:validate_resolutions(state,task,reply)
-    d=caught.value.diagnostics[0]
-    assert d.code in {'condition_missing','condition_extra','condition_duplicate'}
-    assert d.details['current_items'] and d.details['issue']['id']
-    targets=diagnostic_targets(raw,[d],16000)
-    assert targets and 'condition_dispositions' in targets[0]['path']
-    repaired_context=diagnostic_context(raw,[d],context,16000)
-    problem=next(o['current_condition_problem'] for o in repaired_context['objects'] if 'current_condition_problem' in o)
-    assert problem['expected_conditions']==d.details['expected_conditions']
-    assert problem['current_items']==d.details['current_items']
-    assert json.loads((folder/'decoded-response.json').read_text())==raw
 
 
 def test_metadata_correction_keeps_the_negative_substance():

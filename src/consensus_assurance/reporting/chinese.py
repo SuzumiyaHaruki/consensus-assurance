@@ -166,7 +166,10 @@ def audit_lines(state):
     lines=['', '## 义务与有界审计结论']
     for unit in state.units:
         q=unit.audit_question
-        lines += [f"Activity {q.activity_classes if q else []}；义务 {unit.obligation_ids}：{unit.status}", f"问题：{q.question if q else '尚未形成'}；方法：{q.preferred_check if q else '未选'}"]
+        for claim in state.claims:
+            if claim.id in unit.obligation_ids:lines.append(f"{claim.id} — {claim.description}")
+        code=[f"{b.symbol} @ {b.file}:{b.start_line}-{b.end_line}" for b in state.bindings if b.id in unit.binding_ids]
+        lines += ['代码：'+'；'.join(code),f"问题：{q.question if q else '尚未形成'}",f"方法：{q.preferred_check if q else '未选'}；状态：{unit.status}"]
         evidence=[e for e in state.evidence if e.claim_id in unit.obligation_ids]
         lines.append('证据：'+('; '.join(e.id+': '+str(e.assessment)+' / '+e.applicability for e in evidence) if evidence else '尚无；不能宣称正确'))
         if q:
@@ -239,8 +242,6 @@ def render_report(state, root):
         lines.append(f"诊断及材料：{session.get('diagnostics',[])}；重复失败：{session.get('problem_failures',{})}；显式范围/语义计划：{session.get('proposed_change','无')}。")
     for binding in state.bindings:
         lines.append(f"代码位置 `{binding.id}`：{binding.file}:{binding.start_line}–{binding.end_line}；锚点 {binding.anchor}；候选职责关联 {[a.claim_id for a in binding.associations]}。")
-    for unit in state.units:
-        if unit.code_uses:lines.append(f"单元 `{unit.id}` 的代码用途：{[u.model_dump(mode='json') for u in unit.code_uses]}；支撑用途不计为已检查义务。")
     lines += ["", "## 实验能力与执行", "", "| 能力 | 状态 | 执行依据 |", "| --- | --- | --- |"]
     for cap in state.capabilities:
         lines.append(f"| {cap.name} | {cap.status} | {cap.check_id or '无执行确认'}：{cap.description} |")

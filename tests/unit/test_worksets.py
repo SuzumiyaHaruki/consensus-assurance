@@ -11,12 +11,6 @@ from consensus_assurance.workflow.task_packet import prepare,pool_sources
 from consensus_assurance.workflow.prompts import render
 from test_graph_mutations import controller
 
-ARCHIVE=Path(__file__).resolve().parents[2]/'runs/2026-09-16_13-58-11-hashicorp_raft-real-run'
-
-def archived_engine(version):
-    state=Analysis.model_validate(__import__("consensus_assurance.workflow.history",fromlist=["import_record"]).import_record(json.loads((ARCHIVE/'history'/(version+'.json')).read_text())))
-    return SimpleNamespace(state=state,root=ARCHIVE,config=Config.model_validate(state.config),implementation=HashicorpRaft(),budget=SimpleNamespace(remaining=lambda:1))
-
 
 
 def test_mixed_history_projects_only_relevant_items_and_retains_counterevidence(tmp_path,prepared):

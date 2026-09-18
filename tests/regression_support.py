@@ -56,3 +56,26 @@ def inventory_response(runner,prompt,directory,snapshot_id,timeout):
     source=all_materials(packet)[0]['id']
     agent=MockAgent();agent.responses=[descriptive_inventory(source).model_dump(mode='json')]
     return MockAgent.analyze(agent,runner,prompt,directory,snapshot_id,timeout,Discovery)
+
+
+def bounded_derivation(graph):
+    """Convert a fixed graph fixture into the current bounded backend response."""
+    from consensus_assurance.core.proposals import Derivation
+    if hasattr(graph,'model_dump'):graph=graph.model_dump(mode='json')
+    unit=graph['units'][0];primary=unit['obligation_ids'][0]
+    selected=[b for b in graph['bindings'] if b['id'] in unit['binding_ids']]
+    edges=[r for r in graph['relations'] if r['id'] in unit['relation_ids']]
+    wanted={primary}|{r[k] for r in edges for k in ('source','target')}
+    for b in selected:wanted.update(a['claim_id'] for a in b.get('associations',[]) or [{'claim_id':b.get('claim_id')}])
+    return Derivation(obligation=next(c for c in graph['claims'] if c['id']==primary),bindings=selected,dependencies=edges,
+        context_claims=[c for c in graph['claims'] if c['id'] in wanted and c['id']!=primary],audit_question=unit.get('audit_question'),selection_rationale=unit['rationale']).model_dump(mode='json')
+
+
+def add_dependency(state,responses):
+    from consensus_assurance.core.types import Relation
+    edge=Relation(id='input_dependency',source='step_obligation',target='input_obligation',kind='boundary',group=None,
+        rationale='The checked consumer depends on actual producer input',pending=['Producer guarantee remains unverified'],grounding=state.claims[1].grounding.model_copy(deep=True))
+    if not state.relations:state.relations.append(edge)
+    from consensus_assurance.core.proposals import RelationDraft
+    responses[1]['relations']=[{k:v for k,v in edge.model_dump(mode='json').items() if k in RelationDraft.model_fields}]
+    state.units[0].relation_ids=['input_dependency'];responses[1]['units'][0]['relation_ids']=['input_dependency']

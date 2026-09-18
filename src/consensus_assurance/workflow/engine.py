@@ -26,7 +26,7 @@ from .errors import Blocked
 from .agent_tasks import ask as ask_agent
 
 
-FRAMEWORK_REVISION = "obligation-audit-v1"
+FRAMEWORK_REVISION = "obligation-audit-v2"
 
 
 class Engine:

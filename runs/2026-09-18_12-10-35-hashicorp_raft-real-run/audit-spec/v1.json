@@ -1,0 +1,1504 @@
+{
+  "version": 1,
+  "target_profile": {
+    "system_boundary": "Repository implementation of the Raft library, including its built-in storage and transport variants where selected. Application FSM semantics and separately maintained storage backends are outside the concrete implementation currently supplied; library invocation and completion handling remain inside the boundary.",
+    "protocol_contexts": [
+      "Follower, candidate and leader roles; candidate processing uses election terms and optional pre-vote.",
+      "RPC protocol versions and snapshot versions have separate compatibility checks.",
+      "Log entries carry index, term and type.",
+      "Configuration state distinguishes latest and committed versions by log index.",
+      "A commitment object contains a voter map and a leader-term start index."
+    ],
+    "external_interfaces": [
+      "Apply, ApplyLog, Barrier and VerifyLeader return futures.",
+      "Transport exposes RPC delivery, replication pipelines, votes, snapshot transfer and TimeoutNow.",
+      "WithPreVote is an optional transport extension.",
+      "FSM, BatchingFSM and FSMSnapshot expose application callbacks.",
+      "Snapshot storage exposes Create and Open; sinks expose Close, Cancel and ID.",
+      "Log storage supplies index lookup and range deletion in the observed snapshot paths."
+    ],
+    "ownership": [
+      "Candidate event processing runs in the protocol main thread.",
+      "commitment serializes voter-map and commit-index access with a mutex.",
+      "runFSM owns local application index and term and invokes application callbacks.",
+      "takeSnapshot obtains configuration state through a future because the main thread owns it.",
+      "FileSnapshotSink owns file finalization, metadata publication and invocation of snapshot retention.",
+      "Transport implementations may deliver heartbeats through a separate fast-pass callback."
+    ],
+    "selection_injection": [
+      "runFSM selects batching and configuration-storage behavior through interface assertions on r.fsm.",
+      "Snapshot installation selects whole-log removal when the log store implements MonotonicLogStore and reports IsMonotonic; otherwise it selects trailing-log compaction.",
+      "FileSnapshotSink is an observed built-in implementation; its actual selection and noSync configuration are unknown.",
+      "Transport permits optional pre-vote and heartbeat handling. Constructor wiring and effective transport selection have not been read.",
+      "README identifies separately maintained MDB and Bbolt backends. Their recommendation does not establish the active backend.",
+      "File lookup lists in-memory storage, snapshot and transport implementations, a discard snapshot implementation and a log cache; their semantics and activation remain unread."
+    ],
+    "variants": [
+      "Pre-vote enabled, disabled or bypassed for leadership transfer.",
+      "Individual FSM application versus BatchingFSM application.",
+      "Optional ConfigurationStore callback.",
+      "Versioned snapshot configuration versus legacy peer decoding.",
+      "Monotonic log reset versus trailing-log compaction.",
+      "File snapshot synchronization enabled or disabled; parent-directory synchronization skipped on Windows.",
+      "Legacy and newer membership encodings described in config.go; complete activation rules remain unread."
+    ],
+    "source_ids": [
+      "README.md:1:80",
+      "docs/README.md:1:80",
+      "transport.go:1:80",
+      "config.go:1:80",
+      "commitment.go:1:104",
+      "raft.go:285:441",
+      "fsm.go:1:80",
+      "fsm.go:81:240",
+      "raft.go:1814:1955",
+      "snapshot.go:125:278",
+      "file_snapshot.go:397:500"
+    ],
+    "unknowns": [
+      "Constructor, startup reconstruction and goroutine wiring have not been inspected.",
+      "Selected deployment configuration, transport, log store, stable store and snapshot store are unknown.",
+      "Successful storage calls have not yet been tied to concrete crash-persistence guarantees.",
+      "Normal replication, leader dispatch and commit-to-FSM handoffs remain unread.",
+      "Package-test availability is supplied capability metadata, not evidence of behavioral correctness or deterministic schedule control."
+    ]
+  },
+  "activities": [
+    {
+      "class_id": "A1",
+      "applicability": "applicable",
+      "purpose": "Form and advance decisions from operation proposals and participant support.",
+      "realization_summary": "commitment records increasing match indexes for current voters and advances a local aggregate index at a majority order statistic subject to startIndex. The support producers and downstream commit consumer remain unknown.",
+      "entry_points": [
+        "commitment.match",
+        "commitment.recalculate",
+        "newCommitment"
+      ],
+      "behavior_ids": [
+        "B4"
+      ],
+      "variants": [
+        "Voter-map replacement through setConfiguration",
+        "Empty voter map produces no advancement"
+      ],
+      "unknowns": [
+        "Persistence and context checks before match calls",
+        "Leader commit dispatch and follower commit advancement"
+      ],
+      "source_ids": [
+        "commitment.go:1:104"
+      ]
+    },
+    {
+      "class_id": "A2",
+      "applicability": "applicable",
+      "purpose": "Acquire and change protocol authority and interpret term-scoped work.",
+      "realization_summary": "runCandidate tallies pre-votes and votes, requests role transitions, rejects leader-only operations and restarts after timeout. Snapshot installation also changes local role and term for a newer request.",
+      "entry_points": [
+        "Raft.runCandidate",
+        "Raft.checkRPCHeader",
+        "Raft.installSnapshot"
+      ],
+      "behavior_ids": [
+        "B2"
+      ],
+      "variants": [
+        "Pre-vote",
+        "Direct election",
+        "Leadership-transfer election"
+      ],
+      "unknowns": [
+        "Election-result production and uniqueness",
+        "Vote persistence",
+        "Follower timers and leader lease handling",
+        "State-setter side effects"
+      ],
+      "source_ids": [
+        "raft.go:1:80",
+        "raft.go:285:441",
+        "raft.go:1814:1955"
+      ]
+    },
+    {
+      "class_id": "A3",
+      "applicability": "applicable",
+      "purpose": "Restore replicas and resume participation using retained evidence.",
+      "realization_summary": "installSnapshot streams to a sink, waits for an FSM restore future, updates local snapshot/application/configuration metadata and attempts log cleanup before reporting success.",
+      "entry_points": [
+        "Raft.installSnapshot",
+        "runFSM restore closure"
+      ],
+      "behavior_ids": [
+        "B12",
+        "B13"
+      ],
+      "variants": [
+        "Legacy snapshot metadata",
+        "Monotonic and non-monotonic log stores"
+      ],
+      "unknowns": [
+        "Startup restore selection",
+        "Incremental replication after restore",
+        "Restore helper behavior",
+        "Concurrent heartbeat interaction"
+      ],
+      "source_ids": [
+        "raft.go:1814:1955",
+        "fsm.go:81:240"
+      ]
+    },
+    {
+      "class_id": "A4",
+      "applicability": "applicable",
+      "purpose": "Track and consume membership versions.",
+      "realization_summary": "Configuration structures distinguish latest and committed states. commitment.setConfiguration replaces eligible voters, snapshot creation consumes committed configuration, and snapshot installation replaces both configuration fields.",
+      "entry_points": [
+        "commitment.setConfiguration",
+        "checkConfiguration",
+        "Raft.installSnapshot",
+        "Raft.takeSnapshot"
+      ],
+      "behavior_ids": [
+        "B5"
+      ],
+      "variants": [
+        "Voter versus other suffrage",
+        "Legacy versus versioned membership encodings"
+      ],
+      "unknowns": [
+        "Proposal admission and activation ordering",
+        "Configuration rollback",
+        "Actual callers of validation and voter-map replacement"
+      ],
+      "source_ids": [
+        "configuration.go:129:228",
+        "commitment.go:1:104",
+        "config.go:1:80",
+        "snapshot.go:125:278",
+        "raft.go:1814:1955"
+      ]
+    },
+    {
+      "class_id": "A5",
+      "applicability": "applicable",
+      "purpose": "Schedule decisions into application callbacks and correlate responses.",
+      "realization_summary": "runFSM defines individual and batched application, restoration and snapshot-capture handlers. Application implementation is caller-owned; filtering, callback invocation and future completion are library responsibilities.",
+      "entry_points": [
+        "Raft.runFSM",
+        "FSM.Apply",
+        "BatchingFSM.ApplyBatch",
+        "FSM.Restore",
+        "FSM.Snapshot"
+      ],
+      "behavior_ids": [
+        "B6",
+        "B7"
+      ],
+      "variants": [
+        "BatchingFSM",
+        "ConfigurationStore"
+      ],
+      "unknowns": [
+        "Remaining runFSM channel dispatch",
+        "Producer and ordering of commit tuples",
+        "Application-specific determinism and snapshot isolation"
+      ],
+      "source_ids": [
+        "fsm.go:1:80",
+        "fsm.go:81:240"
+      ]
+    },
+    {
+      "class_id": "A6",
+      "applicability": "applicable",
+      "purpose": "Persist, publish, replace and reclaim recovery evidence.",
+      "realization_summary": "Snapshot creation persists an FSM capture before updating snapshot metadata and compacting logs. FileSnapshotSink closes resources, writes metadata, renames the directory and reaps old snapshots. Concrete normal-log persistence remains unread.",
+      "entry_points": [
+        "Raft.takeSnapshot",
+        "Raft.compactLogsWithTrailing",
+        "Raft.removeOldLogs",
+        "FileSnapshotSink.Close",
+        "FileSnapshotSink.Cancel"
+      ],
+      "behavior_ids": [
+        "B8",
+        "B9",
+        "B10",
+        "B11",
+        "B14"
+      ],
+      "variants": [
+        "File synchronization flags and platform behavior",
+        "Trailing-log retention",
+        "Whole-log removal after monotonic-store restore"
+      ],
+      "unknowns": [
+        "Snapshot Create/Open/List and retention semantics",
+        "Metadata synchronization",
+        "Stable term and vote persistence",
+        "Built-in storage error behavior"
+      ],
+      "source_ids": [
+        "snapshot.go:125:278",
+        "file_snapshot.go:397:500",
+        "raft.go:1814:1955"
+      ]
+    },
+    {
+      "class_id": "A7",
+      "applicability": "applicable",
+      "purpose": "Expose operation admission, completion and read-related coordination.",
+      "realization_summary": "ApplyLog, Barrier and VerifyLeader enqueue futures. Candidate processing rejects these operations. FSM handlers respond to application futures after callback handling. API comments explicitly describe ambiguous leadership-loss outcomes and restore abortion.",
+      "entry_points": [
+        "Raft.ApplyLog",
+        "Raft.Barrier",
+        "Raft.VerifyLeader",
+        "Raft.GetConfiguration"
+      ],
+      "behavior_ids": [
+        "B1",
+        "B3"
+      ],
+      "variants": [
+        "Positive enqueue timeout versus no timer",
+        "Command versus barrier",
+        "Candidate rejection"
+      ],
+      "unknowns": [
+        "Future synchronization implementation",
+        "Leader verification completion",
+        "Leader loss and user-restore handling",
+        "Retry and deduplication responsibilities"
+      ],
+      "source_ids": [
+        "api.go:800:897",
+        "api.go:1:80",
+        "raft.go:285:441",
+        "fsm.go:81:240"
+      ]
+    }
+  ],
+  "behaviors": [
+    {
+      "id": "B1",
+      "primary_activity": "A7",
+      "execution_owner": "Caller goroutine executing ApplyLog or Barrier",
+      "protocol_context": "Request admission before index and term assignment",
+      "trigger": "Client invokes ApplyLog or Barrier.",
+      "legal_preconditions": [
+        "A Raft instance exposes the request channels; constructor setup is unread."
+      ],
+      "implementation_guards": [
+        "Positive timeout enables a timer.",
+        "select chooses timeout, shutdown or applyCh send."
+      ],
+      "reads": [
+        "Input Data and Extensions for ApplyLog",
+        "shutdownCh"
+      ],
+      "writes": [
+        "New initialized logFuture containing LogCommand or LogBarrier"
+      ],
+      "durable_effects": [],
+      "external_effects": [
+        "Returns the enqueued future or an immediate errorFuture."
+      ],
+      "important_branches": [
+        "Timeout returns ErrEnqueueTimeout.",
+        "Shutdown returns ErrRaftShutdown.",
+        "Successful send returns an unresolved future."
+      ],
+      "async_boundaries": [
+        "applyCh handoff to protocol processing"
+      ],
+      "produces_fact_ids": [
+        "F1"
+      ],
+      "consumes_fact_ids": [],
+      "cross_activity_effects": {
+        "A1": "Makes a command or barrier request available for protocol processing without assigning an index or establishing a decision."
+      },
+      "existing_protections": [
+        "Caller-supplied log index, term and type are not copied by ApplyLog."
+      ],
+      "source_ids": [
+        "api.go:800:897"
+      ],
+      "unknowns": [
+        "Receiver buffering and future synchronization",
+        "Later leader admission and completion paths"
+      ]
+    },
+    {
+      "id": "B2",
+      "primary_activity": "A2",
+      "execution_owner": "Protocol main thread in runCandidate",
+      "protocol_context": "One candidate invocation with a captured quorum size and election timer",
+      "trigger": "Candidate loop receives pre-vote or vote results.",
+      "legal_preconditions": [
+        "Local state is Candidate.",
+        "Result channels originate from preElectSelf or electSelf, whose bodies are unread."
+      ],
+      "implementation_guards": [
+        "Pre-vote is bypassed if disabled or candidateFromLeadershipTransfer is set.",
+        "Higher-term results cause follower and term setter calls.",
+        "Granted vote count must reach votesNeeded before leader setter calls."
+      ],
+      "reads": [
+        "Current term and state",
+        "ElectionTimeout",
+        "Vote result Term and Granted",
+        "quorumSize result"
+      ],
+      "writes": [
+        "Local tallies and result channels",
+        "Role, term and leader through helper calls",
+        "Leadership-transfer flag on exit"
+      ],
+      "durable_effects": [
+        "Any durable effects of setCurrentTerm and electSelf remain unresolved."
+      ],
+      "external_effects": [],
+      "important_branches": [
+        "Pre-vote majority starts electSelf.",
+        "Vote majority calls setState(Leader) and setLeader.",
+        "Timeout returns so the outer loop can restart.",
+        "RPC processing may change state.",
+        "Shutdown exits."
+      ],
+      "async_boundaries": [
+        "Vote and pre-vote result channels",
+        "RPC delivery",
+        "Election timer"
+      ],
+      "produces_fact_ids": [],
+      "consumes_fact_ids": [],
+      "cross_activity_effects": {
+        "A1": "Selects the local leader path through role setters; leader setup and authority-dependent proposal handling remain unread."
+      },
+      "existing_protections": [
+        "Leadership-transfer flag is reset on every return.",
+        "prevoteCh is disabled after pre-vote success.",
+        "Newer-term responses cause fallback."
+      ],
+      "source_ids": [
+        "raft.go:285:441"
+      ],
+      "unknowns": [
+        "Distinct-voter and per-election provenance of results",
+        "quorumSize configuration source",
+        "Durable vote establishment",
+        "Completion semantics of role and term setters"
+      ]
+    },
+    {
+      "id": "B3",
+      "primary_activity": "A7",
+      "execution_owner": "Protocol main thread in runCandidate",
+      "protocol_context": "Candidate request handling",
+      "trigger": "Candidate selects a client or configuration-related request.",
+      "legal_preconditions": [
+        "The candidate loop selects the corresponding channel case."
+      ],
+      "implementation_guards": [
+        "Candidate loop continues while local state is Candidate."
+      ],
+      "reads": [
+        "Request channels",
+        "r.configurations for configuration queries"
+      ],
+      "writes": [
+        "Configuration query future receives a deep clone."
+      ],
+      "durable_effects": [],
+      "external_effects": [
+        "Responds ErrNotLeader to apply, verification, configuration-change, user-restore and leadership-transfer requests.",
+        "Responds ErrCantBootstrap to bootstrap.",
+        "Responds successfully with a configuration clone to configuration queries."
+      ],
+      "important_branches": [
+        "Configuration queries remain available while leader-only mutations are rejected."
+      ],
+      "async_boundaries": [
+        "Request channels and future responses"
+      ],
+      "produces_fact_ids": [],
+      "consumes_fact_ids": [
+        "F1"
+      ],
+      "cross_activity_effects": {
+        "A4": "Returns a copy containing both latest and committed configuration fields without advancing either."
+      },
+      "existing_protections": [
+        "Explicit candidate rejection of leader-only requests",
+        "Deep configuration clone"
+      ],
+      "source_ids": [
+        "raft.go:285:441",
+        "configuration.go:129:228"
+      ],
+      "unknowns": [
+        "Other role-specific request handlers",
+        "Response synchronization"
+      ]
+    },
+    {
+      "id": "B4",
+      "primary_activity": "A1",
+      "execution_owner": "Caller of commitment.match holding the commitment mutex during mutation",
+      "protocol_context": "A particular commitment object and its current voter map",
+      "trigger": "match(server, index) reports participant progress.",
+      "legal_preconditions": [
+        "The comment requires completed storage and matching log history; producer enforcement is unread."
+      ],
+      "implementation_guards": [
+        "Server must be in matchIndexes.",
+        "Reported index must exceed its previous value.",
+        "Recalculated index must exceed commitIndex and meet startIndex."
+      ],
+      "reads": [
+        "Voter match indexes",
+        "startIndex",
+        "commitIndex"
+      ],
+      "writes": [
+        "Per-voter match index",
+        "commitIndex"
+      ],
+      "durable_effects": [],
+      "external_effects": [
+        "Calls asyncNotifyCh(commitCh) on advancement."
+      ],
+      "important_branches": [
+        "Unknown voters and non-increasing reports are ignored.",
+        "Empty voter map yields no advancement.",
+        "Uses sorted index at (count-1)/2."
+      ],
+      "async_boundaries": [
+        "Notification to leader consumer; asyncNotifyCh implementation unread"
+      ],
+      "produces_fact_ids": [
+        "F2"
+      ],
+      "consumes_fact_ids": [],
+      "cross_activity_effects": {},
+      "existing_protections": [
+        "Mutex",
+        "Monotonic per-voter updates",
+        "Monotonic aggregate update",
+        "startIndex threshold"
+      ],
+      "source_ids": [
+        "commitment.go:1:104"
+      ],
+      "unknowns": [
+        "Actual producer guarantee that reported indexes represent completed matching storage",
+        "Consumer of aggregate commit progress",
+        "Commitment-object lifetime and delayed callback handling"
+      ]
+    },
+    {
+      "id": "B5",
+      "primary_activity": "A4",
+      "execution_owner": "Caller of commitment.setConfiguration holding the commitment mutex",
+      "protocol_context": "Voter membership of an existing commitment object",
+      "trigger": "setConfiguration receives a configuration.",
+      "legal_preconditions": [
+        "Caller-selected configuration applicability and activation point are unread."
+      ],
+      "implementation_guards": [
+        "Only Voter entries enter the replacement map."
+      ],
+      "reads": [
+        "New configuration",
+        "Old matchIndexes",
+        "Existing commitIndex and startIndex"
+      ],
+      "writes": [
+        "Replaced matchIndexes",
+        "Possibly increased commitIndex"
+      ],
+      "durable_effects": [],
+      "external_effects": [
+        "May notify commitCh through recalculate."
+      ],
+      "important_branches": [
+        "Retained voter IDs keep previous indexes.",
+        "New voter IDs start at zero.",
+        "Removed and non-voting IDs are omitted."
+      ],
+      "async_boundaries": [
+        "Commit notification"
+      ],
+      "produces_fact_ids": [
+        "F2"
+      ],
+      "consumes_fact_ids": [],
+      "cross_activity_effects": {
+        "A1": "Changes the voter set used for subsequent majority-index calculation without reducing the stored aggregate index."
+      },
+      "existing_protections": [
+        "Mutex",
+        "Voter filtering",
+        "No decrease of commitIndex"
+      ],
+      "source_ids": [
+        "commitment.go:1:104"
+      ],
+      "unknowns": [
+        "Admission serialization and activation policy at callers",
+        "Relationship of retained reports to changed server addresses or identities"
+      ]
+    },
+    {
+      "id": "B6",
+      "primary_activity": "A5",
+      "execution_owner": "runFSM goroutine, individual application closure",
+      "protocol_context": "A commitTuple processed when batching is unavailable",
+      "trigger": "applySingle receives a commit tuple.",
+      "legal_preconditions": [
+        "Tuple scheduling and decision establishment are unknown; the interface comment requires commitment before FSM.Apply."
+      ],
+      "implementation_guards": [
+        "Dispatch by Log.Type",
+        "ConfigurationStore interface availability"
+      ],
+      "reads": [
+        "Tuple log and optional future",
+        "FSM and ConfigurationStore interfaces"
+      ],
+      "writes": [
+        "Local lastIndex and lastTerm except unsupported configuration early return",
+        "Future response"
+      ],
+      "durable_effects": [
+        "Application-defined effects of Apply or StoreConfiguration are external to this implementation."
+      ],
+      "external_effects": [
+        "Calls FSM.Apply for commands.",
+        "Calls StoreConfiguration for supported configuration entries.",
+        "Responds nil to an attached future after normal handler return."
+      ],
+      "important_branches": [
+        "Unsupported LogConfiguration returns before local index advancement but still executes deferred future response.",
+        "Barrier and other unhandled types skip application callbacks and advance local index and term."
+      ],
+      "async_boundaries": [
+        "Commit-tuple delivery mechanism unread",
+        "Future completion"
+      ],
+      "produces_fact_ids": [
+        "F3"
+      ],
+      "consumes_fact_ids": [],
+      "cross_activity_effects": {
+        "A7": "Associates the application result with the tuple's future and responds after normal callback handling.",
+        "A6": "Updates the local index and term later attached to an FSM snapshot capture."
+      },
+      "existing_protections": [
+        "Single owner of local FSM index and term",
+        "Explicit configuration callback capability check"
+      ],
+      "source_ids": [
+        "fsm.go:1:80",
+        "fsm.go:81:240"
+      ],
+      "unknowns": [
+        "Producer of legally committed tuples",
+        "Complete queue ordering",
+        "Application callback correctness",
+        "Future response implementation"
+      ]
+    },
+    {
+      "id": "B7",
+      "primary_activity": "A5",
+      "execution_owner": "runFSM goroutine, batching application closure",
+      "protocol_context": "A batch of commit tuples with BatchingFSM enabled",
+      "trigger": "applyBatch receives commit tuples.",
+      "legal_preconditions": [
+        "Tuple ordering and commitment must come from unread producers."
+      ],
+      "implementation_guards": [
+        "Only commands and configurations are sent to ApplyBatch.",
+        "Returned response count must equal the filtered input count."
+      ],
+      "reads": [
+        "Ordered input tuples",
+        "Returned callback responses"
+      ],
+      "writes": [
+        "Local lastIndex and lastTerm from the last input tuple",
+        "Per-future response values"
+      ],
+      "durable_effects": [
+        "Application-defined batch effects are external."
+      ],
+      "external_effects": [
+        "Invokes ApplyBatch when filtered input is nonempty.",
+        "Responds nil to attached futures after callback processing."
+      ],
+      "important_branches": [
+        "Falls back to individual processing when batching is unavailable.",
+        "Response-count mismatch panics.",
+        "Filtered-out entries receive nil response without an application callback."
+      ],
+      "async_boundaries": [
+        "Input scheduling unread",
+        "Future completion"
+      ],
+      "produces_fact_ids": [
+        "F3"
+      ],
+      "consumes_fact_ids": [],
+      "cross_activity_effects": {
+        "A7": "Maps filtered callback results back to the original request futures in input order.",
+        "A6": "Advances snapshot-capture position using the complete input batch, including filtered entries."
+      },
+      "existing_protections": [
+        "Response-count validation",
+        "Explicit filtering",
+        "Sequential response mapping"
+      ],
+      "source_ids": [
+        "fsm.go:1:80",
+        "fsm.go:81:240"
+      ],
+      "unknowns": [
+        "Whether every legal caller supplies a nonempty batch",
+        "Upstream ordering and commitment guarantees",
+        "Application interpretation of configuration entries"
+      ]
+    },
+    {
+      "id": "B8",
+      "primary_activity": "A6",
+      "execution_owner": "runFSM goroutine, snapshot closure",
+      "protocol_context": "Current FSM state with locally tracked lastIndex and lastTerm",
+      "trigger": "Snapshot closure receives reqSnapshotFuture.",
+      "legal_preconditions": [
+        "Invocation through the remaining runFSM dispatch is unread."
+      ],
+      "implementation_guards": [
+        "Rejects lastIndex == 0."
+      ],
+      "reads": [
+        "Local lastIndex and lastTerm",
+        "FSM.Snapshot result"
+      ],
+      "writes": [
+        "Snapshot future index, term and snapshot object"
+      ],
+      "durable_effects": [],
+      "external_effects": [
+        "Calls FSM.Snapshot and responds with its error."
+      ],
+      "important_branches": [
+        "Zero index returns ErrNothingNewToSnapshot.",
+        "Callback error is propagated."
+      ],
+      "async_boundaries": [
+        "Snapshot request and response future"
+      ],
+      "produces_fact_ids": [
+        "F4"
+      ],
+      "consumes_fact_ids": [],
+      "cross_activity_effects": {
+        "A5": "Captures an application-provided snapshot object in the FSM execution context."
+      },
+      "existing_protections": [
+        "Capture uses the FSM goroutine's local position."
+      ],
+      "source_ids": [
+        "fsm.go:1:80",
+        "fsm.go:81:240"
+      ],
+      "unknowns": [
+        "Snapshot object's isolation from later Apply calls",
+        "Dispatch ordering relative to restore and commit tuples"
+      ]
+    },
+    {
+      "id": "B9",
+      "primary_activity": "A6",
+      "execution_owner": "Caller of Raft.takeSnapshot",
+      "protocol_context": "Local snapshot attempt spanning FSM capture and main-thread configuration retrieval",
+      "trigger": "takeSnapshot is invoked.",
+      "legal_preconditions": [
+        "Scheduler and manual snapshot admission remain unread."
+      ],
+      "implementation_guards": [
+        "Waits for both futures.",
+        "Requires capture index >= committed configuration index.",
+        "Checks Create, Persist and Close errors before metadata update."
+      ],
+      "reads": [
+        "F4 capture result",
+        "Committed configuration and its index",
+        "Snapshot version"
+      ],
+      "writes": [
+        "Snapshot sink",
+        "Last snapshot metadata through setter"
+      ],
+      "durable_effects": [
+        "Requests snapshot persistence and then log compaction; concrete durability depends on the selected sink."
+      ],
+      "external_effects": [
+        "Calls Release on the captured object after successful capture retrieval.",
+        "Returns sink ID only if compaction also succeeds."
+      ],
+      "important_branches": [
+        "Persist error invokes Cancel.",
+        "Close error aborts before local snapshot metadata update.",
+        "Compaction error is returned after metadata update."
+      ],
+      "async_boundaries": [
+        "fsmSnapshotCh",
+        "configurationsCh",
+        "Future waits",
+        "Persist may overlap later application callbacks"
+      ],
+      "produces_fact_ids": [],
+      "consumes_fact_ids": [
+        "F4"
+      ],
+      "cross_activity_effects": {
+        "A4": "Stores the retrieved committed configuration with the snapshot after checking its index against the capture position.",
+        "A3": "Creates snapshot material intended for later recovery; recoverability depends on unread storage and reopen behavior."
+      },
+      "existing_protections": [
+        "Configuration-position check",
+        "Persist and Close error checks",
+        "Compaction follows successful Close"
+      ],
+      "source_ids": [
+        "snapshot.go:125:278",
+        "fsm.go:1:80"
+      ],
+      "unknowns": [
+        "Concrete selected sink",
+        "Interaction between Persist's sink-closing contract and subsequent Close",
+        "Recovery acceptance and retention behavior"
+      ]
+    },
+    {
+      "id": "B10",
+      "primary_activity": "A6",
+      "execution_owner": "Caller of FileSnapshotSink.Close",
+      "protocol_context": "One FileSnapshotSink instance",
+      "trigger": "Close is invoked.",
+      "legal_preconditions": [
+        "Creation and write methods are unread.",
+        "Concurrent Close use is not established as legal."
+      ],
+      "implementation_guards": [
+        "Returns nil immediately if closed is already true.",
+        "Sets closed before performing finalization.",
+        "Checks each finalization, metadata, rename, sync and retention error."
+      ],
+      "reads": [
+        "closed",
+        "noSync",
+        "Runtime operating system",
+        "Snapshot directories",
+        "File state and checksum accumulator"
+      ],
+      "writes": [
+        "closed",
+        "Metadata size and CRC",
+        "Metadata file through writeMeta",
+        "Directory name"
+      ],
+      "durable_effects": [
+        "Flushes buffered data; conditionally syncs state file; closes file; writes metadata; renames directory; conditionally syncs parent directory; invokes retention."
+      ],
+      "external_effects": [
+        "Returns the first encountered error except cleanup failure may replace finalization error."
+      ],
+      "important_branches": [
+        "Already-closed success does not retry previous work.",
+        "Finalization failure attempts temporary-directory removal.",
+        "Errors after rename can be returned with the directory already moved.",
+        "Parent directory sync is skipped for noSync and Windows."
+      ],
+      "async_boundaries": [
+        "Filesystem operations"
+      ],
+      "produces_fact_ids": [
+        "F5"
+      ],
+      "consumes_fact_ids": [
+        "F5"
+      ],
+      "cross_activity_effects": {
+        "A3": "Changes snapshot publication state used by later recovery; the reader's selection and validation rules remain unknown."
+      },
+      "existing_protections": [
+        "Error checks",
+        "Conditional file and directory sync",
+        "Directory rename",
+        "CRC recorded in metadata"
+      ],
+      "source_ids": [
+        "file_snapshot.go:397:500"
+      ],
+      "unknowns": [
+        "writeMeta durability",
+        "ReapSnapshots behavior and partial errors",
+        "Actual reachability of repeated Close after an error",
+        "How Open interprets publication state"
+      ]
+    },
+    {
+      "id": "B11",
+      "primary_activity": "A6",
+      "execution_owner": "Caller of FileSnapshotSink.Cancel",
+      "protocol_context": "One FileSnapshotSink instance",
+      "trigger": "Cancel is invoked.",
+      "legal_preconditions": [
+        "Caller seeks to abandon a sink."
+      ],
+      "implementation_guards": [
+        "Returns nil immediately if closed is already true."
+      ],
+      "reads": [
+        "closed",
+        "Sink resources and directory"
+      ],
+      "writes": [
+        "closed"
+      ],
+      "durable_effects": [
+        "Finalizes resources and, on success, removes the sink directory."
+      ],
+      "external_effects": [
+        "Returns finalization or directory-removal error."
+      ],
+      "important_branches": [
+        "Finalization error returns before directory removal.",
+        "Already-closed sink receives no cleanup attempt."
+      ],
+      "async_boundaries": [
+        "Filesystem operations"
+      ],
+      "produces_fact_ids": [
+        "F5"
+      ],
+      "consumes_fact_ids": [
+        "F5"
+      ],
+      "cross_activity_effects": {},
+      "existing_protections": [
+        "Repeated calls avoid repeating resource handling."
+      ],
+      "source_ids": [
+        "file_snapshot.go:397:500"
+      ],
+      "unknowns": [
+        "Resource and artifact state after failed finalization",
+        "Cleanup on process restart"
+      ]
+    },
+    {
+      "id": "B12",
+      "primary_activity": "A3",
+      "execution_owner": "runFSM goroutine, restore closure",
+      "protocol_context": "Restore request identified by snapshot ID",
+      "trigger": "Restore closure receives restoreFuture.",
+      "legal_preconditions": [
+        "Snapshot ID is supplied by a requesting actor."
+      ],
+      "implementation_guards": [
+        "Open must succeed.",
+        "fsmRestoreAndMeasure must return nil before local position updates."
+      ],
+      "reads": [
+        "Snapshot metadata and stream returned by Open"
+      ],
+      "writes": [
+        "Local lastIndex and lastTerm"
+      ],
+      "durable_effects": [
+        "Application restore effects depend on the unread helper and caller implementation."
+      ],
+      "external_effects": [
+        "Responds with wrapped Open or restore error, or nil after updating local position.",
+        "Defers stream close after successful Open."
+      ],
+      "important_branches": [
+        "Errors leave the local index and term unchanged in this closure; application partial mutation on error is unknown."
+      ],
+      "async_boundaries": [
+        "Restore request delivery and future response"
+      ],
+      "produces_fact_ids": [
+        "F6"
+      ],
+      "consumes_fact_ids": [],
+      "cross_activity_effects": {
+        "A5": "Replaces the FSM's tracked application position after a successful restore-helper return."
+      },
+      "existing_protections": [
+        "Checks Open and restore-helper errors before position update."
+      ],
+      "source_ids": [
+        "fsm.go:81:240"
+      ],
+      "unknowns": [
+        "Helper implementation and exact application callback",
+        "Storage validation during Open",
+        "Partial application state after restore failure"
+      ]
+    },
+    {
+      "id": "B13",
+      "primary_activity": "A3",
+      "execution_owner": "Protocol RPC handler executing installSnapshot",
+      "protocol_context": "Remote snapshot request carrying term, log position, configuration and byte count",
+      "trigger": "InstallSnapshot RPC arrives.",
+      "legal_preconditions": [
+        "RPC dispatch and header admission are unread."
+      ],
+      "implementation_guards": [
+        "Snapshot version bounds",
+        "Rejects older term",
+        "Checks creation, stream copy, exact byte count and Close",
+        "Waits for restore future success before metadata replacement"
+      ],
+      "reads": [
+        "Request metadata",
+        "RPC stream",
+        "Current term",
+        "Selected log-store capabilities"
+      ],
+      "writes": [
+        "Role and term for newer request",
+        "Leader identity",
+        "Snapshot sink",
+        "Last-applied and last-snapshot metadata",
+        "Latest and committed configurations",
+        "Last contact"
+      ],
+      "durable_effects": [
+        "Writes and closes snapshot sink.",
+        "Attempts log deletion after restore completion."
+      ],
+      "external_effects": [
+        "Drains remaining input and responds on exit.",
+        "Sets Success true after metadata updates and cleanup attempt."
+      ],
+      "important_branches": [
+        "Copy or size error invokes Cancel.",
+        "Restore error prevents metadata replacement.",
+        "Shutdown before restore delivery exits.",
+        "Cleanup errors are logged without preventing Success true."
+      ],
+      "async_boundaries": [
+        "RPC streaming",
+        "fsmMutateCh handoff",
+        "Restore future wait"
+      ],
+      "produces_fact_ids": [
+        "F7"
+      ],
+      "consumes_fact_ids": [
+        "F6"
+      ],
+      "cross_activity_effects": {
+        "A2": "Newer request term invokes follower and term setters before snapshot transfer.",
+        "A4": "Replaces both latest and committed configurations with snapshot request metadata after restore acknowledgement.",
+        "A6": "Attempts full deletion or bounded compaction only after restore acknowledgement and metadata updates."
+      },
+      "existing_protections": [
+        "Version and term rejection",
+        "Exact stream size check",
+        "Close error handling",
+        "Explicit restore completion wait"
+      ],
+      "source_ids": [
+        "raft.go:1814:1955"
+      ],
+      "unknowns": [
+        "Ordering against other FSM work",
+        "Whether opened metadata matches request metadata under every selected store",
+        "Post-restore replication reconciliation",
+        "Crash recovery between publication and restore"
+      ]
+    },
+    {
+      "id": "B14",
+      "primary_activity": "A6",
+      "execution_owner": "Caller of compaction or old-log removal helpers",
+      "protocol_context": "Snapshot-bounded compaction or monotonic-store reset",
+      "trigger": "compactLogs or removeOldLogs is invoked.",
+      "legal_preconditions": [
+        "removeOldLogs requires caller verification of monotonic-store behavior."
+      ],
+      "implementation_guards": [
+        "Checks first-index lookup.",
+        "Returns without deletion when retained trailing count covers lastLogIdx.",
+        "Returns without deletion for an empty computed range."
+      ],
+      "reads": [
+        "First log index",
+        "Last log index from local metadata or store",
+        "TrailingLogs"
+      ],
+      "writes": [],
+      "durable_effects": [
+        "Calls DeleteRange(minLog, min(snapIdx, lastLogIdx-trailingLogs))."
+      ],
+      "external_effects": [
+        "Propagates lookup and deletion errors."
+      ],
+      "important_branches": [
+        "removeOldLogs uses store LastIndex and zero trailing logs.",
+        "Normal compactLogs uses locally tracked last log and configured trailing count."
+      ],
+      "async_boundaries": [
+        "Storage calls"
+      ],
+      "produces_fact_ids": [],
+      "consumes_fact_ids": [],
+      "cross_activity_effects": {
+        "A3": "Removes retained history that later recovery or incremental replication could otherwise read."
+      },
+      "existing_protections": [
+        "Snapshot bound",
+        "Trailing-log bound",
+        "Subtraction guarded by lastLogIdx comparison"
+      ],
+      "source_ids": [
+        "snapshot.go:125:278"
+      ],
+      "unknowns": [
+        "DeleteRange atomicity and partial-error semantics",
+        "Concurrent storage access",
+        "Remaining-history requirements after cleanup errors"
+      ]
+    }
+  ],
+  "facts": [
+    {
+      "id": "F1",
+      "meaning": "The applyCh send for this command or barrier future completed. This establishes queue admission only.",
+      "identity": {
+        "request": "logFuture instance",
+        "node": "Raft instance",
+        "kind": "LogCommand or LogBarrier"
+      },
+      "established_by": [
+        "B1"
+      ],
+      "consumed_by": [
+        "B3"
+      ],
+      "validity_context": "The successful send branch of ApplyLog or Barrier; index and term have not been assigned by these methods.",
+      "representation": [
+        "Returned logFuture",
+        "Corresponding applyCh send"
+      ],
+      "invalidators": [],
+      "reinterpreters": [],
+      "durability": "Volatile request state.",
+      "recovery": "No reconstruction mechanism observed.",
+      "source_ids": [
+        "api.go:800:897",
+        "raft.go:285:441"
+      ],
+      "unknowns": [
+        "Follower and leader consumers are unread.",
+        "Admission does not establish persistence, commitment or application."
+      ]
+    },
+    {
+      "id": "F2",
+      "meaning": "For this commitment object, a recalculation advanced commitIndex to an order-statistic value supported by a majority of the then-current voter map, with that value at least startIndex.",
+      "identity": {
+        "object": "commitment instance",
+        "position": "new commitIndex",
+        "voter_context": "matchIndexes membership at advancement"
+      },
+      "established_by": [
+        "B4",
+        "B5"
+      ],
+      "consumed_by": [],
+      "validity_context": "A historical local calculation over recorded indexes. It does not independently establish that the reports represent durable matching logs.",
+      "representation": [
+        "commitIndex",
+        "matchIndexes at recalculation",
+        "commitCh notification attempt"
+      ],
+      "invalidators": [],
+      "reinterpreters": [
+        "B5"
+      ],
+      "durability": "In-memory aggregate only.",
+      "recovery": "Comments describe a new object per leader term; actual creation and reconstruction callers are unread.",
+      "source_ids": [
+        "commitment.go:1:104"
+      ],
+      "unknowns": [
+        "True storage-support producers",
+        "Leader consumer",
+        "Configuration changes retain commitIndex without storing its original voter context."
+      ]
+    },
+    {
+      "id": "F3",
+      "meaning": "For a command tuple on a normal-return path, its application callback returned and its result was assigned to the associated future before respond(nil) was invoked.",
+      "identity": {
+        "entry": "Command log index and term",
+        "request": "Attached logFuture",
+        "execution": "Individual callback or corresponding batch position"
+      },
+      "established_by": [
+        "B6",
+        "B7"
+      ],
+      "consumed_by": [],
+      "validity_context": "Commands with attached futures processed by the observed FSM closures; excludes barriers and callback panic paths. Application semantic correctness is outside this assertion.",
+      "representation": [
+        "future.response",
+        "future.respond(nil) invocation"
+      ],
+      "invalidators": [],
+      "reinterpreters": [],
+      "durability": "Completion invocation is volatile; application persistence is unspecified.",
+      "recovery": "No client completion reconstruction observed.",
+      "source_ids": [
+        "fsm.go:81:240"
+      ],
+      "unknowns": [
+        "Commit-tuple producer guarantee",
+        "Future observer synchronization",
+        "Meaning of application response values",
+        "Later restore can change application state without changing this historical completion event."
+      ]
+    },
+    {
+      "id": "F4",
+      "meaning": "FSM.Snapshot returned successfully and the snapshot future carries its object plus the FSM goroutine's locally tracked index and term.",
+      "identity": {
+        "request": "reqSnapshotFuture instance",
+        "position": "req.index and req.term",
+        "capture": "Returned FSMSnapshot object"
+      },
+      "established_by": [
+        "B8"
+      ],
+      "consumed_by": [
+        "B9"
+      ],
+      "validity_context": "Successful snapshot closure response with nonzero local lastIndex. The object has not thereby been persisted.",
+      "representation": [
+        "req.snapshot",
+        "req.index",
+        "req.term",
+        "Successful future response"
+      ],
+      "invalidators": [],
+      "reinterpreters": [],
+      "durability": "Volatile capture handle before persistence.",
+      "recovery": "No recovery of an unpersisted capture is observed.",
+      "source_ids": [
+        "fsm.go:81:240",
+        "snapshot.go:125:278"
+      ],
+      "unknowns": [
+        "Application preservation of captured state during concurrent Apply",
+        "Producer validity of local index and term"
+      ]
+    },
+    {
+      "id": "F5",
+      "meaning": "A FileSnapshotSink has entered Close or Cancel and its closed flag has been set. This flag records lifecycle entry, not successful finalization or publication.",
+      "identity": {
+        "sink": "FileSnapshotSink instance"
+      },
+      "established_by": [
+        "B10",
+        "B11"
+      ],
+      "consumed_by": [
+        "B10",
+        "B11"
+      ],
+      "validity_context": "After the initial closed check in Close or Cancel. Later calls return nil through the flag branch regardless of the earlier operation's returned error.",
+      "representation": [
+        "s.closed == true"
+      ],
+      "invalidators": [],
+      "reinterpreters": [],
+      "durability": "In-memory flag.",
+      "recovery": "Startup artifact interpretation is unread.",
+      "source_ids": [
+        "file_snapshot.go:397:500"
+      ],
+      "unknowns": [
+        "Actual callers that repeat Close or Cancel after failure",
+        "Whether callers interpret the later nil as stronger than lifecycle entry",
+        "Create/Open/retention behavior for partially finalized artifacts"
+      ]
+    },
+    {
+      "id": "F6",
+      "meaning": "For this restore request, snapshot Open and the restore helper returned successfully; the FSM closure updated its local index and term from opened metadata and responded nil.",
+      "identity": {
+        "request": "restoreFuture instance",
+        "snapshot": "req.ID",
+        "position": "Opened meta.Index and meta.Term"
+      },
+      "established_by": [
+        "B12"
+      ],
+      "consumed_by": [
+        "B13"
+      ],
+      "validity_context": "Successful restore closure path. The unread helper prevents independently asserting the exact restored application contents.",
+      "representation": [
+        "Local lastIndex and lastTerm assignment",
+        "req.respond(nil)"
+      ],
+      "invalidators": [],
+      "reinterpreters": [],
+      "durability": "Acknowledgement and local position are volatile; snapshot storage durability is unresolved.",
+      "recovery": "Startup restoration is unread.",
+      "source_ids": [
+        "fsm.go:81:240",
+        "raft.go:1814:1955"
+      ],
+      "unknowns": [
+        "Restore helper internals",
+        "Other restore request producers",
+        "Snapshot metadata validation"
+      ]
+    },
+    {
+      "id": "F7",
+      "meaning": "The InstallSnapshot handler completed its accepted path, observed a successful restore future, updated local metadata and attempted cleanup before setting response Success true.",
+      "identity": {
+        "rpc": "InstallSnapshot request",
+        "context": "Request term and leader identity",
+        "position": "LastLogIndex and LastLogTerm",
+        "configuration": "Decoded configuration and configuration index"
+      },
+      "established_by": [
+        "B13"
+      ],
+      "consumed_by": [],
+      "validity_context": "Handler success path. Cleanup success is explicitly not required; actual response delivery and subsequent replication are separate.",
+      "representation": [
+        "InstallSnapshotResponse.Success",
+        "Metadata setter calls",
+        "Last-contact setter call"
+      ],
+      "invalidators": [],
+      "reinterpreters": [],
+      "durability": "RPC response and node metadata updates are not shown to be durable; sink completion occurred earlier.",
+      "recovery": "Restart reconstruction of the installed snapshot and remaining logs is unread.",
+      "source_ids": [
+        "raft.go:1814:1955"
+      ],
+      "unknowns": [
+        "Sender interpretation of Success",
+        "Cleanup failure consequences",
+        "Continuing incremental replication",
+        "Crash points between sink publication, restore and response"
+      ]
+    }
+  ],
+  "surfaces": [
+    {
+      "entry_point": "Apply / ApplyLog / Barrier",
+      "disposition": "mapped",
+      "behavior_ids": [
+        "B1",
+        "B3",
+        "B6",
+        "B7"
+      ],
+      "reason": "Admission, candidate rejection and FSM-side handling are observed; intervening decision and dispatch paths remain explicit gaps.",
+      "source_ids": [
+        "api.go:800:897",
+        "raft.go:285:441",
+        "fsm.go:81:240"
+      ],
+      "high_consequence": true
+    },
+    {
+      "entry_point": "runCandidate",
+      "disposition": "mapped",
+      "behavior_ids": [
+        "B2",
+        "B3"
+      ],
+      "reason": "Candidate loop is supplied; election producers and transition setters remain unresolved.",
+      "source_ids": [
+        "raft.go:285:441"
+      ],
+      "high_consequence": true
+    },
+    {
+      "entry_point": "commitment.match / setConfiguration / recalculate",
+      "disposition": "mapped",
+      "behavior_ids": [
+        "B4",
+        "B5"
+      ],
+      "reason": "Local aggregate calculation is recovered without treating reported matches as independently established persistence.",
+      "source_ids": [
+        "commitment.go:1:104"
+      ],
+      "high_consequence": true
+    },
+    {
+      "entry_point": "runFSM application, snapshot and restore closures",
+      "disposition": "mapped",
+      "behavior_ids": [
+        "B6",
+        "B7",
+        "B8",
+        "B12"
+      ],
+      "reason": "Callback bodies are observed; final select dispatch and restore helper remain unread.",
+      "source_ids": [
+        "fsm.go:81:240"
+      ],
+      "high_consequence": true
+    },
+    {
+      "entry_point": "Application FSM implementation",
+      "disposition": "externalized",
+      "behavior_ids": [],
+      "reason": "FSM interface explicitly assigns application implementation to clients. Library scheduling and response handling remain mapped.",
+      "source_ids": [
+        "fsm.go:1:80"
+      ],
+      "high_consequence": true
+    },
+    {
+      "entry_point": "takeSnapshot / compactLogs / removeOldLogs",
+      "disposition": "mapped",
+      "behavior_ids": [
+        "B9",
+        "B14"
+      ],
+      "reason": "Persistence sequencing and deletion range calculation are observed; storage completion semantics remain unresolved.",
+      "source_ids": [
+        "snapshot.go:125:278"
+      ],
+      "high_consequence": true
+    },
+    {
+      "entry_point": "FileSnapshotSink.Close / Cancel / finalize",
+      "disposition": "mapped",
+      "behavior_ids": [
+        "B10",
+        "B11"
+      ],
+      "reason": "Built-in lifecycle and failure branches are supplied; metadata writer, publication reader and retention implementation need inspection.",
+      "source_ids": [
+        "file_snapshot.go:397:500"
+      ],
+      "high_consequence": true
+    },
+    {
+      "entry_point": "installSnapshot",
+      "disposition": "mapped",
+      "behavior_ids": [
+        "B13"
+      ],
+      "reason": "Receiver stream, restore wait, metadata replacement and cleanup are observed.",
+      "source_ids": [
+        "raft.go:1814:1955"
+      ],
+      "high_consequence": true
+    },
+    {
+      "entry_point": "VerifyLeader and leader-side completion",
+      "disposition": "deferred",
+      "behavior_ids": [
+        "B3"
+      ],
+      "reason": "API queueing and candidate rejection are supplied; successful verification establishment is unread.",
+      "source_ids": [
+        "api.go:800:897",
+        "raft.go:285:441"
+      ],
+      "high_consequence": true
+    },
+    {
+      "entry_point": "Configuration admission, activation and rollback",
+      "disposition": "deferred",
+      "behavior_ids": [
+        "B5"
+      ],
+      "reason": "Structures, validation helper and aggregate consumer are observed, but no complete activation path is supplied.",
+      "source_ids": [
+        "configuration.go:129:228",
+        "commitment.go:1:104"
+      ],
+      "high_consequence": true
+    },
+    {
+      "entry_point": "AppendEntries, RequestVote, RequestPreVote, TimeoutNow and replication pipelines",
+      "disposition": "deferred",
+      "behavior_ids": [],
+      "reason": "Transport declarations identify these responsibilities; request handlers and report-producing code remain unread.",
+      "source_ids": [
+        "transport.go:1:80"
+      ],
+      "high_consequence": true
+    },
+    {
+      "entry_point": "RPC header compatibility and heartbeat fast-pass",
+      "disposition": "deferred",
+      "behavior_ids": [],
+      "reason": "Header checks and optional fast-pass interface are supplied, but dispatch enforcement and concurrent ownership are unread.",
+      "source_ids": [
+        "raft.go:1:80",
+        "transport.go:1:80"
+      ],
+      "high_consequence": true
+    },
+    {
+      "entry_point": "Startup, bootstrap, user restore and shutdown",
+      "disposition": "deferred",
+      "behavior_ids": [],
+      "reason": "Documentation and candidate cases expose these operations without complete implementations.",
+      "source_ids": [
+        "docs/README.md:1:80",
+        "raft.go:285:441",
+        "api.go:1:80"
+      ],
+      "high_consequence": true
+    },
+    {
+      "entry_point": "Snapshot-store creation, opening and retention; log/stable-store adapters",
+      "disposition": "deferred",
+      "behavior_ids": [],
+      "reason": "Observed calls do not determine adapter atomicity or durability. Built-in variants remain in scope despite caller selection.",
+      "source_ids": [
+        "snapshot.go:125:278",
+        "fsm.go:81:240",
+        "file_snapshot.go:397:500",
+        "README.md:1:80"
+      ],
+      "high_consequence": true
+    },
+    {
+      "entry_point": "checkConfiguration / nextConfiguration",
+      "disposition": "deferred",
+      "behavior_ids": [],
+      "reason": "Validation rejects empty or duplicate identities/addresses and zero voters, but applicability at mutation callers and nextConfiguration body remain unread.",
+      "source_ids": [
+        "configuration.go:129:228"
+      ],
+      "high_consequence": true
+    }
+  ]
+}

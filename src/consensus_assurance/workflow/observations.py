@@ -1,6 +1,6 @@
 """Finite, non-evaluating event correlation and fully observed safety monitors."""
 from consensus_assurance.core.types import ExecutionStatus, Origin, Investigation
-from .graph import validate_grounding
+from .graph_diagnostics import validate_grounding
 
 from consensus_assurance.core.events import MISSING, field, compare, match_prerequisites
 

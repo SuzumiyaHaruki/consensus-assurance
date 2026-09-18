@@ -41,8 +41,6 @@ class ScopeAgent(MockAgent):
             unit=copy.deepcopy(unit);unit['binding_ids'].append('input_binding')
             if self.refine:unit['audit_question']['event_paths'].append('Actual input normalization precedes consumption')
             unit['relation_ids'].append('new_support_path')
-            unit['code_uses'].append({'binding_id':'input_binding','role':'support','claim_ids':['input_obligation'],'relation_ids':['input_dependency','new_support_path'],
-                'source_ids':['upstream_support.py:1:2'],'rationale':'Actual provider behavior for the existing bounded counter question','unverified':['Producer guarantee is not independently checked']})
             edge=copy.deepcopy(self.data[1]['relations'][0]);edge.update(id='new_support_path',source='input_obligation',target='input_binding',kind='boundary',group=None,rationale='Actual provider supplies the input',pending=['Not a proof of its guarantee'])
             response={**copy.deepcopy(self.data[4]),'relations':[edge], 'units':[unit],'expected_versions':{old['id']:old['version']}}
         elif name=='ScopeAssessment':
@@ -56,6 +54,9 @@ class ScopeAgent(MockAgent):
             response={'items':items,'limitations':[]}
         elif name=='SpecRefinement':response={'understanding':'The current synthetic source set has a separate unverified input responsibility','audit_spec':p['audit_spec'],'limitations':['The separate input obligation is not automatically discharged']}
         else:raise AssertionError(name)
+        if name=='Derivation':
+            from regression_support import bounded_derivation
+            response=bounded_derivation(response)
         directory.mkdir(parents=True,exist_ok=True);(directory/'prompt.txt').write_text(prompt);write_json(directory/'response.json',response);write_json(directory/'decoded-response.json',response)
         check=runner.run([sys.executable,'-c','print("Explicit scope-reconnection regression responder")'],directory,'agent',snapshot_id,timeout);check.origin=Origin.MOCK
         return check,response_type.model_validate(response)
@@ -133,24 +134,3 @@ def test_saved_scope_assessment_reused_at_exact_semantic_budget(tmp_path,prepare
     assert state.models,state.stop_reason
     assert state.usage['semantic_reviews']==2
     assert len([c for c in state.checks if c.parameters.get('agent_task')=='scope_review'])==1
-
-
-@pytest.mark.real
-def test_original_producer_checker_runs_when_obligation_is_explicitly_selected(tmp_path,prepared,tlc):
-    from consensus_assurance.core.proposals import Bundle,GraphPatch,RelationDraft
-    from consensus_assurance.core.types import CheckerSpec
-    from consensus_assurance.workflow.graph import apply_patch
-    from consensus_assurance.workflow.artifacts import save_bundle
-    from consensus_assurance.plugins.implementations.toy.adapter import ToyImplementation
-    _,state,_,responses=prepared;old=state.units[0]
-    draft=UnitDraft(**{k:v for k,v in old.model_dump().items() if k in UnitDraft.model_fields})
-    draft.id='explicit_joint_check';draft.obligation_ids=['step_obligation','input_obligation'];draft.binding_ids=['step_binding','input_binding']
-    draft.relation_ids=list(dict.fromkeys(draft.relation_ids+['input_dependency','maps_input']))
-    draft.rationale='This regression explicitly selects both checks; supporting code alone does not authorize the producer checker'
-    apply_patch(state,GraphPatch(units=[draft],rationale=draft.rationale))
-    unit=next(u for u in state.units if u.id==draft.id)
-    bundle=Bundle.model_validate(responses[3]);bundle.checkers.append(CheckerSpec(invariant='InputSafe',claim_id='input_obligation',scope=bundle.scope))
-    bundle.checked_claim_ids=['step_obligation','input_obligation'];bundle.invariants=['Safe','InputSafe']
-    verifier,runner=tlc;model=save_bundle(runner.root,state,unit,bundle,ToyImplementation());check=verifier.check(runner,model,20)
-    assert check.outcome=='holds'
-    assert {r.claim_id for r in check.checker_results if r.outcome=='holds'}==set(unit.obligation_ids)

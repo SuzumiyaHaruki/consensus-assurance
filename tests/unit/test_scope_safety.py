@@ -7,25 +7,21 @@ from consensus_assurance.core.types import AuditQuestion
 from consensus_assurance.workflow.graph import apply_patch
 
 
-@pytest.mark.parametrize('field',['assumptions','excluded','obligation','other_unit','role'])
-def test_scope_cannot_smuggle_semantics_or_other_writes(prepared,field):
-    state,patch,_=dependency(prepared);unit=state.units[0]
+@pytest.mark.parametrize('field',['assumptions','excluded','obligation','other_unit'])
+def test_scope_cannot_smuggle_semantics_or_other_writes(dependency_prepared,field):
+    state,patch,_=dependency(dependency_prepared);unit=state.units[0]
     if field in {'assumptions','excluded'}:getattr(patch.units[0].scope,field).append('All inputs satisfy the obligation')
     elif field=='obligation':
         from consensus_assurance.core.proposals import ClaimDraft
         c=state.claims[1];d=ClaimDraft(**{k:v for k,v in c.model_dump().items() if k in ClaimDraft.model_fields});d.description='A weaker responsibility';patch.claims.append(d)
     elif field=='other_unit':patch.units[0].obligation_ids.append('input_obligation')
-    else:
-        # A new direct role is not an existing use reinterpretation; make an existing role first.
-        old=patch.units[0].code_uses[-1].model_copy(deep=True);old.binding_id='step_binding';old.role='direct';old.relation_ids=[]
-        unit.code_uses=[old];patch.units[0].code_uses.insert(0,old.model_copy(update={'role':'support'}))
     before=state.model_dump()
     with pytest.raises(ValueError):apply_scope_update(state,from_patch(state,unit,patch))
     assert state.model_dump()==before
 
 
-def test_question_refinement_requires_sourced_assessment(prepared):
-    state,patch,sources=dependency(prepared);unit=state.units[0]
+def test_question_refinement_requires_sourced_assessment(dependency_prepared):
+    state,patch,sources=dependency(dependency_prepared);unit=state.units[0]
     q=AuditQuestion(question='Does the result stay inside the legal bound?',importance='A consumer relies on the bound',trigger_rationale='An actual consumer input exercises the bound',source_ids=[state.materials[0].id])
     unit.audit_question=q;patch.units[0].audit_question=q.model_copy(deep=True);patch.units[0].audit_question.event_paths=['Provider normalization precedes counter execution']
     update=from_patch(state,unit,patch)
@@ -36,16 +32,16 @@ def test_question_refinement_requires_sourced_assessment(prepared):
     assert new.audit_question.question==q.question and new.scope==unit.scope
 
 
-def test_new_binding_still_requires_real_symbol_and_association(prepared):
-    state,patch,_=dependency(prepared);patch.bindings[0].symbol='imaginary'
+def test_new_binding_still_requires_real_symbol_and_association(dependency_prepared):
+    state,patch,_=dependency(dependency_prepared);patch.bindings[0].symbol='imaginary'
     before=state.model_dump()
     with pytest.raises(ValueError):apply_scope_update(state,from_patch(state,state.units[0],patch))
     assert state.model_dump()==before
 
 
-def test_shared_binding_does_not_select_all_associated_obligations(prepared):
+def test_shared_binding_does_not_select_all_associated_obligations(dependency_prepared):
     from consensus_assurance.workflow.graph import expand_unit
-    _,state,_,_=prepared;b=next(b for b in state.bindings if b.id=='input_binding')
+    _,state,_,_=dependency_prepared;b=next(b for b in state.bindings if b.id=='input_binding')
     b.associations.append(b.associations[0].model_copy(update={'claim_id':'step_obligation'}))
     unit=state.units[0];new=expand_unit(state,unit,['input_dependency'])
     assert new.obligation_ids==unit.obligation_ids

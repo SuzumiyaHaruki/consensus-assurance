@@ -29,7 +29,7 @@ def prepare(engine,kind,context):
         from .locations import declaration_index
         from .associations import graph_contract
         packet['graph_contract']=graph_contract()
-        packet['source_declarations']=declaration_index([m for key in ('materials','new_materials') for m in packet.get(key,[])])
+        packet.setdefault('source_declarations',declaration_index([m for key in ('materials','new_materials') for m in packet.get(key,[])]))
     packet['material_budget']={'used':material_usage(state),'breadth':material_allowance(state,engine.config.budget,'breadth'),'depth':material_allowance(state,engine.config.budget,'depth')}
     packet['context_limit_chars']=engine.config.budget.context_chars
     packet['reading_status']=[{'id':id,'status':p['status'],'unfulfilled':[i for i in p['items'] if i['status']=='deferred']} for id,p in state.read_plans.items() if p['status']!='complete' and (not task or id==task.read_plan_id)]

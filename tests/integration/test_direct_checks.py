@@ -127,7 +127,7 @@ def test_descriptive_derivation_reaches_actual_direct_execution(tmp_path,prepare
     spec=inventory('counter.py:1:10')
     initial=spec.model_copy(deep=True)
     if refine:initial.behaviors[0].produces_fact_ids=['missing']
-    derivation=Derivation.model_validate(responses[1]);derivation.units[0].audit_question=u.audit_question
+    derivation=GraphDraft.model_validate(responses[1]);derivation.units[0].audit_question=u.audit_question
     q=derivation.units[0].audit_question;q.activity_classes=['A1','A5'];q.behavior_ids=['producer','consumer'];q.fact_ids=['fact'];q.obligation_relation_kind='consumption'
     replies=[responses[0],Discovery(understanding='Controlled descriptive input',audit_spec=initial).model_dump(mode='json')]
     if refine:replies.append(SpecRefinement(understanding='Separate the established input from the unknown producer',audit_spec=spec,limitations=['Unverified durability remains explicit']).model_dump(mode='json'))
@@ -141,7 +141,7 @@ def test_descriptive_derivation_reaches_actual_direct_execution(tmp_path,prepare
     impl,_,verifier,knowledge=assemble(config)
     engine=StopAfterActualCheck(config,tmp_path/'whole',impl,MockAgent(fixture),verifier,knowledge,'')
     with pytest.raises(RuntimeError,match='actual direct'):engine.start(prepared[0])
-    assert engine.state.usage['agent_calls']==4+int(refine)
+    assert engine.state.usage['agent_calls']==5+int(refine)
     assert not engine.state.models and not engine.state.repair_sessions
     assert all(t.status=='completed' for t in engine.state.inquiry_tasks if t.kind=='spec_refine')
     assert sum(t.kind=='spec_refine' for t in engine.state.inquiry_tasks)==int(refine)

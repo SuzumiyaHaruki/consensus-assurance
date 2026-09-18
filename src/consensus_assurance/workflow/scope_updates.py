@@ -37,12 +37,12 @@ def question(unit):return unit.audit_question.question if unit.audit_question el
 
 def from_patch(state,unit,patch):
     changes=[JudgmentChange(target_id=id,field=f,old_value_json=json.dumps(a,ensure_ascii=False),new_value_json=json.dumps(b,ensure_ascii=False)) for (id,f),(a,b) in write_set(state,patch).items()]
-    sources={b.material_id for b in patch.bindings}
-    for r in patch.relations:sources.update(r.grounding.behavior_ids+r.grounding.expectation_ids)
-    for u in patch.units:
-        for use in u.code_uses:sources.update(use.source_ids)
+    from .sources import dependency_closure
+    objects={x.id:x for name in ('claims','bindings','relations','units') for x in getattr(state,name)}
+    objects.update({x.id:x for name in ('claims','bindings','relations','units') for x in getattr(patch,name)})
+    sources,_=dependency_closure(objects,[u.id for u in patch.units])
     return ScopeUpdate(unit_id=unit.id,unit_version=unit.version,original_question=question(unit),obligation_ids=unit.obligation_ids,
-        patch=patch,changes=changes,source_ids=sorted(sources),remaining_unknowns=list(dict.fromkeys([x for use in unit.code_uses for x in use.unverified]+unit.coverage_limitations)))
+        patch=patch,changes=changes,source_ids=sorted(sources),remaining_unknowns=list(dict.fromkeys(unit.coverage_limitations+[x for b in state.bindings if b.id in unit.binding_ids for x in b.pending]+[x for r in state.relations if r.id in unit.relation_ids for x in r.pending+r.grounding.unresolved])))
 
 
 def reject(update,code,message,writes):
@@ -63,12 +63,9 @@ def validate_scope_update(state,update):
     draft=update.patch.units[0]
     if not set(unit.binding_ids)<=set(draft.binding_ids) or not set(unit.relation_ids)<=set(draft.relation_ids):reject(update,'scope_removed_path','Removing existing code or dependency paths requires semantic investigation',writes)
     if not update.source_ids or not set(update.source_ids)<={m.id for m in state.materials}:raise ValueError('Scope update requires actually acquired sources')
-    old_uses={u.binding_id:u for u in unit.code_uses};new_uses={u.binding_id:u for u in draft.code_uses}
-    if any(id not in new_uses or old.role!=new_uses[id].role or old.claim_ids!=new_uses[id].claim_ids for id,old in old_uses.items()):reject(update,'scope_use_reinterpreted','Existing code roles and responsibility associations cannot be replaced by scope refinement',writes)
     from .audit_spec import IDENTITY
     if unit.audit_question and (not draft.audit_question or any(getattr(draft.audit_question,k)!=getattr(unit.audit_question,k) for k in IDENTITY)):reject(update,'scope_question_changed','Replacing the audit question requires explicit semantic review',writes)
     refined={f for id,f in writes if f in {'audit_question'}}
-    if any(old!=new_uses[id] for id,old in old_uses.items()):refined.add('code_uses')
     from .graph import apply_patch
     candidate=new_candidate_patch(state,update)
     try:apply_patch(state.model_copy(deep=True),candidate)

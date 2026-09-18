@@ -123,14 +123,14 @@ def task_context(engine,task):
     if task.kind=='spec_refine':
         from .audit_spec import slice_for, source_ids
         view=slice_for(state,classes=task.activity_classes)
-        if view:
+        if view and not task.diagnostics:
             wanted.update(source_ids(view))
         wanted.update(m.id for m in state.materials if m.file.lower().endswith('readme.md'))
     from .audit_spec import issue_groups
     groups=issue_groups(task.diagnostics);active=groups[0] if groups else []
     draft=None
     if task.draft_path:
-        draft=json.loads(Path(task.draft_path).read_text())['audit_spec']
+        draft=json.loads(Path(task.draft_path).read_text());draft=draft.get('audit_spec',draft)
         if not active:wanted.update(source_ids(draft))
     wanted.update(id for d in active for id in d['material_ids'])
     pending_scope=[u for u in state.scope_updates.values() if u['status']=='needs_F2_or_investigation' and u['proposal']['unit_id']==task.unit_id]

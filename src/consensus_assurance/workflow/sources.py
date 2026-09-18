@@ -72,7 +72,6 @@ def dependency_closure(objects,seeds):
         for key in ['source','target','claim_id','fact_id']:
             if obj.get(key) in objects:todo.append(obj[key])
         for association in obj.get('associations',[]):todo.append(association['claim_id']);wanted.update(association.get('source_ids',[]))
-        for use in obj.get('code_uses',[]):todo.extend(use.get('claim_ids',[])+use.get('relation_ids',[]));wanted.update(use.get('source_ids',[]))
         question=obj.get('audit_question') or {};wanted.update(question.get('source_ids',[]))
     return wanted,visited
 

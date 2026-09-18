@@ -42,7 +42,6 @@ class RepairingScopeAgent(ScopeAgent):
             b=copy.deepcopy(response['bindings'][0]);b.update(id='background',symbol='level',start_line=3,end_line=6,anchor=None,description='Actual helper definitions used to produce the input',pending=['No independent helper guarantee is proven'])
             b['associations']=[{**copy.deepcopy(b['associations'][0]),'claim_id':'step_obligation'}]
             response['bindings'].append(b);u=response['units'][0];u['binding_ids'].append('background')
-            u['code_uses'].append({'binding_id':'background','role':'input','claim_ids':['step_obligation'],'relation_ids':[],'source_ids':[b['material_id']],'rationale':'Helper values produce the actual input to this consumer','unverified':['The arithmetic checker does not establish every helper responsibility']})
         write_json(directory/'response.json',response);write_json(directory/'decoded-response.json',response)
         return check,response_type.model_validate(response)
 
@@ -64,7 +63,6 @@ def test_negative_review_cached_context_new_dependencies_split_scope_and_tlc(tmp
         def analyze(self,*a,**kw):
             check,response=super().analyze(*a,**kw)
             if type(response).__name__=='GraphPatch':
-                for use in response.units[0].code_uses:use.source_ids=[x.replace('upstream_support.py:1:2','upstream_support.py:1:6') for x in use.source_ids]
                 for edge in response.relations:edge.grounding.behavior_ids=[x.replace('upstream_support.py:1:2','upstream_support.py:1:6') for x in edge.grounding.behavior_ids]
             return check,response
     args=(args[0],Agent(data),args[2],args[3],args[4]);cfg.budget.targeted_reads=2

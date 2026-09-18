@@ -54,10 +54,6 @@ def repair_targets(value, errors, reason, limit):
                 parent=tuple(route[:-1])
                 if parent:containers.setdefault(parent,set()).add(route[-1]);route=route[:-1]
             paths.append(route)
-    match = re.search(r'Binding ([\w-]+): literal symbol',reason)
-    if match and isinstance(value,dict):
-        for i,b in enumerate(value.get('bindings',[])):
-            if b.get('id')==match[1]: paths.append(['bindings',i,'symbol'])
     if not paths and isinstance(value,dict):
         key='bundle' if isinstance(value.get('bundle'),dict) else 'draft' if isinstance(value.get('draft'),dict) else None
         prefix=[key] if key else []

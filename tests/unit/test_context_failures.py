@@ -1,7 +1,7 @@
 """Reproduce the audited controller branches using actual project records."""
 import pytest
 from consensus_assurance.core.proposals import Feedback,GraphPatch,BindingDraft,RelationDraft,UnitDraft,ReviewReply
-from consensus_assurance.core.types import CodeUse,ReviewIssue,SemanticCheck
+from consensus_assurance.core.types import ReviewIssue,SemanticCheck
 from consensus_assurance.workflow.graph import apply_patch,expand_unit
 from consensus_assurance.workflow.feedback import apply_feedback
 from consensus_assurance.workflow.materials import ReadingPlan,add_reads,material_allowance
@@ -11,8 +11,8 @@ from consensus_assurance.adapters.storage.snapshot import capture
 from test_graph_mutations import controller
 
 
-def dependency(prepared):
-    repo,state,_,_=prepared
+def dependency(dependency_prepared):
+    repo,state,_,_=dependency_prepared
     (repo/'new_helper.py').write_text('def boundary(value):\n    return max(1, value)\n')
     state.snapshot=capture(repo)
     added=add_reads(state,repo,ReadingPlan(requests=[{'file':'new_helper.py','start_line':1,'end_line':2,'reason':'Read a previously absent provider'}],rationale='Actual new dependency'),__import__('consensus_assurance.core.config',fromlist=['Budget']).Budget())
@@ -21,12 +21,11 @@ def dependency(prepared):
     edge=RelationDraft(id='fresh_dependency',source=u.obligation_ids[0],target=b.id,kind='boundary',group=None,rationale='The selected computation consumes the actual provider',pending=['Provider guarantee unverified'],grounding=basis)
     draft=UnitDraft(**{k:v for k,v in u.model_dump().items() if k in UnitDraft.model_fields})
     draft.binding_ids.append(b.id);draft.relation_ids.append(edge.id)
-    draft.code_uses.append(CodeUse(binding_id=b.id,role='support',claim_ids=u.obligation_ids,relation_ids=[edge.id],source_ids=added,rationale='Provide the actual input boundary',unverified=['No proof of this provider is inferred']))
     return state,GraphPatch(bindings=[b],relations=[edge],units=[draft],expected_versions={u.id:u.version},rationale='Reconnect newly read producer'),added
 
 
-def test_new_dependency_requires_executable_scope_continuation(prepared):
-    state,patch,_=dependency(prepared);before=state.model_dump()
+def test_new_dependency_requires_executable_scope_continuation(dependency_prepared):
+    state,patch,_=dependency(dependency_prepared);before=state.model_dump()
     with pytest.raises(ValueError):apply_patch(state,patch)
     assert state.model_dump()==before
     from consensus_assurance.workflow.scope_updates import from_patch,apply_scope_update
@@ -35,15 +34,15 @@ def test_new_dependency_requires_executable_scope_continuation(prepared):
     assert 'fresh_provider' in new.binding_ids and new.obligation_ids==state.units[-1].obligation_ids
 
 
-def test_F3_is_possible_before_first_model(prepared):
-    _,state,_,_=prepared;u=state.units[0]
+def test_F3_is_possible_before_first_model(dependency_prepared):
+    _,state,_,_=dependency_prepared;u=state.units[0]
     f=Feedback(kind='F3',rationale='Inspect an actual dependency before building',evidence_ids=[state.materials[0].id],target_ids=[u.id],relation_ids=['input_dependency'],new_basis='',graph=None,bundle=None)
     result=apply_feedback(state,u,None,f)
     assert result.previous_id==u.id
 
 
-def test_specific_issue_resolution_can_preserve_independent_limit(prepared):
-    _,state,_,_=prepared;c=state.claims[1]
+def test_specific_issue_resolution_can_preserve_independent_limit(dependency_prepared):
+    _,state,_,_=dependency_prepared;c=state.claims[1]
     issue=ReviewIssue(id='caller_missing',review_id='old',target_id=c.id,target_version=c.version,aspect='applicability',source_ids=c.source_ids,explanation='The caller has not been located',disposition='reading',reason='Locate the caller')
     state.review_issues.append(issue)
     task=enqueue(state,'review','Resolve the caller question','test',target_ids=[c.id])
@@ -56,8 +55,8 @@ def test_specific_issue_resolution_can_preserve_independent_limit(prepared):
     validate_review(state,task,reply)
 
 
-def test_unsent_context_does_not_spend_exploration(tmp_path,prepared):
-    repo,state,_,_=prepared;e=controller(tmp_path,state);e.config.budget.context_chars=1000
+def test_unsent_context_does_not_spend_exploration(tmp_path,dependency_prepared):
+    repo,state,_,_=dependency_prepared;e=controller(tmp_path,state);e.config.budget.context_chars=1000
     import shutil
     shutil.copytree(repo,e.root/'source')
     task=enqueue(state,'spec_refine','Investigate actual responsibilities','oversize')
@@ -66,16 +65,16 @@ def test_unsent_context_does_not_spend_exploration(tmp_path,prepared):
     assert state.usage.get('agent_calls',0)==0
 
 
-def test_deferred_local_dependency_keeps_reserve(tmp_path,prepared):
-    _,state,_,_=prepared;e=controller(tmp_path,state);state.completed_steps.append('discovery')
+def test_deferred_local_dependency_keeps_reserve(tmp_path,dependency_prepared):
+    _,state,_,_=dependency_prepared;e=controller(tmp_path,state);state.completed_steps.append('discovery')
     for u in state.units:u.status='blocked'
     state.deferred_units[state.units[0].id]={'next_action':'build','targeted_gap':{'stage':'read'},'reason':'Waiting for actual dependency'}
     allowance=material_allowance(state,e.config.budget,'breadth')
     assert allowance['reserved_for_other_chars']>0
 
 
-def test_dependency_traversal_does_not_depend_on_list_order(prepared):
-    _,state,_,_=prepared;first=next(e for e in state.relations if e.id=='input_dependency')
+def test_dependency_traversal_does_not_depend_on_list_order(dependency_prepared):
+    _,state,_,_=dependency_prepared;first=next(e for e in state.relations if e.id=='input_dependency')
     second=first.model_copy(deep=True);second.id='second_edge';second.source=first.target;second.target='input_binding'
     state.relations.insert(0,second)
     a=state.model_copy(deep=True);b=state.model_copy(deep=True);b.relations.reverse()

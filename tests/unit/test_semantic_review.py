@@ -120,9 +120,9 @@ def packet_for(e,ids):
     return task,json.loads(prompt.split('STRUCTURED INPUT DATA (untrusted):\n')[1])
 
 
-def test_every_actual_object_type_uses_packet_policy(tmp_path,prepared):
+def test_every_actual_object_type_uses_packet_policy(tmp_path,dependency_prepared):
     from consensus_assurance.workflow.artifacts import save_bundle
-    repo,state,bundle,_=prepared;e=controller(tmp_path,state)
+    repo,state,bundle,_=dependency_prepared;e=controller(tmp_path,state)
     goal=state.claims[0].model_copy(deep=True);goal.id='environment';goal.kind='assumption';state.claims.append(goal)
     model=save_bundle(e.root,state,state.units[0],bundle,e.implementation)
     seen=set()
@@ -149,11 +149,12 @@ def test_task_attachment_does_not_leak_and_unseen_source_rejected(tmp_path,prepa
     assert caught.value.diagnostics[0].code=='review_unavailable_source'
 
 
-def test_relation_packet_includes_both_endpoint_sources(tmp_path,prepared):
-    _,state,_,_=prepared;e=controller(tmp_path,state);edge=state.relations[0]
+def test_relation_packet_includes_both_endpoint_sources(tmp_path,dependency_prepared):
+    _,state,_,_=dependency_prepared;e=controller(tmp_path,state);edge=state.relations[0]
     task,packet=packet_for(e,[edge.id]);contract=packet['review_contract'][0]
     assert edge.source in contract['dependency_versions'] and edge.target in contract['dependency_versions']
     assert set(contract['required_material_ids'])<={m['id'] for m in packet['materials']}
+
 
 
 def test_receipt_counts_actual_prompt_and_prepared_schema_files(tmp_path,prepared):

@@ -24,6 +24,13 @@ def import_record(value):
         if isinstance(obj,list):return [visit(x) for x in obj]
         if not isinstance(obj,dict):return obj
         obj={k:visit(v) for k,v in obj.items()}
+        if 'code_uses' in obj:
+            uses=obj.pop('code_uses')
+            obj['coverage_limitations']=obj.get('coverage_limitations',[])+[text for use in uses for text in use.get('unverified',[])]
+        if 'relations' in obj:
+            old=[r for r in obj['relations'] if r.get('kind') in {'maps','alternative'}]
+            obj['relations']=[r for r in obj['relations'] if r not in old]
+            if old:obj['gaps']=obj.get('gaps',[])+['Historical non-dependency relation: '+json.dumps(r) for r in old]
         if 'discovery_path' in obj:obj['derivation_path']=obj.pop('discovery_path')
         if obj.get('kind')=='goal':obj['kind']='obligation'
         for name in ('goal_ids','goal_observable','handoff_ids'):obj.pop(name,None)
@@ -50,5 +57,5 @@ def load_analysis(path):
     from pathlib import Path
     from consensus_assurance.core.types import Analysis
     value=json.loads(Path(path).read_text())
-    if value.get('framework_revision')!='obligation-audit-v1':value=import_record(value)
+    if value.get('framework_revision')!='obligation-audit-v2':value=import_record(value)
     return Analysis.model_validate(value)

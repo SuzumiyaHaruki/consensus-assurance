@@ -5,7 +5,7 @@ from pathlib import Path
 from consensus_assurance.adapters.agents.backend import MockAgent
 from consensus_assurance.adapters.storage.files import write_json
 from consensus_assurance.core.types import Origin
-from consensus_assurance.core.proposals import Derivation, ClaimDraft, BindingDraft, RelationDraft, UnitDraft, GraphPatch
+from consensus_assurance.core.proposals import GraphDraft, ClaimDraft, BindingDraft, RelationDraft, UnitDraft, GraphPatch
 
 
 def delivery_graph(context, wrong=False):
@@ -17,8 +17,8 @@ def delivery_graph(context, wrong=False):
     obligation=ClaimDraft(id='delivery_obligation',kind='obligation',description='Return in memory mode requires persistence' if wrong else 'Return in memory mode requires acceptance',source_ids=[note['id'],material['id']],scope=scope,pending=[],grounding=basis)
     binding=BindingDraft(id='delivery_binding',claim_id=obligation.id,material_id=material['id'],symbol='deliver',start_line=141,end_line=142,description='Actual memory acceptance result',pending=[])
     edge=RelationDraft(id='delivery_support',source=goal.id,target=obligation.id,kind='depends_all',group=None,rationale='The selected configured contract determines completion responsibility',pending=[],grounding=basis)
-    unit=UnitDraft(id='delivery_unit',obligation_ids=[obligation.id],binding_ids=[binding.id],relation_ids=[edge.id],scope=scope,rationale='Investigate a second responsibility',)
-    return GraphPatch(claims=[goal,obligation],bindings=[binding],relations=[edge],units=[unit],rationale='Actual newly read completion source supports candidate goals')
+    unit=UnitDraft(id='delivery_unit',obligation_ids=[obligation.id],binding_ids=[binding.id],relation_ids=[],scope=scope,rationale='Investigate a second responsibility',)
+    return GraphPatch(claims=[obligation],bindings=[binding],relations=[],units=[unit],rationale='Actual newly read completion source supports candidate goals')
 
 
 class CoverageAgent(MockAgent):
@@ -29,6 +29,7 @@ class CoverageAgent(MockAgent):
         return {'available':True,'version':'task-aware-mock/1','checks':[],'reason':'Explicit controlled coverage fixture'}
     def analyze(self,runner,prompt,directory,snapshot_id,timeout,response_type):
         if response_type.__name__=='Discovery':
+            self.descriptive_context=json.loads(prompt.split('STRUCTURED INPUT DATA (untrusted):\n')[1])
             from regression_support import inventory_response
             return inventory_response(runner,prompt,directory,snapshot_id,timeout)
         context=json.loads(prompt.split('STRUCTURED INPUT DATA (untrusted):\n')[1])
@@ -40,13 +41,13 @@ class CoverageAgent(MockAgent):
             response={'requests':[next(r for r in self.source_responses[0]['requests'] if r['file']=='README.md')]+([request] if self.wrong else []),'rationale':'Initial fixture reading intentionally favors the counter region'}
         elif name=='Derivation':
             if self.wrong:
-                graph=delivery_graph(context,True)
-                response={'understanding':'A deliberately misread candidate, to be corrected from actual material','selection_rationale':'Check the result contract',**graph.model_dump(mode='json')}
+                graph=delivery_graph({**context,'materials':self.descriptive_context['materials']},True)
+                response=graph.model_dump(mode='json')
                 response.pop('expected_versions');response.pop('rationale')
             else:
                 response=json.loads(json.dumps(self.source_responses[1]))
                 response['relations']=[r for r in response['relations'] if r['id']!='input_dependency']
-                response['units'][0]['relation_ids'].remove('input_dependency')
+                response['units'][0]['relation_ids']=[id for id in response['units'][0]['relation_ids'] if id!='input_dependency']
                 response['reading_requests']=[request]
         elif name=='SpecRefinement':
             response={'understanding':'Controlled fixture retains explicit descriptive gaps','audit_spec':context.get('audit_spec'),'requests':[], 'limitations':['Finite synthetic coverage only']}
@@ -76,6 +77,9 @@ class CoverageAgent(MockAgent):
             response={'bundle':self.source_responses[2],'gap':''}
         else:
             raise AssertionError('Unexpected task '+name)
+        if name=='Derivation':
+            from regression_support import bounded_derivation
+            response=bounded_derivation(response)
         directory.mkdir(parents=True,exist_ok=True)
         (directory/'prompt.txt').write_text(prompt)
         write_json(directory/'response.json',response)
