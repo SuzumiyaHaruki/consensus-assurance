@@ -72,7 +72,7 @@ class Derivation(Record):
     bindings: list[BindingDraft] = []
     dependencies: list[RelationDraft] = []
     context_claims: list[ClaimDraft] = []
-    audit_question: AuditQuestion
+    audit_question: AuditQuestion | None = None
     selection_rationale: str
     reading_requests: list[ReadRequest] = Field(default_factory=list, max_length=8)
     descriptive_issues: list[DescriptiveIssue] = []

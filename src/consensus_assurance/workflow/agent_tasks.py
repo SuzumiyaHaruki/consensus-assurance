@@ -94,7 +94,7 @@ def ask(engine,kind,response_type,context,validator=None,*,purpose="depth"):
             context['repair_requested_material_ids']=session.get('requested_material_ids',[])
             # Allocate requested source within the existing whole-packet ceiling;
             # error_context_chars bounds diagnostic fields, not repeated old closures.
-            requested=[m for m in context['attached_materials'] if m['id'] in context['repair_requested_material_ids']]
+            requested=[m for m in context['attached_materials'] if m['id'] in set(context['repair_requested_material_ids'])|{id for d in active_diags for id in d.material_ids}]
             source_room=min(engine.config.budget.context_chars//2,max(limit,sum(len(json.dumps(m,ensure_ascii=False)) for m in requested)+limit))
             if active_diags[0].code=='schema_type' or active_diags[0].category in {'association','material'}:
                 # Reference fields need the owning object, dependency claims and source,

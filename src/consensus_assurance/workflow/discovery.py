@@ -101,6 +101,32 @@ def derivation_graph(reply):
         relations=reply.dependencies,units=units,rationale=reply.selection_rationale)
 
 
+def classify_derivation_outcome(state,reply):
+    """One outcome contract for validation and controller acceptance; no mutation."""
+    q=reply.audit_question;current=active_candidate(state)
+    graph=reply.obligation or reply.bindings or reply.dependencies or reply.context_claims
+    if not reply.selection_rationale.strip():raise ValueError('Explain the bounded analysis outcome')
+    if q is None:
+        if not current and state.question_candidates and not (graph or reply.reading_requests or reply.descriptive_issues):return 'selection_exhausted'
+        raise ValueError('Selection can stop only after candidates were considered, with no active question or proposed work')
+    reads=reply.reading_requests+q.requests
+    if not reply.obligation and graph:raise ValueError('A pre-obligation candidate cannot create graph objects')
+    if q.disposition=='explained_by_existing_mechanism' and (graph or reads or not q.counterevidence):
+        raise ValueError('Explained candidates need sourced protections, no graph objects and no pending reads')
+    if not reply.obligation:
+        if q.disposition=='ready_for_check':raise ValueError('A ready check requires its obligation')
+        if reads and q.preferred_check!='source_review':raise ValueError('Candidate source acquisition uses source_review')
+    selected=set(q.behavior_ids+q.fact_ids)
+    if any(selected&set(i.object_ids) for i in reply.descriptive_issues):return 'spec_refine'
+    if reply.obligation:return 'escalate'
+    if q.disposition=='explained_by_existing_mechanism':return 'explained'
+    if reads:return 'continue_read'
+    reviewed=current and (current.material_ids or current.history or len(current.check_ids)>1)
+    if reviewed and not reply.descriptive_issues and q.disposition=='needs_specific_evidence' and q.preferred_check=='source_review' and q.unknowns:
+        return 'blocked_evidence'
+    raise ValueError('An initial question needs actionable source or a grounded result; evidence-blocked requires a reviewed candidate and explicit unknowns')
+
+
 def validate_derivation(state,reply):
     from consensus_assurance.core.diagnostics import Diagnostic,DiagnosticError
     from .audit_spec import load
@@ -114,23 +140,20 @@ def validate_derivation(state,reply):
     q=reply.audit_question;current=active_candidate(state)
     try:
         if spec is None:raise ValueError('An accepted inventory is required')
-        validate_question(spec,q)
-        if not set(q.source_ids)<=known:raise ValueError('Question sources must be acquired')
-        if not q.question.strip() or not q.trigger_rationale.strip():raise ValueError('State the discriminator and selection reason')
-        if current and (q.fact_ids!=current.question.fact_ids or q.obligation_relation_kind!=current.question.obligation_relation_kind):
-            raise ValueError('Finish the current candidate before selecting another fact or lifecycle')
-        if not current and any(c.question.fact_ids==q.fact_ids and c.question.obligation_relation_kind==q.obligation_relation_kind and c.status in {'explained','blocked'} for c in state.question_candidates):
-            raise ValueError('This candidate already has a disposition; select another fact or lifecycle')
-        if reply.obligation and q.disposition=='explained_by_existing_mechanism':raise ValueError('Explained candidates close without an obligation')
-        if not reply.obligation:
-            if reply.bindings or reply.dependencies or reply.context_claims:raise ValueError('A pre-obligation candidate cannot create graph objects')
-            reads=reply.reading_requests+q.requests
-            if reads and q.preferred_check!='source_review':raise ValueError('Candidate source acquisition uses source_review')
-            if q.disposition=='explained_by_existing_mechanism':
-                if reads or not q.counterevidence:raise ValueError('Explained candidates need sourced protections and no pending reads')
-            elif not reads and not reply.descriptive_issues:raise ValueError('Request decisive source, identify a descriptive issue, or explain the suspicion')
+        outcome=classify_derivation_outcome(state,reply)
+        if q:
+            validate_question(spec,q)
+            if not set(q.source_ids)<=known:raise ValueError('Question sources must be acquired')
+            if not q.question.strip() or not q.trigger_rationale.strip():raise ValueError('State the discriminator and selection reason')
+            if current and (q.fact_ids!=current.question.fact_ids or q.obligation_relation_kind!=current.question.obligation_relation_kind):
+                raise ValueError('Finish the current candidate before selecting another fact or lifecycle')
+            if not current and any(c.question.fact_ids==q.fact_ids and c.question.obligation_relation_kind==q.obligation_relation_kind and c.status in {'explained','blocked'} for c in state.question_candidates):
+                raise ValueError('This candidate already has a disposition; select another fact or lifecycle')
     except ValueError as exc:
-        issues.append(Diagnostic(code='derivation_question',category='semantic',paths=['/audit_question'],message=str(exc),allowed=['read','semantic_revision']))
+        questions=[x for x in (q,current.question if current else None) if x]
+        refs={id for x in questions for id in x.fact_ids+x.behavior_ids}
+        sources={id for x in questions for id in x.source_ids}|set(current.material_ids if current else [])
+        issues.append(Diagnostic(code='derivation_question',category='semantic',object_ids=sorted(refs),material_ids=sorted(sources&known),paths=['/audit_question'],message=str(exc),allowed=['read','semantic_revision']))
     if reply.obligation and (reply.obligation.kind!='obligation' or not reply.bindings):
         issues.append(Diagnostic(code='derivation_primary',category='association',object_ids=[reply.obligation.id],paths=['/obligation','/bindings'],message='A primary obligation requires its actual code bindings',allowed=['association','read']))
     existing={o.id for name in ('claims','bindings','relations','units') for o in getattr(state,name)}
@@ -139,9 +162,7 @@ def validate_derivation(state,reply):
         if obj and obj.id in existing:
             issues.append(Diagnostic(code='existing_graph_identity',category='semantic',object_ids=[obj.id],paths=[path],material_ids=sorted(known&set(getattr(obj,'source_ids',[]))),message='Derivation adds candidates; existing semantic objects require attributed F2 rather than replacement',allowed=['read','semantic_revision']))
     if issues:raise DiagnosticError(issues)
-    if not reply.obligation:return
-    selected=set(reply.audit_question.behavior_ids+reply.audit_question.fact_ids) if reply.audit_question else set()
-    if any(selected&set(i.object_ids) for i in reply.descriptive_issues):return
+    if outcome!='escalate':return outcome
     try:validate_patch(state,derivation_graph(reply))
     except DiagnosticError as exc:
         patch=derivation_graph(reply)
@@ -164,14 +185,20 @@ def validate_derivation(state,reply):
                 return path.replace('/relations','/dependencies',1)
             d.paths=list(dict.fromkeys(wire(path) for path in d.paths))
         raise
+    return outcome
 
 
 def accept_derivation(engine,reply,check_id):
     from .transactions import commit_graph
     from consensus_assurance.core.types import QuestionCandidate
-    validate_derivation(engine.state,reply)
+    outcome=validate_derivation(engine.state,reply)
     def commit(proxy):
-        state=proxy.state;candidate=active_candidate(state);q=reply.audit_question.model_copy(deep=True)
+        state=proxy.state
+        if outcome=='selection_exhausted':
+            state.gaps.append('No additional tractable candidate selected: '+reply.selection_rationale)
+            state.completed_steps.append('derived-spec:'+str(state.audit_spec_version))
+            return
+        candidate=active_candidate(state);q=reply.audit_question.model_copy(deep=True)
         if candidate:
             candidate.history.append(candidate.question.model_copy(deep=True))
             for field in ('counterevidence','unknowns','source_ids'):
@@ -190,15 +217,16 @@ def accept_derivation(engine,reply,check_id):
                 task.candidate_id=candidate.id;candidate.spec_task_ids.append(task.id)
         requests=list({(r.file,r.start_line,r.end_line):r for r in reply.reading_requests+q.requests}.values())
         q.requests=requests
-        if candidate.spec_task_ids:
+        if outcome=='spec_refine':
             candidate.stage='read' if requests else 'analyze'
             if requests:candidate.read_plan_id=uid()
             return
-        if not reply.obligation:
-            if q.disposition=='explained_by_existing_mechanism':
-                candidate.status='explained';candidate.stop_reason=reply.selection_rationale
-            else:
-                candidate.stage='read';candidate.read_plan_id=uid()
+        if outcome in {'explained','blocked_evidence'}:
+            candidate.status='explained' if outcome=='explained' else 'blocked'
+            candidate.stage='analyze';candidate.stop_reason=reply.selection_rationale
+            return
+        if outcome=='continue_read':
+            candidate.stage='read';candidate.read_plan_id=uid()
             return
         patch=derivation_graph(reply);patch.units[0].audit_question=q
         apply_patch(state,patch)
@@ -209,7 +237,7 @@ def accept_derivation(engine,reply,check_id):
     path=engine.root/f'derivation-{check_id}.json';write_json(path,reply);engine.state.derivation_path=str(path)
     engine.checkpoint('derivation_candidate_prepared')
     commit_graph(engine,'derive-'+check_id,reply.model_dump(mode='json'),commit)
-    return any(c.obligation_id==reply.obligation.id for c in engine.state.question_candidates) if reply.obligation else False
+    return outcome in {'escalate','selection_exhausted'}
 
 
 def continue_candidate(engine,candidate):
@@ -284,7 +312,7 @@ def derive(engine):
         if proposal is None:continue
         # Cached source still needs actual transmission before semantic acceptance.
         from .sources import dependency_closure
-        while proposal.obligation or proposal.audit_question.disposition=='explained_by_existing_mechanism':
+        while proposal.obligation or proposal.audit_question and proposal.audit_question.disposition=='explained_by_existing_mechanism':
             graph=derivation_graph(proposal)
             objects={x.id:x for name in ('claims','bindings','relations','units') for x in getattr(graph,name)}
             required,_=dependency_closure(objects,objects)

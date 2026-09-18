@@ -11,3 +11,5 @@ For declaration diagnostics, use the supplied candidate declaration offsets and 
 Address active_diagnostics only; residual_problems await later repair. Choose one action: replacements/binding_splits, requests, supported draft_patch, or change_request. Reads require empty replacements and change_request. change_request stops execution; it is not a post-read plan. Sourced dependency selection corrections need not change checked obligations or scope.
 
 An invalid_dictionary_keys target authorizes only its exact dictionary container. Preserve every preserve_entries key/value; do not edit sibling objects. Correcting shape cannot justify invented coverage judgments or producer guarantees. Keep diagnostic reasoning and unresolved evidence in supported fields; request a semantic decision when a lossless representation correction cannot be justified. Source-view citation diagnostics supply candidate original ranges, not permission to cite all of them indiscriminately.
+
+A source-reviewed candidate that legitimately ends in insufficient attributable evidence is not a representation repair; the derivation task should encode that outcome directly.

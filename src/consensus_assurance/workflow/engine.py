@@ -26,7 +26,7 @@ from .errors import Blocked
 from .agent_tasks import ask as ask_agent
 
 
-FRAMEWORK_REVISION = "selected-question-v3"
+FRAMEWORK_REVISION = "selected-question-v4"
 
 
 class Engine:

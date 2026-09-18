@@ -1,0 +1,90 @@
+{
+  "obligation": null,
+  "bindings": [],
+  "dependencies": [],
+  "context_claims": [],
+  "audit_question": {
+    "disposition": "explained_by_existing_mechanism",
+    "preferred_check": "source_review",
+    "requests": [],
+    "question": "After configuration-entry StoreLogs failure, does setState(Follower) synchronously invalidate the next leader-loop guard, preventing consumption of a commitment advance caused by F4's subsequent voter-map replacement?",
+    "importance": "Consumption of such an advance could schedule earlier outstanding entries for application using the replacement configuration's recorded support. The observed volatile commitment advance alone does not establish that consequence; the reviewed role transition and loop guard block this immediate local consumption path.",
+    "source_ids": [
+      "docs/README.md:1:80",
+      "raft.go:1203:1283",
+      "raft.go:1203:1361",
+      "commitment.go:1:104",
+      "raft.go:442:850",
+      "raft.go:851:1010",
+      "raft.go:1956:2241",
+      "state.go:1:100"
+    ],
+    "participants": [
+      "Leader main-loop owner",
+      "Replication goroutines",
+      "Commitment notification consumer"
+    ],
+    "objects": [
+      "Configuration-change future",
+      "Latest configuration",
+      "Commitment voter map",
+      "Commitment index",
+      "Local LogStore",
+      "Inflight log futures",
+      "Raft role state"
+    ],
+    "contexts": [
+      "Configuration-change dispatch on a leader",
+      "StoreLogs returns an error, potentially after partial writes",
+      "Replacement voter map may advance the volatile commitment index",
+      "Pending commitment notifications during transition to follower",
+      "Immediate continuation of the same configuration-change handler and leader-loop invocation"
+    ],
+    "event_paths": [
+      "leaderLoop configuration-change case -> synchronous appendConfigurationEntry -> dispatchLogs",
+      "StoreLogs error -> respond(error) -> Raft.setState(Follower) -> raftState.setState -> atomic.StoreUint32 -> return",
+      "appendConfigurationEntry continuation -> latest configuration replacement -> commitment.setConfiguration -> possible recalculation and commitCh notification -> startStopReplication",
+      "Configuration-change case completes -> atomic role read in next leaderLoop guard -> loop exits without selecting commitCh",
+      "runLeader deferred cleanup -> stop tracked replication -> issue ErrLeadershipLost responses -> clear leader commitment and notification channel"
+    ],
+    "activity_classes": [
+      "A4",
+      "A1",
+      "A2"
+    ],
+    "behavior_ids": [
+      "B4",
+      "B2",
+      "B3"
+    ],
+    "fact_ids": [
+      "F4"
+    ],
+    "obligation_relation_kind": "consumption",
+    "counterevidence": [
+      "raft.go:1203:1283 verifies that the StoreLogs error branch responds with the error and calls setState(Follower) before returning. It skips the local match report, last-log metadata update, and ordinary replication triggers.",
+      "commitment.go:1:104 verifies mutex serialization, increasing per-voter reports, and advancement only beyond the current commitment index and at or above startIndex. Replacement retains surviving voter reports and initializes new voters to zero; it can still advance the volatile commitment index.",
+      "raft.go:1203:1361 verifies that configuration replacement proceeds after dispatchLogs returns, including its error return. processLogs also skips already-applied indexes, although that guard is not needed to explain this path.",
+      "raft.go:442:850 verifies configuration admission only when latest and committed configuration indexes agree and the Raft commit index has reached this leadership's startIndex.",
+      "raft.go:851:1010 resolves the earlier handler-continuation gap: appendConfigurationEntry is called synchronously, and its select case ends immediately afterward.",
+      "raft.go:1956:2241 resolves the wrapper-setter gap: Raft.setState directly calls r.raftState.setState(state) before returning, with observation performed after the state update.",
+      "state.go:1:100 resolves the remaining state-visibility gap: raftState.setState performs atomic.StoreUint32 and getState performs atomic.LoadUint32 on the same state field. The follower transition is an immediate update, not a queued request.",
+      "raft.go:442:850 verifies that leaderLoop checks getState() == Leader before every select and consumes commitment only in a separate commitCh case. Consequently, the synchronous failure-handler continuation cannot consume its newly generated notification before the role guard rejects another iteration.",
+      "raft.go:442:850 verifies deferred leader cleanup that stops tracked replication, issues ErrLeadershipLost responses to inflight operations, and clears commitment and commitCh. Subsequent leader setup allocates a fresh commitment object and channel."
+    ],
+    "unknowns": [
+      "The earlier missing dispatch, recalculation, handler-continuation, and synchronous role-update gaps are resolved by the cited source. Reachability of retained voter reports sufficient for the hypothesized volatile advance remains unverified, but is unnecessary to explain why this immediate consumer cannot run.",
+      "The applicable configuration activation contract remains incompletely established; this disposition does not establish that retaining the changed latest configuration after storage failure is correct.",
+      "StoreLogs partial-write and crash-durability semantics remain unknown. An error does not establish that nothing was stored.",
+      "startStopReplication can initiate or stop replication after failed dispatch. Remote effects and effects outside the selected local commitment-consumption path remain unresolved.",
+      "Future response retention semantics remain unread; response calls alone do not establish the caller-observed result.",
+      "Previously scheduled FSM work and later follower, election, or restart processing have not been shown to depend on this transient commitment advancement and remain outside this disposition.",
+      "This source review does not establish whole-system safety, cleanup termination, or correctness of every concurrent role-transition path."
+    ],
+    "priority": 1,
+    "trigger_rationale": "The newly acquired setter and getter implementations resolve the final immediate discriminator: the completed follower transition is visible to the next role guard, so a pending commitment notification does not permit another leader-loop select on this continuation."
+  },
+  "selection_rationale": "Continue and dispose the selected F4 consumption question. The synchronous configuration handler, immediate atomic follower-state update, and role guard explain the suspected local consumption path even if voter-map replacement advances the volatile commitment index. No obligation or further reading is justified for this discriminator. The disposition is scoped source-grounded analysis, not execution evidence or a conclusion about configuration recovery, remote effects, or overall correctness.",
+  "reading_requests": [],
+  "descriptive_issues": []
+}

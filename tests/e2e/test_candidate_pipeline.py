@@ -75,3 +75,48 @@ def test_recorded_derivation_contract_to_source_review(tmp_path,debt):
     prompt=render('derive',pool_sources(packet),engine.inquiry)
     (tmp_path/'derive-prompt-size.txt').write_text(str(len(prompt)))
     assert len(prompt)<169984 and len(prompt)<config.budget.context_chars*.9
+
+
+@pytest.mark.parametrize('next_outcome',['explained','escalated'])
+def test_evidence_blocked_candidate_does_not_end_autonomous_selection(tmp_path,prepared,next_outcome):
+    """Synthetic 13:43:11 regression: no contract source is a result, not repair."""
+    from consensus_assurance.core.types import AuditQuestion,ReadRequest
+    from regression_support import descriptive_inventory
+    repo,_,_,responses=prepared
+    source=responses[1]['claims'][0]['source_ids'][0]
+    description=descriptive_inventory(source);spec=description.audit_spec
+    spec.behaviors.append(spec.behaviors[0].model_copy(update={'id':'second_step','produces_fact_ids':['second_fact'],'consumes_fact_ids':['second_fact']}))
+    spec.facts.append(spec.facts[0].model_copy(update={'id':'second_fact','established_by':['second_step'],'consumed_by':['second_step']}))
+    first=AuditQuestion(question='Does the caller owe error propagation?',importance='A claimed publication may be absent',source_ids=[source],activity_classes=['A1'],behavior_ids=['fixture_step'],fact_ids=['fixture_value'],obligation_relation_kind='establishment',preferred_check='source_review',disposition='needs_specific_evidence',counterevidence=['First-path guard propagates reported errors'],unknowns=['Applicable caller responsibility is unassigned'],trigger_rationale='Inspect the remaining contract discriminator')
+    second=first.model_copy(update={'question':'Does the independent operation establish its documented bound?','fact_ids':['second_fact'],'behavior_ids':['second_step'],'counterevidence':['Independent operation validates its bound'],'unknowns':['Selected bound requires source verification']})
+    read=lambda a,b:[ReadRequest(file='counter.py',start_line=a,end_line=b,reason='Inspect the selected operation')]
+    replies=[responses[0],description.model_dump(mode='json'),
+        Derivation(audit_question=first,reading_requests=read(1,2),selection_rationale='Select the first discriminator').model_dump(mode='json'),
+        Derivation(audit_question=first,selection_rationale='Reviewed caller and interface do not assign the responsibility; no exact next contract source is known').model_dump(mode='json'),
+        Derivation(audit_question=second,reading_requests=read(1,4),selection_rationale='Select an independent bounded discriminator').model_dump(mode='json')]
+    if next_outcome=='explained':
+        second.disposition='explained_by_existing_mechanism'
+        replies.extend([Derivation(audit_question=second,selection_rationale='The supplied independent validation explains this suspicion').model_dump(mode='json'),Derivation(selection_rationale='No additional tractable candidate follows from the current inventory and sources').model_dump(mode='json')])
+    else:
+        upgrade=Derivation.model_validate(bounded_derivation(responses[1]));upgrade.audit_question=second.model_copy(update={'disposition':'ready_for_check','preferred_check':'local_model'})
+        replies.extend([upgrade.model_dump(mode='json')]*2)  # Exact binding source may need cached reattachment before acceptance.
+    fixture=tmp_path/'candidate-flow.json';fixture.write_text(json.dumps(replies))
+    config=Config(implementation='toy',agent_backend='mock',fixture=str(fixture),allow_experiments=False)
+    engine=Engine(config,tmp_path/'run',*assemble(config));state=engine.start(repo,plan_only=next_outcome=='escalated')
+    assert [c.status for c in state.question_candidates]==['blocked',next_outcome],state.stop_reason
+    assert not state.repair_sessions and state.pending_output_repair is None
+    assert not state.models and not state.direct_checks and not state.evidence
+    first_record,second_record=state.question_candidates
+    assert first_record.question.disposition=='needs_specific_evidence' and first_record.stop_reason
+    assert first.counterevidence[0] not in second_record.question.counterevidence
+    packets=[json.loads(p.read_text().split('STRUCTURED INPUT DATA (untrusted):\n')[1]) for p in (engine.root/'agent').glob('*-derive/prompt.txt')]
+    assert any(any(c['status']=='blocked' and c['fact_ids']==first.fact_ids for c in p['candidate_dispositions']) for p in packets)
+    assert any(p.get('selected_question',{}).get('fact_ids')==second.fact_ids for p in packets)
+    if next_outcome=='explained':
+        assert state.stop_reason=='No pending executable audit units; unresolved gaps remain'
+        assert not state.claims and not state.units and any('No additional tractable candidate selected:' in g for g in state.gaps)
+        assert state.usage['agent_calls']==7
+    else:
+        assert len(state.claims)==len(state.units)==1 and state.units[0].relation_ids==[]
+        assert state.units[0].audit_question.fact_ids==second.fact_ids
+        assert second_record.obligation_id==state.units[0].obligation_ids[0]

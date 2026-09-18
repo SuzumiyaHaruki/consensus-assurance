@@ -169,15 +169,25 @@ def test_selected_packet_excludes_independent_subgraph_and_keeps_sources(focused
 def test_selected_run_preserves_unresolved_candidate_and_failure(tmp_path):
     from consensus_assurance.workflow.history import load_analysis
     from consensus_assurance.reporting.chinese import render_report
-    archive=Path(__file__).resolve().parents[2]/'runs/2026-09-18_13-43-11-hashicorp_raft-real-run'
+    archive=Path(__file__).resolve().parents[2]/'runs/2026-09-18_15-00-06-hashicorp_raft-real-run'
     before={name:(archive/name).read_bytes() for name in ['state.json','report.md']}
     state=load_analysis(archive/'state.json')
-    assert len(state.question_candidates)==1 and not state.claims
-    assert state.question_candidates[0].status=='active'
+    assert [c.status for c in state.question_candidates]==['blocked','explained','explained','explained','explained','active']
+    assert not state.claims and not state.units and not state.evidence
     (tmp_path/'offline').mkdir()
     report=render_report(state,tmp_path/'offline').read_text()
-    assert 'Explicit semantic/scope plan requested' in report and 'F_SNAPSHOT_RECORDED' in report
+    assert 'Budget exhausted: targeted_reads' in report and 'F9' in report
     assert all((archive/name).read_bytes()==data for name,data in before.items())
+
+
+def test_v3_controller_state_cannot_resume_under_v4(focused):
+    from types import SimpleNamespace
+    e,_,_=focused
+    e.state.framework_revision='selected-question-v3'  # Explicit compatibility fixture, not an archive rewrite.
+    e.store=SimpleNamespace(load=lambda:e.state)
+    usage=dict(e.state.usage)
+    assert 'Framework revision differs' in e.resume().stop_reason
+    assert e.state.usage==usage
 
 
 def test_resumed_partial_continuation_explains_then_selects_next(focused):
@@ -231,3 +241,76 @@ def test_new_cached_attachments_are_progress_without_acquisition_charge(focused)
         candidate=e.state.question_candidates[0]
         assert candidate.status==('blocked' if n==3 else 'active')
         assert not e.state.usage.get('targeted_reads')
+
+
+def test_reviewed_evidence_block_is_accepted_without_repair(focused,tmp_path):
+    """13:43:11 shape: concrete source exhausted, responsibility still unattributed."""
+    from consensus_assurance.adapters.agents.backend import MockAgent
+    e,q,_=focused
+    candidate=begin(e,q,[ReadRequest(file='counter.py',start_line=1,end_line=2,reason='Review the caller')])
+    discovery.continue_candidate(e,candidate)
+    reply=Derivation(audit_question=q.model_copy(update={'unknowns':['Applicable contract does not assign error propagation']}),selection_rationale='Caller and interface sources were reviewed; no exact remaining range can assign this responsibility')
+    agent=MockAgent();agent.responses=[reply.model_dump(mode='json')];e.agent=agent
+    result,check=discovery.ask_derivation(e,discovery.derive_context(e))
+    assert discovery.validate_derivation(e.state,result)=='blocked_evidence'
+    assert not discovery.accept_derivation(e,result,check.id)
+    c=e.state.question_candidates[0]
+    assert c.status=='blocked' and c.stage=='analyze' and c.stop_reason==reply.selection_rationale
+    assert c.history and q.counterevidence[0] in c.question.counterevidence and q.unknowns[0] in c.question.unknowns
+    assert not discovery.active_candidate(e.state)
+    assert not e.state.claims and not e.state.units and not e.state.models and not e.state.evidence
+    assert e.state.pending_output_repair is None and not e.state.repair_sessions and e.state.usage['agent_calls']==1
+    from consensus_assurance.reporting.chinese import render_report
+    report=render_report(e.state,e.root).read_text()
+    assert '候选因证据/适用合同不足延期' in report and reply.selection_rationale in report
+
+
+@pytest.mark.parametrize('invalid',['initial_block','initial_exhausted','active_exhausted','unreviewed_block','unknowns_empty','wrong_check','ready_without_obligation','blank_reason','unrelated_debt'])
+def test_incomplete_or_premature_outcome_is_not_an_escape(focused,invalid):
+    e,q,_=focused
+    if invalid not in {'initial_block','initial_exhausted'}:
+        c=begin(e,q,[ReadRequest(file='counter.py',start_line=1,end_line=2,reason='Review')])
+        if invalid!='unreviewed_block':discovery.continue_candidate(e,c)
+    reply=Derivation(audit_question=q,selection_rationale='No remaining justified contract source')
+    if invalid.endswith('exhausted'):reply.audit_question=None
+    if invalid=='unknowns_empty':reply.audit_question=q.model_copy(update={'unknowns':[]})
+    if invalid=='wrong_check':reply.audit_question=q.model_copy(update={'preferred_check':'local_model'})
+    if invalid=='ready_without_obligation':reply.audit_question=q.model_copy(update={'disposition':'ready_for_check'})
+    if invalid=='blank_reason':reply.selection_rationale=' '
+    if invalid=='unrelated_debt':reply.descriptive_issues=[DescriptiveIssue(object_ids=['A7'],source_ids=q.source_ids,reason='Unrelated inventory debt')]
+    with pytest.raises(DiagnosticError):discovery.validate_derivation(e.state,reply)
+    assert not e.state.claims and not e.state.units
+
+
+def test_disposed_selection_exhausts_once_and_cannot_be_silently_reselected(focused):
+    e,q,_=focused;c=begin(e,q,[ReadRequest(file='counter.py',start_line=1,end_line=2,reason='Review')])
+    discovery.continue_candidate(e,c)
+    discovery.accept_derivation(e,Derivation(audit_question=q,selection_rationale='Applicable responsibility is not established'),'block')
+    repeat=Derivation(audit_question=q,reading_requests=[ReadRequest(file='counter.py',start_line=3,end_line=4,reason='Same direction')],selection_rationale='Repeat disposed direction')
+    with pytest.raises(DiagnosticError,match='already has a disposition'):discovery.validate_derivation(e.state,repeat)
+    end=Derivation(selection_rationale='No additional bounded discriminator is supported by current inventory/source')
+    assert discovery.validate_derivation(e.state,end)=='selection_exhausted'
+    assert discovery.accept_derivation(e,end,'finish')
+    discovery.derive(e)  # The same inventory is not asked to select again after resume.
+    assert len(e.state.question_candidates)==1 and e.state.gaps[-1].endswith(end.selection_rationale)
+    assert not e.state.pending_output_repair and not e.state.claims and not e.state.units
+
+
+def test_true_semantic_error_first_repair_has_local_objects_and_source(focused):
+    from consensus_assurance.adapters.agents.backend import MockAgent
+    from consensus_assurance.workflow.errors import Blocked
+    from consensus_assurance.workflow.sources import all_materials
+    e,q,_=focused;c=begin(e,q,[ReadRequest(file='counter.py',start_line=1,end_line=2,reason='Review')])
+    discovery.continue_candidate(e,c)
+    bad=Derivation(audit_question=q.model_copy(update={'obligation_relation_kind':'recovery'}),reading_requests=[ReadRequest(file='counter.py',start_line=1,end_line=2,reason='Read')],selection_rationale='Silently change the lifecycle')
+    with pytest.raises(DiagnosticError) as caught:discovery.validate_derivation(e.state,bad)
+    d=caught.value.diagnostics[0]
+    assert set(q.fact_ids+q.behavior_ids)<=set(d.object_ids)
+    assert set(q.source_ids+c.material_ids)<=set(d.material_ids)
+    agent=MockAgent();agent.responses=[bad.model_dump(mode='json'),{'change_request':'A real lifecycle change needs explicit selection rather than representation repair','rationale':'Preserve the original question'}];e.agent=agent
+    with pytest.raises(Blocked,match='Explicit semantic/scope plan'):discovery.ask_derivation(e,discovery.derive_context(e))
+    repair=next(json.loads(p.read_text().split('STRUCTURED INPUT DATA (untrusted):\n')[1]) for p in (e.root/'agent').glob('*/prompt.txt') if '"repair_targets"' in p.read_text())
+    local=repair['related_context']
+    assert set(d.material_ids)<={m['id'] for m in all_materials(local)}
+    assert set(q.fact_ids+q.behavior_ids)<={o['id'] for o in local['objects']}
+    assert discovery.active_candidate(e.state).status=='active'  # Genuine errors are not swallowed as evidence-blocked.
