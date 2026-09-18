@@ -2,7 +2,6 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Literal
-from typing_extensions import TypedDict
 from uuid import uuid4
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -27,7 +26,7 @@ class ReadRequest(Record):
 
 
 ActivityClass = Literal["A1", "A2", "A3", "A4", "A5", "A6", "A7"]
-Lifecycle = Literal["establishment", "preservation", "consumption", "recovery", "cross_activity_handoff"]
+Lifecycle = Literal["establishment", "preservation", "consumption", "recovery"]
 
 
 class TargetProfile(Record):
@@ -41,12 +40,6 @@ class TargetProfile(Record):
     unknowns: list[str] = []
 
 
-class ActivityCoverage(TypedDict):
-    behavior: Literal["unknown", "partial", "recovered"]
-    fact: Literal["unknown", "partial", "recovered"]
-    handoff: Literal["unknown", "partial", "recovered"]
-
-
 class Activity(Record):
     class_id: ActivityClass
     applicability: Literal["applicable", "externalized", "not_applicable", "unknown"]
@@ -54,12 +47,9 @@ class Activity(Record):
     realization_summary: str
     entry_points: list[str] = []
     behavior_ids: list[str] = Field(default_factory=list, json_schema_extra={"x-controller-derived": True}, description="Derived from Behavior.primary_activity")
-    fact_ids: list[str] = []
-    handoff_ids: list[str] = []
     variants: list[str] = []
     unknowns: list[str] = []
     source_ids: list[str] = []
-    coverage: ActivityCoverage
 
 
 class Behavior(Record):
@@ -100,19 +90,6 @@ class Fact(Record):
     unknowns: list[str] = []
 
 
-class Handoff(Record):
-    id: str
-    fact_id: str
-    producer_activity: ActivityClass
-    consumer_activity: ActivityClass
-    producer_behavior_ids: list[str]
-    consumer_behavior_ids: list[str]
-    consumer_expectation: str
-    existing_protections: list[str] = []
-    unresolved_gap: str = ""
-    source_ids: list[str] = Field(min_length=1)
-
-
 class Surface(Record):
     entry_point: str
     disposition: Literal["mapped", "externalized", "infrastructure", "deferred", "UNCLASSIFIED_PROTOCOL_RESPONSIBILITY"]
@@ -128,9 +105,7 @@ class ConsensusAuditSpec(Record):
     activities: list[Activity] = Field(min_length=7, max_length=7)
     behaviors: list[Behavior] = []
     facts: list[Fact] = []
-    handoffs: list[Handoff] = []
-    unclassified: list[Surface] = []
-    coverage_summary: list[Surface] = []
+    surfaces: list[Surface] = []
 
     @model_validator(mode="before")
     @classmethod
@@ -139,13 +114,14 @@ class ConsensusAuditSpec(Record):
         import copy
         value=copy.deepcopy(value)
         behaviors=value.get('behaviors',[])
-        get=lambda x,k,default=None: x.get(k,default) if isinstance(x,dict) else getattr(x,k,default)
-        for a in value.get('activities',[]):
-            if isinstance(a,dict):a.setdefault('behavior_ids',[get(b,'id') for b in behaviors if get(b,'primary_activity')==a.get('class_id')])
-        for f in value.get('facts',[]):
-            if isinstance(f,dict):
-                for key,edge in [('established_by','produces_fact_ids'),('consumed_by','consumes_fact_ids')]:
-                    f.setdefault(key,[get(b,'id') for b in behaviors if f.get('id') in get(b,edge,[])])
+        get=lambda x,k,default=None:x.get(k,default) if isinstance(x,dict) else getattr(x,k,default)
+        def derived(collection,fields):
+            for i,obj in enumerate(value.get(collection,[])):
+                additions={key:build(obj) for key,build in fields.items() if key not in (obj if isinstance(obj,dict) else obj.model_fields_set)}
+                if isinstance(obj,dict):obj.update(additions)
+                elif additions:value[collection][i]=obj.model_copy(update=additions)
+        derived('activities',{'behavior_ids':lambda a:[get(b,'id') for b in behaviors if get(b,'primary_activity')==get(a,'class_id')]})
+        derived('facts',{key:(lambda f,edge=edge:[get(b,'id') for b in behaviors if get(f,'id') in get(b,edge,[])]) for key,edge in [('established_by','produces_fact_ids'),('consumed_by','consumes_fact_ids')]})
         return value
 
     @model_validator(mode="after")
@@ -169,7 +145,6 @@ class AuditQuestion(Record):
     activity_classes: list[ActivityClass] = []
     behavior_ids: list[str] = []
     fact_ids: list[str] = []
-    handoff_ids: list[str] = []
     obligation_relation_kind: Lifecycle | None = None
     counterevidence: list[str] = []
     unknowns: list[str] = []
@@ -185,7 +160,6 @@ class ReachabilityRequirement(Record):
     claim_ids: list[str] = Field(min_length=1)
     behavior_ids: list[str] = []
     fact_ids: list[str] = []
-    handoff_ids: list[str] = []
     description: str
 
 
@@ -199,6 +173,8 @@ class ReachabilityResult(Record):
 
 
 class InquiryTask(Record):
+    draft_path: str | None = None
+    diagnostics: list[dict] = []
     admitted: bool = False
     preparation_failures: int = 0
     parent_task_id: str | None = None
@@ -367,7 +343,7 @@ class PendingAction(Record):
 
 class Claim(Record):
     id: str
-    kind: Literal["goal", "obligation", "assumption"]
+    kind: Literal["obligation", "assumption"]
     description: str
     scope: Scope
     source: str
@@ -399,7 +375,7 @@ class CodeUse(Record):
     binding_id: str
     role: Literal["direct", "input", "support", "environment", "handoff"]
     claim_ids: list[str] = Field(min_length=1, description="Existing claims associated with this binding; contextual use does not add them to checked obligations")
-    relation_ids: list[str] = Field(default_factory=list, description="For support/handoff: selected directed dependency edges from checked obligations, not a goal mapping or a merely related edge")
+    relation_ids: list[str] = Field(default_factory=list, description="For support/handoff: selected directed dependency edges from checked obligations, not a unselected mapping or a merely related edge")
     source_ids: list[str] = Field(min_length=1)
     rationale: str
     unverified: list[str] = []
@@ -579,7 +555,7 @@ class Finding(Record):
     trace_path: str
     investigation_notes: list[str] = []
     replay_check_id: str | None = None
-    level: Literal["model_candidate", "implementation_candidate", "implementation_obligation", "implementation_goal"] = "model_candidate"
+    level: Literal["model_candidate", "implementation_candidate", "implementation_obligation", "implementation_consequence"] = "model_candidate"
     checker_id: str | None = None
     claim_version: int | None = None
     confirmation_path: str | None = None
@@ -631,13 +607,11 @@ class Material(Record):
 
 class AuditUnit(Record):
     id: str
-    goal_ids: list[str]
     obligation_ids: list[str]
     binding_ids: list[str]
     relation_ids: list[str]
     scope: Scope
     rationale: str
-    goal_observable: bool = False
     status: Literal["pending", "selected", "checked", "partial", "blocked", "revised"] = "pending"
     previous_id: str | None = None
     version: int = 1
@@ -728,7 +702,7 @@ class Analysis(Record):
     revisions: list[Revision] = []
     capabilities: list[Capability] = []
     selections: list[dict] = []
-    discovery_path: str | None = None
+    derivation_path: str | None = None
     created_at: str = Field(default_factory=now)
     first_model_seconds: float | None = None
     parent_run: str | None = None

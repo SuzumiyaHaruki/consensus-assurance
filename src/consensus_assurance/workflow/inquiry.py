@@ -29,16 +29,11 @@ def enqueue(state, kind, reason, trigger, activity_classes=(), target_ids=(), un
     return task
 
 
-def initial_agenda(engine, proposal):
-    if proposal.reading_requests:
-        enqueue(engine.state,'spec_refine','Close the selected minimum coverage or candidate dependency gap','initial_reading',requests=proposal.reading_requests)
-
-
 def review_unit(engine, unit, trigger, model=None):
     if not enabled(engine): return
     available=objects(engine.state)
     if trigger=="before_model" and readiness(engine.state,unit)["status"]=="reviewed":return
-    ids=[x for x in dict.fromkeys(unit.goal_ids+unit.obligation_ids+[unit.id]+([model.id] if model else [])+[i.target_id for i in engine.state.review_issues if not i.resolved_by and i.target_id in unit.binding_ids+unit.relation_ids]) if x in available]
+    ids=[x for x in dict.fromkeys(unit.obligation_ids+[unit.id]+([model.id] if model else [])+[i.target_id for i in engine.state.review_issues if not i.resolved_by and i.target_id in unit.binding_ids+unit.relation_ids]) if x in available]
     from .review_contract import target_contract,same_basis
     needed={};basis={}
     for id in ids:
@@ -104,7 +99,7 @@ def choose_task(engine):
     if pending:return sorted(pending,key=lambda t:t.kind!='review')[0]
     if state.usage.get('exploration_rounds',0)<engine.config.budget.exploration_rounds:
         from .audit_spec import refinement_reason
-        reason=refinement_reason(state) or ('Select a bounded fact-lifecycle candidate after reverse coverage' if not ready else None)
+        reason=refinement_reason(state)
         trigger='spec:'+str(state.audit_spec_version)+':'+str(state.graph_version)
         if reason and not any(t.trigger==trigger for t in state.inquiry_tasks):
             return enqueue(state,'spec_refine',reason,trigger)
@@ -131,6 +126,13 @@ def task_context(engine,task):
         if view:
             wanted.update(source_ids(view))
         wanted.update(m.id for m in state.materials if m.file.lower().endswith('readme.md'))
+    from .audit_spec import issue_groups
+    groups=issue_groups(task.diagnostics);active=groups[0] if groups else []
+    draft=None
+    if task.draft_path:
+        draft=json.loads(Path(task.draft_path).read_text())['audit_spec']
+        if not active:wanted.update(source_ids(draft))
+    wanted.update(id for d in active for id in d['material_ids'])
     pending_scope=[u for u in state.scope_updates.values() if u['status']=='needs_F2_or_investigation' and u['proposal']['unit_id']==task.unit_id]
     for p in pending_scope:wanted.update(p['proposal']['source_ids'])
     selected=[m for m in state.materials if m.id in wanted]
@@ -151,6 +153,7 @@ def task_context(engine,task):
         'overview_limit':'This compact index is not complete implementation coverage; request specific actual ranges before deriving new claims'}
     if task.kind=='spec_refine' and not task.activity_classes:
         result['claims']=[{'id':c.id,'kind':c.kind,'description':c.description,'version':c.version} for c in state.claims]
+    if draft:result.update(draft_audit_spec=draft,diagnostics=active,remaining_issue_groups=[[d['object_ids'] for d in group] for group in groups[1:]])
     if task.unit_id:
         result['selected_unit']=available[task.unit_id].model_dump(mode='json')
         from .task_view import semantic_view
@@ -173,20 +176,16 @@ def task_context(engine,task):
             result['checker_executions']=[engine.error_context(c) for c in state.checks if c.model_id==model.id and c.action=='model_check']
             result['reachability']=[r.model_dump(mode='json') for r in state.reachability_results if r.model_id==model.id]
     if task.kind!='review':
-        from .audit_spec import coverage_ledger
-        result.update(cost_estimate=cost_estimate(engine),coverage_ledger=coverage_ledger(state),current_check_results=[engine.error_context(c) for c in state.checks if c.action in {'direct_check','model_check'}][-2:],evidence=[e.model_dump(mode='json') for e in state.evidence[-4:]])
+        from .audit_spec import audit_progress
+        result.update(cost_estimate=cost_estimate(engine),audit_progress=audit_progress(state),current_check_results=[engine.error_context(c) for c in state.checks if c.action in {'direct_check','model_check'}][-2:],evidence=[e.model_dump(mode='json') for e in state.evidence[-4:]])
     return result
 
 
 def validate_spec_refinement(state,reply):
-    if reply.requests:
-        if reply.patch.claims or reply.patch.bindings or reply.patch.units or reply.patch.relations:
-            raise ValueError('Read missing material before claiming a graph patch based on it')
-        return
-    trial=state.model_copy(deep=True)
-    apply_patch(trial,reply.patch,audit_spec=reply.audit_spec)
+    if reply.requests:return
+    if reply.audit_spec is None:raise ValueError('Descriptive refinement needs a complete candidate inventory or focused reads')
     from .audit_spec import validate
-    if reply.audit_spec:validate(trial,reply.audit_spec)
+    validate(state,reply.audit_spec)
 
 
 def validate_review(state,task,reply):
@@ -238,7 +237,12 @@ def process_task(engine, task):
     if task.repair_session and not state.pending_output_repair:state.pending_output_repair=task.repair_session
     context=task_context(engine,task)
     if task.kind=='spec_refine':
-        reply,check=engine.ask('spec_refine',SpecRefinement,context,lambda p:validate_spec_refinement(state,p))
+        from .audit_spec import SpecIssue
+        try:reply,check=engine.ask('spec_refine',SpecRefinement,context,lambda p:validate_spec_refinement(state,p))
+        except SpecIssue as exc:
+            task.draft_path=exc.draft_path;task.diagnostics=[d.model_dump(mode='json') for d in exc.diagnostics]
+            task.status='pending';task.admitted=False;state.active_inquiry_id=None
+            release_action(engine);engine.checkpoint('descriptive_refinement_remains_open');return
         if reply.requests:
             old={m['id'] for m in context['materials']}
             if all(q.file+':'+str(q.start_line)+':'+str(q.end_line) in old for q in reply.requests):
@@ -348,16 +352,16 @@ def apply_task_response(engine,task_id,reply,check):
     state=engine.state;task=next(t for t in state.inquiry_tasks if t.id==task_id)
     versions={i:getattr(objects(state)[i],'version',1) for i in task.target_ids if i in objects(state)}
     if task.kind=='spec_refine':
-        changed=apply_patch(state,reply.patch,audit_spec=reply.audit_spec)
+        changed=set()
         from .audit_spec import accept
         if reply.audit_spec:accept(engine,reply.audit_spec)
         state.completed_steps.extend('spec-reviewed:'+c.id for c in state.checks if c.action in {'direct_check','model_check'} and 'spec-reviewed:'+c.id not in state.completed_steps)
         state.gaps.extend(reply.limitations)
         material_reviews(engine,None,task.added_material_ids)
         for unit in state.units:
-            if changed & set(unit.goal_ids+unit.obligation_ids+unit.relation_ids):
+            if changed & set(unit.obligation_ids+unit.relation_ids):
                 review_unit(engine,unit,"graph_growth:"+task.id)
-            if set(task.added_material_ids)&{source for c in state.claims if c.id in unit.goal_ids+unit.obligation_ids for source in c.source_ids}:
+            if set(task.added_material_ids)&{source for c in state.claims if c.id in unit.obligation_ids for source in c.source_ids}:
                 review_unit(engine,unit,'spec_materials:'+task.id)
     else:
         review=SemanticReview(context_receipt_id=task.context_receipt_id,context_dependencies=task.context_dependencies,task_id=task.id,check_id=check.id,unit_id=task.unit_id,unit_version=task.unit_version,model_id=task.model_id,target_versions=versions,material_ids=task.material_ids if task.context_receipt_id else task.material_ids or [m.id for m in state.materials],items=reply.items,origin='mock' if engine.agent.mock else 'agent',supersedes_task_ids=reply.supersedes_task_ids,resolves_issue_ids=reply.resolves_issue_ids,resolution_rationale=reply.resolution_rationale)
@@ -372,10 +376,10 @@ def apply_task_response(engine,task_id,reply,check):
             review.revision_id=state.revisions[-1].id
             if state.revisions[-1].status=='applied' and state.active_unit_id:
                 active=next(u for u in state.units if u.id==state.active_unit_id)
-                if set(task.target_ids)&set(active.goal_ids+active.obligation_ids+active.relation_ids+active.binding_ids+[active.id]):
+                if set(task.target_ids)&set(active.obligation_ids+active.relation_ids+active.binding_ids+[active.id]):
                     state.active_model_id=None;state.active_direct_check_id=None;state.active_finding_id=None;state.next_action='select'
             for candidate in state.units:
-                if set(task.target_ids)&set(candidate.goal_ids+candidate.obligation_ids+candidate.relation_ids+candidate.binding_ids+[candidate.id]):
+                if set(task.target_ids)&set(candidate.obligation_ids+candidate.relation_ids+candidate.binding_ids+[candidate.id]):
                     review_unit(engine,candidate,'semantic_revision:'+review.revision_id)
         state.semantic_reviews.append(review)
         from .review_contract import missing_pairs
@@ -468,7 +472,7 @@ def split_model_context(engine, kind):
     if unit is None:return []
     _,closure=material_closure(state,[unit.id])
     disputed={i.target_id for i in state.review_issues if not i.resolved_by and i.target_id in closure}
-    priority=list(dict.fromkeys(unit.obligation_ids+unit.goal_ids+unit.binding_ids+unit.relation_ids+[unit.id]))
+    priority=list(dict.fromkeys(unit.obligation_ids+unit.binding_ids+unit.relation_ids+[unit.id]))
     from .task_packet import prepare,pool_sources
     from .prompts import render
     children=[]

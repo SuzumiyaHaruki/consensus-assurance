@@ -89,14 +89,14 @@ def local_workset(engine,unit):
         'bindings':[b.model_dump(mode='json') for b in state.bindings if b.id in ids],
         'relations':[r.model_dump(mode='json') for r in state.relations if r.id in ids or r.id in unit.relation_ids],
         'obligation_progress':{'checked_scopes':unit.obligation_checks,'remaining':unit.remaining_obligation_ids or unit.obligation_ids},
-        'modeling_brief':{'unit_id':unit.id,'version':unit.version,'question_ref':unit.id,'goal_ids':unit.goal_ids,'obligation_ids':unit.obligation_ids,
+        'modeling_brief':{'unit_id':unit.id,'version':unit.version,'question_ref':unit.id,'obligation_ids':unit.obligation_ids,
             'scope_ref':unit.id,'code_refs':unit.binding_ids,'relationship_refs':unit.relation_ids,
             'remaining_conditions':unit.coverage_limitations+[x for use in unit.code_uses for x in use.unverified],
             'basis':'Derived current G/O/C view; complete referenced objects and required source are included once'}}
 
 
 def local_basis(state,unit):
-    ids=set(unit.goal_ids+unit.obligation_ids+unit.binding_ids+unit.relation_ids+[unit.id])
+    ids=set(unit.obligation_ids+unit.binding_ids+unit.relation_ids+[unit.id])
     materials,closure=material_closure(state,[unit.id]);closure.update(relevant_model_ids(state,unit));view,sources=semantic_view(state,closure)
     materials.update(sources);materials.update(state.task_attachments.get('unit:'+unit.id,[]))
     from .sources import ranges

@@ -15,9 +15,12 @@ from consensus_assurance.core.types import Origin
 class ScopeAgent(MockAgent):
     def __init__(self,responses):super().__init__();self.data=responses;self.refine=False
     def analyze(self,runner,prompt,directory,snapshot_id,timeout,response_type):
+        if response_type.__name__=='Discovery':
+            from regression_support import inventory_response
+            return inventory_response(runner,prompt,directory,snapshot_id,timeout)
         p=json.loads(prompt.split('STRUCTURED INPUT DATA (untrusted):\n')[1]);name=response_type.__name__
         if name=='ReadingPlan':response=self.data[0]
-        elif name=='Discovery':
+        elif name=='Derivation':
             response=copy.deepcopy(self.data[1])
             if self.refine:response['units'][0]['audit_question']={'question':'Does the consumer stay within its supplied bound?','importance':'The consumer relies on the provider boundary','source_ids':response['claims'][0]['grounding']['expectation_ids'],'event_paths':['Input reaches the consumer'],'trigger_rationale':'One input consumption exercises the responsibility'}
         elif name=='BuildReply':
@@ -51,7 +54,7 @@ class ScopeAgent(MockAgent):
                 for aspect in c['required_aspects']:
                     items.append({'target_id':c['target_id'],'aspect':aspect,'status':'no_issue_found','source_ids':c['required_material_ids'],'rationale':'The supplied actual synthetic sources support the scoped question' + "\n" + 'A different legal provider can meet the same responsibility' + "\n" + 'A violated provider boundary can change the reachable counter behavior','limitations':(['Finite synthetic instance; no production consensus claim']) + ([])})
             response={'items':items,'limitations':[]}
-        elif name=='SpecRefinement':response={'understanding':'The current synthetic source set has a separate unverified input responsibility','patch':{'rationale':'No new grounded claim this round'},'limitations':['The separate input obligation is not automatically discharged']}
+        elif name=='SpecRefinement':response={'understanding':'The current synthetic source set has a separate unverified input responsibility','audit_spec':p['audit_spec'],'limitations':['The separate input obligation is not automatically discharged']}
         else:raise AssertionError(name)
         directory.mkdir(parents=True,exist_ok=True);(directory/'prompt.txt').write_text(prompt);write_json(directory/'response.json',response);write_json(directory/'decoded-response.json',response)
         check=runner.run([sys.executable,'-c','print("Explicit scope-reconnection regression responder")'],directory,'agent',snapshot_id,timeout);check.origin=Origin.MOCK

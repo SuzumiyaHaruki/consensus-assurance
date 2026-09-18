@@ -1,11 +1,11 @@
 """Controller-level semantic commit recovery using the real task-aware local fixture."""
 import pytest
-from test_inquiry_loop import setup
+from coverage_support import setup_workflow as setup
 from consensus_assurance.workflow.engine import Engine
 from consensus_assurance.adapters.storage.files import Store
 
 
-@pytest.mark.parametrize('operation',['discovery','inquiry'])
+@pytest.mark.parametrize('operation',['derive','inquiry'])
 def test_interrupted_semantic_commit_resumes_without_duplicate_revision(tmp_path,prepared,operation):
     repo,config,root,args=setup(tmp_path,prepared,wrong=True)
     class Interrupted(Engine):

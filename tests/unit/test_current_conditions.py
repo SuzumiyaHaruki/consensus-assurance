@@ -58,7 +58,7 @@ def test_read_followup_keeps_only_affected_target_aspect_and_issue(tmp_path,prep
     from consensus_assurance.core.types import CheckRun
     from test_graph_mutations import controller
     _,state,_,_=prepared;e=controller(tmp_path,state);u=state.units[0]
-    t=enqueue(state,'review','Inspect selected objects','initial',target_ids=u.goal_ids+u.obligation_ids,unit_id=u.id)
+    t=enqueue(state,'review','Inspect selected objects','initial',target_ids=u.obligation_ids+u.obligation_ids,unit_id=u.id)
     c=next(c for c in state.claims if c.id==u.obligation_ids[0]);t.material_ids=c.source_ids
     r=ReviewReply(items=[{'target_id':c.id,'aspect':'decomposition','status':'needs_reading','source_ids':c.source_ids,'limitations':['Producer bound is not yet explained'],'rationale':'Inspect this producer only' + "\n" + 'The caller may establish the bound' + "\n" + 'An unconstrained input changes the behavior'}],
         requests=[{'file':'limits.py','start_line':1,'end_line':2,'reason':'Locate the real producer'}],limitations=[])

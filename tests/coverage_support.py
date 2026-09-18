@@ -5,7 +5,7 @@ from pathlib import Path
 from consensus_assurance.adapters.agents.backend import MockAgent
 from consensus_assurance.adapters.storage.files import write_json
 from consensus_assurance.core.types import Origin
-from consensus_assurance.core.proposals import Discovery, ClaimDraft, BindingDraft, RelationDraft, UnitDraft, GraphPatch
+from consensus_assurance.core.proposals import Derivation, ClaimDraft, BindingDraft, RelationDraft, UnitDraft, GraphPatch
 
 
 def delivery_graph(context, wrong=False):
@@ -13,11 +13,11 @@ def delivery_graph(context, wrong=False):
     note=next(m for m in context['materials'] if m['file']=='service_notes.md')
     scope={'description':'Synthetic memory-mode completion, no crash claim','assumptions':[],'excluded':['Production protocols'],'parameters':{}}
     basis={'behavior_ids':[material['id']],'expectation_ids':[note['id']],'binding_ids':['delivery_binding'],'derivation':'The selected memory mode promises acceptance; the implementation returns accepted without a persistence step','applicability':'Memory mode only','unresolved':[],'conflicts':[],'alternatives':[]}
-    goal=ClaimDraft(id='delivery_goal',kind='goal',description='The returned result satisfies the configured completion responsibility',source_ids=[note['id']],scope=scope,pending=[],grounding=basis)
+    goal=ClaimDraft(id='delivery_goal',kind='obligation',description='The returned result satisfies the configured completion responsibility',source_ids=[note['id']],scope=scope,pending=[],grounding=basis)
     obligation=ClaimDraft(id='delivery_obligation',kind='obligation',description='Return in memory mode requires persistence' if wrong else 'Return in memory mode requires acceptance',source_ids=[note['id'],material['id']],scope=scope,pending=[],grounding=basis)
     binding=BindingDraft(id='delivery_binding',claim_id=obligation.id,material_id=material['id'],symbol='deliver',start_line=141,end_line=142,description='Actual memory acceptance result',pending=[])
     edge=RelationDraft(id='delivery_support',source=goal.id,target=obligation.id,kind='depends_all',group=None,rationale='The selected configured contract determines completion responsibility',pending=[],grounding=basis)
-    unit=UnitDraft(id='delivery_unit',goal_ids=[goal.id],obligation_ids=[obligation.id],binding_ids=[binding.id],relation_ids=[edge.id],scope=scope,rationale='Investigate a second responsibility',goal_observable=False)
+    unit=UnitDraft(id='delivery_unit',obligation_ids=[obligation.id],binding_ids=[binding.id],relation_ids=[edge.id],scope=scope,rationale='Investigate a second responsibility',)
     return GraphPatch(claims=[goal,obligation],bindings=[binding],relations=[edge],units=[unit],rationale='Actual newly read completion source supports candidate goals')
 
 
@@ -28,6 +28,9 @@ class CoverageAgent(MockAgent):
     def probe(self,runner):
         return {'available':True,'version':'task-aware-mock/1','checks':[],'reason':'Explicit controlled coverage fixture'}
     def analyze(self,runner,prompt,directory,snapshot_id,timeout,response_type):
+        if response_type.__name__=='Discovery':
+            from regression_support import inventory_response
+            return inventory_response(runner,prompt,directory,snapshot_id,timeout)
         context=json.loads(prompt.split('STRUCTURED INPUT DATA (untrusted):\n')[1])
         name=response_type.__name__
         self.cursor+=1
@@ -35,7 +38,7 @@ class CoverageAgent(MockAgent):
         request={'file':'z_delivery.py','start_line':141,'end_line':142,'reason':'Read the unexamined result delivery implementation'}
         if name=='ReadingPlan':
             response={'requests':[next(r for r in self.source_responses[0]['requests'] if r['file']=='README.md')]+([request] if self.wrong else []),'rationale':'Initial fixture reading intentionally favors the counter region'}
-        elif name=='Discovery':
+        elif name=='Derivation':
             if self.wrong:
                 graph=delivery_graph(context,True)
                 response={'understanding':'A deliberately misread candidate, to be corrected from actual material','selection_rationale':'Check the result contract',**graph.model_dump(mode='json')}
@@ -46,17 +49,7 @@ class CoverageAgent(MockAgent):
                 response['units'][0]['relation_ids'].remove('input_dependency')
                 response['reading_requests']=[request]
         elif name=='SpecRefinement':
-            have=any(m['id']=='z_delivery.py:141:142' for m in context['materials'])
-            existing=any(c['id']=='delivery_goal' for c in context['claims'])
-            if not have:
-                response={'understanding':'Missing another responsibility source','requests':[request],'patch':{'rationale':'Read before proposing'},'limitations':[]}
-            elif not existing and note is None:
-                response={'understanding':'The retrieved producer alone cannot establish its configured responsibility','requests':[{'file':'service_notes.md','start_line':1,'end_line':2,'reason':'Read the actual configured completion contract'}],'patch':{'rationale':'Contract material missing'},'limitations':[]}
-            elif not existing:
-                patch=delivery_graph(context)
-                response={'understanding':'Another actual responsibility has now been read','patch':patch.model_dump(mode='json'),'limitations':['This fixture does not establish a complete system inventory']}
-            else:
-                response={'understanding':'The supplied regions have candidate coverage; other unknown duties remain possible','patch':{'rationale':'No further supported additions in this bounded fixture'},'limitations':['No exhaustive coverage claim']}
+            response={'understanding':'Controlled fixture retains explicit descriptive gaps','audit_spec':context.get('audit_spec'),'requests':[], 'limitations':['Finite synthetic coverage only']}
         elif name=='ReviewReply':
             items=[];revision=None
             for obj in context['target_objects']+([context['selected_unit']] if context.get('selected_unit',{}).get('id') in context['task']['target_ids'] else []):
@@ -95,3 +88,18 @@ class CoverageAgent(MockAgent):
 def add_coverage_materials(repo):
     (repo/'service_notes.md').write_text('Memory mode promises acceptance on return. Durable mode promises persistence on return.\nResult delivery consumes accepted operations from state handling.\n')
     (repo/'z_delivery.py').write_text('\n'*140+'def deliver():\n    return "accepted"\n')
+
+
+import os
+from consensus_assurance.core.config import Config
+from consensus_assurance.registry import assemble
+
+def setup_workflow(tmp_path,prepared,wrong=False,weak=False,tlc=None):
+    repo,_,_,responses=prepared;add_coverage_materials(repo)
+    config=Config(implementation='toy',agent_backend='mock',allow_experiments=False,tlc_jar=os.environ.get('TLC_JAR'))
+    config.budget.agent_calls=20;config.budget.exploration_rounds=5;config.budget.semantic_reviews=6
+    config.budget.audit_units=0 if wrong else 1
+    config.budget.targeted_reads=6;config.budget.outer_reserve_seconds=1
+    root=tmp_path/'inquiry-run'
+    impl,_,verifier,knowledge=assemble(config)
+    return repo,config,root,(impl,CoverageAgent(responses,wrong,weak),verifier,knowledge)

@@ -66,7 +66,7 @@ def obligation_progress(state, unit):
             from .audit_spec import reachability_refs
             refs=reachability_refs(unit.audit_question)
             if refs and not refs<=set().union(*(reachability_refs(r) for r in requirements)):complete=False
-            if unit.audit_question and unit.audit_question.obligation_relation_kind in {'preservation','recovery','cross_activity_handoff'} and not any(r.sequence and r.identity_operator for r in requirements):complete=False
+            if unit.audit_question and unit.audit_question.obligation_relation_kind in {'preservation','recovery','consumption'} and not any(r.sequence and r.identity_operator for r in requirements):complete=False
             reach=[r for r in state.reachability_results if r.model_id==model.id and r.search_fingerprint==model.search_fingerprint]
             latest={x.requirement_id:x for x in reach}
             if any(r.id not in latest or latest[r.id].status!='reachable' for r in requirements):complete=False

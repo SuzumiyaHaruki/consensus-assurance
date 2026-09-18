@@ -1,5 +1,6 @@
 ---
-name: local-modeling description: Build bounded implementation models and attributed checkers from a selected audit question.
+name: local-modeling
+description: Build bounded implementation models and attributed checkers from a selected audit question.
 ---
 
 # local-modeling

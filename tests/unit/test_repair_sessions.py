@@ -167,7 +167,7 @@ def test_outer_inquiry_pause_and_resume_preserve_blocked_repair_session(tmp_path
     cfg=Config(implementation='toy',agent_backend='mock',fixture=str(fixture),allow_experiments=False)
     cfg.budget.audit_units=0;cfg.budget.exploration_rounds=0;cfg.budget.semantic_reviews=1
     root=tmp_path/'outer';e=Engine(cfg,root,*assemble(cfg),'');shutil.copytree(state.snapshot.repo,root/'source')
-    state.config=cfg.model_dump(mode='json');state.framework_revision='round6';state.completed_steps=['capabilities','materials','discovery']
+    state.config=cfg.model_dump(mode='json');state.framework_revision=__import__('consensus_assurance.workflow.engine',fromlist=['FRAMEWORK_REVISION']).FRAMEWORK_REVISION;state.completed_steps=['capabilities','materials','understanding','discovery']
     e.state=state;e.budget=BudgetTracker(cfg.budget,state)
     task=enqueue(state,'review','Recheck selected responsibility','controlled',target_ids=[state.claims[1].id],unit_id=state.units[0].id)
     e.execute(probed=True)

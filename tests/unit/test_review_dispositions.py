@@ -6,7 +6,7 @@ from consensus_assurance.core.config import Config
 from consensus_assurance.core.types import SemanticCheck, SemanticReview, InquiryTask
 from consensus_assurance.core.proposals import ReviewReply, ClaimDraft, GraphPatch, JudgmentChange
 from consensus_assurance.workflow.reviews import record_dispositions, validate_resolutions, readiness
-from consensus_assurance.workflow.inquiry import enqueue, initial_agenda, process_task, resume_deferred
+from consensus_assurance.workflow.inquiry import enqueue, process_task, resume_deferred
 from consensus_assurance.workflow.feedback import apply_feedback
 from consensus_assurance.workflow.transactions import commit_graph
 from consensus_assurance.workflow.engine import Engine
@@ -131,7 +131,7 @@ def test_later_full_review_releases_only_current_readiness_limit(tmp_path,prepar
     model=save_bundle(tmp_path,state,unit,bundle,ToyImplementation())
     unit.semantic_readiness=readiness(state,unit)
     assert any('exploratory' in x for x in semantic_limitations(state,model))
-    available=objects(state);ids=unit.goal_ids+unit.obligation_ids+unit.binding_ids+unit.relation_ids+[unit.id]
+    available=objects(state);ids=unit.obligation_ids+unit.obligation_ids+unit.binding_ids+unit.relation_ids+[unit.id]
     source_ids=sorted(material_closure(state,ids)[0])
     checks=[SemanticCheck(target_id=id,aspect=aspect,status='no_issue_found',source_ids=source_ids,rationale='Explicitly reconsider all current materials' + "\n" + 'Check the actual alternative mechanism' + "\n" + 'No unresolved prior counterevidence in this fixture') for id in ids for aspect in required_aspects(available[id])]
     state.semantic_reviews.append(SemanticReview(task_id='new',check_id='actual-review',target_versions={id:available[id].version for id in ids},unit_id=unit.id,unit_version=unit.version,material_ids=source_ids,items=checks,origin='mock'))

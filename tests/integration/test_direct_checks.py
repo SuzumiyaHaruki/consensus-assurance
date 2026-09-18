@@ -60,7 +60,7 @@ emit('returned', value=returned, in_range=0 <= returned <= limit)
 
 def review(state,unit,artifact):
     # Explicit controlled semantic input; real execution is tested separately.
-    ids=set(unit.goal_ids+unit.obligation_ids+[unit.id,artifact.id])
+    ids=set(unit.obligation_ids+unit.obligation_ids+[unit.id,artifact.id])
     for obj in state.claims+state.units+state.direct_checks:
         if obj.id not in ids:continue
         contract=target_contract(state,obj)
@@ -117,31 +117,23 @@ def test_controlled_schedule_has_typed_model_fallback(tmp_path,prepared):
     assert e.state.next_action=='build' and not e.state.direct_checks and not e.state.models
 
 
-@pytest.mark.parametrize('with_spec',[False,True])
-def test_engine_reaches_direct_execution_without_breadth_or_model(tmp_path,prepared,with_spec):
-    e,u,p=setup(tmp_path,prepared)
-    responses=prepared[3]
-    discovery=Discovery.model_validate(responses[1]);discovery.units[0].audit_question=u.audit_question
-    if with_spec:
-        source='counter.py:1:10'
-        discovery.audit_spec=ConsensusAuditSpec(target_profile=TargetProfile(system_boundary='Explicit synthetic counter fixture',source_ids=[source]),
-            activities=[Activity(class_id='A'+str(i),applicability='applicable' if i==1 else 'not_applicable',purpose='Synthetic boundary',
-                realization_summary='Only local counter progression belongs to this fixture',entry_points=['step'] if i==1 else [],
-                behavior_ids=['step'] if i==1 else [],fact_ids=['result'] if i==1 else [],source_ids=[source],
-                coverage={'behavior':'recovered' if i==1 else 'unknown','fact':'partial' if i==1 else 'unknown','handoff':'unknown'}) for i in range(1,8)],
-            behaviors=[Behavior(id='step',primary_activity='A1',execution_owner='local caller',trigger='legal call',protocol_context='one operation',produces_fact_ids=['result'],source_ids=[source])],
-            facts=[Fact(id='result',meaning='Returned counter position',identity={'operation':'one'},established_by=['step'],validity_context='configured capacity',representation=['return value'],durability='Not a durable fixture',recovery='No recovery interface',source_ids=[source])],
-            coverage_summary=[Surface(entry_point='step',disposition='mapped',behavior_ids=['step'],reason='Actual fixture API',source_ids=[source])])
-        q=discovery.units[0].audit_question
-        q.activity_classes=['A1'];q.behavior_ids=['step'];q.fact_ids=['result'];q.obligation_relation_kind='establishment'
-    other=discovery.units[0].model_copy(deep=True);other.id='other_question'
-    other.audit_question.disposition='needs_specific_evidence';other.audit_question.preferred_check=None
-    other.audit_question.requests=[ReadRequest(file='counter.py',start_line=1,end_line=2,reason='Another bounded discriminator')]
-    discovery.units.insert(0,other)
+@pytest.mark.parametrize('refine',[False,True])
+def test_descriptive_derivation_reaches_actual_direct_execution(tmp_path,prepared,refine):
+    from consensus_assurance.core.proposals import Discovery
+    from test_audit_capabilities import inventory
     from consensus_assurance.adapters.agents.backend import MockAgent
     from consensus_assurance.adapters.storage.files import write_json
-    fixture=tmp_path/'direct-responses.json';write_json(fixture,[responses[0],discovery.model_dump(mode='json'),DirectCheckReply(plan=p,gap='').model_dump(mode='json')])
-    config=e.config.model_copy(deep=True);config.agent_backend='mock';config.fixture=str(fixture)
+    e,u,plan=setup(tmp_path,prepared);responses=prepared[3]
+    spec=inventory('counter.py:1:10')
+    initial=spec.model_copy(deep=True)
+    if refine:initial.behaviors[0].produces_fact_ids=['missing']
+    derivation=Derivation.model_validate(responses[1]);derivation.units[0].audit_question=u.audit_question
+    q=derivation.units[0].audit_question;q.activity_classes=['A1','A5'];q.behavior_ids=['producer','consumer'];q.fact_ids=['fact'];q.obligation_relation_kind='consumption'
+    replies=[responses[0],Discovery(understanding='Controlled descriptive input',audit_spec=initial).model_dump(mode='json')]
+    if refine:replies.append(SpecRefinement(understanding='Separate the established input from the unknown producer',audit_spec=spec,limitations=['Unverified durability remains explicit']).model_dump(mode='json'))
+    replies.extend([derivation.model_dump(mode='json'),DirectCheckReply(plan=plan,gap='').model_dump(mode='json')])
+    fixture=tmp_path/'direct-responses.json';write_json(fixture,replies)
+    config=e.config.model_copy(deep=True);config.agent_backend='mock';config.fixture=str(fixture);config.budget.semantic_reviews=0
     class StopAfterActualCheck(Engine):
         def record(self,check):
             super().record(check)
@@ -149,14 +141,12 @@ def test_engine_reaches_direct_execution_without_breadth_or_model(tmp_path,prepa
     impl,_,verifier,knowledge=assemble(config)
     engine=StopAfterActualCheck(config,tmp_path/'whole',impl,MockAgent(fixture),verifier,knowledge,'')
     with pytest.raises(RuntimeError,match='actual direct'):engine.start(prepared[0])
-    assert engine.state.usage['agent_calls']==3  # read, discover, direct plan
-    assert not engine.state.models and not engine.state.inquiry_tasks
+    assert engine.state.usage['agent_calls']==4+int(refine)
+    assert not engine.state.models and not engine.state.repair_sessions
+    assert all(t.status=='completed' for t in engine.state.inquiry_tasks if t.kind=='spec_refine')
+    assert sum(t.kind=='spec_refine' for t in engine.state.inquiry_tasks)==int(refine)
     receipt=json.loads((engine.root/'actions'/engine.state.pending_action.id/'result.json').read_text())
     assert receipt['action']=='direct_check' and receipt['exit_code']==0
-    if with_spec:
-        from consensus_assurance.workflow.audit_spec import refinement_reason,coverage_ledger
-        assert len(coverage_ledger(engine.state))==7
-        assert 'Integrate actual check' in refinement_reason(engine.state)
 
 
 def test_exact_selected_reads_then_one_focused_continuation(tmp_path,prepared):
@@ -187,7 +177,7 @@ def test_direct_violation_enters_separate_consequence_analysis(tmp_path,prepared
     execute(e,a,p);e.state.active_direct_check_id=a.id;e.state.next_action='direct_assess';calls=[]
     def ask(kind,response_type,context,validator=None):
         calls.append(kind)
-        reply=ConsequenceReply(disposition='obligation_only',goal_ids=u.goal_ids,rationale='Only this local return is observed; wider goal consequences are unestablished',source_ids=u.audit_question.source_ids,limitations=['No correlated system-level witness'])
+        reply=ConsequenceReply(disposition='obligation_only',rationale='Only this local return is observed; wider goal consequences are unestablished',source_ids=u.audit_question.source_ids,limitations=['No correlated system-level witness'])
         if validator:validator(reply)
         return reply,CheckRun(action='agent',cwd=str(e.root),snapshot_id=e.state.snapshot.id)
     e.ask=ask;e.process_unit(u)

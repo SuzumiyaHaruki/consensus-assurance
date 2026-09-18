@@ -23,7 +23,6 @@ class ScopeUpdate(Record):
     unit_id: str
     unit_version: int
     original_question: str
-    goal_ids: list[str]
     obligation_ids: list[str]
     patch: GraphPatch
     changes: list[JudgmentChange]
@@ -42,7 +41,7 @@ def from_patch(state,unit,patch):
     for r in patch.relations:sources.update(r.grounding.behavior_ids+r.grounding.expectation_ids)
     for u in patch.units:
         for use in u.code_uses:sources.update(use.source_ids)
-    return ScopeUpdate(unit_id=unit.id,unit_version=unit.version,original_question=question(unit),goal_ids=unit.goal_ids,obligation_ids=unit.obligation_ids,
+    return ScopeUpdate(unit_id=unit.id,unit_version=unit.version,original_question=question(unit),obligation_ids=unit.obligation_ids,
         patch=patch,changes=changes,source_ids=sorted(sources),remaining_unknowns=list(dict.fromkeys([x for use in unit.code_uses for x in use.unverified]+unit.coverage_limitations)))
 
 
@@ -55,7 +54,7 @@ def validate_scope_update(state,update):
     unit=next((u for u in state.units if u.id==update.unit_id),None)
     if unit is None or unit.version!=update.unit_version:raise ValueError('Scope source unit/version no longer matches')
     writes=write_set(state,update.patch)
-    if update.original_question!=question(unit) or update.goal_ids!=unit.goal_ids or update.obligation_ids!=unit.obligation_ids:reject(update,'scope_question_changed','Scope update must preserve the original question and checked claims',writes)
+    if update.original_question!=question(unit) or update.obligation_ids!=unit.obligation_ids:reject(update,'scope_question_changed','Scope update must preserve the original question and checked claims',writes)
     declared={(c.target_id,c.field):(json.loads(c.old_value_json),json.loads(c.new_value_json)) for c in update.changes}
     if len(declared)!=len(update.changes) or canonical(declared_to_list(declared))!=canonical(declared_to_list(writes)):reject(update,'scope_diff_mismatch','Scope changes must describe the entire actual diff',writes)
     if classify_writes(writes,unit.id)=='semantic_revision':reject(update,'scope_requires_F2','Changed existing semantic objects or fault/configuration scope require scoped F2',writes)

@@ -16,7 +16,7 @@ def assemble(state, unit, draft, reply, implementation):
         raise ValueError('Return completed assembly or material requests, not both')
     data=draft.model_dump(mode='json', exclude={'pending_work'})
     data.update(harness=reply.harness, observation=reply.observation,
-                monitors=reply.monitors, goal_observations=reply.goal_observations)
+                monitors=reply.monitors, consequence_observations=reply.consequence_observations)
     bundle=Bundle.model_validate(data)
     validate_bundle(state, unit, bundle, implementation)
     return bundle

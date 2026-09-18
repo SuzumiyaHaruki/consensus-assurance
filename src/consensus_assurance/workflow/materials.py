@@ -187,13 +187,14 @@ def plan_read(state,repo,requests,budget,*,purpose='depth',partial=False,plan_id
     rows=preflight(state,repo,requests)
     cached=material_lines(state);allowance=material_allowance(state,budget,purpose);available=allowance['available_chars'];chunk_room=allowance['available_chunks']
     outcomes=[];new_materials=[]
-    # Whole requested ranges stay intact. Breadth plans may prioritize small independent ranges.
-    ordered=sorted(enumerate(rows),key=lambda pair:sum(len(t)+1 for i,t in enumerate(pair[1][2],1) if pair[1][0].start_line<=i<=pair[1][0].end_line and (pair[1][1]['content_digest'],pair[1][0].file,i) not in cached)) if partial else list(enumerate(rows))
+    # Preserve authored priority, including when a prefix must be deferred.
+    ordered=list(enumerate(rows));deferred=False
     for index,(req,info,lines) in ordered:
         additions={(info['content_digest'],req.file,i):lines[i-1] for i in range(req.start_line,req.end_line+1) if (info['content_digest'],req.file,i) not in cached}
         cost=sum(len(t)+1 for t in additions.values());chunks=usage_of({**cached,**additions})['unique_chunks']-usage_of(cached)['unique_chunks']
         mid=f'{req.file}:{req.start_line}:{req.end_line}'
-        if cost>available or chunks>chunk_room:
+        if deferred or cost>available or chunks>chunk_room:
+            deferred=True
             outcome=ReadItem(request=req,status='deferred',new_chars=cost,new_chunks=max(0,chunks),reason='Unique material allowance or protected reserve is insufficient; the entire request remains pending',file_metadata=info)
         else:
             text='\n'.join(lines[req.start_line-1:req.end_line])
@@ -281,7 +282,18 @@ def request_groups(value,path=''):
 def validate_read_requests(state,repo,response):
     errors=[]
     for path,requests in request_groups(response):
-        try:preflight(state,repo,requests,path)
+        try:
+            rows=preflight(state,repo,requests,path)
+            if isinstance(response,ReadingPlan):
+                from consensus_assurance.core.config import Config
+                budget=Config.model_validate(state.config).budget
+                cached=material_lines(state);projected=dict(cached)
+                for req,info,lines in rows:
+                    projected.update({(info['content_digest'],req.file,n):lines[n-1] for n in range(req.start_line,req.end_line+1)})
+                cost=usage_of(projected)['unique_chars']-usage_of(cached)['unique_chars']
+                allowance=material_allowance(state,budget,'breadth' if not state.audit_spec_path else 'depth')
+                if cost>allowance['available_chars']:
+                    errors.append(Diagnostic(code='reading_plan_budget',category='material',paths=[path],message='Re-plan within the actual unique source allowance; preserve semantic priority',allowed=['representation'],details={'projected_new_chars':cost,**allowance}))
         except DiagnosticError as exc:errors.extend(exc.diagnostics)
     if errors:raise DiagnosticError(errors)
 

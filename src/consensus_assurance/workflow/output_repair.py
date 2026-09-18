@@ -185,8 +185,8 @@ def diagnostic_context(candidate,diagnostics,context,limit):
     sources,visited=dependency_closure(index,ids);wanted.update(sources)
     objects=[index[id] for id in sorted(visited)]
     # Current explicit requests take precedence over a large historical object closure.
-    explicit=list(dict.fromkeys(context.get('repair_requested_material_ids',[])))
     available={m['id']:m for m in all_materials(context)}
+    explicit=list(dict.fromkeys(context.get('repair_requested_material_ids',[])+[id for d in diagnostics for id in d.material_ids if id in available]))
     wanted.update(explicit)
     include_dependencies=schema_ids or any(d.category in {'association','material'} for d in diagnostics)
     direct=[o for o in objects if include_dependencies or o.get('id',o.get('class_id')) in ids]

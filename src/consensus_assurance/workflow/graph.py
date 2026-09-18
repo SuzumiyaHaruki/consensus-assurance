@@ -1,11 +1,11 @@
 from consensus_assurance.core.types import Claim, Binding, Relation, AuditUnit
 from .mutations import adopt, write_set
-from .associations import claim_ids, relevant_use, goal_links
+from .associations import claim_ids, relevant_use
 from .graph_diagnostics import require_graph, validate_grounding
 from .locations import location_evidence
 
 
-def apply_discovery(state, proposal, audit_spec=None):
+def apply_graph(state, proposal, audit_spec=None):
     require_graph(state,proposal)
     count = sum(len(getattr(proposal,name)) for name in ("claims","bindings","relations","units"))
     if count > state.config.get("budget",{}).get("graph_objects",1000):
@@ -47,8 +47,7 @@ def apply_discovery(state, proposal, audit_spec=None):
         relations.append(Relation(**edge.model_dump()))
     units = []
     for u in proposal.units:
-        if not set(u.goal_ids) <= {c.id for c in claims if c.kind == "goal"}:
-            raise ValueError("Audit unit references missing goals")
+        if state.analysis_mode!='regression' and len(u.obligation_ids)!=1:raise ValueError('An autonomous audit unit checks one primary obligation')
         if not set(u.obligation_ids) <= {c.id for c in claims if c.kind == "obligation"}:
             raise ValueError("Audit unit references missing obligations")
         if not set(u.binding_ids) <= {b.id for b in bindings} or not set(u.relation_ids) <= set(relation_ids):
@@ -56,15 +55,13 @@ def apply_discovery(state, proposal, audit_spec=None):
         relevant = [e for e in relations if e.id in u.relation_ids]
         if any(not relevant_use(u,b,relations,materials) for b in bindings if b.id in u.binding_ids):
             raise ValueError("Audit unit contains a binding unrelated to its claims")
-        if not goal_links(u,relevant):
-            raise ValueError("Audit unit must reference a goal-to-obligation relationship")
         if state.mode=='real' and state.analysis_mode!='regression' and not u.audit_question:
             raise ValueError("A generated audit unit needs a sourced audit_question, not a suspected bug")
         if u.audit_question and (not u.audit_question.question.strip() or not u.audit_question.importance.strip() or not set(u.audit_question.source_ids)<=set(materials)):
             raise ValueError("Audit question lacks actual materials or significance")
         from .audit_spec import load, validate_question
         spec=audit_spec or getattr(proposal,'audit_spec',None) or load(state)
-        if spec:validate_question(spec,u.audit_question)
+        if spec and state.analysis_mode!='regression':validate_question(spec,u.audit_question)
         units.append(AuditUnit(**u.model_dump()))
     state.claims, state.bindings, state.relations, state.units = claims, bindings, relations, units
     state.graph_version += 1
@@ -73,13 +70,13 @@ def apply_discovery(state, proposal, audit_spec=None):
 
 def select_unit(state):
     pending = [u for u in state.units if u.status in {"pending", "partial"} and not (u.audit_question and u.audit_question.disposition=="explained_by_existing_mechanism")]
-    pending.sort(key=lambda u: (-getattr(u.audit_question,'priority',0), bool(u.audit_question and u.audit_question.disposition not in {None,'ready_for_check'}), sum(bool(v.audit_question and u.audit_question and set(v.audit_question.activity_classes)&set(u.audit_question.activity_classes)) for v in state.units if v.status in {'checked','blocked'})))
+    pending.sort(key=lambda u: (bool(u.audit_question and u.audit_question.disposition not in {None,'ready_for_check'}), -getattr(u.audit_question,'priority',0), sum(bool(v.audit_question and u.audit_question and set(v.audit_question.activity_classes)&set(u.audit_question.activity_classes)) for v in state.units if v.status in {'checked','blocked'})))
     if not pending:
         return None
     # Prefer a pending producer of a required boundary over its consumer.
     selected = pending[0]
     used, visited = [], {selected.id}
-    while True:
+    while not (selected.audit_question and selected.audit_question.disposition=='ready_for_check'):
         obligations = set(selected.obligation_ids)
         dependency = next(((edge, unit) for edge in state.relations
             if edge.source in obligations and edge.kind in {"depends_all", "boundary"}
@@ -90,7 +87,7 @@ def select_unit(state):
         used.append(edge.id); visited.add(selected.id)
     selected.status = "selected"
     state.selections.append({"unit_id": selected.id, "relation_ids": list(dict.fromkeys(selected.relation_ids + used)),
-        "binding_ids": selected.binding_ids, "rationale": "Follow pending boundary producers before consumers; otherwise use the agent's justified ordering",
+        "binding_ids": selected.binding_ids, "rationale": "Prefer ready evidence; otherwise follow required producers and the justified priority",
         "graph_version": state.graph_version})
     return selected
 
@@ -142,12 +139,12 @@ def _apply_patch(state, patch, semantic=False, audit_spec=None):
     for obj in patch.units:
         if obj.id in current and not semantic:
             old=current[obj.id]
-            if obj.scope!=old.scope or not set(old.goal_ids)<=set(obj.goal_ids) or not set(old.obligation_ids)<=set(obj.obligation_ids):
+            if obj.scope!=old.scope or not set(old.obligation_ids)<=set(obj.obligation_ids):
                 raise ValueError("Ordinary patches cannot remove unit obligations or change scope; use attributed semantic revision or F3 expansion")
     for obj in replacements:
         if obj.id in current and obj.id not in patch.expected_versions:
             raise ValueError("Replacing an object requires its expected version")
-        if obj.id in current and hasattr(obj, "kind") and obj.kind in {"goal", "obligation", "assumption"} and not semantic:
+        if obj.id in current and hasattr(obj, "kind") and obj.kind in {"obligation", "assumption"} and not semantic:
             old = current[obj.id]
             if obj.kind != old.kind or obj.description != old.description or obj.scope != old.scope or obj.grounding != old.grounding or not set(old.pending)<=set(obj.pending):
                 raise ValueError("Changing claim semantics requires F2; dependency additions do not")
@@ -172,7 +169,7 @@ def _apply_patch(state, patch, semantic=False, audit_spec=None):
     relations = merge(internal,patch.relations,lambda x: RelationDraft(**{k:v for k,v in x.model_dump().items() if k in RelationDraft.model_fields}))
     units = merge(state.units,patch.units,lambda x: UnitDraft(**{k:v for k,v in x.model_dump().items() if k in UnitDraft.model_fields}))
     trial = state.model_copy(deep=True)
-    apply_discovery(trial,GraphDraft(claims=claims,bindings=bindings,relations=relations,units=units,gaps=patch.gaps),audit_spec)
+    apply_graph(trial,GraphDraft(claims=claims,bindings=bindings,relations=relations,units=units,gaps=patch.gaps),audit_spec)
     changed = {id for id,field in writes}|{x.id for x in replacements if x.id not in current}
     for kind in ("claims","bindings","relations","units"):
         values = getattr(trial,kind)

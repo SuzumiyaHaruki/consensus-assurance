@@ -137,7 +137,7 @@ def record_dispositions(state,review,reply,followup_ids):
 
 def readiness(state,unit):
     objects={x.id:x for x in [*state.claims,*state.bindings,*state.relations,*state.units]}
-    ids=set(unit.goal_ids+unit.obligation_ids+[unit.id])
+    ids=set(unit.obligation_ids+[unit.id])
     relevant=ids|set(unit.binding_ids+unit.relation_ids)
     ids.update(i.target_id for i in state.review_issues if not i.resolved_by and i.target_id in relevant)
     materials,_=material_closure(state,ids)

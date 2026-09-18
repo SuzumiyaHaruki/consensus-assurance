@@ -48,20 +48,20 @@ def validate_replay(state, unit, bundle, finding, plan, implementation):
 
 
 def consequence_needed(unit, finding):
-    return finding.level=='implementation_obligation' and bool(unit.goal_ids)
+    return finding.level=='implementation_obligation'
 
 
 def validate_consequence(state, unit, reply):
     from .graph import validate_patch
-    if not set(reply.goal_ids)<=set(unit.goal_ids) or not set(reply.source_ids)<={m.id for m in state.materials} or not reply.rationale.strip():
-        raise ValueError('Consequence plan must cite actual material and related goals')
+    if not set(reply.source_ids)<={m.id for m in state.materials} or not reply.rationale.strip():
+        raise ValueError('Consequence plan must cite actual material and broader obligations')
     if reply.disposition=='investigate' and not reply.requests and not reply.patch:
         raise ValueError('Consequence investigation needs a bounded reading or joint-unit plan')
     if reply.patch:
         if not reply.patch.units:raise ValueError('Joint consequence scope needs an explicit unit')
         for new in reply.patch.units:
-            if not set(new.goal_ids)&set(reply.goal_ids) or not new.audit_question:
-                raise ValueError('Joint unit must explain the related goal and actual audit question')
+            if not new.audit_question or set(new.obligation_ids)&set(unit.obligation_ids):
+                raise ValueError('Joint unit must explain the broader obligation and actual audit question')
         validate_patch(state,reply.patch)
 
 
@@ -72,8 +72,8 @@ def record_consequence(engine, unit, finding, reply=None, reason=''):
     if reply and reply.patch:apply_patch(engine.state,reply.patch)
     tasks=[]
     if reply and reply.requests:
-        task=enqueue(engine.state,'spec_refine','Investigate obligation-to-goal consequences and compensation: '+reply.rationale,'consequence:'+finding.id,target_ids=unit.goal_ids+unit.obligation_ids,unit_id=unit.id,model_id=finding.model_id,requests=reply.requests)
+        task=enqueue(engine.state,'spec_refine','Investigate local-to-broader obligation consequences and compensation: '+reply.rationale,'consequence:'+finding.id,target_ids=unit.obligation_ids,unit_id=unit.id,model_id=finding.model_id,requests=reply.requests)
         tasks.append(task.id)
-    engine.state.consequences.append({'finding_id':finding.id,'goal_ids':reply.goal_ids if reply else unit.goal_ids,
+    engine.state.consequences.append({'finding_id':finding.id,
         'disposition':reply.disposition if reply else 'defer','reason':reply.rationale if reply else reason,'source_ids':reply.source_ids if reply else [],'task_ids':tasks,
-        'limitations':reply.limitations if reply else ['Only the evidenced obligation-level result is reported; goal consequence is unestablished']})
+        'limitations':reply.limitations if reply else ['Only the evidenced obligation-level result is reported; broader consequence is unestablished']})

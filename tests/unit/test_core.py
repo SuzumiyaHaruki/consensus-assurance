@@ -4,7 +4,7 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 from consensus_assurance.core.types import *
-from consensus_assurance.core.proposals import Discovery, Bundle, Feedback
+from consensus_assurance.core.proposals import Derivation, Bundle, Feedback
 from consensus_assurance.adapters.storage.files import Store
 from consensus_assurance.workflow.budget import BudgetTracker, BudgetExhausted
 from consensus_assurance.core.config import Budget
@@ -20,7 +20,7 @@ def test_execution_state_transitions():
 def test_strict_structured_result(prepared):
     _, _, _, responses = prepared
     invalid = dict(responses[1], confirmed=True)
-    with pytest.raises(ValidationError): Discovery.model_validate(invalid)
+    with pytest.raises(ValidationError): Derivation.model_validate(invalid)
     with pytest.raises(ValidationError): Bundle.model_validate({"description": "not a model"})
 
 

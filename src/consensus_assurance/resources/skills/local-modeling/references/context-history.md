@@ -1,6 +1,6 @@
 # Context and history in a local consensus question
 
-Input: the selected question, attributed goals/obligations, actual source mappings and unresolved boundaries. Output: a compact context analysis in the Bundle, with links to concrete variables, actions, checkers and reachability requirements. This is an implementation abstraction, not a new normative specification.
+Input: the selected question, attributed obligations, actual source mappings and unresolved boundaries. Output: a compact context analysis in the Bundle, with links to concrete variables, actions, checkers and reachability requirements. This is an implementation abstraction, not a new normative specification.
 
 Identify applicable dimensions independently: participant identity, operation/object identity, epoch/view, execution phase, position and configuration version. Unknown or inapplicable dimensions need a source-grounded explanation. Do not compress all dimensions into one global round.
 

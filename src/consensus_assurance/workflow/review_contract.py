@@ -3,7 +3,6 @@ from consensus_assurance.core.diagnostics import Diagnostic,DiagnosticError
 from .sources import citation_status, ranges
 
 POLICY={
- 'goal': {'applicability':'Why is this goal required by the current implementation contract, configuration and fault scope? Preserve contrary evidence and unresolved applicability.'},
  'obligation': {'applicability':'Why does the implementation owe this responsibility in the selected scope?', 'decomposition':'Explain necessity, sufficiency, alternatives, producer/consumer dependencies and remaining guarantees.'},
  'assumption': {'applicability':'What actual source or explicit environment contract justifies the assumption, and what remains unverified?'},
  'binding': {'decomposition':'Check the source anchor and behavior range, the semantic association to responsibilities, and the selected unit use. Location alone does not establish an obligation.'},
@@ -15,7 +14,7 @@ OPTIONAL={'binding':{'applicability':'Evaluate whether the code mapping applies 
 
 
 def category(obj):
-    if getattr(obj,'kind',None) in {'goal','obligation','assumption'}:return obj.kind
+    if getattr(obj,'kind',None) in {'obligation','assumption'}:return obj.kind
     if hasattr(obj,'plan_path'):return 'direct_check'
     if hasattr(obj,'bundle_path'):return 'model'
     if hasattr(obj,'associations'):return 'binding'

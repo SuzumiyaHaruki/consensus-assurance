@@ -57,7 +57,7 @@ def test_source_pool_preserves_exact_overlap_and_reference_ranges(prepared):
 
 def test_same_review_basis_reused_different_trigger_no_new_work(tmp_path,prepared):
     _,s,_,_=prepared;e=controller(tmp_path,s);u=s.units[0];objects={o.id:o for o in s.claims+s.bindings+s.relations+s.units}
-    for id in u.goal_ids+u.obligation_ids+u.binding_ids+u.relation_ids+[u.id]:
+    for id in u.obligation_ids+u.obligation_ids+u.binding_ids+u.relation_ids+[u.id]:
         contract=target_contract(s,objects[id]);items=[SemanticCheck(target_id=id,aspect=a,status='no_issue_found',source_ids=contract['required_material_ids'],rationale='Actual scoped source checked' + "\n" + 'Alternative mechanisms remain possible' + "\n" + 'Scoped dependencies retained') for a in contract['required_aspects']]
         s.semantic_reviews.append(SemanticReview(task_id='prior',check_id='prior',target_versions={id:objects[id].version},material_ids=contract['required_material_ids'],context_dependencies={id:contract},items=items,origin='mock'))
     review_unit(e,u,'new_trigger');assert not s.inquiry_tasks and s.review_reuses
@@ -132,7 +132,7 @@ def test_every_actual_object_type_uses_packet_policy(tmp_path,prepared):
         seen.add(packet['review_contract'][0]['object_type'])
         assert not packet['catalogue'] and packet['file_lookup']
         assert len([o for key in ('target_objects','claims','bindings','units','relations') for o in packet.get(key,[]) if o['id']==obj.id])==1
-    assert seen=={'goal','obligation','assumption','binding','relation','unit','model'}
+    assert seen=={'obligation','assumption','binding','relation','unit','model'}
 
 
 

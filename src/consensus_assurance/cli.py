@@ -65,7 +65,7 @@ def main(argv=None):
         p.add_argument("--config"); p.add_argument("--repo")
         p.add_argument("--agent-backend", choices=["codex", "mock"])
         p.add_argument("--tlc-jar"); p.add_argument("--runs-dir")
-        p.add_argument("--goal", help="可选定向问题；默认不指定目标")
+        p.add_argument("--question", help="可选定向问题；默认不指定目标")
     for name in ("resume", "report"):
         p = sub.add_parser(name); p.add_argument("--run", required=True)
         p.add_argument("--runs-dir", default="runs")
@@ -86,7 +86,7 @@ def main(argv=None):
             config = Config.model_validate(state.config)
         else:
             config = load_config(args.config, {"agent_backend": args.agent_backend, "tlc_jar": args.tlc_jar,
-                "runs_dir": args.runs_dir, "directed_question": args.goal})
+                "runs_dir": args.runs_dir, "directed_question": args.question})
             if args.command == "estimate":
                 repo = locate_repo(args.repo, config.repo_path)
                 b = config.budget

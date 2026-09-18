@@ -5,7 +5,7 @@ from .types import AssociatedCode, CodeUse, Record, Scope, ConstraintSource, Gro
 
 class ClaimDraft(Record):
     id: str
-    kind: Literal["goal", "obligation", "assumption"]
+    kind: Literal["obligation", "assumption"]
     description: str
     source_ids: list[str] = Field(min_length=1, description="Located materials; file kinds do not establish normative authority")
     scope: Scope
@@ -38,13 +38,11 @@ class UnitDraft(Record):
     audit_question: AuditQuestion | None = None
     code_uses: list[CodeUse] = []
     id: str
-    goal_ids: list[str]
     obligation_ids: list[str] = Field(min_length=1)
     binding_ids: list[str] = Field(min_length=1)
     relation_ids: list[str] = Field(min_length=1)
     scope: Scope
     rationale: str
-    goal_observable: bool
 
 
 class GraphDraft(Record):
@@ -58,15 +56,17 @@ class GraphDraft(Record):
     gaps: list[str] = []
 
 
-class Discovery(GraphDraft):
+class Discovery(Record):
     understanding: str
-    claims: list[ClaimDraft] = Field(default_factory=list, max_length=15)
-    bindings: list[BindingDraft] = Field(default_factory=list, max_length=20)
-    relations: list[RelationDraft] = Field(default_factory=list, max_length=30)
-    units: list[UnitDraft] = Field(default_factory=list, max_length=5)
+    audit_spec: ConsensusAuditSpec
+    reading_requests: list[ReadRequest] = Field(default_factory=list, max_length=8)
+
+
+class Derivation(GraphDraft):
+    understanding: str
     selection_rationale: str
-    reading_requests: list[ReadRequest] = Field(default_factory=list, max_length=12)
-    audit_spec: ConsensusAuditSpec | None = None
+    reading_requests: list[ReadRequest] = Field(default_factory=list, max_length=8)
+    units: list[UnitDraft] = Field(default_factory=list, max_length=1)
 
 
 class FieldProjection(Record):
@@ -142,14 +142,14 @@ class Harness(Record):
 
 
 
-class GoalWitnessEvent(Record):
+class ConsequenceWitnessEvent(Record):
     participant: str
     event: str
 
 
-class GoalObservation(Record):
+class ConsequenceObservation(Record):
     identity_fields: list[str] = []
-    witness_events: list[GoalWitnessEvent] = []
+    witness_events: list[ConsequenceWitnessEvent] = []
     claim_id: str
     required_participants: list[str] = Field(min_length=1)
     required_events: list[str] = Field(min_length=1)
@@ -171,10 +171,10 @@ class ContextScenario(Record):
 class ModelCore(Record):
     context_analysis: list[ContextScenario] = []
     reachability: list[ReachabilityRequirement] = []
-    goal_observations: list[GoalObservation] = []
+    consequence_observations: list[ConsequenceObservation] = []
     description: str
     behavior: str = Field(min_length=1, description="TLA+ MODULE Behavior, with Init, Next, vars, and Obs; implementation behavior only")
-    properties: str = Field(min_length=1, description="TLA+ MODULE Properties EXTENDS Behavior, defining obligation and optional goal invariants")
+    properties: str = Field(min_length=1, description="TLA+ MODULE Properties EXTENDS Behavior, defining obligation and separately scoped consequence invariants")
     constants: str = Field(description="TLC constant assignments only; no state/action constraints or invariant overrides")
     invariants: list[str] = []
     checked_claim_ids: list[str] = []
@@ -217,7 +217,7 @@ class HarnessReply(Record):
     harness: Harness | None
     observation: ObservationMap | None
     monitors: list[EventMonitor] = []
-    goal_observations: list[GoalObservation] = []
+    consequence_observations: list[ConsequenceObservation] = []
     gap: str
     requests: list[ReadRequest] = []
 
@@ -257,7 +257,7 @@ class BuildReply(Record):
 
 class JudgmentChange(Record):
     target_id: str
-    field: Literal["description", "scope", "grounding", "source", "target", "kind", "group", "rationale", "pending", "source_ids", "claim_id", "material_id", "symbol", "start_line", "end_line", "goal_ids", "obligation_ids", "binding_ids", "relation_ids", "goal_observable", "audit_question", "associations", "anchor", "code_uses"]
+    field: Literal["description", "scope", "grounding", "source", "target", "kind", "group", "rationale", "pending", "source_ids", "claim_id", "material_id", "symbol", "start_line", "end_line",  "obligation_ids", "binding_ids", "relation_ids", "audit_question", "associations", "anchor", "code_uses"]
     old_value_json: str
     new_value_json: str
 
@@ -278,7 +278,7 @@ class Feedback(Record):
     target_ids: list[str]
     relation_ids: list[str]
     new_basis: str = Field(description="For F2, why the old semantic judgment is invalid and what new material establishes")
-    graph: Discovery | None
+    graph: GraphDraft | None
     bundle: Bundle | None
     patch: GraphPatch | None = None
     changes: list[JudgmentChange] = []
@@ -325,7 +325,6 @@ class SpecRefinement(Record):
     understanding: str
     requests: list[ReadRequest] = Field(default_factory=list, max_length=12)
     audit_spec: ConsensusAuditSpec | None = None
-    patch: GraphPatch
     limitations: list[str]
 
 
@@ -353,7 +352,6 @@ class ReviewReply(Record):
 
 class ConsequenceReply(Record):
     disposition: Literal["investigate", "obligation_only", "defer", "compensation_candidate"]
-    goal_ids: list[str]
     rationale: str
     source_ids: list[str] = Field(min_length=1)
     requests: list[ReadRequest] = []

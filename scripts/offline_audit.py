@@ -2,7 +2,7 @@
 import argparse,json
 from pathlib import Path
 from consensus_assurance.workflow.history import load_analysis
-from consensus_assurance.workflow.audit_spec import validate,slice_for,accept,coverage_ledger
+from consensus_assurance.workflow.audit_spec import validate,slice_for,accept,audit_progress
 from consensus_assurance.core.types import ConsensusAuditSpec,Material
 from consensus_assurance.adapters.storage.files import write_json
 from types import SimpleNamespace
@@ -21,7 +21,7 @@ def main():
     spec=ConsensusAuditSpec.model_validate(fixture['audit_spec']);validate(state,spec)
     accept(SimpleNamespace(root=out,state=state),spec)
     original=json.loads((root/'state.json').read_text())
-    write_json(out/'audit-spec.json',spec);write_json(out/'coverage-ledger.json',coverage_ledger(state))
+    write_json(out/'audit-spec.json',spec);write_json(out/'audit-progress.json',audit_progress(state))
     write_json(out/'workset.json',slice_for(state,classes=['A6','A3','A5']))
     metrics={'origin':'offline_analyst_reconstruction','parent':str(root),'provenance':fixture['provenance'],
         'original_agent_calls':original['usage'].get('agent_calls',0),'original_largest_prompt':max((p.get('prompt_chars',0) for p in original.get('packet_receipts',[])),default=0),

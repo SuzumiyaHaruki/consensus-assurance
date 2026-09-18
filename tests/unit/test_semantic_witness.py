@@ -1,23 +1,13 @@
 import pytest
-from consensus_assurance.core.proposals import GoalObservation,GoalWitnessEvent,EncodingRevision
-from consensus_assurance.workflow.observations import goal_witness_limitations
+from consensus_assurance.core.proposals import ConsequenceObservation,ConsequenceWitnessEvent,EncodingRevision
+from consensus_assurance.workflow.observations import consequence_witness_limitations
 from consensus_assurance.workflow.encoding import validate_encoding
 from consensus_assurance.workflow.artifacts import save_bundle
 from consensus_assurance.plugins.implementations.toy.adapter import ToyImplementation
 
 
-def goal_mapping():
-    return GoalObservation(claim_id='G',required_participants=['a','b'],required_events=['accepted','returned'],binding_ids=['entry'],identity_fields=['operation','context'],witness_events=[GoalWitnessEvent(participant='a',event='accepted'),GoalWitnessEvent(participant='b',event='returned')],grounding={'derivation':'Synthetic pair responsibility','applicability':'One operation'})
 
 
-@pytest.mark.parametrize('variation',['same','context','operation','unrelated_event','future'])
-def test_goal_witness_uses_actual_violation_history(variation):
-    events=[{'participant':'a','event':'accepted','operation':'x','context':1},{'participant':'b','event':'returned','operation':'x','context':1}];index=1
-    if variation=='context':events[0]['context']=2
-    if variation=='operation':events[0]['operation']='y'
-    if variation=='unrelated_event':events[0]['event']='unrelated'
-    if variation=='future':events.reverse();index=0
-    assert bool(goal_witness_limitations(goal_mapping(),events,[index])) is (variation!='same')
 
 
 @pytest.mark.parametrize('change',['valid','constant','behavior','meaning'])
@@ -52,3 +42,15 @@ def test_old_issue_cannot_be_cleared_by_unrelated_or_unexecuted_model(tmp_path,p
     reply=ReviewReply(items=[item],resolves_issue_ids=[issue.id],resolution_rationale='Attempt to resolve without sufficient related execution',limitations=[])
     with pytest.raises(ValueError):validate_resolutions(state,task,reply)
     assert issue.resolved_by is None
+
+
+@pytest.mark.parametrize('variation',['same','context','operation','unrelated_event','future'])
+def test_R6_consequence_requires_correlated_participants(variation):
+    from consensus_assurance.core.types import Grounding
+    mapping=ConsequenceObservation(claim_id='broader_obligation',identity_fields=['operation','context'],required_participants=['a','b'],required_events=['accepted','returned'],binding_ids=['observed'],grounding=Grounding(),witness_events=[ConsequenceWitnessEvent(participant='a',event='accepted'),ConsequenceWitnessEvent(participant='b',event='returned')])
+    events=[{'participant':'a','event':'accepted','operation':'x','context':1},{'participant':'b','event':'returned','operation':'x','context':1}];index=1
+    if variation=='context':events[0]['context']=2
+    if variation=='operation':events[0]['operation']='y'
+    if variation=='unrelated_event':events[0]['event']='unrelated'
+    if variation=='future':events.reverse();index=0
+    assert bool(consequence_witness_limitations(mapping,events,[index])) is (variation!='same')

@@ -144,7 +144,7 @@ def validate_draft_plan(before,after):
         if not set(old)<=set(new):raise ValueError('Draft plan cannot drop paths; use a source-preserving split or explicit investigation')
         for id,a in old.items():
             b=new[id]
-            fields=('associations','pending') if collection=='bindings' else ('goal_ids','obligation_ids','scope')
+            fields=('associations','pending') if collection=='bindings' else ('obligation_ids','scope')
             if any(a.get(k)!=b.get(k) for k in fields):raise ValueError('Draft plan changes responsibility or fault scope')
             from .audit_spec import IDENTITY
             if collection=='units' and any((a.get('audit_question') or {}).get(k)!=(b.get('audit_question') or {}).get(k) for k in IDENTITY):

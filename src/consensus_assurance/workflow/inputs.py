@@ -25,7 +25,7 @@ def reusable_search(state, model):
 
 
 def semantic_ids(state,unit):
-    ids=set(unit.binding_ids+unit.relation_ids+unit.goal_ids+unit.obligation_ids+[unit.id])
+    ids=set(unit.binding_ids+unit.relation_ids+unit.obligation_ids+[unit.id])
     ids.update(a.claim_id for b in state.bindings if b.id in unit.binding_ids for a in b.associations)
     for r in state.relations:
         if r.id in unit.relation_ids:ids.update([r.source,r.target])

@@ -1,8 +1,8 @@
 import copy
 import pytest
 from consensus_assurance.core.types import AuditUnit, CheckRun, ExecutionStatus, Calibration, Origin
-from consensus_assurance.core.proposals import Discovery, Feedback, GraphPatch
-from consensus_assurance.workflow.graph import apply_discovery, select_unit, expand_unit
+from consensus_assurance.core.proposals import Derivation, Feedback, GraphPatch
+from consensus_assurance.workflow.graph import apply_graph, select_unit, expand_unit
 from consensus_assurance.workflow.feedback import apply_feedback
 
 
@@ -56,7 +56,7 @@ def test_F1_preserves_property(prepared):
 
 def test_F2_requires_normative_basis_and_invalidates(prepared):
     _, state, bundle, responses = prepared; add_check(state)
-    revised = Discovery.model_validate(responses[1])
+    revised = Derivation.model_validate(responses[1])
     revised.claims[1].description = "A refined obligation based on the documented caller responsibility"
     f = feedback(state, "F2", graph=revised, new_basis="The document assigns normalization to the caller")
     with pytest.raises(ValueError): apply_feedback(state, state.units[0], bundle, f)
@@ -89,9 +89,9 @@ def test_F4_changes_only_experiment(prepared):
 
 def test_fake_binding_and_normative_inference_rejected(prepared):
     _, state, _, responses = prepared
-    graph = Discovery.model_validate(responses[1])
+    graph = Derivation.model_validate(responses[1])
     graph.bindings[0].symbol = "nonexistent_symbol"
-    with pytest.raises(ValueError): apply_discovery(state, graph)
-    graph = Discovery.model_validate(responses[1])
+    with pytest.raises(ValueError): apply_graph(state, graph)
+    graph = Derivation.model_validate(responses[1])
     graph.claims[0].grounding.derivation = ""
-    with pytest.raises(ValueError): apply_discovery(state, graph)
+    with pytest.raises(ValueError): apply_graph(state, graph)

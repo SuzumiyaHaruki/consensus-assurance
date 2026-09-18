@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 from coverage_support import CoverageAgent,add_coverage_materials
 from consensus_assurance.core.config import Config
-from consensus_assurance.core.proposals import Discovery
+from consensus_assurance.core.proposals import Derivation
 from consensus_assurance.core.types import CodeUse,Origin
 from consensus_assurance.workflow.engine import Engine
 from consensus_assurance.registry import assemble
@@ -31,7 +31,7 @@ def test_multiple_candidate_repairs_enter_review_and_real_model_check(tmp_path,p
                 check=runner.run([sys.executable,'-c','print("explicit synthetic repair response")'],directory,'agent',snapshot_id,timeout);check.origin=Origin.MOCK
                 return check,response
             check,response=super().analyze(runner,prompt,directory,snapshot_id,timeout,response_type)
-            if response_type is Discovery:
+            if response_type is Derivation:
                 response.bindings[0].symbol='MissingStep'
                 edge=next(r for r in responses[1]['relations'] if r['id']=='input_dependency')
                 from consensus_assurance.core.proposals import RelationDraft

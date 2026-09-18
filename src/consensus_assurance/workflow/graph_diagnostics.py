@@ -2,7 +2,7 @@
 from consensus_assurance.core.diagnostics import Diagnostic,DiagnosticError
 from .locations import locate, location_context
 from .sources import covered
-from .associations import claim_ids,use_errors,goal_links,graph_contract
+from .associations import claim_ids,use_errors,graph_contract
 
 
 def grounding_errors(basis,materials,binding_ids):
@@ -74,7 +74,7 @@ def diagnose_graph(state,proposal):
         if r.source not in set(claims)|set(bindings) or r.target not in set(claims)|set(bindings):
             emit('relation_endpoint','association',[r.id,r.source,r.target],[f'/relations/{i}'],r.grounding.behavior_ids+r.grounding.expectation_ids,'Relation endpoint does not exist; keep a reading gap instead of inventing an endpoint',['association','read'])
     for i,u in enumerate(proposal.units):
-        if not set(u.goal_ids+u.obligation_ids)<=set(claims) or not set(u.binding_ids)<=set(bindings):
+        if not set(u.obligation_ids)<=set(claims) or not set(u.binding_ids)<=set(bindings):
             emit('unit_reference','association',[u.id],[f'/units/{i}'],[],'Audit unit references missing claims or bindings',['association']);continue
         for b in [bindings[id] for id in u.binding_ids]:
             if not claim_ids(b)<=set(claims):continue
@@ -86,14 +86,6 @@ def diagnose_graph(state,proposal):
                 issues[-1].details={'failed_checks':problems,'contract':graph_contract()['code_use'],
                     'selected_obligation_ids':u.obligation_ids,'binding_association_ids':sorted(claim_ids(b)),
                     'selected_relations':[r.model_dump(mode='json') for r in related]}
-        if not goal_links(u,proposal.relations):
-            emit('goal_obligation_link','association',[u.id]+u.goal_ids+u.obligation_ids,
-                 ['/relations/-',f'/units/{i}/relation_ids'],
-                 [id for c in proposal.claims if c.id in u.goal_ids+u.obligation_ids for id in c.source_ids if id in materials],
-                 'Unit needs a selected goal-to-obligation relationship (goal -> checked obligation) of an allowed kind; reversed maps do not satisfy it',
-                 ['association','read','semantic_revision'])
-            issues[-1].details={'contract':graph_contract()['goal_links'],
-                'preservation':'Add a sourced relation only if justified; do not reverse existing meaning, weaken claims or change checked obligations.'}
     return issues
 
 

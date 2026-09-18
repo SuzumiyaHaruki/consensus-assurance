@@ -19,7 +19,7 @@ def setup_ack(repo, mode='durable', partial=False):
     if mode=='conflict': claims[1].grounding=basis.model_copy(update={'conflicts':['Conflicting guarantees remain unresolved']})
     state=Analysis(mode='real',analysis_mode='regression',snapshot=snapshot,config=Config(implementation='toy',protocol='none').model_dump(mode='json'),materials=materials,claims=claims)
     state.bindings=[Binding(id='ack-code',material_id=code.id,claim_id='durable',file=code.file,symbol='execute',start_line=1,end_line=code.end_line,snapshot_id=snapshot.id,content_digest=code.content_digest,basis='code_observation',description='Actual state changes and response event',excerpt=code.text)]
-    unit=AuditUnit(id='ack',goal_ids=[],obligation_ids=['memory','durable'],binding_ids=['ack-code'],relation_ids=[],scope=scope,rationale='Controlled finite contract test')
+    unit=AuditUnit(id='ack',obligation_ids=['memory','durable'],binding_ids=['ack-code'],relation_ids=[],scope=scope,rationale='Controlled finite contract test')
     state.units=[unit]
     behavior=r'''---------------- MODULE Behavior ----------------
 EXTENDS Naturals

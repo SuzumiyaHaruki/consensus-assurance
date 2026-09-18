@@ -56,8 +56,8 @@ def test_actual_dependency_selected_unit_build_is_explicitly_exploratory(tmp_pat
     _,state,_,_=prepared
     consumer=state.units[0]
     producer=consumer.model_copy(deep=True);producer.id='producer';producer.obligation_ids=['input_obligation'];producer.binding_ids=['input_binding'];producer.relation_ids=['producer_support']
-    state.relations.append(Relation(id='producer_support',source=consumer.goal_ids[0],target='input_obligation',kind='depends_all',rationale='Goal depends on producer',grounding=state.claims[0].grounding))
-    state.units.append(producer);state.completed_steps=['capabilities','materials','discovery']
+    state.relations.append(Relation(id='producer_support',source=consumer.obligation_ids[0],target='input_obligation',kind='depends_all',rationale='Goal depends on producer',grounding=state.claims[0].grounding))
+    state.units.append(producer);state.completed_steps=['capabilities','materials','understanding','discovery']
     root=tmp_path/'selection';shutil.copytree(state.snapshot.repo,root/'source')
     config=Config(implementation='toy',agent_backend='mock',allow_experiments=False);config.budget.exploration_rounds=0;config.budget.semantic_reviews=4;config.budget.audit_units=1
     built=[]
@@ -66,7 +66,7 @@ def test_actual_dependency_selected_unit_build_is_explicitly_exploratory(tmp_pat
             if kind=='semantic_review':
                 items=[]
                 for obj in context['target_objects']:
-                    aspects=['applicability','decomposition'] if obj.get('kind')=='obligation' else ['applicability'] if obj.get('kind')=='goal' else ['decomposition']
+                    aspects=['applicability','decomposition'] if obj.get('kind')=='obligation' else ['applicability'] if obj.get('kind')=='obligation' else ['decomposition']
                     for aspect in aspects:items.append(SemanticCheck(target_id=obj['id'],aspect=aspect,status='no_issue_found',source_ids=[next(m.id for m in state.materials if m.file=='README.md')],rationale='Scoped fixture evidence' + "\n" + 'Other mechanisms are not excluded' + "\n" + 'Review actual producer context'))
                 return ReviewReply(items=items,limitations=[]),CheckRun(action='agent',status=ExecutionStatus.COMPLETED,cwd=str(root),snapshot_id=state.snapshot.id)
             if kind=='build':
@@ -198,7 +198,6 @@ from consensus_assurance.workflow.engine import Engine
 from consensus_assurance.workflow.budget import BudgetTracker
 from consensus_assurance.registry import assemble
 from consensus_assurance.workflow.reviews import material_closure
-from consensus_assurance.workflow.inquiry import initial_agenda
 
 
 def controller(tmp_path,state):
@@ -226,13 +225,13 @@ def test_selected_relation_closure_contains_endpoint_contract(prepared):
 
 
 def test_graph_failures_carry_machine_diagnostics(prepared):
-    from consensus_assurance.core.proposals import Discovery
-    from consensus_assurance.workflow.graph import apply_discovery
+    from consensus_assurance.core.proposals import Derivation
+    from consensus_assurance.workflow.graph import apply_graph
     _,state,_,responses=prepared
-    p=Discovery.model_validate(responses[1]);p.bindings[0].symbol='DoesNotExist'
+    p=Derivation.model_validate(responses[1]);p.bindings[0].symbol='DoesNotExist'
     p.units[0].binding_ids.append(p.bindings[-1].id)
     before=state.model_dump()
-    with pytest.raises(ValueError) as caught:apply_discovery(state,p)
+    with pytest.raises(ValueError) as caught:apply_graph(state,p)
     assert hasattr(caught.value,'diagnostics')
     assert len(caught.value.diagnostics)>=2
     assert state.model_dump()==before

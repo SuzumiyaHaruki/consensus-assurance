@@ -5,7 +5,6 @@ from consensus_assurance.workflow.feedback import apply_feedback
 from consensus_assurance.workflow.output_repair import diagnostic_targets
 from consensus_assurance.workflow.prompts import loaded_resources,render,manifest
 from test_graph_mutations import revision_for
-from test_scope_repair import archived,reply
 from consensus_assurance.workflow.scope_updates import from_patch,validate_scope_update
 
 
@@ -27,18 +26,6 @@ def test_F2_cannot_rename_unaddressed_condition(prepared):
     assert s.model_dump()==before
 
 
-@pytest.mark.parametrize('nested',[False,True])
-def test_reordered_scope_diagnostics_address_original_proposal(nested):
-    s=archived();p=GraphPatch.model_validate(reply('f6577be6da9a47f68581404d750a55d6-graph_patch'));p.bindings.reverse()
-    u=next(u for u in s.units if u.id=='U_commit')
-    # Force a genuinely external support use with no selected directed chain.
-    p.units[0].code_uses[-1].role='support'
-    with pytest.raises(ValueError) as exc:validate_scope_update(s,from_patch(s,u,p))
-    raw=p.model_dump(mode='json');targets=diagnostic_targets({'revision':{'patch':raw}} if nested else raw,exc.value.diagnostics,100000)
-    path=('/revision/patch' if nested else '')+'/units/0/code_uses'
-    assert any(t['path']==path and t['exists'] for t in targets)
-    for t in targets:
-        if '/bindings/' in t['path']:assert t['exists']
 
 
 def test_manifest_applies_same_domain_method_to_first_build_and_revisions():
@@ -48,4 +35,4 @@ def test_manifest_applies_same_domain_method_to_first_build_and_revisions():
         assert expected<=set(loaded['paths']) and len(loaded['paths'])==len(set(loaded['paths']))
         text=render(kind,{},'Identify support and its actual context')
         assert 'pending' in text and 'Identify support and its actual context' in text
-    assert set(manifest()['tasks'])=={'read','discover','build','retry','diagnose','F1','F2','F3','F4','targeted_read','graph_patch','replay','technical','spec_refine','semantic_review','consequence','scope_review','harness','direct_check','question'}
+    assert set(manifest()['tasks'])=={'read','discover','derive','build','retry','diagnose','F1','F2','F3','F4','targeted_read','graph_patch','replay','technical','spec_refine','semantic_review','consequence','scope_review','harness','direct_check','question'}

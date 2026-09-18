@@ -98,7 +98,7 @@ def test_F1_repaired_behavior_recalibrates_same_property(tlc, prepared):
 @pytest.mark.real
 def test_F2_normative_revision_executes_new_checker(tlc, prepared):
     from consensus_assurance.workflow.feedback import apply_feedback
-    from consensus_assurance.core.proposals import Feedback, Discovery, GraphPatch
+    from consensus_assurance.core.proposals import Feedback, Derivation, GraphPatch
     verifier, runner = tlc
     _, state, correct, responses = prepared
     overstrong = correct.model_copy(deep=True)
@@ -107,7 +107,7 @@ def test_F2_normative_revision_executes_new_checker(tlc, prepared):
     old_check = verifier.check(runner, old_model, 20)
     state.checks.append(old_check)
     assert old_check.outcome == 'counterexample'
-    graph = Discovery.model_validate(responses[1])
+    graph = Derivation.model_validate(responses[1])
     graph.claims[1].description = 'The documented boundary is the supplied capacity, including capacity itself'
     correction = Feedback(kind='F2',rationale='The old checker excluded the documented capacity value',evidence_ids=[next(m.id for m in state.materials if m.file=='README.md')],target_ids=['step_obligation'],relation_ids=[],new_basis='The fixture documents reaching capacity before reset; the old strict boundary was unsupported',graph=graph,bundle=None)
     correction.graph = None

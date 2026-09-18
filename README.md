@@ -1,10 +1,10 @@
 # consensus-assurance
 
-**Domain-assisted、implementation-grounded：领域引导、实现为据的共识目标—义务驱动局部审计。** 目标决定审计意义，义务决定检查重点，代码决定模型行为，证据限定结论范围。
+**领域引导、实现为据的 CFT 义务审计。** 从 Activity、Behavior、Fact 理解实现，推导 Obligation 和有界 AuditQuestion，由 Evidence 限定结论范围。
 
-系统先从仓库材料恢复七类 Activity 及 Behavior/Fact/Handoff 整体规格，再推导候选目标、义务与代码关系，按当前问题优先取得关键材料、执行直接检查或局部模型，并保留有限覆盖探索和语义复核。实现包括英文 agent 技能、受控代码实验、TLA+/TLC 搜索、轨迹校准、F1—F4 反馈及恢复。候选图不是整体正确性证明，也没有已知的全系统覆盖率分母。
+系统先从仓库材料恢复七类 Activity 及 Behavior/Fact 整体规格，再推导候选义务与代码关系，按当前问题优先取得关键材料、执行直接检查或局部模型，并保留有限覆盖探索和语义复核。实现包括英文 agent 技能、受控代码实验、TLA+/TLC 搜索、轨迹校准、F1—F4 反馈及恢复。候选图不是整体正确性证明，也没有已知的全系统覆盖率分母。
 
-当前保留的真实运行见 [实验报告](runs/2026-09-17_13-59-36-hashicorp_raft-real-run/report.md)。框架回归、受控模型和历史回复播放不替代真实自主验收；目前真实目标的自主建模验证闭环仍未验收通过。该 CFT 运行形成了具体行为问题，使用 19 次 agent 调用，但没有受理模型、TLC 性质搜索、校准或直接性质证据；分析候选不是已确认缺陷。
+当前保留的真实运行见 [实验报告](runs/2026-09-18_10-29-33-hashicorp_raft-real-run/report.md)。本次使用 3 次 agent 调用、426.98 秒，描述性规格已受理，义务推导因关系引用合同与诊断缺口受阻；0 个受理审计单元、模型、TLC 性质搜索或性质证据。该框架问题尚未修复，不能视为 HashiCorp 缺陷。
 
 当前实现将任务工作集与完整审计历史分开，并允许先保存有据的模型、后补 harness。语法检查、探索性搜索、真实轨迹校准与实现确认分别记录。当前方法见 [审计方法](docs/审计方法.md)，不代表已重新完成 HashiCorp 自主实验。
 
@@ -45,7 +45,7 @@ TLC_JAR="$TLC_JAR" .venv/bin/python -m pytest -q
 .venv/bin/consensus-assurance estimate --config configs/targets/hashicorp_raft.yaml
 ```
 
-实际发送材料及隔离执行须有用户授权，命令与配置说明见 [HashiCorp 实验使用](docs/Hashicorp实验准备.md)。默认自主发现目标，`--goal` 仅为可选定向问题；`protocol: none` 不注入固定 Raft 性质清单。
+实际发送材料及隔离执行须有用户授权，命令与配置说明见 [HashiCorp 实验使用](docs/Hashicorp实验准备.md)。默认自主发现目标，`--question` 仅为可选定向问题；`protocol: none` 不注入固定 Raft 性质清单。
 
 ```bash
 .venv/bin/consensus-assurance run --config /实际路径/target.yaml
@@ -62,7 +62,7 @@ TLC_JAR="$TLC_JAR" .venv/bin/python -m pytest -q
 
 ## 运行制品与回归数据
 
-`runs/` 默认忽略，仅通过 `.gitignore` 的明确单目录例外归档用户指定实验。当前索引见 [runs/README.md](runs/README.md)。凭据、虚拟环境、临时锁和执行缓存不提交。删除旧归档不改写 Git 历史；回归所需的最小录制摘录保存在 `tests/fixtures/recorded_repair/`，不作为默认 discovery 输入。
+`runs/` 默认忽略，仅通过 `.gitignore` 的明确单目录例外归档用户指定实验。当前索引见 [runs/README.md](runs/README.md)。凭据、虚拟环境、临时锁和执行缓存不提交。删除旧归档不改写 Git 历史；回归所需的最小合成资源保存在 `tests/fixtures/`，不作为默认 discovery 输入。
 
 原始分析仓库只读，实验在单独副本中运行。清理活动运行前必须先确认已停止；默认不得擅自删除证据。
 
@@ -80,3 +80,5 @@ TLC_JAR="$TLC_JAR" .venv/bin/python -m pytest -q
 运行时英文技能在 `src/consensus_assurance/resources/skills/`，短任务指令在 `resources/tasks/`，唯一加载清单是 `resources/task-skills.json`。控制器实际加载所选参考并记录 receipt，不假定 agent 会自行打开 Markdown 链接。
 
 项目仓库：[SuzumiyaHaruki/consensus-assurance](https://github.com/SuzumiyaHaruki/consensus-assurance)。
+
+当前版本为 `obligation-audit-v1`：描述性 discovery 与单主要义务 derive 分开，理解错误通过 spec_refine 重整。完整流程和证据边界见 [审计方法](docs/审计方法.md)，选定失败及清理记录见 [运行索引](runs/README.md)。

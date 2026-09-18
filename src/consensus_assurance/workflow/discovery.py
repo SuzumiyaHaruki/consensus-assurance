@@ -1,9 +1,9 @@
 """Repository reading, candidate discovery and incremental dependency expansion."""
 from pathlib import Path
-from consensus_assurance.core.proposals import Discovery, GraphPatch
+from consensus_assurance.core.proposals import Discovery, Derivation, GraphPatch
 from consensus_assurance.adapters.storage.files import write_json
 from .materials import catalogue, initial_materials, ReadingPlan, uid, material_allowance
-from .graph import apply_discovery, apply_patch, validate_patch
+from .graph import apply_graph, apply_patch, validate_patch
 from .errors import Blocked
 from . import inquiry
 
@@ -45,24 +45,48 @@ def discover(engine):
         engine.read(plan.requests,purpose="breadth",partial=True,plan_id="initial-reading",related_ids=plan.related_ids,reason=plan.rationale,charge=False)
         write_json(engine.root / "materials.json", [m.model_dump(mode="json") for m in engine.state.materials])
         engine.state.completed_steps.append("materials"); engine.advance("discover")
+    if "understanding" not in engine.state.completed_steps:
+        from .audit_spec import validate, accept, SpecIssue
+        pending=next((t for t in engine.state.inquiry_tasks if t.kind=='spec_refine' and t.draft_path and t.status!='completed'),None)
+        if not pending and not engine.state.audit_spec_path:
+            try:
+                proposal,check=engine.ask('discover',Discovery,engine.context(),lambda p:validate(engine.state,p.audit_spec))
+                accept(engine,proposal.audit_spec)
+                if proposal.reading_requests:inquiry.enqueue(engine.state,'spec_refine','Resolve decisive understanding gaps','initial-reads',requests=proposal.reading_requests)
+            except SpecIssue as exc:
+                pending=inquiry.enqueue(engine.state,'spec_refine','Revise the unaccepted descriptive subgraph from actual source','initial-draft')
+                pending.draft_path=exc.draft_path;pending.diagnostics=[d.model_dump(mode='json') for d in exc.diagnostics]
+                engine.checkpoint('initial_descriptive_refinement_queued')
+        while pending and pending.status!='completed':
+            inquiry.process_task(engine,pending)
+            pending=next(t for t in engine.state.inquiry_tasks if t.id==pending.id)
+        engine.state.completed_steps.append('understanding');engine.checkpoint('implementation_understanding_accepted')
     if "discovery" not in engine.state.completed_steps:
-        def validate(proposal):
-            trial=engine.state.model_copy(deep=True)
-            from .audit_spec import validate
-            if proposal.audit_spec:validate(trial,proposal.audit_spec)
-            elif engine.state.analysis_mode!='regression':raise ValueError('Initial analysis requires a seven-class audit spec')
-            apply_discovery(trial,proposal)
-        proposal, check = engine.ask("discover", Discovery, engine.context(), validate)
-        from .transactions import commit_graph
-        def initial(proxy):
-            from .audit_spec import accept
-            if proposal.audit_spec:accept(proxy,proposal.audit_spec)
-            apply_discovery(proxy.state,proposal)
-            inquiry.initial_agenda(proxy,proposal)
-        commit_graph(engine,"discovery-"+check.id,proposal.model_dump(mode="json"),initial)
-        path = engine.root / f"discovery-v{engine.state.graph_version}.json"
-        write_json(path, proposal); engine.state.discovery_path = str(path)
-        engine.state.completed_steps.append("discovery"); engine.advance("select")
+        derive(engine)
+        engine.state.completed_steps.append('discovery');engine.advance('select')
+
+
+def derive(engine):
+    from .audit_spec import load,validate_question
+    def validate(proposal):
+        if len(proposal.units)>1:raise ValueError('Derive one bounded audit unit')
+        for unit in proposal.units:
+            if len(unit.obligation_ids)!=1:raise ValueError('An autonomous unit checks one primary obligation')
+            if engine.state.analysis_mode!='regression':validate_question(load(engine.state),unit.audit_question)
+        trial=engine.state.model_copy(deep=True)
+        from .graph import validate_patch
+        validate_patch(trial,GraphPatch(**{k:v for k,v in proposal.model_dump().items() if k in GraphPatch.model_fields},rationale=proposal.selection_rationale))
+    proposal,check=engine.ask('derive',Derivation,engine.context(),validate)
+    from .transactions import commit_graph
+    patch=GraphPatch(**{k:v for k,v in proposal.model_dump().items() if k in GraphPatch.model_fields},rationale=proposal.selection_rationale)
+    commit_graph(engine,'derive-'+check.id,proposal.model_dump(mode='json'),lambda proxy:apply_patch(proxy.state,patch))
+    if proposal.reading_requests:inquiry.enqueue(engine.state,'spec_refine','Resolve selected obligation source gaps','derive:'+check.id,requests=proposal.reading_requests)
+    for unit in engine.state.units:
+        if unit.id in {u.id for u in proposal.units}:inquiry.review_unit(engine,unit,'derived:'+check.id)
+    engine.state.completed_steps.append('derived-spec:'+str(engine.state.audit_spec_version))
+    path=engine.root/f'derivation-{check.id}.json'
+    write_json(path,proposal);engine.state.derivation_path=str(path)
+
 
 def targeted_read(engine, unit, gap, relation_ids=None, requests=None, update_required=True):
     source = engine.root/"source"

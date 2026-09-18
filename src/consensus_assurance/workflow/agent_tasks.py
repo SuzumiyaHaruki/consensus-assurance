@@ -80,9 +80,9 @@ def ask(engine,kind,response_type,context,validator=None):
             candidate=json.loads(Path(session['current_path']).read_text())
             diags=[Diagnostic.model_validate(d) for d in session['diagnostics']]
             context,_=prepare(engine,kind,context)
-            context={**context,'attached_materials':[m.model_dump(mode='json') for m in state.materials if m.id in state.task_attachments.get(attachment_key(state),[])]}
+            context={**context,'attached_materials':[m.model_dump(mode='json') for m in state.materials if m.id in set(state.task_attachments.get(attachment_key(state),[]))|{id for d in diags for id in d.material_ids}]}
             active_diags=diags[:1]
-            if diags[0].code=='audit_spec_reference':
+            if 'representation' in diags[0].allowed:
                 for d in diags[1:]:
                     if len(active_diags)>=24:break
                     if d.code!=diags[0].code or d.category!=diags[0].category:continue
@@ -238,6 +238,15 @@ def ask(engine,kind,response_type,context,validator=None):
             state.pending_output_repair=None
             return response,check
         except ValueError as exc:
+            from .audit_spec import SpecIssue
+            if isinstance(exc,SpecIssue):
+                exc.draft_path=str(cwd/'unaccepted-analysis.json')
+                write_json(Path(exc.draft_path),merged)
+                if session:
+                    session['status']='requires_spec_refinement';save_session(engine,session)
+                state.pending_output_repair=None;state.pending_action=None
+                engine.checkpoint('descriptive_draft_requires_refinement')
+                raise
             if session is None:
                 id=uid();folder=engine.root/'repair-sessions'/id
                 decoded=cwd/'decoded-response.json'

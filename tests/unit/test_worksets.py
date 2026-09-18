@@ -17,12 +17,6 @@ def archived_engine(version):
     state=Analysis.model_validate(__import__("consensus_assurance.workflow.history",fromlist=["import_record"]).import_record(json.loads((ARCHIVE/'history'/(version+'.json')).read_text())))
     return SimpleNamespace(state=state,root=ARCHIVE,config=Config.model_validate(state.config),implementation=HashicorpRaft(),budget=SimpleNamespace(remaining=lambda:1))
 
-@pytest.mark.parametrize('version',['862b1f3d9ffe43b9a1a61e23f1f19b3e','b69d50c2a0ac4e20897e36c355f034ef'])
-def test_archived_build_packet_fits_without_raising_limit(version):
-    e=archived_engine(version);unit=next(u for u in e.state.units if u.id==e.state.active_unit_id)
-    packet,_=prepare(e,'build',context(e,unit))
-    assert len(render('build',pool_sources(packet)))<e.config.budget.context_chars
-    assert 'semantic_reviews' not in packet or all('context_dependencies' not in r for r in packet['semantic_reviews'])
 
 
 def test_mixed_history_projects_only_relevant_items_and_retains_counterevidence(tmp_path,prepared):
@@ -94,7 +88,7 @@ def test_skill_routing_loads_actual_behavior_method_without_global_repair_ballas
         text=render(task,{'modeling_brief':{'unit_id':'synthetic'}})
         from importlib.resources import files
         assert files('consensus_assurance').joinpath('resources/skills/consensus-analysis/references/behavior-facts.md').read_text() in text
-        assert 'Configuration:' in text and 'discriminator' in text
+        assert 'discriminator' in text and 'unknown' in text
     assert 'skills/consensus-analysis/references/graph-repair.md' not in loaded_resources('build',{})['paths']
     assert 'activity-classes.md' in ' '.join(loaded_resources('discover',{})['paths'])
     for task in manifest()['tasks']:

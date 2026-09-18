@@ -52,60 +52,13 @@ def test_missing_trigger_or_changed_model_never_counts_as_reached(tmp_path,prepa
     assert result.status=='unknown' and check.status.value=='not_scheduled'
 
 
-@pytest.mark.real
-@pytest.mark.parametrize('compensate',[False,True])
-def test_actual_obligation_result_has_bounded_goal_consequence_disposition(tlc,tmp_path,compensate):
-    verifier,runner=tlc
-    repo=tmp_path/'repo';shutil.copytree(ROOT/'fixtures/ack_service',repo)
-    if compensate:
-        p=repo/'counter.py';source=p.read_text()
-        # The actual configured durable path may legally persist before response.
-        source=source.replace("state['returned'] = True", "state['persisted'] = True\n    state['returned'] = True")
-        assert source!=p.read_text();p.write_text(source)
-    state,unit,bundle=setup_ack(repo)
-    goal=state.claims[1].model_copy(update={'id':'configured_result','kind':'goal','description':'Returned operations satisfy the configured guarantee'})
-    state.claims.append(goal);unit.goal_ids=[goal.id]
-    bundle.checkers=[bundle.checkers[1]]
-    bundle.observable_properties=[p for p in bundle.observable_properties if p.checker_id=='DurableAck']
-    from consensus_assurance.adapters.verifiers.observable import properties_source
-    bundle.properties=properties_source(bundle.observable_properties,bundle.observation)
-    if compensate:
-        bundle.behavior=bundle.behavior.replace("returned' = TRUE /\\ UNCHANGED <<accepted, persisted>>", "returned' = TRUE /\\ persisted' = TRUE /\\ UNCHANGED accepted")
-    model=save_bundle(runner.root,state,unit,bundle,ToyImplementation())
-    from consensus_assurance.adapters.runners.experiment import run_experiment, extract_events
-    workspace=runner.root/'workspace';shutil.copytree(repo,workspace)
-    (workspace/'assurance_generated.py').write_text(bundle.harness.source)
-    experiment=run_experiment(runner,ToyImplementation().experiment_command(),workspace,state.snapshot.id,20,'bwrap')
-    experiment.model_id=model.id;experiment.input_versions=model.artifact_digests;state.checks.append(experiment)
-    calibration,checks=verifier.calibrate(runner,model,bundle,experiment,20);state.calibrations.append(calibration);state.checks.extend(checks)
-    assert calibration.status=='compatible'
-    search=verifier.check(runner,model,20);state.checks.append(search)
-    assert search.outcome==('holds' if compensate else 'counterexample')
-    if compensate:
-        from consensus_assurance.workflow.observations import monitor_events
-        assert monitor_events(extract_events(experiment),bundle.monitors[0])['outcome']=='holds'
-        assert not state.findings
-    else:
-        from consensus_assurance.workflow.observations import assess_execution
-        finding=Finding(claim_id='durable',checker_id='DurableAck',model_id=model.id,check_id=search.id,origin=Origin.EXECUTED,description='Synthetic observed obligation violation',trace_path=search.stdout)
-        state.findings.append(finding)
-        record=assess_execution(state,model,bundle,experiment,calibration,finding,extract_events(experiment))
-        assert record['confirmed'] and finding.level=='implementation_obligation',record
-        cfg=Config(implementation='toy',agent_backend='mock');cfg.budget.consequence_investigations=0
-        engine=Engine(cfg,runner.root,*assemble(cfg),'');engine.state=state;engine.budget=BudgetTracker(cfg.budget,state)
-        state.active_unit_id=unit.id;state.active_model_id=model.id;state.active_finding_id=finding.id;state.next_action='consequence_plan'
-        engine.process_unit(unit)
-        assert state.consequences[0]['disposition']=='defer'
-        assert 'Budget' in state.consequences[0]['reason']
-        assert finding.level=='implementation_obligation' and goal.assessment.value=='unassessed'
-    write_json(runner.root/'actual-contract-result.json',state)
 
 
 def test_consequence_reading_queues_real_material_and_keeps_obligation_level(tmp_path,prepared):
     _,state,_,_=prepared;cfg=Config(implementation='toy',agent_backend='mock')
     engine=Engine(cfg,tmp_path/'engine',*assemble(cfg),'');engine.state=state;engine.budget=BudgetTracker(cfg.budget,state);unit=state.units[0]
     finding=Finding(claim_id=unit.obligation_ids[0],model_id='model',check_id='search',origin=Origin.EXECUTED,description='Controlled evidence linkage only',trace_path='trace',level='implementation_obligation')
-    reply=ConsequenceReply(disposition='compensation_candidate',goal_ids=unit.goal_ids,rationale='Read whether the upstream provider establishes an alternative bound',source_ids=state.claims[0].source_ids,requests=[{'file':'limits.py','start_line':1,'end_line':2,'reason':'Read an actual alternative producer path'}],limitations=['Goal violation not established'])
+    reply=ConsequenceReply(disposition='compensation_candidate',rationale='Read whether the upstream provider establishes an alternative bound',source_ids=state.claims[0].source_ids,requests=[{'file':'limits.py','start_line':1,'end_line':2,'reason':'Read an actual alternative producer path'}],limitations=['Goal violation not established'])
     validate_consequence(state,unit,reply);record_consequence(engine,unit,finding,reply)
     record_consequence(engine,unit,finding,reply)
     assert len(state.consequences)==1 and len(state.inquiry_tasks)==1

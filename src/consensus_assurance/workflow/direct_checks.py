@@ -70,7 +70,7 @@ def validate_plan(state,unit,plan,implementation):
 def validate_revision(state,unit,revision):
     from .mutations import validate_changes
     from .feedback import apply_feedback
-    validate_changes(state,revision,unit.goal_ids+unit.obligation_ids+unit.binding_ids+unit.relation_ids+[unit.id])
+    validate_changes(state,revision,unit.obligation_ids+unit.binding_ids+unit.relation_ids+[unit.id])
     trial=state.model_copy(deep=True)
     apply_feedback(trial,next(u for u in trial.units if u.id==unit.id),None,revision)
 

@@ -92,21 +92,21 @@ def assess_execution(state, model, bundle, experiment, calibration, finding, eve
         # A fully observed witness must belong to the actual correlated prerequisite operation.
         if result['witness_indices'] and not set(result['witness_indices']) <= set(prerequisite['matched_indices']):
             local.append('Violation witness is not part of the correlated counterexample execution')
-        if claim and claim.kind=='goal':
-            mapping=next((g for g in bundle.goal_observations if g.claim_id==claim.id),None)
-            local.extend(goal_witness_limitations(mapping,events,result['witness_indices']))
+        if claim and any(g.claim_id==claim.id for g in bundle.consequence_observations):
+            mapping=next((g for g in bundle.consequence_observations if g.claim_id==claim.id),None)
+            local.extend(consequence_witness_limitations(mapping,events,result['witness_indices']))
             if mapping:
                 try:validate_grounding(mapping.grounding,materials,bindings)
                 except ValueError as exc:local.append(str(exc))
                 local.extend(mapping.grounding.unresolved+mapping.grounding.conflicts)
-                if not mapping.binding_ids or not set(mapping.binding_ids)<=set(model.binding_ids):local.append('Goal observation mapping lacks selected source bindings')
+                if not mapping.binding_ids or not set(mapping.binding_ids)<=set(model.binding_ids):local.append('Consequence observation mapping lacks selected source bindings')
         result['limitations']=local
         if result['outcome']=='violated' and not local and not limitations: confirmed=result
     if not results: limitations.append('No supported monitor for this checker; trace compatibility is not property violation')
     if confirmed:
         finding.stage=Investigation.REPRODUCED
         finding.applicability='current'
-        finding.level='implementation_goal' if claim.kind=='goal' else 'implementation_obligation'
+        finding.level='implementation_obligation'
         finding.claim_id=claim.id; finding.claim_version=claim.version
     else:
         finding.stage=Investigation.INCONCLUSIVE
@@ -144,13 +144,13 @@ def monitor_support(events, monitor):
         'reason':'Compare effective support objects for the same observed identity/context across ordered events'}
 
 
-def goal_witness_limitations(mapping,events,indices):
+def consequence_witness_limitations(mapping,events,indices):
     if mapping is None or not mapping.identity_fields or not mapping.witness_events:
-        return ['Goal witness lacks explicit correlated participants, events and identity fields']
+        return ['Consequence witness lacks explicit correlated participants, events and identity fields']
     limitations=[]
     for index in indices:
         witness=events[index];ids=[field(witness,key) for key in mapping.identity_fields]
         matched=[e for e in events[:index+1] if all(field(e,k)==v and v is not MISSING for k,v in zip(mapping.identity_fields,ids))]
-        if any(not any(e.get('participant')==r.participant and e.get('event')==r.event for e in matched) for r in mapping.witness_events):limitations.append('Goal events do not belong to the actual violating operation/context history')
-        if not set(mapping.required_participants)<={r.participant for r in mapping.witness_events} or not set(mapping.required_events)<={r.event for r in mapping.witness_events}:limitations.append('Goal witness plan does not account for its declared observation requirements')
+        if any(not any(e.get('participant')==r.participant and e.get('event')==r.event for e in matched) for r in mapping.witness_events):limitations.append('Consequence events do not belong to the actual violating operation/context history')
+        if not set(mapping.required_participants)<={r.participant for r in mapping.witness_events} or not set(mapping.required_events)<={r.event for r in mapping.witness_events}:limitations.append('Consequence witness plan does not account for its declared observation requirements')
     return limitations

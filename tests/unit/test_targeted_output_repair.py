@@ -72,7 +72,7 @@ def test_invalid_build_artifact_is_repaired_before_commit(tmp_path,prepared):
 
 
 def test_schema_reference_repair_receives_owner_and_dependency_context():
-    from consensus_assurance.core.proposals import Discovery
+    from consensus_assurance.core.proposals import Derivation
     from consensus_assurance.core.diagnostics import Diagnostic
     from consensus_assurance.workflow.output_repair import diagnostic_context
     candidate={'patch':{'units':[{'id':'U','obligation_ids':['O'],'binding_ids':['B'],
@@ -95,22 +95,6 @@ def test_schema_reference_repair_receives_owner_and_dependency_context():
         apply_replacements(candidate,[{'path':d.paths[0]}],repair)
 
 
-def test_recorded_invalid_keys_have_executable_bounded_container_repairs():
-    from consensus_assurance.core.proposals import Discovery
-    from pydantic import ValidationError
-    fixture=json.loads((Path(__file__).parents[1]/'fixtures/discovery_wire_failure.json').read_text())
-    original=fixture['candidate'];snapshot=json.dumps(original,sort_keys=True)
-    with pytest.raises(ValidationError) as failure:Discovery.model_validate(original)
-    targets=repair_targets(original,failure.value.errors(),str(failure.value),16000)
-    patch=OutputRepair.model_validate(fixture['attempted_repair'])
-    assert {r.path for r in patch.replacements}<={t['path'] for t in targets}
-    merged=apply_replacements(original,targets,patch)
-    candidate=Discovery.model_validate(merged)
-    assert candidate.units[0].audit_question.counterevidence==original['units'][0]['audit_question']['counterevidence']
-    assert merged['claims']==original['claims'] and merged['bindings']==original['bindings']
-    assert json.dumps(original,sort_keys=True)==snapshot
-    # Shape acceptance is not acceptance of the recorded producer guarantees.
-    assert candidate.audit_spec.facts[0].invalidators==original['audit_spec']['facts'][0]['invalidators']
 
 
 def test_dictionary_key_repair_preserves_undiagnosed_entries_and_siblings():

@@ -44,7 +44,7 @@ def test_F3_reads_new_producer_then_generates_and_checks_new_scope(tmp_path,tlc,
     state=Engine(config,root,*assemble(config)).start(repo)
     assert state.stop_reason.startswith('No pending'),state.stop_reason
     assert len(state.models)==2
-    initial=json.loads(Path(state.discovery_path).read_text())
+    initial=json.loads(Path(state.derivation_path).read_text())
     assert all(b['id']!='input_binding' for b in initial['bindings'])
     read=next(h for h in state.reading_history if h['related_ids']==['step_obligation'])
     assert read['added_material_ids']==['upstream_support.py:1:2']
@@ -130,7 +130,7 @@ def test_compilation_failure_gets_actual_log_and_finite_repair(tmp_path,tlc,prep
 @pytest.mark.parametrize('interrupt_plan',[False,True])
 def test_initial_replay_then_F4_and_attribution_continue(tmp_path,tlc,interrupt_plan):
     from ack_support import ROOT as TESTS, setup_ack
-    from consensus_assurance.core.proposals import Discovery, ClaimDraft, BindingDraft, RelationDraft, UnitDraft, ReplayPlan, Feedback
+    from consensus_assurance.core.proposals import Derivation, ClaimDraft, BindingDraft, RelationDraft, UnitDraft, ReplayPlan, Feedback
     from consensus_assurance.adapters.agents.backend import MockAgent
     from consensus_assurance.core.types import Claim, Grounding
     repo=tmp_path/'ack-repo';shutil.copytree(TESTS/'fixtures/ack_service',repo)
@@ -138,15 +138,15 @@ def test_initial_replay_then_F4_and_attribution_continue(tmp_path,tlc,interrupt_
     bundle.checkers=[bundle.checkers[1]]
     obligation=source_state.claims[1]
     basis=obligation.grounding
-    goal=obligation.model_copy(update={'id':'ack_goal','kind':'goal','description':'Returned operations satisfy the selected configuration guarantee'})
+    goal=obligation.model_copy(update={'id':'ack_goal','kind':'obligation','description':'Returned operations satisfy the selected configuration guarantee'})
     claims=[ClaimDraft(**{k:v for k,v in c.model_dump().items() if k in ClaimDraft.model_fields}) for c in [goal,obligation]]
     code=source_state.materials[0]
     import ast
     declaration=next(n for n in ast.parse(code.text).body if isinstance(n,ast.FunctionDef) and n.name=='execute')
     binding=BindingDraft(id='ack-code',claim_id='durable',material_id=code.id,symbol='execute',start_line=declaration.lineno,end_line=declaration.end_lineno,description='Actual acceptance and return ordering',pending=[])
     edge=RelationDraft(id='supports_ack',source='ack_goal',target='durable',kind='depends_all',group=None,rationale='Return guarantee depends on the configured durability responsibility',pending=[],grounding=basis)
-    u=UnitDraft(id='ack',goal_ids=['ack_goal'],obligation_ids=['durable'],binding_ids=['ack-code'],relation_ids=['supports_ack'],scope=unit.scope,rationale='Fixture candidate selection',goal_observable=False)
-    graph=Discovery(understanding='Controlled fixture',claims=claims,bindings=[binding],relations=[edge],units=[u],conflicts=[],unexplored=[],selection_rationale='Check the configured response responsibility')
+    u=UnitDraft(id='ack',obligation_ids=['durable'],binding_ids=['ack-code'],relation_ids=['supports_ack'],scope=unit.scope,rationale='Fixture candidate selection',)
+    graph=Derivation(understanding='Controlled fixture',claims=claims,bindings=[binding],relations=[edge],units=[u],conflicts=[],unexplored=[],selection_rationale='Check the configured response responsibility')
     missed=bundle.harness.model_copy(deep=True)
     missed.prerequisites[0].event='not_observed_setup'
     replay=ReplayPlan(harness=missed,checker_id='DurableAck',rationale='Initial candidate experiment with an unmet prerequisite')

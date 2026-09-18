@@ -22,10 +22,10 @@ def prepare(engine,kind,context):
     index=compact_index(state,engine.root/'source') if state.snapshot else []
     if isinstance(index,dict):index=list(index.values())
     files={m['file'] for key in ('materials','new_materials','initial_materials') for m in packet.get(key,[])}
-    packet['file_lookup']=[{'file':x['file'],'lines':x.get('lines'),'unavailable':x.get('unavailable')} for x in index if kind in {'read','discover','spec_refine','targeted_read'} or x['file'] in files]
+    packet['file_lookup']=[{'file':x['file'],'lines':x.get('lines'),'unavailable':x.get('unavailable')} for x in index if kind in {'read','discover','derive','spec_refine','targeted_read'} or x['file'] in files]
     packet['lookup_request']='Request a focused ReadingPlan for an unlisted path or symbol; omitted files are not absent from the repository'
     packet['file_metadata']=[{**x,'attached_ranges':[[m['start_line'],m['end_line']] for key in ('materials','new_materials','initial_materials') for m in packet.get(key,[]) if m['file']==x['file']]} for x in index if x['file'] in files]
-    if kind in {'discover','spec_refine','graph_patch'}:
+    if kind in {'derive','graph_patch'}:
         from .locations import declaration_index
         from .associations import graph_contract
         packet['graph_contract']=graph_contract()

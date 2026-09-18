@@ -26,7 +26,7 @@ from .errors import Blocked
 from .agent_tasks import ask as ask_agent
 
 
-FRAMEWORK_REVISION = "seven-activity-v2"
+FRAMEWORK_REVISION = "obligation-audit-v1"
 
 
 class Engine:
@@ -67,10 +67,10 @@ class Engine:
             "claims": [x.model_dump(mode="json") for x in self.state.claims],
             "bindings": [x.model_dump(mode="json") for x in self.state.bindings],
             "relations": [x.model_dump(mode="json") for x in self.state.relations]})
-        from .audit_spec import load, coverage_ledger
+        from .audit_spec import load, audit_progress
         spec=load(self.state)
         if spec:write_json(self.root / "audit-spec.json",spec)
-        write_json(self.root / "coverage-ledger.json",coverage_ledger(self.state))
+        write_json(self.root / "audit-progress.json",audit_progress(self.state))
         write_json(self.root / "plan.json", {"units": [u.model_dump(mode="json") for u in self.state.units], "selections": self.state.selections})
 
     def start(self, repo, plan_only=False):
@@ -617,7 +617,7 @@ class Engine:
                 if can_inquire:
                     focused_review=any(t.kind=="review" and t.status=="pending" and t.unit_id in self.state.deferred_units for t in self.state.inquiry_tasks)
                     from .audit_spec import refinement_reason
-                    if not refinement_reason(self.state) and not focused_review and not self.state.active_unit_id and self.state.usage.get("audit_units",0)<self.config.budget.audit_units:
+                    if not focused_review and not self.state.active_unit_id and self.state.usage.get("audit_units",0)<self.config.budget.audit_units:
                         candidate=select_unit(self.state)
                         if candidate:
                             self.budget.take("audit_units");self.state.active_unit_id=candidate.id;self.state.next_action="select"
@@ -645,6 +645,9 @@ class Engine:
                         if not inquiry.enabled(self) or str(exc).startswith("Agent blocked:"): raise
                         inquiry.pause_unit(self,str(exc))
                     continue
+                if self.state.audit_spec_path and not any(u.status in {'pending','partial'} for u in self.state.units) and 'derived-spec:'+str(self.state.audit_spec_version) not in self.state.completed_steps:
+                    from .discovery import derive
+                    derive(self);continue
                 if not any(u.status in {"pending", "partial"} for u in self.state.units):
                     missing = [u.id + ": " + ", ".join(u.remaining_obligation_ids) for u in self.state.units if u.remaining_obligation_ids and u.status != "revised"]
                     self.state.stop_reason = "Unfinished obligations remain without an executable next step: " + "; ".join(missing) if missing else "No pending executable audit units; unresolved gaps remain"
@@ -663,9 +666,6 @@ class Engine:
                         continue
                     raise BudgetExhausted("Audit-unit budget exhausted")
                 from .audit_spec import refinement_reason
-                if self.state.audit_spec_path and refinement_reason(self.state):
-                    self.state.stop_reason='Minimum reverse coverage remains deferred; see coverage ledger'
-                    break
                 unit = select_unit(self.state)
                 if unit is None:
                     self.state.stop_reason = "No pending executable audit units; unresolved gaps remain"

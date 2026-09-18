@@ -4,7 +4,7 @@ import sys
 from pathlib import Path
 import pytest
 from coverage_support import CoverageAgent
-from test_inquiry_loop import setup
+from coverage_support import setup_workflow as setup
 from consensus_assurance.core.types import Origin
 from consensus_assurance.adapters.storage.files import write_json
 from consensus_assurance.workflow.engine import Engine
@@ -58,7 +58,8 @@ def test_accepted_graph_review_and_read_repairs_reach_real_tlc(tmp_path,prepared
     state=Engine(config,root,impl,agent,verifier,knowledge).start(repo)
     assert state.models,state.stop_reason
     assert any(c.action=='model_check' and c.outcome==('counterexample' if negative else 'holds') for c in state.checks),state.stop_reason
-    assert {'delivery_goal','capacity_goal'}<={c.id for c in state.claims}
+    assert 'step_obligation' in {c.id for c in state.claims}
+    assert len(state.units[0].obligation_ids)==1
     assert any(t.kind=='spec_refine' for t in state.inquiry_tasks)
     sessions=list(state.repair_sessions.values())
     assert {s['task'] for s in sessions}=={'build'}

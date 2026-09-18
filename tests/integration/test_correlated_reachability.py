@@ -65,14 +65,3 @@ def test_new_model_review_can_resolve_old_encoding_issue_after_actual_recheck(tl
     assert issue.resolved_by==review.id and issue.resolution_model_id==new.id
     assert issue.resolution_checks==[check2.id]
     assert not any('Open review issue' in text for text in semantic_limitations(state,new))
-
-
-def test_model_goal_check_does_not_require_implementation_observations(prepared,tmp_path):
-    _,state,bundle,_=prepared;u=state.units[0];u.goal_observable=True
-    bundle.checkers=bundle.checker_specs()+[bundle.checker_specs()[0].model_copy(update={'invariant':'GoalSafe','claim_id':u.goal_ids[0]})]
-    bundle.invariants=[];bundle.checked_claim_ids=[]
-    bundle.properties=bundle.properties.replace('====================================================','GoalSafe == Safe\n====================================================')
-    if 'GoalSafe ==' not in bundle.properties:
-        lines=bundle.properties.splitlines();lines.insert(-1,'GoalSafe == Safe');bundle.properties='\n'.join(lines)
-    assert not bundle.goal_observations
-    validate_bundle(state,u,bundle,ToyImplementation())

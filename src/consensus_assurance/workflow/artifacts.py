@@ -26,7 +26,7 @@ def validate_bundle(state, unit, bundle, implementation):
     specs = bundle.checker_specs()
     checked_ids = {c.claim_id for c in specs}
     invariants = [c.invariant for c in specs]
-    if not set(checked_ids) <= set(unit.obligation_ids + (unit.goal_ids if unit.goal_observable else [])):
+    if not set(checked_ids) <= set(unit.obligation_ids):
         raise ValueError("Checker claims must belong to the selected observable audit unit")
     if not set(unit.obligation_ids) & set(checked_ids):
         raise ValueError("Model must check a selected obligation")
@@ -96,9 +96,9 @@ def validate_bundle(state, unit, bundle, implementation):
         if scenario.mode=='cross_context' and not {c.claim_id for c in specs if c.invariant in scenario.checker_ids}<={id for r in requirements for id in r.claim_ids}:context_error('Joint-history trigger does not cover the scenario checker claims')
         for name in scenario.actions:
             if not re.search(r'\b'+re.escape(name)+r'\s*(?:\([^\n]*\))?\s*==',tla_code(bundle.behavior)):context_error('Context action has no actual Behavior definition')
-    # Model-level goal expression does not require an implementation monitor.
-    for mapping in bundle.goal_observations:
-        if mapping.claim_id not in unit.goal_ids or not set(mapping.binding_ids)<=set(unit.binding_ids):raise ValueError("Goal observation references an unrelated goal or binding")
+    # Model-level consequence expression does not require an implementation monitor.
+    for mapping in bundle.consequence_observations:
+        if mapping.claim_id not in unit.obligation_ids or not set(mapping.binding_ids)<=set(unit.binding_ids):raise ValueError("Consequence observation references an unbroader obligation or binding")
     return specs
 
 

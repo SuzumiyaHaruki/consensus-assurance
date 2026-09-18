@@ -4,7 +4,7 @@ from types import SimpleNamespace
 from consensus_assurance.core.types import AuditQuestion, ConstraintSource
 from consensus_assurance.workflow import inquiry
 from consensus_assurance.workflow.artifacts import validate_bundle
-from consensus_assurance.core.proposals import Discovery
+from consensus_assurance.core.proposals import Derivation
 from test_graph_mutations import controller
 
 
@@ -20,8 +20,8 @@ def test_typed_question_selects_direct_route(prepared):
 
 def test_thin_overview_does_not_enqueue_generic_exploration(tmp_path,prepared):
     _,state,_,responses=prepared;e=controller(tmp_path,state)
-    proposal=Discovery.model_validate(responses[1])
-    inquiry.initial_agenda(e,proposal)
+    proposal=Derivation.model_validate(responses[1])
+    inquiry.enqueue(e.state,'spec_refine','Read selected dependency','initial_reading',requests=proposal.reading_requests)
     assert not any(t.trigger=='initial_breadth' or t.trigger.startswith(('responsibility:','handoff:')) for t in state.inquiry_tasks)
 
 
@@ -115,7 +115,7 @@ def test_core_semantics_review_without_independent_binding_certificate(tmp_path,
     _,s,_,_=prepared;e=controller(tmp_path,s);u=s.units[0]
     inquiry.review_unit(e,u,'explicit_question_review')
     targets={id for t in s.inquiry_tasks for id in t.target_ids}
-    assert targets==set(u.goal_ids+u.obligation_ids+[u.id])
+    assert targets==set(u.obligation_ids+u.obligation_ids+[u.id])
     for obj in s.claims+s.units:
         if obj.id not in targets:continue
         contract=target_contract(s,obj)

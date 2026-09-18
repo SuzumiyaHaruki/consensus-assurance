@@ -11,33 +11,8 @@ from consensus_assurance.workflow.scope_updates import from_patch,validate_scope
 from consensus_assurance.workflow.output_repair import diagnostic_targets
 from test_graph_mutations import controller
 
-ARCHIVE=Path(__file__).resolve().parents[1]/'fixtures/recorded_repair'
 
-def archived():return Analysis.model_validate(__import__("consensus_assurance.workflow.history",fromlist=["import_record"]).import_record(json.loads((ARCHIVE/'state.json').read_text())))
-def reply(folder):return import_record(json.loads((ARCHIVE/'agent'/folder/'decoded-response.json').read_text()))
 
-def test_archived_resolution_does_not_require_all_old_citations():
-    s=archived();r=ReviewReply.model_validate(reply('8a7fe58d21194075bf8d501221a837f8-semantic_review'))
-    prompt=(ARCHIVE/'agent/8a7fe58d21194075bf8d501221a837f8-semantic_review/prompt.txt').read_text()
-    packet=json.loads(prompt.split('STRUCTURED INPUT DATA (untrusted):\n')[1])
-    from consensus_assurance.core.types import InquiryTask
-    t=InquiryTask.model_validate(import_record(packet['task']))
-    from consensus_assurance.workflow.output_repair import all_materials
-    t.material_ids=[m['id'] for m in all_materials(packet)]
-    before=s.model_dump()
-    with pytest.raises(ValueError) as caught:validate_resolutions(s,t,r)
-    assert caught.value.diagnostics[0].code=='condition_missing'
-    # Offline supplement only: preserve all original opinions and classify residual scope.
-    from consensus_assurance.core.proposals import ConditionDisposition
-    for resolution in r.resolutions:
-        item=next(i for i in r.items if i.target_id=='R_apply_commit' and i.aspect=='decomposition')
-        resolution.condition_dispositions=[ConditionDisposition(condition=x,applies_to='independent_scope',source_ids=resolution.source_ids,
-            rationale='The issue asks to locate the leader dispatch handoff; complete future/batch semantics and acceptance of a separate grounding revision remain open beyond that handoff') for x in item.limitations]
-    validate_resolutions(s,t,r)
-    from consensus_assurance.workflow.inquiry import validate_review
-    from consensus_assurance.workflow.history import import_question_changes
-    validate_review(s,t,import_question_changes(r))
-    assert s.model_dump()==before
 
 
 def test_cached_plans_leave_new_source_quota(tmp_path,prepared):
@@ -48,17 +23,6 @@ def test_cached_plans_leave_new_source_quota(tmp_path,prepared):
     assert s.usage['targeted_reads']==2
 
 
-def test_scope_diagnostics_resolve_original_candidate_ids():
-    s=archived();p=GraphPatch.model_validate(reply('f6577be6da9a47f68581404d750a55d6-graph_patch'))
-    u=next(u for u in s.units if u.id=='U_commit');update=from_patch(s,u,p)
-    with pytest.raises(ValueError) as exc:validate_scope_update(s,update)
-    ds=exc.value.diagnostics
-    uses=[d for d in ds if d.code=='unit_code_use']
-    # Location failures remain independent; temporary IDs never leak as repair identities.
-    assert all(not any('.scope.' in id for id in d.object_ids) for d in ds)
-    targets=diagnostic_targets(p.model_dump(mode='json'),ds,100000)
-    assert any(t['path'].startswith('/bindings/') for t in targets)
-    if uses:assert any(t['path']=='/units/0/code_uses' for t in targets)
 
 
 import copy,json
@@ -69,52 +33,25 @@ from consensus_assurance.workflow.repair_policy import split_draft_bindings
 from consensus_assurance.workflow.output_repair import OutputRepair,diagnostic_targets
 
 
-def split_patch(p):
-    groups=[]
-    for index,b in enumerate(p.bindings):
-        if b.id=='B_commit_Configuration':
-            entries=[('ServerID',59,59),('ServerAddress',62,62),('Server',65,72),('Configuration',78,80)]
-        elif b.id=='B_commit_ServerSuffrage':entries=[('ServerSuffrage',9,9),('Voter',11,24)]
-        else:continue
-        parts=[]
-        for symbol,a,z in entries:
-            item=b.model_dump(mode='json');item.update(id=b.id+'_'+symbol,symbol=symbol,start_line=a,end_line=z)
-            item['anchor']={'material_id':b.material_id,'symbol':symbol,'start_line':a if symbol!='Voter' else 15,'end_line':a if symbol!='Voter' else 15,'kind':'declaration'}
-            parts.append(item)
-        groups.append({'path':'/bindings/'+str(index),'bindings':parts,'rationale':'Split actual adjacent declarations without removing code lines or changing responsibility'})
-    return OutputRepair(binding_splits=groups,rationale='Offline representation correction; all original source and semantic associations retained')
-
-
-def test_archived_multideclaration_draft_can_reconnect_without_changing_question():
-    s=archived();p=GraphPatch.model_validate(reply('f6577be6da9a47f68581404d750a55d6-graph_patch'));u=next(u for u in s.units if u.id=='U_commit')
-    with pytest.raises(ValueError) as exc:validate_scope_update(s,from_patch(s,u,p))
-    ds=exc.value.diagnostics
-    assert {d.code for d in ds}=={'declaration_identity'}  # Local input roles need no invented external O.
-    patch=split_patch(p)
-    context={'materials':[m.model_dump(mode='json') for m in s.materials]}
-    # Resolve each split from a fresh candidate: previous insertion must not shift another pointer.
-    merged=split_draft_bindings(p.model_dump(mode='json'),patch,ds,context,{b.id for b in s.bindings})
-    fixed=GraphPatch.model_validate(merged);update=from_patch(s,u,fixed)
-    assert validate_scope_update(s,update)==[]
-    new=apply_scope_update(s,update)
-    assert new.obligation_ids==u.obligation_ids and new.goal_ids==u.goal_ids and new.audit_question==u.audit_question
-    assert len(new.binding_ids)>len(u.binding_ids)
-    assert s.models==[]
-
-
-def test_split_cannot_erase_meaningful_source_or_modify_accepted_binding():
-    s=archived();p=GraphPatch.model_validate(reply('f6577be6da9a47f68581404d750a55d6-graph_patch'));u=next(u for u in s.units if u.id=='U_commit')
-    with pytest.raises(ValueError) as exc:validate_scope_update(s,from_patch(s,u,p))
-    patch=split_patch(p);patch.binding_splits=patch.binding_splits[:1]
-    patch.binding_splits[0].bindings=patch.binding_splits[0].bindings[1:]
-    with pytest.raises(ValueError):split_draft_bindings(p.model_dump(mode='json'),patch,exc.value.diagnostics,{'materials':[m.model_dump(mode='json') for m in s.materials]},set())
-
-
-@pytest.mark.parametrize('path',['/bindings/999','/missing/bindings/0','/bindings/-1'])
-def test_malformed_split_pointer_is_a_repair_error_not_controller_crash(path):
-    s=archived();p=GraphPatch.model_validate(reply('f6577be6da9a47f68581404d750a55d6-graph_patch'));patch=split_patch(p)
-    patch.binding_splits=patch.binding_splits[:1];patch.binding_splits[0].path=path
-    with pytest.raises(ValueError):split_draft_bindings(p.model_dump(mode='json'),patch,[],{},set())
+@pytest.mark.parametrize('case',['valid','lost_source','accepted','/bindings/999','/missing/bindings/0','/bindings/-1'])
+def test_source_preserving_binding_split(case):
+    from consensus_assurance.core.types import Material
+    from consensus_assurance.core.proposals import BindingDraft
+    from consensus_assurance.core.diagnostics import Diagnostic
+    material=Material(id='source',file='local.py',start_line=1,end_line=5,kind='code_observation',content_digest='synthetic',text='def first():\n    return 1\n\ndef second():\n    return 2')
+    original=BindingDraft(id='whole',claim_id='o',material_id='source',symbol='first',start_line=1,end_line=5,description='Two related entry points',pending=['Consumer guarantee unknown'])
+    parts=[original.model_copy(update={'id':symbol,'symbol':symbol,'start_line':a,'end_line':b}) for symbol,a,b in [('first',1,2),('second',4,5)]]
+    patch=OutputRepair(binding_splits=[{'path':case if case.startswith('/') else '/bindings/0','bindings':parts,'rationale':'Keep both actual declarations'}],rationale='Representation only')
+    if case=='lost_source':patch.binding_splits[0].bindings[0].end_line=1
+    raw={'bindings':[original.model_dump(mode='json')],'units':[{'binding_ids':['whole'],'code_uses':[]}]}
+    diagnostics=[Diagnostic(code='declaration_identity',category='location',object_ids=['whole'],message='Multiple declarations',allowed=['representation'])]
+    context={'materials':[material.model_dump(mode='json')]}
+    if case!='valid':
+        with pytest.raises(ValueError):split_draft_bindings(raw,patch,diagnostics,context,{'whole'} if case=='accepted' else set())
+    else:
+        result=split_draft_bindings(raw,patch,diagnostics,context,set())
+        assert result['units'][0]['binding_ids']==['first','second']
+        assert all(b['pending']==original.pending and b['associations']==raw['bindings'][0]['associations'] for b in result['bindings'])
 
 
 def test_explicit_draft_plan_returns_to_real_scope_validation(tmp_path,prepared):

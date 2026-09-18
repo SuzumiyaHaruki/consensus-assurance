@@ -2,21 +2,15 @@
 
 DIRECT_ROLES=('direct','input','environment')
 DEPENDENCY_KINDS=('boundary','depends_all','conditional_on')
-GOAL_KINDS=('depends_all','supports','alternative','conditional_on')
 
 
 def graph_contract():
     return {'material_references':'Grounding.behavior_ids/expectation_ids and source_ids reference acquired material IDs only; binding_ids reference code bindings.',
-        'goal_links':{'direction':'goal -> checked obligation','kinds':list(GOAL_KINDS)},
-        'code_use':{'direct_roles':list(DIRECT_ROLES),'direct_condition':'Use claim_ids are associated with the binding and selected as unit goals/obligations.',
+        'code_use':{'direct_roles':list(DIRECT_ROLES),'direct_condition':'Use claim_ids are associated with the binding and selected as unit obligations.',
             'dependency_kinds':list(DEPENDENCY_KINDS),'dependency_direction':'checked obligation -> producer obligation or binding',
-            'support_condition':'Every selected dependency edge must be reachable in that direction, reach the used binding or associated claim, and retain unverified guarantees. Goal maps alone do not provide a dependency path.'},
+            'support_condition':'Every selected dependency edge must be reachable in that direction, reach the used binding or associated claim, and retain unverified guarantees. Unselected mappings alone do not provide a dependency path.'},
         'repair':'Source-reference correction must preserve derivation and applicability. A new relation needs sourced rationale and full graph validation; existing meaning cannot be silently reversed.'}
 
-
-def goal_links(unit,relations):
-    return [r for r in relations if r.id in unit.relation_ids and r.source in unit.goal_ids
-            and r.target in unit.obligation_ids and r.kind in GOAL_KINDS]
 
 
 def claim_ids(binding):
@@ -37,18 +31,18 @@ def support_path(unit,use,binding,relations):
 
 def use_errors(unit,binding,relations,materials):
     use=next((u for u in unit.code_uses if u.binding_id==binding.id),None)
-    direct=claim_ids(binding)&set(unit.goal_ids+unit.obligation_ids)
+    direct=claim_ids(binding)&set(unit.obligation_ids)
     if use is None:return [] if direct else ['Binding is unrelated to selected claims: no selected association or explicit dependency use']
     errors=[]
     if not set(use.claim_ids)<=claim_ids(binding):errors.append('Use claim_ids are not all associated with this binding')
     if not set(use.source_ids)<=set(materials):errors.append('Use source_ids include unacquired material')
     if not use.rationale.strip():errors.append('Use rationale is empty')
     if errors:return errors
-    if use.role in DIRECT_ROLES and set(use.claim_ids)<=set(unit.goal_ids+unit.obligation_ids):
-        return [] if direct else ['No association to selected goals or obligations']
+    if use.role in DIRECT_ROLES and set(use.claim_ids)<=set(unit.obligation_ids):
+        return [] if direct else ['No association to selected obligations']
     if not use.unverified:errors.append('Dependency use must retain unverified producer guarantees')
     if not support_path(unit,use,binding,relations):
-        errors.append('No complete selected directed dependency path from checked obligations to this binding or its used claims; goal maps/supports/alternative edges do not count')
+        errors.append('No complete selected directed dependency path from checked obligations to this binding or its used claims; unselected supports/alternative edges do not count')
     return errors
 
 

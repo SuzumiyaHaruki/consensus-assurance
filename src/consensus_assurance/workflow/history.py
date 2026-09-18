@@ -24,6 +24,12 @@ def import_record(value):
         if isinstance(obj,list):return [visit(x) for x in obj]
         if not isinstance(obj,dict):return obj
         obj={k:visit(v) for k,v in obj.items()}
+        if 'discovery_path' in obj:obj['derivation_path']=obj.pop('discovery_path')
+        if obj.get('kind')=='goal':obj['kind']='obligation'
+        for name in ('goal_ids','goal_observable','handoff_ids'):obj.pop(name,None)
+        if obj.get('obligation_relation_kind')=='cross_activity_handoff':obj['obligation_relation_kind']='consumption'
+        if 'goal_observations' in obj:obj['consequence_observations']=obj.pop('goal_observations')
+        if obj.get('level')=='implementation_goal':obj['level']='implementation_consequence'
         for k in ('responsibilities','responsibility_history','exploration_requests','coverage_intent'):
             obj.pop(k,None)
         if 'points' in obj and 'question' in obj:
@@ -44,5 +50,5 @@ def load_analysis(path):
     from pathlib import Path
     from consensus_assurance.core.types import Analysis
     value=json.loads(Path(path).read_text())
-    if value.get('framework_revision')!='seven-activity-v2':value=import_record(value)
+    if value.get('framework_revision')!='obligation-audit-v1':value=import_record(value)
     return Analysis.model_validate(value)

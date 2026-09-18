@@ -37,3 +37,22 @@ def toy_responses(repo):
         if isinstance(value,dict):return {k:replace(v) for k,v in value.items()}
         return value
     return replace(responses)
+
+
+def descriptive_inventory(material_id):
+    from consensus_assurance.core.proposals import Discovery
+    from consensus_assurance.core.types import ConsensusAuditSpec,TargetProfile,Activity
+    spec=ConsensusAuditSpec(target_profile=TargetProfile(system_boundary='Controlled local fixture',source_ids=[material_id]),
+        activities=[Activity(class_id='A'+str(n),applicability='unknown',purpose='Controlled responsibility coordinate',realization_summary='The execution fixture does not claim autonomous coverage',source_ids=[material_id],unknowns=['Actual responsibility requires analysis']) for n in range(1,8)])
+    return Discovery(understanding='Explicit synthetic inventory for downstream verification regression',audit_spec=spec)
+
+
+def inventory_response(runner,prompt,directory,snapshot_id,timeout):
+    import json
+    from consensus_assurance.adapters.agents.backend import MockAgent
+    from consensus_assurance.core.proposals import Discovery
+    from consensus_assurance.workflow.sources import all_materials
+    packet=json.loads(prompt.split('STRUCTURED INPUT DATA (untrusted):\n')[1])
+    source=all_materials(packet)[0]['id']
+    agent=MockAgent();agent.responses=[descriptive_inventory(source).model_dump(mode='json')]
+    return MockAgent.analyze(agent,runner,prompt,directory,snapshot_id,timeout,Discovery)

@@ -1,18 +1,11 @@
-# 运行制品
+# 保留运行
 
-当前保留并跟踪 [2026-09-17_13-59-36-hashicorp_raft-real-run](2026-09-17_13-59-36-hashicorp_raft-real-run/report.md)。原始回复、配置、源码快照、历史检查点和日志保留；临时锁与可重建的执行缓存不归档。
+当前选定归档：[2026-09-18_10-29-33-hashicorp_raft-real-run](2026-09-18_10-29-33-hashicorp_raft-real-run/report.md)，运行 ID `590a37c240a74d4e852838a8f1ed59af`；目标提交 `c0dc6a0b2c7e889f31e5ab2f7ed90ceb159acffe`。
 
-其他运行默认由 .gitignore 排除。清理活动运行前必须确认进程已停止；归档选择或删除旧实验须由用户明确授权。历史已提交记录仍可从 Git 历史读取，本地删除不改写提交历史。
+本次记录 17 个材料片段、76708 / 120000 唯一字符、3 次 agent 调用、426.98 秒。描述性 AuditSpec 已受理；derive 产生一个候选义务和有界问题，但图校验未通过：0 个受理主张、0 个受理单元、0 个直接检查、0 个模型、0 次 TLC 性质搜索、0 条性质证据。能力探测执行了已有测试，不是候选义务的验证。
 
-一般回归使用 tests/fixtures；工作集与上下文的离线回归还会只读已选归档，它们不进入 runtime discovery。使用和证据边界见 [运行工作流](../docs/运行工作流.md)。
+停止原因是单元引用了未定义的关系 `scope`。当前 UnitDraft 强制非空 relation_ids，而直接绑定不需要额外关系；typed diagnostics 又漏查关系引用，最终停止于无法定位的机械修复。本次归档如实保留该框架缺陷，尚未修复；不是 HashiCorp 缺陷或预算耗尽。
 
-最新 CFT 运行已形成具体问题，尚无受理模型、TLC 搜索、校准或直接性质证据。
+2026-09-18 按用户明确要求删除此前日期的运行结果（包括 9 月 16 日的 local-workset-checks）；此前已提交的内容仍存在于 Git 历史。当天其他诊断目录保留本地，不纳入 Git。此次授权不代表今后可以自动清理或发布。
 
-未来选定归档保留 run/source、执行前的 workspace-delta/manifest.json 与新增/改动文件、
-执行后的 workspace-outcome 差异、原始日志、action 输入/结果和环境元数据；不再重复提交整个 experiment workspace。
-现有已跟踪 workspace 不删除。重建使用
-`adapters.storage.workspace_delta.restore(source, manifest, new_destination)`，
-校验实际源版本后生成新隔离副本。运行目录中的 workspace 本地仍保留，
-默认不自动清理；缓存和外部依赖不属于可重建源码承诺。
-
-当前选中归档：`2026-09-17_13-59-36-hashicorp_raft-real-run`。它有 19 次 agent 调用、830.49 秒、3 个候选主张及 2 个审计单元；0 direct-check 执行、0 model、0 TLC 性质搜索、0 property evidence。能力探测不计为候选验证。新 framework revision 不恢复该运行；查看和离线分析不改原始证据。
+选定运行保留原始回复、来源快照、状态、日志及失败报告；临时锁、.execution 缓存和可重建的 experiments 工作副本不纳入 Git。归档不作为 runtime discovery 答案，测试仅在隔离副本读取。不要把候选分析或已受理描述规格当作性质证据。
