@@ -195,6 +195,7 @@ class InquiryTask(Record):
     diagnostics: list[dict] = []
     admitted: bool = False
     preparation_failures: int = 0
+    semantic_failures: int = 0
     parent_task_id: str | None = None
     child_task_ids: list[str] = []
     requested_aspects: dict[str, list[str]] = {}

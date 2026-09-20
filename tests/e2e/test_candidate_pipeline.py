@@ -110,7 +110,7 @@ def test_evidence_blocked_candidate_does_not_end_autonomous_selection(tmp_path,p
     assert first_record.question.disposition=='needs_specific_evidence' and first_record.stop_reason
     assert first.counterevidence[0] not in second_record.question.counterevidence
     packets=[json.loads(p.read_text().split('STRUCTURED INPUT DATA (untrusted):\n')[1]) for p in (engine.root/'agent').glob('*-derive/prompt.txt')]
-    assert any(any(c['status']=='blocked' and c['fact_ids']==first.fact_ids for c in p['candidate_dispositions']) for p in packets)
+    assert any(any(c['status']=='blocked' and c['fact_ids']==first.fact_ids for c in p.get('candidate_dispositions',[])) for p in packets)
     assert any(p.get('selected_question',{}).get('fact_ids')==second.fact_ids for p in packets)
     if next_outcome=='explained':
         assert state.stop_reason=='No pending executable audit units; unresolved gaps remain'
@@ -149,7 +149,7 @@ def test_progressive_frontier_prevents_candidate_monopoly(tmp_path,prepared):
         select(later,[reading]),explain(later),Derivation(selection_rationale='No further tractable discriminator is supported').model_dump(mode='json')]
     fixture=tmp_path/'progressive.json';fixture.write_text(json.dumps(replies))
     config=Config(implementation='toy',agent_backend='mock',fixture=str(fixture),allow_experiments=False)
-    config.budget.agent_calls=len(replies)  # Exact finite scripted sequence; production budgets are unchanged.
+    config.budget.agent_calls=len(replies)+1  # Exact finite scripted sequence; production budgets are unchanged.
     engine=Engine(config,tmp_path/'progressive-run',*assemble(config));state=engine.start(repo)
     assert [c.status for c in state.question_candidates]==['explained','explained'],state.stop_reason
     assert state.audit_spec_version==2 and not state.repair_sessions

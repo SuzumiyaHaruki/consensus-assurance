@@ -93,12 +93,12 @@ def test_partial_receipt_reaches_reasoning_then_explained(focused,tmp_path):
     discovery.accept_derivation(e,Derivation(audit_question=close,selection_rationale='Existing caller protection explains this scoped path'),'explain')
     c=e.state.question_candidates[0]
     assert c.status=='explained' and len(c.history)==1 and not discovery.active_candidate(e.state)
-    assert 'Caller contract still unread' in c.question.unknowns and q.counterevidence[0] in c.question.counterevidence
+    assert not c.question.unknowns and c.history[0].unknowns==q.unknowns and c.history[0].counterevidence==q.counterevidence
     assert not e.state.claims and not e.state.units and not e.state.models and not e.state.direct_checks and not e.state.evidence
     from consensus_assurance.reporting.chinese import render_report
     (tmp_path/'report').mkdir()
     report=render_report(e.state,tmp_path/'report').read_text()
-    assert '候选问题与已有保护' in report and 'Acquired caller propagates' in report and 'Caller contract still unread' in report
+    assert '候选问题与已有保护' in report and 'Acquired caller propagates' in report and 'Caller contract still unread' not in report
 
 
 def test_zero_progress_is_bounded_and_not_charged(focused):
@@ -117,7 +117,7 @@ def test_escalation_preserves_identity_and_protections_without_relation(focused)
     from regression_support import bounded_derivation
     e,q,responses=focused
     begin(e,q,[ReadRequest(file='counter.py',start_line=1,end_line=2,reason='Check actual step')])
-    reply=Derivation.model_validate(bounded_derivation(responses[1]));reply.audit_question=q.model_copy(update={'requests':[],'preferred_check':'local_model','disposition':'ready_for_check','counterevidence':[]})
+    reply=Derivation.model_validate(bounded_derivation(responses[1]));reply.audit_question=q.model_copy(update={'requests':[],'preferred_check':'local_model','disposition':'ready_for_check','counterevidence':q.counterevidence})
     discovery.accept_derivation(e,reply,'escalate')
     assert len(e.state.units)==1 and len(e.state.claims)==1 and not e.state.relations
     c=e.state.question_candidates[0]
@@ -135,7 +135,7 @@ def test_descriptive_debt_routes_by_selected_objects(focused,selected):
     reply=Derivation(audit_question=q,reading_requests=[ReadRequest(file='counter.py',start_line=1,end_line=2,reason='Read selected behavior')],descriptive_issues=[issue],selection_rationale='Continue selected question')
     discovery.accept_derivation(e,reply,'issue')
     c=discovery.active_candidate(e.state);task=e.state.inquiry_tasks[0]
-    assert bool(c.spec_task_ids)==selected and (read_purpose(task)=='depth')==selected
+    assert bool(c.spec_task_ids)==selected and read_purpose(task)=='depth'
     if selected:
         from consensus_assurance.adapters.agents.backend import MockAgent
         revised=load(e.state);revised.behaviors[1].execution_owner='serialized callback'
@@ -169,22 +169,23 @@ def test_selected_packet_excludes_independent_subgraph_and_keeps_sources(focused
 def test_selected_run_preserves_unresolved_candidate_and_failure(tmp_path):
     from consensus_assurance.workflow.history import load_analysis
     from consensus_assurance.reporting.chinese import render_report
-    archive=Path(__file__).resolve().parents[2]/'runs/2026-09-20_09-51-08-hashicorp_raft-real-run'
+    archive=Path(__file__).resolve().parents[2]/'runs/2026-09-20_12-07-49-hashicorp_raft-real-run'
     before={name:(archive/name).read_bytes() for name in ['state.json','report.md']}
     state=load_analysis(archive/'state.json')
     state.audit_spec_path=str(archive/'audit-spec'/f'v{state.audit_spec_version}.json')
-    assert [c.status for c in state.question_candidates]==['blocked','explained','blocked','explained','explained','active']
+    assert [c.status for c in state.question_candidates]==['blocked','explained','active']
     assert not state.claims and not state.units and not state.evidence
     (tmp_path/'offline').mkdir()
     report=render_report(state,tmp_path/'offline').read_text()
-    assert 'Budget exhausted: agent_calls' in report and 'F_snapshot_recorded_locally' in report
+    assert 'Budget exhausted: agent_calls' in report and 'F4' in report
+    assert 'evidence_blocked=1' in report and 'workflow_blocked=0' in report and 'resource_blocked=1' in report
     assert all((archive/name).read_bytes()==data for name,data in before.items())
 
 
-def test_v4_controller_state_cannot_resume_under_v5(focused):
+def test_v5_controller_state_cannot_resume_under_v6(focused):
     from types import SimpleNamespace
     e,_,_=focused
-    e.state.framework_revision='selected-question-v4'  # Explicit compatibility fixture, not an archive rewrite.
+    e.state.framework_revision='selected-question-v5'  # Explicit compatibility fixture, not an archive rewrite.
     e.store=SimpleNamespace(load=lambda:e.state)
     usage=dict(e.state.usage)
     assert 'Framework revision differs' in e.resume().stop_reason
@@ -259,7 +260,7 @@ def test_reviewed_evidence_block_is_accepted_without_repair(focused,tmp_path):
     assert not discovery.accept_derivation(e,result,check.id)
     c=e.state.question_candidates[0]
     assert c.status=='blocked' and c.stage=='analyze' and c.stop_reason==reply.selection_rationale
-    assert c.history and q.counterevidence[0] in c.question.counterevidence and q.unknowns[0] in c.question.unknowns
+    assert c.history and q.counterevidence[0] in c.question.counterevidence and q.unknowns[0] in c.history[0].unknowns and q.unknowns[0] not in c.question.unknowns
     assert not discovery.active_candidate(e.state)
     assert not e.state.claims and not e.state.units and not e.state.models and not e.state.evidence
     assert e.state.pending_output_repair is None and not e.state.repair_sessions and e.state.usage['agent_calls']==1
@@ -329,3 +330,37 @@ def test_unrelated_reusable_feedback_survives_evidence_blocked_outcome(focused):
     assert e.state.question_candidates[0].status=='blocked' and e.state.audit_spec_version==version
     task=choose_task(e)
     assert task.target_ids==['A7'] and task.candidate_id is None and task.diagnostics
+
+
+def test_three_narrowings_keep_history_out_of_current_packet(focused):
+    e,q,_=focused
+    q.unknowns=['First caller','Second caller','Remaining contract']
+    c=begin(e,q,[request('counter.py')]);original=q.model_dump(mode='json')
+    for n in range(3):
+        narrowed=q.model_copy(update={'unknowns':q.unknowns[n+1:]})
+        discovery.accept_derivation(e,Derivation(audit_question=narrowed,reading_requests=[request('counter.py')],selection_rationale='Resolve one specific caller discriminator'),f'narrow-{n}')
+    c=discovery.active_candidate(e.state)
+    assert len(c.history)==3 and not c.question.unknowns and c.history[0].unknowns==original['unknowns']
+    packet=discovery.derive_context(e)
+    assert not packet['selected_question']['unknowns'] and 'history' not in packet
+
+
+def test_episode_admission_and_blockage_classification(focused):
+    from consensus_assurance.workflow.budget import can_start_episode
+    from consensus_assurance.workflow.discovery import candidate_blockage
+    from consensus_assurance.workflow.inquiry import enqueue,inquiry_resource
+    from consensus_assurance.workflow.engine import FRAMEWORK_REVISION
+    from consensus_assurance.workflow.prompts import manifest
+    e,q,_=focused;e.state.usage['agent_calls']=e.state.config['budget']['agent_calls']-1
+    assert not can_start_episode(e.state,'candidate') and not can_start_episode(e.state,'surface')
+    c=begin(e,q,[request('counter.py')]);c.stage='analyze'
+    assert can_start_episode(e.state,'candidate') and not can_start_episode(e.state,'surface')
+    c.status='blocked';c.question.requests=[]
+    assert candidate_blockage(e.state,c)=='evidence_blocked'
+    task=enqueue(e.state,'spec_refine','Correct the selected producer','depth',target_ids=['producer']);task.status='blocked';c.spec_task_ids=[task.id]
+    assert candidate_blockage(e.state,c)=='workflow_blocked' and inquiry_resource(task) is None
+    surface=enqueue(e.state,'spec_refine','Find another owner','surface',surface_entry_points=['other'])
+    assert inquiry_resource(surface)=='exploration_rounds'
+    c.spec_task_ids=[];c.status='active';e.state.usage['agent_calls']+=1
+    assert candidate_blockage(e.state,c)=='resource_blocked'
+    assert FRAMEWORK_REVISION==manifest()['version']=='selected-question-v6'

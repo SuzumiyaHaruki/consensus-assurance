@@ -1,19 +1,5 @@
 """Explicit offline imports only; never normalize fresh backend declarations here."""
 import json
-from consensus_assurance.core.types import AuditQuestion
-
-
-def import_question_changes(reply):
-    """Return a copy with historical whole-question diffs normalized to this schema."""
-    reply=reply.model_copy(deep=True)
-    revision=getattr(reply,'revision',None)
-    if revision:
-        for change in revision.changes:
-            if change.field=='audit_question':
-                for name in ('old_value_json','new_value_json'):
-                    value=json.loads(getattr(change,name))
-                    if value is not None:setattr(change,name,AuditQuestion.model_validate(import_record(value)).model_dump_json())
-    return reply
 
 
 def import_record(value):
@@ -57,5 +43,5 @@ def load_analysis(path):
     from pathlib import Path
     from consensus_assurance.core.types import Analysis
     value=json.loads(Path(path).read_text())
-    if value.get('framework_revision') not in {'obligation-audit-v2','selected-question-v3','selected-question-v4','selected-question-v5'}:value=import_record(value)
+    if value.get('framework_revision') not in {'obligation-audit-v2','selected-question-v3','selected-question-v4','selected-question-v5','selected-question-v6'}:value=import_record(value)
     return Analysis.model_validate(value)

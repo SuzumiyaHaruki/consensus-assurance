@@ -11,7 +11,8 @@ from consensus_assurance.workflow.graph import apply_graph, apply_patch
 from consensus_assurance.workflow.graph_diagnostics import validate_grounding
 from consensus_assurance.workflow.artifacts import validate_tla
 from consensus_assurance.workflow.observations import match_prerequisites, monitor_events
-from consensus_assurance.workflow.materials import ReadingPlan, ReadRequest, add_reads, catalogue
+from consensus_assurance.workflow.materials import ReadingPlan, ReadRequest,  catalogue
+from regression_support import add_reads
 from consensus_assurance.adapters.storage.snapshot import capture
 from consensus_assurance.adapters.agents.backend import strict_schema, wire_value
 from consensus_assurance.adapters.verifiers.trace import project

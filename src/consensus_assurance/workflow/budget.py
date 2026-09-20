@@ -36,3 +36,9 @@ class BudgetTracker:
         if remaining <= 0:
             raise BudgetExhausted("Runtime reserved for pending exploration or review")
         return min(remaining, self.limits.action_timeout)
+
+
+def can_start_episode(state,kind):
+    remaining=state.config.get('budget',{}).get('agent_calls',0)-state.usage.get('agent_calls',0)
+    started=any(c.status=='active' for c in state.question_candidates) if kind=='candidate' else any(t.id==state.active_inquiry_id and t.admitted for t in state.inquiry_tasks)
+    return remaining >= (1 if started else 2)

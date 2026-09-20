@@ -1,16 +1,105 @@
 """Task-scoped context, explicit review contracts and actual transmission receipts."""
 import json
+from pathlib import Path
 from .materials import compact_index, material_usage, material_allowance
 from .review_contract import target_contract
 from consensus_assurance.core.types import uid
 
 
+def review_projection(engine,task):
+    from .reviews import review_objects as objects,material_closure
+    state=engine.state; available=objects(state)
+    seeds=set(task.target_ids)
+    wanted,closure=material_closure(state,seeds)
+    wanted.update(task.added_material_ids)
+    wanted.update(state.task_attachments.get('inquiry:'+task.id,[]))
+    wanted.update(task.material_ids)
+    for issue in state.review_issues:
+        if (issue.target_id in closure or issue.id in task.resolution_issue_ids) and not issue.resolved_by:wanted.update(issue.source_ids)
+    pending_scope=[u for u in state.scope_updates.values() if u['status']=='needs_F2_or_investigation' and u['proposal']['unit_id']==task.unit_id]
+    for p in pending_scope:wanted.update(p['proposal']['source_ids'])
+    task.unit_version=next((u.version for u in state.units if u.id==task.unit_id),None)
+    result={'pending_scope_updates':pending_scope,'task':task.model_dump(mode='json',exclude={'context_receipt_id','context_dependencies','admitted','preparation_failures','child_task_ids'}),
+        'materials':[m.model_dump(mode='json') for m in state.materials if m.id in wanted],
+        'omitted_material_ids':[m.id for m in state.materials if m.id not in wanted],
+        'remaining_seconds':engine.budget.remaining(),
+        'target_objects':[available[i].model_dump(mode='json') for i in task.target_ids if i in available and i!=task.unit_id],
+        **{name:[o.model_dump(mode='json') for o in getattr(state,name) if o.id in closure and o.id not in task.target_ids and o.id!=task.unit_id] for name in ('claims','bindings','relations','units')},
+        'open_issues':[i.model_dump(mode='json',exclude_defaults=True,exclude_none=True) for i in state.review_issues if (i.target_id in closure or i.id in task.resolution_issue_ids) and not i.resolved_by],
+        'blocked_review_tasks':[{'id':t.id,'target_ids':t.target_ids,'target_versions':t.target_versions,'requested_aspects':t.requested_aspects,'model_id':t.model_id,'stop_reason':t.stop_reason} for t in state.inquiry_tasks if t.kind=='review' and t.status=='blocked' and not t.superseded_by and set(t.target_ids)<=set(task.target_ids)],
+        'overview_limit':'This compact index is not complete implementation coverage; request specific actual ranges before deriving new claims'}
+    if task.unit_id:
+        result['selected_unit']=available[task.unit_id].model_dump(mode='json')
+        from .task_view import semantic_view
+        result['semantic_view'],extra=semantic_view(state,closure)
+        result['semantic_view'].pop('open_issues')
+        wanted.update(extra)
+        result['materials']=[m.model_dump(mode='json') for m in state.materials if m.id in wanted]
+        result['required_material_ids']=sorted(wanted)
+    for artifact in state.direct_checks:
+        if artifact.id in task.target_ids:
+            result['direct_check_plan']=json.loads(Path(artifact.plan_path).read_text())
+            result['actual_checks']=[engine.error_context(c) for c in state.checks if c.direct_check_id==artifact.id]
+    if task.model_id:
+        model=next((m for m in state.models if m.id==task.model_id),None)
+        if model:
+            result['bundle']=json.loads(Path(model.bundle_path).read_text())
+            result['prior_issue_models']=[{'issue_id':i.id,'model_id':old.id,'bundle':json.loads(Path(old.bundle_path).read_text()),'current_model_id':model.id} for i in state.review_issues if i.id in task.resolution_issue_ids for old in state.models if old.id==i.model_id]
+            result['checker_executions']=[engine.error_context(c) for c in state.checks if c.model_id==model.id and c.action=='model_check']
+            result['reachability']=[r.model_dump(mode='json') for r in state.reachability_results if r.model_id==model.id]
+    return result
+
+
+def descriptive_projection(engine,kind,context,task):
+    from .audit_spec import load,slice_for
+    state=engine.state;spec=load(state)
+    candidate=next((c for c in state.question_candidates if c.id==(task.candidate_id if task else context.get('candidate_id'))),None)
+    question=candidate.question if candidate else None
+    seeds=task.target_ids+task.activity_classes+['surface:'+s for s in task.surface_entry_points] if task else []
+    view=slice_for(state,question,object_ids=seeds)
+    draft=json.loads(Path(task.draft_path).read_text()) if task and task.draft_path else {}
+    view=view or draft.get('audit_spec',draft)
+    level=task.preparation_failures if task and task.surface_entry_points else 0
+    focus=question.model_dump(mode='json') if question else {'object_keys':seeds,'reason':task.reason if task else 'Select a bounded Fact lifecycle'}
+    wanted=set(context.get('current_material_ids',[]))|{m['id'] for m in context.get('materials',[])}
+    if candidate:
+        wanted.update(question.source_ids)
+        wanted.update(id for item in state.read_plans.get(candidate.read_plan_id,{}).get('items',[]) if item['status']!='deferred' for id in item['material_ids'])
+    if task:wanted.update(id for d in task.diagnostics for id in d['material_ids'])
+    if level and not task.added_material_ids:wanted={id for id in wanted if any(m.id==id and not m.file.lower().endswith('readme.md') for m in state.materials)}
+    if level>=2 and not task.added_material_ids:wanted.clear()
+    profile=(view or {}).get('target_profile',{})
+    orientation={k:profile[k] for k in ('system_boundary','protocol_contexts') if k in profile and (not level or k=='system_boundary')}
+    local={k:v for k,v in (view or {}).items() if k!='target_profile'}
+    orientation['activities']=[{k:a[k] for k in ('class_id','realization_summary')} for a in local.get('activities',[])]
+    if 'target_profile' in seeds:local['target_profile']=profile
+    if not question and not seeds:
+        local={k:[{field:o[field] for field in fields if field in o} for o in local.get(k,[])] for k,fields in {'activities':['class_id','realization_summary','unknowns'],'behaviors':['id','primary_activity','execution_owner','trigger','produces_fact_ids','consumes_fact_ids'],'facts':['id','meaning','identity','validity_context','source_ids']}.items()}
+    if level>=2:local={'surfaces':[s for s in (view or {}).get('surfaces',[]) if 'surface:'+s['entry_point'] in seeds]}
+    result={**context,'focus':focus,'orientation':orientation,'audit_spec':local,
+        'directed_question':engine.config.directed_question,'parameters':engine.config.parameters,
+        'materials':[m.model_dump(mode='json') for m in state.materials if m.id in wanted],
+        'required_material_ids':sorted(wanted),'projection_level':level,
+        'source_rule':'Orientation, provenance IDs and declaration hints are navigation, not source evidence. Only attached exact source supports current implementation judgments.'}
+    if task:
+        result.update(task=task.model_dump(mode='json',exclude={'repair_session','context_dependencies','material_ids','diagnostics'}),diagnostics=task.diagnostics)
+        if draft.get('delta') is not None:result['attempted_delta']=draft['delta']
+        if not spec:result['draft_audit_spec']=draft.get('audit_spec',draft)
+        result['focused_surfaces']=[s for s in (view or {}).get('surfaces',[]) if s['entry_point'] in task.surface_entry_points]
+        result['phase']='interpret' if task.added_material_ids else 'navigate'
+    if candidate:result.update(selected_question=focus,source_receipt=state.read_plans.get(candidate.read_plan_id))
+    elif kind=='derive':result['candidate_dispositions']=[{'fact_ids':c.question.fact_ids,'lifecycle':c.question.obligation_relation_kind,'status':c.status,'reason':c.stop_reason} for c in state.question_candidates if c.status!='active']
+    result['existing_objects']=[{'id':o.id,'version':o.version} for name in ('claims','bindings','relations','units') for o in getattr(state,name)] if kind=='derive' else []
+    return result
+
+
 def prepare(engine,kind,context):
     state=engine.state
     packet=dict(context)
-    task=next((t for t in state.inquiry_tasks if t.id==state.active_inquiry_id),None)
+    task=next((t for t in state.inquiry_tasks if t.id==context.get('task',{}).get('id',state.active_inquiry_id)),None) if kind!='derive' else None
+    if kind in {'spec_refine','derive'}:packet=descriptive_projection(engine,kind,context,task)
+    elif kind=='semantic_review' and task:packet=review_projection(engine,task)
     if kind=='semantic_review':
-        task=task or next((t for t in state.inquiry_tasks if t.id==context.get('task',{}).get('id')),None)
         if task:
             from .inquiry import objects
             packet['review_contract']=[target_contract(state,objects(state)[i]) for i in task.target_ids]
@@ -20,9 +109,16 @@ def prepare(engine,kind,context):
             task.context_dependencies={c['target_id']:c for c in packet['review_contract']}
     # The global index is a lookup aid, not full catalogue or source text.
     index=compact_index(state,engine.root/'source') if state.snapshot else []
-    if isinstance(index,dict):index=list(index.values())
     files={m['file'] for key in ('materials','new_materials','initial_materials') for m in packet.get(key,[])}
     packet['file_lookup']=[{'file':x['file'],'lines':x.get('lines'),'unavailable':x.get('unavailable')} for x in index if kind in {'read','discover','derive','spec_refine','targeted_read'} or x['file'] in files]
+    if task and task.surface_entry_points:
+        import re
+        from .materials import catalogue
+        terms=set(re.findall(r'[a-z][a-z0-9]*', re.sub(r'\b\w+\.', '', ' '.join(task.surface_entry_points+[e for a in packet.get('audit_spec',{}).get('activities',[]) for e in a.get('entry_points',[])])).lower()))-{'and','the','helpers','consumers'}
+        hints=[{'file':f['file'],**symbol} for f in catalogue(engine.root/'source',state.snapshot,engine.implementation) for symbol in f['symbols'] if terms&set(re.findall(r'[a-z][a-z0-9]*',(f['file']+' '+symbol['declaration']).lower()))]
+        packet['declaration_hints']=sorted(hints,key=lambda h:(-len(terms&set(re.findall(r'[a-z][a-z0-9]*',h['declaration'].lower()))),h['file'],h['line']))[:(4 if task.preparation_failures>=2 else 24)]
+    for key in ('catalogue','source_ranges','unread_ranges','current_material_ids'):
+        if kind in {'derive','spec_refine'}:packet.pop(key,None)
     packet['lookup_request']='Request a focused ReadingPlan for an unlisted path or symbol; omitted files are not absent from the repository'
     packet['file_metadata']=[{**x,'attached_ranges':[[m['start_line'],m['end_line']] for key in ('materials','new_materials','initial_materials') for m in packet.get(key,[]) if m['file']==x['file']]} for x in index if x['file'] in files]
     if kind in {'derive','graph_patch'}:
@@ -47,7 +143,6 @@ def prepare(engine,kind,context):
 def receipt(engine,kind,packet,prompt,schema,task=None,repair=False):
     from consensus_assurance.adapters.agents.backend import strict_schema
     from consensus_assurance.adapters.storage.files import write_json
-    from pathlib import Path
     from .action_identity import stable_input
     pending=engine.state.pending_action
     if pending and pending.input_path and Path(pending.input_path).is_file():

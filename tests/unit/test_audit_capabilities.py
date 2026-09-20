@@ -48,7 +48,8 @@ def test_R2_object_refinement_replaces_mixed_draft_without_mechanical_pointers(t
     path=tmp_path/'draft.json';path.write_text(json.dumps({'audit_spec':bad.model_dump(mode='json')}))
     task=enqueue(state,'spec_refine','Split the mixed producer and assertion','test')
     task.draft_path=str(path);task.diagnostics=[d.model_dump(mode='json') for d in exc.value.diagnostics]
-    packet=task_context(e,task);required={id for d in task.diagnostics for id in d['material_ids']}
+    from consensus_assurance.workflow.task_packet import prepare
+    packet=prepare(e,'spec_refine',task_context(e,task))[0];required={id for d in task.diagnostics for id in d['material_ids']}
     assert required<={m['id'] for m in packet['materials']}
     spec.behaviors.append(Behavior(id='notifier',primary_activity='A2',execution_owner='control loop',protocol_context='one operation',trigger='timeout',produces_fact_ids=['notification'],source_ids=[state.materials[0].id],unknowns=['Completion consumer unread']))
     spec.facts.append(Fact(id='notification',meaning='A context transition has been requested',identity={'operation':'request'},validity_context='one operation',established_by=['notifier'],representation=['notification'],durability='Not persisted',recovery='Discarded',source_ids=[state.materials[0].id],unknowns=['Completion consumer unread']))
@@ -150,19 +151,20 @@ def test_frontier_alternation_navigation_and_same_run_dedup(prepared,tmp_path):
     accept(e,spec);refresh_unread(state,e.root/'source')
     task=choose_task(e)
     assert task.surface_entry_points==['first'] and read_purpose(task)=='breadth'
-    packet=task_context(e,task)
+    from consensus_assurance.workflow.task_packet import prepare
+    packet=prepare(e,'spec_refine',task_context(e,task))[0]
     assert [s['entry_point'] for s in packet['focused_surfaces']]==['first']
-    assert len(packet['audit_spec']['activities'])==7 and not packet['audit_spec']['behaviors']
-    assert packet['catalogue'] and any(f['symbols'] for f in packet['catalogue']) and packet['source_ranges']
-    assert 'candidate_dispositions' not in packet
-    task.status='completed';state.last_work_kind='surface'
+    assert not packet['audit_spec']['behaviors']
+    assert packet['file_lookup'] and 'catalogue' not in packet and 'source_ranges' not in packet
+    assert not packet.get('candidate_dispositions')
+    task.status='completed';task.admitted=True;state.last_work_kind='surface'
     assert choose_task(e) is None
     q=AuditQuestion(question='Selected input question',importance='Scoped service effect',source_ids=[source],trigger_rationale='Selected discriminator',activity_classes=['A1'],behavior_ids=['producer'],fact_ids=['fact'],obligation_relation_kind='establishment')
     state.question_candidates=[QuestionCandidate(question=q)];state.last_work_kind='candidate'
     assert next_surface_refinement(state) is None and choose_task(e) is None
     state.question_candidates[0].status='blocked'
     second=choose_task(e);assert second.surface_entry_points==['second']
-    second.status='blocked';state.last_work_kind='candidate'
+    second.status='blocked';second.admitted=True;state.last_work_kind='candidate'
     assert next_surface_refinement(state) is None
 
 
@@ -185,3 +187,129 @@ def test_delta_preserves_full_inventory_validation(prepared,tmp_path,failure):
     before=load(state).model_dump_json()
     with pytest.raises(ValueError):merge_delta(state,task,delta)
     assert load(state).model_dump_json()==before
+
+
+def test_focused_projection_at_repository_scale(tmp_path,prepared):
+    import shutil
+    from consensus_assurance.workflow.task_packet import prepare,pool_sources
+    from consensus_assurance.workflow.prompts import render
+    from consensus_assurance.workflow.materials import catalogue,ReadingPlan
+    from regression_support import add_reads
+    from consensus_assurance.workflow.inquiry import enqueue,task_context
+    from consensus_assurance.adapters.storage.snapshot import capture
+    from consensus_assurance.core.config import Budget
+    from test_graph_mutations import controller
+    _,state,_,_=prepared;e=controller(tmp_path,state);source=e.root/'source';source.mkdir()
+    for n in range(88):
+        name=('election' if n==0 else 'fsm' if n==1 else 'snapshot' if n==2 else 'module'+str(n))+'.py'
+        (source/name).write_text(''.join(f'def handler_{n}_{i}(value):\n    return value\n' for i in range(14 if n==0 else 10)))
+    state.snapshot=capture(source);state.materials=[]
+    # Acquire ten ranges as profile provenance, but attach only election now.
+    requests=[{'file':p.name,'start_line':1,'end_line':20,'reason':'Historical survey'} for p in list(source.glob('*.py'))[:10]]
+    if not any(r['file']=='election.py' for r in requests):requests[-1]['file']='election.py'
+    ids=add_reads(state,source,ReadingPlan(requests=requests,rationale='Historical provenance'),Budget())
+    spec=inventory(ids[0]);spec.target_profile.source_ids=ids
+    spec.surfaces.append(Surface(entry_point='election.handler_0_0',disposition='deferred',reason='Election owner unread',high_consequence=True))
+    accept(e,spec);task=enqueue(state,'spec_refine','Inspect election context','surface-test',surface_entry_points=['election.handler_0_0'])
+    task.material_ids=['election.py:1:20']
+    packet,_=prepare(e,'spec_refine',task_context(e,task));text=render('spec_refine',pool_sources(packet),e.inquiry)
+    assert len(catalogue(source,state.snapshot,e.implementation))==88
+    assert sum(len(f['symbols']) for f in catalogue(source,state.snapshot,e.implementation))==884
+    assert len(text)<120000 and len(packet['file_lookup'])==88
+    assert [m['file'] for m in packet['materials']]==['election.py']
+    assert len(packet['declaration_hints'])<=24 and not {'catalogue','source_ranges','unread_ranges'}&packet.keys()
+    assert len(load(state).target_profile.source_ids)==10
+
+
+def test_canonical_objects_and_profile_semantic_retry(tmp_path,prepared):
+    import shutil
+    from consensus_assurance.workflow.audit_spec import audit_object_key,audit_object_index,audit_object_path,audit_object_sources
+    from consensus_assurance.workflow.inquiry import enqueue,process_task
+    from consensus_assurance.adapters.agents.backend import MockAgent
+    from consensus_assurance.core.proposals import AuditSpecDelta,SpecRefinement
+    from test_graph_mutations import controller
+    repo,state,_,_=prepared;e=controller(tmp_path,state);shutil.copytree(repo,e.root/'source')
+    spec=inventory(state.materials[0].id);spec.target_profile.protocol_contexts=['Construction and retirement unread'];accept(e,spec)
+    index=audit_object_index(spec)
+    for key in ['target_profile','A1','producer','fact','surface:entry']:
+        assert audit_object_key(index[key])==key and audit_object_path(spec,key) and audit_object_sources(index[key])
+    task=enqueue(state,'spec_refine','Interpret fresh local accounting owner','depth-test',target_ids=['producer'])
+    task.material_ids=[state.materials[0].id]
+    profile=spec.target_profile.model_copy(update={'protocol_contexts':['The control owner constructs fresh accounting and retires it on cleanup']})
+    narrower=spec.behaviors[0].model_copy(update={'execution_owner':'fresh accounting within the control owner'})
+    agent=MockAgent();agent.responses=[SpecRefinement(understanding='Observe the actual local construction',delta=AuditSpecDelta(target_profile=profile,rationale='Local source recovered'),limitations=[]).model_dump(mode='json'),SpecRefinement(understanding='Keep the new knowledge on the local producer',delta=AuditSpecDelta(behaviors=[narrower],rationale='No global orientation change required'),limitations=[]).model_dump(mode='json')];e.agent=agent
+    process_task(e,task)
+    task=state.inquiry_tasks[0];d=task.diagnostics[0]
+    assert task.status=='pending' and task.admitted and not state.repair_sessions
+    assert d['object_ids']==['target_profile'] and d['paths']==['/delta/target_profile/protocol_contexts']
+    assert d['material_ids'] and d['details']['old']['protocol_contexts']==spec.target_profile.protocol_contexts
+    assert d['details']['proposed']['protocol_contexts']==profile.protocol_contexts and d['details']['focus']==['producer']
+    process_task(e,task)
+    assert state.inquiry_tasks[0].status=='completed' and load(state).behaviors[0].execution_owner==narrower.execution_owner
+    assert load(state).target_profile==spec.target_profile and not state.repair_sessions
+    assert state.usage['agent_calls']==2 and state.usage.get('exploration_rounds',0)==0
+    packet=next(data for p in (e.root/'agent').glob('*-spec_refine/prompt.txt') if 'attempted_delta' in (data:=json.loads(p.read_text().split('STRUCTURED INPUT DATA (untrusted):\n')[1])))
+    assert packet['attempted_delta']['target_profile']==profile.model_dump(mode='json')
+    assert packet['materials'] and packet['diagnostics'][0]['details']==d['details']
+
+
+def test_surface_projection_fallback_is_not_an_attempt(tmp_path,prepared):
+    import shutil
+    from consensus_assurance.workflow.inquiry import enqueue,process_task
+    from consensus_assurance.workflow.errors import Blocked
+    from test_graph_mutations import controller
+    repo,state,_,_=prepared;e=controller(tmp_path,state);shutil.copytree(repo,e.root/'source');state.units=[]
+    spec=inventory(state.materials[0].id);spec.surfaces.append(Surface(entry_point='unread',disposition='deferred',high_consequence=True,reason='Actual owner unknown'));accept(e,spec)
+    task=enqueue(state,'spec_refine','Navigate unread owner','surface-test',surface_entry_points=['unread'])
+    e.config.budget.context_chars=1000
+    with pytest.raises(Blocked,match='context_chars'):process_task(e,task)
+    assert task.preparation_failures==e.config.budget.context_preparations+1
+    assert not task.admitted and not task.child_task_ids and not state.usage.get('agent_calls') and not state.usage.get('exploration_rounds')
+    assert len(state.packet_receipts)==3 and all(p['status']=='blocked_context_limit' for p in state.packet_receipts)
+    assert next_surface_refinement(state) is None  # Exhausted preparation, never an investigated surface.
+    task.preparation_failures=1
+    assert next_surface_refinement(state).entry_point=='unread'
+    from consensus_assurance.workflow.task_packet import prepare
+    packets=[]
+    for level in (0,1,2):
+        task.preparation_failures=level
+        packets.append(prepare(e,'spec_refine',{'task':{'id':task.id}})[0])
+    assert all(p['focused_surfaces'][0]['entry_point']=='unread' for p in packets)
+    assert not packets[2]['materials'] and len(packets[2]['declaration_hints'])<=4
+
+
+def test_surface_can_send_after_compaction_without_splitting(tmp_path,prepared):
+    import shutil
+    from consensus_assurance.workflow.inquiry import enqueue,process_task,task_context
+    from consensus_assurance.workflow.task_packet import prepare,pool_sources
+    from consensus_assurance.workflow.prompts import render
+    from consensus_assurance.adapters.agents.backend import MockAgent
+    from consensus_assurance.core.proposals import SpecRefinement,AuditSpecDelta
+    from test_graph_mutations import controller
+    repo,state,_,_=prepared;e=controller(tmp_path,state);shutil.copytree(repo,e.root/'source');state.units=[]
+    spec=inventory(state.materials[0].id);spec.target_profile.protocol_contexts=['Ancillary orientation '*12000]
+    spec.surfaces.append(Surface(entry_point='unread',disposition='deferred',high_consequence=True,reason='Actual owner unknown'));accept(e,spec)
+    task=enqueue(state,'spec_refine','Navigate one owner','surface-test',surface_entry_points=['unread'])
+    task.preparation_failures=1
+    compact=render('spec_refine',pool_sources(prepare(e,'spec_refine',task_context(e,task))[0]),e.inquiry)
+    task.preparation_failures=0;e.config.budget.context_chars=len(compact)+1000
+    agent=MockAgent();agent.responses=[SpecRefinement(understanding='Only the unrepresented external boundary remains',delta=AuditSpecDelta(rationale='No implementation source justifies a mapping; retain the deferred surface'),limitations=['External provider absent']).model_dump(mode='json')];e.agent=agent
+    process_task(e,task);task=state.inquiry_tasks[0]
+    assert task.preparation_failures==1 and task.admitted and task.status=='completed' and not task.child_task_ids
+    assert [p['status'] for p in state.packet_receipts]==['blocked_context_limit','accepted']
+    assert state.usage['agent_calls']==state.usage['exploration_rounds']==1
+
+
+def test_navigation_provenance_cannot_support_unseen_delta(tmp_path,prepared):
+    from consensus_assurance.workflow.audit_spec import merge_delta
+    from consensus_assurance.core.types import InquiryTask
+    from consensus_assurance.core.proposals import AuditSpecDelta
+    from test_graph_mutations import controller
+    _,state,_,_=prepared;e=controller(tmp_path,state);spec=inventory(state.materials[0].id);accept(e,spec)
+    task=InquiryTask(kind='spec_refine',reason='Interpret the producer',trigger='unseen',target_ids=['producer'],context_receipt_id='navigation-only')
+    delta=AuditSpecDelta(behaviors=[spec.behaviors[0].model_copy(update={'execution_owner':'A different owner'})],rationale='A proposed observation from historical provenance')
+    with pytest.raises(SpecIssue,match='attached exact source'):merge_delta(state,task,delta)
+    task.material_ids=[state.materials[0].id]
+    delta.behaviors[0].source_ids.append(state.materials[-1].id)
+    assert state.materials[-1].id not in task.material_ids  # Retained provenance is not a current body dependency.
+    assert merge_delta(state,task,delta).behaviors[0].execution_owner=='A different owner'

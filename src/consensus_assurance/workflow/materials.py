@@ -262,13 +262,6 @@ def execute_read(engine,requests,*,purpose='depth',partial=False,plan_id=None,re
     return state.read_plans[plan_id]
 
 
-def add_reads(state,repo,reading,budget):
-    receipt,materials=plan_read(state,repo,reading.requests,budget,reason=reading.gap or reading.rationale,related_ids=reading.related_ids)
-    apply_read(state,receipt,materials)
-    refresh_unread(state,repo)
-    return [id for item in receipt.items if item.status=='acquired' for id in item.material_ids]
-
-
 def request_groups(value,path=''):
     if isinstance(value,Record):value=value.model_dump(mode='json')
     if isinstance(value,dict):

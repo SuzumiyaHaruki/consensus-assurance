@@ -158,9 +158,11 @@ from .sources import all_materials
 def diagnostic_context(candidate,diagnostics,context,limit):
     """Follow explicit referenced objects; never arbitrary graph connectedness."""
     ids={id for d in diagnostics for id in d.object_ids};wanted={id for d in diagnostics for id in d.material_ids};objects=[];index={}
+    from .audit_spec import audit_object_key
     def collect(node):
         if isinstance(node,dict):
-            if isinstance(node.get('id',node.get('class_id')),str):index[node.get('id',node.get('class_id'))]=node
+            key=audit_object_key(node)
+            if key:index[key]=node
             for value in node.values():collect(value)
         elif isinstance(node,list):
             for value in node:collect(value)
@@ -185,7 +187,7 @@ def diagnostic_context(candidate,diagnostics,context,limit):
     explicit=list(dict.fromkeys(context.get('repair_requested_material_ids',[])+[id for d in diagnostics for id in d.material_ids if id in available]))
     wanted.update(explicit)
     include_dependencies=schema_ids or any(d.category in {'association','material'} for d in diagnostics)
-    direct=[o for o in objects if include_dependencies or o.get('id',o.get('class_id')) in ids]
+    direct=[o for o in objects if include_dependencies or audit_object_key(o) in ids]
     for diagnostic in diagnostics:
         if diagnostic.code.startswith('condition_') or diagnostic.code=='declaration_identity':direct.append({'current_condition_problem':diagnostic.details})
     objects=direct
@@ -198,7 +200,7 @@ def diagnostic_context(candidate,diagnostics,context,limit):
         else:omitted.append(id)
     missing_objects=[]
     if len(json.dumps(objects,ensure_ascii=False))>limit:
-        missing_objects=[o['id'] for o in objects if 'id' in o]
+        missing_objects+=list(filter(None,(audit_object_key(o) for o in objects)))
         objects=[]
     return {'objects':objects,'required_objects_missing':missing_objects,'materials':selected,'omitted_material_ids':sorted(set(omitted)),
         'required_material_ids':explicit,'required_materials_missing':[id for id in explicit if id not in {m['id'] for m in selected}],

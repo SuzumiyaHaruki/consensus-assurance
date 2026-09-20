@@ -4,7 +4,8 @@ from consensus_assurance.core.types import InquiryTask,SemanticCheck
 from consensus_assurance.core.proposals import ReviewReply
 from consensus_assurance.core.config import Budget
 from consensus_assurance.workflow.inquiry import validate_review
-from consensus_assurance.workflow.materials import ReadingPlan,add_reads
+from consensus_assurance.workflow.materials import ReadingPlan
+from regression_support import add_reads
 
 
 

@@ -7,7 +7,8 @@ from consensus_assurance.core.config import Config
 from consensus_assurance.core.types import Analysis
 from consensus_assurance.core.proposals import Bundle, GraphDraft
 from consensus_assurance.adapters.storage.snapshot import capture
-from consensus_assurance.workflow.materials import initial_materials, add_reads, ReadingPlan
+from consensus_assurance.workflow.materials import initial_materials,  ReadingPlan
+from regression_support import add_reads
 from consensus_assurance.workflow.graph import apply_graph
 from consensus_assurance.adapters.verifiers.tlc import TLCVerifier
 from consensus_assurance.adapters.runners.process import ProcessRunner

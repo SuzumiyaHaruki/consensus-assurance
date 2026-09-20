@@ -97,3 +97,11 @@ def fixture_reachability(bundle):
     result['reachability']=[{'id':'fixture_step_reached','operator':'FixtureStep','claim_ids':['step_obligation'],
         'behavior_ids':['fixture_step'],'fact_ids':['fixture_value'],'description':'The isolated toy step establishes value one'}]
     return result
+
+
+def add_reads(state,repo,reading,budget):
+    from consensus_assurance.workflow.materials import plan_read,apply_read,refresh_unread
+    receipt,materials=plan_read(state,repo,reading.requests,budget,reason=reading.gap or reading.rationale,related_ids=reading.related_ids)
+    apply_read(state,receipt,materials)
+    refresh_unread(state,repo)
+    return [id for item in receipt.items if item.status=='acquired' for id in item.material_ids]

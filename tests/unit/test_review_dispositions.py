@@ -113,10 +113,10 @@ def test_semantic_transaction_failure_and_recovery_are_atomic(tmp_path,prepared,
 
 
 def test_zero_review_budget_records_unreviewed_exploratory_permission(tmp_path,prepared):
-    from consensus_assurance.workflow.inquiry import prepare_selected
+    from consensus_assurance.workflow.reviews import readiness
     _,state,_,_=prepared;engine=engine_for(tmp_path,state)
     engine.config.budget.semantic_reviews=0;engine.config.budget.exploration_rounds=0
-    assert prepare_selected(engine,state.units[0])
+    state.units[0].semantic_readiness=readiness(state,state.units[0])
     assert state.units[0].semantic_readiness['status']=='unreviewed'
     assert state.units[0].semantic_readiness['unresolved']
     assert 'cannot confirm' in state.units[0].semantic_readiness['limitation']

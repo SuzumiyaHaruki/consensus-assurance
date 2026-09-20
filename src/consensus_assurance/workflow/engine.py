@@ -26,7 +26,8 @@ from .errors import Blocked
 from .agent_tasks import ask as ask_agent
 
 
-FRAMEWORK_REVISION = "selected-question-v5"
+from .prompts import manifest
+FRAMEWORK_REVISION = manifest()['version']
 
 
 class Engine:
@@ -441,7 +442,8 @@ class Engine:
                     task=self.state.targeted_gap
                     self.targeted_read(unit,task["gap"],task.get("relation_ids"),task.get("requests"))
                     self.advance("build");continue
-                if not inquiry.prepare_selected(self,unit):return
+                unit.semantic_readiness=inquiry.readiness(self.state,unit)
+                self.checkpoint('selected_unit_semantic_readiness')
                 previous=model or next((m for m in reversed(self.state.models) if m.unit_id==unit.previous_id),None)
                 if previous is None and (unit.recheck_reasons or unit.obligation_checks):
                     previous=next((m for m in reversed(self.state.models) if m.unit_id==unit.id),None)
@@ -498,7 +500,7 @@ class Engine:
                 failed=next((f for f in reversed(self.state.findings) if f.check_id==check.id),None)
                 if check.outcome=="counterexample" and not failed:
                     raise Blocked("Reported invariant cannot be attributed to a configured claim; other properties remain unknown")
-                inquiry.after_search(self,unit,model,check)
+                inquiry.review_unit(self,unit,'after_search:'+check.id,model)
                 self.state.last_work_kind="local"
                 if failed:
                     self.state.active_finding_id=failed.id; failed.stage=Investigation.REACHABILITY_PENDING
@@ -613,7 +615,7 @@ class Engine:
                     self.state.stop_reason = "Plan generated; modeling and checks not scheduled"
                     return self.state
                 inquiry.wake_changed(self)
-                inquiry.clear_reserve(self)
+                self.budget.reserved_agent_calls=0;self.budget.reserved_seconds=0
                 can_inquire = inquiry.enabled(self) and (self.state.active_inquiry_id or (self.state.pending_action is None and self.state.pending_output_repair is None))
                 if can_inquire:
                     focused_review=any(t.kind=="review" and t.status=="pending" and t.unit_id in self.state.deferred_units for t in self.state.inquiry_tasks)
@@ -651,7 +653,9 @@ class Engine:
                         inquiry.pause_unit(self,str(exc))
                     continue
                 if self.state.audit_spec_path and not any(u.status in {'pending','partial'} for u in self.state.units) and 'derived-spec:'+str(self.state.audit_spec_version) not in self.state.completed_steps:
-                    from .discovery import derive
+                    from .budget import can_start_episode
+                    if not can_start_episode(self.state,'candidate'):
+                        self.state.stop_reason='Insufficient remaining agent calls to start a new candidate episode; unresolved work remains';break
                     derive(self);continue
                 if not any(u.status in {"pending", "partial"} for u in self.state.units):
                     missing = [u.id + ": " + ", ".join(u.remaining_obligation_ids) for u in self.state.units if u.remaining_obligation_ids and u.status != "revised"]

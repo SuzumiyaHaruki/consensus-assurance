@@ -1,0 +1,1863 @@
+{
+  "input": {
+    "obligation": null,
+    "bindings": [],
+    "dependencies": [],
+    "context_claims": [],
+    "audit_question": {
+      "disposition": "explained_by_existing_mechanism",
+      "preferred_check": "source_review",
+      "requests": [],
+      "question": "For F4's normally returning command application, how is the attached future's FSM response published to a caller that waits for its completion before calling Response? The local publication discriminator is resolved by response assignment followed by channel synchronization; end-to-end dispatch identity and competing completion ownership remain outside this explanation.",
+      "importance": "A caller may use an operation's returned response to decide subsequent actions. Publishing completion before its associated response could expose an incorrect result despite the FSM callback having run.",
+      "source_ids": [
+        "fsm.go:81:240",
+        "future.go:1:180",
+        "api.go:800:899"
+      ],
+      "participants": [
+        "runFSM goroutine executing applySingle",
+        "Caller invoking Error and then Response on the attached logFuture"
+      ],
+      "objects": [
+        "Command commitTuple",
+        "Attached logFuture",
+        "FSM callback response",
+        "deferError.errCh"
+      ],
+      "contexts": [
+        "Single-entry command application with an attached initialized future",
+        "Normal FSM.Apply return",
+        "Completion received from this application path",
+        "Caller invokes Response after Error returns and does not call Error concurrently on the same future"
+      ],
+      "event_paths": [
+        "FSM.Apply returns -> applySingle assigns req.future.response -> respond sends completion and closes errCh -> Error receives completion -> Response reads the same future's response field"
+      ],
+      "activity_classes": [
+        "A5",
+        "A7"
+      ],
+      "behavior_ids": [
+        "B1",
+        "B6"
+      ],
+      "fact_ids": [
+        "F4"
+      ],
+      "obligation_relation_kind": "consumption",
+      "counterevidence": [
+        "future.go:1:180 explicitly requires Response to be called only after Error returns and prohibits concurrent Error calls on the same future.",
+        "fsm.go:81:240 assigns the normally returned FSM.Apply value to req.future.response before invoking req.future.respond(nil). Both accesses use the same attached future.",
+        "future.go:1:180 shows respond sending on errCh and then closing it, while Error receives from errCh. Under Go channel synchronization semantics, the preceding response assignment is published to the receiving caller. Sequential repeated successful Error calls receive from the closed channel.",
+        "future.go:1:180 shows logFuture.Response returning its response field directly; an FSM-returned error remains that response rather than becoming the Raft completion error.",
+        "api.go:800:899 initializes a distinct command future and returns the same pointer sent to applyCh. Immediate enqueue or shutdown failures instead return errorFuture."
+      ],
+      "unknowns": [
+        "The unread protocol-to-FSM dispatch path has not established that the future returned by ApplyLog is always the future attached to the corresponding command tuple.",
+        "Ownership and ordering of competing completion paths remain unread. The responded flag suppresses repeated responses but is not itself evidence of synchronization between concurrent producers.",
+        "This explanation does not establish response validity after an earlier error completion, callback panic, later mutation of application-owned response objects, or snapshot restoration."
+      ],
+      "priority": 3,
+      "trigger_rationale": "The acquired future implementation resolves the selected local visibility suspicion: completion from applySingle follows response assignment and supplies a synchronization boundary. This is a scoped source explanation, not execution evidence or an end-to-end completion guarantee."
+    },
+    "selection_rationale": "Continue F4 consumption and close the local publication suspicion using the acquired producer, future contract, and synchronization implementation. No obligation or experiment is needed for that discriminator. Upstream identity preservation and competing completion ownership remain explicit limitations; they are not established by the local channel mechanism.",
+    "reading_requests": [],
+    "descriptive_issues": [
+      {
+        "object_ids": [
+          "A7",
+          "F4"
+        ],
+        "source_ids": [
+          "future.go:1:180",
+          "fsm.go:81:240"
+        ],
+        "reason": "The inventory omits the now-observed caller-side consumer: Error receives completion through errCh, after which Response reads the attached logFuture.response. Add this consumption behavior with the documented caller ordering and nonconcurrent Error restriction, preserving the distinction between an FSM response that contains an error and a Raft completion error. Do not infer upstream tuple identity or exclusive completion ownership."
+      }
+    ]
+  },
+  "before": {
+    "question_candidates": [
+      {
+        "id": "ac2179e4559d4eb49e9e02a9fbf82982",
+        "question": {
+          "disposition": "needs_specific_evidence",
+          "preferred_check": "source_review",
+          "requests": [],
+          "question": "Can an applicable FSMSnapshot.Persist implementation return nil after FileSnapshotSink.Close fails, allowing takeSnapshot to consume the repeated Close's nil result as completion and proceed to log compaction?",
+          "importance": "Reclaiming logs after unsuccessful snapshot publication could leave restart recovery without necessary state or history. The supplied code establishes a conditional path to compaction, but neither an admissible callback execution nor actual recovery loss.",
+          "source_ids": [
+            "file_snapshot.go:397:500",
+            "fsm.go:1:80",
+            "snapshot.go:1:278"
+          ],
+          "participants": [
+            "Snapshot goroutine invoking takeSnapshot",
+            "Application-provided FSMSnapshot.Persist implementation",
+            "FileSnapshotSink.Close caller"
+          ],
+          "objects": [
+            "Specific FileSnapshotSink instance",
+            "Persist return value",
+            "Last-snapshot index and term",
+            "Retained snapshots and log history"
+          ],
+          "contexts": [
+            "Snapshot creation using the built-in file snapshot store",
+            "An initial Close fails after setting the sink's closed flag",
+            "A subsequent Close on the same sink returns nil",
+            "Application callback error handling and its contractual admissibility remain unverified"
+          ],
+          "event_paths": [
+            "FileSnapshotSink.Close sets closed before fallible finalization and publication; a subsequent Close returns nil without retrying those operations.",
+            "If Persist propagates the initial Close error, takeSnapshot calls Cancel and returns before its own Close, metadata update, or compaction.",
+            "If Persist instead returns nil, takeSnapshot's subsequent Close returns nil, allowing last-snapshot metadata update and compactLogs invocation.",
+            "If the first failing Close occurs in takeSnapshot itself, its error check prevents the metadata update and compaction.",
+            "Log deletion additionally requires a nonempty range permitted by the snapshot index and trailing-log retention, and successful DeleteRange execution."
+          ],
+          "activity_classes": [
+            "A6"
+          ],
+          "behavior_ids": [
+            "B8",
+            "B9"
+          ],
+          "fact_ids": [
+            "F5"
+          ],
+          "obligation_relation_kind": "consumption",
+          "counterevidence": [
+            "FSMSnapshot.Persist documentation assigns the callback responsibility for writing necessary state and calling Close when finished or Cancel on error; SnapshotSink documentation likewise assigns completion and cancellation to the FSM.",
+            "takeSnapshot checks Persist's error before its own Close. Propagation of the initial Close failure prevents the proposed path to compaction.",
+            "takeSnapshot checks its own Close result before updating last-snapshot metadata or invoking compaction.",
+            "F5 establishes an in-memory closed flag and subsequent nil-return behavior, not successful publication.",
+            "Compaction preserves configured trailing logs and does not delete beyond the supplied snapshot index; reaching compaction alone does not demonstrate loss of necessary recovery history.",
+            "Directory synchronization and reaping failures can occur after rename, so a Close error alone does not establish snapshot unavailability."
+          ],
+          "unknowns": [
+            "Which application-selected FSMSnapshot.Persist implementation is applicable and whether it propagates, suppresses, or retries a sink Close failure.",
+            "Whether the applicable callback contract requires propagating Close failures through Persist's return value; the attached comments specify Close/Cancel ownership without expressly settling this requirement.",
+            "Whether returning nil after failed completion is an admissible execution within the intended library guarantee or violates an application responsibility.",
+            "The filesystem failure point, snapshot discoverability, older retained snapshots, and remaining logs necessary to establish a recovery consequence."
+          ],
+          "priority": 1,
+          "trigger_rationale": "Source review resolves the consumer discriminator: Persist and takeSnapshot's subsequent Close must both return nil before metadata update and compaction. Propagating the initial failure prevents that path. The remaining discriminator concerns applicable callback behavior and responsibility, which the supplied sources do not resolve."
+        },
+        "history": [
+          {
+            "disposition": null,
+            "preferred_check": "source_review",
+            "requests": [
+              {
+                "file": "file_snapshot.go",
+                "start_line": 397,
+                "end_line": 500,
+                "reason": "Verify Close error branches, repeated-close behavior, and publication ordering for F5."
+              },
+              {
+                "file": "snapshot.go",
+                "start_line": 1,
+                "end_line": 278,
+                "reason": "Locate the snapshot sink contract and trace takeSnapshot through Persist, Close, error handling, progress updates, and log reclamation."
+              },
+              {
+                "file": "fsm.go",
+                "start_line": 1,
+                "end_line": 80,
+                "reason": "Establish the FSMSnapshot.Persist contract, including ownership of sink completion and propagation of persistence errors."
+              }
+            ],
+            "question": "When snapshot persistence uses FileSnapshotSink, can takeSnapshot consume a nil result from a repeated Close after an earlier finalization failure as successful snapshot publication, or do the Persist contract and caller error handling prevent that interpretation?",
+            "importance": "If unsuccessful snapshot publication can authorize log reclamation, a later restart could lack both the snapshot and the log history needed to reconstruct state. This consequence is conditional on the actual completion and reclamation paths; neither the triggering execution nor data loss is established.",
+            "source_ids": [
+              "file_snapshot.go:397:500"
+            ],
+            "participants": [
+              "Snapshot execution invoking takeSnapshot",
+              "Application-provided FSMSnapshot.Persist implementation",
+              "FileSnapshotSink.Close caller"
+            ],
+            "objects": [
+              "FileSnapshotSink instance",
+              "Snapshot persistence result",
+              "Retained log history"
+            ],
+            "contexts": [
+              "Snapshot creation using the built-in file snapshot store",
+              "Fallible sink finalization followed by a possible repeated Close",
+              "Caller-selected FSMSnapshot implementation with currently unread completion obligations"
+            ],
+            "event_paths": [
+              "Observed sink behavior: Close sets closed before finalize; a finalize failure returns an error and attempts temporary-directory removal; a subsequent Close returns nil without retrying publication.",
+              "Candidate consumer path to verify: takeSnapshot invokes Persist; sink Close encounters a finalization error; another Close returns nil; takeSnapshot interprets completion and potentially reclaims logs."
+            ],
+            "activity_classes": [
+              "A6"
+            ],
+            "behavior_ids": [
+              "B8",
+              "B9"
+            ],
+            "fact_ids": [
+              "F5"
+            ],
+            "obligation_relation_kind": "consumption",
+            "counterevidence": [
+              "The acquired Close implementation returns an error on the first failed finalization. A consumer that propagates that error could prevent the candidate path.",
+              "The closed flag and repeated-close nil result do not by themselves establish successful publication: closed is set before finalize, metadata writing, rename, directory synchronization, and snapshot reaping.",
+              "Persist error propagation or takeSnapshot error handling could prevent the candidate path. Neither consumer mechanism has been verified from attached source."
+            ],
+            "unknowns": [
+              "Whether Persist must close the sink and propagate a Close failure.",
+              "Whether takeSnapshot can reach a repeated Close after a failed close under an applicable caller contract.",
+              "Which completion results authorize snapshot progress updates and log reclamation.",
+              "The applicable filesystem failure semantics and resulting retained recovery state are not established by the supplied Close implementation alone."
+            ],
+            "priority": 1,
+            "trigger_rationale": "The acquired source verifies F5's narrow assertion: closed is set before fallible finalization, and subsequent Close invocations immediately return nil. This resolves the sink-side control-flow discriminator but leaves consumer interpretation and caller-contract applicability unresolved. The same F5 consumption question requires focused review of Persist and takeSnapshot before deriving an obligation or disposing the candidate."
+          },
+          {
+            "disposition": "needs_specific_evidence",
+            "preferred_check": "source_review",
+            "requests": [],
+            "question": "Can an applicable FSMSnapshot.Persist implementation return nil after FileSnapshotSink.Close fails, allowing takeSnapshot to consume the repeated Close's nil result as completion and proceed to log compaction?",
+            "importance": "If a failed snapshot publication is followed by log reclamation, restart recovery could lack necessary state and history. The supplied code establishes a conditional route to compaction, but does not establish an applicable callback execution or actual recovery loss.",
+            "source_ids": [
+              "file_snapshot.go:397:500",
+              "fsm.go:1:80",
+              "snapshot.go:1:278"
+            ],
+            "participants": [
+              "Snapshot goroutine invoking takeSnapshot",
+              "Application-provided FSMSnapshot.Persist implementation",
+              "FileSnapshotSink.Close caller"
+            ],
+            "objects": [
+              "Specific FileSnapshotSink instance",
+              "Persist return value",
+              "Last-snapshot index and term",
+              "Retained snapshots and log history"
+            ],
+            "contexts": [
+              "Snapshot creation using the built-in file snapshot store",
+              "A first Close fails after setting the sink's closed flag",
+              "A subsequent Close on the same sink returns nil",
+              "Application callback error handling and its applicable contract remain unverified"
+            ],
+            "event_paths": [
+              "FileSnapshotSink.Close sets closed before fallible finalization and publication. Following a failure, another Close returns nil without retrying those operations.",
+              "If Persist returns the first Close error, takeSnapshot calls Cancel and returns before its own Close, last-snapshot update, or compaction.",
+              "If Persist returns nil after that failure, takeSnapshot calls Close again, receives nil, updates last-snapshot metadata, and invokes compactLogs.",
+              "If the first failing Close instead occurs in takeSnapshot itself, its error check returns before the metadata update and compaction.",
+              "Actual deletion additionally requires a nonempty range permitted by snapshot index and trailing-log retention."
+            ],
+            "activity_classes": [
+              "A6"
+            ],
+            "behavior_ids": [
+              "B8",
+              "B9"
+            ],
+            "fact_ids": [
+              "F5"
+            ],
+            "obligation_relation_kind": "consumption",
+            "counterevidence": [
+              "FSMSnapshot.Persist's interface documentation assigns the callback responsibility to write necessary state and call Close when finished or Cancel on error. SnapshotSink's documentation likewise assigns completion and cancellation to the FSM.",
+              "takeSnapshot checks Persist's error before calling Close; propagation of the first Close failure prevents this candidate execution.",
+              "takeSnapshot also checks its own Close result before updating last-snapshot metadata or invoking compaction.",
+              "A repeated Close returning nil is an observed lifecycle behavior, not an independently established guarantee of successful publication.",
+              "Compaction retains configured trailing logs and never deletes beyond the supplied snapshot index; invocation alone does not establish loss of necessary recovery history.",
+              "Some Close failures occur after rename, so a Close error alone does not establish that the snapshot is unavailable."
+            ],
+            "unknowns": [
+              "The actual application-selected FSMSnapshot.Persist implementation and whether it propagates, suppresses, or retries a sink Close failure.",
+              "Whether the applicable callback contract requires propagation of Close failures through Persist's return value. The attached interface comments specify Close/Cancel ownership but do not expressly settle that return-value requirement.",
+              "Whether a callback returning nil after failed completion is an admissible execution within the intended guarantee or a violation of an application responsibility.",
+              "The filesystem failure point, snapshot discoverability, older retained snapshots, and remaining logs needed to establish any recovery consequence."
+            ],
+            "priority": 1,
+            "trigger_rationale": "The acquired consumer source resolves which results authorize progress: both Persist and takeSnapshot's subsequent Close must return nil before metadata update and compaction. It also establishes a concrete protection when Persist propagates failure. The remaining discriminator is callback error handling and contractual admissibility, which cannot be inferred from the sink's closed flag or the orchestrator's guards."
+          }
+        ],
+        "check_ids": [
+          "1817c33cf14e4002ab3fd9247df633e1",
+          "056800eaa7e7438ba979df011eb28e52",
+          "5ec73e3b20e64e2a85b8f5e96c0a73b2"
+        ],
+        "status": "blocked",
+        "stage": "analyze",
+        "read_plan_id": "8237f90ee5b4401d88cc596450dce4e9",
+        "material_ids": [
+          "file_snapshot.go:397:500",
+          "snapshot.go:1:278",
+          "fsm.go:1:80"
+        ],
+        "spec_task_ids": [],
+        "stagnation": 0,
+        "stop_reason": "Retain the selected F5 consumption question as evidence-blocked. The acquired receipt is complete, and the supplied code establishes the conditional control flow and its error-propagation protection. Responsibility for reporting an initial sink Close failure through Persist remains unattributed. No supplied source identifies the selected callback implementation or an exact repository range that settles its applicable return-value contract. An arbitrary example callback or injected callback that suppresses errors would not establish admissibility. Further publication and recovery reads could characterize consequences but would not resolve this prerequisite. No obligation or executable check is justified from the current evidence; this disposition establishes neither an explanation nor a defect.",
+        "obligation_id": null
+      },
+      {
+        "id": "fb1a27032fce4da48b6ef4793b71f912",
+        "question": {
+          "disposition": "explained_by_existing_mechanism",
+          "preferred_check": "source_review",
+          "requests": [],
+          "question": "Can a delayed campaign_vote_result produced for a completed runCandidate invocation enter a later invocation's election tally?",
+          "importance": "Counting support from a superseded election could establish local leadership without support for the current election context. The reviewed channel mechanism addresses cross-invocation tally contamination; broader leadership guarantees remain outside this conclusion.",
+          "source_ids": [
+            "raft.go:285:441",
+            "raft.go:1900:2241"
+          ],
+          "participants": [
+            "Candidate Raft instance",
+            "Remote vote worker goroutines"
+          ],
+          "objects": [
+            "Invocation-local election result channel",
+            "Captured vote request",
+            "Invocation-local grantedVotes counter"
+          ],
+          "contexts": [
+            "Delayed worker completion after election timeout",
+            "Candidate-loop exit followed by a new invocation",
+            "Direct election or election following successful pre-vote"
+          ],
+          "event_paths": [
+            "electSelf allocates channel -> worker captures that channel -> runCandidate returns -> later invocation allocates a different channel -> old worker sends only to its captured channel"
+          ],
+          "activity_classes": [
+            "A2"
+          ],
+          "behavior_ids": [
+            "candidate_campaign_control",
+            "election_setup_and_self_vote",
+            "remote_vote_result"
+          ],
+          "fact_ids": [
+            "campaign_vote_result"
+          ],
+          "obligation_relation_kind": "consumption",
+          "counterevidence": [
+            "Every electSelf call allocates a fresh respCh. Each remote worker closes over that call's channel and request, and sends its result once to that channel.",
+            "runCandidate keeps voteCh and grantedVotes in invocation-local variables. Its election-timeout branch returns, so subsequent invocations do not inherit the prior channel or tally.",
+            "The pre-vote success branch disables prevoteCh before calling electSelf. The shown invocation therefore does not repeatedly replace its election channel while retaining accumulated vote grants.",
+            "A higher-term vote response causes a follower transition and return before grant counting. A role change observed at the next loop guard ends candidate processing.",
+            "Transport errors are converted to refusals. A self-vote persistence error returns a nil channel, which prevents that caller from consuming even results already produced on the abandoned channel.",
+            "The tally checks for higher response terms but does not require term equality. Channel isolation explains the selected cross-invocation delay scenario without establishing the semantics of every response received through the active transport call."
+          ],
+          "unknowns": [
+            "Transport response correlation and remote voting semantics remain unread; channel isolation does not establish that a successful transport call returns support for its captured request.",
+            "Effects of processRPC on the term and role within a still-running candidate invocation remain unread. This conclusion does not establish that every counted grant matches the current term after such processing.",
+            "Quorum calculation, configuration identity uniqueness, dispatcher behavior, and completed leader initialization remain outside the attached evidence."
+          ],
+          "priority": 1,
+          "trigger_rationale": "Source review resolved the selected delayed-worker discriminator: producer closures retain their original channels, while subsequent candidate invocations have fresh channels and counters. This is a scoped mechanism explanation, not evidence of overall election correctness."
+        },
+        "history": [
+          {
+            "disposition": "needs_specific_evidence",
+            "preferred_check": "source_review",
+            "requests": [
+              {
+                "file": "raft.go",
+                "start_line": 285,
+                "end_line": 441,
+                "reason": "Inspect candidate result consumption, term checks, campaign replacement, quorum counting, and the branch that enters the leader role."
+              },
+              {
+                "file": "raft.go",
+                "start_line": 1900,
+                "end_line": 2241,
+                "reason": "Inspect election result producers, channel ownership, participant selection, request context, and error normalization to determine which results can reach the selected tally."
+              }
+            ],
+            "question": "When runCandidate consumes campaign_vote_result, can a delayed result from a superseded election contribute to entering the leader role, or do invocation-specific channels and term handling restrict counted grants to the active election?",
+            "importance": "Counting support from a superseded election could establish local leadership without the support required for its current election context. This could affect subsequent proposal admission and replication; those consequences require separate evidence.",
+            "source_ids": [
+              "raft.go:285:441",
+              "raft.go:1900:2241"
+            ],
+            "participants": [
+              "Candidate Raft instance",
+              "Voters contacted by election goroutines"
+            ],
+            "objects": [
+              "Election result channel",
+              "Vote request and response",
+              "Candidate election tally",
+              "Local term and role"
+            ],
+            "contexts": [
+              "Candidate elections with delayed RPC responses",
+              "Election timeout followed by a new campaign",
+              "Higher-term responses during candidate execution"
+            ],
+            "event_paths": [
+              "electSelf launches remote result producers -> campaign is superseded -> delayed result becomes available -> runCandidate processes election results"
+            ],
+            "activity_classes": [
+              "A2"
+            ],
+            "behavior_ids": [
+              "candidate_campaign_control",
+              "election_setup_and_self_vote",
+              "remote_vote_result"
+            ],
+            "fact_ids": [
+              "campaign_vote_result"
+            ],
+            "obligation_relation_kind": "consumption",
+            "counterevidence": [
+              "The provisional inventory describes invocation-specific result channels and higher-term checks. These may isolate old results completely; their actual control flow needs attached source review.",
+              "The selected fact describes an available tally input, not established authority or a durable remote vote."
+            ],
+            "unknowns": [
+              "Whether every election invocation allocates a distinct channel and producers retain only that invocation's channel.",
+              "Whether timeout, role changes, and campaign replacement prevent consumption of superseded results.",
+              "Which response term and grant conditions permit tally increments and entry into the leader role.",
+              "The applicable election-context expectation has not yet been grounded in acquired source."
+            ],
+            "priority": 1,
+            "trigger_rationale": "The accepted inventory identifies independent remote producers and a candidate consumer, creating a concrete asynchronous boundary to inspect. No exact source is attached, so this is an initial source-review question rather than a defect judgment."
+          }
+        ],
+        "check_ids": [
+          "69582fd6f2454d7d91b2b90f77964ef6",
+          "e176f0ae972442688646e1b24e04363f"
+        ],
+        "status": "explained",
+        "stage": "analyze",
+        "read_plan_id": "8b5efc452b604277a207f1ed37058614",
+        "material_ids": [
+          "raft.go:285:441",
+          "raft.go:1900:2241"
+        ],
+        "spec_task_ids": [],
+        "stagnation": 0,
+        "stop_reason": "The acquired producer and consumer declarations explain why delayed results from a completed invocation cannot enter a later invocation's tally through the shown channels. No obligation or executable check is needed for that suspicion. The conclusion is restricted to channel ownership across invocations; transport correlation and changes of protocol context within an invocation remain explicit gaps. The accepted inventory already represents these mechanisms and unknowns, so this review identifies no descriptive correction.",
+        "obligation_id": null
+      },
+      {
+        "id": "86c45c1ac6074cbea5ca95e3ccd56f0d",
+        "question": {
+          "disposition": "needs_specific_evidence",
+          "preferred_check": "source_review",
+          "requests": [
+            {
+              "file": "fsm.go",
+              "start_line": 81,
+              "end_line": 240,
+              "reason": "Verify the selected F4 producer, response assignment, deferred completion, and command versus non-command branches."
+            },
+            {
+              "file": "future.go",
+              "start_line": 1,
+              "end_line": 180,
+              "reason": "Read the future interface contracts and completion synchronization to determine when a caller may consume the FSM response."
+            },
+            {
+              "file": "api.go",
+              "start_line": 800,
+              "end_line": 899,
+              "reason": "Verify ApplyLog's caller-facing completion contract and the identity of the returned command future."
+            }
+          ],
+          "question": "For a command handled by applySingle with an attached future, does the documented caller sequence for awaiting successful completion and reading Response reliably consume the response established by F4? The discriminator is whether completion synchronization publishes that same future's assigned FSM response before the permitted caller read, or whether a permitted read can observe an unset or unrelated response.",
+          "importance": "Callers may use successful operation completion and its response to decide subsequent actions. A mismatch between callback completion, response publication, and the documented future API could expose an incorrect operation result even when the state-machine callback ran.",
+          "source_ids": [
+            "fsm.go:81:240",
+            "api.go:800:899"
+          ],
+          "participants": [
+            "runFSM goroutine executing applySingle",
+            "Caller awaiting and reading the command future"
+          ],
+          "objects": [
+            "Command commitTuple",
+            "Attached logFuture",
+            "FSM callback response"
+          ],
+          "contexts": [
+            "Single-entry command application with an attached future",
+            "Normal FSM.Apply return",
+            "Caller follows the future API's documented ordering requirements"
+          ],
+          "event_paths": [
+            "ApplyLog returns a command future -> applySingle invokes FSM.Apply -> callback response is assigned -> completion is signaled -> caller awaits completion and reads Response"
+          ],
+          "activity_classes": [
+            "A5",
+            "A7"
+          ],
+          "behavior_ids": [
+            "B1",
+            "B6"
+          ],
+          "fact_ids": [
+            "F4"
+          ],
+          "obligation_relation_kind": "consumption",
+          "counterevidence": [
+            "The supplied inventory describes response assignment before respond(nil), which is a plausible publication protection. Its implementation and synchronization must be verified from exact source.",
+            "The supplied inventory describes ApplyLog returning the same allocated future after enqueue, which may preserve request identity. This remains a navigation aid rather than acquired implementation evidence."
+          ],
+          "unknowns": [
+            "The applicable Error and Response interface contracts and required caller ordering.",
+            "The synchronization used by respond and Error, including whether it publishes the response field to the caller.",
+            "The exact future identity passed into applySingle and whether competing completion paths matter within this bounded scenario."
+          ],
+          "priority": 3,
+          "trigger_rationale": "F4 identifies a concrete application result whose consumer-side interpretation remains unread. The producer, future implementation, and public API provide a bounded source discriminator without reopening either previously disposed candidate."
+        },
+        "history": [],
+        "check_ids": [
+          "3cbe178c05a94d50830cfb3bbb40e01b"
+        ],
+        "status": "active",
+        "stage": "analyze",
+        "read_plan_id": "4d4b1bac9bb945ccb5c7a4d77c36c8cf",
+        "material_ids": [
+          "fsm.go:81:240",
+          "future.go:1:180",
+          "api.go:800:899"
+        ],
+        "spec_task_ids": [],
+        "stagnation": 0,
+        "stop_reason": "",
+        "obligation_id": null
+      }
+    ],
+    "inquiry_tasks": [
+      {
+        "surface_entry_points": [],
+        "candidate_id": null,
+        "draft_path": null,
+        "diagnostics": [],
+        "admitted": false,
+        "preparation_failures": 0,
+        "semantic_failures": 0,
+        "parent_task_id": null,
+        "child_task_ids": [],
+        "requested_aspects": {},
+        "expected_contribution": "",
+        "context_receipt_id": null,
+        "context_dependencies": {},
+        "read_plan_id": null,
+        "repair_session": null,
+        "resolution_issue_ids": [],
+        "id": "9e2b1259bd284d6fa4a18c172a06d71c",
+        "kind": "spec_refine",
+        "reason": "Resolve decisive understanding gaps",
+        "trigger": "initial-reads",
+        "activity_classes": [],
+        "target_ids": [],
+        "target_versions": {},
+        "unit_id": null,
+        "model_id": null,
+        "requests": [
+          {
+            "file": "file_snapshot.go",
+            "start_line": 1,
+            "end_line": 220,
+            "reason": "Expand the file-snapshot frontier: identify constructor configuration, sink creation, temporary naming, and publication prerequisites."
+          },
+          {
+            "file": "file_snapshot.go",
+            "start_line": 221,
+            "end_line": 396,
+            "reason": "Recover snapshot listing, opening, retention, and sink lifecycle declarations so publication has concrete consumers and failure handling."
+          },
+          {
+            "file": "file_snapshot.go",
+            "start_line": 501,
+            "end_line": 551,
+            "reason": "Read writeMeta and remaining helpers to establish actual metadata write and synchronization ordering."
+          },
+          {
+            "file": "snapshot.go",
+            "start_line": 1,
+            "end_line": 124,
+            "reason": "Read SnapshotStore and SnapshotSink contracts and snapshot-loop selection to distinguish required callback behavior from observed file-sink behavior."
+          },
+          {
+            "file": "fsm.go",
+            "start_line": 241,
+            "end_line": 285,
+            "reason": "Complete FSM dispatch and restore helper context needed to separate queue receipt, callback return, and restore completion."
+          }
+        ],
+        "status": "pending",
+        "stage": "read",
+        "added_material_ids": [],
+        "stop_reason": "",
+        "check_id": null,
+        "unit_version": null,
+        "material_ids": [],
+        "superseded_by": null
+      },
+      {
+        "surface_entry_points": [
+          "Raft.Barrier / VerifyLeader / GetConfiguration"
+        ],
+        "candidate_id": null,
+        "draft_path": null,
+        "diagnostics": [],
+        "admitted": true,
+        "preparation_failures": 0,
+        "semantic_failures": 0,
+        "parent_task_id": null,
+        "child_task_ids": [],
+        "requested_aspects": {},
+        "expected_contribution": "",
+        "context_receipt_id": "1b7e202343804ec3b90df0d04db87b74",
+        "context_dependencies": {},
+        "read_plan_id": "2ec229ccf4374641ae944c508f80d55d",
+        "repair_session": null,
+        "resolution_issue_ids": [],
+        "id": "bd32357e7f1e41df9b8f2aac9f0e821c",
+        "kind": "spec_refine",
+        "reason": "Expand one source-grounded implementation surface",
+        "trigger": "surface:Raft.Barrier / VerifyLeader / GetConfiguration",
+        "activity_classes": [],
+        "target_ids": [],
+        "target_versions": {},
+        "unit_id": null,
+        "model_id": null,
+        "requests": [
+          {
+            "file": "api.go",
+            "start_line": 850,
+            "end_line": 925,
+            "reason": "Recover the contracts and complete implementations of Raft.Barrier, Raft.VerifyLeader, and Raft.GetConfiguration, including request construction, enqueue paths, rejection conditions, and returned futures. Use actual references to identify subsequent execution and completion dependencies."
+          },
+          {
+            "file": "raft.go",
+            "start_line": 950,
+            "end_line": 1035,
+            "reason": "Inspect the hinted verifyLeader declaration and surrounding context to identify how verification starts, its immediate completion branches, and references to asynchronous support collection. Further reads will follow only dependencies established by this source."
+          }
+        ],
+        "status": "completed",
+        "stage": "done",
+        "added_material_ids": [
+          "api.go:850:925",
+          "raft.go:950:1035"
+        ],
+        "stop_reason": "",
+        "check_id": "c79ef528e2c549468937c0f9e4c8bdc9",
+        "unit_version": null,
+        "material_ids": [
+          "api.go:850:925",
+          "raft.go:950:1035"
+        ],
+        "superseded_by": null
+      },
+      {
+        "surface_entry_points": [],
+        "candidate_id": "ac2179e4559d4eb49e9e02a9fbf82982",
+        "draft_path": "/home/nitro/Desktop/consensus-assurance/runs/2026-09-20_12-07-49-hashicorp_raft-real-run/audit-spec/v2.json",
+        "diagnostics": [
+          {
+            "code": "audit_spec_semantics",
+            "category": "semantic",
+            "object_ids": [
+              "A6",
+              "B9",
+              "surface:Raft.takeSnapshot / compactLogsWithTrailing / removeOldLogs"
+            ],
+            "material_ids": [
+              "snapshot.go:1:278"
+            ],
+            "message": "B9 still records timer and public API callers as unread. The acquired runSnapshots implementation now identifies the snapshot goroutine's randomized timer branch with shouldSnapshot filtering, its userSnapshotCh branch, and shutdown handling. These are reusable trigger and execution-owner details missing from the inventory. The user-request branch also publishes an opener only after takeSnapshot succeeds and responds with the returned error; the public API producer of userSnapshotCh remains unread.",
+            "allowed": [
+              "read",
+              "semantic_revision"
+            ]
+          }
+        ],
+        "admitted": true,
+        "preparation_failures": 0,
+        "semantic_failures": 0,
+        "parent_task_id": null,
+        "child_task_ids": [],
+        "requested_aspects": {},
+        "expected_contribution": "",
+        "context_receipt_id": "f764f40ab8544df5b79208a012ee621a",
+        "context_dependencies": {},
+        "read_plan_id": null,
+        "repair_session": null,
+        "resolution_issue_ids": [],
+        "id": "14ddc43e65e34734a9aac03320cd6522",
+        "kind": "spec_refine",
+        "reason": "B9 still records timer and public API callers as unread. The acquired runSnapshots implementation now identifies the snapshot goroutine's randomized timer branch with shouldSnapshot filtering, its userSnapshotCh branch, and shutdown handling. These are reusable trigger and execution-owner details missing from the inventory. The user-request branch also publishes an opener only after takeSnapshot succeeds and responds with the returned error; the public API producer of userSnapshotCh remains unread.",
+        "trigger": "056800eaa7e7438ba979df011eb28e52:A6,B9,surface:Raft.takeSnapshot / compactLogsWithTrailing / removeOldLogs",
+        "activity_classes": [],
+        "target_ids": [
+          "A6",
+          "B9",
+          "surface:Raft.takeSnapshot / compactLogsWithTrailing / removeOldLogs"
+        ],
+        "target_versions": {},
+        "unit_id": null,
+        "model_id": null,
+        "requests": [],
+        "status": "completed",
+        "stage": "done",
+        "added_material_ids": [],
+        "stop_reason": "",
+        "check_id": "9e62ea4e6f854c78a3583dd8862877b7",
+        "unit_version": null,
+        "material_ids": [
+          "fsm.go:1:80",
+          "file_snapshot.go:397:500",
+          "snapshot.go:1:278"
+        ],
+        "superseded_by": null
+      },
+      {
+        "surface_entry_points": [
+          "Raft.runCandidate, electSelf, preElectSelf, and authority setters"
+        ],
+        "candidate_id": null,
+        "draft_path": null,
+        "diagnostics": [],
+        "admitted": true,
+        "preparation_failures": 0,
+        "semantic_failures": 0,
+        "parent_task_id": null,
+        "child_task_ids": [],
+        "requested_aspects": {},
+        "expected_contribution": "",
+        "context_receipt_id": "3caa059ff60643e0b233e40c0b738b33",
+        "context_dependencies": {},
+        "read_plan_id": "b31418af8ea442bfb677540d2c2b5de2",
+        "repair_session": null,
+        "resolution_issue_ids": [],
+        "id": "3fec3fd7e1f346a889a06209f8335f4b",
+        "kind": "spec_refine",
+        "reason": "Expand one source-grounded implementation surface",
+        "trigger": "surface:Raft.runCandidate, electSelf, preElectSelf, and authority setters",
+        "activity_classes": [],
+        "target_ids": [],
+        "target_versions": {},
+        "unit_id": null,
+        "model_id": null,
+        "requests": [
+          {
+            "file": "raft.go",
+            "start_line": 285,
+            "end_line": 441,
+            "reason": "Recover candidate execution ownership, election and pre-election result consumption, timeout and higher-term branches, and calls requesting authority transitions."
+          },
+          {
+            "file": "raft.go",
+            "start_line": 1900,
+            "end_line": 2241,
+            "reason": "Read electSelf and preElectSelf with adjacent helper declarations and authority setters to identify result producers, asynchronous boundaries, persistence ordering, error branches, and the distinction between requested and completed transitions."
+          },
+          {
+            "file": "state.go",
+            "start_line": 1,
+            "end_line": 174,
+            "reason": "Recover the underlying role and term state accessors and mutation semantics used by authority setters, without inferring transition completion from candidate call sites."
+          }
+        ],
+        "status": "completed",
+        "stage": "done",
+        "added_material_ids": [
+          "raft.go:285:441",
+          "raft.go:1900:2241",
+          "state.go:1:174"
+        ],
+        "stop_reason": "",
+        "check_id": "8af772fbdc4f4d58a04e85e1903bf497",
+        "unit_version": null,
+        "material_ids": [
+          "raft.go:285:441",
+          "raft.go:1900:2241",
+          "state.go:1:174"
+        ],
+        "superseded_by": null
+      },
+      {
+        "surface_entry_points": [
+          "Raft.checkRPCHeader / Transport heartbeat dispatch"
+        ],
+        "candidate_id": null,
+        "draft_path": null,
+        "diagnostics": [],
+        "admitted": true,
+        "preparation_failures": 0,
+        "semantic_failures": 0,
+        "parent_task_id": null,
+        "child_task_ids": [],
+        "requested_aspects": {},
+        "expected_contribution": "",
+        "context_receipt_id": "37e6ef30f52b465bb1424452f4312b4c",
+        "context_dependencies": {},
+        "read_plan_id": "dea87d37665f49b4ad029c60e9326c80",
+        "repair_session": null,
+        "resolution_issue_ids": [],
+        "id": "64dad39380b54cef8d9e750bb423d64d",
+        "kind": "spec_refine",
+        "reason": "Expand one source-grounded implementation surface",
+        "trigger": "surface:Raft.checkRPCHeader / Transport heartbeat dispatch",
+        "activity_classes": [],
+        "target_ids": [],
+        "target_versions": {},
+        "unit_id": null,
+        "model_id": null,
+        "requests": [
+          {
+            "file": "raft.go",
+            "start_line": 1,
+            "end_line": 100,
+            "reason": "Read checkRPCHeader and adjacent declarations to identify the actual compatibility checks, rejection results, and dependencies needed to trace enforcement."
+          },
+          {
+            "file": "transport.go",
+            "start_line": 1,
+            "end_line": 141,
+            "reason": "Read the transport and RPC interfaces, including heartbeat callback semantics, to distinguish ordinary RPC delivery from separately dispatched callbacks."
+          },
+          {
+            "file": "api.go",
+            "start_line": 500,
+            "end_line": 680,
+            "reason": "Inspect NewRaft transport initialization and any heartbeat-handler registration to identify the concrete callback whose validation and execution ownership require follow-up reading."
+          }
+        ],
+        "status": "completed",
+        "stage": "done",
+        "added_material_ids": [
+          "raft.go:1:100",
+          "transport.go:1:141",
+          "api.go:500:680"
+        ],
+        "stop_reason": "",
+        "check_id": "969411fa3fdd4cb792a60736ae60ffe0",
+        "unit_version": null,
+        "material_ids": [
+          "raft.go:1:100",
+          "transport.go:1:141",
+          "api.go:500:680"
+        ],
+        "superseded_by": null
+      }
+    ],
+    "applied_operations": {
+      "reading-automatic-survey-1": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-09-20_12-07-49-hashicorp_raft-real-run/graph-commits/reading-automatic-survey-1.json"
+      },
+      "reading-initial-reading-1": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-09-20_12-07-49-hashicorp_raft-real-run/graph-commits/reading-initial-reading-1.json"
+      },
+      "reading-2ec229ccf4374641ae944c508f80d55d-1": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-09-20_12-07-49-hashicorp_raft-real-run/graph-commits/reading-2ec229ccf4374641ae944c508f80d55d-1.json"
+      },
+      "inquiry-c79ef528e2c549468937c0f9e4c8bdc9": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-09-20_12-07-49-hashicorp_raft-real-run/graph-commits/inquiry-c79ef528e2c549468937c0f9e4c8bdc9.json"
+      },
+      "derive-1817c33cf14e4002ab3fd9247df633e1": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-09-20_12-07-49-hashicorp_raft-real-run/graph-commits/derive-1817c33cf14e4002ab3fd9247df633e1.json"
+      },
+      "reading-8237f90ee5b4401d88cc596450dce4e9-1": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-09-20_12-07-49-hashicorp_raft-real-run/graph-commits/reading-8237f90ee5b4401d88cc596450dce4e9-1.json"
+      },
+      "derive-056800eaa7e7438ba979df011eb28e52": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-09-20_12-07-49-hashicorp_raft-real-run/graph-commits/derive-056800eaa7e7438ba979df011eb28e52.json"
+      },
+      "inquiry-9e62ea4e6f854c78a3583dd8862877b7": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-09-20_12-07-49-hashicorp_raft-real-run/graph-commits/inquiry-9e62ea4e6f854c78a3583dd8862877b7.json"
+      },
+      "derive-5ec73e3b20e64e2a85b8f5e96c0a73b2": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-09-20_12-07-49-hashicorp_raft-real-run/graph-commits/derive-5ec73e3b20e64e2a85b8f5e96c0a73b2.json"
+      },
+      "reading-b31418af8ea442bfb677540d2c2b5de2-1": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-09-20_12-07-49-hashicorp_raft-real-run/graph-commits/reading-b31418af8ea442bfb677540d2c2b5de2-1.json"
+      },
+      "inquiry-8af772fbdc4f4d58a04e85e1903bf497": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-09-20_12-07-49-hashicorp_raft-real-run/graph-commits/inquiry-8af772fbdc4f4d58a04e85e1903bf497.json"
+      },
+      "reading-2f08a73df1a844e594222993ad23fb48-1": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-09-20_12-07-49-hashicorp_raft-real-run/graph-commits/reading-2f08a73df1a844e594222993ad23fb48-1.json"
+      },
+      "derive-69582fd6f2454d7d91b2b90f77964ef6": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-09-20_12-07-49-hashicorp_raft-real-run/graph-commits/derive-69582fd6f2454d7d91b2b90f77964ef6.json"
+      },
+      "reading-8b5efc452b604277a207f1ed37058614-1": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-09-20_12-07-49-hashicorp_raft-real-run/graph-commits/reading-8b5efc452b604277a207f1ed37058614-1.json"
+      },
+      "derive-e176f0ae972442688646e1b24e04363f": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-09-20_12-07-49-hashicorp_raft-real-run/graph-commits/derive-e176f0ae972442688646e1b24e04363f.json"
+      },
+      "reading-dea87d37665f49b4ad029c60e9326c80-1": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-09-20_12-07-49-hashicorp_raft-real-run/graph-commits/reading-dea87d37665f49b4ad029c60e9326c80-1.json"
+      },
+      "inquiry-969411fa3fdd4cb792a60736ae60ffe0": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-09-20_12-07-49-hashicorp_raft-real-run/graph-commits/inquiry-969411fa3fdd4cb792a60736ae60ffe0.json"
+      },
+      "derive-3cbe178c05a94d50830cfb3bbb40e01b": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-09-20_12-07-49-hashicorp_raft-real-run/graph-commits/derive-3cbe178c05a94d50830cfb3bbb40e01b.json"
+      },
+      "reading-4d4b1bac9bb945ccb5c7a4d77c36c8cf-1": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-09-20_12-07-49-hashicorp_raft-real-run/graph-commits/reading-4d4b1bac9bb945ccb5c7a4d77c36c8cf-1.json"
+      }
+    }
+  },
+  "after": {
+    "question_candidates": [
+      {
+        "id": "ac2179e4559d4eb49e9e02a9fbf82982",
+        "question": {
+          "disposition": "needs_specific_evidence",
+          "preferred_check": "source_review",
+          "requests": [],
+          "question": "Can an applicable FSMSnapshot.Persist implementation return nil after FileSnapshotSink.Close fails, allowing takeSnapshot to consume the repeated Close's nil result as completion and proceed to log compaction?",
+          "importance": "Reclaiming logs after unsuccessful snapshot publication could leave restart recovery without necessary state or history. The supplied code establishes a conditional path to compaction, but neither an admissible callback execution nor actual recovery loss.",
+          "source_ids": [
+            "file_snapshot.go:397:500",
+            "fsm.go:1:80",
+            "snapshot.go:1:278"
+          ],
+          "participants": [
+            "Snapshot goroutine invoking takeSnapshot",
+            "Application-provided FSMSnapshot.Persist implementation",
+            "FileSnapshotSink.Close caller"
+          ],
+          "objects": [
+            "Specific FileSnapshotSink instance",
+            "Persist return value",
+            "Last-snapshot index and term",
+            "Retained snapshots and log history"
+          ],
+          "contexts": [
+            "Snapshot creation using the built-in file snapshot store",
+            "An initial Close fails after setting the sink's closed flag",
+            "A subsequent Close on the same sink returns nil",
+            "Application callback error handling and its contractual admissibility remain unverified"
+          ],
+          "event_paths": [
+            "FileSnapshotSink.Close sets closed before fallible finalization and publication; a subsequent Close returns nil without retrying those operations.",
+            "If Persist propagates the initial Close error, takeSnapshot calls Cancel and returns before its own Close, metadata update, or compaction.",
+            "If Persist instead returns nil, takeSnapshot's subsequent Close returns nil, allowing last-snapshot metadata update and compactLogs invocation.",
+            "If the first failing Close occurs in takeSnapshot itself, its error check prevents the metadata update and compaction.",
+            "Log deletion additionally requires a nonempty range permitted by the snapshot index and trailing-log retention, and successful DeleteRange execution."
+          ],
+          "activity_classes": [
+            "A6"
+          ],
+          "behavior_ids": [
+            "B8",
+            "B9"
+          ],
+          "fact_ids": [
+            "F5"
+          ],
+          "obligation_relation_kind": "consumption",
+          "counterevidence": [
+            "FSMSnapshot.Persist documentation assigns the callback responsibility for writing necessary state and calling Close when finished or Cancel on error; SnapshotSink documentation likewise assigns completion and cancellation to the FSM.",
+            "takeSnapshot checks Persist's error before its own Close. Propagation of the initial Close failure prevents the proposed path to compaction.",
+            "takeSnapshot checks its own Close result before updating last-snapshot metadata or invoking compaction.",
+            "F5 establishes an in-memory closed flag and subsequent nil-return behavior, not successful publication.",
+            "Compaction preserves configured trailing logs and does not delete beyond the supplied snapshot index; reaching compaction alone does not demonstrate loss of necessary recovery history.",
+            "Directory synchronization and reaping failures can occur after rename, so a Close error alone does not establish snapshot unavailability."
+          ],
+          "unknowns": [
+            "Which application-selected FSMSnapshot.Persist implementation is applicable and whether it propagates, suppresses, or retries a sink Close failure.",
+            "Whether the applicable callback contract requires propagating Close failures through Persist's return value; the attached comments specify Close/Cancel ownership without expressly settling this requirement.",
+            "Whether returning nil after failed completion is an admissible execution within the intended library guarantee or violates an application responsibility.",
+            "The filesystem failure point, snapshot discoverability, older retained snapshots, and remaining logs necessary to establish a recovery consequence."
+          ],
+          "priority": 1,
+          "trigger_rationale": "Source review resolves the consumer discriminator: Persist and takeSnapshot's subsequent Close must both return nil before metadata update and compaction. Propagating the initial failure prevents that path. The remaining discriminator concerns applicable callback behavior and responsibility, which the supplied sources do not resolve."
+        },
+        "history": [
+          {
+            "disposition": null,
+            "preferred_check": "source_review",
+            "requests": [
+              {
+                "file": "file_snapshot.go",
+                "start_line": 397,
+                "end_line": 500,
+                "reason": "Verify Close error branches, repeated-close behavior, and publication ordering for F5."
+              },
+              {
+                "file": "snapshot.go",
+                "start_line": 1,
+                "end_line": 278,
+                "reason": "Locate the snapshot sink contract and trace takeSnapshot through Persist, Close, error handling, progress updates, and log reclamation."
+              },
+              {
+                "file": "fsm.go",
+                "start_line": 1,
+                "end_line": 80,
+                "reason": "Establish the FSMSnapshot.Persist contract, including ownership of sink completion and propagation of persistence errors."
+              }
+            ],
+            "question": "When snapshot persistence uses FileSnapshotSink, can takeSnapshot consume a nil result from a repeated Close after an earlier finalization failure as successful snapshot publication, or do the Persist contract and caller error handling prevent that interpretation?",
+            "importance": "If unsuccessful snapshot publication can authorize log reclamation, a later restart could lack both the snapshot and the log history needed to reconstruct state. This consequence is conditional on the actual completion and reclamation paths; neither the triggering execution nor data loss is established.",
+            "source_ids": [
+              "file_snapshot.go:397:500"
+            ],
+            "participants": [
+              "Snapshot execution invoking takeSnapshot",
+              "Application-provided FSMSnapshot.Persist implementation",
+              "FileSnapshotSink.Close caller"
+            ],
+            "objects": [
+              "FileSnapshotSink instance",
+              "Snapshot persistence result",
+              "Retained log history"
+            ],
+            "contexts": [
+              "Snapshot creation using the built-in file snapshot store",
+              "Fallible sink finalization followed by a possible repeated Close",
+              "Caller-selected FSMSnapshot implementation with currently unread completion obligations"
+            ],
+            "event_paths": [
+              "Observed sink behavior: Close sets closed before finalize; a finalize failure returns an error and attempts temporary-directory removal; a subsequent Close returns nil without retrying publication.",
+              "Candidate consumer path to verify: takeSnapshot invokes Persist; sink Close encounters a finalization error; another Close returns nil; takeSnapshot interprets completion and potentially reclaims logs."
+            ],
+            "activity_classes": [
+              "A6"
+            ],
+            "behavior_ids": [
+              "B8",
+              "B9"
+            ],
+            "fact_ids": [
+              "F5"
+            ],
+            "obligation_relation_kind": "consumption",
+            "counterevidence": [
+              "The acquired Close implementation returns an error on the first failed finalization. A consumer that propagates that error could prevent the candidate path.",
+              "The closed flag and repeated-close nil result do not by themselves establish successful publication: closed is set before finalize, metadata writing, rename, directory synchronization, and snapshot reaping.",
+              "Persist error propagation or takeSnapshot error handling could prevent the candidate path. Neither consumer mechanism has been verified from attached source."
+            ],
+            "unknowns": [
+              "Whether Persist must close the sink and propagate a Close failure.",
+              "Whether takeSnapshot can reach a repeated Close after a failed close under an applicable caller contract.",
+              "Which completion results authorize snapshot progress updates and log reclamation.",
+              "The applicable filesystem failure semantics and resulting retained recovery state are not established by the supplied Close implementation alone."
+            ],
+            "priority": 1,
+            "trigger_rationale": "The acquired source verifies F5's narrow assertion: closed is set before fallible finalization, and subsequent Close invocations immediately return nil. This resolves the sink-side control-flow discriminator but leaves consumer interpretation and caller-contract applicability unresolved. The same F5 consumption question requires focused review of Persist and takeSnapshot before deriving an obligation or disposing the candidate."
+          },
+          {
+            "disposition": "needs_specific_evidence",
+            "preferred_check": "source_review",
+            "requests": [],
+            "question": "Can an applicable FSMSnapshot.Persist implementation return nil after FileSnapshotSink.Close fails, allowing takeSnapshot to consume the repeated Close's nil result as completion and proceed to log compaction?",
+            "importance": "If a failed snapshot publication is followed by log reclamation, restart recovery could lack necessary state and history. The supplied code establishes a conditional route to compaction, but does not establish an applicable callback execution or actual recovery loss.",
+            "source_ids": [
+              "file_snapshot.go:397:500",
+              "fsm.go:1:80",
+              "snapshot.go:1:278"
+            ],
+            "participants": [
+              "Snapshot goroutine invoking takeSnapshot",
+              "Application-provided FSMSnapshot.Persist implementation",
+              "FileSnapshotSink.Close caller"
+            ],
+            "objects": [
+              "Specific FileSnapshotSink instance",
+              "Persist return value",
+              "Last-snapshot index and term",
+              "Retained snapshots and log history"
+            ],
+            "contexts": [
+              "Snapshot creation using the built-in file snapshot store",
+              "A first Close fails after setting the sink's closed flag",
+              "A subsequent Close on the same sink returns nil",
+              "Application callback error handling and its applicable contract remain unverified"
+            ],
+            "event_paths": [
+              "FileSnapshotSink.Close sets closed before fallible finalization and publication. Following a failure, another Close returns nil without retrying those operations.",
+              "If Persist returns the first Close error, takeSnapshot calls Cancel and returns before its own Close, last-snapshot update, or compaction.",
+              "If Persist returns nil after that failure, takeSnapshot calls Close again, receives nil, updates last-snapshot metadata, and invokes compactLogs.",
+              "If the first failing Close instead occurs in takeSnapshot itself, its error check returns before the metadata update and compaction.",
+              "Actual deletion additionally requires a nonempty range permitted by snapshot index and trailing-log retention."
+            ],
+            "activity_classes": [
+              "A6"
+            ],
+            "behavior_ids": [
+              "B8",
+              "B9"
+            ],
+            "fact_ids": [
+              "F5"
+            ],
+            "obligation_relation_kind": "consumption",
+            "counterevidence": [
+              "FSMSnapshot.Persist's interface documentation assigns the callback responsibility to write necessary state and call Close when finished or Cancel on error. SnapshotSink's documentation likewise assigns completion and cancellation to the FSM.",
+              "takeSnapshot checks Persist's error before calling Close; propagation of the first Close failure prevents this candidate execution.",
+              "takeSnapshot also checks its own Close result before updating last-snapshot metadata or invoking compaction.",
+              "A repeated Close returning nil is an observed lifecycle behavior, not an independently established guarantee of successful publication.",
+              "Compaction retains configured trailing logs and never deletes beyond the supplied snapshot index; invocation alone does not establish loss of necessary recovery history.",
+              "Some Close failures occur after rename, so a Close error alone does not establish that the snapshot is unavailable."
+            ],
+            "unknowns": [
+              "The actual application-selected FSMSnapshot.Persist implementation and whether it propagates, suppresses, or retries a sink Close failure.",
+              "Whether the applicable callback contract requires propagation of Close failures through Persist's return value. The attached interface comments specify Close/Cancel ownership but do not expressly settle that return-value requirement.",
+              "Whether a callback returning nil after failed completion is an admissible execution within the intended guarantee or a violation of an application responsibility.",
+              "The filesystem failure point, snapshot discoverability, older retained snapshots, and remaining logs needed to establish any recovery consequence."
+            ],
+            "priority": 1,
+            "trigger_rationale": "The acquired consumer source resolves which results authorize progress: both Persist and takeSnapshot's subsequent Close must return nil before metadata update and compaction. It also establishes a concrete protection when Persist propagates failure. The remaining discriminator is callback error handling and contractual admissibility, which cannot be inferred from the sink's closed flag or the orchestrator's guards."
+          }
+        ],
+        "check_ids": [
+          "1817c33cf14e4002ab3fd9247df633e1",
+          "056800eaa7e7438ba979df011eb28e52",
+          "5ec73e3b20e64e2a85b8f5e96c0a73b2"
+        ],
+        "status": "blocked",
+        "stage": "analyze",
+        "read_plan_id": "8237f90ee5b4401d88cc596450dce4e9",
+        "material_ids": [
+          "file_snapshot.go:397:500",
+          "snapshot.go:1:278",
+          "fsm.go:1:80"
+        ],
+        "spec_task_ids": [],
+        "stagnation": 0,
+        "stop_reason": "Retain the selected F5 consumption question as evidence-blocked. The acquired receipt is complete, and the supplied code establishes the conditional control flow and its error-propagation protection. Responsibility for reporting an initial sink Close failure through Persist remains unattributed. No supplied source identifies the selected callback implementation or an exact repository range that settles its applicable return-value contract. An arbitrary example callback or injected callback that suppresses errors would not establish admissibility. Further publication and recovery reads could characterize consequences but would not resolve this prerequisite. No obligation or executable check is justified from the current evidence; this disposition establishes neither an explanation nor a defect.",
+        "obligation_id": null
+      },
+      {
+        "id": "fb1a27032fce4da48b6ef4793b71f912",
+        "question": {
+          "disposition": "explained_by_existing_mechanism",
+          "preferred_check": "source_review",
+          "requests": [],
+          "question": "Can a delayed campaign_vote_result produced for a completed runCandidate invocation enter a later invocation's election tally?",
+          "importance": "Counting support from a superseded election could establish local leadership without support for the current election context. The reviewed channel mechanism addresses cross-invocation tally contamination; broader leadership guarantees remain outside this conclusion.",
+          "source_ids": [
+            "raft.go:285:441",
+            "raft.go:1900:2241"
+          ],
+          "participants": [
+            "Candidate Raft instance",
+            "Remote vote worker goroutines"
+          ],
+          "objects": [
+            "Invocation-local election result channel",
+            "Captured vote request",
+            "Invocation-local grantedVotes counter"
+          ],
+          "contexts": [
+            "Delayed worker completion after election timeout",
+            "Candidate-loop exit followed by a new invocation",
+            "Direct election or election following successful pre-vote"
+          ],
+          "event_paths": [
+            "electSelf allocates channel -> worker captures that channel -> runCandidate returns -> later invocation allocates a different channel -> old worker sends only to its captured channel"
+          ],
+          "activity_classes": [
+            "A2"
+          ],
+          "behavior_ids": [
+            "candidate_campaign_control",
+            "election_setup_and_self_vote",
+            "remote_vote_result"
+          ],
+          "fact_ids": [
+            "campaign_vote_result"
+          ],
+          "obligation_relation_kind": "consumption",
+          "counterevidence": [
+            "Every electSelf call allocates a fresh respCh. Each remote worker closes over that call's channel and request, and sends its result once to that channel.",
+            "runCandidate keeps voteCh and grantedVotes in invocation-local variables. Its election-timeout branch returns, so subsequent invocations do not inherit the prior channel or tally.",
+            "The pre-vote success branch disables prevoteCh before calling electSelf. The shown invocation therefore does not repeatedly replace its election channel while retaining accumulated vote grants.",
+            "A higher-term vote response causes a follower transition and return before grant counting. A role change observed at the next loop guard ends candidate processing.",
+            "Transport errors are converted to refusals. A self-vote persistence error returns a nil channel, which prevents that caller from consuming even results already produced on the abandoned channel.",
+            "The tally checks for higher response terms but does not require term equality. Channel isolation explains the selected cross-invocation delay scenario without establishing the semantics of every response received through the active transport call."
+          ],
+          "unknowns": [
+            "Transport response correlation and remote voting semantics remain unread; channel isolation does not establish that a successful transport call returns support for its captured request.",
+            "Effects of processRPC on the term and role within a still-running candidate invocation remain unread. This conclusion does not establish that every counted grant matches the current term after such processing.",
+            "Quorum calculation, configuration identity uniqueness, dispatcher behavior, and completed leader initialization remain outside the attached evidence."
+          ],
+          "priority": 1,
+          "trigger_rationale": "Source review resolved the selected delayed-worker discriminator: producer closures retain their original channels, while subsequent candidate invocations have fresh channels and counters. This is a scoped mechanism explanation, not evidence of overall election correctness."
+        },
+        "history": [
+          {
+            "disposition": "needs_specific_evidence",
+            "preferred_check": "source_review",
+            "requests": [
+              {
+                "file": "raft.go",
+                "start_line": 285,
+                "end_line": 441,
+                "reason": "Inspect candidate result consumption, term checks, campaign replacement, quorum counting, and the branch that enters the leader role."
+              },
+              {
+                "file": "raft.go",
+                "start_line": 1900,
+                "end_line": 2241,
+                "reason": "Inspect election result producers, channel ownership, participant selection, request context, and error normalization to determine which results can reach the selected tally."
+              }
+            ],
+            "question": "When runCandidate consumes campaign_vote_result, can a delayed result from a superseded election contribute to entering the leader role, or do invocation-specific channels and term handling restrict counted grants to the active election?",
+            "importance": "Counting support from a superseded election could establish local leadership without the support required for its current election context. This could affect subsequent proposal admission and replication; those consequences require separate evidence.",
+            "source_ids": [
+              "raft.go:285:441",
+              "raft.go:1900:2241"
+            ],
+            "participants": [
+              "Candidate Raft instance",
+              "Voters contacted by election goroutines"
+            ],
+            "objects": [
+              "Election result channel",
+              "Vote request and response",
+              "Candidate election tally",
+              "Local term and role"
+            ],
+            "contexts": [
+              "Candidate elections with delayed RPC responses",
+              "Election timeout followed by a new campaign",
+              "Higher-term responses during candidate execution"
+            ],
+            "event_paths": [
+              "electSelf launches remote result producers -> campaign is superseded -> delayed result becomes available -> runCandidate processes election results"
+            ],
+            "activity_classes": [
+              "A2"
+            ],
+            "behavior_ids": [
+              "candidate_campaign_control",
+              "election_setup_and_self_vote",
+              "remote_vote_result"
+            ],
+            "fact_ids": [
+              "campaign_vote_result"
+            ],
+            "obligation_relation_kind": "consumption",
+            "counterevidence": [
+              "The provisional inventory describes invocation-specific result channels and higher-term checks. These may isolate old results completely; their actual control flow needs attached source review.",
+              "The selected fact describes an available tally input, not established authority or a durable remote vote."
+            ],
+            "unknowns": [
+              "Whether every election invocation allocates a distinct channel and producers retain only that invocation's channel.",
+              "Whether timeout, role changes, and campaign replacement prevent consumption of superseded results.",
+              "Which response term and grant conditions permit tally increments and entry into the leader role.",
+              "The applicable election-context expectation has not yet been grounded in acquired source."
+            ],
+            "priority": 1,
+            "trigger_rationale": "The accepted inventory identifies independent remote producers and a candidate consumer, creating a concrete asynchronous boundary to inspect. No exact source is attached, so this is an initial source-review question rather than a defect judgment."
+          }
+        ],
+        "check_ids": [
+          "69582fd6f2454d7d91b2b90f77964ef6",
+          "e176f0ae972442688646e1b24e04363f"
+        ],
+        "status": "explained",
+        "stage": "analyze",
+        "read_plan_id": "8b5efc452b604277a207f1ed37058614",
+        "material_ids": [
+          "raft.go:285:441",
+          "raft.go:1900:2241"
+        ],
+        "spec_task_ids": [],
+        "stagnation": 0,
+        "stop_reason": "The acquired producer and consumer declarations explain why delayed results from a completed invocation cannot enter a later invocation's tally through the shown channels. No obligation or executable check is needed for that suspicion. The conclusion is restricted to channel ownership across invocations; transport correlation and changes of protocol context within an invocation remain explicit gaps. The accepted inventory already represents these mechanisms and unknowns, so this review identifies no descriptive correction.",
+        "obligation_id": null
+      },
+      {
+        "id": "86c45c1ac6074cbea5ca95e3ccd56f0d",
+        "question": {
+          "disposition": "explained_by_existing_mechanism",
+          "preferred_check": "source_review",
+          "requests": [],
+          "question": "For F4's normally returning command application, how is the attached future's FSM response published to a caller that waits for its completion before calling Response? The local publication discriminator is resolved by response assignment followed by channel synchronization; end-to-end dispatch identity and competing completion ownership remain outside this explanation.",
+          "importance": "A caller may use an operation's returned response to decide subsequent actions. Publishing completion before its associated response could expose an incorrect result despite the FSM callback having run.",
+          "source_ids": [
+            "fsm.go:81:240",
+            "future.go:1:180",
+            "api.go:800:899"
+          ],
+          "participants": [
+            "runFSM goroutine executing applySingle",
+            "Caller invoking Error and then Response on the attached logFuture"
+          ],
+          "objects": [
+            "Command commitTuple",
+            "Attached logFuture",
+            "FSM callback response",
+            "deferError.errCh"
+          ],
+          "contexts": [
+            "Single-entry command application with an attached initialized future",
+            "Normal FSM.Apply return",
+            "Completion received from this application path",
+            "Caller invokes Response after Error returns and does not call Error concurrently on the same future"
+          ],
+          "event_paths": [
+            "FSM.Apply returns -> applySingle assigns req.future.response -> respond sends completion and closes errCh -> Error receives completion -> Response reads the same future's response field"
+          ],
+          "activity_classes": [
+            "A5",
+            "A7"
+          ],
+          "behavior_ids": [
+            "B1",
+            "B6"
+          ],
+          "fact_ids": [
+            "F4"
+          ],
+          "obligation_relation_kind": "consumption",
+          "counterevidence": [
+            "future.go:1:180 explicitly requires Response to be called only after Error returns and prohibits concurrent Error calls on the same future.",
+            "fsm.go:81:240 assigns the normally returned FSM.Apply value to req.future.response before invoking req.future.respond(nil). Both accesses use the same attached future.",
+            "future.go:1:180 shows respond sending on errCh and then closing it, while Error receives from errCh. Under Go channel synchronization semantics, the preceding response assignment is published to the receiving caller. Sequential repeated successful Error calls receive from the closed channel.",
+            "future.go:1:180 shows logFuture.Response returning its response field directly; an FSM-returned error remains that response rather than becoming the Raft completion error.",
+            "api.go:800:899 initializes a distinct command future and returns the same pointer sent to applyCh. Immediate enqueue or shutdown failures instead return errorFuture."
+          ],
+          "unknowns": [
+            "The unread protocol-to-FSM dispatch path has not established that the future returned by ApplyLog is always the future attached to the corresponding command tuple.",
+            "Ownership and ordering of competing completion paths remain unread. The responded flag suppresses repeated responses but is not itself evidence of synchronization between concurrent producers.",
+            "This explanation does not establish response validity after an earlier error completion, callback panic, later mutation of application-owned response objects, or snapshot restoration."
+          ],
+          "priority": 3,
+          "trigger_rationale": "The acquired future implementation resolves the selected local visibility suspicion: completion from applySingle follows response assignment and supplies a synchronization boundary. This is a scoped source explanation, not execution evidence or an end-to-end completion guarantee."
+        },
+        "history": [
+          {
+            "disposition": "needs_specific_evidence",
+            "preferred_check": "source_review",
+            "requests": [
+              {
+                "file": "fsm.go",
+                "start_line": 81,
+                "end_line": 240,
+                "reason": "Verify the selected F4 producer, response assignment, deferred completion, and command versus non-command branches."
+              },
+              {
+                "file": "future.go",
+                "start_line": 1,
+                "end_line": 180,
+                "reason": "Read the future interface contracts and completion synchronization to determine when a caller may consume the FSM response."
+              },
+              {
+                "file": "api.go",
+                "start_line": 800,
+                "end_line": 899,
+                "reason": "Verify ApplyLog's caller-facing completion contract and the identity of the returned command future."
+              }
+            ],
+            "question": "For a command handled by applySingle with an attached future, does the documented caller sequence for awaiting successful completion and reading Response reliably consume the response established by F4? The discriminator is whether completion synchronization publishes that same future's assigned FSM response before the permitted caller read, or whether a permitted read can observe an unset or unrelated response.",
+            "importance": "Callers may use successful operation completion and its response to decide subsequent actions. A mismatch between callback completion, response publication, and the documented future API could expose an incorrect operation result even when the state-machine callback ran.",
+            "source_ids": [
+              "fsm.go:81:240",
+              "api.go:800:899"
+            ],
+            "participants": [
+              "runFSM goroutine executing applySingle",
+              "Caller awaiting and reading the command future"
+            ],
+            "objects": [
+              "Command commitTuple",
+              "Attached logFuture",
+              "FSM callback response"
+            ],
+            "contexts": [
+              "Single-entry command application with an attached future",
+              "Normal FSM.Apply return",
+              "Caller follows the future API's documented ordering requirements"
+            ],
+            "event_paths": [
+              "ApplyLog returns a command future -> applySingle invokes FSM.Apply -> callback response is assigned -> completion is signaled -> caller awaits completion and reads Response"
+            ],
+            "activity_classes": [
+              "A5",
+              "A7"
+            ],
+            "behavior_ids": [
+              "B1",
+              "B6"
+            ],
+            "fact_ids": [
+              "F4"
+            ],
+            "obligation_relation_kind": "consumption",
+            "counterevidence": [
+              "The supplied inventory describes response assignment before respond(nil), which is a plausible publication protection. Its implementation and synchronization must be verified from exact source.",
+              "The supplied inventory describes ApplyLog returning the same allocated future after enqueue, which may preserve request identity. This remains a navigation aid rather than acquired implementation evidence."
+            ],
+            "unknowns": [
+              "The applicable Error and Response interface contracts and required caller ordering.",
+              "The synchronization used by respond and Error, including whether it publishes the response field to the caller.",
+              "The exact future identity passed into applySingle and whether competing completion paths matter within this bounded scenario."
+            ],
+            "priority": 3,
+            "trigger_rationale": "F4 identifies a concrete application result whose consumer-side interpretation remains unread. The producer, future implementation, and public API provide a bounded source discriminator without reopening either previously disposed candidate."
+          }
+        ],
+        "check_ids": [
+          "3cbe178c05a94d50830cfb3bbb40e01b",
+          "eb2a72cbdd8f4899a167dd35e7708d7d"
+        ],
+        "status": "active",
+        "stage": "analyze",
+        "read_plan_id": "4d4b1bac9bb945ccb5c7a4d77c36c8cf",
+        "material_ids": [
+          "fsm.go:81:240",
+          "future.go:1:180",
+          "api.go:800:899"
+        ],
+        "spec_task_ids": [
+          "fc5b0c3c2e3547398ba25e5dd4778fd3"
+        ],
+        "stagnation": 0,
+        "stop_reason": "",
+        "obligation_id": null
+      }
+    ],
+    "inquiry_tasks": [
+      {
+        "surface_entry_points": [],
+        "candidate_id": null,
+        "draft_path": null,
+        "diagnostics": [],
+        "admitted": false,
+        "preparation_failures": 0,
+        "semantic_failures": 0,
+        "parent_task_id": null,
+        "child_task_ids": [],
+        "requested_aspects": {},
+        "expected_contribution": "",
+        "context_receipt_id": null,
+        "context_dependencies": {},
+        "read_plan_id": null,
+        "repair_session": null,
+        "resolution_issue_ids": [],
+        "id": "9e2b1259bd284d6fa4a18c172a06d71c",
+        "kind": "spec_refine",
+        "reason": "Resolve decisive understanding gaps",
+        "trigger": "initial-reads",
+        "activity_classes": [],
+        "target_ids": [],
+        "target_versions": {},
+        "unit_id": null,
+        "model_id": null,
+        "requests": [
+          {
+            "file": "file_snapshot.go",
+            "start_line": 1,
+            "end_line": 220,
+            "reason": "Expand the file-snapshot frontier: identify constructor configuration, sink creation, temporary naming, and publication prerequisites."
+          },
+          {
+            "file": "file_snapshot.go",
+            "start_line": 221,
+            "end_line": 396,
+            "reason": "Recover snapshot listing, opening, retention, and sink lifecycle declarations so publication has concrete consumers and failure handling."
+          },
+          {
+            "file": "file_snapshot.go",
+            "start_line": 501,
+            "end_line": 551,
+            "reason": "Read writeMeta and remaining helpers to establish actual metadata write and synchronization ordering."
+          },
+          {
+            "file": "snapshot.go",
+            "start_line": 1,
+            "end_line": 124,
+            "reason": "Read SnapshotStore and SnapshotSink contracts and snapshot-loop selection to distinguish required callback behavior from observed file-sink behavior."
+          },
+          {
+            "file": "fsm.go",
+            "start_line": 241,
+            "end_line": 285,
+            "reason": "Complete FSM dispatch and restore helper context needed to separate queue receipt, callback return, and restore completion."
+          }
+        ],
+        "status": "pending",
+        "stage": "read",
+        "added_material_ids": [],
+        "stop_reason": "",
+        "check_id": null,
+        "unit_version": null,
+        "material_ids": [],
+        "superseded_by": null
+      },
+      {
+        "surface_entry_points": [
+          "Raft.Barrier / VerifyLeader / GetConfiguration"
+        ],
+        "candidate_id": null,
+        "draft_path": null,
+        "diagnostics": [],
+        "admitted": true,
+        "preparation_failures": 0,
+        "semantic_failures": 0,
+        "parent_task_id": null,
+        "child_task_ids": [],
+        "requested_aspects": {},
+        "expected_contribution": "",
+        "context_receipt_id": "1b7e202343804ec3b90df0d04db87b74",
+        "context_dependencies": {},
+        "read_plan_id": "2ec229ccf4374641ae944c508f80d55d",
+        "repair_session": null,
+        "resolution_issue_ids": [],
+        "id": "bd32357e7f1e41df9b8f2aac9f0e821c",
+        "kind": "spec_refine",
+        "reason": "Expand one source-grounded implementation surface",
+        "trigger": "surface:Raft.Barrier / VerifyLeader / GetConfiguration",
+        "activity_classes": [],
+        "target_ids": [],
+        "target_versions": {},
+        "unit_id": null,
+        "model_id": null,
+        "requests": [
+          {
+            "file": "api.go",
+            "start_line": 850,
+            "end_line": 925,
+            "reason": "Recover the contracts and complete implementations of Raft.Barrier, Raft.VerifyLeader, and Raft.GetConfiguration, including request construction, enqueue paths, rejection conditions, and returned futures. Use actual references to identify subsequent execution and completion dependencies."
+          },
+          {
+            "file": "raft.go",
+            "start_line": 950,
+            "end_line": 1035,
+            "reason": "Inspect the hinted verifyLeader declaration and surrounding context to identify how verification starts, its immediate completion branches, and references to asynchronous support collection. Further reads will follow only dependencies established by this source."
+          }
+        ],
+        "status": "completed",
+        "stage": "done",
+        "added_material_ids": [
+          "api.go:850:925",
+          "raft.go:950:1035"
+        ],
+        "stop_reason": "",
+        "check_id": "c79ef528e2c549468937c0f9e4c8bdc9",
+        "unit_version": null,
+        "material_ids": [
+          "api.go:850:925",
+          "raft.go:950:1035"
+        ],
+        "superseded_by": null
+      },
+      {
+        "surface_entry_points": [],
+        "candidate_id": "ac2179e4559d4eb49e9e02a9fbf82982",
+        "draft_path": "/home/nitro/Desktop/consensus-assurance/runs/2026-09-20_12-07-49-hashicorp_raft-real-run/audit-spec/v2.json",
+        "diagnostics": [
+          {
+            "code": "audit_spec_semantics",
+            "category": "semantic",
+            "object_ids": [
+              "A6",
+              "B9",
+              "surface:Raft.takeSnapshot / compactLogsWithTrailing / removeOldLogs"
+            ],
+            "material_ids": [
+              "snapshot.go:1:278"
+            ],
+            "message": "B9 still records timer and public API callers as unread. The acquired runSnapshots implementation now identifies the snapshot goroutine's randomized timer branch with shouldSnapshot filtering, its userSnapshotCh branch, and shutdown handling. These are reusable trigger and execution-owner details missing from the inventory. The user-request branch also publishes an opener only after takeSnapshot succeeds and responds with the returned error; the public API producer of userSnapshotCh remains unread.",
+            "allowed": [
+              "read",
+              "semantic_revision"
+            ]
+          }
+        ],
+        "admitted": true,
+        "preparation_failures": 0,
+        "semantic_failures": 0,
+        "parent_task_id": null,
+        "child_task_ids": [],
+        "requested_aspects": {},
+        "expected_contribution": "",
+        "context_receipt_id": "f764f40ab8544df5b79208a012ee621a",
+        "context_dependencies": {},
+        "read_plan_id": null,
+        "repair_session": null,
+        "resolution_issue_ids": [],
+        "id": "14ddc43e65e34734a9aac03320cd6522",
+        "kind": "spec_refine",
+        "reason": "B9 still records timer and public API callers as unread. The acquired runSnapshots implementation now identifies the snapshot goroutine's randomized timer branch with shouldSnapshot filtering, its userSnapshotCh branch, and shutdown handling. These are reusable trigger and execution-owner details missing from the inventory. The user-request branch also publishes an opener only after takeSnapshot succeeds and responds with the returned error; the public API producer of userSnapshotCh remains unread.",
+        "trigger": "056800eaa7e7438ba979df011eb28e52:A6,B9,surface:Raft.takeSnapshot / compactLogsWithTrailing / removeOldLogs",
+        "activity_classes": [],
+        "target_ids": [
+          "A6",
+          "B9",
+          "surface:Raft.takeSnapshot / compactLogsWithTrailing / removeOldLogs"
+        ],
+        "target_versions": {},
+        "unit_id": null,
+        "model_id": null,
+        "requests": [],
+        "status": "completed",
+        "stage": "done",
+        "added_material_ids": [],
+        "stop_reason": "",
+        "check_id": "9e62ea4e6f854c78a3583dd8862877b7",
+        "unit_version": null,
+        "material_ids": [
+          "fsm.go:1:80",
+          "file_snapshot.go:397:500",
+          "snapshot.go:1:278"
+        ],
+        "superseded_by": null
+      },
+      {
+        "surface_entry_points": [
+          "Raft.runCandidate, electSelf, preElectSelf, and authority setters"
+        ],
+        "candidate_id": null,
+        "draft_path": null,
+        "diagnostics": [],
+        "admitted": true,
+        "preparation_failures": 0,
+        "semantic_failures": 0,
+        "parent_task_id": null,
+        "child_task_ids": [],
+        "requested_aspects": {},
+        "expected_contribution": "",
+        "context_receipt_id": "3caa059ff60643e0b233e40c0b738b33",
+        "context_dependencies": {},
+        "read_plan_id": "b31418af8ea442bfb677540d2c2b5de2",
+        "repair_session": null,
+        "resolution_issue_ids": [],
+        "id": "3fec3fd7e1f346a889a06209f8335f4b",
+        "kind": "spec_refine",
+        "reason": "Expand one source-grounded implementation surface",
+        "trigger": "surface:Raft.runCandidate, electSelf, preElectSelf, and authority setters",
+        "activity_classes": [],
+        "target_ids": [],
+        "target_versions": {},
+        "unit_id": null,
+        "model_id": null,
+        "requests": [
+          {
+            "file": "raft.go",
+            "start_line": 285,
+            "end_line": 441,
+            "reason": "Recover candidate execution ownership, election and pre-election result consumption, timeout and higher-term branches, and calls requesting authority transitions."
+          },
+          {
+            "file": "raft.go",
+            "start_line": 1900,
+            "end_line": 2241,
+            "reason": "Read electSelf and preElectSelf with adjacent helper declarations and authority setters to identify result producers, asynchronous boundaries, persistence ordering, error branches, and the distinction between requested and completed transitions."
+          },
+          {
+            "file": "state.go",
+            "start_line": 1,
+            "end_line": 174,
+            "reason": "Recover the underlying role and term state accessors and mutation semantics used by authority setters, without inferring transition completion from candidate call sites."
+          }
+        ],
+        "status": "completed",
+        "stage": "done",
+        "added_material_ids": [
+          "raft.go:285:441",
+          "raft.go:1900:2241",
+          "state.go:1:174"
+        ],
+        "stop_reason": "",
+        "check_id": "8af772fbdc4f4d58a04e85e1903bf497",
+        "unit_version": null,
+        "material_ids": [
+          "raft.go:285:441",
+          "raft.go:1900:2241",
+          "state.go:1:174"
+        ],
+        "superseded_by": null
+      },
+      {
+        "surface_entry_points": [
+          "Raft.checkRPCHeader / Transport heartbeat dispatch"
+        ],
+        "candidate_id": null,
+        "draft_path": null,
+        "diagnostics": [],
+        "admitted": true,
+        "preparation_failures": 0,
+        "semantic_failures": 0,
+        "parent_task_id": null,
+        "child_task_ids": [],
+        "requested_aspects": {},
+        "expected_contribution": "",
+        "context_receipt_id": "37e6ef30f52b465bb1424452f4312b4c",
+        "context_dependencies": {},
+        "read_plan_id": "dea87d37665f49b4ad029c60e9326c80",
+        "repair_session": null,
+        "resolution_issue_ids": [],
+        "id": "64dad39380b54cef8d9e750bb423d64d",
+        "kind": "spec_refine",
+        "reason": "Expand one source-grounded implementation surface",
+        "trigger": "surface:Raft.checkRPCHeader / Transport heartbeat dispatch",
+        "activity_classes": [],
+        "target_ids": [],
+        "target_versions": {},
+        "unit_id": null,
+        "model_id": null,
+        "requests": [
+          {
+            "file": "raft.go",
+            "start_line": 1,
+            "end_line": 100,
+            "reason": "Read checkRPCHeader and adjacent declarations to identify the actual compatibility checks, rejection results, and dependencies needed to trace enforcement."
+          },
+          {
+            "file": "transport.go",
+            "start_line": 1,
+            "end_line": 141,
+            "reason": "Read the transport and RPC interfaces, including heartbeat callback semantics, to distinguish ordinary RPC delivery from separately dispatched callbacks."
+          },
+          {
+            "file": "api.go",
+            "start_line": 500,
+            "end_line": 680,
+            "reason": "Inspect NewRaft transport initialization and any heartbeat-handler registration to identify the concrete callback whose validation and execution ownership require follow-up reading."
+          }
+        ],
+        "status": "completed",
+        "stage": "done",
+        "added_material_ids": [
+          "raft.go:1:100",
+          "transport.go:1:141",
+          "api.go:500:680"
+        ],
+        "stop_reason": "",
+        "check_id": "969411fa3fdd4cb792a60736ae60ffe0",
+        "unit_version": null,
+        "material_ids": [
+          "raft.go:1:100",
+          "transport.go:1:141",
+          "api.go:500:680"
+        ],
+        "superseded_by": null
+      },
+      {
+        "surface_entry_points": [],
+        "candidate_id": "86c45c1ac6074cbea5ca95e3ccd56f0d",
+        "draft_path": "/home/nitro/Desktop/consensus-assurance/runs/2026-09-20_12-07-49-hashicorp_raft-real-run/audit-spec/v5.json",
+        "diagnostics": [
+          {
+            "code": "audit_spec_semantics",
+            "category": "semantic",
+            "object_ids": [
+              "A7",
+              "F4"
+            ],
+            "material_ids": [
+              "future.go:1:180",
+              "fsm.go:81:240"
+            ],
+            "message": "The inventory omits the now-observed caller-side consumer: Error receives completion through errCh, after which Response reads the attached logFuture.response. Add this consumption behavior with the documented caller ordering and nonconcurrent Error restriction, preserving the distinction between an FSM response that contains an error and a Raft completion error. Do not infer upstream tuple identity or exclusive completion ownership.",
+            "allowed": [
+              "read",
+              "semantic_revision"
+            ]
+          }
+        ],
+        "admitted": false,
+        "preparation_failures": 0,
+        "semantic_failures": 0,
+        "parent_task_id": null,
+        "child_task_ids": [],
+        "requested_aspects": {},
+        "expected_contribution": "",
+        "context_receipt_id": null,
+        "context_dependencies": {},
+        "read_plan_id": null,
+        "repair_session": null,
+        "resolution_issue_ids": [],
+        "id": "fc5b0c3c2e3547398ba25e5dd4778fd3",
+        "kind": "spec_refine",
+        "reason": "The inventory omits the now-observed caller-side consumer: Error receives completion through errCh, after which Response reads the attached logFuture.response. Add this consumption behavior with the documented caller ordering and nonconcurrent Error restriction, preserving the distinction between an FSM response that contains an error and a Raft completion error. Do not infer upstream tuple identity or exclusive completion ownership.",
+        "trigger": "eb2a72cbdd8f4899a167dd35e7708d7d:A7,F4",
+        "activity_classes": [],
+        "target_ids": [
+          "A7",
+          "F4"
+        ],
+        "target_versions": {},
+        "unit_id": null,
+        "model_id": null,
+        "requests": [],
+        "status": "pending",
+        "stage": "analyze",
+        "added_material_ids": [],
+        "stop_reason": "",
+        "check_id": null,
+        "unit_version": null,
+        "material_ids": [],
+        "superseded_by": null
+      }
+    ],
+    "applied_operations": {
+      "reading-automatic-survey-1": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-09-20_12-07-49-hashicorp_raft-real-run/graph-commits/reading-automatic-survey-1.json"
+      },
+      "reading-initial-reading-1": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-09-20_12-07-49-hashicorp_raft-real-run/graph-commits/reading-initial-reading-1.json"
+      },
+      "reading-2ec229ccf4374641ae944c508f80d55d-1": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-09-20_12-07-49-hashicorp_raft-real-run/graph-commits/reading-2ec229ccf4374641ae944c508f80d55d-1.json"
+      },
+      "inquiry-c79ef528e2c549468937c0f9e4c8bdc9": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-09-20_12-07-49-hashicorp_raft-real-run/graph-commits/inquiry-c79ef528e2c549468937c0f9e4c8bdc9.json"
+      },
+      "derive-1817c33cf14e4002ab3fd9247df633e1": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-09-20_12-07-49-hashicorp_raft-real-run/graph-commits/derive-1817c33cf14e4002ab3fd9247df633e1.json"
+      },
+      "reading-8237f90ee5b4401d88cc596450dce4e9-1": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-09-20_12-07-49-hashicorp_raft-real-run/graph-commits/reading-8237f90ee5b4401d88cc596450dce4e9-1.json"
+      },
+      "derive-056800eaa7e7438ba979df011eb28e52": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-09-20_12-07-49-hashicorp_raft-real-run/graph-commits/derive-056800eaa7e7438ba979df011eb28e52.json"
+      },
+      "inquiry-9e62ea4e6f854c78a3583dd8862877b7": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-09-20_12-07-49-hashicorp_raft-real-run/graph-commits/inquiry-9e62ea4e6f854c78a3583dd8862877b7.json"
+      },
+      "derive-5ec73e3b20e64e2a85b8f5e96c0a73b2": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-09-20_12-07-49-hashicorp_raft-real-run/graph-commits/derive-5ec73e3b20e64e2a85b8f5e96c0a73b2.json"
+      },
+      "reading-b31418af8ea442bfb677540d2c2b5de2-1": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-09-20_12-07-49-hashicorp_raft-real-run/graph-commits/reading-b31418af8ea442bfb677540d2c2b5de2-1.json"
+      },
+      "inquiry-8af772fbdc4f4d58a04e85e1903bf497": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-09-20_12-07-49-hashicorp_raft-real-run/graph-commits/inquiry-8af772fbdc4f4d58a04e85e1903bf497.json"
+      },
+      "reading-2f08a73df1a844e594222993ad23fb48-1": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-09-20_12-07-49-hashicorp_raft-real-run/graph-commits/reading-2f08a73df1a844e594222993ad23fb48-1.json"
+      },
+      "derive-69582fd6f2454d7d91b2b90f77964ef6": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-09-20_12-07-49-hashicorp_raft-real-run/graph-commits/derive-69582fd6f2454d7d91b2b90f77964ef6.json"
+      },
+      "reading-8b5efc452b604277a207f1ed37058614-1": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-09-20_12-07-49-hashicorp_raft-real-run/graph-commits/reading-8b5efc452b604277a207f1ed37058614-1.json"
+      },
+      "derive-e176f0ae972442688646e1b24e04363f": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-09-20_12-07-49-hashicorp_raft-real-run/graph-commits/derive-e176f0ae972442688646e1b24e04363f.json"
+      },
+      "reading-dea87d37665f49b4ad029c60e9326c80-1": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-09-20_12-07-49-hashicorp_raft-real-run/graph-commits/reading-dea87d37665f49b4ad029c60e9326c80-1.json"
+      },
+      "inquiry-969411fa3fdd4cb792a60736ae60ffe0": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-09-20_12-07-49-hashicorp_raft-real-run/graph-commits/inquiry-969411fa3fdd4cb792a60736ae60ffe0.json"
+      },
+      "derive-3cbe178c05a94d50830cfb3bbb40e01b": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-09-20_12-07-49-hashicorp_raft-real-run/graph-commits/derive-3cbe178c05a94d50830cfb3bbb40e01b.json"
+      },
+      "reading-4d4b1bac9bb945ccb5c7a4d77c36c8cf-1": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-09-20_12-07-49-hashicorp_raft-real-run/graph-commits/reading-4d4b1bac9bb945ccb5c7a4d77c36c8cf-1.json"
+      },
+      "derive-eb2a72cbdd8f4899a167dd35e7708d7d": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-09-20_12-07-49-hashicorp_raft-real-run/graph-commits/derive-eb2a72cbdd8f4899a167dd35e7708d7d.json"
+      }
+    }
+  }
+}

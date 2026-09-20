@@ -28,7 +28,8 @@ def test_thin_overview_does_not_enqueue_generic_exploration(tmp_path,prepared):
 def test_binding_review_contains_selected_current_unit(tmp_path,prepared):
     _,state,_,_=prepared;e=controller(tmp_path,state);unit=state.units[0];unit.version=2
     task=inquiry.enqueue(state,'review','Selected association','explicit',target_ids=unit.binding_ids,unit_id=unit.id)
-    packet=inquiry.task_context(e,task)
+    from consensus_assurance.workflow.task_packet import prepare
+    packet=prepare(e,'semantic_review',inquiry.task_context(e,task))[0]
     assert packet['selected_unit']==unit.model_dump(mode='json')
 
 

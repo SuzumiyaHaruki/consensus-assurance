@@ -27,11 +27,25 @@ def ask(engine,kind,response_type,context,validator=None,*,purpose="depth"):
     state=engine.state
     context={**context,'read_purpose':purpose}
     if not engine.agent.mock and not engine.config.allow_agent_materials:raise Blocked('Agent material transmission disabled by configuration; no repository payload was sent')
-    def register_citations(response):
+    from .audit_spec import SpecIssue
+    def validate(response):
+        from .sources import validate_view_citations
+        from .task_packet import pool_sources
+        validate_view_citations(response,pool_sources(context))
         from .sources import citation_ranges
         refs=citation_ranges(response,state)
         if refs:
             engine.read([{k:v for k,v in ref.items() if k!='content_digest'} | {'reason':'Register an exact citation within already acquired source'} for ref in refs.values()],reason='Resolve covered citation ranges without new source acquisition')
+        validate_read_requests(state,engine.root/"source",response,purpose=purpose)
+        if validator:
+            try:validator(response)
+            except SpecIssue as exc:
+                exc.draft_path=str(engine.root/'audit-spec'/('unaccepted-'+uid()+'.json'))
+                write_json(Path(exc.draft_path),response)
+                if session:session['status']='requires_spec_refinement';save_session(engine,session)
+                state.pending_output_repair=None;state.pending_action=None
+                engine.checkpoint('descriptive_draft_requires_refinement')
+                raise
     session=state.pending_output_repair
     if session and session.get('task')!=kind:raise Blocked('Another repair session is pending')
     if session and 'id' not in session:raise Blocked('Historical repair needs an explicit migrated child run; original artifacts preserved')
@@ -44,10 +58,9 @@ def ask(engine,kind,response_type,context,validator=None,*,purpose="depth"):
         session.pop('read_plan_id')
         try:
             candidate=json.loads(Path(session['current_path']).read_text());response=response_type.model_validate(candidate)
-            register_citations(response)
-            validate_read_requests(state,engine.root/'source',response,purpose=purpose)
-            if validator:validator(response)
+            validate(response)
         except ValueError as exc:
+            if isinstance(exc,SpecIssue):raise
             diags,targets=diagnostics_for(exc,candidate,kind,session['version'],engine.config.budget.error_context_chars)
             session.update(diagnostics=[d.model_dump(mode='json') for d in diags],targets=targets,error=str(exc))
         else:
@@ -55,20 +68,12 @@ def ask(engine,kind,response_type,context,validator=None,*,purpose="depth"):
         state.pending_action=None;save_session(engine,session)
     if session and session.get('status') in {'accepted','accepted_after_read'} and session.get('accepted_check'):
         response=response_type.model_validate_json(Path(session['current_path']).read_text())
-        register_citations(response)
-        validate_read_requests(state,engine.root/'source',response,purpose=purpose)
-        if validator:validator(response)
+        validate(response)
         state.pending_output_repair=None
         return response,CheckRun.model_validate(session['accepted_check'])
     from .task_packet import prepare, receipt
+    seed_context=context
     context,review_task=prepare(engine,kind,context)
-    def validate(response):
-        from .sources import validate_view_citations
-        from .task_packet import pool_sources
-        validate_view_citations(response,pool_sources(context))
-        register_citations(response)
-        validate_read_requests(state,engine.root/"source",response,purpose=purpose)
-        if validator:validator(response)
     limit=engine.config.budget.error_context_chars
     while True:
         import time
@@ -130,11 +135,13 @@ def ask(engine,kind,response_type,context,validator=None,*,purpose="depth"):
                 sent['child_task_ids']=split_model_context(engine,kind)
             write_json(engine.root/'packets'/(sent['id']+'.json'),sent)
             engine.checkpoint('context_limit')
+            if review_task and review_task.surface_entry_points and not session and review_task.preparation_failures<=engine.config.budget.context_preparations:
+                context,review_task=prepare(engine,kind,seed_context);continue
             raise Blocked('Required context exceeds context_chars; split the task or explicitly revise the limit; no payload sent')
         if review_task and not review_task.admitted:
-            resource='exploration_rounds' if review_task.kind=='spec_refine' else 'semantic_reviews'
-            if state.usage.get(resource,0)>=getattr(engine.config.budget,resource):raise Blocked('Actual inquiry admission budget exhausted: '+resource)
-            if review_task.preparation_failures>=engine.config.budget.context_preparations:raise Blocked('Context preparation limit exhausted; no backend call sent')
+            from .inquiry import inquiry_resource
+            resource=inquiry_resource(review_task)
+            if resource and state.usage.get(resource,0)>=getattr(engine.config.budget,resource):raise Blocked('Actual inquiry admission budget exhausted: '+resource)
         from .action_identity import stable_input
         pending=state.pending_action
         saved_scope_result=bool(pending and pending.kind=='agent:scope_review' and pending.status=='completed' and pending.logical_input.get('inputs')==stable_input({'prompt':prompt,'response_type':schema.__name__}))
@@ -144,7 +151,9 @@ def ask(engine,kind,response_type,context,validator=None,*,purpose="depth"):
             nonlocal invoked
             invoked=True
             if review_task and not review_task.admitted:
-                engine.budget.take('exploration_rounds' if review_task.kind=='spec_refine' else 'semantic_reviews')
+                from .inquiry import inquiry_resource
+                resource=inquiry_resource(review_task)
+                if resource:engine.budget.take(resource)
                 review_task.admitted=True
                 engine.checkpoint('inquiry_backend_admitted')
             elif kind=='scope_review':
@@ -191,6 +200,7 @@ def ask(engine,kind,response_type,context,validator=None,*,purpose="depth"):
                         response=response_type.model_validate(candidate)
                         validate(response)
                     except ValueError as exc:
+                        if isinstance(exc,SpecIssue):raise
                         diags,targets=diagnostics_for(exc,candidate,kind,session['version'],limit)
                         session.update(diagnostics=[d.model_dump(mode='json') for d in diags],targets=targets,error=str(exc))
                         state.pending_action=None;save_session(engine,session);continue
@@ -213,6 +223,7 @@ def ask(engine,kind,response_type,context,validator=None,*,purpose="depth"):
                         merged=split_draft_bindings(merged,patch,active_diags,related,{b.id for b in state.bindings})
                 session['patch_error']=None
             except ValueError as exc:
+                if isinstance(exc,SpecIssue):raise
                 session['patch_error']={'message':str(exc),'raw_patch':raw,'diagnostics':[d.model_dump(mode='json') for d in getattr(exc,'diagnostics',[])]}
                 session['patch_failures']=session.get('patch_failures',0)+1
                 if session['patch_failures']>=max(1,engine.config.budget.repeated_error_revisions):session['blocked']=True
@@ -239,15 +250,7 @@ def ask(engine,kind,response_type,context,validator=None,*,purpose="depth"):
             state.pending_output_repair=None
             return response,check
         except ValueError as exc:
-            from .audit_spec import SpecIssue
-            if isinstance(exc,SpecIssue):
-                exc.draft_path=str(cwd/'unaccepted-analysis.json')
-                write_json(Path(exc.draft_path),merged)
-                if session:
-                    session['status']='requires_spec_refinement';save_session(engine,session)
-                state.pending_output_repair=None;state.pending_action=None
-                engine.checkpoint('descriptive_draft_requires_refinement')
-                raise
+            if isinstance(exc,SpecIssue):raise
             if session is None:
                 id=uid();folder=engine.root/'repair-sessions'/id
                 decoded=cwd/'decoded-response.json'

@@ -4,7 +4,8 @@ from consensus_assurance.core.proposals import Feedback,GraphPatch,BindingDraft,
 from consensus_assurance.core.types import ReviewIssue,SemanticCheck
 from consensus_assurance.workflow.graph import apply_patch,expand_unit
 from consensus_assurance.workflow.feedback import apply_feedback
-from consensus_assurance.workflow.materials import ReadingPlan,add_reads,material_allowance
+from consensus_assurance.workflow.materials import ReadingPlan,material_allowance
+from regression_support import add_reads
 from consensus_assurance.workflow.inquiry import enqueue,process_task,validate_review
 from consensus_assurance.workflow.errors import Blocked
 from consensus_assurance.adapters.storage.snapshot import capture

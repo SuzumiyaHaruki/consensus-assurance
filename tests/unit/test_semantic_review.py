@@ -130,7 +130,7 @@ def test_every_actual_object_type_uses_packet_policy(tmp_path,dependency_prepare
         task,packet=packet_for(e,[obj.id]);reply=respond(packet)
         validate_review(state,task,reply)
         seen.add(packet['review_contract'][0]['object_type'])
-        assert not packet['catalogue'] and packet['file_lookup']
+        assert 'catalogue' not in packet and packet['file_lookup']
         assert len([o for key in ('target_objects','claims','bindings','units','relations') for o in packet.get(key,[]) if o['id']==obj.id])==1
     assert seen=={'obligation','assumption','binding','relation','unit','model'}
 

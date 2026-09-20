@@ -19,14 +19,9 @@ def context(engine, unit=None):
         from .task_view import local_workset
         result.update(local_workset(engine,unit))
     else:
-        result.update({name:[item.model_dump(mode="json") for item in getattr(engine.state,name)]
-                       for name in ("materials",)})
-    from .audit_spec import slice_for, source_ids
+        result["materials"]=[item.model_dump(mode="json") for item in engine.state.materials]
+    from .audit_spec import slice_for
     result["audit_spec"]=slice_for(engine.state,unit.audit_question if unit else None)
-    if result['audit_spec']:
-        ids=source_ids(result['audit_spec'])
-        present={m['id'] for m in result.get('materials',[])}
-        result.setdefault('materials',[]).extend(m.model_dump(mode='json') for m in engine.state.materials if m.id in ids-present)
     return result
 
 def discover(engine):
@@ -58,6 +53,7 @@ def discover(engine):
                 pending.draft_path=exc.draft_path;pending.diagnostics=[d.model_dump(mode='json') for d in exc.diagnostics]
                 engine.checkpoint('initial_descriptive_refinement_queued')
         while pending and pending.status!='completed':
+            if pending.status=='blocked':raise Blocked(pending.stop_reason)
             inquiry.process_task(engine,pending)
             pending=next(t for t in engine.state.inquiry_tasks if t.id==pending.id)
         engine.state.completed_steps.append('understanding');engine.checkpoint('implementation_understanding_accepted')
@@ -69,25 +65,21 @@ def active_candidate(state):
     return next((c for c in state.question_candidates if c.status=='active'),None)
 
 
+def candidate_blockage(state,candidate):
+    if candidate.status not in {'blocked','active'}:return None
+    tasks=[t for t in state.inquiry_tasks if t.id in candidate.spec_task_ids and t.status=='blocked']
+    if any(t.preparation_failures or t.semantic_failures or any(d['category']=='semantic' for d in t.diagnostics+(t.repair_session or {}).get('diagnostics',[])) for t in tasks):return 'workflow_blocked'
+    deferred=any(i['status']=='deferred' for id in [candidate.read_plan_id]+[t.read_plan_id for t in tasks] for i in state.read_plans.get(id,{}).get('items',[]))
+    if candidate.status=='blocked' and not deferred and not tasks and not candidate.question.requests and not candidate.stagnation:return 'evidence_blocked'
+    if deferred or any(state.usage.get(k,0)>=v for k,v in state.config.get('budget',{}).items() if k in {'agent_calls','targeted_reads','total_seconds'} and v>0):return 'resource_blocked'
+    if candidate.status=='blocked':return 'workflow_blocked'
+    return None
+
+
 def derive_context(engine):
-    from .locations import declaration_index
-    from .audit_spec import slice_for,source_ids
     state=engine.state;candidate=active_candidate(state)
-    if candidate:
-        view=slice_for(state,candidate.question)
-        wanted=source_ids(view)|set(candidate.question.source_ids+candidate.material_ids)
-        packet={'audit_spec':view,'selected_question':candidate.question.model_dump(mode='json'),
-            'candidate_id':candidate.id,'materials':[m.model_dump(mode='json') for m in state.materials if m.id in wanted],
-            'required_material_ids':sorted(wanted),'source_receipt':state.read_plans.get(candidate.read_plan_id),
-            'remaining_seconds':engine.budget.remaining()}
-    else:
-        packet=context(engine)
-        packet['source_declarations']=declaration_index(packet['materials'])
-        packet['materials']=[m for m in packet['materials'] if m['file'].lower().endswith(('.md','.rst'))]
-    packet['candidate_dispositions']=[{'id':c.id,'fact_ids':c.question.fact_ids,'lifecycle':c.question.obligation_relation_kind,'question':c.question.question,'status':c.status,'reason':c.stop_reason} for c in state.question_candidates if c.status!='active'] if not candidate else []
-    packet['existing_objects']=[{'id':o.id,'version':o.version} for name in ('claims','bindings','relations','units') for o in getattr(state,name)]
-    packet['source_rule']='Inventory and declaration metadata are selection aids, not source verification. Request exact code before relying on its implementation semantics.'
-    return packet
+    from .task_packet import prepare
+    return prepare(engine,'derive',{'candidate_id':candidate.id if candidate else None,'remaining_seconds':engine.budget.remaining()})[0]
 
 
 def derivation_graph(reply):
@@ -115,7 +107,7 @@ def classify_derivation_outcome(state,reply):
     if not reply.obligation:
         if q.disposition=='ready_for_check':raise ValueError('A ready check requires its obligation')
         if reads and q.preferred_check!='source_review':raise ValueError('Candidate source acquisition uses source_review')
-    selected=set(q.behavior_ids+q.fact_ids)
+    selected=set(q.behavior_ids+q.fact_ids+q.activity_classes+['target_profile'])
     if any(selected&set(i.object_ids) for i in reply.descriptive_issues):return 'spec_refine'
     if reply.obligation:return 'escalate'
     if q.disposition=='explained_by_existing_mechanism':return 'explained'
@@ -130,7 +122,8 @@ def validate_derivation(state,reply):
     from consensus_assurance.core.diagnostics import Diagnostic,DiagnosticError
     from .audit_spec import load
     spec=load(state);known={m.id for m in state.materials}
-    objects={o.id for o in spec.behaviors+spec.facts}|{a.class_id for a in spec.activities} if spec else set()
+    from .audit_spec import audit_object_index
+    objects=set(audit_object_index(spec))
     issues=[]
     for i,issue in enumerate(reply.descriptive_issues):
         if not set(issue.object_ids)<=objects or not set(issue.source_ids)<=known or not issue.reason.strip():
@@ -201,13 +194,11 @@ def accept_derivation(engine,reply,check_id):
         candidate=active_candidate(state);q=reply.audit_question.model_copy(deep=True)
         if candidate:
             candidate.history.append(candidate.question.model_copy(deep=True))
-            for field in ('counterevidence','unknowns','source_ids'):
-                setattr(q,field,list(dict.fromkeys(getattr(candidate.question,field)+getattr(q,field))))
             candidate.question=q
         else:
             candidate=QuestionCandidate(question=q);state.question_candidates.append(candidate)
         candidate.check_ids.append(check_id)
-        selected=set(q.behavior_ids+q.fact_ids)
+        selected=set(q.behavior_ids+q.fact_ids+q.activity_classes+['target_profile'])
         candidate.spec_task_ids=[]
         for issue in reply.descriptive_issues:
             task=inquiry.enqueue(state,'spec_refine',issue.reason,check_id+':'+','.join(issue.object_ids),target_ids=issue.object_ids)

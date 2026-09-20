@@ -1,0 +1,640 @@
+{
+  "understanding": "The supplied code supports a partial map of candidate orchestration, separate asynchronous election-result producers, vote persistence, and local authority setters. Pre-vote tallies consume normalized results that can include compatibility-generated grants. Election success completes a local role-field update; leader-loop initialization and known-leader publication remain unresolved. Storage calls returning successfully are distinguished from verified crash durability.",
+  "requests": [],
+  "delta": {
+    "target_profile": null,
+    "activities": [
+      {
+        "class_id": "A2",
+        "applicability": "applicable",
+        "purpose": "Campaign for authority and update local role and term context.",
+        "realization_summary": "The candidate loop chooses pre-vote or direct election, consumes campaign-specific result channels, handles higher terms, and sets local role. Separate goroutines obtain remote results. Role mutation is atomic; term mutation follows a successful StableStore call.",
+        "entry_points": [
+          "Raft.runCandidate",
+          "Raft.electSelf",
+          "Raft.preElectSelf",
+          "Raft.setCurrentTerm",
+          "Raft.setState"
+        ],
+        "variants": [
+          "Pre-vote is bypassed when disabled or when candidacy originates from leadership transfer.",
+          "An unsupported remote pre-vote command is normalized into a granted pre-vote result.",
+          "Local self-voting occurs only when the latest configuration contains the local server as a Voter."
+        ],
+        "unknowns": [
+          "The dispatch loop, leader initialization, setLeader implementation, and inbound vote handlers are not attached.",
+          "quorumSize implementation and configuration validation are not attached.",
+          "Transport selection and StableStore crash/error semantics remain unresolved."
+        ],
+        "source_ids": [
+          "raft.go:285:441",
+          "raft.go:1900:2241",
+          "state.go:1:174"
+        ]
+      }
+    ],
+    "behaviors": [
+      {
+        "id": "candidate_campaign_control",
+        "primary_activity": "A2",
+        "execution_owner": "Raft main-thread candidate loop",
+        "protocol_context": "One runCandidate invocation with invocation-local result channels and counters.",
+        "trigger": "Invocation of runCandidate.",
+        "legal_preconditions": [
+          "Intended entry is Candidate state; the caller and dispatch loop are unread."
+        ],
+        "implementation_guards": [
+          "Pre-vote runs only when enabled and the leadership-transfer flag is false.",
+          "Loop iterations require the current role to be Candidate.",
+          "Pre-vote higher-term handling compares against the term captured as currentTerm + 1 at entry.",
+          "Vote higher-term handling compares against the current term at consumption."
+        ],
+        "reads": [
+          "Role, current term, campaign results, quorumSize result, election timeout, and leadership-transfer flag."
+        ],
+        "writes": [
+          "Invocation-local tallies and result-channel references.",
+          "Election timer.",
+          "Role and term through setters.",
+          "Leadership-transfer flag is cleared by deferred cleanup."
+        ],
+        "durable_effects": [
+          "Higher-term results invoke setCurrentTerm after setting Follower."
+        ],
+        "external_effects": [
+          "After sufficient granted vote results, calls setState(Leader), then setLeader(localAddr, localID), and returns.",
+          "Processes incoming RPCs through an unread dispatcher.",
+          "Rejects configuration changes, application, verification, restore, and leadership-transfer requests with ErrNotLeader.",
+          "Returns a cloned configuration for configurationsCh requests and ErrCantBootstrap for bootstrap requests."
+        ],
+        "important_branches": [
+          "A sufficient pre-vote grant tally disables the pre-vote channel, resets the timer, and starts electSelf.",
+          "A sufficient pre-vote refusal tally logs failure but continues waiting.",
+          "Higher-term results cause a Follower update followed by a term update and return.",
+          "Granted vote results increment a counter without a visible voter-ID deduplication or term-equality check.",
+          "Timeout returns without explicitly changing the role; subsequent dispatch is unread.",
+          "Shutdown returns; follower notification can replace the timeout when configuration changes."
+        ],
+        "async_boundaries": [
+          "Select receives results from independent RPC goroutines.",
+          "RPC processing can affect protocol context before subsequent result consumption."
+        ],
+        "produces_fact_ids": [],
+        "consumes_fact_ids": [
+          "campaign_prevote_result",
+          "campaign_vote_result"
+        ],
+        "cross_activity_effects": {
+          "A7": "Selected client-facing operations received while campaigning complete with ErrNotLeader.",
+          "A4": "Configuration-change requests received while campaigning are rejected; configuration queries receive a clone."
+        },
+        "existing_protections": [
+          "Invocation-local channels separate campaign result streams.",
+          "Higher-term checks precede tallying.",
+          "The leadership-transfer flag is reset on every normal exit through the deferred cleanup.",
+          "Pre-vote success disables further consumption from that pre-vote channel."
+        ],
+        "source_ids": [
+          "raft.go:285:441"
+        ],
+        "unknowns": [
+          "quorumSize calculation, legal configuration identities, RPC effects, and dispatch after return are not established.",
+          "Local Leader state does not establish completed leader-loop initialization."
+        ]
+      },
+      {
+        "id": "election_setup_and_self_vote",
+        "primary_activity": "A2",
+        "execution_owner": "Raft main thread executing electSelf",
+        "protocol_context": "A new election using the latest configuration and a newly incremented current term.",
+        "trigger": "Candidate entry selecting direct election or successful pre-vote tally.",
+        "legal_preconditions": [
+          "The declaration comment requires main-thread invocation."
+        ],
+        "implementation_guards": [
+          "Only entries with Voter suffrage participate.",
+          "A local grant is enqueued only after persistVote returns nil."
+        ],
+        "reads": [
+          "Current term, latest configuration, local identity, RPC header, leadership-transfer flag, and last-entry cache."
+        ],
+        "writes": [
+          "Current term through setCurrentTerm.",
+          "A response channel buffered to the latest configuration server count.",
+          "An election request shared with remote workers."
+        ],
+        "durable_effects": [
+          "Calls setCurrentTerm before constructing requests.",
+          "Calls persistVote for a local Voter entry before enqueuing its grant."
+        ],
+        "external_effects": [
+          "Launches one remote vote worker for each nonlocal Voter entry."
+        ],
+        "important_branches": [
+          "If self-vote persistence fails, returns nil; remote workers for earlier configuration entries may already have started.",
+          "If the local server is not a Voter entry, no self-grant is emitted.",
+          "getLastEntry selects the cached log pair when its index is at least the cached snapshot index, otherwise the snapshot pair."
+        ],
+        "async_boundaries": [
+          "Remote workers can execute while configuration iteration continues."
+        ],
+        "produces_fact_ids": [
+          "campaign_vote_result"
+        ],
+        "consumes_fact_ids": [
+          "current_term_store_acknowledged",
+          "vote_store_calls_acknowledged"
+        ],
+        "cross_activity_effects": {},
+        "existing_protections": [
+          "Term store acknowledgement precedes the in-memory term update and request dispatch.",
+          "Local grant emission follows both successful vote-store calls."
+        ],
+        "source_ids": [
+          "raft.go:1900:2241",
+          "state.go:1:174"
+        ],
+        "unknowns": [
+          "Store durability and legal configuration uniqueness are not established.",
+          "A nil returned channel prevents the caller from consuming any results already produced for this election."
+        ]
+      },
+      {
+        "id": "remote_vote_result",
+        "primary_activity": "A2",
+        "execution_owner": "One goFunc goroutine per nonlocal Voter entry",
+        "protocol_context": "One RequestVote call for a captured election request and selected peer.",
+        "trigger": "electSelf launches askPeer.",
+        "legal_preconditions": [],
+        "implementation_guards": [
+          "The launching loop filters for nonlocal Voter entries."
+        ],
+        "reads": [
+          "Captured request, peer identity/address, transport return value, and response."
+        ],
+        "writes": [
+          "One voteResult tagged with the selected peer ID.",
+          "The invocation-specific response channel."
+        ],
+        "durable_effects": [],
+        "external_effects": [
+          "Calls transport.RequestVote."
+        ],
+        "important_branches": [
+          "On transport error, overwrites Term with request.Term and Granted with false.",
+          "On success, forwards response fields without additional local semantic validation."
+        ],
+        "async_boundaries": [
+          "Transport completion and channel send occur independently of the candidate loop.",
+          "The shown worker has no shutdown-select around its result send."
+        ],
+        "produces_fact_ids": [
+          "campaign_vote_result"
+        ],
+        "consumes_fact_ids": [],
+        "cross_activity_effects": {},
+        "existing_protections": [
+          "Transport errors do not produce granted vote results.",
+          "Each shown worker sends once to a campaign-specific buffered channel."
+        ],
+        "source_ids": [
+          "raft.go:1900:2241",
+          "state.go:1:174"
+        ],
+        "unknowns": [
+          "Remote vote establishment, response authentication/correlation, and transport cancellation semantics are unread."
+        ]
+      },
+      {
+        "id": "prevote_setup_and_self_result",
+        "primary_activity": "A2",
+        "execution_owner": "Raft main thread executing preElectSelf",
+        "protocol_context": "A proposed next term without a current-term mutation.",
+        "trigger": "Candidate entry with pre-vote enabled and no leadership-transfer flag.",
+        "legal_preconditions": [
+          "The declaration comment requires main-thread invocation."
+        ],
+        "implementation_guards": [
+          "Transport must implement WithPreVote or the function panics.",
+          "Only Voter configuration entries participate."
+        ],
+        "reads": [
+          "Current term, latest configuration, local identity, RPC header, and cached last entry."
+        ],
+        "writes": [
+          "A pre-vote request with currentTerm + 1.",
+          "A response channel buffered to the latest configuration server count.",
+          "A granted local result for a local Voter entry."
+        ],
+        "durable_effects": [],
+        "external_effects": [
+          "Launches remote pre-vote workers for nonlocal Voter entries."
+        ],
+        "important_branches": [
+          "Local self-pre-vote requires no vote-store call.",
+          "Absence of a local Voter entry means no local result is emitted."
+        ],
+        "async_boundaries": [
+          "Remote workers run independently after launch."
+        ],
+        "produces_fact_ids": [
+          "campaign_prevote_result"
+        ],
+        "consumes_fact_ids": [],
+        "cross_activity_effects": {},
+        "existing_protections": [
+          "This helper does not increment or persist the current term.",
+          "Result channels are distinct for each helper invocation."
+        ],
+        "source_ids": [
+          "raft.go:1900:2241",
+          "state.go:1:174"
+        ],
+        "unknowns": [
+          "Constructor validation of pre-vote transport support is unread."
+        ]
+      },
+      {
+        "id": "remote_prevote_result",
+        "primary_activity": "A2",
+        "execution_owner": "One goFunc goroutine per nonlocal Voter entry",
+        "protocol_context": "One RequestPreVote call for a captured proposed-term request.",
+        "trigger": "preElectSelf launches askPeer.",
+        "legal_preconditions": [],
+        "implementation_guards": [
+          "The launching loop filters for nonlocal Voter entries."
+        ],
+        "reads": [
+          "Captured request, peer identity/address, response, and transport error text."
+        ],
+        "writes": [
+          "One preVoteResult tagged with selected peer ID.",
+          "The invocation-specific response channel."
+        ],
+        "durable_effects": [],
+        "external_effects": [
+          "Calls WithPreVote.RequestPreVote."
+        ],
+        "important_branches": [
+          "An error containing rpcUnexpectedCommandError produces Granted=true and Term=request.Term.",
+          "Other errors produce Granted=false and Term=request.Term.",
+          "Successful calls forward the remote response."
+        ],
+        "async_boundaries": [
+          "Transport completion and result enqueue occur independently of candidate processing."
+        ],
+        "produces_fact_ids": [
+          "campaign_prevote_result"
+        ],
+        "consumes_fact_ids": [],
+        "cross_activity_effects": {},
+        "existing_protections": [
+          "Ordinary transport errors are normalized to refusals.",
+          "Each shown worker emits one result to its own campaign channel."
+        ],
+        "source_ids": [
+          "raft.go:1900:2241",
+          "state.go:1:174"
+        ],
+        "unknowns": [
+          "The consumer representation does not identify whether a grant came from remote approval or compatibility fallback.",
+          "Error provenance and remote pre-vote decision semantics are unread."
+        ]
+      },
+      {
+        "id": "persist_vote_fields",
+        "primary_activity": "A6",
+        "execution_owner": "Synchronous caller of Raft.persistVote",
+        "protocol_context": "Vote metadata identified by term and candidate bytes.",
+        "trigger": "persistVote(term, candidate) call.",
+        "legal_preconditions": [],
+        "implementation_guards": [
+          "Candidate bytes are written only after the vote-term write returns nil."
+        ],
+        "reads": [
+          "Supplied term and candidate bytes."
+        ],
+        "writes": [
+          "StableStore keyLastVoteTerm, then keyLastVoteCand."
+        ],
+        "durable_effects": [
+          "Issues two sequential store writes; nil return means both calls returned nil."
+        ],
+        "external_effects": [],
+        "important_branches": [
+          "First-write error returns immediately.",
+          "Second-write error returns without a shown rollback of the first write."
+        ],
+        "async_boundaries": [],
+        "produces_fact_ids": [
+          "vote_store_calls_acknowledged"
+        ],
+        "consumes_fact_ids": [],
+        "cross_activity_effects": {
+          "A2": "Successful return permits electSelf to emit its local granted vote result."
+        },
+        "existing_protections": [
+          "Errors from either write propagate to the caller.",
+          "The self-election caller suppresses its local grant on failure."
+        ],
+        "source_ids": [
+          "raft.go:1900:2241"
+        ],
+        "unknowns": [
+          "Atomicity, durability, partial-write behavior, and recovery interpretation depend on unread store and startup implementations."
+        ]
+      },
+      {
+        "id": "set_current_term",
+        "primary_activity": "A2",
+        "execution_owner": "Synchronous caller of Raft.setCurrentTerm",
+        "protocol_context": "One requested current-term update.",
+        "trigger": "setCurrentTerm(t) call.",
+        "legal_preconditions": [],
+        "implementation_guards": [
+          "StableStore SetUint64 must return nil before in-memory publication."
+        ],
+        "reads": [
+          "Requested term."
+        ],
+        "writes": [
+          "StableStore keyCurrentTerm.",
+          "Atomic in-memory currentTerm."
+        ],
+        "durable_effects": [
+          "Requests persistence before the atomic in-memory store."
+        ],
+        "external_effects": [],
+        "important_branches": [
+          "Store error panics before updating the in-memory term.",
+          "No monotonicity check is present inside this setter."
+        ],
+        "async_boundaries": [],
+        "produces_fact_ids": [
+          "current_term_store_acknowledged"
+        ],
+        "consumes_fact_ids": [],
+        "cross_activity_effects": {
+          "A6": "Writes the current-term recovery representation through StableStore."
+        },
+        "existing_protections": [
+          "Store acknowledgement precedes in-memory publication.",
+          "In-memory access uses atomic operations."
+        ],
+        "source_ids": [
+          "raft.go:1900:2241",
+          "state.go:1:174"
+        ],
+        "unknowns": [
+          "Store acknowledgement alone does not establish crash durability.",
+          "Other callers and startup term reconstruction are not mapped."
+        ]
+      },
+      {
+        "id": "set_local_role",
+        "primary_activity": "A2",
+        "execution_owner": "Synchronous caller of Raft.setState",
+        "protocol_context": "One local role update.",
+        "trigger": "setState(state) call.",
+        "legal_preconditions": [],
+        "implementation_guards": [
+          "An observation is requested only when oldState differs from the requested state."
+        ],
+        "reads": [
+          "Previous role and requested role."
+        ],
+        "writes": [
+          "Atomic raftState.state after calling setLeader with empty identity."
+        ],
+        "durable_effects": [],
+        "external_effects": [
+          "Calls setLeader with empty address and ID on every invocation.",
+          "Calls observe after a changed role is stored."
+        ],
+        "important_branches": [
+          "An unchanged role still invokes setLeader with empty identity.",
+          "The role store occurs before observation dispatch."
+        ],
+        "async_boundaries": [
+          "Atomic readers may observe the new role before subsequent caller actions."
+        ],
+        "produces_fact_ids": [
+          "local_role_stored"
+        ],
+        "consumes_fact_ids": [],
+        "cross_activity_effects": {},
+        "existing_protections": [
+          "Role reads and writes use atomic operations."
+        ],
+        "source_ids": [
+          "raft.go:1900:2241",
+          "state.go:1:174"
+        ],
+        "unknowns": [
+          "setLeader and observe implementations are unread.",
+          "This setter does not establish completion of role-specific loop initialization."
+        ]
+      }
+    ],
+    "facts": [
+      {
+        "id": "campaign_prevote_result",
+        "meaning": "A producer has enqueued one normalized pre-vote tally input. A grant can be a local self-result, a remote response, or a compatibility-generated result; it does not by itself establish a remote vote or authority.",
+        "identity": {
+          "campaign": "preElectSelf invocation and its response channel",
+          "participant": "voterID attached by the producer",
+          "proposal": "captured request term; returned result term can differ"
+        },
+        "validity_context": "Establishment records enqueue into the invocation-specific channel. Tally eligibility is determined separately by runCandidate.",
+        "representation": [
+          "preVoteResult containing RequestPreVoteResponse and voterID",
+          "Buffered response channel"
+        ],
+        "invalidators": [],
+        "reinterpreters": [],
+        "durability": "Volatile channel result.",
+        "recovery": "No recovery of these results is shown.",
+        "source_ids": [
+          "raft.go:285:441",
+          "raft.go:1900:2241"
+        ],
+        "unknowns": [
+          "The result carries no explicit compatibility-fallback provenance.",
+          "Remote approval semantics are not established."
+        ]
+      },
+      {
+        "id": "campaign_vote_result",
+        "meaning": "A producer has enqueued one election tally input. A local grant follows successful self-vote store calls; a remote result represents a transport response or a synthesized refusal on error.",
+        "identity": {
+          "campaign": "electSelf invocation and its response channel",
+          "participant": "voterID attached by the producer",
+          "request": "captured election term"
+        },
+        "validity_context": "This establishes availability of a result, not remote durable voting or global leadership. runCandidate separately checks for a higher result term and counts grants.",
+        "representation": [
+          "voteResult containing RequestVoteResponse and voterID",
+          "Buffered response channel"
+        ],
+        "invalidators": [],
+        "reinterpreters": [],
+        "durability": "Volatile channel result.",
+        "recovery": "No recovery of campaign channels is shown.",
+        "source_ids": [
+          "raft.go:285:441",
+          "raft.go:1900:2241"
+        ],
+        "unknowns": [
+          "Remote voting semantics, transport correlation, and configuration identity uniqueness are unread."
+        ]
+      },
+      {
+        "id": "vote_store_calls_acknowledged",
+        "meaning": "For one persistVote invocation, the vote-term write and subsequent candidate-byte write both returned nil.",
+        "identity": {
+          "operation": "persistVote invocation",
+          "vote": "term and candidate bytes"
+        },
+        "validity_context": "Established on successful return; this is an operation outcome, not a guarantee that a crash-atomic vote pair exists.",
+        "representation": [
+          "nil return from persistVote"
+        ],
+        "invalidators": [],
+        "reinterpreters": [],
+        "durability": "Acknowledged store operations; actual crash persistence is unresolved.",
+        "recovery": "Startup reads and partial-write interpretation are unread.",
+        "source_ids": [
+          "raft.go:1900:2241"
+        ],
+        "unknowns": [
+          "Store-specific guarantees and additional consumers are unresolved."
+        ]
+      },
+      {
+        "id": "current_term_store_acknowledged",
+        "meaning": "A setCurrentTerm invocation successfully wrote the requested term through StableStore and then atomically published that term in memory.",
+        "identity": {
+          "operation": "setCurrentTerm invocation",
+          "term": "requested term t"
+        },
+        "validity_context": "An update-completion event; later setters may replace the current value without changing this historical operation outcome.",
+        "representation": [
+          "Successful keyCurrentTerm SetUint64 call followed by atomic currentTerm store"
+        ],
+        "invalidators": [],
+        "reinterpreters": [],
+        "durability": "Store acknowledgement is observed; storage failure and crash guarantees remain unknown.",
+        "recovery": "Term reconstruction on restart is unread.",
+        "source_ids": [
+          "raft.go:1900:2241",
+          "state.go:1:174"
+        ],
+        "unknowns": [
+          "No store implementation or recovery consumer is attached."
+        ]
+      },
+      {
+        "id": "local_role_stored",
+        "meaning": "A setState invocation has atomically stored the requested local role after its setLeader-empty call returned.",
+        "identity": {
+          "operation": "setState invocation",
+          "role": "requested RaftState"
+        },
+        "validity_context": "An operation event at the atomic store; it does not assert that the role remains current, that observers received it, or that role-specific initialization completed.",
+        "representation": [
+          "Atomic raftState.state store"
+        ],
+        "invalidators": [],
+        "reinterpreters": [],
+        "durability": "Volatile.",
+        "recovery": "Startup role selection is not attached.",
+        "source_ids": [
+          "raft.go:1900:2241",
+          "state.go:1:174"
+        ],
+        "unknowns": [
+          "Role-dispatch consumers and completed leader readiness remain unresolved."
+        ]
+      }
+    ],
+    "surfaces": [
+      {
+        "entry_point": "Raft.runCandidate, electSelf, preElectSelf, and authority setters",
+        "disposition": "mapped",
+        "behavior_ids": [
+          "candidate_campaign_control",
+          "election_setup_and_self_vote",
+          "prevote_setup_and_self_result",
+          "set_current_term",
+          "set_local_role"
+        ],
+        "reason": "Maps the supplied main-thread orchestration and local setter semantics. Independent workers and persistence are separated below; mapping does not establish completed leader initialization.",
+        "source_ids": [
+          "raft.go:285:441",
+          "raft.go:1900:2241",
+          "state.go:1:174"
+        ],
+        "high_consequence": true
+      },
+      {
+        "entry_point": "Raft.electSelf.askPeer goroutine",
+        "disposition": "mapped",
+        "behavior_ids": [
+          "remote_vote_result"
+        ],
+        "reason": "Independent remote vote producer with explicit transport-error normalization.",
+        "source_ids": [
+          "raft.go:1900:2241",
+          "state.go:1:174"
+        ],
+        "high_consequence": true
+      },
+      {
+        "entry_point": "Raft.preElectSelf.askPeer goroutine",
+        "disposition": "mapped",
+        "behavior_ids": [
+          "remote_prevote_result"
+        ],
+        "reason": "Independent pre-vote result producer, including the compatibility-generated grant branch.",
+        "source_ids": [
+          "raft.go:1900:2241",
+          "state.go:1:174"
+        ],
+        "high_consequence": true
+      },
+      {
+        "entry_point": "Raft.persistVote",
+        "disposition": "mapped",
+        "behavior_ids": [
+          "persist_vote_fields"
+        ],
+        "reason": "Sequential store-call outcomes are mapped without claiming atomic or durable vote recovery.",
+        "source_ids": [
+          "raft.go:1900:2241"
+        ],
+        "high_consequence": true
+      },
+      {
+        "entry_point": "Raft.setLeader and post-candidate leader initialization",
+        "disposition": "deferred",
+        "behavior_ids": [],
+        "reason": "The candidate calls are visible, but setLeader and role dispatch/leader initialization declarations are not attached. Local Leader publication cannot be equated with completed readiness.",
+        "source_ids": [
+          "raft.go:285:441",
+          "raft.go:1900:2241"
+        ],
+        "high_consequence": true
+      }
+    ],
+    "remove_behavior_ids": [],
+    "remove_fact_ids": [],
+    "remove_surface_entry_points": [],
+    "rationale": "Expand only the selected authority frontier and its directly connected result producers and persistence helper. Facts describe producer-established operation outcomes and channel inputs, preserving the distinction between pre-vote compatibility grants, remote voting guarantees, local role publication, and completed authority initialization. Unread callees and storage semantics remain explicit gaps; no normative obligation or correctness conclusion is introduced."
+  },
+  "limitations": [
+    "All judgments are descriptive observations of the attached code, not independently validated protocol guarantees.",
+    "Inbound vote/pre-vote handlers, quorum calculation, configuration validation, transport implementations, storage variants, and startup recovery remain unread.",
+    "The attached snapshot and configuration helper code is outside this focused expansion.",
+    "No execution, calibration, reproduction, or overall correctness assessment was performed."
+  ]
+}
