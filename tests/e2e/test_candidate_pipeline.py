@@ -39,7 +39,7 @@ def test_recorded_derivation_contract_to_source_review(tmp_path,debt):
         next(b for b in broken.behaviors if b.id=='B5').existing_protections=[]
         Path(state.audit_spec_path).write_text(broken.model_dump_json())
     if debt:
-        from consensus_assurance.core.proposals import DescriptiveIssue,SpecRefinement
+        from consensus_assurance.core.proposals import DescriptiveIssue,AuditSpecDelta,SpecRefinement
         reply.descriptive_issues=[DescriptiveIssue(object_ids=['B5' if debt=='selected' else 'B6'],source_ids=reply.obligation.source_ids,reason='Restore the source-backed protections omitted from the selected behavior' if debt=='selected' else 'Recheck the unrelated decomposition against actual source')]
     validate_derivation(state,reply);accepted=accept_derivation(engine,reply,'offline-recorded')
     tasks=[t for t in engine.state.inquiry_tasks if t.kind=='spec_refine' and t.diagnostics]
@@ -50,7 +50,7 @@ def test_recorded_derivation_contract_to_source_review(tmp_path,debt):
         from consensus_assurance.workflow.inquiry import process_task
         from consensus_assurance.adapters.agents.backend import MockAgent
         spec=corrected
-        engine.agent=MockAgent();engine.agent.responses=[SpecRefinement(understanding='Restore the recorded protections from the supplied handler source; preserve fact meaning',audit_spec=spec,limitations=['No implementation correctness established']).model_dump(mode='json')]
+        engine.agent=MockAgent();engine.agent.responses=[SpecRefinement(understanding='Restore the recorded protections from the supplied handler source; preserve fact meaning',delta=AuditSpecDelta(behaviors=[b for b in spec.behaviors if b.id=='B5'],rationale='Restore sourced selected protections'),limitations=['No implementation correctness established']).model_dump(mode='json')]
         process_task(engine,tasks[0])
         assert next(t for t in engine.state.inquiry_tasks if t.id==tasks[0].id).status=='completed'
         assert load(engine.state).version==2 and next(b for b in load(engine.state).behaviors if b.id=='B5').existing_protections
@@ -120,3 +120,43 @@ def test_evidence_blocked_candidate_does_not_end_autonomous_selection(tmp_path,p
         assert len(state.claims)==len(state.units)==1 and state.units[0].relation_ids==[]
         assert state.units[0].audit_question.fact_ids==second.fact_ids
         assert second_record.obligation_id==state.units[0].obligation_ids[0]
+
+
+def test_progressive_frontier_prevents_candidate_monopoly(tmp_path,prepared):
+    """15-00-06 run shape: candidate loop starved high-consequence deferred surfaces."""
+    from consensus_assurance.core.types import AuditQuestion,ReadRequest,Surface,Behavior,Fact
+    from consensus_assurance.core.proposals import SpecRefinement,AuditSpecDelta
+    from regression_support import descriptive_inventory
+    repo,_,_,responses=prepared
+    (repo/'latent.py').write_text('\n'*99+'def restore(value):\n    return value\n# recovery boundary\n')
+    source=responses[1]['claims'][0]['source_ids'][0]
+    description=descriptive_inventory(source)
+    description.audit_spec.activities[0].behavior_ids=['fixture_step']
+    description.audit_spec.surfaces.extend(Surface(entry_point=name,disposition='deferred',high_consequence=True,reason='Implementation owner unread',source_ids=[source]) for name in ['external boundary','recovery boundary'])
+    q=AuditQuestion(question='Does the established input retain identity?',importance='Result correlation',source_ids=[source],activity_classes=['A1'],behavior_ids=['fixture_step'],fact_ids=['fixture_value'],obligation_relation_kind='consumption',preferred_check='source_review',disposition='needs_specific_evidence',counterevidence=['Scoped identity check exists'],unknowns=['Verify actual owner'],trigger_rationale='Check the selected source')
+    actual='latent.py:100:102'
+    behavior=Behavior(id='restore',primary_activity='A7',execution_owner='caller',protocol_context='one restore',trigger='restore call',produces_fact_ids=['restored'],source_ids=[actual])
+    fact=Fact(id='restored',meaning='The supplied value is returned',identity={'operation':'restore call'},validity_context='one synchronous call',representation=['return value'],durability='No durable effect',recovery='Supplied by caller',source_ids=[actual],unknowns=['External consumer not inspected'])
+    later=q.model_copy(update={'question':'Does restore return the same scoped input?','source_ids':[actual],'activity_classes':['A7'],'behavior_ids':['restore'],'fact_ids':['restored'],'counterevidence':['The acquired return preserves the supplied value']})
+    reading=ReadRequest(file='latent.py',start_line=100,end_line=102,reason='Read the exact previously unread restore declaration')
+    def select(question,requests):return Derivation(audit_question=question,reading_requests=requests,selection_rationale='One bounded source discriminator').model_dump(mode='json')
+    def explain(question):return select(question.model_copy(update={'disposition':'explained_by_existing_mechanism'}),[])
+    replies=[responses[0],description.model_dump(mode='json'),
+        SpecRefinement(understanding='The external provider is absent',delta=AuditSpecDelta(rationale='Retain deferred boundary; no source supports a mapping'),limitations=['External provider unavailable']).model_dump(mode='json'),
+        select(q,[ReadRequest(file='counter.py',start_line=1,end_line=10,reason='Review scoped operation')]),explain(q),
+        SpecRefinement(understanding='Navigate to the unread restore owner',requests=[reading],limitations=[]).model_dump(mode='json'),
+        SpecRefinement(understanding='Recover the synchronous restore owner',delta=AuditSpecDelta(behaviors=[behavior],facts=[fact],surfaces=[Surface(entry_point='recovery boundary',disposition='mapped',behavior_ids=['restore'],reason='Acquired declaration and return',source_ids=[actual],high_consequence=True)],rationale='Add the previously absent recovery path'),limitations=['Consumer remains external']).model_dump(mode='json'),
+        select(later,[reading]),explain(later),Derivation(selection_rationale='No further tractable discriminator is supported').model_dump(mode='json')]
+    fixture=tmp_path/'progressive.json';fixture.write_text(json.dumps(replies))
+    config=Config(implementation='toy',agent_backend='mock',fixture=str(fixture),allow_experiments=False)
+    config.budget.agent_calls=len(replies)  # Exact finite scripted sequence; production budgets are unchanged.
+    engine=Engine(config,tmp_path/'progressive-run',*assemble(config));state=engine.start(repo)
+    assert [c.status for c in state.question_candidates]==['explained','explained'],state.stop_reason
+    assert state.audit_spec_version==2 and not state.repair_sessions
+    tasks=[t for t in state.inquiry_tasks if t.surface_entry_points]
+    assert [t.surface_entry_points for t in tasks]==[['external boundary'],['recovery boundary']]
+    assert all(t.status=='completed' for t in tasks)
+    assert not state.claims and not state.units and not state.evidence
+    assert [c.parameters.get('agent_task') for c in state.checks if c.parameters.get('agent_task')]==['read','discover','spec_refine','derive','derive','spec_refine','spec_refine','derive','derive','derive']
+    from consensus_assurance.workflow.audit_spec import load
+    assert load(state).surfaces[-2].disposition=='deferred' and load(state).facts[-1].established_by==['restore']

@@ -189,6 +189,7 @@ class ReachabilityResult(Record):
 
 
 class InquiryTask(Record):
+    surface_entry_points: list[str] = []
     candidate_id: str | None = None
     draft_path: str | None = None
     diagnostics: list[dict] = []

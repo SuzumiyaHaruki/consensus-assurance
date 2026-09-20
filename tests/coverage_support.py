@@ -50,7 +50,7 @@ class CoverageAgent(MockAgent):
                 response['units'][0]['relation_ids']=[id for id in response['units'][0]['relation_ids'] if id!='input_dependency']
                 response['reading_requests']=[request]
         elif name=='SpecRefinement':
-            response={'understanding':'Controlled fixture retains explicit descriptive gaps','audit_spec':context.get('audit_spec'),'requests':[], 'limitations':['Finite synthetic coverage only']}
+            response={'understanding':'Controlled fixture retains explicit descriptive gaps','delta':{'rationale':'No descriptive change justified by this fixture'},'requests':[], 'limitations':['Finite synthetic coverage only']}
         elif name=='ReviewReply':
             items=[];revision=None
             for obj in context['target_objects']+([context['selected_unit']] if context.get('selected_unit',{}).get('id') in context['task']['target_ids'] else []):

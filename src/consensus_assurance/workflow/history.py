@@ -57,5 +57,5 @@ def load_analysis(path):
     from pathlib import Path
     from consensus_assurance.core.types import Analysis
     value=json.loads(Path(path).read_text())
-    if value.get('framework_revision') not in {'obligation-audit-v2','selected-question-v3','selected-question-v4'}:value=import_record(value)
+    if value.get('framework_revision') not in {'obligation-audit-v2','selected-question-v3','selected-question-v4','selected-question-v5'}:value=import_record(value)
     return Analysis.model_validate(value)

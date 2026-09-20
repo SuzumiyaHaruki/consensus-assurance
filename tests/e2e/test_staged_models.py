@@ -125,5 +125,5 @@ def test_repairs_fragmented_new_source_scope_model_components_and_real_tools(tmp
     assert any(i.explanation=='Source is located, but the provider obligation is not independently proven' and not i.resolved_by for i in state.review_issues)
     assert {s['task'] for s in state.repair_sessions.values() if s['status']=='accepted'}=={'graph_patch'}
     assert any(t.trigger.endswith(':missing_aspects') for t in state.inquiry_tasks)
-    assert any(t.kind=='spec_refine' and t.status=='completed' for t in state.inquiry_tasks)
+    assert not any(t.kind=='spec_refine' for t in state.inquiry_tasks)
     assert all(m.origin.value=='mock' for m in state.models)

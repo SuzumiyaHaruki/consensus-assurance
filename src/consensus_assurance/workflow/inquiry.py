@@ -15,12 +15,12 @@ def enabled(engine):
     return engine.config.budget.exploration_rounds > 0 or engine.config.budget.semantic_reviews > 0
 
 
-def enqueue(state, kind, reason, trigger, activity_classes=(), target_ids=(), unit_id=None, model_id=None, requests=()):
-    signature=(kind,trigger,tuple(activity_classes),tuple(target_ids),unit_id,model_id)
+def enqueue(state, kind, reason, trigger, activity_classes=(), target_ids=(), unit_id=None, model_id=None, requests=(), surface_entry_points=()):
+    signature=(kind,trigger,tuple(activity_classes),tuple(target_ids),unit_id,model_id,tuple(surface_entry_points))
     for task in state.inquiry_tasks:
-        if signature==(task.kind,task.trigger,tuple(task.activity_classes),tuple(task.target_ids),task.unit_id,task.model_id):
+        if signature==(task.kind,task.trigger,tuple(task.activity_classes),tuple(task.target_ids),task.unit_id,task.model_id,tuple(task.surface_entry_points)):
             return task
-    task=InquiryTask(kind=kind,reason=reason,trigger=trigger,activity_classes=list(activity_classes),target_ids=list(target_ids),unit_id=unit_id,model_id=model_id,requests=list(requests),stage='read' if requests else 'analyze')
+    task=InquiryTask(surface_entry_points=list(surface_entry_points),kind=kind,reason=reason,trigger=trigger,activity_classes=list(activity_classes),target_ids=list(target_ids),unit_id=unit_id,model_id=model_id,requests=list(requests),stage='read' if requests else 'analyze')
     task.target_versions={i:getattr(objects(state)[i],"version",1) for i in task.target_ids if i in objects(state)}
     unit=next((u for u in state.units if u.id==unit_id),None)
     task.unit_version=unit.version if unit else None
@@ -89,20 +89,16 @@ def choose_task(engine):
     focused=[t for t in pending if t.kind=='review' and t.unit_id in state.deferred_units]
     if focused:return focused[0]
     ready=any(u.status in {'pending','partial','selected'} and not (u.audit_question and u.audit_question.disposition=='explained_by_existing_mechanism') for u in state.units)
-    from .audit_spec import refinement_reason
-    urgent=refinement_reason(state)
-    latest=next((c.id for c in reversed(state.checks) if c.action in {'direct_check','model_check'}),'initial')
-    closure='closure:'+str(state.audit_spec_version)+':'+latest
-    if urgent and not any(t.trigger==closure for t in state.inquiry_tasks):
-        return enqueue(state,'spec_refine',urgent,closure)
-    if ready and not urgent and engine.config.budget.audit_units>state.usage.get('audit_units',0):return None
-    if pending:return sorted(pending,key=lambda t:t.kind!='review')[0]
+    if ready and engine.config.budget.audit_units>state.usage.get('audit_units',0):return None
+    if any(c.status=='active' for c in state.question_candidates):return None
+    feedback=[t for t in pending if t.kind=='review' or t.diagnostics or t.candidate_id]
+    if feedback:return feedback[0]
+    from .audit_spec import next_surface_refinement
     if state.usage.get('exploration_rounds',0)<engine.config.budget.exploration_rounds:
-        from .audit_spec import refinement_reason
-        reason=refinement_reason(state)
-        trigger='spec:'+str(state.audit_spec_version)+':'+str(state.graph_version)
-        if reason and not any(t.trigger==trigger for t in state.inquiry_tasks):
-            return enqueue(state,'spec_refine',reason,trigger)
+        surface=next_surface_refinement(state)
+        if surface:
+            return enqueue(state,'spec_refine','Expand one source-grounded implementation surface','surface:'+surface.entry_point,surface_entry_points=[surface.entry_point])
+    if pending and state.last_work_kind!='surface':return pending[0]
     return None
 
 
@@ -124,7 +120,17 @@ def task_context(engine,task):
         if (issue.target_id in closure or issue.id in task.resolution_issue_ids) and not issue.resolved_by:wanted.update(issue.source_ids)
     if task.kind=='spec_refine':
         from .audit_spec import slice_for, source_ids
-        view=slice_for(state,focus,classes=task.activity_classes)
+        view=slice_for(state,focus,classes=task.activity_classes,object_ids=task.target_ids)
+        if task.surface_entry_points:
+            from .audit_spec import load
+            spec=load(state);entries=set(task.surface_entry_points)
+            bs={id for surface in spec.surfaces if surface.entry_point in entries for id in surface.behavior_ids}
+            fs={f.id for f in spec.facts if set(f.established_by+f.consumed_by)&bs}
+            bs.update(id for f in spec.facts if f.id in fs for id in f.established_by+f.consumed_by+f.invalidators+f.reinterpreters)
+            view={**view,'behaviors':[b.model_dump(mode='json') for b in spec.behaviors if b.id in bs],
+                'facts':[f.model_dump(mode='json') for f in spec.facts if f.id in fs],
+                'surfaces':[s.model_dump(mode='json') for s in spec.surfaces if s.entry_point in entries]}
+            view['activities']=[{'class_id':a.class_id,'realization_summary':a.realization_summary,'unknowns':a.unknowns,'source_ids':[]} for a in spec.activities]
         if view and not task.diagnostics:
             wanted.update(source_ids(view))
         wanted.update(m.id for m in state.materials if m.file.lower().endswith('readme.md'))
@@ -133,14 +139,14 @@ def task_context(engine,task):
     draft=None
     if task.draft_path:
         draft=json.loads(Path(task.draft_path).read_text());draft=draft.get('audit_spec',draft)
-        if not active:wanted.update(source_ids(draft))
+        if not active and 'target_profile' in draft:wanted.update(source_ids(draft))
     wanted.update(id for d in active for id in d['material_ids'])
     pending_scope=[u for u in state.scope_updates.values() if u['status']=='needs_F2_or_investigation' and u['proposal']['unit_id']==task.unit_id]
     for p in pending_scope:wanted.update(p['proposal']['source_ids'])
     selected=[m for m in state.materials if m.id in wanted]
     task.material_ids=[m.id for m in selected]
     task.unit_version=next((u.version for u in state.units if u.id==task.unit_id),None)
-    result={'pending_scope_updates':pending_scope,'task':task.model_dump(mode='json',exclude={'context_receipt_id','context_dependencies','admitted','preparation_failures','child_task_ids'}),'audit_spec':slice_for(state,focus,classes=task.activity_classes) if task.kind=='spec_refine' else None,
+    result={'pending_scope_updates':pending_scope,'task':task.model_dump(mode='json',exclude={'context_receipt_id','context_dependencies','admitted','preparation_failures','child_task_ids'}),'audit_spec':view if task.kind=='spec_refine' else None,
         'materials':[m.model_dump(mode='json') for m in selected],
         'omitted_material_ids':[m.id for m in state.materials if m.id not in wanted],
         'catalogue':[],
@@ -158,7 +164,15 @@ def task_context(engine,task):
         result['source_receipt']=state.read_plans.get(task.read_plan_id)
     if task.kind=='spec_refine' and not task.activity_classes:
         result['claims']=[{'id':c.id,'kind':c.kind,'description':c.description,'version':c.version} for c in state.claims]
-    if draft:result.update(draft_audit_spec=draft,diagnostics=active,remaining_issue_groups=[[d['object_ids'] for d in group] for group in groups[1:]])
+    if draft:
+        result.update(diagnostics=active,remaining_issue_groups=[[d['object_ids'] for d in group] for group in groups[1:]])
+        if 'delta' in draft:result['attempted_delta']=draft['delta']
+        elif not state.audit_spec_path:result['draft_audit_spec']=draft
+    if task.surface_entry_points:
+        from .materials import catalogue,compact_index
+        result.update(focused_surfaces=view['surfaces'],catalogue=catalogue(engine.root/'source',state.snapshot,engine.implementation),
+            source_ranges=compact_index(state,engine.root/'source'),unread_ranges=state.unread_ranges)
+        result['source_rule']='Catalogue declarations and read/unread ranges are navigation only; descriptive assertions must cite acquired source.'
     if task.unit_id:
         result['selected_unit']=available[task.unit_id].model_dump(mode='json')
         from .task_view import semantic_view
@@ -186,11 +200,10 @@ def task_context(engine,task):
     return result
 
 
-def validate_spec_refinement(state,reply):
+def validate_spec_refinement(state,reply,task):
     if reply.requests:return
-    if reply.audit_spec is None:raise ValueError('Descriptive refinement needs a complete candidate inventory or focused reads')
-    from .audit_spec import validate
-    validate(state,reply.audit_spec)
+    from .audit_spec import merge_delta
+    merge_delta(state,task,reply.delta)
 
 
 def validate_review(state,task,reply):
@@ -222,6 +235,8 @@ def release_action(engine):
 
 def process_task(engine, task):
     state=engine.state
+    if task.kind=='spec_refine' and task.diagnostics and not task.target_ids:
+        task.target_ids=list(dict.fromkeys(id for d in task.diagnostics for id in d['object_ids']))
     if task.status=='pending':
         planned_versions=dict(task.target_versions)
         task.target_versions={i:objects(state)[i].version for i in task.target_ids if i in objects(state)}
@@ -243,9 +258,10 @@ def process_task(engine, task):
     context=task_context(engine,task)
     if task.kind=='spec_refine':
         from .audit_spec import SpecIssue
-        try:reply,check=engine.ask('spec_refine',SpecRefinement,context,lambda p:validate_spec_refinement(state,p),purpose=read_purpose(task))
+        try:reply,check=engine.ask('spec_refine',SpecRefinement,context,lambda p:validate_spec_refinement(state,p,task),purpose=read_purpose(task))
         except SpecIssue as exc:
-            task.draft_path=exc.draft_path;task.diagnostics=[d.model_dump(mode='json') for d in exc.diagnostics]
+            if state.audit_spec_path or not task.draft_path:task.draft_path=exc.draft_path
+            task.diagnostics=[d.model_dump(mode='json') for d in exc.diagnostics]
             task.status='pending';task.admitted=False;state.active_inquiry_id=None
             release_action(engine);engine.checkpoint('descriptive_refinement_remains_open');return
         if reply.requests:
@@ -357,15 +373,11 @@ def apply_task_response(engine,task_id,reply,check):
     state=engine.state;task=next(t for t in state.inquiry_tasks if t.id==task_id)
     versions={i:getattr(objects(state)[i],'version',1) for i in task.target_ids if i in objects(state)}
     if task.kind=='spec_refine':
-        changed=set()
-        from .audit_spec import accept
-        if reply.audit_spec:accept(engine,reply.audit_spec)
-        state.completed_steps.extend('spec-reviewed:'+c.id for c in state.checks if c.action in {'direct_check','model_check'} and 'spec-reviewed:'+c.id not in state.completed_steps)
+        from .audit_spec import accept,merge_delta
+        accept(engine,merge_delta(state,task,reply.delta))
         state.gaps.extend(reply.limitations)
         material_reviews(engine,None,task.added_material_ids)
         for unit in state.units:
-            if changed & set(unit.obligation_ids+unit.relation_ids):
-                review_unit(engine,unit,"graph_growth:"+task.id)
             if set(task.added_material_ids)&{source for c in state.claims if c.id in unit.obligation_ids for source in c.source_ids}:
                 review_unit(engine,unit,'spec_materials:'+task.id)
     else:
@@ -414,7 +426,7 @@ def apply_task_response(engine,task_id,reply,check):
         state.gaps.extend(reply.limitations)
     task.repair_session=None;task.check_id=check.id;task.status='blocked' if task.stop_reason=='Focused review still omitted required aspects' else 'completed';task.stage='done';state.active_inquiry_id=None
     settle_parents(state)
-    state.last_work_kind=task.kind;release_action(engine)
+    state.last_work_kind='surface' if task.surface_entry_points else task.kind;release_action(engine)
 
 
 def cost_estimate(engine):

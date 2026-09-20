@@ -26,7 +26,7 @@ from .errors import Blocked
 from .agent_tasks import ask as ask_agent
 
 
-FRAMEWORK_REVISION = "selected-question-v4"
+FRAMEWORK_REVISION = "selected-question-v5"
 
 
 class Engine:
@@ -607,22 +607,24 @@ class Engine:
                     self.state.capabilities=[Capability(name="target_execution",status="unavailable",check_id=None,description="All target execution, including probes and replay, disabled by configuration")]
                 self.state.completed_steps.append("capabilities"); self.advance("discover")
             self.discover()
-            if plan_only:
-                self.state.stop_reason = "Plan generated; modeling and checks not scheduled"
-                return self.state
             while True:
+                from .discovery import active_candidate,derive
+                if plan_only and (self.state.units or 'derived-spec:'+str(self.state.audit_spec_version) in self.state.completed_steps):
+                    self.state.stop_reason = "Plan generated; modeling and checks not scheduled"
+                    return self.state
                 inquiry.wake_changed(self)
                 inquiry.clear_reserve(self)
                 can_inquire = inquiry.enabled(self) and (self.state.active_inquiry_id or (self.state.pending_action is None and self.state.pending_output_repair is None))
                 if can_inquire:
                     focused_review=any(t.kind=="review" and t.status=="pending" and t.unit_id in self.state.deferred_units for t in self.state.inquiry_tasks)
-                    from .audit_spec import refinement_reason
                     if not focused_review and not self.state.active_unit_id and self.state.usage.get("audit_units",0)<self.config.budget.audit_units:
                         candidate=select_unit(self.state)
                         if candidate:
                             self.budget.take("audit_units");self.state.active_unit_id=candidate.id;self.state.next_action="select"
                             self.checkpoint("actual_unit_selected_before_review")
                     candidate=next((u for u in self.state.units if u.id==self.state.active_unit_id),None)
+                    if not self.state.active_unit_id and active_candidate(self.state):
+                        derive(self);continue
                     task=inquiry.choose_task(self)
                     if task:
                         try:
@@ -633,9 +635,12 @@ class Engine:
                             current_task.repair_session=self.state.pending_output_repair
                             self.state.active_inquiry_id=None;self.state.pending_output_repair=None
                             inquiry.release_action(self);self.state.gaps.append(str(exc))
+                            if task.surface_entry_points:self.state.last_work_kind='surface'
                             self.checkpoint("inquiry_task_blocked")
                             if str(exc).startswith("Agent blocked:"): raise
                         continue
+                if not self.state.active_unit_id and active_candidate(self.state):
+                    derive(self);continue
                 if self.state.active_unit_id:
                     active=next(u for u in self.state.units if u.id==self.state.active_unit_id)
                     if inquiry.enabled(self): inquiry.reserve_for_inquiry(self)
@@ -665,7 +670,6 @@ class Engine:
                         self.state.last_work_kind="local"
                         continue
                     raise BudgetExhausted("Audit-unit budget exhausted")
-                from .audit_spec import refinement_reason
                 unit = select_unit(self.state)
                 if unit is None:
                     self.state.stop_reason = "No pending executable audit units; unresolved gaps remain"

@@ -1,0 +1,328 @@
+{
+  "understanding": "The complete runFSM loop establishes worker-local serialization: each selected batch, runtime restore, or snapshot-capture request is handled synchronously before the worker selects another request. This resolves the inventory's incomplete-dispatch description. It does not establish upstream tuple commitment or ordering, priority between ready channels, application callback correctness, or snapshot persistence.",
+  "requests": [],
+  "delta": {
+    "target_profile": null,
+    "activities": [
+      {
+        "class_id": "A5",
+        "applicability": "applicable",
+        "purpose": "Schedule decisions and invoke application effects.",
+        "realization_summary": "runFSM synchronously dispatches commit-tuple batches and runtime restores received on fsmMutateCh, and snapshot-capture requests received on fsmSnapshotCh, within one worker. Single-entry and batch callbacks, response association, and worker-local progress tracking occur within these handlers. The worker does not dispatch another request while the current handler runs. Application callback internals remain external.",
+        "entry_points": [
+          "Raft.runFSM",
+          "FSM.Apply",
+          "BatchingFSM.ApplyBatch",
+          "FSM.Restore",
+          "FSM.Snapshot"
+        ],
+        "behavior_ids": [],
+        "variants": [
+          "ConfigurationStore optional callback.",
+          "Batch filtering excludes barriers from application delivery.",
+          "Without BatchingFSM, applyBatch synchronously invokes applySingle for each tuple.",
+          "Runtime restore updates worker progress only after successful restoration.",
+          "Snapshot capture rejects zero worker progress; otherwise it returns the callback result with current worker index and term."
+        ],
+        "unknowns": [
+          "The producer of commit tuples and its ordering and commitment checks remain unread.",
+          "Ordering established by concurrent senders and coordination between mutation and snapshot-request producers remain unresolved.",
+          "Worker serialization does not establish serialization with external application access or later snapshot persistence.",
+          "Future synchronization and competing completion paths remain unread."
+        ],
+        "source_ids": [
+          "fsm.go:1:80",
+          "fsm.go:86:285"
+        ]
+      }
+    ],
+    "behaviors": [
+      {
+        "id": "B_fsm_batch",
+        "primary_activity": "A5",
+        "execution_owner": "runFSM worker executing the BatchingFSM-enabled branch of applyBatch",
+        "protocol_context": "An input slice of commit tuples received from fsmMutateCh; processing follows slice order, while upstream ordering and commitment remain unverified.",
+        "trigger": "Synchronous applyBatch invocation after runFSM receives a []*commitTuple value on fsmMutateCh",
+        "legal_preconditions": [
+          "Input commitment and ordering are expected by interface comments; producer enforcement is unread."
+        ],
+        "implementation_guards": [
+          "Only LogCommand and LogConfiguration are sent to ApplyBatch.",
+          "A response-count mismatch panics."
+        ],
+        "reads": [
+          "Input tuple sequence and futures"
+        ],
+        "writes": [
+          "lastIndex and lastTerm from the final input tuple for nonempty input; zero values for empty input",
+          "Per-future response using positions in the filtered log sequence"
+        ],
+        "durable_effects": [
+          "Application durability remains callback-dependent."
+        ],
+        "external_effects": [
+          "Calls ApplyBatch when filtered input is nonempty.",
+          "Invokes respond(nil) on each present future after batch processing."
+        ],
+        "important_branches": [
+          "Barrier entries are not delivered to the callback.",
+          "An entirely filtered batch invokes no application callback.",
+          "Without BatchingFSM, the enclosing helper calls applySingle for each tuple.",
+          "The response cursor advances for each delivered entry, including entries without a future.",
+          "Empty input assigns zero values to worker progress; whether producers submit empty batches remains unknown."
+        ],
+        "async_boundaries": [
+          "Receipt from fsmMutateCh crosses from upstream producers into the worker.",
+          "Future notification crosses toward waiting callers; observation semantics remain unread."
+        ],
+        "produces_fact_ids": [
+          "F_batch_callbacks_returned"
+        ],
+        "consumes_fact_ids": [],
+        "cross_activity_effects": {
+          "A7": "Associates returned batch responses with futures using filtered positions and invokes respond only after the callback returns and its response count passes validation.",
+          "A6": "Sets progress subsequently used by snapshot capture from the final unfiltered input tuple, or zero for empty input."
+        },
+        "existing_protections": [
+          "Response-count check.",
+          "Filtering and response assignment use the same shouldSend predicate.",
+          "A separate response cursor advances only for delivered log types, independently of future presence.",
+          "Synchronous worker dispatch prevents another batch, runtime restore, or snapshot capture from being dispatched by this worker during this handler."
+        ],
+        "source_ids": [
+          "fsm.go:86:285",
+          "fsm.go:1:80"
+        ],
+        "unknowns": [
+          "Upstream commitment, legal tuple sequences, nonempty-input enforcement, and producer ordering remain unread.",
+          "Application compliance with positional response semantics and preservation of supplied log types during callbacks are not independently established.",
+          "Future notification internals and downstream client observation remain unread."
+        ]
+      },
+      {
+        "id": "B_fsm_dispatch",
+        "primary_activity": "A5",
+        "execution_owner": "runFSM worker",
+        "protocol_context": "One worker selects among fsmMutateCh, fsmSnapshotCh, and shutdownCh.",
+        "trigger": "A select case becomes ready in the runFSM loop",
+        "legal_preconditions": [],
+        "implementation_guards": [
+          "Mutation-channel values are dispatched by a type switch.",
+          "Unsupported mutation-channel value types panic."
+        ],
+        "reads": [
+          "fsmMutateCh",
+          "fsmSnapshotCh",
+          "shutdownCh"
+        ],
+        "writes": [
+          "Worker saturation metrics"
+        ],
+        "durable_effects": [],
+        "external_effects": [
+          "Synchronously invokes applyBatch for []*commitTuple values.",
+          "Synchronously invokes restore for *restoreFuture values.",
+          "Synchronously invokes snapshot for snapshot-channel requests."
+        ],
+        "important_branches": [
+          "Mutation requests distinguish batch application from runtime restoration.",
+          "Snapshot capture has a separate select case.",
+          "Selecting shutdown returns from the worker.",
+          "No explicit priority is imposed between ready select cases."
+        ],
+        "async_boundaries": [
+          "Channel receipt hands producer work to the worker.",
+          "Each handler runs to return before the worker selects another request."
+        ],
+        "produces_fact_ids": [],
+        "consumes_fact_ids": [],
+        "cross_activity_effects": {
+          "A3": "Runtime restoration shares the worker with batch application.",
+          "A6": "Snapshot capture shares the worker with application and runtime restoration; later persistence is outside this dispatch observation."
+        },
+        "existing_protections": [
+          "Direct synchronous handler calls serialize dispatched work within this worker."
+        ],
+        "source_ids": [
+          "fsm.go:86:285"
+        ],
+        "unknowns": [
+          "Upstream producers, sender coordination, and legal request histories remain unread.",
+          "Serialization with application access outside this worker is not established.",
+          "Callback blocking can delay subsequent dispatch; callback termination is not established."
+        ]
+      },
+      {
+        "id": "B_fsm_runtime_restore",
+        "primary_activity": "A3",
+        "execution_owner": "runFSM worker executing restore",
+        "protocol_context": "Runtime restore request identified by req.ID, dispatched from fsmMutateCh",
+        "trigger": "The dispatcher invokes restore for a *restoreFuture",
+        "legal_preconditions": [
+          "Authorization and ordering of the runtime restore request are unresolved upstream."
+        ],
+        "implementation_guards": [
+          "Snapshot Open errors return before invoking FSM.Restore.",
+          "Restore errors return before updating worker progress."
+        ],
+        "reads": [
+          "req.ID",
+          "Snapshot metadata and source returned by r.snapshots.Open"
+        ],
+        "writes": [
+          "On successful FSM.Restore return, lastIndex and lastTerm are assigned meta.Index and meta.Term."
+        ],
+        "durable_effects": [
+          "Durability of restored application state is not established by this handler."
+        ],
+        "external_effects": [
+          "Opens the selected snapshot.",
+          "Invokes FSM.Restore through fsmRestoreAndMeasure.",
+          "Invokes req.respond with a wrapped error or nil.",
+          "Defers source.Close after successful Open; the close result is not checked."
+        ],
+        "important_branches": [
+          "Open failure responds with an error and leaves worker progress unchanged.",
+          "Restore failure responds with an error and leaves worker progress unchanged; application rollback is not shown.",
+          "Successful restore assigns metadata progress before invoking respond(nil)."
+        ],
+        "async_boundaries": [
+          "Request arrives through fsmMutateCh.",
+          "Future notification occurs inside the synchronous handler."
+        ],
+        "produces_fact_ids": [],
+        "consumes_fact_ids": [],
+        "cross_activity_effects": {
+          "A5": "Invokes restoration without interleaving another request handler in this worker.",
+          "A6": "Successful restoration replaces worker progress used by subsequent snapshot capture with the opened snapshot's metadata."
+        },
+        "existing_protections": [
+          "Progress replacement follows successful restoration.",
+          "Snapshot source closure is deferred after successful Open.",
+          "Worker-local synchronous dispatch excludes overlapping handlers."
+        ],
+        "source_ids": [
+          "fsm.go:86:285"
+        ],
+        "unknowns": [
+          "Snapshot selection, metadata validity, request admission, and subsequent replication resumption remain unresolved.",
+          "Application state after a failed Restore is not established.",
+          "SnapshotStore implementation and failure semantics remain unresolved."
+        ]
+      },
+      {
+        "id": "B_fsm_snapshot_capture",
+        "primary_activity": "A6",
+        "execution_owner": "runFSM worker executing snapshot",
+        "protocol_context": "Snapshot-capture request dispatched from fsmSnapshotCh using worker-local lastIndex and lastTerm",
+        "trigger": "The dispatcher invokes snapshot for a snapshot-channel request",
+        "legal_preconditions": [],
+        "implementation_guards": [
+          "lastIndex == 0 returns ErrNothingNewToSnapshot without invoking FSM.Snapshot."
+        ],
+        "reads": [
+          "Worker-local lastIndex and lastTerm",
+          "FSM.Snapshot return values"
+        ],
+        "writes": [
+          "req.index",
+          "req.term",
+          "req.snapshot"
+        ],
+        "durable_effects": [
+          "This handler does not persist or publish the returned snapshot."
+        ],
+        "external_effects": [
+          "Calls FSM.Snapshot when worker progress is nonzero.",
+          "Invokes req.respond with the callback error after assigning result fields."
+        ],
+        "important_branches": [
+          "Zero progress rejects capture.",
+          "For nonzero progress, result fields are assigned even when FSM.Snapshot returns an error."
+        ],
+        "async_boundaries": [
+          "Request arrives through fsmSnapshotCh.",
+          "Future notification hands the result toward the snapshot requester."
+        ],
+        "produces_fact_ids": [],
+        "consumes_fact_ids": [],
+        "cross_activity_effects": {
+          "A5": "Capture executes between dispatched mutation handlers, without another handler changing worker progress during the capture call."
+        },
+        "existing_protections": [
+          "Zero-progress guard.",
+          "Synchronous worker dispatch prevents application or runtime restoration handlers in this worker from overlapping capture."
+        ],
+        "source_ids": [
+          "fsm.go:86:285"
+        ],
+        "unknowns": [
+          "Application snapshot consistency, later Persist/Release interactions, and snapshot-request producer ordering are outside this refinement.",
+          "Progress metadata alone does not establish durable snapshot availability or successful recovery."
+        ]
+      }
+    ],
+    "facts": [],
+    "surfaces": [
+      {
+        "entry_point": "runFSM applySingle / applyBatch",
+        "disposition": "mapped",
+        "behavior_ids": [
+          "B_fsm_single",
+          "B_fsm_batch"
+        ],
+        "reason": "Callback branches and response association are mapped. Complete dispatch establishes synchronous worker-local handling; upstream tuple establishment and ordering remain unknown.",
+        "source_ids": [
+          "fsm.go:86:285"
+        ],
+        "high_consequence": true
+      },
+      {
+        "entry_point": "Raft.runFSM select loop",
+        "disposition": "mapped",
+        "behavior_ids": [
+          "B_fsm_dispatch"
+        ],
+        "reason": "The complete loop synchronously dispatches mutation and snapshot requests and returns on selected shutdown. Producer coordination remains unresolved.",
+        "source_ids": [
+          "fsm.go:86:285"
+        ],
+        "high_consequence": true
+      },
+      {
+        "entry_point": "runFSM restore",
+        "disposition": "mapped",
+        "behavior_ids": [
+          "B_fsm_runtime_restore"
+        ],
+        "reason": "Runtime restore opening, callback execution, error branches, and progress replacement are visible. Admission, snapshot validity, and recovery continuation remain unresolved.",
+        "source_ids": [
+          "fsm.go:86:285"
+        ],
+        "high_consequence": true
+      },
+      {
+        "entry_point": "runFSM snapshot",
+        "disposition": "mapped",
+        "behavior_ids": [
+          "B_fsm_snapshot_capture"
+        ],
+        "reason": "Worker-side capture and result assignment are visible. This mapping does not cover durable snapshot publication.",
+        "source_ids": [
+          "fsm.go:86:285"
+        ],
+        "high_consequence": true
+      }
+    ],
+    "remove_behavior_ids": [],
+    "remove_fact_ids": [],
+    "remove_surface_entry_points": [],
+    "rationale": "Resolve the supplied descriptive diagnostic using the complete fsm.go:86:285 loop. Refine A5 and B_fsm_batch and separately describe dispatch, runtime restore, and snapshot capture because their triggers and outcomes differ. Preserve F_batch_callbacks_returned without changing its meaning, identity, validity context, or producer edge, so the selected establishment question remains attached to the same fact. No normative obligation or correctness conclusion is introduced."
+  },
+  "limitations": [
+    "Serialization is established only for handlers dispatched by this runFSM worker; it does not imply upstream ordering, select priority, or exclusion of external application access.",
+    "Upstream commitment and tuple production, future observation, callback correctness, and restore/snapshot persistence semantics remain unresolved.",
+    "The selected batch-response explanation remains bounded to worker-side association and respond invocation; this refinement does not establish the complete Barrier guarantee.",
+    "No execution, calibration, or reproduction evidence is supplied or produced."
+  ]
+}

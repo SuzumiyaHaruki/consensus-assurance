@@ -1,6 +1,6 @@
 from typing import Literal
 from pydantic import Field, model_validator
-from .types import AssociatedCode, Record, Scope, ConstraintSource, Grounding, CheckerSpec, ReadRequest, ConsensusAuditSpec, SemanticCheck, AuditQuestion, ReachabilityRequirement
+from .types import AssociatedCode, Record, Scope, ConstraintSource, Grounding, CheckerSpec, ReadRequest, ConsensusAuditSpec, TargetProfile, Activity, Behavior, Fact, Surface, SemanticCheck, AuditQuestion, ReachabilityRequirement
 
 
 class ClaimDraft(Record):
@@ -330,11 +330,29 @@ class SemanticRevision(Record):
     def bundle(self):return None
 
 
+class AuditSpecDelta(Record):
+    target_profile: TargetProfile | None = None
+    activities: list[Activity] = []
+    behaviors: list[Behavior] = []
+    facts: list[Fact] = []
+    surfaces: list[Surface] = []
+    remove_behavior_ids: list[str] = []
+    remove_fact_ids: list[str] = []
+    remove_surface_entry_points: list[str] = []
+    rationale: str = Field(min_length=1)
+
+
 class SpecRefinement(Record):
     understanding: str
     requests: list[ReadRequest] = Field(default_factory=list, max_length=12)
-    audit_spec: ConsensusAuditSpec | None = None
+    delta: AuditSpecDelta | None = None
     limitations: list[str]
+
+    @model_validator(mode='after')
+    def one_response(self):
+        if bool(self.requests) == (self.delta is not None):
+            raise ValueError('Return either focused requests or a descriptive delta')
+        return self
 
 
 class IssueResolution(Record):

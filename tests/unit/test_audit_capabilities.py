@@ -4,7 +4,7 @@ from pathlib import Path
 from types import SimpleNamespace
 import pytest
 from consensus_assurance.core.types import ConsensusAuditSpec,Activity,Behavior,Fact,Surface,TargetProfile,AuditQuestion
-from consensus_assurance.workflow.audit_spec import validate,accept,SpecIssue,load,refinement_reason
+from consensus_assurance.workflow.audit_spec import validate,accept,SpecIssue,load,next_surface_refinement
 
 
 def inventory(source,variant='local'):
@@ -38,7 +38,7 @@ def test_R2_object_refinement_replaces_mixed_draft_without_mechanical_pointers(t
     from consensus_assurance.workflow.inquiry import enqueue,process_task,task_context
     from consensus_assurance.adapters.agents.backend import MockAgent
     from test_graph_mutations import controller
-    from consensus_assurance.core.proposals import SpecRefinement
+    from consensus_assurance.core.proposals import AuditSpecDelta,SpecRefinement
     import shutil
     repo,state,_,_=prepared;e=controller(tmp_path,state);shutil.copytree(repo,e.root/'source')
     spec=inventory(state.materials[0].id);bad=spec.model_copy(deep=True)
@@ -52,7 +52,7 @@ def test_R2_object_refinement_replaces_mixed_draft_without_mechanical_pointers(t
     assert required<={m['id'] for m in packet['materials']}
     spec.behaviors.append(Behavior(id='notifier',primary_activity='A2',execution_owner='control loop',protocol_context='one operation',trigger='timeout',produces_fact_ids=['notification'],source_ids=[state.materials[0].id],unknowns=['Completion consumer unread']))
     spec.facts.append(Fact(id='notification',meaning='A context transition has been requested',identity={'operation':'request'},validity_context='one operation',established_by=['notifier'],representation=['notification'],durability='Not persisted',recovery='Discarded',source_ids=[state.materials[0].id],unknowns=['Completion consumer unread']))
-    agent=MockAgent();agent.responses=[SpecRefinement(understanding='Separate request notification from established input',audit_spec=spec,limitations=['Completion remains unknown']).model_dump(mode='json')];e.agent=agent
+    agent=MockAgent();agent.responses=[SpecRefinement(understanding='Separate request notification from established input',delta=AuditSpecDelta(behaviors=spec.behaviors,facts=spec.facts,surfaces=spec.surfaces,rationale='Split the mixed initial inventory'),limitations=['Completion remains unknown']).model_dump(mode='json')];e.agent=agent
     process_task(e,task)
     assert load(state).facts[0].unknowns and len(load(state).behaviors)==3 and len(load(state).facts)==2
     assert not state.repair_sessions and json.loads(path.read_text())['audit_spec']['facts'][0]['meaning']==bad.facts[0].meaning
@@ -82,11 +82,16 @@ def test_R4_breadth_preserves_order_and_requests_replan(tmp_path,prepared):
 
 def test_R5_ready_evidence_precedes_unrelated_unknowns(tmp_path,prepared):
     from consensus_assurance.workflow.graph import select_unit
-    _,state,_,_=prepared;spec=inventory(state.materials[0].id);accept(SimpleNamespace(state=state,root=tmp_path),spec)
+    from consensus_assurance.workflow.inquiry import choose_task
+    from test_graph_mutations import controller
+    _,state,_,_=prepared;spec=inventory(state.materials[0].id)
+    spec.surfaces.append(Surface(entry_point='unread high-consequence handler',disposition='deferred',high_consequence=True,reason='Owner unread'))
+    accept(SimpleNamespace(state=state,root=tmp_path),spec)
     question=dict(question='Does this established input satisfy the selected obligation?',importance='Observable service consequence',source_ids=[state.materials[0].id],activity_classes=['A1','A5'],behavior_ids=['producer','consumer'],fact_ids=['fact'],obligation_relation_kind='consumption',trigger_rationale='Exercise the actual input consumption')
     unit=state.units[0];unit.audit_question=AuditQuestion(**question,disposition='ready_for_check',preferred_check='direct_test')
     other=unit.model_copy(deep=True);other.id='needs-source';other.obligation_ids=['input_obligation'];other.audit_question.disposition='needs_specific_evidence';other.audit_question.priority=3;state.units.append(other)
-    assert select_unit(state).id==unit.id and refinement_reason(state) is None
+    assert select_unit(state).id==unit.id and next_surface_refinement(state) is None
+    assert choose_task(controller(tmp_path,state)) is None
     assert len(unit.obligation_ids)==1 and not state.inquiry_tasks
 
 
@@ -106,3 +111,77 @@ def test_R8_selected_archive_is_view_only(tmp_path):
     engine=controller(tmp_path,state);engine.store=SimpleNamespace(load=lambda:state)
     before=dict(state.usage);assert engine.resume() is state
     assert 'Framework revision differs' in state.stop_reason and state.usage==before
+
+
+def test_surface_delta_split_growth_and_scope(prepared,tmp_path):
+    from consensus_assurance.core.proposals import AuditSpecDelta
+    from consensus_assurance.core.types import InquiryTask
+    from consensus_assurance.core.diagnostics import DiagnosticError
+    from consensus_assurance.workflow.audit_spec import merge_delta
+    from test_graph_mutations import controller
+    _,state,_,_=prepared;state.units=[];e=controller(tmp_path,state)
+    source=state.materials[0].id;spec=inventory(source)
+    spec.surfaces.append(Surface(entry_point='unread pair',disposition='deferred',high_consequence=True,reason='Independent owners unread',source_ids=[source]))
+    accept(e,spec);before=load(state).model_dump_json()
+    task=InquiryTask(kind='spec_refine',reason='Expand one pair',trigger='test',surface_entry_points=['unread pair'])
+    new_b=spec.behaviors[0].model_copy(update={'id':'new_producer','primary_activity':'A3','produces_fact_ids':['new_fact']})
+    new_f=spec.facts[0].model_copy(update={'id':'new_fact','established_by':[],'consumed_by':[]})
+    delta=AuditSpecDelta(behaviors=[new_b],facts=[new_f],surfaces=[Surface(entry_point='first owner',disposition='mapped',behavior_ids=['new_producer'],reason='Acquired producer',source_ids=[source],high_consequence=True),Surface(entry_point='second owner',disposition='deferred',reason='Consumer source remains unread',high_consequence=True)],remove_surface_entry_points=['unread pair'],rationale='Split independent execution owners')
+    trial=merge_delta(state,task,delta)
+    assert load(state).model_dump_json()==before
+    assert trial.facts[-1].established_by==['new_producer'] and trial.activities[2].behavior_ids==['new_producer']
+    accept(e,trial)
+    assert load(state).version==2 and len(load(state).behaviors)==3 and load(state).surfaces[-1].disposition=='deferred'
+    # A separate accepted region cannot be rewritten by a surface delta.
+    for field,obj in [('behaviors',spec.behaviors[1].model_copy(update={'execution_owner':'invented owner'})),('facts',spec.facts[0].model_copy(update={'meaning':'unrelated assertion'})),('activities',spec.activities[6].model_copy(update={'realization_summary':'unrelated change'})),('surfaces',spec.surfaces[0].model_copy(update={'reason':'unrelated change'}))]:
+        with pytest.raises(DiagnosticError,match='outside this descriptive focus'):
+            merge_delta(state,task,AuditSpecDelta(**{field:[obj]},rationale='Unrelated rewrite'))
+
+
+def test_frontier_alternation_navigation_and_same_run_dedup(prepared,tmp_path):
+    import shutil
+    from consensus_assurance.core.types import QuestionCandidate
+    from consensus_assurance.workflow.inquiry import choose_task,task_context,read_purpose
+    from consensus_assurance.workflow.materials import refresh_unread
+    from test_graph_mutations import controller
+    repo,state,_,_=prepared;state.units=[];e=controller(tmp_path,state);shutil.copytree(repo,e.root/'source')
+    source=state.materials[0].id;spec=inventory(source)
+    spec.surfaces.extend(Surface(entry_point=name,disposition='deferred',high_consequence=True,reason='Unread owner',source_ids=[source]) for name in ['first','second'])
+    accept(e,spec);refresh_unread(state,e.root/'source')
+    task=choose_task(e)
+    assert task.surface_entry_points==['first'] and read_purpose(task)=='breadth'
+    packet=task_context(e,task)
+    assert [s['entry_point'] for s in packet['focused_surfaces']]==['first']
+    assert len(packet['audit_spec']['activities'])==7 and not packet['audit_spec']['behaviors']
+    assert packet['catalogue'] and any(f['symbols'] for f in packet['catalogue']) and packet['source_ranges']
+    assert 'candidate_dispositions' not in packet
+    task.status='completed';state.last_work_kind='surface'
+    assert choose_task(e) is None
+    q=AuditQuestion(question='Selected input question',importance='Scoped service effect',source_ids=[source],trigger_rationale='Selected discriminator',activity_classes=['A1'],behavior_ids=['producer'],fact_ids=['fact'],obligation_relation_kind='establishment')
+    state.question_candidates=[QuestionCandidate(question=q)];state.last_work_kind='candidate'
+    assert next_surface_refinement(state) is None and choose_task(e) is None
+    state.question_candidates[0].status='blocked'
+    second=choose_task(e);assert second.surface_entry_points==['second']
+    second.status='blocked';state.last_work_kind='candidate'
+    assert next_surface_refinement(state) is None
+
+
+@pytest.mark.parametrize('failure',['duplicate','dangling','unacquired','accepted_fact'])
+def test_delta_preserves_full_inventory_validation(prepared,tmp_path,failure):
+    from consensus_assurance.core.proposals import AuditSpecDelta
+    from consensus_assurance.core.types import InquiryTask
+    from consensus_assurance.workflow.audit_spec import merge_delta
+    from test_graph_mutations import controller
+    _,state,_,_=prepared;e=controller(tmp_path,state);source=state.materials[0].id
+    spec=inventory(source);accept(e,spec)
+    task=InquiryTask(kind='spec_refine',reason='Correct the selected input',trigger='test',target_ids=['producer','fact'])
+    delta=AuditSpecDelta(rationale='Correct sourced description')
+    if failure=='duplicate':delta.behaviors=[spec.behaviors[0],spec.behaviors[0]]
+    if failure=='dangling':delta.remove_fact_ids=['fact']
+    if failure=='unacquired':delta.behaviors=[spec.behaviors[0].model_copy(update={'source_ids':['unread:1:20']})]
+    if failure=='accepted_fact':
+        state.units[0].audit_question=AuditQuestion(question='Selected input question',importance='Scoped service effect',source_ids=[source],trigger_rationale='Selected discriminator',activity_classes=['A1'],behavior_ids=['producer'],fact_ids=['fact'],obligation_relation_kind='establishment')
+        delta.facts=[spec.facts[0].model_copy(update={'meaning':'A stronger assertion'})]
+    before=load(state).model_dump_json()
+    with pytest.raises(ValueError):merge_delta(state,task,delta)
+    assert load(state).model_dump_json()==before

@@ -53,7 +53,7 @@ class ScopeAgent(MockAgent):
                 for aspect in c['required_aspects']:
                     items.append({'target_id':c['target_id'],'aspect':aspect,'status':'no_issue_found','source_ids':c['required_material_ids'],'rationale':'The supplied actual synthetic sources support the scoped question' + "\n" + 'A different legal provider can meet the same responsibility' + "\n" + 'A violated provider boundary can change the reachable counter behavior','limitations':(['Finite synthetic instance; no production consensus claim']) + ([])})
             response={'items':items,'limitations':[]}
-        elif name=='SpecRefinement':response={'understanding':'The current synthetic source set has a separate unverified input responsibility','audit_spec':p['audit_spec'],'limitations':['The separate input obligation is not automatically discharged']}
+        elif name=='SpecRefinement':response={'understanding':'The current synthetic source set has a separate unverified input responsibility','delta':{'rationale':'Retain current descriptive unknowns'},'limitations':['The separate input obligation is not automatically discharged']}
         else:raise AssertionError(name)
         if name=='Derivation':
             from regression_support import bounded_derivation

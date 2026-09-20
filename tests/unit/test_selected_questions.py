@@ -6,7 +6,7 @@ import shutil
 from pathlib import Path
 import pytest
 from consensus_assurance.core.types import AuditQuestion,ReadRequest,InquiryTask,Behavior,Fact
-from consensus_assurance.core.proposals import Derivation,SpecRefinement,DescriptiveIssue
+from consensus_assurance.core.proposals import Derivation,AuditSpecDelta,SpecRefinement,DescriptiveIssue
 from consensus_assurance.core.diagnostics import DiagnosticError
 from consensus_assurance.workflow import discovery
 from consensus_assurance.workflow.audit_spec import accept,load
@@ -139,7 +139,7 @@ def test_descriptive_debt_routes_by_selected_objects(focused,selected):
     if selected:
         from consensus_assurance.adapters.agents.backend import MockAgent
         revised=load(e.state);revised.behaviors[1].execution_owner='serialized callback'
-        agent=MockAgent();agent.responses=[SpecRefinement(understanding='Correct selected owner without changing fact meaning',audit_spec=revised,limitations=[]).model_dump(mode='json')];e.agent=agent
+        agent=MockAgent();agent.responses=[SpecRefinement(understanding='Correct selected owner without changing fact meaning',delta=AuditSpecDelta(behaviors=[revised.behaviors[1]],rationale='Correct the selected owner'),limitations=[]).model_dump(mode='json')];e.agent=agent
         discovery.continue_candidate(e,c)
         assert load(e.state).behaviors[1].execution_owner=='serialized callback'
         assert discovery.active_candidate(e.state).question.fact_ids==q.fact_ids
@@ -169,21 +169,22 @@ def test_selected_packet_excludes_independent_subgraph_and_keeps_sources(focused
 def test_selected_run_preserves_unresolved_candidate_and_failure(tmp_path):
     from consensus_assurance.workflow.history import load_analysis
     from consensus_assurance.reporting.chinese import render_report
-    archive=Path(__file__).resolve().parents[2]/'runs/2026-09-18_15-00-06-hashicorp_raft-real-run'
+    archive=Path(__file__).resolve().parents[2]/'runs/2026-09-20_09-51-08-hashicorp_raft-real-run'
     before={name:(archive/name).read_bytes() for name in ['state.json','report.md']}
     state=load_analysis(archive/'state.json')
-    assert [c.status for c in state.question_candidates]==['blocked','explained','explained','explained','explained','active']
+    state.audit_spec_path=str(archive/'audit-spec'/f'v{state.audit_spec_version}.json')
+    assert [c.status for c in state.question_candidates]==['blocked','explained','blocked','explained','explained','active']
     assert not state.claims and not state.units and not state.evidence
     (tmp_path/'offline').mkdir()
     report=render_report(state,tmp_path/'offline').read_text()
-    assert 'Budget exhausted: targeted_reads' in report and 'F9' in report
+    assert 'Budget exhausted: agent_calls' in report and 'F_snapshot_recorded_locally' in report
     assert all((archive/name).read_bytes()==data for name,data in before.items())
 
 
-def test_v3_controller_state_cannot_resume_under_v4(focused):
+def test_v4_controller_state_cannot_resume_under_v5(focused):
     from types import SimpleNamespace
     e,_,_=focused
-    e.state.framework_revision='selected-question-v3'  # Explicit compatibility fixture, not an archive rewrite.
+    e.state.framework_revision='selected-question-v4'  # Explicit compatibility fixture, not an archive rewrite.
     e.store=SimpleNamespace(load=lambda:e.state)
     usage=dict(e.state.usage)
     assert 'Framework revision differs' in e.resume().stop_reason
@@ -209,6 +210,8 @@ def test_resumed_partial_continuation_explains_then_selects_next(focused):
         validator(reply)
         return reply,CheckRun(id='closed',action='agent',status=ExecutionStatus.COMPLETED,cwd=str(e.root),snapshot_id=e.state.snapshot.id)
     e.ask=ask
+    discovery.derive(e)
+    assert len(seen)==1 and e.state.last_work_kind=='candidate'
     with pytest.raises(RuntimeError,match='Next candidate'):discovery.derive(e)
     assert not e.state.claims and not e.state.units and not e.state.models
     assert e.state.question_candidates[0].status=='explained' and not e.state.inquiry_tasks
@@ -265,7 +268,7 @@ def test_reviewed_evidence_block_is_accepted_without_repair(focused,tmp_path):
     assert '候选因证据/适用合同不足延期' in report and reply.selection_rationale in report
 
 
-@pytest.mark.parametrize('invalid',['initial_block','initial_exhausted','active_exhausted','unreviewed_block','unknowns_empty','wrong_check','ready_without_obligation','blank_reason','unrelated_debt'])
+@pytest.mark.parametrize('invalid',['initial_block','initial_exhausted','active_exhausted','unreviewed_block','unknowns_empty','wrong_check','ready_without_obligation','blank_reason'])
 def test_incomplete_or_premature_outcome_is_not_an_escape(focused,invalid):
     e,q,_=focused
     if invalid not in {'initial_block','initial_exhausted'}:
@@ -277,7 +280,6 @@ def test_incomplete_or_premature_outcome_is_not_an_escape(focused,invalid):
     if invalid=='wrong_check':reply.audit_question=q.model_copy(update={'preferred_check':'local_model'})
     if invalid=='ready_without_obligation':reply.audit_question=q.model_copy(update={'disposition':'ready_for_check'})
     if invalid=='blank_reason':reply.selection_rationale=' '
-    if invalid=='unrelated_debt':reply.descriptive_issues=[DescriptiveIssue(object_ids=['A7'],source_ids=q.source_ids,reason='Unrelated inventory debt')]
     with pytest.raises(DiagnosticError):discovery.validate_derivation(e.state,reply)
     assert not e.state.claims and not e.state.units
 
@@ -314,3 +316,16 @@ def test_true_semantic_error_first_repair_has_local_objects_and_source(focused):
     assert set(d.material_ids)<={m['id'] for m in all_materials(local)}
     assert set(q.fact_ids+q.behavior_ids)<={o['id'] for o in local['objects']}
     assert discovery.active_candidate(e.state).status=='active'  # Genuine errors are not swallowed as evidence-blocked.
+
+
+def test_unrelated_reusable_feedback_survives_evidence_blocked_outcome(focused):
+    from consensus_assurance.workflow.inquiry import choose_task
+    e,q,_=focused;c=begin(e,q,[ReadRequest(file='counter.py',start_line=1,end_line=2,reason='Review the selected source')])
+    discovery.continue_candidate(e,c)
+    version=e.state.audit_spec_version
+    reply=Derivation(audit_question=q,descriptive_issues=[DescriptiveIssue(object_ids=['A7'],source_ids=q.source_ids,reason='Source exposes an unrepresented recovery execution owner; inspect that reusable boundary')],selection_rationale='The selected contract remains unattributed without a justified next range')
+    assert discovery.validate_derivation(e.state,reply)=='blocked_evidence'
+    discovery.accept_derivation(e,reply,'blocked-with-feedback')
+    assert e.state.question_candidates[0].status=='blocked' and e.state.audit_spec_version==version
+    task=choose_task(e)
+    assert task.target_ids==['A7'] and task.candidate_id is None and task.diagnostics

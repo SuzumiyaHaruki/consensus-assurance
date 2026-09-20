@@ -2,9 +2,9 @@
 
 **领域引导、实现为据的 CFT 义务审计。** 从 Activity、Behavior、Fact 理解实现，推导 Obligation 和有界 AuditQuestion，由 Evidence 限定结论范围。
 
-系统先从仓库材料恢复七类 Activity 及 Behavior/Fact 整体规格，再选中结构化问题，补读后解释关闭或推导义务与代码关系，按当前问题优先取得关键材料、执行直接检查或局部模型，并保留有限覆盖探索和语义复核。实现包括英文 agent 技能、受控代码实验、TLA+/TLC 搜索、轨迹校准、F1—F4 反馈及恢复。候选图不是整体正确性证明，也没有已知的全系统覆盖率分母。
+系统先从仓库材料恢复七类 Activity 及 Behavior/Fact 的不完整骨架，在有界 Surface 扩展与单个候选的深度分析之间交替，补读后解释关闭、保留证据不足或推导义务与代码关系，按当前问题优先取得关键材料、执行直接检查或局部模型，并保留有限覆盖探索和语义复核。实现包括英文 agent 技能、受控代码实验、TLA+/TLC 搜索、轨迹校准、F1—F4 反馈及恢复。候选图不是整体正确性证明，也没有已知的全系统覆盖率分母。
 
-当前保留的真实运行见 [实验报告](runs/2026-09-18_15-00-06-hashicorp_raft-real-run/report.md)。本次使用 selected-question-v4、18 次 agent 调用、1364.88 秒；6 个候选中，1 个因合同证据不足延期，4 个由限定范围的已有保护解释，第 6 个仍待补读。读取正确使用 depth，缓存重传未重复收费；运行在第 7 次新源码读取触及 6 次上限时停止。尚无受理义务、审计单元、模型或性质证据。此次归档证明候选可以延期后继续选题，但仍暴露读取次数预检与预算终止状态的缺口；不是 HashiCorp 缺陷或系统正确性结论。
+当前保留的真实运行见 [实验报告](runs/2026-09-20_09-51-08-hashicorp_raft-real-run/report.md)。本次使用 selected-question-v5、20 次 agent 调用、1527.81 秒；6 个候选中 3 个由已有保护解释，2 个受阻，1 个待继续分析。AuditSpec 从 v1 增长至 v3，Behavior 从 9 增至 13、Fact 从 7 增至 8；两次深度知识回流成功，三次 Surface 扩展均在发送前因上下文超限受阻，另一次回流被 profile 范围校验及不完整诊断上下文阻塞。最终因 agent_calls 耗尽停止；尚无受理义务、模型或性质证据。本次归档保留这些失败，不表示 HashiCorp 缺陷或系统正确性结论。
 
 当前实现将任务工作集与完整审计历史分开，并允许先保存有据的模型、后补 harness。语法检查、探索性搜索、真实轨迹校准与实现确认分别记录。当前方法见 [审计方法](docs/审计方法.md)，不代表已重新完成 HashiCorp 自主实验。
 
@@ -81,4 +81,4 @@ TLC_JAR="$TLC_JAR" .venv/bin/python -m pytest -q
 
 项目仓库：[SuzumiyaHaruki/consensus-assurance](https://github.com/SuzumiyaHaruki/consensus-assurance)。
 
-当前版本为 `selected-question-v4`：描述性 discovery 之后先选结构化 AuditQuestion，再补读、解释关闭或升级为一个主要义务；实际理解错误才通过 spec_refine 重整。完整流程和证据边界见 [审计方法](docs/审计方法.md)，选定失败及清理记录见 [运行索引](runs/README.md)。
+当前版本为 `selected-question-v5`：discovery 只建立初始骨架；可执行审计单元和活跃候选优先，候选结束后让出调度机会，每次只扩展一个尚未尝试的高后果 Surface。`spec_refine` 使用对象增量合并并验证整个 AuditSpec；深度分析发现的可复用描述性遗漏也可回流，候选自身的保护解释留在 AuditQuestion。同一运行不自动重试已尝试的 Surface，不增加默认预算。历史 v4 归档保持只读，不能直接续跑到 v5。完整流程和证据边界见 [审计方法](docs/审计方法.md)，选定失败及清理记录见 [运行索引](runs/README.md)。

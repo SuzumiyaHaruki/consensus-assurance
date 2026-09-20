@@ -207,7 +207,7 @@ def render_report(state, root):
             lines += [f"定向补读：{history['gap']}；关联 {history['related_ids']}；实际新增片段 {history['added_material_ids']}。"]
     lines += ['', '## 候选问题与已有保护', '', '候选解释是有来源的分析判断，不是性质证据或协议正确性证明。']
     if not state.question_candidates:
-        lines.append('历史未记录结构化候选问题。' if state.framework_revision not in {'selected-question-v3','selected-question-v4'} else '尚未记录结构化候选问题。')
+        lines.append('历史未记录结构化候选问题。' if state.framework_revision not in {'selected-question-v3','selected-question-v4','selected-question-v5'} else '尚未记录结构化候选问题。')
     for candidate in state.question_candidates:
         q=candidate.question
         if candidate.status=='blocked' and q.disposition=='needs_specific_evidence' and not q.requests:
@@ -218,6 +218,19 @@ def render_report(state, root):
             f"  已有保护/反证：{q.counterevidence}；剩余判别与限制：{q.unknowns}。",
             f"  选择/缩窄依据：{q.trigger_rationale}；历史问题版本：{len(candidate.history)}。",
             f"  升级义务：{candidate.obligation_id or '未生成'}；候选结论或受阻原因：{candidate.stop_reason or '继续获取证据'}。"]
+    if state.audit_spec_path:
+        from consensus_assurance.workflow.audit_spec import load
+        from consensus_assurance.core.types import ConsensusAuditSpec
+        current=load(state);first_path=Path(state.audit_spec_path).parent/'v1.json'
+        first=ConsensusAuditSpec.model_validate_json(first_path.read_text()) if first_path.exists() else current
+        expansions=[t for t in state.inquiry_tasks if t.surface_entry_points]
+        candidate_calls={id for c in state.question_candidates for id in c.check_ids}
+        feedback=[t for t in state.inquiry_tasks if t.kind=='spec_refine' and any(t.trigger.startswith(id+':') for id in candidate_calls)]
+        lines += ['', '## 描述性理解演化', '', f'AuditSpec：v{first.version} → v{current.version}；Behavior：{len(first.behaviors)} → {len(current.behaviors)}；Fact：{len(first.facts)} → {len(current.facts)}。',
+            f'Surface 扩展任务：{len(expansions)}；深度分析反馈任务：{len(feedback)}（完成 {sum(t.status=="completed" for t in feedback)}）。这些是描述性进度，不是正确性覆盖率。']
+        for task in expansions:lines.append(f'- 扩展 {task.surface_entry_points}：{task.status}；{task.stop_reason or task.reason}')
+        for surface in current.surfaces:
+            if surface.high_consequence:lines.append(f'- 高后果 Surface `{surface.entry_point}`：{surface.disposition}；{surface.reason}')
     lines += inquiry_lines(state)
     lines += ['', '## 未受理草稿分析']
     import json

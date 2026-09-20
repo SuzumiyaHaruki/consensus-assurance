@@ -1,1 +1,3 @@
 Return Discovery containing only implementation understanding: target profile, seven Activity coordinates, local Behaviors, identity-scoped Facts, Surfaces, unknowns and focused reading_requests. Do not generate obligations, bindings, relations, audit units or audit questions in this task. Unknown producers/consumers are legal when explicit; do not invent edges to make an inventory look complete.
+
+The initial AuditSpec is intentionally incomplete. Surface entries form a coverage frontier. Describe high-consequence unmapped surfaces clearly enough for later bounded expansion; never fabricate a Behavior or Fact merely to mark a Surface mapped.

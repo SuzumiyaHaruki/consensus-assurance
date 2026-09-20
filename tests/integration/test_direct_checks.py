@@ -130,7 +130,7 @@ def test_descriptive_derivation_reaches_actual_direct_execution(tmp_path,prepare
     derivation=GraphDraft.model_validate(responses[1]);derivation.units[0].audit_question=u.audit_question
     q=derivation.units[0].audit_question;q.activity_classes=['A1','A5'];q.behavior_ids=['producer','consumer'];q.fact_ids=['fact'];q.obligation_relation_kind='consumption'
     replies=[responses[0],Discovery(understanding='Controlled descriptive input',audit_spec=initial).model_dump(mode='json')]
-    if refine:replies.append(SpecRefinement(understanding='Separate the established input from the unknown producer',audit_spec=spec,limitations=['Unverified durability remains explicit']).model_dump(mode='json'))
+    if refine:replies.append(SpecRefinement(understanding='Separate the established input from the unknown producer',delta=AuditSpecDelta(behaviors=[spec.behaviors[0]],rationale='Restore the sourced producer edge'),limitations=['Unverified durability remains explicit']).model_dump(mode='json'))
     replies.extend([derivation.model_dump(mode='json'),DirectCheckReply(plan=plan,gap='').model_dump(mode='json')])
     fixture=tmp_path/'direct-responses.json';write_json(fixture,replies)
     config=e.config.model_copy(deep=True);config.agent_backend='mock';config.fixture=str(fixture);config.budget.semantic_reviews=0

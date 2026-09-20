@@ -62,7 +62,6 @@ def discover(engine):
             pending=next(t for t in engine.state.inquiry_tasks if t.id==pending.id)
         engine.state.completed_steps.append('understanding');engine.checkpoint('implementation_understanding_accepted')
     if "discovery" not in engine.state.completed_steps:
-        derive(engine)
         engine.state.completed_steps.append('discovery');engine.advance('select')
 
 
@@ -122,7 +121,7 @@ def classify_derivation_outcome(state,reply):
     if q.disposition=='explained_by_existing_mechanism':return 'explained'
     if reads:return 'continue_read'
     reviewed=current and (current.material_ids or current.history or len(current.check_ids)>1)
-    if reviewed and not reply.descriptive_issues and q.disposition=='needs_specific_evidence' and q.preferred_check=='source_review' and q.unknowns:
+    if reviewed and q.disposition=='needs_specific_evidence' and q.preferred_check=='source_review' and q.unknowns:
         return 'blocked_evidence'
     raise ValueError('An initial question needs actionable source or a grounded result; evidence-blocked requires a reviewed candidate and explicit unknowns')
 
@@ -195,6 +194,7 @@ def accept_derivation(engine,reply,check_id):
     def commit(proxy):
         state=proxy.state
         if outcome=='selection_exhausted':
+            state.last_work_kind='candidate'
             state.gaps.append('No additional tractable candidate selected: '+reply.selection_rationale)
             state.completed_steps.append('derived-spec:'+str(state.audit_spec_version))
             return
@@ -210,7 +210,7 @@ def accept_derivation(engine,reply,check_id):
         selected=set(q.behavior_ids+q.fact_ids)
         candidate.spec_task_ids=[]
         for issue in reply.descriptive_issues:
-            task=inquiry.enqueue(state,'spec_refine',issue.reason,check_id+':'+','.join(issue.object_ids))
+            task=inquiry.enqueue(state,'spec_refine',issue.reason,check_id+':'+','.join(issue.object_ids),target_ids=issue.object_ids)
             task.draft_path=state.audit_spec_path
             task.diagnostics=[{'code':'audit_spec_semantics','category':'semantic','object_ids':issue.object_ids,'material_ids':issue.source_ids,'message':issue.reason,'allowed':['read','semantic_revision']}]
             if selected&set(issue.object_ids):
@@ -303,13 +303,18 @@ def derive(engine):
     if engine.state.derivation_path:
         path=Path(engine.state.derivation_path);check_id=path.stem.removeprefix('derivation-')
         if 'derive-'+check_id not in engine.state.applied_operations:
-            if accept_derivation(engine,Derivation.model_validate_json(path.read_text()),check_id):return
+            if accept_derivation(engine,Derivation.model_validate_json(path.read_text()),check_id):
+                inquiry.release_action(engine);engine.checkpoint('derivation_episode_committed');return
+            if active_candidate(engine.state) is None:
+                engine.state.last_work_kind='candidate';return
     while True:
         candidate=active_candidate(engine.state)
-        if candidate:continue_candidate(engine,candidate)
+        if candidate:
+            continue_candidate(engine,candidate)
+            if active_candidate(engine.state) is None:break
         packet=derive_context(engine)
         proposal,check=ask_derivation(engine,packet)
-        if proposal is None:continue
+        if proposal is None:break
         # Cached source still needs actual transmission before semantic acceptance.
         from .sources import dependency_closure
         while proposal.obligation or proposal.audit_question and proposal.audit_question.disposition=='explained_by_existing_mechanism':
@@ -324,9 +329,13 @@ def derive(engine):
             packet['candidate_for_source_review']=proposal.model_dump(mode='json');packet['required_material_ids']=sorted(required)
             proposal,check=ask_derivation(engine,packet)
             if proposal is None:break
-        if proposal is None:continue
-        if accept_derivation(engine,proposal,check.id):return
+        if proposal is None:break
+        if accept_derivation(engine,proposal,check.id):
+            inquiry.release_action(engine);engine.checkpoint('derivation_episode_committed');return
         inquiry.release_action(engine);engine.checkpoint('candidate_continuation_saved')
+        if active_candidate(engine.state) is None:break
+    engine.state.last_work_kind='candidate'
+    inquiry.release_action(engine);engine.checkpoint('candidate_episode_finished')
 
 
 def targeted_read(engine, unit, gap, relation_ids=None, requests=None, update_required=True):
