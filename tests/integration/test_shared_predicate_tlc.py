@@ -1,7 +1,7 @@
 import pytest
 from consensus_assurance.core.proposals import ObservableProperty, Comparison, ObservationMap, FieldProjection
 from consensus_assurance.workflow.artifacts import save_bundle
-from consensus_assurance.plugins.implementations.toy.adapter import ToyImplementation
+from consensus_assurance.adapters.runners.python import PythonBackend
 from consensus_assurance.workflow.observations import monitor_support
 from consensus_assurance.core.proposals import EventMonitor
 from consensus_assurance.core.types import Grounding
@@ -28,7 +28,7 @@ Next == \/ /\ Len(history) = 0 /\ history' = Append(history, Entry("a"))
 Obs == [history |-> history]
 ====================================================
 '''.replace('OBJECT',obj)
-    model=save_bundle(runner.root,state,state.units[0],bundle,ToyImplementation())
+    model=save_bundle(runner.root,state,state.units[0],bundle,PythonBackend())
     result=verifier.check(runner,model,20)
     assert result.outcome==('counterexample' if conflict else 'holds'),result.reason
     m=EventMonitor(id='support',checker_id='Safe',event='support',identity_fields=prop.identity_fields,conditions=[prop.trigger],assertion=prop.assertion,binding_ids=['b'],grounding=Grounding(),property=prop)

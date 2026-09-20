@@ -166,7 +166,7 @@ def merge_delta(state,task,delta):
             if id not in allowed[collection]:reject([id],'Removal is outside this descriptive focus')
         for obj in updates:
             id=audit_object_key(obj)
-            if task.context_receipt_id and obj!=before.get(id) and collection in {'behaviors','facts'} and not any(includes(state,[source],task.material_ids) for source in obj.source_ids):reject([id],'Current implementation assertions need attached exact source; request the missing range before interpretation')
+            if task.context_receipt_id and obj!=before.get(id) and (collection in {'behaviors','facts'} or collection=='surfaces' and obj.disposition=='mapped') and not any(includes(state,[source],task.material_ids) for source in obj.source_ids):reject([id],'Current implementation assertions need attached exact source; request the missing range before interpretation')
             if id in before and obj!=before[id] and id not in allowed[collection]:reject([audit_object_key(obj)],'Existing object change is outside this descriptive focus; queue separate sourced feedback')
         merged={id:obj for id,obj in before.items() if id not in remove};merged.update({audit_object_key(o):o for o in updates})
         raw[collection]=[o.model_dump(mode='json') for o in merged.values()]

@@ -13,8 +13,9 @@ def context(engine, unit=None):
         "parameters": engine.config.parameters, "remaining_seconds": engine.budget.remaining(),
         "directed_question": engine.config.directed_question,
         "snapshot_id": engine.state.snapshot.id,
-        "harness_kind": engine.implementation.harness_kind,
-        "harness_instructions": engine.implementation.harness_instructions}
+        "harness_kind": engine.implementation.harness_kind if engine.implementation else None,
+        "harness_instructions": engine.implementation.harness_instructions if engine.implementation else "No execution backend configured; source review and local ModelDraft/TLC remain available",
+        "target":engine.config.target.model_dump(mode="json")}
     if unit:
         from .task_view import local_workset
         result.update(local_workset(engine,unit))
@@ -34,7 +35,7 @@ def discover(engine):
                 if m.kind=='protocol_candidate':engine.state.materials.append(m)
             engine.checkpoint('initial_sample_recorded')
         if not engine.state.materials and material_allowance(engine.state,engine.config.budget,"breadth")["available_chars"]==0:raise Blocked("No material capacity for a grounded initial plan; no agent request sent")
-        inventory = catalogue(source, engine.state.snapshot,engine.implementation)
+        inventory = catalogue(source, engine.state.snapshot)
         write_json(engine.root / "catalogue.json", inventory)
         plan, _ = engine.ask("read", ReadingPlan, {"catalogue": inventory, "initial_materials": [m.model_dump(mode="json") for m in engine.state.materials]},purpose="breadth")
         engine.read(plan.requests,purpose="breadth",partial=True,plan_id="initial-reading",related_ids=plan.related_ids,reason=plan.rationale,charge=False)
@@ -93,7 +94,7 @@ def derivation_graph(reply):
 
 
 def classify_derivation_outcome(state,reply):
-    """One outcome contract for validation and controller acceptance; no mutation."""
+    """Classify the candidate decision independently of descriptive feedback; no mutation."""
     q=reply.audit_question;current=active_candidate(state)
     graph=reply.obligation or reply.bindings or reply.dependencies or reply.context_claims
     if not reply.selection_rationale.strip():raise ValueError('Explain the bounded analysis outcome')
@@ -104,11 +105,8 @@ def classify_derivation_outcome(state,reply):
     if not reply.obligation and graph:raise ValueError('A pre-obligation candidate cannot create graph objects')
     if q.disposition=='explained_by_existing_mechanism' and (graph or reads or not q.counterevidence):
         raise ValueError('Explained candidates need sourced protections, no graph objects and no pending reads')
-    if not reply.obligation:
-        if q.disposition=='ready_for_check':raise ValueError('A ready check requires its obligation')
-        if reads and q.preferred_check!='source_review':raise ValueError('Candidate source acquisition uses source_review')
-    selected=set(q.behavior_ids+q.fact_ids+q.activity_classes+['target_profile'])
-    if any(selected&set(i.object_ids) for i in reply.descriptive_issues):return 'spec_refine'
+    if not reply.obligation and (q.disposition=='ready_for_check' or reads and q.preferred_check!='source_review'):
+        raise ValueError('Pre-obligation candidates use source_review for acquisition; a ready check requires its obligation')
     if reply.obligation:return 'escalate'
     if q.disposition=='explained_by_existing_mechanism':return 'explained'
     if reads:return 'continue_read'
@@ -120,22 +118,21 @@ def classify_derivation_outcome(state,reply):
 
 def validate_derivation(state,reply):
     from consensus_assurance.core.diagnostics import Diagnostic,DiagnosticError
-    from .audit_spec import load
+    from .audit_spec import load,audit_object_index,validate_question
     spec=load(state);known={m.id for m in state.materials}
-    from .audit_spec import audit_object_index
     objects=set(audit_object_index(spec))
     issues=[]
     for i,issue in enumerate(reply.descriptive_issues):
         if not set(issue.object_ids)<=objects or not set(issue.source_ids)<=known or not issue.reason.strip():
             issues.append(Diagnostic(code='descriptive_issue',category='material',object_ids=issue.object_ids,paths=[f'/descriptive_issues/{i}'],material_ids=sorted(known&set(issue.source_ids)),message='Describe an existing inventory object issue with acquired source and reason',allowed=['representation','read']))
-    from .audit_spec import validate_question
     q=reply.audit_question;current=active_candidate(state)
+    attached=set(current.material_ids if current else [])
+    attached.update(next((r['material_ids'] for r in reversed(state.packet_receipts) if r['kind']=='derive'),[]))
     try:
         if spec is None:raise ValueError('An accepted inventory is required')
         outcome=classify_derivation_outcome(state,reply)
         if q:
             validate_question(spec,q)
-            if not set(q.source_ids)<=known:raise ValueError('Question sources must be acquired')
             if not q.question.strip() or not q.trigger_rationale.strip():raise ValueError('State the discriminator and selection reason')
             if current and (q.fact_ids!=current.question.fact_ids or q.obligation_relation_kind!=current.question.obligation_relation_kind):
                 raise ValueError('Finish the current candidate before selecting another fact or lifecycle')
@@ -145,7 +142,16 @@ def validate_derivation(state,reply):
         questions=[x for x in (q,current.question if current else None) if x]
         refs={id for x in questions for id in x.fact_ids+x.behavior_ids}
         sources={id for x in questions for id in x.source_ids}|set(current.material_ids if current else [])
-        issues.append(Diagnostic(code='derivation_question',category='semantic',object_ids=sorted(refs),material_ids=sorted(sources&known),paths=['/audit_question'],message=str(exc),allowed=['read','semantic_revision']))
+        issues.append(Diagnostic(code='question_identity',category='semantic',object_ids=sorted(refs),material_ids=sorted(sources&known),paths=['/audit_question'],message=str(exc),allowed=['read','semantic_revision']))
+    if q:
+        invalid=set(q.source_ids)-known
+        from .sources import includes
+        missing=not q.source_ids or not includes(state,q.source_ids,attached)
+        terminal=reply.obligation or not (reply.reading_requests+q.requests)
+        if invalid or terminal and missing:
+            issues.append(Diagnostic(code='question_source_reference' if invalid else 'question_source_missing',category='material',
+                object_ids=q.fact_ids+q.behavior_ids,paths=['/audit_question/source_ids'],material_ids=sorted(set(attached)&known),
+                message='Use actual material IDs; terminal reasoning requires nonempty currently attached/read sources',allowed=['representation','read']))
     if reply.obligation and (reply.obligation.kind!='obligation' or not reply.bindings):
         issues.append(Diagnostic(code='derivation_primary',category='association',object_ids=[reply.obligation.id],paths=['/obligation','/bindings'],message='A primary obligation requires its actual code bindings',allowed=['association','read']))
     existing={o.id for name in ('claims','bindings','relations','units') for o in getattr(state,name)}
@@ -153,6 +159,12 @@ def validate_derivation(state,reply):
     for path,obj in candidates:
         if obj and obj.id in existing:
             issues.append(Diagnostic(code='existing_graph_identity',category='semantic',object_ids=[obj.id],paths=[path],material_ids=sorted(known&set(getattr(obj,'source_ids',[]))),message='Derivation adds candidates; existing semantic objects require attributed F2 rather than replacement',allowed=['read','semantic_revision']))
+    if reply.obligation:
+        from .sources import dependency_closure,includes
+        graph=derivation_graph(reply);objects={o.id:o for name in ('claims','bindings','relations','units') for o in getattr(graph,name)}
+        required,_=dependency_closure(objects,objects)
+        missing=[id for id in required&known if not includes(state,[id],attached)]
+        if missing:issues.append(Diagnostic(code='derivation_source_missing',category='material',object_ids=[reply.obligation.id],material_ids=sorted(missing),message='Read and attach the actual obligation/code dependency source before escalation',allowed=['read']))
     if issues:raise DiagnosticError(issues)
     if outcome!='escalate':return outcome
     try:validate_patch(state,derivation_graph(reply))
@@ -198,17 +210,16 @@ def accept_derivation(engine,reply,check_id):
         else:
             candidate=QuestionCandidate(question=q);state.question_candidates.append(candidate)
         candidate.check_ids.append(check_id)
-        selected=set(q.behavior_ids+q.fact_ids+q.activity_classes+['target_profile'])
         candidate.spec_task_ids=[]
         for issue in reply.descriptive_issues:
             task=inquiry.enqueue(state,'spec_refine',issue.reason,check_id+':'+','.join(issue.object_ids),target_ids=issue.object_ids)
             task.draft_path=state.audit_spec_path
             task.diagnostics=[{'code':'audit_spec_semantics','category':'semantic','object_ids':issue.object_ids,'material_ids':issue.source_ids,'message':issue.reason,'allowed':['read','semantic_revision']}]
-            if selected&set(issue.object_ids):
+            if issue.candidate_effect=='requires_recheck':
                 task.candidate_id=candidate.id;candidate.spec_task_ids.append(task.id)
         requests=list({(r.file,r.start_line,r.end_line):r for r in reply.reading_requests+q.requests}.values())
         q.requests=requests
-        if outcome=='spec_refine':
+        if candidate.spec_task_ids:
             candidate.stage='read' if requests else 'analyze'
             if requests:candidate.read_plan_id=uid()
             return
@@ -228,7 +239,7 @@ def accept_derivation(engine,reply,check_id):
     path=engine.root/f'derivation-{check_id}.json';write_json(path,reply);engine.state.derivation_path=str(path)
     engine.checkpoint('derivation_candidate_prepared')
     commit_graph(engine,'derive-'+check_id,reply.model_dump(mode='json'),commit)
-    return outcome in {'escalate','selection_exhausted'}
+    return outcome in {'escalate','selection_exhausted'} and active_candidate(engine.state) is None
 
 
 def continue_candidate(engine,candidate):
@@ -253,7 +264,6 @@ def continue_candidate(engine,candidate):
         except ValueError as exc:
             candidate.status='blocked';candidate.stop_reason='Inventory correction requires explicit question reconnection: '+str(exc)
             engine.checkpoint('candidate_reconnection_required');return
-        candidate.spec_task_ids=[]
     if candidate.stage!='read':return
     receipt=engine.read(candidate.question.requests,purpose='depth',partial=True,plan_id=candidate.read_plan_id,
         related_ids=candidate.question.fact_ids+candidate.question.behavior_ids,reason=candidate.question.question)
@@ -306,21 +316,6 @@ def derive(engine):
         packet=derive_context(engine)
         proposal,check=ask_derivation(engine,packet)
         if proposal is None:break
-        # Cached source still needs actual transmission before semantic acceptance.
-        from .sources import dependency_closure
-        while proposal.obligation or proposal.audit_question and proposal.audit_question.disposition=='explained_by_existing_mechanism':
-            graph=derivation_graph(proposal)
-            objects={x.id:x for name in ('claims','bindings','relations','units') for x in getattr(graph,name)}
-            required,_=dependency_closure(objects,objects)
-            required.update(proposal.audit_question.source_ids)
-            supplied={m['id'] for m in packet['materials']}
-            missing=[m for m in engine.state.materials if m.id in required-supplied]
-            if not missing:break
-            packet['materials'].extend(m.model_dump(mode='json') for m in missing)
-            packet['candidate_for_source_review']=proposal.model_dump(mode='json');packet['required_material_ids']=sorted(required)
-            proposal,check=ask_derivation(engine,packet)
-            if proposal is None:break
-        if proposal is None:break
         if accept_derivation(engine,proposal,check.id):
             inquiry.release_action(engine);engine.checkpoint('derivation_episode_committed');return
         inquiry.release_action(engine);engine.checkpoint('candidate_continuation_saved')
@@ -340,7 +335,7 @@ def targeted_read(engine, unit, gap, relation_ids=None, requests=None, update_re
         if task["requests"]:
             reading=ReadingPlan.model_validate({"requests":task["requests"],"rationale":gap,"related_ids":task["related_ids"],"gap":gap})
         else:
-            reading,_=engine.ask("targeted_read",ReadingPlan,{"gap":task,"catalogue":catalogue(source,engine.state.snapshot,engine.implementation),
+            reading,_=engine.ask("targeted_read",ReadingPlan,{"gap":task,"catalogue":catalogue(source,engine.state.snapshot),
                 "already_read":[{"id":m.id,"file":m.file,"start":m.start_line,"end":m.end_line} for m in engine.state.materials],
                 "relevant_bindings":[b.model_dump() for b in engine.state.bindings if unit and b.id in unit.binding_ids]})
         reading.related_ids=task["related_ids"]; reading.gap=gap

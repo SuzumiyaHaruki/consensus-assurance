@@ -12,7 +12,7 @@ from consensus_assurance.workflow.budget import BudgetTracker
 from consensus_assurance.core.config import Config
 from consensus_assurance.registry import assemble
 from consensus_assurance.adapters.storage.files import write_json
-from consensus_assurance.plugins.implementations.toy.adapter import ToyImplementation
+from consensus_assurance.adapters.runners.python import PythonBackend
 from ack_support import setup_ack, ROOT
 
 
@@ -25,7 +25,7 @@ def test_original_holds_and_actual_trigger_coverage_remain_separate(tlc,prepared
     lines=bundle.behavior.splitlines();lines.insert(-1,'Used == '+predicate);bundle.behavior='\n'.join(lines)+'\n'
     req=ReachabilityRequirement(id='use-trigger',operator='Used',claim_ids=[unit.obligation_ids[0]],behavior_ids=['use'],description='Actual supported step is reachable')
     bundle.reachability=[req]
-    model=save_bundle(runner.root,state,unit,bundle,ToyImplementation())
+    model=save_bundle(runner.root,state,unit,bundle,PythonBackend())
     search=verifier.check(runner,model,20);state.checks.append(search)
     assert search.outcome=='holds'
     assert unit.obligation_ids[0] not in obligation_progress(state,unit)[0]
@@ -41,8 +41,8 @@ def test_original_holds_and_actual_trigger_coverage_remain_separate(tlc,prepared
 def test_missing_trigger_or_changed_model_never_counts_as_reached(tmp_path,prepared):
     _,state,bundle,_=prepared;unit=state.units[0]
     bundle.reachability=[ReachabilityRequirement(id='missing',operator='RecoveryEntry',claim_ids=unit.obligation_ids,description='Missing actual recovery behavior')]
-    with pytest.raises(ValueError,match='actual named'):validate_bundle(state,unit,bundle,ToyImplementation())
-    bundle.reachability=[];model=save_bundle(tmp_path,state,unit,bundle,ToyImplementation())
+    with pytest.raises(ValueError,match='actual named'):validate_bundle(state,unit,bundle,PythonBackend())
+    bundle.reachability=[];model=save_bundle(tmp_path,state,unit,bundle,PythonBackend())
     from pathlib import Path
     Path(model.path).write_text(Path(model.path).read_text()+'\n')
     from consensus_assurance.adapters.verifiers.tlc import TLCVerifier
@@ -55,7 +55,7 @@ def test_missing_trigger_or_changed_model_never_counts_as_reached(tmp_path,prepa
 
 
 def test_consequence_reading_queues_real_material_and_keeps_obligation_level(tmp_path,prepared):
-    _,state,_,_=prepared;cfg=Config(implementation='toy',agent_backend='mock')
+    _,state,_,_=prepared;cfg=Config(execution_backend='python',agent_backend='mock')
     engine=Engine(cfg,tmp_path/'engine',*assemble(cfg),'');engine.state=state;engine.budget=BudgetTracker(cfg.budget,state);unit=state.units[0]
     finding=Finding(claim_id=unit.obligation_ids[0],model_id='model',check_id='search',origin=Origin.EXECUTED,description='Controlled evidence linkage only',trace_path='trace',level='implementation_obligation')
     reply=ConsequenceReply(disposition='compensation_candidate',rationale='Read whether the upstream provider establishes an alternative bound',source_ids=state.claims[0].source_ids,requests=[{'file':'limits.py','start_line':1,'end_line':2,'reason':'Read an actual alternative producer path'}],limitations=['Goal violation not established'])
@@ -72,7 +72,7 @@ def test_unfinished_trigger_execution_stays_unknown(tmp_path,prepared,status):
     from consensus_assurance.adapters.verifiers.reachability import check_requirement
     from consensus_assurance.adapters.runners.process import ProcessRunner
     _,state,bundle,_=prepared;unit=state.units[0]
-    model=save_bundle(tmp_path,state,unit,bundle,ToyImplementation())
+    model=save_bundle(tmp_path,state,unit,bundle,PythonBackend())
     req=ReachabilityRequirement(id='missing-tool',operator='Init',claim_ids=unit.obligation_ids,description='Controller failure-path regression')
     class Unavailable:
         def check(self,runner,model,timeout):

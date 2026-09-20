@@ -9,7 +9,7 @@ from consensus_assurance.core.proposals import BuildReply, Feedback, ReadRequest
 from consensus_assurance.core.types import CheckRun, CheckerResult, ExecutionStatus
 from consensus_assurance.workflow.artifacts import save_bundle, validate_bundle
 from consensus_assurance.workflow.modeling import validate_technical_repair, obligation_progress
-from consensus_assurance.plugins.implementations.toy.adapter import ToyImplementation
+from consensus_assurance.adapters.runners.python import PythonBackend
 
 
 def test_technical_repair_cannot_weaken_same_named_property(prepared):
@@ -39,7 +39,7 @@ def test_pure_bundle_validation_has_no_files_or_state_changes(tmp_path,prepared)
     before=state.model_dump(); files_before=set(tmp_path.rglob("*"))
     bad=bundle.model_copy(deep=True);bad.behavior=bad.behavior.replace('Init ==','MissingInit ==')
     with pytest.raises(ValueError,match='missing Init'):
-        validate_bundle(state,state.units[0],bad,ToyImplementation())
+        validate_bundle(state,state.units[0],bad,PythonBackend())
     assert set(tmp_path.rglob("*"))==files_before and state.model_dump()==before
 
 
@@ -50,11 +50,11 @@ def test_unchecked_obligation_remains_partial_and_schedulable(tmp_path,prepared)
     _,state,bundle,_=prepared
     unit=state.units[0]
     unit.obligation_ids.append('input_obligation')
-    model=save_bundle(tmp_path,state,unit,bundle,ToyImplementation())
+    model=save_bundle(tmp_path,state,unit,bundle,PythonBackend())
     spec=model.checkers[0]
     check=CheckRun(action='model_check',status=ExecutionStatus.COMPLETED,outcome='holds',cwd=str(tmp_path),snapshot_id=state.snapshot.id,model_id=model.id,search_fingerprint=model.search_fingerprint,checker_results=[CheckerResult(invariant=spec.invariant,claim_id=spec.claim_id,scope=spec.scope,outcome='holds')])
     state.checks.append(check)
-    engine=Engine(Config(),tmp_path,ToyImplementation(),None,None,'','')
+    engine=Engine(Config(),tmp_path,PythonBackend(),None,None,'','')
     engine.state=state;engine.budget=BudgetTracker(Config().budget,state)
     engine.finish_unit(unit)
     assert unit.status=='partial'
@@ -71,28 +71,28 @@ def test_model_commit_recovery_uses_same_action_and_version(tmp_path,prepared,po
         folder=tmp_path/'models/.pending-action1';folder.mkdir(parents=True)
         (folder/'Behavior.tla').write_text('partial bytes')
     else:
-        first=save_bundle(tmp_path,state,unit,bundle,ToyImplementation(),transaction_key='action1')
-    restored=save_bundle(tmp_path,before,before.units[0],bundle,ToyImplementation(),transaction_key='action1')
+        first=save_bundle(tmp_path,state,unit,bundle,PythonBackend(),transaction_key='action1')
+    restored=save_bundle(tmp_path,before,before.units[0],bundle,PythonBackend(),transaction_key='action1')
     assert restored.version==1 and len(before.models)==1
     if point=='complete': assert restored.id==first.id
-    again=save_bundle(tmp_path,before,before.units[0],bundle,ToyImplementation(),transaction_key='action1')
+    again=save_bundle(tmp_path,before,before.units[0],bundle,PythonBackend(),transaction_key='action1')
     assert again.id==restored.id and len(before.models)==1
     assert (tmp_path/'models/v1/commit.json').exists()
 
 
 def test_model_commit_refuses_changed_inputs(tmp_path,prepared):
     _,state,bundle,_=prepared
-    save_bundle(tmp_path,state,state.units[0],bundle,ToyImplementation(),transaction_key='action1')
+    save_bundle(tmp_path,state,state.units[0],bundle,PythonBackend(),transaction_key='action1')
     changed=bundle.model_copy(deep=True);changed.description='Different generation input'
     with pytest.raises(ValueError,match='differs'):
-        save_bundle(tmp_path,state,state.units[0],changed,ToyImplementation(),transaction_key='action1')
+        save_bundle(tmp_path,state,state.units[0],changed,PythonBackend(),transaction_key='action1')
 
 
 def test_f2_relation_dependency_requeues_unrelated_completed_unit(tmp_path,dependency_prepared):
     from consensus_assurance.workflow.feedback import apply_feedback
     from consensus_assurance.core.proposals import GraphPatch, ClaimDraft, RelationDraft
     _,state,bundle,_=dependency_prepared
-    unit=state.units[0];model=save_bundle(tmp_path,state,unit,bundle,ToyImplementation())
+    unit=state.units[0];model=save_bundle(tmp_path,state,unit,bundle,PythonBackend())
     other=unit.model_copy(deep=True);other.id='other';other.status='checked';state.units.append(other)
     other_model=model.model_copy(deep=True);other_model.id='other-model';other_model.unit_id='other';other_model.binding_ids=[];other_model.checkers=[]
     edge=state.relations[0];other_model.graph_versions={edge.id:edge.version};state.models.append(other_model)
@@ -119,9 +119,9 @@ def test_later_bundle_cannot_hide_an_unfinished_checker_of_same_obligation(tmp_p
     second=CheckerSpec(invariant='Additional',claim_id=first.claim_id,scope=first.scope)
     bundle.checkers=[first,second]
     bundle.properties=bundle.properties.replace('Safe ==','Additional == TRUE\nSafe ==')
-    model1=save_bundle(tmp_path,state,unit,bundle,ToyImplementation())
+    model1=save_bundle(tmp_path,state,unit,bundle,PythonBackend())
     bundle.checkers=[first]
-    model2=save_bundle(tmp_path,state,unit,bundle,ToyImplementation())
+    model2=save_bundle(tmp_path,state,unit,bundle,PythonBackend())
     for model in [model1,model2]:
         state.checks.append(CheckRun(action='model_check',status=ExecutionStatus.COMPLETED,cwd=str(tmp_path),snapshot_id=state.snapshot.id,model_id=model.id,
             checker_results=[CheckerResult(invariant=first.invariant,claim_id=first.claim_id,scope=first.scope,outcome='holds')]))

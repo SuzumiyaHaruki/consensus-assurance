@@ -30,8 +30,8 @@ def validate_bundle(state, unit, bundle, implementation):
         raise ValueError("Checker claims must belong to the selected observable audit unit")
     if not set(unit.obligation_ids) & set(checked_ids):
         raise ValueError("Model must check a selected obligation")
-    if isinstance(bundle, Bundle) and bundle.harness.kind != implementation.harness_kind:
-        raise ValueError("Harness kind is incompatible with the selected implementation adapter")
+    if isinstance(bundle, Bundle) and (implementation is None or bundle.harness.kind != implementation.harness_kind):
+        raise ValueError("Harness kind is incompatible with the configured execution backend")
     validate_tla(bundle.behavior, "Behavior"); validate_tla(bundle.properties, "Properties")
     for name in ("Init", "Next", "vars", "Obs"):
         if not re.search(r"\b" + name + r"\s*==", bundle.behavior):
@@ -133,11 +133,12 @@ def save_bundle(root, state, unit, bundle, implementation, previous=None, reason
     behavior, checker, cfg = folder / "Behavior.tla", folder / "Properties.tla", folder / "Properties.cfg"
     behavior.write_text(bundle.behavior); checker.write_text(bundle.properties)
     cfg.write_text("INIT Init\nNEXT Next\nCHECK_DEADLOCK FALSE\n" + ("CONSTANTS\n" + bundle.constants + "\n" if bundle.constants.strip() else "") + "INVARIANTS\n" + "\n".join(invariants) + "\n")
-    mapping, harness, proposal = folder / "mapping.json", folder / implementation.harness_filename, folder / "bundle.json"
+    mapping, harness, proposal = folder / "mapping.json", folder / (implementation.harness_filename if implementation else "unavailable"), folder / "bundle.json"
     files = [behavior, checker, cfg, proposal]
     complete = isinstance(bundle, Bundle)
     if complete:
         write_json(mapping, bundle.observation)
+        harness.parent.mkdir(parents=True,exist_ok=True)
         harness.write_text(bundle.harness.source)
         files.extend([mapping, harness])
     write_json(proposal, bundle)

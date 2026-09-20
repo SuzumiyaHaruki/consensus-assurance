@@ -79,7 +79,7 @@ class CoverageAgent(MockAgent):
             raise AssertionError('Unexpected task '+name)
         if name=='Derivation':
             from regression_support import bounded_derivation
-            response=bounded_derivation(response)
+            response=bounded_derivation(response,context)
         directory.mkdir(parents=True,exist_ok=True)
         (directory/'prompt.txt').write_text(prompt)
         write_json(directory/'response.json',response)
@@ -100,7 +100,7 @@ from consensus_assurance.registry import assemble
 
 def setup_workflow(tmp_path,prepared,wrong=False,weak=False,tlc=None):
     repo,_,_,responses=prepared;add_coverage_materials(repo)
-    config=Config(implementation='toy',agent_backend='mock',allow_experiments=False,tlc_jar=os.environ.get('TLC_JAR'))
+    config=Config(execution_backend='python',agent_backend='mock',allow_experiments=False,tlc_jar=os.environ.get('TLC_JAR'))
     config.budget.agent_calls=20;config.budget.exploration_rounds=5;config.budget.semantic_reviews=6
     config.budget.audit_units=0 if wrong else 1
     config.budget.targeted_reads=6;config.budget.outer_reserve_seconds=1

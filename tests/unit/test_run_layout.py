@@ -12,11 +12,11 @@ from consensus_assurance.workflow.materials import ReadingPlan
 
 
 def test_readable_unique_run_directories(tmp_path):
-    config = Config(runs_dir=str(tmp_path), implementation='hashicorp_raft', agent_backend='mock')
+    config = Config(runs_dir=str(tmp_path), execution_backend='go_module', agent_backend='mock')
     first = create_run_directory(config, 'plan')
     second = create_run_directory(config, 'plan')
     assert first != second
-    assert re.match(r'\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}-hashicorp_raft-mock-plan', first.name)
+    assert re.match(r'\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}-go_module-mock-plan', first.name)
     assert resolve_run(first.name, tmp_path) == first
     old = tmp_path / ('a' * 32)
     old.mkdir()
@@ -43,7 +43,7 @@ def test_semantic_validation_failure_is_saved_with_specific_reason(tmp_path, pre
     repo, _, _, responses = prepared
     fixture = tmp_path / 'responses.json'
     fixture.write_text(json.dumps([responses[0], responses[0]]))
-    config = Config(implementation='toy', agent_backend='mock', fixture=str(fixture))
+    config = Config(execution_backend='python', agent_backend='mock', fixture=str(fixture))
     class CheckValidation(Engine):
         def execute(self, **kwargs):
             def reject(proposal):

@@ -146,7 +146,7 @@ def diagnostic_targets(value,diagnostics,limit):
                 except (ValueError,KeyError,IndexError,TypeError):exists=False;current=None;break
             item={'path':pointer(route),'exists':exists,'current_value':current}
             if diagnostic.code=='source_view_citation':item['citation_aliases']=diagnostic.details['alias_candidates']
-            if diagnostic.code=='grounding_reference':item['grounding_reference_repair']=True
+            if diagnostic.code in {'grounding_reference','question_source_reference'}:item['source_reference_repair']=True
             if item not in result:result.append(item)
     if len(json.dumps(result,ensure_ascii=False))>limit:raise ValueError('Repair target set exceeds bounded context; preserve candidate and request smaller scope')
     return result

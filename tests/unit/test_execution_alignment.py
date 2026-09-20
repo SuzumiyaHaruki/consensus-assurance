@@ -34,10 +34,10 @@ def test_binding_review_contains_selected_current_unit(tmp_path,prepared):
 
 
 def test_constraint_cites_material_and_selected_binding(prepared):
-    from consensus_assurance.plugins.implementations.toy.adapter import ToyImplementation
+    from consensus_assurance.adapters.runners.python import PythonBackend
     _,state,bundle,_=prepared;unit=state.units[0];binding=state.bindings[0]
     bundle.constraints=[ConstraintSource(constraint='Actual step',source_kind='code_observation',source_ids=[binding.material_id],binding_ids=[binding.id],justification='Actual transition source')]
-    validate_bundle(state,unit,bundle,ToyImplementation())
+    validate_bundle(state,unit,bundle,PythonBackend())
 
 
 def test_selected_exploration_dependency_uses_depth(tmp_path,prepared):
@@ -73,11 +73,11 @@ def test_workspace_delta_reconstructs_inputs(tmp_path):
 
 def test_constraint_repair_supplies_graph_objects_not_source_requests(prepared):
     import pytest
-    from consensus_assurance.plugins.implementations.toy.adapter import ToyImplementation
+    from consensus_assurance.adapters.runners.python import PythonBackend
     from consensus_assurance.workflow.output_repair import diagnostic_context,diagnostic_targets
     _,state,bundle,_=prepared;unit=state.units[0]
     bundle.constraints[0].binding_ids=[]
-    with pytest.raises(ValueError) as caught:validate_bundle(state,unit,bundle,ToyImplementation())
+    with pytest.raises(ValueError) as caught:validate_bundle(state,unit,bundle,PythonBackend())
     diagnostic=caught.value.diagnostics[0]
     assert diagnostic.allowed==['representation']
     assert diagnostic.details['selected_bindings'][0]['associations']
@@ -90,7 +90,7 @@ def test_constraint_repair_supplies_graph_objects_not_source_requests(prepared):
     with pytest.raises(ValueError):
         apply_replacements({'bundle':bundle.model_dump(mode='json')},targets,OutputRepair(replacements=[Replacement(path='/bundle/constraints/0/source_kind',value_json='"model_assumption"')],rationale='Not an authorized citation repair'))
     bundle.constraints[0].binding_ids=['not_selected']
-    with pytest.raises(ValueError):validate_bundle(state,unit,bundle,ToyImplementation())
+    with pytest.raises(ValueError):validate_bundle(state,unit,bundle,PythonBackend())
 
 
 def test_selected_read_can_use_protected_depth(tmp_path,prepared):

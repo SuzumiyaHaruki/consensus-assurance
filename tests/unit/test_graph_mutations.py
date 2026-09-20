@@ -8,7 +8,7 @@ from consensus_assurance.core.types import CheckRun,CheckerResult,ExecutionStatu
 from consensus_assurance.workflow.artifacts import save_bundle
 from consensus_assurance.workflow.modeling import obligation_progress
 from consensus_assurance.workflow.inquiry import validate_review,semantic_limitations
-from consensus_assurance.plugins.implementations.toy.adapter import ToyImplementation
+from consensus_assurance.adapters.runners.python import PythonBackend
 
 
 def revision_for(state, ids):
@@ -36,12 +36,12 @@ def test_review_cannot_modify_an_unreviewed_obligation(prepared):
 
 def test_same_named_stronger_unexecuted_model_is_not_covered(tmp_path,prepared):
     _,state,bundle,_=prepared;unit=state.units[0]
-    old=save_bundle(tmp_path,state,unit,bundle,ToyImplementation())
+    old=save_bundle(tmp_path,state,unit,bundle,PythonBackend())
     spec=old.checkers[0]
     state.checks.append(CheckRun(action='model_check',status=ExecutionStatus.COMPLETED,outcome='holds',cwd=str(tmp_path),snapshot_id=state.snapshot.id,model_id=old.id,search_fingerprint=old.search_fingerprint,checker_results=[CheckerResult(invariant=spec.invariant,claim_id=spec.claim_id,scope=spec.scope,outcome='holds')]))
     assert spec.claim_id in obligation_progress(state,unit)[0]
     stronger=bundle.model_copy(deep=True);stronger.properties=stronger.properties.replace('value <= 3','value <= 2')
-    save_bundle(tmp_path,state,unit,stronger,ToyImplementation(),previous=old)
+    save_bundle(tmp_path,state,unit,stronger,PythonBackend(),previous=old)
     checked,missing=obligation_progress(state,unit)
     assert spec.claim_id in missing and spec.claim_id not in checked
 
@@ -59,7 +59,7 @@ def test_actual_dependency_selected_unit_build_is_explicitly_exploratory(tmp_pat
     state.relations.append(Relation(id='producer_support',source=consumer.obligation_ids[0],target='input_obligation',kind='depends_all',rationale='Goal depends on producer',grounding=state.claims[0].grounding))
     state.units.append(producer);state.completed_steps=['capabilities','materials','understanding','discovery']
     root=tmp_path/'selection';shutil.copytree(state.snapshot.repo,root/'source')
-    config=Config(implementation='toy',agent_backend='mock',allow_experiments=False);config.budget.exploration_rounds=0;config.budget.semantic_reviews=4;config.budget.audit_units=1
+    config=Config(execution_backend='python',agent_backend='mock',allow_experiments=False);config.budget.exploration_rounds=0;config.budget.semantic_reviews=4;config.budget.audit_units=1
     built=[]
     class ObserveBuild(Engine):
         def ask(self,kind,response_type,context,validator=None,**kwargs):
@@ -82,7 +82,7 @@ def test_actual_dependency_selected_unit_build_is_explicitly_exploratory(tmp_pat
 
 def test_equivalent_explicit_review_can_replace_old_budget_blockage(tmp_path,prepared):
     _,state,bundle,_=prepared
-    model=save_bundle(tmp_path,state,state.units[0],bundle,ToyImplementation())
+    model=save_bundle(tmp_path,state,state.units[0],bundle,PythonBackend())
     claim=next(c for c in state.claims if c.id==model.claim_id)
     old=InquiryTask(id='old',kind='review',reason='Review contract',trigger='before_model',target_ids=[claim.id],target_versions={claim.id:claim.version},status='blocked',stop_reason='Budget exhausted or disabled: semantic_reviews')
     state.inquiry_tasks.append(old)
@@ -101,7 +101,7 @@ from consensus_assurance.workflow.feedback import apply_feedback
 from consensus_assurance.workflow.graph import apply_patch
 from consensus_assurance.workflow.artifacts import save_bundle
 from consensus_assurance.workflow.modeling import obligation_progress
-from consensus_assurance.plugins.implementations.toy.adapter import ToyImplementation
+from consensus_assurance.adapters.runners.python import PythonBackend
 
 
 @pytest.mark.parametrize('extra',['claim','relation','unit','binding'])
@@ -151,19 +151,19 @@ def test_reuse_requires_identical_search_inputs_and_explicit_receipt(tmp_path,pr
     from consensus_assurance.workflow.budget import BudgetTracker
     from consensus_assurance.core.config import Config
     _,state,bundle,_=prepared;unit=state.units[0]
-    first=save_bundle(tmp_path,state,unit,bundle,ToyImplementation());source=complete_search(state,first,tmp_path)
+    first=save_bundle(tmp_path,state,unit,bundle,PythonBackend());source=complete_search(state,first,tmp_path)
     changed=bundle.model_copy(deep=True)
     if change=='harness':changed.harness.source+='\n# Observation-only formatting\n'
     if change=='constants':changed.constants='N = 2'
     if change=='behavior':changed.behavior=changed.behavior.replace('value < 3','value < 2')
     if change=='faults':changed.scope.assumptions.append('An additional crash may occur')
     if change=='property':changed.properties=changed.properties.replace('value <= 3','value <= 2')
-    second=save_bundle(tmp_path,state,unit,changed,ToyImplementation(),first)
+    second=save_bundle(tmp_path,state,unit,changed,PythonBackend(),first)
     assert unit.obligation_ids[0] in obligation_progress(state,unit)[1]
     reusable=reusable_search(state,second)
     if change!='harness':assert reusable is None;return
     assert reusable.id==source.id
-    engine=Engine(Config(),tmp_path,ToyImplementation(),None,None,'','');engine.state=state;engine.budget=BudgetTracker(Config().budget,state)
+    engine=Engine(Config(),tmp_path,PythonBackend(),None,None,'','');engine.state=state;engine.budget=BudgetTracker(Config().budget,state)
     result=engine.search(unit,second,changed,None)
     assert result.reused_from==source.id and result.model_id==second.id and result.id!=source.id
     assert unit.obligation_ids[0] in obligation_progress(state,unit)[0]
@@ -178,13 +178,13 @@ def test_reused_counterexample_keeps_current_attribution_without_reexecuting(tmp
     from consensus_assurance.core.config import Config
     from consensus_assurance.core.types import uid
     _,state,bundle,_=prepared;unit=state.units[0]
-    old=save_bundle(tmp_path,state,unit,bundle,ToyImplementation());source=complete_search(state,old,tmp_path)
+    old=save_bundle(tmp_path,state,unit,bundle,PythonBackend());source=complete_search(state,old,tmp_path)
     source.outcome='counterexample';source.violated_invariant=old.checkers[0].invariant;source.checker_results[0].outcome='violated'
     revised=bundle.model_copy(deep=True);revised.harness.source+='\n# Revised observation formatting\n'
-    new=save_bundle(tmp_path,state,unit,revised,ToyImplementation(),old)
+    new=save_bundle(tmp_path,state,unit,revised,PythonBackend(),old)
     receipt=source.model_copy(update={'id':uid(),'model_id':new.id,'reused':True,'reused_from':source.id,'input_versions':new.artifact_digests},deep=True)
     state.checks.append(receipt)
-    engine=Engine(Config(),tmp_path,ToyImplementation(),None,None,'','');engine.state=state;engine.budget=BudgetTracker(Config().budget,state)
+    engine=Engine(Config(),tmp_path,PythonBackend(),None,None,'','');engine.state=state;engine.budget=BudgetTracker(Config().budget,state)
     assert engine.search(unit,new,revised,None).id==receipt.id
     assert len(state.findings)==1 and state.findings[0].model_id==new.id
     assert state.findings[0].claim_id==old.checkers[0].claim_id
@@ -202,7 +202,7 @@ from consensus_assurance.workflow.reviews import material_closure
 
 
 def controller(tmp_path,state):
-    cfg=Config(implementation='toy',agent_backend='mock',allow_experiments=False)
+    cfg=Config(execution_backend='python',agent_backend='mock',allow_experiments=False)
     engine=Engine(cfg,tmp_path/'engine',*assemble(cfg),'');engine.state=state;engine.budget=BudgetTracker(cfg.budget,state)
     return engine
 

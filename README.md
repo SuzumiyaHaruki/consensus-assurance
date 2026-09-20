@@ -81,4 +81,6 @@ TLC_JAR="$TLC_JAR" .venv/bin/python -m pytest -q
 
 项目仓库：[SuzumiyaHaruki/consensus-assurance](https://github.com/SuzumiyaHaruki/consensus-assurance)。
 
-当前版本为 `selected-question-v6`，控制器与资源清单共用版本来源。`task_packet.prepare()` 统一投影当前焦点、简要方向、局部语义邻域、文件导航与显式源码；历史 provenance 不自动附带正文。Surface 在同一任务内导航、补读、解释，超大包按现有准备预算缩减，未发送不计语义尝试。描述性语义错误留在 `spec_refine`；当前候选可收缩，旧问题完整留档。只剩一次调用时优先完成已有工作，不开启新的候选或未读 Surface。生产预算和初始 8×80 保持不变。历史 v5 只读，不可原地续跑到 v6；本次 v6 真实运行及其未决事项见上述归档。完整流程见 [审计方法](docs/审计方法.md)。
+当前版本为 `selected-question-v7`，控制器和资源清单共用版本。初选候选可只有身份与精确阅读计划；终局判断必须有当前实际来源。知识回流与候选结论正交，只有 requires_recheck 阻塞重连，independent_enrichment 可留待后续处理。v6 归档只读，不可直接续跑。
+
+源码审计默认不需要执行后端；HashiCorp 与三个 SwiftPaxos 变体共用 go_module，目标差异写入 YAML。新增配置为 `configs/targets/swiftpaxos_{paxos,n2paxos,swift}.yaml`，均为 protocol:none，材料发送及目标执行默认关闭。实际环境准备、隔离构建与未决限制见 [环境要求](docs/环境要求.md)；尚未启动新的自主审计。

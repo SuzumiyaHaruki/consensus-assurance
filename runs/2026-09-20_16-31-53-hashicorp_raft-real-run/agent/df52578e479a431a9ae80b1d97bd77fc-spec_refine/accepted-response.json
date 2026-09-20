@@ -1,0 +1,378 @@
+{
+  "understanding": "The focused helpers synchronously calculate deletion bounds and delegate inclusive deletion to the selected LogStore. Normal compaction retains an index window and never requests deletion beyond the supplied snapshot index. removeOldLogs instead uses the store's observed last index with zero trailing retention; its restore callers and monotonic-store selection checks remain unread. The built-in memory store and cache adapter have distinct completion, synchronization, and durability semantics.",
+  "requests": [],
+  "delta": {
+    "target_profile": null,
+    "activities": [
+      {
+        "class_id": "A6",
+        "applicability": "applicable",
+        "purpose": "Reclaim log history through bounded compaction or removal of old stored logs.",
+        "realization_summary": "Raft computes inclusive deletion ranges and calls the selected LogStore. InmemStore deletes under a mutex; LogCache clears its cache before delegating deletion. This is a partial description of reclamation, not coverage of the full history lifecycle.",
+        "entry_points": [
+          "Raft.compactLogs",
+          "Raft.compactLogsWithTrailing",
+          "Raft.removeOldLogs",
+          "InmemStore.DeleteRange",
+          "LogCache.DeleteRange"
+        ],
+        "behavior_ids": [],
+        "variants": [
+          "Normal compaction uses a supplied snapshot index, Raft's last-log index, and one captured TrailingLogs value.",
+          "Old-log removal uses the store's LastIndex and zero trailing retention.",
+          "Direct InmemStore or LogCache wrapping a caller-selected backend."
+        ],
+        "unknowns": [
+          "Actual adapter selection is not supplied.",
+          "Restore callers, their monotonic-store checks, and their handling of deletion failures are unread.",
+          "Persistent backend deletion atomicity and crash recovery are not established by the supplied interface."
+        ],
+        "source_ids": [
+          "snapshot.go:125:278",
+          "log.go:1:192",
+          "inmem_store.go:1:133",
+          "log_cache.go:1:95"
+        ]
+      }
+    ],
+    "behaviors": [
+      {
+        "id": "b_compact_log_range",
+        "primary_activity": "A6",
+        "execution_owner": "Calling Raft execution context; the helper runs synchronously.",
+        "protocol_context": "Compaction for supplied snapIdx, lastLogIdx, and trailingLogs. compactLogs captures the latter two from Raft state and configuration.",
+        "trigger": "Invocation of compactLogs or compactLogsWithTrailing.",
+        "legal_preconditions": [
+          "The caller supplies a snapshot boundary appropriate to its operation; the helper does not establish snapshot availability."
+        ],
+        "implementation_guards": [
+          "Return an error if FirstIndex fails.",
+          "Return nil without deletion if lastLogIdx <= trailingLogs.",
+          "Compute maxLog = min(snapIdx, lastLogIdx - trailingLogs).",
+          "Return nil without deletion if minLog > maxLog."
+        ],
+        "reads": [
+          "LogStore.FirstIndex",
+          "Supplied snapshot and last-log indexes",
+          "Captured trailing-log retention value"
+        ],
+        "writes": [],
+        "durable_effects": [
+          "Delegates inclusive deletion to LogStore.DeleteRange(minLog, maxLog); concrete durability depends on the selected implementation."
+        ],
+        "external_effects": [
+          "Returns a wrapped deletion error or nil to its caller."
+        ],
+        "important_branches": [
+          "Nil can mean no deletion was requested or the selected backend returned nil.",
+          "takeSnapshot calls compactLogs only after Persist and sink.Close return nil and after setLastSnapshot; a compaction failure is returned after that metadata update.",
+          "The retention calculation bounds indexes; it does not count actual stored entries when gaps exist."
+        ],
+        "async_boundaries": [
+          "FirstIndex and DeleteRange are separate calls; this helper supplies no lock spanning them."
+        ],
+        "produces_fact_ids": [
+          "f_compaction_backend_ack"
+        ],
+        "consumes_fact_ids": [],
+        "cross_activity_effects": {},
+        "existing_protections": [
+          "The subtraction is guarded by lastLogIdx > trailingLogs.",
+          "The requested upper deletion bound cannot exceed the supplied snapshot index.",
+          "One trailingLogs argument is used throughout each helper invocation.",
+          "Backend deletion errors propagate to the caller."
+        ],
+        "source_ids": [
+          "snapshot.go:125:278",
+          "log.go:1:192"
+        ],
+        "unknowns": [
+          "Other caller contexts and serialization with concurrent log mutation are not established.",
+          "Snapshot sink completion does not itself establish concrete snapshot durability without the selected implementation.",
+          "A backend error's partial deletion effects are unspecified by the supplied interface."
+        ]
+      },
+      {
+        "id": "b_remove_old_logs",
+        "primary_activity": "A6",
+        "execution_owner": "Calling Raft execution context; restore caller ownership remains unread.",
+        "protocol_context": "Helper documented for use after restore with monotonic log stores.",
+        "trigger": "Invocation of removeOldLogs.",
+        "legal_preconditions": [
+          "The helper comment assigns verification that the store is monotonic to its callers."
+        ],
+        "implementation_guards": [
+          "Return a wrapped error if LogStore.LastIndex fails."
+        ],
+        "reads": [
+          "LogStore.LastIndex"
+        ],
+        "writes": [],
+        "durable_effects": [
+          "Calls compactLogsWithTrailing(lastLogIdx, lastLogIdx, 0), which may delegate deletion."
+        ],
+        "external_effects": [
+          "Returns the compaction helper's result."
+        ],
+        "important_branches": [
+          "An observed last index of zero causes the compaction helper to skip deletion after reading FirstIndex.",
+          "A positive observed last index becomes the deletion ceiling; later additions are not automatically included.",
+          "This helper performs no IsMonotonic check itself."
+        ],
+        "async_boundaries": [
+          "LastIndex, the delegated FirstIndex, and DeleteRange are separate operations."
+        ],
+        "produces_fact_ids": [],
+        "consumes_fact_ids": [],
+        "cross_activity_effects": {},
+        "existing_protections": [
+          "LastIndex failures prevent delegation.",
+          "The delegated helper propagates FirstIndex and DeleteRange failures."
+        ],
+        "source_ids": [
+          "snapshot.go:125:278",
+          "log.go:1:192"
+        ],
+        "unknowns": [
+          "Actual restore callers, monotonic selection checks, mutation exclusion, and error consequences remain unread.",
+          "Successful return alone does not establish that the store is empty under concurrent insertion."
+        ]
+      },
+      {
+        "id": "b_inmem_delete_range",
+        "primary_activity": "A6",
+        "execution_owner": "InmemStore invoked synchronously by its caller.",
+        "protocol_context": "Deletion within one in-memory store instance.",
+        "trigger": "DeleteRange(min, max).",
+        "legal_preconditions": [],
+        "implementation_guards": [
+          "Acquire the store's exclusive mutex for the entire operation."
+        ],
+        "reads": [
+          "min and max",
+          "lowIndex and highIndex"
+        ],
+        "writes": [
+          "Delete logs[j] for successive uint64 indexes j from min through max.",
+          "Set lowIndex to max + 1 when min <= lowIndex.",
+          "Set highIndex to min - 1 when max >= highIndex.",
+          "Reset both indexes to zero when the updated lowIndex exceeds highIndex."
+        ],
+        "durable_effects": [],
+        "external_effects": [
+          "Returns nil after the deletion loop and metadata updates complete."
+        ],
+        "important_branches": [
+          "Metadata updates use arithmetic boundaries rather than scanning remaining map entries.",
+          "The loop and boundary arithmetic use uint64 values; behavior at arithmetic extremes is not justified by caller constraints in the supplied material."
+        ],
+        "async_boundaries": [
+          "Other methods using the same store mutex cannot interleave with the deletion body."
+        ],
+        "produces_fact_ids": [
+          "f_inmem_range_absent"
+        ],
+        "consumes_fact_ids": [],
+        "cross_activity_effects": {},
+        "existing_protections": [
+          "Map deletion and boundary metadata updates share one exclusive critical section.",
+          "GetLog, FirstIndex, and LastIndex use the same mutex for reads."
+        ],
+        "source_ids": [
+          "inmem_store.go:1:133"
+        ],
+        "unknowns": [
+          "Permitted index extremes and assumptions about gaps for metadata interpretation are not established.",
+          "The supplied comments designate this volatile implementation for tests; it provides no crash persistence."
+        ]
+      },
+      {
+        "id": "b_cache_delete_range",
+        "primary_activity": "A6",
+        "execution_owner": "LogCache adapter invoked synchronously by its caller.",
+        "protocol_context": "A cache instance wrapping a selected LogStore.",
+        "trigger": "DeleteRange(min, max).",
+        "legal_preconditions": [],
+        "implementation_guards": [
+          "Acquire the cache's exclusive mutex while replacing its cache slice."
+        ],
+        "reads": [
+          "Cache capacity",
+          "Underlying store reference",
+          "Requested deletion bounds"
+        ],
+        "writes": [
+          "Replace the entire cache slice with an empty slice of the same length."
+        ],
+        "durable_effects": [
+          "Delegate DeleteRange(min, max) to the underlying store after unlocking the cache."
+        ],
+        "external_effects": [
+          "Return the underlying store's deletion result unchanged."
+        ],
+        "important_branches": [
+          "The cache is cleared before backend deletion regardless of the backend result.",
+          "GetLog can capture a cached pointer under a read lock and inspect it after unlocking.",
+          "StoreLogs writes the backend before acquiring the cache lock to insert entries."
+        ],
+        "async_boundaries": [
+          "Cache invalidation and backend deletion are separate critical operations.",
+          "Concurrent cache reads and fills may overlap the backend deletion call."
+        ],
+        "produces_fact_ids": [
+          "f_cache_clear_event"
+        ],
+        "consumes_fact_ids": [],
+        "cross_activity_effects": {},
+        "existing_protections": [
+          "All cache slots are invalidated, including entries outside the requested range.",
+          "Backend errors remain visible to the caller.",
+          "Cache hits check the cached entry's index."
+        ],
+        "source_ids": [
+          "log_cache.go:1:95"
+        ],
+        "unknowns": [
+          "Caller serialization and supported concurrent-operation semantics are not established.",
+          "Clearing the slice does not establish that already captured pointers are unusable or that the cache remains empty.",
+          "The selected backend's partial failure and durability behavior remain unknown."
+        ]
+      }
+    ],
+    "facts": [
+      {
+        "id": "f_compaction_backend_ack",
+        "meaning": "On the deletion branch, the selected LogStore returned nil for the requested inclusive range. This fact excludes the helper's no-op success branches.",
+        "identity": {
+          "operation": "One compactLogsWithTrailing invocation",
+          "range": "Observed FirstIndex through min(snapIdx, lastLogIdx - trailingLogs)",
+          "store": "The invocation's selected LogStore"
+        },
+        "established_by": [],
+        "consumed_by": [],
+        "validity_context": "Established only after DeleteRange returns nil; it is an acknowledgement, not an independently observed durability or emptiness guarantee.",
+        "representation": [
+          "Nil DeleteRange result on the deletion branch, followed by nil helper return"
+        ],
+        "invalidators": [],
+        "reinterpreters": [],
+        "durability": "No separate durable acknowledgement record is shown.",
+        "recovery": "Crash recovery and persistent backend semantics are unread.",
+        "source_ids": [
+          "snapshot.go:125:278",
+          "log.go:1:192"
+        ],
+        "unknowns": [
+          "Consumers beyond the shown takeSnapshot error check are unread.",
+          "The helper's returned nil does not distinguish this fact from no-op completion."
+        ]
+      },
+      {
+        "id": "f_inmem_range_absent",
+        "meaning": "When the deletion loop completes, keys in the requested inclusive range are absent from this store's log map while the exclusive lock is still held.",
+        "identity": {
+          "store": "One InmemStore instance",
+          "range": "The invocation's min and max"
+        },
+        "established_by": [],
+        "consumed_by": [],
+        "validity_context": "For an ordered range whose uint64 loop terminates, at completion inside the deletion critical section; later writes may repopulate entries.",
+        "representation": [
+          "Absence of the corresponding keys in logs"
+        ],
+        "invalidators": [],
+        "reinterpreters": [],
+        "durability": "Volatile memory only.",
+        "recovery": "No persistence or recovery mechanism is provided by this implementation.",
+        "source_ids": [
+          "inmem_store.go:1:133"
+        ],
+        "unknowns": [
+          "StoreLogs can later reinsert entries; that separate write behavior is outside this focused mapping.",
+          "This fact does not assert that lowIndex and highIndex identify actual remaining map keys for every possible input.",
+          "Protocol consumers of the resulting absence remain unmapped."
+        ]
+      },
+      {
+        "id": "f_cache_clear_event",
+        "meaning": "This deletion invocation replaced every cache slot with nil before calling the underlying store's DeleteRange.",
+        "identity": {
+          "cache": "One LogCache instance",
+          "operation": "One DeleteRange invocation"
+        },
+        "established_by": [],
+        "consumed_by": [],
+        "validity_context": "A completed invalidation event under the cache lock, not a promise of continued cache emptiness or completed backend deletion.",
+        "representation": [
+          "Replacement cache slice allocated with the previous capacity"
+        ],
+        "invalidators": [],
+        "reinterpreters": [],
+        "durability": "Volatile event with no persistent record.",
+        "recovery": "No recovery semantics are established by this operation.",
+        "source_ids": [
+          "log_cache.go:1:95"
+        ],
+        "unknowns": [
+          "No mapped consumer relies on this event as an explicit acknowledgement.",
+          "Subsequent cache fills and previously captured read pointers require separate concurrency analysis."
+        ]
+      }
+    ],
+    "surfaces": [
+      {
+        "entry_point": "compactLogs and compactLogsWithTrailing deletion execution",
+        "disposition": "mapped",
+        "behavior_ids": [
+          "b_compact_log_range",
+          "b_inmem_delete_range",
+          "b_cache_delete_range"
+        ],
+        "reason": "The attached sources establish bounds, no-op branches, error propagation, and available built-in deletion implementations. Backend activation and broader caller serialization remain unknown.",
+        "source_ids": [
+          "snapshot.go:125:278",
+          "log.go:1:192",
+          "inmem_store.go:1:133",
+          "log_cache.go:1:95"
+        ],
+        "high_consequence": true
+      },
+      {
+        "entry_point": "removeOldLogs helper execution",
+        "disposition": "mapped",
+        "behavior_ids": [
+          "b_remove_old_logs"
+        ],
+        "reason": "The helper reads LastIndex and delegates with zero trailing retention. Its own implementation is available independently of the unread restore callers.",
+        "source_ids": [
+          "snapshot.go:125:278",
+          "log.go:1:192"
+        ],
+        "high_consequence": true
+      },
+      {
+        "entry_point": "removeOldLogs restore callers and monotonic-store selection",
+        "disposition": "deferred",
+        "behavior_ids": [],
+        "reason": "Recover the actual callers, their execution ownership, IsMonotonic checks, ordering with restoration and new log insertion, and handling of removal failure. The helper comment and optional interface describe intended use but do not establish those caller behaviors.",
+        "source_ids": [
+          "snapshot.go:125:278",
+          "log.go:1:192",
+          "log_cache.go:1:95"
+        ],
+        "high_consequence": true
+      }
+    ],
+    "remove_behavior_ids": [],
+    "remove_fact_ids": [],
+    "remove_surface_entry_points": [
+      "compactLogsWithTrailing and removeOldLogs"
+    ],
+    "rationale": "Replace the composite frontier with sourced helper and adapter behaviors plus an explicit unread restore-caller remainder. Separate backend acknowledgement, volatile map deletion, and cache invalidation because they establish different assertions. Preserve no-op success, snapshot-before-compaction ordering, adapter concurrency boundaries, and unknown persistent failure semantics without deriving a normative obligation."
+  },
+  "limitations": [
+    "Only the four attached source ranges support this refinement; no execution or correctness check was performed.",
+    "Restore caller ownership, monotonic-store activation, and serialization remain deferred.",
+    "No claim is made that interface acknowledgement establishes crash durability, globally empty storage, or exclusion of concurrent cached reads."
+  ]
+}

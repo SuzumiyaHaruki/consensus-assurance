@@ -25,6 +25,8 @@ def focused(tmp_path,prepared):
     source=state.materials[0].id
     accept(e,inventory(source))
     q=AuditQuestion(question='Can a late success hide an earlier failed publication?',importance='History remains recoverable',source_ids=[source],activity_classes=['A1','A5'],behavior_ids=['producer','consumer'],fact_ids=['fact'],obligation_relation_kind='consumption',preferred_check='source_review',disposition='needs_specific_evidence',counterevidence=['Caller propagates an original error'],unknowns=['Caller contract still unread'],trigger_rationale='Inspect the remaining caller discriminator')
+    from consensus_assurance.workflow.task_packet import receipt
+    receipt(e,'derive',{'materials':[m.model_dump(mode='json') for m in e.state.materials]},'offline source',Derivation)
     return e,q,responses
 
 
@@ -131,19 +133,22 @@ def test_descriptive_debt_routes_by_selected_objects(focused,selected):
     spec=load(e.state)
     spec.behaviors.append(Behavior(id='unrelated',primary_activity='A2',execution_owner='other loop',protocol_context='independent',trigger='timer',source_ids=q.source_ids))
     accept(e,spec)
-    issue=DescriptiveIssue(object_ids=['consumer' if selected else 'unrelated'],source_ids=q.source_ids,reason='Correct the owner from source')
+    issue=DescriptiveIssue(candidate_effect='requires_recheck' if selected else 'independent_enrichment',object_ids=['consumer' if selected else 'unrelated'],source_ids=q.source_ids,reason='Correct the owner from source')
     reply=Derivation(audit_question=q,reading_requests=[ReadRequest(file='counter.py',start_line=1,end_line=2,reason='Read selected behavior')],descriptive_issues=[issue],selection_rationale='Continue selected question')
     discovery.accept_derivation(e,reply,'issue')
     c=discovery.active_candidate(e.state);task=e.state.inquiry_tasks[0]
     assert bool(c.spec_task_ids)==selected and read_purpose(task)=='depth'
     if selected:
         from consensus_assurance.adapters.agents.backend import MockAgent
-        revised=load(e.state);revised.behaviors[1].execution_owner='serialized callback'
-        agent=MockAgent();agent.responses=[SpecRefinement(understanding='Correct selected owner without changing fact meaning',delta=AuditSpecDelta(behaviors=[revised.behaviors[1]],rationale='Correct the selected owner'),limitations=[]).model_dump(mode='json')];e.agent=agent
+        (e.root/'source'/'callback.py').write_text('def completed():\n    return True\n');e.state.snapshot=capture(e.root/'source')
+        revised=load(e.state);revised.behaviors[1].execution_owner='serialized callback';revised.behaviors[1].source_ids=['callback.py:1:2']
+        agent=MockAgent();agent.responses=[SpecRefinement(understanding='Read the decisive callback owner',requests=[ReadRequest(file='callback.py',start_line=1,end_line=2,reason='Resolve selected correction')],limitations=[]).model_dump(mode='json'),SpecRefinement(understanding='Correct selected owner without changing fact meaning',delta=AuditSpecDelta(behaviors=[revised.behaviors[1]],rationale='Correct the selected owner'),limitations=[]).model_dump(mode='json')];e.agent=agent
         discovery.continue_candidate(e,c)
         assert load(e.state).behaviors[1].execution_owner=='serialized callback'
         assert discovery.active_candidate(e.state).question.fact_ids==q.fact_ids
         assert e.state.inquiry_tasks[0].status=='completed'
+        assert 'callback.py:1:2' in {m['id'] for m in discovery.derive_context(e)['materials']}
+        assert 'callback.py:1:2' not in q.source_ids  # Reconnection transmits correction evidence without rewriting the prior question.
     else:
         discovery.continue_candidate(e,c)
         assert task.status=='pending' and c.stage=='analyze'
@@ -182,10 +187,10 @@ def test_selected_run_preserves_unresolved_candidate_and_failure(tmp_path):
     assert all((archive/name).read_bytes()==data for name,data in before.items())
 
 
-def test_v5_controller_state_cannot_resume_under_v6(focused):
+def test_v6_controller_state_cannot_resume_under_v7(focused):
     from types import SimpleNamespace
     e,_,_=focused
-    e.state.framework_revision='selected-question-v5'  # Explicit compatibility fixture, not an archive rewrite.
+    e.state.framework_revision='selected-question-v6'  # Explicit compatibility fixture, not an archive rewrite.
     e.store=SimpleNamespace(load=lambda:e.state)
     usage=dict(e.state.usage)
     assert 'Framework revision differs' in e.resume().stop_reason
@@ -324,7 +329,7 @@ def test_unrelated_reusable_feedback_survives_evidence_blocked_outcome(focused):
     e,q,_=focused;c=begin(e,q,[ReadRequest(file='counter.py',start_line=1,end_line=2,reason='Review the selected source')])
     discovery.continue_candidate(e,c)
     version=e.state.audit_spec_version
-    reply=Derivation(audit_question=q,descriptive_issues=[DescriptiveIssue(object_ids=['A7'],source_ids=q.source_ids,reason='Source exposes an unrepresented recovery execution owner; inspect that reusable boundary')],selection_rationale='The selected contract remains unattributed without a justified next range')
+    reply=Derivation(audit_question=q,descriptive_issues=[DescriptiveIssue(candidate_effect='independent_enrichment',object_ids=['A7'],source_ids=q.source_ids,reason='Source exposes an unrepresented recovery execution owner; inspect that reusable boundary')],selection_rationale='The selected contract remains unattributed without a justified next range')
     assert discovery.validate_derivation(e.state,reply)=='blocked_evidence'
     discovery.accept_derivation(e,reply,'blocked-with-feedback')
     assert e.state.question_candidates[0].status=='blocked' and e.state.audit_spec_version==version
@@ -363,4 +368,74 @@ def test_episode_admission_and_blockage_classification(focused):
     assert inquiry_resource(surface)=='exploration_rounds'
     c.spec_task_ids=[];c.status='active';e.state.usage['agent_calls']+=1
     assert candidate_blockage(e.state,c)=='resource_blocked'
-    assert FRAMEWORK_REVISION==manifest()['version']=='selected-question-v6'
+    assert FRAMEWORK_REVISION==manifest()['version']=='selected-question-v7'
+
+
+@pytest.mark.parametrize('decision,effect,empty,expected',[
+    ('read',None,True,'active'),('read',None,False,'active'),
+    ('explained',None,True,'question_source_missing'),('explained',None,False,'explained'),
+    ('explained','independent_enrichment',False,'explained'),('explained','requires_recheck',False,'active'),
+    ('blocked','independent_enrichment',False,'blocked'),('escalate','independent_enrichment',False,'escalated')])
+def test_candidate_decision_and_feedback_are_orthogonal(focused,decision,effect,empty,expected):
+    from regression_support import bounded_derivation
+    e,q,responses=focused
+    c=begin(e,q,[request('counter.py')]);discovery.continue_candidate(e,c)
+    q=q.model_copy(update={'source_ids':[] if empty else q.source_ids})
+    reply=Derivation(audit_question=q,selection_rationale='Actual selected source determines the scoped result')
+    if decision=='read':reply.reading_requests=[request('counter.py')]
+    elif decision=='explained':q.disposition='explained_by_existing_mechanism'
+    elif decision=='escalate':
+        reply=Derivation.model_validate(bounded_derivation(responses[1]));reply.audit_question=q
+    if effect:reply.descriptive_issues=[DescriptiveIssue(candidate_effect=effect,object_ids=['consumer'],source_ids=e.state.materials[:1] and [e.state.materials[0].id],reason='The selected source exposes reusable consumer detail')]
+    if expected.startswith('question_'):
+        with pytest.raises(DiagnosticError) as exc:discovery.accept_derivation(e,reply,'matrix')
+        assert exc.value.diagnostics[0].code==expected
+        return
+    discovery.accept_derivation(e,reply,'matrix')
+    c=e.state.question_candidates[0]
+    assert c.status==expected and bool(c.spec_task_ids)==(effect=='requires_recheck')
+    if effect:
+        task=next(t for t in e.state.inquiry_tasks if t.kind=='spec_refine')
+        assert task.status=='pending' and bool(task.candidate_id)==(effect=='requires_recheck')
+    assert not e.state.evidence
+
+
+@pytest.mark.parametrize('bad,code',[('identity','question_identity'),('token','question_source_reference'),('unattached','question_source_missing')])
+def test_question_diagnostics_preserve_identity_scope(focused,bad,code):
+    e,q,_=focused;e.state.packet_receipts=[]
+    if bad=='identity':q.fact_ids=['absent']
+    if bad=='token':q.source_ids=['participants']
+    q.disposition='explained_by_existing_mechanism'
+    with pytest.raises(DiagnosticError) as exc:discovery.validate_derivation(e.state,Derivation(audit_question=q,selection_rationale='Inspect actual evidence'))
+    d=exc.value.diagnostics[0]
+    assert d.code==code
+    assert d.paths==(['/audit_question'] if bad=='identity' else ['/audit_question/source_ids'])
+    assert ('representation' in d.allowed)==(bad!='identity')
+
+
+def test_three_call_tail_closes_with_independent_selected_feedback(focused):
+    from consensus_assurance.adapters.agents.backend import MockAgent
+    e,q,_=focused;e.state.packet_receipts=[];q.source_ids=[]
+    e.state.usage['agent_calls']=e.config.budget.agent_calls-3
+    choose=Derivation(audit_question=q,reading_requests=[request('counter.py')],selection_rationale='Inspect the current discriminator')
+    close=q.model_copy(update={'source_ids':['counter.py:1:1'],'disposition':'explained_by_existing_mechanism'})
+    finish=Derivation(audit_question=close,selection_rationale='The actual guard explains this scoped question',descriptive_issues=[DescriptiveIssue(candidate_effect='independent_enrichment',object_ids=['consumer'],source_ids=close.source_ids,reason='Add the independently useful consumer detail')])
+    e.agent=MockAgent();e.agent.responses=[x.model_dump(mode='json') for x in [choose,finish]]
+    discovery.derive(e)
+    assert e.state.question_candidates[0].status=='explained'
+    assert e.state.usage['agent_calls']==e.config.budget.agent_calls-1
+    assert not e.state.repair_sessions and not e.state.question_candidates[0].spec_task_ids
+    assert e.state.inquiry_tasks[0].status=='pending'
+
+
+def test_initial_source_token_repairs_only_source_ids(focused):
+    from consensus_assurance.adapters.agents.backend import MockAgent
+    e,q,_=focused;e.state.packet_receipts=[];q.source_ids=['participants']
+    reply=Derivation(audit_question=q,reading_requests=[request('counter.py')],selection_rationale='Select an identity before inspecting evidence')
+    actual=e.state.materials[0]
+    e.agent=MockAgent();e.agent.responses=[reply.model_dump(mode='json'),{'replacements':[{'path':'/audit_question/source_ids','value_json':json.dumps([actual.id])}],'rationale':'Replace the invalid token with the supplied actual source'}]
+    accepted,_=discovery.ask_derivation(e,{**discovery.derive_context(e),'materials':[actual.model_dump(mode='json')]})
+    assert accepted.audit_question==q.model_copy(update={'source_ids':[actual.id]})
+    session=next(iter(e.state.repair_sessions.values()))
+    assert session['status']=='accepted' and e.state.usage['agent_calls']==2
+    assert session['resolved_diagnostics'][0]['paths']==['/audit_question/source_ids']

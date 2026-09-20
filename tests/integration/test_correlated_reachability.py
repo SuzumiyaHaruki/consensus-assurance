@@ -4,7 +4,7 @@ from consensus_assurance.core.proposals import ReviewReply
 from consensus_assurance.workflow.artifacts import save_bundle,validate_bundle
 from consensus_assurance.workflow.inquiry import review_unit,validate_review,task_context,semantic_limitations
 from consensus_assurance.workflow.reviews import record_dispositions
-from consensus_assurance.plugins.implementations.toy.adapter import ToyImplementation
+from consensus_assurance.adapters.runners.python import PythonBackend
 from consensus_assurance.workflow.engine import Engine
 from consensus_assurance.workflow.budget import BudgetTracker
 from consensus_assurance.core.config import Config
@@ -33,7 +33,7 @@ Obs == [value |-> phase]
     reqs=[ReachabilityRequirement(id=name,operator=name,claim_ids=unit.obligation_ids,description='Synthetic point reachability') for name in ['AtA','AtB']]
     seq=ReachabilityRequirement(id='ordered',operator='AtB',sequence=['AtA','AtB'],identity_operator='Identity',claim_ids=unit.obligation_ids,description='Same history and identity')
     bundle.reachability=reqs+[seq]
-    model=save_bundle(runner.root,state,unit,bundle,ToyImplementation())
+    model=save_bundle(runner.root,state,unit,bundle,PythonBackend())
     assert verifier.check(runner,model,20).outcome=='holds'
     results=[verifier.reachability(runner,model,bundle,r,20) for r in bundle.reachability]
     assert [r.status for r,c in results[:2]]==['reachable','reachable']
@@ -44,13 +44,13 @@ Obs == [value |-> phase]
 def test_new_model_review_can_resolve_old_encoding_issue_after_actual_recheck(tlc,prepared):
     verifier,runner=tlc;_,state,bundle,_=prepared;unit=state.units[0]
     wrong=bundle.model_copy(deep=True);wrong.properties=wrong.properties.replace('value <= 3','value <= 2')
-    old=save_bundle(runner.root,state,unit,wrong,ToyImplementation());check1=verifier.check(runner,old,20);state.checks.append(check1)
+    old=save_bundle(runner.root,state,unit,wrong,PythonBackend());check1=verifier.check(runner,old,20);state.checks.append(check1)
     assert check1.outcome=='counterexample'
     issue=ReviewIssue(review_id='oldreview',target_id=old.id,target_version=old.version,aspect='checker_correspondence',model_id=old.id,source_ids=state.claims[1].source_ids,explanation='The encoded bound is narrower than the actual specified bound',disposition='revision',reason='Re-encode the unchanged contract')
     state.review_issues.append(issue)
-    new=save_bundle(runner.root,state,unit,bundle,ToyImplementation(),old,'Explicit controlled encoding correction')
+    new=save_bundle(runner.root,state,unit,bundle,PythonBackend(),old,'Explicit controlled encoding correction')
     check2=verifier.check(runner,new,20);state.checks.append(check2);assert check2.outcome=='holds'
-    cfg=Config(implementation='toy',agent_backend='mock');e=Engine(cfg,runner.root,*assemble(cfg),'');e.state=state;e.budget=BudgetTracker(cfg.budget,state)
+    cfg=Config(execution_backend='python',agent_backend='mock');e=Engine(cfg,runner.root,*assemble(cfg),'');e.state=state;e.budget=BudgetTracker(cfg.budget,state)
     review_unit(e,unit,'after_search',new)
     task=next(t for t in state.inquiry_tasks if new.id in t.target_ids)
     assert issue.id in task.resolution_issue_ids

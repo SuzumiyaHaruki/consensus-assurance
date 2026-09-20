@@ -8,7 +8,7 @@ from consensus_assurance.core.config import Config
 from consensus_assurance.core.proposals import Feedback, ReplayPlan, BuildReply
 from consensus_assurance.core.types import (Analysis, Assessment, Calibration, CheckRun, Evidence, ExecutionStatus,
     Finding, Investigation, Origin, Relation, uid, PendingAction, Record, Capability)
-from consensus_assurance.ports.interfaces import AgentBackend, ImplementationAdapter, VerifierBackend
+from consensus_assurance.ports.interfaces import AgentBackend, ExecutionBackend, VerifierBackend
 from . import discovery, inquiry
 from consensus_assurance.adapters.runners.process import ProcessRunner, output
 from consensus_assurance.adapters.runners.experiment import run_experiment, extract_events
@@ -31,7 +31,7 @@ FRAMEWORK_REVISION = manifest()['version']
 
 
 class Engine:
-    def __init__(self, config: Config, root: Path, implementation: ImplementationAdapter,
+    def __init__(self, config: Config, root: Path, implementation: ExecutionBackend | None,
                  agent: AgentBackend, verifier: VerifierBackend, knowledge: str, inquiry: str = ""):
         self.config, self.root = config, root.resolve()
         self.implementation, self.agent, self.verifier = implementation, agent, verifier
@@ -77,12 +77,8 @@ class Engine:
     def start(self, repo, plan_only=False):
         if self.root.is_relative_to(repo.resolve()) or repo.resolve().is_relative_to(self.root):
             raise ValueError("Run and original target directories must be disjoint")
-        if not self.implementation.identify(repo):
-            raise ValueError("Repository does not match the configured implementation adapter")
         started = time.monotonic()
-        snapshot = capture(repo, self.root / "source")
-        missing = [f for f in self.implementation.required_inputs(repo) if f not in snapshot.files] if hasattr(self.implementation,"required_inputs") else []
-        if missing: raise ValueError("Required build inputs could not be safely copied: " + ", ".join(missing))
+        snapshot = capture(repo, self.root / "source", analysis_roots=self.config.target.analysis_roots, expected_module=self.config.target.expected_module)
         self.state = Analysis(framework_revision=FRAMEWORK_REVISION, mode="mock" if self.agent.mock else "real", config=self.config.model_dump(mode="json"), snapshot=snapshot)
         self.state.guidance = [{"source":"configured_reference","text":self.knowledge}]
         if self.inquiry:
@@ -106,7 +102,7 @@ class Engine:
         if self.state.framework_revision!=FRAMEWORK_REVISION:
             self.state.stop_reason="Framework revision differs or was not recorded; preserve this historical run and use an explicit offline migration/subrun"
             return self.state
-        current = capture(Path(self.state.snapshot.repo))
+        current = capture(Path(self.state.snapshot.repo), analysis_roots=self.config.target.analysis_roots, expected_module=self.config.target.expected_module)
         reasons = []
         changed_models = set()
         if current.files != self.state.snapshot.files:
@@ -122,7 +118,7 @@ class Engine:
         for artifact in self.state.direct_checks:
             if any(not Path(p).is_file() or digest(Path(p).read_bytes())!=d for p,d in artifact.artifact_digests.items()):
                 reasons.append("Direct-check artifact changed")
-        copied = capture(self.root / "source")
+        copied = capture(self.root / "source", analysis_roots=self.config.target.analysis_roots, expected_module=self.config.target.expected_module)
         if copied.files != self.state.snapshot.files:
             reasons.append("Preserved source copy changed")
         if reasons:
@@ -208,6 +204,7 @@ class Engine:
                     self.state.tools["java"] = output(check).strip()
             if not result["available"]:
                 self.state.gaps.append(result["reason"])
+        if self.implementation is None:return
         check = self.runner.run(self.implementation.version_command(), self.root, "implementation_tool_probe", self.state.snapshot.id, self.budget.timeout())
         self.record(check)
         self.state.tools["implementation"] = output(check).strip()
@@ -276,12 +273,13 @@ class Engine:
         return discovery.targeted_read(self,unit,gap,relation_ids,requests,update_required)
 
     def experiment(self, model, bundle, replay=False):
-        if not self.config.allow_experiments:
-            raise Blocked("Target execution disabled; capability probes and replay are also prohibited")
+        if not self.config.allow_experiments or self.implementation is None:
+            raise Blocked("Target execution disabled or no execution backend configured; probes and replay unavailable")
         def execute():
             if replay: self.budget.take("replays")
             workspace=self.workspace()
             destination=workspace/self.implementation.harness_filename
+            destination.parent.mkdir(parents=True,exist_ok=True)
             if destination.exists(): raise Blocked("Generated harness would overwrite a target file")
             destination.write_text(bundle.harness.source)
             check=run_experiment(self.runner,self.implementation.experiment_command(),workspace,self.state.snapshot.id,
@@ -596,7 +594,7 @@ class Engine:
             if not probed:
                 self.probe_tools()
             if "capabilities" not in self.state.completed_steps:
-                if self.config.allow_experiments:
+                if self.config.allow_experiments and self.implementation:
                     def probe():
                         workspace=self.workspace()
                         check=run_experiment(self.runner,self.implementation.probe_command(),workspace,self.state.snapshot.id,
@@ -606,7 +604,7 @@ class Engine:
                     check=CheckRun.model_validate(self.action("capability_probe","experiments",probe))
                     self.record(check); self.state.capabilities=self.implementation.capabilities(check)
                 else:
-                    self.state.capabilities=[Capability(name="target_execution",status="unavailable",check_id=None,description="All target execution, including probes and replay, disabled by configuration")]
+                    self.state.capabilities=[Capability(name="target_execution",status="unavailable",check_id=None,description="Target execution disabled or execution backend not configured")]
                 self.state.completed_steps.append("capabilities"); self.advance("discover")
             self.discover()
             while True:

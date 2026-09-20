@@ -62,6 +62,7 @@ class Discovery(Record):
 
 
 class DescriptiveIssue(Record):
+    candidate_effect: Literal["requires_recheck", "independent_enrichment"]
     object_ids: list[str] = Field(min_length=1)
     source_ids: list[str] = Field(min_length=1)
     reason: str
@@ -139,7 +140,7 @@ class EventMonitor(Record):
 
 
 class Harness(Record):
-    kind: str = Field(description="Harness kind advertised by the selected implementation adapter")
+    kind: str = Field(description="Harness kind advertised by the configured execution backend")
     source: str = Field(min_length=1, description="Executable experiment source, calling actual target code; no fabricated expected observations")
     description: str
     prerequisite_events: list[str] = Field(description="Ordered events required for candidate replay; not claims that they occurred")

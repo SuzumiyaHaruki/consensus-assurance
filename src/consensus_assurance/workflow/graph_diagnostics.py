@@ -98,7 +98,7 @@ def diagnose_graph(state,proposal,audit_spec=None):
                 emit('unit_dependency','association',[u.id,b.id,*sorted(claim_ids(b))],[f'/units/{i}/relation_ids',f'/units/{i}/binding_ids'],sources,'Selected code has no direct association or selected directed dependency path',['association','read','semantic_revision'])
                 issues[-1].details={'contract':graph_contract()['dependency']}
         q=u.audit_question
-        if q and (not q.question.strip() or not q.importance.strip() or not set(q.source_ids)<=set(materials)):
+        if q and (not q.question.strip() or not q.importance.strip() or not q.source_ids or not set(q.source_ids)<=set(materials)):
             emit('audit_question','semantic',[u.id],[f'/units/{i}/audit_question'],sources,'Audit question requires actual materials and significance',['read','semantic_revision'])
         if q and (q.disposition is not None or state.analysis_mode!='regression'):
             from .direct_checks import validate_question as validate_route

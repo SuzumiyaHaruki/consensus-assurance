@@ -5,7 +5,7 @@ from pathlib import Path
 from consensus_assurance.core.proposals import ContextScenario
 from consensus_assurance.core.types import ReachabilityRequirement
 from consensus_assurance.workflow.artifacts import save_bundle,validate_bundle
-from consensus_assurance.plugins.implementations.toy.adapter import ToyImplementation
+from consensus_assurance.adapters.runners.python import PythonBackend
 
 
 @pytest.mark.real
@@ -52,7 +52,7 @@ Obs == [value |-> phase]
     bundle.actions=['Start','Switch','Complete'];bundle.variables=['current','owner','phase','completedOn']
     bundle.reachability=[ReachabilityRequirement(id='same-operation',operator='Completed',sequence=['Started','Switched','Completed'],identity_operator='Operation',claim_ids=unit.obligation_ids,description='Same pending operation survives a context change and completes')]
     bundle.context_analysis=[ContextScenario(description='Synthetic callback retains object ownership while another object becomes current; completion is allowed without testing a term field',mode='cross_context',binding_ids=unit.binding_ids,variables=bundle.variables,actions=bundle.actions,checker_ids=['Safe'],reachability_ids=['same-operation'],excluded=['No disk recovery, network or production implementation claim; context is object identity'])]
-    model=save_bundle(runner.root,state,unit,bundle,ToyImplementation())
+    model=save_bundle(runner.root,state,unit,bundle,PythonBackend())
     check=verifier.check(runner,model,20)
     assert check.outcome==('holds' if isolated else 'counterexample'),check
     reach,execution=verifier.reachability(runner,model,bundle,bundle.reachability[0],20)
@@ -65,8 +65,8 @@ def test_context_prose_cannot_replace_joint_history_and_actual_actions(prepared)
     scenario=ContextScenario(description='Claimed crossing',mode='cross_context',binding_ids=u.binding_ids,variables=b.variables,actions=b.actions,checker_ids=[b.checker_specs()[0].invariant],reachability_ids=[],excluded=[])
     b.actions=['Next'];scenario.actions=['Next']
     b.context_analysis=[scenario]
-    with pytest.raises(ValueError,match='same-history'):validate_bundle(s,u,b,ToyImplementation())
+    with pytest.raises(ValueError,match='same-history'):validate_bundle(s,u,b,PythonBackend())
     scenario.mode='local';scenario.excluded=['This arithmetic unit has one immutable instance; network contexts are outside scope']
-    validate_bundle(s,u,b,ToyImplementation())
+    validate_bundle(s,u,b,PythonBackend())
     scenario.actions=['InventedAction']
-    with pytest.raises(ValueError):validate_bundle(s,u,b,ToyImplementation())
+    with pytest.raises(ValueError):validate_bundle(s,u,b,PythonBackend())

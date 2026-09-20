@@ -15,7 +15,7 @@ from test_graph_mutations import controller
 
 def make(tmp_path,prepared,responses,interrupt=False):
     repo,state,_,_=prepared;fixture=tmp_path/'responses.json';fixture.write_text(json.dumps(responses))
-    cfg=Config(implementation='toy',agent_backend='mock',fixture=str(fixture),allow_experiments=False)
+    cfg=Config(execution_backend='python',agent_backend='mock',fixture=str(fixture),allow_experiments=False)
     cfg.budget.repeated_error_revisions=2;cfg.budget.agent_calls=10
     class Scenario(Engine):
         crashed=False
@@ -164,7 +164,7 @@ def test_outer_inquiry_pause_and_resume_preserve_blocked_repair_session(tmp_path
     from consensus_assurance.workflow.inquiry import enqueue
     _,state,_,_=prepared
     fixture=tmp_path/'outer.json';fixture.write_text(json.dumps([{'items':None,'limitations':[]},{'replacements':None}]))
-    cfg=Config(implementation='toy',agent_backend='mock',fixture=str(fixture),allow_experiments=False)
+    cfg=Config(execution_backend='python',agent_backend='mock',fixture=str(fixture),allow_experiments=False)
     cfg.budget.audit_units=0;cfg.budget.exploration_rounds=0;cfg.budget.semantic_reviews=1
     root=tmp_path/'outer';e=Engine(cfg,root,*assemble(cfg),'');shutil.copytree(state.snapshot.repo,root/'source')
     state.config=cfg.model_dump(mode='json');state.framework_revision=__import__('consensus_assurance.workflow.engine',fromlist=['FRAMEWORK_REVISION']).FRAMEWORK_REVISION;state.completed_steps=['capabilities','materials','understanding','discovery']

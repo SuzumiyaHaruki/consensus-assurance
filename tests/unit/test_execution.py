@@ -62,6 +62,37 @@ def test_snapshot_preserves_dirty_code_and_excludes_sensitive_files(tmp_path):
     assert capture(repo).files != s.files
 
 
+@pytest.mark.parametrize("name", ["swift/key.go", "store/key.py", "map_key.rs", "key_test.go", "key.ts"])
+def test_data_key_source_is_copied_and_readable(tmp_path, name):
+    repo = tmp_path / "repo"
+    path = repo / name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("// Ordinary data-key implementation\n")
+    destination = tmp_path / "copy"
+    snapshot = capture(repo, destination)
+    assert name in snapshot.files and name in snapshot.readable_files
+    assert (destination / name).read_bytes() == path.read_bytes()
+
+
+@pytest.mark.parametrize("name,content", [
+    ("key", "opaque"), ("server.key", "opaque"), ("key.json", "{}"),
+    ("private_key.py", "opaque"), ("credentials.json", "{}"),
+    (".env", "opaque"), ("id_rsa", "opaque"),
+    ("key.go", "-----BEGIN PRIVATE KEY-----"),
+    ("key.py", 'api_key="not-a-real-key-for-testing"'),
+    ("ordinary.go", "ghp_" + "x" * 24),
+])
+def test_sensitive_key_files_and_source_contents_remain_excluded(tmp_path, name, content):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / name).write_text(content)
+    destination = tmp_path / "copy"
+    snapshot = capture(repo, destination)
+    assert name in snapshot.excluded and name in snapshot.exclusion_reasons
+    assert name not in snapshot.files and name not in snapshot.readable_files
+    assert not (destination / name).exists()
+
+
 def test_missing_explicit_target_never_falls_back(tmp_path):
     with pytest.raises(FileNotFoundError): locate_repo(str(tmp_path / "absent"), str(tmp_path))
 
@@ -110,7 +141,7 @@ def test_persistent_no_transmission_permission(tmp_path, prepared):
     from consensus_assurance.registry import assemble
     from consensus_assurance.workflow.engine import Engine, Blocked
     from consensus_assurance.core.proposals import GraphDraft
-    config = Config(implementation="toy", protocol="toy", allow_agent_materials=False)
+    config = Config(execution_backend="python", protocol="toy", allow_agent_materials=False)
     engine = Engine(config, tmp_path / "private", *assemble(config))
     with pytest.raises(Blocked, match="transmission disabled"):
         engine.ask("discover", GraphDraft, {"private_material": "never transmitted"})
@@ -120,8 +151,44 @@ def test_persistent_no_transmission_permission(tmp_path, prepared):
 @pytest.mark.parametrize('events,expected', [([], 'not_applicable'), ([{'Action':'run','Test':'TestA'}, {'Action':'skip','Test':'TestA'}], 'not_applicable'), ([{'Action':'run','Test':'TestA'}, {'Action':'pass','Test':'TestA'}], 'tests_passed')])
 def test_go_absent_or_skipped_tests_are_not_passed(events, expected):
     import json
-    from consensus_assurance.plugins.implementations.hashicorp_raft.adapter import HashicorpRaft
+    from consensus_assurance.adapters.runners.go_module import GoModuleBackend
     from consensus_assurance.core.types import CheckRun
     check = CheckRun(action='test',cwd='/tmp',snapshot_id='s',status=ExecutionStatus.COMPLETED,exit_code=0)
-    HashicorpRaft().parse_test_result(check, '\n'.join(json.dumps(e) for e in events))
+    GoModuleBackend().parse_test_result(check, '\n'.join(json.dumps(e) for e in events))
     assert check.outcome == expected
+
+
+@pytest.mark.parametrize('module,package',[('example.org/first','.'),('example.net/second','./subsystem')])
+def test_go_backend_is_toolchain_scoped(tmp_path,module,package):
+    from consensus_assurance.core.config import TargetConfig
+    from consensus_assurance.adapters.runners.go_module import GoModuleBackend
+    from consensus_assurance.adapters.runners.process import ProcessRunner
+    from consensus_assurance.adapters.runners.experiment import run_experiment
+    from pathlib import Path
+    import shutil
+    if not shutil.which('go'):pytest.skip('Go unavailable')
+    workspace=tmp_path/'workspace';workspace.mkdir()
+    (workspace/'go.mod').write_text(f'module {module}\n\ngo 1.20\n')
+    folder=workspace/package;folder.mkdir(exist_ok=True)
+    (folder/'source.go').write_text('package isolated\n')
+    harness=str(Path(package)/'assurance_generated_test.go')
+    backend=GoModuleBackend(TargetConfig(execution_package=package,harness_path=harness))
+    runner=ProcessRunner(tmp_path)
+    version=runner.run(backend.version_command(),workspace,'version','s',10)
+    assert version.exit_code==0
+    env=backend.environment(workspace)
+    assert {k:env[k] for k in ('GOPROXY','GOSUMDB','GOTOOLCHAIN','GOFLAGS')}==dict(GOPROXY='off',GOSUMDB='off',GOTOOLCHAIN='local',GOFLAGS='-mod=readonly')
+    assert env['GOCACHE'].startswith(str(workspace))
+    probe=run_experiment(runner,backend.probe_command(),workspace,'s',120,'workspace','capability_probe',adapter=backend)
+    assert probe.outcome=='not_applicable' and probe.parameters['package_build'],probe
+    assert backend.capabilities(probe)[0].status=='probe_confirmed'
+    assert backend.capabilities(probe)[1].status=='unavailable'
+    (workspace/harness).write_text('package isolated\nimport "testing"\nfunc TestAssuranceBuild(t *testing.T) {}\n')
+    run=run_experiment(runner,backend.experiment_command(),workspace,'s',120,'workspace',adapter=backend)
+    assert run.outcome=='tests_passed',run
+
+
+@pytest.mark.parametrize('paths',[{'harness_path':'../escape.go'},{'analysis_roots':['/tmp']},{'execution_package':'-args'}])
+def test_target_paths_cannot_escape_relative_namespace(paths):
+    from consensus_assurance.core.config import TargetConfig
+    with pytest.raises(ValueError,match='relative repository'):TargetConfig(**paths)

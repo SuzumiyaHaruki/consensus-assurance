@@ -10,7 +10,7 @@ from consensus_assurance.adapters.runners.process import ProcessRunner
 from consensus_assurance.core.config import Config
 from consensus_assurance.core.types import Calibration, Finding, Origin
 from consensus_assurance.core.proposals import ReplayPlan
-from consensus_assurance.plugins.implementations.toy.adapter import ToyImplementation
+from consensus_assurance.adapters.runners.python import PythonBackend
 
 
 @pytest.mark.parametrize('kind',['build','F1','F3','technical'])
@@ -24,14 +24,14 @@ def test_modeling_guidance_is_in_every_actual_render(kind):
 
 def test_diagnosis_and_F1_receive_real_trace_and_calibration_output(tmp_path,prepared):
     _,state,bundle,_=prepared
-    root=tmp_path/'audit';model=save_bundle(root,state,state.units[0],bundle,ToyImplementation())
+    root=tmp_path/'audit';model=save_bundle(root,state,state.units[0],bundle,PythonBackend())
     runner=ProcessRunner(root)
     search=runner.run([sys.executable,'-c','print("MODEL_TRACE: old context -> delayed completion")'],root,'model_check',state.snapshot.id,5)
     calcheck=runner.run([sys.executable,'-c','print("CALIBRATION: observed index does not match")'],root,'trace_calibration',state.snapshot.id,5)
     state.checks.extend([search,calcheck])
     cal=Calibration(model_id=model.id,experiment_check_id='exp',mapping_path=model.mapping_path,trace_path=str(root/'events.json'),reason='Mismatch',origin=Origin.EXECUTED,check_ids=[calcheck.id],status='incompatible')
     finding=Finding(claim_id=model.claim_id,model_id=model.id,check_id=search.id,origin=Origin.EXECUTED,description='Candidate',trace_path=search.stdout)
-    engine=Engine(Config(),root,ToyImplementation(),None,None,'','');engine.state=state;engine.budget=BudgetTracker(Config().budget,state)
+    engine=Engine(Config(),root,PythonBackend(),None,None,'','');engine.state=state;engine.budget=BudgetTracker(Config().budget,state)
     context=feedback_context(engine,state.units[0],model,bundle,None,cal,finding)
     for kind in ['diagnose','F1']:
         text=render(kind,context)
@@ -44,10 +44,10 @@ def test_replay_can_add_monitor_without_changing_property(tmp_path):
     repo=tmp_path/'repo';shutil.copytree(ROOT/'fixtures/ack_service',repo)
     state,unit,bundle=setup_ack(repo)
     monitors=bundle.monitors;initial=bundle.model_copy(deep=True);initial.monitors=[]
-    model=save_bundle(tmp_path/'audit',state,unit,initial,ToyImplementation())
+    model=save_bundle(tmp_path/'audit',state,unit,initial,PythonBackend())
     f=Finding(claim_id='durable',checker_id='DurableAck',model_id=model.id,check_id='search',origin=Origin.EXECUTED,description='Candidate',trace_path='trace')
     plan=ReplayPlan(harness=bundle.harness,monitors=monitors,observation=bundle.observation,checker_id='DurableAck',rationale='Add sufficient observed fields for the existing property')
-    revised=validate_replay(state,unit,initial,f,plan,ToyImplementation())
+    revised=validate_replay(state,unit,initial,f,plan,PythonBackend())
     assert revised.properties==initial.properties and revised.behavior==initial.behavior
     assert revised.monitors==monitors and not initial.monitors
 
@@ -58,7 +58,7 @@ def test_discovery_packet_indexes_only_supplied_source(tmp_path,prepared):
     from consensus_assurance.workflow.task_packet import prepare,pool_sources
     from consensus_assurance.core.types import Material
     _,state,_,_=prepared
-    engine=Engine(Config(),tmp_path,ToyImplementation(),None,None,'');engine.state=state
+    engine=Engine(Config(),tmp_path,PythonBackend(),None,None,'');engine.state=state
     visible=Material(id='visible',file='nav.go',start_line=1,end_line=3,text='func (s *Store) save() {\n value++\n}',content_digest='fixture',kind='code_observation')
     hidden=visible.model_copy(update={'id':'hidden','file':'hidden.go'})
     state.materials.extend([visible,hidden])

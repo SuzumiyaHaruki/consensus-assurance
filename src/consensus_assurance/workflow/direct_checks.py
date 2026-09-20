@@ -41,7 +41,7 @@ def validate_plan(state,unit,plan,implementation):
     for binding in state.bindings:
         if binding.id in plan.binding_ids and (binding.snapshot_id!=state.snapshot.id or state.snapshot.files.get(binding.file)!=binding.content_digest):
             raise ValueError('Direct binding does not describe the selected source snapshot')
-    if plan.harness.kind!=implementation.harness_kind:raise ValueError('Unsupported direct harness kind')
+    if implementation is None or plan.harness.kind!=implementation.harness_kind:raise ValueError('Unsupported direct harness kind')
     if not plan.harness.prerequisites:raise ValueError('Direct check needs observable correlated prerequisites')
     if not plan.harness.legal_conditions:raise ValueError('Direct check needs observable legality conditions')
     materials={m.id:m for m in state.materials}
@@ -101,11 +101,12 @@ def save_plan(engine,unit,plan,operation_id):
         if temporary.exists():temporary.rename(temporary.with_name(temporary.name+'-incomplete-'+uid()))
         temporary.mkdir(parents=True,exist_ok=False)
         write_json(temporary/'plan.json',plan)
+        (temporary/engine.implementation.harness_filename).parent.mkdir(parents=True,exist_ok=True)
         (temporary/engine.implementation.harness_filename).write_text(plan.harness.source)
         from .inputs import semantic_ids
         ids=semantic_ids(state,unit)
         artifact=DirectCheckArtifact(plan_path=str(folder/'plan.json'),harness_path=str(folder/engine.implementation.harness_filename),
-            artifact_digests={str(folder/p.name):digest(p.read_bytes()) for p in [temporary/'plan.json',temporary/engine.implementation.harness_filename]},
+            artifact_digests={str(folder/p.relative_to(temporary)):digest(p.read_bytes()) for p in [temporary/'plan.json',temporary/engine.implementation.harness_filename]},
             snapshot_id=state.snapshot.id,unit_id=unit.id,claim_id=plan.claim_id,binding_ids=plan.binding_ids,
             graph_versions={o.id:o.version for o in state.claims+state.bindings+state.relations+state.units if o.id in ids},
             origin=Origin.MOCK if state.mode=='mock' else Origin.PRESET if state.analysis_mode=='regression' else Origin.AGENT,
@@ -117,13 +118,14 @@ def save_plan(engine,unit,plan,operation_id):
 
 
 def execute(engine,artifact,plan):
-    if not engine.config.allow_experiments:raise Blocked('Target execution disabled')
+    if not engine.config.allow_experiments or engine.implementation is None:raise Blocked('Target execution disabled or no execution backend configured')
     def perform():
         if any(not Path(p).is_file() or digest(Path(p).read_bytes())!=v for p,v in artifact.artifact_digests.items()):raise Blocked('Saved direct artifact changed')
         workspace=engine.workspace()
         before=capture(workspace).files
         if before!=engine.state.snapshot.files:raise Blocked("Execution source differs from the selected snapshot")
         destination=workspace/engine.implementation.harness_filename
+        destination.parent.mkdir(parents=True,exist_ok=True)
         if destination.exists():raise Blocked('Generated harness would overwrite target code')
         destination.write_text(plan.harness.source)
         check=run_experiment(engine.runner,engine.implementation.experiment_command(),workspace,engine.state.snapshot.id,
@@ -205,6 +207,7 @@ def assess(state,unit,artifact,plan,check,events):
 
 
 def proceed(engine,unit,phase):
+    if engine.implementation is None:raise Blocked('Direct execution unavailable: no execution backend configured')
     state=engine.state
     artifact=next((a for a in state.direct_checks if a.id==state.active_direct_check_id),None)
     if phase!='direct_check' and (artifact is None or artifact.unit_id!=unit.id):raise Blocked('Selected direct artifact is unavailable for this unit')

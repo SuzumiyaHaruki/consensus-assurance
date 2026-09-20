@@ -57,7 +57,7 @@ class ScopeAgent(MockAgent):
         else:raise AssertionError(name)
         if name=='Derivation':
             from regression_support import bounded_derivation
-            response=bounded_derivation(response)
+            response=bounded_derivation(response,p)
         directory.mkdir(parents=True,exist_ok=True);(directory/'prompt.txt').write_text(prompt);write_json(directory/'response.json',response);write_json(directory/'decoded-response.json',response)
         check=runner.run([sys.executable,'-c','print("Explicit scope-reconnection regression responder")'],directory,'agent',snapshot_id,timeout);check.origin=Origin.MOCK
         return check,response_type.model_validate(response)
@@ -65,7 +65,7 @@ class ScopeAgent(MockAgent):
 
 def setup(tmp_path,prepared,tlc):
     repo,fixture=deferred_fixture(tmp_path,prepared[3]);responses=json.loads(fixture.read_text())
-    cfg=Config(implementation='toy',agent_backend='mock',tlc_jar=str(tlc[0].jar),allow_experiments=True)
+    cfg=Config(execution_backend='python',agent_backend='mock',tlc_jar=str(tlc[0].jar),allow_experiments=True)
     cfg.budget.agent_calls=20;cfg.budget.semantic_reviews=6;cfg.budget.exploration_rounds=3;cfg.budget.material_chars=5000;cfg.budget.outer_reserve_seconds=1
     impl,_,verifier,knowledge=assemble(cfg)
     return repo,cfg,(impl,ScopeAgent(responses),verifier,knowledge,''),tmp_path/'scope-run'

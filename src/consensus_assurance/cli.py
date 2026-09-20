@@ -44,7 +44,7 @@ def resolve_run(value, runs_dir):
 def create_run_directory(config, command):
     parent = Path(config.runs_dir).expanduser().resolve()
     parent.mkdir(parents=True, exist_ok=True)
-    label = re.sub(r"[^A-Za-z0-9_-]+", "-", config.implementation).strip("-")[:64] or "implementation"
+    label = re.sub(r"[^A-Za-z0-9_-]+", "-", config.target.variant or config.execution_backend).strip("-")[:64] or "implementation"
     mode = "mock" if config.agent_backend == "mock" else "real"
     name = f"{datetime.now().astimezone():%Y-%m-%d_%H-%M-%S}-{label}-{mode}-{command}"
     for number in range(10000):
@@ -103,14 +103,14 @@ def main(argv=None):
             results = {"agent": agent.probe(runner), "verifier": verifier.probe(runner)}
             for result in results.values():
                 result["checks"] = [c.model_dump(mode="json") for c in result["checks"]]
-            results["implementation"] = runner.run(implementation.version_command(), root, "implementation_probe", "environment", 10).model_dump(mode="json")
+            results["implementation"] = runner.run(implementation.version_command(), root, "implementation_probe", "environment", 10).model_dump(mode="json") if implementation else {"available":False,"reason":"No execution backend configured"}
             write_json(root / "doctor.json", results)
             print(f"环境诊断已保存：{root / 'doctor.json'}")
             return 0 if all(results[k]["available"] for k in ("agent", "verifier")) else 2
         if args.command == "inspect":
             from consensus_assurance.adapters.storage.snapshot import capture
             repo = locate_repo(args.repo, config.repo_path)
-            snapshot = capture(repo)
+            snapshot = capture(repo, analysis_roots=config.target.analysis_roots, expected_module=config.target.expected_module)
             write_json(root / "snapshot.json", snapshot)
             print(f"目标快照已保存：{root / 'snapshot.json'}"); return 0
         engine = Engine(config, root, implementation, agent, verifier, knowledge)

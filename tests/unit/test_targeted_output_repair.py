@@ -28,7 +28,7 @@ def test_field_repair_is_executed_and_resumes_without_replacing_graph(tmp_path,p
     original={'requests':[{'file':'counter.py','start_line':'bad','end_line':2,'reason':'Inspect actual step'}],'rationale':'x'*30000+'preserved'}
     patch={'replacements':[{'path':'/requests/0/start_line','value_json':'1'}],'rationale':'Correct integer type'}
     fixture=tmp_path/'fixture.json';fixture.write_text(json.dumps([original,patch]))
-    config=Config(implementation='toy',agent_backend='mock',fixture=str(fixture),allow_experiments=False)
+    config=Config(execution_backend='python',agent_backend='mock',fixture=str(fixture),allow_experiments=False)
     config.budget.error_context_chars=1000
     root=tmp_path/'audit'
     class ReadingEngine(Engine):
@@ -60,7 +60,7 @@ def test_invalid_build_artifact_is_repaired_before_commit(tmp_path,prepared):
     fixture=tmp_path/'fixture.json';fixture.write_text(json.dumps([
         BuildReply(bundle=bad,gap='').model_dump(mode='json'),
         {'replacements':[{'path':'/bundle/behavior','value_json':json.dumps(valid)}],'rationale':'Restore the declared initial operator'}]))
-    config=Config(implementation='toy',agent_backend='mock',fixture=str(fixture))
+    config=Config(execution_backend='python',agent_backend='mock',fixture=str(fixture))
     from consensus_assurance.workflow.budget import BudgetTracker
     engine=Engine(config,tmp_path/'audit',*assemble(config));engine.state=state;engine.budget=BudgetTracker(config.budget,state)
     unit=state.units[0]

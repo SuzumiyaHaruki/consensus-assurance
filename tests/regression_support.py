@@ -60,7 +60,7 @@ def inventory_response(runner,prompt,directory,snapshot_id,timeout):
     return MockAgent.analyze(agent,runner,prompt,directory,snapshot_id,timeout,Discovery)
 
 
-def bounded_derivation(graph):
+def bounded_derivation(graph,packet=None):
     """Convert a fixed graph fixture into the current bounded backend response."""
     from consensus_assurance.core.proposals import Derivation
     if hasattr(graph,'model_dump'):graph=graph.model_dump(mode='json')
@@ -74,8 +74,9 @@ def bounded_derivation(graph):
         from consensus_assurance.core.types import AuditQuestion
         source=next(c for c in graph['claims'] if c['id']==primary)['source_ids']
         question=AuditQuestion(question='Does the local step respect the declared bound?',importance='Bounded service value',source_ids=source,activity_classes=['A1'],behavior_ids=['fixture_step'],fact_ids=['fixture_value'],obligation_relation_kind='establishment',trigger_rationale='Controlled verification fixture',preferred_check='local_model',disposition='ready_for_check').model_dump(mode='json')
-    return Derivation(obligation=next(c for c in graph['claims'] if c['id']==primary),bindings=selected,dependencies=edges,
+    reply=Derivation(obligation=next(c for c in graph['claims'] if c['id']==primary),bindings=selected,dependencies=edges,
         context_claims=[c for c in graph['claims'] if c['id'] in wanted and c['id']!=primary],audit_question=question,selection_rationale=unit['rationale']).model_dump(mode='json')
+    return selection_derivation(reply) if packet is not None and not packet.get('selected_question') else reply
 
 
 def add_dependency(state,responses):
@@ -105,3 +106,19 @@ def add_reads(state,repo,reading,budget):
     apply_read(state,receipt,materials)
     refresh_unread(state,repo)
     return [id for item in receipt.items if item.status=='acquired' for id in item.material_ids]
+
+
+def selection_derivation(reply):
+    """Script an actual selected-source read before a downstream fixture conclusion."""
+    import copy,re
+    from consensus_assurance.core.proposals import Derivation
+    from consensus_assurance.workflow.discovery import derivation_graph
+    from consensus_assurance.workflow.sources import dependency_closure
+    graph=derivation_graph(Derivation.model_validate(reply))
+    objects={o.id:o for name in ('claims','bindings','relations','units') for o in getattr(graph,name)}
+    sources,_=dependency_closure(objects,objects)
+    sources.update(reply['audit_question']['source_ids'])
+    selection=copy.deepcopy(reply);selection.update(obligation=None,bindings=[],dependencies=[],context_claims=[])
+    selection['audit_question'].update(source_ids=[],requests=[],preferred_check='source_review',disposition='needs_specific_evidence')
+    selection['reading_requests']=[dict(file=m[1],start_line=int(m[2]),end_line=int(m[3]),reason='Inspect fixture dependency before deriving a result') for id in sorted(sources) if (m:=re.fullmatch(r'(.+):(\d+):(\d+)',id))]
+    return selection

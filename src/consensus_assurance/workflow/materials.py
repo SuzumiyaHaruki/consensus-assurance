@@ -18,15 +18,13 @@ class ReadingPlan(Record):
     gap: str = ""
 
 
-def catalogue(repo, snapshot, adapter=None):
+def catalogue(repo, snapshot):
     entries = []
     for rel in sorted(snapshot.readable_files if snapshot.readable_files is not None else snapshot.files):
         path = repo / rel
         lines = path.read_text(errors="replace").splitlines()
         symbols = [{"line": i+1, "declaration": line[:180]} for i, line in enumerate(lines)
                    if re.match(r"^(?:func |type |def |class )", line)]
-        if adapter and hasattr(adapter,"symbol_hints"):
-            symbols.extend(adapter.symbol_hints(rel, lines))
         entries.append({"file": rel, "lines": len(lines), "symbols": symbols[:100]})
     return entries
 
@@ -92,7 +90,7 @@ def initial_materials(repo, snapshot, budget, knowledge):
     documents.sort(key=lambda f: (Path(f).stem.lower() != "readme", len(Path(f).parts), f))
     selected = documents[:2]
     code=[f for f in available if f.endswith(('.go','.py','.rs','.java','.cc','.cpp','.h')) and 'test' not in Path(f).name.lower()]
-    hints=('api|client|future|service','rpc|transport|message','consensus|raft|paxos|node','storage|snapshot|log|history','recovery|restore|startup','config|member','fsm|apply|state')
+    hints=('api|client|future|service','rpc|transport|message','protocol|consensus|replica|participant|coordinator|node|server','storage|snapshot|log|history','recovery|restore|startup','config|member','fsm|apply|state')
     for pattern in hints:
         matches=[f for f in code if f not in selected and re.search(pattern,Path(f).stem,re.I)]
         match=min(matches,key=lambda f:(len(Path(f).parts),not bool(re.fullmatch(pattern,Path(f).stem,re.I)),f)) if matches else None

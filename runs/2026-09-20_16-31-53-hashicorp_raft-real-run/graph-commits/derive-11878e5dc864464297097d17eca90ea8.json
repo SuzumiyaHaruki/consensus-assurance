@@ -1,0 +1,2705 @@
+{
+  "input": {
+    "obligation": null,
+    "bindings": [],
+    "dependencies": [],
+    "context_claims": [],
+    "audit_question": {
+      "disposition": "needs_specific_evidence",
+      "preferred_check": "source_review",
+      "requests": [
+        {
+          "file": "raft.go",
+          "start_line": 1750,
+          "end_line": 2050,
+          "reason": "Locate the InstallSnapshot handler referenced by processRPC and inspect its restoreFuture dispatch, restore-error handling, configuration adoption and completion ordering. Compare this network restoration path with restoreUserSnapshot's panic on restoration failure before deciding whether failed restoration can feed a later snapshot capture."
+        }
+      ],
+      "question": "When takeSnapshot consumes F_capture_returned after runtime restoration, does the network InstallSnapshot path prevent a failed, potentially state-changing Restore from being followed by publication under unchanged worker coordinates, as the user-restore path attempts through fatal error handling?",
+      "importance": "Publishing partially restored application state under old processing coordinates could make later recovery skip required history. Configuration mismatch and subsequent compaction could compound that consequence. No such execution or consequence has been established.",
+      "source_ids": [
+        "fsm.go:1:285",
+        "snapshot.go:125:278",
+        "raft.go:1000:1450"
+      ],
+      "participants": [
+        "runFSM worker",
+        "Raft.takeSnapshot execution owner",
+        "Raft.restoreUserSnapshot caller",
+        "Network InstallSnapshot handler",
+        "Raft.processLogs caller",
+        "Caller-supplied FSM"
+      ],
+      "objects": [
+        "reqSnapshotFuture",
+        "FSMSnapshot",
+        "Worker processing index and term",
+        "restoreFuture",
+        "Snapshot configuration metadata",
+        "fsmMutateCh"
+      ],
+      "contexts": [
+        "Single and batch FSM application variants",
+        "Snapshot capture and publication",
+        "User-requested runtime restoration",
+        "Network snapshot installation",
+        "Restore errors after possible application-state mutation"
+      ],
+      "event_paths": [
+        "processLogs -> ordered nonempty tuple batches -> runFSM -> snapshot capture",
+        "restoreUserSnapshot -> restoreFuture error -> caller panic",
+        "InstallSnapshot RPC -> unread restore handling -> possible subsequent capture -> takeSnapshot publication"
+      ],
+      "activity_classes": [
+        "A5",
+        "A6",
+        "A3",
+        "A4"
+      ],
+      "behavior_ids": [
+        "B_fsm_single",
+        "B_fsm_batch",
+        "B_snapshot_capture",
+        "B_take_snapshot",
+        "runtime_restore_fsm"
+      ],
+      "fact_ids": [
+        "F_capture_returned"
+      ],
+      "obligation_relation_kind": "consumption",
+      "counterevidence": [
+        "runFSM serializes application, Restore and Snapshot callbacks within one worker; their callback bodies do not interleave.",
+        "Successful restoration assigns worker coordinates from Open-returned metadata only after Restore returns nil.",
+        "restoreUserSnapshot explicitly panics on a restoreFuture error because the FSM may be in a bad state. Continued normal operation after that error cannot simply be assumed for this path.",
+        "restoreUserSnapshot rejects an outstanding configuration change, uses the current configuration and term, assigns an index greater than both the current and supplied indexes, and updates protocol positions only after successful restoration.",
+        "processLogs scans increasing indexes, appends only nonnil prepared tuples and dispatches only nonempty batches. This resolves the local empty-batch concern, but does not establish all caller ordering across restoration.",
+        "prepareLog filters no-ops and deprecated configuration entries and forwards LogConfiguration only for protocolVersion greater than 2. Worker coordinates therefore need not advance for every committed entry.",
+        "The single worker path skips coordinate advancement for unsupported configuration callbacks; the batch path records the final tuple coordinate, including barriers. This difference alone does not establish invalid captured contents.",
+        "takeSnapshot rejects a capture older than the returned committed configuration index and checks Create, Persist and Close before updating snapshot coordinates and compacting.",
+        "FSM and FSMSnapshot interface comments assign snapshot contents and concurrent Apply compatibility to the application implementation; callback success does not independently establish content correctness."
+      ],
+      "unknowns": [
+        "The InstallSnapshot handler's restore request production, error handling and subsequent protocol behavior remain unread; the user-restore panic cannot be generalized to that path.",
+        "Whether a capture selected after a failed Restore can reach publication before any fatal handling or other protection takes effect.",
+        "How committed configuration advancement and configurationsFuture responses are ordered relative to tuple dispatch and restoration.",
+        "Whether all relevant processLogs callers serialize tuple production with restoration and prevent stale queued work from invalidating restored coordinates.",
+        "Whether the selected application implementation can partially mutate state before returning a Restore error, and whether captured objects remain valid during later Restore operations.",
+        "Which SnapshotStore implementation is selected and whether its metadata/content association and publication semantics support the proposed execution."
+      ],
+      "priority": 3,
+      "trigger_rationale": "The acquired range resolves two parts of the previous discriminator: processLogs constructs increasing, nonempty batches, and restoreUserSnapshot treats restore failure as fatal. However, processRPC exposes a distinct InstallSnapshot path whose completion policy is unread. Comparing that path is the smallest useful next step; the user-restore protection neither explains all runtime restoration nor establishes a defect."
+    },
+    "selection_rationale": "Continue the same F_capture_returned consumption question. The complete receipt supplies raft.go:1000:1450, with no deferred text to infer. Its user-restore protection narrows the suspicion, while the explicit InstallSnapshot dispatch supplies a concrete alternative path for focused source review. The requested bounded navigation range stays within raft.go metadata and the remaining source allowance; it is not a verified declaration range. No obligation is justified before the alternative restore policy and applicable failure boundary are established.",
+    "reading_requests": [
+      {
+        "file": "raft.go",
+        "start_line": 1750,
+        "end_line": 2050,
+        "reason": "Locate the InstallSnapshot handler referenced by processRPC and inspect its restoreFuture dispatch, restore-error handling, configuration adoption and completion ordering. Compare this network restoration path with restoreUserSnapshot's panic on restoration failure before deciding whether failed restoration can feed a later snapshot capture."
+      }
+    ],
+    "descriptive_issues": [
+      {
+        "candidate_effect": "independent_enrichment",
+        "object_ids": [
+          "A3",
+          "A4",
+          "runtime_restore_fsm"
+        ],
+        "source_ids": [
+          "raft.go:1000:1450"
+        ],
+        "reason": "The inventory omits the now-observed user-restore producer: it rejects outstanding configuration changes, aborts inflight futures, publishes supplied contents under current configuration and a newly advanced coordinate, dispatches restoration, panics on restoration error, and updates protocol positions after success. Record this distinct producer and its branches without generalizing its protection to network installation. This adds reusable context without changing F_capture_returned's weak meaning or the continuing decision."
+      },
+      {
+        "candidate_effect": "independent_enrichment",
+        "object_ids": [
+          "A5",
+          "B_fsm_single",
+          "B_fsm_batch"
+        ],
+        "source_ids": [
+          "raft.go:1000:1450"
+        ],
+        "reason": "Tuple production is now partially observed: processLogs iterates increasing indexes, prepares and filters entries, dispatches nonempty batches and advances Raft's lastApplied after dispatch rather than callback completion. prepareLog forwards configurations only when protocolVersion is greater than 2. Add the producer and protocol-version boundary while preserving unknown caller serialization and commitment establishment. These observations do not strengthen F_capture_returned."
+      }
+    ]
+  },
+  "before": {
+    "question_candidates": [
+      {
+        "id": "b3042e8bbbb24408943079f7e046dbd5",
+        "question": {
+          "disposition": "needs_specific_evidence",
+          "preferred_check": "source_review",
+          "requests": [],
+          "question": "When reclamation consumes file_snapshot_metadata_eligible, must it preserve an openable fallback if retained metadata-eligible snapshots cannot be opened? The publication sequence is now known, but whether a permitted storage failure can leave an unusable retained prefix after older snapshots are reclaimed, and whether the applicable contract requires tolerating that failure, remain unresolved.",
+          "importance": "If all snapshots returned by List are unusable, startup with snapshot restoration enabled returns an error. Reclamation may already have deleted older readable snapshots. This creates a potential recovery availability consequence, but neither a supported failure history nor a violated preservation guarantee has been established.",
+          "source_ids": [
+            "file_snapshot.go:1:159",
+            "file_snapshot.go:160:396",
+            "file_snapshot.go:397:500",
+            "file_snapshot.go:501:551",
+            "snapshot.go:1:100",
+            "api.go:600:760"
+          ],
+          "participants": [
+            "Caller executing FileSnapshotStore.ReapSnapshots",
+            "Caller executing FileSnapshotSink.Close",
+            "Caller executing FileSnapshotStore.Open",
+            "Initialization caller executing Raft.restoreSnapshot"
+          ],
+          "objects": [
+            "Snapshot metadata",
+            "Snapshot state files",
+            "Retention prefix",
+            "Snapshot directories",
+            "Startup snapshot list"
+          ],
+          "contexts": [
+            "FileSnapshotStore retention reclamation",
+            "First Close reaching reclamation",
+            "Startup with NoSnapshotRestoreOnStart false",
+            "Storage failure and concurrency contracts remain unspecified"
+          ],
+          "event_paths": [
+            "getSnapshots -> metadata ordering -> ReapSnapshots -> removal beyond retained prefix",
+            "Close -> finalize -> writeMeta -> Rename -> conditional parent-directory Sync -> ReapSnapshots",
+            "restoreSnapshot -> List -> tryRestoreSingleSnapshot -> Open -> retry next listed entry on failure",
+            "restoreSnapshot -> nonempty list exhausted without successful restoration -> error"
+          ],
+          "activity_classes": [
+            "A6",
+            "A3"
+          ],
+          "behavior_ids": [
+            "file_snapshot_discover",
+            "file_snapshot_reap",
+            "file_snapshot_open",
+            "file_snapshot_close_first"
+          ],
+          "fact_ids": [
+            "file_snapshot_metadata_eligible"
+          ],
+          "obligation_relation_kind": "consumption",
+          "counterevidence": [
+            "Discovery excludes temporary directories, unreadable or undecodable metadata, and unsupported versions.",
+            "Finalization checks buffered Flush, enabled state-file Sync, state-file Close and Stat before recording size and CRC. These errors prevent that Close invocation from reaching reclamation.",
+            "writeMeta checks file creation, JSON encoding, buffered Flush and enabled metadata-file Sync before returning nil. Close requires this result before rename and automatic reclamation.",
+            "After rename, enabled non-Windows parent-directory synchronization must succeed before that Close invocation reaches reclamation.",
+            "Open reads the state file, validates its CRC and rewinds the handle before returning it. Startup retries another listed snapshot after Open or FSM restoration failure.",
+            "NoSnapshotRestoreOnStart bypasses Open and FSM restoration; the described startup failure requires restoration to be enabled.",
+            "Constructor comments require retain >= 1, and the interface describes available snapshots, but neither explicitly promises retention of a corruption-tolerant fallback.",
+            "The private noSync field is documented as testing-only; it does not establish an ordinary production configuration that disables synchronization.",
+            "writeMeta ignores its deferred metadata-file Close result, unlike finalize's checked state-file Close. The supplied evidence does not establish that a close-only error after successful Sync permits loss of the retained snapshot.",
+            "The observed sequence synchronizes files and the parent directory but does not explicitly synchronize the snapshot directory itself. Its crash consequence depends on filesystem guarantees absent from the supplied materials."
+          ],
+          "unknowns": [
+            "Whether the applicable storage and recovery contract requires an openable fallback under corruption, read failures or partial persistence, and which component owns that guarantee.",
+            "A justified crash or interference history that leaves the retained prefix unusable while an older snapshot would remain readable.",
+            "The selected platform and filesystem guarantees for file Sync, snapshot-directory entries, rename, parent-directory Sync and delayed Close errors.",
+            "Caller serialization and permitted concurrent access among explicit reclamation, creation and readers.",
+            "The concrete retention count and deployed store configuration.",
+            "Caller-level handling of startup restoration failure and any broader recovery procedure outside the attached restoration routine."
+          ],
+          "priority": 3,
+          "trigger_rationale": "The requested metadata-publication discriminator is resolved: encoding, Flush and enabled Sync errors stop publication, while deferred metadata Close errors are ignored. These observations narrow possible failure histories without establishing their legality or an applicable fallback requirement. The candidate therefore remains evidence-blocked."
+        },
+        "history": [
+          {
+            "disposition": null,
+            "preferred_check": "source_review",
+            "requests": [
+              {
+                "file": "file_snapshot.go",
+                "start_line": 160,
+                "end_line": 396,
+                "reason": "Inspect metadata discovery, Open validation and retention selection to determine whether reclamation consumes metadata eligibility as evidence of recoverability."
+              },
+              {
+                "file": "file_snapshot.go",
+                "start_line": 397,
+                "end_line": 500,
+                "reason": "Inspect the Close-to-reclamation path and its error branches for protections establishing usable replacement snapshots before older snapshots are removed."
+              }
+            ],
+            "question": "When retention reclamation consumes file_snapshot_metadata_eligible, can an entry whose state fails Open validation displace an older readable snapshot, or does publication or reclamation establish a stronger replacement guarantee before deletion?",
+            "importance": "If retention removes readable recovery evidence while retaining unusable replacements, restart recovery could lose an available snapshot fallback. Whether this scenario is permitted and whether retained logs or other snapshots mitigate its consequence remain unresolved.",
+            "source_ids": [],
+            "participants": [
+              "Caller executing FileSnapshotStore.ReapSnapshots",
+              "Caller executing FileSnapshotSink.Close",
+              "Caller executing FileSnapshotStore.Open"
+            ],
+            "objects": [
+              "Snapshot metadata",
+              "Snapshot state files",
+              "Retention ordering",
+              "Snapshot directories"
+            ],
+            "contexts": [
+              "FileSnapshotStore retention reclamation",
+              "First Close reaching reclamation",
+              "Listed snapshot with state that fails Open validation; reachability and fault applicability remain unestablished"
+            ],
+            "event_paths": [
+              "getSnapshots -> ReapSnapshots -> retention deletion",
+              "FileSnapshotSink.Close -> publication steps -> ReapSnapshots",
+              "FileSnapshotStore.Open -> state validation"
+            ],
+            "activity_classes": [
+              "A6",
+              "A3"
+            ],
+            "behavior_ids": [
+              "file_snapshot_discover",
+              "file_snapshot_reap",
+              "file_snapshot_open",
+              "file_snapshot_close_first"
+            ],
+            "fact_ids": [
+              "file_snapshot_metadata_eligible"
+            ],
+            "obligation_relation_kind": "consumption",
+            "counterevidence": [
+              "The provisional inventory describes temporary-directory exclusion and finalized metadata before publication; these may prevent incomplete writes from entering retention selection.",
+              "The provisional inventory describes CRC validation in Open, which may reject unusable snapshots at recovery time but does not itself establish retention safety.",
+              "No attached source currently verifies these protections or their applicability."
+            ],
+            "unknowns": [
+              "Whether retention validates state contents or relies solely on metadata eligibility.",
+              "Whether every relevant reclamation invocation follows successful publication of a readable replacement.",
+              "Which error or permitted interference scenarios can produce metadata-eligible entries that fail Open.",
+              "What recovery guarantees and storage fault assumptions apply to retention.",
+              "Whether recovery can use other snapshots or retained logs after the hypothesized deletion."
+            ],
+            "priority": 3,
+            "trigger_rationale": "The accepted inventory distinguishes metadata eligibility from successful state validation and identifies reclamation as a consumer of the weaker fact. This supports a focused cross-path comparison, but does not establish a defect or an applicable recovery obligation."
+          },
+          {
+            "disposition": null,
+            "preferred_check": "source_review",
+            "requests": [
+              {
+                "file": "snapshot.go",
+                "start_line": 1,
+                "end_line": 100,
+                "reason": "Inspect snapshot interface contracts for what List availability and successful snapshot publication promise, keeping interface expectations distinct from file-store behavior."
+              },
+              {
+                "file": "api.go",
+                "start_line": 600,
+                "end_line": 760,
+                "reason": "Inspect the startup snapshot restoration consumer and surrounding initialization to establish fallback handling when a listed snapshot fails Open and locate any remaining recovery dependency."
+              },
+              {
+                "file": "file_snapshot.go",
+                "start_line": 1,
+                "end_line": 159,
+                "reason": "Inspect file-store retention documentation, constructor constraints and configuration boundaries for an applicable retention guarantee and storage assumptions."
+              }
+            ],
+            "question": "When reclamation consumes file_snapshot_metadata_eligible, does the applicable retention or recovery contract require preserving an openable fallback if a higher-ranked eligible entry fails Open? The observed reaper permits displacement without state validation; the remaining discriminator is whether that scenario lies within a claimed recovery guarantee and permitted fault context.",
+            "importance": "An unusable retained prefix could cause deletion of an older readable snapshot and reduce startup recovery options. Actual recovery failure depends on the restoration consumer, remaining recovery evidence and applicable storage fault assumptions; none is established by the observed retention behavior alone.",
+            "source_ids": [
+              "file_snapshot.go:160:396",
+              "file_snapshot.go:397:500"
+            ],
+            "participants": [
+              "Caller executing FileSnapshotStore.ReapSnapshots",
+              "Caller executing FileSnapshotSink.Close",
+              "Caller executing FileSnapshotStore.Open"
+            ],
+            "objects": [
+              "Snapshot metadata",
+              "Snapshot state files",
+              "Retention ordering",
+              "Snapshot directories"
+            ],
+            "contexts": [
+              "FileSnapshotStore retention reclamation",
+              "First Close reaching reclamation",
+              "A higher-ranked metadata-eligible entry whose state fails Open; legal reachability and fault applicability remain unresolved"
+            ],
+            "event_paths": [
+              "getSnapshots -> ReapSnapshots -> removal beyond retained prefix",
+              "FileSnapshotSink.Close -> finalize -> writeMeta -> Rename -> conditional parent Sync -> ReapSnapshots",
+              "FileSnapshotStore.Open -> state read -> CRC comparison -> rewind"
+            ],
+            "activity_classes": [
+              "A6",
+              "A3"
+            ],
+            "behavior_ids": [
+              "file_snapshot_discover",
+              "file_snapshot_reap",
+              "file_snapshot_open",
+              "file_snapshot_close_first"
+            ],
+            "fact_ids": [
+              "file_snapshot_metadata_eligible"
+            ],
+            "obligation_relation_kind": "consumption",
+            "counterevidence": [
+              "getSnapshots excludes temporary directories and skips metadata decoding failures and unsupported versions.",
+              "The first Close reaches automatic reclamation only after finalize, writeMeta and Rename succeed, and after parent-directory Sync succeeds when enabled on non-Windows platforms.",
+              "finalize checks buffered Flush, enabled state Sync, file Close and Stat before recording size and CRC; errors prevent that Close invocation from reaching reclamation.",
+              "Open independently reads the state file, rejects CRC disagreement and requires a successful rewind before returning its reader. This protects that read boundary but is not invoked by retention selection.",
+              "Normal publication includes protections against exposing unfinished construction. The supplied source does not establish a permitted execution that defeats those protections and leaves every retained replacement unusable."
+            ],
+            "unknowns": [
+              "Whether the snapshot interfaces or file-store documentation promise an openable retained fallback under state corruption, read failures or partial persistence.",
+              "Which permitted fault or interference history can produce a higher-ranked metadata-eligible entry that fails Open while an older entry remains readable.",
+              "Which caller serialization and storage assumptions apply to explicit ReapSnapshots calls and automatic reclamation.",
+              "Whether startup tries other listed snapshots after Open failure, and whether remaining logs or other recovery mechanisms can compensate.",
+              "The implementation of writeMeta is not attached; its successful return cannot yet be interpreted as a verified metadata durability guarantee.",
+              "The configured retention count, synchronization setting and platform for a concrete check remain unspecified."
+            ],
+            "priority": 3,
+            "trigger_rationale": "Cross-path review resolves the implementation discriminator: discovery reads metadata only, reclamation deletes beyond its ordered prefix without Open, and Open performs separate state validation. Given an unusable entry in that prefix, reclamation does not distinguish it from a usable one. Publication protections materially constrain how that state could arise, so contract and recovery-consumer evidence are needed before deriving an obligation."
+          },
+          {
+            "disposition": "needs_specific_evidence",
+            "preferred_check": "source_review",
+            "requests": [
+              {
+                "file": "file_snapshot.go",
+                "start_line": 501,
+                "end_line": 551,
+                "reason": "Inspect writeMeta and the remaining ordering implementation to complete the publication dependency: determine which metadata persistence operations precede rename and reclamation, and whether their error handling supports or rules out a crash-related unusable retained entry."
+              }
+            ],
+            "question": "When reclamation consumes file_snapshot_metadata_eligible, does the applicable retention or recovery contract require preserving an openable fallback if a retained eligible entry fails Open? Startup retries only the entries returned by List, and fails if that nonempty list has no restorable entry when snapshot restoration is enabled. The remaining discriminator is whether an unusable retained prefix can arise within the supported publication and storage fault contract.",
+            "importance": "Reclamation can remove older snapshots outside the retained metadata prefix. If every listed replacement is unusable, the observed restoration routine returns an error despite any formerly readable older snapshot. Establishing an implementation violation still requires a permitted failure history and an applicable preservation guarantee.",
+            "source_ids": [
+              "file_snapshot.go:1:159",
+              "file_snapshot.go:160:396",
+              "file_snapshot.go:397:500",
+              "snapshot.go:1:100",
+              "api.go:600:760"
+            ],
+            "participants": [
+              "Caller executing FileSnapshotStore.ReapSnapshots",
+              "Caller executing FileSnapshotSink.Close",
+              "Caller executing FileSnapshotStore.Open",
+              "Initialization caller executing Raft.restoreSnapshot"
+            ],
+            "objects": [
+              "Snapshot metadata",
+              "Snapshot state files",
+              "Retention prefix",
+              "Snapshot directories",
+              "Startup snapshot list"
+            ],
+            "contexts": [
+              "FileSnapshotStore retention reclamation",
+              "First Close reaching reclamation",
+              "Startup with NoSnapshotRestoreOnStart false",
+              "A metadata-eligible retained entry whose state fails Open; fault applicability remains unresolved"
+            ],
+            "event_paths": [
+              "getSnapshots -> ReapSnapshots -> removal beyond retained prefix",
+              "FileSnapshotSink.Close -> finalize -> writeMeta -> Rename -> conditional parent Sync -> ReapSnapshots",
+              "restoreSnapshot -> List -> tryRestoreSingleSnapshot -> Open -> retry next listed entry on failure",
+              "restoreSnapshot -> nonempty list exhausted without successful restoration -> error"
+            ],
+            "activity_classes": [
+              "A6",
+              "A3"
+            ],
+            "behavior_ids": [
+              "file_snapshot_discover",
+              "file_snapshot_reap",
+              "file_snapshot_open",
+              "file_snapshot_close_first"
+            ],
+            "fact_ids": [
+              "file_snapshot_metadata_eligible"
+            ],
+            "obligation_relation_kind": "consumption",
+            "counterevidence": [
+              "Discovery excludes temporary directories, metadata decoding failures and unsupported versions.",
+              "Automatic reclamation follows successful finalization, writeMeta and rename, plus successful parent-directory synchronization when enabled on non-Windows platforms.",
+              "Finalization checks buffered Flush, enabled state Sync, file Close and Stat before recording size and CRC; errors prevent that invocation from reaching reclamation.",
+              "Open validates the state checksum and rewinds the reader before returning it; metadata eligibility alone is not accepted as successful restoration.",
+              "Startup retries other listed entries after either Open or FSM restoration failure. This protects recovery when another listed entry remains restorable.",
+              "NoSnapshotRestoreOnStart bypasses Open and FSM restoration; the observed failure scenario is conditional on restoration being enabled.",
+              "Constructor comments specify a retention count of at least one, but do not explicitly promise a corruption-tolerant fallback. SnapshotStore.List describes available snapshots without specifying tolerance of state corruption or read failures.",
+              "The private noSync field is documented as testing-only and as skipping crash-safe fsync calls. Its existence does not establish an ordinary production configuration permitting synchronization to be disabled."
+            ],
+            "unknowns": [
+              "Whether the applicable storage and recovery contract requires an openable fallback under corruption, read failures or partial persistence.",
+              "Which permitted crash or interference history can produce an unusable retained prefix while an older snapshot remains readable.",
+              "The actual writeMeta persistence sequence and error handling are not attached.",
+              "Caller serialization and concurrent access assumptions for explicit reclamation, creation and readers remain unresolved.",
+              "The concrete retention count, platform and filesystem persistence semantics remain unspecified.",
+              "The restoration routine does not attempt log-only recovery after exhausting a nonempty snapshot list; caller-level error handling and any broader recovery procedure remain outside the attached range."
+            ],
+            "priority": 3,
+            "trigger_rationale": "The consumer discriminator is now resolved: failed Open does not immediately terminate the loop, but fallback is confined to List's retained prefix. The interface and constructor comments do not establish the stronger corruption-tolerant retention requirement. Completing the exact missing metadata publication dependency is justified before deciding whether a supported crash scenario exists or the candidate remains contract-blocked."
+          }
+        ],
+        "check_ids": [
+          "a5a7b7e61dd64b02b563257213ee721f",
+          "47a54cc484774e03867ef8709956aa88",
+          "85559a22f0174d46ade60cf63b082553",
+          "5751a79d184348d9914a618781ae1bf4"
+        ],
+        "status": "blocked",
+        "stage": "analyze",
+        "read_plan_id": "ca2dc8863544477190a9b9e42454b04a",
+        "material_ids": [
+          "file_snapshot.go:160:396",
+          "file_snapshot.go:397:500",
+          "snapshot.go:1:100",
+          "api.go:600:760",
+          "file_snapshot.go:1:159",
+          "file_snapshot.go:501:551"
+        ],
+        "spec_task_ids": [],
+        "stagnation": 0,
+        "stop_reason": "Continue the same metadata-eligibility consumption question and stop provisionally with its contract gap visible. The complete publication code supplies significant protections but cannot establish the missing storage fault contract. No exact next repository range is identified as assigning corruption-tolerant retention responsibility or specifying the needed filesystem semantics. An injected corruption test would demonstrate conditional behavior without resolving applicability, so no obligation or execution check is justified yet.",
+        "obligation_id": null
+      },
+      {
+        "id": "e37681d1e571460d9a427f20a55e9f85",
+        "question": {
+          "disposition": "explained_by_existing_mechanism",
+          "preferred_check": "source_review",
+          "requests": [],
+          "question": "For LogCache wrapping InmemStore, can an overlapping GetLog repopulate an invalidated slot and cause a lookup begun after successful DeleteRange to return the deleted entry, in the absence of overlapping or subsequent writes?",
+          "importance": "Stale post-deletion lookup results could misrepresent retained history to protocol consumers. This review addresses only the proposed lookup-driven cache refill; consensus and recovery consequences require separate consumer evidence.",
+          "source_ids": [
+            "log_cache.go:1:95",
+            "inmem_store.go:1:133",
+            "log.go:1:192"
+          ],
+          "participants": [
+            "LogCache deletion caller",
+            "Concurrent LogCache lookup caller",
+            "InmemStore backing adapter"
+          ],
+          "objects": [
+            "LogCache slots",
+            "Requested deletion range",
+            "Backing log entries"
+          ],
+          "contexts": [
+            "LogCache wrapping InmemStore; deployment selection remains unknown",
+            "Concurrent lookup and deletion without crash",
+            "Ordered deletion bounds for which the uint64 deletion loop terminates",
+            "No overlapping or subsequent StoreLog or StoreLogs operation, direct backend reinsertion, or external mutation of stored Log objects",
+            "The discriminating lookup begins after DeleteRange returns successfully"
+          ],
+          "event_paths": [
+            "DeleteRange replaces the cache slice under its exclusive lock, unlocks, then delegates backend deletion.",
+            "An overlapping GetLog may return a previously captured cache entry or read the backend before deletion, but neither path writes a cache slot.",
+            "After successful backend deletion, a newly begun lookup encounters an empty cache slot and InmemStore.GetLog returns ErrLogNotFound for the deleted index under the stated scope."
+          ],
+          "activity_classes": [
+            "A6"
+          ],
+          "behavior_ids": [
+            "b_cache_delete_range",
+            "b_inmem_delete_range"
+          ],
+          "fact_ids": [
+            "f_cache_clear_event"
+          ],
+          "obligation_relation_kind": "consumption",
+          "counterevidence": [
+            "LogCache.GetLog only reads the cache and forwards misses directly to the backend; it never refills the cache. The proposed lookup-driven refill step has no implementation.",
+            "LogCache.DeleteRange replaces all slots while holding the cache lock. A lookup beginning after successful deletion cannot capture an entry from the replaced slice.",
+            "InmemStore.GetLog and DeleteRange use the same RWMutex. Successful terminating deletion removes the requested keys before returning.",
+            "An already overlapping lookup can return an old entry after deletion by retaining a previously captured pointer. This does not establish stale behavior for a lookup begun after deletion.",
+            "StoreLogs, unlike GetLog, populates cache slots after backend success using a separate cache critical section. The explanation does not cover overlapping writes.",
+            "The selected fact describes an invalidation event only; it does not promise continued cache emptiness or backend deletion completion."
+          ],
+          "unknowns": [
+            "The attached LogStore interface does not specify a general concurrent-operation consistency contract.",
+            "Actual deployment selection of this adapter composition remains unknown; InmemStore is explicitly designated for testing.",
+            "Caller serialization and the applicability of overlapping StoreLogs and DeleteRange remain unestablished.",
+            "Protocol consumers and broader consequences of stale entries from other schedules remain unmapped."
+          ],
+          "priority": 3,
+          "trigger_rationale": "Comparing lookup and write paths resolves the selected discriminator: cache population belongs to StoreLogs, while GetLog misses do not populate the cache. Separate cache and backend critical sections therefore do not enable the proposed lookup-only refill schedule."
+        },
+        "history": [
+          {
+            "disposition": null,
+            "preferred_check": "source_review",
+            "requests": [
+              {
+                "file": "log_cache.go",
+                "start_line": 1,
+                "end_line": 95,
+                "reason": "Inspect deletion, lookup, cache refill and locking together to determine whether a concurrent lookup can repopulate an invalidated slot before backend deletion completes."
+              },
+              {
+                "file": "inmem_store.go",
+                "start_line": 1,
+                "end_line": 133,
+                "reason": "Inspect the built-in backing store's lookup and deletion synchronization to assess whether the proposed interleaving is possible for this concrete adapter composition."
+              },
+              {
+                "file": "log.go",
+                "start_line": 1,
+                "end_line": 192,
+                "reason": "Recover the LogStore lookup, deletion and concurrency contracts before attributing any requirement to cache invalidation."
+              }
+            ],
+            "question": "When LogCache uses the built-in InmemStore, can a concurrent lookup refill a slot after the recorded cache-clear event but before backend deletion, allowing a lookup started after successful deletion to return a deleted entry, or does synchronization or later validation prevent this?",
+            "importance": "If cache invalidation is consumed as assurance that subsequent reads reflect completed deletion, stale entries could affect protocol consumers of retained history. The bounded consequence is inconsistent post-deletion lookup behavior; any effect on consensus or recovery requires additional consumer evidence.",
+            "source_ids": [],
+            "participants": [
+              "LogCache deletion caller",
+              "Concurrent LogCache lookup caller",
+              "InmemStore backing adapter"
+            ],
+            "objects": [
+              "LogCache slots",
+              "Requested deletion range",
+              "Backing log entries"
+            ],
+            "contexts": [
+              "Caller-selected LogCache wrapping InmemStore; actual deployment selection is unknown",
+              "Concurrent lookup and deletion without crash",
+              "A subsequent lookup begins after DeleteRange returns successfully"
+            ],
+            "event_paths": [
+              "Candidate schedule to inspect: cache clear → concurrent backing lookup and cache refill → backing deletion completes → subsequent cached lookup"
+            ],
+            "activity_classes": [
+              "A6"
+            ],
+            "behavior_ids": [
+              "b_cache_delete_range",
+              "b_inmem_delete_range"
+            ],
+            "fact_ids": [
+              "f_cache_clear_event"
+            ],
+            "obligation_relation_kind": "consumption",
+            "counterevidence": [
+              "The accepted inventory describes cache clearing under a lock, which may participate in a wider synchronization mechanism; exact code is not currently attached.",
+              "The selected fact explicitly establishes an invalidation event, not continued cache emptiness or completed backend deletion.",
+              "The inventory describes exclusive locking during InmemStore deletion; whether this also prevents stale cache refill remains unread."
+            ],
+            "unknowns": [
+              "Whether cache locking spans the backend deletion call.",
+              "Whether lookups hold a cache lock across backing reads and refill.",
+              "Whether a generation check or another validation rejects results overlapping deletion.",
+              "What concurrent lookup and deletion behavior the LogStore contract requires.",
+              "Whether the concrete adapter composition is selected in any target deployment.",
+              "Which protocol consumers could encounter a stale post-deletion cache entry."
+            ],
+            "priority": 3,
+            "trigger_rationale": "The inventory separates cache invalidation from backend deletion. Comparing the deletion path with the lookup/refill path provides a concrete discriminator without treating the historical clear event as a stronger guarantee."
+          }
+        ],
+        "check_ids": [
+          "1bac66b356e940f5bc9f169a92bfc7bb",
+          "be40509a36a14ceabd6a9d1b04212409"
+        ],
+        "status": "explained",
+        "stage": "analyze",
+        "read_plan_id": "28a5228fb5ef4eaa83bb4c34b53be37f",
+        "material_ids": [
+          "log_cache.go:1:95",
+          "inmem_store.go:1:133",
+          "log.go:1:192"
+        ],
+        "spec_task_ids": [],
+        "stagnation": 0,
+        "stop_reason": "All requested ranges are attached, with no deferred receipt items. Source review explains the selected lookup-refill suspicion because GetLog has no cache write. This is a bounded source-grounded disposition, not execution evidence or overall correctness. Overlapping writes and already-started reads remain explicit limitations; they are not silently included in the explanation. No obligation or further reading is necessary to resolve this discriminator.",
+        "obligation_id": null
+      },
+      {
+        "id": "a4baad92835841ae9b99fb8c68304dd6",
+        "question": {
+          "disposition": "needs_specific_evidence",
+          "preferred_check": "source_review",
+          "requests": [
+            {
+              "file": "raft.go",
+              "start_line": 1000,
+              "end_line": 1450,
+              "reason": "Locate and inspect runtime restore request production and error handling, committed-tuple dispatch, and configuration advancement near the inventoried appendConfigurationEntry declaration. Determine whether failed restoration permits subsequent capture and whether dispatched processing coordinates remain compatible with committed configuration metadata."
+            }
+          ],
+          "question": "When takeSnapshot consumes F_capture_returned, do runtime restore completion handling and committed-tuple production ensure that its processing coordinates still identify the captured state and a compatible committed configuration, especially after a Restore error?",
+          "importance": "Publishing application state under incompatible snapshot coordinates or configuration could cause recovery to skip required history or reconstruct an incorrect participant context. Subsequent compaction could remove recovery options. These are conditional consequences, not observed failures.",
+          "source_ids": [
+            "fsm.go:1:285",
+            "snapshot.go:125:278"
+          ],
+          "participants": [
+            "runFSM worker",
+            "Raft.takeSnapshot execution owner",
+            "Runtime restore request producer",
+            "Committed-tuple producer",
+            "Caller-supplied FSM"
+          ],
+          "objects": [
+            "reqSnapshotFuture",
+            "FSMSnapshot",
+            "Worker processing index and term",
+            "restoreFuture",
+            "Snapshot configuration metadata"
+          ],
+          "contexts": [
+            "Single and batch FSM application variants",
+            "Snapshot capture and publication",
+            "Successful and failed runtime restoration",
+            "Committed configuration selection after capture"
+          ],
+          "event_paths": [
+            "Committed-tuple dispatch -> single or batch processing -> snapshot capture -> configuration selection",
+            "Runtime Restore error -> producer error handling -> possible subsequent snapshot capture",
+            "Successful Restore -> metadata coordinate assignment -> subsequent snapshot capture"
+          ],
+          "activity_classes": [
+            "A5",
+            "A6",
+            "A3",
+            "A4"
+          ],
+          "behavior_ids": [
+            "B_fsm_single",
+            "B_fsm_batch",
+            "B_snapshot_capture",
+            "B_take_snapshot",
+            "runtime_restore_fsm"
+          ],
+          "fact_ids": [
+            "F_capture_returned"
+          ],
+          "obligation_relation_kind": "consumption",
+          "counterevidence": [
+            "The runFSM select loop executes application, restoration, and capture synchronously in one worker. These handlers cannot interleave within a callback.",
+            "The FSM contract assigns snapshot capture to the application implementation and explicitly requires snapshot methods to tolerate concurrent Apply calls. Callback success alone does not independently verify snapshot contents.",
+            "Single processing leaves coordinates unchanged for an unsupported configuration operation. Batch processing passes configurations to ApplyBatch and records the final input tuple coordinate, including filtered barriers. This asymmetry does not itself establish incompatible state.",
+            "Successful runtime restoration assigns coordinates from Open-returned metadata only after Restore returns nil.",
+            "takeSnapshot obtains committed configuration through a future and rejects a capture whose index precedes committedIndex.",
+            "takeSnapshot checks Create, Persist, and Close results before updating stable snapshot coordinates and compacting; compaction is bounded by the supplied snapshot index. These checks do not independently establish content correctness or concrete sink durability."
+          ],
+          "unknowns": [
+            "Whether runtime restore callers stop further processing, terminate execution, or otherwise repair application state after Restore returns an error. The worker leaves coordinates unchanged, but the interface supplies no rollback guarantee for application state.",
+            "Whether tuple production guarantees ordered, nonempty batches and preserves the coordinate-to-state relationship across runtime restoration.",
+            "How committed configuration advancement and configurationsFuture responses are ordered relative to tuple dispatch and restoration; the numerical index guard alone does not establish the complete relationship.",
+            "Whether the selected application implementation preserves captured contents during subsequent Apply or Restore operations.",
+            "Whether the selected SnapshotStore binds Open-returned metadata to the restored contents and provides the publication semantics relied upon by compaction."
+          ],
+          "priority": 3,
+          "trigger_rationale": "Source review resolves worker serialization and the visible single/batch coordinate rules. It also exposes a narrower discriminator: Restore can return an error after changing application state while the worker retains its previous coordinates and resumes its loop. The surrounding producer may provide a decisive protection, so its actual error handling must be inspected before deriving an obligation or concluding that incompatible capture is possible."
+        },
+        "history": [
+          {
+            "disposition": "needs_specific_evidence",
+            "preferred_check": "source_review",
+            "requests": [
+              {
+                "file": "fsm.go",
+                "start_line": 1,
+                "end_line": 285,
+                "reason": "Inspect the FSM snapshot contract, single and batch position updates, restoration, and worker serialization to establish what coordinates accompany a successful capture."
+              },
+              {
+                "file": "snapshot.go",
+                "start_line": 125,
+                "end_line": 278,
+                "reason": "Inspect how takeSnapshot consumes the captured object and coordinates, selects configuration metadata, publishes recovery evidence, and initiates compaction."
+              }
+            ],
+            "question": "When takeSnapshot consumes F_capture_returned, what ensures that the captured object, processing coordinates, and selected configuration describe a compatible recovery point, including when single and batch application paths process filtered entries or restoration precedes capture?",
+            "importance": "If snapshot publication associates captured application state with incompatible recovery coordinates or configuration, subsequent recovery could skip required history or reconstruct the wrong participant context. Compaction could make that mismatch harder to recover from. These are conditional consequences to investigate, not observed failures.",
+            "source_ids": [],
+            "participants": [
+              "runFSM worker",
+              "Raft.takeSnapshot execution owner",
+              "Caller-supplied FSM"
+            ],
+            "objects": [
+              "reqSnapshotFuture",
+              "FSMSnapshot",
+              "Worker processing index and term",
+              "Snapshot configuration metadata"
+            ],
+            "contexts": [
+              "Single and batch FSM application variants",
+              "Snapshot capture and publication",
+              "Runtime restoration serialized with FSM work"
+            ],
+            "event_paths": [
+              "Application processing -> snapshot capture -> takeSnapshot metadata selection and publication",
+              "Runtime restoration -> subsequent snapshot capture"
+            ],
+            "activity_classes": [
+              "A5",
+              "A6",
+              "A3",
+              "A4"
+            ],
+            "behavior_ids": [
+              "B_fsm_single",
+              "B_fsm_batch",
+              "B_snapshot_capture",
+              "B_take_snapshot",
+              "runtime_restore_fsm"
+            ],
+            "fact_ids": [
+              "F_capture_returned"
+            ],
+            "obligation_relation_kind": "consumption",
+            "counterevidence": [
+              "The inventory describes one runFSM worker serializing application, restoration, and capture; exact source must establish the extent of this protection.",
+              "F_capture_returned explicitly establishes callback success and attached processing coordinates, without claiming persisted or recoverable contents.",
+              "Different treatment of entries in single and batch paths may be compatible with the snapshot contract; asymmetry alone would not establish a defect."
+            ],
+            "unknowns": [
+              "The exact FSM and FSMSnapshot contracts governing the relationship between captured state and processing coordinates.",
+              "How single and batch paths update processing coordinates for entries that do not invoke an application callback.",
+              "How takeSnapshot obtains and validates configuration metadata relative to the captured index.",
+              "Which publication and compaction guards prevent consumption of an unsuitable capture.",
+              "Whether restoration changes the coordinate-to-state relationship relevant to the next capture."
+            ],
+            "priority": 3,
+            "trigger_rationale": "The accepted inventory exposes related single and batch producers and a concrete snapshot consumer. Comparing their coordinate semantics offers a bounded discriminator: whether the consumer relies only on guarantees established by capture and its applicable callback contract."
+          }
+        ],
+        "check_ids": [
+          "31173bab9c04464ea7f8963fcd70c934",
+          "fcf213c831324a80a8e43e578195bf0a"
+        ],
+        "status": "active",
+        "stage": "analyze",
+        "read_plan_id": "0a8e22dafcf04876a0ae6b1ab901890d",
+        "material_ids": [
+          "fsm.go:1:285",
+          "snapshot.go:125:278",
+          "raft.go:1000:1450"
+        ],
+        "spec_task_ids": [],
+        "stagnation": 0,
+        "stop_reason": "",
+        "obligation_id": null
+      }
+    ],
+    "inquiry_tasks": [
+      {
+        "surface_entry_points": [],
+        "candidate_id": null,
+        "draft_path": null,
+        "diagnostics": [],
+        "admitted": false,
+        "preparation_failures": 0,
+        "semantic_failures": 0,
+        "parent_task_id": null,
+        "child_task_ids": [],
+        "requested_aspects": {},
+        "expected_contribution": "",
+        "context_receipt_id": null,
+        "context_dependencies": {},
+        "read_plan_id": null,
+        "repair_session": null,
+        "resolution_issue_ids": [],
+        "id": "b5c2e981d9564afcae0a9a57621372cc",
+        "kind": "spec_refine",
+        "reason": "Resolve decisive understanding gaps",
+        "trigger": "initial-reads",
+        "activity_classes": [],
+        "target_ids": [],
+        "target_versions": {},
+        "unit_id": null,
+        "model_id": null,
+        "requests": [
+          {
+            "file": "file_snapshot.go",
+            "start_line": 1,
+            "end_line": 210,
+            "reason": "Expand the snapshot publication frontier: recover constructor options, sink creation and metadata identity without assuming the active adapter."
+          },
+          {
+            "file": "file_snapshot.go",
+            "start_line": 211,
+            "end_line": 396,
+            "reason": "Recover snapshot listing, opening and retention consumers to distinguish publication, discoverability, validation and reclamation."
+          },
+          {
+            "file": "file_snapshot.go",
+            "start_line": 501,
+            "end_line": 551,
+            "reason": "Complete the called writeMeta implementation and its synchronization and error behavior."
+          },
+          {
+            "file": "api.go",
+            "start_line": 660,
+            "end_line": 740,
+            "reason": "Complete startup snapshot selection and inspect the restoration helper consuming retained snapshot evidence."
+          }
+        ],
+        "status": "pending",
+        "stage": "read",
+        "added_material_ids": [],
+        "stop_reason": "",
+        "check_id": null,
+        "unit_version": null,
+        "material_ids": [],
+        "superseded_by": null
+      },
+      {
+        "surface_entry_points": [
+          "FileSnapshotStore Create, List, Open and ReapSnapshots; FileSnapshotSink.writeMeta"
+        ],
+        "candidate_id": null,
+        "draft_path": null,
+        "diagnostics": [],
+        "admitted": true,
+        "preparation_failures": 0,
+        "semantic_failures": 0,
+        "parent_task_id": null,
+        "child_task_ids": [],
+        "requested_aspects": {},
+        "expected_contribution": "",
+        "context_receipt_id": "17c1cbb92d6844c99a0add9b32f6df9c",
+        "context_dependencies": {},
+        "read_plan_id": "e6bd2e5c086d46dcbc967782cf0942c0",
+        "repair_session": null,
+        "resolution_issue_ids": [],
+        "id": "f2210bd68ba84279babe303a0cc9f039",
+        "kind": "spec_refine",
+        "reason": "Expand one source-grounded implementation surface",
+        "trigger": "surface:FileSnapshotStore Create, List, Open and ReapSnapshots; FileSnapshotSink.writeMeta",
+        "activity_classes": [],
+        "target_ids": [],
+        "target_versions": {},
+        "unit_id": null,
+        "model_id": null,
+        "requests": [
+          {
+            "file": "file_snapshot.go",
+            "start_line": 1,
+            "end_line": 159,
+            "reason": "Read store and sink representations, file naming constants, constructor configuration and filesystem setup needed to interpret the focused snapshot lifecycle."
+          },
+          {
+            "file": "file_snapshot.go",
+            "start_line": 160,
+            "end_line": 396,
+            "reason": "Read Create, List, getSnapshots, readMeta, Open and ReapSnapshots to recover identity, discovery filters, validation, error branches and reclamation selection from actual code."
+          },
+          {
+            "file": "file_snapshot.go",
+            "start_line": 397,
+            "end_line": 551,
+            "reason": "Read sink completion, cancellation, metadata writing and directly connected helpers to distinguish snapshot construction, publication, persistence and cleanup, including partial failures."
+          }
+        ],
+        "status": "completed",
+        "stage": "done",
+        "added_material_ids": [
+          "file_snapshot.go:1:159",
+          "file_snapshot.go:160:396",
+          "file_snapshot.go:397:551"
+        ],
+        "stop_reason": "",
+        "check_id": "737db942b41b463d993d468ad49ecfd6",
+        "unit_version": null,
+        "material_ids": [
+          "file_snapshot.go:1:159",
+          "file_snapshot.go:160:396",
+          "file_snapshot.go:397:551"
+        ],
+        "superseded_by": null
+      },
+      {
+        "surface_entry_points": [],
+        "candidate_id": null,
+        "draft_path": "/home/nitro/Desktop/consensus-assurance/runs/2026-09-20_16-31-53-hashicorp_raft-real-run/audit-spec/v2.json",
+        "diagnostics": [
+          {
+            "code": "audit_spec_semantics",
+            "category": "semantic",
+            "object_ids": [
+              "A3",
+              "A6",
+              "file_snapshot_metadata_eligible",
+              "file_snapshot_open"
+            ],
+            "material_ids": [
+              "api.go:600:760",
+              "file_snapshot.go:160:396"
+            ],
+            "message": "The inventory leaves startup selection and Open consumers unread. The attached source now identifies initialization-owned restoration: List supplies candidates, Open or FSM restoration failure advances to another listed candidate, successful restoration precedes snapshot/application/configuration updates, and exhaustion of a nonempty list returns an error. NoSnapshotRestoreOnStart is a distinct bypass branch. Record these reusable consumer behaviors and boundaries without strengthening metadata eligibility into readability. This enrichment does not change the selected Fact's meaning or the remaining retention-contract discriminator.",
+            "allowed": [
+              "read",
+              "semantic_revision"
+            ]
+          }
+        ],
+        "admitted": true,
+        "preparation_failures": 0,
+        "semantic_failures": 0,
+        "parent_task_id": null,
+        "child_task_ids": [],
+        "requested_aspects": {},
+        "expected_contribution": "",
+        "context_receipt_id": "83d9ae768e364c098fe7cd0011ba2c5e",
+        "context_dependencies": {},
+        "read_plan_id": null,
+        "repair_session": null,
+        "resolution_issue_ids": [],
+        "id": "58df103f7991480ba5d5dbfaa7ff9d94",
+        "kind": "spec_refine",
+        "reason": "The inventory leaves startup selection and Open consumers unread. The attached source now identifies initialization-owned restoration: List supplies candidates, Open or FSM restoration failure advances to another listed candidate, successful restoration precedes snapshot/application/configuration updates, and exhaustion of a nonempty list returns an error. NoSnapshotRestoreOnStart is a distinct bypass branch. Record these reusable consumer behaviors and boundaries without strengthening metadata eligibility into readability. This enrichment does not change the selected Fact's meaning or the remaining retention-contract discriminator.",
+        "trigger": "85559a22f0174d46ade60cf63b082553:A3,A6,file_snapshot_metadata_eligible,file_snapshot_open",
+        "activity_classes": [],
+        "target_ids": [
+          "A3",
+          "A6",
+          "file_snapshot_metadata_eligible",
+          "file_snapshot_open"
+        ],
+        "target_versions": {},
+        "unit_id": null,
+        "model_id": null,
+        "requests": [],
+        "status": "completed",
+        "stage": "done",
+        "added_material_ids": [],
+        "stop_reason": "",
+        "check_id": "fdebd0871cd1413eb8f9cc7b6cfe2a4d",
+        "unit_version": null,
+        "material_ids": [
+          "file_snapshot.go:160:396",
+          "api.go:600:760"
+        ],
+        "superseded_by": null
+      },
+      {
+        "surface_entry_points": [],
+        "candidate_id": null,
+        "draft_path": "/home/nitro/Desktop/consensus-assurance/runs/2026-09-20_16-31-53-hashicorp_raft-real-run/audit-spec/v2.json",
+        "diagnostics": [
+          {
+            "code": "audit_spec_semantics",
+            "category": "semantic",
+            "object_ids": [
+              "A3",
+              "A6",
+              "file_snapshot_metadata_eligible",
+              "file_snapshot_open_crc_validated"
+            ],
+            "material_ids": [
+              "api.go:600:760",
+              "file_snapshot.go:160:396"
+            ],
+            "message": "The inventory still marks recovery consumers as unread. The attached startup code establishes a distinct initialization owner that consumes List's bounded metadata results, attempts Open and FSM restoration in order, retries failures, and errors after exhausting a nonempty list. NoSnapshotRestoreOnStart bypasses these attempts. Record these branches and appropriate consumer relationships without equating CRC validation with successful FSM restoration. This reusable omission does not change the current evidence-blocked disposition.",
+            "allowed": [
+              "read",
+              "semantic_revision"
+            ]
+          }
+        ],
+        "admitted": true,
+        "preparation_failures": 0,
+        "semantic_failures": 0,
+        "parent_task_id": null,
+        "child_task_ids": [],
+        "requested_aspects": {},
+        "expected_contribution": "",
+        "context_receipt_id": "87692a712bc84a2d9909e0e3f785fe80",
+        "context_dependencies": {},
+        "read_plan_id": null,
+        "repair_session": null,
+        "resolution_issue_ids": [],
+        "id": "f76d0428514f4d929ee1f340cfbb4b6d",
+        "kind": "spec_refine",
+        "reason": "The inventory still marks recovery consumers as unread. The attached startup code establishes a distinct initialization owner that consumes List's bounded metadata results, attempts Open and FSM restoration in order, retries failures, and errors after exhausting a nonempty list. NoSnapshotRestoreOnStart bypasses these attempts. Record these branches and appropriate consumer relationships without equating CRC validation with successful FSM restoration. This reusable omission does not change the current evidence-blocked disposition.",
+        "trigger": "5751a79d184348d9914a618781ae1bf4:A3,A6,file_snapshot_metadata_eligible,file_snapshot_open_crc_validated",
+        "activity_classes": [],
+        "target_ids": [
+          "A3",
+          "A6",
+          "file_snapshot_metadata_eligible",
+          "file_snapshot_open_crc_validated"
+        ],
+        "target_versions": {},
+        "unit_id": null,
+        "model_id": null,
+        "requests": [],
+        "status": "completed",
+        "stage": "done",
+        "added_material_ids": [],
+        "stop_reason": "",
+        "check_id": "c3f4ef5bee6d40f3bce0aaed836f9446",
+        "unit_version": null,
+        "material_ids": [
+          "file_snapshot.go:160:396",
+          "api.go:600:760"
+        ],
+        "superseded_by": null
+      },
+      {
+        "surface_entry_points": [
+          "compactLogsWithTrailing and removeOldLogs"
+        ],
+        "candidate_id": null,
+        "draft_path": null,
+        "diagnostics": [],
+        "admitted": true,
+        "preparation_failures": 0,
+        "semantic_failures": 0,
+        "parent_task_id": null,
+        "child_task_ids": [],
+        "requested_aspects": {},
+        "expected_contribution": "",
+        "context_receipt_id": "8a7fc587a543417e8d52b4d66d0cc188",
+        "context_dependencies": {},
+        "read_plan_id": "d8b3ee19177f4fbf8564184334e71b82",
+        "repair_session": null,
+        "resolution_issue_ids": [],
+        "id": "c28109f279dc4cb6b112a4e09b754bc8",
+        "kind": "spec_refine",
+        "reason": "Expand one source-grounded implementation surface",
+        "trigger": "surface:compactLogsWithTrailing and removeOldLogs",
+        "activity_classes": [],
+        "target_ids": [],
+        "target_versions": {},
+        "unit_id": null,
+        "model_id": null,
+        "requests": [
+          {
+            "file": "snapshot.go",
+            "start_line": 125,
+            "end_line": 278,
+            "reason": "Inspect compaction and removal implementations and their surrounding snapshot caller to identify deletion bounds, guards, errors, and the distinction between requesting deletion and completing it."
+          },
+          {
+            "file": "log.go",
+            "start_line": 1,
+            "end_line": 192,
+            "reason": "Inspect the log storage interface and any deletion or monotonic-storage contracts consumed by the focused helpers."
+          },
+          {
+            "file": "inmem_store.go",
+            "start_line": 1,
+            "end_line": 133,
+            "reason": "Inspect the built-in storage implementation's deletion semantics, boundary metadata updates, and synchronization."
+          },
+          {
+            "file": "log_cache.go",
+            "start_line": 1,
+            "end_line": 95,
+            "reason": "Inspect how the in-repository cache adapter delegates deletion and handles cached entries and failures."
+          }
+        ],
+        "status": "completed",
+        "stage": "done",
+        "added_material_ids": [
+          "snapshot.go:125:278",
+          "log.go:1:192",
+          "inmem_store.go:1:133",
+          "log_cache.go:1:95"
+        ],
+        "stop_reason": "",
+        "check_id": "5dc57b4ff11843d19cd163c8ff602316",
+        "unit_version": null,
+        "material_ids": [
+          "snapshot.go:125:278",
+          "log.go:1:192",
+          "inmem_store.go:1:133",
+          "log_cache.go:1:95"
+        ],
+        "superseded_by": null
+      },
+      {
+        "surface_entry_points": [],
+        "candidate_id": null,
+        "draft_path": "/home/nitro/Desktop/consensus-assurance/runs/2026-09-20_16-31-53-hashicorp_raft-real-run/audit-spec/v5.json",
+        "diagnostics": [
+          {
+            "code": "audit_spec_semantics",
+            "category": "semantic",
+            "object_ids": [
+              "A6",
+              "b_cache_delete_range",
+              "f_cache_clear_event"
+            ],
+            "material_ids": [
+              "log_cache.go:1:95",
+              "inmem_store.go:1:133"
+            ],
+            "message": "The inventory mentions concurrent cache fills without separately mapping their execution owner. Add distinct lookup and write behaviors: GetLog reads a cached pointer or delegates a miss without filling; StoreLogs completes its backend write before acquiring the cache lock and publishing pointers. Preserve this asynchronous boundary and the possibility of an already captured lookup pointer surviving invalidation. This reusable decomposition does not change the selected invalidation-event fact or the completed lookup-only disposition; write/delete applicability remains unresolved.",
+            "allowed": [
+              "read",
+              "semantic_revision"
+            ]
+          }
+        ],
+        "admitted": true,
+        "preparation_failures": 0,
+        "semantic_failures": 0,
+        "parent_task_id": null,
+        "child_task_ids": [],
+        "requested_aspects": {},
+        "expected_contribution": "",
+        "context_receipt_id": "9310f1ebc3be4435860fa772a514a3d6",
+        "context_dependencies": {},
+        "read_plan_id": null,
+        "repair_session": null,
+        "resolution_issue_ids": [],
+        "id": "cb97f9ad71534d24935d8f00d7bfbaa0",
+        "kind": "spec_refine",
+        "reason": "The inventory mentions concurrent cache fills without separately mapping their execution owner. Add distinct lookup and write behaviors: GetLog reads a cached pointer or delegates a miss without filling; StoreLogs completes its backend write before acquiring the cache lock and publishing pointers. Preserve this asynchronous boundary and the possibility of an already captured lookup pointer surviving invalidation. This reusable decomposition does not change the selected invalidation-event fact or the completed lookup-only disposition; write/delete applicability remains unresolved.",
+        "trigger": "be40509a36a14ceabd6a9d1b04212409:A6,b_cache_delete_range,f_cache_clear_event",
+        "activity_classes": [],
+        "target_ids": [
+          "A6",
+          "b_cache_delete_range",
+          "f_cache_clear_event"
+        ],
+        "target_versions": {},
+        "unit_id": null,
+        "model_id": null,
+        "requests": [],
+        "status": "completed",
+        "stage": "done",
+        "added_material_ids": [],
+        "stop_reason": "",
+        "check_id": "1437a9b051d8495db858614f0d03005b",
+        "unit_version": null,
+        "material_ids": [
+          "inmem_store.go:1:133",
+          "log_cache.go:1:95"
+        ],
+        "superseded_by": null
+      },
+      {
+        "surface_entry_points": [
+          "NewRaft, restoreSnapshot and runtime FSM restore"
+        ],
+        "candidate_id": null,
+        "draft_path": null,
+        "diagnostics": [],
+        "admitted": true,
+        "preparation_failures": 0,
+        "semantic_failures": 0,
+        "parent_task_id": null,
+        "child_task_ids": [],
+        "requested_aspects": {},
+        "expected_contribution": "",
+        "context_receipt_id": "1fd9065ebd1e4a6d8b20aaed2b6b39e8",
+        "context_dependencies": {},
+        "read_plan_id": "730977f085074c70b13286d5ba6ef952",
+        "repair_session": null,
+        "resolution_issue_ids": [],
+        "id": "63f0335214c2410289cb8f935c20dd36",
+        "kind": "spec_refine",
+        "reason": "Expand one source-grounded implementation surface",
+        "trigger": "surface:NewRaft, restoreSnapshot and runtime FSM restore",
+        "activity_classes": [],
+        "target_ids": [],
+        "target_versions": {},
+        "unit_id": null,
+        "model_id": null,
+        "requests": [
+          {
+            "file": "api.go",
+            "start_line": 500,
+            "end_line": 730,
+            "reason": "Inspect NewRaft initialization and restoreSnapshot, including snapshot selection, failure handling, recovered metadata, and worker startup ordering. The range extends beyond the supplied prior provenance to recover the restore implementation."
+          },
+          {
+            "file": "fsm.go",
+            "start_line": 1,
+            "end_line": 285,
+            "reason": "Inspect the FSM interface contract, runtime restore handling, serialization with application and snapshot work, completion signaling, and fsmRestoreAndMeasure. Distinguish invoking restoration from successful restoration and metadata advancement."
+          }
+        ],
+        "status": "completed",
+        "stage": "done",
+        "added_material_ids": [
+          "api.go:500:730",
+          "fsm.go:1:285"
+        ],
+        "stop_reason": "",
+        "check_id": "f5775ac65d8a4c60b7d3fbb25732b7d8",
+        "unit_version": null,
+        "material_ids": [
+          "api.go:500:730",
+          "fsm.go:1:285"
+        ],
+        "superseded_by": null
+      }
+    ],
+    "applied_operations": {
+      "reading-automatic-survey-1": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-09-20_16-31-53-hashicorp_raft-real-run/graph-commits/reading-automatic-survey-1.json"
+      },
+      "reading-initial-reading-1": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-09-20_16-31-53-hashicorp_raft-real-run/graph-commits/reading-initial-reading-1.json"
+      },
+      "reading-e6bd2e5c086d46dcbc967782cf0942c0-1": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-09-20_16-31-53-hashicorp_raft-real-run/graph-commits/reading-e6bd2e5c086d46dcbc967782cf0942c0-1.json"
+      },
+      "inquiry-737db942b41b463d993d468ad49ecfd6": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-09-20_16-31-53-hashicorp_raft-real-run/graph-commits/inquiry-737db942b41b463d993d468ad49ecfd6.json"
+      },
+      "derive-a5a7b7e61dd64b02b563257213ee721f": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-09-20_16-31-53-hashicorp_raft-real-run/graph-commits/derive-a5a7b7e61dd64b02b563257213ee721f.json"
+      },
+      "reading-15dd75bcc7a94d4f889f445c78933a62-1": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-09-20_16-31-53-hashicorp_raft-real-run/graph-commits/reading-15dd75bcc7a94d4f889f445c78933a62-1.json"
+      },
+      "derive-47a54cc484774e03867ef8709956aa88": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-09-20_16-31-53-hashicorp_raft-real-run/graph-commits/derive-47a54cc484774e03867ef8709956aa88.json"
+      },
+      "reading-8a34fe6280c841bc93d4843d00201ad6-1": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-09-20_16-31-53-hashicorp_raft-real-run/graph-commits/reading-8a34fe6280c841bc93d4843d00201ad6-1.json"
+      },
+      "derive-85559a22f0174d46ade60cf63b082553": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-09-20_16-31-53-hashicorp_raft-real-run/graph-commits/derive-85559a22f0174d46ade60cf63b082553.json"
+      },
+      "reading-ca2dc8863544477190a9b9e42454b04a-1": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-09-20_16-31-53-hashicorp_raft-real-run/graph-commits/reading-ca2dc8863544477190a9b9e42454b04a-1.json"
+      },
+      "derive-5751a79d184348d9914a618781ae1bf4": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-09-20_16-31-53-hashicorp_raft-real-run/graph-commits/derive-5751a79d184348d9914a618781ae1bf4.json"
+      },
+      "inquiry-fdebd0871cd1413eb8f9cc7b6cfe2a4d": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-09-20_16-31-53-hashicorp_raft-real-run/graph-commits/inquiry-fdebd0871cd1413eb8f9cc7b6cfe2a4d.json"
+      },
+      "inquiry-c3f4ef5bee6d40f3bce0aaed836f9446": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-09-20_16-31-53-hashicorp_raft-real-run/graph-commits/inquiry-c3f4ef5bee6d40f3bce0aaed836f9446.json"
+      },
+      "reading-d8b3ee19177f4fbf8564184334e71b82-1": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-09-20_16-31-53-hashicorp_raft-real-run/graph-commits/reading-d8b3ee19177f4fbf8564184334e71b82-1.json"
+      },
+      "inquiry-5dc57b4ff11843d19cd163c8ff602316": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-09-20_16-31-53-hashicorp_raft-real-run/graph-commits/inquiry-5dc57b4ff11843d19cd163c8ff602316.json"
+      },
+      "derive-1bac66b356e940f5bc9f169a92bfc7bb": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-09-20_16-31-53-hashicorp_raft-real-run/graph-commits/derive-1bac66b356e940f5bc9f169a92bfc7bb.json"
+      },
+      "reading-28a5228fb5ef4eaa83bb4c34b53be37f-1": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-09-20_16-31-53-hashicorp_raft-real-run/graph-commits/reading-28a5228fb5ef4eaa83bb4c34b53be37f-1.json"
+      },
+      "derive-be40509a36a14ceabd6a9d1b04212409": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-09-20_16-31-53-hashicorp_raft-real-run/graph-commits/derive-be40509a36a14ceabd6a9d1b04212409.json"
+      },
+      "inquiry-1437a9b051d8495db858614f0d03005b": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-09-20_16-31-53-hashicorp_raft-real-run/graph-commits/inquiry-1437a9b051d8495db858614f0d03005b.json"
+      },
+      "reading-730977f085074c70b13286d5ba6ef952-1": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-09-20_16-31-53-hashicorp_raft-real-run/graph-commits/reading-730977f085074c70b13286d5ba6ef952-1.json"
+      },
+      "inquiry-f5775ac65d8a4c60b7d3fbb25732b7d8": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-09-20_16-31-53-hashicorp_raft-real-run/graph-commits/inquiry-f5775ac65d8a4c60b7d3fbb25732b7d8.json"
+      },
+      "derive-31173bab9c04464ea7f8963fcd70c934": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-09-20_16-31-53-hashicorp_raft-real-run/graph-commits/derive-31173bab9c04464ea7f8963fcd70c934.json"
+      },
+      "reading-8bff2be28c9d49a9b86ae7574b23fde1-1": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-09-20_16-31-53-hashicorp_raft-real-run/graph-commits/reading-8bff2be28c9d49a9b86ae7574b23fde1-1.json"
+      },
+      "derive-fcf213c831324a80a8e43e578195bf0a": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-09-20_16-31-53-hashicorp_raft-real-run/graph-commits/derive-fcf213c831324a80a8e43e578195bf0a.json"
+      },
+      "reading-0a8e22dafcf04876a0ae6b1ab901890d-1": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-09-20_16-31-53-hashicorp_raft-real-run/graph-commits/reading-0a8e22dafcf04876a0ae6b1ab901890d-1.json"
+      }
+    }
+  },
+  "after": {
+    "question_candidates": [
+      {
+        "id": "b3042e8bbbb24408943079f7e046dbd5",
+        "question": {
+          "disposition": "needs_specific_evidence",
+          "preferred_check": "source_review",
+          "requests": [],
+          "question": "When reclamation consumes file_snapshot_metadata_eligible, must it preserve an openable fallback if retained metadata-eligible snapshots cannot be opened? The publication sequence is now known, but whether a permitted storage failure can leave an unusable retained prefix after older snapshots are reclaimed, and whether the applicable contract requires tolerating that failure, remain unresolved.",
+          "importance": "If all snapshots returned by List are unusable, startup with snapshot restoration enabled returns an error. Reclamation may already have deleted older readable snapshots. This creates a potential recovery availability consequence, but neither a supported failure history nor a violated preservation guarantee has been established.",
+          "source_ids": [
+            "file_snapshot.go:1:159",
+            "file_snapshot.go:160:396",
+            "file_snapshot.go:397:500",
+            "file_snapshot.go:501:551",
+            "snapshot.go:1:100",
+            "api.go:600:760"
+          ],
+          "participants": [
+            "Caller executing FileSnapshotStore.ReapSnapshots",
+            "Caller executing FileSnapshotSink.Close",
+            "Caller executing FileSnapshotStore.Open",
+            "Initialization caller executing Raft.restoreSnapshot"
+          ],
+          "objects": [
+            "Snapshot metadata",
+            "Snapshot state files",
+            "Retention prefix",
+            "Snapshot directories",
+            "Startup snapshot list"
+          ],
+          "contexts": [
+            "FileSnapshotStore retention reclamation",
+            "First Close reaching reclamation",
+            "Startup with NoSnapshotRestoreOnStart false",
+            "Storage failure and concurrency contracts remain unspecified"
+          ],
+          "event_paths": [
+            "getSnapshots -> metadata ordering -> ReapSnapshots -> removal beyond retained prefix",
+            "Close -> finalize -> writeMeta -> Rename -> conditional parent-directory Sync -> ReapSnapshots",
+            "restoreSnapshot -> List -> tryRestoreSingleSnapshot -> Open -> retry next listed entry on failure",
+            "restoreSnapshot -> nonempty list exhausted without successful restoration -> error"
+          ],
+          "activity_classes": [
+            "A6",
+            "A3"
+          ],
+          "behavior_ids": [
+            "file_snapshot_discover",
+            "file_snapshot_reap",
+            "file_snapshot_open",
+            "file_snapshot_close_first"
+          ],
+          "fact_ids": [
+            "file_snapshot_metadata_eligible"
+          ],
+          "obligation_relation_kind": "consumption",
+          "counterevidence": [
+            "Discovery excludes temporary directories, unreadable or undecodable metadata, and unsupported versions.",
+            "Finalization checks buffered Flush, enabled state-file Sync, state-file Close and Stat before recording size and CRC. These errors prevent that Close invocation from reaching reclamation.",
+            "writeMeta checks file creation, JSON encoding, buffered Flush and enabled metadata-file Sync before returning nil. Close requires this result before rename and automatic reclamation.",
+            "After rename, enabled non-Windows parent-directory synchronization must succeed before that Close invocation reaches reclamation.",
+            "Open reads the state file, validates its CRC and rewinds the handle before returning it. Startup retries another listed snapshot after Open or FSM restoration failure.",
+            "NoSnapshotRestoreOnStart bypasses Open and FSM restoration; the described startup failure requires restoration to be enabled.",
+            "Constructor comments require retain >= 1, and the interface describes available snapshots, but neither explicitly promises retention of a corruption-tolerant fallback.",
+            "The private noSync field is documented as testing-only; it does not establish an ordinary production configuration that disables synchronization.",
+            "writeMeta ignores its deferred metadata-file Close result, unlike finalize's checked state-file Close. The supplied evidence does not establish that a close-only error after successful Sync permits loss of the retained snapshot.",
+            "The observed sequence synchronizes files and the parent directory but does not explicitly synchronize the snapshot directory itself. Its crash consequence depends on filesystem guarantees absent from the supplied materials."
+          ],
+          "unknowns": [
+            "Whether the applicable storage and recovery contract requires an openable fallback under corruption, read failures or partial persistence, and which component owns that guarantee.",
+            "A justified crash or interference history that leaves the retained prefix unusable while an older snapshot would remain readable.",
+            "The selected platform and filesystem guarantees for file Sync, snapshot-directory entries, rename, parent-directory Sync and delayed Close errors.",
+            "Caller serialization and permitted concurrent access among explicit reclamation, creation and readers.",
+            "The concrete retention count and deployed store configuration.",
+            "Caller-level handling of startup restoration failure and any broader recovery procedure outside the attached restoration routine."
+          ],
+          "priority": 3,
+          "trigger_rationale": "The requested metadata-publication discriminator is resolved: encoding, Flush and enabled Sync errors stop publication, while deferred metadata Close errors are ignored. These observations narrow possible failure histories without establishing their legality or an applicable fallback requirement. The candidate therefore remains evidence-blocked."
+        },
+        "history": [
+          {
+            "disposition": null,
+            "preferred_check": "source_review",
+            "requests": [
+              {
+                "file": "file_snapshot.go",
+                "start_line": 160,
+                "end_line": 396,
+                "reason": "Inspect metadata discovery, Open validation and retention selection to determine whether reclamation consumes metadata eligibility as evidence of recoverability."
+              },
+              {
+                "file": "file_snapshot.go",
+                "start_line": 397,
+                "end_line": 500,
+                "reason": "Inspect the Close-to-reclamation path and its error branches for protections establishing usable replacement snapshots before older snapshots are removed."
+              }
+            ],
+            "question": "When retention reclamation consumes file_snapshot_metadata_eligible, can an entry whose state fails Open validation displace an older readable snapshot, or does publication or reclamation establish a stronger replacement guarantee before deletion?",
+            "importance": "If retention removes readable recovery evidence while retaining unusable replacements, restart recovery could lose an available snapshot fallback. Whether this scenario is permitted and whether retained logs or other snapshots mitigate its consequence remain unresolved.",
+            "source_ids": [],
+            "participants": [
+              "Caller executing FileSnapshotStore.ReapSnapshots",
+              "Caller executing FileSnapshotSink.Close",
+              "Caller executing FileSnapshotStore.Open"
+            ],
+            "objects": [
+              "Snapshot metadata",
+              "Snapshot state files",
+              "Retention ordering",
+              "Snapshot directories"
+            ],
+            "contexts": [
+              "FileSnapshotStore retention reclamation",
+              "First Close reaching reclamation",
+              "Listed snapshot with state that fails Open validation; reachability and fault applicability remain unestablished"
+            ],
+            "event_paths": [
+              "getSnapshots -> ReapSnapshots -> retention deletion",
+              "FileSnapshotSink.Close -> publication steps -> ReapSnapshots",
+              "FileSnapshotStore.Open -> state validation"
+            ],
+            "activity_classes": [
+              "A6",
+              "A3"
+            ],
+            "behavior_ids": [
+              "file_snapshot_discover",
+              "file_snapshot_reap",
+              "file_snapshot_open",
+              "file_snapshot_close_first"
+            ],
+            "fact_ids": [
+              "file_snapshot_metadata_eligible"
+            ],
+            "obligation_relation_kind": "consumption",
+            "counterevidence": [
+              "The provisional inventory describes temporary-directory exclusion and finalized metadata before publication; these may prevent incomplete writes from entering retention selection.",
+              "The provisional inventory describes CRC validation in Open, which may reject unusable snapshots at recovery time but does not itself establish retention safety.",
+              "No attached source currently verifies these protections or their applicability."
+            ],
+            "unknowns": [
+              "Whether retention validates state contents or relies solely on metadata eligibility.",
+              "Whether every relevant reclamation invocation follows successful publication of a readable replacement.",
+              "Which error or permitted interference scenarios can produce metadata-eligible entries that fail Open.",
+              "What recovery guarantees and storage fault assumptions apply to retention.",
+              "Whether recovery can use other snapshots or retained logs after the hypothesized deletion."
+            ],
+            "priority": 3,
+            "trigger_rationale": "The accepted inventory distinguishes metadata eligibility from successful state validation and identifies reclamation as a consumer of the weaker fact. This supports a focused cross-path comparison, but does not establish a defect or an applicable recovery obligation."
+          },
+          {
+            "disposition": null,
+            "preferred_check": "source_review",
+            "requests": [
+              {
+                "file": "snapshot.go",
+                "start_line": 1,
+                "end_line": 100,
+                "reason": "Inspect snapshot interface contracts for what List availability and successful snapshot publication promise, keeping interface expectations distinct from file-store behavior."
+              },
+              {
+                "file": "api.go",
+                "start_line": 600,
+                "end_line": 760,
+                "reason": "Inspect the startup snapshot restoration consumer and surrounding initialization to establish fallback handling when a listed snapshot fails Open and locate any remaining recovery dependency."
+              },
+              {
+                "file": "file_snapshot.go",
+                "start_line": 1,
+                "end_line": 159,
+                "reason": "Inspect file-store retention documentation, constructor constraints and configuration boundaries for an applicable retention guarantee and storage assumptions."
+              }
+            ],
+            "question": "When reclamation consumes file_snapshot_metadata_eligible, does the applicable retention or recovery contract require preserving an openable fallback if a higher-ranked eligible entry fails Open? The observed reaper permits displacement without state validation; the remaining discriminator is whether that scenario lies within a claimed recovery guarantee and permitted fault context.",
+            "importance": "An unusable retained prefix could cause deletion of an older readable snapshot and reduce startup recovery options. Actual recovery failure depends on the restoration consumer, remaining recovery evidence and applicable storage fault assumptions; none is established by the observed retention behavior alone.",
+            "source_ids": [
+              "file_snapshot.go:160:396",
+              "file_snapshot.go:397:500"
+            ],
+            "participants": [
+              "Caller executing FileSnapshotStore.ReapSnapshots",
+              "Caller executing FileSnapshotSink.Close",
+              "Caller executing FileSnapshotStore.Open"
+            ],
+            "objects": [
+              "Snapshot metadata",
+              "Snapshot state files",
+              "Retention ordering",
+              "Snapshot directories"
+            ],
+            "contexts": [
+              "FileSnapshotStore retention reclamation",
+              "First Close reaching reclamation",
+              "A higher-ranked metadata-eligible entry whose state fails Open; legal reachability and fault applicability remain unresolved"
+            ],
+            "event_paths": [
+              "getSnapshots -> ReapSnapshots -> removal beyond retained prefix",
+              "FileSnapshotSink.Close -> finalize -> writeMeta -> Rename -> conditional parent Sync -> ReapSnapshots",
+              "FileSnapshotStore.Open -> state read -> CRC comparison -> rewind"
+            ],
+            "activity_classes": [
+              "A6",
+              "A3"
+            ],
+            "behavior_ids": [
+              "file_snapshot_discover",
+              "file_snapshot_reap",
+              "file_snapshot_open",
+              "file_snapshot_close_first"
+            ],
+            "fact_ids": [
+              "file_snapshot_metadata_eligible"
+            ],
+            "obligation_relation_kind": "consumption",
+            "counterevidence": [
+              "getSnapshots excludes temporary directories and skips metadata decoding failures and unsupported versions.",
+              "The first Close reaches automatic reclamation only after finalize, writeMeta and Rename succeed, and after parent-directory Sync succeeds when enabled on non-Windows platforms.",
+              "finalize checks buffered Flush, enabled state Sync, file Close and Stat before recording size and CRC; errors prevent that Close invocation from reaching reclamation.",
+              "Open independently reads the state file, rejects CRC disagreement and requires a successful rewind before returning its reader. This protects that read boundary but is not invoked by retention selection.",
+              "Normal publication includes protections against exposing unfinished construction. The supplied source does not establish a permitted execution that defeats those protections and leaves every retained replacement unusable."
+            ],
+            "unknowns": [
+              "Whether the snapshot interfaces or file-store documentation promise an openable retained fallback under state corruption, read failures or partial persistence.",
+              "Which permitted fault or interference history can produce a higher-ranked metadata-eligible entry that fails Open while an older entry remains readable.",
+              "Which caller serialization and storage assumptions apply to explicit ReapSnapshots calls and automatic reclamation.",
+              "Whether startup tries other listed snapshots after Open failure, and whether remaining logs or other recovery mechanisms can compensate.",
+              "The implementation of writeMeta is not attached; its successful return cannot yet be interpreted as a verified metadata durability guarantee.",
+              "The configured retention count, synchronization setting and platform for a concrete check remain unspecified."
+            ],
+            "priority": 3,
+            "trigger_rationale": "Cross-path review resolves the implementation discriminator: discovery reads metadata only, reclamation deletes beyond its ordered prefix without Open, and Open performs separate state validation. Given an unusable entry in that prefix, reclamation does not distinguish it from a usable one. Publication protections materially constrain how that state could arise, so contract and recovery-consumer evidence are needed before deriving an obligation."
+          },
+          {
+            "disposition": "needs_specific_evidence",
+            "preferred_check": "source_review",
+            "requests": [
+              {
+                "file": "file_snapshot.go",
+                "start_line": 501,
+                "end_line": 551,
+                "reason": "Inspect writeMeta and the remaining ordering implementation to complete the publication dependency: determine which metadata persistence operations precede rename and reclamation, and whether their error handling supports or rules out a crash-related unusable retained entry."
+              }
+            ],
+            "question": "When reclamation consumes file_snapshot_metadata_eligible, does the applicable retention or recovery contract require preserving an openable fallback if a retained eligible entry fails Open? Startup retries only the entries returned by List, and fails if that nonempty list has no restorable entry when snapshot restoration is enabled. The remaining discriminator is whether an unusable retained prefix can arise within the supported publication and storage fault contract.",
+            "importance": "Reclamation can remove older snapshots outside the retained metadata prefix. If every listed replacement is unusable, the observed restoration routine returns an error despite any formerly readable older snapshot. Establishing an implementation violation still requires a permitted failure history and an applicable preservation guarantee.",
+            "source_ids": [
+              "file_snapshot.go:1:159",
+              "file_snapshot.go:160:396",
+              "file_snapshot.go:397:500",
+              "snapshot.go:1:100",
+              "api.go:600:760"
+            ],
+            "participants": [
+              "Caller executing FileSnapshotStore.ReapSnapshots",
+              "Caller executing FileSnapshotSink.Close",
+              "Caller executing FileSnapshotStore.Open",
+              "Initialization caller executing Raft.restoreSnapshot"
+            ],
+            "objects": [
+              "Snapshot metadata",
+              "Snapshot state files",
+              "Retention prefix",
+              "Snapshot directories",
+              "Startup snapshot list"
+            ],
+            "contexts": [
+              "FileSnapshotStore retention reclamation",
+              "First Close reaching reclamation",
+              "Startup with NoSnapshotRestoreOnStart false",
+              "A metadata-eligible retained entry whose state fails Open; fault applicability remains unresolved"
+            ],
+            "event_paths": [
+              "getSnapshots -> ReapSnapshots -> removal beyond retained prefix",
+              "FileSnapshotSink.Close -> finalize -> writeMeta -> Rename -> conditional parent Sync -> ReapSnapshots",
+              "restoreSnapshot -> List -> tryRestoreSingleSnapshot -> Open -> retry next listed entry on failure",
+              "restoreSnapshot -> nonempty list exhausted without successful restoration -> error"
+            ],
+            "activity_classes": [
+              "A6",
+              "A3"
+            ],
+            "behavior_ids": [
+              "file_snapshot_discover",
+              "file_snapshot_reap",
+              "file_snapshot_open",
+              "file_snapshot_close_first"
+            ],
+            "fact_ids": [
+              "file_snapshot_metadata_eligible"
+            ],
+            "obligation_relation_kind": "consumption",
+            "counterevidence": [
+              "Discovery excludes temporary directories, metadata decoding failures and unsupported versions.",
+              "Automatic reclamation follows successful finalization, writeMeta and rename, plus successful parent-directory synchronization when enabled on non-Windows platforms.",
+              "Finalization checks buffered Flush, enabled state Sync, file Close and Stat before recording size and CRC; errors prevent that invocation from reaching reclamation.",
+              "Open validates the state checksum and rewinds the reader before returning it; metadata eligibility alone is not accepted as successful restoration.",
+              "Startup retries other listed entries after either Open or FSM restoration failure. This protects recovery when another listed entry remains restorable.",
+              "NoSnapshotRestoreOnStart bypasses Open and FSM restoration; the observed failure scenario is conditional on restoration being enabled.",
+              "Constructor comments specify a retention count of at least one, but do not explicitly promise a corruption-tolerant fallback. SnapshotStore.List describes available snapshots without specifying tolerance of state corruption or read failures.",
+              "The private noSync field is documented as testing-only and as skipping crash-safe fsync calls. Its existence does not establish an ordinary production configuration permitting synchronization to be disabled."
+            ],
+            "unknowns": [
+              "Whether the applicable storage and recovery contract requires an openable fallback under corruption, read failures or partial persistence.",
+              "Which permitted crash or interference history can produce an unusable retained prefix while an older snapshot remains readable.",
+              "The actual writeMeta persistence sequence and error handling are not attached.",
+              "Caller serialization and concurrent access assumptions for explicit reclamation, creation and readers remain unresolved.",
+              "The concrete retention count, platform and filesystem persistence semantics remain unspecified.",
+              "The restoration routine does not attempt log-only recovery after exhausting a nonempty snapshot list; caller-level error handling and any broader recovery procedure remain outside the attached range."
+            ],
+            "priority": 3,
+            "trigger_rationale": "The consumer discriminator is now resolved: failed Open does not immediately terminate the loop, but fallback is confined to List's retained prefix. The interface and constructor comments do not establish the stronger corruption-tolerant retention requirement. Completing the exact missing metadata publication dependency is justified before deciding whether a supported crash scenario exists or the candidate remains contract-blocked."
+          }
+        ],
+        "check_ids": [
+          "a5a7b7e61dd64b02b563257213ee721f",
+          "47a54cc484774e03867ef8709956aa88",
+          "85559a22f0174d46ade60cf63b082553",
+          "5751a79d184348d9914a618781ae1bf4"
+        ],
+        "status": "blocked",
+        "stage": "analyze",
+        "read_plan_id": "ca2dc8863544477190a9b9e42454b04a",
+        "material_ids": [
+          "file_snapshot.go:160:396",
+          "file_snapshot.go:397:500",
+          "snapshot.go:1:100",
+          "api.go:600:760",
+          "file_snapshot.go:1:159",
+          "file_snapshot.go:501:551"
+        ],
+        "spec_task_ids": [],
+        "stagnation": 0,
+        "stop_reason": "Continue the same metadata-eligibility consumption question and stop provisionally with its contract gap visible. The complete publication code supplies significant protections but cannot establish the missing storage fault contract. No exact next repository range is identified as assigning corruption-tolerant retention responsibility or specifying the needed filesystem semantics. An injected corruption test would demonstrate conditional behavior without resolving applicability, so no obligation or execution check is justified yet.",
+        "obligation_id": null
+      },
+      {
+        "id": "e37681d1e571460d9a427f20a55e9f85",
+        "question": {
+          "disposition": "explained_by_existing_mechanism",
+          "preferred_check": "source_review",
+          "requests": [],
+          "question": "For LogCache wrapping InmemStore, can an overlapping GetLog repopulate an invalidated slot and cause a lookup begun after successful DeleteRange to return the deleted entry, in the absence of overlapping or subsequent writes?",
+          "importance": "Stale post-deletion lookup results could misrepresent retained history to protocol consumers. This review addresses only the proposed lookup-driven cache refill; consensus and recovery consequences require separate consumer evidence.",
+          "source_ids": [
+            "log_cache.go:1:95",
+            "inmem_store.go:1:133",
+            "log.go:1:192"
+          ],
+          "participants": [
+            "LogCache deletion caller",
+            "Concurrent LogCache lookup caller",
+            "InmemStore backing adapter"
+          ],
+          "objects": [
+            "LogCache slots",
+            "Requested deletion range",
+            "Backing log entries"
+          ],
+          "contexts": [
+            "LogCache wrapping InmemStore; deployment selection remains unknown",
+            "Concurrent lookup and deletion without crash",
+            "Ordered deletion bounds for which the uint64 deletion loop terminates",
+            "No overlapping or subsequent StoreLog or StoreLogs operation, direct backend reinsertion, or external mutation of stored Log objects",
+            "The discriminating lookup begins after DeleteRange returns successfully"
+          ],
+          "event_paths": [
+            "DeleteRange replaces the cache slice under its exclusive lock, unlocks, then delegates backend deletion.",
+            "An overlapping GetLog may return a previously captured cache entry or read the backend before deletion, but neither path writes a cache slot.",
+            "After successful backend deletion, a newly begun lookup encounters an empty cache slot and InmemStore.GetLog returns ErrLogNotFound for the deleted index under the stated scope."
+          ],
+          "activity_classes": [
+            "A6"
+          ],
+          "behavior_ids": [
+            "b_cache_delete_range",
+            "b_inmem_delete_range"
+          ],
+          "fact_ids": [
+            "f_cache_clear_event"
+          ],
+          "obligation_relation_kind": "consumption",
+          "counterevidence": [
+            "LogCache.GetLog only reads the cache and forwards misses directly to the backend; it never refills the cache. The proposed lookup-driven refill step has no implementation.",
+            "LogCache.DeleteRange replaces all slots while holding the cache lock. A lookup beginning after successful deletion cannot capture an entry from the replaced slice.",
+            "InmemStore.GetLog and DeleteRange use the same RWMutex. Successful terminating deletion removes the requested keys before returning.",
+            "An already overlapping lookup can return an old entry after deletion by retaining a previously captured pointer. This does not establish stale behavior for a lookup begun after deletion.",
+            "StoreLogs, unlike GetLog, populates cache slots after backend success using a separate cache critical section. The explanation does not cover overlapping writes.",
+            "The selected fact describes an invalidation event only; it does not promise continued cache emptiness or backend deletion completion."
+          ],
+          "unknowns": [
+            "The attached LogStore interface does not specify a general concurrent-operation consistency contract.",
+            "Actual deployment selection of this adapter composition remains unknown; InmemStore is explicitly designated for testing.",
+            "Caller serialization and the applicability of overlapping StoreLogs and DeleteRange remain unestablished.",
+            "Protocol consumers and broader consequences of stale entries from other schedules remain unmapped."
+          ],
+          "priority": 3,
+          "trigger_rationale": "Comparing lookup and write paths resolves the selected discriminator: cache population belongs to StoreLogs, while GetLog misses do not populate the cache. Separate cache and backend critical sections therefore do not enable the proposed lookup-only refill schedule."
+        },
+        "history": [
+          {
+            "disposition": null,
+            "preferred_check": "source_review",
+            "requests": [
+              {
+                "file": "log_cache.go",
+                "start_line": 1,
+                "end_line": 95,
+                "reason": "Inspect deletion, lookup, cache refill and locking together to determine whether a concurrent lookup can repopulate an invalidated slot before backend deletion completes."
+              },
+              {
+                "file": "inmem_store.go",
+                "start_line": 1,
+                "end_line": 133,
+                "reason": "Inspect the built-in backing store's lookup and deletion synchronization to assess whether the proposed interleaving is possible for this concrete adapter composition."
+              },
+              {
+                "file": "log.go",
+                "start_line": 1,
+                "end_line": 192,
+                "reason": "Recover the LogStore lookup, deletion and concurrency contracts before attributing any requirement to cache invalidation."
+              }
+            ],
+            "question": "When LogCache uses the built-in InmemStore, can a concurrent lookup refill a slot after the recorded cache-clear event but before backend deletion, allowing a lookup started after successful deletion to return a deleted entry, or does synchronization or later validation prevent this?",
+            "importance": "If cache invalidation is consumed as assurance that subsequent reads reflect completed deletion, stale entries could affect protocol consumers of retained history. The bounded consequence is inconsistent post-deletion lookup behavior; any effect on consensus or recovery requires additional consumer evidence.",
+            "source_ids": [],
+            "participants": [
+              "LogCache deletion caller",
+              "Concurrent LogCache lookup caller",
+              "InmemStore backing adapter"
+            ],
+            "objects": [
+              "LogCache slots",
+              "Requested deletion range",
+              "Backing log entries"
+            ],
+            "contexts": [
+              "Caller-selected LogCache wrapping InmemStore; actual deployment selection is unknown",
+              "Concurrent lookup and deletion without crash",
+              "A subsequent lookup begins after DeleteRange returns successfully"
+            ],
+            "event_paths": [
+              "Candidate schedule to inspect: cache clear → concurrent backing lookup and cache refill → backing deletion completes → subsequent cached lookup"
+            ],
+            "activity_classes": [
+              "A6"
+            ],
+            "behavior_ids": [
+              "b_cache_delete_range",
+              "b_inmem_delete_range"
+            ],
+            "fact_ids": [
+              "f_cache_clear_event"
+            ],
+            "obligation_relation_kind": "consumption",
+            "counterevidence": [
+              "The accepted inventory describes cache clearing under a lock, which may participate in a wider synchronization mechanism; exact code is not currently attached.",
+              "The selected fact explicitly establishes an invalidation event, not continued cache emptiness or completed backend deletion.",
+              "The inventory describes exclusive locking during InmemStore deletion; whether this also prevents stale cache refill remains unread."
+            ],
+            "unknowns": [
+              "Whether cache locking spans the backend deletion call.",
+              "Whether lookups hold a cache lock across backing reads and refill.",
+              "Whether a generation check or another validation rejects results overlapping deletion.",
+              "What concurrent lookup and deletion behavior the LogStore contract requires.",
+              "Whether the concrete adapter composition is selected in any target deployment.",
+              "Which protocol consumers could encounter a stale post-deletion cache entry."
+            ],
+            "priority": 3,
+            "trigger_rationale": "The inventory separates cache invalidation from backend deletion. Comparing the deletion path with the lookup/refill path provides a concrete discriminator without treating the historical clear event as a stronger guarantee."
+          }
+        ],
+        "check_ids": [
+          "1bac66b356e940f5bc9f169a92bfc7bb",
+          "be40509a36a14ceabd6a9d1b04212409"
+        ],
+        "status": "explained",
+        "stage": "analyze",
+        "read_plan_id": "28a5228fb5ef4eaa83bb4c34b53be37f",
+        "material_ids": [
+          "log_cache.go:1:95",
+          "inmem_store.go:1:133",
+          "log.go:1:192"
+        ],
+        "spec_task_ids": [],
+        "stagnation": 0,
+        "stop_reason": "All requested ranges are attached, with no deferred receipt items. Source review explains the selected lookup-refill suspicion because GetLog has no cache write. This is a bounded source-grounded disposition, not execution evidence or overall correctness. Overlapping writes and already-started reads remain explicit limitations; they are not silently included in the explanation. No obligation or further reading is necessary to resolve this discriminator.",
+        "obligation_id": null
+      },
+      {
+        "id": "a4baad92835841ae9b99fb8c68304dd6",
+        "question": {
+          "disposition": "needs_specific_evidence",
+          "preferred_check": "source_review",
+          "requests": [
+            {
+              "file": "raft.go",
+              "start_line": 1750,
+              "end_line": 2050,
+              "reason": "Locate the InstallSnapshot handler referenced by processRPC and inspect its restoreFuture dispatch, restore-error handling, configuration adoption and completion ordering. Compare this network restoration path with restoreUserSnapshot's panic on restoration failure before deciding whether failed restoration can feed a later snapshot capture."
+            }
+          ],
+          "question": "When takeSnapshot consumes F_capture_returned after runtime restoration, does the network InstallSnapshot path prevent a failed, potentially state-changing Restore from being followed by publication under unchanged worker coordinates, as the user-restore path attempts through fatal error handling?",
+          "importance": "Publishing partially restored application state under old processing coordinates could make later recovery skip required history. Configuration mismatch and subsequent compaction could compound that consequence. No such execution or consequence has been established.",
+          "source_ids": [
+            "fsm.go:1:285",
+            "snapshot.go:125:278",
+            "raft.go:1000:1450"
+          ],
+          "participants": [
+            "runFSM worker",
+            "Raft.takeSnapshot execution owner",
+            "Raft.restoreUserSnapshot caller",
+            "Network InstallSnapshot handler",
+            "Raft.processLogs caller",
+            "Caller-supplied FSM"
+          ],
+          "objects": [
+            "reqSnapshotFuture",
+            "FSMSnapshot",
+            "Worker processing index and term",
+            "restoreFuture",
+            "Snapshot configuration metadata",
+            "fsmMutateCh"
+          ],
+          "contexts": [
+            "Single and batch FSM application variants",
+            "Snapshot capture and publication",
+            "User-requested runtime restoration",
+            "Network snapshot installation",
+            "Restore errors after possible application-state mutation"
+          ],
+          "event_paths": [
+            "processLogs -> ordered nonempty tuple batches -> runFSM -> snapshot capture",
+            "restoreUserSnapshot -> restoreFuture error -> caller panic",
+            "InstallSnapshot RPC -> unread restore handling -> possible subsequent capture -> takeSnapshot publication"
+          ],
+          "activity_classes": [
+            "A5",
+            "A6",
+            "A3",
+            "A4"
+          ],
+          "behavior_ids": [
+            "B_fsm_single",
+            "B_fsm_batch",
+            "B_snapshot_capture",
+            "B_take_snapshot",
+            "runtime_restore_fsm"
+          ],
+          "fact_ids": [
+            "F_capture_returned"
+          ],
+          "obligation_relation_kind": "consumption",
+          "counterevidence": [
+            "runFSM serializes application, Restore and Snapshot callbacks within one worker; their callback bodies do not interleave.",
+            "Successful restoration assigns worker coordinates from Open-returned metadata only after Restore returns nil.",
+            "restoreUserSnapshot explicitly panics on a restoreFuture error because the FSM may be in a bad state. Continued normal operation after that error cannot simply be assumed for this path.",
+            "restoreUserSnapshot rejects an outstanding configuration change, uses the current configuration and term, assigns an index greater than both the current and supplied indexes, and updates protocol positions only after successful restoration.",
+            "processLogs scans increasing indexes, appends only nonnil prepared tuples and dispatches only nonempty batches. This resolves the local empty-batch concern, but does not establish all caller ordering across restoration.",
+            "prepareLog filters no-ops and deprecated configuration entries and forwards LogConfiguration only for protocolVersion greater than 2. Worker coordinates therefore need not advance for every committed entry.",
+            "The single worker path skips coordinate advancement for unsupported configuration callbacks; the batch path records the final tuple coordinate, including barriers. This difference alone does not establish invalid captured contents.",
+            "takeSnapshot rejects a capture older than the returned committed configuration index and checks Create, Persist and Close before updating snapshot coordinates and compacting.",
+            "FSM and FSMSnapshot interface comments assign snapshot contents and concurrent Apply compatibility to the application implementation; callback success does not independently establish content correctness."
+          ],
+          "unknowns": [
+            "The InstallSnapshot handler's restore request production, error handling and subsequent protocol behavior remain unread; the user-restore panic cannot be generalized to that path.",
+            "Whether a capture selected after a failed Restore can reach publication before any fatal handling or other protection takes effect.",
+            "How committed configuration advancement and configurationsFuture responses are ordered relative to tuple dispatch and restoration.",
+            "Whether all relevant processLogs callers serialize tuple production with restoration and prevent stale queued work from invalidating restored coordinates.",
+            "Whether the selected application implementation can partially mutate state before returning a Restore error, and whether captured objects remain valid during later Restore operations.",
+            "Which SnapshotStore implementation is selected and whether its metadata/content association and publication semantics support the proposed execution."
+          ],
+          "priority": 3,
+          "trigger_rationale": "The acquired range resolves two parts of the previous discriminator: processLogs constructs increasing, nonempty batches, and restoreUserSnapshot treats restore failure as fatal. However, processRPC exposes a distinct InstallSnapshot path whose completion policy is unread. Comparing that path is the smallest useful next step; the user-restore protection neither explains all runtime restoration nor establishes a defect."
+        },
+        "history": [
+          {
+            "disposition": "needs_specific_evidence",
+            "preferred_check": "source_review",
+            "requests": [
+              {
+                "file": "fsm.go",
+                "start_line": 1,
+                "end_line": 285,
+                "reason": "Inspect the FSM snapshot contract, single and batch position updates, restoration, and worker serialization to establish what coordinates accompany a successful capture."
+              },
+              {
+                "file": "snapshot.go",
+                "start_line": 125,
+                "end_line": 278,
+                "reason": "Inspect how takeSnapshot consumes the captured object and coordinates, selects configuration metadata, publishes recovery evidence, and initiates compaction."
+              }
+            ],
+            "question": "When takeSnapshot consumes F_capture_returned, what ensures that the captured object, processing coordinates, and selected configuration describe a compatible recovery point, including when single and batch application paths process filtered entries or restoration precedes capture?",
+            "importance": "If snapshot publication associates captured application state with incompatible recovery coordinates or configuration, subsequent recovery could skip required history or reconstruct the wrong participant context. Compaction could make that mismatch harder to recover from. These are conditional consequences to investigate, not observed failures.",
+            "source_ids": [],
+            "participants": [
+              "runFSM worker",
+              "Raft.takeSnapshot execution owner",
+              "Caller-supplied FSM"
+            ],
+            "objects": [
+              "reqSnapshotFuture",
+              "FSMSnapshot",
+              "Worker processing index and term",
+              "Snapshot configuration metadata"
+            ],
+            "contexts": [
+              "Single and batch FSM application variants",
+              "Snapshot capture and publication",
+              "Runtime restoration serialized with FSM work"
+            ],
+            "event_paths": [
+              "Application processing -> snapshot capture -> takeSnapshot metadata selection and publication",
+              "Runtime restoration -> subsequent snapshot capture"
+            ],
+            "activity_classes": [
+              "A5",
+              "A6",
+              "A3",
+              "A4"
+            ],
+            "behavior_ids": [
+              "B_fsm_single",
+              "B_fsm_batch",
+              "B_snapshot_capture",
+              "B_take_snapshot",
+              "runtime_restore_fsm"
+            ],
+            "fact_ids": [
+              "F_capture_returned"
+            ],
+            "obligation_relation_kind": "consumption",
+            "counterevidence": [
+              "The inventory describes one runFSM worker serializing application, restoration, and capture; exact source must establish the extent of this protection.",
+              "F_capture_returned explicitly establishes callback success and attached processing coordinates, without claiming persisted or recoverable contents.",
+              "Different treatment of entries in single and batch paths may be compatible with the snapshot contract; asymmetry alone would not establish a defect."
+            ],
+            "unknowns": [
+              "The exact FSM and FSMSnapshot contracts governing the relationship between captured state and processing coordinates.",
+              "How single and batch paths update processing coordinates for entries that do not invoke an application callback.",
+              "How takeSnapshot obtains and validates configuration metadata relative to the captured index.",
+              "Which publication and compaction guards prevent consumption of an unsuitable capture.",
+              "Whether restoration changes the coordinate-to-state relationship relevant to the next capture."
+            ],
+            "priority": 3,
+            "trigger_rationale": "The accepted inventory exposes related single and batch producers and a concrete snapshot consumer. Comparing their coordinate semantics offers a bounded discriminator: whether the consumer relies only on guarantees established by capture and its applicable callback contract."
+          },
+          {
+            "disposition": "needs_specific_evidence",
+            "preferred_check": "source_review",
+            "requests": [
+              {
+                "file": "raft.go",
+                "start_line": 1000,
+                "end_line": 1450,
+                "reason": "Locate and inspect runtime restore request production and error handling, committed-tuple dispatch, and configuration advancement near the inventoried appendConfigurationEntry declaration. Determine whether failed restoration permits subsequent capture and whether dispatched processing coordinates remain compatible with committed configuration metadata."
+              }
+            ],
+            "question": "When takeSnapshot consumes F_capture_returned, do runtime restore completion handling and committed-tuple production ensure that its processing coordinates still identify the captured state and a compatible committed configuration, especially after a Restore error?",
+            "importance": "Publishing application state under incompatible snapshot coordinates or configuration could cause recovery to skip required history or reconstruct an incorrect participant context. Subsequent compaction could remove recovery options. These are conditional consequences, not observed failures.",
+            "source_ids": [
+              "fsm.go:1:285",
+              "snapshot.go:125:278"
+            ],
+            "participants": [
+              "runFSM worker",
+              "Raft.takeSnapshot execution owner",
+              "Runtime restore request producer",
+              "Committed-tuple producer",
+              "Caller-supplied FSM"
+            ],
+            "objects": [
+              "reqSnapshotFuture",
+              "FSMSnapshot",
+              "Worker processing index and term",
+              "restoreFuture",
+              "Snapshot configuration metadata"
+            ],
+            "contexts": [
+              "Single and batch FSM application variants",
+              "Snapshot capture and publication",
+              "Successful and failed runtime restoration",
+              "Committed configuration selection after capture"
+            ],
+            "event_paths": [
+              "Committed-tuple dispatch -> single or batch processing -> snapshot capture -> configuration selection",
+              "Runtime Restore error -> producer error handling -> possible subsequent snapshot capture",
+              "Successful Restore -> metadata coordinate assignment -> subsequent snapshot capture"
+            ],
+            "activity_classes": [
+              "A5",
+              "A6",
+              "A3",
+              "A4"
+            ],
+            "behavior_ids": [
+              "B_fsm_single",
+              "B_fsm_batch",
+              "B_snapshot_capture",
+              "B_take_snapshot",
+              "runtime_restore_fsm"
+            ],
+            "fact_ids": [
+              "F_capture_returned"
+            ],
+            "obligation_relation_kind": "consumption",
+            "counterevidence": [
+              "The runFSM select loop executes application, restoration, and capture synchronously in one worker. These handlers cannot interleave within a callback.",
+              "The FSM contract assigns snapshot capture to the application implementation and explicitly requires snapshot methods to tolerate concurrent Apply calls. Callback success alone does not independently verify snapshot contents.",
+              "Single processing leaves coordinates unchanged for an unsupported configuration operation. Batch processing passes configurations to ApplyBatch and records the final input tuple coordinate, including filtered barriers. This asymmetry does not itself establish incompatible state.",
+              "Successful runtime restoration assigns coordinates from Open-returned metadata only after Restore returns nil.",
+              "takeSnapshot obtains committed configuration through a future and rejects a capture whose index precedes committedIndex.",
+              "takeSnapshot checks Create, Persist, and Close results before updating stable snapshot coordinates and compacting; compaction is bounded by the supplied snapshot index. These checks do not independently establish content correctness or concrete sink durability."
+            ],
+            "unknowns": [
+              "Whether runtime restore callers stop further processing, terminate execution, or otherwise repair application state after Restore returns an error. The worker leaves coordinates unchanged, but the interface supplies no rollback guarantee for application state.",
+              "Whether tuple production guarantees ordered, nonempty batches and preserves the coordinate-to-state relationship across runtime restoration.",
+              "How committed configuration advancement and configurationsFuture responses are ordered relative to tuple dispatch and restoration; the numerical index guard alone does not establish the complete relationship.",
+              "Whether the selected application implementation preserves captured contents during subsequent Apply or Restore operations.",
+              "Whether the selected SnapshotStore binds Open-returned metadata to the restored contents and provides the publication semantics relied upon by compaction."
+            ],
+            "priority": 3,
+            "trigger_rationale": "Source review resolves worker serialization and the visible single/batch coordinate rules. It also exposes a narrower discriminator: Restore can return an error after changing application state while the worker retains its previous coordinates and resumes its loop. The surrounding producer may provide a decisive protection, so its actual error handling must be inspected before deriving an obligation or concluding that incompatible capture is possible."
+          }
+        ],
+        "check_ids": [
+          "31173bab9c04464ea7f8963fcd70c934",
+          "fcf213c831324a80a8e43e578195bf0a",
+          "11878e5dc864464297097d17eca90ea8"
+        ],
+        "status": "active",
+        "stage": "read",
+        "read_plan_id": "130e86672fa142c48203b9ed78db17c5",
+        "material_ids": [
+          "fsm.go:1:285",
+          "snapshot.go:125:278",
+          "raft.go:1000:1450"
+        ],
+        "spec_task_ids": [],
+        "stagnation": 0,
+        "stop_reason": "",
+        "obligation_id": null
+      }
+    ],
+    "inquiry_tasks": [
+      {
+        "surface_entry_points": [],
+        "candidate_id": null,
+        "draft_path": null,
+        "diagnostics": [],
+        "admitted": false,
+        "preparation_failures": 0,
+        "semantic_failures": 0,
+        "parent_task_id": null,
+        "child_task_ids": [],
+        "requested_aspects": {},
+        "expected_contribution": "",
+        "context_receipt_id": null,
+        "context_dependencies": {},
+        "read_plan_id": null,
+        "repair_session": null,
+        "resolution_issue_ids": [],
+        "id": "b5c2e981d9564afcae0a9a57621372cc",
+        "kind": "spec_refine",
+        "reason": "Resolve decisive understanding gaps",
+        "trigger": "initial-reads",
+        "activity_classes": [],
+        "target_ids": [],
+        "target_versions": {},
+        "unit_id": null,
+        "model_id": null,
+        "requests": [
+          {
+            "file": "file_snapshot.go",
+            "start_line": 1,
+            "end_line": 210,
+            "reason": "Expand the snapshot publication frontier: recover constructor options, sink creation and metadata identity without assuming the active adapter."
+          },
+          {
+            "file": "file_snapshot.go",
+            "start_line": 211,
+            "end_line": 396,
+            "reason": "Recover snapshot listing, opening and retention consumers to distinguish publication, discoverability, validation and reclamation."
+          },
+          {
+            "file": "file_snapshot.go",
+            "start_line": 501,
+            "end_line": 551,
+            "reason": "Complete the called writeMeta implementation and its synchronization and error behavior."
+          },
+          {
+            "file": "api.go",
+            "start_line": 660,
+            "end_line": 740,
+            "reason": "Complete startup snapshot selection and inspect the restoration helper consuming retained snapshot evidence."
+          }
+        ],
+        "status": "pending",
+        "stage": "read",
+        "added_material_ids": [],
+        "stop_reason": "",
+        "check_id": null,
+        "unit_version": null,
+        "material_ids": [],
+        "superseded_by": null
+      },
+      {
+        "surface_entry_points": [
+          "FileSnapshotStore Create, List, Open and ReapSnapshots; FileSnapshotSink.writeMeta"
+        ],
+        "candidate_id": null,
+        "draft_path": null,
+        "diagnostics": [],
+        "admitted": true,
+        "preparation_failures": 0,
+        "semantic_failures": 0,
+        "parent_task_id": null,
+        "child_task_ids": [],
+        "requested_aspects": {},
+        "expected_contribution": "",
+        "context_receipt_id": "17c1cbb92d6844c99a0add9b32f6df9c",
+        "context_dependencies": {},
+        "read_plan_id": "e6bd2e5c086d46dcbc967782cf0942c0",
+        "repair_session": null,
+        "resolution_issue_ids": [],
+        "id": "f2210bd68ba84279babe303a0cc9f039",
+        "kind": "spec_refine",
+        "reason": "Expand one source-grounded implementation surface",
+        "trigger": "surface:FileSnapshotStore Create, List, Open and ReapSnapshots; FileSnapshotSink.writeMeta",
+        "activity_classes": [],
+        "target_ids": [],
+        "target_versions": {},
+        "unit_id": null,
+        "model_id": null,
+        "requests": [
+          {
+            "file": "file_snapshot.go",
+            "start_line": 1,
+            "end_line": 159,
+            "reason": "Read store and sink representations, file naming constants, constructor configuration and filesystem setup needed to interpret the focused snapshot lifecycle."
+          },
+          {
+            "file": "file_snapshot.go",
+            "start_line": 160,
+            "end_line": 396,
+            "reason": "Read Create, List, getSnapshots, readMeta, Open and ReapSnapshots to recover identity, discovery filters, validation, error branches and reclamation selection from actual code."
+          },
+          {
+            "file": "file_snapshot.go",
+            "start_line": 397,
+            "end_line": 551,
+            "reason": "Read sink completion, cancellation, metadata writing and directly connected helpers to distinguish snapshot construction, publication, persistence and cleanup, including partial failures."
+          }
+        ],
+        "status": "completed",
+        "stage": "done",
+        "added_material_ids": [
+          "file_snapshot.go:1:159",
+          "file_snapshot.go:160:396",
+          "file_snapshot.go:397:551"
+        ],
+        "stop_reason": "",
+        "check_id": "737db942b41b463d993d468ad49ecfd6",
+        "unit_version": null,
+        "material_ids": [
+          "file_snapshot.go:1:159",
+          "file_snapshot.go:160:396",
+          "file_snapshot.go:397:551"
+        ],
+        "superseded_by": null
+      },
+      {
+        "surface_entry_points": [],
+        "candidate_id": null,
+        "draft_path": "/home/nitro/Desktop/consensus-assurance/runs/2026-09-20_16-31-53-hashicorp_raft-real-run/audit-spec/v2.json",
+        "diagnostics": [
+          {
+            "code": "audit_spec_semantics",
+            "category": "semantic",
+            "object_ids": [
+              "A3",
+              "A6",
+              "file_snapshot_metadata_eligible",
+              "file_snapshot_open"
+            ],
+            "material_ids": [
+              "api.go:600:760",
+              "file_snapshot.go:160:396"
+            ],
+            "message": "The inventory leaves startup selection and Open consumers unread. The attached source now identifies initialization-owned restoration: List supplies candidates, Open or FSM restoration failure advances to another listed candidate, successful restoration precedes snapshot/application/configuration updates, and exhaustion of a nonempty list returns an error. NoSnapshotRestoreOnStart is a distinct bypass branch. Record these reusable consumer behaviors and boundaries without strengthening metadata eligibility into readability. This enrichment does not change the selected Fact's meaning or the remaining retention-contract discriminator.",
+            "allowed": [
+              "read",
+              "semantic_revision"
+            ]
+          }
+        ],
+        "admitted": true,
+        "preparation_failures": 0,
+        "semantic_failures": 0,
+        "parent_task_id": null,
+        "child_task_ids": [],
+        "requested_aspects": {},
+        "expected_contribution": "",
+        "context_receipt_id": "83d9ae768e364c098fe7cd0011ba2c5e",
+        "context_dependencies": {},
+        "read_plan_id": null,
+        "repair_session": null,
+        "resolution_issue_ids": [],
+        "id": "58df103f7991480ba5d5dbfaa7ff9d94",
+        "kind": "spec_refine",
+        "reason": "The inventory leaves startup selection and Open consumers unread. The attached source now identifies initialization-owned restoration: List supplies candidates, Open or FSM restoration failure advances to another listed candidate, successful restoration precedes snapshot/application/configuration updates, and exhaustion of a nonempty list returns an error. NoSnapshotRestoreOnStart is a distinct bypass branch. Record these reusable consumer behaviors and boundaries without strengthening metadata eligibility into readability. This enrichment does not change the selected Fact's meaning or the remaining retention-contract discriminator.",
+        "trigger": "85559a22f0174d46ade60cf63b082553:A3,A6,file_snapshot_metadata_eligible,file_snapshot_open",
+        "activity_classes": [],
+        "target_ids": [
+          "A3",
+          "A6",
+          "file_snapshot_metadata_eligible",
+          "file_snapshot_open"
+        ],
+        "target_versions": {},
+        "unit_id": null,
+        "model_id": null,
+        "requests": [],
+        "status": "completed",
+        "stage": "done",
+        "added_material_ids": [],
+        "stop_reason": "",
+        "check_id": "fdebd0871cd1413eb8f9cc7b6cfe2a4d",
+        "unit_version": null,
+        "material_ids": [
+          "file_snapshot.go:160:396",
+          "api.go:600:760"
+        ],
+        "superseded_by": null
+      },
+      {
+        "surface_entry_points": [],
+        "candidate_id": null,
+        "draft_path": "/home/nitro/Desktop/consensus-assurance/runs/2026-09-20_16-31-53-hashicorp_raft-real-run/audit-spec/v2.json",
+        "diagnostics": [
+          {
+            "code": "audit_spec_semantics",
+            "category": "semantic",
+            "object_ids": [
+              "A3",
+              "A6",
+              "file_snapshot_metadata_eligible",
+              "file_snapshot_open_crc_validated"
+            ],
+            "material_ids": [
+              "api.go:600:760",
+              "file_snapshot.go:160:396"
+            ],
+            "message": "The inventory still marks recovery consumers as unread. The attached startup code establishes a distinct initialization owner that consumes List's bounded metadata results, attempts Open and FSM restoration in order, retries failures, and errors after exhausting a nonempty list. NoSnapshotRestoreOnStart bypasses these attempts. Record these branches and appropriate consumer relationships without equating CRC validation with successful FSM restoration. This reusable omission does not change the current evidence-blocked disposition.",
+            "allowed": [
+              "read",
+              "semantic_revision"
+            ]
+          }
+        ],
+        "admitted": true,
+        "preparation_failures": 0,
+        "semantic_failures": 0,
+        "parent_task_id": null,
+        "child_task_ids": [],
+        "requested_aspects": {},
+        "expected_contribution": "",
+        "context_receipt_id": "87692a712bc84a2d9909e0e3f785fe80",
+        "context_dependencies": {},
+        "read_plan_id": null,
+        "repair_session": null,
+        "resolution_issue_ids": [],
+        "id": "f76d0428514f4d929ee1f340cfbb4b6d",
+        "kind": "spec_refine",
+        "reason": "The inventory still marks recovery consumers as unread. The attached startup code establishes a distinct initialization owner that consumes List's bounded metadata results, attempts Open and FSM restoration in order, retries failures, and errors after exhausting a nonempty list. NoSnapshotRestoreOnStart bypasses these attempts. Record these branches and appropriate consumer relationships without equating CRC validation with successful FSM restoration. This reusable omission does not change the current evidence-blocked disposition.",
+        "trigger": "5751a79d184348d9914a618781ae1bf4:A3,A6,file_snapshot_metadata_eligible,file_snapshot_open_crc_validated",
+        "activity_classes": [],
+        "target_ids": [
+          "A3",
+          "A6",
+          "file_snapshot_metadata_eligible",
+          "file_snapshot_open_crc_validated"
+        ],
+        "target_versions": {},
+        "unit_id": null,
+        "model_id": null,
+        "requests": [],
+        "status": "completed",
+        "stage": "done",
+        "added_material_ids": [],
+        "stop_reason": "",
+        "check_id": "c3f4ef5bee6d40f3bce0aaed836f9446",
+        "unit_version": null,
+        "material_ids": [
+          "file_snapshot.go:160:396",
+          "api.go:600:760"
+        ],
+        "superseded_by": null
+      },
+      {
+        "surface_entry_points": [
+          "compactLogsWithTrailing and removeOldLogs"
+        ],
+        "candidate_id": null,
+        "draft_path": null,
+        "diagnostics": [],
+        "admitted": true,
+        "preparation_failures": 0,
+        "semantic_failures": 0,
+        "parent_task_id": null,
+        "child_task_ids": [],
+        "requested_aspects": {},
+        "expected_contribution": "",
+        "context_receipt_id": "8a7fc587a543417e8d52b4d66d0cc188",
+        "context_dependencies": {},
+        "read_plan_id": "d8b3ee19177f4fbf8564184334e71b82",
+        "repair_session": null,
+        "resolution_issue_ids": [],
+        "id": "c28109f279dc4cb6b112a4e09b754bc8",
+        "kind": "spec_refine",
+        "reason": "Expand one source-grounded implementation surface",
+        "trigger": "surface:compactLogsWithTrailing and removeOldLogs",
+        "activity_classes": [],
+        "target_ids": [],
+        "target_versions": {},
+        "unit_id": null,
+        "model_id": null,
+        "requests": [
+          {
+            "file": "snapshot.go",
+            "start_line": 125,
+            "end_line": 278,
+            "reason": "Inspect compaction and removal implementations and their surrounding snapshot caller to identify deletion bounds, guards, errors, and the distinction between requesting deletion and completing it."
+          },
+          {
+            "file": "log.go",
+            "start_line": 1,
+            "end_line": 192,
+            "reason": "Inspect the log storage interface and any deletion or monotonic-storage contracts consumed by the focused helpers."
+          },
+          {
+            "file": "inmem_store.go",
+            "start_line": 1,
+            "end_line": 133,
+            "reason": "Inspect the built-in storage implementation's deletion semantics, boundary metadata updates, and synchronization."
+          },
+          {
+            "file": "log_cache.go",
+            "start_line": 1,
+            "end_line": 95,
+            "reason": "Inspect how the in-repository cache adapter delegates deletion and handles cached entries and failures."
+          }
+        ],
+        "status": "completed",
+        "stage": "done",
+        "added_material_ids": [
+          "snapshot.go:125:278",
+          "log.go:1:192",
+          "inmem_store.go:1:133",
+          "log_cache.go:1:95"
+        ],
+        "stop_reason": "",
+        "check_id": "5dc57b4ff11843d19cd163c8ff602316",
+        "unit_version": null,
+        "material_ids": [
+          "snapshot.go:125:278",
+          "log.go:1:192",
+          "inmem_store.go:1:133",
+          "log_cache.go:1:95"
+        ],
+        "superseded_by": null
+      },
+      {
+        "surface_entry_points": [],
+        "candidate_id": null,
+        "draft_path": "/home/nitro/Desktop/consensus-assurance/runs/2026-09-20_16-31-53-hashicorp_raft-real-run/audit-spec/v5.json",
+        "diagnostics": [
+          {
+            "code": "audit_spec_semantics",
+            "category": "semantic",
+            "object_ids": [
+              "A6",
+              "b_cache_delete_range",
+              "f_cache_clear_event"
+            ],
+            "material_ids": [
+              "log_cache.go:1:95",
+              "inmem_store.go:1:133"
+            ],
+            "message": "The inventory mentions concurrent cache fills without separately mapping their execution owner. Add distinct lookup and write behaviors: GetLog reads a cached pointer or delegates a miss without filling; StoreLogs completes its backend write before acquiring the cache lock and publishing pointers. Preserve this asynchronous boundary and the possibility of an already captured lookup pointer surviving invalidation. This reusable decomposition does not change the selected invalidation-event fact or the completed lookup-only disposition; write/delete applicability remains unresolved.",
+            "allowed": [
+              "read",
+              "semantic_revision"
+            ]
+          }
+        ],
+        "admitted": true,
+        "preparation_failures": 0,
+        "semantic_failures": 0,
+        "parent_task_id": null,
+        "child_task_ids": [],
+        "requested_aspects": {},
+        "expected_contribution": "",
+        "context_receipt_id": "9310f1ebc3be4435860fa772a514a3d6",
+        "context_dependencies": {},
+        "read_plan_id": null,
+        "repair_session": null,
+        "resolution_issue_ids": [],
+        "id": "cb97f9ad71534d24935d8f00d7bfbaa0",
+        "kind": "spec_refine",
+        "reason": "The inventory mentions concurrent cache fills without separately mapping their execution owner. Add distinct lookup and write behaviors: GetLog reads a cached pointer or delegates a miss without filling; StoreLogs completes its backend write before acquiring the cache lock and publishing pointers. Preserve this asynchronous boundary and the possibility of an already captured lookup pointer surviving invalidation. This reusable decomposition does not change the selected invalidation-event fact or the completed lookup-only disposition; write/delete applicability remains unresolved.",
+        "trigger": "be40509a36a14ceabd6a9d1b04212409:A6,b_cache_delete_range,f_cache_clear_event",
+        "activity_classes": [],
+        "target_ids": [
+          "A6",
+          "b_cache_delete_range",
+          "f_cache_clear_event"
+        ],
+        "target_versions": {},
+        "unit_id": null,
+        "model_id": null,
+        "requests": [],
+        "status": "completed",
+        "stage": "done",
+        "added_material_ids": [],
+        "stop_reason": "",
+        "check_id": "1437a9b051d8495db858614f0d03005b",
+        "unit_version": null,
+        "material_ids": [
+          "inmem_store.go:1:133",
+          "log_cache.go:1:95"
+        ],
+        "superseded_by": null
+      },
+      {
+        "surface_entry_points": [
+          "NewRaft, restoreSnapshot and runtime FSM restore"
+        ],
+        "candidate_id": null,
+        "draft_path": null,
+        "diagnostics": [],
+        "admitted": true,
+        "preparation_failures": 0,
+        "semantic_failures": 0,
+        "parent_task_id": null,
+        "child_task_ids": [],
+        "requested_aspects": {},
+        "expected_contribution": "",
+        "context_receipt_id": "1fd9065ebd1e4a6d8b20aaed2b6b39e8",
+        "context_dependencies": {},
+        "read_plan_id": "730977f085074c70b13286d5ba6ef952",
+        "repair_session": null,
+        "resolution_issue_ids": [],
+        "id": "63f0335214c2410289cb8f935c20dd36",
+        "kind": "spec_refine",
+        "reason": "Expand one source-grounded implementation surface",
+        "trigger": "surface:NewRaft, restoreSnapshot and runtime FSM restore",
+        "activity_classes": [],
+        "target_ids": [],
+        "target_versions": {},
+        "unit_id": null,
+        "model_id": null,
+        "requests": [
+          {
+            "file": "api.go",
+            "start_line": 500,
+            "end_line": 730,
+            "reason": "Inspect NewRaft initialization and restoreSnapshot, including snapshot selection, failure handling, recovered metadata, and worker startup ordering. The range extends beyond the supplied prior provenance to recover the restore implementation."
+          },
+          {
+            "file": "fsm.go",
+            "start_line": 1,
+            "end_line": 285,
+            "reason": "Inspect the FSM interface contract, runtime restore handling, serialization with application and snapshot work, completion signaling, and fsmRestoreAndMeasure. Distinguish invoking restoration from successful restoration and metadata advancement."
+          }
+        ],
+        "status": "completed",
+        "stage": "done",
+        "added_material_ids": [
+          "api.go:500:730",
+          "fsm.go:1:285"
+        ],
+        "stop_reason": "",
+        "check_id": "f5775ac65d8a4c60b7d3fbb25732b7d8",
+        "unit_version": null,
+        "material_ids": [
+          "api.go:500:730",
+          "fsm.go:1:285"
+        ],
+        "superseded_by": null
+      },
+      {
+        "surface_entry_points": [],
+        "candidate_id": null,
+        "draft_path": "/home/nitro/Desktop/consensus-assurance/runs/2026-09-20_16-31-53-hashicorp_raft-real-run/audit-spec/v7.json",
+        "diagnostics": [
+          {
+            "code": "audit_spec_semantics",
+            "category": "semantic",
+            "object_ids": [
+              "A3",
+              "A4",
+              "runtime_restore_fsm"
+            ],
+            "material_ids": [
+              "raft.go:1000:1450"
+            ],
+            "message": "The inventory omits the now-observed user-restore producer: it rejects outstanding configuration changes, aborts inflight futures, publishes supplied contents under current configuration and a newly advanced coordinate, dispatches restoration, panics on restoration error, and updates protocol positions after success. Record this distinct producer and its branches without generalizing its protection to network installation. This adds reusable context without changing F_capture_returned's weak meaning or the continuing decision.",
+            "allowed": [
+              "read",
+              "semantic_revision"
+            ]
+          }
+        ],
+        "admitted": false,
+        "preparation_failures": 0,
+        "semantic_failures": 0,
+        "parent_task_id": null,
+        "child_task_ids": [],
+        "requested_aspects": {},
+        "expected_contribution": "",
+        "context_receipt_id": null,
+        "context_dependencies": {},
+        "read_plan_id": null,
+        "repair_session": null,
+        "resolution_issue_ids": [],
+        "id": "7419c9cdcf5c4ca1bd8ee7c4e04cc591",
+        "kind": "spec_refine",
+        "reason": "The inventory omits the now-observed user-restore producer: it rejects outstanding configuration changes, aborts inflight futures, publishes supplied contents under current configuration and a newly advanced coordinate, dispatches restoration, panics on restoration error, and updates protocol positions after success. Record this distinct producer and its branches without generalizing its protection to network installation. This adds reusable context without changing F_capture_returned's weak meaning or the continuing decision.",
+        "trigger": "11878e5dc864464297097d17eca90ea8:A3,A4,runtime_restore_fsm",
+        "activity_classes": [],
+        "target_ids": [
+          "A3",
+          "A4",
+          "runtime_restore_fsm"
+        ],
+        "target_versions": {},
+        "unit_id": null,
+        "model_id": null,
+        "requests": [],
+        "status": "pending",
+        "stage": "analyze",
+        "added_material_ids": [],
+        "stop_reason": "",
+        "check_id": null,
+        "unit_version": null,
+        "material_ids": [],
+        "superseded_by": null
+      },
+      {
+        "surface_entry_points": [],
+        "candidate_id": null,
+        "draft_path": "/home/nitro/Desktop/consensus-assurance/runs/2026-09-20_16-31-53-hashicorp_raft-real-run/audit-spec/v7.json",
+        "diagnostics": [
+          {
+            "code": "audit_spec_semantics",
+            "category": "semantic",
+            "object_ids": [
+              "A5",
+              "B_fsm_single",
+              "B_fsm_batch"
+            ],
+            "material_ids": [
+              "raft.go:1000:1450"
+            ],
+            "message": "Tuple production is now partially observed: processLogs iterates increasing indexes, prepares and filters entries, dispatches nonempty batches and advances Raft's lastApplied after dispatch rather than callback completion. prepareLog forwards configurations only when protocolVersion is greater than 2. Add the producer and protocol-version boundary while preserving unknown caller serialization and commitment establishment. These observations do not strengthen F_capture_returned.",
+            "allowed": [
+              "read",
+              "semantic_revision"
+            ]
+          }
+        ],
+        "admitted": false,
+        "preparation_failures": 0,
+        "semantic_failures": 0,
+        "parent_task_id": null,
+        "child_task_ids": [],
+        "requested_aspects": {},
+        "expected_contribution": "",
+        "context_receipt_id": null,
+        "context_dependencies": {},
+        "read_plan_id": null,
+        "repair_session": null,
+        "resolution_issue_ids": [],
+        "id": "d84a6c2f8f78432b89dc0795abcc5065",
+        "kind": "spec_refine",
+        "reason": "Tuple production is now partially observed: processLogs iterates increasing indexes, prepares and filters entries, dispatches nonempty batches and advances Raft's lastApplied after dispatch rather than callback completion. prepareLog forwards configurations only when protocolVersion is greater than 2. Add the producer and protocol-version boundary while preserving unknown caller serialization and commitment establishment. These observations do not strengthen F_capture_returned.",
+        "trigger": "11878e5dc864464297097d17eca90ea8:A5,B_fsm_single,B_fsm_batch",
+        "activity_classes": [],
+        "target_ids": [
+          "A5",
+          "B_fsm_single",
+          "B_fsm_batch"
+        ],
+        "target_versions": {},
+        "unit_id": null,
+        "model_id": null,
+        "requests": [],
+        "status": "pending",
+        "stage": "analyze",
+        "added_material_ids": [],
+        "stop_reason": "",
+        "check_id": null,
+        "unit_version": null,
+        "material_ids": [],
+        "superseded_by": null
+      }
+    ],
+    "applied_operations": {
+      "reading-automatic-survey-1": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-09-20_16-31-53-hashicorp_raft-real-run/graph-commits/reading-automatic-survey-1.json"
+      },
+      "reading-initial-reading-1": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-09-20_16-31-53-hashicorp_raft-real-run/graph-commits/reading-initial-reading-1.json"
+      },
+      "reading-e6bd2e5c086d46dcbc967782cf0942c0-1": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-09-20_16-31-53-hashicorp_raft-real-run/graph-commits/reading-e6bd2e5c086d46dcbc967782cf0942c0-1.json"
+      },
+      "inquiry-737db942b41b463d993d468ad49ecfd6": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-09-20_16-31-53-hashicorp_raft-real-run/graph-commits/inquiry-737db942b41b463d993d468ad49ecfd6.json"
+      },
+      "derive-a5a7b7e61dd64b02b563257213ee721f": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-09-20_16-31-53-hashicorp_raft-real-run/graph-commits/derive-a5a7b7e61dd64b02b563257213ee721f.json"
+      },
+      "reading-15dd75bcc7a94d4f889f445c78933a62-1": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-09-20_16-31-53-hashicorp_raft-real-run/graph-commits/reading-15dd75bcc7a94d4f889f445c78933a62-1.json"
+      },
+      "derive-47a54cc484774e03867ef8709956aa88": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-09-20_16-31-53-hashicorp_raft-real-run/graph-commits/derive-47a54cc484774e03867ef8709956aa88.json"
+      },
+      "reading-8a34fe6280c841bc93d4843d00201ad6-1": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-09-20_16-31-53-hashicorp_raft-real-run/graph-commits/reading-8a34fe6280c841bc93d4843d00201ad6-1.json"
+      },
+      "derive-85559a22f0174d46ade60cf63b082553": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-09-20_16-31-53-hashicorp_raft-real-run/graph-commits/derive-85559a22f0174d46ade60cf63b082553.json"
+      },
+      "reading-ca2dc8863544477190a9b9e42454b04a-1": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-09-20_16-31-53-hashicorp_raft-real-run/graph-commits/reading-ca2dc8863544477190a9b9e42454b04a-1.json"
+      },
+      "derive-5751a79d184348d9914a618781ae1bf4": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-09-20_16-31-53-hashicorp_raft-real-run/graph-commits/derive-5751a79d184348d9914a618781ae1bf4.json"
+      },
+      "inquiry-fdebd0871cd1413eb8f9cc7b6cfe2a4d": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-09-20_16-31-53-hashicorp_raft-real-run/graph-commits/inquiry-fdebd0871cd1413eb8f9cc7b6cfe2a4d.json"
+      },
+      "inquiry-c3f4ef5bee6d40f3bce0aaed836f9446": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-09-20_16-31-53-hashicorp_raft-real-run/graph-commits/inquiry-c3f4ef5bee6d40f3bce0aaed836f9446.json"
+      },
+      "reading-d8b3ee19177f4fbf8564184334e71b82-1": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-09-20_16-31-53-hashicorp_raft-real-run/graph-commits/reading-d8b3ee19177f4fbf8564184334e71b82-1.json"
+      },
+      "inquiry-5dc57b4ff11843d19cd163c8ff602316": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-09-20_16-31-53-hashicorp_raft-real-run/graph-commits/inquiry-5dc57b4ff11843d19cd163c8ff602316.json"
+      },
+      "derive-1bac66b356e940f5bc9f169a92bfc7bb": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-09-20_16-31-53-hashicorp_raft-real-run/graph-commits/derive-1bac66b356e940f5bc9f169a92bfc7bb.json"
+      },
+      "reading-28a5228fb5ef4eaa83bb4c34b53be37f-1": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-09-20_16-31-53-hashicorp_raft-real-run/graph-commits/reading-28a5228fb5ef4eaa83bb4c34b53be37f-1.json"
+      },
+      "derive-be40509a36a14ceabd6a9d1b04212409": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-09-20_16-31-53-hashicorp_raft-real-run/graph-commits/derive-be40509a36a14ceabd6a9d1b04212409.json"
+      },
+      "inquiry-1437a9b051d8495db858614f0d03005b": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-09-20_16-31-53-hashicorp_raft-real-run/graph-commits/inquiry-1437a9b051d8495db858614f0d03005b.json"
+      },
+      "reading-730977f085074c70b13286d5ba6ef952-1": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-09-20_16-31-53-hashicorp_raft-real-run/graph-commits/reading-730977f085074c70b13286d5ba6ef952-1.json"
+      },
+      "inquiry-f5775ac65d8a4c60b7d3fbb25732b7d8": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-09-20_16-31-53-hashicorp_raft-real-run/graph-commits/inquiry-f5775ac65d8a4c60b7d3fbb25732b7d8.json"
+      },
+      "derive-31173bab9c04464ea7f8963fcd70c934": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-09-20_16-31-53-hashicorp_raft-real-run/graph-commits/derive-31173bab9c04464ea7f8963fcd70c934.json"
+      },
+      "reading-8bff2be28c9d49a9b86ae7574b23fde1-1": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-09-20_16-31-53-hashicorp_raft-real-run/graph-commits/reading-8bff2be28c9d49a9b86ae7574b23fde1-1.json"
+      },
+      "derive-fcf213c831324a80a8e43e578195bf0a": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-09-20_16-31-53-hashicorp_raft-real-run/graph-commits/derive-fcf213c831324a80a8e43e578195bf0a.json"
+      },
+      "reading-0a8e22dafcf04876a0ae6b1ab901890d-1": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-09-20_16-31-53-hashicorp_raft-real-run/graph-commits/reading-0a8e22dafcf04876a0ae6b1ab901890d-1.json"
+      },
+      "derive-11878e5dc864464297097d17eca90ea8": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-09-20_16-31-53-hashicorp_raft-real-run/graph-commits/derive-11878e5dc864464297097d17eca90ea8.json"
+      }
+    }
+  }
+}

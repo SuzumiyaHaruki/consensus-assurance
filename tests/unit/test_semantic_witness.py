@@ -3,7 +3,7 @@ from consensus_assurance.core.proposals import ConsequenceObservation,Consequenc
 from consensus_assurance.workflow.observations import consequence_witness_limitations
 from consensus_assurance.workflow.encoding import validate_encoding
 from consensus_assurance.workflow.artifacts import save_bundle
-from consensus_assurance.plugins.implementations.toy.adapter import ToyImplementation
+from consensus_assurance.adapters.runners.python import PythonBackend
 
 
 
@@ -13,7 +13,7 @@ from consensus_assurance.plugins.implementations.toy.adapter import ToyImplement
 @pytest.mark.parametrize('change',['valid','constant','behavior','meaning'])
 def test_encoding_correction_preserves_meaning_and_behavior(tmp_path,prepared,change):
     _,state,bundle,_=prepared;u=state.units[0]
-    old=save_bundle(tmp_path,state,u,bundle,ToyImplementation())
+    old=save_bundle(tmp_path,state,u,bundle,PythonBackend())
     new=bundle.model_copy(deep=True)
     new.properties=new.properties.replace('value <= 3','value < 4')
     if change=='constant':new.properties='---- MODULE Properties ----\nEXTENDS Behavior\nSafe == TRUE\n====\n'
@@ -30,11 +30,11 @@ def test_old_issue_cannot_be_cleared_by_unrelated_or_unexecuted_model(tmp_path,p
     from consensus_assurance.core.types import ReviewIssue,InquiryTask,SemanticCheck
     from consensus_assurance.core.proposals import ReviewReply
     from consensus_assurance.workflow.reviews import validate_resolutions
-    _,state,bundle,_=prepared;u=state.units[0];old=save_bundle(tmp_path,state,u,bundle,ToyImplementation())
+    _,state,bundle,_=prepared;u=state.units[0];old=save_bundle(tmp_path,state,u,bundle,PythonBackend())
     updated=bundle.model_copy(deep=True)
     if variation=='harness':updated.harness.source+='\n# Formatting\n'
     else:updated.properties=updated.properties.replace('value <= 3','value < 4')
-    new=save_bundle(tmp_path,state,u,updated,ToyImplementation(),old if variation!='unrelated' else None)
+    new=save_bundle(tmp_path,state,u,updated,PythonBackend(),old if variation!='unrelated' else None)
     issue=ReviewIssue(review_id='oldreview',target_id=old.id,target_version=old.version,aspect='checker_correspondence',model_id=old.id,source_ids=state.claims[1].source_ids,explanation='The checker needs a correspondence investigation',disposition='blocked',reason='Actual correction and execution required')
     state.review_issues.append(issue)
     task=InquiryTask(kind='review',reason='Review the new artifact',trigger='test',target_ids=[new.id],target_versions={new.id:new.version},model_id=new.id,resolution_issue_ids=[issue.id])

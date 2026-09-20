@@ -213,8 +213,8 @@ def test_focused_projection_at_repository_scale(tmp_path,prepared):
     accept(e,spec);task=enqueue(state,'spec_refine','Inspect election context','surface-test',surface_entry_points=['election.handler_0_0'])
     task.material_ids=['election.py:1:20']
     packet,_=prepare(e,'spec_refine',task_context(e,task));text=render('spec_refine',pool_sources(packet),e.inquiry)
-    assert len(catalogue(source,state.snapshot,e.implementation))==88
-    assert sum(len(f['symbols']) for f in catalogue(source,state.snapshot,e.implementation))==884
+    assert len(catalogue(source,state.snapshot))==88
+    assert sum(len(f['symbols']) for f in catalogue(source,state.snapshot))==884
     assert len(text)<120000 and len(packet['file_lookup'])==88
     assert [m['file'] for m in packet['materials']]==['election.py']
     assert len(packet['declaration_hints'])<=24 and not {'catalogue','source_ranges','unread_ranges'}&packet.keys()
@@ -313,3 +313,56 @@ def test_navigation_provenance_cannot_support_unseen_delta(tmp_path,prepared):
     delta.behaviors[0].source_ids.append(state.materials[-1].id)
     assert state.materials[-1].id not in task.material_ids  # Retained provenance is not a current body dependency.
     assert merge_delta(state,task,delta).behaviors[0].execution_owner=='A different owner'
+
+
+@pytest.mark.parametrize('mode',['partial','complete','navigation'])
+def test_composite_surface_retains_schedulable_remainder(tmp_path,prepared,mode):
+    from consensus_assurance.core.proposals import AuditSpecDelta
+    from consensus_assurance.core.types import InquiryTask
+    from consensus_assurance.workflow.audit_spec import merge_delta
+    from test_graph_mutations import controller
+    _,state,_,_=prepared;e=controller(tmp_path,state);state.units=[]
+    spec=inventory(state.materials[0].id)
+    parent=Surface(entry_point='composite',disposition='deferred',high_consequence=True,reason='Two owners unread')
+    spec.surfaces=[parent];accept(e,spec)
+    task=InquiryTask(kind='spec_refine',reason='Interpret one owner',trigger='surface',surface_entry_points=['composite'],context_receipt_id='current',admitted=True,
+        material_ids=[] if mode=='navigation' else [state.materials[0].id])
+    state.inquiry_tasks=[task]
+    mapped=Surface(entry_point='known owner' if mode=='partial' else 'composite',disposition='mapped',behavior_ids=['producer'],source_ids=[state.materials[0].id],reason='Exact acquired producer source')
+    surfaces=[mapped]
+    if mode=='partial':surfaces.append(Surface(entry_point='remaining owner',disposition='deferred',high_consequence=True,reason='Remaining independent owner is unread'))
+    delta=AuditSpecDelta(surfaces=surfaces,remove_surface_entry_points=['composite'] if mode=='partial' else [],rationale='Map only the interpreted responsibility')
+    if mode=='navigation':
+        with pytest.raises(SpecIssue,match='attached exact source'):merge_delta(state,task,delta)
+        return
+    accept(e,merge_delta(state,task,delta))
+    pending=next_surface_refinement(state)
+    assert (pending.entry_point if pending else None)==('remaining owner' if mode=='partial' else None)
+    assert len(load(state).surfaces)==(2 if mode=='partial' else 1)
+
+
+@pytest.mark.parametrize('variant',['paxos','n2paxos','swift'])
+def test_variant_visibility_is_a_subset_of_safe_build_files(tmp_path,variant):
+    from consensus_assurance.cli import load_config,main
+    from consensus_assurance.adapters.storage.snapshot import capture
+    from consensus_assurance.workflow.materials import metadata,catalogue,initial_materials
+    repo=tmp_path/'source';repo.mkdir()
+    families=['paxos','n2paxos','swift','epaxos','fastpaxos','curp']
+    for family in families+['replica']:
+        (repo/family).mkdir();(repo/family/'node.go').write_text('package '+family+'\n')
+    (repo/'go.mod').write_text('module github.com/imdea-software/swiftpaxos\n')
+    (repo/'README.md').write_text('Repository orientation')
+    (repo/variant/'secret.txt').write_text('Private file')
+    (repo/variant/'binary').write_bytes(b'\0')
+    cfg=Path(__file__).resolve().parents[2]/f'configs/targets/swiftpaxos_{variant}.yaml'
+    config=load_config(str(cfg));snapshot=capture(repo,analysis_roots=config.target.analysis_roots)
+    assert all(f'{f}/node.go' in snapshot.files for f in families)
+    assert {f'{variant}/node.go','replica/node.go','go.mod','README.md'}==set(snapshot.readable_files)
+    for f in families:
+        if f!=variant:
+            with pytest.raises(PermissionError):metadata(repo,snapshot,f'{f}/node.go')
+    assert {f['file'] for f in catalogue(repo,snapshot)}==set(snapshot.readable_files)
+    assert {m.file for m in initial_materials(repo,snapshot,config.budget,'')}<=set(snapshot.readable_files)
+    assert main(['inspect','--config',str(cfg),'--repo',str(repo),'--runs-dir',str(tmp_path/'inspect')])==0
+    saved=json.loads(next((tmp_path/'inspect').glob('*/snapshot.json')).read_text())
+    assert saved['files']==snapshot.files and saved['readable_files']==snapshot.readable_files

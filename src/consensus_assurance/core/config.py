@@ -1,6 +1,6 @@
 from pathlib import Path
 from typing import Any, Literal
-from pydantic import Field
+from pydantic import Field, model_validator
 from .types import Record
 
 
@@ -37,9 +37,25 @@ class Budget(Record):
     error_context_chars: int = Field(default=16000, ge=1000)
 
 
+class TargetConfig(Record):
+    expected_module: str | None = None
+    variant: str = ""
+    analysis_roots: list[str] = []
+    execution_package: str = "."
+    harness_path: str | None = None
+
+    @model_validator(mode="after")
+    def relative_paths(self):
+        paths=self.analysis_roots+[self.execution_package]+([self.harness_path] if self.harness_path else [])
+        if any(not p or p.startswith('-') or Path(p).is_absolute() or '..' in Path(p).parts for p in paths):
+            raise ValueError("Target paths must stay within the relative repository namespace")
+        return self
+
+
 class Config(Record):
     protocol: str = "none"
-    implementation: str = "hashicorp_raft"
+    execution_backend: Literal["none", "go_module", "python"] = "none"
+    target: TargetConfig = TargetConfig()
     repo_path: str | None = None
     agent_backend: str = "codex"
     verifier_backend: str = "tlc"
@@ -58,21 +74,7 @@ class Config(Record):
 
 def locate_repo(explicit: str | None, configured: str | None) -> Path:
     candidate = explicit or configured
-    if candidate:
-        path = Path(candidate).expanduser().resolve()
-        if not path.is_dir():
-            raise FileNotFoundError(f"Target directory does not exist: {path}; supply --repo")
-        return path
-    desktops = [Path.home() / "Desktop"]
-    xdg = Path.home() / ".config/user-dirs.dirs"
-    if xdg.is_file():
-        import re
-        match = re.search(r'^XDG_DESKTOP_DIR="([^"\n]+)"', xdg.read_text(), re.M)
-        if match:
-            value = match[1].replace("$HOME", str(Path.home()))
-            if "$" not in value:
-                desktops.append(Path(value))
-    for desktop in desktops:
-        if (desktop / "hashicorp-raft").is_dir():
-            return (desktop / "hashicorp-raft").resolve()
-    raise FileNotFoundError("Target not found on discovered desktops; supply --repo")
+    if not candidate:raise FileNotFoundError("Supply --repo or config.repo_path explicitly")
+    path = Path(candidate).expanduser().resolve()
+    if not path.is_dir():raise FileNotFoundError(f"Target directory does not exist: {path}; supply --repo")
+    return path

@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import pytest
 from consensus_assurance.core.types import Analysis,SemanticReview,SemanticCheck
 from consensus_assurance.core.config import Config
-from consensus_assurance.plugins.implementations.hashicorp_raft.adapter import HashicorpRaft
+from consensus_assurance.adapters.runners.go_module import GoModuleBackend
 from consensus_assurance.workflow.discovery import context
 from consensus_assurance.workflow.task_packet import prepare,pool_sources
 from consensus_assurance.workflow.prompts import render
@@ -91,11 +91,11 @@ def test_skill_routing_loads_actual_behavior_method_without_global_repair_ballas
 
 def test_current_model_keeps_unresolved_predecessor_encoding_issue(tmp_path,prepared):
     from consensus_assurance.workflow.artifacts import save_bundle
-    from consensus_assurance.plugins.implementations.toy.adapter import ToyImplementation
+    from consensus_assurance.adapters.runners.python import PythonBackend
     from consensus_assurance.core.types import ReviewIssue
     _,state,bundle,_=prepared;unit=state.units[0]
-    first=save_bundle(tmp_path/'artifacts',state,unit,bundle,ToyImplementation())
-    second=save_bundle(tmp_path/'artifacts',state,unit,bundle,ToyImplementation(),first,'Harness-only continuation')
+    first=save_bundle(tmp_path/'artifacts',state,unit,bundle,PythonBackend())
+    second=save_bundle(tmp_path/'artifacts',state,unit,bundle,PythonBackend(),first,'Harness-only continuation')
     state.review_issues.append(ReviewIssue(review_id='old',target_id=first.id,target_version=first.version,aspect='checker_correspondence',model_id=first.id,
         source_ids=state.claims[1].source_ids,explanation='The previous checker may exclude legal completion',disposition='revision',reason='Needs attributed encoding investigation'))
     e=controller(tmp_path,state);state.active_model_id=second.id

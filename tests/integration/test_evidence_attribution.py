@@ -9,7 +9,7 @@ from consensus_assurance.core.proposals import Comparison
 from consensus_assurance.workflow.artifacts import save_bundle
 from consensus_assurance.workflow.observations import assess_execution, monitor_events
 from consensus_assurance.adapters.runners.experiment import run_experiment, extract_events
-from consensus_assurance.plugins.implementations.toy.adapter import ToyImplementation
+from consensus_assurance.adapters.runners.python import PythonBackend
 
 
 @pytest.mark.real
@@ -19,7 +19,7 @@ def test_multiple_invariants_are_attributed_individually(tlc,tmp_path,reversed_o
     repo=tmp_path/'repo';shutil.copytree(ROOT/'fixtures/ack_service',repo)
     state,unit,bundle=setup_ack(repo)
     if reversed_order: bundle.checkers.reverse()
-    model=save_bundle(runner.root,state,unit,bundle,ToyImplementation())
+    model=save_bundle(runner.root,state,unit,bundle,PythonBackend())
     check=verifier.check(runner,model,20)
     assert check.status==ExecutionStatus.COMPLETED
     assert check.violated_invariant=='DurableAck'
@@ -29,7 +29,7 @@ def test_multiple_invariants_are_attributed_individually(tlc,tmp_path,reversed_o
     from consensus_assurance.workflow.budget import BudgetTracker
     from consensus_assurance.core.config import Config
     from consensus_assurance.adapters.agents.backend import MockAgent
-    engine=Engine(Config(),runner.root,ToyImplementation(),MockAgent(),verifier,'','')
+    engine=Engine(Config(),runner.root,PythonBackend(),MockAgent(),verifier,'','')
     engine.state=state;engine.budget=BudgetTracker(Config().budget,state)
     engine.search(unit,model,bundle,None)
     assert [f.claim_id for f in state.findings]==['durable']
@@ -49,10 +49,10 @@ def test_actual_contract_and_observation_determine_confirmation(tlc,tmp_path,mod
         line=next(i for i,l in enumerate(bundle.harness.source.splitlines(),1) if "print('CA_EVENT '" in l)
         bundle.harness.semantic_changes=['Add actual event printing']
         bundle.harness.observation_changes=[ObservationChange(change_index=0,start_line=line,end_line=line,binding_ids=['ack-code'],rationale='Only serial event formatting and output in this scoped experiment')]
-    model=save_bundle(runner.root,state,unit,bundle,ToyImplementation())
+    model=save_bundle(runner.root,state,unit,bundle,PythonBackend())
     workspace=runner.root/'workspace';shutil.copytree(repo,workspace)
     (workspace/'assurance_generated.py').write_text(bundle.harness.source)
-    exp=run_experiment(runner,ToyImplementation().experiment_command(),workspace,state.snapshot.id,20,'bwrap')
+    exp=run_experiment(runner,PythonBackend().experiment_command(),workspace,state.snapshot.id,20,'bwrap')
     exp.model_id=model.id;exp.input_versions=model.artifact_digests
     state.checks.append(exp)
     cal,checks=verifier.calibrate(runner,model,bundle,exp,20)
@@ -100,7 +100,7 @@ Obs == [value |-> slots[1]]
 '''
     bundle.properties='---- MODULE Properties ----\nEXTENDS Behavior\nSafe == slots[1] <= 2\n====\n'
     bundle.variables=['slots']
-    model=save_bundle(runner.root,state,state.units[0],bundle,ToyImplementation())
+    model=save_bundle(runner.root,state,state.units[0],bundle,PythonBackend())
     result=verifier.check(runner,model,20)
     assert result.outcome=='holds'
 
@@ -110,7 +110,7 @@ def test_unconfigured_checker_is_never_supported(tlc,tmp_path):
     verifier,runner=tlc
     repo=tmp_path/'repo';shutil.copytree(ROOT/'fixtures/ack_service',repo)
     state,unit,bundle=setup_ack(repo)
-    model=save_bundle(runner.root,state,unit,bundle,ToyImplementation())
+    model=save_bundle(runner.root,state,unit,bundle,PythonBackend())
     cfg=Path(model.config_path);cfg.write_text(cfg.read_text().replace('\nDurableAck\n','\n'))
     result=verifier.check(runner,model,20)
     assert {c.invariant:c.outcome for c in result.checker_results}=={'MemoryAck':'holds','DurableAck':'unknown'}
@@ -121,7 +121,7 @@ def test_deadlock_and_search_constraints_are_not_invariant_results(tlc,prepared)
     verifier,runner=tlc
     _,state,bundle,_=prepared
     bundle.behavior=bundle.behavior.replace('value < 3','value < 2').replace("        \\/ /\\ value = 3 /\\ value' = 0\n",'')
-    model=save_bundle(runner.root,state,state.units[0],bundle,ToyImplementation())
+    model=save_bundle(runner.root,state,state.units[0],bundle,PythonBackend())
     cfg=Path(model.config_path);cfg.write_text(cfg.read_text().replace('CHECK_DEADLOCK FALSE','CHECK_DEADLOCK TRUE'))
     result=verifier.check(runner,model,20)
     assert result.status==ExecutionStatus.COMPLETED and result.outcome=='deadlock'

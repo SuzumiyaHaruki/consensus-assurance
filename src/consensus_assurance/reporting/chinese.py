@@ -69,10 +69,10 @@ def progress_lines(state):
 
 
 def resource_lines(state):
-    from consensus_assurance.core.config import Config
+    from consensus_assurance.core.config import Budget
     from consensus_assurance.workflow.materials import material_usage,material_allowance
-    cfg=Config.model_validate(state.config)
-    used=material_usage(state);breadth=material_allowance(state,cfg.budget,'breadth');depth=material_allowance(state,cfg.budget,'depth')
+    budget=Budget.model_validate(state.config.get("budget",{}))
+    used=material_usage(state);breadth=material_allowance(state,budget,'breadth');depth=material_allowance(state,budget,'depth')
     stages={}
     for check in state.checks:
         key=check.parameters.get('agent_task','agent') if check.action=='agent' else check.action
@@ -89,7 +89,7 @@ def resource_lines(state):
             try:accepted+=isinstance(json.loads(path.read_text()).get('bundle'),dict)
             except (ValueError,OSError):pass
     lines=['','## 材料、上下文与实际产物','','字符口径为唯一源代码逻辑行（含一个换行分隔符），不等于每次发送量、token 或费用。未提供 token 数据时不推算账单。',
-        f"唯一材料 {used['unique_chars']}/{cfg.budget.material_chars} 字符；区间并集 {used['unique_chunks']}/{cfg.budget.material_chunks}。广度当前可分配 {breadth['available_chars']}、为深度保留 {breadth['reserved_for_other_chars']}；深度可分配 {depth['available_chars']}、为广度保留 {depth['reserved_for_other_chars']}。",
+        f"唯一材料 {used['unique_chars']}/{budget.material_chars} 字符；区间并集 {used['unique_chunks']}/{budget.material_chunks}。广度当前可分配 {breadth['available_chars']}、为深度保留 {breadth['reserved_for_other_chars']}；深度可分配 {depth['available_chars']}、为广度保留 {depth['reserved_for_other_chars']}。",
         f"建模类执行记录 {len(builds)}；受理且非空 Bundle 回复 {accepted}；落盘模型版本 {len(state.models)}（仅模型阶段 {sum(m.stage=='model_only' for m in state.models)}，完整组件 {sum(m.stage=='complete' for m in state.models)}）；实际性质搜索记录 {sum(c.action=='model_check' and not c.reused for c in state.checks)}（触达与校准另列）。",
         '', '| 阶段 | 新调用记录 | 已记录时长（秒） |', '| --- | --- | --- |']
     for name,item in stages.items():lines.append(f"| {name} | {item['calls']} | {item['seconds']:.2f}（{item['timed']} 条有起止时间） |")

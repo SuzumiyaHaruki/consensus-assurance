@@ -33,7 +33,7 @@ def setup(tmp_path,prepared,broken=False):
         claim.pending=[];claim.grounding=basis.model_copy(deep=True)
     unit.audit_question=AuditQuestion(question='Does one legal boundary call preserve the range?',importance='Bounded service result',source_ids=basis.behavior_ids+basis.expectation_ids,
         disposition='ready_for_check',preferred_check='direct_test',event_paths=['legal input -> actual call -> correlated observed return'],trigger_rationale='Observe actual return and independent range predicate')
-    cfg=Config(implementation='toy',allow_experiments=True,allow_agent_materials=True,execution_isolation='workspace')
+    cfg=Config(execution_backend='python',allow_experiments=True,allow_agent_materials=True,execution_isolation='workspace')
     state.config=cfg.model_dump(mode='json')
     e=Engine(cfg,tmp_path/'direct',*assemble(cfg),'');e.state=state;e.budget=BudgetTracker(cfg.budget,state)
     shutil.copytree(repo,e.root/'source');state.active_unit_id=unit.id
@@ -102,8 +102,11 @@ def test_direct_failure_never_confirms(tmp_path,prepared,failure):
     assert not any(f.level=='implementation_obligation' for f in e.state.findings)
 
 
-def test_saved_direct_plan_reused_and_tampering_rejected(tmp_path,prepared):
-    e,u,p=setup(tmp_path,prepared);first=save_plan(e,u,p,'same')
+@pytest.mark.parametrize('nested',[False,True])
+def test_saved_direct_plan_reused_and_tampering_rejected(tmp_path,prepared,nested):
+    e,u,p=setup(tmp_path,prepared)
+    if nested:e.implementation.harness_filename='package/assurance_generated.py'
+    first=save_plan(e,u,p,'same')
     assert save_plan(e,u,p,'same').id==first.id and len(e.state.direct_checks)==1
     from pathlib import Path
     Path(first.harness_path).write_text('print("fake")')

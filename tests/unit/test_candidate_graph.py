@@ -22,7 +22,7 @@ def test_default_has_inquiry_without_property_list():
     config=Config()
     assert config.protocol=='none' and config.directed_question is None
     assert assemble(config)[3]==''
-    assert assemble(Config(implementation='hashicorp_raft'))[3]==''
+    assert assemble(Config(execution_backend='go_module'))[3]==''
     assert assemble(Config(protocol='raft'))[3]  # Explicit reference uses the same workflow.
 
 
@@ -138,9 +138,9 @@ def test_build_resources_separate_from_read_material(tmp_path):
 def test_F4_retains_model_search_and_other_unit_history(prepared,tmp_path):
     from consensus_assurance.workflow.artifacts import save_bundle
     from consensus_assurance.workflow.feedback import apply_feedback
-    from consensus_assurance.plugins.implementations.toy.adapter import ToyImplementation
+    from consensus_assurance.adapters.runners.python import PythonBackend
     _,state,bundle,_=prepared
-    model=save_bundle(tmp_path,state,state.units[0],bundle,ToyImplementation())
+    model=save_bundle(tmp_path,state,state.units[0],bundle,PythonBackend())
     state.checks.append(CheckRun(id='execution',action='experiment',cwd=str(tmp_path),snapshot_id=state.snapshot.id,status=ExecutionStatus.COMPLETED))
     cal=Calibration(model_id=model.id,experiment_check_id='execution',mapping_path='m',trace_path='t',status='compatible',reason='Observed',origin=Origin.MOCK)
     state.calibrations.append(cal)
@@ -152,7 +152,7 @@ def test_F4_retains_model_search_and_other_unit_history(prepared,tmp_path):
 def test_error_context_contains_bounded_original_text(tmp_path,prepared):
     from consensus_assurance.workflow.engine import Engine
     from consensus_assurance.core.config import Config
-    config=Config(implementation='toy',agent_backend='mock')
+    config=Config(execution_backend='python',agent_backend='mock')
     engine=Engine(config,tmp_path/'run',*assemble(config),'')
     log=tmp_path/'error.log';original='SyntaxError at source line 1\n'+('x'*30000)+'\nModuleNotFoundError: missing_producer'
     log.write_text(original)
@@ -163,25 +163,19 @@ def test_error_context_contains_bounded_original_text(tmp_path,prepared):
     assert log.read_text()==original
 
 
-def test_adapter_supplied_symbol_hints_are_used(tmp_path):
-    repo=tmp_path/'repo';repo.mkdir();(repo/'core.rs').write_text('fn produce() {}\n')
-    class Adapter:
-        def symbol_hints(self,file,lines):
-            return [{'line':1,'declaration':lines[0]}]
-    assert catalogue(repo,capture(repo),Adapter())[0]['symbols'][0]['declaration']=='fn produce() {}'
+def test_catalogue_is_independent_of_execution_backend(tmp_path):
+    repo=tmp_path/'repo';repo.mkdir();(repo/'core.go').write_text('func produce() {}\n')
+    assert catalogue(repo,capture(repo))[0]['symbols'][0]['declaration']=='func produce() {}'
 
 
-def test_required_build_resource_exclusion_is_explicit(tmp_path):
+@pytest.mark.parametrize('module',[None,'module another.example/module\n'])
+def test_explicit_module_identity_requires_safe_build_input(tmp_path,module):
     from consensus_assurance.workflow.engine import Engine
-    from consensus_assurance.plugins.implementations.toy.adapter import ToyImplementation
-    repo=tmp_path/'repo';repo.mkdir();(repo/'counter.py').write_text('print(1)\n');(repo/'credentials.json').write_text('{}')
-    class Adapter(ToyImplementation):
-        def required_inputs(self,repo): return ['counter.py','credentials.json']
-    config=Config(implementation='toy',agent_backend='mock')
-    _,agent,verifier,knowledge=assemble(config)
-    with pytest.raises(ValueError,match='Required build inputs.*credentials.json'):
-        Engine(config,tmp_path/'run',Adapter(),agent,verifier,knowledge,'').start(repo)
-    assert not (tmp_path/'run/source/credentials.json').exists()
+    repo=tmp_path/'repo';repo.mkdir()
+    if module:(repo/'go.mod').write_text(module)
+    config=Config(execution_backend='none',target={'expected_module':'example.org/module'},agent_backend='mock')
+    with pytest.raises(ValueError,match='explicit target.expected_module'):
+        Engine(config,tmp_path/'run',*assemble(config)).start(repo)
 
 
 def test_binary_only_build_inputs_are_not_agent_materials(tmp_path):
@@ -196,9 +190,9 @@ def test_binary_only_build_inputs_are_not_agent_materials(tmp_path):
 def test_F1_changes_only_related_calibration(prepared,tmp_path):
     from consensus_assurance.workflow.artifacts import save_bundle
     from consensus_assurance.workflow.feedback import apply_feedback
-    from consensus_assurance.plugins.implementations.toy.adapter import ToyImplementation
+    from consensus_assurance.adapters.runners.python import PythonBackend
     _,state,bundle,_=prepared
-    model=save_bundle(tmp_path,state,state.units[0],bundle,ToyImplementation())
+    model=save_bundle(tmp_path,state,state.units[0],bundle,PythonBackend())
     other=model.model_copy(update={'id':'other-model','unit_id':'other-unit'})
     state.models.append(other)
     state.checks.append(CheckRun(id='observed',action='experiment',cwd=str(tmp_path),snapshot_id=state.snapshot.id,status=ExecutionStatus.COMPLETED))

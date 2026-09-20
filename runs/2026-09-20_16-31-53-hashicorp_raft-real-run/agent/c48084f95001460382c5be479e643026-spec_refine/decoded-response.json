@@ -1,0 +1,290 @@
+{
+  "understanding": "The attached source resolves startup snapshot selection and its immediate Open consumer. Initialization tries listed candidates in order, advances after Open or restoration-helper failure, and errors when a nonempty list is exhausted. The explicit bypass accepts a candidate without opening or restoring it. Metadata eligibility remains distinct from readability, and a successful restoration-helper return remains distinct from verified FSM reconstruction.",
+  "requests": [],
+  "delta": {
+    "target_profile": null,
+    "activities": [
+      {
+        "class_id": "A3",
+        "applicability": "applicable",
+        "purpose": "Reconstruct participant state and restore snapshots.",
+        "realization_summary": "Initialization-owned restoreSnapshot obtains candidates from the selected SnapshotStore.List and attempts them in returned order. Normal attempts require Open and fsmRestoreAndMeasure to return without error; NoSnapshotRestoreOnStart bypasses both. An accepted attempt precedes application and snapshot coordinate updates and configuration installation. Open or restoration-helper failure advances to another listed candidate; exhaustion of a nonempty list returns an error. Runtime restoration and subsequent resynchronization remain incompletely mapped.",
+        "entry_points": [
+          "NewRaft",
+          "Raft.restoreSnapshot",
+          "Raft.tryRestoreSingleSnapshot",
+          "Raft.runFSM restore closure",
+          "Transport.InstallSnapshot"
+        ],
+        "variants": [
+          "Startup restoration through the selected SnapshotStore",
+          "NoSnapshotRestoreOnStart bypass",
+          "Version-zero peer decoding versus explicit configuration metadata",
+          "Runtime restoration"
+        ],
+        "unknowns": [
+          "The implementation and failure-side effects of fsmRestoreAndMeasure are not attached.",
+          "The caller's obligation to prepare FSM state when restoration is bypassed is unresolved.",
+          "InstallSnapshot handling and incremental replication after restore remain unmapped."
+        ],
+        "source_ids": [
+          "api.go:600:760"
+        ]
+      }
+    ],
+    "behaviors": [
+      {
+        "id": "startup_snapshot_select",
+        "primary_activity": "A3",
+        "execution_owner": "Initialization caller executing Raft.restoreSnapshot",
+        "protocol_context": "One startup restoration invocation and its selected SnapshotStore",
+        "trigger": "restoreSnapshot is invoked during initialization.",
+        "legal_preconditions": [
+          "The function comment restricts this operation to initialization and describes other use as unsafe."
+        ],
+        "implementation_guards": [
+          "Return a List error immediately.",
+          "Continue to the next candidate when tryRestoreSingleSnapshot returns false.",
+          "Update coordinates and configurations only after the attempt returns true."
+        ],
+        "reads": [
+          "SnapshotStore.List result in returned order",
+          "Each listed candidate's ID, Index, Term, Version, Configuration, ConfigurationIndex and Peers",
+          "tryRestoreSingleSnapshot result"
+        ],
+        "writes": [
+          "LastApplied from the accepted listed candidate's Index",
+          "LastSnapshot from the accepted listed candidate's Index and Term",
+          "Committed and latest configurations from explicit metadata or decoded legacy peers"
+        ],
+        "durable_effects": [],
+        "external_effects": [
+          "Returns the List error, legacy peer-decoding error, exhaustion error or nil."
+        ],
+        "important_branches": [
+          "An empty list returns nil without snapshot-derived updates.",
+          "With FileSnapshotStore selected, List supplies at most retain metadata-eligible candidates; candidates outside that returned prefix are not attempted.",
+          "Normal helper success and explicit bypass both permit coordinate and configuration processing.",
+          "Version > 0 uses Configuration and ConfigurationIndex directly.",
+          "Version zero decodes Peers and uses snapshot.Index as the configuration index.",
+          "Legacy decoding failure returns after application and snapshot coordinate updates, without trying another candidate.",
+          "A nonempty list whose attempts all return false produces an error."
+        ],
+        "async_boundaries": [],
+        "produces_fact_ids": [],
+        "consumes_fact_ids": [
+          "file_snapshot_metadata_eligible",
+          "startup_snapshot_restore_helper_returned",
+          "startup_snapshot_restore_bypassed"
+        ],
+        "cross_activity_effects": {
+          "A4": "Installs committed and latest configuration values from the accepted listed candidate after explicit metadata selection or successful legacy peer decoding.",
+          "A5": "Sets LastApplied to the accepted listed candidate's Index, including when restoration was explicitly bypassed.",
+          "A6": "Sets LastSnapshot coordinates from the accepted listed candidate."
+        },
+        "existing_protections": [
+          "Open or restoration-helper failure does not itself cause candidate coordinate installation.",
+          "Fallback attempts another candidate in the returned list.",
+          "Failure to restore every candidate in a nonempty list is surfaced as an error."
+        ],
+        "source_ids": [
+          "api.go:600:760",
+          "file_snapshot.go:160:396"
+        ],
+        "unknowns": [
+          "The metadata-eligibility consumption edge applies only when FileSnapshotStore is selected; activation is not established.",
+          "The two attempt-result facts are alternative branch inputs, not jointly required facts.",
+          "The retained-prefix contract remains unresolved; fallback does not establish that any listed candidate can be restored.",
+          "Setter internals and any downstream replay behavior are not established by the attached source."
+        ]
+      },
+      {
+        "id": "startup_snapshot_restore_attempt",
+        "primary_activity": "A3",
+        "execution_owner": "Initialization caller executing the normal branch of Raft.tryRestoreSingleSnapshot",
+        "protocol_context": "One listed SnapshotMeta with NoSnapshotRestoreOnStart false",
+        "trigger": "restoreSnapshot attempts a listed candidate.",
+        "legal_preconditions": [
+          "Called within initialization-owned snapshot selection."
+        ],
+        "implementation_guards": [
+          "Return false when SnapshotStore.Open returns an error.",
+          "Return false when fsmRestoreAndMeasure returns an error.",
+          "Return true only after both calls return without error."
+        ],
+        "reads": [
+          "NoSnapshotRestoreOnStart",
+          "Listed snapshot ID and Size",
+          "Reader returned by the selected SnapshotStore.Open"
+        ],
+        "writes": [
+          "Passes r.fsm and the opened source to fsmRestoreAndMeasure; actual FSM mutations are unresolved."
+        ],
+        "durable_effects": [],
+        "external_effects": [
+          "Calls SnapshotStore.Open using the listed snapshot ID.",
+          "Calls fsmRestoreAndMeasure using the listed Size.",
+          "Closes the source after either helper success or helper failure; Close errors are ignored.",
+          "Returns a boolean attempt result."
+        ],
+        "important_branches": [
+          "Open failure prevents invocation of the restoration helper.",
+          "Restoration-helper failure closes the source and permits the outer selector to attempt another candidate.",
+          "Metadata returned by Open is discarded; subsequent outer updates use the original listed metadata.",
+          "When FileSnapshotStore is selected, successful Open supplies a reader whose previously observed bytes passed CRC validation."
+        ],
+        "async_boundaries": [
+          "Restoration consumes the returned reader after Open validation; no immutability guarantee is established."
+        ],
+        "produces_fact_ids": [
+          "startup_snapshot_restore_helper_returned"
+        ],
+        "consumes_fact_ids": [
+          "file_snapshot_open_crc_validated"
+        ],
+        "cross_activity_effects": {},
+        "existing_protections": [
+          "Open failure and restoration-helper failure remain distinguishable from successful attempt completion.",
+          "The opened source is closed on both helper-result branches."
+        ],
+        "source_ids": [
+          "api.go:600:760",
+          "file_snapshot.go:160:396"
+        ],
+        "unknowns": [
+          "The checksum fact consumption edge is conditional on selection of FileSnapshotStore.",
+          "The restoration helper's implementation and any partial FSM mutation after failure are unread.",
+          "No comparison between listed metadata and Open-returned metadata is shown.",
+          "Concurrent mutation between listing, opening and restoring remains unresolved."
+        ]
+      },
+      {
+        "id": "startup_snapshot_restore_bypass",
+        "primary_activity": "A3",
+        "execution_owner": "Initialization caller executing the bypass branch of Raft.tryRestoreSingleSnapshot",
+        "protocol_context": "One listed SnapshotMeta with NoSnapshotRestoreOnStart true",
+        "trigger": "A candidate attempt observes NoSnapshotRestoreOnStart enabled.",
+        "legal_preconditions": [
+          "Called within initialization-owned snapshot selection."
+        ],
+        "implementation_guards": [
+          "Test NoSnapshotRestoreOnStart before opening or restoring the candidate."
+        ],
+        "reads": [
+          "Current configuration's NoSnapshotRestoreOnStart"
+        ],
+        "writes": [],
+        "durable_effects": [],
+        "external_effects": [
+          "Returns true without SnapshotStore.Open or fsmRestoreAndMeasure."
+        ],
+        "important_branches": [
+          "The outer selector processes candidate coordinates and configuration despite no restoration attempt."
+        ],
+        "async_boundaries": [],
+        "produces_fact_ids": [
+          "startup_snapshot_restore_bypassed"
+        ],
+        "consumes_fact_ids": [],
+        "cross_activity_effects": {},
+        "existing_protections": [
+          "Bypass requires the explicit configuration flag."
+        ],
+        "source_ids": [
+          "api.go:600:760"
+        ],
+        "unknowns": [
+          "The configuration contract and external preparation required for this branch are not attached."
+        ]
+      }
+    ],
+    "facts": [
+      {
+        "id": "startup_snapshot_restore_helper_returned",
+        "meaning": "For this normal startup candidate attempt, the selected SnapshotStore.Open and fsmRestoreAndMeasure returned without error, the source Close was invoked, and tryRestoreSingleSnapshot returned true. This does not independently establish semantic FSM reconstruction or successful Close.",
+        "identity": {
+          "attempt": "Raft instance, initialization invocation and tryRestoreSingleSnapshot invocation",
+          "candidate": "Listed SnapshotMeta and its ID, with the source obtained by Open for that ID"
+        },
+        "validity_context": "Historical result of the normal branch with NoSnapshotRestoreOnStart false; outer coordinate and configuration updates have not yet followed this return.",
+        "representation": [
+          "Nil Open result",
+          "Nil fsmRestoreAndMeasure result",
+          "True tryRestoreSingleSnapshot return"
+        ],
+        "invalidators": [],
+        "reinterpreters": [],
+        "durability": "Volatile control-flow result; no new persistence operation is established.",
+        "recovery": "This records one startup recovery attempt; another startup must obtain its own result.",
+        "source_ids": [
+          "api.go:600:760"
+        ],
+        "unknowns": [
+          "The helper's semantic success contract and implementation are not attached.",
+          "Ignored source Close errors do not affect this result.",
+          "Listed metadata correspondence with the opened content is not verified here."
+        ]
+      },
+      {
+        "id": "startup_snapshot_restore_bypassed",
+        "meaning": "A startup candidate attempt observed NoSnapshotRestoreOnStart enabled and returned true without opening the snapshot or invoking the restoration helper.",
+        "identity": {
+          "attempt": "Raft instance, initialization invocation and candidate attempt",
+          "candidate": "Listed SnapshotMeta passed to tryRestoreSingleSnapshot"
+        },
+        "validity_context": "Historical bypass-branch result; establishes neither snapshot readability nor FSM restoration.",
+        "representation": [
+          "NoSnapshotRestoreOnStart true",
+          "Immediate true return"
+        ],
+        "invalidators": [],
+        "reinterpreters": [],
+        "durability": "Volatile branch result.",
+        "recovery": "External FSM preparation and its recovery contract are unresolved.",
+        "source_ids": [
+          "api.go:600:760"
+        ],
+        "unknowns": [
+          "The caller's applicable preparation obligations are not established."
+        ]
+      }
+    ],
+    "surfaces": [
+      {
+        "entry_point": "Raft.restoreSnapshot and Raft.tryRestoreSingleSnapshot",
+        "disposition": "mapped",
+        "behavior_ids": [
+          "startup_snapshot_select",
+          "startup_snapshot_restore_attempt",
+          "startup_snapshot_restore_bypass"
+        ],
+        "reason": "The attached declarations establish initialization-owned selection, fallback, bypass and subsequent metadata updates. The restoration helper remains an unresolved callee rather than an asserted FSM-restoration guarantee.",
+        "source_ids": [
+          "api.go:600:760",
+          "file_snapshot.go:160:396"
+        ],
+        "high_consequence": true
+      },
+      {
+        "entry_point": "fsmRestoreAndMeasure implementation and failure-side effects",
+        "disposition": "deferred",
+        "behavior_ids": [],
+        "reason": "The startup call site establishes invocation and result handling, but the helper implementation and FSM failure semantics are not attached.",
+        "source_ids": [
+          "api.go:600:760"
+        ],
+        "high_consequence": true
+      }
+    ],
+    "remove_behavior_ids": [],
+    "remove_fact_ids": [],
+    "remove_surface_entry_points": [],
+    "rationale": "Use the already attached exact source to add the missing startup consumer neighborhood. Separate normal helper completion from explicit bypass, and preserve the distinction between metadata eligibility, checksum validation and restoration-helper success. Existing Fact meanings, identities and validity contexts remain unchanged. This descriptive enrichment does not resolve or change the selected retention-contract discriminator."
+  },
+  "limitations": [
+    "No normative retention requirement or implementation violation is established.",
+    "FileSnapshotStore-specific consumer edges are conditional on adapter selection.",
+    "The helper implementation, bypass preparation contract and concurrent filesystem guarantees remain unresolved.",
+    "Existing historical unknown strings on unchanged objects are not rewritten; the added behaviors supply the newly sourced startup consumer detail."
+  ]
+}

@@ -17,7 +17,7 @@ from test_graph_mutations import revision_for
 
 
 def engine_for(tmp_path,state):
-    cfg=Config(implementation='toy',agent_backend='mock',allow_experiments=False)
+    cfg=Config(execution_backend='python',agent_backend='mock',allow_experiments=False)
     engine=Engine(cfg,tmp_path/'engine',*assemble(cfg),'')
     engine.state=state;engine.budget=BudgetTracker(cfg.budget,state)
     shutil.copytree(state.snapshot.repo,engine.root/'source')
@@ -126,9 +126,9 @@ def test_later_full_review_releases_only_current_readiness_limit(tmp_path,prepar
     from consensus_assurance.workflow.inquiry import objects,semantic_limitations
     from consensus_assurance.workflow.reviews import material_closure,required_aspects
     from consensus_assurance.workflow.artifacts import save_bundle
-    from consensus_assurance.plugins.implementations.toy.adapter import ToyImplementation
+    from consensus_assurance.adapters.runners.python import PythonBackend
     _,state,bundle,_=prepared;unit=state.units[0]
-    model=save_bundle(tmp_path,state,unit,bundle,ToyImplementation())
+    model=save_bundle(tmp_path,state,unit,bundle,PythonBackend())
     unit.semantic_readiness=readiness(state,unit)
     assert any('exploratory' in x for x in semantic_limitations(state,model))
     available=objects(state);ids=unit.obligation_ids+unit.obligation_ids+unit.binding_ids+unit.relation_ids+[unit.id]

@@ -30,7 +30,7 @@ def test_recorded_derivation_contract_to_source_review(tmp_path,debt):
     state=Analysis.model_validate_json(data)
     assert Path(state.audit_spec_path).is_relative_to(root)
     state.framework_revision=FRAMEWORK_REVISION;state.pending_output_repair=None;state.pending_action=None
-    config=Config(implementation='hashicorp_raft',agent_backend='mock',allow_experiments=False)
+    config=Config(execution_backend='go_module',agent_backend='mock',allow_experiments=False)
     engine=Engine(config,root,*assemble(config));engine.state=state;engine.budget=BudgetTracker(config.budget,state)
     if debt=='selected':
         from consensus_assurance.workflow.audit_spec import load
@@ -40,7 +40,8 @@ def test_recorded_derivation_contract_to_source_review(tmp_path,debt):
         Path(state.audit_spec_path).write_text(broken.model_dump_json())
     if debt:
         from consensus_assurance.core.proposals import DescriptiveIssue,AuditSpecDelta,SpecRefinement
-        reply.descriptive_issues=[DescriptiveIssue(object_ids=['B5' if debt=='selected' else 'B6'],source_ids=reply.obligation.source_ids,reason='Restore the source-backed protections omitted from the selected behavior' if debt=='selected' else 'Recheck the unrelated decomposition against actual source')]
+        reply.descriptive_issues=[DescriptiveIssue(candidate_effect='requires_recheck' if debt=='selected' else 'independent_enrichment',object_ids=['B5' if debt=='selected' else 'B6'],source_ids=reply.obligation.source_ids,reason='Restore the source-backed protections omitted from the selected behavior' if debt=='selected' else 'Recheck the unrelated decomposition against actual source')]
+    state.packet_receipts.append({'kind':'derive','material_ids':[m.id for m in state.materials]})
     validate_derivation(state,reply);accepted=accept_derivation(engine,reply,'offline-recorded')
     tasks=[t for t in engine.state.inquiry_tasks if t.kind=='spec_refine' and t.diagnostics]
     assert bool(tasks)==bool(debt)
@@ -93,19 +94,23 @@ def test_evidence_blocked_candidate_does_not_end_autonomous_selection(tmp_path,p
     replies=[responses[0],description.model_dump(mode='json'),
         Derivation(audit_question=first,reading_requests=read(1,2),selection_rationale='Select the first discriminator').model_dump(mode='json'),
         Derivation(audit_question=first,selection_rationale='Reviewed caller and interface do not assign the responsibility; no exact next contract source is known').model_dump(mode='json'),
-        Derivation(audit_question=second,reading_requests=read(1,4),selection_rationale='Select an independent bounded discriminator').model_dump(mode='json')]
+        Derivation(audit_question=second,reading_requests=read(1,10 if next_outcome=='escalated' else 4),selection_rationale='Select an independent bounded discriminator').model_dump(mode='json')]
     if next_outcome=='explained':
         second.disposition='explained_by_existing_mechanism'
         replies.extend([Derivation(audit_question=second,selection_rationale='The supplied independent validation explains this suspicion').model_dump(mode='json'),Derivation(selection_rationale='No additional tractable candidate follows from the current inventory and sources').model_dump(mode='json')])
     else:
         upgrade=Derivation.model_validate(bounded_derivation(responses[1]));upgrade.audit_question=second.model_copy(update={'disposition':'ready_for_check','preferred_check':'local_model'})
-        replies.extend([upgrade.model_dump(mode='json')]*2)  # Exact binding source may need cached reattachment before acceptance.
+        replies.append(upgrade.model_dump(mode='json'))
     fixture=tmp_path/'candidate-flow.json';fixture.write_text(json.dumps(replies))
-    config=Config(implementation='toy',agent_backend='mock',fixture=str(fixture),allow_experiments=False)
+    config=Config(execution_backend='none',agent_backend='mock',fixture=str(fixture),allow_experiments=False)
     engine=Engine(config,tmp_path/'run',*assemble(config));state=engine.start(repo,plan_only=next_outcome=='escalated')
     assert [c.status for c in state.question_candidates]==['blocked',next_outcome],state.stop_reason
     assert not state.repair_sessions and state.pending_output_repair is None
     assert not state.models and not state.direct_checks and not state.evidence
+    assert engine.implementation is None and state.capabilities[0].status=='unavailable'
+    from consensus_assurance.workflow.direct_checks import proceed
+    from consensus_assurance.workflow.errors import Blocked
+    with pytest.raises(Blocked,match='no execution backend'):proceed(engine,None,'direct_check')
     first_record,second_record=state.question_candidates
     assert first_record.question.disposition=='needs_specific_evidence' and first_record.stop_reason
     assert first.counterevidence[0] not in second_record.question.counterevidence
@@ -148,7 +153,7 @@ def test_progressive_frontier_prevents_candidate_monopoly(tmp_path,prepared):
         SpecRefinement(understanding='Recover the synchronous restore owner',delta=AuditSpecDelta(behaviors=[behavior],facts=[fact],surfaces=[Surface(entry_point='recovery boundary',disposition='mapped',behavior_ids=['restore'],reason='Acquired declaration and return',source_ids=[actual],high_consequence=True)],rationale='Add the previously absent recovery path'),limitations=['Consumer remains external']).model_dump(mode='json'),
         select(later,[reading]),explain(later),Derivation(selection_rationale='No further tractable discriminator is supported').model_dump(mode='json')]
     fixture=tmp_path/'progressive.json';fixture.write_text(json.dumps(replies))
-    config=Config(implementation='toy',agent_backend='mock',fixture=str(fixture),allow_experiments=False)
+    config=Config(execution_backend='none',agent_backend='mock',fixture=str(fixture),allow_experiments=False)
     config.budget.agent_calls=len(replies)+1  # Exact finite scripted sequence; production budgets are unchanged.
     engine=Engine(config,tmp_path/'progressive-run',*assemble(config));state=engine.start(repo)
     assert [c.status for c in state.question_candidates]==['explained','explained'],state.stop_reason

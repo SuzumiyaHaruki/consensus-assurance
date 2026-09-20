@@ -27,7 +27,7 @@ def validate_representation(before,after,targets,context):
         supplied=[available[id] for id in right if id in available]
         for id in set(left)-set(right):
             import re
-            if target.get('grounding_reference_repair') and id not in available and not re.fullmatch(r'.+:\d+:\d+',id) and supplied:continue
+            if target.get('source_reference_repair') and id not in available and not re.fullmatch(r'.+:\d+:\d+',id) and supplied:continue
             if id in target.get('citation_aliases',{}) and set(right)&set(target['citation_aliases'][id]):continue
             if id not in available or not covered(available[id],supplied):
                 raise ValueError('Citation repair cannot discard evidence; acquire the missing range or request an explicit semantic decision')

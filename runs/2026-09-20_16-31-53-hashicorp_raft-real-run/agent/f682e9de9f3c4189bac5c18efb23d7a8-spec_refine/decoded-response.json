@@ -1,0 +1,458 @@
+{
+  "understanding": "The supplied code distinguishes startup snapshot selection, successful FSM restoration, startup restoration bypass, and runtime FSM restoration. Startup recovery adopts listed snapshot metadata after either successful restoration or an explicit bypass. Runtime restoration uses metadata returned by Open and advances worker-local indexes only after Restore returns nil. These observations establish local control flow, not snapshot integrity, application-state correctness, or completion of a surrounding protocol operation.",
+  "requests": [],
+  "delta": {
+    "target_profile": null,
+    "activities": [
+      {
+        "class_id": "A3",
+        "applicability": "applicable",
+        "purpose": "Recover startup state and execute runtime FSM snapshot restoration.",
+        "realization_summary": "NewRaft attempts snapshot recovery before starting workers. Startup recovery tries listed snapshots until one is accepted, with an explicit option to bypass FSM restoration. The runFSM worker serializes runtime restoration with its application and snapshot-capture handlers.",
+        "entry_points": [
+          "NewRaft",
+          "restoreSnapshot",
+          "tryRestoreSingleSnapshot",
+          "runFSM restore handler"
+        ],
+        "variants": [
+          "Startup restoration enabled",
+          "NoSnapshotRestoreOnStart bypass",
+          "No listed snapshots",
+          "Runtime restoreFuture"
+        ],
+        "unknowns": [
+          "SnapshotStore ordering, metadata consistency, integrity checks and concrete selected implementation are not established.",
+          "Runtime request producers and surrounding protocol completion are outside the supplied source.",
+          "Application FSM state after a failed Restore is unknown."
+        ],
+        "source_ids": [
+          "api.go:500:730",
+          "fsm.go:1:285"
+        ]
+      }
+    ],
+    "behaviors": [
+      {
+        "id": "startup_initialize_before_workers",
+        "primary_activity": "A3",
+        "execution_owner": "NewRaft caller",
+        "protocol_context": "Construction of one Raft instance before background workers start",
+        "trigger": "NewRaft invocation",
+        "legal_preconditions": [],
+        "implementation_guards": [
+          "ValidateConfig must succeed.",
+          "Current-term read errors other than the string \"not found\" abort construction.",
+          "LastIndex and any required last-log read must succeed.",
+          "ProtocolVersion below 3 requires LocalID to equal the transport address."
+        ],
+        "reads": [
+          "Injected configuration, FSM, stores and transport",
+          "Persisted current term",
+          "Last log index and entry",
+          "Logs following the selected snapshot index"
+        ],
+        "writes": [
+          "New Raft instance fields and channels",
+          "Follower state, current term and last-log metadata through setter calls",
+          "Configuration state through processConfigurationLogEntry calls"
+        ],
+        "durable_effects": [],
+        "external_effects": [
+          "Registers the heartbeat handler after recovery and configuration scanning.",
+          "Launches run, runFSM and runSnapshots unless skipStartup is set."
+        ],
+        "important_branches": [
+          "restoreSnapshot error aborts construction before worker startup.",
+          "A missing log during the post-snapshot configuration scan causes a panic.",
+          "A configuration-processing error aborts construction.",
+          "skipStartup returns the initialized instance without launching workers."
+        ],
+        "async_boundaries": [
+          "Background workers are launched only after synchronous snapshot recovery and configuration scanning."
+        ],
+        "produces_fact_ids": [],
+        "consumes_fact_ids": [
+          "startup_snapshot_metadata_adopted"
+        ],
+        "cross_activity_effects": {
+          "A4": "Scans entries after the adopted snapshot index through the configuration-processing helper before worker startup.",
+          "A2": "Calls setters to initialize follower state and the loaded current term."
+        },
+        "existing_protections": [
+          "Startup recovery completes or returns an error before workers are launched."
+        ],
+        "source_ids": [
+          "api.go:500:730"
+        ],
+        "unknowns": [
+          "Setter internals and configuration-log processing semantics are not supplied.",
+          "The consumed snapshot metadata fact is absent on the no-snapshot branch.",
+          "Initialization does not visibly transfer the recovered snapshot index into runFSM's local lastIndex, which starts at zero; subsequent producer behavior is unread."
+        ]
+      },
+      {
+        "id": "startup_restore_snapshot_candidate",
+        "primary_activity": "A3",
+        "execution_owner": "Startup caller executing tryRestoreSingleSnapshot",
+        "protocol_context": "One listed snapshot candidate with startup FSM restoration enabled",
+        "trigger": "restoreSnapshot invokes tryRestoreSingleSnapshot",
+        "legal_preconditions": [
+          "The enclosing restoreSnapshot routine is documented for initialization only."
+        ],
+        "implementation_guards": [
+          "NoSnapshotRestoreOnStart is false.",
+          "Open(snapshot.ID) must succeed.",
+          "fsmRestoreAndMeasure must return nil."
+        ],
+        "reads": [
+          "Listed SnapshotMeta",
+          "Snapshot stream opened by listed ID"
+        ],
+        "writes": [
+          "Application FSM through Restore"
+        ],
+        "durable_effects": [],
+        "external_effects": [
+          "Calls FSM.Restore through the measurement wrapper.",
+          "Closes the opened source after restoration returns."
+        ],
+        "important_branches": [
+          "Open failure returns false without invoking Restore.",
+          "Restore error closes the source and returns false.",
+          "Restore success closes the source and returns true.",
+          "Metadata returned by Open is discarded."
+        ],
+        "async_boundaries": [
+          "FSM.Restore is synchronous within startup recovery.",
+          "The wrapper starts a progress monitor and defers StopAndWait."
+        ],
+        "produces_fact_ids": [
+          "startup_restore_callback_succeeded"
+        ],
+        "consumes_fact_ids": [],
+        "cross_activity_effects": {
+          "A5": "Invokes the application callback to replace FSM state before background application begins."
+        },
+        "existing_protections": [
+          "An Open or Restore error prevents this candidate from being accepted through the restoration-enabled branch.",
+          "Source closure is attempted after either callback outcome."
+        ],
+        "source_ids": [
+          "api.go:500:730",
+          "fsm.go:1:285"
+        ],
+        "unknowns": [
+          "A nil callback result does not independently establish correct state contents.",
+          "Listed metadata and Open-returned metadata consistency is not checked in this caller.",
+          "Close errors are ignored.",
+          "Rollback or cleanup of partially mutated FSM state after Restore failure is not established."
+        ]
+      },
+      {
+        "id": "startup_bypass_snapshot_restore",
+        "primary_activity": "A3",
+        "execution_owner": "Startup caller executing tryRestoreSingleSnapshot",
+        "protocol_context": "One listed snapshot candidate with NoSnapshotRestoreOnStart enabled",
+        "trigger": "restoreSnapshot invokes tryRestoreSingleSnapshot",
+        "legal_preconditions": [
+          "The enclosing restoreSnapshot routine is documented for initialization only."
+        ],
+        "implementation_guards": [
+          "NoSnapshotRestoreOnStart is true."
+        ],
+        "reads": [
+          "Current configuration flag"
+        ],
+        "writes": [],
+        "durable_effects": [],
+        "external_effects": [],
+        "important_branches": [
+          "Returns true before opening the snapshot or invoking the FSM."
+        ],
+        "async_boundaries": [],
+        "produces_fact_ids": [
+          "startup_restore_bypass_accepted"
+        ],
+        "consumes_fact_ids": [],
+        "cross_activity_effects": {},
+        "existing_protections": [],
+        "source_ids": [
+          "api.go:500:730"
+        ],
+        "unknowns": [
+          "The configuration contract and caller responsibilities for preexisting FSM state are not supplied.",
+          "This branch establishes no successful FSM restoration."
+        ]
+      },
+      {
+        "id": "startup_select_and_adopt_snapshot",
+        "primary_activity": "A3",
+        "execution_owner": "Startup caller executing restoreSnapshot",
+        "protocol_context": "Initialization-time snapshot enumeration and recovered metadata adoption",
+        "trigger": "NewRaft calls restoreSnapshot",
+        "legal_preconditions": [
+          "The function comment restricts invocation to initialization."
+        ],
+        "implementation_guards": [
+          "SnapshotStore.List must succeed.",
+          "Candidate helper must return true before metadata adoption."
+        ],
+        "reads": [
+          "SnapshotStore.List result in returned order",
+          "Candidate helper result",
+          "Selected listed snapshot index, term, version and configuration fields"
+        ],
+        "writes": [
+          "Raft lastApplied",
+          "Raft lastSnapshot index and term",
+          "Committed and latest configuration through setters"
+        ],
+        "durable_effects": [],
+        "external_effects": [],
+        "important_branches": [
+          "Failed candidates are skipped.",
+          "No listed snapshots returns nil without snapshot adoption.",
+          "Exhausting a nonempty list returns an error.",
+          "Version greater than zero uses Configuration and ConfigurationIndex.",
+          "Legacy snapshots decode Peers and use snapshot.Index as the configuration index.",
+          "Legacy decoding failure returns after lastApplied and lastSnapshot setters have already been called.",
+          "Either successful FSM restoration or the bypass branch permits adoption."
+        ],
+        "async_boundaries": [],
+        "produces_fact_ids": [
+          "startup_snapshot_metadata_adopted"
+        ],
+        "consumes_fact_ids": [
+          "startup_restore_callback_succeeded",
+          "startup_restore_bypass_accepted"
+        ],
+        "cross_activity_effects": {
+          "A4": "Initializes committed and latest configuration from the accepted listed snapshot.",
+          "A6": "Sets the startup snapshot boundary used by subsequent configuration-log scanning."
+        },
+        "existing_protections": [
+          "Attempts later listed candidates after an Open or Restore failure.",
+          "Returns an error when every candidate in a nonempty list fails."
+        ],
+        "source_ids": [
+          "api.go:500:730"
+        ],
+        "unknowns": [
+          "The two consumed facts are alternative branch inputs, not jointly required.",
+          "Newest-first ordering is stated by a comment but depends on the unread store implementation.",
+          "Configuration decoding and setter implementations remain unread."
+        ]
+      },
+      {
+        "id": "runtime_restore_fsm",
+        "primary_activity": "A3",
+        "execution_owner": "runFSM goroutine",
+        "protocol_context": "One restoreFuture selected from fsmMutateCh",
+        "trigger": "The worker receives a *restoreFuture",
+        "legal_preconditions": [],
+        "implementation_guards": [
+          "Open(req.ID) must succeed.",
+          "FSM.Restore must return nil before local indexes advance."
+        ],
+        "reads": [
+          "restoreFuture.ID",
+          "Metadata and source returned by SnapshotStore.Open"
+        ],
+        "writes": [
+          "Application FSM through Restore",
+          "Worker-local lastIndex and lastTerm on success"
+        ],
+        "durable_effects": [],
+        "external_effects": [
+          "Calls req.respond with an Open error, Restore error, or nil.",
+          "Defers closing the opened source until the handler returns."
+        ],
+        "important_branches": [
+          "Open failure responds with an error and leaves local indexes unchanged.",
+          "Restore failure responds with an error and leaves local indexes unchanged.",
+          "Restore success assigns Open-returned meta.Index and meta.Term before responding nil."
+        ],
+        "async_boundaries": [
+          "Request arrives through fsmMutateCh.",
+          "The callback runs synchronously inside the worker's select handler.",
+          "Other application and snapshot-capture handlers in this worker cannot execute during the callback.",
+          "The success response is issued before deferred source closure."
+        ],
+        "produces_fact_ids": [
+          "runtime_restore_callback_and_position_succeeded"
+        ],
+        "consumes_fact_ids": [],
+        "cross_activity_effects": {
+          "A5": "Replaces FSM state through the Restore callback while serializing this handler with worker application.",
+          "A6": "Updates the local position subsequently attached to snapshot-capture responses."
+        },
+        "existing_protections": [
+          "Local position advances only after a nil Restore result.",
+          "Open and Restore errors are reported to the request.",
+          "Worker-local serialization prevents concurrent execution of its application and capture handlers."
+        ],
+        "source_ids": [
+          "fsm.go:1:285"
+        ],
+        "unknowns": [
+          "Request admission, producer ordering and response consumers are unread.",
+          "No surrounding protocol metadata update or client completion guarantee is established by this handler.",
+          "Failure can leave unknown application state even though local indexes remain unchanged.",
+          "Concurrent snapshot persistence is not excluded by this worker serialization.",
+          "Future response implementation and Close error handling guarantees are not established."
+        ]
+      }
+    ],
+    "facts": [
+      {
+        "id": "startup_restore_callback_succeeded",
+        "meaning": "For a listed startup candidate, its ID was opened and FSM.Restore returned nil through the measurement wrapper.",
+        "identity": {
+          "attempt": "One startup candidate attempt on one Raft instance",
+          "snapshot": "Listed snapshot.ID"
+        },
+        "validity_context": "Startup restoration enabled; assertion concerns callback completion, not independently verified FSM contents.",
+        "representation": [
+          "true returned by the restoration-enabled helper branch"
+        ],
+        "invalidators": [],
+        "reinterpreters": [
+          "startup_select_and_adopt_snapshot"
+        ],
+        "durability": "Transient control-flow result; no durable completion record is shown.",
+        "recovery": "Open or Restore failure causes the caller to attempt another listed candidate.",
+        "source_ids": [
+          "api.go:500:730",
+          "fsm.go:1:285"
+        ],
+        "unknowns": [
+          "Application correctness and snapshot metadata consistency are not established."
+        ]
+      },
+      {
+        "id": "startup_restore_bypass_accepted",
+        "meaning": "The startup candidate helper returned true because NoSnapshotRestoreOnStart was enabled, without opening or restoring the candidate.",
+        "identity": {
+          "attempt": "One startup candidate attempt on one Raft instance",
+          "snapshot": "Listed snapshot.ID"
+        },
+        "validity_context": "NoSnapshotRestoreOnStart is true at helper evaluation.",
+        "representation": [
+          "Immediate true return from tryRestoreSingleSnapshot"
+        ],
+        "invalidators": [],
+        "reinterpreters": [
+          "startup_select_and_adopt_snapshot"
+        ],
+        "durability": "Transient branch result.",
+        "recovery": "No FSM recovery is performed by this branch.",
+        "source_ids": [
+          "api.go:500:730"
+        ],
+        "unknowns": [
+          "Required correspondence between caller-provided FSM state and listed metadata is unknown."
+        ]
+      },
+      {
+        "id": "startup_snapshot_metadata_adopted",
+        "meaning": "After accepting a listed snapshot and obtaining its configuration, startup recovery invoked setters for lastApplied, lastSnapshot, committed configuration and latest configuration using that candidate.",
+        "identity": {
+          "instance": "Raft instance under construction",
+          "snapshot": "Selected listed ID, index and term",
+          "configuration": "Listed configuration and index, or decoded legacy peers at snapshot.Index"
+        },
+        "validity_context": "Successful nonempty-list restoreSnapshot path; acceptance may reflect restoration or explicit bypass.",
+        "representation": [
+          "Metadata setter calls preceding restoreSnapshot's success return"
+        ],
+        "invalidators": [],
+        "reinterpreters": [],
+        "durability": "Observed initialization assignments; persistence semantics of setters are unread.",
+        "recovery": "Reconstructed from snapshot listing on initialization.",
+        "source_ids": [
+          "api.go:500:730"
+        ],
+        "unknowns": [
+          "Subsequent metadata mutation paths and setter internals are not mapped.",
+          "This fact does not establish successful FSM restoration on the bypass path."
+        ]
+      },
+      {
+        "id": "runtime_restore_callback_and_position_succeeded",
+        "meaning": "For one runtime restore request, FSM.Restore returned nil and the worker assigned its local position from Open-returned metadata before issuing a nil response.",
+        "identity": {
+          "request": "One restoreFuture instance and its ID",
+          "position": "Open-returned meta.Index and meta.Term"
+        },
+        "validity_context": "Historical completion event in the runFSM handler; it does not assert that this position remains current after later work.",
+        "representation": [
+          "Worker-local assignments followed by req.respond(nil)"
+        ],
+        "invalidators": [],
+        "reinterpreters": [],
+        "durability": "In-memory worker state and response invocation; no persistence is shown.",
+        "recovery": "Another restoration request can execute this path; no rollback after failed restoration is shown.",
+        "source_ids": [
+          "fsm.go:1:285"
+        ],
+        "unknowns": [
+          "Response consumers and their interpretation remain unread.",
+          "A nil response does not independently prove snapshot contents or completion of a protocol installation."
+        ]
+      }
+    ],
+    "surfaces": [
+      {
+        "entry_point": "NewRaft startup initialization and snapshot adoption",
+        "disposition": "mapped",
+        "behavior_ids": [
+          "startup_initialize_before_workers",
+          "startup_restore_snapshot_candidate",
+          "startup_bypass_snapshot_restore",
+          "startup_select_and_adopt_snapshot"
+        ],
+        "reason": "Supplied source supports startup sequencing, candidate fallback, bypass and metadata-adoption branches; helper and adapter internals remain explicit unknowns.",
+        "source_ids": [
+          "api.go:500:730",
+          "fsm.go:1:285"
+        ],
+        "high_consequence": true
+      },
+      {
+        "entry_point": "runFSM runtime restore handler and fsmRestoreAndMeasure",
+        "disposition": "mapped",
+        "behavior_ids": [
+          "runtime_restore_fsm"
+        ],
+        "reason": "Supplied source shows callback execution, local position updates, response ordering and worker serialization.",
+        "source_ids": [
+          "fsm.go:1:285"
+        ],
+        "high_consequence": true
+      },
+      {
+        "entry_point": "Runtime restore request production and completion consumption",
+        "disposition": "deferred",
+        "behavior_ids": [],
+        "reason": "The supplied handler receives restoreFuture and calls respond, but source establishing who enqueues requests, which protocol metadata surrounds them, and what consumers infer from completion is absent.",
+        "source_ids": [
+          "fsm.go:1:285"
+        ],
+        "high_consequence": true
+      }
+    ],
+    "remove_behavior_ids": [],
+    "remove_fact_ids": [],
+    "remove_surface_entry_points": [
+      "NewRaft, restoreSnapshot and runtime FSM restore"
+    ],
+    "rationale": "Replace the composite frontier with sourced startup and runtime handler mappings plus a specific deferred handoff remainder. Separate successful restoration from bypass acceptance because the shared boolean has different meanings. Preserve the startup use of listed metadata, runtime use of Open-returned metadata, fallback behavior, error handling and serialization without deriving a normative obligation."
+  },
+  "limitations": [
+    "Only the two attached source ranges support this refinement; no tools or additional reads were used.",
+    "FSM interface comments supply callback expectations, while the observed nil returns establish only reported callback success.",
+    "Concrete storage behavior, configuration-option contracts, setter internals and runtime restore producers and consumers remain unresolved.",
+    "No correctness claim, executable check, calibration or reproduction is established."
+  ]
+}

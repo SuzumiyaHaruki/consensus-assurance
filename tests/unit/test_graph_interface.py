@@ -23,7 +23,7 @@ def test_saved_draft_repairs_multiple_reference_errors_with_existing_budget(tmp_
         original['obligation']['grounding'][field].append('unknown-reference')
         repairs.append({'path':'/obligation/grounding/'+field,'value_json':json.dumps(correct['obligation']['grounding'][field])})
     fixture=tmp_path/'interface.json';fixture.write_text(json.dumps([original,{'replacements':repairs,'rationale':'Correct opaque references while preserving all actual source'}]))
-    cfg=Config(implementation='toy',agent_backend='mock',fixture=str(fixture),allow_experiments=False)
+    cfg=Config(execution_backend='python',agent_backend='mock',fixture=str(fixture),allow_experiments=False)
     class CandidateOnly(Engine):
         def execute(self,**kwargs):
             self.state.materials=source.materials;self.state.analysis_mode='regression'
@@ -37,7 +37,7 @@ def test_saved_draft_repairs_multiple_reference_errors_with_existing_budget(tmp_
     assert session['status']=='accepted' and json.loads(Path(session['original_path']).read_text())==original
 
 
-@pytest.mark.parametrize('case',['direct','dangling','dependency','missing_support','multiple_primary','empty_question','unread_question','wrong_claim_kind','invalid_grounding','unattributed','duplicate'])
+@pytest.mark.parametrize('case',['direct','dangling','dependency','missing_support','multiple_primary','empty_question','unread_question','empty_source','wrong_claim_kind','invalid_grounding','unattributed','duplicate'])
 def test_candidate_contract_parity(prepared,case):
     from consensus_assurance.core.proposals import UnitDraft,RelationDraft
     from pydantic import ValidationError
@@ -56,9 +56,9 @@ def test_candidate_contract_parity(prepared,case):
         raw=u.model_dump();raw['obligation_ids'].append('input_obligation')
         with pytest.raises(ValidationError):UnitDraft.model_validate(raw)
         p.units[0]=u.model_copy(update={'obligation_ids':raw['obligation_ids']})
-    if case in {'empty_question','unread_question'}:
+    if case in {'empty_question','unread_question','empty_source'}:
         from consensus_assurance.core.types import AuditQuestion
-        u.audit_question=AuditQuestion(question='' if case=='empty_question' else 'An actual question',importance='Service consequence',trigger_rationale='Inspect scoped behavior',source_ids=['missing'] if case=='unread_question' else [state.materials[0].id])
+        u.audit_question=AuditQuestion(question='' if case=='empty_question' else 'An actual question',importance='Service consequence',trigger_rationale='Inspect scoped behavior',source_ids=[] if case=='empty_source' else ['missing'] if case=='unread_question' else [state.materials[0].id])
     if case=='wrong_claim_kind':next(c for c in p.claims if c.id=='step_obligation').kind='assumption'
     before=state.model_dump();issues=diagnose_graph(state,p)
     if case in {'direct','dependency'}:

@@ -64,6 +64,7 @@ def descriptive_projection(engine,kind,context,task):
     wanted=set(context.get('current_material_ids',[]))|{m['id'] for m in context.get('materials',[])}
     if candidate:
         wanted.update(question.source_ids)
+        wanted.update(id for t in state.inquiry_tasks if t.id in candidate.spec_task_ids and t.status=='completed' for id in t.material_ids)
         wanted.update(id for item in state.read_plans.get(candidate.read_plan_id,{}).get('items',[]) if item['status']!='deferred' for id in item['material_ids'])
     if task:wanted.update(id for d in task.diagnostics for id in d['material_ids'])
     if level and not task.added_material_ids:wanted={id for id in wanted if any(m.id==id and not m.file.lower().endswith('readme.md') for m in state.materials)}
@@ -115,7 +116,7 @@ def prepare(engine,kind,context):
         import re
         from .materials import catalogue
         terms=set(re.findall(r'[a-z][a-z0-9]*', re.sub(r'\b\w+\.', '', ' '.join(task.surface_entry_points+[e for a in packet.get('audit_spec',{}).get('activities',[]) for e in a.get('entry_points',[])])).lower()))-{'and','the','helpers','consumers'}
-        hints=[{'file':f['file'],**symbol} for f in catalogue(engine.root/'source',state.snapshot,engine.implementation) for symbol in f['symbols'] if terms&set(re.findall(r'[a-z][a-z0-9]*',(f['file']+' '+symbol['declaration']).lower()))]
+        hints=[{'file':f['file'],**symbol} for f in catalogue(engine.root/'source',state.snapshot) for symbol in f['symbols'] if terms&set(re.findall(r'[a-z][a-z0-9]*',(f['file']+' '+symbol['declaration']).lower()))]
         packet['declaration_hints']=sorted(hints,key=lambda h:(-len(terms&set(re.findall(r'[a-z][a-z0-9]*',h['declaration'].lower()))),h['file'],h['line']))[:(4 if task.preparation_failures>=2 else 24)]
     for key in ('catalogue','source_ranges','unread_ranges','current_material_ids'):
         if kind in {'derive','spec_refine'}:packet.pop(key,None)

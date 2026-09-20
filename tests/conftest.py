@@ -25,7 +25,7 @@ def prepared(tmp_path):
     responses = toy_responses(repo)
     fixture = tmp_path / "toy_responses.json"
     fixture.write_text(json.dumps(responses))
-    config = Config(protocol="toy", implementation="toy", agent_backend="mock", fixture=str(fixture))
+    config = Config(protocol="toy", execution_backend="python", agent_backend="mock", fixture=str(fixture))
     state = Analysis(mode="mock", analysis_mode="regression", config=config.model_dump(mode="json"), snapshot=snapshot)
     state.materials = initial_materials(repo, snapshot, config.budget, "Toy fixture normative context")
     add_reads(state, repo, ReadingPlan.model_validate(responses[0]), config.budget)
@@ -60,7 +60,10 @@ def verification_fixture_inventory(monkeypatch):
                 if len(responses)==1 and 'requests' in responses[0]:
                     source=reply['claims'][0]['source_ids'][0]
                     responses.append(descriptive_inventory(source).model_dump(mode='json'))
-                response=bounded_derivation(reply);structured=response['audit_question']['fact_ids']==['fixture_value'];responses.extend([response,response])
+                response=bounded_derivation(reply);structured=response['audit_question']['fact_ids']==['fixture_value']
+                from regression_support import selection_derivation
+                selection=selection_derivation(response)
+                responses.extend([selection,response])
             elif structured and isinstance(reply,dict) and 'behavior' in reply:responses.append(fixture_reachability(reply))
             else:responses.append(reply)
         self.responses=responses

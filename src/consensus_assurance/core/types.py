@@ -137,7 +137,7 @@ class AuditQuestion(Record):
     requests: list[ReadRequest] = []
     question: str
     importance: str
-    source_ids: list[str] = Field(min_length=1)
+    source_ids: list[str] = []
     participants: list[str] = []
     objects: list[str] = []
     contexts: list[str] = []

@@ -75,6 +75,7 @@ def proceed(engine, unit, model, draft, phase):
         engine.state.gaps.append('Model-only result '+model.id+' has no implementation calibration; pending harness and observation assembly')
         engine.advance('harness')
     elif phase == 'harness':
+        if engine.implementation is None:raise Blocked('Implementation calibration unavailable: no execution backend configured; local search retained')
         if engine.state.targeted_gap:
             gap=engine.state.targeted_gap
             engine.targeted_read(unit,gap['gap'],requests=gap.get('requests'),update_required=False)

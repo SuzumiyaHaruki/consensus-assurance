@@ -1,0 +1,371 @@
+{
+  "understanding": "The supplied source establishes a mismatch between the broadcast RPC code and payload codec: bcastCommit sends Commit bytes under commitShortRPC. The registered decoder reads sixteen bytes as CommitShort, so the sender's ballot becomes Count and subsequent bytes determine the receiver's ballot. For state.NOOP(), those subsequent bytes decode to ballot 2 and ten payload bytes remain. Successful decoding, asynchronous channel delivery, and handler commitment are distinct events. The committed-Prepare response separately sends Commit under commitRPC. These observations require reassessment of the same F3 consumption question; they do not establish a legal violating history.",
+  "requests": [],
+  "delta": {
+    "target_profile": null,
+    "activities": [],
+    "behaviors": [
+      {
+        "id": "paxos_commit_broadcast",
+        "primary_activity": "A1",
+        "execution_owner": "Paxos run goroutine executing bcastCommit and synchronous SendMsg calls",
+        "protocol_context": "Broadcast of the instance, ballot, and commands supplied by handleAcceptReply after its local commitment branch",
+        "trigger": "handleAcceptReply invokes bcastCommit after assigning COMMITTED.",
+        "legal_preconditions": [
+          "Peer indices and initialized transport state must permit the selected SendMsg calls.",
+          "Local COMMITTED status does not independently establish globally decided commands."
+        ],
+        "implementation_guards": [
+          "Skips entries whose Alive flag is false.",
+          "SendMsg returns without serialization when the selected PeerWriter is nil.",
+          "bcastCommit catches and logs panics."
+        ],
+        "reads": [
+          "Supplied instance, ballot, and command slice",
+          "N, PreferredPeerOrder, Alive, commitShortRPC, and PeerWriters"
+        ],
+        "writes": [
+          "Package-level pc receives the full Commit fields.",
+          "Package-level pcs receives CommitShort fields but is not passed to SendMsg."
+        ],
+        "durable_effects": [],
+        "external_effects": [
+          "For each selected alive peer, passes &pc with commitShortRPC to SendMsg.",
+          "SendMsg writes the code byte, invokes Commit.Marshal synchronously, and flushes under r.M.",
+          "WriteByte, payload writes, and Flush errors are not inspected."
+        ],
+        "important_branches": [
+          "The loop examines the first N-1 preferred-peer entries; it does not test whether a peer accepted these commands.",
+          "Commit.Marshal emits twelve header bytes, a signed-varint command count, and command encodings despite the short-commit RPC code.",
+          "The separately constructed pcs is not the serialized object.",
+          "A recovered panic can leave a partially attempted broadcast; return does not establish peer receipt.",
+          "The committed branch of handlePrepare instead sends a local Commit object with commitRPC, preserving a distinct correctly paired path."
+        ],
+        "async_boundaries": [
+          "Network buffering and peer receipt occur beyond the synchronous marshaling call.",
+          "Package-level message objects are shared across replica objects; supported multi-replica process configurations remain unresolved."
+        ],
+        "produces_fact_ids": [],
+        "consumes_fact_ids": [
+          "F5"
+        ],
+        "cross_activity_effects": {},
+        "existing_protections": [
+          "SendMsg serializes writes under the replica mutex.",
+          "Marshaling completes within SendMsg rather than being deferred through a message-object reference.",
+          "Nil-writer and Alive checks exclude some unavailable destinations."
+        ],
+        "source_ids": [
+          "paxos/paxos.go:164:397",
+          "paxos/paxos.go:398:666",
+          "paxos/defs.go:1:558",
+          "replica/replica.go:201:577"
+        ],
+        "unknowns": [
+          "Actual successful writes and peer receipt in a selected execution",
+          "Legal histories establishing the commands associated with the local COMMITTED marker",
+          "Whether the selected deployment contains multiple replica objects sharing package-level pc and pcs"
+        ]
+      },
+      {
+        "id": "paxos_peer_decode_short_commit",
+        "primary_activity": "A1",
+        "execution_owner": "Per-peer replicaListener goroutine",
+        "protocol_context": "Peer byte stream at a message-code boundary resolving to the registered CommitShort decoder",
+        "trigger": "replicaListener reads a code whose RPC table entry contains a CommitShort prototype.",
+        "legal_preconditions": [
+          "The peer listener has started with a usable reader.",
+          "The selected stream position reaches the registered short-commit code without an earlier blocking read or error."
+        ],
+        "implementation_guards": [
+          "RPC.Get must find the code.",
+          "CommitShort.Unmarshal must obtain sixteen bytes before the delivery goroutine is launched.",
+          "The listener continues only while err is nil and Shutdown is false."
+        ],
+        "reads": [
+          "Peer stream code and payload bytes",
+          "RPC table prototype and notification channel",
+          "Shutdown"
+        ],
+        "writes": [
+          "A fresh CommitShort object containing four little-endian int32 fields",
+          "Listener error state",
+          "Alive[rid]=false when the listener loop exits"
+        ],
+        "durable_effects": [],
+        "external_effects": [
+          "Launches a delivery goroutine after successful decoding.",
+          "Calls r.Fatal for an unknown message code; the logger's exact termination semantics are not attached."
+        ],
+        "important_branches": [
+          "New registers CommitShort and commitShortChan together; Table.Register stores that pair under its returned code.",
+          "When the payload is emitted by Commit.Marshal, LeaderId and Instance retain their header positions, the original Ballot becomes Count, and payload bytes 12 through 15 become decoded Ballot.",
+          "For a one-command batch, decoded Ballot is int32(2 | uint32(Op)<<8 | uint32(byte(K))<<16 | uint32(byte(uint64(K)>>8))<<24).",
+          "state.NOOP() contains one NONE command with key zero and an empty value. Its Commit payload is 26 bytes; short decoding yields Ballot=2 and leaves ten zero bytes.",
+          "An empty command batch supplies only thirteen Commit payload bytes, so short decoding requires three additional stream bytes or ends with a read error.",
+          "Remaining payload bytes become input to subsequent message-code reads; recognized codes can invoke other decoders, and unknown codes invoke r.Fatal.",
+          "A correctly paired full Commit follows Commit.Unmarshal instead; this short-decoder analysis does not replace that path."
+        ],
+        "async_boundaries": [
+          "ReadAtLeast can wait for later stream traffic.",
+          "After launching delivery, the listener resumes parsing independently of that delivery goroutine."
+        ],
+        "produces_fact_ids": [
+          "paxos_short_commit_decoded"
+        ],
+        "consumes_fact_ids": [],
+        "cross_activity_effects": {},
+        "existing_protections": [
+          "A fresh object is allocated for each registered message.",
+          "A short read returning an error prevents delivery-goroutine creation for that object.",
+          "The decoder has a fixed sixteen-byte read requirement."
+        ],
+        "source_ids": [
+          "paxos/paxos.go:24:163",
+          "paxos/defs.go:1:558",
+          "rpc/rpc.go:1:48",
+          "state/state.go:1:254",
+          "replica/replica.go:201:577"
+        ],
+        "unknowns": [
+          "Numeric RPC_TABLE and generic message-code constants, needed to resolve how leftover zero bytes are dispatched",
+          "Exact effects of r.Fatal",
+          "Concrete subsequent stream contents and whether the selected candidate's later messages remain reachable",
+          "No accepted-command or sender-ballot guarantee follows from successful short decoding"
+        ]
+      },
+      {
+        "id": "paxos_short_commit_channel_delivery",
+        "primary_activity": "A1",
+        "execution_owner": "Per-message delivery goroutine launched by replicaListener",
+        "protocol_context": "A successfully decoded CommitShort object and its registered notification channel",
+        "trigger": "The listener launches the goroutine after CommitShort.Unmarshal returns nil.",
+        "legal_preconditions": [
+          "The process and delivery goroutine remain runnable.",
+          "The channel send requires available buffer capacity or a receiver."
+        ],
+        "implementation_guards": [],
+        "reads": [
+          "Decoded object, registered p.Chan, peer rid, and r.Dt"
+        ],
+        "writes": [],
+        "durable_effects": [],
+        "external_effects": [
+          "Sleeps for r.Dt.WaitDurationID(rid), then sends the object to the registered channel."
+        ],
+        "important_branches": [
+          "WaitDurationID returns zero for a nil latency-table receiver.",
+          "A non-nil table returns a peer-specific duration when present, otherwise its default duration.",
+          "NewLatencyTable returns nil for empty configuration or an open failure; a nil table alone does not prevent delivery.",
+          "The channel send can block; goroutine creation does not establish delivery completion.",
+          "There is no Shutdown or Alive check in this delivery closure."
+        ],
+        "async_boundaries": [
+          "Each decoded message receives an independent delivery goroutine.",
+          "Channel-send completion and run's handler invocation are separate events.",
+          "Independent goroutines do not by themselves establish an arbitrary realizable ordering."
+        ],
+        "produces_fact_ids": [
+          "paxos_short_commit_delivered"
+        ],
+        "consumes_fact_ids": [
+          "paxos_short_commit_decoded"
+        ],
+        "cross_activity_effects": {},
+        "existing_protections": [
+          "Delivery is launched only after successful decoding.",
+          "Nil latency-table access is explicitly handled."
+        ],
+        "source_ids": [
+          "replica/replica.go:201:577",
+          "replica/defs/latency.go:1:238",
+          "paxos/paxos.go:24:163"
+        ],
+        "unknowns": [
+          "Actual scheduling and buffer occupancy for the selected history",
+          "Whether later stream errors terminate the process before an already launched delivery completes",
+          "Startup must already have completed; nil-safe WaitDurationID does not establish successful constructor or connection initialization"
+        ]
+      },
+      {
+        "id": "B7",
+        "primary_activity": "A1",
+        "execution_owner": "Paxos replica run goroutine",
+        "protocol_context": "Decoded CommitShort for an existing local instance",
+        "trigger": "run receives a CommitShort from commitShortChan and invokes handleCommitShort.",
+        "legal_preconditions": [
+          "The instance index must be within instanceSpace.",
+          "The transport path must reach successful decoding and channel delivery; broadcast invocation alone does not establish either.",
+          "No sender-side guarantee correlating retained commands with decoded Ballot has been established."
+        ],
+        "implementation_guards": [
+          "Returns if the instance is absent.",
+          "Returns if already COMMITTED.",
+          "Returns if decoded commit.Ballot is below inst.bal."
+        ],
+        "reads": [
+          "commit.Instance and decoded commit.Ballot",
+          "inst.status, inst.bal, and retained inst.cmds"
+        ],
+        "writes": [
+          "COMMITTED status",
+          "inst.bal=commit.Ballot"
+        ],
+        "durable_effects": [
+          "Records metadata and retained commands subject to Durable, without sync in this handler."
+        ],
+        "external_effects": [],
+        "important_branches": [
+          "Commands and vbal remain unchanged.",
+          "Count and LeaderId are not used.",
+          "No non-nil-command or accepted-status guard appears.",
+          "For mismatched broadcasts, the ballot guard evaluates the value decoded from command-count and following stream bytes, not necessarily the sender's ballot.",
+          "The separate full-Commit handler installs incoming commands and vbal and retains its own guards."
+        ],
+        "async_boundaries": [
+          "Channel delivery precedes serialized run dispatch.",
+          "The independent execution loop can observe the published status."
+        ],
+        "produces_fact_ids": [
+          "F5"
+        ],
+        "consumes_fact_ids": [
+          "paxos_short_commit_delivered"
+        ],
+        "cross_activity_effects": {
+          "A5": "Makes retained commands eligible for execution if the execution loop's additional guards hold."
+        },
+        "existing_protections": [
+          "Instance-existence check",
+          "Committed-state guard",
+          "Decoded-ballot comparison",
+          "Protocol-handler dispatch is serialized by run."
+        ],
+        "source_ids": [
+          "paxos/paxos.go:164:397",
+          "paxos/paxos.go:398:666",
+          "paxos/defs.go:1:558",
+          "replica/replica.go:201:577"
+        ],
+        "unknowns": [
+          "Legal reachability of a retained-command state passing the decoded-ballot guard",
+          "Command provenance and command availability are not established by delivery.",
+          "Whether the same F3 consumption candidate remains realizable under concrete stream processing"
+        ]
+      }
+    ],
+    "facts": [
+      {
+        "id": "paxos_short_commit_decoded",
+        "meaning": "The registered CommitShort decoder has successfully consumed sixteen stream bytes into a fresh object; its fields report those bytes, without establishing the sender's intended ballot or command identity.",
+        "identity": {
+          "stream": "Receiving replica, peer rid, connection, and payload position",
+          "object": "Fresh decoded CommitShort object"
+        },
+        "validity_context": "Historical successful decoding at the selected stream position. It does not imply channel delivery or preserved framing of subsequent traffic.",
+        "representation": [
+          "CommitShort{LeaderId, Instance, Count, Ballot}"
+        ],
+        "invalidators": [],
+        "reinterpreters": [],
+        "durability": "Transient in-memory object.",
+        "recovery": "No replay or reconstruction mechanism is established for this object.",
+        "source_ids": [
+          "paxos/defs.go:1:558",
+          "replica/replica.go:201:577",
+          "rpc/rpc.go:1:48"
+        ],
+        "unknowns": [
+          "The byte stream may contain a mismatched full-Commit payload.",
+          "Successful decoding does not authenticate semantic field provenance."
+        ]
+      },
+      {
+        "id": "paxos_short_commit_delivered",
+        "meaning": "The delivery goroutine has completed sending the decoded CommitShort object to its registered commitShortChan.",
+        "identity": {
+          "receiver": "Receiving replica and registered commitShortChan",
+          "object": "The previously decoded CommitShort object"
+        },
+        "validity_context": "Historical channel-send completion; handler invocation, guard passage, and COMMITTED assignment remain separate.",
+        "representation": [
+          "Completed p.Chan <- obj for the CommitShort registration"
+        ],
+        "invalidators": [],
+        "reinterpreters": [],
+        "durability": "Transient channel handoff.",
+        "recovery": "No durable delivery receipt or restart replay is established.",
+        "source_ids": [
+          "paxos/paxos.go:24:163",
+          "replica/replica.go:201:577",
+          "replica/defs/latency.go:1:238"
+        ],
+        "unknowns": [
+          "Actual delivery ordering relative to PrepareReply and other protocol messages",
+          "Whether run processes the object before shutdown or process termination"
+        ]
+      }
+    ],
+    "surfaces": [
+      {
+        "entry_point": "paxos.(*Replica).bcastCommit",
+        "disposition": "mapped",
+        "behavior_ids": [
+          "paxos_commit_broadcast"
+        ],
+        "reason": "Maps the actual Commit payload sent with commitShortRPC, synchronous transport calls, peer filtering, and partial-send limitations.",
+        "source_ids": [
+          "paxos/paxos.go:164:397",
+          "replica/replica.go:201:577",
+          "paxos/defs.go:1:558"
+        ],
+        "high_consequence": true
+      },
+      {
+        "entry_point": "replicaListener CommitShort decoding and channel delivery",
+        "disposition": "mapped",
+        "behavior_ids": [
+          "paxos_peer_decode_short_commit",
+          "paxos_short_commit_channel_delivery"
+        ],
+        "reason": "Separates stream decoding from asynchronous channel delivery and records their concrete prerequisites; this mapping covers the short-commit branch only.",
+        "source_ids": [
+          "paxos/paxos.go:24:163",
+          "rpc/rpc.go:1:48",
+          "paxos/defs.go:1:558",
+          "replica/replica.go:201:577",
+          "replica/defs/latency.go:1:238",
+          "state/state.go:1:254"
+        ],
+        "high_consequence": true
+      },
+      {
+        "entry_point": "handleCommit and handleCommitShort",
+        "disposition": "mapped",
+        "behavior_ids": [
+          "B6",
+          "B7"
+        ],
+        "reason": "Preserves distinct full-command installation and retained-command commitment. Short-commit ingress now has mapped decoding and delivery prerequisites; the correctly paired full Commit sent by handlePrepare remains an independent reconciliation path.",
+        "source_ids": [
+          "paxos/paxos.go:398:666",
+          "paxos/paxos.go:164:397",
+          "paxos/defs.go:1:558",
+          "replica/replica.go:201:577"
+        ],
+        "high_consequence": true
+      }
+    ],
+    "remove_behavior_ids": [],
+    "remove_fact_ids": [],
+    "remove_surface_entry_points": [],
+    "rationale": "Add the previously missing broadcast and receiver boundary using attached implementation source, and update B7 ownership, prerequisites, ignored fields, and authoritative delivery-fact consumption. Existing F3 and F5 meanings and B5 support-counting semantics remain unchanged. Preserve handlePrepare's correctly paired full-Commit path as counterevidence against treating every remote commitment as dependent on the mismatched broadcast. Return the same candidate to F3 consumption reassessment with concrete byte-stream and delivery constraints."
+  },
+  "limitations": [
+    "No execution, calibration, counterexample reproduction, or normative obligation is established.",
+    "The NOOP byte calculation is a source-derived inference conditional on successful serialization and aligned entry into CommitShort decoding.",
+    "Exact handling of leftover zero bytes requires the unattached message-code constants and, if relevant, the selected generic decoder and logger behavior.",
+    "Master registration constraints, a legal same-instance command-replacement history, and an applicable support-attribution contract remain unresolved.",
+    "Independent delivery goroutines and nil-safe latency lookup establish possible handoff mechanics, not the specific correlated schedule required by the selected candidate."
+  ]
+}

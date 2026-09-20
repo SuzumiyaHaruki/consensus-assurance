@@ -41,7 +41,7 @@ def deferred_fixture(tmp_path, responses):
 @pytest.mark.real
 def test_F3_reads_new_producer_then_generates_and_checks_new_scope(tmp_path,tlc,prepared):
     repo,fixture=deferred_fixture(tmp_path,prepared[3])
-    config=Config(implementation='toy',agent_backend='mock',fixture=str(fixture),tlc_jar=os.environ['TLC_JAR'])
+    config=Config(execution_backend='python',agent_backend='mock',fixture=str(fixture),tlc_jar=os.environ['TLC_JAR'])
     config.budget.audit_units=3
     root=tmp_path/'audit'
     state=Engine(config,root,*assemble(config)).start(repo)
@@ -65,7 +65,7 @@ def test_F3_reads_new_producer_then_generates_and_checks_new_scope(tmp_path,tlc,
 @pytest.mark.parametrize('event',['action_started','action_result_saved'])
 def test_interrupted_experiment_resumes_same_model_and_action(tmp_path,tlc,prepared,event):
     repo,fixture=deferred_fixture(tmp_path,prepared[3])
-    config=Config(implementation='toy',agent_backend='mock',fixture=str(fixture),tlc_jar=os.environ['TLC_JAR'])
+    config=Config(execution_backend='python',agent_backend='mock',fixture=str(fixture),tlc_jar=os.environ['TLC_JAR'])
     config.budget.audit_units=3;config.budget.experiments=5
     root=tmp_path/'resume'
     class Interrupted(Engine):
@@ -90,16 +90,16 @@ def test_experiments_false_prevents_probes_and_replay(tmp_path,prepared):
     from consensus_assurance.core.proposals import Bundle
     from consensus_assurance.workflow.artifacts import save_bundle
     from consensus_assurance.workflow.engine import Blocked
-    from consensus_assurance.plugins.implementations.toy.adapter import ToyImplementation
+    from consensus_assurance.adapters.runners.python import PythonBackend
     repo=prepared[0]
-    config=Config(implementation='toy',agent_backend='mock',allow_experiments=False)
+    config=Config(execution_backend='python',agent_backend='mock',allow_experiments=False)
     root=tmp_path/'disabled'
     engine=Engine(config,root,*assemble(config))
     state=engine.start(repo)
     assert not any(c.action in {'capability_probe','experiment','replay'} for c in state.checks)
     assert not (root/'experiments').exists()
     assert state.capabilities[0].status=='unavailable'
-    model=save_bundle(root,prepared[1],prepared[1].units[0],prepared[2],ToyImplementation())
+    model=save_bundle(root,prepared[1],prepared[1].units[0],prepared[2],PythonBackend())
     with pytest.raises(Blocked,match='disabled'): engine.experiment(model,prepared[2],replay=True)
 
 
@@ -111,7 +111,7 @@ def test_compilation_failure_gets_actual_log_and_finite_repair(tmp_path,tlc,prep
     original=copy.deepcopy(responses[2]);broken=copy.deepcopy(original)
     broken['harness']['source']='import missing_round2_fixture_module\n'
     fixture=tmp_path/'compile.json';fixture.write_text(json.dumps([responses[0],responses[1],broken,original]))
-    config=Config(implementation='toy',agent_backend='mock',fixture=str(fixture),tlc_jar=os.environ['TLC_JAR'])
+    config=Config(execution_backend='python',agent_backend='mock',fixture=str(fixture),tlc_jar=os.environ['TLC_JAR'])
     # Python runtime import failure is an executable harness error, never F1-F4.
     class Adapter(type(assemble(config)[0])):
         def parse_test_result(self,check,text):
@@ -167,7 +167,7 @@ def test_initial_replay_then_F4_and_attribution_continue(tmp_path,tlc,interrupt_
     unresolved=Feedback(kind='unresolved',rationale='Explicit mock cannot confirm implementation correctness',evidence_ids=[],target_ids=[],relation_ids=[],new_basis='',graph=None,bundle=None)
     fixture=tmp_path/'replay-responses.json'
     fixture.write_text(json.dumps([{'requests':[],'rationale':'Initial files contain the complete fixture'},description.model_dump(mode='json'),graph.model_dump(mode='json'),bundle.model_dump(mode='json'),replay.model_dump(mode='json'),fix.model_dump(mode='json'),unresolved.model_dump(mode='json')]))
-    config=Config(implementation='toy',agent_backend='mock',fixture=str(fixture),tlc_jar=os.environ['TLC_JAR'])
+    config=Config(execution_backend='python',agent_backend='mock',fixture=str(fixture),tlc_jar=os.environ['TLC_JAR'])
     config.budget.replays=2;config.budget.experiments=4
     class CorrelatedMock(MockAgent):
         def analyze(self,runner,prompt,directory,snapshot_id,timeout,response_type):
@@ -211,7 +211,7 @@ def test_initial_replay_then_F4_and_attribution_continue(tmp_path,tlc,interrupt_
 @pytest.mark.real
 def test_model_files_written_before_state_checkpoint_resume_same_generation(tmp_path,tlc,prepared):
     repo,fixture=deferred_fixture(tmp_path,prepared[3])
-    config=Config(implementation='toy',agent_backend='mock',fixture=str(fixture),tlc_jar=os.environ['TLC_JAR'])
+    config=Config(execution_backend='python',agent_backend='mock',fixture=str(fixture),tlc_jar=os.environ['TLC_JAR'])
     config.budget.audit_units=3
     root=tmp_path/'model-commit-resume'
     class Interrupted(Engine):
