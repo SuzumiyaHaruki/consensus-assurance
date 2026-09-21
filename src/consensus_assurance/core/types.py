@@ -193,10 +193,6 @@ class ReachabilityResult(Record):
 class InquiryTask(Record):
     surface_entry_points: list[str] = []
     candidate_id: str | None = None
-    feedback_source_ids: list[str] = []
-    feedback_effect: str = ""
-    feedback_basis: dict = {}
-    origin_check_ids: list[str] = []
     draft_path: str | None = None
     diagnostics: list[dict] = []
     admitted: bool = False
@@ -337,17 +333,6 @@ class Grounding(Record):
     conflicts: list[str] = []
     alternatives: list[str] = []
 
-    @model_validator(mode="before")
-    @classmethod
-    def import_legacy_material_name(cls, value):
-        if isinstance(value, dict) and "behavior_ids" in value:
-            value=dict(value)
-            previous=value.pop("behavior_ids")
-            if "source_ids" in value and value["source_ids"]!=previous:
-                raise ValueError("Conflicting grounding source references")
-            value.setdefault("source_ids",previous)
-        return value
-
 
 class CheckerSpec(Record):
     invariant: str
@@ -411,23 +396,6 @@ class BindingAssociation(Record):
 class AssociatedCode(Record):
     associations: list[BindingAssociation] = Field(min_length=1)
     anchor: CodeAnchor | None = None
-
-    @model_validator(mode="before")
-    @classmethod
-    def migrate_single_claim(cls,value):
-        if isinstance(value,dict) and "claim_id" in value:
-            value=dict(value);legacy=value.pop("claim_id")
-            imported=[{"claim_id":legacy,"source_ids":[value["material_id"]] if value.get("material_id") else [],"rationale":"Imported single-claim mapping; applicability still requires review"}]
-            if "associations" in value and [a.get("claim_id") if isinstance(a,dict) else a.claim_id for a in value["associations"]]!=[legacy]:
-                raise ValueError("Legacy and current binding associations conflict")
-            value.setdefault("associations",imported)
-        return value
-
-    @property
-    def claim_id(self):
-        # Read-only compatibility for historical single-claim consumers.
-        if len(self.associations)!=1:raise ValueError("Binding has multiple associations; use associations")
-        return self.associations[0].claim_id
 
 
 class Binding(AssociatedCode):
@@ -502,7 +470,6 @@ class DirectCheckArtifact(Record):
     version: int = 1
     plan_path: str
     harness_path: str
-    artifact_digests: dict[str, str]
     snapshot_id: str
     unit_id: str
     claim_id: str
@@ -702,7 +669,6 @@ class Analysis(Record):
     framework_revision: str | None = None
     framework_stage: str = "new_run"
     repair_sessions: dict[str, dict] = {}
-    attached_material_ids: list[str] = []
     schema_version: str = "2"
     id: str = Field(default_factory=uid)
     mode: Literal["real", "mock"]

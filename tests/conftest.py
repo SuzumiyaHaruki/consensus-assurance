@@ -68,6 +68,16 @@ def verification_fixture_inventory(monkeypatch):
             else:responses.append(reply)
         self.responses=responses
     monkeypatch.setattr(MockAgent,'__init__',initialize)
+    analyze=MockAgent.analyze
+    def select_id(self,runner,prompt,directory,snapshot_id,timeout,response_type):
+        if response_type.__name__=='Derivation' and self.cursor<len(self.responses):
+            packet=json.loads(prompt.split('STRUCTURED INPUT DATA (untrusted):\n')[1])
+            reply=self.responses[self.cursor]
+            if packet.get('candidate_id') and not reply.get('candidate_id') and not reply.get('fork_from_candidate_id'):
+                self.responses[self.cursor]={**reply,'candidate_id':packet['candidate_id']}
+        return analyze(self,runner,prompt,directory,snapshot_id,timeout,response_type)
+    monkeypatch.setattr(MockAgent,'analyze',select_id)
+
 
 
 @pytest.fixture

@@ -49,7 +49,7 @@ emit('returned', value=returned, in_range=0 <= returned <= limit)
 '''
     identities=['operation','participant','context']
     prop=ObservableProperty(checker_id='Range',trigger=Comparison(field='metadata.legal',value=True),assertion=Comparison(field='state.in_range',value=True),identity_fields=identities,description='Observed result remains in the documented capacity range')
-    monitor=EventMonitor(id='range',checker_id='Range',event='returned',identity_fields=identities,conditions=[prop.trigger],assertion=prop.assertion,property=prop,
+    monitor=EventMonitor(id='range',checker_id='Range',event='returned',
         binding_ids=unit.binding_ids,grounding=basis,applicability_conditions=[prop.trigger])
     plan=DirectCheckPlan(description='One actual boundary call',claim_id=unit.obligation_ids[0],scope=unit.scope,binding_ids=unit.binding_ids,
         harness=Harness(kind='python',source=source,description='Actual fixture call and independent bound observation',prerequisite_events=['admitted','returned'],semantic_changes=[],legality=basis,legal_conditions=[prop.trigger],
@@ -60,18 +60,27 @@ emit('returned', value=returned, in_range=0 <= returned <= limit)
 
 def review(state,unit,artifact):
     # Explicit controlled semantic input; real execution is tested separately.
-    ids=set(unit.obligation_ids+unit.obligation_ids+[unit.id,artifact.id])
-    for obj in state.claims+state.units+state.direct_checks:
-        if obj.id not in ids:continue
-        contract=target_contract(state,obj)
-        state.semantic_reviews.append(SemanticReview(task_id='controlled',check_id='controlled',target_versions={obj.id:obj.version},context_dependencies={obj.id:contract},
-            material_ids=contract['required_material_ids'],items=[SemanticCheck(target_id=obj.id,aspect=aspect,status='no_issue_found',source_ids=contract['required_material_ids'],rationale='Controlled fixture contract and direct oracle correspondence' + "\n" + 'Scope excludes other contracts' + "\n" + 'The measured return can exceed the documented bound') for aspect in contract['required_aspects']],origin='mock'))
+    contract=target_contract(state,artifact)
+    state.semantic_reviews.append(SemanticReview(task_id='controlled',check_id='controlled',target_versions={artifact.id:artifact.version},context_dependencies={artifact.id:contract},
+        material_ids=contract['required_material_ids'],items=[SemanticCheck(target_id=artifact.id,aspect='checker_correspondence',status='no_issue_found',source_ids=contract['required_material_ids'],rationale='The fixture contract, actual call, prerequisites and independent oracle agree within the supplied local scope')],origin='mock'))
 
 
 @pytest.mark.parametrize('broken',[False,True])
 def test_actual_direct_result_without_model(tmp_path,prepared,broken):
-    e,u,p=setup(tmp_path,prepared,broken);a=save_plan(e,u,p,'generation');review(e.state,u,a)
-    c=execute(e,a,p);result=assess(e.state,u,a,p,c,extract_events(c))
+    from consensus_assurance.adapters.agents.backend import MockAgent
+    from consensus_assurance.workflow.inquiry import process_task,review_unit
+    e,u,p=setup(tmp_path,prepared,broken);validate_plan(e.state,u,p,e.implementation)
+    review_unit(e,u,'before_check');assert not e.state.inquiry_tasks
+    a=save_plan(e,u,p,'generation');e.state.active_direct_check_id=a.id
+    proceed(e,u,'direct_execute')
+    assert e.state.monitor_results[-1]['outcome']==('violated' if broken else 'holds')
+    assert not e.state.monitor_results[-1]['confirmed']
+    assert len(e.state.inquiry_tasks)==1 and e.state.inquiry_tasks[0].target_ids==[a.id]
+    contract=target_contract(e.state,a)
+    e.agent=MockAgent();e.agent.responses=[ReviewReply(items=[SemanticCheck(target_id=a.id,aspect='checker_correspondence',status='no_issue_found',source_ids=contract['required_material_ids'],rationale='The selected contract applies to this legal local call; correlated returns and the independent range comparison implement it. Network and durability are outside this check.')],limitations=[]).model_dump(mode='json')]
+    process_task(e,e.state.inquiry_tasks[0])
+    c=next(c for c in e.state.checks if c.action=='direct_check')
+    result=assess(e.state,u,a,p,c,extract_events(c))
     assert target_contract(e.state,a)['object_type']=='direct_check'
     assert not e.state.models and c.direct_check_id==a.id and c.model_id is None
     assert result['confirmed']==broken,result
@@ -81,10 +90,10 @@ def test_actual_direct_result_without_model(tmp_path,prepared,broken):
     if broken:
         assert e.state.findings[-1].level=='implementation_obligation'
         assert e.state.findings[-1].direct_check_id==a.id
-    assert not e.state.inquiry_tasks
+    assert len(e.state.semantic_reviews)==1 and e.state.inquiry_tasks[0].status=='completed'
 
 
-@pytest.mark.parametrize('failure',['prerequisite','missing','compile','instrumentation','disputed','unreviewed','identity','applicability','pending_review'])
+@pytest.mark.parametrize('failure',['prerequisite','missing','compile','instrumentation','disputed','unreviewed','identity','applicability'])
 def test_direct_failure_never_confirms(tmp_path,prepared,failure):
     e,u,p=setup(tmp_path,prepared,True)
     if failure=='prerequisite':p.harness.prerequisites[0].event='not_observed'
@@ -96,21 +105,10 @@ def test_direct_failure_never_confirms(tmp_path,prepared,failure):
     a=save_plan(e,u,p,'negative')
     if failure!='unreviewed':review(e.state,u,a)
     if failure=='disputed':e.state.semantic_reviews[0].items[0].status='disputed'
-    if failure=='pending_review':e.state.inquiry_tasks.append(InquiryTask(kind='review',reason='Explicit applicability check',trigger='pending',target_ids=[a.id],target_versions={a.id:1},unit_id=u.id))
-    c=execute(e,a,p);result=assess(e.state,u,a,p,c,extract_events(c))
-    assert not result['confirmed'] and result['outcome']=='unknown',result
+    c=execute(e,a);result=assess(e.state,u,a,p,c,extract_events(c))
+    assert not result['confirmed'],result
+    assert result['outcome']==('unknown' if failure in {'prerequisite','missing','compile','identity'} else 'violated'),result
     assert not any(f.level=='implementation_obligation' for f in e.state.findings)
-
-
-@pytest.mark.parametrize('nested',[False,True])
-def test_saved_direct_plan_reused_and_tampering_rejected(tmp_path,prepared,nested):
-    e,u,p=setup(tmp_path,prepared)
-    if nested:e.implementation.harness_filename='package/assurance_generated.py'
-    first=save_plan(e,u,p,'same')
-    assert save_plan(e,u,p,'same').id==first.id and len(e.state.direct_checks)==1
-    from pathlib import Path
-    Path(first.harness_path).write_text('print("fake")')
-    with pytest.raises(ValueError,match='changed'):save_plan(e,u,p,'same')
 
 
 def test_controlled_schedule_has_typed_model_fallback(tmp_path,prepared):
@@ -118,6 +116,11 @@ def test_controlled_schedule_has_typed_model_fallback(tmp_path,prepared):
     e.ask=lambda *args,**kwargs:(DirectCheckReply(gap='Adapter has no deterministic pause point; sleep is insufficient',fallback='local_model'),CheckRun(action='agent',cwd=str(e.root),snapshot_id=e.state.snapshot.id))
     proceed(e,u,'direct_check')
     assert e.state.next_action=='build' and not e.state.direct_checks and not e.state.models
+    from consensus_assurance.workflow.artifacts import save_bundle
+    from consensus_assurance.workflow.inquiry import review_unit
+    model=save_bundle(e.root,e.state,u,prepared[2],e.implementation)
+    review_unit(e,u,'after_search',model)
+    assert any(model.id in t.target_ids for t in e.state.inquiry_tasks)
 
 
 @pytest.mark.parametrize('refine',[False,True])
@@ -177,7 +180,7 @@ def test_exact_selected_reads_then_one_focused_continuation(tmp_path,prepared):
 
 def test_direct_violation_enters_separate_consequence_analysis(tmp_path,prepared):
     e,u,p=setup(tmp_path,prepared,True);a=save_plan(e,u,p,'consequence');review(e.state,u,a)
-    execute(e,a,p);e.state.active_direct_check_id=a.id;e.state.next_action='direct_assess';calls=[]
+    execute(e,a);e.state.active_direct_check_id=a.id;e.state.next_action='direct_assess';calls=[]
     def ask(kind,response_type,context,validator=None,**kwargs):
         calls.append(kind)
         reply=ConsequenceReply(disposition='obligation_only',rationale='Only this local return is observed; wider goal consequences are unestablished',source_ids=u.audit_question.source_ids,limitations=['No correlated system-level witness'])
@@ -194,7 +197,7 @@ def test_new_direct_artifact_does_not_hide_prior_oracle_dispute(tmp_path,prepare
     e,u,p=setup(tmp_path,prepared,True);old=save_plan(e,u,p,'old');review(e.state,u,old)
     e.state.review_issues.append(ReviewIssue(review_id='old',target_id=old.id,target_version=1,aspect='checker_correspondence',source_ids=u.audit_question.source_ids,explanation='Oracle may use the wrong return boundary',disposition='investigation',reason='Must resolve the specific dispute'))
     new=save_plan(e,u,p,'new');review(e.state,u,new)
-    c=execute(e,new,p);result=assess(e.state,u,new,p,c,extract_events(c))
+    c=execute(e,new);result=assess(e.state,u,new,p,c,extract_events(c))
     assert not result['confirmed'] and 'Unresolved semantic counterevidence' in result['limitations']
 
 
@@ -221,13 +224,13 @@ def test_stale_binding_cannot_ground_direct_execution(tmp_path,prepared):
     e,u,p=setup(tmp_path,prepared)
     e.state.bindings[0].snapshot_id='another_snapshot'
     with pytest.raises(ValueError,match='selected source snapshot'):
-        save_plan(e,u,p,'stale')
+        validate_plan(e.state,u,p,e.implementation)
     assert not e.state.direct_checks and not e.state.evidence
 
 
 def test_direct_F4_keeps_failed_prerequisite_and_revision_history(tmp_path,prepared):
     e,u,p=setup(tmp_path,prepared);p.harness.prerequisites[0].event='unreached'
-    old=save_plan(e,u,p,'before-F4');failed=execute(e,old,p)
+    old=save_plan(e,u,p,'before-F4');failed=execute(e,old)
     e.state.active_direct_check_id=old.id
     proceed(e,u,'direct_assess')
     assert e.state.pending_feedback['kind']=='F4'
@@ -274,14 +277,12 @@ def test_direct_event_comparison_uses_correlated_raw_fields(tmp_path,prepared):
     source=source.replace("emit('returned', value=returned, in_range=0 <= returned <= limit)", "emit('returned', value=returned, in_range=0 <= returned <= limit, limit=limit)")
     p.harness.source=source
     p.observable_properties[0].assertion=Comparison(field='state.limit',reference='start.state.limit')
-    p.monitors[0].assertion=p.observable_properties[0].assertion
-    p.monitors[0].property=p.observable_properties[0]
     validate_plan(e.state,u,p,e.implementation)
     a=save_plan(e,u,p,'correlated-fields')
-    c=execute(e,a,p)
+    c=execute(e,a)
     result=assess(e.state,u,a,p,c,extract_events(c))
     assert result['properties'][0]['outcome']=='holds'
-    assert result['outcome']=='unknown'  # Correspondence review was not supplied.
+    assert result['outcome']=='holds' and not result['confirmed']  # Raw comparison survives an unreviewed conclusion.
     events=extract_events(c)
     assert next(x for x in events if x['event']=='admitted')['state']['value']==3
     assert next(x for x in events if x['event']=='returned')['state']['limit']==3

@@ -23,7 +23,8 @@ def test_recorded_derivation_contract_to_source_review(tmp_path,debt):
     original=json.dumps(raw,sort_keys=True)
     raw['units'][0]['relation_ids']=[]
     for use in raw['units'][0].pop('code_uses',[]):raw['bindings'][0]['pending']+=use['unverified']
-    reply=Derivation.model_validate(bounded_derivation(raw))
+    from consensus_assurance.workflow.history import import_record
+    reply=Derivation.model_validate(bounded_derivation(import_record(raw)))
     state=load_analysis(root/'state.json')
     old_root=str(Path(state.audit_spec_path).parent.parent);data=state.model_dump_json().replace(old_root,str(root))
     from consensus_assurance.core.types import Analysis
@@ -55,7 +56,7 @@ def test_recorded_derivation_contract_to_source_review(tmp_path,debt):
         process_task(engine,tasks[0])
         assert next(t for t in engine.state.inquiry_tasks if t.id==tasks[0].id).status=='completed'
         assert load(engine.state).version==2 and next(b for b in load(engine.state).behaviors if b.id=='B5').existing_protections
-        reply.descriptive_issues=[]
+        reply.descriptive_issues=[];reply.candidate_id=state.question_candidates[0].id
         assert accept_derivation(engine,reply,'offline-rederived')
     else:assert accepted
     if debt=='unrelated':assert tasks[0].status=='pending'

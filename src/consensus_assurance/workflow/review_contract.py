@@ -8,7 +8,7 @@ POLICY={
  'binding': {'decomposition':'Check the source anchor and behavior range, the semantic association to responsibilities, and the selected unit use. Location alone does not establish an obligation.'},
  'relation': {'decomposition':'Check the direction, kind, conditions and actual endpoint responsibilities; explain the implementing handoff and alternatives.'},
  'unit': {'decomposition':'Check that the audit question, selected obligations, direct/support code uses and boundary assumptions form a coherent executable scope.'},
- 'direct_check': {'checker_correspondence':'Compare the saved shared property, actual harness calls, independent oracle computation, correlated observations and legality with the selected obligation. No model or calibration is required; an assertion or matching ID alone is not correspondence.'},
+ 'direct_check': {'checker_correspondence':'Review the entire selected obligation, question, source bindings, assumptions and scope together with the saved property, actual calls, oracle, correlated observations and legality. State concrete issues within this whole check instead of requesting separate object/aspect approvals. No model or calibration is required; an assertion or matching ID alone is not correspondence.'},
  'model': {'checker_correspondence':'Compare actual behavior and checker/oracle encoding with the attributed claim, trigger, observations, scope and contrary evidence; tool completion alone is not correspondence.'}}
 OPTIONAL={'binding':{'applicability':'Evaluate whether the code mapping applies to the current implementation configuration.'},'unit':{'applicability':'Evaluate whether the unit scope is applicable under the supplied execution conditions.'}}
 

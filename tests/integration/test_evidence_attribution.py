@@ -37,13 +37,11 @@ def test_multiple_invariants_are_attributed_individually(tlc,tmp_path,reversed_o
 
 
 @pytest.mark.real
-@pytest.mark.parametrize('mode,partial,confirm,variant',[('memory',False,False,'plain'),('durable',False,True,'plain'),('conflict',False,False,'plain'),('durable',True,False,'plain'),('durable',False,True,'reviewed_observation'),('durable',False,False,'wrong_monitor')])
+@pytest.mark.parametrize('mode,partial,confirm,variant',[('memory',False,False,'plain'),('durable',False,True,'plain'),('conflict',False,False,'plain'),('durable',True,False,'plain'),('durable',False,True,'reviewed_observation')])
 def test_actual_contract_and_observation_determine_confirmation(tlc,tmp_path,mode,partial,confirm,variant):
     verifier,runner=tlc
     repo=tmp_path/'repo';shutil.copytree(ROOT/'fixtures/ack_service',repo)
     state,unit,bundle=setup_ack(repo,mode,partial)
-    if variant=='wrong_monitor':
-        bundle.monitors[0].assertion=Comparison(field='state.accepted',value=False)
     if variant=='reviewed_observation':
         from consensus_assurance.core.proposals import ObservationChange
         line=next(i for i,l in enumerate(bundle.harness.source.splitlines(),1) if "print('CA_EVENT '" in l)

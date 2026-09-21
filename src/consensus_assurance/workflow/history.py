@@ -10,6 +10,15 @@ def import_record(value):
         if isinstance(obj,list):return [visit(x) for x in obj]
         if not isinstance(obj,dict):return obj
         obj={k:visit(v) for k,v in obj.items()}
+        if 'expectation_ids' in obj and 'behavior_ids' in obj:
+            obj.setdefault('source_ids',obj.pop('behavior_ids'))
+        if 'claim_id' in obj and 'symbol' in obj and 'start_line' in obj:
+            claim=obj.pop('claim_id')
+            obj.setdefault('associations',[{'claim_id':claim,'source_ids':[obj['material_id']] if obj.get('material_id') else [],'rationale':'Historical single-claim mapping; unreviewed'}])
+        if 'trigger' in obj and obj.get('kind') in {'spec_refine','review','explore'}:
+            for name in ('feedback_basis','feedback_effect','feedback_source_ids','origin_check_ids'):obj.pop(name,None)
+        if 'plan_path' in obj and 'operation_id' in obj:obj.pop('artifact_digests',None)
+        obj.pop('attached_material_ids',None)
         if 'code_uses' in obj:
             uses=obj.pop('code_uses')
             obj['coverage_limitations']=obj.get('coverage_limitations',[])+[text for use in uses for text in use.get('unverified',[])]
@@ -43,5 +52,6 @@ def load_analysis(path):
     from pathlib import Path
     from consensus_assurance.core.types import Analysis
     value=json.loads(Path(path).read_text())
-    if value.get('framework_revision') not in {'obligation-audit-v2','selected-question-v3','selected-question-v4','selected-question-v5','selected-question-v6','selected-question-v7','selected-question-v8'}:value=import_record(value)
+    from .prompts import manifest
+    if value.get('framework_revision')!=manifest()['version']:value=import_record(value)
     return Analysis.model_validate(value)

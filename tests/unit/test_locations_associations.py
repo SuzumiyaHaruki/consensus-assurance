@@ -14,7 +14,7 @@ def material(text,start=1,file='sample.go'):
 
 
 def binding(m,symbol='accept',start=2,end=2,anchor=None):
-    return BindingDraft(id='code',claim_id='O',material_id=m.id,symbol=symbol,start_line=start,end_line=end,description='Observed operation body',pending=[],anchor=anchor)
+    return BindingDraft(id='code',associations=[dict(claim_id='O',source_ids=[m.id],rationale='Selected fixture operation')],material_id=m.id,symbol=symbol,start_line=start,end_line=end,description='Observed operation body',pending=[],anchor=anchor)
 
 
 
@@ -38,7 +38,6 @@ def test_multiple_obligations_share_one_binding_with_sourced_associations(prepar
     b.associations.append(BindingAssociation(claim_id=p.claims[-1].id,source_ids=[b.material_id],rationale='The same entry also consumes the producer condition'))
     apply_graph(state,p)
     assert len(state.bindings[0].associations)==2
-    with pytest.raises(ValueError):_ = state.bindings[0].claim_id
 
 
 

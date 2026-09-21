@@ -21,13 +21,13 @@ def deferred_fixture(tmp_path, responses):
     first=copy.deepcopy(responses[0]);first['requests']=[q for q in first['requests'] if q['file']!='limits.py']
     graph=copy.deepcopy(responses[1])
     basis=copy.deepcopy(graph['claims'][1]['grounding'])
-    basis['source_ids']=basis.pop('behavior_ids')
     dependency={'id':'input_dependency','source':'step_obligation','target':'input_obligation','kind':'boundary','group':None,'rationale':'Actual consumer depends on producer input','pending':['Producer guarantee unverified'],'grounding':basis}
     graph['relations']=[dependency];graph['units'][0]['relation_ids']=['input_dependency']
     graph['bindings']=[b for b in graph['bindings'] if b['id']!='input_binding']
     graph['relations']=[e for e in graph['relations'] if e['id']!='maps_input']
     read={'requests':[{'file':'upstream_support.py','start_line':1,'end_line':2,'reason':'Read actual producer of the unexplained boundary'}],'rationale':'Consumer needs a positive effective capacity','related_ids':['step_obligation'],'gap':'Input producer not yet read'}
     binding=copy.deepcopy(responses[1]['bindings'][1]);binding['material_id']='upstream_support.py:1:2'
+    for association in binding['associations']:association['source_ids']=[binding['material_id']]
     edge=copy.deepcopy(dependency);edge.update(id='producer_location',source='input_obligation',target='input_binding')
     edge['grounding']['source_ids']=['upstream_support.py:1:2']
     patch={'bindings':[binding],'relations':[edge],'rationale':'Actual new producer code explains the dependency without changing the obligation'}
@@ -147,7 +147,7 @@ def test_initial_replay_then_F4_and_attribution_continue(tmp_path,tlc,interrupt_
     code=source_state.materials[0]
     import ast
     declaration=next(n for n in ast.parse(code.text).body if isinstance(n,ast.FunctionDef) and n.name=='execute')
-    binding=BindingDraft(id='ack-code',claim_id='durable',material_id=code.id,symbol='execute',start_line=declaration.lineno,end_line=declaration.end_lineno,description='Actual acceptance and return ordering',pending=[])
+    binding=BindingDraft(id='ack-code',associations=[dict(claim_id='durable',source_ids=[code.id],rationale='Selected fixture operation')],material_id=code.id,symbol='execute',start_line=declaration.lineno,end_line=declaration.end_lineno,description='Actual acceptance and return ordering',pending=[])
     edge=RelationDraft(id='supports_ack',source='ack_goal',target='durable',kind='depends_all',group=None,rationale='Return guarantee depends on the configured durability responsibility',pending=[],grounding=basis)
     u=UnitDraft(id='ack',obligation_ids=['durable'],binding_ids=['ack-code'],relation_ids=[],scope=unit.scope,rationale='Fixture candidate selection',)
     from consensus_assurance.core.types import AuditQuestion,ReachabilityRequirement

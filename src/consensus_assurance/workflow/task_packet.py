@@ -88,8 +88,14 @@ def descriptive_projection(engine,kind,context,task):
         if not spec:result['draft_audit_spec']=draft.get('audit_spec',draft)
         result['focused_surfaces']=[s for s in (view or {}).get('surfaces',[]) if s['entry_point'] in task.surface_entry_points]
         result['phase']='interpret' if task.added_material_ids else 'navigate'
-    if candidate:result.update(selected_question=focus,source_receipt=state.read_plans.get(candidate.read_plan_id))
-    elif kind=='derive':result['candidate_dispositions']=[{'fact_ids':c.question.fact_ids,'lifecycle':c.question.obligation_relation_kind,'status':c.status,'reason':c.stop_reason} for c in state.question_candidates if c.status!='active']
+    if candidate:
+        result.pop('focus')
+        result.update(selected_question=focus,source_receipt=state.read_plans.get(candidate.read_plan_id))
+    if kind=='derive':
+        result['candidate_dispositions']=[{'id':c.id,'question':c.question.question,'fact_ids':c.question.fact_ids,
+            'lifecycle':c.question.obligation_relation_kind,'scope':{'objects':c.question.objects,'contexts':c.question.contexts,'event_paths':c.question.event_paths},
+            'status':c.status,'reason':c.stop_reason} for c in state.question_candidates]
+        result['pending_enrichment']=[{'id':t.id,'target_ids':t.target_ids,'reason':t.reason} for t in state.inquiry_tasks if t.kind=='spec_refine' and not t.candidate_id and t.status=='pending']
     result['existing_objects']=[{'id':o.id,'version':o.version} for name in ('claims','bindings','relations','units') for o in getattr(state,name)] if kind=='derive' else []
     return result
 
@@ -127,8 +133,7 @@ def prepare(engine,kind,context):
         from .associations import graph_contract
         packet['graph_contract']=graph_contract()
         packet.setdefault('source_declarations',declaration_index([m for key in ('materials','new_materials') for m in packet.get(key,[])]))
-    packet['material_budget']={'used':material_usage(state),'breadth':material_allowance(state,engine.config.budget,'breadth'),'depth':material_allowance(state,engine.config.budget,'depth'),
-        'remaining_targeted_reads':max(0,engine.config.budget.targeted_reads-state.usage.get('targeted_reads',0))}
+    packet['material_budget']={'used':material_usage(state),'breadth':material_allowance(state,engine.config.budget,'breadth'),'depth':material_allowance(state,engine.config.budget,'depth')}
     packet['remaining_agent_calls']=max(0,engine.config.budget.agent_calls-state.usage.get('agent_calls',0))
     packet['context_limit_chars']=engine.config.budget.context_chars
     packet['reading_status']=[{'id':id,'status':p['status'],'unfulfilled':[i for i in p['items'] if i['status']=='deferred']} for id,p in state.read_plans.items() if p['status']!='complete' and (not task or id==task.read_plan_id)]

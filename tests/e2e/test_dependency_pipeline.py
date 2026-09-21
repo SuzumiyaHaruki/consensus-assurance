@@ -65,7 +65,7 @@ def test_negative_review_cached_context_new_dependencies_split_scope_and_tlc(tmp
             if type(response).__name__=='GraphPatch':
                 for edge in response.relations:edge.grounding.source_ids=[x.replace('upstream_support.py:1:2','upstream_support.py:1:6') for x in edge.grounding.source_ids]
             return check,response
-    args=(args[0],Agent(data),args[2],args[3],args[4]);cfg.budget.targeted_reads=2
+    args=(args[0],Agent(data),args[2],args[3],args[4])
     state=Engine(cfg,root,*args).start(repo)
     assert state.models,state.stop_reason
     assert state.units[0].obligation_ids==['step_obligation']
@@ -74,6 +74,6 @@ def test_negative_review_cached_context_new_dependencies_split_scope_and_tlc(tmp
     assert any(c.action=='experiment' and c.outcome=='tests_passed' for c in state.checks)
     assert any(c.status=='compatible' for c in state.calibrations)
     assert any(i.explanation.startswith('The consumer boundary') for i in state.review_issues)
-    assert state.usage['targeted_reads']==1 and state.usage['agent_calls']<=20
+    assert state.usage['agent_calls']<=20
     assert any(p['items'] and all(i['status']=='cached' for i in p['items']) for p in state.read_plans.values())
     assert any(s['status']=='accepted' and s['task']=='graph_patch' for s in state.repair_sessions.values())

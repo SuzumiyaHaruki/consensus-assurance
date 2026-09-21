@@ -1,0 +1,1249 @@
+{
+  "understanding": "The selected entry point constructs the repository's Paxos implementation with master-provided replica identity, peer addresses and initial leader flag. Observed responsibilities include per-instance prepare/accept processing, local commit marking, an independent ordered execution loop, recovery initiation, optional persistence helpers and client replies. This is a partial descriptive inventory, not a correctness assessment. The event dispatcher, proposal admission, ballot construction, broadcast selection, storage initialization and master failover loop remain unread. In particular, local COMMITTED status, an accept reply carrying a ballot, successful persistence and completed application are distinct assertions.",
+  "audit_spec": {
+    "version": 1,
+    "target_profile": {
+      "system_boundary": "The selected paxos package and its in-repository replica, master, client, state, configuration and RPC dependencies. Other protocol implementations selected by runReplica are outside this initial inventory.",
+      "protocol_contexts": [
+        "Per-instance Instance records contain commands, promise ballot bal, value ballot vbal, status and optional LeaderBookkeeping.",
+        "Replica-wide context includes IsLeader, maxRecvBallot, per-peer defaultBallot, smallestDefaultBallot, crtInstance and executedUpTo.",
+        "The master supplies initial replica identity, peer list and leader flag; their subsequent evolution is only partially read."
+      ],
+      "external_interfaces": [
+        "Master.Register and Master.GetLeader use net/rpc.",
+        "runReplica exposes registered replica RPC methods through HTTP.",
+        "Paxos message types are registered with the repository RPC table and notification channels.",
+        "Client proposals use buffered network writers; replies are decoded as ProposeReplyTS.",
+        "StableStore is a concrete *os.File owned by the embedded replica.",
+        "Command.Execute is the application call site; its implementation remains unread."
+      ],
+      "ownership": [
+        "paxos.New constructs and embeds replica.Replica, registers six message types and starts r.run in a goroutine.",
+        "The execution loop reads instanceSpace and advances executedUpTo; its launch and synchronization with protocol dispatch remain unread.",
+        "Master.Register serializes registration using master.lock.",
+        "BeTheLeader changes the Paxos replica's local leader flag directly."
+      ],
+      "selection_injection": [
+        "runReplica selects paxos.New when strings.ToLower(c.Protocol) equals paxos.",
+        "registerWithMaster supplies id, addrs and isLeader; runReplica computes f from configured ReplicaAddrs.",
+        "paxos.New calls replica.New with thrifty=false, exec=true and lread=false.",
+        "The embedded constructor initializes Dreply=true, Durable=false and StableStore=nil. Later assignments have not been inspected.",
+        "Storage, application and transport helpers have in-repository implementations and are not externalized merely because some call sites remain unread."
+      ],
+      "variants": [
+        "Durable guards all three persistence helpers; constructor defaults disable them.",
+        "Dreply selects execution-time value replies versus commit-time replies with an empty value.",
+        "Full Commit carries commands; CommitShort operates on an existing local instance and retains its commands.",
+        "Client.SendProposal supports leader-directed, closest-replica and broadcast routing, but activation for this selected deployment is unread.",
+        "ReadQuorumSize returns N-F and WriteQuorumSize returns F+1."
+      ],
+      "source_ids": [
+        "run.go:23:103",
+        "paxos/paxos.go:24:163",
+        "replica/replica.go:1:80",
+        "replica/replica.go:81:136",
+        "paxos/paxos.go:398:538",
+        "paxos/paxos.go:539:666",
+        "paxos/paxos.go:667:736",
+        "client/client.go:142:256",
+        "master/master.go:187:277"
+      ],
+      "unknowns": [
+        "Actual proposal admission, handler dispatch, ballot generation and message fanout in paxos/paxos.go:164:397.",
+        "Runtime overrides of Durable, Dreply, execution and storage setup.",
+        "Master failover, fencing and the legal relationship between BeTheLeader and existing protocol work.",
+        "Transport delivery, duplication, sender attribution and error behavior.",
+        "Crash/restart support and any stable-store reconstruction contract.",
+        "No deployment-specific fault contract or runtime configuration has been established."
+      ]
+    },
+    "activities": [
+      {
+        "class_id": "A1",
+        "applicability": "applicable",
+        "purpose": "Process per-instance proposals and protocol responses and advance local decision state.",
+        "realization_summary": "Prepare and accept handlers maintain instance state. Prepare replies update leader bookkeeping and can trigger accept broadcast; accept replies can trigger local COMMITTED status and commit broadcast. Proposal admission and broadcast implementations remain deferred.",
+        "entry_points": [
+          "Replica.handlePrepare",
+          "Replica.handleAccept",
+          "Replica.handlePrepareReply",
+          "Replica.handleAcceptReply",
+          "Replica.handleCommit",
+          "Replica.handleCommitShort"
+        ],
+        "variants": [
+          "Full and short commit reception.",
+          "Separate N-F read and F+1 write thresholds."
+        ],
+        "unknowns": [
+          "Dispatcher ordering, initialization of leader bookkeeping and response multiplicity.",
+          "Construction and selection of outbound commands and recipients."
+        ],
+        "source_ids": [
+          "paxos/paxos.go:398:538",
+          "paxos/paxos.go:539:666",
+          "replica/replica.go:81:136"
+        ]
+      },
+      {
+        "class_id": "A2",
+        "applicability": "applicable",
+        "purpose": "Maintain leader indication and per-instance ballot context.",
+        "realization_summary": "Initial leadership is supplied by registration. BeTheLeader sets a local flag. Prepare handling changes instance promises and sometimes the local default ballot. Reply paths update maximum observed ballot and can request another prepare attempt.",
+        "entry_points": [
+          "Master.Register",
+          "Replica.BeTheLeader",
+          "Replica.handlePrepare",
+          "Replica.handlePrepareReply",
+          "Replica.handleAcceptReply"
+        ],
+        "variants": [
+          "Configured initial leader or latency-selected initial leader.",
+          "Replica-wide default ballots and per-instance ballots."
+        ],
+        "unknowns": [
+          "Ballot construction and leadership loss.",
+          "Whether master leadership indication is fenced or merely advisory.",
+          "RPC callback ordering relative to the protocol loop."
+        ],
+        "source_ids": [
+          "master/master.go:187:277",
+          "paxos/paxos.go:24:163",
+          "paxos/paxos.go:398:538",
+          "paxos/paxos.go:539:666"
+        ]
+      },
+      {
+        "class_id": "A3",
+        "applicability": "applicable",
+        "purpose": "Request recovery of instances that obstruct ordered execution.",
+        "realization_summary": "executeCommands queues instance indices after a grace interval at an execution gap. recover creates missing instance/bookkeeping state and calls ballot generation and prepare broadcast. Dispatch between these endpoints and successful recovery completion remain unestablished.",
+        "entry_points": [
+          "Replica.executeCommands",
+          "Replica.recover",
+          "Replica.instancesToRecover"
+        ],
+        "variants": [
+          "Missing instance versus existing instance with missing leader bookkeeping.",
+          "A committed replica answers a prepare with a full Commit."
+        ],
+        "unknowns": [
+          "Consumer of instancesToRecover and filtering of obsolete requests.",
+          "Whether recovery is leader-restricted.",
+          "Restart reconstruction and any independent catch-up mechanism."
+        ],
+        "source_ids": [
+          "paxos/paxos.go:398:538",
+          "paxos/paxos.go:667:736"
+        ]
+      },
+      {
+        "class_id": "A4",
+        "applicability": "applicable",
+        "purpose": "Establish the participant list used by replica construction and quorum calculations.",
+        "realization_summary": "Master.Register collects addresses and reports readiness at master.N participants. runReplica passes the returned list into paxos.New. Dynamic membership changes are not established by the supplied material.",
+        "entry_points": [
+          "Master.Register",
+          "registerWithMaster",
+          "replica.New",
+          "Replica.ReadQuorumSize",
+          "Replica.WriteQuorumSize"
+        ],
+        "variants": [
+          "Existing address registration reuses its index.",
+          "New address registration extends the master's lists."
+        ],
+        "unknowns": [
+          "Master initialization and capacity constraints.",
+          "Post-start participant changes and configuration versioning.",
+          "Whether configured ReplicaAddrs and returned NodeList must have identical cardinality."
+        ],
+        "source_ids": [
+          "master/master.go:187:277",
+          "run.go:23:103",
+          "replica/replica.go:1:80",
+          "replica/replica.go:81:136"
+        ]
+      },
+      {
+        "class_id": "A5",
+        "applicability": "applicable",
+        "purpose": "Process locally committed instance commands in index order and update application state.",
+        "realization_summary": "executeCommands stops at the first missing, commandless or noncommitted instance. It calls Execute for all commands when direct replies and client bookkeeping are available; otherwise it executes only PUT commands. It advances executedUpTo after processing an eligible instance.",
+        "entry_points": [
+          "Replica.executeCommands",
+          "state.Command.Execute"
+        ],
+        "variants": [
+          "Execution with client value replies.",
+          "PUT-only execution without client reply bookkeeping."
+        ],
+        "unknowns": [
+          "Application implementation and error semantics.",
+          "Synchronization with handlers and mutation of command slices.",
+          "Restart behavior and duplicate operation semantics."
+        ],
+        "source_ids": [
+          "paxos/paxos.go:667:736",
+          "state/state.go:1:80"
+        ]
+      },
+      {
+        "class_id": "A6",
+        "applicability": "applicable",
+        "purpose": "Retain instance history and optionally issue persistent writes.",
+        "realization_summary": "Instance history is held in a fixed-size instanceSpace slice. Conditional helpers write ballot/status metadata, marshal commands and call file Sync. Call sites use different write/sync sequences. These observations establish attempted persistence only.",
+        "entry_points": [
+          "Replica.recordInstanceMetadata",
+          "Replica.recordCommands",
+          "Replica.sync",
+          "Replica.handleAccept",
+          "Replica.handleCommit",
+          "Replica.handleCommitShort",
+          "Replica.handlePrepareReply",
+          "Replica.handleAcceptReply"
+        ],
+        "variants": [
+          "Durable=false makes helpers return immediately.",
+          "Accept reception writes metadata and commands then syncs.",
+          "Commit reception writes metadata and commands without an explicit sync in those handlers.",
+          "Prepare-reply progression writes metadata and syncs without a command-write call in that branch."
+        ],
+        "unknowns": [
+          "Storage opening, record framing and recovery parsing.",
+          "Activation and support contract of durable operation.",
+          "Deletion, compaction, capacity exhaustion and reclamation."
+        ],
+        "source_ids": [
+          "paxos/paxos.go:24:163",
+          "paxos/paxos.go:398:538",
+          "paxos/paxos.go:539:666",
+          "replica/replica.go:81:136"
+        ]
+      },
+      {
+        "class_id": "A7",
+        "applicability": "applicable",
+        "purpose": "Assign and route client operations and expose completion replies.",
+        "realization_summary": "Client requests carry ClientId and incrementing CommandId. Reply call sites differ between commit-time empty results and execution-time application values. BufferClient.Write waits for one reply-channel item; complete correlation and retry handling remain unread.",
+        "entry_points": [
+          "Client.SendProposal",
+          "Client.SendWrite",
+          "Client.SendRead",
+          "Client.SendScan",
+          "Client.GetReplyFrom",
+          "BufferClient.RegisterReply",
+          "BufferClient.Write",
+          "Replica.handleAcceptReply",
+          "Replica.executeCommands"
+        ],
+        "variants": [
+          "Dreply controls server reply timing.",
+          "Client Fast and Leaderless flags control routing."
+        ],
+        "unknowns": [
+          "Admission, rejection, redirection, retries and deduplication.",
+          "Meaning promised to clients by a successful reply.",
+          "Response correlation and network write failure handling."
+        ],
+        "source_ids": [
+          "client/client.go:1:80",
+          "client/client.go:142:256",
+          "client/buffer.go:1:80",
+          "paxos/paxos.go:539:666",
+          "paxos/paxos.go:667:736"
+        ]
+      }
+    ],
+    "behaviors": [
+      {
+        "id": "B1",
+        "primary_activity": "A2",
+        "execution_owner": "Paxos replica RPC callback",
+        "protocol_context": "Local replica leader indication",
+        "trigger": "BeTheLeader RPC invocation",
+        "legal_preconditions": [
+          "Authorized caller and failover ordering are not established by supplied code."
+        ],
+        "implementation_guards": [],
+        "reads": [],
+        "writes": [
+          "IsLeader=true",
+          "totalRecNum=0",
+          "totalSendNum=0"
+        ],
+        "durable_effects": [],
+        "external_effects": [
+          "Logs leader indication and returns nil."
+        ],
+        "important_branches": [],
+        "async_boundaries": [
+          "RPC execution relative to run and executeCommands is unread."
+        ],
+        "produces_fact_ids": [
+          "F1"
+        ],
+        "consumes_fact_ids": [],
+        "cross_activity_effects": [
+          {
+            "key": "A1",
+            "value": "Sets the flag consulted by higher-ballot reply branches before requesting another prepare attempt."
+          }
+        ],
+        "existing_protections": [],
+        "source_ids": [
+          "paxos/paxos.go:24:163"
+        ],
+        "unknowns": [
+          "Caller, leadership loss and authority establishment beyond the local flag."
+        ]
+      },
+      {
+        "id": "B2",
+        "primary_activity": "A2",
+        "execution_owner": "Paxos replica handlePrepare invocation; dispatcher unread",
+        "protocol_context": "prepare.Instance and prepare.Ballot against local instance and default ballot",
+        "trigger": "Prepare message",
+        "legal_preconditions": [
+          "Legal instance indices and sender/ballot provenance require unread admission and transport code."
+        ],
+        "implementation_guards": [
+          "COMMITTED instances return a full Commit.",
+          "A lower incoming ballot does not lower inst.bal.",
+          "Only a strictly higher incoming ballot changes status to PREPARED."
+        ],
+        "reads": [
+          "instanceSpace",
+          "maxRecvBallot",
+          "defaultBallot[r.Id]",
+          "crtInstance"
+        ],
+        "writes": [
+          "Maximum observed ballot",
+          "Missing instance initialization",
+          "Instance promise ballot and PREPARED status for a higher ballot",
+          "Local default ballot when the prepared instance equals crtInstance"
+        ],
+        "durable_effects": [
+          "No persistence helper is called in this handler."
+        ],
+        "external_effects": [
+          "Calls replyPrepare with instance ballot, value ballot, local default ballot, acceptor ID and commands.",
+          "For an already committed instance, calls SendMsg with a full Commit instead."
+        ],
+        "important_branches": [
+          "Missing instance is initialized using the local default ballot.",
+          "Equal and lower incoming ballots still produce a PrepareReply reflecting current state."
+        ],
+        "async_boundaries": [
+          "Reply and SendMsg helper semantics are unread."
+        ],
+        "produces_fact_ids": [],
+        "consumes_fact_ids": [
+          "F4"
+        ],
+        "cross_activity_effects": [
+          {
+            "key": "A3",
+            "value": "Offers retained committed commands to a preparing participant."
+          }
+        ],
+        "existing_protections": [
+          "Committed-instance branch preserves its local record.",
+          "Promise ballot is not decreased by a lower Prepare."
+        ],
+        "source_ids": [
+          "paxos/paxos.go:398:538"
+        ],
+        "unknowns": [
+          "No fact is inferred about durable promises.",
+          "Delivery and subsequent use of PrepareReply are not guaranteed by the send call."
+        ]
+      },
+      {
+        "id": "B3",
+        "primary_activity": "A1",
+        "execution_owner": "Paxos replica handleAccept invocation; dispatcher unread",
+        "protocol_context": "accept.Instance and accept.Ballot",
+        "trigger": "Accept message",
+        "legal_preconditions": [
+          "Valid instance index, command provenance and legal sender remain to be established."
+        ],
+        "implementation_guards": [
+          "Existing instance rejects mutation for an incoming ballot below inst.bal.",
+          "An existing COMMITTED instance is not overwritten."
+        ],
+        "reads": [
+          "instanceSpace",
+          "maxRecvBallot",
+          "crtInstance"
+        ],
+        "writes": [
+          "Maximum observed ballot",
+          "On installation: commands, bal, vbal and ACCEPTED status",
+          "crtInstance for a newly observed higher instance"
+        ],
+        "durable_effects": [
+          "Installation branches call metadata write, command write and sync helpers before replying; helpers are conditional and do not report success."
+        ],
+        "external_effects": [
+          "Every branch calls replyAccept with only instance index and current inst.bal."
+        ],
+        "important_branches": [
+          "Missing instance installs the incoming value directly.",
+          "Lower-ballot and already-committed branches reply without installing the incoming value.",
+          "Eligible existing instance replaces its command and value-ballot fields."
+        ],
+        "async_boundaries": [
+          "Accept reply delivery is outside this handler's observed semantics."
+        ],
+        "produces_fact_ids": [
+          "F2"
+        ],
+        "consumes_fact_ids": [],
+        "cross_activity_effects": [
+          {
+            "key": "A6",
+            "value": "Requests conditional persistence on value installation before calling replyAccept."
+          }
+        ],
+        "existing_protections": [
+          "Existing promise comparison.",
+          "Existing committed-state preservation."
+        ],
+        "source_ids": [
+          "paxos/paxos.go:398:538",
+          "paxos/paxos.go:24:163"
+        ],
+        "unknowns": [
+          "F2 applies only to installation branches; an AcceptReply alone does not identify which branch ran.",
+          "The missing-instance branch's relationship to default ballots requires surrounding context.",
+          "Persistence completion and reply sender attribution are unestablished."
+        ]
+      },
+      {
+        "id": "B4",
+        "primary_activity": "A1",
+        "execution_owner": "Paxos replica handlePrepareReply invocation; dispatcher unread",
+        "protocol_context": "Instance leader bookkeeping and lastTriedBallot",
+        "trigger": "PrepareReply message",
+        "legal_preconditions": [
+          "The code dereferences the instance and its leader bookkeeping; their existence requires an unread producer."
+        ],
+        "implementation_guards": [
+          "Replies below lastTriedBallot return.",
+          "Replies above lastTriedBallot enter the nack path and return.",
+          "Progression tests prepareOKs+1 against ReadQuorumSize."
+        ],
+        "reads": [
+          "Reply Ballot, VBallot, Command, AcceptorId and DefaultBallot",
+          "Leader bookkeeping and client proposals",
+          "defaultBallot",
+          "IsLeader",
+          "ReadQuorumSize"
+        ],
+        "writes": [
+          "maxRecvBallot, nacks and prepareOKs",
+          "Highest observed value-ballot selection in lb.ballot and lb.cmds",
+          "Per-acceptor default ballot",
+          "On threshold: lb.cmds is reassigned from client proposals or state.NOOP",
+          "On threshold: inst.cmds, inst.bal and ACCEPTED status",
+          "smallestDefaultBallot when the observed default-ballot count and minimum pass the branch"
+        ],
+        "durable_effects": [
+          "Threshold branch records metadata and calls sync; no recordCommands call appears in that branch."
+        ],
+        "external_effects": [
+          "Higher-ballot nack threshold can call makeBallot and bcastPrepare while IsLeader.",
+          "Matching-ballot threshold calls bcastAccept."
+        ],
+        "important_branches": [
+          "Returned value information is recorded before the threshold branch reassigns lb.cmds.",
+          "The threshold branch uses local client commands when available, otherwise a NOOP.",
+          "The visible handler does not record a set of unique reply senders."
+        ],
+        "async_boundaries": [
+          "Broadcast helper implementation and transport are unread."
+        ],
+        "produces_fact_ids": [
+          "F3"
+        ],
+        "consumes_fact_ids": [
+          "F1"
+        ],
+        "cross_activity_effects": [
+          {
+            "key": "A2",
+            "value": "Updates observed/default ballot context and may initiate another ballot attempt."
+          },
+          {
+            "key": "A6",
+            "value": "Issues conditional metadata persistence before accept broadcast."
+          }
+        ],
+        "existing_protections": [
+          "Comparison of response ballot to lastTriedBallot.",
+          "Configured read threshold.",
+          "IsLeader guard on nack-driven prepare restart."
+        ],
+        "source_ids": [
+          "paxos/paxos.go:539:666",
+          "replica/replica.go:81:136"
+        ],
+        "unknowns": [
+          "Ballot generation, local self-support semantics and counter reset.",
+          "Legal response duplication and distinct-sender accounting outside this handler.",
+          "Applicability of returned accepted values to this path requires proposal/recovery and broadcast code."
+        ]
+      },
+      {
+        "id": "B5",
+        "primary_activity": "A1",
+        "execution_owner": "Paxos replica handleAcceptReply invocation; dispatcher unread",
+        "protocol_context": "Instance leader bookkeeping and lastTriedBallot",
+        "trigger": "AcceptReply message",
+        "legal_preconditions": [
+          "Instance and leader bookkeeping must already exist; their initialization is unread."
+        ],
+        "implementation_guards": [
+          "Returns when instance status is at least COMMITTED.",
+          "Returns for ballots below lastTriedBallot.",
+          "Higher ballots follow the nack branch and return.",
+          "Matching replies advance when acceptOKs+1 reaches WriteQuorumSize."
+        ],
+        "reads": [
+          "Reply instance and ballot",
+          "Instance status, commands and ballot",
+          "Leader bookkeeping",
+          "IsLeader",
+          "Dreply",
+          "WriteQuorumSize"
+        ],
+        "writes": [
+          "maxRecvBallot",
+          "nacks or acceptOKs",
+          "COMMITTED status at the matching-reply threshold"
+        ],
+        "durable_effects": [
+          "Commit branch records metadata and calls sync conditionally."
+        ],
+        "external_effects": [
+          "Commit branch calls bcastCommit.",
+          "With client proposals and Dreply=false, calls ReplyProposeTS with success, corresponding CommandId, empty value and timestamp.",
+          "Higher-ballot nack threshold while IsLeader calls makeBallot with areply.Ballot and bcastPrepare with areply.Instance."
+        ],
+        "important_branches": [
+          "A matching ballot is counted without command identity in the visible reply object.",
+          "Visible accounting is a counter; distinct-peer attribution is unread.",
+          "Commit-time reply path does not call application Execute."
+        ],
+        "async_boundaries": [
+          "Commit broadcast and client reply completion are hidden behind unread helpers."
+        ],
+        "produces_fact_ids": [
+          "F4"
+        ],
+        "consumes_fact_ids": [
+          "F1"
+        ],
+        "cross_activity_effects": [
+          {
+            "key": "A5",
+            "value": "Makes the instance locally eligible for execution if commands are nonnil and earlier instances are processed."
+          },
+          {
+            "key": "A7",
+            "value": "Can request success replies before application execution when Dreply is false."
+          }
+        ],
+        "existing_protections": [
+          "Committed-state early return.",
+          "Ballot correlation with lastTriedBallot.",
+          "Configured write threshold."
+        ],
+        "source_ids": [
+          "paxos/paxos.go:539:666",
+          "replica/replica.go:81:136"
+        ],
+        "unknowns": [
+          "The response-to-installation relation is not inferred from matching ballots.",
+          "makeBallot parameter meaning and reachable nack histories remain unread.",
+          "Counter initialization and local self-support are not established."
+        ]
+      },
+      {
+        "id": "B6",
+        "primary_activity": "A1",
+        "execution_owner": "Paxos replica handleCommit invocation; dispatcher unread",
+        "protocol_context": "Full Commit for one instance",
+        "trigger": "Commit message",
+        "legal_preconditions": [
+          "Message authority and command provenance require unread producers and transport."
+        ],
+        "implementation_guards": [
+          "Returns for an already COMMITTED instance.",
+          "Returns when commit.Ballot is below inst.bal."
+        ],
+        "reads": [
+          "Local default ballot",
+          "Instance status, ballot and client proposals"
+        ],
+        "writes": [
+          "Missing instance initialization and possible crtInstance advancement",
+          "Client proposal bookkeeping cleared after requeue",
+          "Incoming commands, bal, vbal and COMMITTED status"
+        ],
+        "durable_effects": [
+          "Records metadata and incoming commands conditionally; no explicit sync call in this handler."
+        ],
+        "external_effects": [
+          "Requeues retained client proposals to ProposeChan before installing the commit."
+        ],
+        "important_branches": [
+          "A missing instance is first initialized with local default ballots.",
+          "Retained client proposals are requeued before committed fields are assigned."
+        ],
+        "async_boundaries": [
+          "ProposeChan sends may block before commit installation."
+        ],
+        "produces_fact_ids": [
+          "F4"
+        ],
+        "consumes_fact_ids": [],
+        "cross_activity_effects": [
+          {
+            "key": "A5",
+            "value": "Installs commands and local commit status used by the execution eligibility check."
+          },
+          {
+            "key": "A7",
+            "value": "Resubmits displaced local proposals through the proposal channel."
+          }
+        ],
+        "existing_protections": [
+          "Committed-state early return.",
+          "Incoming ballot comparison."
+        ],
+        "source_ids": [
+          "paxos/paxos.go:398:538"
+        ],
+        "unknowns": [
+          "Requeue consumer, buffer availability and operation identity preservation.",
+          "Meaning of full commit provenance and persistence after return."
+        ]
+      },
+      {
+        "id": "B7",
+        "primary_activity": "A1",
+        "execution_owner": "Paxos replica handleCommitShort invocation; dispatcher unread",
+        "protocol_context": "Short Commit for an existing local instance",
+        "trigger": "CommitShort message",
+        "legal_preconditions": [
+          "Sender selection and the relationship between short commit and retained commands remain unread."
+        ],
+        "implementation_guards": [
+          "Returns for a missing instance.",
+          "Returns for an already COMMITTED instance.",
+          "Returns for a ballot below inst.bal."
+        ],
+        "reads": [
+          "Existing instance status, ballot and commands"
+        ],
+        "writes": [
+          "COMMITTED status",
+          "inst.bal=commit.Ballot"
+        ],
+        "durable_effects": [
+          "Records metadata and retained commands conditionally; no explicit sync call in this handler."
+        ],
+        "external_effects": [],
+        "important_branches": [
+          "Commands and vbal are retained without reassignment.",
+          "No command-presence or command-identity check appears in this handler."
+        ],
+        "async_boundaries": [],
+        "produces_fact_ids": [
+          "F4"
+        ],
+        "consumes_fact_ids": [],
+        "cross_activity_effects": [
+          {
+            "key": "A5",
+            "value": "Changes local execution eligibility while relying on existing command contents."
+          }
+        ],
+        "existing_protections": [
+          "Existing-instance requirement.",
+          "Committed-state and ballot guards."
+        ],
+        "source_ids": [
+          "paxos/paxos.go:398:538"
+        ],
+        "unknowns": [
+          "Which outbound paths use short commits and what prior delivery they establish.",
+          "Producer of the retained command representation is not necessarily B3 and is not assigned without reading admission and broadcast paths."
+        ]
+      },
+      {
+        "id": "B8",
+        "primary_activity": "A5",
+        "execution_owner": "Replica.executeCommands loop",
+        "protocol_context": "Ordered instance prefix after executedUpTo",
+        "trigger": "Loop iteration finding a nonnil instance with nonnil commands and COMMITTED status",
+        "legal_preconditions": [
+          "Loop startup and shared-state synchronization remain unread."
+        ],
+        "implementation_guards": [
+          "Visits instances from executedUpTo+1 through crtInstance.",
+          "Stops on the first ineligible instance.",
+          "Direct value replies require Dreply, leader bookkeeping and client proposals."
+        ],
+        "reads": [
+          "Shutdown",
+          "executedUpTo and crtInstance",
+          "Instance commands, status and client proposals",
+          "Dreply and State"
+        ],
+        "writes": [
+          "Application state through Command.Execute",
+          "executedUpTo after each eligible instance"
+        ],
+        "durable_effects": [],
+        "external_effects": [
+          "Direct-reply branch calls Execute and ReplyProposeTS for each command.",
+          "Other branch executes only PUT commands."
+        ],
+        "important_branches": [
+          "Commands without direct client reply bookkeeping are filtered to PUT.",
+          "Advancement records loop processing, including commands skipped by that filter."
+        ],
+        "async_boundaries": [
+          "Application calls and reply helper calls occur before prefix advancement.",
+          "The loop shares instance data with protocol handlers.",
+          "When no execution occurs it briefly locks/unlocks M and sleeps."
+        ],
+        "produces_fact_ids": [
+          "F5"
+        ],
+        "consumes_fact_ids": [
+          "F4"
+        ],
+        "cross_activity_effects": [
+          {
+            "key": "A7",
+            "value": "Requests successful client replies carrying values returned by application execution."
+          }
+        ],
+        "existing_protections": [
+          "Contiguous-prefix traversal.",
+          "Nonnil instance and command checks plus local COMMITTED status."
+        ],
+        "source_ids": [
+          "paxos/paxos.go:667:736"
+        ],
+        "unknowns": [
+          "Execute semantics and response delivery.",
+          "Alignment of command and client-proposal slices.",
+          "Persistence and reconstruction of execution progress."
+        ]
+      },
+      {
+        "id": "B9",
+        "primary_activity": "A3",
+        "execution_owner": "Replica.executeCommands loop",
+        "protocol_context": "First execution gap and its locally accumulated grace interval",
+        "trigger": "Repeated encounter with an ineligible instance until timeout reaches COMMIT_GRACE_PERIOD",
+        "legal_preconditions": [],
+        "implementation_guards": [
+          "Timeout accumulates only when the current gap equals problemInstance.",
+          "A different gap resets timeout.",
+          "Enqueue starts only after the grace threshold."
+        ],
+        "reads": [
+          "Instance eligibility",
+          "problemInstance",
+          "timeout",
+          "crtInstance"
+        ],
+        "writes": [
+          "Loop-local problemInstance and timeout"
+        ],
+        "durable_effects": [],
+        "external_effects": [
+          "Sends each index from problemInstance through the loop's current crtInstance bound to instancesToRecover."
+        ],
+        "important_branches": [
+          "A channel send must complete before the loop proceeds to the next index.",
+          "After enqueueing the range, resets problemInstance and timeout."
+        ],
+        "async_boundaries": [
+          "Buffered recovery-request channel separates this loop from its unread consumer."
+        ],
+        "produces_fact_ids": [
+          "F6"
+        ],
+        "consumes_fact_ids": [],
+        "cross_activity_effects": [],
+        "existing_protections": [
+          "Grace interval delays recovery requests for an execution gap."
+        ],
+        "source_ids": [
+          "paxos/paxos.go:667:736",
+          "paxos/paxos.go:24:163"
+        ],
+        "unknowns": [
+          "Channel consumer, leader filtering and stale-request handling.",
+          "A queued request does not establish recovery initiation or completion."
+        ]
+      },
+      {
+        "id": "B10",
+        "primary_activity": "A3",
+        "execution_owner": "Replica.recover caller context unread",
+        "protocol_context": "One requested instance index",
+        "trigger": "recover(instance) invocation",
+        "legal_preconditions": [
+          "Caller filtering and valid index requirements remain unread."
+        ],
+        "implementation_guards": [
+          "Allocates an instance only if absent.",
+          "Allocates leader bookkeeping only if absent."
+        ],
+        "reads": [
+          "instanceSpace",
+          "defaultBallot[r.Id]"
+        ],
+        "writes": [
+          "Missing PREPARING instance",
+          "Missing leader bookkeeping"
+        ],
+        "durable_effects": [],
+        "external_effects": [
+          "Calls makeBallot(instance) then bcastPrepare(instance)."
+        ],
+        "important_branches": [
+          "Existing instance and bookkeeping are reused.",
+          "No leadership or committed-state guard appears within recover itself."
+        ],
+        "async_boundaries": [
+          "Prepare broadcast implementation remains unread."
+        ],
+        "produces_fact_ids": [],
+        "consumes_fact_ids": [],
+        "cross_activity_effects": [
+          {
+            "key": "A2",
+            "value": "Requests ballot construction for the selected instance."
+          },
+          {
+            "key": "A1",
+            "value": "Requests a prepare broadcast for the selected instance."
+          }
+        ],
+        "existing_protections": [
+          "Conditional allocation preserves existing instance and bookkeeping objects."
+        ],
+        "source_ids": [
+          "paxos/paxos.go:667:736"
+        ],
+        "unknowns": [
+          "The connection from F6 to this invocation is deliberately unresolved until the dispatcher is read.",
+          "Ballot construction, broadcast completion and recovery completion."
+        ]
+      }
+    ],
+    "facts": [
+      {
+        "id": "F1",
+        "meaning": "The local IsLeader flag has been set true; this assertion does not establish exclusive or quorum-backed authority.",
+        "identity": [
+          {
+            "key": "replica",
+            "value": "Replica object and r.Id"
+          }
+        ],
+        "validity_context": "Current in-memory replica state after initialization or BeTheLeader.",
+        "representation": [
+          "r.IsLeader"
+        ],
+        "invalidators": [],
+        "reinterpreters": [],
+        "durability": "In-memory only in supplied code.",
+        "recovery": "Constructor receives an initial flag from master registration; restart authority semantics are unread.",
+        "source_ids": [
+          "paxos/paxos.go:24:163",
+          "run.go:23:103"
+        ],
+        "unknowns": [
+          "Constructor is an additional observed producer not expanded into a Behavior.",
+          "Leadership loss and other flag writers are unread.",
+          "Additional consumers in run and admission are unread."
+        ]
+      },
+      {
+        "id": "F2",
+        "meaning": "An installation branch of handleAccept placed the incoming command slice in the local instance with bal and vbal equal to the incoming ballot and status ACCEPTED.",
+        "identity": [
+          {
+            "key": "replica",
+            "value": "r.Id"
+          },
+          {
+            "key": "instance",
+            "value": "accept.Instance"
+          },
+          {
+            "key": "ballot",
+            "value": "accept.Ballot"
+          },
+          {
+            "key": "commands",
+            "value": "accept.Command contents at installation"
+          }
+        ],
+        "validity_context": "Local instance representation after an installation branch, until subsequent mutation. It does not describe lower-ballot or already-committed reply branches.",
+        "representation": [
+          "Instance.cmds",
+          "Instance.bal",
+          "Instance.vbal",
+          "Instance.status"
+        ],
+        "invalidators": [
+          "B2",
+          "B3",
+          "B4",
+          "B5",
+          "B6",
+          "B7"
+        ],
+        "reinterpreters": [],
+        "durability": "Conditional write and sync calls are observed, but their success is not established.",
+        "recovery": "Stable-store reconstruction is unread.",
+        "source_ids": [
+          "paxos/paxos.go:398:538",
+          "paxos/paxos.go:24:163"
+        ],
+        "unknowns": [
+          "Other installation paths and consumers are not fully read.",
+          "A ballot-only AcceptReply is not itself F2.",
+          "Aliasing or concurrent command mutation is unexamined."
+        ]
+      },
+      {
+        "id": "F3",
+        "meaning": "The matching prepare-reply counter reached its local threshold and the handler assigned client-proposal commands or a NOOP to the instance, set its ballot to lastTriedBallot and marked it ACCEPTED.",
+        "identity": [
+          {
+            "key": "replica",
+            "value": "r.Id"
+          },
+          {
+            "key": "instance",
+            "value": "preply.Instance"
+          },
+          {
+            "key": "attempt",
+            "value": "lb.lastTriedBallot"
+          },
+          {
+            "key": "commands",
+            "value": "Threshold branch's assigned lb.cmds"
+          }
+        ],
+        "validity_context": "Local representation established by the prepare-reply threshold branch. No distinct-participant quorum or selected-value guarantee is inferred.",
+        "representation": [
+          "lb.prepareOKs",
+          "lb.cmds",
+          "inst.cmds",
+          "inst.bal",
+          "inst.status"
+        ],
+        "invalidators": [
+          "B2",
+          "B3",
+          "B4",
+          "B5",
+          "B6",
+          "B7"
+        ],
+        "reinterpreters": [],
+        "durability": "Metadata write and Sync are requested conditionally; command durability is not established.",
+        "recovery": "Reconstruction and attempt reset are unread.",
+        "source_ids": [
+          "paxos/paxos.go:539:666"
+        ],
+        "unknowns": [
+          "bcastAccept is a called but unread consumer of instance state.",
+          "Counter provenance, self contribution and response uniqueness.",
+          "Relationship of this assignment to prior accepted values requires surrounding code."
+        ]
+      },
+      {
+        "id": "F4",
+        "meaning": "The local instance status is COMMITTED. This common assertion does not by itself establish command presence, global agreement, durable retention or application completion.",
+        "identity": [
+          {
+            "key": "replica",
+            "value": "r.Id"
+          },
+          {
+            "key": "instance",
+            "value": "instanceSpace index"
+          }
+        ],
+        "validity_context": "Current local instance after an accept-reply threshold, accepted full Commit, or accepted CommitShort. Command and ballot fields depend on the producing path.",
+        "representation": [
+          "instanceSpace[index].status == COMMITTED"
+        ],
+        "invalidators": [
+          "B4"
+        ],
+        "reinterpreters": [],
+        "durability": "All three observed producers request metadata writes when Durable; only the accept-reply producer explicitly calls sync.",
+        "recovery": "Prepare handling can send retained committed commands; disk reconstruction is unknown.",
+        "source_ids": [
+          "paxos/paxos.go:398:538",
+          "paxos/paxos.go:539:666",
+          "paxos/paxos.go:667:736"
+        ],
+        "unknowns": [
+          "B4 has no visible committed-state guard; whether such a later invocation is legal or reachable remains unknown.",
+          "Ballot construction and unread admission may introduce additional mutations.",
+          "CommitShort does not establish nonnil commands.",
+          "Crash invalidation and reconstruction are not mapped."
+        ]
+      },
+      {
+        "id": "F5",
+        "meaning": "The execution loop finished processing this instance under its branch-specific execution policy and advanced the local execution prefix through it.",
+        "identity": [
+          {
+            "key": "replica",
+            "value": "r.Id"
+          },
+          {
+            "key": "instance",
+            "value": "executeCommands loop index i"
+          },
+          {
+            "key": "policy",
+            "value": "Dreply and availability of client proposal bookkeeping at processing time"
+          }
+        ],
+        "validity_context": "Current process execution-loop history; commands skipped by the PUT-only branch are still included in prefix advancement.",
+        "representation": [
+          "r.executedUpTo",
+          "Completed branch-specific Command.Execute calls"
+        ],
+        "invalidators": [],
+        "reinterpreters": [],
+        "durability": "No persistence of the execution prefix is shown.",
+        "recovery": "Constructor initializes executedUpTo=-1; restart reconstruction is unread.",
+        "source_ids": [
+          "paxos/paxos.go:24:163",
+          "paxos/paxos.go:667:736"
+        ],
+        "unknowns": [
+          "The loop reuses executedUpTo as its next traversal boundary; no independent consumer has been mapped.",
+          "This is not an assertion that every operation was executed or that clients received replies.",
+          "Application semantics and concurrent access remain unread."
+        ]
+      },
+      {
+        "id": "F6",
+        "meaning": "A recovery-request channel send for one instance index completed after the execution loop's gap timeout.",
+        "identity": [
+          {
+            "key": "replica",
+            "value": "r.Id"
+          },
+          {
+            "key": "instance",
+            "value": "Enqueued index k"
+          }
+        ],
+        "validity_context": "Historical enqueue event in the current process; it does not imply dequeue, recover invocation or successful reconstruction.",
+        "representation": [
+          "Completed r.instancesToRecover <- k"
+        ],
+        "invalidators": [],
+        "reinterpreters": [],
+        "durability": "Volatile channel handoff.",
+        "recovery": "The execution loop can request gaps again; no durable queue reconstruction is shown.",
+        "source_ids": [
+          "paxos/paxos.go:667:736"
+        ],
+        "unknowns": [
+          "Actual channel consumer and its filters are unread.",
+          "No authoritative consume edge to B10 is established."
+        ]
+      }
+    ],
+    "surfaces": [
+      {
+        "entry_point": "runReplica and paxos.New",
+        "disposition": "deferred",
+        "behavior_ids": [],
+        "reason": "Selection and initialization are described in the target profile; protocol-loop startup and subsequent setup need the adjacent unread range.",
+        "source_ids": [
+          "run.go:23:103",
+          "paxos/paxos.go:24:163"
+        ],
+        "high_consequence": true
+      },
+      {
+        "entry_point": "Replica.run, proposal dispatch, makeBallot and broadcast/reply helpers",
+        "disposition": "deferred",
+        "behavior_ids": [],
+        "reason": "Known from constructor and handler call sites, but bodies are unread. These determine legal prehistory, counter initialization, recovery handoff and full/short commit selection.",
+        "source_ids": [
+          "paxos/paxos.go:24:163",
+          "paxos/paxos.go:539:666",
+          "paxos/paxos.go:667:736"
+        ],
+        "high_consequence": true
+      },
+      {
+        "entry_point": "Replica.BeTheLeader",
+        "disposition": "mapped",
+        "behavior_ids": [
+          "B1"
+        ],
+        "reason": "Local callback mutation is mapped; master caller and authority transition semantics remain deferred.",
+        "source_ids": [
+          "paxos/paxos.go:24:163"
+        ],
+        "high_consequence": true
+      },
+      {
+        "entry_point": "Replica.handlePrepare and Replica.handleAccept",
+        "disposition": "mapped",
+        "behavior_ids": [
+          "B2",
+          "B3"
+        ],
+        "reason": "Local branch effects are described without equating replies to durable acceptance.",
+        "source_ids": [
+          "paxos/paxos.go:398:538"
+        ],
+        "high_consequence": true
+      },
+      {
+        "entry_point": "Replica.handlePrepareReply and Replica.handleAcceptReply",
+        "disposition": "mapped",
+        "behavior_ids": [
+          "B4",
+          "B5"
+        ],
+        "reason": "Threshold and ballot branches are mapped; response provenance and legal initialization remain open.",
+        "source_ids": [
+          "paxos/paxos.go:539:666"
+        ],
+        "high_consequence": true
+      },
+      {
+        "entry_point": "Replica.handleCommit and Replica.handleCommitShort",
+        "disposition": "mapped",
+        "behavior_ids": [
+          "B6",
+          "B7"
+        ],
+        "reason": "Distinct command installation and retention paths are mapped separately; outbound selection remains deferred.",
+        "source_ids": [
+          "paxos/paxos.go:398:538"
+        ],
+        "high_consequence": true
+      },
+      {
+        "entry_point": "Replica.executeCommands and Replica.recover",
+        "disposition": "mapped",
+        "behavior_ids": [
+          "B8",
+          "B9",
+          "B10"
+        ],
+        "reason": "Application processing, request enqueue and recovery entry are separated. The unread dispatch handoff remains explicit.",
+        "source_ids": [
+          "paxos/paxos.go:667:736"
+        ],
+        "high_consequence": true
+      },
+      {
+        "entry_point": "recordInstanceMetadata, recordCommands, sync and StableStore lifecycle",
+        "disposition": "deferred",
+        "behavior_ids": [],
+        "reason": "Helper bodies and selected call sites are visible, but activation, file opening, error handling and reconstruction are not. No durable-success fact is declared.",
+        "source_ids": [
+          "paxos/paxos.go:24:163",
+          "replica/replica.go:1:80",
+          "replica/replica.go:81:136"
+        ],
+        "high_consequence": true
+      },
+      {
+        "entry_point": "Master.Register, Master.GetLeader and master failover",
+        "disposition": "deferred",
+        "behavior_ids": [],
+        "reason": "Registration and leader lookup are observed; initialization and failover are required to describe participant and authority lifecycle coherently.",
+        "source_ids": [
+          "master/master.go:187:277"
+        ],
+        "high_consequence": true
+      },
+      {
+        "entry_point": "Client.SendProposal, request constructors, GetReplyFrom and BufferClient reply handling",
+        "disposition": "deferred",
+        "behavior_ids": [],
+        "reason": "Routing and request identifiers are observed; complete reply correlation, retries and completion semantics are not yet mapped.",
+        "source_ids": [
+          "client/client.go:1:80",
+          "client/client.go:142:256",
+          "client/buffer.go:1:80"
+        ],
+        "high_consequence": true
+      },
+      {
+        "entry_point": "state.Command.Execute",
+        "disposition": "deferred",
+        "behavior_ids": [],
+        "reason": "Application call sites are observed, but command effects, locking and result meanings require the implementation.",
+        "source_ids": [
+          "state/state.go:1:80",
+          "paxos/paxos.go:667:736"
+        ],
+        "high_consequence": true
+      },
+      {
+        "entry_point": "Replica transport dispatch, SendMsg and ReplyProposeTS",
+        "disposition": "deferred",
+        "behavior_ids": [],
+        "reason": "Transport state and call sites are known; sender correlation, message ordering and partial I/O behavior remain unread.",
+        "source_ids": [
+          "replica/replica.go:1:80",
+          "paxos/paxos.go:398:538",
+          "paxos/paxos.go:539:666",
+          "paxos/paxos.go:667:736"
+        ],
+        "high_consequence": true
+      },
+      {
+        "entry_point": "rpc.Table.Register and rpc.Table.Get",
+        "disposition": "infrastructure",
+        "behavior_ids": [],
+        "reason": "Maps sequential message tags to prototypes and channels. This table alone establishes no protocol delivery or sender guarantee.",
+        "source_ids": [
+          "rpc/rpc.go:1:48"
+        ],
+        "high_consequence": false
+      }
+    ]
+  },
+  "reading_requests": [
+    {
+      "file": "paxos/paxos.go",
+      "start_line": 164,
+      "end_line": 397,
+      "reason": "Expand the highest-consequence deferred surface: establish event-loop ownership, proposal and recovery dispatch, ballot construction, counter initialization and full versus short commit broadcast selection. These connect the already observed handlers without inventing handoffs."
+    }
+  ]
+}

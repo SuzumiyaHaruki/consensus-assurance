@@ -69,6 +69,7 @@ class DescriptiveIssue(Record):
 
 
 class Derivation(Record):
+    candidate_id: str | None = None
     obligation: ClaimDraft | None = None
     bindings: list[BindingDraft] = []
     dependencies: list[RelationDraft] = []
@@ -130,13 +131,9 @@ class EventMonitor(Record):
     id: str
     checker_id: str
     event: str
-    identity_fields: list[str]
-    conditions: list[Comparison] = []
-    assertion: Comparison
     binding_ids: list[str]
     grounding: Grounding
     applicability_conditions: list[Comparison] = []
-    property: ObservableProperty | None = None
 
 
 
@@ -315,22 +312,6 @@ class SemanticRevision(Record):
     grounding: Grounding
     condition_dispositions: list[ConditionDisposition] = []
     requests: list[ReadRequest] = []
-
-    @model_validator(mode='before')
-    @classmethod
-    def import_legacy_feedback(cls,value):
-        if isinstance(value,Feedback):value=value.model_dump(mode='json')
-        if isinstance(value,dict):
-            value=dict(value)
-            for name in ('graph','bundle'):
-                if value.get(name) is not None:raise ValueError('Semantic review cannot contain a model or full discovery')
-                value.pop(name,None)
-        return value
-
-    @property
-    def graph(self):return None
-    @property
-    def bundle(self):return None
 
 
 class AuditSpecDelta(Record):

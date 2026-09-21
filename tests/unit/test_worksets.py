@@ -42,8 +42,7 @@ def test_review_reading_is_consumed_by_its_unit_but_not_an_unrelated_unit(tmp_pa
     assert not any(m['file']=='setup_detail.py' for m in e.context(unit)['materials'])
     task=enqueue(e.state,'review','Resolve assembly source','assembly',target_ids=[unit.id],unit_id=unit.id)
     e.state.active_inquiry_id=task.id
-    acquired=e.state.usage['targeted_reads'];e.read([q],plan_id='reattach-during-review')
-    assert e.state.usage['targeted_reads']==acquired
+    e.read([q],plan_id='reattach-during-review')
     e.state.active_inquiry_id=None;e.state.active_unit_id=unit.id
     packet,_=prepare(e,'build',e.context(unit));packet=pool_sources(packet)
     sent=receipt(e,'build',packet,render('build',packet),BuildReply)

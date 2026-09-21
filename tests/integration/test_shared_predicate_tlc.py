@@ -31,6 +31,6 @@ Obs == [history |-> history]
     model=save_bundle(runner.root,state,state.units[0],bundle,PythonBackend())
     result=verifier.check(runner,model,20)
     assert result.outcome==('counterexample' if conflict else 'holds'),result.reason
-    m=EventMonitor(id='support',checker_id='Safe',event='support',identity_fields=prop.identity_fields,conditions=[prop.trigger],assertion=prop.assertion,binding_ids=['b'],grounding=Grounding(),property=prop)
+    m=EventMonitor(id='support',checker_id='Safe',event='support',binding_ids=['b'],grounding=Grounding())
     events=[{'event':'support','participant':'n1','context':1,'effective':True,'object':x} for x in ['a',obj]]
-    assert monitor_support(events,m)['outcome']==('violated' if conflict else 'holds')
+    assert monitor_support(events,m,prop)['outcome']==('violated' if conflict else 'holds')

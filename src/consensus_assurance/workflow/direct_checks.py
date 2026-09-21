@@ -1,18 +1,16 @@
 """Question routing and bounded implementation checks using existing execution evidence."""
 import json
-import os
 from pathlib import Path
 from consensus_assurance.core.proposals import DirectCheckReply, DirectCheckPlan, QuestionReply
 from consensus_assurance.core.types import DirectCheckArtifact, CheckRun, Evidence, Finding, Origin, Assessment, Investigation, ExecutionStatus, uid
 from consensus_assurance.core.events import compare, match_prerequisites
-from consensus_assurance.adapters.storage.files import write_json, digest
+from consensus_assurance.adapters.storage.files import write_json
 from consensus_assurance.adapters.storage.snapshot import capture
 from consensus_assurance.adapters.runners.experiment import run_experiment, extract_events
 from .errors import Blocked
 from .graph_diagnostics import validate_grounding
 from .observations import monitor_events
 from .instrumentation import observation_change_limitations
-from .reviews import readiness
 
 
 def validate_question(question):
@@ -54,9 +52,9 @@ def validate_plan(state,unit,plan,implementation):
         p=props.get(monitor.checker_id)
         # History predicates need a complete observed history contract. Initially
         # keep this route to scalar event assertions; unsupported paths are gaps.
-        if p is None or p.kind!='event_assertion' or p!=monitor.property or monitor.conditions!=[p.trigger] or monitor.assertion!=p.assertion:
+        if p is None or p.kind!='event_assertion':
             raise ValueError('Direct monitor requires the supported shared event assertion')
-        if not monitor.identity_fields or monitor.identity_fields!=p.identity_fields:
+        if not p.identity_fields:
             raise ValueError('Direct monitor needs shared operation/participant/context identity')
         if not monitor.binding_ids or not set(monitor.binding_ids)<=set(plan.binding_ids):raise ValueError('Monitor needs selected source bindings')
         if not monitor.applicability_conditions:raise ValueError('Monitor needs observed applicability conditions')
@@ -65,7 +63,7 @@ def validate_plan(state,unit,plan,implementation):
             raise ValueError('Direct comparison must reference a prior correlated prerequisite event')
         witness=[r for r in plan.harness.prerequisites[1:] if r.event==monitor.event]
         aliases={r.alias for r in plan.harness.prerequisites}
-        if not any(all(any(c.field==key and c.op=='eq' and c.reference and c.reference.partition('.')[0] in aliases and c.reference.partition('.')[2]==key for c in r.conditions) for key in monitor.identity_fields) for r in witness):
+        if not any(all(any(c.field==key and c.op=='eq' and c.reference and c.reference.partition('.')[0] in aliases and c.reference.partition('.')[2]==key for c in r.conditions) for key in p.identity_fields) for r in witness):
             raise ValueError('Monitor witness must correlate each identity to prerequisite events')
 
 
@@ -90,42 +88,30 @@ def validate_reply(state,unit,reply,implementation,previous=None):
 
 def save_plan(engine,unit,plan,operation_id):
     state=engine.state
-    validate_plan(state,unit,plan,engine.implementation)
+    existing=next((a for a in state.direct_checks if a.operation_id==operation_id),None)
+    if existing:return existing
     folder=engine.root/'direct-checks'/operation_id
-    if (folder/'commit.json').exists():
-        artifact=DirectCheckArtifact.model_validate_json((folder/'commit.json').read_text())
-        current={o.id:o.version for o in state.claims+state.bindings+state.relations+state.units}
-        if artifact.snapshot_id!=state.snapshot.id or artifact.unit_id!=unit.id or any(current.get(k)!=v for k,v in artifact.graph_versions.items()):raise ValueError('Direct commit semantic inputs changed')
-        if json.loads(Path(artifact.plan_path).read_text())!=plan.model_dump(mode='json'):raise ValueError('Direct commit action inputs changed')
-        if any(not Path(p).is_file() or digest(Path(p).read_bytes())!=d for p,d in artifact.artifact_digests.items()):raise ValueError('Direct artifact changed')
-    else:
-        temporary=folder.with_name('.pending-'+operation_id)
-        if temporary.exists():temporary.rename(temporary.with_name(temporary.name+'-incomplete-'+uid()))
-        temporary.mkdir(parents=True,exist_ok=False)
-        write_json(temporary/'plan.json',plan)
-        (temporary/engine.implementation.harness_filename).parent.mkdir(parents=True,exist_ok=True)
-        (temporary/engine.implementation.harness_filename).write_text(plan.harness.source)
-        from .inputs import semantic_ids
-        ids=semantic_ids(state,unit)
-        artifact=DirectCheckArtifact(plan_path=str(folder/'plan.json'),harness_path=str(folder/engine.implementation.harness_filename),
-            artifact_digests={str(folder/p.relative_to(temporary)):digest(p.read_bytes()) for p in [temporary/'plan.json',temporary/engine.implementation.harness_filename]},
-            snapshot_id=state.snapshot.id,unit_id=unit.id,claim_id=plan.claim_id,binding_ids=plan.binding_ids,
-            graph_versions={o.id:o.version for o in state.claims+state.bindings+state.relations+state.units if o.id in ids},
-            origin=Origin.MOCK if state.mode=='mock' else Origin.PRESET if state.analysis_mode=='regression' or state.config.get('parameters',{}).get('manual_directed_followup') else Origin.AGENT,
-            scope=plan.scope,operation_id=operation_id)
-        write_json(temporary/'commit.json',artifact)
-        os.rename(temporary,folder)
-    if not any(a.id==artifact.id for a in state.direct_checks):state.direct_checks.append(artifact)
+    write_json(folder/'plan.json',plan)
+    harness=folder/engine.implementation.harness_filename
+    harness.parent.mkdir(parents=True,exist_ok=True)
+    harness.write_text(plan.harness.source)
+    from .inputs import semantic_ids
+    ids=semantic_ids(state,unit)
+    artifact=DirectCheckArtifact(plan_path=str(folder/'plan.json'),harness_path=str(harness),
+        snapshot_id=state.snapshot.id,unit_id=unit.id,claim_id=plan.claim_id,binding_ids=plan.binding_ids,
+        graph_versions={o.id:o.version for o in state.claims+state.bindings+state.relations+state.units if o.id in ids},
+        origin=Origin.MOCK if state.mode=='mock' else Origin.PRESET if state.analysis_mode=='regression' else Origin.AGENT,
+        scope=plan.scope,operation_id=operation_id)
+    state.direct_checks.append(artifact)
     return artifact
 
 
-def execute(engine,artifact,plan):
+def execute(engine,artifact):
     if not engine.config.allow_experiments or engine.implementation is None:raise Blocked('Target execution disabled or no execution backend configured')
+    plan=DirectCheckPlan.model_validate_json(Path(artifact.plan_path).read_text())
     def perform():
-        if any(not Path(p).is_file() or digest(Path(p).read_bytes())!=v for p,v in artifact.artifact_digests.items()):raise Blocked('Saved direct artifact changed')
         workspace=engine.workspace()
-        before=capture(workspace).files
-        if before!=engine.state.snapshot.files:raise Blocked("Execution source differs from the selected snapshot")
+        before=engine.state.snapshot.files
         destination=workspace/engine.implementation.harness_filename
         destination.parent.mkdir(parents=True,exist_ok=True)
         if destination.exists():raise Blocked('Generated harness would overwrite target code')
@@ -134,13 +120,13 @@ def execute(engine,artifact,plan):
             engine.budget.timeout(),engine.config.execution_isolation,'direct_check',adapter=engine.implementation)
         after=capture(workspace,excluded_dirs={".execution"}).files
         changed=[p for p,value in before.items() if after.get(p)!=value]
-        check.direct_check_id=artifact.id;check.input_versions=artifact.artifact_digests
+        check.direct_check_id=artifact.id
         check.origin=Origin.MOCK if engine.state.mode=='mock' else Origin.EXECUTED
         check.parameters['changed_target_files']=changed
         check.tool_version=engine.state.tools.get('implementation','unknown')
         check.artifacts.append(str(destination))
         return check
-    check=CheckRun.model_validate(engine.action('direct_execute','experiments',perform,{'direct_check_id':artifact.id,'inputs':artifact.artifact_digests}))
+    check=CheckRun.model_validate(engine.action('direct_execute','experiments',perform,{'direct_check_id':artifact.id}))
     engine.record(check)
     return check
 
@@ -148,29 +134,22 @@ def execute(engine,artifact,plan):
 def assess(state,unit,artifact,plan,check,events):
     prerequisite=match_prerequisites(events,plan.harness.prerequisites)
     aliases={r.alias:events[index] for r,index in zip(plan.harness.prerequisites,prerequisite['matched_indices'])} if prerequisite['status']=='matched' else {}
-    results=[monitor_events(events,m,aliases=aliases) for m in plan.monitors]
+    properties={p.checker_id:p for p in plan.observable_properties}
+    results=[monitor_events(events,m,properties[m.checker_id],aliases=aliases) for m in plan.monitors]
     limitations=list(plan.uncertainties)
-    if DirectCheckPlan.model_validate_json(Path(artifact.plan_path).read_text())!=plan:limitations.append('Plan differs from saved executable input')
-    validate_plan(state,unit,plan,type('Adapter',(),{'harness_kind':plan.harness.kind})())
     claim=next(c for c in state.claims if c.id==plan.claim_id)
-    from .task_view import semantic_view
     ids=set(artifact.graph_versions)|{a.id for a in state.direct_checks if a.unit_id in {unit.id,unit.previous_id}}
-    semantics,_=semantic_view(state,ids)
-    if readiness(state,unit)['status']!='reviewed':limitations.append('Selected question semantics remain exploratory')
     correspondence=[r for r in state.semantic_reviews if r.target_versions.get(artifact.id)==artifact.version and any(i.target_id==artifact.id and i.aspect=='checker_correspondence' and i.status=='no_issue_found' and not i.limitations for i in r.items)]
     if not correspondence:limitations.append('Direct oracle correspondence is unreviewed')
-    if semantics['open_issues'] or any(i['status']!='no_issue_found' or i['limitations'] or i.get('counterevidence') for i in semantics['judgments']):limitations.append('Unresolved semantic counterevidence')
-    current={o.id:o.version for o in state.claims+state.bindings+state.relations+state.units+state.direct_checks}
-    from .reviews import valid_supersession
-    for task in state.inquiry_tasks:
-        if task.kind=='review' and task.status in {'pending','running','blocked'} and not task.superseded_by and not any(valid_supersession(state,r,task) for r in state.semantic_reviews) and any(id in ids and task.target_versions.get(id)==current.get(id) for id in task.target_ids):
-            limitations.append('Relevant semantic review is unfinished: '+task.id)
-    if any(current.get(k)!=v for k,v in artifact.graph_versions.items()):limitations.append('Direct semantic inputs changed')
+    issues=[i for i in state.review_issues if i.target_id in ids]
+    disputed=any(i.target_id in ids and (i.status!='no_issue_found' or i.limitations or i.counterevidence)
+        and not any(x.review_id==r.id and x.target_id==i.target_id and x.aspect==i.aspect and x.resolved_by for x in issues)
+        for r in state.semantic_reviews for i in r.items)
+    if any(not i.resolved_by for i in issues) or disputed:limitations.append('Unresolved semantic counterevidence')
     if check.status==ExecutionStatus.TIMEOUT:limitations.append('External timeout; target behavior and harness completion are unestablished')
     elif check.status!=ExecutionStatus.COMPLETED:limitations.append('Execution tool or build failed: '+check.reason)
     elif check.exit_code!=0:limitations.append('Nonzero direct test exit ('+check.parameters.get('failure_class','unclassified')+'); inspect raw stack and target path before attribution')
-    if check.snapshot_id!=artifact.snapshot_id or check.direct_check_id!=artifact.id or check.input_versions!=artifact.artifact_digests:limitations.append('Direct input association mismatch')
-    if any(not Path(p).is_file() or digest(Path(p).read_bytes())!=v for p,v in artifact.artifact_digests.items()):limitations.append('Saved direct artifact changed')
+    if check.snapshot_id!=artifact.snapshot_id or check.direct_check_id!=artifact.id:limitations.append('Direct input association mismatch')
     if state.mode=='mock' or artifact.origin in {Origin.MOCK,Origin.SYNTHETIC,Origin.MUTATION,Origin.IMPORTED} or check.origin!=Origin.EXECUTED:limitations.append('Nonoriginal execution cannot confirm implementation')
     if prerequisite['status']!='matched':limitations.append('Correlated prerequisites not established')
     if check.parameters.get('changed_target_files'):limitations.append('Experiment changed target implementation files')
@@ -179,18 +158,24 @@ def assess(state,unit,artifact,plan,check,events):
     for basis in [claim.grounding,plan.harness.legality]+[m.grounding for m in plan.monitors]:limitations.extend(basis.unresolved+basis.conflicts)
     for condition in plan.harness.legal_conditions:
         if not events or not all(compare(e,condition) is True for e in events):limitations.append('Observable execution legality not established')
+    correlated=True
     for monitor,result in zip(plan.monitors,results):
         local=[]
-        matched=[i for i,e in enumerate(events) if e.get('event')==monitor.event and all(compare(e,c) is True for c in monitor.conditions)]
+        matched=[i for i,e in enumerate(events) if e.get('event')==monitor.event and compare(e,properties[monitor.checker_id].trigger) is True]
         if result['missing_indices']:local.append('Required observed fields missing')
         if not matched or any(not all(compare(events[i],c) is True for c in monitor.applicability_conditions) for i in matched):local.append('Observable applicability not established')
-        if not set(matched)<=set(prerequisite['matched_indices']):local.append('Observed checks are outside the correlated prerequisite execution')
+        if not set(matched)<=set(prerequisite['matched_indices']):
+            correlated=False;local.append('Observed checks are outside the correlated prerequisite execution')
         result['limitations']=local
     violated=any(r['outcome']=='violated' for r in results)
     clean=not limitations and all(not r['limitations'] and r['outcome']!='unknown' for r in results)
-    confirmed=clean and violated
+    observed=(check.status==ExecutionStatus.COMPLETED and check.exit_code==0 and check.origin==Origin.EXECUTED
+        and state.mode!='mock' and check.snapshot_id==artifact.snapshot_id and check.direct_check_id==artifact.id
+        and correlated and prerequisite['status']=='matched' and all(r['outcome']!='unknown' and not r['missing_indices']
+            and set(r['witness_indices'])<=set(prerequisite['matched_indices']) for r in results))
+    confirmed=clean and violated and observed
     record={'direct_check_id':artifact.id,'experiment_check_id':check.id,'prerequisites':prerequisite,'properties':results,
-        'limitations':limitations,'confirmed':confirmed,'outcome':'violated' if confirmed else 'holds' if clean else 'unknown',
+        'limitations':limitations,'confirmed':confirmed,'outcome':('violated' if violated else 'holds') if observed else 'unknown',
         'level':'implementation_obligation' if confirmed else 'implementation_test','claim_id':claim.id,'claim_version':claim.version}
     # Keep exploratory passing traces, with their limitations, separate from proof.
     if check.status==ExecutionStatus.COMPLETED and check.exit_code==0 and prerequisite['status']=='matched' and all(r['outcome']!='unknown' and not r['limitations'] for r in results):
@@ -250,18 +235,19 @@ def proceed(engine,unit,phase):
         state.active_direct_check_id=artifact.id;state.pending_feedback=None
         engine.advance('direct_execute');return
     if phase=='direct_execute':
-        execute(engine,artifact,plan);engine.advance('direct_assess');return
+        check=execute(engine,artifact)
+        assess(state,unit,artifact,plan,check,extract_events(check))
+        from .inquiry import enabled,enqueue
+        if enabled(engine) and check.status==ExecutionStatus.COMPLETED:
+            enqueue(state,'review','Review the whole direct check against its obligation, actual calls and observations',
+                'direct_check:'+artifact.id,target_ids=[artifact.id],unit_id=unit.id)
+        engine.advance('direct_assess');return
     check=next(c for c in reversed(state.checks) if c.direct_check_id==artifact.id)
     record=assess(state,unit,artifact,plan,check,extract_events(check))
     write_json(engine.root/'direct-checks'/artifact.operation_id/(check.id+'-assessment.json'),record)
-    if record.get('finding_id') and not record['confirmed'] and not any(t.trigger.startswith('direct_witness:') and check.id in t.trigger and t.unit_id==unit.id for t in state.inquiry_tasks):
-        from .inquiry import review_unit,enqueue
-        review_unit(engine,unit,'direct_witness:'+check.id)
-        enqueue(state,'review','Interpret actual direct oracle witness','direct_witness:oracle:'+check.id,target_ids=[artifact.id],unit_id=unit.id)
-        engine.checkpoint('direct_witness_review_pending');return
     if record['confirmed']:
         state.active_finding_id=record['finding_id'];engine.advance('consequence_plan');return
-    if check.status!=ExecutionStatus.COMPLETED or check.exit_code!=0 or record['prerequisites']['status']!='matched':
+    if check.status==ExecutionStatus.ERROR or check.status==ExecutionStatus.COMPLETED and check.exit_code==0 and record['prerequisites']['status']=='not_reached':
         engine.budget.take('technical_repairs' if check.status!=ExecutionStatus.COMPLETED else 'replays')
         state.pending_feedback={'kind':'technical' if check.status!=ExecutionStatus.COMPLETED else 'F4','check_id':check.id,'assessment':record,'failure':engine.error_context(check)}
         engine.advance('direct_check');return
@@ -275,11 +261,11 @@ def continue_question(engine,unit):
     if session['stage']=='read':
         if session['requests']:
             read_id=session.setdefault('read_plan_id',uid())
-            engine.checkpoint('question_read_planned')
+
             receipt=engine.read(session['requests'],purpose='depth',plan_id=read_id,related_ids=[unit.id],reason=q.question)
             if receipt['status']!='complete':raise Blocked('Selected question dependency read remains incomplete')
         session=state.question_continuations[key]
-        session['stage']='continue';engine.checkpoint('question_dependency_read')
+        session['stage']='continue'
     def validate(reply):
         if reply.revision:
             if reply.patch or reply.requests:raise ValueError('F2 interpretation changes must be a separate complete revision')

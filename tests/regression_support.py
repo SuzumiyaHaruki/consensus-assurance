@@ -68,13 +68,13 @@ def bounded_derivation(graph,packet=None):
     selected=[b for b in graph['bindings'] if b['id'] in unit['binding_ids']]
     edges=[r for r in graph['relations'] if r['id'] in unit['relation_ids']]
     wanted={primary}|{r[k] for r in edges for k in ('source','target')}
-    for b in selected:wanted.update(a['claim_id'] for a in b.get('associations',[]) or [{'claim_id':b.get('claim_id')}])
+    for b in selected:wanted.update(a['claim_id'] for a in b['associations'])
     question=unit.get('audit_question')
     if not question or not question.get('fact_ids'):
         from consensus_assurance.core.types import AuditQuestion
         source=next(c for c in graph['claims'] if c['id']==primary)['source_ids']
         question=AuditQuestion(question='Does the local step respect the declared bound?',importance='Bounded service value',source_ids=source,activity_classes=['A1'],behavior_ids=['fixture_step'],fact_ids=['fixture_value'],obligation_relation_kind='establishment',trigger_rationale='Controlled verification fixture',preferred_check='local_model',disposition='ready_for_check').model_dump(mode='json')
-    reply=Derivation(obligation=next(c for c in graph['claims'] if c['id']==primary),bindings=selected,dependencies=edges,
+    reply=Derivation(candidate_id=packet.get('candidate_id') if packet else None,obligation=next(c for c in graph['claims'] if c['id']==primary),bindings=selected,dependencies=edges,
         context_claims=[c for c in graph['claims'] if c['id'] in wanted and c['id']!=primary],audit_question=question,selection_rationale=unit['rationale']).model_dump(mode='json')
     return selection_derivation(reply) if packet is not None and not packet.get('selected_question') else reply
 

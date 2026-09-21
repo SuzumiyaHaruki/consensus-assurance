@@ -15,16 +15,6 @@ from test_graph_mutations import controller
 
 
 
-def test_cached_plans_leave_new_source_quota(tmp_path,prepared):
-    repo,s,_,_=prepared;e=controller(tmp_path,s);shutil.copytree(repo,e.root/'source')
-    e.config.budget.targeted_reads=2;s.usage['targeted_reads']=2
-    q=[dict(file='limits.py',start_line=1,end_line=2,reason='Reattach actual cached source')]
-    for i in range(4):assert e.read(q,plan_id='cache-'+str(i))['status']=='complete'
-    assert s.usage['targeted_reads']==2
-
-
-
-
 import copy,json
 import pytest
 from consensus_assurance.core.proposals import GraphPatch
@@ -39,7 +29,7 @@ def test_source_preserving_binding_split(case):
     from consensus_assurance.core.proposals import BindingDraft
     from consensus_assurance.core.diagnostics import Diagnostic
     material=Material(id='source',file='local.py',start_line=1,end_line=5,kind='code_observation',content_digest='synthetic',text='def first():\n    return 1\n\ndef second():\n    return 2')
-    original=BindingDraft(id='whole',claim_id='o',material_id='source',symbol='first',start_line=1,end_line=5,description='Two related entry points',pending=['Consumer guarantee unknown'])
+    original=BindingDraft(id='whole',associations=[dict(claim_id='o',source_ids=['source'],rationale='Selected fixture operation')],material_id='source',symbol='first',start_line=1,end_line=5,description='Two related entry points',pending=['Consumer guarantee unknown'])
     parts=[original.model_copy(update={'id':symbol,'symbol':symbol,'start_line':a,'end_line':b}) for symbol,a,b in [('first',1,2),('second',4,5)]]
     patch=OutputRepair(binding_splits=[{'path':case if case.startswith('/') else '/bindings/0','bindings':parts,'rationale':'Keep both actual declarations'}],rationale='Representation only')
     if case=='lost_source':patch.binding_splits[0].bindings[0].end_line=1

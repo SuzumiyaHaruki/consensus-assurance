@@ -3,7 +3,7 @@ import json
 import os
 import re
 from pathlib import Path
-from consensus_assurance.core.types import Analysis, Record, uid
+from consensus_assurance.core.types import Analysis, Record, uid, now
 
 
 def digest(data: bytes) -> str:
@@ -31,11 +31,9 @@ class Store:
         self.root.mkdir(parents=True, exist_ok=True)
 
     def save(self, state: Analysis, event: str):
-        event_id = uid()
-        write_json(self.root / "history" / f"{event_id}.json", state)
         write_json(self.root / "state.json", state)
         with (self.root / "events.jsonl").open("a", encoding="utf-8") as stream:
-            stream.write(json.dumps({"event": event, "state_version": event_id}, ensure_ascii=False) + "\n")
+            stream.write(json.dumps({"event": event, "at": now()}, ensure_ascii=False) + "\n")
 
     def load(self) -> Analysis:
         from consensus_assurance.workflow.history import load_analysis

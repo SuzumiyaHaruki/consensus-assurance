@@ -71,7 +71,7 @@ def progress_lines(state):
 def resource_lines(state):
     from consensus_assurance.core.config import Budget
     from consensus_assurance.workflow.materials import material_usage,material_allowance
-    budget=Budget.model_validate(state.config.get("budget",{}))
+    budget=Budget.model_validate({k:v for k,v in state.config.get("budget",{}).items() if k in Budget.model_fields})
     used=material_usage(state);breadth=material_allowance(state,budget,'breadth');depth=material_allowance(state,budget,'depth')
     stages={}
     for check in state.checks:
@@ -113,7 +113,7 @@ def resource_lines(state):
     source_plans=sum(any(i['status']=='acquired' for i in p['items']) for p in plans)
     cache_plans=sum(bool(p['items']) and all(i['status']=='cached' for i in p['items']) for p in plans)
     stalled=sum(s.get('stagnation',0) for s in state.repair_sessions.values())
-    lines.append(f"读取计划：当前 receipt 有新源 {source_plans}、纯缓存 {cache_plans}；修复无进展次数 {stalled}。targeted_reads 按取得新源的逻辑计划计数，历史用量不重算；缓存发送仍消耗实际 agent 调用与时间。")
+    lines.append(f"读取计划：当前 receipt 有新源 {source_plans}、纯缓存 {cache_plans}；修复无进展次数 {stalled}。读取次数仅从回执统计；材料总量、上下文、Agent 调用与时间仍有限制。")
     for packet in state.packet_receipts:
         resources=packet.get('skill_resources')
         if resources:lines.append(f"技能加载 `{packet['id']}`：版本 {resources['manifest_version']}，{resources['paths']}；仅以实际发送状态为准。")
@@ -180,8 +180,21 @@ def audit_lines(state):
     return lines
 
 
+def export_views(state, root):
+    from consensus_assurance.adapters.storage.files import write_json
+    from consensus_assurance.workflow.audit_spec import load, audit_progress
+    write_json(root / "materials.json",[m.model_dump(mode="json") for m in state.materials])
+    write_json(root / "graph.json", {"version": state.graph_version,
+        **{name:[x.model_dump(mode="json") for x in getattr(state,name)] for name in ("claims","bindings","relations")}})
+    spec=load(state)
+    if spec:write_json(root / "audit-spec.json",spec)
+    write_json(root / "audit-progress.json",audit_progress(state))
+    write_json(root / "plan.json", {"units":[u.model_dump(mode="json") for u in state.units],"selections":state.selections})
+
+
 def render_report(state, root):
     root = Path(root)
+    export_views(state,root)
     def link(path):
         if not path:
             return "无"
@@ -207,7 +220,7 @@ def render_report(state, root):
             lines += [f"定向补读：{history['gap']}；关联 {history['related_ids']}；实际新增片段 {history['added_material_ids']}。"]
     lines += ['', '## 候选问题与已有保护', '', '候选解释是有来源的分析判断，不是性质证据或协议正确性证明。']
     if not state.question_candidates:
-        lines.append('历史未记录结构化候选问题。' if state.framework_revision not in {'selected-question-v3','selected-question-v4','selected-question-v5','selected-question-v6'} else '尚未记录结构化候选问题。')
+        lines.append('未记录结构化候选问题。')
     from consensus_assurance.workflow.discovery import candidate_blockage
     blockages=[candidate_blockage(state,c) for c in state.question_candidates]
     lines.append('候选受阻分类：'+ '；'.join(k+'='+str(blockages.count(k)) for k in ('evidence_blocked','workflow_blocked','resource_blocked')))
@@ -327,7 +340,8 @@ def render_report(state, root):
         if f.confirmation_path:
             lines += [f"  实际观测、前提、合法性及性质判定：{link(f.confirmation_path)}；checker `{f.checker_id}`。"]
     for result in state.monitor_results:
-        lines += [f"观测判定 `{result.get('finding_id',result.get('direct_check_id','unknown'))}`：前提 `{result['prerequisites']['status']}`；确认层级 `{result['level']}`；限制：{result['limitations']}。"]
+        observed='；'.join(p['checker_id']+'='+p['outcome'] for p in result['properties'])
+        lines += [f"观测判定 `{result.get('finding_id',result.get('direct_check_id','unknown'))}`：实际结果 `{result.get('outcome',observed)}`；性质 `{observed}`；前提 `{result['prerequisites']['status']}`；确认层级 `{result['level']}`；限制：{result['limitations']}。"]
     for decision in state.consequences:
         lines.append(f"义务→更广泛后果处置：发现 `{decision['finding_id']}`；`{decision['disposition']}`；{decision['reason']}；后续 {decision['task_ids']}；限制 {decision['limitations']}。")
     for revision in state.revisions:
@@ -343,7 +357,7 @@ def render_report(state, root):
               "", "## 实际运行统计", "", f"累计执行时间：{state.elapsed_seconds:.2f} 秒；预算计数：`{state.usage}`。",
               f"首个已保存模型前耗时：{state.first_model_seconds if state.first_model_seconds is not None else '尚无模型'}；模型仍须通过实际工具检查。",
               f"审计单元 {len(state.units)}；范围扩展 {sum(x.kind == 'F3' for x in state.revisions)}；语义修订 {len(state.revisions)}；校准 {len(state.calibrations)}。",
-              "完整命令、时间、版本与制品关联见 [state.json](state.json)，历史检查点见 `history/`，事件见 [events.jsonl](events.jsonl)。", ""]
+              "完整命令、时间、版本与制品关联见 [state.json](state.json)，图、规格和计划视图在结束或生成报告时导出；事件见 [events.jsonl](events.jsonl)。", ""]
     lines += resource_lines(state)
     first = next((c for c in state.checks if c.action == "model_check" and c.status == ExecutionStatus.COMPLETED), None)
     if first and first.started_at:

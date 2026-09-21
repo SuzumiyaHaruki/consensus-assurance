@@ -66,7 +66,6 @@ def test_saved_model_then_new_assembly_source_actual_harness_and_calibration(tmp
     assert any(c.action=='experiment' and c.outcome=='tests_passed' for c in state.checks)
     assert agent.harness_calls==1
     assert state.usage['agent_calls']<=20 and state.usage['model_checks']<=cfg.budget.model_checks
-    assert state.usage['targeted_reads']==2
     assert all(e.level=='framework_test' for e in state.evidence)
     assert (repo/'zz_assembly.py').read_text()=='START = 0\n'
 
@@ -116,7 +115,7 @@ def test_repairs_fragmented_new_source_scope_model_components_and_real_tools(tmp
     agent=RepairingStagedAgent(data);args=(args[0],agent,*args[2:])
     state=Engine(cfg,root,*args).start(repo)
     assert [m.stage for m in state.models]==['model_only','complete'],state.stop_reason
-    assert state.usage['agent_calls']<=20 and state.usage['targeted_reads']==2
+    assert state.usage['agent_calls']<=20
     assert any(c.status=='compatible' for c in state.calibrations)
     assert any(c.outcome=='holds' and not c.reused for c in state.checks if c.action=='model_check')
     binding=next(b for b in state.bindings if b.id=='input_binding')

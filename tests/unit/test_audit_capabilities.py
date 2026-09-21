@@ -68,15 +68,14 @@ def test_R3_unread_intermediate_establishment_has_no_invented_edge(prepared,gap)
     assert spec.facts[0].consumed_by==[] and spec.behaviors[1].consumes_fact_ids==[]
 
 
-def test_R4_breadth_preserves_order_and_requests_replan(tmp_path,prepared):
+def test_R4_breadth_preserves_order_and_defers(tmp_path,prepared):
     from consensus_assurance.workflow.materials import plan_read,ReadingPlan,validate_read_requests
     from consensus_assurance.core.config import Config
     from consensus_assurance.core.diagnostics import DiagnosticError
     repo,state,_,_=prepared;state.materials=[]
     budget=Config.model_validate(state.config).budget;budget.material_chars=10;state.config['budget']=budget.model_dump(mode='json')
     requests=[{'file':'counter.py','start_line':1,'end_line':10,'reason':'Priority producer'}, {'file':'limits.py','start_line':1,'end_line':1,'reason':'Secondary range'}]
-    with pytest.raises(DiagnosticError) as exc:validate_read_requests(state,repo,ReadingPlan(requests=requests,rationale='Authored priority'),purpose='breadth')
-    assert exc.value.diagnostics[0].code=='reading_plan_budget'
+    validate_read_requests(state,repo,ReadingPlan(requests=requests,rationale='Authored priority'))
     receipt,_=plan_read(state,repo,requests,budget,purpose='breadth',partial=True)
     assert [i.request.file for i in receipt.items]==['counter.py','limits.py'] and all(i.status=='deferred' for i in receipt.items)
 

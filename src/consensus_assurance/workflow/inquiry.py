@@ -13,20 +13,18 @@ def enabled(engine):
     return engine.config.budget.exploration_rounds > 0 or engine.config.budget.semantic_reviews > 0
 
 
-def enqueue(state, kind, reason, trigger, activity_classes=(), target_ids=(), unit_id=None, model_id=None, requests=(), surface_entry_points=(), feedback_source_ids=(), feedback_effect=''):
-    from .audit_spec import audit_object_index,load
-    inventory=audit_object_index(load(state)) if feedback_source_ids and state.audit_spec_path else {}
-    feedback_basis={id:inventory.get(id) for id in target_ids} if feedback_source_ids else {}
-    signature=(kind,trigger,tuple(activity_classes),tuple(target_ids),unit_id,model_id,tuple(surface_entry_points))
+def enqueue(state, kind, reason, trigger, activity_classes=(), target_ids=(), unit_id=None, model_id=None, requests=(), surface_entry_points=(), candidate_id=None, diagnostics=()):
+    signature=(kind,trigger,tuple(activity_classes),tuple(target_ids),unit_id,model_id,tuple(surface_entry_points),candidate_id)
     for task in state.inquiry_tasks:
-        if signature==(task.kind,task.trigger,tuple(task.activity_classes),tuple(task.target_ids),task.unit_id,task.model_id,tuple(task.surface_entry_points)):
+        if (kind==task.kind=='spec_refine' and diagnostics and task.status=='pending'
+                and set(task.target_ids)==set(target_ids) and task.candidate_id==candidate_id):
+            task.diagnostics.extend(diagnostics)
             return task
-        if (feedback_source_ids and task.kind==kind=='spec_refine' and task.reason==reason and task.feedback_effect==feedback_effect
-                and set(task.feedback_source_ids)==set(feedback_source_ids) and set(task.target_ids)==set(target_ids)
-                and task.feedback_basis==feedback_basis and task.status in {'pending','running','completed'}):
-            if trigger not in task.origin_check_ids:task.origin_check_ids.append(trigger)
+        if signature==(task.kind,task.trigger,tuple(task.activity_classes),tuple(task.target_ids),task.unit_id,task.model_id,tuple(task.surface_entry_points),task.candidate_id):
             return task
-    task=InquiryTask(surface_entry_points=list(surface_entry_points),kind=kind,reason=reason,trigger=trigger,activity_classes=list(activity_classes),target_ids=list(target_ids),unit_id=unit_id,model_id=model_id,requests=list(requests),stage='read' if requests else 'analyze',feedback_source_ids=list(feedback_source_ids),feedback_effect=feedback_effect,feedback_basis=feedback_basis,origin_check_ids=[trigger] if feedback_source_ids else [])
+    task=InquiryTask(surface_entry_points=list(surface_entry_points),kind=kind,reason=reason,trigger=trigger,
+        activity_classes=list(activity_classes),target_ids=list(target_ids),unit_id=unit_id,model_id=model_id,
+        requests=list(requests),stage='read' if requests else 'analyze',candidate_id=candidate_id,diagnostics=list(diagnostics))
     task.target_versions={i:getattr(objects(state)[i],"version",1) for i in task.target_ids if i in objects(state)}
     unit=next((u for u in state.units if u.id==unit_id),None)
     task.unit_version=unit.version if unit else None
@@ -37,6 +35,7 @@ def enqueue(state, kind, reason, trigger, activity_classes=(), target_ids=(), un
 
 def review_unit(engine, unit, trigger, model=None):
     if not enabled(engine): return
+    if model is None and unit.audit_question and unit.audit_question.preferred_check in {'direct_test','controlled_schedule'}:return
     available=objects(engine.state)
     if trigger=="before_model" and readiness(engine.state,unit)["status"]=="reviewed":return
     ids=[x for x in dict.fromkeys(unit.obligation_ids+[unit.id]+([model.id] if model else [])+[i.target_id for i in engine.state.review_issues if not i.resolved_by and i.target_id in unit.binding_ids+unit.relation_ids]) if x in available]
@@ -134,10 +133,11 @@ def validate_review(state,task,reply):
             raise ValueError('Semantic review cites an unavailable object or material')
         if not item.rationale.strip():raise ValueError('Semantic review needs sourced reasoning')
     if reply.revision:
-        if reply.revision.kind!='F2' or not set(reply.revision.target_ids)<=set(task.target_ids):
+        reviewed=set(task.target_ids)|{id for a in state.direct_checks if a.id in task.target_ids for id in a.graph_versions}
+        if reply.revision.kind!='F2' or not set(reply.revision.target_ids)<=reviewed:
             raise ValueError('Review revisions must be F2 and target the reviewed semantic objects')
         from .mutations import validate_changes
-        validate_changes(state,reply.revision,task.target_ids)
+        validate_changes(state,reply.revision,reviewed)
         trial=state.model_copy(deep=True)
         unit=next((u for u in trial.units if u.id==task.unit_id),None)
         apply_feedback(trial,unit,None,reply.revision)
@@ -158,18 +158,17 @@ def process_task(engine, task):
         task.target_versions={i:objects(state)[i].version for i in task.target_ids if i in objects(state)}
         task.status='running';state.active_inquiry_id=task.id
         state.inquiry_selections.append({'task_id':task.id,'kind':task.kind,'reason':task.reason,'trigger':task.trigger,'planned_target_versions':planned_versions,'execution_target_versions':task.target_versions})
-        engine.checkpoint('inquiry_task_started')
+
     if task.stage=='read':
         if not task.read_plan_id:
             from consensus_assurance.core.types import uid
-            task.read_plan_id=uid();engine.checkpoint('inquiry_read_plan_saved')
+            task.read_plan_id=uid()
         receipt=engine.read(task.requests,purpose=read_purpose(task),partial=read_purpose(task)=='breadth',plan_id=task.read_plan_id,related_ids=task.target_ids+task.activity_classes+([task.unit_id] if task.unit_id else []),reason=task.reason)
         task=next(t for t in state.inquiry_tasks if t.id==task.id)
         task.added_material_ids=list(dict.fromkeys(task.added_material_ids+[id for item in receipt['items'] if item['status']!='deferred' for id in item['material_ids']]))
         if receipt['status']!='complete' and not task.candidate_id:
             raise Blocked('Requested inquiry material is deferred within its protected allowance; unmet requests remain in the receipt')
         task.stage='analyze';release_action(engine)
-        write_json(engine.root/'materials.json',[m.model_dump(mode='json') for m in state.materials]);engine.checkpoint('inquiry_materials_read')
     if task.repair_session and not state.pending_output_repair:state.pending_output_repair=task.repair_session
     context=task_context(engine,task)
     if task.kind=='spec_refine':
@@ -301,14 +300,14 @@ def apply_task_response(engine,task_id,reply,check):
             review.revision_id=state.revisions[-1].id
             if state.revisions[-1].status=='applied' and state.active_unit_id:
                 active=next(u for u in state.units if u.id==state.active_unit_id)
-                if set(task.target_ids)&set(active.obligation_ids+active.relation_ids+active.binding_ids+[active.id]):
+                if set(reply.revision.target_ids)&set(active.obligation_ids+active.relation_ids+active.binding_ids+[active.id]):
                     state.active_model_id=None;state.active_direct_check_id=None;state.active_finding_id=None;state.next_action='select'
             for candidate in state.units:
-                if set(task.target_ids)&set(candidate.obligation_ids+candidate.relation_ids+candidate.binding_ids+[candidate.id]):
+                if set(reply.revision.target_ids)&set(candidate.obligation_ids+candidate.relation_ids+candidate.binding_ids+[candidate.id]):
                     review_unit(engine,candidate,'semantic_revision:'+review.revision_id)
         state.semantic_reviews.append(review)
         from .review_contract import missing_pairs
-        missing=missing_pairs(state,task,reply.items)
+        missing={} if any(a.id in task.target_ids for a in state.direct_checks) else missing_pairs(state,task,reply.items)
         if missing and not task.trigger.endswith(':missing_aspects'):
             follow=enqueue(state,'review','Supply only the missing target/aspect judgments',task.id+':missing_aspects',target_ids=list(missing),unit_id=task.unit_id,model_id=task.model_id)
             follow.requested_aspects=missing

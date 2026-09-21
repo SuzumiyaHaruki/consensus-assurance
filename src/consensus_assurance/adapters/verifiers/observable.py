@@ -62,13 +62,8 @@ def tokens(source):
 
 
 def correspondence(bundle, monitor):
-    p = monitor.property
-    if p is None or p.checker_id != monitor.checker_id or p not in bundle.observable_properties:
+    if not any(p.checker_id==monitor.checker_id for p in bundle.observable_properties):
         return 'No shared observable property description for this monitor'
-    if p.kind == 'event_assertion' and (monitor.assertion != p.assertion or monitor.conditions != [p.trigger]):
-        return 'Monitor assertion/trigger differs from the shared checker description'
-    if p.kind == 'stable_support' and (monitor.identity_fields != p.identity_fields or monitor.assertion != p.assertion or monitor.conditions != [p.trigger]):
-        return 'History monitor differs from the shared checker description'
     try:
         expected = properties_source(bundle.observable_properties, bundle.observation)
     except ValueError as exc:

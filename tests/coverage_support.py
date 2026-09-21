@@ -12,10 +12,10 @@ def delivery_graph(context, wrong=False):
     material=next(m for m in context['materials'] if m['id']=='z_delivery.py:141:142')
     note=next(m for m in context['materials'] if m['file']=='service_notes.md')
     scope={'description':'Synthetic memory-mode completion, no crash claim','assumptions':[],'excluded':['Production protocols'],'parameters':{}}
-    basis={'behavior_ids':[material['id']],'expectation_ids':[note['id']],'binding_ids':['delivery_binding'],'derivation':'The selected memory mode promises acceptance; the implementation returns accepted without a persistence step','applicability':'Memory mode only','unresolved':[],'conflicts':[],'alternatives':[]}
+    basis={'source_ids':[material['id']],'expectation_ids':[note['id']],'binding_ids':['delivery_binding'],'derivation':'The selected memory mode promises acceptance; the implementation returns accepted without a persistence step','applicability':'Memory mode only','unresolved':[],'conflicts':[],'alternatives':[]}
     goal=ClaimDraft(id='delivery_goal',kind='obligation',description='The returned result satisfies the configured completion responsibility',source_ids=[note['id']],scope=scope,pending=[],grounding=basis)
     obligation=ClaimDraft(id='delivery_obligation',kind='obligation',description='Return in memory mode requires persistence' if wrong else 'Return in memory mode requires acceptance',source_ids=[note['id'],material['id']],scope=scope,pending=[],grounding=basis)
-    binding=BindingDraft(id='delivery_binding',claim_id=obligation.id,material_id=material['id'],symbol='deliver',start_line=141,end_line=142,description='Actual memory acceptance result',pending=[])
+    binding=BindingDraft(id='delivery_binding',associations=[dict(claim_id=obligation.id,source_ids=[material['id']],rationale='Selected fixture operation')],material_id=material['id'],symbol='deliver',start_line=141,end_line=142,description='Actual memory acceptance result',pending=[])
     edge=RelationDraft(id='delivery_support',source=goal.id,target=obligation.id,kind='depends_all',group=None,rationale='The selected configured contract determines completion responsibility',pending=[],grounding=basis)
     unit=UnitDraft(id='delivery_unit',obligation_ids=[obligation.id],binding_ids=[binding.id],relation_ids=[],scope=scope,rationale='Investigate a second responsibility',)
     return GraphPatch(claims=[obligation],bindings=[binding],relations=[],units=[unit],rationale='Actual newly read completion source supports candidate goals')
@@ -62,7 +62,7 @@ class CoverageAgent(MockAgent):
                     status='revision_needed';explanation='service_notes.md explicitly promises acceptance in memory mode, not persistence'
                     changed=ClaimDraft(**{k:v for k,v in obj.items() if k in ClaimDraft.model_fields});changed.description='Return in memory mode requires acceptance'
                     basis=changed.grounding.model_dump(mode='json')
-                    revision={'kind':'F2','rationale':explanation,'evidence_ids':[note['id']],'target_ids':[obj['id']],'relation_ids':[],'new_basis':explanation,'graph':None,'bundle':None,
+                    revision={'kind':'F2','rationale':explanation,'evidence_ids':[note['id']],'target_ids':[obj['id']],'relation_ids':[],'new_basis':explanation,
                         'patch':{'claims':[changed.model_dump(mode='json')],'expected_versions':{obj['id']:obj['version']},'rationale':explanation},'old_judgment':obj['description'],'new_judgment':changed.description,'grounding':basis,'changes':[{'target_id':obj['id'],'field':'description','old_value_json':json.dumps(obj['description']),'new_value_json':json.dumps(changed.description)}]}
                 if self.weak and context['task']['trigger'].startswith('after_search') and bool(obj.get('bundle_path')):
                     status='disputed';explanation='The local bound holds but does not establish the delivery handoff responsibility'
@@ -103,7 +103,7 @@ def setup_workflow(tmp_path,prepared,wrong=False,weak=False,tlc=None):
     config=Config(execution_backend='python',agent_backend='mock',allow_experiments=False,tlc_jar=os.environ.get('TLC_JAR'))
     config.budget.agent_calls=20;config.budget.exploration_rounds=5;config.budget.semantic_reviews=6
     config.budget.audit_units=0 if wrong else 1
-    config.budget.targeted_reads=6;config.budget.outer_reserve_seconds=1
+    config.budget.outer_reserve_seconds=1
     root=tmp_path/'inquiry-run'
     impl,_,verifier,knowledge=assemble(config)
     return repo,config,root,(impl,CoverageAgent(responses,wrong,weak),verifier,knowledge)

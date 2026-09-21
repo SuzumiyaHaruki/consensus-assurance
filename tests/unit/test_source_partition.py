@@ -13,7 +13,7 @@ def test_contiguous_prefix_can_prove_owner_without_claiming_complete_end():
     text='func (x *State) Handle(\n v int,\n) {\n f := func() { println("}") }\n f()\n'
     def source(id,a,z,version='same'):
         return Material(id=id,file='state.go',start_line=a,end_line=z,text='\n'.join(text.splitlines()[a-1:z]),content_digest=version,kind='code_observation')
-    b=BindingDraft(id='b',claim_id='o',material_id='body',symbol='Handle',start_line=5,end_line=5,anchor={'material_id':'head','symbol':'Handle','start_line':1,'end_line':3,'kind':'declaration'},description='A real internal statement',pending=[])
+    b=BindingDraft(id='b',associations=[dict(claim_id='o',source_ids=['body'],rationale='Selected fixture operation')],material_id='body',symbol='Handle',start_line=5,end_line=5,anchor={'material_id':'head','symbol':'Handle','start_line':1,'end_line':3,'kind':'declaration'},description='A real internal statement',pending=[])
     assert locate(b,{'head':source('head',1,3),'body':source('body',4,5)})[0]
     assert not locate(b,{'head':source('head',1,3),'body':source('body',5,5)})[0]
     assert not locate(b,{'head':source('head',1,3),'body':source('body',4,5,'different')})[0]
@@ -25,7 +25,7 @@ def test_multiline_signature_and_receiver_identity_survive_read_partition(cuts):
     materials={str(i):Material(id=str(i),file='state.go',start_line=a,end_line=z,text='\n'.join(text.splitlines()[a-1:z]),content_digest='version',kind='code_observation') for i,(a,z) in enumerate(cuts)}
     body=next(m for m in materials.values() if m.start_line<=4<=m.end_line)
     head=next(m for m in materials.values() if m.start_line==1)
-    b=BindingDraft(id='b',claim_id='o',material_id=body.id,symbol='Handle',start_line=4,end_line=4,anchor={'material_id':head.id,'symbol':'Handle','start_line':1,'end_line':3,'kind':'declaration'},description='Only the first receiver is intended',pending=[])
+    b=BindingDraft(id='b',associations=[dict(claim_id='o',source_ids=[body.id],rationale='Selected fixture operation')],material_id=body.id,symbol='Handle',start_line=4,end_line=4,anchor={'material_id':head.id,'symbol':'Handle','start_line':1,'end_line':3,'kind':'declaration'},description='Only the first receiver is intended',pending=[])
     anchor,error=locate(b,materials);assert anchor,error
     assert anchor['start_line']==1 and anchor['boundary_complete']
     b.anchor.start_line=6;b.anchor.end_line=6
@@ -34,7 +34,7 @@ def test_multiline_signature_and_receiver_identity_survive_read_partition(cuts):
 
 def test_comment_name_does_not_create_identity_and_interface_is_distinct():
     m=Material(id='code',file='state.go',start_line=1,end_line=5,content_digest='v',kind='code_observation',text='// func Fake() {\ntype Store interface {\n Save(\n  value int) error\n}')
-    b=BindingDraft(id='b',claim_id='o',material_id=m.id,symbol='Fake',start_line=1,end_line=1,description='Comment is not code',pending=[])
+    b=BindingDraft(id='b',associations=[dict(claim_id='o',source_ids=[m.id],rationale='Selected fixture operation')],material_id=m.id,symbol='Fake',start_line=1,end_line=1,description='Comment is not code',pending=[])
     assert not locate(b,{m.id:m})[0]
     b.symbol='Store';b.start_line=2;b.end_line=5
     assert locate(b,{m.id:m})[0]

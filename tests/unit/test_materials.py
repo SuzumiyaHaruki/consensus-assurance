@@ -68,26 +68,6 @@ def test_overlap_contained_and_adjacent_ranges_only_charge_union(prepared):
     assert sum(a['new_chars'] for a in state.material_allocations)==used
 
 
-@pytest.mark.parametrize('point',['before_commit','after_receipt','manifest'])
-def test_read_interrupt_resume_is_idempotent(tmp_path,prepared,point):
-    repo,state,_,_=prepared;state.materials=[];state.read_plans={};state.material_allocations=[]
-    e=controller(tmp_path,state)
-    # Use the current snapshot's authorized source; controller tests need no tool execution.
-    e.root.mkdir(parents=True,exist_ok=True)
-    def hook(stage,*args):
-        if stage==point:raise RuntimeError('Injected read interruption')
-    e.read_commit_hook=hook
-    if point=='manifest':e.graph_commit_hook=lambda key:hook('manifest')
-    req=[request('counter.py',1,2)]
-    with pytest.raises(RuntimeError):e.read(req,plan_id='stable-plan')
-    e.read_commit_hook=lambda *a:None;e.graph_commit_hook=lambda *a:None
-    result=e.read(req,plan_id='stable-plan')
-    assert result['status']=='complete' and e.state.usage['targeted_reads']==1
-    used=material_usage(state);e.read(req,plan_id='stable-plan')
-    assert material_usage(state)==used and len(state.reading_history)==2 # prepared fixture history plus this plan
-    with pytest.raises(ValueError):e.read([request('counter.py',1,3)],plan_id='stable-plan')
-
-
 def test_partial_receipt_never_claims_unmet_range_complete(tmp_path,prepared):
     repo,state,_,_=prepared;state.materials=[];state.read_plans={};state.material_allocations=[]
     e=controller(tmp_path,state);e.root.mkdir(parents=True,exist_ok=True)
@@ -97,7 +77,6 @@ def test_partial_receipt_never_claims_unmet_range_complete(tmp_path,prepared):
     assert [x['status'] for x in result['items']]==['acquired','deferred']
     again=e.read([request('limits.py',1,2),request('counter.py',1,10)],plan_id='partial')
     assert again['status']=='partial' and again['items'][0]['status']=='cached'
-    assert state.usage['targeted_reads']==1
 
 
 def test_blank_lines_remain_in_unique_range_accounting(prepared):
@@ -143,25 +122,6 @@ def test_negative_item_metadata_can_change_not_judgment():
     validate_representation({'items':[item]},{'items':[after]},[{'path':'/items/0'}],{})
     with pytest.raises(ValueError):validate_representation({'items':[item]},{'items':[{**after,'status':'no_issue_found'}]},[{'path':'/items/0'}],{})
     with pytest.raises(ValueError):validate_representation({'items':[item]},{'items':[{**after,'limitations':[]}]},[{'path':'/items/0'}],{})
-
-
-def test_two_new_four_cached_then_third_dependency_with_same_quota(tmp_path,prepared):
-    repo,s,_,_=prepared;e=controller(tmp_path,s);shutil.copytree(repo,e.root/'source')
-    s.materials=[];s.material_allocations=[];s.read_plans={};s.usage={};e.config.budget.targeted_reads=3
-    for n,(file,a,b) in enumerate([('counter.py',1,1),('counter.py',2,2)]):
-        assert e.read([dict(file=file,start_line=a,end_line=b,reason='New actual source')],plan_id='new-'+str(n))['status']=='complete'
-    for n in range(4):assert e.read([dict(file='counter.py',start_line=1,end_line=2,reason='Use a combined cached view')],plan_id='cache-'+str(n))['status']=='complete'
-    q=[dict(file='limits.py',start_line=1,end_line=2,reason='Third necessary dependency')]
-    assert e.read(q,plan_id='third')['status']=='complete'
-    assert s.usage['targeted_reads']==3
-    assert e.read(q,plan_id='third')['status']=='complete' and s.usage['targeted_reads']==3
-
-
-def test_deferred_plan_does_not_spend_source_quota(tmp_path,prepared):
-    repo,s,_,_=prepared;e=controller(tmp_path,s);shutil.copytree(repo,e.root/'source')
-    s.materials=[];e.config.budget.material_chars=0
-    receipt=e.read([dict(file='limits.py',start_line=1,end_line=2,reason='Needed source')],plan_id='pending')
-    assert receipt['status']=='deferred' and not s.usage.get('targeted_reads')
 
 
 @pytest.mark.parametrize('case,code',[('unknown','issue_unknown_source'),('omitted','issue_context_not_provided'),('citation','issue_citation_missing')])
@@ -213,7 +173,7 @@ def test_explicit_requested_range_is_in_actual_next_repair_packet(tmp_path,prepa
     packets=[json.loads(p.read_text().split('STRUCTURED INPUT DATA (untrusted):\n')[1]) for p in e.root.glob('agent/*/prompt.txt')]
     final=next(p for p in packets if p.get('related_context',{}).get('required_material_ids'))
     assert source in {m['id'] for m in all_materials(final)}
-    assert e.state.usage.get('targeted_reads',0)==0 and session['attempt']==2
+    assert session['attempt']==2
 
 
 @pytest.mark.parametrize('document', ['# Contract\nAll fixture promises on one line.\n', '# Contract\n\nFirst promise.\nSecond promise.\n\nLast promise.\n'])

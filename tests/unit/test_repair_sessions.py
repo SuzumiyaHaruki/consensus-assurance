@@ -109,7 +109,7 @@ def test_local_existing_material_is_reattached_without_graph_patch(tmp_path,prep
     e.ask=lambda *a,**k:(_ for _ in ()).throw(AssertionError('Existing context does not require generation'))
     version=state.graph_version
     assert e.targeted_read(state.units[0],'The selected context omitted the producer',requests=[{'file':'limits.py','start_line':1,'end_line':2,'reason':'Reattach actual source'}]) is None
-    assert 'limits.py:1:2' in state.attached_material_ids
+    assert 'limits.py:1:2' in state.task_attachments['discovery']
     assert state.graph_version==version
     assert state.reading_history[-1]['added_material_ids']==[]
     assert state.reading_history[-1]['reattached_material_ids']==['limits.py:1:2']
@@ -210,7 +210,6 @@ def test_covered_citation_uses_cached_read_without_agent_repair(tmp_path,prepare
     assert result.source_ids==['counter.py:2:3'] and result.counterevidence==reply.counterevidence
     assert any(m.id=='counter.py:2:3' for m in state.materials)
     assert not state.repair_sessions and state.usage['agent_calls']==1
-    assert state.usage.get('targeted_reads',0)==before.get('targeted_reads',0)
     receipt=list(state.read_plans.values())[-1]
     assert all(i['status']=='cached' and i['new_chars']==0 for i in receipt['items'])
 

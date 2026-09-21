@@ -89,30 +89,6 @@ def test_actual_new_read_reconnects_existing_unit_before_model(tmp_path,prepared
 
 
 @pytest.mark.real
-@pytest.mark.parametrize('event',['targeted_materials_read','scope_proposal_saved','scope_manifest','scope_accepted','build_saved','model_manifest'])
-def test_scope_recovery_continues_same_problem_once(tmp_path,prepared,tlc,event):
-    repo,cfg,args,root=setup(tmp_path,prepared,tlc)
-    class Interrupted(Engine):
-        def checkpoint(self,name):
-            super().checkpoint(name)
-            if name==event:raise RuntimeError('Injected scope interruption')
-            if event=='scope_accepted' and name=='semantic_operation_committed' and any(v['status']=='accepted' for v in self.state.scope_updates.values()):raise RuntimeError('Injected scope interruption')
-            if event=='build_saved' and name=='action_result_saved' and self.state.pending_action.kind=='agent:F3':raise RuntimeError('Injected scope interruption')
-        def graph_commit_hook(self,key):
-            if event=='scope_manifest' and key.startswith('scope-'):raise RuntimeError('Injected scope interruption')
-        def model_commit_hook(self,model):
-            if event=='model_manifest':raise RuntimeError('Injected scope interruption')
-    with pytest.raises(RuntimeError):Interrupted(cfg,root,*args).start(repo)
-    saved=Store(root).load();reads=saved.usage.get('targeted_reads',0)
-    state=Engine(cfg,root,*args).resume()
-    assert state.models,state.stop_reason
-    assert len([u for u in state.units if u.previous_id])==1
-    assert len([r for r in state.revisions if r.kind=='F3'])==1
-    assert state.usage.get('targeted_reads',0)==reads
-    assert any(c.action=='model_check' and c.outcome=='holds' for c in state.checks),state.stop_reason
-
-
-@pytest.mark.real
 def test_event_refinement_executes_explicit_assessment_before_build(tmp_path,prepared,tlc):
     repo,cfg,args,root=setup(tmp_path,prepared,tlc);args[1].refine=True
     state=Engine(cfg,root,*args).start(repo)

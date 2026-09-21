@@ -141,7 +141,7 @@ def test_task_attachment_does_not_leak_and_unseen_source_rejected(tmp_path,prepa
     from consensus_assurance.core.types import Material
     _,state,_,_=prepared;e=controller(tmp_path,state)
     other=Material(id='unrelated',file='unrelated.txt',start_line=1,end_line=1,text='Unrelated private task context',kind='document_statement',content_digest='synthetic')
-    state.materials.append(other);state.attached_material_ids.append(other.id);state.task_attachments['inquiry:other']=[other.id]
+    state.materials.append(other);state.task_attachments['inquiry:other']=[other.id]
     task,packet=packet_for(e,[state.bindings[0].id])
     assert other.id not in [m['id'] for m in packet['materials']]
     reply=respond(packet);reply.items[0].source_ids.append(other.id)

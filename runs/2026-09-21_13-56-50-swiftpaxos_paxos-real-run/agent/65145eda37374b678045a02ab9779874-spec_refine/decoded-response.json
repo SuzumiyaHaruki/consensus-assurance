@@ -1,0 +1,309 @@
+{
+  "understanding": "The supplied source resolves Paxos selection, constructor-local initialization, and asynchronous loop startup. runReplica obtains registration results from the master before selecting Paxos. paxos.New initializes local protocol state, registers six message channels, and launches run before returning. The run goroutine performs peer setup, conditionally launches execution and batching workers, launches client connection handling, and dispatches messages to handlers. These observations establish startup and dispatch behavior, not completed authority acquisition, recovery, decision formation, or application.",
+  "requests": [],
+  "delta": {
+    "target_profile": null,
+    "activities": [
+      {
+        "class_id": "A1",
+        "applicability": "applicable",
+        "purpose": "Dispatch proposals and protocol messages to decision-processing handlers.",
+        "realization_summary": "One run goroutine selects among proposal, Prepare, Accept, Commit, CommitShort, reply, recovery, and batching channels. Handler semantics remain unread in this packet.",
+        "entry_points": [
+          "paxos.(*Replica).run"
+        ],
+        "variants": [
+          "When BatchingEnabled returns true, proposal reception is disabled after handling a proposal and restored on a fastClockChan event."
+        ],
+        "unknowns": [
+          "The dispatched handlers' admission, support, decision, and error semantics are not established.",
+          "Other workers and RPC methods may access shared state; run-loop serialization does not establish exclusive ownership."
+        ],
+        "source_ids": [
+          "paxos/paxos.go:24:260"
+        ]
+      },
+      {
+        "class_id": "A2",
+        "applicability": "applicable",
+        "purpose": "Initialize local role and ballot context for a newly constructed Paxos replica.",
+        "realization_summary": "The constructor copies the caller-supplied isLeader flag and initializes replica-wide ballot fields to -1. The startup caller obtains that flag from a Ready master registration reply. This establishes local initialization only.",
+        "entry_points": [
+          "runReplica",
+          "paxos.New"
+        ],
+        "variants": [
+          "The supplied isLeader flag determines the initial local IsLeader value."
+        ],
+        "unknowns": [
+          "Master-side assignment semantics and their relationship to protocol authority are unread.",
+          "Fresh construction versus restart behavior depends on unread base-replica initialization and recovery paths."
+        ],
+        "source_ids": [
+          "run.go:23:103",
+          "paxos/paxos.go:24:260"
+        ]
+      }
+    ],
+    "behaviors": [
+      {
+        "id": "startup_register_select_paxos",
+        "primary_activity": "A2",
+        "execution_owner": "runReplica caller goroutine",
+        "protocol_context": "Startup with a Config whose lowercased Protocol is paxos.",
+        "trigger": "runReplica is invoked.",
+        "legal_preconditions": [],
+        "implementation_guards": [
+          "registerWithMaster returns only after Master.Register succeeds with reply.Ready true.",
+          "The Paxos constructor is selected by strings.ToLower(c.Protocol) == \"paxos\"."
+        ],
+        "reads": [
+          "Config address, alias, port, master address, protocol, and ReplicaAddrs",
+          "Master registration reply ReplicaId, NodeList, and IsLeader"
+        ],
+        "writes": [
+          "Local replicaId, nodeList, isLeader, and f variables"
+        ],
+        "durable_effects": [],
+        "external_effects": [
+          "Dials the master and invokes Master.Register.",
+          "Calls paxos.New with the registration results and f = (len(c.ReplicaAddrs) - 1) / 2.",
+          "Attempts rpc.Register for the constructed replica.",
+          "Installs HTTP RPC handlers and serves a TCP listener on port + 1000."
+        ],
+        "important_branches": [
+          "Dial failures retry after time.Sleep(4); unsuccessful registration calls retry in the inner loop.",
+          "A successful registration with Ready false sleeps and retries.",
+          "Listener creation failure invokes log.Fatal.",
+          "rpc.Register and http.Serve return values are not checked in the supplied caller."
+        ],
+        "async_boundaries": [
+          "Master RPC exchanges",
+          "paxos.New launches run before returning to this caller",
+          "HTTP RPC service"
+        ],
+        "produces_fact_ids": [
+          "startup_master_ready_reply_observed"
+        ],
+        "consumes_fact_ids": [],
+        "cross_activity_effects": {},
+        "existing_protections": [
+          "Paxos construction follows an error-free Ready registration response."
+        ],
+        "source_ids": [
+          "run.go:23:103"
+        ],
+        "unknowns": [
+          "Master.Register implementation and the guarantees attached to Ready and IsLeader are unread.",
+          "The relationship between configured ReplicaAddrs cardinality and returned NodeList cardinality is not established."
+        ]
+      },
+      {
+        "id": "startup_construct_paxos",
+        "primary_activity": "A2",
+        "execution_owner": "paxos.New caller goroutine",
+        "protocol_context": "Construction of one Paxos Replica with supplied identity, peer addresses, initial role, failure count, and configuration.",
+        "trigger": "paxos.New is called.",
+        "legal_preconditions": [],
+        "implementation_guards": [],
+        "reads": [
+          "Constructor arguments",
+          "len(addrs)"
+        ],
+        "writes": [
+          "Embedded Replica returned by replica.New",
+          "Six buffered protocol channels and instancesToRecover",
+          "A 15*1024*1024-entry instanceSpace initially containing nil pointers",
+          "crtInstance, maxRecvBallot, smallestDefaultBallot, and executedUpTo initialized to -1",
+          "Every defaultBallot entry initialized to -1",
+          "IsLeader copied from isLeader and flush initialized to true",
+          "Six protocol RPC identifiers"
+        ],
+        "durable_effects": [],
+        "external_effects": [
+          "Calls replica.New(alias, id, f, addrs, false, true, false, conf, logger).",
+          "Registers Prepare, Accept, Commit, CommitShort, PrepareReply, and AcceptReply with their respective channels."
+        ],
+        "important_branches": [
+          "No constructor-local branch waits for peer connections, recovery, application startup, or protocol readiness."
+        ],
+        "async_boundaries": [
+          "Launches go r.run() before returning r."
+        ],
+        "produces_fact_ids": [
+          "startup_paxos_local_state_initialized"
+        ],
+        "consumes_fact_ids": [],
+        "cross_activity_effects": {
+          "A1": "Creates the channels and instance array subsequently used by protocol dispatch."
+        },
+        "existing_protections": [
+          "Local field initialization and protocol channel registration precede launching run."
+        ],
+        "source_ids": [
+          "paxos/paxos.go:24:260"
+        ],
+        "unknowns": [
+          "The implementation effects of replica.New and RPC.Register are unread.",
+          "The constructor accepts arbitrary caller-supplied arguments; master registration is established only for the observed runReplica call path.",
+          "No claim about durable initialization or restart reconstruction follows from the visible allocation."
+        ]
+      },
+      {
+        "id": "startup_run_dispatch",
+        "primary_activity": "A1",
+        "execution_owner": "Paxos Replica run goroutine",
+        "protocol_context": "The locally initialized replica launched by paxos.New.",
+        "trigger": "The run goroutine begins and subsequently receives channel events.",
+        "legal_preconditions": [],
+        "implementation_guards": [
+          "Calls ConnectToPeers and ComputeClosestPeers before entering the select loop.",
+          "Launches executeCommands only if r.Exec is true.",
+          "Launches fastClock only if r.batchWait > 0.",
+          "Checks !r.Shutdown at the loop boundary."
+        ],
+        "reads": [
+          "Exec, batchWait, Shutdown, and ProposeChan",
+          "Protocol message channels, instancesToRecover, and fastClockChan"
+        ],
+        "writes": [
+          "Package-level fastClockChan initialized to a buffered channel of capacity one",
+          "Local onOffProposeChan"
+        ],
+        "durable_effects": [],
+        "external_effects": [
+          "Invokes peer connection and peer ordering setup.",
+          "Launches WaitForClientConnections.",
+          "Synchronously dispatches received events to handlePropose, handlePrepare, handleAccept, handleCommit, handleCommitShort, handlePrepareReply, handleAcceptReply, or recover."
+        ],
+        "important_branches": [
+          "With batching enabled, handling a proposal sets onOffProposeChan to nil; receiving a clock event restores r.ProposeChan.",
+          "Without batching enabled, the visible proposal branch leaves proposal reception enabled.",
+          "The select has no dedicated shutdown case."
+        ],
+        "async_boundaries": [
+          "Optional executeCommands goroutine",
+          "Optional fastClock goroutine",
+          "WaitForClientConnections goroutine",
+          "Channel reception from independent producers"
+        ],
+        "produces_fact_ids": [],
+        "consumes_fact_ids": [
+          "startup_paxos_local_state_initialized"
+        ],
+        "cross_activity_effects": {
+          "A3": "Dispatches received instance identifiers to recover; receipt alone does not establish recovery.",
+          "A5": "Conditionally launches executeCommands; launch does not establish execution of any decision.",
+          "A7": "Launches client connection handling and routes received proposals to handlePropose."
+        },
+        "existing_protections": [
+          "Handlers invoked directly by this select loop execute sequentially within this goroutine.",
+          "Batching controls proposal reception through a local channel variable."
+        ],
+        "source_ids": [
+          "paxos/paxos.go:24:260"
+        ],
+        "unknowns": [
+          "Connection setup, application execution, client handling, recovery, and message-handler semantics require their implementations.",
+          "The source of any positive batchWait setting is not shown; the constructor leaves it at the Go zero value.",
+          "Shutdown signaling, worker termination, and channel closure behavior are not established.",
+          "Package-level clock sharing across multiple replica instances is visible, but supported deployment multiplicity is unknown."
+        ]
+      }
+    ],
+    "facts": [
+      {
+        "id": "startup_master_ready_reply_observed",
+        "meaning": "This startup caller observed a successful Master.Register call whose reply had Ready true and extracted its replica identity, peer list, and initial leader flag.",
+        "identity": {
+          "startup": "One registerWithMaster invocation for the supplied address, master address, and port"
+        },
+        "validity_context": "Historical observation at registration return; it does not establish continuing membership validity or protocol authority.",
+        "representation": [
+          "Returned reply.ReplicaId, reply.NodeList, and reply.IsLeader"
+        ],
+        "invalidators": [],
+        "reinterpreters": [],
+        "durability": "Transient caller state; no persistence is shown.",
+        "recovery": "No recovery semantics established.",
+        "source_ids": [
+          "run.go:23:103"
+        ],
+        "unknowns": [
+          "Master-side establishment of Ready and initial role is unread.",
+          "The constructor receives these values but does not validate the registration observation."
+        ]
+      },
+      {
+        "id": "startup_paxos_local_state_initialized",
+        "meaning": "For this newly allocated Replica, constructor-local field initialization and six protocol message registrations have completed before run is launched.",
+        "identity": {
+          "replica": "The Replica allocation created by this paxos.New invocation"
+        },
+        "validity_context": "Startup ordering assertion. Initial field values describe the pre-launch point and are not asserted to remain unchanged after concurrent processing begins.",
+        "representation": [
+          "Initialized Replica fields, protocol channels, and RPC identifiers"
+        ],
+        "invalidators": [],
+        "reinterpreters": [],
+        "durability": "In-memory initialization only.",
+        "recovery": "Whether base construction restores retained state is unknown.",
+        "source_ids": [
+          "paxos/paxos.go:24:260"
+        ],
+        "unknowns": [
+          "Registration internals are unread; completed calls do not establish transport readiness.",
+          "This fact establishes neither peer connectivity nor authority acquisition."
+        ]
+      }
+    ],
+    "surfaces": [
+      {
+        "entry_point": "runReplica / registerWithMaster / paxos.New / run startup and dispatch",
+        "disposition": "mapped",
+        "behavior_ids": [
+          "startup_register_select_paxos",
+          "startup_construct_paxos",
+          "startup_run_dispatch"
+        ],
+        "reason": "Attached source resolves caller selection, registration-result handling, local initialization, worker launch conditions, and loop dispatch.",
+        "source_ids": [
+          "run.go:23:103",
+          "paxos/paxos.go:24:260"
+        ],
+        "high_consequence": true
+      },
+      {
+        "entry_point": "paxos.New -> replica.New and run -> ConnectToPeers / ComputeClosestPeers",
+        "disposition": "deferred",
+        "behavior_ids": [],
+        "reason": "Read concrete base-replica initialization and peer setup to establish configuration interpretation, transport readiness, storage ownership, and any startup reconstruction. Visible call sites do not resolve these responsibilities.",
+        "source_ids": [
+          "paxos/paxos.go:24:260"
+        ],
+        "high_consequence": true
+      },
+      {
+        "entry_point": "run worker and dispatch targets",
+        "disposition": "deferred",
+        "behavior_ids": [],
+        "reason": "The execution, client connection, proposal, protocol-message, and recovery implementations remain unresolved here. Worker launch and handler invocation do not establish their semantic results.",
+        "source_ids": [
+          "paxos/paxos.go:24:260"
+        ],
+        "high_consequence": true
+      }
+    ],
+    "remove_behavior_ids": [],
+    "remove_fact_ids": [],
+    "remove_surface_entry_points": [
+      "runReplica and paxos.New"
+    ],
+    "rationale": "Replace the composite startup frontier with sourced caller, constructor, and dispatcher behaviors and explicit unresolved dependency surfaces. Facts distinguish observing master readiness from local initialization and from unestablished runtime guarantees. Unrelated persistence helpers and authority RPC behavior appearing in the same packet are not expanded."
+  },
+  "limitations": [
+    "Only the two attached source ranges support this delta.",
+    "The other activity coordinates remain unclassified in this focused inventory; their absence does not imply inapplicability or externalization.",
+    "No normative obligation, correctness result, executable calibration, or reproduced failure is established."
+  ]
+}

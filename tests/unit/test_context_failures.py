@@ -18,7 +18,7 @@ def dependency(dependency_prepared):
     state.snapshot=capture(repo)
     added=add_reads(state,repo,ReadingPlan(requests=[{'file':'new_helper.py','start_line':1,'end_line':2,'reason':'Read a previously absent provider'}],rationale='Actual new dependency'),__import__('consensus_assurance.core.config',fromlist=['Budget']).Budget())
     u=state.units[0];basis=state.relations[0].grounding.model_copy(deep=True)
-    b=BindingDraft(id='fresh_provider',claim_id=u.obligation_ids[0],material_id=added[0],symbol='boundary',start_line=1,end_line=2,description='New supporting producer',pending=['Guarantee not checked'])
+    b=BindingDraft(id='fresh_provider',associations=[dict(claim_id=u.obligation_ids[0],source_ids=[added[0]],rationale='Selected fixture operation')],material_id=added[0],symbol='boundary',start_line=1,end_line=2,description='New supporting producer',pending=['Guarantee not checked'])
     edge=RelationDraft(id='fresh_dependency',source=u.obligation_ids[0],target=b.id,kind='boundary',group=None,rationale='The selected computation consumes the actual provider',pending=['Provider guarantee unverified'],grounding=basis)
     draft=UnitDraft(**{k:v for k,v in u.model_dump().items() if k in UnitDraft.model_fields})
     draft.binding_ids.append(b.id);draft.relation_ids.append(edge.id)
@@ -61,7 +61,10 @@ def test_unsent_context_does_not_spend_exploration(tmp_path,dependency_prepared)
     import shutil
     shutil.copytree(repo,e.root/'source')
     task=enqueue(state,'spec_refine','Investigate actual responsibilities','oversize')
-    with pytest.raises(Blocked):process_task(e,task)
+    with pytest.raises(Blocked) as error:process_task(e,task)
+    packet=state.packet_receipts[-1]
+    assert f"spec_refine: {packet['prompt_chars']} > 1000" in str(error.value)
+    assert packet['status']=='blocked_context_limit'
     assert state.usage.get('exploration_rounds',0)==0
     assert state.usage.get('agent_calls',0)==0
 

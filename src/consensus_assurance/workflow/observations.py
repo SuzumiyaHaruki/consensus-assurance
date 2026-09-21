@@ -5,18 +5,21 @@ from .graph_diagnostics import validate_grounding
 from consensus_assurance.core.events import MISSING, field, compare, match_prerequisites
 
 
-def monitor_events(events, monitor, aliases=None):
-    if monitor.property and monitor.property.kind == 'stable_support':
-        return monitor_support(events, monitor)
+def monitor_events(events, monitor, prop, aliases=None):
+    if prop is None:
+        return {'monitor_id':monitor.id,'checker_id':monitor.checker_id,'outcome':'unknown',
+            'witness_indices':[],'missing_indices':[],'reason':'No shared observable property'}
+    if prop.kind == 'stable_support':
+        return monitor_support(events, monitor, prop)
 
     results, missing = [], []
     for index,event in enumerate(events):
         if event.get('event') != monitor.event: continue
-        selectors = [compare(event,c) for c in monitor.conditions]
+        selectors = [compare(event,c) for c in [prop.trigger]]
         if any(x is None for x in selectors): missing.append(index); continue
         if not all(selectors): continue
-        if any(field(event,p) is MISSING for p in monitor.identity_fields): missing.append(index); continue
-        value = compare(event,monitor.assertion,aliases)
+        if any(field(event,p) is MISSING for p in prop.identity_fields): missing.append(index); continue
+        value = compare(event,prop.assertion,aliases)
         if value is None: missing.append(index)
         else: results.append((index,value))
     violations = [index for index,value in results if value is False]
@@ -29,7 +32,8 @@ def monitor_events(events, monitor, aliases=None):
 def assess_execution(state, model, bundle, experiment, calibration, finding, events):
     prerequisite = match_prerequisites(events,bundle.harness.prerequisites)
     specs = {c.invariant:c for c in model.checkers}
-    results = [monitor_events(events,m) for m in bundle.monitors if m.checker_id == finding.checker_id]
+    properties={p.checker_id:p for p in bundle.observable_properties}
+    results = [monitor_events(events,m,properties.get(m.checker_id)) for m in bundle.monitors if m.checker_id == finding.checker_id]
     from .inquiry import semantic_limitations
     limitations = semantic_limitations(state,model)
     from pathlib import Path
@@ -71,9 +75,9 @@ def assess_execution(state, model, bundle, experiment, calibration, finding, eve
         from consensus_assurance.adapters.verifiers.observable import correspondence
         mismatch = correspondence(bundle, monitor)
         if mismatch: local.append(mismatch)
-        if monitor.property and monitor.property.kind == 'stable_support':
+        p=properties.get(monitor.checker_id)
+        if p and p.kind == 'stable_support':
             history = []
-            p = monitor.property
             for event in events:
                 if event.get('event') == monitor.event:
                     history.append({key:field(event,key) for key in p.identity_fields + [p.trigger.field,p.assertion.field]})
@@ -85,7 +89,7 @@ def assess_execution(state, model, bundle, experiment, calibration, finding, eve
         except ValueError as exc: local.append(str(exc))
         local.extend(monitor.grounding.unresolved+monitor.grounding.conflicts)
         if not monitor.binding_ids or not set(monitor.binding_ids)<=set(model.binding_ids): local.append('Observation monitor lacks selected code bindings')
-        if not monitor.identity_fields: local.append('Observation lacks participant/operation/context identity requirements')
+        if not p or not p.identity_fields: local.append('Observation lacks participant/operation/context identity requirements')
         if not monitor.applicability_conditions: local.append('No observable applicability conditions')
         for index in result['witness_indices']:
             if not all(compare(events[index],c) is True for c in monitor.applicability_conditions): local.append('Property applicability is not established at the observed violation')
@@ -122,8 +126,7 @@ def assess_execution(state, model, bundle, experiment, calibration, finding, eve
     return record
 
 
-def monitor_support(events, monitor):
-    p = monitor.property
+def monitor_support(events, monitor, p):
     seen, violations, missing = [], [], []
     for index, event in enumerate(events):
         if event.get('event') != monitor.event:

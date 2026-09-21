@@ -3,7 +3,7 @@ from pathlib import Path
 from consensus_assurance.core.proposals import Discovery, Derivation, GraphPatch
 from consensus_assurance.adapters.storage.files import write_json
 from .materials import catalogue, initial_materials, ReadingPlan, uid, material_allowance
-from .graph import apply_graph, apply_patch, validate_patch
+from .graph import apply_patch, validate_patch
 from .errors import Blocked
 from . import inquiry
 
@@ -30,16 +30,15 @@ def discover(engine):
     if "materials" not in engine.state.completed_steps:
         if not engine.state.materials and 'automatic-survey' not in engine.state.read_plans:
             sample=initial_materials(source, engine.state.snapshot, engine.config.budget, engine.knowledge)
-            engine.read([{'file':m.file,'start_line':m.start_line,'end_line':m.end_line,'reason':'Automatic bounded survey'} for m in sample if m.kind!='protocol_candidate'],purpose='breadth',partial=True,plan_id='automatic-survey',charge=False)
+            engine.read([{'file':m.file,'start_line':m.start_line,'end_line':m.end_line,'reason':'Automatic bounded survey'} for m in sample if m.kind!='protocol_candidate'],purpose='breadth',partial=True,plan_id='automatic-survey')
             for m in sample:
                 if m.kind=='protocol_candidate':engine.state.materials.append(m)
-            engine.checkpoint('initial_sample_recorded')
+
         if not engine.state.materials and material_allowance(engine.state,engine.config.budget,"breadth")["available_chars"]==0:raise Blocked("No material capacity for a grounded initial plan; no agent request sent")
         inventory = catalogue(source, engine.state.snapshot)
         write_json(engine.root / "catalogue.json", inventory)
         plan, _ = engine.ask("read", ReadingPlan, {"catalogue": inventory, "initial_materials": [m.model_dump(mode="json") for m in engine.state.materials]},purpose="breadth")
-        engine.read(plan.requests,purpose="breadth",partial=True,plan_id="initial-reading",related_ids=plan.related_ids,reason=plan.rationale,charge=False)
-        write_json(engine.root / "materials.json", [m.model_dump(mode="json") for m in engine.state.materials])
+        engine.read(plan.requests,purpose="breadth",partial=True,plan_id="initial-reading",related_ids=plan.related_ids,reason=plan.rationale)
         engine.state.completed_steps.append("materials"); engine.advance("discover")
     if "understanding" not in engine.state.completed_steps:
         from .audit_spec import validate, accept, SpecIssue
@@ -66,19 +65,13 @@ def active_candidate(state):
     return next((c for c in state.question_candidates if c.status=='active'),None)
 
 
-def discriminator(question):
-    """Stable investigation scope, independent of prose edits and graph version."""
-    return (tuple(question.fact_ids),question.obligation_relation_kind,
-        tuple(sorted(question.objects)),tuple(sorted(question.contexts)),tuple(sorted(question.event_paths)))
-
-
 def candidate_blockage(state,candidate):
     if candidate.status not in {'blocked','active'}:return None
     tasks=[t for t in state.inquiry_tasks if t.id in candidate.spec_task_ids and t.status=='blocked']
     if any(t.preparation_failures or t.semantic_failures or any(d['category']=='semantic' for d in t.diagnostics+(t.repair_session or {}).get('diagnostics',[])) for t in tasks):return 'workflow_blocked'
     deferred=any(i['status']=='deferred' for id in [candidate.read_plan_id]+[t.read_plan_id for t in tasks] for i in state.read_plans.get(id,{}).get('items',[]))
     if candidate.status=='blocked' and not deferred and not tasks and not candidate.question.requests and not candidate.stagnation:return 'evidence_blocked'
-    if deferred or any(state.usage.get(k,0)>=v for k,v in state.config.get('budget',{}).items() if k in {'agent_calls','targeted_reads','total_seconds'} and v>0):return 'resource_blocked'
+    if deferred or any(state.usage.get(k,0)>=v for k,v in state.config.get('budget',{}).items() if k in {'agent_calls','total_seconds'} and v>0):return 'resource_blocked'
     if candidate.status=='blocked':return 'workflow_blocked'
     return None
 
@@ -101,14 +94,27 @@ def derivation_graph(reply):
 
 def classify_derivation_outcome(state,reply):
     """Classify the candidate decision independently of descriptive feedback; no mutation."""
+    from consensus_assurance.core.diagnostics import Diagnostic,DiagnosticError
+    def invalid_reference(path,message):
+        raise DiagnosticError([Diagnostic(code='candidate_reference',category='association',paths=[path],message=message,allowed=['representation'])])
     q=reply.audit_question;current=active_candidate(state)
-    if reply.fork_from_candidate_id and (not current or current.id!=reply.fork_from_candidate_id or not reply.fork_reason.strip()):
-        raise ValueError('Fork must name the active parent and an explicit changed discriminator')
-    if reply.fork_reason and not reply.fork_from_candidate_id and current:
-        raise ValueError('Fork reason requires its parent candidate')
+    selected=next((c for c in state.question_candidates if c.id==reply.candidate_id),None)
+    parent=next((c for c in state.question_candidates if c.id==reply.fork_from_candidate_id),None)
+    if reply.candidate_id:
+        if selected is None or selected.status not in {'active','paused','blocked'}:
+            invalid_reference('/candidate_id','Select an existing active, paused or blocked candidate ID')
+        if reply.fork_from_candidate_id:invalid_reference('/fork_from_candidate_id','Choose an existing candidate or fork a new one')
+        if current and current.id!=selected.id:invalid_reference('/candidate_id','Pause the current question before resuming another ID')
+    elif current and not reply.fork_from_candidate_id:
+        invalid_reference('/candidate_id','Continue the selected question by its candidate_id')
+    if reply.fork_from_candidate_id and parent is None:invalid_reference('/fork_from_candidate_id','Fork requires an existing parent ID')
+    if parent and not reply.fork_reason.strip():invalid_reference('/fork_reason','Explain why the question needs a separate candidate')
+    if reply.fork_reason and not parent:invalid_reference('/fork_from_candidate_id','Fork reason requires its parent candidate ID')
+    if current and parent and parent.id!=current.id:invalid_reference('/fork_from_candidate_id','Fork must pause the active candidate')
     graph=reply.obligation or reply.bindings or reply.dependencies or reply.context_claims
     if not reply.selection_rationale.strip():raise ValueError('Explain the bounded analysis outcome')
     if q is None:
+        if selected and not (graph or reply.reading_requests or reply.descriptive_issues):return 'resume'
         if not current and state.question_candidates and not (graph or reply.reading_requests or reply.descriptive_issues):return 'selection_exhausted'
         raise ValueError('Selection can stop only after candidates were considered, with no active question or proposed work')
     reads=reply.reading_requests+q.requests
@@ -120,7 +126,7 @@ def classify_derivation_outcome(state,reply):
     if reply.obligation:return 'escalate'
     if q.disposition=='explained_by_existing_mechanism':return 'explained'
     if reads:return 'continue_read'
-    reviewed=current and (current.material_ids or current.history or len(current.check_ids)>1)
+    reviewed=selected and (selected.material_ids or selected.history or len(selected.check_ids)>1)
     if reviewed and q.disposition=='needs_specific_evidence' and q.preferred_check=='source_review' and q.unknowns:
         return 'blocked_evidence'
     raise ValueError('An initial question needs actionable source or a grounded result; evidence-blocked requires a reviewed candidate and explicit unknowns')
@@ -144,14 +150,8 @@ def validate_derivation(state,reply):
         if q:
             validate_question(spec,q)
             if not q.question.strip() or not q.trigger_rationale.strip():raise ValueError('State the discriminator and selection reason')
-            if current and not reply.fork_from_candidate_id and (q.fact_ids!=current.question.fact_ids or q.obligation_relation_kind!=current.question.obligation_relation_kind):
-                raise ValueError('Finish the current candidate before selecting another fact or lifecycle')
-            if reply.fork_from_candidate_id and discriminator(q)==discriminator(current.question) and set(q.source_ids)==set(current.question.source_ids):
-                raise ValueError('Fork needs a changed relation or acquired evidence; prose alone is not a new investigation')
-            if not current and any(discriminator(c.question)==discriminator(q) and (not reply.fork_reason.strip() or set(c.question.source_ids)==set(q.source_ids)) for c in state.question_candidates):
-                raise ValueError('This candidate already has a disposition; identify a changed relation or acquired evidence')
-            if not current and any(c.question.fact_ids==q.fact_ids and c.question.obligation_relation_kind==q.obligation_relation_kind for c in state.question_candidates) and not reply.fork_reason.strip():
-                raise ValueError('A second investigation of the same Fact/lifecycle needs an explicit changed discriminator')
+    except DiagnosticError as exc:
+        issues.extend(exc.diagnostics)
     except ValueError as exc:
         questions=[x for x in (q,current.question if current else None) if x]
         refs={id for x in questions for id in x.fact_ids+x.behavior_ids}
@@ -209,41 +209,35 @@ def validate_derivation(state,reply):
 def accept_derivation(engine,reply,check_id):
     from .transactions import commit_graph
     from consensus_assurance.core.types import QuestionCandidate
-    if 'derive-'+check_id in engine.state.applied_operations:
-        import json
-        saved=engine.root/f'derivation-{check_id}.json'
-        if not saved.is_file() or json.loads(saved.read_text())!=reply.model_dump(mode='json'):
-            raise ValueError('Derivation operation identity reused with different input')
-        return active_candidate(engine.state) is None
-    outcome=validate_derivation(engine.state,reply)
     def commit(proxy):
         state=proxy.state
+        outcome=validate_derivation(state,reply)
         if outcome=='selection_exhausted':
             state.last_work_kind='candidate'
             state.gaps.append('No additional tractable candidate selected: '+reply.selection_rationale)
             state.completed_steps.append('derived-spec:'+str(state.audit_spec_version))
             return
-        candidate=active_candidate(state);q=reply.audit_question.model_copy(deep=True)
-        if candidate and reply.fork_from_candidate_id:
-            parent=candidate
-            parent.status='paused';parent.stop_reason=reply.fork_reason
-            candidate=QuestionCandidate(question=q,parent_candidate_id=parent.id,fork_reason=reply.fork_reason)
-            state.question_candidates.append(candidate)
-        elif candidate:
+        candidate=next((c for c in state.question_candidates if c.id==reply.candidate_id),None)
+        if outcome=='resume':
+            candidate.status='active';candidate.stop_reason=''
+            candidate.check_ids.append(check_id)
+            return
+        q=reply.audit_question.model_copy(deep=True)
+        if candidate:
             candidate.history.append(candidate.question.model_copy(deep=True))
-            candidate.question=q
+            candidate.question=q;candidate.status='active';candidate.stop_reason=''
         else:
-            prior=next((c for c in reversed(state.question_candidates) if c.question.fact_ids==q.fact_ids and c.question.obligation_relation_kind==q.obligation_relation_kind),None)
-            candidate=QuestionCandidate(question=q,parent_candidate_id=prior.id if prior else None,fork_reason=reply.fork_reason)
+            parent=next((c for c in state.question_candidates if c.id==reply.fork_from_candidate_id),None)
+            if parent and parent.status=='active':parent.status='paused';parent.stop_reason=reply.fork_reason
+            candidate=QuestionCandidate(question=q,parent_candidate_id=reply.fork_from_candidate_id,fork_reason=reply.fork_reason)
             state.question_candidates.append(candidate)
         candidate.check_ids.append(check_id)
         candidate.spec_task_ids=[]
         for issue in reply.descriptive_issues:
-            task=inquiry.enqueue(state,'spec_refine',issue.reason,check_id+':'+','.join(issue.object_ids),target_ids=issue.object_ids,feedback_source_ids=issue.source_ids,feedback_effect=issue.candidate_effect)
-            task.draft_path=state.audit_spec_path
-            task.diagnostics=[{'code':'audit_spec_semantics','category':'semantic','object_ids':issue.object_ids,'material_ids':issue.source_ids,'message':issue.reason,'allowed':['read','semantic_revision']}]
-            if issue.candidate_effect=='requires_recheck':
-                task.candidate_id=candidate.id;candidate.spec_task_ids.append(task.id)
+            task=inquiry.enqueue(state,'spec_refine',issue.reason,check_id,target_ids=issue.object_ids,
+                candidate_id=candidate.id if issue.candidate_effect=='requires_recheck' else None,
+                diagnostics=[{'code':'audit_spec_semantics','category':'semantic','object_ids':issue.object_ids,'material_ids':issue.source_ids,'message':issue.reason,'allowed':['read','semantic_revision'],'details':{'check_id':check_id}}])
+            if issue.candidate_effect=='requires_recheck':candidate.spec_task_ids.append(task.id)
         requests=list({(r.file,r.start_line,r.end_line):r for r in reply.reading_requests+q.requests}.values())
         q.requests=requests
         if candidate.spec_task_ids:
@@ -264,41 +258,13 @@ def accept_derivation(engine,reply,check_id):
         inquiry.review_unit(proxy,unit,'derived:'+check_id)
         state.completed_steps.append('derived-spec:'+str(state.audit_spec_version))
     path=engine.root/f'derivation-{check_id}.json';write_json(path,reply);engine.state.derivation_path=str(path)
-    engine.checkpoint('derivation_candidate_prepared')
     commit_graph(engine,'derive-'+check_id,reply.model_dump(mode='json'),commit)
-    return outcome in {'escalate','selection_exhausted'} and active_candidate(engine.state) is None
+    return active_candidate(engine.state) is None and bool(reply.obligation or reply.audit_question is None)
 
 
 def continue_candidate(engine,candidate):
     """Resume only this question's source work and selected inventory corrections."""
     state=engine.state
-    calls_left=engine.config.budget.agent_calls-state.usage.get('agent_calls',0)
-    needs_judgment=candidate.stage=='read' or any(next(t for t in state.inquiry_tasks if t.id==id).status not in {'completed','blocked'} for id in candidate.spec_task_ids)
-    if needs_judgment and calls_left<=1:
-        pending_corrections=any(next(t for t in state.inquiry_tasks if t.id==id).status not in {'completed','blocked'} for id in candidate.spec_task_ids)
-        if candidate.material_ids and not pending_corrections:
-            candidate.stage='analyze'
-            engine.checkpoint('candidate_cached_judgment_reserved')
-            return
-        candidate.status='paused';candidate.stop_reason='One remaining agent call cannot cover missing source or a required inventory correction and still reserve a judgment call'
-        engine.checkpoint('candidate_paused_for_judgment')
-        return
-    shared=[t for t in state.inquiry_tasks if t.id in candidate.spec_task_ids and t.stage=='read' and t.requests and not t.read_plan_id]
-    if candidate.stage=='read' and candidate.read_plan_id and candidate.read_plan_id not in state.read_plans and shared:
-        requests=list({(r.file,r.start_line,r.end_line):r for r in candidate.question.requests+[r for t in shared for r in t.requests]}.values())
-        receipt=engine.read(requests,purpose='depth',partial=True,plan_id=candidate.read_plan_id,
-            related_ids=candidate.question.fact_ids+[id for t in shared for id in t.target_ids],reason='Selected candidate and required corrections share known source dependencies')
-        items={(i['request']['file'],i['request']['start_line'],i['request']['end_line']):i for i in receipt['items']}
-        for task in shared:
-            selected=[items[(r.file,r.start_line,r.end_line)] for r in task.requests]
-            task.added_material_ids=list(dict.fromkeys(task.added_material_ids+[id for i in selected if i['status']!='deferred' for id in i['material_ids']]))
-            state.task_attachments['inquiry:'+task.id]=list(dict.fromkeys(state.task_attachments.get('inquiry:'+task.id,[])+task.added_material_ids))
-            if any(i['status']=='deferred' for i in selected):
-                task.status='blocked';task.stop_reason='Required correction source deferred in the shared read receipt'
-            else:task.stage='analyze'
-        candidate.material_ids=list(dict.fromkeys(candidate.material_ids+[id for i in receipt['items'] if i['status']!='deferred' for id in i['material_ids']]))
-        candidate.stage='analyze'
-        engine.checkpoint('shared_candidate_source_receipt_saved')
     for id in candidate.spec_task_ids:
         task=next(t for t in state.inquiry_tasks if t.id==id)
         while task.status not in {'completed','blocked'}:
@@ -334,23 +300,7 @@ def continue_candidate(engine,candidate):
 
 
 def ask_derivation(engine,packet):
-    try:
-        return engine.ask('derive',Derivation,packet,lambda p:validate_derivation(engine.state,p),purpose='depth')
-    except Blocked:
-        session=engine.state.pending_output_repair
-        if not session or not session.get('diagnostics') or any(d['code']!='reading_plan_budget' for d in session['diagnostics']):raise
-        candidate=active_candidate(engine.state)
-        if candidate is None:
-            reply=Derivation.model_validate_json(Path(session['current_path']).read_text())
-            validate_derivation(engine.state,reply)
-            # Preserve a valid selected focus even when its first source plan cannot fit.
-            if reply.obligation:raise
-            accept_derivation(engine,reply,session['id'])
-            candidate=active_candidate(engine.state)
-        candidate.status='blocked';candidate.stop_reason='Source replanning exhausted; repair session '+session['id']+' retains unmet requests'
-        engine.state.pending_output_repair=None;inquiry.release_action(engine)
-        engine.checkpoint('candidate_budget_replanning_exhausted')
-        return None,None
+    return engine.ask('derive',Derivation,packet,lambda p:validate_derivation(engine.state,p),purpose='depth')
 
 
 def derive(engine):
@@ -369,7 +319,6 @@ def derive(engine):
             if active_candidate(engine.state) is None:break
         packet=derive_context(engine)
         proposal,check=ask_derivation(engine,packet)
-        if proposal is None:break
         if accept_derivation(engine,proposal,check.id):
             inquiry.release_action(engine);engine.checkpoint('derivation_episode_committed');return
         inquiry.release_action(engine);engine.checkpoint('candidate_continuation_saved')
@@ -383,7 +332,7 @@ def targeted_read(engine, unit, gap, relation_ids=None, requests=None, update_re
     if engine.state.targeted_gap is None:
         engine.state.targeted_gap={"plan_id":uid(),"requests":[q.model_dump(mode="json") if hasattr(q,"model_dump") else q for q in (requests or [])],"gap":gap,"related_ids":unit.obligation_ids if unit else [],
             "update_required":update_required,"relation_ids":relation_ids or [],"stage":"read","new_material_ids":[]}
-        engine.checkpoint("targeted_gap_recorded")
+
     task=engine.state.targeted_gap
     if task["stage"] == "read":
         if task["requests"]:
@@ -394,7 +343,7 @@ def targeted_read(engine, unit, gap, relation_ids=None, requests=None, update_re
                 "relevant_bindings":[b.model_dump() for b in engine.state.bindings if unit and b.id in unit.binding_ids]})
         reading.related_ids=task["related_ids"]; reading.gap=gap
         task['requests']=[q.model_dump(mode='json') for q in reading.requests]
-        engine.checkpoint('targeted_read_plan_saved')
+
         receipt=engine.read(reading.requests,plan_id=task['plan_id'],related_ids=task['related_ids'],reason=gap)
         task=engine.state.targeted_gap
         receipt['scope_requested']=task.get('update_required',True)
@@ -404,13 +353,13 @@ def targeted_read(engine, unit, gap, relation_ids=None, requests=None, update_re
         if task['unfulfilled']:
             engine.checkpoint('targeted_read_deferred');raise Blocked('Required material remains deferred; resume the same reading plan before graph patch')
         task['stage']='patch';inquiry.release_action(engine)
-        engine.checkpoint('targeted_materials_read')
+
     if not task["new_material_ids"]:
         if task.get('reattached_material_ids'):
-            engine.state.targeted_gap=None;engine.checkpoint('existing_material_reattached');return None
+            engine.state.targeted_gap=None;return None
         raise Blocked("Targeted reading found no usable range; dependency remains unexplained: "+gap)
     if not task.get("update_required",update_required):
-        engine.state.targeted_gap=None;engine.checkpoint('material_context_returned');return None
+        engine.state.targeted_gap=None;return None
     from .scope_updates import from_patch,validate_scope_update,ScopeUpdate,ScopeAssessment,accept
     def validate_proposal(p):
         from .mutations import write_set,classify_writes
@@ -467,6 +416,5 @@ def targeted_read(engine, unit, gap, relation_ids=None, requests=None, update_re
         proxy.state.targeted_gap=None
         inquiry.release_action(proxy)
     commit_graph(engine,"targeted-"+engine.state.pending_action.id,patch.model_dump(mode="json"),commit)
-    write_json(engine.root/"materials.json",[m.model_dump(mode="json") for m in engine.state.materials])
     engine.checkpoint("targeted_graph_patch_applied")
     return patch

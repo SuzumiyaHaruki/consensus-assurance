@@ -48,11 +48,12 @@ def test_budget_has_finite_independent_limits(prepared):
     assert state.usage == {"agent_calls": 1}
 
 
-def test_store_preserves_old_checkpoints(tmp_path, prepared):
+def test_store_saves_current_state_and_events(tmp_path, prepared):
     _, state, _, _ = prepared
     store = Store(tmp_path / "store")
     store.save(state, "before")
     state.gaps.append("New unresolved issue")
     store.save(state, "after")
-    assert len(list((store.root / "history").glob("*.json"))) == 2
+    assert not (store.root / "history").exists()
+    assert len((store.root / "events.jsonl").read_text().splitlines()) == 2
     assert store.load().gaps == state.gaps

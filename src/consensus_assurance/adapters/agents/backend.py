@@ -99,6 +99,9 @@ class CodexAgent:
     name = "codex"
     mock = False
 
+    def __init__(self, reasoning_effort: str | None = None):
+        self.reasoning_effort = reasoning_effort
+
     def probe(self, runner):
         version = runner.run(["codex", "--version"], runner.root, "agent_probe", "environment", 10)
         help_run = runner.run(["codex", "exec", "--help"], runner.root, "agent_capabilities", "environment", 10)
@@ -121,7 +124,10 @@ class CodexAgent:
                 reason="Codex capability probe failed"), None
         result_path = directory / "response.json"
         command = ["codex", "exec", "--ephemeral", "--sandbox", "read-only", "--skip-git-repo-check",
-                   "--output-schema", str(schema), "--output-last-message", str(result_path), "-"]
+                   "--output-schema", str(schema), "--output-last-message", str(result_path)]
+        if self.reasoning_effort is not None:
+            command.extend(["-c", "model_reasoning_effort=" + json.dumps(self.reasoning_effort)])
+        command.append("-")
         check = runner.run(command, directory, "agent", snapshot_id, timeout, stdin=prompt)
         check.tool_version = self.version
         if check.status != ExecutionStatus.COMPLETED:

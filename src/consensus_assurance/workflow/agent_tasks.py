@@ -36,7 +36,7 @@ def ask(engine,kind,response_type,context,validator=None,*,purpose="depth"):
         refs=citation_ranges(response,state)
         if refs:
             engine.read([{k:v for k,v in ref.items() if k!='content_digest'} | {'reason':'Register an exact citation within already acquired source'} for ref in refs.values()],reason='Resolve covered citation ranges without new source acquisition')
-        validate_read_requests(state,engine.root/"source",response,purpose=purpose)
+        validate_read_requests(state,engine.root/"source",response)
         if validator:
             try:validator(response)
             except SpecIssue as exc:
@@ -137,7 +137,7 @@ def ask(engine,kind,response_type,context,validator=None,*,purpose="depth"):
             engine.checkpoint('context_limit')
             if review_task and review_task.surface_entry_points and not session and review_task.preparation_failures<=engine.config.budget.context_preparations:
                 context,review_task=prepare(engine,kind,seed_context);continue
-            raise Blocked('Required context exceeds context_chars; split the task or explicitly revise the limit; no payload sent')
+            raise Blocked(f'Required context exceeds context_chars ({kind}: {len(prompt)} > {engine.config.budget.context_chars}); split the task or explicitly revise the limit; no payload sent')
         if review_task and not review_task.admitted:
             from .inquiry import inquiry_resource
             resource=inquiry_resource(review_task)
@@ -155,7 +155,7 @@ def ask(engine,kind,response_type,context,validator=None,*,purpose="depth"):
                 resource=inquiry_resource(review_task)
                 if resource:engine.budget.take(resource)
                 review_task.admitted=True
-                engine.checkpoint('inquiry_backend_admitted')
+
             elif kind=='scope_review':
                 engine.budget.take('semantic_reviews')
             return engine.agent.analyze(engine.runner,prompt,directory,state.snapshot.id,engine.budget.timeout(),schema)
@@ -180,7 +180,7 @@ def ask(engine,kind,response_type,context,validator=None,*,purpose="depth"):
                 if patch.requests:
                     if not any('read' in d.allowed for d in active_diags):raise ValueError('This diagnostic requires citation/metadata correction, not another source request')
                     if patch.replacements:raise ValueError('Read or attach material before returning replacements')
-                    validate_read_requests(state,engine.root/'source',patch,purpose=purpose)
+                    validate_read_requests(state,engine.root/'source',patch)
                     session.setdefault('read_plan_id',uid());session['read_requests']=[q.model_dump(mode='json') for q in patch.requests]
                     session['read_check']=check.model_dump(mode='json');session['read_related_ids']=[id for d in diags for id in d.object_ids];session['read_rationale']=patch.rationale
                     save_session(engine,session)

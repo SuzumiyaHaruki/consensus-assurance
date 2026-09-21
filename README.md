@@ -4,7 +4,7 @@
 
 系统先从仓库材料恢复七类 Activity 及 Behavior/Fact 的不完整骨架，在有界 Surface 扩展与单个候选的深度分析之间交替，补读后解释关闭、保留证据不足或推导义务与代码关系，按当前问题优先取得关键材料、执行直接检查或局部模型，并保留有限覆盖探索和语义复核。实现包括英文 agent 技能、受控代码实验、TLA+/TLC 搜索、轨迹校准、F1—F4 反馈及恢复。候选图不是整体正确性证明，也没有已知的全系统覆盖率分母。
 
-当前保留的真实运行见 [实验报告](runs/2026-09-20_12-07-49-hashicorp_raft-real-run/report.md)。本次使用 selected-question-v6、20 次 agent 调用、1353.09 秒；3 个候选中 1 个因合同证据不足受阻、1 个获局部解释、1 个已有局部解释但仍等待描述性回流。三个 Surface 均实际发送并完成任务，AuditSpec 从 v1 增长至 v5，Behavior 从 10 增至 27、Fact 从 5 增至 11；四次额外调用用于来源引用修复，最终因 agent_calls 耗尽停止。尚无受理义务、模型或性质证据，任务完成不代表整个 Surface 已覆盖。
+当前 Git 归档为 [2026-09-21 Paxos 自主分析](runs/2026-09-21_13-56-50-swiftpaxos_paxos-real-run/report.md)：使用 `medium`，形成 1 项义务和 1 个审计单元；模型草稿未受理，没有模型搜索、校准或性质证据。旧运行保留本地及已有 Git 历史，归档切换不删除原始证据。
 
 当前实现将任务工作集与完整审计历史分开，并允许先保存有据的模型、后补 harness。语法检查、探索性搜索、真实轨迹校准与实现确认分别记录。当前方法见 [审计方法](docs/审计方法.md)，不代表已重新完成 HashiCorp 自主实验。
 
@@ -54,9 +54,9 @@ TLC_JAR="$TLC_JAR" .venv/bin/python -m pytest -q
 .venv/bin/consensus-assurance report --run /实际路径/运行目录
 ```
 
-`--repo` 优先于配置；均未提供才从实际桌面位置发现目标。配置相对路径以配置目录为基准。`plan` 会读取材料并调用已配置后端形成计划，不是无成本静态预览；只估算请用 `estimate`。
+`--repo` 优先于配置；均未提供时要求显式指定目标。配置相对路径以配置目录为基准。`plan` 会读取材料并调用已配置后端形成计划，不是无成本静态预览；只估算请用 `estimate`。
 
-恢复不重置已消耗的调用和总时长。`--action-timeout 600` 只调整后续单动作上限，不能解决总预算耗尽、上下文过大或语义受阻。输入或控制器版本变化时使用新的运行或明确离线阶段，不能改写旧失败。
+恢复使用运行自身保存的源码副本，保留已完成的 Agent/执行结果与已用预算；不保证内部任意语句中断后的透明恢复。`--action-timeout 600` 只调整后续单动作上限，不能解决总预算耗尽、上下文过大或语义受阻。输入被修改或控制器版本变化后需新运行；旧报告只读，失败原文不变。
 
 退出码 0 表示工作流正常结束，不表示协议正确；报告分别记录执行状态、产物接受、模型检查、校准与证据层级。
 
@@ -81,6 +81,6 @@ TLC_JAR="$TLC_JAR" .venv/bin/python -m pytest -q
 
 项目仓库：[SuzumiyaHaruki/consensus-assurance](https://github.com/SuzumiyaHaruki/consensus-assurance)。
 
-当前版本为 `selected-question-v7`，控制器和资源清单共用版本。初选候选可只有身份与精确阅读计划；终局判断必须有当前实际来源。知识回流与候选结论正交，只有 requires_recheck 阻塞重连，independent_enrichment 可留待后续处理。v6 归档只读，不可直接续跑。
+控制器版本以 `resources/task-skills.json` 为唯一来源。候选按明确 ID 继续、暂停和恢复；读取没有次数硬配额，材料总量、上下文、Agent 调用、时间和执行预算仍有效。直接检查按整体审阅，实际观察与最终结论范围分别记录。详见 [当前工作流](docs/运行工作流.md)。
 
-源码审计默认不需要执行后端；HashiCorp 与三个 SwiftPaxos 变体共用 go_module，目标差异写入 YAML。新增配置为 `configs/targets/swiftpaxos_{paxos,n2paxos,swift}.yaml`，均为 protocol:none，材料发送及目标执行默认关闭。实际环境准备、隔离构建与未决限制见 [环境要求](docs/环境要求.md)；尚未启动新的自主审计。
+源码审计默认不需要执行后端；HashiCorp 与三个 SwiftPaxos 变体共用 go_module，目标差异写入 YAML。新增配置为 `configs/targets/swiftpaxos_{paxos,n2paxos,swift}.yaml`，均为 protocol:none，材料发送及目标执行默认关闭。实际环境准备、隔离构建与未决限制见 [环境要求](docs/环境要求.md)；最新 Paxos 自主分析结果见 [运行索引](runs/README.md)。

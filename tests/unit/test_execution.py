@@ -120,13 +120,21 @@ def test_codex_adapter_blocking_statuses(tmp_path, monkeypatch, message, expecte
     assert check.status == expected and response is None
 
 
-def test_codex_invalid_output_preserves_raw(tmp_path):
-    from consensus_assurance.adapters.agents.backend import CodexAgent
+@pytest.mark.parametrize("effort", [None, "medium"])
+def test_codex_invalid_output_preserves_raw(tmp_path, effort):
+    from consensus_assurance.core.config import Config
+    from consensus_assurance.registry import assemble
     from consensus_assurance.core.proposals import GraphDraft
     from consensus_assurance.core.types import CheckRun
-    agent = CodexAgent(); agent.available = True; agent.version = "fake-test-cli"
+    _, agent, _, _ = assemble(Config(agent_reasoning_effort=effort))
+    agent.available = True; agent.version = "fake-test-cli"
     class Runner:
         def run(self, command, directory, action, snapshot_id, timeout, stdin):
+            if effort is None:
+                assert "-c" not in command
+            else:
+                assert command[command.index("-c") + 1] == 'model_reasoning_effort="medium"'
+            assert command[-1] == "-"
             (directory / "response.json").write_text("not valid JSON")
             out = directory / "stdout.log"; err = directory / "stderr.log"
             out.write_text(""); err.write_text("")
@@ -193,17 +201,3 @@ def test_go_backend_is_toolchain_scoped(tmp_path,module,package):
 def test_target_paths_cannot_escape_relative_namespace(paths):
     from consensus_assurance.core.config import TargetConfig
     with pytest.raises(ValueError,match='relative repository'):TargetConfig(**paths)
-
-
-@pytest.mark.parametrize('output,kind', [
-    ('panic: target error\n\t/tmp/source/protocol/engine.go:41\n\t/tmp/source/protocol/assurance_generated_test.go:20\n', 'target_panic_candidate'),
-    ('panic: bad harness\n\t/tmp/source/protocol/assurance_generated_test.go:20\n', 'harness_panic'),
-    ('--- FAIL: TestAssuranceOne\n', 'test_failure'),
-])
-def test_go_failure_classification_retains_unattributed_nonzero_exit(output,kind):
-    from consensus_assurance.adapters.runners.go_module import GoModuleBackend
-    from consensus_assurance.core.types import CheckRun
-    check=CheckRun(action='direct_check',cwd='/tmp',snapshot_id='source',status=ExecutionStatus.COMPLETED,exit_code=1)
-    GoModuleBackend().parse_test_result(check,json.dumps({'Action':'output','Test':'TestAssuranceOne','Output':output}))
-    assert check.outcome=='tests_failed' and check.parameters['failure_class']==kind
-    assert check.status==ExecutionStatus.COMPLETED

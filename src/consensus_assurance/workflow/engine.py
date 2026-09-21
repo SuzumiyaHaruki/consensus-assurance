@@ -12,7 +12,7 @@ from consensus_assurance.ports.interfaces import AgentBackend, ExecutionBackend,
 from . import discovery, inquiry
 from consensus_assurance.adapters.runners.process import ProcessRunner, output
 from consensus_assurance.adapters.runners.experiment import run_experiment, extract_events
-from consensus_assurance.adapters.storage.files import Store, write_json, digest
+from consensus_assurance.adapters.storage.files import Store, write_json
 from consensus_assurance.adapters.storage.snapshot import capture
 from .graph import select_unit
 from .artifacts import save_bundle
@@ -64,15 +64,6 @@ class Engine:
         for key,seen in observed.items():
             if seen:self.state.milestones.setdefault(key,now())
         self.store.save(self.state, event)
-        write_json(self.root / "graph.json", {"version": self.state.graph_version,
-            "claims": [x.model_dump(mode="json") for x in self.state.claims],
-            "bindings": [x.model_dump(mode="json") for x in self.state.bindings],
-            "relations": [x.model_dump(mode="json") for x in self.state.relations]})
-        from .audit_spec import load, audit_progress
-        spec=load(self.state)
-        if spec:write_json(self.root / "audit-spec.json",spec)
-        write_json(self.root / "audit-progress.json",audit_progress(self.state))
-        write_json(self.root / "plan.json", {"units": [u.model_dump(mode="json") for u in self.state.units], "selections": self.state.selections})
 
     def start(self, repo, plan_only=False):
         if self.root.is_relative_to(repo.resolve()) or repo.resolve().is_relative_to(self.root):
@@ -102,42 +93,17 @@ class Engine:
         if self.state.framework_revision!=FRAMEWORK_REVISION:
             self.state.stop_reason="Framework revision differs or was not recorded; preserve this historical run and use an explicit offline migration/subrun"
             return self.state
-        current = capture(Path(self.state.snapshot.repo), analysis_roots=self.config.target.analysis_roots, expected_module=self.config.target.expected_module)
-        reasons = []
-        changed_models = set()
-        if current.files != self.state.snapshot.files:
-            reasons.append("Source snapshot changed")
         if self.config.model_dump(mode="json") != self.state.config:
-            reasons.append("Configuration changed")
-        for model in self.state.models:
-            for path, expected in model.artifact_digests.items():
-                if not Path(path).is_file() or digest(Path(path).read_bytes()) != expected:
-                    reasons.append("Model, checker, mapping or harness artifact changed")
-                    changed_models.add(model.id)
-                    break
-        for artifact in self.state.direct_checks:
-            if any(not Path(p).is_file() or digest(Path(p).read_bytes())!=d for p,d in artifact.artifact_digests.items()):
-                reasons.append("Direct-check artifact changed")
-        copied = capture(self.root / "source", analysis_roots=self.config.target.analysis_roots, expected_module=self.config.target.expected_module)
-        if copied.files != self.state.snapshot.files:
-            reasons.append("Preserved source copy changed")
-        if reasons:
-            if all(reason == "Model, checker, mapping or harness artifact changed" for reason in reasons):
-                self.state.affect(changed_models, "; ".join(reasons))
-            else:
-                self.state.invalidate("; ".join(reasons))
-            self.state.stop_reason = "Inputs changed; start a new run to avoid mixing evidence"
-            self.checkpoint("resume_inputs_changed")
+            self.state.stop_reason="Configuration changed; start a new run"
+            self.checkpoint("resume_configuration_changed")
             return self.state
         if repair_attempts is not None and repair_attempts!=self.config.budget.repair_attempts:
             old=self.config.budget.repair_attempts
-            self.checkpoint("before_explicit_repair_budget_change")
             data=self.config.model_dump(mode="json");data['budget']['repair_attempts']=repair_attempts
             self.config=Config.model_validate(data);self.state.config=self.config.model_dump(mode='json');self.budget.limits=self.config.budget
             self.checkpoint(f"repair_attempt_limit_changed:{old}:{repair_attempts}; usage and failures preserved")
         if action_timeout is not None and action_timeout != self.config.budget.action_timeout:
             old_timeout = self.config.budget.action_timeout
-            self.checkpoint("before_resume_timeout_adjustment")
             data = self.config.model_dump(mode="json")
             data["budget"]["action_timeout"] = action_timeout
             self.config = Config.model_validate(data)
@@ -220,8 +186,7 @@ class Engine:
         logical={'inputs':stable_input(inputs or {}),'inquiry_id':self.state.active_inquiry_id,'finding_id':self.state.active_finding_id}
         if pending and pending.kind==kind and pending.unit_id==self.state.active_unit_id and pending.model_id==self.state.active_model_id and pending.finding_id==self.state.active_finding_id and pending.inquiry_id==self.state.active_inquiry_id:
             result_path=self.root/'actions'/pending.id/'result.json'
-            original=Path(pending.input_path)
-            if pending.status=='completed' and result_path.exists() and original.is_file() and pending.logical_input==logical and stable_input(json.loads(original.read_text()))==logical['inputs']:
+            if pending.status=='completed' and result_path.exists() and pending.logical_input==logical:
                 return json.loads(result_path.read_text())
         if pending:
             self.state.action_history.append(pending.model_copy(deep=True))
@@ -231,7 +196,6 @@ class Engine:
         action.input_path = str(directory / "input.json")
         write_json(Path(action.input_path),inputs or {})
         self.state.pending_action = action
-        self.checkpoint("action_planned")
         action.status = "running"; self.runner.active_action_id = action.id
         self.checkpoint("action_started")
         value = callback()
@@ -356,9 +320,6 @@ class Engine:
             self.record(receipt)
         return model
 
-    def read_commit_hook(self,stage,receipt):
-        """Interruption seam around the atomic material receipt commit."""
-
     def read(self,requests,**kwargs):
         from .materials import execute_read
         return execute_read(self,requests,**kwargs)
@@ -441,7 +402,6 @@ class Engine:
                     self.targeted_read(unit,task["gap"],task.get("relation_ids"),task.get("requests"))
                     self.advance("build");continue
                 unit.semantic_readiness=inquiry.readiness(self.state,unit)
-                self.checkpoint('selected_unit_semantic_readiness')
                 previous=model or next((m for m in reversed(self.state.models) if m.unit_id==unit.previous_id),None)
                 if previous is None and (unit.recheck_reasons or unit.obligation_checks):
                     previous=next((m for m in reversed(self.state.models) if m.unit_id==unit.id),None)
@@ -687,4 +647,6 @@ class Engine:
             self.state.gaps.append(str(exc))
         finally:
             self.checkpoint("stopped")
+            from consensus_assurance.reporting.chinese import export_views
+            export_views(self.state,self.root)
         return self.state

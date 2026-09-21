@@ -1,0 +1,348 @@
+{
+  "understanding": "The acquired source establishes a synchronous protocol dispatch loop with independent timer, client-connection and optional execution goroutines. Proposal handling rejects nonleaders, batches queued proposals for leaders, chooses an instance ballot, and branches between prepare broadcast and local acceptance followed by accept broadcast. Broadcast helpers select peers through Alive and PreferredPeerOrder. Commit broadcast passes a full Commit object under commitShortRPC; its wire interpretation remains unknown without registration and serialization code. These observations describe local actions, not decision, durability or delivery guarantees.",
+  "requests": [],
+  "delta": {
+    "target_profile": null,
+    "activities": [
+      {
+        "class_id": "A1",
+        "applicability": "applicable",
+        "purpose": "Dispatch protocol events and initiate per-instance proposal progression.",
+        "realization_summary": "Replica.run invokes handlers synchronously. Leader proposal handling allocates an instance and selects prepare or accept progression; helpers attempt sends to peers marked alive.",
+        "entry_points": [
+          "Replica.run",
+          "Replica.handlePropose",
+          "Replica.bcastPrepare",
+          "Replica.bcastAccept",
+          "Replica.bcastCommit"
+        ],
+        "variants": [
+          "Batching-enabled dispatch temporarily disables the proposal select case.",
+          "Selected ballot equal to smallestDefaultBallot takes the local acceptance branch."
+        ],
+        "unknowns": [
+          "Reply-handler decision formation is outside the attached source.",
+          "Transport delivery, serialization and peer-selection initialization are unresolved."
+        ],
+        "source_ids": ["paxos/paxos.go:164:538"]
+      },
+      {
+        "class_id": "A2",
+        "applicability": "applicable",
+        "purpose": "Select the ballot used by a local instance attempt.",
+        "realization_summary": "makeBallot starts at the replica ID and, when IsLeader is true, adds N until the candidate is no smaller than the local default ballot and maxRecvBallot.",
+        "entry_points": ["Replica.makeBallot"],
+        "variants": [
+          "A nonleader invocation stores the replica ID without checking either bound."
+        ],
+        "unknowns": [
+          "Authority acquisition and loss are not established by this source.",
+          "Configuration bounds preventing arithmetic overflow or nontermination are not established."
+        ],
+        "source_ids": ["paxos/paxos.go:164:538"]
+      },
+      {
+        "class_id": "A7",
+        "applicability": "applicable",
+        "purpose": "Admit or reject client proposals and retain their association with an instance attempt.",
+        "realization_summary": "Nonleaders issue a negative reply. Leaders retain the received proposal and a snapshot-sized batch drained from ProposeChan in new instance bookkeeping.",
+        "entry_points": ["Replica.handlePropose"],
+        "variants": [
+          "Negative reply on the nonleader branch.",
+          "Queued proposals are drained even when the periodic batching timer is disabled."
+        ],
+        "unknowns": [
+          "Client retry, deduplication and successful completion semantics are unresolved.",
+          "The positional LeaderBookkeeping initializer cannot establish named counter identities without its declaration."
+        ],
+        "source_ids": ["paxos/paxos.go:164:538"]
+      }
+    ],
+    "behaviors": [
+      {
+        "id": "paxos_run_dispatch",
+        "primary_activity": "A1",
+        "execution_owner": "Goroutine executing Replica.run",
+        "protocol_context": "Replica-local channel dispatch",
+        "trigger": "Invocation of Replica.run",
+        "legal_preconditions": [],
+        "implementation_guards": ["Loop continues while Shutdown is false.", "Exec controls starting executeCommands.", "BatchingEnabled controls starting fastClock."],
+        "reads": ["Shutdown", "Exec", "batchWait", "Proposal, protocol-message and instancesToRecover channels"],
+        "writes": ["Package-level fastClockChan", "Local onOffProposeChan"],
+        "durable_effects": [],
+        "external_effects": ["Calls ConnectToPeers and ComputeClosestPeers.", "Starts WaitForClientConnections.", "Dispatches selected messages and recovery instance IDs to handlers."],
+        "important_branches": ["After handling a proposal, batching disables the proposal select case until a timer signal.", "Protocol and recovery handlers remain selectable while proposal selection is disabled."],
+        "async_boundaries": ["Starts executeCommands conditionally.", "Starts fastClock conditionally.", "Starts WaitForClientConnections.", "Receives channel events; each selected handler runs synchronously."],
+        "produces_fact_ids": [],
+        "consumes_fact_ids": [],
+        "cross_activity_effects": [
+          {"key": "A3", "value": "An instancesToRecover receipt invokes recover(iid); completion semantics remain unread."},
+          {"key": "A5", "value": "Exec enables an independently running executeCommands goroutine."},
+          {"key": "A7", "value": "Proposal dispatch is temporarily gated by timer receipt when batching is enabled."}
+        ],
+        "existing_protections": ["The select loop serializes its own handler invocations."],
+        "source_ids": ["paxos/paxos.go:164:538"],
+        "unknowns": ["This loop does not establish exclusive ownership against other goroutines.", "Channel closure and shutdown-unblocking behavior are unresolved.", "Package-level timer-channel behavior with multiple replicas in one process is unresolved."]
+      },
+      {
+        "id": "paxos_batch_timer",
+        "primary_activity": "A7",
+        "execution_owner": "Goroutine started as Replica.fastClock",
+        "protocol_context": "Batching-enabled proposal dispatch",
+        "trigger": "run starts fastClock when batchWait > 0",
+        "legal_preconditions": [],
+        "implementation_guards": ["Checks Shutdown before each sleep/send iteration."],
+        "reads": ["Shutdown", "batchWait", "Package-level fastClockChan"],
+        "writes": [],
+        "durable_effects": [],
+        "external_effects": ["Sends true to fastClockChan after sleeping batchWait milliseconds."],
+        "important_branches": ["A full timer channel blocks the send."],
+        "async_boundaries": ["Sleep", "Channel send"],
+        "produces_fact_ids": [],
+        "consumes_fact_ids": [],
+        "cross_activity_effects": [],
+        "existing_protections": ["run creates a timer channel with capacity one."],
+        "source_ids": ["paxos/paxos.go:164:538"],
+        "unknowns": ["No timer-delivery deadline or shutdown completion guarantee is established."]
+      },
+      {
+        "id": "paxos_select_ballot",
+        "primary_activity": "A2",
+        "execution_owner": "Caller goroutine executing Replica.makeBallot",
+        "protocol_context": "Existing instance with LeaderBookkeeping",
+        "trigger": "makeBallot(instance)",
+        "legal_preconditions": ["The indexed instance and its bookkeeping must exist for normal completion."],
+        "implementation_guards": ["Only the IsLeader branch raises the candidate against defaultBallot[Id] and maxRecvBallot."],
+        "reads": ["Id", "N", "IsLeader", "defaultBallot[Id]", "maxRecvBallot", "instanceSpace[instance].lb"],
+        "writes": ["instanceSpace[instance].lb.lastTriedBallot"],
+        "durable_effects": [],
+        "external_effects": [],
+        "important_branches": ["Leader starts at int32(Id) and repeatedly adds int32(N) while below either bound.", "Nonleader stores int32(Id) directly."],
+        "async_boundaries": [],
+        "produces_fact_ids": ["paxos_attempt_ballot_selected"],
+        "consumes_fact_ids": [],
+        "cross_activity_effects": [{"key": "A1", "value": "Supplies the ballot used by proposal progression and prepare/accept message construction."}],
+        "existing_protections": ["The leader branch compares against both the local default and maximum received ballot."],
+        "source_ids": ["paxos/paxos.go:164:538"],
+        "unknowns": ["Other callers and possible concurrent mutation are unresolved.", "The function does not establish authority, uniqueness or a strictly greater ballot."]
+      },
+      {
+        "id": "paxos_reject_nonleader_proposal",
+        "primary_activity": "A7",
+        "execution_owner": "Proposal-handler caller, including Replica.run",
+        "protocol_context": "Received GPropose",
+        "trigger": "handlePropose with IsLeader false",
+        "legal_preconditions": [],
+        "implementation_guards": ["!IsLeader"],
+        "reads": ["IsLeader", "propose.Reply", "propose.Mutex"],
+        "writes": [],
+        "durable_effects": [],
+        "external_effects": ["Calls ReplyProposeTS with ProposeReplyTS{FALSE, -1, state.NIL(), 0}."],
+        "important_branches": ["Returns before batch draining or instance allocation."],
+        "async_boundaries": ["ReplyProposeTS transport behavior is unread."],
+        "produces_fact_ids": [],
+        "consumes_fact_ids": [],
+        "cross_activity_effects": [],
+        "existing_protections": ["Local leader flag guards proposal initiation."],
+        "source_ids": ["paxos/paxos.go:164:538"],
+        "unknowns": ["Client receipt and interpretation of the negative reply are unresolved."]
+      },
+      {
+        "id": "paxos_proposal_prepare_branch",
+        "primary_activity": "A1",
+        "execution_owner": "Proposal-handler caller, including Replica.run",
+        "protocol_context": "New locally allocated instance",
+        "trigger": "Leader proposal handling with selected ballot unequal to smallestDefaultBallot",
+        "legal_preconditions": [],
+        "implementation_guards": ["IsLeader", "lb.lastTriedBallot != smallestDefaultBallot"],
+        "reads": ["Received proposal", "len(ProposeChan)", "Queued proposals", "crtInstance", "defaultBallot[Id]", "smallestDefaultBallot"],
+        "writes": ["Increments crtInstance.", "Installs a PREPARING Instance with nil commands and new bookkeeping retaining proposals.", "Calls makeBallot and assigns defaultBallot[Id] = lb.lastTriedBallot."],
+        "durable_effects": [],
+        "external_effects": ["Calls bcastPrepare for the allocated instance."],
+        "important_branches": ["Batch size is len(ProposeChan)+1, then exactly that many proposals including the triggering proposal are collected.", "The locally assembled cmds slice is not assigned to inst.cmds or lb.cmds on this branch."],
+        "async_boundaries": ["Receives queued proposals while draining the batch.", "Calls broadcast helper."],
+        "produces_fact_ids": [],
+        "consumes_fact_ids": ["paxos_attempt_ballot_selected"],
+        "cross_activity_effects": [{"key": "A7", "value": "Retains client proposal objects in the instance bookkeeping for later handling."}],
+        "existing_protections": ["Leader guard precedes allocation.", "Ballot comparison determines whether prepare is initiated."],
+        "source_ids": ["paxos/paxos.go:164:538"],
+        "unknowns": ["Named bookkeeping counter initialization requires the unread struct declaration.", "Subsequent command selection from replies and retained proposals is unresolved.", "Instance-allocation bounds and competing channel consumers are unresolved."]
+      },
+      {
+        "id": "paxos_proposal_local_accept_branch",
+        "primary_activity": "A1",
+        "execution_owner": "Proposal-handler caller, including Replica.run",
+        "protocol_context": "New locally allocated instance",
+        "trigger": "Leader proposal handling with selected ballot equal to smallestDefaultBallot",
+        "legal_preconditions": [],
+        "implementation_guards": ["IsLeader", "lb.lastTriedBallot == smallestDefaultBallot"],
+        "reads": ["Received and queued proposals", "crtInstance", "defaultBallot[Id]", "smallestDefaultBallot"],
+        "writes": ["Allocates the instance and bookkeeping retaining proposals.", "Calls makeBallot and updates defaultBallot[Id].", "Assigns the batch to inst.cmds and lb.cmds.", "Assigns inst.bal and inst.vbal to lastTriedBallot and status to ACCEPTED."],
+        "durable_effects": [],
+        "external_effects": ["Calls bcastAccept."],
+        "important_branches": ["Skips bcastPrepare on ballot equality.", "No recordInstanceMetadata, recordCommands or sync call occurs in this branch."],
+        "async_boundaries": ["Receives queued proposals during batching.", "Calls broadcast helper."],
+        "produces_fact_ids": ["paxos_proposal_locally_accepted"],
+        "consumes_fact_ids": ["paxos_attempt_ballot_selected"],
+        "cross_activity_effects": [{"key": "A7", "value": "Associates the accepted command batch with retained client proposals without issuing success replies here."}],
+        "existing_protections": ["Leader guard and smallestDefaultBallot equality gate this branch."],
+        "source_ids": ["paxos/paxos.go:164:538"],
+        "unknowns": ["How smallestDefaultBallot is established and maintained is unresolved.", "This local state does not establish quorum support or durability."]
+      },
+      {
+        "id": "paxos_broadcast_prepare",
+        "primary_activity": "A1",
+        "execution_owner": "Caller goroutine executing Replica.bcastPrepare",
+        "protocol_context": "Instance with selected attempt ballot",
+        "trigger": "bcastPrepare(instance)",
+        "legal_preconditions": ["Instance bookkeeping must exist for normal message construction."],
+        "implementation_guards": ["Skips peers whose Alive entry is false."],
+        "reads": ["Id", "N", "PreferredPeerOrder", "Alive", "lb.lastTriedBallot"],
+        "writes": [],
+        "durable_effects": [],
+        "external_effects": ["Calls SendMsg with prepareRPC and Prepare{Id, instance, lastTriedBallot} for selected peers."],
+        "important_branches": ["Iterates the first N-1 preferred-peer entries.", "Recovers and logs a panic, terminating the invocation without completing remaining sends."],
+        "async_boundaries": ["SendMsg ownership and delivery semantics are unresolved."],
+        "produces_fact_ids": [],
+        "consumes_fact_ids": ["paxos_attempt_ballot_selected"],
+        "cross_activity_effects": [],
+        "existing_protections": ["Alive filtering", "Panic logging"],
+        "source_ids": ["paxos/paxos.go:164:538"],
+        "unknowns": ["Peer-order uniqueness and coverage are unresolved.", "Return from this helper does not establish delivery or peer promises."]
+      },
+      {
+        "id": "paxos_broadcast_accept",
+        "primary_activity": "A1",
+        "execution_owner": "Caller goroutine executing Replica.bcastAccept",
+        "protocol_context": "Instance bookkeeping supplies ballot and commands",
+        "trigger": "bcastAccept(instance)",
+        "legal_preconditions": ["Instance bookkeeping must exist for normal message construction."],
+        "implementation_guards": ["Skips peers whose Alive entry is false."],
+        "reads": ["Id", "N", "PreferredPeerOrder", "Alive", "lb.lastTriedBallot", "lb.cmds"],
+        "writes": ["Package-level Accept variable pa"],
+        "durable_effects": [],
+        "external_effects": ["Passes &pa to SendMsg under acceptRPC for selected peers."],
+        "important_branches": ["Iterates the first N-1 preferred-peer entries.", "Recovers and logs a panic, ending the remaining broadcast."],
+        "async_boundaries": ["SendMsg may serialize or retain the pointer; its implementation is unread."],
+        "produces_fact_ids": [],
+        "consumes_fact_ids": ["paxos_attempt_ballot_selected"],
+        "cross_activity_effects": [],
+        "existing_protections": ["Alive filtering", "Panic logging"],
+        "source_ids": ["paxos/paxos.go:164:538"],
+        "unknowns": ["Other callers may populate lb.cmds through unread paths.", "Shared message-object lifetime and concurrent callers are unresolved.", "Send attempts do not establish remote acceptance."]
+      },
+      {
+        "id": "paxos_broadcast_commit",
+        "primary_activity": "A1",
+        "execution_owner": "Caller goroutine executing Replica.bcastCommit",
+        "protocol_context": "Caller-supplied instance, ballot and commands",
+        "trigger": "bcastCommit(instance, ballot, command)",
+        "legal_preconditions": [],
+        "implementation_guards": ["Skips peers whose Alive entry is false."],
+        "reads": ["Id", "N", "PreferredPeerOrder", "Alive", "Function arguments"],
+        "writes": ["Package-level Commit variable pc", "Package-level CommitShort variable pcs"],
+        "durable_effects": [],
+        "external_effects": ["Calls SendMsg(peer, commitShortRPC, &pc)."],
+        "important_branches": ["Populates pcs.Count from command length but does not send &pcs.", "Uses the same RPC identifier and full Commit pointer for every selected peer.", "Recovers and logs a panic, ending remaining sends."],
+        "async_boundaries": ["Serialization, framing and message-object retention inside SendMsg are unresolved."],
+        "produces_fact_ids": [],
+        "consumes_fact_ids": [],
+        "cross_activity_effects": [],
+        "existing_protections": ["Alive filtering", "Panic logging"],
+        "source_ids": ["paxos/paxos.go:164:538"],
+        "unknowns": ["Caller-side decision prerequisites are unread.", "The relationship between commitShortRPC registration and Commit serialization requires exact source.", "No successful remote commit interpretation is established by this helper."]
+      },
+      {
+        "id": "paxos_send_protocol_reply",
+        "primary_activity": "A1",
+        "execution_owner": "Caller goroutine executing replyPrepare or replyAccept",
+        "protocol_context": "Caller-constructed reply and destination replica ID",
+        "trigger": "replyPrepare(replicaId, reply) or replyAccept(replicaId, reply)",
+        "legal_preconditions": [],
+        "implementation_guards": [],
+        "reads": ["Destination replica ID", "Supplied reply pointer", "Corresponding reply RPC identifier"],
+        "writes": [],
+        "durable_effects": [],
+        "external_effects": ["Passes the supplied pointer to SendMsg with prepareReplyRPC or acceptReplyRPC."],
+        "important_branches": ["The wrapper selects the RPC identifier by reply type and performs no additional state validation."],
+        "async_boundaries": ["SendMsg implementation is unread."],
+        "produces_fact_ids": [],
+        "consumes_fact_ids": [],
+        "cross_activity_effects": [],
+        "existing_protections": [],
+        "source_ids": ["paxos/paxos.go:164:538"],
+        "unknowns": ["These wrappers do not independently establish the assertions encoded in replies or their delivery."]
+      }
+    ],
+    "facts": [
+      {
+        "id": "paxos_attempt_ballot_selected",
+        "meaning": "On normal completion of makeBallot, the addressed bookkeeping object holds the candidate computed by that invocation in lastTriedBallot. This is local attempt selection, not authority acquisition.",
+        "identity": [
+          {"key": "replica", "value": "Replica object executing makeBallot"},
+          {"key": "instance", "value": "instance argument"},
+          {"key": "bookkeeping", "value": "LeaderBookkeeping object addressed by the invocation"},
+          {"key": "selection", "value": "Completed makeBallot invocation and stored candidate"}
+        ],
+        "validity_context": "At completion of the invocation and while the same bookkeeping object and lastTriedBallot remain unchanged.",
+        "representation": ["instanceSpace[instance].lb.lastTriedBallot"],
+        "invalidators": ["paxos_select_ballot"],
+        "reinterpreters": [],
+        "durability": "In-memory assignment only; no persistence call in makeBallot.",
+        "recovery": "Restart reconstruction is not established.",
+        "source_ids": ["paxos/paxos.go:164:538"],
+        "unknowns": ["Additional writers and object replacement paths are unresolved.", "The nonleader branch performs no comparison against received or default ballots."]
+      },
+      {
+        "id": "paxos_proposal_locally_accepted",
+        "meaning": "The proposal equality branch installs its collected command batch in both instance commands and bookkeeping commands, sets both ballot fields to the selected ballot, and marks the instance ACCEPTED before invoking bcastAccept.",
+        "identity": [
+          {"key": "replica", "value": "Replica object handling the proposal"},
+          {"key": "instance", "value": "New crtInstance and allocated Instance object"},
+          {"key": "ballot", "value": "lb.lastTriedBallot at the branch"},
+          {"key": "commands", "value": "Batch assembled from the triggering proposal and drained queued proposals"}
+        ],
+        "validity_context": "Established at the final local acceptance assignment; describes that local transition without asserting persistence, quorum acceptance or decision.",
+        "representation": ["inst.cmds", "inst.lb.cmds", "inst.bal", "inst.vbal", "inst.status == ACCEPTED"],
+        "invalidators": [],
+        "reinterpreters": [],
+        "durability": "Only in-memory establishment is visible on this branch.",
+        "recovery": "No reconstruction mechanism is established by the focused behavior.",
+        "source_ids": ["paxos/paxos.go:164:538"],
+        "unknowns": ["Subsequent acceptance, prepare and commit handlers can change instance fields; their lifecycle mapping is outside this focused delta.", "bcastAccept reads bookkeeping commands and ballot without testing this complete local assertion.", "Consumers that infer decision or client completion remain unmapped."]
+      }
+    ],
+    "surfaces": [
+      {
+        "entry_point": "Replica.run, proposal dispatch, makeBallot and broadcast/reply helpers",
+        "disposition": "mapped",
+        "behavior_ids": [
+          "paxos_run_dispatch",
+          "paxos_batch_timer",
+          "paxos_select_ballot",
+          "paxos_reject_nonleader_proposal",
+          "paxos_proposal_prepare_branch",
+          "paxos_proposal_local_accept_branch",
+          "paxos_broadcast_prepare",
+          "paxos_broadcast_accept",
+          "paxos_broadcast_commit",
+          "paxos_send_protocol_reply"
+        ],
+        "reason": "The acquired bodies support mapping dispatch, batching timer ownership, proposal branches, ballot selection and outgoing helper behavior. Mapping records call boundaries without claiming that transport, recovery, execution or reply-handler semantics are resolved.",
+        "source_ids": ["paxos/paxos.go:164:538"],
+        "high_consequence": true
+      }
+    ],
+    "remove_behavior_ids": [],
+    "remove_fact_ids": [],
+    "remove_surface_entry_points": [],
+    "rationale": "Expand only the selected frontier using attached code. Separate the timer owner, proposal rejection and the two proposal progression branches. Retain local ballot selection and local acceptance as distinct weak facts. Broadcast and reply calls establish no delivery, persistence or decision facts. Preserve the observed full Commit pointer passed under commitShortRPC as an unresolved transport interpretation, not a confirmed defect. Other responsibility classes and adjacent handler lifecycles remain outside this bounded expansion."
+  },
+  "limitations": [
+    "Only paxos/paxos.go:164:538 was available as semantic evidence in this packet.",
+    "Transport registration, serializers, SendMsg, instance/bookkeeping declarations and selected configuration bounds remain unresolved.",
+    "A3, A4, A5 and A6 applicability and full behavior inventories are not recovered by this focused delta.",
+    "The mapped surface is descriptive understanding, not complete coverage or correctness evidence.",
+    "No execution, calibration, normative obligation or confirmed violation is established."
+  ]
+}

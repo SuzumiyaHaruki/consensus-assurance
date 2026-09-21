@@ -3,7 +3,7 @@ import json
 import shutil
 from pathlib import Path
 import pytest
-from consensus_assurance.core.proposals import ClaimDraft,GraphPatch,Feedback,JudgmentChange,ReviewReply
+from consensus_assurance.core.proposals import ClaimDraft,GraphPatch,Feedback,JudgmentChange,ReviewReply,SemanticRevision
 from consensus_assurance.core.types import CheckRun,CheckerResult,ExecutionStatus,InquiryTask,SemanticReview,SemanticCheck
 from consensus_assurance.workflow.artifacts import save_bundle
 from consensus_assurance.workflow.modeling import obligation_progress
@@ -28,7 +28,7 @@ def test_review_cannot_modify_an_unreviewed_obligation(prepared):
     a,b=state.claims[1:3]
     task=InquiryTask(kind='review',reason='Review A only',trigger='test',target_ids=[a.id],unit_id=state.units[0].id)
     items=[SemanticCheck(target_id=a.id,aspect=aspect,status='revision_needed',source_ids=a.source_ids,rationale='The selected responsibility needs correction' + "\n" + 'Other mechanisms remain possible' + "\n" + 'The old requirement can be stronger than the current contract') for aspect in ['applicability','decomposition']]
-    reply=ReviewReply(items=items,revision=revision_for(state,[a.id,b.id]),limitations=[])
+    reply=ReviewReply(items=items,revision=SemanticRevision.model_validate(revision_for(state,[a.id,b.id]).model_dump(exclude={'graph','bundle'})),limitations=[])
     before=state.model_dump()
     with pytest.raises(ValueError):validate_review(state,task,reply)
     assert state.model_dump()==before
@@ -116,7 +116,7 @@ def test_actual_write_set_rejects_every_unreviewed_object(dependency_prepared,ex
         f.patch.units=[UnitDraft(**{k:v for k,v in old.model_dump().items() if k in UnitDraft.model_fields}).model_copy(update={'obligation_ids':[b.id]})]
     if extra=='binding':
         old=state.bindings[0];m=next(m for m in state.materials if m.file==old.file and m.start_line<=old.start_line<=old.end_line<=m.end_line)
-        f.patch.bindings=[BindingDraft(id=old.id,claim_id=b.id,material_id=m.id,symbol=old.symbol,start_line=old.start_line,end_line=old.end_line,description=old.description,pending=old.pending)]
+        f.patch.bindings=[BindingDraft(id=old.id,associations=[dict(claim_id=b.id,source_ids=[m.id],rationale='Selected fixture operation')],material_id=m.id,symbol=old.symbol,start_line=old.start_line,end_line=old.end_line,description=old.description,pending=old.pending)]
     for name in ('claims','relations','bindings','units'):
         for obj in getattr(f.patch,name):f.patch.expected_versions[obj.id]=1
     from regression_support import declared_changes

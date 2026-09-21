@@ -76,11 +76,12 @@ def main(argv=None):
     try:
         if args.command in {"resume", "report"}:
             root = resolve_run(args.run, args.runs_dir)
-            state = Store(root).load()
-            if state.framework_revision!=FRAMEWORK_REVISION:
+            raw=json.loads((root/"state.json").read_text())
+            if raw.get("framework_revision")!=FRAMEWORK_REVISION:
                 if args.command=="report" and (root/"report.md").is_file():
                     print((root/"report.md").read_text());return 0
                 print("历史运行只读；使用原始报告或离线导入，不能恢复到新语义。");return 2
+            state=Store(root).load()
             if args.command == "report":
                 print(render_report(state, root)); return 0
             config = Config.model_validate(state.config)
