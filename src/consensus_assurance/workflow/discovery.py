@@ -21,8 +21,9 @@ def context(engine, unit=None):
         result.update(local_workset(engine,unit))
     else:
         result["materials"]=[item.model_dump(mode="json") for item in engine.state.materials]
-    from .audit_spec import slice_for
-    result["audit_spec"]=slice_for(engine.state,unit.audit_question if unit else None)
+    from .audit_spec import load
+    spec=load(engine.state)
+    result["audit_spec"]=({'version':spec.version,'facts':[f.model_dump(mode='json') for f in spec.facts if unit.audit_question and f.id in unit.audit_question.fact_ids]} if unit else spec.model_dump(mode='json')) if spec else None
     return result
 
 def discover(engine):
@@ -78,8 +79,7 @@ def candidate_blockage(state,candidate):
 
 def derive_context(engine):
     state=engine.state;candidate=active_candidate(state)
-    from .task_packet import prepare
-    return prepare(engine,'derive',{'candidate_id':candidate.id if candidate else None,'remaining_seconds':engine.budget.remaining()})[0]
+    return {'candidate_id':candidate.id if candidate else None,'remaining_seconds':engine.budget.remaining()}
 
 
 def derivation_graph(reply):
@@ -115,7 +115,7 @@ def classify_derivation_outcome(state,reply):
     if not reply.selection_rationale.strip():raise ValueError('Explain the bounded analysis outcome')
     if q is None:
         if selected and not (graph or reply.reading_requests or reply.descriptive_issues):return 'resume'
-        if not current and state.question_candidates and not (graph or reply.reading_requests or reply.descriptive_issues):return 'selection_exhausted'
+        if not current and not (graph or reply.reading_requests or reply.descriptive_issues):return 'selection_exhausted'
         raise ValueError('Selection can stop only after candidates were considered, with no active question or proposed work')
     reads=reply.reading_requests+q.requests
     if not reply.obligation and graph:raise ValueError('A pre-obligation candidate cannot create graph objects')
@@ -256,7 +256,6 @@ def accept_derivation(engine,reply,check_id):
         unit=next(u for u in state.units if u.id==patch.units[0].id)
         candidate.status='escalated';candidate.obligation_id=reply.obligation.id
         inquiry.review_unit(proxy,unit,'derived:'+check_id)
-        state.completed_steps.append('derived-spec:'+str(state.audit_spec_version))
     path=engine.root/f'derivation-{check_id}.json';write_json(path,reply);engine.state.derivation_path=str(path)
     commit_graph(engine,'derive-'+check_id,reply.model_dump(mode='json'),commit)
     return active_candidate(engine.state) is None and bool(reply.obligation or reply.audit_question is None)

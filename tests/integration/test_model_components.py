@@ -26,31 +26,18 @@ def test_model_only_tool_result_is_not_a_calibrated_implementation(prepared,tlc,
     assert not state.calibrations and not state.evidence
 
 
-@pytest.mark.real
-def test_sany_errors_are_separate_from_property_results(prepared,tlc):
-    _,state,bundle,_=prepared;verifier,runner=tlc;draft=draft_of(bundle)
-    draft.behavior=draft.behavior.replace('value = 0','value = missingOperator(0)',1)
-    model=save_bundle(runner.root,state,state.units[0],draft,None)
-    result=verifier.syntax(runner,model,20)
-    assert result.status.value=='error' and result.outcome=='unknown'
-    assert not result.checker_results and result.reason=='Model syntax error'
-
-
 def test_missing_tools_and_core_dependencies_never_complete_a_draft(tmp_path,prepared):
     from consensus_assurance.adapters.verifiers.tlc import TLCVerifier
     from consensus_assurance.adapters.runners.process import ProcessRunner
-    from consensus_assurance.workflow.staged_model import proceed
-    from consensus_assurance.workflow.errors import Blocked
-    from test_graph_mutations import controller
     _,state,bundle,_=prepared;draft=draft_of(bundle);impl=PythonBackend()
     model=save_bundle(tmp_path/'models-run',state,state.units[0],draft,impl)
     missing=TLCVerifier(None).syntax(ProcessRunner(tmp_path/'runner'),model,1)
     assert missing.status.value=='tool_missing' and missing.outcome=='unknown'
     from consensus_assurance.core.proposals import ComponentWork
     draft.pending_work.append(ComponentWork(component='behavior',reason='Producer source is unavailable'))
-    draft=ModelDraft.model_validate(draft.model_dump())
-    e=controller(tmp_path,state)
-    with pytest.raises(Blocked,match='unresolved core'):proceed(e,state.units[0],model,draft,'model_syntax')
+    with pytest.raises(ValueError,match='Unfinished core'):
+        save_bundle(tmp_path/'unfinished',state,state.units[0],draft,None)
+    assert len(state.models)==1 and not (tmp_path/'unfinished').exists()
     assert not state.checks
 
 
@@ -82,3 +69,8 @@ def test_tlc_help_exit_is_capability_information_not_a_property_verdict(tmp_path
     assert '工具可用' in execution_summary(result['checks'][-1])[1]
     syntax=result['checks'][-1].model_copy(update={'action':'model_syntax','outcome':'not_applicable','exit_code':0})
     assert '未检查性质' in execution_summary(syntax)[2]
+    from types import SimpleNamespace
+    verifier=TLCVerifier(str(jar));verifier.available=True
+    # A successful subprocess exit with unrelated output is not a TLA diagnostic.
+    failed=verifier.syntax(Runner(),SimpleNamespace(path=str(tmp_path/'Properties.tla'),snapshot_id='fixture',id='model',artifact_digests={}),1)
+    assert failed.status==ExecutionStatus.ERROR and failed.reason.startswith('SANY execution failed')

@@ -21,7 +21,7 @@ def semantic_view(state,ids):
                 'aspect':item.aspect,'status':item.status,'source_ids':item.source_ids,'explanation':item.rationale,
                 'counterevidence':item.counterevidence,
                 'limitations':item.limitations,'current_version':same_version}
-            if item.status!='no_issue_found' or item.limitations or item.counterevidence:
+            if item.status!='no_issue_found' or item.counterevidence:
                 # Keep unresolved counterevidence even after a later positive opinion.
                 key=json.dumps({k:v for k,v in record.items() if k!='review_id'},sort_keys=True)
                 negative[key]=record
@@ -33,14 +33,8 @@ def semantic_view(state,ids):
                 positive[(item.target_id,item.aspect)]=record
     open_issues=[{'id':i.id,'target_id':i.target_id,'version':i.target_version,'aspect':i.aspect,'explanation':i.explanation,
         'source_ids':i.source_ids,'disposition':i.disposition,'reason':i.reason} for i in issues if not i.resolved_by]
-    resolved={}
-    for i in issues:
-        if i.resolved_by:
-            resolved[(i.target_id,i.aspect,i.explanation)]={'issue_id':i.id,'target_id':i.target_id,'aspect':i.aspect,'resolved_by':i.resolved_by,
-                'conclusion':i.resolution_basis.get('rationale','Explicit scoped resolution; consult the recorded disposition'),
-                'source_ids':i.resolution_basis.get('source_ids',i.source_ids),'remaining_scope':i.resolution_basis.get('scope_limitations',[])}
     records=list(positive.values())+list(negative.values())
-    for r in records+open_issues+list(resolved.values()):sources.update(r['source_ids'])
+    for r in records+open_issues:sources.update(r['source_ids'])
     # The issue already carries the same attributed explanation and sources.
     # Reference those exact fields, retaining alternatives and counterarguments.
     for record in records:
@@ -53,7 +47,7 @@ def semantic_view(state,ids):
             if record['source_ids']==issue.source_ids:
                 record.pop('source_ids');record['source_ids_ref']=issue.id
     return {'issue_reference_rule':'explanation_ref/source_ids_ref point to the exact unchanged fields of open_issues by issue ID; all alternatives and counterarguments remain on the judgment',
-        'judgments':records,'open_issues':open_issues,'resolved':list(resolved.values()),
+        'judgments':records,'open_issues':open_issues,
         'archive_access':'Request a focused review of a named issue/review to retrieve its archived reasoning; these are scoped opinions, not proof'},sources
 
 
@@ -83,23 +77,18 @@ def local_workset(engine,unit):
         'omitted_material_ids':[m.id for m in state.materials if m.id not in needed],
         'omission_reason':'Outside this unit, its selected dependency closure and current semantic issues; full history remains archived',
         'semantic_view':semantic,
-        'unit':unit.model_dump(mode='json'),
+        'unit':unit.model_dump(mode='json',exclude={'semantic_readiness','obligation_checks','remaining_obligation_ids'}),
         'verification_continuation':state.question_continuations.get(unit.id,{}),
         'claims':[c.model_dump(mode='json') for c in state.claims if c.id in ids],
         'bindings':[b.model_dump(mode='json') for b in state.bindings if b.id in ids],
         'relations':[r.model_dump(mode='json') for r in state.relations if r.id in ids or r.id in unit.relation_ids],
-        'obligation_progress':{'checked_scopes':unit.obligation_checks,'remaining':unit.remaining_obligation_ids or unit.obligation_ids},
-        'modeling_brief':{'unit_id':unit.id,'version':unit.version,'question_ref':unit.id,'obligation_ids':unit.obligation_ids,
-            'scope_ref':unit.id,'code_refs':unit.binding_ids,'relationship_refs':unit.relation_ids,
-            'remaining_conditions':unit.coverage_limitations+[x for b in state.bindings if b.id in unit.binding_ids for x in b.pending]+[x for r in state.relations if r.id in unit.relation_ids for x in r.pending+r.grounding.unresolved],
-            'basis':'Derived current obligation and code view; complete referenced objects and required source are included once'}}
+        'obligation_progress':{'checked_scopes':unit.obligation_checks,'remaining':unit.remaining_obligation_ids or unit.obligation_ids}}
 
 
 def local_basis(state,unit):
-    ids=set(unit.obligation_ids+unit.binding_ids+unit.relation_ids+[unit.id])
-    materials,closure=material_closure(state,[unit.id]);closure.update(relevant_model_ids(state,unit));view,sources=semantic_view(state,closure)
-    materials.update(sources);materials.update(state.task_attachments.get('unit:'+unit.id,[]))
+    materials,ids=material_closure(state,[unit.id])
+    materials.update(state.task_attachments.get('unit:'+unit.id,[]))
     from .sources import ranges
     spans=[{'file':f,'content_digest':v,'ranges':r} for (f,v),r in sorted(ranges([m for m in state.materials if m.id in materials]).items())]
     return {'versions':{o.id:o.version for o in state.claims+state.bindings+state.relations+state.units if o.id in ids},
-        'materials':spans,'issues':[[i['id'],i['version']] for i in view['open_issues']]}
+        'materials':spans,'model_ids':sorted(relevant_model_ids(state,unit))}

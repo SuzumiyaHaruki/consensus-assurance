@@ -46,7 +46,8 @@ def test_F3_reads_new_producer_then_generates_and_checks_new_scope(tmp_path,tlc,
     config.budget.audit_units=3
     root=tmp_path/'audit'
     state=Engine(config,root,*assemble(config)).start(repo)
-    assert state.stop_reason.startswith('No pending'),state.stop_reason
+    assert state.stop_reason=='Insufficient calls for another candidate'
+    assert state.usage['agent_calls']==config.budget.agent_calls
     assert len(state.models)==2
     initial=json.loads(Path(state.derivation_path).read_text())
     assert all(b['id']!='input_binding' for b in initial['bindings'])
@@ -80,7 +81,7 @@ def test_interrupted_experiment_resumes_same_model_and_action(tmp_path,tlc,prepa
     before=Store(root).load()
     assert before.next_action=='experiment' and before.active_model_id
     state=Engine(config,root,*assemble(config)).resume()
-    assert state.stop_reason.startswith('No pending'),state.stop_reason
+    assert state.stop_reason=='Insufficient calls for another candidate'
     assert len(state.models)==2 and state.models[0].id==before.active_model_id
     assert len([c for c in state.checks if c.action=='experiment'])==2
     if event=='action_started':
@@ -111,7 +112,8 @@ def test_compilation_failure_gets_actual_log_and_finite_repair(tmp_path,tlc,prep
     responses[1]['units'][0]['relation_ids']=[]
     original=copy.deepcopy(responses[2]);broken=copy.deepcopy(original)
     broken['harness']['source']='import missing_round2_fixture_module\n'
-    fixture=tmp_path/'compile.json';fixture.write_text(json.dumps([responses[0],responses[1],broken,original]))
+    exhausted={'selection_rationale':'No further question is supplied by this fixed synthetic inventory'}
+    fixture=tmp_path/'compile.json';fixture.write_text(json.dumps([responses[0],responses[1],broken,original,exhausted]))
     config=Config(execution_backend='python',agent_backend='mock',fixture=str(fixture),tlc_jar=os.environ['TLC_JAR'])
     # Python runtime import failure is an executable harness error, never F1-F4.
     class Adapter(type(assemble(config)[0])):
@@ -197,6 +199,7 @@ def test_initial_replay_then_F4_and_attribution_continue(tmp_path,tlc,interrupt_
     # A structured question cannot be declared complete from the counterexample
     # replay alone: this path has no independent model-trigger search.
     assert state.stop_reason.startswith('Unfinished obligations remain'),state.stop_reason
+    assert 'unit-durable: durable' in state.stop_reason and 'remaining agent calls=0' in state.stop_reason
     assert not state.reachability_results
     from consensus_assurance.workflow.modeling import obligation_progress
     assert obligation_progress(state,state.units[0])[1]==['durable']
@@ -230,9 +233,10 @@ def test_model_files_written_before_state_checkpoint_resume_same_generation(tmp_
     commit=json.loads((root/'models/v1/commit.json').read_text())
     calls=before.usage['agent_calls']
     state=Engine(config,root,*assemble(config)).resume()
-    assert state.stop_reason.startswith('No pending'),state.stop_reason
+    assert state.stop_reason=='Insufficient calls for another candidate'
     assert state.models[0].id==commit['model']['id']
     assert len([m for m in state.models if m.version==1])==1
     assert state.usage['agent_calls']==calls+3
     prompts=[p.read_text() for p in (root/'agent').glob('*/prompt.txt')]
-    assert any('scope_delta' in p and 'Split actions at actual interruptible boundaries' in p and 'Use MODULE Behavior' in p for p in prompts)
+    method=(ROOT/'src/consensus_assurance/resources/skills/local-modeling/references/context-history.md').read_text()
+    assert any('scope_delta' in p and method in p for p in prompts)

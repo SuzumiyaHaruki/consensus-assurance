@@ -12,7 +12,7 @@ from consensus_assurance.adapters.verifiers.tla_syntax import tla_code, validate
 def materialize_bundle(bundle):
     if bundle.properties == "GENERATE_FROM_OBSERVABLE_PROPERTIES":
         if isinstance(bundle, ModelDraft):
-            raise ValueError("Observable property generation requires a complete observation map")
+            raise ValueError("ModelDraft requires native MODULE Properties; automatic generation requires a complete Bundle observation map")
         from consensus_assurance.adapters.verifiers.observable import properties_source
         if not bundle.observable_properties:
             raise ValueError("Shared property generation requires nonempty observable_properties")
@@ -23,6 +23,8 @@ def materialize_bundle(bundle):
 
 def validate_bundle(state, unit, bundle, implementation):
     bundle = materialize_bundle(bundle)
+    if isinstance(bundle,ModelDraft) and any(p.component in {'behavior','properties'} for p in bundle.pending_work):
+        raise ValueError('Unfinished core model belongs to build continuation, not executable model registration')
     specs = bundle.checker_specs()
     checked_ids = {c.claim_id for c in specs}
     invariants = [c.invariant for c in specs]
@@ -99,12 +101,12 @@ def validate_bundle(state, unit, bundle, implementation):
     # Model-level consequence expression does not require an implementation monitor.
     for mapping in bundle.consequence_observations:
         if mapping.claim_id not in unit.obligation_ids or not set(mapping.binding_ids)<=set(unit.binding_ids):raise ValueError("Consequence observation references an unselected obligation or binding")
-    return specs
+    return bundle
 
 
-def save_bundle(root, state, unit, bundle, implementation, previous=None, reason="Initial generation", transaction_key=None):
-    bundle = materialize_bundle(bundle)
-    specs = validate_bundle(state, unit, bundle, implementation)
+def save_bundle(root, state, unit, bundle, implementation, previous=None, reason="Initial generation", transaction_key=None, validated=False):
+    if not validated:bundle = validate_bundle(state, unit, bundle, implementation)
+    specs = bundle.checker_specs()
     invariants = [c.invariant for c in specs]
     checked_ids = {c.claim_id for c in specs}
     root = Path(root)

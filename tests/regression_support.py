@@ -65,6 +65,8 @@ def bounded_derivation(graph,packet=None):
     from consensus_assurance.core.proposals import Derivation
     if hasattr(graph,'model_dump'):graph=graph.model_dump(mode='json')
     unit=graph['units'][0];primary=unit['obligation_ids'][0]
+    if packet and not packet.get('candidate_id') and any(o['id']==primary for o in packet.get('existing_objects',[])):
+        return Derivation(selection_rationale='No further question is supplied by this fixed synthetic inventory').model_dump(mode='json')
     selected=[b for b in graph['bindings'] if b['id'] in unit['binding_ids']]
     edges=[r for r in graph['relations'] if r['id'] in unit['relation_ids']]
     wanted={primary}|{r[k] for r in edges for k in ('source','target')}

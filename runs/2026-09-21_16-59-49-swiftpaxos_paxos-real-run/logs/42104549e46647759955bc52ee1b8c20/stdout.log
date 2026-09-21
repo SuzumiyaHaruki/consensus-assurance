@@ -1,0 +1,618 @@
+{
+  "reading_purpose": "context",
+  "plan": {
+    "description": "Exercise the actual broadcast, sender, RPC table, and registered decoder synchronously; compare decoded fields with broadcast inputs and decoder consumption with the observed transmission boundary.",
+    "claim_id": "O_short_commit_wire_fidelity",
+    "scope": {
+      "description": "One nonempty command batch sent to one alive peer through bcastCommit and SendMsg, followed by another valid message. Check notification fields and the exact stream boundary after registered decoding.",
+      "assumptions": [
+        "Sender and recipient have corresponding RPC registrations.",
+        "Successful ordered transport is represented by a buffered writer backed by an in-memory byte buffer.",
+        "No other test concurrently invokes broadcasts that mutate pc or pcs.",
+        "The component invocation is admissible within the selected local interface scope; complete consensus-history reachability is excluded."
+      ],
+      "excluded": [
+        "Consensus decision correctness and complete legal-history reachability.",
+        "Actual socket establishment, listener goroutine delivery, and handler ordering.",
+        "Retained-command correspondence, execution, client completion, recovery, and overall progress."
+      ],
+      "parameters": [
+        {
+          "key": "sender",
+          "value_json": "0"
+        },
+        {
+          "key": "recipient",
+          "value_json": "1"
+        },
+        {
+          "key": "instance",
+          "value_json": "7"
+        },
+        {
+          "key": "ballot",
+          "value_json": "6"
+        },
+        {
+          "key": "batch",
+          "value_json": "[{\"operation\":\"PUT\",\"key\":4660,\"value\":[97,98,99]}]"
+        }
+      ]
+    },
+    "binding_ids": [
+      "BIND_wire_broadcast",
+      "BIND_wire_send",
+      "BIND_wire_registration",
+      "BIND_wire_listener",
+      "BIND_wire_commit_encoder",
+      "BIND_wire_short_decoder"
+    ],
+    "harness": {
+      "kind": "go_test",
+      "source": "package paxos\n\nimport (\n \"bufio\"\n \"bytes\"\n \"encoding/hex\"\n \"encoding/json\"\n \"fmt\"\n \"io\"\n \"testing\"\n\n shared \"github.com/imdea-software/swiftpaxos/replica\"\n defs \"github.com/imdea-software/swiftpaxos/replica/defs\"\n rpc \"github.com/imdea-software/swiftpaxos/rpc\"\n \"github.com/imdea-software/swiftpaxos/state\"\n)\n\nfunc TestAssuranceShortCommitWireFidelity(t *testing.T) {\n emit := func(event string, fields map[string]interface{}) {\n  fields[\"event\"] = event\n  fields[\"operation\"] = \"short-commit-wire-1\"\n  fields[\"sender\"] = 0\n  fields[\"recipient\"] = 1\n  fields[\"context\"] = \"ordered-memory-stream\"\n  data, err := json.Marshal(fields)\n  if err != nil { t.Fatal(err) }\n  fmt.Println(\"CA_EVENT \" + string(data))\n }\n register := func() (*rpc.Table, []uint8) {\n  table := rpc.NewTableId(defs.RPC_TABLE)\n  objects := []rpc.Serializable{new(Prepare), new(Accept), new(Commit), new(CommitShort), new(PrepareReply), new(AcceptReply)}\n  tags := make([]uint8, len(objects))\n  for i, obj := range objects {\n   tags[i] = table.Register(obj, make(chan rpc.Serializable, 1))\n  }\n  return table, tags\n }\n senderTable, senderTags := register()\n receiverTable, receiverTags := register()\n if !bytes.Equal(senderTags, receiverTags) { t.Fatal(\"registration mismatch\") }\n var wire bytes.Buffer\n writer := bufio.NewWriter(&wire)\n base := &shared.Replica{\n  N: 2, Id: 0, RPC: senderTable,\n  Alive: []bool{false, true},\n  PreferredPeerOrder: []int32{1, 0},\n  PeerWriters: []*bufio.Writer{nil, writer},\n }\n r := &Replica{Replica: base, commitShortRPC: senderTags[3]}\n savedPC, savedPCS := pc, pcs\n defer func() { pc, pcs = savedPC, savedPCS }()\n instance, ballot := int32(7), int32(6)\n commands := []state.Command{{Op: state.PUT, K: state.Key(4660), V: state.Value([]byte(\"abc\"))}}\n pair, exists := receiverTable.Get(r.commitShortRPC)\n if !exists { t.Fatal(\"missing short-commit registration\") }\n _, shortType := pair.Obj.(*CommitShort)\n if !shortType { t.Fatal(\"unexpected registered decoder\") }\n emit(\"broadcast_input\", map[string]interface{}{\n  \"leader\": r.Id, \"instance\": instance, \"ballot\": ballot, \"count\": len(commands),\n  \"alive\": base.Alive[1], \"writer_present\": base.PeerWriters[1] != nil,\n  \"registration_matches\": bytes.Equal(senderTags, receiverTags), \"registered_short\": shortType,\n  \"stream_start\": wire.Len(),\n })\n r.bcastCommit(instance, ballot, commands)\n if err := writer.Flush(); err != nil { t.Fatal(err) }\n firstEnd := wire.Len()\n if firstEnd == 0 || writer.Buffered() != 0 { t.Fatal(\"broadcast transmission prerequisite not reached\") }\n emit(\"broadcast_sent\", map[string]interface{}{\n  \"end_offset\": firstEnd, \"buffered\": writer.Buffered(), \"write_ok\": true,\n  \"wire_hex\": hex.EncodeToString(wire.Bytes()),\n })\n following := &Prepare{LeaderId: 0, Instance: 19, Ballot: 12}\n base.SendMsg(1, senderTags[0], following)\n if err := writer.Flush(); err != nil { t.Fatal(err) }\n stream := append([]byte(nil), wire.Bytes()...)\n if len(stream) <= firstEnd || writer.Buffered() != 0 { t.Fatal(\"following transmission prerequisite not reached\") }\n emit(\"following_sent\", map[string]interface{}{\n  \"start_offset\": firstEnd, \"end_offset\": len(stream), \"write_ok\": true,\n  \"tail_hex\": hex.EncodeToString(stream[firstEnd:]),\n })\n underlying := bytes.NewReader(stream)\n reader := bufio.NewReader(underlying)\n tag, err := reader.ReadByte()\n if err != nil { t.Fatal(err) }\n selected, found := receiverTable.Get(tag)\n if !found { t.Fatal(\"emitted tag has no registered decoder\") }\n obj := selected.Obj.New()\n decoded, ok := obj.(*CommitShort)\n if !ok { t.Fatal(\"emitted tag did not select CommitShort\") }\n emit(\"decoder_selected\", map[string]interface{}{\n  \"tag\": tag, \"expected_tag\": r.commitShortRPC,\n  \"tag_matches\": tag == r.commitShortRPC, \"registered_short\": ok,\n })\n if err := obj.Unmarshal(reader); err != nil {\n  emit(\"decode_error\", map[string]interface{}{\"error\": err.Error()})\n  t.Fatal(err)\n }\n consumed := len(stream) - underlying.Len() - reader.Buffered()\n emit(\"short_decoded\", map[string]interface{}{\n  \"decode_ok\": true,\n  \"leader\": decoded.LeaderId, \"instance\": decoded.Instance,\n  \"ballot\": decoded.Ballot, \"count\": decoded.Count,\n  \"consumed_offset\": consumed,\n })\n remaining, err := io.ReadAll(reader)\n if err != nil { t.Fatal(err) }\n emit(\"remaining_stream\", map[string]interface{}{\n  \"read_ok\": true, \"tail_hex\": hex.EncodeToString(remaining),\n })\n}\n",
+      "description": "A serial component test calls unchanged target methods. Separate matching RPC tables reproduce the constructor's registration sequence using actual Register calls. The recipient performs the listener's Get/New/Unmarshal sequence. Events are emitted after actual transmission and decoder completion; comparison failures are evaluated by the shared monitors.",
+      "prerequisite_events": [
+        "broadcast_input",
+        "broadcast_sent",
+        "following_sent",
+        "decoder_selected"
+      ],
+      "semantic_changes": [
+        "Construct minimal replica state directly instead of invoking New, which starts networking and protocol goroutines.",
+        "Replace the peer socket with a lossless bytes.Buffer behind the actual bufio.Writer used by SendMsg.",
+        "Reproduce the constructor registration sequence with actual Table.Register calls; do not invoke the constructor itself.",
+        "Invoke the registered decoder synchronously using the listener's lookup and construction sequence; do not execute replicaListener or its asynchronous delivery.",
+        "Add observations in the test only. No target source edits or protocol-expression changes are proposed.",
+        "Restore package-level broadcast objects after the serial test."
+      ],
+      "prerequisites": [
+        {
+          "alias": "input",
+          "event": "broadcast_input",
+          "conditions": [
+            {
+              "field": "alive",
+              "op": "eq",
+              "value": true,
+              "reference": null
+            },
+            {
+              "field": "writer_present",
+              "op": "eq",
+              "value": true,
+              "reference": null
+            },
+            {
+              "field": "registration_matches",
+              "op": "eq",
+              "value": true,
+              "reference": null
+            },
+            {
+              "field": "registered_short",
+              "op": "eq",
+              "value": true,
+              "reference": null
+            },
+            {
+              "field": "stream_start",
+              "op": "eq",
+              "value": 0,
+              "reference": null
+            }
+          ]
+        },
+        {
+          "alias": "sent",
+          "event": "broadcast_sent",
+          "conditions": [
+            {
+              "field": "write_ok",
+              "op": "eq",
+              "value": true,
+              "reference": null
+            },
+            {
+              "field": "buffered",
+              "op": "eq",
+              "value": 0,
+              "reference": null
+            }
+          ]
+        },
+        {
+          "alias": "following",
+          "event": "following_sent",
+          "conditions": [
+            {
+              "field": "write_ok",
+              "op": "eq",
+              "value": true,
+              "reference": null
+            }
+          ]
+        },
+        {
+          "alias": "selected",
+          "event": "decoder_selected",
+          "conditions": [
+            {
+              "field": "tag_matches",
+              "op": "eq",
+              "value": true,
+              "reference": null
+            },
+            {
+              "field": "registered_short",
+              "op": "eq",
+              "value": true,
+              "reference": null
+            }
+          ]
+        }
+      ],
+      "legality": {
+        "source_ids": [
+          "paxos/paxos.go:24:160",
+          "paxos/paxos.go:161:397",
+          "replica/replica.go:1:136",
+          "replica/replica.go:137:349",
+          "replica/replica.go:350:577",
+          "rpc/rpc.go:1:48",
+          "state/state.go:1:80",
+          "state/state.go:81:254",
+          "paxos/defs.go:1:558"
+        ],
+        "expectation_ids": [
+          "paxos/paxos.go:161:397",
+          "paxos/paxos.go:24:160",
+          "replica/replica.go:350:577",
+          "paxos/defs.go:1:558"
+        ],
+        "binding_ids": [
+          "BIND_wire_broadcast",
+          "BIND_wire_send",
+          "BIND_wire_registration",
+          "BIND_wire_listener",
+          "BIND_wire_commit_encoder",
+          "BIND_wire_short_decoder"
+        ],
+        "derivation": "The selected obligation is a local interface contract inferred from the producer's intended pcs fields, its commitShortRPC tag, the corresponding registration, and the listener's shared-stream decoder. Inputs independently supply the four expected fields. The successful first transmission independently supplies its end offset; the subsequent actual SendMsg supplies the expected untouched suffix. Neither oracle predicts the bytes produced by Commit.Marshal or repeats the incorrect payload selection. The concrete PUT command uses the attached state serializer. bcastCommit requires no instance record for this invocation.",
+        "applicability": "Applies only after matching registration, an alive recipient, a nonnil writer, successful completed transmission, and selection of the registered short decoder are observed for the same operation and participants. The synchronous component schedule needs no asynchronous scheduling controls.",
+        "unresolved": [
+          "The registration and listener adapters require correspondence review before confirmation.",
+          "Compilation and execution have not occurred.",
+          "A complete consensus history producing this invocation is outside the selected scope."
+        ],
+        "conflicts": [
+          "The producer initializes pcs but supplies pc to SendMsg under commitShortRPC.",
+          "The supplied encoder and registered decoder have different field layouts and payload lengths."
+        ],
+        "alternatives": [
+          "The actual sender lock protects ordering but supplies no payload conversion.",
+          "Handler guards may limit downstream consequences; they do not establish wire fidelity."
+        ]
+      },
+      "legal_conditions": [
+        {
+          "field": "sender",
+          "op": "eq",
+          "value": 0,
+          "reference": null
+        },
+        {
+          "field": "recipient",
+          "op": "eq",
+          "value": 1,
+          "reference": null
+        },
+        {
+          "field": "operation",
+          "op": "eq",
+          "value": "short-commit-wire-1",
+          "reference": null
+        },
+        {
+          "field": "context",
+          "op": "eq",
+          "value": "ordered-memory-stream",
+          "reference": null
+        }
+      ],
+      "observation_changes": []
+    },
+    "monitors": [
+      {
+        "id": "monitor_wire_leader",
+        "checker_id": "wire_leader",
+        "event": "short_decoded",
+        "binding_ids": [
+          "BIND_wire_broadcast",
+          "BIND_wire_short_decoder"
+        ],
+        "grounding": {
+          "source_ids": [
+            "paxos/paxos.go:161:397",
+            "paxos/defs.go:1:558"
+          ],
+          "expectation_ids": [
+            "paxos/paxos.go:161:397",
+            "paxos/defs.go:1:558"
+          ],
+          "binding_ids": [
+            "BIND_wire_broadcast",
+            "BIND_wire_short_decoder"
+          ],
+          "derivation": "The producer assigns its replica ID to the intended notification LeaderId. Compare the completed decoder's raw LeaderId with the correlated input leader.",
+          "applicability": "Successful selected CommitShort decoding after the correlated transmission prerequisites.",
+          "unresolved": [],
+          "conflicts": [],
+          "alternatives": []
+        },
+        "applicability_conditions": [
+          {
+            "field": "decode_ok",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          }
+        ]
+      },
+      {
+        "id": "monitor_wire_instance",
+        "checker_id": "wire_instance",
+        "event": "short_decoded",
+        "binding_ids": [
+          "BIND_wire_broadcast",
+          "BIND_wire_short_decoder"
+        ],
+        "grounding": {
+          "source_ids": [
+            "paxos/paxos.go:161:397",
+            "paxos/defs.go:1:558"
+          ],
+          "expectation_ids": [
+            "paxos/paxos.go:161:397",
+            "paxos/defs.go:1:558"
+          ],
+          "binding_ids": [
+            "BIND_wire_broadcast",
+            "BIND_wire_short_decoder"
+          ],
+          "derivation": "The intended notification Instance comes from the broadcast argument. Compare the raw decoded field with that argument.",
+          "applicability": "Successful selected decoding with correlated prerequisites.",
+          "unresolved": [],
+          "conflicts": [],
+          "alternatives": []
+        },
+        "applicability_conditions": [
+          {
+            "field": "decode_ok",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          }
+        ]
+      },
+      {
+        "id": "monitor_wire_ballot",
+        "checker_id": "wire_ballot",
+        "event": "short_decoded",
+        "binding_ids": [
+          "BIND_wire_broadcast",
+          "BIND_wire_commit_encoder",
+          "BIND_wire_short_decoder"
+        ],
+        "grounding": {
+          "source_ids": [
+            "paxos/paxos.go:161:397",
+            "paxos/defs.go:1:558"
+          ],
+          "expectation_ids": [
+            "paxos/paxos.go:161:397",
+            "paxos/defs.go:1:558"
+          ],
+          "binding_ids": [
+            "BIND_wire_broadcast",
+            "BIND_wire_commit_encoder",
+            "BIND_wire_short_decoder"
+          ],
+          "derivation": "The intended pcs.Ballot is the broadcast ballot argument. Its independent oracle is the recorded argument, not an interpretation of the actual encoded bytes.",
+          "applicability": "Successful selected decoding with correlated prerequisites.",
+          "unresolved": [],
+          "conflicts": [
+            "Commit and CommitShort encode Ballot at different offsets."
+          ],
+          "alternatives": []
+        },
+        "applicability_conditions": [
+          {
+            "field": "decode_ok",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          }
+        ]
+      },
+      {
+        "id": "monitor_wire_count",
+        "checker_id": "wire_count",
+        "event": "short_decoded",
+        "binding_ids": [
+          "BIND_wire_broadcast",
+          "BIND_wire_commit_encoder",
+          "BIND_wire_short_decoder"
+        ],
+        "grounding": {
+          "source_ids": [
+            "paxos/paxos.go:161:397",
+            "paxos/defs.go:1:558"
+          ],
+          "expectation_ids": [
+            "paxos/paxos.go:161:397",
+            "paxos/defs.go:1:558"
+          ],
+          "binding_ids": [
+            "BIND_wire_broadcast",
+            "BIND_wire_commit_encoder",
+            "BIND_wire_short_decoder"
+          ],
+          "derivation": "The intended notification Count denotes the supplied batch cardinality. Compare the raw decoded Count with the recorded input batch length.",
+          "applicability": "The one-command batch has a representable count; successful selected decoding and correlated prerequisites are required.",
+          "unresolved": [],
+          "conflicts": [
+            "Commit places Ballot where CommitShort expects Count."
+          ],
+          "alternatives": []
+        },
+        "applicability_conditions": [
+          {
+            "field": "decode_ok",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          }
+        ]
+      },
+      {
+        "id": "monitor_wire_boundary",
+        "checker_id": "wire_boundary",
+        "event": "short_decoded",
+        "binding_ids": [
+          "BIND_wire_send",
+          "BIND_wire_listener",
+          "BIND_wire_commit_encoder",
+          "BIND_wire_short_decoder"
+        ],
+        "grounding": {
+          "source_ids": [
+            "replica/replica.go:137:349",
+            "replica/replica.go:350:577",
+            "paxos/defs.go:1:558"
+          ],
+          "expectation_ids": [
+            "replica/replica.go:350:577",
+            "paxos/paxos.go:24:160"
+          ],
+          "binding_ids": [
+            "BIND_wire_send",
+            "BIND_wire_listener",
+            "BIND_wire_commit_encoder",
+            "BIND_wire_short_decoder"
+          ],
+          "derivation": "The listener reads the next tag immediately after decoding. Therefore logical consumption, including the first tag, must equal the independently observed end offset of the first SendMsg. Subtract both underlying unread bytes and bufio buffered bytes to exclude read-ahead from consumption.",
+          "applicability": "An initially empty, immutable ordered stream contains the completed broadcast followed by a separately completed valid SendMsg.",
+          "unresolved": [
+            "The listener's decode sequence is adapted in the test rather than invoked through its private method."
+          ],
+          "conflicts": [
+            "The supplied layouts permit encoder length and decoder consumption to differ."
+          ],
+          "alternatives": []
+        },
+        "applicability_conditions": [
+          {
+            "field": "decode_ok",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          }
+        ]
+      },
+      {
+        "id": "monitor_wire_tail",
+        "checker_id": "wire_tail",
+        "event": "remaining_stream",
+        "binding_ids": [
+          "BIND_wire_send",
+          "BIND_wire_listener",
+          "BIND_wire_short_decoder"
+        ],
+        "grounding": {
+          "source_ids": [
+            "replica/replica.go:137:349",
+            "replica/replica.go:350:577",
+            "paxos/defs.go:1:558"
+          ],
+          "expectation_ids": [
+            "replica/replica.go:350:577"
+          ],
+          "binding_ids": [
+            "BIND_wire_send",
+            "BIND_wire_listener",
+            "BIND_wire_short_decoder"
+          ],
+          "derivation": "The complete unread suffix after decoding must equal the following message bytes captured after its actual SendMsg. Hex encoding preserves exact byte equality without predicting serializer output.",
+          "applicability": "The completed first decode and remaining-stream observation belong to the same immutable stream and operation as the following-message prerequisite.",
+          "unresolved": [],
+          "conflicts": [],
+          "alternatives": []
+        },
+        "applicability_conditions": [
+          {
+            "field": "read_ok",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          }
+        ]
+      }
+    ],
+    "observable_properties": [
+      {
+        "checker_id": "wire_leader",
+        "kind": "event_assertion",
+        "trigger": {
+          "field": "event",
+          "op": "eq",
+          "value": "short_decoded",
+          "reference": null
+        },
+        "assertion": {
+          "field": "leader",
+          "op": "eq",
+          "value": null,
+          "reference": "input.leader"
+        },
+        "identity_fields": [
+          "operation",
+          "sender",
+          "recipient",
+          "context"
+        ],
+        "history_field": null,
+        "description": "The completed registered short-commit decoder preserves the correlated broadcast's intended LeaderId."
+      },
+      {
+        "checker_id": "wire_instance",
+        "kind": "event_assertion",
+        "trigger": {
+          "field": "event",
+          "op": "eq",
+          "value": "short_decoded",
+          "reference": null
+        },
+        "assertion": {
+          "field": "instance",
+          "op": "eq",
+          "value": null,
+          "reference": "input.instance"
+        },
+        "identity_fields": [
+          "operation",
+          "sender",
+          "recipient",
+          "context"
+        ],
+        "history_field": null,
+        "description": "The completed registered short-commit decoder preserves the correlated broadcast's intended Instance."
+      },
+      {
+        "checker_id": "wire_ballot",
+        "kind": "event_assertion",
+        "trigger": {
+          "field": "event",
+          "op": "eq",
+          "value": "short_decoded",
+          "reference": null
+        },
+        "assertion": {
+          "field": "ballot",
+          "op": "eq",
+          "value": null,
+          "reference": "input.ballot"
+        },
+        "identity_fields": [
+          "operation",
+          "sender",
+          "recipient",
+          "context"
+        ],
+        "history_field": null,
+        "description": "The completed registered short-commit decoder preserves the correlated broadcast's intended Ballot."
+      },
+      {
+        "checker_id": "wire_count",
+        "kind": "event_assertion",
+        "trigger": {
+          "field": "event",
+          "op": "eq",
+          "value": "short_decoded",
+          "reference": null
+        },
+        "assertion": {
+          "field": "count",
+          "op": "eq",
+          "value": null,
+          "reference": "input.count"
+        },
+        "identity_fields": [
+          "operation",
+          "sender",
+          "recipient",
+          "context"
+        ],
+        "history_field": null,
+        "description": "The completed registered short-commit decoder reports the correlated input batch's command count."
+      },
+      {
+        "checker_id": "wire_boundary",
+        "kind": "event_assertion",
+        "trigger": {
+          "field": "event",
+          "op": "eq",
+          "value": "short_decoded",
+          "reference": null
+        },
+        "assertion": {
+          "field": "consumed_offset",
+          "op": "eq",
+          "value": null,
+          "reference": "sent.end_offset"
+        },
+        "identity_fields": [
+          "operation",
+          "sender",
+          "recipient",
+          "context"
+        ],
+        "history_field": null,
+        "description": "After the first tag and registered payload are decoded, logical stream consumption equals the observed end of exactly the first transmission."
+      },
+      {
+        "checker_id": "wire_tail",
+        "kind": "event_assertion",
+        "trigger": {
+          "field": "event",
+          "op": "eq",
+          "value": "remaining_stream",
+          "reference": null
+        },
+        "assertion": {
+          "field": "tail_hex",
+          "op": "eq",
+          "value": null,
+          "reference": "following.tail_hex"
+        },
+        "identity_fields": [
+          "operation",
+          "sender",
+          "recipient",
+          "context"
+        ],
+        "history_field": null,
+        "description": "The unread stream after short-commit decoding equals exactly the subsequent actual message, preserving all its bytes and its starting boundary."
+      }
+    ],
+    "uncertainties": [
+      "This is an unexecuted plan; no observed mismatch or successful compilation is claimed.",
+      "Independent review must assess the minimal replica construction, reproduced registrations, decoder adapter, and monitor correspondence.",
+      "The test covers one concrete nonempty batch and does not prove fidelity for other inputs.",
+      "Decoder errors or missing prerequisites are retained as incomplete execution evidence rather than substituted field observations.",
+      "Any supported failure is limited to the selected local wire contract; it does not establish an end-to-end consensus violation."
+    ]
+  },
+  "gap": "",
+  "requests": [],
+  "fallback": "none"
+}

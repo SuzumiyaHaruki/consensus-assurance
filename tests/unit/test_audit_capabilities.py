@@ -105,7 +105,7 @@ def test_R8_selected_archive_is_view_only(tmp_path):
     state=load_analysis(root/'state.json')
     assert state.framework_revision!=FRAMEWORK_REVISION and state.audit_spec_path and not state.claims and not state.evidence
     report=render_report(state,root).read_text()
-    assert '候选修复会话' in report and 'Audit unit references missing bindings or relations' in report
+    assert 'Audit unit references missing bindings or relations' in report
     state=state.model_copy(deep=True);state.framework_revision='historical-test-revision'
     from test_graph_mutations import controller
     engine=controller(tmp_path,state);engine.store=SimpleNamespace(load=lambda:state)

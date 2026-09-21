@@ -66,7 +66,7 @@ class ScopeAgent(MockAgent):
 def setup(tmp_path,prepared,tlc):
     repo,fixture=deferred_fixture(tmp_path,prepared[3]);responses=json.loads(fixture.read_text())
     cfg=Config(execution_backend='python',agent_backend='mock',tlc_jar=str(tlc[0].jar),allow_experiments=True)
-    cfg.budget.agent_calls=20;cfg.budget.semantic_reviews=6;cfg.budget.exploration_rounds=3;cfg.budget.material_chars=5000;cfg.budget.outer_reserve_seconds=1
+    cfg.budget.agent_calls=20;cfg.budget.semantic_reviews=6;cfg.budget.exploration_rounds=3;cfg.budget.material_chars=5000
     impl,_,verifier,knowledge=assemble(cfg)
     return repo,cfg,(impl,ScopeAgent(responses),verifier,knowledge,''),tmp_path/'scope-run'
 

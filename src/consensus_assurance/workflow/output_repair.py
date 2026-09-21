@@ -55,18 +55,8 @@ def repair_targets(value, errors, reason, limit):
                 if parent:containers.setdefault(parent,set()).add(route[-1]);route=route[:-1]
             paths.append(route)
     if not paths and isinstance(value,dict):
-        key='bundle' if isinstance(value.get('bundle'),dict) else 'draft' if isinstance(value.get('draft'),dict) else None
-        prefix=[key] if key else []
-        model=value[key] if key else value
-        if isinstance(model,dict):
-            if any(x in reason for x in ['Behavior module','TLA module','module feature','module dependency']): paths.append(prefix+['behavior'])
-            elif 'Checker declaration missing' in reason: paths.append(prefix+['properties'])
-            elif 'Harness kind' in reason: paths.append(prefix+['harness','kind'])
-            elif any(x in reason for x in ['Checker claims','Model must check','invariant-to-claim','Duplicate invariant']): paths.append(prefix+['checkers'])
-            elif 'constraint cites' in reason or 'transition constraint' in reason: paths.append(prefix+['constraints'])
-            elif 'Only constant assignments' in reason: paths.append(prefix+['constants'])
-            elif 'Feedback target' in reason: paths.append(['target_ids'])
-            elif 'Semantic feedback requires' in reason: paths.append(['evidence_ids'])
+        if 'Feedback target' in reason: paths.append(['target_ids'])
+        elif 'Semantic feedback requires' in reason: paths.append(['evidence_ids'])
     for route in paths:
         for parent,keys in containers.items():
             if tuple(route[:len(parent)])==parent and len(route)>len(parent):keys.add(route[len(parent)])

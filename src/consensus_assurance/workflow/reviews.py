@@ -124,7 +124,7 @@ def record_dispositions(state,review,reply,followup_ids):
     for item in reply.items:
         independent={x for r in reply.resolutions if r.issue_id in reply.resolves_issue_ids and any(i.id==r.issue_id and i.target_id==item.target_id and i.aspect==item.aspect for i in state.review_issues) for x in r.scope_limitations}
         unresolved=[x for x in item.counterevidence+item.limitations if x not in independent or x in item.counterevidence]
-        if item.status=='no_issue_found' and not unresolved:continue
+        if item.status=='no_issue_found' and not item.counterevidence:continue
         disposition='reading' if reply.requests else 'revision' if reply.revision else 'investigation' if followup_ids else 'blocked'
         prior=next((i for i in state.review_issues if not i.resolved_by and i.target_id==item.target_id and i.target_version==review.target_versions[item.target_id] and i.aspect==item.aspect and i.explanation==item.rationale),None)
         if prior:
@@ -150,7 +150,7 @@ def readiness(state,unit):
             candidates=[r for r in state.semantic_reviews if r.target_versions.get(id)==obj.version and includes(state,needed,r.material_ids) and all(r.context_dependencies.get(id,{}).get('dependency_versions',dependency['dependency_versions']).get(k)==v for k,v in dependency['dependency_versions'].items()) and any(i.target_id==id and i.aspect==aspect for i in r.items)]
             if not candidates:missing.append(id+':'+aspect);continue
             review=candidates[-1];reviews.append(review.id)
-            if any(i.target_id==id and i.aspect==aspect and (i.status!='no_issue_found' or i.limitations or i.counterevidence) for i in review.items):disputed.append(id+':'+aspect)
+            if any(i.target_id==id and i.aspect==aspect and (i.status!='no_issue_found' or i.counterevidence) for i in review.items):disputed.append(id+':'+aspect)
     disputed.extend(i.id for i in state.review_issues if i.target_id in relevant and not i.resolved_by)
     return {'unit_version':unit.version,'target_versions':{id:objects[id].version for id in ids},'material_ids':sorted(materials),
         'review_ids':sorted(set(reviews)),'status':'unreviewed' if missing else 'disputed' if disputed else 'reviewed',

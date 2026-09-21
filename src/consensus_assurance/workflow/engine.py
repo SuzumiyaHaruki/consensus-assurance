@@ -303,7 +303,7 @@ class Engine:
         key = self.state.pending_action.id if self.state.pending_action else None
         if key is None:
             raise Blocked("Model commit requires a persisted generation action")
-        model = save_bundle(self.root, self.state, unit, bundle, self.implementation, previous, reason, transaction_key=key)
+        model = save_bundle(self.root, self.state, unit, bundle, self.implementation, previous, reason, transaction_key=key, validated=True)
         self.model_commit_hook(model)
         if previous and bundle.properties!=load_model(previous).properties and "Encoding" in reason:
             from consensus_assurance.core.types import ReviewIssue
@@ -392,7 +392,7 @@ class Engine:
             if phase=='question_closed':
                 self.state.gaps.append('Scoped source explanation: '+unit.audit_question.trigger_rationale)
                 self.finish_unit(unit,'blocked');return
-            if phase in {"model_syntax", "model_explore", "model_repair", "harness"}:
+            if phase in {"model_syntax", "model_explore", "harness"}:
                 from .staged_model import proceed
                 proceed(self, unit, model, bundle, phase)
                 continue
@@ -410,6 +410,7 @@ class Engine:
                     context.update(previous_bundle=json.loads(Path(previous.bundle_path).read_text()),scope_delta={"before":previous.scope.model_dump(),"after":unit.scope.model_dump(),"added_bindings":list(set(unit.binding_ids)-set(previous.binding_ids)),"boundary_changes":unit.boundary_changes})
                 reply,_=self.ask("F3" if unit.previous_id else "build",BuildReply,context, lambda p: validate_build_reply(self.state,unit,p,self.implementation))
                 if reply.bundle is None and reply.draft is None:
+                    if not reply.requests:raise Blocked('Model construction blocked: '+reply.gap)
                     self.targeted_read(unit,reply.gap,requests=reply.requests,update_required=reply.reading_purpose=="dependency"); self.advance("build"); continue
                 if reply.draft is not None:
                     model=self.save_model(unit,reply.draft,previous,"Staged local model; implementation experiment pending")
@@ -541,12 +542,13 @@ class Engine:
                     self.budget.take("technical_repairs")
                 failure=next(c for c in self.state.checks if c.id==self.state.pending_feedback["check_id"])
                 reply,_=self.ask("technical",BuildReply,{**self.context(unit),"model_id":model.id,"semantic_versions":model.graph_versions,"bundle":bundle.model_dump(mode="json"),"failure":self.error_context(failure)}, lambda p: validate_build_reply(self.state,unit,p,self.implementation,bundle,self.state.pending_feedback["technical_phase"]))
-                if reply.bundle is None:
+                if reply.bundle is None and reply.draft is None:
+                    if not reply.requests:raise Blocked('Technical model repair blocked: '+reply.gap)
                     self.targeted_read(unit,reply.gap,requests=reply.requests,update_required=reply.reading_purpose=="dependency"); self.advance("technical_repair"); continue
-                repaired=reply.bundle
+                repaired=reply.draft or reply.bundle
                 new=self.save_model(unit,repaired,model,"Encoding correction: "+reply.encoding_revision.rationale if reply.encoding_revision else "Bounded technical repair; no semantic attribution")
                 self.state.active_model_id=new.id
-                self.advance("replay" if finding else "experiment" if self.config.allow_experiments else "search")
+                self.advance("model_syntax" if reply.draft else "replay" if finding else "experiment" if self.config.allow_experiments else "search")
             else: raise Blocked("Unknown checkpoint action: "+phase)
 
     def execute(self, probed=False, plan_only=False):
@@ -573,7 +575,6 @@ class Engine:
                     self.state.stop_reason = "Plan generated; modeling and checks not scheduled"
                     return self.state
                 inquiry.wake_changed(self)
-                self.budget.reserved_agent_calls=0;self.budget.reserved_seconds=0
                 can_inquire = inquiry.enabled(self) and (self.state.active_inquiry_id or (self.state.pending_action is None and self.state.pending_output_repair is None))
                 if can_inquire:
                     focused_review=any(t.kind=="review" and t.status=="pending" and t.unit_id in self.state.deferred_units for t in self.state.inquiry_tasks)
@@ -603,7 +604,6 @@ class Engine:
                     derive(self);continue
                 if self.state.active_unit_id:
                     active=next(u for u in self.state.units if u.id==self.state.active_unit_id)
-                    if inquiry.enabled(self): inquiry.reserve_for_inquiry(self)
                     try:
                         self.process_unit(active)
                     except (BudgetExhausted,Blocked,ValueError,OSError) as exc:
@@ -613,15 +613,12 @@ class Engine:
                 if self.state.audit_spec_path and not any(u.status in {'pending','partial'} for u in self.state.units) and 'derived-spec:'+str(self.state.audit_spec_version) not in self.state.completed_steps:
                     from .budget import can_start_episode
                     if not can_start_episode(self.state,'candidate'):
-                        self.state.stop_reason='Insufficient remaining agent calls to start a new candidate episode; unresolved work remains';break
+                        self.state.stop_reason='Insufficient calls for another candidate';break
                     derive(self);continue
                 if not any(u.status in {"pending", "partial"} for u in self.state.units):
-                    missing = [u.id + ": " + ", ".join(u.remaining_obligation_ids) for u in self.state.units if u.remaining_obligation_ids and u.status != "revised"]
-                    self.state.stop_reason = "Unfinished obligations remain without an executable next step: " + "; ".join(missing) if missing else "No pending executable audit units; unresolved gaps remain"
+                    self.state.stop_reason = "No pending executable audit units; unresolved gaps remain"
                     if inquiry.enabled(self) and any(t.status in {"blocked","pending","running"} for t in self.state.inquiry_tasks):
                         self.state.stop_reason="Inquiry work remains incomplete; exploration or review is blocked by budget, evidence or capability"
-                    elif inquiry.enabled(self) and any(u.status=="blocked" for u in self.state.units):
-                        self.state.stop_reason="Local audit work remains blocked; inspect remaining obligations and deferred actions"
                     break
                 if self.state.usage.get("audit_units", 0) >= self.config.budget.audit_units:
                     if inquiry.enabled(self):
@@ -646,6 +643,13 @@ class Engine:
             self.state.stop_reason = str(exc)
             self.state.gaps.append(str(exc))
         finally:
+            deferred=[u.id+' / '+d['next_action']+': '+d['reason'] for u in self.state.units if u.status=='blocked' for d in [self.state.deferred_units.get(u.id)] if d]
+            missing=[u.id+': '+', '.join(u.remaining_obligation_ids) for u in self.state.units if u.remaining_obligation_ids and u.status!='revised']
+            unfinished='Unfinished local work: '+'; '.join(deferred) if deferred else ''
+            if not unfinished and missing:
+                unfinished='Unfinished obligations remain without an executable next step: '+'; '.join(missing)
+            if unfinished:
+                self.state.stop_reason=unfinished+'; scheduler: '+self.state.stop_reason+f'; remaining agent calls={self.config.budget.agent_calls-self.state.usage.get("agent_calls",0)}, seconds={self.budget.remaining():.1f}'
             self.checkpoint("stopped")
             from consensus_assurance.reporting.chinese import export_views
             export_views(self.state,self.root)

@@ -77,7 +77,8 @@ class TLCVerifier:
             if check.exit_code==0 and 'Semantic processing of module Properties' in text and not re.search(r'(?i)(?:errors?:|fatal error|parse error|lexical error|abort)',text):
                 check.outcome='not_applicable';check.reason='SANY parsed the saved modules; no property or implementation conclusion'
             else:
-                check.status=ExecutionStatus.ERROR;check.reason='Model syntax error'
+                check.status=ExecutionStatus.ERROR
+                check.reason='Model syntax error' if re.search(r'(?i)(?:semantic errors|parse error|lexical error|unknown operator)',text) else 'SANY execution failed or produced no complete recognized result'
         return check
 
     def reachability(self,runner,model,bundle,requirement,timeout):

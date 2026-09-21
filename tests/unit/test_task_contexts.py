@@ -1,7 +1,8 @@
 from pathlib import Path
+from importlib.resources import files
 import sys
 import pytest
-from consensus_assurance.workflow.prompts import render
+from consensus_assurance.workflow.prompts import render, loaded_resources
 from consensus_assurance.workflow.investigation import feedback_context, validate_replay
 from consensus_assurance.workflow.artifacts import save_bundle
 from consensus_assurance.workflow.engine import Engine
@@ -16,9 +17,10 @@ from consensus_assurance.adapters.runners.python import PythonBackend
 @pytest.mark.parametrize('kind',['build','F1','F3','technical'])
 def test_modeling_guidance_is_in_every_actual_render(kind):
     text=render(kind,{'file':'/目录/源文件.go'})
-    assert 'Use MODULE Behavior with Init, Next, vars, and Obs' in text
-    assert 'Split actions at actual interruptible boundaries' in text
-    assert 'Emit lines prefixed CA_EVENT' in text
+    paths=loaded_resources(kind,{})['paths']
+    assert 'skills/local-modeling/references/context-history.md' in paths
+    assert ('skills/evidence-review/references/experiments.md' in paths)==(kind in {'F1','technical'})
+    assert all(files('consensus_assurance').joinpath('resources',p).read_text() in text for p in paths)
     assert '/目录/源文件.go' in text
 
 

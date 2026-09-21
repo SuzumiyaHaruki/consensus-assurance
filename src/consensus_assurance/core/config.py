@@ -32,7 +32,6 @@ class Budget(Record):
     exploration_rounds: int = Field(default=3, ge=0)
     semantic_reviews: int = Field(default=4, ge=0)
     graph_objects: int = Field(default=1000, ge=1)
-    outer_reserve_seconds: float = Field(default=60, ge=0)
     error_context_chars: int = Field(default=16000, ge=1000)
 
 

@@ -17,8 +17,10 @@ def enqueue(state, kind, reason, trigger, activity_classes=(), target_ids=(), un
     signature=(kind,trigger,tuple(activity_classes),tuple(target_ids),unit_id,model_id,tuple(surface_entry_points),candidate_id)
     for task in state.inquiry_tasks:
         if (kind==task.kind=='spec_refine' and diagnostics and task.status=='pending'
-                and set(task.target_ids)==set(target_ids) and task.candidate_id==candidate_id):
+                and task.candidate_id==candidate_id and (set(task.target_ids)==set(target_ids)
+                    or candidate_id is None and set(task.target_ids)&set(target_ids))):
             task.diagnostics.extend(diagnostics)
+            task.target_ids=list(dict.fromkeys(task.target_ids+list(target_ids)))
             return task
         if signature==(task.kind,task.trigger,tuple(task.activity_classes),tuple(task.target_ids),task.unit_id,task.model_id,tuple(task.surface_entry_points),task.candidate_id):
             return task
@@ -83,6 +85,7 @@ def choose_task(engine):
             task.status='blocked';task.stop_reason='Budget exhausted or disabled: '+resource
     pending=[t for t in pending if t.status=='pending' and not t.superseded_by]
     if state.active_unit_id:
+        if state.next_action in {'select','build','technical_repair','model_syntax','model_explore','harness'}:return None
         local=[t for t in pending if t.unit_id==state.active_unit_id]
         # Executable checks precede generic inquiry; explicit selected reviews still run.
         return next((t for t in local if t.kind=='review'),None)
@@ -93,6 +96,9 @@ def choose_task(engine):
     if any(c.status=='active' for c in state.question_candidates):return None
     feedback=[t for t in pending if t.kind=='review' or t.candidate_id]
     if feedback:return feedback[0]
+    if state.last_work_kind in {'candidate','local','review'}:
+        enrichment=next((t for t in pending if t.diagnostics and not t.candidate_id),None)
+        if enrichment:return enrichment
     from .audit_spec import next_surface_refinement
     from .budget import can_start_episode
     if can_start_episode(state,'surface') and state.usage.get('exploration_rounds',0)<engine.config.budget.exploration_rounds:
@@ -212,12 +218,6 @@ def pause_unit(engine, reason):
     engine.checkpoint('local_work_deferred_for_other_tasks')
 
 
-def reserve_for_inquiry(engine):
-    pending=[t for t in engine.state.inquiry_tasks if t.status=='pending' and t.unit_id==engine.state.active_unit_id and (not inquiry_resource(t) or engine.state.usage.get(inquiry_resource(t),0)<getattr(engine.config.budget,inquiry_resource(t)))]
-    engine.budget.reserved_agent_calls=min(2,len(pending))
-    engine.budget.reserved_seconds=engine.config.budget.outer_reserve_seconds if pending else 0
-
-
 def semantic_limitations(state, model):
     available=objects(state)
     lineage={model.id}
@@ -238,7 +238,7 @@ def semantic_limitations(state, model):
             latest[key]=item
     result=[]
     for item in latest.values():
-        if item.status!='no_issue_found' or item.limitations or item.counterevidence:
+        if item.status!='no_issue_found' or item.counterevidence:
             result.append('Unresolved semantic review for '+item.target_id+': '+item.rationale)
     for task in state.inquiry_tasks:
         if task.kind=='review' and task.status in {'pending','running','blocked'} and not task.superseded_by and not any(valid_supersession(state,r,task) for r in state.semantic_reviews) and any(i in relevant and i in available and task.target_versions.get(i)==getattr(available[i],'version',1) for i in task.target_ids):
@@ -321,14 +321,14 @@ def apply_task_response(engine,task_id,reply,check):
                 if state.active_model_id==task.model_id:
                     state.active_model_id=None;state.active_direct_check_id=None;state.active_finding_id=None;state.next_action='select'
         followup_before={t.id for t in state.inquiry_tasks}
-        if reply.requests:
-            focus=[i for i in reply.items if i.status!='no_issue_found' or i.limitations]
+        focus=[i for i in reply.items if i.status!='no_issue_found' or i.counterevidence]
+        if reply.requests and focus:
             targets=list(dict.fromkeys(i.target_id for i in focus)) or task.target_ids
             follow=enqueue(state,'review','Follow up only the unresolved aspects using the requested source',task.id+':followup',target_ids=targets,unit_id=task.unit_id,model_id=task.model_id,requests=reply.requests)
             follow.requested_aspects={id:list(dict.fromkeys(i.aspect for i in focus if i.target_id==id)) or task.requested_aspects.get(id,list(required_aspects(objects(state)[id]))) for id in targets}
             follow.resolution_issue_ids=[i.id for i in state.review_issues if not i.resolved_by and i.target_id in targets and i.aspect in follow.requested_aspects[i.target_id]]
         record_dispositions(state,review,reply,[t.id for t in state.inquiry_tasks if t.id not in followup_before])
-        if reply.requests:
+        if reply.requests and focus:
             follow.resolution_issue_ids=[i.id for i in state.review_issues if not i.resolved_by and i.target_id in targets and i.aspect in follow.requested_aspects[i.target_id]]
         state.gaps.extend(reply.limitations)
     task.repair_session=None;task.check_id=check.id;task.status='blocked' if task.stop_reason=='Focused review still omitted required aspects' else 'completed';task.stage='done';state.active_inquiry_id=None
@@ -381,6 +381,7 @@ def wake_changed(engine):
     for unit in state.units:
         saved=state.deferred_units.get(unit.id)
         if unit.status!='blocked' or not saved or not saved.get('basis'):continue
+        if (saved.get('pending_output_repair') or {}).get('mode')=='model_generation':continue
         if saved['basis']==local_basis(state,unit):continue
         if saved.get('pending_output_repair',{} ) and saved['pending_output_repair'].get('blocked'):continue
         unit.status='selected';state.active_unit_id=unit.id;state.active_model_id=saved['model_id'];state.active_finding_id=saved['finding_id'];state.active_direct_check_id=saved.get('direct_check_id')

@@ -192,9 +192,13 @@ def test_counterevidence_blocks_even_with_no_issue_status(tmp_path,prepared):
     from consensus_assurance.workflow.reviews import record_dispositions
     from consensus_assurance.core.types import SemanticReview
     _,state,_,_=prepared;e=controller(tmp_path,state);task,packet=packet_for(e,[state.claims[1].id]);reply=respond(packet)
-    reply.items[0].counterevidence=['A producer failure remains unexplained']
+    reply.items[0].limitations=['Model execution and implementation calibration remain pending']
     review=SemanticReview(task_id=task.id,check_id='fixture',target_versions=task.target_versions,material_ids=task.material_ids,items=reply.items,origin='mock')
     state.semantic_reviews.append(review);record_dispositions(state,review,reply,[])
+    assert not state.review_issues and readiness(state,state.units[0])['status']!='disputed'
+    assert review.items[0].limitations
+    review.items[0].counterevidence=['A producer failure remains unexplained']
+    record_dispositions(state,review,reply,[])
     assert state.review_issues and readiness(state,state.units[0])['status']!='reviewed'
 
 

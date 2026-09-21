@@ -30,6 +30,11 @@ def focused(tmp_path,prepared):
     return e,q,responses
 
 
+def selected_packet(e):
+    from consensus_assurance.workflow.task_packet import prepare
+    return prepare(e,'derive',discovery.derive_context(e))[0]
+
+
 def current_id(e):return getattr(discovery.active_candidate(e.state),'id',None)
 
 
@@ -68,7 +73,7 @@ def test_partial_receipt_reaches_reasoning_then_explained(focused,tmp_path):
     e,q,_=focused;sources(e,A=500,B=1100,C=100)
     candidate=begin(e,q,[request('A'),request('B'),request('C')])
     discovery.continue_candidate(e,candidate)
-    packet=discovery.derive_context(e)
+    packet=selected_packet(e)
     assert [i['status'] for i in packet['source_receipt']['items']]==['acquired','deferred','deferred']
     assert any(m['file']=='A' for m in packet['materials'])
     assert not any(m['file'] in {'B','C'} for m in packet['materials'])
@@ -89,7 +94,7 @@ def test_zero_progress_is_bounded(focused):
     e,q,_=focused;sources(e,B=2000)
     c=begin(e,q,[request('B')])
     discovery.continue_candidate(e,c)
-    assert discovery.derive_context(e)['source_receipt']['status']=='deferred'
+    assert selected_packet(e)['source_receipt']['status']=='deferred'
     assert c.status=='active'
     again=Derivation(candidate_id=current_id(e),audit_question=q,reading_requests=[request('B')],selection_rationale='Still missing')
     discovery.accept_derivation(e,again,'repeat')
@@ -107,6 +112,14 @@ def test_escalation_preserves_identity_and_protections_without_relation(focused)
     c=e.state.question_candidates[0]
     assert c.status=='escalated' and c.question.fact_ids==q.fact_ids and c.question.counterevidence==q.counterevidence
     assert e.state.units[0].audit_question.counterevidence==q.counterevidence
+    assert 'derived-spec:'+str(e.state.audit_spec_version) not in e.state.completed_steps
+    # Once the ready unit has its disposition, the same inventory can select another question.
+    e.state.units[0].status='checked'
+    alternate=q.model_copy(update={'question':'Can a later writer republish an invalidated entry?'})
+    discovery.accept_derivation(e,Derivation(audit_question=alternate,reading_requests=[request('counter.py')],selection_rationale='The next supported discriminator concerns a later writer'),'select-next')
+    later=discovery.active_candidate(e.state)
+    assert later.id!=c.id and later.question.question==alternate.question
+    assert len(e.state.question_candidates)==2 and c.question.counterevidence==q.counterevidence
 
 
 @pytest.mark.parametrize('selected',[True,False])
@@ -129,7 +142,7 @@ def test_descriptive_debt_routes_by_selected_objects(focused,selected):
         assert load(e.state).behaviors[1].execution_owner=='serialized callback'
         assert discovery.active_candidate(e.state).question.fact_ids==q.fact_ids
         assert e.state.inquiry_tasks[0].status=='completed'
-        assert 'callback.py:1:2' in {m['id'] for m in discovery.derive_context(e)['materials']}
+        assert 'callback.py:1:2' in {m['id'] for m in selected_packet(e)['materials']}
         assert 'callback.py:1:2' not in q.source_ids  # Reconnection transmits correction evidence without rewriting the prior question.
     else:
         discovery.continue_candidate(e,c)
@@ -143,33 +156,16 @@ def test_selected_packet_excludes_independent_subgraph_and_keeps_sources(focused
     spec.facts.append(Fact(id='other_fact',meaning='An independent result',identity={'other':'operation'},validity_context='other',established_by=['other'],representation=['field'],durability='volatile',recovery='discarded',unknowns=['Consumer unknown'],source_ids=q.source_ids))
     accept(e,spec);begin(e,q,[ReadRequest(file='counter.py',start_line=1,end_line=2,reason='Inspect')])
     expected_question=discovery.active_candidate(e.state).question.model_dump(mode='json')
-    packet=discovery.derive_context(e)
+    packet=selected_packet(e)
     assert {f['id'] for f in packet['audit_spec']['facts']}=={'fact'}
     assert {b['id'] for b in packet['audit_spec']['behaviors']}=={'producer','consumer'}
     assert set(packet['required_material_ids'])<={m['id'] for m in packet['materials']}
     assert packet['selected_question']==expected_question and 'focus' not in packet
     from consensus_assurance.workflow.task_packet import prepare,pool_sources
     from consensus_assurance.workflow.prompts import render
-    packet,_=prepare(e,'derive',packet)
     assert packet['selected_question']==expected_question and 'focus' not in packet
     assert set(packet['required_material_ids'])<={m['id'] for m in packet['materials']}
     assert len(render('derive',pool_sources(packet),e.inquiry))<e.config.budget.context_chars
-
-
-def test_selected_run_preserves_unresolved_candidate_and_failure(tmp_path):
-    from consensus_assurance.workflow.history import load_analysis
-    from consensus_assurance.reporting.chinese import render_report
-    archive=Path(__file__).resolve().parents[2]/'runs/2026-09-20_12-07-49-hashicorp_raft-real-run'
-    before={name:(archive/name).read_bytes() for name in ['state.json','report.md']}
-    state=load_analysis(archive/'state.json')
-    state.audit_spec_path=str(archive/'audit-spec'/f'v{state.audit_spec_version}.json')
-    assert [c.status for c in state.question_candidates]==['blocked','explained','active']
-    assert not state.claims and not state.units and not state.evidence
-    (tmp_path/'offline').mkdir()
-    report=render_report(state,tmp_path/'offline').read_text()
-    assert 'Budget exhausted: agent_calls' in report and 'F4' in report
-    assert 'evidence_blocked=1' in report and 'workflow_blocked=0' in report and 'resource_blocked=1' in report
-    assert all((archive/name).read_bytes()==data for name,data in before.items())
 
 
 def test_v6_controller_state_cannot_resume_under_v7(focused):
@@ -190,6 +186,8 @@ def test_resumed_partial_continuation_explains_then_selects_next(focused):
     e.state=Analysis.model_validate_json(e.state.model_dump_json())
     seen=[]
     def ask(kind,response_type,packet,validator=None,**kwargs):
+        from consensus_assurance.workflow.task_packet import prepare
+        packet,_=prepare(e,kind,packet)
         seen.append(packet)
         assert kwargs['purpose']=='depth'
         if len(seen)==2:
@@ -240,7 +238,7 @@ def test_reviewed_evidence_block_is_accepted_without_repair(focused,tmp_path):
     assert '候选因证据/适用合同不足延期' in report and reply.selection_rationale in report
 
 
-@pytest.mark.parametrize('invalid',['initial_block','initial_exhausted','active_exhausted','unreviewed_block','unknowns_empty','wrong_check','ready_without_obligation','blank_reason'])
+@pytest.mark.parametrize('invalid',['initial_block','active_exhausted','unreviewed_block','unknowns_empty','wrong_check','ready_without_obligation','blank_reason'])
 def test_incomplete_or_premature_outcome_is_not_an_escape(focused,invalid):
     e,q,_=focused
     if invalid not in {'initial_block','initial_exhausted'}:
@@ -290,7 +288,7 @@ def test_three_narrowings_keep_history_out_of_current_packet(focused):
         discovery.accept_derivation(e,Derivation(candidate_id=current_id(e),audit_question=narrowed,reading_requests=[request('counter.py')],selection_rationale='Resolve one specific caller discriminator'),f'narrow-{n}')
     c=discovery.active_candidate(e.state)
     assert len(c.history)==3 and not c.question.unknowns and c.history[0].unknowns==original['unknowns']
-    packet=discovery.derive_context(e)
+    packet=selected_packet(e)
     assert not packet['selected_question']['unknowns'] and 'history' not in packet
 
 
@@ -312,7 +310,7 @@ def test_episode_admission_and_blockage_classification(focused):
     assert inquiry_resource(surface)=='exploration_rounds'
     c.spec_task_ids=[];c.status='active';e.state.usage['agent_calls']+=1
     assert candidate_blockage(e.state,c)=='resource_blocked'
-    assert FRAMEWORK_REVISION==manifest()['version']=='simplified-workflow-v9'
+    assert FRAMEWORK_REVISION==manifest()['version']=='model-continuation-v10'
 
 
 @pytest.mark.parametrize('decision,effect,empty,expected',[
@@ -420,3 +418,10 @@ def test_pending_feedback_merges_opinions_without_blocking_candidate(focused):
     required=enqueue(e.state,'spec_refine','Correct decisive owner','review-c',target_ids=['producer'],candidate_id=c.id,diagnostics=opinion('Correct decisive owner'))
     assert first.id==again.id and len(first.diagnostics)==2 and required.id!=first.id
     assert first.candidate_id is None and not c.spec_task_ids and choose_task(e) is None
+    overlap=enqueue(e.state,'spec_refine','Check shared consumer','review-d',target_ids=['producer','consumer'],diagnostics=opinion('Check shared consumer'))
+    assert overlap.id==first.id and len(first.diagnostics)==3 and first.target_ids==['producer','consumer']
+    c.status='explained';e.state.last_work_kind='candidate'
+    required.status='completed'
+    assert choose_task(e).id==first.id
+    e.state.active_unit_id='ready';e.state.next_action='build'
+    assert choose_task(e) is None

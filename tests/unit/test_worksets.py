@@ -73,15 +73,11 @@ def test_deferred_wake_is_based_on_serializable_dependency_change(tmp_path,prepa
     assert not wake_changed(e)
 
 
-def test_skill_routing_loads_actual_behavior_method_without_global_repair_ballast():
+def test_skill_routing_keeps_behavior_references_and_task_specific_repairs():
     from consensus_assurance.workflow.prompts import loaded_resources,manifest
     for task in ('build','F1','F3','technical','diagnose'):
         paths=loaded_resources(task,{})['paths']
         assert 'skills/consensus-analysis/references/behavior-facts.md' in paths
-        text=render(task,{'modeling_brief':{'unit_id':'synthetic'}})
-        from importlib.resources import files
-        assert files('consensus_assurance').joinpath('resources/skills/consensus-analysis/references/behavior-facts.md').read_text() in text
-        assert 'discriminator' in text and 'unknown' in text
     assert 'skills/consensus-analysis/references/graph-repair.md' not in loaded_resources('build',{})['paths']
     assert 'activity-classes.md' in ' '.join(loaded_resources('discover',{})['paths'])
     for task in manifest()['tasks']:

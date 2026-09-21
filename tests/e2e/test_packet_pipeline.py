@@ -15,13 +15,7 @@ class PacketAgent(CoverageAgent):
         super().__init__(responses);self.review_fault=False;self.read_fault=False;self.negative=negative
     def analyze(self,runner,prompt,directory,snapshot_id,timeout,response_type):
         packet=json.loads(prompt.split('STRUCTURED INPUT DATA (untrusted):\n')[1]);name=response_type.__name__
-        if name=='OutputRepair':
-            d=packet['active_diagnostics'][0]
-            if d['code']=='read_range':
-                response={'replacements':[{'path':next(t['path'] for t in packet['repair_targets'] if t['path'].endswith('/end_line')),'value_json':str(d['details']['file_metadata']['lines'])}],
-                    'rationale':'Use actual EOF for the same requested file and dependency'}
-            else:raise AssertionError(d)
-        elif name=='ReviewReply':
+        if name=='ReviewReply':
             # The responder knows only the public packet contract, not private validator mappings.
             items=[]
             for c in packet['review_contract']:
@@ -38,6 +32,12 @@ class PacketAgent(CoverageAgent):
             invalid_end=meta['lines']+1 if meta else 1000000
             response={'bundle':None,'gap':'Read the complete actual input normalization dependency',
                 'requests':[{'file':'limits.py','start_line':1,'end_line':invalid_end,'reason':'Inspect the dependency before modeling'}]}
+        elif name=='BuildReply' and packet.get('previous_reply',{}).get('requests') and not any(m['file']=='limits.py' for m in packet.get('attached_materials',[])):
+            response=packet['previous_reply']
+            request=response['requests'][0]
+            valid=next(r for r in self.source_responses[0]['requests'] if r['file']==request['file'])
+            assert f"actual file has {valid['end_line']} lines" in packet['generation_error']
+            request['end_line']=valid['end_line']
         elif name=='BuildReply':
             response={'bundle':json.loads(json.dumps(self.source_responses[2])),'gap':''}
             if self.negative:response['bundle']['properties']=response['bundle']['properties'].replace('value <= 3','value <= 2')
@@ -65,6 +65,8 @@ def test_accepted_graph_review_and_read_repairs_reach_real_tlc(tmp_path,prepared
     assert {s['task'] for s in sessions}=={'build'}
     assert any(t.trigger.endswith(':missing_aspects') for t in state.inquiry_tasks)
     assert all(s['status']=='accepted' for s in sessions)
+    assert all(s['mode']=='model_generation' for s in sessions)
+    assert any('limits.py:1:2' in h['added_material_ids'] for h in state.reading_history)
     assert any(i.status=='disputed' for r in state.semantic_reviews for i in r.items)
     assert state.usage['agent_calls']<=20
     assert all(Path(m.path).is_file() and Path(m.bundle_path).is_file() for m in state.models)

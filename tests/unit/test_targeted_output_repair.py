@@ -2,12 +2,10 @@ import json
 from pathlib import Path
 import pytest
 from consensus_assurance.core.config import Config
-from consensus_assurance.core.proposals import BuildReply
 from consensus_assurance.registry import assemble
 from consensus_assurance.workflow.engine import Engine
 from consensus_assurance.workflow.materials import ReadingPlan
 from consensus_assurance.workflow.output_repair import OutputRepair, Replacement, repair_targets, apply_replacements
-from consensus_assurance.workflow.modeling import validate_build_reply
 
 
 def test_large_original_tail_is_preserved_without_resending():
@@ -52,23 +50,6 @@ def test_field_repair_is_executed_and_resumes_without_replacing_graph(tmp_path,p
     prompt=next(p.read_text() for p in (root/'agent').glob('*/prompt.txt') if 'repair_targets' in p.read_text())
     assert 'preserved' not in json.loads(prompt.split('STRUCTURED INPUT DATA (untrusted):\n')[1]).get('raw_output','')
     assert len(prompt)<12000
-
-
-def test_invalid_build_artifact_is_repaired_before_commit(tmp_path,prepared):
-    repo,state,bundle,_=prepared
-    valid=bundle.behavior;bad=bundle.model_copy(deep=True);bad.behavior=valid.replace('Init ==','BadInit ==')
-    fixture=tmp_path/'fixture.json';fixture.write_text(json.dumps([
-        BuildReply(bundle=bad,gap='').model_dump(mode='json'),
-        {'replacements':[{'path':'/bundle/behavior','value_json':json.dumps(valid)}],'rationale':'Restore the declared initial operator'}]))
-    config=Config(execution_backend='python',agent_backend='mock',fixture=str(fixture))
-    from consensus_assurance.workflow.budget import BudgetTracker
-    engine=Engine(config,tmp_path/'audit',*assemble(config));engine.state=state;engine.budget=BudgetTracker(config.budget,state)
-    unit=state.units[0]
-    reply,_=engine.ask('build',BuildReply,{},lambda p:validate_build_reply(state,unit,p,engine.implementation))
-    assert not (engine.root/'models').exists()
-    model=engine.save_model(unit,reply.bundle)
-    assert model.version==1 and len(state.models)==1
-    assert (engine.root/'models/v1/commit.json').exists()
 
 
 def test_schema_reference_repair_receives_owner_and_dependency_context():

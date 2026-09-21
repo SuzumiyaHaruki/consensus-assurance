@@ -72,7 +72,6 @@ def descriptive_projection(engine,kind,context,task):
     profile=(view or {}).get('target_profile',{})
     orientation={k:profile[k] for k in ('system_boundary','protocol_contexts') if k in profile and (not level or k=='system_boundary')}
     local={k:v for k,v in (view or {}).items() if k!='target_profile'}
-    orientation['activities']=[{k:a[k] for k in ('class_id','realization_summary')} for a in local.get('activities',[])]
     if 'target_profile' in seeds:local['target_profile']=profile
     if not question and not seeds:
         local={k:[{field:o[field] for field in fields if field in o} for o in local.get(k,[])] for k,fields in {'activities':['class_id','realization_summary','unknowns'],'behaviors':['id','primary_activity','execution_owner','trigger','produces_fact_ids','consumes_fact_ids'],'facts':['id','meaning','identity','validity_context','source_ids']}.items()}
@@ -95,7 +94,6 @@ def descriptive_projection(engine,kind,context,task):
         result['candidate_dispositions']=[{'id':c.id,'question':c.question.question,'fact_ids':c.question.fact_ids,
             'lifecycle':c.question.obligation_relation_kind,'scope':{'objects':c.question.objects,'contexts':c.question.contexts,'event_paths':c.question.event_paths},
             'status':c.status,'reason':c.stop_reason} for c in state.question_candidates]
-        result['pending_enrichment']=[{'id':t.id,'target_ids':t.target_ids,'reason':t.reason} for t in state.inquiry_tasks if t.kind=='spec_refine' and not t.candidate_id and t.status=='pending']
     result['existing_objects']=[{'id':o.id,'version':o.version} for name in ('claims','bindings','relations','units') for o in getattr(state,name)] if kind=='derive' else []
     return result
 
@@ -106,6 +104,8 @@ def prepare(engine,kind,context):
     task=next((t for t in state.inquiry_tasks if t.id==context.get('task',{}).get('id',state.active_inquiry_id)),None) if kind!='derive' else None
     if kind in {'spec_refine','derive'}:packet=descriptive_projection(engine,kind,context,task)
     elif kind=='semantic_review' and task:packet=review_projection(engine,task)
+    if kind in {'derive','build','F3','technical','harness'}:
+        packet['pending_enrichment']=[{'id':t.id,'target_ids':t.target_ids,'opinions':[{k:d[k] for k in ('message','material_ids')} for d in t.diagnostics]} for t in state.inquiry_tasks if t.kind=='spec_refine' and not t.candidate_id and t.status=='pending' and t.diagnostics]
     if kind=='semantic_review':
         if task:
             from .inquiry import objects
@@ -172,7 +172,7 @@ def receipt(engine,kind,packet,prompt,schema,task=None,repair=False):
     def size(value):
         text=json.dumps(value,ensure_ascii=False,indent=2)
         return {'chars':len(text),'bytes':len(text.encode())}
-    groups={'sources':{'materials','new_materials','initial_materials','source_text_pool'},'current_graph':{'unit','claims','bindings','relations','modeling_brief','review_contract'},
+    groups={'sources':{'materials','new_materials','initial_materials','source_text_pool'},'current_graph':{'unit','claims','bindings','relations','review_contract'},
         'semantic_view':{'semantic_view','open_issues','resolved_issues'},'catalogue':{'file_lookup','file_metadata','catalogue','audit_spec'}}
     sections={name:size({k:v for k,v in packet.items() if k in keys}) for name,keys in groups.items()}
     instructions=prompt.split('STRUCTURED INPUT DATA (untrusted):\n',1)[0]

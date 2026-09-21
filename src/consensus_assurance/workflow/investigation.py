@@ -28,7 +28,7 @@ def validate_feedback(state, unit, bundle, feedback, implementation, requested_k
     if requested_kind in {'F1','F4'} and feedback.kind != requested_kind:
         raise ValueError('Feedback attempts to change a different semantic object')
     if feedback.bundle:
-        validate_bundle(state,unit,feedback.bundle,implementation)
+        feedback.bundle=validate_bundle(state,unit,feedback.bundle,implementation)
     copied = state.model_copy(deep=True)
     copied_unit = next(u for u in copied.units if u.id == unit.id)
     apply_feedback(copied,copied_unit,bundle,feedback)

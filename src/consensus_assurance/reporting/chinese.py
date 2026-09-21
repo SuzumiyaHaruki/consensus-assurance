@@ -278,7 +278,7 @@ def render_report(state, root):
         lines += [f"单元 `{unit.id}` 逐项执行进度：{unit.obligation_checks}；尚待检查：{unit.remaining_obligation_ids or ([c for c in unit.obligation_ids if c not in unit.obligation_checks] if unit.status != 'checked' else [])}。已检查仅指记录范围内的 checker，不代表义务整体成立。"]
         if unit.recheck_reasons:
             lines += [f"重验任务 `{unit.id}`：{'；'.join(unit.recheck_reasons)}；调度状态 `{unit.status}`。"]
-    lines += ["", "## 候选修复会话", "", "原始候选、当前版本、修复 patch 与问题计数分开保存；调用完成不等于候选或语义已接受。"]
+    lines += ["", "## 候选修复与模型续写", "", "模型续写保存原稿、当前工作草稿及错误，返回完整修订稿；其他对象按具体字段修复。未完成草稿不等于受理模型，调用完成也不等于语义问题已解决。"]
     for session in state.repair_sessions.values():
         lines.append(f"会话 `{session['id']}`：{session.get('status')}；候选版本 {session['version']}；修复调用 {session['attempt']}；原始候选 {link(session['original_path'])}；当前候选 {link(session['current_path'])}；问题 {session.get('error','')}。")
         lines.append(f"诊断及材料：{session.get('diagnostics',[])}；重复失败：{session.get('problem_failures',{})}；显式范围/语义计划：{session.get('proposed_change','无')}。")
@@ -295,7 +295,7 @@ def render_report(state, root):
         task, product, verdict = execution_summary(check)
         diagnostic = f"{link(check.stdout)} / {link(check.stderr)}"
         if check.action == "agent":
-            for name in ("response.json", "validation-error.txt", "graph-validation-error.txt"):
+            for name in ("response.json", "validation-error.txt", "graph-validation-error.txt", "generation-error.json"):
                 artifact = Path(check.cwd) / name
                 if artifact.is_file():
                     diagnostic += " / " + link(artifact)

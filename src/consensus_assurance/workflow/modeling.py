@@ -1,5 +1,31 @@
 """Pure model acceptance and execution coverage policies."""
-from .artifacts import validate_bundle
+import json
+from pathlib import Path
+from .artifacts import materialize_bundle, validate_bundle
+
+
+def continue_generation(engine, kind, logical_task, raw, check, reason, session, requests=()):
+    """Keep unfinished generation in its original task, outside field replacement."""
+    from consensus_assurance.core.types import uid
+    from consensus_assurance.adapters.storage.files import write_json
+    from .output_repair import save_session
+    if session is None:
+        folder=engine.root/'repair-sessions'/uid()
+        write_json(folder/'original.json',raw)
+        session={'id':folder.name,'task':kind,'logical_task':logical_task,'mode':'model_generation',
+            'original_path':str(folder/'original.json'),'attempt':0,'version':0,'stagnation':0}
+    else:
+        previous=json.loads(Path(session['current_path']).read_text())
+        session['stagnation']=session['stagnation']+1 if previous==raw else 0
+        session['version']+=1
+    session.update(status='building',error=reason,current_path=str(engine.root/'repair-sessions'/session['id']/f"candidate-{session['version']}.json"),
+        read_requests=[r.model_dump(mode='json') for r in requests])
+    write_json(Path(session['current_path']),raw)
+    write_json(Path(check.cwd)/'generation-error.json',{'reason':reason,'requests':session['read_requests']})
+    from .inquiry import release_action
+    release_action(engine)
+    save_session(engine,session)
+    return session
 
 
 def validate_technical_repair(current, repaired, phase):
@@ -24,7 +50,6 @@ def validate_build_reply(state, unit, reply, implementation, current=None, phase
         return
     if reply.requests:
         raise ValueError('Return a model or focused reading requests; stage missing-component requests under pending_work')
-    validate_bundle(state,unit,model,implementation)
     if reply.draft is not None:
         if not {'harness','observation'} <= {p.component for p in reply.draft.pending_work}:
             raise ValueError('Model-only output must acknowledge missing harness and observation components')
@@ -38,6 +63,12 @@ def validate_build_reply(state, unit, reply, implementation, current=None, phase
             from .encoding import validate_encoding
             validate_encoding(state,previous,current,model,reply.encoding_revision)
         else:validate_technical_repair(current,model,phase)
+    if reply.draft and any(p.component in {'behavior','properties'} for p in reply.draft.pending_work):
+        materialize_bundle(model)
+        return
+    model=validate_bundle(state,unit,model,implementation)
+    if reply.draft is not None:reply.draft=model
+    else:reply.bundle=model
 
 
 def obligation_progress(state, unit):
