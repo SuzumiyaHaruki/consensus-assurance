@@ -17,7 +17,7 @@ def validate_representation(before,after,targets,context):
     # Citation repair cannot silently discard an asserted evidence dependency.
     for target in targets:
         route=parts(target['path'])
-        if route[-1] not in {'source_ids','expectation_ids'} and route[-2:]!=['grounding','behavior_ids']:continue
+        if route[-1] not in {'source_ids','expectation_ids'} and route[-2:]!=['grounding','source_ids']:continue
         left=before;right=after
         for key in route:
             left=left[int(key)] if isinstance(left,list) else left[key]

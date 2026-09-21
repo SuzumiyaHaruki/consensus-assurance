@@ -5,7 +5,7 @@ from .graph_diagnostics import validate_grounding
 from consensus_assurance.core.events import MISSING, field, compare, match_prerequisites
 
 
-def monitor_events(events, monitor):
+def monitor_events(events, monitor, aliases=None):
     if monitor.property and monitor.property.kind == 'stable_support':
         return monitor_support(events, monitor)
 
@@ -16,7 +16,7 @@ def monitor_events(events, monitor):
         if any(x is None for x in selectors): missing.append(index); continue
         if not all(selectors): continue
         if any(field(event,p) is MISSING for p in monitor.identity_fields): missing.append(index); continue
-        value = compare(event,monitor.assertion)
+        value = compare(event,monitor.assertion,aliases)
         if value is None: missing.append(index)
         else: results.append((index,value))
     violations = [index for index,value in results if value is False]

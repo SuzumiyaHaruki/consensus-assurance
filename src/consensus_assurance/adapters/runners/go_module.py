@@ -32,6 +32,18 @@ class GoModuleBackend:
                 check.outcome = "tests_passed"
         else:
             check.outcome = "tests_failed"
+            outputs=[]
+            for line in text.splitlines():
+                try:
+                    item=json.loads(line)
+                    if isinstance(item,dict) and isinstance(item.get('Output'),str):outputs.append(item['Output'])
+                except ValueError:continue
+            trace=''.join(outputs)
+            if 'panic:' in trace:
+                import re
+                frames=re.findall(r'(?m)^\s*(\S+\.go):\d+',trace)
+                check.parameters['failure_class']='target_panic_candidate' if any(not p.endswith('_test.go') for p in frames) else 'harness_panic'
+            else:check.parameters['failure_class']='test_failure'
 
     def __init__(self, target=None, timeout=90):
         self.package=target.execution_package if target else "."

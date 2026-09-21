@@ -28,10 +28,10 @@ def setup(tmp_path,prepared,broken=False):
         binding.snapshot_id=state.snapshot.id;binding.content_digest=state.snapshot.files[binding.file]
         binding.excerpt='\n'.join((repo/binding.file).read_text().splitlines()[binding.start_line-1:binding.end_line])
     unit=state.units[0];unit.binding_ids=['step_binding']
-    basis=Grounding(behavior_ids=['counter.py:1:10'],expectation_ids=[next(m.id for m in state.materials if m.file=='README.md')],binding_ids=unit.binding_ids,derivation='Finite legal counter inputs must return within capacity',applicability='One local operation, legal initial value and positive capacity')
+    basis=Grounding(source_ids=['counter.py:1:10'],expectation_ids=[next(m.id for m in state.materials if m.file=='README.md')],binding_ids=unit.binding_ids,derivation='Finite legal counter inputs must return within capacity',applicability='One local operation, legal initial value and positive capacity')
     for claim in state.claims:
         claim.pending=[];claim.grounding=basis.model_copy(deep=True)
-    unit.audit_question=AuditQuestion(question='Does one legal boundary call preserve the range?',importance='Bounded service result',source_ids=basis.behavior_ids+basis.expectation_ids,
+    unit.audit_question=AuditQuestion(question='Does one legal boundary call preserve the range?',importance='Bounded service result',source_ids=basis.source_ids+basis.expectation_ids,
         disposition='ready_for_check',preferred_check='direct_test',event_paths=['legal input -> actual call -> correlated observed return'],trigger_rationale='Observe actual return and independent range predicate')
     cfg=Config(execution_backend='python',allow_experiments=True,allow_agent_materials=True,execution_isolation='workspace')
     state.config=cfg.model_dump(mode='json')
@@ -266,3 +266,22 @@ def test_question_narrowing_preserves_structural_identity_and_counterevidence(tm
     continue_question(e,u)
     assert e.state.units[0].audit_question.preferred_check=='source_review'
     assert e.state.units[0].audit_question.counterevidence==q.counterevidence
+
+
+def test_direct_event_comparison_uses_correlated_raw_fields(tmp_path,prepared):
+    e,u,p=setup(tmp_path,prepared)
+    source=p.harness.source
+    source=source.replace("emit('returned', value=returned, in_range=0 <= returned <= limit)", "emit('returned', value=returned, in_range=0 <= returned <= limit, limit=limit)")
+    p.harness.source=source
+    p.observable_properties[0].assertion=Comparison(field='state.limit',reference='start.state.limit')
+    p.monitors[0].assertion=p.observable_properties[0].assertion
+    p.monitors[0].property=p.observable_properties[0]
+    validate_plan(e.state,u,p,e.implementation)
+    a=save_plan(e,u,p,'correlated-fields')
+    c=execute(e,a,p)
+    result=assess(e.state,u,a,p,c,extract_events(c))
+    assert result['properties'][0]['outcome']=='holds'
+    assert result['outcome']=='unknown'  # Correspondence review was not supplied.
+    events=extract_events(c)
+    assert next(x for x in events if x['event']=='admitted')['state']['value']==3
+    assert next(x for x in events if x['event']=='returned')['state']['limit']==3

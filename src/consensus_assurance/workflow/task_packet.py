@@ -127,7 +127,9 @@ def prepare(engine,kind,context):
         from .associations import graph_contract
         packet['graph_contract']=graph_contract()
         packet.setdefault('source_declarations',declaration_index([m for key in ('materials','new_materials') for m in packet.get(key,[])]))
-    packet['material_budget']={'used':material_usage(state),'breadth':material_allowance(state,engine.config.budget,'breadth'),'depth':material_allowance(state,engine.config.budget,'depth')}
+    packet['material_budget']={'used':material_usage(state),'breadth':material_allowance(state,engine.config.budget,'breadth'),'depth':material_allowance(state,engine.config.budget,'depth'),
+        'remaining_targeted_reads':max(0,engine.config.budget.targeted_reads-state.usage.get('targeted_reads',0))}
+    packet['remaining_agent_calls']=max(0,engine.config.budget.agent_calls-state.usage.get('agent_calls',0))
     packet['context_limit_chars']=engine.config.budget.context_chars
     packet['reading_status']=[{'id':id,'status':p['status'],'unfulfilled':[i for i in p['items'] if i['status']=='deferred']} for id,p in state.read_plans.items() if p['status']!='complete' and (not task or id==task.read_plan_id)]
     def strip_excerpts(value):

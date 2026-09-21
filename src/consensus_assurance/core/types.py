@@ -158,7 +158,9 @@ class QuestionCandidate(Record):
     question: AuditQuestion
     history: list[AuditQuestion] = []
     check_ids: list[str] = []
-    status: Literal["active", "explained", "escalated", "blocked"] = "active"
+    status: Literal["active", "explained", "escalated", "blocked", "paused"] = "active"
+    parent_candidate_id: str | None = None
+    fork_reason: str = ""
     stage: Literal["read", "analyze"] = "analyze"
     read_plan_id: str | None = None
     material_ids: list[str] = []
@@ -191,6 +193,10 @@ class ReachabilityResult(Record):
 class InquiryTask(Record):
     surface_entry_points: list[str] = []
     candidate_id: str | None = None
+    feedback_source_ids: list[str] = []
+    feedback_effect: str = ""
+    feedback_basis: dict = {}
+    origin_check_ids: list[str] = []
     draft_path: str | None = None
     diagnostics: list[dict] = []
     admitted: bool = False
@@ -322,7 +328,7 @@ class Scope(Record):
 
 
 class Grounding(Record):
-    behavior_ids: list[str] = Field(default_factory=list, description="Exact IDs of acquired materials containing observed behavior; not invented behavior labels or Binding IDs")
+    source_ids: list[str] = Field(default_factory=list, description="Exact IDs of acquired implementation source materials; not Behavior or Binding IDs")
     expectation_ids: list[str] = Field(default_factory=list, description="Exact IDs of acquired materials supporting the expectation; not invented expectation labels. Explain normative applicability in derivation.")
     binding_ids: list[str] = []
     derivation: str = ""
@@ -330,6 +336,17 @@ class Grounding(Record):
     unresolved: list[str] = []
     conflicts: list[str] = []
     alternatives: list[str] = []
+
+    @model_validator(mode="before")
+    @classmethod
+    def import_legacy_material_name(cls, value):
+        if isinstance(value, dict) and "behavior_ids" in value:
+            value=dict(value)
+            previous=value.pop("behavior_ids")
+            if "source_ids" in value and value["source_ids"]!=previous:
+                raise ValueError("Conflicting grounding source references")
+            value.setdefault("source_ids",previous)
+        return value
 
 
 class CheckerSpec(Record):

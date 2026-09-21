@@ -54,7 +54,7 @@ class CoverageAgent(MockAgent):
         elif name=='ReviewReply':
             items=[];revision=None
             for obj in context['target_objects']+([context['selected_unit']] if context.get('selected_unit',{}).get('id') in context['task']['target_ids'] else []):
-                source_ids=obj.get('source_ids') or obj.get('grounding',{}).get('behavior_ids') or [context['materials'][0]['id']]
+                source_ids=obj.get('source_ids') or obj.get('grounding',{}).get('source_ids') or [context['materials'][0]['id']]
                 contract=next(c for c in context['review_contract'] if c['target_id']==obj['id'])
                 aspect=contract['required_aspects'][0]
                 status='no_issue_found';explanation='Actual supplied responsibilities agree with the scoped candidate; this is not a proof'

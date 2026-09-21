@@ -77,6 +77,8 @@ class Derivation(Record):
     selection_rationale: str
     reading_requests: list[ReadRequest] = Field(default_factory=list, max_length=8)
     descriptive_issues: list[DescriptiveIssue] = []
+    fork_from_candidate_id: str | None = None
+    fork_reason: str = ""
 
 
 class FieldProjection(Record):
@@ -402,7 +404,7 @@ class DirectCheckPlan(Record):
     binding_ids: list[str] = Field(min_length=1)
     harness: Harness
     monitors: list[EventMonitor] = Field(min_length=1)
-    observable_properties: list[ObservableProperty] = Field(min_length=1, description="Direct route supports event_assertion only. Use literal trigger/assertion comparisons, shared identity_fields and matching monitor.property; history properties require a local_model fallback.")
+    observable_properties: list[ObservableProperty] = Field(min_length=1, description="Direct route supports event_assertion only. Assertions may compare an observed field with a prior correlated prerequisite field; history properties require a local_model fallback.")
     uncertainties: list[str] = []
 
 

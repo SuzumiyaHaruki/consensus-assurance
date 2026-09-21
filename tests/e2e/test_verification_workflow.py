@@ -21,6 +21,7 @@ def deferred_fixture(tmp_path, responses):
     first=copy.deepcopy(responses[0]);first['requests']=[q for q in first['requests'] if q['file']!='limits.py']
     graph=copy.deepcopy(responses[1])
     basis=copy.deepcopy(graph['claims'][1]['grounding'])
+    basis['source_ids']=basis.pop('behavior_ids')
     dependency={'id':'input_dependency','source':'step_obligation','target':'input_obligation','kind':'boundary','group':None,'rationale':'Actual consumer depends on producer input','pending':['Producer guarantee unverified'],'grounding':basis}
     graph['relations']=[dependency];graph['units'][0]['relation_ids']=['input_dependency']
     graph['bindings']=[b for b in graph['bindings'] if b['id']!='input_binding']
@@ -28,7 +29,7 @@ def deferred_fixture(tmp_path, responses):
     read={'requests':[{'file':'upstream_support.py','start_line':1,'end_line':2,'reason':'Read actual producer of the unexplained boundary'}],'rationale':'Consumer needs a positive effective capacity','related_ids':['step_obligation'],'gap':'Input producer not yet read'}
     binding=copy.deepcopy(responses[1]['bindings'][1]);binding['material_id']='upstream_support.py:1:2'
     edge=copy.deepcopy(dependency);edge.update(id='producer_location',source='input_obligation',target='input_binding')
-    edge['grounding']['behavior_ids']=['upstream_support.py:1:2']
+    edge['grounding']['source_ids']=['upstream_support.py:1:2']
     patch={'bindings':[binding],'relations':[edge],'rationale':'Actual new producer code explains the dependency without changing the obligation'}
     expanded=copy.deepcopy(responses[3]);expanded['harness']['source']=expanded['harness']['source'].replace('from limits import','from upstream_support import')
     for constraint in expanded['constraints']:

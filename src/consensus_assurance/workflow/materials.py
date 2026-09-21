@@ -182,9 +182,12 @@ def attachment_key(state):
     return 'inquiry:'+state.active_inquiry_id if state.active_inquiry_id else 'unit:'+state.active_unit_id if state.active_unit_id else 'candidate:'+candidate.id if candidate else 'discovery'
 
 
-def plan_read(state,repo,requests,budget,*,purpose='depth',partial=False,plan_id=None,related_ids=(),reason='Read requested material'):
+def plan_read(state,repo,requests,budget,*,purpose='depth',partial=False,plan_id=None,related_ids=(),reason='Read requested material',charge=True):
     rows=preflight(state,repo,requests)
     cached=material_lines(state);allowance=material_allowance(state,budget,purpose);available=allowance['available_chars'];chunk_room=allowance['available_chunks']
+    prior=state.read_plans.get(plan_id) if plan_id else None
+    already_charged=bool(prior and (prior.get('acquisition_charged') or 'acquisition_charged' not in prior))
+    quota_exhausted=charge and not already_charged and state.usage.get('targeted_reads',0)>=budget.targeted_reads
     outcomes=[];new_materials=[]
     # Preserve authored priority, including when a prefix must be deferred.
     ordered=list(enumerate(rows));deferred=False
@@ -192,7 +195,9 @@ def plan_read(state,repo,requests,budget,*,purpose='depth',partial=False,plan_id
         additions={(info['content_digest'],req.file,i):lines[i-1] for i in range(req.start_line,req.end_line+1) if (info['content_digest'],req.file,i) not in cached}
         cost=sum(len(t)+1 for t in additions.values());chunks=usage_of({**cached,**additions})['unique_chunks']-usage_of(cached)['unique_chunks']
         mid=f'{req.file}:{req.start_line}:{req.end_line}'
-        if deferred or cost>available or chunks>chunk_room:
+        if quota_exhausted and cost:
+            outcome=ReadItem(request=req,status='deferred',new_chars=cost,new_chunks=max(0,chunks),reason='Targeted read plan budget exhausted; cached ranges remain attachable',file_metadata=info)
+        elif deferred or cost>available or chunks>chunk_room:
             deferred=True
             outcome=ReadItem(request=req,status='deferred',new_chars=cost,new_chunks=max(0,chunks),reason='Unique material allowance or protected reserve is insufficient; the entire request remains pending',file_metadata=info)
         else:
@@ -243,7 +248,7 @@ def execute_read(engine,requests,*,purpose='depth',partial=False,plan_id=None,re
         if parsed!=previous['original_requests'] or previous['snapshot_id']!=state.snapshot.id or purpose!=previous['purpose']:raise ValueError('Reading operation reused with different requests, purpose or snapshot')
         preflight(state,engine.root/'source',requests)
         if previous['status']=='complete':return previous
-    receipt,materials=plan_read(state,engine.root/'source',requests,engine.config.budget,purpose=purpose,partial=partial,plan_id=plan_id,related_ids=related_ids,reason=reason)
+    receipt,materials=plan_read(state,engine.root/'source',requests,engine.config.budget,purpose=purpose,partial=partial,plan_id=plan_id,related_ids=related_ids,reason=reason,charge=charge)
     attempt=previous.get('attempt',1)+1 if previous else 1
     engine.read_commit_hook('before_commit',receipt)
     payload={'requests':[q.model_dump(mode='json') for q in receipt.original_requests],'plan_id':plan_id,'purpose':purpose,'partial':partial}
@@ -273,20 +278,30 @@ def request_groups(value,path=''):
 
 def validate_read_requests(state,repo,response,*,purpose):
     from consensus_assurance.core.config import Config
-    errors=[];paths=[];cached=material_lines(state);projected=dict(cached)
+    errors=[];paths=[];requested=[];cached=material_lines(state);projected=dict(cached)
     for path,requests in request_groups(response):
         if not requests:continue
         paths.append(path)
         try:
             for req,info,lines in preflight(state,repo,requests,path):
+                requested.append(req.model_dump(mode='json'))
                 projected.update({(info['content_digest'],req.file,n):lines[n-1] for n in range(req.start_line,req.end_line+1)})
         except DiagnosticError as exc:errors.extend(exc.diagnostics)
     if paths and not errors:
         allowance=material_allowance(state,Config.model_validate(state.config).budget,purpose)
         cost=usage_of(projected)['unique_chars']-usage_of(cached)['unique_chars']
         chunks=usage_of(projected)['unique_chunks']-usage_of(cached)['unique_chunks']
-        if cost>allowance['available_chars'] or chunks>allowance['available_chunks']:
-            errors.append(Diagnostic(code='reading_plan_budget',category='material',paths=paths,message='Re-plan within the actual unique source allowance; preserve semantic priority',allowed=['representation'],details={'projected_new_chars':cost,'projected_new_chunks':chunks,**allowance}))
+        budget=Config.model_validate(state.config).budget
+        current=next((c for c in state.question_candidates if c.status=='active'),None)
+        task=next((t for t in state.inquiry_tasks if t.id==state.active_inquiry_id),None)
+        plan_id=(task.read_plan_id if task else current.read_plan_id if current else None)
+        prior=state.read_plans.get(plan_id) if plan_id else None
+        distinct_requests=list({(r['file'],r['start_line'],r['end_line']):r for r in requested}.values())
+        already_charged=bool(prior and prior['original_requests']==distinct_requests and (prior.get('acquisition_charged') or 'acquisition_charged' not in prior))
+        charged_request=purpose=='depth' or 'materials' in state.completed_steps
+        no_new_plan=charged_request and cost and not already_charged and state.usage.get('targeted_reads',0)>=budget.targeted_reads
+        if cost>allowance['available_chars'] or chunks>allowance['available_chunks'] or no_new_plan:
+            errors.append(Diagnostic(code='reading_plan_budget',category='material',paths=paths,message='Re-plan within the actual source and logical-plan allowance; cached ranges remain available',allowed=['representation'],details={'projected_new_chars':cost,'projected_new_chunks':chunks,'targeted_reads_remaining':max(0,budget.targeted_reads-state.usage.get('targeted_reads',0)),'plan_already_charged':already_charged,**allowance}))
     if errors:raise DiagnosticError(errors)
 
 

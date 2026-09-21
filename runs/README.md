@@ -14,3 +14,5 @@ HashiCorp 形成快照保留合同证据不足、LogCache 读取回填疑点的�
 2026-09-20 按用户要求，将 Git 追踪从 `2026-09-20_12-07-49-hashicorp_raft-real-run` 切换至上述两次运行，并发布当前修改。旧实验保留本地，已提交归档仍在 Git 历史；不删除本地证据，不改写原始回复、状态、日志和失败结论。
 
 排除临时锁、.execution 缓存、可重建的 experiments 工作副本和本地权限配置。其他 runs 不纳入 Git。归档不作为 runtime discovery 答案；旧框架阶段不能直接用当前版本原地 resume。
+
+2026-09-21 的 Paxos 消息编解码定向续查在独立 `/tmp` 工作目录进行；其输入与观察由非默认加载的 `tests/acceptance/paxos_codec_followup.py` 产生，不改写上面两份 v7 原始运行。当前 v8 的真实自主发现能力仍需下一次独立实验验证。

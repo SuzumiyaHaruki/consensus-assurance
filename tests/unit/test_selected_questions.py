@@ -368,7 +368,7 @@ def test_episode_admission_and_blockage_classification(focused):
     assert inquiry_resource(surface)=='exploration_rounds'
     c.spec_task_ids=[];c.status='active';e.state.usage['agent_calls']+=1
     assert candidate_blockage(e.state,c)=='resource_blocked'
-    assert FRAMEWORK_REVISION==manifest()['version']=='selected-question-v7'
+    assert FRAMEWORK_REVISION==manifest()['version']=='selected-question-v8'
 
 
 @pytest.mark.parametrize('decision,effect,empty,expected',[
@@ -439,3 +439,115 @@ def test_initial_source_token_repairs_only_source_ids(focused):
     session=next(iter(e.state.repair_sessions.values()))
     assert session['status']=='accepted' and e.state.usage['agent_calls']==2
     assert session['resolved_diagnostics'][0]['paths']==['/audit_question/source_ids']
+
+
+def test_same_fact_distinct_discriminator_and_atomic_fork(focused):
+    e,q,_=focused
+    parent=begin(e,q,[request('counter.py')])
+    alternate=q.model_copy(update={'question':'Does a later write republish an invalidated entry?',
+        'objects':['later writer'], 'event_paths':['delete -> later write -> read'],
+        'counterevidence':['GetLog does not fill the cache; writer behavior remains unread']})
+    wrong=Derivation(audit_question=alternate,reading_requests=[request('counter.py')],selection_rationale='Different writer relation')
+    fork=wrong.model_copy(update={'fork_from_candidate_id':parent.id,'fork_reason':'A later writer, not a read miss, can republish the entry'})
+    discovery.accept_derivation(e,fork,'fork')
+    child=discovery.active_candidate(e.state)
+    assert child.id!=parent.id and child.parent_candidate_id==parent.id
+    saved_parent=next(c for c in e.state.question_candidates if c.id==parent.id)
+    assert saved_parent.status=='paused' and saved_parent.question.question==q.question and saved_parent.question.requests==[request('counter.py')] and saved_parent.stop_reason==fork.fork_reason
+    assert child.question.counterevidence==alternate.counterevidence
+    assert len(e.state.question_candidates)==2
+    assert not discovery.accept_derivation(e,fork,'fork')
+    assert len(e.state.question_candidates)==2
+
+
+def test_same_fact_prose_rewrite_does_not_reopen_explained_hypothesis(focused):
+    e,q,_=focused;c=begin(e,q,[request('counter.py')])
+    discovery.continue_candidate(e,c)
+    close=q.model_copy(update={'disposition':'explained_by_existing_mechanism','counterevidence':['The acquired caller excludes the stated path']})
+    discovery.accept_derivation(e,Derivation(audit_question=close,selection_rationale='The stated path is excluded'),'closed')
+    renamed=q.model_copy(update={'question':'Could late success conceal failed publication?'})
+    with pytest.raises(DiagnosticError,match='already has a disposition'):
+        discovery.validate_derivation(e.state,Derivation(audit_question=renamed,reading_requests=[request('counter.py')],selection_rationale='Only prose changed'))
+    alternate=q.model_copy(update={'objects':['a distinct writer'],'event_paths':['writer -> delete -> read']})
+    assert discovery.validate_derivation(e.state,Derivation(audit_question=alternate,reading_requests=[request('counter.py')],fork_reason='Different producer and order',selection_rationale='Inspect the distinct writer path'))=='continue_read'
+    revised=q.model_copy(update={'source_ids':q.source_ids+['counter.py:1:1'],'counterevidence':['Newly acquired caller contradicts the old disposition']})
+    assert discovery.validate_derivation(e.state,Derivation(audit_question=revised,reading_requests=[request('counter.py')],fork_reason='New acquired caller evidence changes the original applicability',selection_rationale='Recheck the old relation against the new source'))=='continue_read'
+
+
+def test_targeted_read_quota_preflight_matches_partial_cached_receipt(focused):
+    from consensus_assurance.workflow.materials import execute_read
+    e,q,_=focused;sources(e,new_source=50)
+    e.config.budget.targeted_reads=0;e.state.config=e.config.model_dump(mode='json')
+    cached=ReadRequest(file='counter.py',start_line=1,end_line=2,reason='Reattach cached')
+    fresh=request('new_source')
+    with pytest.raises(DiagnosticError) as caught:
+        validate_read_requests(e.state,e.root/'source',ReadingPlan(requests=[fresh],rationale='New evidence'),purpose='depth')
+    assert caught.value.diagnostics[0].details['targeted_reads_remaining']==0
+    receipt=execute_read(e,[fresh,cached],purpose='depth',partial=True,plan_id='bounded-plan')
+    assert [i['status'] for i in receipt['items']]==['deferred','cached']
+    assert not e.state.usage.get('targeted_reads')
+    assert 'new_source:1:1' not in {m.id for m in e.state.materials}
+
+
+def test_feedback_dedup_preserves_origins_and_distinct_meanings(focused):
+    from consensus_assurance.workflow.inquiry import enqueue
+    e,q,_=focused;source=q.source_ids[0]
+    first=enqueue(e.state,'spec_refine','Correct actual producer ownership','review-a',target_ids=['producer'],feedback_source_ids=[source],feedback_effect='independent_enrichment')
+    again=enqueue(e.state,'spec_refine','Correct actual producer ownership','review-b',target_ids=['producer'],feedback_source_ids=[source],feedback_effect='independent_enrichment')
+    other=enqueue(e.state,'spec_refine','Correct retry consumer ownership','review-c',target_ids=['producer'],feedback_source_ids=[source],feedback_effect='independent_enrichment')
+    assert first.id==again.id and first.origin_check_ids==['review-a','review-b']
+    assert other.id!=first.id
+
+
+def test_last_call_preserves_pending_source_and_pauses_question(focused):
+    e,q,_=focused;c=begin(e,q,[request('counter.py')])
+    e.state.usage['agent_calls']=e.config.budget.agent_calls-1
+    discovery.continue_candidate(e,c)
+    assert c.status=='paused' and 'judgment' in c.stop_reason
+    assert c.question.requests==[request('counter.py')] and c.read_plan_id not in e.state.read_plans
+
+
+def test_last_call_judges_acquired_candidate_without_new_read(focused):
+    e,q,_=focused;c=begin(e,q,[request('counter.py')])
+    c.material_ids=[q.source_ids[0]]
+    e.state.usage['agent_calls']=e.config.budget.agent_calls-1
+    discovery.continue_candidate(e,c)
+    assert c.status=='active' and c.stage=='analyze'
+    assert c.read_plan_id not in e.state.read_plans
+
+
+def test_charged_partial_plan_continues_without_second_read_charge(focused):
+    from consensus_assurance.workflow.materials import execute_read
+    e,q,_=focused;sources(e,A=500,B=1100)
+    e.config.budget.targeted_reads=1;e.state.config=e.config.model_dump(mode='json')
+    requests=[request('A'),request('B')]
+    first=execute_read(e,requests,purpose='depth',partial=True,plan_id='same-logical-plan')
+    assert [i['status'] for i in first['items']]==['acquired','deferred']
+    assert e.state.usage['targeted_reads']==1
+    e.config.budget.material_chars=10000;e.state.config=e.config.model_dump(mode='json')
+    from consensus_assurance.core.types import QuestionCandidate
+    e.state.question_candidates.append(QuestionCandidate(question=q,stage='read',read_plan_id='same-logical-plan'))
+    validate_read_requests(e.state,e.root/'source',ReadingPlan(requests=requests,rationale='Complete the same charged plan'),purpose='depth')
+    second=execute_read(e,requests,purpose='depth',partial=True,plan_id='same-logical-plan')
+    assert [i['status'] for i in second['items']]==['cached','acquired']
+    assert e.state.usage['targeted_reads']==1
+
+
+def test_selected_question_and_required_feedback_share_known_read_plan(focused,monkeypatch):
+    from consensus_assurance.workflow.inquiry import enqueue
+    e,q,_=focused;sources(e,A=80,B=80)
+    candidate=begin(e,q,[request('A')])
+    task=enqueue(e.state,'spec_refine','Correct the selected producer','needed',target_ids=['producer'],requests=[request('A'),request('B')])
+    task.candidate_id=candidate.id;candidate.spec_task_ids=[task.id]
+    seen=[]
+    def complete(engine,current):
+        seen.append([m.id for m in engine.state.materials])
+        assert current.stage=='analyze' and {'A:1:1','B:1:1'}<=set(current.added_material_ids)
+        current.status='completed'
+    monkeypatch.setattr(discovery.inquiry,'process_task',complete)
+    discovery.continue_candidate(e,candidate)
+    receipt=e.state.read_plans[candidate.read_plan_id]
+    assert len(receipt['original_requests'])==2
+    assert [i['status'] for i in receipt['items']]==['acquired','acquired']
+    assert e.state.usage['targeted_reads']==1 and seen
+    assert {'A:1:1','B:1:1'}<=set(e.state.task_attachments['inquiry:'+task.id])

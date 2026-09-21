@@ -20,7 +20,7 @@ def revision_for(state, ids):
         drafts.append(new)
         changes.append(JudgmentChange(target_id=id,field='description',old_value_json=json.dumps(old.description),new_value_json=json.dumps(new.description)))
     basis=drafts[0].grounding.model_copy(deep=True);basis.unresolved=[];basis.conflicts=[]
-    return Feedback(kind='F2',rationale='Candidate correction',evidence_ids=basis.expectation_ids or basis.behavior_ids,target_ids=[ids[0]],relation_ids=[],new_basis='Actual materials support the requested correction',graph=None,bundle=None,patch=GraphPatch(claims=drafts,expected_versions={i:1 for i in ids},rationale='Correction'),changes=changes,old_judgment=state.claims[1].description,new_judgment=drafts[0].description,grounding=basis)
+    return Feedback(kind='F2',rationale='Candidate correction',evidence_ids=basis.expectation_ids or basis.source_ids,target_ids=[ids[0]],relation_ids=[],new_basis='Actual materials support the requested correction',graph=None,bundle=None,patch=GraphPatch(claims=drafts,expected_versions={i:1 for i in ids},rationale='Correction'),changes=changes,old_judgment=state.claims[1].description,new_judgment=drafts[0].description,grounding=basis)
 
 
 def test_review_cannot_modify_an_unreviewed_obligation(prepared):

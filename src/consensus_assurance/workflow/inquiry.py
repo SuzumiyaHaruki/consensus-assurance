@@ -13,12 +13,20 @@ def enabled(engine):
     return engine.config.budget.exploration_rounds > 0 or engine.config.budget.semantic_reviews > 0
 
 
-def enqueue(state, kind, reason, trigger, activity_classes=(), target_ids=(), unit_id=None, model_id=None, requests=(), surface_entry_points=()):
+def enqueue(state, kind, reason, trigger, activity_classes=(), target_ids=(), unit_id=None, model_id=None, requests=(), surface_entry_points=(), feedback_source_ids=(), feedback_effect=''):
+    from .audit_spec import audit_object_index,load
+    inventory=audit_object_index(load(state)) if feedback_source_ids and state.audit_spec_path else {}
+    feedback_basis={id:inventory.get(id) for id in target_ids} if feedback_source_ids else {}
     signature=(kind,trigger,tuple(activity_classes),tuple(target_ids),unit_id,model_id,tuple(surface_entry_points))
     for task in state.inquiry_tasks:
         if signature==(task.kind,task.trigger,tuple(task.activity_classes),tuple(task.target_ids),task.unit_id,task.model_id,tuple(task.surface_entry_points)):
             return task
-    task=InquiryTask(surface_entry_points=list(surface_entry_points),kind=kind,reason=reason,trigger=trigger,activity_classes=list(activity_classes),target_ids=list(target_ids),unit_id=unit_id,model_id=model_id,requests=list(requests),stage='read' if requests else 'analyze')
+        if (feedback_source_ids and task.kind==kind=='spec_refine' and task.reason==reason and task.feedback_effect==feedback_effect
+                and set(task.feedback_source_ids)==set(feedback_source_ids) and set(task.target_ids)==set(target_ids)
+                and task.feedback_basis==feedback_basis and task.status in {'pending','running','completed'}):
+            if trigger not in task.origin_check_ids:task.origin_check_ids.append(trigger)
+            return task
+    task=InquiryTask(surface_entry_points=list(surface_entry_points),kind=kind,reason=reason,trigger=trigger,activity_classes=list(activity_classes),target_ids=list(target_ids),unit_id=unit_id,model_id=model_id,requests=list(requests),stage='read' if requests else 'analyze',feedback_source_ids=list(feedback_source_ids),feedback_effect=feedback_effect,feedback_basis=feedback_basis,origin_check_ids=[trigger] if feedback_source_ids else [])
     task.target_versions={i:getattr(objects(state)[i],"version",1) for i in task.target_ids if i in objects(state)}
     unit=next((u for u in state.units if u.id==unit_id),None)
     task.unit_version=unit.version if unit else None
@@ -84,7 +92,7 @@ def choose_task(engine):
     ready=any(u.status in {'pending','partial','selected'} and not (u.audit_question and u.audit_question.disposition=='explained_by_existing_mechanism') for u in state.units)
     if ready and engine.config.budget.audit_units>state.usage.get('audit_units',0):return None
     if any(c.status=='active' for c in state.question_candidates):return None
-    feedback=[t for t in pending if t.kind=='review' or t.diagnostics or t.candidate_id]
+    feedback=[t for t in pending if t.kind=='review' or t.candidate_id]
     if feedback:return feedback[0]
     from .audit_spec import next_surface_refinement
     from .budget import can_start_episode

@@ -45,7 +45,7 @@ def _apply_feedback(state, unit, current, feedback):
                 after={"old_judgment":feedback.old_judgment,"new_judgment":feedback.new_judgment,
                        "grounding":feedback.grounding.model_dump()}, return_step="understand", status="unresolved"))
             return None
-        if not set(feedback.evidence_ids) & set(feedback.grounding.behavior_ids + feedback.grounding.expectation_ids):
+        if not set(feedback.evidence_ids) & set(feedback.grounding.source_ids + feedback.grounding.expectation_ids):
             raise ValueError("A failed trace alone cannot authorize a semantic weakening")
         validate_changes(state,feedback)
         originals={obj.id:obj for obj in [*state.claims,*state.bindings,*state.relations,*state.units]}

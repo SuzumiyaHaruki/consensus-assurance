@@ -3,7 +3,7 @@ DEPENDENCY_KINDS=('depends_all','conditional_on','boundary')
 
 
 def graph_contract():
-    return {'material_references':'Grounding.behavior_ids/expectation_ids and source_ids reference acquired material IDs; binding_ids reference located code.',
+    return {'material_references':'Grounding.source_ids/expectation_ids and source_ids reference acquired material IDs; binding_ids reference located code.',
         'dependency':{'kinds':list(DEPENDENCY_KINDS),'direction':'checked obligation -> producer obligation or binding',
             'direct':'A selected binding associated with the checked obligation needs no relation.',
             'support':'Other selected bindings need a selected directed path from the checked obligation. Keep producer guarantees unresolved in relation grounding/pending or binding pending; selecting support does not check its obligation.'},

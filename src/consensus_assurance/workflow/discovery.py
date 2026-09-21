@@ -66,6 +66,12 @@ def active_candidate(state):
     return next((c for c in state.question_candidates if c.status=='active'),None)
 
 
+def discriminator(question):
+    """Stable investigation scope, independent of prose edits and graph version."""
+    return (tuple(question.fact_ids),question.obligation_relation_kind,
+        tuple(sorted(question.objects)),tuple(sorted(question.contexts)),tuple(sorted(question.event_paths)))
+
+
 def candidate_blockage(state,candidate):
     if candidate.status not in {'blocked','active'}:return None
     tasks=[t for t in state.inquiry_tasks if t.id in candidate.spec_task_ids and t.status=='blocked']
@@ -96,6 +102,10 @@ def derivation_graph(reply):
 def classify_derivation_outcome(state,reply):
     """Classify the candidate decision independently of descriptive feedback; no mutation."""
     q=reply.audit_question;current=active_candidate(state)
+    if reply.fork_from_candidate_id and (not current or current.id!=reply.fork_from_candidate_id or not reply.fork_reason.strip()):
+        raise ValueError('Fork must name the active parent and an explicit changed discriminator')
+    if reply.fork_reason and not reply.fork_from_candidate_id and current:
+        raise ValueError('Fork reason requires its parent candidate')
     graph=reply.obligation or reply.bindings or reply.dependencies or reply.context_claims
     if not reply.selection_rationale.strip():raise ValueError('Explain the bounded analysis outcome')
     if q is None:
@@ -134,10 +144,14 @@ def validate_derivation(state,reply):
         if q:
             validate_question(spec,q)
             if not q.question.strip() or not q.trigger_rationale.strip():raise ValueError('State the discriminator and selection reason')
-            if current and (q.fact_ids!=current.question.fact_ids or q.obligation_relation_kind!=current.question.obligation_relation_kind):
+            if current and not reply.fork_from_candidate_id and (q.fact_ids!=current.question.fact_ids or q.obligation_relation_kind!=current.question.obligation_relation_kind):
                 raise ValueError('Finish the current candidate before selecting another fact or lifecycle')
-            if not current and any(c.question.fact_ids==q.fact_ids and c.question.obligation_relation_kind==q.obligation_relation_kind and c.status in {'explained','blocked'} for c in state.question_candidates):
-                raise ValueError('This candidate already has a disposition; select another fact or lifecycle')
+            if reply.fork_from_candidate_id and discriminator(q)==discriminator(current.question) and set(q.source_ids)==set(current.question.source_ids):
+                raise ValueError('Fork needs a changed relation or acquired evidence; prose alone is not a new investigation')
+            if not current and any(discriminator(c.question)==discriminator(q) and (not reply.fork_reason.strip() or set(c.question.source_ids)==set(q.source_ids)) for c in state.question_candidates):
+                raise ValueError('This candidate already has a disposition; identify a changed relation or acquired evidence')
+            if not current and any(c.question.fact_ids==q.fact_ids and c.question.obligation_relation_kind==q.obligation_relation_kind for c in state.question_candidates) and not reply.fork_reason.strip():
+                raise ValueError('A second investigation of the same Fact/lifecycle needs an explicit changed discriminator')
     except ValueError as exc:
         questions=[x for x in (q,current.question if current else None) if x]
         refs={id for x in questions for id in x.fact_ids+x.behavior_ids}
@@ -195,6 +209,12 @@ def validate_derivation(state,reply):
 def accept_derivation(engine,reply,check_id):
     from .transactions import commit_graph
     from consensus_assurance.core.types import QuestionCandidate
+    if 'derive-'+check_id in engine.state.applied_operations:
+        import json
+        saved=engine.root/f'derivation-{check_id}.json'
+        if not saved.is_file() or json.loads(saved.read_text())!=reply.model_dump(mode='json'):
+            raise ValueError('Derivation operation identity reused with different input')
+        return active_candidate(engine.state) is None
     outcome=validate_derivation(engine.state,reply)
     def commit(proxy):
         state=proxy.state
@@ -204,15 +224,22 @@ def accept_derivation(engine,reply,check_id):
             state.completed_steps.append('derived-spec:'+str(state.audit_spec_version))
             return
         candidate=active_candidate(state);q=reply.audit_question.model_copy(deep=True)
-        if candidate:
+        if candidate and reply.fork_from_candidate_id:
+            parent=candidate
+            parent.status='paused';parent.stop_reason=reply.fork_reason
+            candidate=QuestionCandidate(question=q,parent_candidate_id=parent.id,fork_reason=reply.fork_reason)
+            state.question_candidates.append(candidate)
+        elif candidate:
             candidate.history.append(candidate.question.model_copy(deep=True))
             candidate.question=q
         else:
-            candidate=QuestionCandidate(question=q);state.question_candidates.append(candidate)
+            prior=next((c for c in reversed(state.question_candidates) if c.question.fact_ids==q.fact_ids and c.question.obligation_relation_kind==q.obligation_relation_kind),None)
+            candidate=QuestionCandidate(question=q,parent_candidate_id=prior.id if prior else None,fork_reason=reply.fork_reason)
+            state.question_candidates.append(candidate)
         candidate.check_ids.append(check_id)
         candidate.spec_task_ids=[]
         for issue in reply.descriptive_issues:
-            task=inquiry.enqueue(state,'spec_refine',issue.reason,check_id+':'+','.join(issue.object_ids),target_ids=issue.object_ids)
+            task=inquiry.enqueue(state,'spec_refine',issue.reason,check_id+':'+','.join(issue.object_ids),target_ids=issue.object_ids,feedback_source_ids=issue.source_ids,feedback_effect=issue.candidate_effect)
             task.draft_path=state.audit_spec_path
             task.diagnostics=[{'code':'audit_spec_semantics','category':'semantic','object_ids':issue.object_ids,'material_ids':issue.source_ids,'message':issue.reason,'allowed':['read','semantic_revision']}]
             if issue.candidate_effect=='requires_recheck':
@@ -245,6 +272,33 @@ def accept_derivation(engine,reply,check_id):
 def continue_candidate(engine,candidate):
     """Resume only this question's source work and selected inventory corrections."""
     state=engine.state
+    calls_left=engine.config.budget.agent_calls-state.usage.get('agent_calls',0)
+    needs_judgment=candidate.stage=='read' or any(next(t for t in state.inquiry_tasks if t.id==id).status not in {'completed','blocked'} for id in candidate.spec_task_ids)
+    if needs_judgment and calls_left<=1:
+        pending_corrections=any(next(t for t in state.inquiry_tasks if t.id==id).status not in {'completed','blocked'} for id in candidate.spec_task_ids)
+        if candidate.material_ids and not pending_corrections:
+            candidate.stage='analyze'
+            engine.checkpoint('candidate_cached_judgment_reserved')
+            return
+        candidate.status='paused';candidate.stop_reason='One remaining agent call cannot cover missing source or a required inventory correction and still reserve a judgment call'
+        engine.checkpoint('candidate_paused_for_judgment')
+        return
+    shared=[t for t in state.inquiry_tasks if t.id in candidate.spec_task_ids and t.stage=='read' and t.requests and not t.read_plan_id]
+    if candidate.stage=='read' and candidate.read_plan_id and candidate.read_plan_id not in state.read_plans and shared:
+        requests=list({(r.file,r.start_line,r.end_line):r for r in candidate.question.requests+[r for t in shared for r in t.requests]}.values())
+        receipt=engine.read(requests,purpose='depth',partial=True,plan_id=candidate.read_plan_id,
+            related_ids=candidate.question.fact_ids+[id for t in shared for id in t.target_ids],reason='Selected candidate and required corrections share known source dependencies')
+        items={(i['request']['file'],i['request']['start_line'],i['request']['end_line']):i for i in receipt['items']}
+        for task in shared:
+            selected=[items[(r.file,r.start_line,r.end_line)] for r in task.requests]
+            task.added_material_ids=list(dict.fromkeys(task.added_material_ids+[id for i in selected if i['status']!='deferred' for id in i['material_ids']]))
+            state.task_attachments['inquiry:'+task.id]=list(dict.fromkeys(state.task_attachments.get('inquiry:'+task.id,[])+task.added_material_ids))
+            if any(i['status']=='deferred' for i in selected):
+                task.status='blocked';task.stop_reason='Required correction source deferred in the shared read receipt'
+            else:task.stage='analyze'
+        candidate.material_ids=list(dict.fromkeys(candidate.material_ids+[id for i in receipt['items'] if i['status']!='deferred' for id in i['material_ids']]))
+        candidate.stage='analyze'
+        engine.checkpoint('shared_candidate_source_receipt_saved')
     for id in candidate.spec_task_ids:
         task=next(t for t in state.inquiry_tasks if t.id==id)
         while task.status not in {'completed','blocked'}:

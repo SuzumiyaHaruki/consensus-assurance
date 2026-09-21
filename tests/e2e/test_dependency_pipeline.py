@@ -63,7 +63,7 @@ def test_negative_review_cached_context_new_dependencies_split_scope_and_tlc(tmp
         def analyze(self,*a,**kw):
             check,response=super().analyze(*a,**kw)
             if type(response).__name__=='GraphPatch':
-                for edge in response.relations:edge.grounding.behavior_ids=[x.replace('upstream_support.py:1:2','upstream_support.py:1:6') for x in edge.grounding.behavior_ids]
+                for edge in response.relations:edge.grounding.source_ids=[x.replace('upstream_support.py:1:2','upstream_support.py:1:6') for x in edge.grounding.source_ids]
             return check,response
     args=(args[0],Agent(data),args[2],args[3],args[4]);cfg.budget.targeted_reads=2
     state=Engine(cfg,root,*args).start(repo)

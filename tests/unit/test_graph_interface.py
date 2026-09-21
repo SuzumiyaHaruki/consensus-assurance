@@ -19,7 +19,7 @@ def test_saved_draft_repairs_multiple_reference_errors_with_existing_budget(tmp_
     from regression_support import bounded_derivation
     repo,source,_,responses=prepared;correct=bounded_derivation(responses[1])
     original=json.loads(json.dumps(correct));repairs=[]
-    for field in ('behavior_ids','expectation_ids'):
+    for field in ('source_ids','expectation_ids'):
         original['obligation']['grounding'][field].append('unknown-reference')
         repairs.append({'path':'/obligation/grounding/'+field,'value_json':json.dumps(correct['obligation']['grounding'][field])})
     fixture=tmp_path/'interface.json';fixture.write_text(json.dumps([original,{'replacements':repairs,'rationale':'Correct opaque references while preserving all actual source'}]))
@@ -72,3 +72,12 @@ def test_candidate_contract_parity(prepared,case):
         with pytest.raises(DiagnosticError) as exc:apply_graph(state.model_copy(deep=True),p)
         assert exc.value.diagnostics==issues
     assert state.model_dump()==before
+
+
+def test_legacy_grounding_material_name_imports_to_single_wire_field():
+    from consensus_assurance.core.types import Grounding
+    imported=Grounding.model_validate({'behavior_ids':['implementation.go:1:2'],'expectation_ids':['contract.md:1:2'],'derivation':'Actual relationship','applicability':'One local operation'})
+    assert imported.source_ids==['implementation.go:1:2']
+    assert 'behavior_ids' not in imported.model_dump(mode='json')
+    with pytest.raises(ValueError,match='Conflicting grounding'):
+        Grounding.model_validate({'behavior_ids':['old:1:2'],'source_ids':['new:1:2']})

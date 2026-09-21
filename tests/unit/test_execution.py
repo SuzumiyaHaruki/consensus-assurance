@@ -1,3 +1,4 @@
+import json
 import os
 import subprocess
 import sys
@@ -192,3 +193,17 @@ def test_go_backend_is_toolchain_scoped(tmp_path,module,package):
 def test_target_paths_cannot_escape_relative_namespace(paths):
     from consensus_assurance.core.config import TargetConfig
     with pytest.raises(ValueError,match='relative repository'):TargetConfig(**paths)
+
+
+@pytest.mark.parametrize('output,kind', [
+    ('panic: target error\n\t/tmp/source/protocol/engine.go:41\n\t/tmp/source/protocol/assurance_generated_test.go:20\n', 'target_panic_candidate'),
+    ('panic: bad harness\n\t/tmp/source/protocol/assurance_generated_test.go:20\n', 'harness_panic'),
+    ('--- FAIL: TestAssuranceOne\n', 'test_failure'),
+])
+def test_go_failure_classification_retains_unattributed_nonzero_exit(output,kind):
+    from consensus_assurance.adapters.runners.go_module import GoModuleBackend
+    from consensus_assurance.core.types import CheckRun
+    check=CheckRun(action='direct_check',cwd='/tmp',snapshot_id='source',status=ExecutionStatus.COMPLETED,exit_code=1)
+    GoModuleBackend().parse_test_result(check,json.dumps({'Action':'output','Test':'TestAssuranceOne','Output':output}))
+    assert check.outcome=='tests_failed' and check.parameters['failure_class']==kind
+    assert check.status==ExecutionStatus.COMPLETED

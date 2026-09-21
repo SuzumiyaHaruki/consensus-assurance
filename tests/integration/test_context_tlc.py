@@ -30,7 +30,7 @@ def test_old_operation_completes_on_owned_context_not_current_object(prepared,tl
     state.claims[0].description='A completed callback changes only the object that accepted the operation'
     state.claims[1].description='Completion uses the retained object identity after the current context changes'
     for claim in state.claims[:2]:
-        claim.source_ids=[material.id];claim.grounding.behavior_ids=[material.id]
+        claim.source_ids=[material.id];claim.grounding.source_ids=[material.id]
     bundle.constraints=[]
     bundle.behavior=r'''---- MODULE Behavior ----
 EXTENDS Naturals

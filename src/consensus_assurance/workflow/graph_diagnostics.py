@@ -9,9 +9,9 @@ def grounding_errors(basis,materials,binding_ids):
     errors=[]
     if not basis.derivation.strip() or not basis.applicability.strip():
         errors.append((['derivation','applicability'],'A derivation and implementation applicability are required, not a source file kind'))
-    if not basis.behavior_ids and not basis.expectation_ids:
-        errors.append((['behavior_ids','expectation_ids'],'Grounding must reference actually read materials'))
-    for field in ('behavior_ids','expectation_ids'):
+    if not basis.source_ids and not basis.expectation_ids:
+        errors.append((['source_ids','expectation_ids'],'Grounding must reference actually read materials'))
+    for field in ('source_ids','expectation_ids'):
         unknown=set(getattr(basis,field))-set(materials)
         if unknown:errors.append(([field],'Grounding must reference actually read materials; unknown '+field+': '+', '.join(sorted(unknown))))
     if not set(basis.binding_ids)<=set(binding_ids):
@@ -53,7 +53,7 @@ def diagnose_graph(state,proposal,audit_spec=None):
             problems=grounding_errors(obj.grounding,materials,bindings)
             if problems:
                 fields=list(dict.fromkeys(f for names,_ in problems for f in names))
-                supplied=[id for id in obj.grounding.behavior_ids+obj.grounding.expectation_ids if id in materials]
+                supplied=[id for id in obj.grounding.source_ids+obj.grounding.expectation_ids if id in materials]
                 emit('grounding_reference','material',[obj.id],[f'/{collection}/{i}/grounding/{f}' for f in fields],supplied,
                      '; '.join(message for _,message in problems),['representation','read'])
                 issues[-1].details={'reference_contract':graph_contract()['material_references'],
@@ -79,7 +79,7 @@ def diagnose_graph(state,proposal,audit_spec=None):
             issues[-1].details=evidence
     for i,r in enumerate(proposal.relations):
         if r.source not in set(claims)|set(bindings) or r.target not in set(claims)|set(bindings):
-            emit('relation_endpoint','association',[r.id,r.source,r.target],[f'/relations/{i}'],r.grounding.behavior_ids+r.grounding.expectation_ids,'Relation endpoint does not exist; keep a reading gap instead of inventing an endpoint',['association','read'])
+            emit('relation_endpoint','association',[r.id,r.source,r.target],[f'/relations/{i}'],r.grounding.source_ids+r.grounding.expectation_ids,'Relation endpoint does not exist; keep a reading gap instead of inventing an endpoint',['association','read'])
     from .audit_spec import load,validate_question
     spec=audit_spec or load(state)
     relations={r.id:r for r in proposal.relations}

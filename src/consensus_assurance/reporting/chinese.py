@@ -247,7 +247,7 @@ def render_report(state, root):
     for claim in state.claims:
         lines += [f"- `{claim.id}`（{claim.kind}，{claim.assessment.value}）：{claim.description}",
                   f"  来源：{', '.join(claim.source_ids)}；待确认：{'；'.join(claim.pending) or '见范围假设'}。"]
-        lines += [f"  语义版本：{claim.version}；行为材料 {claim.grounding.behavior_ids}；职责依据 {claim.grounding.expectation_ids}；绑定 {claim.grounding.binding_ids}。",
+        lines += [f"  语义版本：{claim.version}；行为材料 {claim.grounding.source_ids}；职责依据 {claim.grounding.expectation_ids}；绑定 {claim.grounding.binding_ids}。",
                   f"  推导：{claim.grounding.derivation}；适用性：{claim.grounding.applicability}；未决/冲突：{claim.grounding.unresolved + claim.grounding.conflicts}。"]
     if not state.claims:
         lines.append("尚未完成自主义务发现；未补入预置义务。")

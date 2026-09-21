@@ -60,7 +60,9 @@ def validate_plan(state,unit,plan,implementation):
             raise ValueError('Direct monitor needs shared operation/participant/context identity')
         if not monitor.binding_ids or not set(monitor.binding_ids)<=set(plan.binding_ids):raise ValueError('Monitor needs selected source bindings')
         if not monitor.applicability_conditions:raise ValueError('Monitor needs observed applicability conditions')
-        if p.trigger.reference or p.assertion.reference:raise ValueError('Direct assertions use actual event fields; aliases belong to prerequisites')
+        if p.trigger.reference:raise ValueError('Direct trigger must select an actual event field')
+        if p.assertion.reference and (p.assertion.reference.partition('.')[0] not in {r.alias for r in plan.harness.prerequisites[:-1]} or not p.assertion.reference.partition('.')[2]):
+            raise ValueError('Direct comparison must reference a prior correlated prerequisite event')
         witness=[r for r in plan.harness.prerequisites[1:] if r.event==monitor.event]
         aliases={r.alias for r in plan.harness.prerequisites}
         if not any(all(any(c.field==key and c.op=='eq' and c.reference and c.reference.partition('.')[0] in aliases and c.reference.partition('.')[2]==key for c in r.conditions) for key in monitor.identity_fields) for r in witness):
@@ -109,7 +111,7 @@ def save_plan(engine,unit,plan,operation_id):
             artifact_digests={str(folder/p.relative_to(temporary)):digest(p.read_bytes()) for p in [temporary/'plan.json',temporary/engine.implementation.harness_filename]},
             snapshot_id=state.snapshot.id,unit_id=unit.id,claim_id=plan.claim_id,binding_ids=plan.binding_ids,
             graph_versions={o.id:o.version for o in state.claims+state.bindings+state.relations+state.units if o.id in ids},
-            origin=Origin.MOCK if state.mode=='mock' else Origin.PRESET if state.analysis_mode=='regression' else Origin.AGENT,
+            origin=Origin.MOCK if state.mode=='mock' else Origin.PRESET if state.analysis_mode=='regression' or state.config.get('parameters',{}).get('manual_directed_followup') else Origin.AGENT,
             scope=plan.scope,operation_id=operation_id)
         write_json(temporary/'commit.json',artifact)
         os.rename(temporary,folder)
@@ -145,7 +147,8 @@ def execute(engine,artifact,plan):
 
 def assess(state,unit,artifact,plan,check,events):
     prerequisite=match_prerequisites(events,plan.harness.prerequisites)
-    results=[monitor_events(events,m) for m in plan.monitors]
+    aliases={r.alias:events[index] for r,index in zip(plan.harness.prerequisites,prerequisite['matched_indices'])} if prerequisite['status']=='matched' else {}
+    results=[monitor_events(events,m,aliases=aliases) for m in plan.monitors]
     limitations=list(plan.uncertainties)
     if DirectCheckPlan.model_validate_json(Path(artifact.plan_path).read_text())!=plan:limitations.append('Plan differs from saved executable input')
     validate_plan(state,unit,plan,type('Adapter',(),{'harness_kind':plan.harness.kind})())
@@ -163,7 +166,9 @@ def assess(state,unit,artifact,plan,check,events):
         if task.kind=='review' and task.status in {'pending','running','blocked'} and not task.superseded_by and not any(valid_supersession(state,r,task) for r in state.semantic_reviews) and any(id in ids and task.target_versions.get(id)==current.get(id) for id in task.target_ids):
             limitations.append('Relevant semantic review is unfinished: '+task.id)
     if any(current.get(k)!=v for k,v in artifact.graph_versions.items()):limitations.append('Direct semantic inputs changed')
-    if check.status!=ExecutionStatus.COMPLETED or check.exit_code!=0:limitations.append('Execution failed; not property evidence')
+    if check.status==ExecutionStatus.TIMEOUT:limitations.append('External timeout; target behavior and harness completion are unestablished')
+    elif check.status!=ExecutionStatus.COMPLETED:limitations.append('Execution tool or build failed: '+check.reason)
+    elif check.exit_code!=0:limitations.append('Nonzero direct test exit ('+check.parameters.get('failure_class','unclassified')+'); inspect raw stack and target path before attribution')
     if check.snapshot_id!=artifact.snapshot_id or check.direct_check_id!=artifact.id or check.input_versions!=artifact.artifact_digests:limitations.append('Direct input association mismatch')
     if any(not Path(p).is_file() or digest(Path(p).read_bytes())!=v for p,v in artifact.artifact_digests.items()):limitations.append('Saved direct artifact changed')
     if state.mode=='mock' or artifact.origin in {Origin.MOCK,Origin.SYNTHETIC,Origin.MUTATION,Origin.IMPORTED} or check.origin!=Origin.EXECUTED:limitations.append('Nonoriginal execution cannot confirm implementation')

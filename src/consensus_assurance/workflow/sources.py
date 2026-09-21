@@ -67,7 +67,7 @@ def dependency_closure(objects,seeds):
         anchor=obj.get('anchor') or {}
         if anchor.get('material_id'):wanted.add(anchor['material_id'])
         wanted.update(anchor.get('source_ids',[]))
-        basis=obj.get('grounding') or {};wanted.update(basis.get('behavior_ids',[])+basis.get('expectation_ids',[]));todo.extend(basis.get('binding_ids',[]))
+        basis=obj.get('grounding') or {};wanted.update(basis.get('source_ids',[])+basis.get('expectation_ids',[]));todo.extend(basis.get('binding_ids',[]))
         for key in ['obligation_ids','binding_ids','relation_ids','behavior_ids','fact_ids','produces_fact_ids','consumes_fact_ids','producer_behavior_ids','consumer_behavior_ids']:todo.extend(obj.get(key,[]))
         for key in ['source','target','claim_id','fact_id']:
             if obj.get(key) in objects:todo.append(obj[key])
@@ -107,7 +107,7 @@ def validate_view_citations(response, context):
     def walk(node, route=()):
         if isinstance(node,dict):
             for key,value in node.items():
-                citation=key in {'source_ids','expectation_ids','material_id'} or (key=='behavior_ids' and route and route[-1]=='grounding')
+                citation=key in {'source_ids','expectation_ids','material_id'} or (key=='source_ids' and route and route[-1]=='grounding')
                 if citation:
                     aliases=[v for v in (value if isinstance(value,list) else [value]) if isinstance(v,str) and v in views]
                     if aliases:

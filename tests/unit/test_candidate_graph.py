@@ -37,7 +37,7 @@ def test_code_derived_responsibilities_are_candidates(prepared):
     graph=GraphDraft.model_validate(responses[1])
     c=graph.claims[1]
     c.source_ids=['counter.py:1:10','limits.py:1:2']
-    c.grounding=Grounding(behavior_ids=c.source_ids,binding_ids=['step_binding','input_binding'],
+    c.grounding=Grounding(source_ids=c.source_ids,binding_ids=['step_binding','input_binding'],
         derivation='The consumer assumes a positive limit and the producer must establish that precondition',
         applicability='Serial calls in the fixture',unresolved=['No direct documented contract; inferred responsibility'])
     apply_graph(state,graph)

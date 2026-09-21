@@ -14,7 +14,7 @@ def setup_ack(repo, mode='durable', partial=False):
     materials=[read_material(repo,snapshot,ReadRequest(file=f,start_line=1,end_line=len((repo/f).read_text().splitlines()),reason='Controlled contract evidence')) for f in ['counter.py','README.md']]
     code,document=materials
     scope=Scope(description='Synthetic serial acknowledgement, one participant and operation, no faults',excluded=['Production implementations','General crash semantics'])
-    basis=Grounding(behavior_ids=[code.id],expectation_ids=[document.id],binding_ids=['ack-code'],derivation='The selected configuration defines whether return promises memory acceptance or persistence',applicability='The emitted mode and fault metadata identify the exercised configuration')
+    basis=Grounding(source_ids=[code.id],expectation_ids=[document.id],binding_ids=['ack-code'],derivation='The selected configuration defines whether return promises memory acceptance or persistence',applicability='The emitted mode and fault metadata identify the exercised configuration')
     claims=[Claim(id='memory',kind='obligation',description='Return implies memory acceptance',scope=scope,source='Synthetic contract',source_ids=[document.id],grounding=basis),Claim(id='durable',kind='obligation',description='Return implies persistence in durable mode',scope=scope,source='Synthetic contract',source_ids=[document.id],grounding=basis)]
     if mode=='conflict': claims[1].grounding=basis.model_copy(update={'conflicts':['Conflicting guarantees remain unresolved']})
     state=Analysis(mode='real',analysis_mode='regression',snapshot=snapshot,config=Config(execution_backend='python',protocol='none').model_dump(mode='json'),materials=materials,claims=claims)
