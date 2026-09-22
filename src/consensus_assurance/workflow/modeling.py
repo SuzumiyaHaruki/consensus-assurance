@@ -90,7 +90,7 @@ def obligation_progress(state, unit):
         record=records[-1];check_id=record.get('experiment_check_id')
         if any(p.get('comparison_complete') for p in record.get('properties',[])) and check_id:
             covered[artifact.claim_id]=list(dict.fromkeys(covered.get(artifact.claim_id,[])+[check_id]))
-        if record.get('bounded_complete'):completed.add(artifact.claim_id)
+        if record.get('bounded_complete') and not record.get('blockers'):completed.add(artifact.claim_id)
     return covered,[c for c in unit.obligation_ids if c not in completed]
 
 

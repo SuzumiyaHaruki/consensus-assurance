@@ -34,10 +34,10 @@ class RepairingScopeAgent(ScopeAgent):
             return check,response_type.model_validate(response)
         check,typed=super().analyze(runner,prompt,directory,snapshot_id,timeout,response_type)
         response=typed.model_dump(mode='json')
-        if response_type.__name__=='ReviewReply' and not self.bad_review:
+        if response_type.__name__ in {'ReviewReply','ReviewKnowledgeReply'} and not self.bad_review:
             item=next((i for i in response['items'] if i['target_id']==p.get('selected_unit',{}).get('id')),None)
             if item:
-                self.bad_review=True;item.update(aspect='checker_correspondence',status='disputed',rationale='The consumer boundary is grounded; the unseen producer still requires source inspection',limitations=['Upstream context is not yet explained'])
+                self.bad_review=True;item.update(aspect='checker_correspondence',status='disputed',rationale='The consumer boundary is grounded; the unseen producer still requires source inspection',counterevidence=['The selected producer source is absent'],limitations=['Upstream context is not yet explained'])
         if response_type.__name__=='GraphPatch':
             b=copy.deepcopy(response['bindings'][0]);b.update(id='background',symbol='level',start_line=3,end_line=6,anchor=None,description='Actual helper definitions used to produce the input',pending=['No independent helper guarantee is proven'])
             b['associations']=[{**copy.deepcopy(b['associations'][0]),'claim_id':'step_obligation'}]

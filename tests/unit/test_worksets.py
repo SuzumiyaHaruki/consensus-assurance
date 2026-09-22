@@ -3,7 +3,7 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 import pytest
-from consensus_assurance.core.types import Analysis,SemanticReview,SemanticCheck
+from consensus_assurance.core.types import Analysis,SemanticReview,SemanticCheck,ReviewIssue
 from consensus_assurance.core.config import Config
 from consensus_assurance.adapters.runners.go_module import GoModuleBackend
 from consensus_assurance.workflow.discovery import context
@@ -22,7 +22,9 @@ def test_mixed_history_projects_only_relevant_items_and_retains_counterevidence(
     packet=context(e,u)
     assert len(json.dumps(packet))-before<5000
     assert 'UNRELATED HISTORY' not in json.dumps(packet)
-    s.semantic_reviews.append(SemanticReview(task_id='negative',check_id='fixture',target_versions={target:1},material_ids=[],items=[item(target,'disputed','Unresolved counterevidence must survive')],origin='mock'))
+    negative=SemanticReview(task_id='negative',check_id='fixture',target_versions={target:1},material_ids=[],items=[item(target,'disputed','Unresolved counterevidence must survive')],origin='mock')
+    s.semantic_reviews.append(negative)
+    s.review_issues.append(ReviewIssue(review_id=negative.id,target_id=target,target_version=1,aspect='applicability',source_ids=s.claims[0].source_ids,explanation='Unresolved counterevidence must survive',disposition='blocked',reason='Current sourced dispute'))
     s.semantic_reviews.append(SemanticReview(task_id='positive',check_id='fixture',target_versions={target:1},material_ids=[],items=[item(target,'no_issue_found','A later positive claim')],origin='mock'))
     assert 'Unresolved counterevidence must survive' in json.dumps(context(e,u))
 

@@ -10,6 +10,12 @@ def review_objects(state):
     return {o.id:o for o in state.claims+state.bindings+state.relations+state.units+state.models+state.direct_checks}
 
 
+def issue_challenges(state,issue):
+    review=next((r for r in state.semantic_reviews if r.id==issue.review_id),None)
+    item=next((x for x in review.items if x.target_id==issue.target_id and x.aspect==issue.aspect),None) if review else None
+    return item.counterevidence if item and item.counterevidence else [c['text'] for c in issue.conditions] or [issue.explanation]
+
+
 def material_closure(state, ids):
     objects=review_objects(state)
     from .sources import dependency_closure
@@ -33,7 +39,7 @@ def valid_supersession(state,review,task):
         if review.context_receipt_id:
             contract=target_contract(state,objects[id])
             if review.context_dependencies.get(id,{}).get('dependency_versions')!=contract['dependency_versions'] or not includes(state,contract['required_material_ids'],review.material_ids):return False
-        items=[i for i in review.items if i.target_id==id and i.status=='no_issue_found' and not i.limitations and not i.counterevidence]
+        items=[i for i in review.items if i.target_id==id and i.status=='no_issue_found' and not i.counterevidence]
         if not set(task.requested_aspects.get(id,required_aspects(objects[id])))<={i.aspect for i in items}:return False
     return bool(task.target_versions)
 
@@ -122,16 +128,14 @@ def record_dispositions(state,review,reply,followup_ids):
             issue.resolution_basis=next((r.model_dump(mode='json') for r in reply.resolutions if r.issue_id==issue.id),{'rationale':reply.resolution_rationale})
             issue.resolution_checks=[c.id for c in state.checks if c.model_id==review.model_id and c.action=='model_check']
     for item in reply.items:
-        independent={x for r in reply.resolutions if r.issue_id in reply.resolves_issue_ids and any(i.id==r.issue_id and i.target_id==item.target_id and i.aspect==item.aspect for i in state.review_issues) for x in r.scope_limitations}
-        unresolved=[x for x in item.counterevidence+item.limitations if x not in independent or x in item.counterevidence]
-        if item.status=='no_issue_found' and not item.counterevidence:continue
+        if item.status=='no_issue_found':continue
         disposition='reading' if reply.requests else 'revision' if reply.revision else 'investigation' if followup_ids else 'blocked'
         prior=next((i for i in state.review_issues if not i.resolved_by and i.target_id==item.target_id and i.target_version==review.target_versions[item.target_id] and i.aspect==item.aspect and i.explanation==item.rationale),None)
         if prior:
             prior.source_ids=list(dict.fromkeys(prior.source_ids+item.source_ids))
             prior.prior_review_ids=list(dict.fromkeys(prior.prior_review_ids+[review.id]));prior.task_ids=list(dict.fromkeys(prior.task_ids+followup_ids));continue
         from .repair_policy import condition_records
-        state.review_issues.append(ReviewIssue(conditions=condition_records(unresolved,review.task_id+'/'+item.target_id+'/'+item.aspect,item.source_ids,item.target_id,review.target_versions[item.target_id]),review_id=review.id,target_id=item.target_id,target_version=review.target_versions[item.target_id],aspect=item.aspect,model_id=review.model_id,source_ids=item.source_ids,explanation=item.rationale,disposition=disposition,task_ids=followup_ids,
+        state.review_issues.append(ReviewIssue(conditions=condition_records(item.counterevidence,review.task_id+'/'+item.target_id+'/'+item.aspect,item.source_ids,item.target_id,review.target_versions[item.target_id]),review_id=review.id,target_id=item.target_id,target_version=review.target_versions[item.target_id],aspect=item.aspect,model_id=review.model_id,source_ids=item.source_ids,explanation=item.rationale,disposition=disposition,task_ids=followup_ids,
             reason='Follow-up evidence or semantic review is required' if disposition!='blocked' else 'No actionable follow-up was supplied; the issue remains unresolved and requires planning'))
 
 
@@ -150,7 +154,7 @@ def readiness(state,unit):
             candidates=[r for r in state.semantic_reviews if r.target_versions.get(id)==obj.version and includes(state,needed,r.material_ids) and all(r.context_dependencies.get(id,{}).get('dependency_versions',dependency['dependency_versions']).get(k)==v for k,v in dependency['dependency_versions'].items()) and any(i.target_id==id and i.aspect==aspect for i in r.items)]
             if not candidates:missing.append(id+':'+aspect);continue
             review=candidates[-1];reviews.append(review.id)
-            if any(i.target_id==id and i.aspect==aspect and (i.status!='no_issue_found' or i.counterevidence) for i in review.items):disputed.append(id+':'+aspect)
+            if any(i.target_id==id and i.aspect==aspect and i.status!='no_issue_found' for i in review.items):disputed.append(id+':'+aspect)
     disputed.extend(i.id for i in state.review_issues if i.target_id in relevant and not i.resolved_by)
     return {'unit_version':unit.version,'target_versions':{id:objects[id].version for id in ids},'material_ids':sorted(materials),
         'review_ids':sorted(set(reviews)),'status':'unreviewed' if missing else 'disputed' if disputed else 'reviewed',

@@ -104,9 +104,8 @@ def descriptive_projection(engine,kind,context,task):
         result.pop('focus')
         result.update(selected_question=focus,source_receipt=state.read_plans.get(candidate.read_plan_id))
     if kind=='derive':
-        result['candidate_dispositions']=[{'id':c.id,'question':c.question.question,'fact_ids':c.question.fact_ids,
-            'lifecycle':c.question.obligation_relation_kind,'scope':{'objects':c.question.objects,'contexts':c.question.contexts,'event_paths':c.question.event_paths},
-            'status':c.status,'reason':c.stop_reason} for c in state.question_candidates]
+        from .task_view import candidate_view
+        result['candidate_dispositions']=[candidate_view(state,c) for c in state.question_candidates]
     result['existing_objects']=[{'id':o.id,'version':o.version} for name in ('claims','bindings','relations','units') for o in getattr(state,name)] if kind=='derive' else []
     return result
 

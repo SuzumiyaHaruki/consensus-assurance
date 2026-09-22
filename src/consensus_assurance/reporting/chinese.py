@@ -73,56 +73,50 @@ def resource_lines(state):
     from consensus_assurance.workflow.materials import material_usage,material_allowance
     budget=Budget.model_validate({k:v for k,v in state.config.get("budget",{}).items() if k in Budget.model_fields})
     used=material_usage(state);breadth=material_allowance(state,budget,'breadth');depth=material_allowance(state,budget,'depth')
-    stages={}
-    for check in state.checks:
-        key=check.parameters.get('agent_task','agent') if check.action=='agent' else check.action
-        stage=stages.setdefault(key,{'calls':0,'seconds':0.0,'timed':0})
-        stage['calls']+=not check.reused
-        if check.started_at and check.ended_at and not check.reused:
-            stage['seconds']+=(datetime.fromisoformat(check.ended_at)-datetime.fromisoformat(check.started_at)).total_seconds();stage['timed']+=1
-    builds=[c for c in state.checks if c.action=='agent' and c.parameters.get('agent_task') in {'build','F3'}]
-    accepted=0
-    import json
-    for check in builds:
-        path=Path(check.cwd)/'accepted-response.json'
-        if path.is_file():
-            try:accepted+=isinstance(json.loads(path.read_text()).get('bundle'),dict)
-            except (ValueError,OSError):pass
-    lines=['','## 材料、上下文与实际产物','','字符口径为唯一源代码逻辑行（含一个换行分隔符），不等于每次发送量、token 或费用。未提供 token 数据时不推算账单。',
-        f"唯一材料 {used['unique_chars']}/{budget.material_chars} 字符；区间并集 {used['unique_chunks']}/{budget.material_chunks}。广度当前可分配 {breadth['available_chars']}、为深度保留 {breadth['reserved_for_other_chars']}；深度可分配 {depth['available_chars']}、为广度保留 {depth['reserved_for_other_chars']}。",
-        f"建模类执行记录 {len(builds)}；受理且非空 Bundle 回复 {accepted}；落盘模型版本 {len(state.models)}（仅模型阶段 {sum(m.stage=='model_only' for m in state.models)}，完整组件 {sum(m.stage=='complete' for m in state.models)}）；实际性质搜索记录 {sum(c.action=='model_check' and not c.reused for c in state.checks)}（触达与校准另列）。",
-        '', '| 阶段 | 新调用记录 | 已记录时长（秒） |', '| --- | --- | --- |']
-    for name,item in stages.items():lines.append(f"| {name} | {item['calls']} | {item['seconds']:.2f}（{item['timed']} 条有起止时间） |")
+    lines=['','## 材料、上下文与实际产物','','字符不是 token 或费用。',
+        f"唯一材料 {used['unique_chars']}/{budget.material_chars} 字符；区间并集 {used['unique_chunks']}/{budget.material_chunks}。广度当前可分配 {breadth['available_chars']}、为深度保留 {breadth['reserved_for_other_chars']}；深度可分配 {depth['available_chars']}、为广度保留 {depth['reserved_for_other_chars']}。"]
     deferred=[(id,item) for id,p in state.read_plans.items() for item in p['items'] if item['status']=='deferred']
     for id,item in deferred:
         q=item['request'];lines.append(f"延期读取 `{id}`：{q['file']}:{q['start_line']}–{q['end_line']}；预计新增 {item['new_chars']} 字符；{item['reason']}")
     cached=sum(len(h.get('reattached_material_ids',[])) for h in state.reading_history)
-    lines += [f"缓存复用/重附加记录 {cached} 个；部分重叠只计增量。完整逐项状态及申请原文见 state.json 的 read_plans。",'', '| 任务/包 | 状态 | prompt 字符/字节 | wire schema 字符 | 材料重复出现/省略数 |','| --- | --- | --- | --- | --- |']
-    for p in state.packet_receipts:
-        lines.append(f"| {p['kind']}/{p['id'][:8]} | {p['status']} | {p['prompt_chars']}/{p['prompt_bytes']} | {p['wire_schema_chars']} | {p['duplicate_material_occurrences']}/{len(p['omitted_material_ids'])} |")
-    if not state.packet_receipts:lines.append('历史运行没有任务发送 receipt；不补造输入统计。')
+    lines.append(f"缓存复用/重附加 {cached} 个；每包详情保留在 state.json，不重复展开。")
     interface=sum(any(d['code'].startswith('review_') for d in session.get('resolved_diagnostics',[])+session.get('diagnostics',[])) for session in state.repair_sessions.values())
     lines.append(f"复核接口修复会话 {interface}；实际 F2 语义修订 {sum(r.kind=='F2' and r.status=='applied' for r in state.revisions)}。二者不互相替代。")
-    for task in state.trigger_retry_tasks:lines.append(f"触达任务 {task['model_id']}/{task['requirement_id']}：{task['status']}；尝试 {len(task['attempts'])} 次；{task['reason']}")
-    lines += ['', '## 范围接回、复核复用与里程碑', '', '里程碑是本次记录首次出现该事实的时间；缺失不是零耗时。离线、mock 与真实自主运行不合并比较。']
+    lines += ['', '## 范围接回、复核复用与里程碑', '', '里程碑缺失不表示零耗时；离线、mock 与真实运行分开统计。']
     for name,value in state.milestones.items():lines.append(f'- {name}：{value}')
-    lines.append(f"同语义复核复用记录 {len(state.review_reuses)}；上下文准备失败 {state.usage.get('packet_preparation_failures',0)}；未发送包不消耗实际探索/复核轮数。")
+    lines.append(f"复核复用 {len(state.review_reuses)}；上下文准备失败 {state.usage.get('packet_preparation_failures',0)}；未发送包不计调用。")
     acquired={id for id,p in state.read_plans.items() if p.get('scope_requested') and p['status']=='complete' and any(i['status']=='acquired' for i in p['items'])}
     connected={u['proposal'].get('read_plan_id') for u in state.scope_updates.values() if u['status']=='accepted'} & acquired
-    plans=list(state.read_plans.values())
-    source_plans=sum(any(i['status']=='acquired' for i in p['items']) for p in plans)
-    cache_plans=sum(bool(p['items']) and all(i['status']=='cached' for i in p['items']) for p in plans)
-    stalled=sum(s.get('stagnation',0) for s in state.repair_sessions.values())
-    lines.append(f"读取计划：当前 receipt 有新源 {source_plans}、纯缓存 {cache_plans}；修复无进展次数 {stalled}。读取次数仅从回执统计；材料总量、上下文、Agent 调用与时间仍有限制。")
-    for packet in state.packet_receipts:
-        resources=packet.get('skill_resources')
-        if resources:lines.append(f"技能加载 `{packet['id']}`：版本 {resources['manifest_version']}，{resources['paths']}；仅以实际发送状态为准。")
+    resources=[p['skill_resources'] for p in state.packet_receipts if p.get('skill_resources')]
+    if resources:lines.append(f"实际包加载技能清单版本：{sorted({r['manifest_version'] for r in resources})}。")
     lines.append(f"需接回且已取得新材料的计划 {len(acquired)}；已接回 {len(connected)}；连接率 {str(len(connected))+'/'+str(len(acquired)) if acquired else '无可计算分母/历史未记录'}。这不是语义通过率或系统覆盖率。")
     sent=[p for p in state.packet_receipts if p['status'] in {'executed','accepted'} and not p.get('result_reused')]
-    lines.append(f"实际发送包中源正文累计 {sum(p.get('source_chars_sent',0) for p in sent)} 字符（跨调用重复发送会重复计入）；schema 累计 {sum(p.get('wire_schema_bytes',0) for p in sent)} 字节。无真实 token/账单字段时不换算费用。")
-    for id,update in state.scope_updates.items():lines.append(f"范围提案 {id}：{update['status']}；原单元 {update['proposal']['unit_id']}；新单元 {update.get('new_unit_id','尚未接回')}。")
-    for task in state.inquiry_tasks:
-        if task.child_task_ids:lines.append(f"分包父任务 {task.id}：子任务 {task.child_task_ids}；父状态 {task.status}，未执行子任务不计完成。")
+    lines.append(f"发送源码累计 {sum(p.get('source_chars_sent',0) for p in sent)} 字符（跨调用重复计数）；schema {sum(p.get('wire_schema_bytes',0) for p in sent)} 字节；不换算 token 或费用。")
+    tasks={t.id:t for t in state.inquiry_tasks};artifacts={a.id:a for a in state.direct_checks};models={m.id:m for m in state.models}
+    owners={id:('candidate',c.id) for c in state.question_candidates for id in c.check_ids}
+    owners.update({t.check_id:('candidate',t.candidate_id) if t.candidate_id else ('unit',t.unit_id) for t in state.inquiry_tasks if t.check_id and (t.candidate_id or t.unit_id)})
+    for check in state.checks:
+        if check.direct_check_id in artifacts:owners.setdefault(check.id,('unit',artifacts[check.direct_check_id].unit_id))
+        if check.model_id in models:owners.setdefault(check.id,('unit',models[check.model_id].unit_id))
+    rows={};row=lambda owner:rows.setdefault(owner,{'calls':0,'executions':0,'acquired':0,'sent':0,'result':''})
+    for check in state.checks:
+        owner=owners.get(check.id,('startup','shared') if check.action in PROBES else ('unknown','unattributed'));r=row(owner)
+        r['calls']+=check.action=='agent' and not check.reused;r['executions']+=check.action in {'direct_check','model_check','experiment','replay'} and not check.reused
+    for packet in sent:
+        task=tasks.get(packet.get('task_id'));owner=owners.get(packet.get('check_id')) or (('candidate',task.candidate_id) if task and task.candidate_id else ('unit',task.unit_id) if task and task.unit_id else ('unit',packet['unit_id']) if packet.get('unit_id') else ('unknown','unattributed') if task else ('startup','shared'))
+        row(owner)['sent']+=packet.get('source_chars_sent',0)
+    seen=set()
+    for history in state.reading_history:
+        related=history.get('related_ids',[]);owner=next((('candidate',x) for x in related if any(c.id==x for c in state.question_candidates)),None) or next((('unit',x) for x in related if any(u.id==x for u in state.units)),None) or (('unknown','unattributed') if related else ('startup','shared'))
+        for id in history.get('added_material_ids',[]):
+            if id not in seen:row(owner)['acquired']+=len(next((m.text for m in state.materials if m.id==id),''));seen.add(id)
+    for candidate in state.question_candidates:
+        view=__import__('consensus_assurance.workflow.task_view',fromlist=['candidate_view']).candidate_view(state,candidate);result=view['current_result']
+        row(('candidate',candidate.id))['result']=(f"{result['outcome']}; blockers={len(result['blockers'])}; boundaries={len(result['boundaries'])}" if result else candidate.status)
+    for unit in state.units:row(('unit',unit.id))['result']='blocked' if any(r.get('bounded_complete') and r.get('blockers') and any(a.unit_id==unit.id and a.id==r.get('direct_check_id') for a in state.direct_checks) for r in state.monitor_results) else unit.status
+    lines += ['', '| 工作归属 | Agent 调用 | 工具执行 | 新取得片段字符 | 发送源码字符 | 当前结果 |','| --- | --- | --- | --- | --- | --- |']
+    for owner,item in rows.items():lines.append(f"| {owner[0]}:{owner[1]} | {item['calls']} | {item['executions']} | {item['acquired']} | {item['sent']} | {item['result'] or '无结果'} |")
+    lines.append('统计从既有记录派生；共同启动单列，每项只归属一次，无法关联则列为 unknown。')
     return lines
 
 
@@ -146,23 +140,9 @@ def inquiry_lines(state):
             from consensus_assurance.workflow.materials import uncovered_requests
             stage='read（仍待读取）' if uncovered_requests(state,task.requests) else 'analyze（源码已取得，分析待处理）'
         lines.append(f"| `{task.id[:8]}` | {kind} | {task.status}/{stage} | {text(task.reason)}；{text(task.stop_reason)} |")
-    current={x.id:getattr(x,'version',1) for x in [*state.claims,*state.bindings,*state.units,*state.relations,*state.models]}
-    verdicts={'no_issue_found':'本次范围内暂未发现语义问题','needs_reading':'需要补读','disputed':'解释仍有争议','revision_needed':'需要修订'}
-    aspects={'applicability':'适用性','decomposition':'义务及支撑关系','checker_correspondence':'checker 语义对应'}
-    lines += ["", "| 复核对象/版本 | 层面 | 判断 | 材料与推导 |", "| --- | --- | --- | --- |"]
-    for review in state.semantic_reviews:
-        for item in review.items:
-            version=review.target_versions.get(item.target_id)
-            history='历史语义版本' if current.get(item.target_id)!=version else '当前对象版本'
-            lines.append(f"| {text(item.target_id)} v{version}（{history}） | {aspects[item.aspect]} | {verdicts[item.status]} | {text(item.source_ids)}：{text(item.rationale)} |")
-            if item.limitations: lines.append(f"未解决的有效性条件：{text(item.limitations)}")
-            if item.limitations:lines.append(f"独立范围边界：{text(item.limitations)}")
+    lines += ["", f"语义复核 {len(state.semantic_reviews)} 次；完整判断、来源和历史边界保留在 state.json。当前控制问题如下："]
     for issue in state.review_issues:
         lines.append(f"复核问题 `{issue.id}`：{'由 '+issue.resolved_by+' 显式解决' if issue.resolved_by else '未决'}；处置 `{issue.disposition}`；后续 {issue.task_ids}；{issue.explanation}；{issue.reason}。")
-    for task in state.inquiry_tasks:
-        if task.superseded_by: lines.append(f"历史任务 `{task.id}` 已由复核 `{task.superseded_by}` 完整替代；保留原执行状态。")
-    if not state.semantic_reviews: lines.append("尚无已执行的语义复核；有来源的候选不因此变成已确认规范。")
-    lines += ["", "职责清单之外仍可能有未知遗漏。未复核对象、未执行义务和受阻任务保留原状态；局部模型通过不能消除它们。"]
     return lines
 
 
@@ -173,7 +153,8 @@ def audit_lines(state):
         for claim in state.claims:
             if claim.id in unit.obligation_ids:lines.append(f"{claim.id} — {claim.description}")
         code=[f"{b.symbol} @ {b.file}:{b.start_line}-{b.end_line}" for b in state.bindings if b.id in unit.binding_ids]
-        lines += ['代码：'+'；'.join(code),f"问题：{q.question if q else '尚未形成'}",f"方法：{q.preferred_check if q else '未选'}；状态：{unit.status}"]
+        blocked=any(r.get('bounded_complete') and r.get('blockers') and any(a.unit_id==unit.id and a.id==r.get('direct_check_id') for a in state.direct_checks) for r in state.monitor_results)
+        lines += ['代码：'+'；'.join(code),f"问题：{q.question if q else '尚未形成'}",f"方法：{q.preferred_check if q else '未选'}；当前状态：{'blocked' if blocked else unit.status}（归档 {unit.status}）"]
         evidence=[e for e in state.evidence if e.claim_id in unit.obligation_ids]
         lines.append('证据：'+('; '.join(e.id+': '+str(e.assessment)+' / '+e.applicability for e in evidence) if evidence else '尚无；不能宣称正确'))
         if q:
@@ -213,42 +194,37 @@ def render_report(state, root):
         "", f"分析入口：`{'regression' if state.mode == 'mock' else state.analysis_mode}`。regression 表示预设开发回归，不能计为自主发现验收。",
         "", "## 分析输入与探索范围", "", f"仓库：`{state.snapshot.repo}`", f"提交：`{state.snapshot.commit or '无 Git 元数据'}`；分支：`{state.snapshot.branch or 'detached / unavailable'}`；脏工作区：`{state.snapshot.dirty}`。",
         f"快照：`{state.snapshot.id}`，纳入 {len(state.snapshot.files)} 个文件；读取 {len(state.materials)} 个材料片段，仍有未读范围的文件 {len(state.unexplored)} 个。完整清单见 [materials.json](materials.json)、[catalogue.json](catalogue.json) 和 [snapshot.json](snapshot.json)。",
-        "候选集合不代表全部正确性要求；原始材料和机器分析字段保留英文或原文。", "", "## 义务与选择依据", ""]
+        "候选不代表完整性；原始材料保留原文。", "", "## 义务与选择依据", ""]
     insert_at = lines.index("## 分析输入与探索范围")
     lines[insert_at:insert_at] = audit_lines(state) + progress_lines(state) + [""]
-    lines += ["领域引导采用同一流程；不使用‘完全无先验’或‘纯独立发现’标签。实际提供的引导与参考："]
+    lines += ["领域引导与参考："]
     for guidance in state.guidance:
         lines += [f"- `{guidance['source']}`：{guidance['text'] or '未提供协议参考清单'}"]
     for history in state.reading_history:
         if history['gap']:
             lines += [f"定向补读：{history['gap']}；关联 {history['related_ids']}；实际新增片段 {history['added_material_ids']}。"]
-    lines += ['', '## 候选问题与已有保护', '', '候选解释是有来源的分析判断，不是性质证据或协议正确性证明。']
+    lines += ['', '## 候选问题与已有保护', '', '候选判断不是性质证据。']
     if not state.question_candidates:
         lines.append('未记录结构化候选问题。')
     from consensus_assurance.workflow.discovery import candidate_blockage
     blockages=[candidate_blockage(state,c) for c in state.question_candidates]
     lines.append('候选受阻分类：'+ '；'.join(k+'='+str(blockages.count(k)) for k in ('evidence_blocked','workflow_blocked','resource_blocked')))
-    children={c.id:[x for x in state.question_candidates if x.parent_candidate_id==c.id] for c in state.question_candidates}
+    from consensus_assurance.workflow.task_view import candidate_view
+    children={c.id:[candidate_view(state,x) for x in state.question_candidates if x.parent_candidate_id==c.id] for c in state.question_candidates}
     for candidate in state.question_candidates:
-        q=candidate.question
-        if candidate_blockage(state,candidate)=='evidence_blocked':
-            lines.append('当前问题及已识别的局部关系都没有足够依据形成局部可归因检查；候选延期，未确认缺陷。')
+        q=candidate.question;current=candidate_view(state,candidate);result=current['current_result']
         if candidate.status=='explained':
-            lines.append('当前选定怀疑：已由记录的来源与保护机制解释。')
             adjacent=q.unknowns or ['当前记录未结构化列出相邻问题']
             lines.append('相邻但未检查的问题：'+str(adjacent)+'；不由本候选结论覆盖，需以独立来源和判别条件另行调查。')
-        lines += [f"- 候选 `{candidate.id}`：Fact {q.fact_ids}；生命周期 {q.obligation_relation_kind}；状态 {candidate.status} / {q.disposition}；受阻分类 {candidate_blockage(state,candidate) or '无'}。",
-            f"  问题：{q.question}；意义：{q.importance}。",
-            f"  适用上下文：{q.contexts}；事件路径：{q.event_paths}；来源：{q.source_ids}。",
-            f"  已有保护/反证：{q.counterevidence}；剩余判别与限制：{q.unknowns}。",
-            f"  选择/缩窄依据：{q.trigger_rationale}；历史问题版本：{len(candidate.history)}。",
-            f"  升级义务：{candidate.obligation_id or '未生成'}；候选结论或受阻原因：{candidate.stop_reason or '继续获取证据'}。"]
+        lines += [f"- 候选 `{candidate.id}`：Fact {q.fact_ids}；{q.obligation_relation_kind}；{candidate.status}/{q.disposition}；受阻 {candidate_blockage(state,candidate) or '无'}。",
+            f"  {q.question}；意义：{q.importance}；上下文/路径：{q.contexts}/{q.event_paths}；来源：{q.source_ids}。",
+            f"  提出时的保护与未知：{q.counterevidence}/{q.unknowns}；选择依据：{q.trigger_rationale}；义务：{candidate.obligation_id or '未生成'}；处置：{candidate.stop_reason or '继续获取证据'}；历史版本 {len(candidate.history)}。"]
+        if result:lines.append(f"  当前局部结果：{result}；执行/证据关联：{current['check_ids']} / {current['evidence_ids']}；当前剩余判别：{current['remaining_discriminators']}。")
         if candidate.parent_candidate_id:
             parent=next((x for x in state.question_candidates if x.id==candidate.parent_candidate_id),None)
-            unit=next((u for u in state.units if candidate.obligation_id in u.obligation_ids),None)
-            lines.append(f"  Parent `{candidate.parent_candidate_id}`；fork 原因：{candidate.fork_reason}；Parent 未决：{parent.question.unknowns if parent else '历史 Parent 不可用'}；child 局部义务/检查：{candidate.obligation_id or '未生成'} / {unit.status if unit else '未形成 AuditUnit'}。")
+            lines.append(f"  Parent `{candidate.parent_candidate_id}`；fork 原因：{candidate.fork_reason}；Parent 未决：{parent.question.unknowns if parent else '历史 Parent 不可用'}；child 局部义务/检查：{candidate.obligation_id or '未生成'} / {current['unit_status'] or '未形成 AuditUnit'}。")
         if children[candidate.id]:
-            lines.append('  Child：'+str([{'id':c.id,'fork_reason':c.fork_reason,'local_obligation':c.obligation_id} for c in children[candidate.id]])+'；Parent 原问题及未决项保持独立。')
+            lines.append('  Child 当前贡献：'+str(children[candidate.id])+'；Parent 原问题及未决项保持独立。')
     if state.audit_spec_path:
         from consensus_assurance.workflow.audit_spec import load,audit_object_key
         from consensus_assurance.core.types import ConsensusAuditSpec

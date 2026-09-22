@@ -235,7 +235,7 @@ def test_no_local_normative_basis_remains_evidence_blocked(focused,tmp_path):
     assert e.state.pending_output_repair is None and not e.state.repair_sessions and e.state.usage['agent_calls']==1
     from consensus_assurance.reporting.chinese import render_report
     report=render_report(e.state,e.root).read_text()
-    assert '没有足够依据形成局部可归因检查' in report and reply.selection_rationale in report
+    assert '受阻 evidence_blocked' in report and reply.selection_rationale in report
 
 
 @pytest.mark.parametrize('invalid',['initial_block','active_exhausted','unreviewed_block','unknowns_empty','wrong_check','ready_without_obligation','blank_reason'])
@@ -421,8 +421,11 @@ def test_child_result_does_not_close_parent_or_promote_consequence(focused,tmp_p
         description='Only the child local relation was observed',assessment=Assessment.INCONCLUSIVE))
     assert parent.status=='paused' and parent.question==original and parent.obligation_id is None
     assert all(x.claim_id!=parent.obligation_id for x in e.state.evidence)
+    projected={x['id']:x for x in selected_packet(e)['candidate_dispositions']}
+    assert projected[child.id]['evidence_ids']==[e.state.evidence[-1].id]
+    assert 'local-check' in projected[child.id]['check_ids'] and projected[parent.id]['current_result'] is None
     report=__import__('consensus_assurance.reporting.chinese',fromlist=['render_report']).render_report(e.state,tmp_path).read_text()
-    assert f"Parent `{parent.id}`" in report and 'Parent 原问题及未决项保持独立' in report
+    assert f"Parent `{parent.id}`" in report and 'Parent 原问题及未决项保持独立' in report and 'local-check' in report
 
 
 def test_ready_child_check_precedes_enrichment_and_surface(focused):

@@ -1,0 +1,291 @@
+{
+  "understanding": "Attached source resolves the snapshot scheduling owner and a repository test-helper selection path. runSnapshots invokes takeSnapshot for periodic and user requests. makeCluster passes a FileSnapTest-created FileSnapshotStore and a selected FSM to NewRaft; FileSnapTest sets the store's noSync option. Successful user requests install an opener delegated to the snapshot store, and sequential Open calls consume that opener once. These observations do not establish deployment selection, callback compliance, successful opening, or publication correctness.",
+  "requests": [],
+  "delta": {
+    "target_profile": null,
+    "activities": [],
+    "behaviors": [
+      {
+        "id": "B_take_snapshot",
+        "primary_activity": "A6",
+        "execution_owner": "runSnapshots goroutine executing Raft.takeSnapshot",
+        "protocol_context": "Local FSM capture plus committed configuration metadata obtained separately. The snapshot loop runs independently of the FSM and main goroutines.",
+        "trigger": "Periodic timeout when shouldSnapshot returns true, or a request received on userSnapshotCh.",
+        "legal_preconditions": [
+          "FSMSnapshot implementation must satisfy its interface contract; deployment-selected implementation is unknown.",
+          "The takeSnapshot declaration requires invocation from the snapshot thread, never the main thread."
+        ],
+        "implementation_guards": [
+          "Periodic invocation requires shouldSnapshot: a successful log LastIndex lookup and an unsigned index delta at least SnapshotThreshold.",
+          "User-triggered invocation bypasses shouldSnapshot.",
+          "Waits for successful capture and configuration futures.",
+          "Rejects capture index below committed configuration index.",
+          "Checks Create, Persist, Close and compaction errors."
+        ],
+        "reads": [
+          "Capture handle, index and term.",
+          "Committed configuration and index.",
+          "Protocol version, log bounds and TrailingLogs.",
+          "For periodic scheduling, SnapshotInterval, SnapshotThreshold and last-snapshot index."
+        ],
+        "writes": [
+          "Snapshot sink through Persist.",
+          "Last-snapshot metadata after successful Close.",
+          "Log store through bounded DeleteRange."
+        ],
+        "durable_effects": [
+          "Requests snapshot persistence and publication through the selected adapter.",
+          "Deletes an eligible prefix only after Persist and Close return nil; actual storage guarantees depend on adapters."
+        ],
+        "external_effects": [
+          "Always releases a successfully obtained capture handle on exit.",
+          "Cancels the sink when Persist returns an error.",
+          "Returns snapshot ID only after successful compaction."
+        ],
+        "important_branches": [
+          "Compaction failure occurs after last-snapshot metadata update.",
+          "Compaction retains at least the configured trailing range and does not delete beyond the snapshot index.",
+          "Persist may itself close the sink under the interface contract before takeSnapshot calls Close.",
+          "The visible snapshot loop executes each takeSnapshot call synchronously before selecting another trigger.",
+          "In makeCluster, ConfigStoreFSM selects MockFSMConfigStore wrapping MockFSM; otherwise MakeFSMFunc selects the FSM when provided, with MockFSM as the default.",
+          "makeCluster passes its selected FSM and FileSnapTest-created FileSnapshotStore to NewRaft. FileSnapTest sets the store's noSync option to true; this identifies a test-helper path, not a deployment configuration."
+        ],
+        "async_boundaries": [
+          "fsmSnapshotCh request and wait.",
+          "configurationsCh request and wait.",
+          "Persist may overlap later FSM application under the interface contract.",
+          "Periodic timer and userSnapshotCh feed the snapshot loop, which also selects shutdownCh between operations."
+        ],
+        "produces_fact_ids": [
+          "F_local_snapshot_completed"
+        ],
+        "consumes_fact_ids": [
+          "F_capture_return"
+        ],
+        "cross_activity_effects": {
+          "A4": "Embeds separately obtained committed configuration metadata in the snapshot.",
+          "A3": "Creates a snapshot ID potentially available to recovery; startup recovery selection remains unresolved.",
+          "A7": "The user-request branch uses successful completion and its returned ID to install a delegated snapshot opener before responding to the future."
+        },
+        "existing_protections": [
+          "Capture/configuration index comparison.",
+          "Error checks before metadata advancement and compaction.",
+          "Snapshot-bounded deletion.",
+          "Deferred Release.",
+          "The visible loop serializes its periodic and user-triggered takeSnapshot calls."
+        ],
+        "source_ids": [
+          "snapshot.go:125:278",
+          "fsm.go:1:80",
+          "snapshot.go:1:125",
+          "testing.go:551:874"
+        ],
+        "unknowns": [
+          "Deployment-selected FSM and snapshot adapter.",
+          "Snapshot callback content correctness, including the behavior of the selected test callback.",
+          "Startup recovery use of the resulting ID.",
+          "Sink close behavior after a callback closes it.",
+          "Constructor assignment and store-to-sink propagation of noSync are not established by the attached selection call sites.",
+          "Goroutine startup and exhaustive takeSnapshot call-site coverage are not established by the attached loop."
+        ]
+      },
+      {
+        "id": "B_file_sink_close",
+        "primary_activity": "A6",
+        "execution_owner": "Caller executing FileSnapshotSink.Close",
+        "protocol_context": "A concrete file snapshot sink with closed flag, temporary directory and synchronization option. The repository makeCluster helper supplies a FileSnapshotStore with store.noSync set true by FileSnapTest.",
+        "trigger": "Close invocation.",
+        "legal_preconditions": [
+          "Sink construction and concurrent-call ownership remain unread."
+        ],
+        "implementation_guards": [
+          "Returns nil immediately when closed is already true.",
+          "Checks finalize, writeMeta, rename, conditional directory Sync and ReapSnapshots results."
+        ],
+        "reads": [
+          "closed",
+          "noSync",
+          "runtime.GOOS",
+          "Directory paths and open file resources."
+        ],
+        "writes": [
+          "Sets closed before finalization.",
+          "Flushes buffer and conditionally syncs state file.",
+          "Closes state file and records size and CRC.",
+          "Writes metadata and renames directory.",
+          "Invokes snapshot reaping."
+        ],
+        "durable_effects": [
+          "Fresh successful execution performs publication and configured synchronization steps; writeMeta details remain unread."
+        ],
+        "external_effects": [
+          "Returns errors from intermediate stages.",
+          "On finalize failure, attempts removal of the temporary directory."
+        ],
+        "important_branches": [
+          "An already-closed invocation returns nil without checking the outcome of an earlier invocation.",
+          "Errors after rename occur after the directory has moved.",
+          "Parent-directory Sync is skipped on Windows or with noSync.",
+          "A cleanup error can replace the original finalize error.",
+          "FileSnapTest explicitly sets FileSnapshotStore.noSync to true before makeCluster passes that store to NewRaft; the attached helper does not show propagation into a created sink."
+        ],
+        "async_boundaries": [],
+        "produces_fact_ids": [
+          "F_file_snapshot_fresh_close"
+        ],
+        "consumes_fact_ids": [],
+        "cross_activity_effects": {},
+        "existing_protections": [
+          "Checked flush, optional sync, file close, metadata write and rename.",
+          "Temporary-directory publication pattern.",
+          "Fresh-call error propagation."
+        ],
+        "source_ids": [
+          "file_snapshot.go:397:500",
+          "testing.go:551:874"
+        ],
+        "unknowns": [
+          "writeMeta implementation.",
+          "ReapSnapshots and retention semantics.",
+          "Listing and opening published snapshots.",
+          "Constructor initialization and propagation of the selected store's noSync option into sinks.",
+          "Deployment selection of this adapter and synchronization option.",
+          "No stronger fact is assigned to the already-closed return branch."
+        ]
+      },
+      {
+        "id": "B_user_snapshot_completion",
+        "primary_activity": "A7",
+        "execution_owner": "runSnapshots goroutine",
+        "protocol_context": "A userSnapshotFuture received on userSnapshotCh and the result of its synchronous takeSnapshot invocation.",
+        "trigger": "Return from takeSnapshot in the userSnapshotCh branch.",
+        "legal_preconditions": [],
+        "implementation_guards": [
+          "Installs the opener only when takeSnapshot returns no error."
+        ],
+        "reads": [
+          "Returned snapshot ID and error.",
+          "Raft snapshot-store reference."
+        ],
+        "writes": [
+          "On success, future.opener is set to a closure delegating to r.snapshots.Open(id).",
+          "Future completion through future.respond(err)."
+        ],
+        "durable_effects": [],
+        "external_effects": [
+          "Logs a takeSnapshot error.",
+          "Responds to the user future with the takeSnapshot result."
+        ],
+        "important_branches": [
+          "Successful completion installs a closure without invoking the store's Open method.",
+          "Error completion does not install an opener.",
+          "The periodic branch logs errors but does not provide a user future opener."
+        ],
+        "async_boundaries": [
+          "Future response separates snapshot-loop completion from later caller access."
+        ],
+        "produces_fact_ids": [],
+        "consumes_fact_ids": [
+          "F_local_snapshot_completed"
+        ],
+        "cross_activity_effects": {},
+        "existing_protections": [
+          "The success branch assigns the opener before responding to the future."
+        ],
+        "source_ids": [
+          "snapshot.go:1:125",
+          "future.go:1:314"
+        ],
+        "unknowns": [
+          "Availability and retention of the snapshot at a later Open call.",
+          "Concrete snapshot-store Open behavior."
+        ]
+      },
+      {
+        "id": "B_user_snapshot_open",
+        "primary_activity": "A7",
+        "execution_owner": "Caller executing userSnapshotFuture.Open",
+        "protocol_context": "A user snapshot future containing an optional delegated opener.",
+        "trigger": "SnapshotFuture.Open invocation.",
+        "legal_preconditions": [
+          "The SnapshotFuture interface requires Error to return before Open is called."
+        ],
+        "implementation_guards": [
+          "Returns a no-snapshot-available error when opener is nil."
+        ],
+        "reads": [
+          "future.opener."
+        ],
+        "writes": [
+          "Defers setting opener to nil when invoking a nonnil opener."
+        ],
+        "durable_effects": [],
+        "external_effects": [
+          "Invokes the installed opener and returns its metadata, reader and error."
+        ],
+        "important_branches": [
+          "A nonnil opener is cleared after invocation even when the delegated operation returns an error.",
+          "A subsequent sequential Open call returns no snapshot available.",
+          "Clearing occurs after invocation; this is not an observed synchronization mechanism for concurrent Open calls."
+        ],
+        "async_boundaries": [
+          "Caller invocation occurs separately from snapshot-loop installation and future completion."
+        ],
+        "produces_fact_ids": [],
+        "consumes_fact_ids": [],
+        "cross_activity_effects": {},
+        "existing_protections": [
+          "Nil-opener rejection.",
+          "Deferred invalidation prevents repeated sequential use of the installed opener."
+        ],
+        "source_ids": [
+          "future.go:1:314",
+          "snapshot.go:1:125"
+        ],
+        "unknowns": [
+          "Concurrent Open usage contract and caller discipline.",
+          "Concrete adapter opening, validation and retention semantics.",
+          "Returned reader lifecycle at consumers."
+        ]
+      }
+    ],
+    "facts": [],
+    "surfaces": [
+      {
+        "entry_point": "runSnapshots userSnapshotCh completion",
+        "disposition": "mapped",
+        "behavior_ids": [
+          "B_user_snapshot_completion"
+        ],
+        "reason": "The attached user-request branch installs a delegated opener only after successful takeSnapshot completion and then responds to the future.",
+        "source_ids": [
+          "snapshot.go:1:125",
+          "future.go:1:314"
+        ],
+        "high_consequence": true
+      },
+      {
+        "entry_point": "userSnapshotFuture.Open",
+        "disposition": "mapped",
+        "behavior_ids": [
+          "B_user_snapshot_open"
+        ],
+        "reason": "The attached method rejects a missing opener, delegates a present opener and clears it after invocation. Store opening semantics remain a separate unresolved responsibility.",
+        "source_ids": [
+          "future.go:1:314"
+        ],
+        "high_consequence": true
+      }
+    ],
+    "remove_behavior_ids": [],
+    "remove_fact_ids": [],
+    "remove_surface_entry_points": [],
+    "rationale": "Resolve the supplied descriptive issue using the already attached exact source. Preserve existing snapshot orchestration and close protections while replacing the unknown scheduling owner and qualifying adapter selection with the observed test-helper scope. Separate snapshot-loop completion from caller-owned opening. Add the successful user completion consumer of F_local_snapshot_completed without changing any existing Fact meaning, identity or validity context. Global Activity and TargetProfile descriptions remain unchanged."
+  },
+  "limitations": [
+    "Existing behavior details supported by previously registered sources are retained; those source bodies are not reattached here and were not independently reassessed.",
+    "makeCluster and FileSnapTest establish repository helper choices, not activation in a deployment or an executed test.",
+    "Store-to-sink noSync propagation, concrete Open behavior, callback compliance and crash-recovery publication semantics remain unresolved.",
+    "No test, model, execution, correctness determination or normative revision is supplied."
+  ]
+}

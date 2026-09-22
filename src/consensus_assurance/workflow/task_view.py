@@ -1,13 +1,38 @@
 """Derived current worksets. Immutable audit records remain in state and raw artifacts."""
-import json
-from .reviews import material_closure, review_objects
+from .reviews import material_closure, review_objects, issue_challenges
+
+
+def candidate_view(state,candidate):
+    unit=next((u for u in state.units if candidate.obligation_id in u.obligation_ids),None)
+    artifacts=[a for a in state.direct_checks if unit and a.unit_id==unit.id]
+    result=next((r for r in reversed(state.monitor_results) if any(a.id==r.get('direct_check_id') for a in artifacts)),None)
+    current={k:result.get(k) for k in ('outcome','bounded_complete','confirmed','blockers','boundaries','level')} if result else None
+    if current:
+        issues=[i for i in state.review_issues if not i.resolved_by and any(a.id==i.target_id for a in artifacts)]
+        reviews=[i for r in state.semantic_reviews for i in r.items if any(a.id==i.target_id for a in artifacts) and i.aspect=='checker_correspondence']
+        try:
+            from .direct_checks import load_plan
+            uncertainties=load_plan(next(a for a in artifacts if a.id==result['direct_check_id']).plan_path).uncertainties
+        except (OSError,ValueError,StopIteration):uncertainties=[]
+        if issues:current['blockers']=['Issue '+i.id+': '+'; '.join(issue_challenges(state,i)) for i in issues]
+        if reviews:current['boundaries']=list(dict.fromkeys(unit.scope.excluded+uncertainties+reviews[-1].limitations))
+    records=[e for e in state.evidence if e.claim_id==candidate.obligation_id and (not result or e.check_id==result['experiment_check_id'])]
+    checks=list(dict.fromkeys(candidate.check_ids+[e.check_id for e in records]+([result['experiment_check_id']] if result else [])+
+        [t.check_id for t in state.inquiry_tasks if t.check_id and (t.candidate_id==candidate.id or unit and t.unit_id==unit.id)]))
+    evidence=[e.id for e in records]
+    return {'id':candidate.id,'parent_candidate_id':candidate.parent_candidate_id,'fork_reason':candidate.fork_reason,
+        'question':candidate.question.question,'fact_ids':candidate.question.fact_ids,'lifecycle':candidate.question.obligation_relation_kind,
+        'status':candidate.status,'reason':candidate.stop_reason,'obligation_id':candidate.obligation_id,
+        'unit_id':unit.id if unit else None,'unit_status':'blocked' if current and current['blockers'] else unit.status if unit else None,'archived_unit_status':unit.status if unit else None,'scope':result.get('scope') if result else unit.scope.model_dump(mode='json') if unit else {'contexts':candidate.question.contexts,'event_paths':candidate.question.event_paths},'check_ids':checks,'evidence_ids':evidence,
+        'current_result':current,
+        'remaining_discriminators':result.get('blockers',[])+result.get('boundaries',[]) if result else candidate.question.unknowns}
 
 
 def semantic_view(state,ids):
     objects=review_objects(state)
     issues=[i for i in state.review_issues if i.target_id in ids]
     tasks={t.id:t for t in state.inquiry_tasks}
-    positive={};negative={};sources=set()
+    positive={};sources=set()
     for review in state.semantic_reviews:
         for item in review.items:
             if item.target_id not in ids:continue
@@ -17,37 +42,17 @@ def semantic_view(state,ids):
             if task and task.superseded_by and not any(not i.resolved_by for i in linked):continue
             current=objects.get(item.target_id)
             same_version=bool(current and review.target_versions.get(item.target_id)==current.version)
-            record={'review_id':review.id,'target_id':item.target_id,'version':review.target_versions.get(item.target_id),
+            if item.status!='no_issue_found' or not same_version:continue
+            from .review_contract import target_contract,same_basis
+            basis=review.context_dependencies.get(item.target_id,{})
+            if basis and not same_basis(basis,target_contract(state,current)):continue
+            positive[(item.target_id,item.aspect)]={'review_id':review.id,'target_id':item.target_id,'version':review.target_versions.get(item.target_id),
                 'aspect':item.aspect,'status':item.status,'source_ids':item.source_ids,'explanation':item.rationale,
-                'counterevidence':item.counterevidence,
-                'limitations':item.limitations,'current_version':same_version}
-            if item.status!='no_issue_found' or item.counterevidence:
-                # Keep unresolved counterevidence even after a later positive opinion.
-                key=json.dumps({k:v for k,v in record.items() if k!='review_id'},sort_keys=True)
-                negative[key]=record
-            elif same_version:
-                from .review_contract import target_contract,same_basis
-                basis=review.context_dependencies.get(item.target_id,{})
-                if basis and not same_basis(basis,target_contract(state,current)):continue
-                record['basis_status']='current' if basis else 'historical_dependency_basis_unrecorded'
-                positive[(item.target_id,item.aspect)]=record
+                'limitations':item.limitations,'basis_status':'current' if basis else 'historical_dependency_basis_unrecorded'}
     open_issues=[{'id':i.id,'target_id':i.target_id,'version':i.target_version,'aspect':i.aspect,'explanation':i.explanation,
         'source_ids':i.source_ids,'disposition':i.disposition,'reason':i.reason} for i in issues if not i.resolved_by]
-    records=list(positive.values())+list(negative.values())
-    for r in records+open_issues:sources.update(r['source_ids'])
-    # The issue already carries the same attributed explanation and sources.
-    # Reference those exact fields, retaining alternatives and counterarguments.
-    for record in records:
-        linked=[i for i in issues if not i.resolved_by and i.review_id==record['review_id'] and i.target_id==record['target_id'] and i.aspect==record['aspect']]
-        if len(linked)==1:
-            issue=linked[0]
-            record['issue_ref']=issue.id
-            if record['explanation']==issue.explanation:
-                record.pop('explanation');record['explanation_ref']=issue.id
-            if record['source_ids']==issue.source_ids:
-                record.pop('source_ids');record['source_ids_ref']=issue.id
-    return {'issue_reference_rule':'explanation_ref/source_ids_ref point to the exact unchanged fields of open_issues by issue ID; all alternatives and counterarguments remain on the judgment',
-        'judgments':records,'open_issues':open_issues,
+    for r in list(positive.values())+open_issues:sources.update(r['source_ids'])
+    return {'judgments':list(positive.values()),'open_issues':open_issues,
         'archive_access':'Request a focused review of a named issue/review to retrieve its archived reasoning; these are scoped opinions, not proof'},sources
 
 

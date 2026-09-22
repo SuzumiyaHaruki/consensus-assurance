@@ -51,7 +51,7 @@ class CoverageAgent(MockAgent):
                 response['reading_requests']=[request]
         elif name=='SpecRefinement':
             response={'understanding':'Controlled fixture retains explicit descriptive gaps','delta':{'rationale':'No descriptive change justified by this fixture'},'requests':[], 'limitations':['Finite synthetic coverage only']}
-        elif name=='ReviewReply':
+        elif name in {'ReviewReply','ReviewKnowledgeReply'}:
             items=[];revision=None
             for obj in context['target_objects']+([context['selected_unit']] if context.get('selected_unit',{}).get('id') in context['task']['target_ids'] else []):
                 source_ids=obj.get('source_ids') or obj.get('grounding',{}).get('source_ids') or [context['materials'][0]['id']]
@@ -66,7 +66,7 @@ class CoverageAgent(MockAgent):
                         'patch':{'claims':[changed.model_dump(mode='json')],'expected_versions':{obj['id']:obj['version']},'rationale':explanation},'old_judgment':obj['description'],'new_judgment':changed.description,'grounding':basis,'changes':[{'target_id':obj['id'],'field':'description','old_value_json':json.dumps(obj['description']),'new_value_json':json.dumps(changed.description)}]}
                 if self.weak and context['task']['trigger'].startswith('after_search') and bool(obj.get('bundle_path')):
                     status='disputed';explanation='The local bound holds but does not establish the delivery handoff responsibility'
-                items.append({'target_id':obj['id'],'aspect':aspect,'status':status,'source_ids':source_ids,'limitations':[],'rationale':explanation + "\n" + 'Different configured completion contracts can have different responsibilities' + "\n" + 'A local counter bound alone cannot establish a returned-result contract'})
+                items.append({'target_id':obj['id'],'aspect':aspect,'status':status,'source_ids':source_ids,'counterevidence':[explanation] if status in {'disputed','revision_needed'} else [],'limitations':[],'rationale':explanation + "\n" + 'Different configured completion contracts can have different responsibilities' + "\n" + 'A local counter bound alone cannot establish a returned-result contract'})
             for obj in context['target_objects']+([context['selected_unit']] if context.get('selected_unit',{}).get('id') in context['task']['target_ids'] else []):
                 contract=next(c for c in context['review_contract'] if c['target_id']==obj['id'])
                 original=next(i for i in items if i['target_id']==obj['id'])

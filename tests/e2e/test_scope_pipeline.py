@@ -47,7 +47,7 @@ class ScopeAgent(MockAgent):
         elif name=='ScopeAssessment':
             update=p['scope_update']
             response={'decision':'refinement','source_ids':update['source_ids'],'addressed_fields':p['required_fields'],'preserved_question':update['original_question'],'rationale':'The actual provider source refines the input production event; the checked question and fault assumptions remain unchanged','remaining_unknowns':['The provider is not separately proven']}
-        elif name=='ReviewReply':
+        elif name in {'ReviewReply','ReviewKnowledgeReply'}:
             items=[]
             for c in p['review_contract']:
                 for aspect in c['required_aspects']:

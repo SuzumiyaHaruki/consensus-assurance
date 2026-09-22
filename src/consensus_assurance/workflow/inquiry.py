@@ -2,7 +2,7 @@
 from pathlib import Path
 import json
 from consensus_assurance.core.types import InquiryTask, SemanticReview
-from consensus_assurance.core.proposals import SpecRefinement, ReviewReply
+from consensus_assurance.core.proposals import SpecRefinement, ReviewReply, ReviewKnowledgeReply
 from consensus_assurance.adapters.storage.files import write_json
 from .feedback import apply_feedback
 from .errors import Blocked
@@ -154,6 +154,16 @@ def validate_review(state,task,reply):
         trial=state.model_copy(deep=True)
         unit=next((u for u in trial.units if u.id==task.unit_id),None)
         apply_feedback(trial,unit,None,reply.revision)
+    if getattr(reply,'descriptive_delta',None):
+        from .audit_spec import merge_delta
+        merge_delta(state,descriptive_task(state,task),reply.descriptive_delta)
+
+
+def descriptive_task(state,task):
+    unit=next((u for u in state.units if u.id==task.unit_id),None)
+    question=unit.audit_question if unit else None
+    return task.model_copy(update={'target_ids':list(dict.fromkeys(task.target_ids+(question.behavior_ids+question.fact_ids if question else []))),
+        'activity_classes':list(dict.fromkeys(task.activity_classes+(question.activity_classes if question else [])))})
 
 
 def release_action(engine):
@@ -204,7 +214,8 @@ def process_task(engine, task):
                 raise Blocked('Exploration repeated already available ranges without producing a new interpretation')
             task.requests=reply.requests;task.read_plan_id=None;task.stage='read';release_action(engine);engine.checkpoint('inquiry_reading_requested');return
     else:
-        reply,check=engine.ask('semantic_review',ReviewReply,context,lambda p:validate_review(state,task,p))
+        schema=ReviewKnowledgeReply if task.unit_id and state.audit_spec_path else ReviewReply
+        reply,check=engine.ask('semantic_review',schema,context,lambda p:validate_review(state,task,p))
     from .transactions import commit_graph
     commit_graph(engine,'inquiry-'+check.id,{'task_id':task.id,'reply':reply.model_dump(mode='json')},lambda proxy:apply_task_response(proxy,task.id,reply,check))
     release_action(engine);engine.checkpoint('inquiry_task_completed')
@@ -248,7 +259,7 @@ def semantic_limitations(state, model):
             latest[key]=item
     result=[]
     for item in latest.values():
-        if item.status!='no_issue_found' or item.counterevidence:
+        if item.status!='no_issue_found':
             result.append('Unresolved semantic review for '+item.target_id+': '+item.rationale)
     for task in state.inquiry_tasks:
         if task.kind=='review' and task.status in {'pending','running','blocked'} and not task.superseded_by and not any(valid_supersession(state,r,task) for r in state.semantic_reviews) and any(i in relevant and i in available and task.target_versions.get(i)==getattr(available[i],'version',1) for i in task.target_ids):
@@ -295,7 +306,6 @@ def apply_task_response(engine,task_id,reply,check):
         if revised!=load(state):accept(engine,revised)
         current=audit_object_index(load(state))
         task.context_dependencies={id:current.get(id) for id in task.target_ids}
-        state.gaps.extend(reply.limitations)
         material_reviews(engine,None,task.added_material_ids)
         for unit in state.units:
             if set(task.added_material_ids)&{source for c in state.claims if c.id in unit.obligation_ids for source in c.source_ids}:
@@ -318,6 +328,10 @@ def apply_task_response(engine,task_id,reply,check):
             for candidate in state.units:
                 if set(reply.revision.target_ids)&set(candidate.obligation_ids+candidate.relation_ids+candidate.binding_ids+[candidate.id]):
                     review_unit(engine,candidate,'semantic_revision:'+review.revision_id)
+        if getattr(reply,'descriptive_delta',None):
+            from .audit_spec import accept,merge_delta,load
+            revised=merge_delta(state,descriptive_task(state,task),reply.descriptive_delta)
+            if revised!=load(state):accept(engine,revised)
         state.semantic_reviews.append(review)
         from .review_contract import missing_pairs
         missing={} if any(a.id in task.target_ids for a in state.direct_checks) else missing_pairs(state,task,reply.items)
@@ -334,7 +348,7 @@ def apply_task_response(engine,task_id,reply,check):
                 if state.active_model_id==task.model_id:
                     state.active_model_id=None;state.active_direct_check_id=None;state.active_finding_id=None;state.next_action='select'
         followup_before={t.id for t in state.inquiry_tasks}
-        focus=[i for i in reply.items if i.status!='no_issue_found' or i.counterevidence]
+        focus=[i for i in reply.items if i.status!='no_issue_found']
         if reply.requests and focus:
             targets=list(dict.fromkeys(i.target_id for i in focus)) or task.target_ids
             follow=enqueue(state,'review','Follow up only the unresolved aspects using the requested source',task.id+':followup',target_ids=targets,unit_id=task.unit_id,model_id=task.model_id,requests=reply.requests)
@@ -343,21 +357,9 @@ def apply_task_response(engine,task_id,reply,check):
         record_dispositions(state,review,reply,[t.id for t in state.inquiry_tasks if t.id not in followup_before])
         if reply.requests and focus:
             follow.resolution_issue_ids=[i.id for i in state.review_issues if not i.resolved_by and i.target_id in targets and i.aspect in follow.requested_aspects[i.target_id]]
-        state.gaps.extend(reply.limitations)
     task.repair_session=None;task.check_id=check.id;task.status='blocked' if task.stop_reason=='Focused review still omitted required aspects' else 'completed';task.stage='done';state.active_inquiry_id=None
     settle_parents(state)
     state.last_work_kind='surface' if task.surface_entry_points else task.kind;release_action(engine)
-
-
-def cost_estimate(engine):
-    tasks=[t for t in engine.state.inquiry_tasks if t.status=='pending' and not t.superseded_by]
-    units=[u for u in engine.state.units if u.status in {'pending','partial','selected'}]
-    available=max(0,engine.config.budget.agent_calls-engine.state.usage.get('agent_calls',0))
-    lower=len(tasks)+len(units)
-    from .materials import material_allowance
-    return {'material_allocation':{p:material_allowance(engine.state,engine.config.budget,p) for p in ('breadth','depth')},'pending_inquiries':len(tasks),'pending_units':len(units),'minimum_agent_calls':lower,
-        'remaining_agent_calls':available,'fits_minimum':lower<=available,
-        'limitations':['Lower bound only: excludes retries, additional reading, model repair, replay and tool latency; not a price or token bill']}
 
 
 def split_context_task(engine,task):

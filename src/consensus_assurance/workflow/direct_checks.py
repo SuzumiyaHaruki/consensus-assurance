@@ -155,17 +155,17 @@ def compute_assessment(state,unit,artifact,plan,check,events):
         try:related={m.checker_id for m in load_plan(candidate.plan_path).monitors}
         except (OSError,ValueError):related=set()
         if checker_ids&related:related_artifacts.append(candidate.id)
-    boundaries=list(dict.fromkeys(unit.scope.excluded+plan.uncertainties+claim.pending+
-        claim.grounding.unresolved+plan.harness.legality.unresolved+
-        [item for monitor in plan.monitors for item in monitor.grounding.unresolved]+
-        [limit for review in state.semantic_reviews for item in review.items if item.target_id in related_artifacts for limit in item.limitations]))
     blockers=[]
-    correspondence=[r for r in state.semantic_reviews if r.target_versions.get(artifact.id)==artifact.version and
-        any(i.target_id==artifact.id and i.aspect=='checker_correspondence' and i.status=='no_issue_found' and not i.counterevidence for i in r.items)]
-    reviewed=any(r.target_versions.get(artifact.id)==artifact.version and any(i.target_id==artifact.id and i.aspect=='checker_correspondence' for i in r.items) for r in state.semantic_reviews)
-    if not correspondence:blockers.append('Direct oracle correspondence is disputed' if reviewed else 'Direct oracle correspondence is unreviewed')
+    reviews=[i for r in state.semantic_reviews if r.target_versions.get(artifact.id)==artifact.version
+        for i in r.items if i.target_id==artifact.id and i.aspect=='checker_correspondence']
+    current_review=reviews[-1] if reviews else None
+    correspondence=bool(current_review and current_review.status=='no_issue_found' and not current_review.counterevidence)
     issues=[i for i in state.review_issues if i.target_id in related_artifacts and not i.resolved_by]
-    if issues:blockers.append('Unresolved direct-check semantic counterevidence')
+    if not correspondence and not issues:
+        blockers.append('Direct oracle correspondence is unreviewed' if current_review is None else
+            'Direct oracle correspondence remains disputed: '+current_review.rationale)
+    from .reviews import issue_challenges
+    blockers.extend('Open review issue '+i.id+' ['+','.join(i.source_ids)+']: '+'; '.join(issue_challenges(state,i)) for i in issues)
     if check.status==ExecutionStatus.TIMEOUT:blockers.append('External timeout; target behavior and harness completion are unestablished')
     elif check.status!=ExecutionStatus.COMPLETED:blockers.append('Execution tool or build failed: '+check.reason)
     elif check.exit_code!=0:blockers.append('Nonzero direct test exit ('+check.parameters.get('failure_class','unclassified')+'); inspect raw stack and target path before attribution')
@@ -177,8 +177,9 @@ def compute_assessment(state,unit,artifact,plan,check,events):
     if check.parameters.get('changed_target_files'):blockers.append('Experiment changed target implementation files')
     parsing=[e.get('_ca_observation') for e in events if e.get('event')=='invalid_observation']
     if parsing:blockers.append('Event output contains incomplete or invalid CA_EVENT records')
-    blockers.extend(claim.grounding.conflicts+plan.harness.legality.conflicts+
-        [item for monitor in plan.monitors for item in monitor.grounding.conflicts])
+    if not correspondence and not issues:
+        blockers.extend(claim.grounding.conflicts+plan.harness.legality.conflicts+
+            [item for monitor in plan.monitors for item in monitor.grounding.conflicts])
     for result in results:
         local=[]
         if result['missing_indices']:local.append('Required observed fields, event identity, or prerequisite association are missing')
@@ -188,12 +189,15 @@ def compute_assessment(state,unit,artifact,plan,check,events):
         result['confirmed']=result['outcome']=='violated' and result['comparison_complete'] and not blockers
     execution_complete=check.status==ExecutionStatus.COMPLETED and check.exit_code==0 and associated and prerequisite['status']=='matched' and not parsing and not check.parameters.get('changed_target_files')
     bounded_complete=execution_complete and bool(results) and all(r['comparison_complete'] for r in results)
+    semantic_boundaries=(current_review.limitations if current_review else claim.grounding.unresolved+plan.harness.legality.unresolved+
+        [item for monitor in plan.monitors for item in monitor.grounding.unresolved])
+    boundaries=list(dict.fromkeys(unit.scope.excluded+plan.uncertainties+([] if bounded_complete else claim.pending)+semantic_boundaries))
     violated=any(r['outcome']=='violated' for r in results)
     outcome='violated' if violated else 'holds' if bounded_complete else 'unknown'
     return {'direct_check_id':artifact.id,'experiment_check_id':check.id,'scope':artifact.scope.model_dump(mode='json'),
         'raw_log':check.stdout,'parsing_errors':parsing,'prerequisites':prerequisite,'properties':results,
         'adaptations':plan.harness.semantic_changes,
-        'blockers':list(dict.fromkeys(blockers)),'boundaries':boundaries,'limitations':list(dict.fromkeys(blockers+boundaries)),
+        'blockers':list(dict.fromkeys(blockers)),'boundaries':boundaries,
         'bounded_complete':bounded_complete,'confirmed':any(r['confirmed'] for r in results),'outcome':outcome,
         'level':'implementation_obligation' if any(r['confirmed'] for r in results) else 'implementation_test',
         'claim_id':claim.id,'claim_version':claim.version}
@@ -210,7 +214,8 @@ def persist_assessment(state,artifact,plan,check,record):
         if not result['comparison_complete']:continue
         assessment=Assessment.CHALLENGED if result['confirmed'] else Assessment.INCONCLUSIVE
         evidence=next((e for e in state.evidence if e.check_id==check.id and e.direct_check_id==artifact.id and e.checker_id==result['checker_id']),None)
-        description='Finite measured comparison; broader obligation and goal remain outside this result; '+json.dumps(record)
+        description=('Finite measured '+result['outcome']+' comparison for direct check '+artifact.id+
+            '; current attribution is stored in its monitor result; broader consequences remain outside this evidence')
         if evidence is None:
             state.add_evidence(Evidence(check_id=check.id,model_id=None,direct_check_id=artifact.id,snapshot_id=artifact.snapshot_id,
                 claim_id=claim.id,claim_version=claim.version,origin=check.origin,level='framework_test' if state.mode=='mock' else 'implementation_test',
@@ -290,7 +295,7 @@ def proceed(engine,unit,phase):
     if record['confirmed']:
         state.active_finding_id=record['finding_id'];engine.advance('consequence_plan');return
     if record['bounded_complete']:
-        engine.finish_unit(unit,'checked');return
+        engine.finish_unit(unit,'checked' if not record['blockers'] else 'blocked');return
     if check.status==ExecutionStatus.ERROR or check.status==ExecutionStatus.COMPLETED and check.exit_code==0 and record['prerequisites']['status']=='not_reached':
         engine.budget.take('technical_repairs' if check.status!=ExecutionStatus.COMPLETED else 'replays')
         state.pending_feedback={'kind':'technical' if check.status!=ExecutionStatus.COMPLETED else 'F4','check_id':check.id,'assessment':record,'failure':engine.error_context(check)}

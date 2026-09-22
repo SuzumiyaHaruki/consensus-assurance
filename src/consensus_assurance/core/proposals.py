@@ -347,6 +347,10 @@ class ReviewReply(Record):
     limitations: list[str]
 
 
+class ReviewKnowledgeReply(ReviewReply):
+    descriptive_delta: AuditSpecDelta | None = None
+
+
 class ConsequenceReply(Record):
     disposition: Literal["investigate", "obligation_only", "defer", "compensation_candidate"]
     rationale: str

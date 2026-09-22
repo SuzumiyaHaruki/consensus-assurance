@@ -188,7 +188,7 @@ def test_missing_aspect_is_one_focused_call_not_whole_response_repair(tmp_path,p
     assert not state.repair_sessions and len(state.semantic_reviews)==2
 
 
-def test_counterevidence_blocks_even_with_no_issue_status(tmp_path,prepared):
+def test_scope_boundary_does_not_block_and_contradictory_judgment_is_rejected(tmp_path,prepared):
     from consensus_assurance.workflow.reviews import record_dispositions
     from consensus_assurance.core.types import SemanticReview
     _,state,_,_=prepared;e=controller(tmp_path,state);task,packet=packet_for(e,[state.claims[1].id]);reply=respond(packet)
@@ -197,9 +197,48 @@ def test_counterevidence_blocks_even_with_no_issue_status(tmp_path,prepared):
     state.semantic_reviews.append(review);record_dispositions(state,review,reply,[])
     assert not state.review_issues and readiness(state,state.units[0])['status']!='disputed'
     assert review.items[0].limitations
-    review.items[0].counterevidence=['A producer failure remains unexplained']
-    record_dispositions(state,review,reply,[])
+    reply.items[0].counterevidence=['A producer failure remains unexplained']
+    with pytest.raises(DiagnosticError) as failure:validate_review(state,task,reply)
+    assert failure.value.diagnostics[0].code=='review_contradictory_judgment'
+    reply.items[0].status='disputed';validate_review(state,task,reply)
+    review.items=reply.items;record_dispositions(state,review,reply,[])
     assert state.review_issues and readiness(state,state.units[0])['status']!='reviewed'
+
+
+def test_review_writes_stable_descriptive_knowledge_without_an_extra_call(tmp_path,prepared):
+    from consensus_assurance.core.proposals import AuditSpecDelta,ReviewKnowledgeReply
+    from consensus_assurance.core.types import AuditQuestion,CheckRun
+    from consensus_assurance.workflow.audit_spec import accept,load
+    from consensus_assurance.workflow.inquiry import apply_task_response
+    from test_audit_capabilities import inventory
+    _,state,_,_=prepared;e=controller(tmp_path,state);source=state.claims[1].source_ids[0]
+    accept(e,inventory(source));unit=state.units[0]
+    unit.audit_question=AuditQuestion(question='Which owner establishes the reusable result?',importance='Consumers depend on the owner',source_ids=[source],activity_classes=['A1'],behavior_ids=['producer'],fact_ids=['fact'],obligation_relation_kind='establishment',trigger_rationale='Retain the source-grounded owner after reviewing the selected obligation')
+    task=enqueue(state,'review','Review and retain stable owner knowledge','knowledge',target_ids=[state.claims[1].id],unit_id=unit.id)
+    task.context_receipt_id='offline-scoped';task.material_ids=list(dict.fromkeys(task.material_ids+[source]))
+    behavior=load(state).behaviors[0].model_copy(update={'execution_owner':'source-grounded producer owner'})
+    reply=ReviewKnowledgeReply(**respond({'review_contract':[target_contract(state,state.claims[1])]}).model_dump(),
+        descriptive_delta=AuditSpecDelta(behaviors=[behavior],rationale='Record the sourced owner learned during this review'))
+    validate_review(state,task,reply)
+    apply_task_response(e,task.id,reply,CheckRun(id='same-review-call',action='agent',cwd=str(tmp_path),snapshot_id=state.snapshot.id))
+    assert load(state).behaviors[0].execution_owner==behavior.execution_owner
+    assert task.check_id=='same-review-call' and task.status=='completed'
+
+
+def test_archived_hashicorp_review_requires_explicit_current_judgment(tmp_path,prepared):
+    from pathlib import Path
+    _,state,_,_=prepared;e=controller(tmp_path,state);task,packet=packet_for(e,[state.claims[1].id]);base=respond(packet)
+    excerpt=json.loads((Path(__file__).parents[1]/'fixtures/hashicorp_review_excerpt.json').read_text())
+    base.items[0]=base.items[0].model_copy(update=excerpt)
+    with pytest.raises(DiagnosticError) as failure:validate_review(state,task,base)
+    assert any(d.code=='review_contradictory_judgment' for d in failure.value.diagnostics)
+    repaired=base.model_copy(deep=True);item=repaired.items[0]
+    item.rationale+=' Examined alternatives: '+'; '.join(item.counterevidence)
+    item.counterevidence=[]
+    validate_review(state,task,repaired)
+    review=SemanticReview(task_id=task.id,check_id='offline-reinterpretation',target_versions=task.target_versions,material_ids=task.material_ids,items=repaired.items,origin='mock')
+    record_dispositions(state,review,repaired,[])
+    assert not state.review_issues and item.limitations
 
 
 def test_text_view_alias_requires_explicit_original_range_selection(prepared):

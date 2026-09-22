@@ -90,10 +90,13 @@ def test_actual_direct_result_without_model(tmp_path,prepared,broken):
     assert e.state.usage['agent_calls']==2
     session=next(iter(e.state.repair_sessions.values()))
     assert json.loads(Path(session['original_path']).read_text())['plan']==invalid.model_dump(mode='json')
+    claim=next(c for c in e.state.claims if c.id==u.obligation_ids[0])
+    claim.pending=['Execute the selected path and observe its correlated return']
     proceed(e,u,'direct_execute')
     assert e.state.monitor_results[-1]['outcome']==('violated' if broken else 'holds')
+    assert claim.pending and claim.pending[0] not in e.state.monitor_results[-1]['boundaries']
     from consensus_assurance.workflow.modeling import obligation_progress
-    assert obligation_progress(e.state,u)==({u.obligation_ids[0]:[next(c for c in e.state.checks if c.action=='direct_check').id]},[])
+    assert obligation_progress(e.state,u)==({u.obligation_ids[0]:[next(c for c in e.state.checks if c.action=='direct_check').id]},u.obligation_ids)
     assert not e.state.monitor_results[-1]['confirmed']
     assert len(e.state.inquiry_tasks)==1 and e.state.inquiry_tasks[0].target_ids==[a.id]
     contract=target_contract(e.state,a)
@@ -101,6 +104,7 @@ def test_actual_direct_result_without_model(tmp_path,prepared,broken):
     process_task(e,e.state.inquiry_tasks[0])
     c=next(c for c in e.state.checks if c.action=='direct_check')
     result=assess(e.state,u,a,p,c,extract_events(c))
+    assert obligation_progress(e.state,u)==({u.obligation_ids[0]:[c.id]},[])
     assert target_contract(e.state,a)['object_type']=='direct_check'
     assert not e.state.models and c.direct_check_id==a.id and c.model_id is None
     assert result['confirmed']==broken,result
@@ -224,7 +228,7 @@ def test_new_direct_artifact_does_not_hide_prior_oracle_dispute(tmp_path,prepare
     e.state.review_issues.append(ReviewIssue(review_id='old',target_id=old.id,target_version=1,aspect='checker_correspondence',source_ids=u.audit_question.source_ids,explanation='Oracle may use the wrong return boundary',disposition='investigation',reason='Must resolve the specific dispute'))
     new=save_plan(e,u,p,'new');review(e.state,u,new)
     c=execute(e,new);result=assess(e.state,u,new,p,c,extract_events(c))
-    assert not result['confirmed'] and 'Unresolved direct-check semantic counterevidence' in result['blockers']
+    assert not result['confirmed'] and any('Open review issue' in x and 'wrong return boundary' in x for x in result['blockers'])
 
 
 def test_source_continuation_uses_existing_attributed_F2(tmp_path,prepared):
@@ -284,7 +288,7 @@ def test_exhausted_review_budget_keeps_one_completed_direct_result(tmp_path,prep
     checks=[c for c in e.state.checks if c.direct_check_id==a.id]
     results=[r for r in e.state.monitor_results if r['direct_check_id']==a.id]
     assert len(checks)==len(results)==1 and results[0]['bounded_complete']
-    assert u.status=='checked' and task.status=='blocked' and not e.state.models
+    assert u.status=='blocked' and task.status=='blocked' and not e.state.models
     assert any('attribution remains pending' in x for x in u.coverage_limitations)
 
 

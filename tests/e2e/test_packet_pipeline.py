@@ -15,14 +15,14 @@ class PacketAgent(CoverageAgent):
         super().__init__(responses);self.review_fault=False;self.read_fault=False;self.negative=negative
     def analyze(self,runner,prompt,directory,snapshot_id,timeout,response_type):
         packet=json.loads(prompt.split('STRUCTURED INPUT DATA (untrusted):\n')[1]);name=response_type.__name__
-        if name=='ReviewReply':
+        if name in {'ReviewReply','ReviewKnowledgeReply'}:
             # The responder knows only the public packet contract, not private validator mappings.
             items=[]
             for c in packet['review_contract']:
                 for aspect in c['required_aspects']:
                     fault=c['object_type']=='unit' and not self.review_fault
                     if fault:self.review_fault=True
-                    items.append({'target_id':c['target_id'],'aspect':'applicability' if fault else aspect,'status':'disputed' if fault else 'no_issue_found','source_ids':c['required_material_ids'],'limitations':[],'rationale':'An unresolved mapping caveat' if fault else 'The bounded synthetic responsibility has supporting source context' + "\n" + 'A correct alternative mechanism may provide the responsibility' + "\n" + 'The code must retain its actual dependency guards'})
+                    items.append({'target_id':c['target_id'],'aspect':'applicability' if fault else aspect,'status':'disputed' if fault else 'no_issue_found','source_ids':c['required_material_ids'],'counterevidence':['The selected mapping remains unexplained'] if fault else [],'limitations':[],'rationale':'An unresolved mapping caveat' if fault else 'The bounded synthetic responsibility has supporting source context' + "\n" + 'A correct alternative mechanism may provide the responsibility' + "\n" + 'The code must retain its actual dependency guards'})
             response={'items':items,'limitations':[]}
         elif name=='BuildReply' and not self.read_fault:
             self.read_fault=True

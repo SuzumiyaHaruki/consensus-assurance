@@ -53,6 +53,10 @@ def validate_contract(state,task,reply):
         if key in seen:issue('review_duplicate_item',item.target_id,'Duplicate semantic review aspect for an object',i)
         seen.add(key);kind=category(objects[item.target_id])
         if item.aspect not in set(POLICY[kind])|set(OPTIONAL.get(kind,{})):issue('review_wrong_aspect',item.target_id,'Aspect is not applicable to this object type under the supplied review contract',i)
+        if item.status=='no_issue_found' and item.counterevidence:
+            issue('review_contradictory_judgment',item.target_id,'no_issue_found cannot include current counterevidence; use a negative status or explain alternatives in rationale',i)
+        if item.status in {'disputed','revision_needed'} and not item.counterevidence:
+            issue('review_missing_challenge',item.target_id,'A negative judgment needs counterevidence; put scope boundaries in limitations',i)
         for source,status in citation_status(state,item.source_ids,supplied).items():
             if status!='provided':issue('review_unknown_source' if status=='unknown' else 'review_unavailable_source',item.target_id,'Citation '+source+': '+status+'; correct the reference or attach the actual range',i)
     if errors:raise DiagnosticError(errors)
