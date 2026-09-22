@@ -58,7 +58,7 @@ def obligation_progress(state, unit):
         for spec in model.checkers:
             if spec.claim_id in expected:
                 expected[spec.claim_id][(spec.invariant,json.dumps(spec.scope.model_dump(mode='json'),sort_keys=True))]=(model,spec)
-    covered={}
+    covered={};completed=set()
     for claim,slots in expected.items():
         ids=[]; complete=bool(slots)
         for model,spec in slots.values():
@@ -79,17 +79,29 @@ def obligation_progress(state, unit):
             if any(r.id not in latest or latest[r.id].status!='reachable' for r in requirements):complete=False
             if not result or result.outcome not in {'holds','violated'}:complete=False
             else:ids.append(check.id)
-        if complete:covered[claim]=list(dict.fromkeys(ids))
-    return covered,[c for c in unit.obligation_ids if c not in covered]
+        if complete:
+            covered[claim]=list(dict.fromkeys(ids));completed.add(claim)
+    versions={x.id:x.version for x in [*state.claims,*state.bindings,*state.relations,*state.units]}
+    for artifact in state.direct_checks:
+        if artifact.unit_id!=unit.id or artifact.claim_id not in unit.obligation_ids:continue
+        if any(versions.get(k)!=v for k,v in artifact.graph_versions.items()):continue
+        records=[r for r in state.monitor_results if r.get('direct_check_id')==artifact.id]
+        if not records:continue
+        record=records[-1];check_id=record.get('experiment_check_id')
+        if any(p.get('comparison_complete') for p in record.get('properties',[])) and check_id:
+            covered[artifact.claim_id]=list(dict.fromkeys(covered.get(artifact.claim_id,[])+[check_id]))
+        if record.get('bounded_complete'):completed.add(artifact.claim_id)
+    return covered,[c for c in unit.obligation_ids if c not in completed]
 
 
 def coverage_limitations(state,unit):
     limits=[]
     models=[m for m in state.models if m.unit_id==unit.id]
+    direct=[a for a in state.direct_checks if a.unit_id==unit.id]
     if not unit.audit_question:limits.append('Audit question is not structured; effective interaction coverage is unestablished')
     from .audit_spec import reachability_refs
     for ref in reachability_refs(unit.audit_question):
-        if not any(ref in reachability_refs(r) for m in models for r in m.reachability_requirements):
+        if not direct and not any(ref in reachability_refs(r) for m in models for r in m.reachability_requirements):
             limits.append('No executable trigger requirement covers reference '+ref)
     for model in models:
         import json
@@ -101,6 +113,13 @@ def coverage_limitations(state,unit):
             if result is None or result.status!='reachable':limits.append('Trigger '+req.id+' is '+(result.status if result else 'unchecked'))
         cals=[c for c in state.calibrations if c.model_id==model.id]
         if not cals or cals[-1].status!='compatible':limits.append('Model '+model.id+' has no completed compatible implementation calibration')
+    for artifact in direct:
+        result=next((r for r in reversed(state.monitor_results) if r.get('direct_check_id')==artifact.id),None)
+        if result is None:limits.append('Direct check '+artifact.id+' has no saved machine assessment')
+        elif result.get('bounded_complete') and result.get('blockers'):
+            limits.append('Bounded direct comparison completed; local attribution remains pending: '+'; '.join(result['blockers']))
+        elif not result.get('bounded_complete'):
+            limits.append('Direct check '+artifact.id+' is incomplete: '+'; '.join(result.get('blockers',[])))
     return limits
 
 

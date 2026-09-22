@@ -2,15 +2,24 @@
 import json
 from pathlib import Path
 from consensus_assurance.core.proposals import DirectCheckReply, DirectCheckPlan, QuestionReply
-from consensus_assurance.core.types import DirectCheckArtifact, CheckRun, Evidence, Finding, Origin, Assessment, Investigation, ExecutionStatus, uid
-from consensus_assurance.core.events import compare, match_prerequisites, event_requirements
+from consensus_assurance.core.types import DirectCheckArtifact, CheckRun, CheckerResult, Evidence, Finding, Origin, Assessment, Investigation, ExecutionStatus, uid
+from consensus_assurance.core.events import match_prerequisites, event_requirements
 from consensus_assurance.adapters.storage.files import write_json
 from consensus_assurance.adapters.storage.snapshot import capture
 from consensus_assurance.adapters.runners.experiment import run_experiment, extract_events
 from .errors import Blocked
 from .graph_diagnostics import validate_grounding
 from .observations import monitor_events
-from .instrumentation import observation_change_limitations
+
+
+def load_plan(path):
+    """Convert a legacy saved plan once at its file boundary; new plans have one schema."""
+    raw=json.loads(Path(path).read_text())
+    raw.pop('scope',None)
+    harness=raw.get('harness',{})
+    harness.pop('legal_conditions',None)
+    harness.pop('observation_changes',None)
+    return DirectCheckPlan.model_validate(raw)
 
 
 def validate_question(question):
@@ -34,35 +43,39 @@ def route(unit):
 
 
 def validate_plan(state,unit,plan,implementation):
-    if plan.claim_id not in unit.obligation_ids:raise ValueError('Direct check must select one unit obligation')
-    if plan.scope!=unit.scope:raise ValueError('Changing accepted check scope requires explicit scope revision')
-    if not set(plan.binding_ids)<=set(unit.binding_ids):raise ValueError('Direct check uses nonselected bindings')
+    errors=[]
+    if plan.claim_id not in unit.obligation_ids:errors.append('Direct check must select one unit obligation')
+    if not set(plan.binding_ids)<=set(unit.binding_ids):errors.append('Direct check uses nonselected bindings')
     for binding in state.bindings:
         if binding.id in plan.binding_ids and (binding.snapshot_id!=state.snapshot.id or state.snapshot.files.get(binding.file)!=binding.content_digest):
-            raise ValueError('Direct binding does not describe the selected source snapshot')
-    if implementation is None or plan.harness.kind!=implementation.harness_kind:raise ValueError('Unsupported direct harness kind')
-    if not plan.harness.prerequisites:raise ValueError('Direct check needs observable correlated prerequisites')
-    if not plan.harness.legal_conditions:raise ValueError('Direct check needs observable legality conditions')
+            errors.append('Direct binding does not describe the selected source snapshot: '+binding.id)
+    if implementation is None or plan.harness.kind!=implementation.harness_kind:errors.append('Unsupported direct harness kind')
+    if not plan.harness.prerequisites:errors.append('Direct check needs observable correlated prerequisites')
     materials={m.id:m for m in state.materials}
     for basis in [plan.harness.legality]+[m.grounding for m in plan.monitors]:
-        validate_grounding(basis,materials,set(plan.binding_ids))
+        try:validate_grounding(basis,materials,set(plan.binding_ids))
+        except ValueError as exc:errors.append(str(exc))
     props={p.checker_id:p for p in plan.observable_properties}
-    if len(props)!=len(plan.observable_properties) or len({m.id for m in plan.monitors})!=len(plan.monitors):raise ValueError('Duplicate direct property or monitor')
-    if set(props)!={m.checker_id for m in plan.monitors}:raise ValueError('Direct property/monitor mismatch')
+    if len(props)!=len(plan.observable_properties) or len({m.id for m in plan.monitors})!=len(plan.monitors):errors.append('Duplicate direct property or monitor')
+    if set(props)!={m.checker_id for m in plan.monitors}:errors.append('Direct property/monitor mismatch')
     for monitor in plan.monitors:
         p=props.get(monitor.checker_id)
         # History predicates need a complete observed history contract. Initially
         # keep this route to scalar event assertions; unsupported paths are gaps.
         if p is None or p.kind!='event_assertion':
-            raise ValueError('Direct monitor requires the supported shared event assertion')
+            errors.append('Direct monitor '+monitor.id+' requires the supported shared event assertion')
+            continue
         if not p.identity_fields:
-            raise ValueError('Direct monitor needs shared operation/participant/context identity')
-        if not monitor.binding_ids or not set(monitor.binding_ids)<=set(plan.binding_ids):raise ValueError('Monitor needs selected source bindings')
-        if not monitor.applicability_conditions:raise ValueError('Monitor needs observed applicability conditions')
-        if p.trigger.reference:raise ValueError('Direct trigger must select an actual event field')
-        event_requirements(plan.harness.prerequisites,p.assertion.reference)
+            errors.append('Direct monitor '+monitor.id+' needs shared operation/participant/context identity')
+        if not monitor.binding_ids or not set(monitor.binding_ids)<=set(plan.binding_ids):errors.append('Monitor '+monitor.id+' needs selected source bindings')
+        if p.trigger.reference:errors.append('Direct trigger '+p.checker_id+' must select an actual event field')
+        try:event_requirements(plan.harness.prerequisites,p.assertion.reference)
+        except ValueError as exc:errors.append(p.checker_id+': '+str(exc))
         if p.assertion.field in p.identity_fields:
-            raise ValueError('The compared value cannot also establish independent operation identity')
+            errors.append(p.checker_id+': the compared value cannot also establish independent operation identity')
+        if p.trigger.field==p.assertion.field or any(c.field==p.assertion.field for c in monitor.applicability_conditions):
+            errors.append(p.checker_id+': trigger/applicability cannot filter on the result field being checked')
+    if errors:raise ValueError('; '.join(dict.fromkeys(errors)))
 
 
 def validate_revision(state,unit,revision):
@@ -80,7 +93,7 @@ def validate_reply(state,unit,reply,implementation,previous=None):
         if previous:
             left=previous.model_dump();right=reply.plan.model_dump()
             left.pop('harness');right.pop('harness')
-            if left!=right:raise ValueError('Technical/F4 direct repair must preserve scope and oracle; use F2/F3 for semantics')
+            if left!=right:raise ValueError('Technical/F4 direct repair must preserve the selected claim and oracle; use F2/F3 for semantics')
     elif not reply.gap.strip():raise ValueError('Missing direct plan requires a concrete gap')
 
 
@@ -99,14 +112,14 @@ def save_plan(engine,unit,plan,operation_id):
         snapshot_id=state.snapshot.id,unit_id=unit.id,claim_id=plan.claim_id,binding_ids=plan.binding_ids,
         graph_versions={o.id:o.version for o in state.claims+state.bindings+state.relations+state.units if o.id in ids},
         origin=Origin.MOCK if state.mode=='mock' else Origin.PRESET if state.analysis_mode=='regression' else Origin.AGENT,
-        scope=plan.scope,operation_id=operation_id)
+        scope=unit.scope,operation_id=operation_id)
     state.direct_checks.append(artifact)
     return artifact
 
 
 def execute(engine,artifact):
     if not engine.config.allow_experiments or engine.implementation is None:raise Blocked('Target execution disabled or no execution backend configured')
-    plan=DirectCheckPlan.model_validate_json(Path(artifact.plan_path).read_text())
+    plan=load_plan(artifact.plan_path)
     def perform():
         workspace=engine.workspace()
         before=engine.state.snapshot.files
@@ -129,67 +142,99 @@ def execute(engine,artifact):
     return check
 
 
-def assess(state,unit,artifact,plan,check,events):
+def compute_assessment(state,unit,artifact,plan,check,events):
+    """Compute observed values and current interpretation without mutating state."""
     prerequisite=match_prerequisites(events,plan.harness.prerequisites)
     properties={p.checker_id:p for p in plan.observable_properties}
     results=[monitor_events(events,m,properties[m.checker_id],plan.harness.prerequisites) for m in plan.monitors]
-    limitations=list(plan.uncertainties)
     claim=next(c for c in state.claims if c.id==plan.claim_id)
-    ids=set(artifact.graph_versions)|{a.id for a in state.direct_checks if a.unit_id in {unit.id,unit.previous_id}}
-    correspondence=[r for r in state.semantic_reviews if r.target_versions.get(artifact.id)==artifact.version and any(i.target_id==artifact.id and i.aspect=='checker_correspondence' and i.status=='no_issue_found' and not i.counterevidence for i in r.items)]
-    if not correspondence:limitations.append('Direct oracle correspondence is unreviewed')
-    issues=[i for i in state.review_issues if i.target_id in ids]
-    disputed=any(i.target_id in ids and (i.status!='no_issue_found' or i.counterevidence)
-        and not any(x.review_id==r.id and x.target_id==i.target_id and x.aspect==i.aspect and x.resolved_by for x in issues)
-        for r in state.semantic_reviews for i in r.items)
-    if any(not i.resolved_by for i in issues) or disputed:limitations.append('Unresolved semantic counterevidence')
-    limitations.extend(limit for r in state.semantic_reviews for i in r.items if i.target_id in ids
-        and not any(x.review_id==r.id and x.target_id==i.target_id and x.aspect==i.aspect and x.resolved_by for x in issues)
-        for limit in i.limitations)
-    if check.status==ExecutionStatus.TIMEOUT:limitations.append('External timeout; target behavior and harness completion are unestablished')
-    elif check.status!=ExecutionStatus.COMPLETED:limitations.append('Execution tool or build failed: '+check.reason)
-    elif check.exit_code!=0:limitations.append('Nonzero direct test exit ('+check.parameters.get('failure_class','unclassified')+'); inspect raw stack and target path before attribution')
-    if check.snapshot_id!=artifact.snapshot_id or check.direct_check_id!=artifact.id:limitations.append('Direct input association mismatch')
-    if state.mode=='mock' or artifact.origin in {Origin.MOCK,Origin.SYNTHETIC,Origin.MUTATION,Origin.IMPORTED} or check.origin!=Origin.EXECUTED:limitations.append('Nonoriginal execution cannot confirm implementation')
-    if prerequisite['status']!='matched':limitations.append('Correlated prerequisites not established')
-    if check.parameters.get('changed_target_files'):limitations.append('Experiment changed target implementation files')
-    limitations.extend(observation_change_limitations(plan.harness,artifact.binding_ids))
-    limitations.extend(claim.pending)
-    for basis in [claim.grounding,plan.harness.legality]+[m.grounding for m in plan.monitors]:limitations.extend(basis.unresolved+basis.conflicts)
-    for condition in plan.harness.legal_conditions:
-        if not events or not all(compare(e,condition) is True for e in events):limitations.append('Observable execution legality not established')
-    for monitor,result in zip(plan.monitors,results):
+    checker_ids=set(properties)
+    related_artifacts=[]
+    for candidate in state.direct_checks:
+        if candidate.unit_id!=artifact.unit_id:continue
+        try:related={m.checker_id for m in load_plan(candidate.plan_path).monitors}
+        except (OSError,ValueError):related=set()
+        if checker_ids&related:related_artifacts.append(candidate.id)
+    boundaries=list(dict.fromkeys(unit.scope.excluded+plan.uncertainties+claim.pending+
+        claim.grounding.unresolved+plan.harness.legality.unresolved+
+        [item for monitor in plan.monitors for item in monitor.grounding.unresolved]+
+        [limit for review in state.semantic_reviews for item in review.items if item.target_id in related_artifacts for limit in item.limitations]))
+    blockers=[]
+    correspondence=[r for r in state.semantic_reviews if r.target_versions.get(artifact.id)==artifact.version and
+        any(i.target_id==artifact.id and i.aspect=='checker_correspondence' and i.status=='no_issue_found' and not i.counterevidence for i in r.items)]
+    reviewed=any(r.target_versions.get(artifact.id)==artifact.version and any(i.target_id==artifact.id and i.aspect=='checker_correspondence' for i in r.items) for r in state.semantic_reviews)
+    if not correspondence:blockers.append('Direct oracle correspondence is disputed' if reviewed else 'Direct oracle correspondence is unreviewed')
+    issues=[i for i in state.review_issues if i.target_id in related_artifacts and not i.resolved_by]
+    if issues:blockers.append('Unresolved direct-check semantic counterevidence')
+    if check.status==ExecutionStatus.TIMEOUT:blockers.append('External timeout; target behavior and harness completion are unestablished')
+    elif check.status!=ExecutionStatus.COMPLETED:blockers.append('Execution tool or build failed: '+check.reason)
+    elif check.exit_code!=0:blockers.append('Nonzero direct test exit ('+check.parameters.get('failure_class','unclassified')+'); inspect raw stack and target path before attribution')
+    associated=check.snapshot_id==artifact.snapshot_id and check.direct_check_id==artifact.id
+    if not associated:blockers.append('Direct input association mismatch')
+    original=state.mode!='mock' and artifact.origin not in {Origin.MOCK,Origin.SYNTHETIC,Origin.MUTATION,Origin.IMPORTED} and check.origin==Origin.EXECUTED
+    if not original:blockers.append('Nonoriginal execution cannot confirm implementation')
+    if prerequisite['status']!='matched':blockers.append('Correlated prerequisites not established: '+prerequisite['reason'])
+    if check.parameters.get('changed_target_files'):blockers.append('Experiment changed target implementation files')
+    parsing=[e.get('_ca_observation') for e in events if e.get('event')=='invalid_observation']
+    if parsing:blockers.append('Event output contains incomplete or invalid CA_EVENT records')
+    blockers.extend(claim.grounding.conflicts+plan.harness.legality.conflicts+
+        [item for monitor in plan.monitors for item in monitor.grounding.conflicts])
+    for result in results:
         local=[]
-        matched=[i for i,e in enumerate(events) if e.get('event')==monitor.event and compare(e,properties[monitor.checker_id].trigger) is True]
-        if result['missing_indices']:local.append('Required observed fields missing')
-        if not matched or any(not all(compare(events[i],c) is True for c in monitor.applicability_conditions) for i in matched):local.append('Observable applicability not established')
+        if result['missing_indices']:local.append('Required observed fields, event identity, or prerequisite association are missing')
+        if result['outcome']=='unknown' and not result['missing_indices']:local.append('No applicable result event was reached')
         result['limitations']=local
+        result['comparison_complete']=result['outcome'] in {'holds','violated'} and not local
+        result['confirmed']=result['outcome']=='violated' and result['comparison_complete'] and not blockers
+    execution_complete=check.status==ExecutionStatus.COMPLETED and check.exit_code==0 and associated and prerequisite['status']=='matched' and not parsing and not check.parameters.get('changed_target_files')
+    bounded_complete=execution_complete and bool(results) and all(r['comparison_complete'] for r in results)
     violated=any(r['outcome']=='violated' for r in results)
-    clean=not limitations and all(not r['limitations'] and r['outcome']!='unknown' for r in results)
-    observed=(check.status==ExecutionStatus.COMPLETED and check.origin==Origin.EXECUTED
-        and state.mode!='mock' and check.snapshot_id==artifact.snapshot_id and check.direct_check_id==artifact.id
-        and prerequisite['status']=='matched' and all(r['outcome']!='unknown' and not r['missing_indices'] for r in results))
-    confirmed=clean and violated and observed
-    record={'direct_check_id':artifact.id,'experiment_check_id':check.id,'prerequisites':prerequisite,'properties':results,
-        'limitations':limitations,'confirmed':confirmed,'outcome':('violated' if violated else 'holds') if observed else 'unknown',
-        'level':'implementation_obligation' if confirmed else 'implementation_test','claim_id':claim.id,'claim_version':claim.version}
-    # Keep exploratory passing traces, with their limitations, separate from proof.
-    if check.status==ExecutionStatus.COMPLETED and check.exit_code==0 and prerequisite['status']=='matched' and all(r['outcome']!='unknown' and not r['limitations'] for r in results):
-        if not any(e.check_id==check.id and e.direct_check_id==artifact.id and e.assessment==(Assessment.CHALLENGED if confirmed else Assessment.INCONCLUSIVE) for e in state.evidence):
+    outcome='violated' if violated else 'holds' if bounded_complete else 'unknown'
+    return {'direct_check_id':artifact.id,'experiment_check_id':check.id,'scope':artifact.scope.model_dump(mode='json'),
+        'raw_log':check.stdout,'parsing_errors':parsing,'prerequisites':prerequisite,'properties':results,
+        'adaptations':plan.harness.semantic_changes,
+        'blockers':list(dict.fromkeys(blockers)),'boundaries':boundaries,'limitations':list(dict.fromkeys(blockers+boundaries)),
+        'bounded_complete':bounded_complete,'confirmed':any(r['confirmed'] for r in results),'outcome':outcome,
+        'level':'implementation_obligation' if any(r['confirmed'] for r in results) else 'implementation_test',
+        'claim_id':claim.id,'claim_version':claim.version}
+
+
+def persist_assessment(state,artifact,plan,check,record):
+    """Upsert the current interpretation for one execution and its checker results."""
+    claim=next(c for c in state.claims if c.id==plan.claim_id)
+    current=next((r for r in state.monitor_results if r.get('direct_check_id')==artifact.id and r.get('experiment_check_id')==check.id),None)
+    if current is None:state.monitor_results.append(record)
+    check.checker_results=[CheckerResult(invariant=r['checker_id'],claim_id=claim.id,scope=artifact.scope,
+        outcome=r['outcome'],reason=r['reason']) for r in record['properties']]
+    for result in record['properties']:
+        if not result['comparison_complete']:continue
+        assessment=Assessment.CHALLENGED if result['confirmed'] else Assessment.INCONCLUSIVE
+        evidence=next((e for e in state.evidence if e.check_id==check.id and e.direct_check_id==artifact.id and e.checker_id==result['checker_id']),None)
+        description='Finite measured comparison; broader obligation and goal remain outside this result; '+json.dumps(record)
+        if evidence is None:
             state.add_evidence(Evidence(check_id=check.id,model_id=None,direct_check_id=artifact.id,snapshot_id=artifact.snapshot_id,
                 claim_id=claim.id,claim_version=claim.version,origin=check.origin,level='framework_test' if state.mode=='mock' else 'implementation_test',
-                scope=plan.scope,description='Finite actual direct check; '+json.dumps(record),assessment=Assessment.CHALLENGED if confirmed else Assessment.INCONCLUSIVE))
-    if violated:
-        finding=next((f for f in state.findings if f.direct_check_id==artifact.id and f.check_id==check.id),None)
+                scope=artifact.scope,checker_id=result['checker_id'],description=description,assessment=assessment))
+        else:
+            evidence.description=description;evidence.assessment=assessment
+        if result['outcome']!='violated':continue
+        finding=next((f for f in state.findings if f.direct_check_id==artifact.id and f.check_id==check.id and f.checker_id==result['checker_id']),None)
         if finding is None:
             finding=Finding(claim_id=claim.id,claim_version=claim.version,model_id=None,direct_check_id=artifact.id,check_id=check.id,
-                origin=check.origin,description='Observed direct-check violation candidate; interpretation is conditional on recorded limitations',trace_path=check.stdout)
+                checker_id=result['checker_id'],origin=check.origin,description='Measured direct-check comparison failed; normative attribution is conditional on recorded blockers',trace_path=check.stdout)
             state.findings.append(finding)
-        finding.stage=Investigation.REPRODUCED if confirmed else Investigation.INCONCLUSIVE
-        finding.level='implementation_obligation' if confirmed else 'implementation_candidate'
-        record['finding_id']=finding.id
-    state.monitor_results.append(record)
+        finding.stage=Investigation.REPRODUCED if result['confirmed'] else Investigation.INCONCLUSIVE
+        finding.level='implementation_obligation' if result['confirmed'] else 'implementation_candidate'
+        record.setdefault('finding_ids',{})[result['checker_id']]=finding.id
+    if record.get('finding_ids'):
+        primary=next((r['checker_id'] for r in record['properties'] if r['confirmed']),next(iter(record['finding_ids'])))
+        record['finding_id']=record['finding_ids'][primary]
+    if current is not None:current.clear();current.update(record)
     return record
+
+
+def assess(state,unit,artifact,plan,check,events):
+    return persist_assessment(state,artifact,plan,check,compute_assessment(state,unit,artifact,plan,check,events))
 
 
 def proceed(engine,unit,phase):
@@ -197,7 +242,7 @@ def proceed(engine,unit,phase):
     state=engine.state
     artifact=next((a for a in state.direct_checks if a.id==state.active_direct_check_id),None)
     if phase!='direct_check' and (artifact is None or artifact.unit_id!=unit.id):raise Blocked('Selected direct artifact is unavailable for this unit')
-    plan=DirectCheckPlan.model_validate_json(Path(artifact.plan_path).read_text()) if artifact else None
+    plan=load_plan(artifact.plan_path) if artifact else None
     if phase=='direct_check':
         previous=plan if state.pending_feedback else None
         reply,call=engine.ask('direct_check',DirectCheckReply,{**engine.context(unit),'previous_plan':previous.model_dump(mode='json') if previous else None,
@@ -232,7 +277,8 @@ def proceed(engine,unit,phase):
         engine.advance('direct_execute');return
     if phase=='direct_execute':
         check=execute(engine,artifact)
-        assess(state,unit,artifact,plan,check,extract_events(check))
+        record=assess(state,unit,artifact,plan,check,extract_events(check))
+        write_json(engine.root/'direct-checks'/artifact.operation_id/(check.id+'-assessment.json'),record)
         from .inquiry import enabled,enqueue
         if enabled(engine) and check.status==ExecutionStatus.COMPLETED:
             enqueue(state,'review','Review the whole direct check against its obligation, actual calls and observations',
@@ -243,11 +289,13 @@ def proceed(engine,unit,phase):
     write_json(engine.root/'direct-checks'/artifact.operation_id/(check.id+'-assessment.json'),record)
     if record['confirmed']:
         state.active_finding_id=record['finding_id'];engine.advance('consequence_plan');return
+    if record['bounded_complete']:
+        engine.finish_unit(unit,'checked');return
     if check.status==ExecutionStatus.ERROR or check.status==ExecutionStatus.COMPLETED and check.exit_code==0 and record['prerequisites']['status']=='not_reached':
         engine.budget.take('technical_repairs' if check.status!=ExecutionStatus.COMPLETED else 'replays')
         state.pending_feedback={'kind':'technical' if check.status!=ExecutionStatus.COMPLETED else 'F4','check_id':check.id,'assessment':record,'failure':engine.error_context(check)}
         engine.advance('direct_check');return
-    engine.finish_unit(unit,'blocked')  # Finite test never discharges the entire obligation.
+    engine.finish_unit(unit,'blocked')
 
 
 def continue_question(engine,unit):

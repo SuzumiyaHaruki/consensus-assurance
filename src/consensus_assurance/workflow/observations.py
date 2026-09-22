@@ -9,7 +9,7 @@ def monitor_events(events, monitor, prop, requirements=None):
     if prop is None:
         return {'monitor_id':monitor.id,'checker_id':monitor.checker_id,'outcome':'unknown',
             'witness_indices':[],'missing_indices':[],'reason':'No shared observable property'}
-    results, missing, correlations = [], [], {}
+    results, missing, correlations, outside = [], [], {}, []
     for index,event in enumerate(events):
         if event.get('event') != monitor.event: continue
         active = compare(event,prop.trigger)
@@ -22,17 +22,22 @@ def monitor_events(events, monitor, prop, requirements=None):
             correlations[str(index)] = linked
             if linked['status']!='matched': missing.append(index); continue
             aliases = {alias:events[i] for alias,i in linked['alias_indices'].items()}
+        applicability=[compare(event,c,aliases) for c in monitor.applicability_conditions]
+        if any(value is None for value in applicability):
+            missing.append(index); continue
+        if any(value is False for value in applicability):
+            outside.append(index); continue
         value = compare(event,prop.assertion,aliases) if prop.kind=='event_assertion' else True
         if value is None: missing.append(index)
         else: results.append((index,value))
     violations = [index for index,value in results if value is False]
     if prop.kind=='stable_support':
-        support = monitor_support(events,monitor,prop)
+        support = monitor_support(events,monitor,prop,{index for index,_ in results})
         violations = support['witness_indices']; missing.extend(support['missing_indices'])
     return {'monitor_id':monitor.id,'checker_id':monitor.checker_id,
         'outcome':'violated' if violations else 'unknown' if missing or not results else 'holds',
         'witness_indices':violations,'missing_indices':sorted(set(missing)),
-        'evaluated_indices':[index for index,value in results],'correlations':correlations,
+        'evaluated_indices':[index for index,value in results],'outside_applicability_indices':outside,'correlations':correlations,
         'reason':'Actual result fields are compared after independent prerequisite association'}
 
 
@@ -42,43 +47,40 @@ def assess_execution(state, model, bundle, experiment, calibration, finding, eve
     properties={p.checker_id:p for p in bundle.observable_properties}
     results = [monitor_events(events,m,properties.get(m.checker_id),bundle.harness.prerequisites) for m in bundle.monitors if m.checker_id == finding.checker_id]
     from .inquiry import semantic_limitations
-    limitations = semantic_limitations(state,model)
+    blockers = semantic_limitations(state,model)
+    boundaries=list(bundle.uncertainties)
     from pathlib import Path
     from consensus_assurance.core.proposals import Bundle
     try:
         stored = Bundle.model_validate_json(Path(model.bundle_path).read_text())
         if stored.model_dump(mode="json") != bundle.model_dump(mode="json"):
-            limitations.append('Assessment bundle differs from the saved model input')
+            blockers.append('Assessment bundle differs from the saved model input')
     except (ValueError, OSError):
-        limitations.append('Saved model input is unavailable for correspondence checking')
-    if experiment.status != ExecutionStatus.COMPLETED or experiment.exit_code != 0: limitations.append('Experiment did not complete successfully')
-    if experiment.snapshot_id != model.snapshot_id or experiment.model_id != model.id: limitations.append('Experiment input association mismatch')
-    if experiment.input_versions != model.artifact_digests: limitations.append('Experiment artifact versions do not match')
-    if state.mode == 'mock' or model.origin in {Origin.MOCK, Origin.SYNTHETIC, Origin.MUTATION} or experiment.origin != Origin.EXECUTED: limitations.append('Mock, synthetic, imported or mutation execution cannot confirm the original implementation')
+        blockers.append('Saved model input is unavailable for correspondence checking')
+    if experiment.status != ExecutionStatus.COMPLETED or experiment.exit_code != 0: blockers.append('Experiment did not complete successfully')
+    if experiment.snapshot_id != model.snapshot_id or experiment.model_id != model.id: blockers.append('Experiment input association mismatch')
+    if experiment.input_versions != model.artifact_digests: blockers.append('Experiment artifact versions do not match')
+    if state.mode == 'mock' or model.origin in {Origin.MOCK, Origin.SYNTHETIC, Origin.MUTATION} or experiment.origin != Origin.EXECUTED: blockers.append('Mock, synthetic, imported or mutation execution cannot confirm the original implementation')
     if not calibration or calibration.status != 'compatible' or calibration.model_id != model.id or calibration.experiment_check_id != experiment.id:
-        limitations.append('Exact experiment has not completed code calibration')
-    if prerequisite['status'] != 'matched': limitations.append('Candidate prerequisites are not established')
+        blockers.append('Exact experiment has not completed code calibration')
+    if prerequisite['status'] != 'matched': blockers.append('Candidate prerequisites are not established')
     spec = specs.get(finding.checker_id)
+    if spec:boundaries.extend(spec.scope.excluded)
     claim = next((c for c in state.claims if spec and c.id == spec.claim_id),None)
     bases = [bundle.harness.legality] + ([claim.grounding] if claim else [])
-    if not claim: limitations.append('Checker claim is unavailable')
-    elif claim.pending: limitations.extend(claim.pending)
+    if not claim: blockers.append('Checker claim is unavailable')
+    elif claim.pending: boundaries.extend(claim.pending)
     if claim and (finding.claim_id != claim.id or model.graph_versions.get(claim.id) != claim.version):
-        limitations.append('Finding or claim version differs from the checked model')
-    from .instrumentation import observation_change_limitations
-    limitations.extend(observation_change_limitations(bundle.harness, model.binding_ids))
-    if bundle.uncertainties: limitations.extend(bundle.uncertainties)
+        blockers.append('Finding or claim version differs from the checked model')
     materials={m.id:m for m in state.materials}; bindings={b.id for b in state.bindings}
     for basis in bases:
         try: validate_grounding(basis,materials,bindings)
-        except ValueError as exc: limitations.append(str(exc))
-        limitations.extend(basis.unresolved+basis.conflicts)
-    if not bundle.harness.legal_conditions: limitations.append('No observable legality conditions supplied')
-    for condition in bundle.harness.legal_conditions:
-        if not events or not all(compare(event,condition) is True for event in events): limitations.append('Legal execution condition is missing or violated in the observed execution: '+condition.field)
+        except ValueError as exc: blockers.append(str(exc))
+        blockers.extend(basis.unresolved+basis.conflicts)
+    if any(event.get('event')=='invalid_observation' for event in events):blockers.append('Event output contains an incomplete or invalid CA_EVENT record')
     confirmed = None
     for monitor,result in zip([m for m in bundle.monitors if m.checker_id==finding.checker_id],results):
-        local=[]
+        local=[];local_boundaries=[]
         from consensus_assurance.adapters.verifiers.observable import correspondence
         mismatch = correspondence(bundle, monitor)
         if mismatch: local.append(mismatch)
@@ -97,22 +99,20 @@ def assess_execution(state, model, bundle, experiment, calibration, finding, eve
         local.extend(monitor.grounding.unresolved+monitor.grounding.conflicts)
         if not monitor.binding_ids or not set(monitor.binding_ids)<=set(model.binding_ids): local.append('Observation monitor lacks selected code bindings')
         if not p or not p.identity_fields: local.append('Observation lacks participant/operation/context identity requirements')
-        if not monitor.applicability_conditions: local.append('No observable applicability conditions')
-        for index in result['witness_indices']:
-            if not all(compare(events[index],c) is True for c in monitor.applicability_conditions): local.append('Property applicability is not established at the observed violation')
         if result['missing_indices']:
             local.append('Result fields or unambiguous prerequisite association are missing')
         if claim and any(g.claim_id==claim.id for g in bundle.consequence_observations):
             mapping=next((g for g in bundle.consequence_observations if g.claim_id==claim.id),None)
-            local.extend(consequence_witness_limitations(mapping,events,result['witness_indices']))
+            local_boundaries.extend(consequence_witness_limitations(mapping,events,result['witness_indices']))
             if mapping:
                 try:validate_grounding(mapping.grounding,materials,bindings)
                 except ValueError as exc:local.append(str(exc))
-                local.extend(mapping.grounding.unresolved+mapping.grounding.conflicts)
-                if not mapping.binding_ids or not set(mapping.binding_ids)<=set(model.binding_ids):local.append('Consequence observation mapping lacks selected source bindings')
-        result['limitations']=local
-        if result['outcome']=='violated' and not local and not limitations: confirmed=result
-    if not results: limitations.append('No supported monitor for this checker; trace compatibility is not property violation')
+                local_boundaries.extend(mapping.grounding.unresolved+mapping.grounding.conflicts)
+                if not mapping.binding_ids or not set(mapping.binding_ids)<=set(model.binding_ids):local_boundaries.append('Consequence observation mapping lacks selected source bindings')
+        result['blockers']=list(dict.fromkeys(local));result['boundaries']=list(dict.fromkeys(local_boundaries))
+        result['limitations']=list(dict.fromkeys(local+local_boundaries))
+        if result['outcome']=='violated' and not local and not blockers: confirmed=result
+    if not results: blockers.append('No supported monitor for this checker; trace compatibility is not property violation')
     if confirmed:
         finding.stage=Investigation.REPRODUCED
         finding.applicability='current'
@@ -124,18 +124,24 @@ def assess_execution(state, model, bundle, experiment, calibration, finding, eve
     finding.replay_check_id=experiment.id
     record={'finding_id':finding.id,'experiment_check_id':experiment.id,'snapshot_id':model.snapshot_id,'model_id':model.id,
         'calibration_id':calibration.id if calibration else None,'prerequisites':prerequisite,'properties':results,
-        'limitations':limitations,'level':finding.level,'confirmed':confirmed is not None,
+        'adaptations':bundle.harness.semantic_changes,
+        'blockers':list(dict.fromkeys(blockers)),'boundaries':list(dict.fromkeys(boundaries)),
+        'limitations':list(dict.fromkeys(blockers+boundaries)),'level':finding.level,'confirmed':confirmed is not None,
         'claim_version':claim.version if claim else None,
         'checker_scope':spec.scope.model_dump(mode='json') if spec else None,
         'monitor_algorithm':'shared_observable_property/2'}
-    state.monitor_results.append(record)
+    current=next((r for r in state.monitor_results if r.get('finding_id')==finding.id and r.get('experiment_check_id')==experiment.id),None)
+    if current is None:state.monitor_results.append(record)
+    else:current.clear();current.update(record)
     return record
 
 
-def monitor_support(events, monitor, p):
+def monitor_support(events, monitor, p, eligible=None):
     seen, violations, missing = [], [], []
     for index, event in enumerate(events):
         if event.get('event') != monitor.event:
+            continue
+        if eligible is not None and index not in eligible:
             continue
         active = compare(event,p.trigger)
         keys = [field(event,k) for k in p.identity_fields]

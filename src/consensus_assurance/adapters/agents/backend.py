@@ -130,6 +130,12 @@ class CodexAgent:
         command.append("-")
         check = runner.run(command, directory, "agent", snapshot_id, timeout, stdin=prompt)
         check.tool_version = self.version
+        if check.stderr and Path(check.stderr).is_file():
+            reported=Path(check.stderr).read_text(errors='replace')
+            model=re.search(r'(?m)^model:\s*(\S.*?)\s*$',reported)
+            effort=re.search(r'(?m)^reasoning effort:\s*(\S.*?)\s*$',reported)
+            if model:check.parameters['agent_model']=model.group(1)
+            if effort:check.parameters['agent_reasoning_effort']=effort.group(1)
         if check.status != ExecutionStatus.COMPLETED:
             return check, None
         if check.exit_code != 0:

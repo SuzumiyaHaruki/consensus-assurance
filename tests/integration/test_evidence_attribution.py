@@ -43,10 +43,7 @@ def test_actual_contract_and_observation_determine_confirmation(tlc,tmp_path,mod
     repo=tmp_path/'repo';shutil.copytree(ROOT/'fixtures/ack_service',repo)
     state,unit,bundle=setup_ack(repo,mode,partial)
     if variant=='reviewed_observation':
-        from consensus_assurance.core.proposals import ObservationChange
-        line=next(i for i,l in enumerate(bundle.harness.source.splitlines(),1) if "print('CA_EVENT '" in l)
         bundle.harness.semantic_changes=['Add actual event printing']
-        bundle.harness.observation_changes=[ObservationChange(change_index=0,start_line=line,end_line=line,binding_ids=['ack-code'],rationale='Only serial event formatting and output in this scoped experiment')]
     model=save_bundle(runner.root,state,unit,bundle,PythonBackend())
     workspace=runner.root/'workspace';shutil.copytree(repo,workspace)
     (workspace/'assurance_generated.py').write_text(bundle.harness.source)

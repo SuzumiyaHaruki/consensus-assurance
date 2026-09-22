@@ -1,6 +1,7 @@
 """Actual fixture execution, never a real backend or a production correctness claim."""
 import json
 import shutil
+import subprocess
 from pathlib import Path
 import pytest
 from consensus_assurance.core.types import *
@@ -29,6 +30,7 @@ def setup(tmp_path,prepared,broken=False):
         binding.snapshot_id=state.snapshot.id;binding.content_digest=state.snapshot.files[binding.file]
         binding.excerpt='\n'.join((repo/binding.file).read_text().splitlines()[binding.start_line-1:binding.end_line])
     unit=state.units[0];unit.binding_ids=['step_binding']
+    unit.scope.excluded.append('Cluster-wide consequences outside this finite call')
     basis=Grounding(source_ids=['counter.py:1:10'],expectation_ids=[next(m.id for m in state.materials if m.file=='README.md')],binding_ids=unit.binding_ids,derivation='Finite legal counter inputs must return within capacity',applicability='One local operation, legal initial value and positive capacity')
     for claim in state.claims:
         claim.pending=[];claim.grounding=basis.model_copy(deep=True)
@@ -41,20 +43,19 @@ def setup(tmp_path,prepared,broken=False):
     source='''import json
 from counter import step
 value, limit = 3, 3
-metadata = {'legal': 0 <= value <= limit and limit > 0}
 def emit(event, **values):
-    print('CA_EVENT ' + json.dumps({'event': event, 'operation': 'one', 'participant': 'local', 'context': 'configured', 'metadata': metadata, 'state': values}))
-emit('admitted', value=value, limit=limit)
+    print('CA_EVENT ' + json.dumps({'event': event, 'operation': 'one', 'participant': 'local', 'context': 'configured', 'state': values}))
+emit('admitted', value=value, limit=limit, input_valid=0 <= value <= limit and limit > 0)
 returned = step(value, limit)
 emit('returned', value=returned, in_range=0 <= returned <= limit)
 '''
     identities=['operation','participant','context']
-    prop=ObservableProperty(checker_id='Range',trigger=Comparison(field='metadata.legal',value=True),assertion=Comparison(field='state.in_range',value=True),identity_fields=identities,description='Observed result remains in the documented capacity range')
+    prop=ObservableProperty(checker_id='Range',trigger=Comparison(field='event',value='returned'),assertion=Comparison(field='state.in_range',value=True),identity_fields=identities,description='Observed result remains in the documented capacity range')
     monitor=EventMonitor(id='range',checker_id='Range',event='returned',
-        binding_ids=unit.binding_ids,grounding=basis,applicability_conditions=[prop.trigger])
-    plan=DirectCheckPlan(description='One actual boundary call',claim_id=unit.obligation_ids[0],scope=unit.scope,binding_ids=unit.binding_ids,
-        harness=Harness(kind='python',source=source,description='Actual fixture call and independent bound observation',semantic_changes=[],legality=basis,legal_conditions=[prop.trigger],
-            prerequisites=[EventRequirement(alias='start',event='admitted')]),
+        binding_ids=unit.binding_ids,grounding=basis)
+    plan=DirectCheckPlan(description='One actual boundary call',claim_id=unit.obligation_ids[0],binding_ids=unit.binding_ids,
+        harness=Harness(kind='python',source=source,description='Actual fixture call and independent bound observation',semantic_changes=['Emit actual event values after the target call'],legality=basis,
+            prerequisites=[EventRequirement(alias='start',event='admitted',conditions=[Comparison(field='state.input_valid',value=True)])]),
         monitors=[monitor],observable_properties=[prop])
     return e,unit,plan
 
@@ -85,11 +86,14 @@ def test_actual_direct_result_without_model(tmp_path,prepared,broken):
     e.agent=Generation();e.agent.responses=[DirectCheckReply(plan=plan,gap='').model_dump(mode='json') for plan in (invalid,p)]
     proceed(e,u,'direct_check')
     a=e.state.direct_checks[0]
+    assert a.scope==u.scope and 'scope' not in json.loads(Path(a.plan_path).read_text())
     assert e.state.usage['agent_calls']==2
     session=next(iter(e.state.repair_sessions.values()))
     assert json.loads(Path(session['original_path']).read_text())['plan']==invalid.model_dump(mode='json')
     proceed(e,u,'direct_execute')
     assert e.state.monitor_results[-1]['outcome']==('violated' if broken else 'holds')
+    from consensus_assurance.workflow.modeling import obligation_progress
+    assert obligation_progress(e.state,u)==({u.obligation_ids[0]:[next(c for c in e.state.checks if c.action=='direct_check').id]},[])
     assert not e.state.monitor_results[-1]['confirmed']
     assert len(e.state.inquiry_tasks)==1 and e.state.inquiry_tasks[0].target_ids==[a.id]
     contract=target_contract(e.state,a)
@@ -100,33 +104,35 @@ def test_actual_direct_result_without_model(tmp_path,prepared,broken):
     assert target_contract(e.state,a)['object_type']=='direct_check'
     assert not e.state.models and c.direct_check_id==a.id and c.model_id is None
     assert result['confirmed']==broken,result
+    assert 'Cluster-wide consequences outside this finite call' in result['boundaries']
+    assert result['adaptations']==['Emit actual event values after the target call']
     assert result['outcome']==('violated' if broken else 'holds'),result
     assert e.state.evidence[-1].level=='implementation_test'
+    assert len([r for r in e.state.monitor_results if r['experiment_check_id']==c.id])==1
+    assert len([x for x in e.state.evidence if x.check_id==c.id and x.checker_id=='Range'])==1
     assert all(claim.assessment==Assessment.UNASSESSED for claim in e.state.claims)
     if broken:
         assert e.state.findings[-1].level=='implementation_obligation'
         assert e.state.findings[-1].direct_check_id==a.id
+        assert len([x for x in e.state.findings if x.check_id==c.id and x.checker_id=='Range'])==1
     assert len(e.state.semantic_reviews)==1 and e.state.inquiry_tasks[0].status=='completed'
 
 
-@pytest.mark.parametrize('failure',['prerequisite','missing','compile','test_failure','instrumentation','disputed','limited','unreviewed','identity','applicability'])
+@pytest.mark.parametrize('failure',['prerequisite','missing','compile','test_failure','disputed','unreviewed','identity','applicability'])
 def test_direct_failure_never_confirms(tmp_path,prepared,failure):
     e,u,p=setup(tmp_path,prepared,True)
     if failure=='prerequisite':p.harness.prerequisites[0].event='not_observed'
     if failure=='missing':p.harness.source=p.harness.source.replace('in_range=0 <= returned <= limit','other=0 <= returned <= limit')
     if failure=='compile':p.harness.source+='\ninvalid python syntax!'
     if failure=='test_failure':p.harness.source+='\nraise AssertionError("Observed result outside range")'
-    if failure=='instrumentation':p.harness.semantic_changes=['Alter protocol behavior to produce the outcome']
     if failure=='identity':p.harness.source=p.harness.source.replace("'operation': 'one'", "'operation': event")
     if failure=='applicability':p.monitors[0].applicability_conditions=[Comparison(field='metadata.unknown',value=True)]
     a=save_plan(e,u,p,'negative')
     if failure!='unreviewed':review(e.state,u,a)
     if failure=='disputed':e.state.semantic_reviews[0].items[0].status='disputed'
-    if failure=='limited':e.state.semantic_reviews[0].items[0].limitations=['The actual durability path remains unobserved']
     c=execute(e,a);result=assess(e.state,u,a,p,c,extract_events(c))
     assert not result['confirmed'],result
-    if failure=='limited':assert 'The actual durability path remains unobserved' in result['limitations']
-    assert result['outcome']==('unknown' if failure in {'prerequisite','missing','compile','identity'} else 'violated'),result
+    assert result['outcome']==('unknown' if failure in {'prerequisite','missing','compile','identity','applicability'} else 'violated'),result
     assert not any(f.level=='implementation_obligation' for f in e.state.findings)
 
 
@@ -218,7 +224,7 @@ def test_new_direct_artifact_does_not_hide_prior_oracle_dispute(tmp_path,prepare
     e.state.review_issues.append(ReviewIssue(review_id='old',target_id=old.id,target_version=1,aspect='checker_correspondence',source_ids=u.audit_question.source_ids,explanation='Oracle may use the wrong return boundary',disposition='investigation',reason='Must resolve the specific dispute'))
     new=save_plan(e,u,p,'new');review(e.state,u,new)
     c=execute(e,new);result=assess(e.state,u,new,p,c,extract_events(c))
-    assert not result['confirmed'] and 'Unresolved semantic counterevidence' in result['limitations']
+    assert not result['confirmed'] and 'Unresolved direct-check semantic counterevidence' in result['blockers']
 
 
 def test_source_continuation_uses_existing_attributed_F2(tmp_path,prepared):
@@ -266,6 +272,20 @@ def test_direct_F4_keeps_failed_prerequisite_and_revision_history(tmp_path,prepa
     assert e.state.usage['revisions']==1 and e.state.usage['replays']==1
     assert e.state.monitor_results[0]['prerequisites']['status']=='not_reached'
     assert not e.state.models and not e.state.evidence
+
+
+def test_exhausted_review_budget_keeps_one_completed_direct_result(tmp_path,prepared):
+    e,u,p=setup(tmp_path,prepared,True);a=save_plan(e,u,p,'budget-end')
+    e.state.active_direct_check_id=a.id
+    proceed(e,u,'direct_execute')
+    task=next(t for t in e.state.inquiry_tasks if t.unit_id==u.id)
+    task.status='blocked';task.stop_reason='Budget exhausted or disabled: semantic_reviews'
+    proceed(e,u,'direct_assess')
+    checks=[c for c in e.state.checks if c.direct_check_id==a.id]
+    results=[r for r in e.state.monitor_results if r['direct_check_id']==a.id]
+    assert len(checks)==len(results)==1 and results[0]['bounded_complete']
+    assert u.status=='checked' and task.status=='blocked' and not e.state.models
+    assert any('attribution remains pending' in x for x in u.coverage_limitations)
 
 
 def test_question_narrowing_preserves_structural_identity_and_counterevidence(tmp_path,prepared):
@@ -327,3 +347,50 @@ def test_independent_results_correlate_without_filtering_comparison(change,expec
     result=monitor_events(events,monitor,prop,requirements)
     assert result['outcome']==expected
     if change=='value':assert result['witness_indices']==[2]
+
+
+@pytest.mark.real
+def test_go_json_fragments_preserve_streams_and_report_incomplete_events(tmp_path):
+    from consensus_assurance.workflow.observations import monitor_events
+    if not shutil.which('go'):pytest.skip('Go unavailable')
+    repo=tmp_path/'go-events';repo.mkdir()
+    (repo/'go.mod').write_text('module example.test/events\n\ngo 1.22\n')
+    (repo/'event_test.go').write_text(r'''package events
+import (
+    "encoding/json"
+    "fmt"
+    "strings"
+    "testing"
+)
+func TestLongEvent(t *testing.T) {
+    raw, _ := json.Marshal(map[string]any{"event":"result", "operation":"one", "payload":strings.Repeat("x", 8192)})
+    fmt.Println("CA_EVENT " + string(raw))
+}
+''')
+    completed=subprocess.run(['go','test','-json','./...'],cwd=repo,text=True,capture_output=True,check=False)
+    assert completed.returncode==0,completed.stderr
+    outputs=[json.loads(line).get('Output','') for line in completed.stdout.splitlines() if json.loads(line).get('Test')=='TestLongEvent']
+    start=next(i for i,text in enumerate(outputs) if 'CA_EVENT ' in text)
+    assert len(outputs[start])<8192 and any('\n' in text for text in outputs[start+1:])
+    stdout=tmp_path/'go.stdout';stdout.write_text(completed.stdout)
+    check=CheckRun(action='direct_check',cwd=str(repo),snapshot_id='snapshot',stdout=str(stdout),status=ExecutionStatus.COMPLETED,exit_code=0)
+    events=extract_events(check)
+    result=next(e for e in events if e['event']=='result')
+    assert len(result['payload'])==8192 and result['_ca_stream']
+    ordinary=tmp_path/'ordinary.stdout';ordinary.write_text('CA_EVENT '+json.dumps({k:v for k,v in result.items() if not k.startswith('_ca_')})+'\n')
+    plain=extract_events(check.model_copy(update={'stdout':str(ordinary)}))[0]
+    assert {k:v for k,v in result.items() if not k.startswith('_ca_')}=={k:v for k,v in plain.items() if not k.startswith('_ca_')}
+
+    envelopes=[
+        {'Action':'output','Package':'p','Test':'A','Output':'CA_EVENT {"event":"input","operation":"same","state":{"value":1}}\n'},
+        {'Action':'output','Package':'p','Test':'B','Output':'CA_EVENT {"event":"output","operation":"same","state":{"value":1}}\n'},
+        {'Action':'output','Package':'p','Test':'C','Output':'CA_EVENT {"event":"truncated","operation":"same"'},
+    ]
+    interleaved=tmp_path/'interleaved.stdout';interleaved.write_text('\n'.join(json.dumps(x) for x in envelopes)+'\n')
+    separated=extract_events(check.model_copy(update={'stdout':str(interleaved)}))
+    prop=ObservableProperty(checker_id='Value',trigger=Comparison(field='event',value='output'),assertion=Comparison(field='state.value',reference='input.state.value'),identity_fields=['operation'],description='Same-stream comparison')
+    monitor=EventMonitor(id='value',checker_id='Value',event='output',binding_ids=[],grounding=Grounding())
+    outcome=monitor_events(separated,monitor,prop,[EventRequirement(alias='input',event='input')])
+    assert outcome['outcome']=='unknown' and outcome['missing_indices']==[1]
+    invalid=next(e for e in separated if e['event']=='invalid_observation')
+    assert invalid['_ca_observation']['location']['line']=='end-of-stream'

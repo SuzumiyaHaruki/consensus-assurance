@@ -137,11 +137,12 @@ def test_codex_invalid_output_preserves_raw(tmp_path, effort):
             assert command[-1] == "-"
             (directory / "response.json").write_text("not valid JSON")
             out = directory / "stdout.log"; err = directory / "stderr.log"
-            out.write_text(""); err.write_text("")
+            out.write_text(""); err.write_text("model: gpt-test\nreasoning effort: low\n")
             return CheckRun(action=action, cwd=str(directory), snapshot_id=snapshot_id, status=ExecutionStatus.COMPLETED,
                 exit_code=0, stdout=str(out), stderr=str(err))
     check, response = agent.analyze(Runner(), "English test task", tmp_path, "s", 1, GraphDraft)
     assert response is None and check.reason == "Structured agent output is invalid"
+    assert check.parameters=={'agent_model':'gpt-test','agent_reasoning_effort':'low'}
     assert (tmp_path / "raw-response.txt").read_text() == "not valid JSON"
 
 

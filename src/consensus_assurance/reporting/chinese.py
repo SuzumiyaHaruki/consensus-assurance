@@ -356,7 +356,8 @@ def render_report(state, root):
             lines += [f"  实际观测、前提、合法性及性质判定：{link(f.confirmation_path)}；checker `{f.checker_id}`。"]
     for result in state.monitor_results:
         observed='；'.join(p['checker_id']+'='+p['outcome'] for p in result['properties'])
-        lines += [f"观测判定 `{result.get('finding_id',result.get('direct_check_id','unknown'))}`：实际结果 `{result.get('outcome',observed)}`；性质 `{observed}`；前提 `{result['prerequisites']['status']}`；确认层级 `{result['level']}`；限制：{result['limitations']}。"]
+        completion=('有界检查完成' if result.get('bounded_complete') else '有界检查未完成') if result.get('direct_check_id') else '模型回放解释'
+        lines += [f"观测判定 `{result.get('finding_id',result.get('direct_check_id','unknown'))}`：{completion}；实际结果 `{result.get('outcome',observed)}`；性质 `{observed}`；前提 `{result['prerequisites']['status']}`；确认层级 `{result['level']}`；当前归因阻塞：{result.get('blockers',result.get('limitations',[]))}；实验适配：{result.get('adaptations',[])}；范围边界：{result.get('boundaries',[])}。"]
     for decision in state.consequences:
         lines.append(f"义务→更广泛后果处置：发现 `{decision['finding_id']}`；`{decision['disposition']}`；{decision['reason']}；后续 {decision['task_ids']}；限制 {decision['limitations']}。")
     for revision in state.revisions:
@@ -367,9 +368,11 @@ def render_report(state, root):
         f"控制器格式：{state.framework_revision or '历史运行未记录'}；阶段：{state.framework_stage}。",
         f"恢复位置：探索/复核任务 `{state.active_inquiry_id}`；单元 `{state.active_unit_id}`，模型 `{state.active_model_id}`，反例 `{state.active_finding_id}`，下一动作 `{state.next_action}`。"]
     lines += [f"- {gap}" for gap in dict.fromkeys(state.gaps)]
+    reported=sorted({(c.parameters.get('agent_model'),c.parameters.get('agent_reasoning_effort')) for c in state.checks if c.action=='agent' and c.parameters.get('agent_model')})
     lines += ["- 活性、公平性、最终同步及未纳入的交互，不从有限安全性检查推断成立。",
               "- 当前实现不会仅凭 agent 声称或生成测试断言，将模型候选升级为已确认局部或更广泛义务违反；合法性与后果证据不足时保留未决。",
               "", "## 实际运行统计", "", f"累计执行时间：{state.elapsed_seconds:.2f} 秒；预算计数：`{state.usage}`。",
+              "Agent CLI 报告："+("；".join(f"model={model}，reasoning_effort={effort or '未记录'}" for model,effort in reported) if reported else "未记录。"),
               f"首个已保存模型前耗时：{state.first_model_seconds if state.first_model_seconds is not None else '尚无模型'}；模型仍须通过实际工具检查。",
               f"审计单元 {len(state.units)}；范围扩展 {sum(x.kind == 'F3' for x in state.revisions)}；语义修订 {len(state.revisions)}；校准 {len(state.calibrations)}。",
               "完整命令、时间、版本与制品关联见 [state.json](state.json)，图、规格和计划视图在结束或生成报告时导出；事件见 [events.jsonl](events.jsonl)。", ""]

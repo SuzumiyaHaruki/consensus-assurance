@@ -119,14 +119,6 @@ class ObservableProperty(Record):
     description: str
 
 
-class ObservationChange(Record):
-    change_index: int = Field(ge=0)
-    start_line: int = Field(ge=1)
-    end_line: int = Field(ge=1)
-    binding_ids: list[str] = Field(min_length=1)
-    rationale: str
-
-
 class EventMonitor(Record):
     id: str
     checker_id: str
@@ -136,8 +128,6 @@ class EventMonitor(Record):
     applicability_conditions: list[Comparison] = []
 
 
-
-
 class Harness(Record):
     kind: str = Field(description="Harness kind advertised by the configured execution backend")
     source: str = Field(min_length=1, description="Executable experiment source, calling actual target code; no fabricated expected observations")
@@ -145,9 +135,6 @@ class Harness(Record):
     semantic_changes: list[str] = Field(description="Instrumentation and adaptation differences; never alter protocol logic to create a real finding")
     prerequisites: list[EventRequirement] = []
     legality: Grounding = Grounding()
-    legal_conditions: list[Comparison] = []
-    observation_changes: list[ObservationChange] = []
-
 
 
 class ConsequenceWitnessEvent(Record):
@@ -380,7 +367,6 @@ class QuestionReply(Record):
 class DirectCheckPlan(Record):
     description: str
     claim_id: str
-    scope: Scope
     binding_ids: list[str] = Field(min_length=1)
     harness: Harness
     monitors: list[EventMonitor] = Field(min_length=1)

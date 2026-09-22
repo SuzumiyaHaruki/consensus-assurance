@@ -65,25 +65,48 @@ def run_experiment(runner, command, workspace, snapshot_id, timeout, mode, actio
 
 
 def extract_events(check):
+    """Extract complete CA_EVENT lines, preserving runner-provided stream ownership."""
     events = []
     if not check.stdout or not Path(check.stdout).is_file():
         return events
-    for line in Path(check.stdout).read_text().splitlines():
-        if line.startswith("{"):
-            try:
-                outer = json.loads(line)
-                line = outer.get("Output", "")
-            except (ValueError, AttributeError):
-                continue
-        marker = "CA_EVENT "
+
+    marker = "CA_EVENT "
+    buffers = {}
+
+    def parse_line(line, stream=None, location=None):
         if marker not in line:
-            continue
+            return
         raw = line.split(marker, 1)[1].strip()
+        provenance = {'stream':stream,'location':location}
         try:
             event = json.loads(raw)
             if not isinstance(event, dict) or not isinstance(event.get("event"), str):
                 raise ValueError("Event must be an object with an event name")
+            if stream is not None:
+                event['_ca_stream'] = stream
+            event['_ca_observation'] = provenance
             events.append(event)
-        except ValueError:
-            events.append({"event": "invalid_observation", "raw": raw})
+        except ValueError as exc:
+            events.append({"event":"invalid_observation","raw":raw,"reason":str(exc),
+                "_ca_stream":stream,"_ca_observation":provenance})
+
+    for physical, line in enumerate(Path(check.stdout).read_text().splitlines(keepends=True), 1):
+        try:
+            outer = json.loads(line)
+        except (ValueError, TypeError):
+            parse_line(line.rstrip('\r\n'), location={'line':physical})
+            continue
+        if not isinstance(outer,dict) or not isinstance(outer.get('Output'),str):
+            continue
+        # Package-level output is a real, separate stream. Never guess that it
+        # belongs to a concurrently reported test stream.
+        stream = json.dumps([outer.get('Package'),outer.get('Test') if 'Test' in outer else None],
+            ensure_ascii=False,separators=(',',':'))
+        buffers[stream] = buffers.get(stream,'') + outer['Output']
+        while '\n' in buffers[stream]:
+            complete,buffers[stream] = buffers[stream].split('\n',1)
+            parse_line(complete.rstrip('\r'),stream,{'line':physical,'stream':stream})
+    for stream,tail in buffers.items():
+        if marker in tail:
+            parse_line(tail,stream,{'line':'end-of-stream','stream':stream})
     return events

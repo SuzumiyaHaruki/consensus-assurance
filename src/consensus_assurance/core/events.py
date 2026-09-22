@@ -50,6 +50,7 @@ def match_prerequisites(events, requirements, witness_index=None, identity_field
         return {'status':'unknown','reason':str(exc),'matched_indices':[], 'alias_indices':{}}
     missing, matches = False, []
     witness = events[witness_index] if witness_index is not None else None
+    witness_stream = witness.get('_ca_stream') if witness is not None else None
     def search(step, indices):
         nonlocal missing
         if step == len(ordered):
@@ -57,8 +58,12 @@ def match_prerequisites(events, requirements, witness_index=None, identity_field
         req = ordered[step]
         aliases = {alias:events[index] for alias,index in indices.items()}
         predecessors = [indices[c.reference.partition('.')[0]] for c in req.conditions if c.reference]
+        selected_streams = {events[index].get('_ca_stream') for index in indices.values()}
         for index,event in enumerate(events[:witness_index] if witness_index is not None else events):
             if event.get('event') != req.event or index in indices.values(): continue
+            stream = event.get('_ca_stream')
+            if witness is not None and stream != witness_stream: continue
+            if selected_streams and stream not in selected_streams: continue
             if any(index <= prior for prior in predecessors): continue
             identity = [compare(event,Comparison(field=k,reference='witness.'+k),{'witness':witness}) for k in identity_fields] if witness is not None else []
             if any(v is False for v in identity): continue

@@ -38,8 +38,19 @@ def review_projection(engine,task):
         result['required_material_ids']=sorted(wanted)
     for artifact in state.direct_checks:
         if artifact.id in task.target_ids:
-            result['direct_check_plan']=json.loads(Path(artifact.plan_path).read_text())
-            result['actual_checks']=[engine.error_context(c) for c in state.checks if c.direct_check_id==artifact.id]
+            from .direct_checks import load_plan
+            from consensus_assurance.adapters.runners.experiment import extract_events
+            plan=load_plan(artifact.plan_path)
+            checks=[c for c in state.checks if c.direct_check_id==artifact.id]
+            current=next((r for r in reversed(state.monitor_results) if r.get('direct_check_id')==artifact.id and
+                any(c.id==r.get('experiment_check_id') for c in checks)),None)
+            result['direct_check_plan']=plan.model_dump(mode='json')
+            result['direct_check_scope']=artifact.scope.model_dump(mode='json')
+            result['actual_checks']=[engine.error_context(c) for c in checks]
+            result['machine_assessment']=current
+            if checks:
+                result['observed_events']=extract_events(checks[-1])
+                result['raw_log_path']=checks[-1].stdout
     if task.model_id:
         model=next((m for m in state.models if m.id==task.model_id),None)
         if model:
