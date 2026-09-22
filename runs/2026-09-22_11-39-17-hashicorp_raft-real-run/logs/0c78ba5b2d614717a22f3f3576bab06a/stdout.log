@@ -1,0 +1,387 @@
+{
+  "understanding": "The supplied source establishes candidate-local campaign dispatch, result tallying, self-vote handling, and sequential vote-storage calls. Pre-vote can precede an election, while disabled pre-vote and leadership transfer bypass it. This delta maps those synchronous responsibilities and retains a separate frontier for asynchronous response semantics and unresolved transition helpers.",
+  "requests": [],
+  "delta": {
+    "target_profile": null,
+    "activities": [],
+    "behaviors": [
+      {
+        "id": "candidate_campaign_control",
+        "primary_activity": "A2",
+        "execution_owner": "Raft candidate loop",
+        "protocol_context": "One runCandidate invocation while local state remains Candidate.",
+        "trigger": "Entry into runCandidate.",
+        "legal_preconditions": [],
+        "implementation_guards": [
+          "Pre-vote runs only when preVoteDisabled is false and candidateFromLeadershipTransfer is false.",
+          "The loop continues while getState() returns Candidate.",
+          "Pre-vote responses above the invocation's initially computed next term request follower transition and term update.",
+          "Vote responses above getCurrentTerm() request follower transition and term update."
+        ],
+        "reads": [
+          "Current term and state.",
+          "ElectionTimeout, preVoteDisabled, and candidateFromLeadershipTransfer.",
+          "quorumSize() result.",
+          "Campaign-local response channels."
+        ],
+        "writes": [
+          "Local granted and refused counters.",
+          "Election timer and active campaign channels.",
+          "candidateFromLeadershipTransfer is reset by a deferred store."
+        ],
+        "durable_effects": [
+          "Invokes setCurrentTerm on a higher-term response; its implementation and durability semantics are not supplied."
+        ],
+        "external_effects": [
+          "Processes incoming RPCs through processRPC.",
+          "Rejects configuration changes, apply, verify, restore, and leadership-transfer requests with ErrNotLeader.",
+          "Returns a cloned configuration on configurationsCh and ErrCantBootstrap on bootstrapCh.",
+          "Calls setState(Leader) and setLeader after the granted-vote threshold is reached."
+        ],
+        "important_branches": [
+          "A successful pre-vote tally disables prevoteCh, resets the election timer, and invokes electSelf.",
+          "A refused pre-vote threshold only logs failure; the loop continues until another selected event.",
+          "Granted vote results increment a scalar count; this loop does not deduplicate voterID or explicitly reject lower-term grants.",
+          "Election timeout returns; restart depends on the caller, whose implementation is not attached.",
+          "Follower notification refreshes the timer only if ElectionTimeout changed.",
+          "Shutdown returns."
+        ],
+        "async_boundaries": [
+          "select receives RPCs, campaign results, client requests, notifications, timeout, and shutdown.",
+          "Remote result establishment occurs in separate goroutines."
+        ],
+        "produces_fact_ids": [],
+        "consumes_fact_ids": [
+          "local_election_vote_enqueued",
+          "local_prevote_enqueued"
+        ],
+        "cross_activity_effects": [
+          {
+            "key": "A7",
+            "value": "Candidate-side handling rejects the listed leader-only requests with ErrNotLeader."
+          },
+          {
+            "key": "A4",
+            "value": "Candidate-side handling rejects configuration changes and serves a cloned configuration through configurationsCh."
+          }
+        ],
+        "existing_protections": [
+          "Campaign response channels are obtained separately for each invocation.",
+          "Higher-term responses cause an early return after transition-helper calls.",
+          "The leadership-transfer flag is reset on exit.",
+          "An election timeout bounds waiting in the candidate loop."
+        ],
+        "source_ids": [
+          "raft.go:285:441"
+        ],
+        "unknowns": [
+          "quorumSize, setState, setLeader, setCurrentTerm, and processRPC implementations are not attached.",
+          "Remote response validity, transport identity correlation, and configuration uniqueness are not established by the scalar tally.",
+          "Leader transition completion and subsequent leader initialization are not established by the observed call sites."
+        ]
+      },
+      {
+        "id": "election_campaign_dispatch",
+        "primary_activity": "A2",
+        "execution_owner": "Caller of electSelf, synchronously within candidate campaign control",
+        "protocol_context": "Election request construction over configurations.latest.Servers.",
+        "trigger": "runCandidate invokes electSelf directly or after reaching the pre-vote threshold.",
+        "legal_preconditions": [],
+        "implementation_guards": [
+          "Only entries with Suffrage == Voter are selected.",
+          "The local ServerID branch requires persistVote to return nil before enqueueing its granted result."
+        ],
+        "reads": [
+          "getCurrentTerm(), getLastEntry(), getRPCHeader(), and encoded local peer identity.",
+          "candidateFromLeadershipTransfer.",
+          "configurations.latest.Servers."
+        ],
+        "writes": [
+          "A new response channel buffered to the number of configured servers.",
+          "A RequestVoteRequest containing next term, last-entry metadata, and leadership-transfer flag."
+        ],
+        "durable_effects": [
+          "Calls setCurrentTerm before constructing and dispatching the request.",
+          "Calls persistVote for a selected local voter."
+        ],
+        "external_effects": [
+          "Schedules a RequestVote goroutine for each selected nonlocal voter."
+        ],
+        "important_branches": [
+          "On local persistVote error, electSelf returns nil without enqueueing the local granted result.",
+          "Remote goroutines scheduled before a local persistence error are not cancelled here.",
+          "If no selected server matches localID, no local vote is enqueued."
+        ],
+        "async_boundaries": [
+          "Each selected nonlocal voter is handled by a separate r.goFunc callback.",
+          "Local results are enqueued for later candidate-loop consumption."
+        ],
+        "produces_fact_ids": [
+          "local_election_vote_enqueued"
+        ],
+        "consumes_fact_ids": [
+          "vote_storage_calls_succeeded"
+        ],
+        "cross_activity_effects": [
+          {
+            "key": "A6",
+            "value": "Election dispatch invokes term storage and local vote storage before publishing the local granted result."
+          }
+        ],
+        "existing_protections": [
+          "Voter filtering.",
+          "Local granted-result publication follows successful return from persistVote.",
+          "Response buffering is sized from the configured server list."
+        ],
+        "source_ids": [
+          "raft.go:1976:2140"
+        ],
+        "unknowns": [
+          "setCurrentTerm failure behavior and storage durability remain unresolved.",
+          "Configuration validity and uniqueness are not established in this source.",
+          "Remote response production is retained as a separate deferred responsibility."
+        ]
+      },
+      {
+        "id": "prevote_campaign_dispatch",
+        "primary_activity": "A2",
+        "execution_owner": "Main-thread caller of preElectSelf, as required by its supplied comment",
+        "protocol_context": "Pre-election request construction over configurations.latest.Servers.",
+        "trigger": "runCandidate selects the pre-vote path.",
+        "legal_preconditions": [
+          "The supplied function comment requires invocation from the main thread."
+        ],
+        "implementation_guards": [
+          "Transport must implement WithPreVote or the function panics.",
+          "Only entries with Suffrage == Voter are selected."
+        ],
+        "reads": [
+          "Current term, last-entry metadata, RPC header, and configurations.latest.Servers."
+        ],
+        "writes": [
+          "A new response channel buffered to the number of configured servers.",
+          "A RequestPreVoteRequest proposing current term plus one.",
+          "A granted local result when the selected voter ID equals localID."
+        ],
+        "durable_effects": [],
+        "external_effects": [
+          "Schedules a RequestPreVote goroutine for each selected nonlocal voter."
+        ],
+        "important_branches": [
+          "The local-voter branch enqueues a grant without calling persistVote.",
+          "This function does not call setCurrentTerm.",
+          "If no selected server matches localID, no local pre-vote is enqueued."
+        ],
+        "async_boundaries": [
+          "Nonlocal requests execute in separate r.goFunc callbacks.",
+          "The local result is consumed later by runCandidate."
+        ],
+        "produces_fact_ids": [
+          "local_prevote_enqueued"
+        ],
+        "consumes_fact_ids": [],
+        "cross_activity_effects": [],
+        "existing_protections": [
+          "Explicit transport-capability check.",
+          "Voter filtering.",
+          "A separate response channel for this pre-vote invocation."
+        ],
+        "source_ids": [
+          "raft.go:1976:2140"
+        ],
+        "unknowns": [
+          "The remote compatibility fallback and transport response guarantees require separate actor-level interpretation.",
+          "No persistent vote or acquired authority is established by the local pre-vote result."
+        ]
+      },
+      {
+        "id": "persist_vote_storage_sequence",
+        "primary_activity": "A6",
+        "execution_owner": "Synchronous caller of Raft.persistVote",
+        "protocol_context": "Writing the last-vote term and candidate through the selected stable store.",
+        "trigger": "persistVote(term, candidate) is called.",
+        "legal_preconditions": [],
+        "implementation_guards": [
+          "The candidate write is attempted only if SetUint64(keyLastVoteTerm, term) returns nil."
+        ],
+        "reads": [
+          "Supplied term and candidate bytes.",
+          "Selected r.stable implementation."
+        ],
+        "writes": [
+          "keyLastVoteTerm through SetUint64.",
+          "keyLastVoteCand through Set."
+        ],
+        "durable_effects": [
+          "Requests two sequential stable-store writes; actual crash durability and atomicity depend on the store implementation."
+        ],
+        "external_effects": [
+          "Returns the first encountered storage error or nil after both calls return nil."
+        ],
+        "important_branches": [
+          "First-write error prevents the second call.",
+          "Second-write error is returned without an explicit rollback in this helper."
+        ],
+        "async_boundaries": [],
+        "produces_fact_ids": [
+          "vote_storage_calls_succeeded"
+        ],
+        "consumes_fact_ids": [],
+        "cross_activity_effects": [
+          {
+            "key": "A2",
+            "value": "Its successful return permits electSelf to enqueue the local granted vote."
+          }
+        ],
+        "existing_protections": [
+          "Both storage calls are checked for errors.",
+          "Errors propagate to the caller."
+        ],
+        "source_ids": [
+          "raft.go:1976:2140"
+        ],
+        "unknowns": [
+          "The selected stable-store variant, failed-write effects, crash consistency, and recovery readers are not attached.",
+          "Successful return alone does not establish an atomic durable term-and-candidate record."
+        ]
+      }
+    ],
+    "facts": [
+      {
+        "id": "vote_storage_calls_succeeded",
+        "meaning": "For this persistVote invocation, the term write and then the candidate write both returned nil.",
+        "identity": [
+          {
+            "key": "invocation",
+            "value": "Specific persistVote call"
+          },
+          {
+            "key": "values",
+            "value": "Supplied term and candidate bytes"
+          }
+        ],
+        "validity_context": "A historical assertion about the completed calls, not a guarantee of current contents, atomicity, or crash durability.",
+        "representation": [
+          "nil return from persistVote"
+        ],
+        "invalidators": [],
+        "reinterpreters": [],
+        "durability": "The assertion concerns API completion; storage persistence semantics are unresolved.",
+        "recovery": "Recovery consumers are not attached.",
+        "source_ids": [
+          "raft.go:1976:2140"
+        ],
+        "unknowns": [
+          "Other callers and storage implementations remain unexamined."
+        ]
+      },
+      {
+        "id": "local_election_vote_enqueued",
+        "meaning": "electSelf enqueued a local Granted=true result after persistVote returned nil for the request term and RPCHeader.Addr.",
+        "identity": [
+          {
+            "key": "campaign",
+            "value": "Specific electSelf response channel"
+          },
+          {
+            "key": "voter",
+            "value": "r.localID"
+          },
+          {
+            "key": "term",
+            "value": "req.Term"
+          }
+        ],
+        "validity_context": "The selected configuration entry has Voter suffrage and matches localID. This is a local result-publication assertion.",
+        "representation": [
+          "voteResult containing voterID=localID, Term=req.Term, and Granted=true"
+        ],
+        "invalidators": [],
+        "reinterpreters": [],
+        "durability": "The queued result is volatile; the preceding storage-call success has separately bounded meaning.",
+        "recovery": "No recovery of this channel result is shown.",
+        "source_ids": [
+          "raft.go:1976:2140",
+          "raft.go:285:441"
+        ],
+        "unknowns": [
+          "Durable self-vote recovery and configuration uniqueness are not established."
+        ]
+      },
+      {
+        "id": "local_prevote_enqueued",
+        "meaning": "preElectSelf enqueued a local Granted=true result for its proposed next term without persisting a vote in this function.",
+        "identity": [
+          {
+            "key": "campaign",
+            "value": "Specific preElectSelf response channel"
+          },
+          {
+            "key": "voter",
+            "value": "r.localID"
+          },
+          {
+            "key": "term",
+            "value": "req.Term"
+          }
+        ],
+        "validity_context": "The selected configuration entry has Voter suffrage and matches localID. The result contributes to a pre-vote tally only.",
+        "representation": [
+          "preVoteResult containing voterID=localID, Term=req.Term, and Granted=true"
+        ],
+        "invalidators": [],
+        "reinterpreters": [],
+        "durability": "Volatile channel result.",
+        "recovery": "No recovery mechanism for the result is shown.",
+        "source_ids": [
+          "raft.go:1976:2140",
+          "raft.go:285:441"
+        ],
+        "unknowns": [
+          "The result does not establish a remote vote, persistent election vote, or completed authority transition."
+        ]
+      }
+    ],
+    "surfaces": [
+      {
+        "entry_point": "runCandidate / electSelf / preElectSelf: synchronous campaign control and local votes",
+        "disposition": "mapped",
+        "behavior_ids": [
+          "candidate_campaign_control",
+          "election_campaign_dispatch",
+          "prevote_campaign_dispatch",
+          "persist_vote_storage_sequence"
+        ],
+        "reason": "Attached implementations support local dispatch, tally branches, self-result publication, client handling, and the sequential persistence helper. Mapping does not resolve called transition helpers or remote response guarantees.",
+        "source_ids": [
+          "raft.go:285:441",
+          "raft.go:1976:2140"
+        ],
+        "high_consequence": true
+      },
+      {
+        "entry_point": "electSelf / preElectSelf: remote response production and transition-helper semantics",
+        "disposition": "deferred",
+        "behavior_ids": [],
+        "reason": "Separately interpret remote goroutine results, including RequestVote error-to-refusal conversion and RequestPreVote unsupported-command error-to-grant conversion. Resolve transport correlation and the quorumSize, setCurrentTerm, setState, and setLeader declarations before asserting stronger support, durability, or completed-transition facts. The remote callback bodies are already attached; helper implementations require focused reading.",
+        "source_ids": [
+          "raft.go:285:441",
+          "raft.go:1976:2140"
+        ],
+        "high_consequence": true
+      }
+    ],
+    "remove_behavior_ids": [],
+    "remove_fact_ids": [],
+    "remove_surface_entry_points": [
+      "runCandidate / electSelf / preElectSelf"
+    ],
+    "rationale": "Replace the composite deferred surface with a sourced synchronous mapping and an explicit remaining frontier. Separate campaign control, election dispatch, pre-vote dispatch, and vote storage. Facts describe API completion and channel publication without converting them into durable vote validity or completed leadership. No global Activity or TargetProfile changes are justified by this focused packet."
+  },
+  "limitations": [
+    "Remote response producers are intentionally not represented as fact producers in this delta; their actor-level interpretation remains deferred.",
+    "Transition-helper call sites do not establish completed role changes or durable term updates.",
+    "Stable-store semantics, configuration validation, receiver-side voting rules, and transport correlation remain unresolved.",
+    "No normative obligation, defect, calibration result, or overall correctness conclusion is derived."
+  ]
+}

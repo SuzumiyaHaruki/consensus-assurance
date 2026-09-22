@@ -1,0 +1,159 @@
+{
+  "candidate_id": null,
+  "obligation": {
+    "id": "O_pipeline_response_validity",
+    "kind": "obligation",
+    "description": "Raft.pipelineDecode must wait for the delivered AppendFuture.Error() to return before calling Response(), and must interpret the response as valid only when Error() returns nil.",
+    "source_ids": [
+      "transport.go:81:141",
+      "replication.go:400:665",
+      "net_transport.go:780:912"
+    ],
+    "scope": {
+      "description": "One delivered AppendFuture consumed by Raft.pipelineDecode. Check the ordering and result of Error() relative to Response() and response-field interpretation.",
+      "assumptions": [
+        "The pipeline supplies an AppendFuture governed by the attached AppendFuture interface contract.",
+        "The consumer receives the future before its stop branch terminates processing."
+      ],
+      "excluded": [
+        "Establishing a network history that produces an errored future with success-looking response fields",
+        "Proving incorrect follower progress, commitment, leadership behavior, or application effects",
+        "General pipeline shutdown and cancellation guarantees"
+      ],
+      "parameters": {}
+    },
+    "pending": [],
+    "grounding": {
+      "source_ids": [
+        "replication.go:400:665",
+        "net_transport.go:780:912"
+      ],
+      "expectation_ids": [
+        "transport.go:81:141"
+      ],
+      "binding_ids": [
+        "binding_pipeline_response_consumer"
+      ],
+      "derivation": "AppendFuture.Response explicitly requires Error to return before invocation and limits response validity to success. This contract applies directly to the AppendFuture received from AppendPipeline.Consumer. Raft.pipelineDecode calls ready.Response without calling ready.Error and subsequently interprets Term and Success. The network decoder calls future.respond(err) and can deliver the future after either a successful or failed decode attempt; its preceding notification does not establish that Error returned successfully to this consumer. These observations support a local interface-consumption obligation without assuming an incorrect commitment.",
+      "applicability": "The checked function accepts AppendPipeline and consumes its AppendFuture interface directly. The expectation is an explicit interface requirement, rather than a protocol rule inferred from implementation guards.",
+      "unresolved": [
+        "The concrete appendFuture synchronization implementation is unread.",
+        "Reachability of an errored network future whose response fields permit a progress update remains unresolved.",
+        "Any broader effect on commitment remains unresolved."
+      ],
+      "conflicts": [],
+      "alternatives": [
+        "Producer-side completion before channel delivery may ensure memory visibility, but does not establish successful completion or satisfy the explicit consumer-side Error requirement."
+      ]
+    }
+  },
+  "bindings": [
+    {
+      "associations": [
+        {
+          "claim_id": "O_pipeline_response_validity",
+          "source_ids": [
+            "replication.go:400:665",
+            "transport.go:81:141"
+          ],
+          "rationale": "This consumer directly calls Response and interprets its fields, so it bears the interface precondition being checked."
+        }
+      ],
+      "anchor": {
+        "source_ids": [
+          "replication.go:400:665"
+        ],
+        "boundary_complete": true,
+        "kind": "declaration",
+        "material_id": "replication.go:400:665",
+        "start_line": 534,
+        "end_line": 567,
+        "symbol": "Raft.pipelineDecode"
+      },
+      "id": "binding_pipeline_response_consumer",
+      "material_id": "replication.go:400:665",
+      "symbol": "Raft.pipelineDecode",
+      "start_line": 534,
+      "end_line": 567,
+      "description": "Receives a pipeline future, calls Request and Response without Error, checks response term and success, and may update replication state.",
+      "pending": [
+        "No network-level failure reachability or broader consequence is established by this binding."
+      ]
+    }
+  ],
+  "dependencies": [],
+  "context_claims": [],
+  "audit_question": {
+    "disposition": "ready_for_check",
+    "preferred_check": "direct_test",
+    "requests": [],
+    "question": "When Raft.pipelineDecode receives one AppendFuture, does it call Error and observe a nil result before calling Response and interpreting its fields, as required by the AppendFuture interface?",
+    "importance": "Ignoring the future's error can allow response fields without an established validity guarantee to influence authority, contact, or replication decisions. This check stops at the interface-consumption violation; it does not establish incorrect replication or commitment.",
+    "source_ids": [
+      "transport.go:81:141",
+      "replication.go:400:665",
+      "net_transport.go:780:912"
+    ],
+    "participants": [
+      "Raft.pipelineDecode",
+      "AppendPipeline",
+      "AppendFuture"
+    ],
+    "objects": [
+      "One delivered AppendFuture",
+      "Error result",
+      "Response invocation",
+      "AppendEntries response fields"
+    ],
+    "contexts": [
+      "Pipeline consumer receives a future before stopping",
+      "Successful and failed future completion"
+    ],
+    "event_paths": [
+      "Deliver one interface-conforming future -> observe Error and Response invocation order -> stop at Response precondition assessment"
+    ],
+    "activity_classes": [
+      "A1",
+      "A2"
+    ],
+    "behavior_ids": [
+      "network_pipeline_decode"
+    ],
+    "fact_ids": [
+      "network_pipeline_future_delivered"
+    ],
+    "obligation_relation_kind": "consumption",
+    "counterevidence": [
+      "The network decoder calls future.respond before delivering the future, potentially providing completion synchronization.",
+      "The consumer rejects responses with a term greater than the associated request's term and returns when Success is false.",
+      "The consumer obtains the request and response from the same delivered future; pipelineSend allocates a fresh request and response for each submission.",
+      "These protections do not establish a nil Error result before Response is consumed."
+    ],
+    "unknowns": [
+      "Concrete appendFuture synchronization and Error behavior remain unread.",
+      "A contract test using an instrumented future establishes only consumer interface behavior, not actual NetworkTransport failure reachability.",
+      "Whether shutdown or earlier pipeline failure invalidates later results remains unresolved in the parent.",
+      "Ordinary versus pipelined replication acceptance checks remain unresolved in the parent.",
+      "Incorrect follower progress and commitment consequences remain unresolved in the parent."
+    ],
+    "priority": 1,
+    "trigger_rationale": "The acquired interface explicitly states the precondition, and the complete consumer declaration contains no Error call before Response. An instrumented AppendFuture can record invocation order and completion result while executing the actual consumer, giving an independent interface-contract oracle. The observation should stop at the first premature Response call; no fabricated response content is needed to establish this local relation."
+  },
+  "selection_rationale": "Continue the selected fact's consumption investigation through an ID-linked child. Source review resolved the immediate code question: pipelineDecode does not call Error, although it checks Term and Success. The explicit Response contract supports a local check now. The parent additionally asks about context-valid acceptance and actual progress; network failure reachability, shutdown interactions, and commitment consequences remain unresolved. Those missing conclusions do not block this interface-level obligation. No global candidate reranking is needed during this continuation.",
+  "reading_requests": [],
+  "descriptive_issues": [
+    {
+      "candidate_effect": "independent_enrichment",
+      "object_ids": [
+        "network_pipeline_future_delivered",
+        "network_pipeline_decode"
+      ],
+      "source_ids": [
+        "replication.go:400:665"
+      ],
+      "reason": "The previously unread consumer is now located: Raft.pipelineDecode receives delivered futures, obtains their request and response without Error, checks newer term and Success, and calls updateLastAppended on the remaining branch. Add this separately owned consumer behavior and its consumption relationship while preserving the existing weak meaning of delivered-future completion."
+    }
+  ],
+  "fork_from_candidate_id": "aa3e406669814209be6e1c02b9419e61",
+  "fork_reason": "Pause the parent with its original network prehistory, acceptance question, protections, and unresolved consequences intact. The child isolates the explicitly documented Error-before-Response relation, which has a verified consumer declaration and an independent invocation-order oracle. A local result does not establish a realizable erroneous network response or incorrect commitment."
+}

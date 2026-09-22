@@ -173,14 +173,17 @@ def process_task(engine, task):
         state.inquiry_selections.append({'task_id':task.id,'kind':task.kind,'reason':task.reason,'trigger':task.trigger,'planned_target_versions':planned_versions,'execution_target_versions':task.target_versions})
 
     if task.stage=='read':
-        if not task.read_plan_id:
+        from .materials import uncovered_requests,request_material_ids
+        requested=list(task.requests);remaining=uncovered_requests(state,requested)
+        task.added_material_ids=list(dict.fromkeys(task.added_material_ids+request_material_ids(state,requested)))
+        if remaining:
             from consensus_assurance.core.types import uid
-            task.read_plan_id=uid()
-        receipt=engine.read(task.requests,purpose=read_purpose(task),partial=read_purpose(task)=='breadth',plan_id=task.read_plan_id,related_ids=task.target_ids+task.activity_classes+([task.unit_id] if task.unit_id else []),reason=task.reason)
-        task=next(t for t in state.inquiry_tasks if t.id==task.id)
-        task.added_material_ids=list(dict.fromkeys(task.added_material_ids+[id for item in receipt['items'] if item['status']!='deferred' for id in item['material_ids']]))
-        if receipt['status']!='complete' and not task.candidate_id:
-            raise Blocked('Requested inquiry material is deferred within its protected allowance; unmet requests remain in the receipt')
+            if not task.read_plan_id or task.read_plan_id in state.read_plans:task.read_plan_id=uid()
+            receipt=engine.read(remaining,purpose=read_purpose(task),partial=read_purpose(task)=='breadth',plan_id=task.read_plan_id,related_ids=task.target_ids+task.activity_classes+([task.unit_id] if task.unit_id else []),reason=task.reason)
+            task=next(t for t in state.inquiry_tasks if t.id==task.id)
+            task.added_material_ids=list(dict.fromkeys(task.added_material_ids+[id for item in receipt['items'] if item['status']!='deferred' for id in item['material_ids']]))
+            if receipt['status']!='complete' and not task.candidate_id:
+                raise Blocked('Requested inquiry material is deferred within its protected allowance; unmet requests remain in the receipt')
         task.stage='analyze';release_action(engine)
     if task.repair_session and not state.pending_output_repair:state.pending_output_repair=task.repair_session
     context=task_context(engine,task)

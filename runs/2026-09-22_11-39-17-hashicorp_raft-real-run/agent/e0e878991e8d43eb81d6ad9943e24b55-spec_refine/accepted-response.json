@@ -1,0 +1,414 @@
+{
+  "understanding": "The supplied source distinguishes transport submission, response decoding, future delivery, and protocol acceptance. Network heartbeats use a request-shape predicate and an optional callback; other requests enter the consumer channel. Network pipeline submission sends before handing a future to a separate decoder. Neither transport success nor future delivery alone establishes replication progress, current authority, or durable acceptance. The in-memory variant ignores heartbeat-handler registration, but its RPC and pipeline implementations remain unread.",
+  "requests": [],
+  "delta": {
+    "target_profile": null,
+    "activities": [],
+    "behaviors": [
+      {
+        "id": "network_append_rpc",
+        "primary_activity": "A1",
+        "execution_owner": "Calling goroutine executing NetworkTransport.AppendEntries and genericRPC",
+        "protocol_context": "One synchronous AppendEntries transport exchange",
+        "trigger": "AppendEntries(id, target, args, resp)",
+        "legal_preconditions": [],
+        "implementation_guards": [
+          "Connection acquisition must succeed.",
+          "A positive configured timeout installs a connection deadline."
+        ],
+        "reads": [
+          "ServerID, target address, request, timeout, and connection codec state"
+        ],
+        "writes": [
+          "Encoded request on the connection",
+          "Decoded response into the caller-provided response object"
+        ],
+        "durable_effects": [],
+        "external_effects": [
+          "Sends an AppendEntries RPC and returns a transport or remote RPC error."
+        ],
+        "important_branches": [
+          "Connection acquisition or send failure returns immediately.",
+          "Response error-string or payload decoding failure releases the connection.",
+          "A decoded nonempty remote error returns an error even though the payload was decoded.",
+          "Successfully decoded exchanges permit connection reuse, including exchanges carrying a remote error.",
+          "The wrapper does not inspect protocol response fields before returning."
+        ],
+        "async_boundaries": [
+          "Network request and response exchange"
+        ],
+        "produces_fact_ids": [
+          "network_append_response_decoded"
+        ],
+        "consumes_fact_ids": [],
+        "cross_activity_effects": {},
+        "existing_protections": [
+          "Configured connection deadline",
+          "Release on encoding, flushing, or decoding failure",
+          "Connection pool insertion checks shutdown and pool capacity"
+        ],
+        "source_ids": [
+          "net_transport.go:430:530",
+          "net_transport.go:780:912"
+        ],
+        "unknowns": [
+          "Address-provider selection and connection acquisition internals are not supplied.",
+          "Protocol consumers and their interpretation of response fields are unread."
+        ]
+      },
+      {
+        "id": "network_append_dispatch",
+        "primary_activity": "A1",
+        "execution_owner": "Inbound connection handler executing NetworkTransport.handleCommand",
+        "protocol_context": "Decoded inbound AppendEntries request on one connection",
+        "trigger": "handleConn reads an rpcAppendEntries command",
+        "legal_preconditions": [],
+        "implementation_guards": [
+          "Request decoding must succeed.",
+          "Heartbeat classification requires nonzero Term, nonnil selected leader address, zero PrevLogEntry and PrevLogTerm, no Entries, and zero LeaderCommitIndex.",
+          "The selected leader address is RPCHeader.Addr, falling back to Leader when the header address has zero length."
+        ],
+        "reads": [
+          "Decoded request fields",
+          "heartbeatFn under heartbeatFnLock",
+          "shutdownCh",
+          "Per-request response channel"
+        ],
+        "writes": [
+          "RPC.Command and a buffered per-request response channel",
+          "Encoded response error string and response payload"
+        ],
+        "durable_effects": [],
+        "external_effects": [
+          "Invokes the registered heartbeat callback directly when the predicate matches and a callback exists.",
+          "Otherwise sends the RPC to consumeCh.",
+          "Encodes the handler-provided response, then handleConn flushes it."
+        ],
+        "important_branches": [
+          "SetHeartbeatHandler replaces the callback under the same lock used to retrieve it.",
+          "The callback runs after releasing heartbeatFnLock.",
+          "A classified heartbeat without a callback follows ordinary channel dispatch.",
+          "Channel dispatch and response waiting can terminate on transport shutdown.",
+          "The direct callback invocation has no enclosing shutdown select.",
+          "Encoding or flushing failure ends the connection handler."
+        ],
+        "async_boundaries": [
+          "Handoff to consumeCh or callback-owned processing",
+          "Waiting for RPCResponse on the request-specific channel",
+          "Network response flush"
+        ],
+        "produces_fact_ids": [],
+        "consumes_fact_ids": [],
+        "cross_activity_effects": {},
+        "existing_protections": [
+          "Synchronized callback registration and retrieval",
+          "Per-request buffered response channel",
+          "Sequential command processing and response flushing within each connection"
+        ],
+        "source_ids": [
+          "transport.go:1:80",
+          "net_transport.go:280:320",
+          "net_transport.go:600:780"
+        ],
+        "unknowns": [
+          "The registered callback and ordinary protocol consumer are unread.",
+          "Dispatch and response serialization do not establish the meaning of protocol acceptance or contact updates.",
+          "Stream-context cancellation is checked between commands; interruption of an already executing callback depends on unread callback behavior."
+        ]
+      },
+      {
+        "id": "network_pipeline_submit",
+        "primary_activity": "A1",
+        "execution_owner": "Caller executing NetworkTransport.AppendEntriesPipeline and netPipeline.AppendEntries",
+        "protocol_context": "AppendEntries pipeline over one acquired connection",
+        "trigger": "Pipeline construction followed by submission of an AppendEntries request",
+        "legal_preconditions": [],
+        "implementation_guards": [
+          "Pipeline construction rejects maxInFlight below minInFlightForPipelining.",
+          "Connection acquisition must succeed.",
+          "A positive timeout installs a write deadline for submission."
+        ],
+        "reads": [
+          "maxInFlight",
+          "Request and response pointers",
+          "Transport timeout",
+          "Pipeline shutdown channel"
+        ],
+        "writes": [
+          "Future start time and retained request and response pointers",
+          "Encoded request on the connection",
+          "Future handed to inprogressCh"
+        ],
+        "durable_effects": [],
+        "external_effects": [
+          "Flushes the encoded request before attempting the decoder handoff.",
+          "Returns a future after successful handoff."
+        ],
+        "important_branches": [
+          "Construction allocates inprogressCh and doneCh with capacity maxInFlight minus two and starts decodeResponses.",
+          "Send failure returns no future.",
+          "After successful send, submission can block on inprogressCh.",
+          "Shutdown selected during handoff returns ErrPipelineShutdown even though sendRPC already succeeded."
+        ],
+        "async_boundaries": [
+          "Network transmission",
+          "inprogressCh handoff to the decoder goroutine"
+        ],
+        "produces_fact_ids": [
+          "network_pipeline_submitted"
+        ],
+        "consumes_fact_ids": [],
+        "cross_activity_effects": {},
+        "existing_protections": [
+          "Minimum pipeline concurrency check",
+          "Bounded handoff channel providing backpressure",
+          "Configured write deadline",
+          "Send failure releases the connection"
+        ],
+        "source_ids": [
+          "net_transport.go:430:530",
+          "net_transport.go:780:912"
+        ],
+        "unknowns": [
+          "Caller serialization and concurrent submission expectations are unread.",
+          "Future initialization implementation is unread.",
+          "Successful flushing does not establish remote receipt or protocol acceptance."
+        ]
+      },
+      {
+        "id": "network_pipeline_decode",
+        "primary_activity": "A1",
+        "execution_owner": "netPipeline.decodeResponses goroutine",
+        "protocol_context": "Ordered response processing on a pipeline connection",
+        "trigger": "Receipt of a future from inprogressCh",
+        "legal_preconditions": [],
+        "implementation_guards": [
+          "A positive timeout installs a read deadline."
+        ],
+        "reads": [
+          "Future response pointer",
+          "Connection response stream",
+          "Pipeline shutdown channel"
+        ],
+        "writes": [
+          "Decoded payload into future.resp",
+          "Calls future.respond with the decoding or remote error",
+          "Sends the future to doneCh when selected"
+        ],
+        "durable_effects": [],
+        "external_effects": [
+          "Exposes delivered futures through Consumer."
+        ],
+        "important_branches": [
+          "Decoding failures release the connection.",
+          "A decoded remote error is passed to future.respond.",
+          "The decoder ignores decodeResponse's connection-reuse result.",
+          "Shutdown can terminate the loop before selecting a queued future or before delivering a processed future.",
+          "The loop has no explicit error-triggered exit after future.respond."
+        ],
+        "async_boundaries": [
+          "inprogressCh receive",
+          "Network response decoding",
+          "Future notification through an unread implementation",
+          "doneCh delivery"
+        ],
+        "produces_fact_ids": [
+          "network_append_response_decoded",
+          "network_pipeline_future_delivered"
+        ],
+        "consumes_fact_ids": [
+          "network_pipeline_submitted"
+        ],
+        "cross_activity_effects": {},
+        "existing_protections": [
+          "One decoder goroutine processes handed-off futures sequentially.",
+          "Configured read deadline",
+          "Shutdown alternative while delivering completed processing"
+        ],
+        "source_ids": [
+          "net_transport.go:780:912",
+          "transport.go:81:141"
+        ],
+        "unknowns": [
+          "The implementation of future.respond and Future.Error is unread; their synchronization and repeated-call behavior are not established.",
+          "Caller-owned request and response pointer lifetimes are unread.",
+          "Protocol consumers of delivered futures are unread."
+        ]
+      },
+      {
+        "id": "network_pipeline_close",
+        "primary_activity": "A1",
+        "execution_owner": "Caller executing netPipeline.Close",
+        "protocol_context": "Shutdown of one network AppendEntries pipeline",
+        "trigger": "Close()",
+        "legal_preconditions": [],
+        "implementation_guards": [
+          "shutdownLock serializes Close calls.",
+          "An already-set shutdown flag causes an immediate nil return."
+        ],
+        "reads": [
+          "Pipeline shutdown flag"
+        ],
+        "writes": [
+          "Sets shutdown to true",
+          "Closes shutdownCh"
+        ],
+        "durable_effects": [],
+        "external_effects": [
+          "Calls connection Release before publishing shutdown."
+        ],
+        "important_branches": [
+          "Repeated Close calls return without closing shutdownCh again.",
+          "Close does not explicitly drain pending futures or close doneCh in the supplied implementation."
+        ],
+        "async_boundaries": [
+          "Connection release can interact with active I/O.",
+          "Shutdown channel wakes submission and decoder select statements."
+        ],
+        "produces_fact_ids": [],
+        "consumes_fact_ids": [],
+        "cross_activity_effects": {},
+        "existing_protections": [
+          "Serialized, idempotent shutdown publication"
+        ],
+        "source_ids": [
+          "net_transport.go:780:912",
+          "transport.go:81:141"
+        ],
+        "unknowns": [
+          "The AppendPipeline interface describes cancellation of all inflight RPCs; terminal observability for each pending future requires the unread future implementation and actual caller lifecycle.",
+          "Connection Release internals are not supplied."
+        ]
+      }
+    ],
+    "facts": [
+      {
+        "id": "network_pipeline_submitted",
+        "meaning": "For a submission returning a nonnil future and nil error, sendRPC completed its encoding and flush, and that future was handed to inprogressCh. This establishes neither a received response nor remote acceptance.",
+        "identity": {
+          "pipeline": "The particular netPipeline instance and connection",
+          "submission": "The appendFuture allocated for this invocation, retaining its request and response pointers"
+        },
+        "established_by": [],
+        "consumed_by": [],
+        "validity_context": "Historical submission event for this future; it does not promise eventual delivery after shutdown.",
+        "representation": [
+          "Successful AppendEntries return",
+          "Future transferred through inprogressCh"
+        ],
+        "invalidators": [],
+        "reinterpreters": [],
+        "durability": "Volatile local event; no persistence is performed here.",
+        "recovery": "No reconstruction mechanism is shown.",
+        "source_ids": [
+          "net_transport.go:780:912"
+        ],
+        "unknowns": [
+          "Request pointer retention is not an immutable capture of its contents.",
+          "Caller consumption and retry interpretation remain unread."
+        ]
+      },
+      {
+        "id": "network_append_response_decoded",
+        "meaning": "When decodeResponse returns nil error for an AppendEntries exchange, both the remote error string and response payload were decoded, and the error string was empty. No protocol response-field predicate is checked by decodeResponse.",
+        "identity": {
+          "exchange": "The response decode position on the selected connection",
+          "response_destination": "The caller response pointer or selected future.resp"
+        },
+        "established_by": [],
+        "consumed_by": [],
+        "validity_context": "Successful decode event; response meaning depends on unread protocol handlers and consumers. Pipeline correlation is positional through the handed-off future order.",
+        "representation": [
+          "decodeResponse nil error",
+          "Decoded AppendEntriesResponse object"
+        ],
+        "invalidators": [],
+        "reinterpreters": [],
+        "durability": "Volatile response data; no durable acceptance is established.",
+        "recovery": "No recovery of this transport observation is shown.",
+        "source_ids": [
+          "net_transport.go:430:530",
+          "net_transport.go:780:912"
+        ],
+        "unknowns": [
+          "Actual protocol consumers and their context checks are unread.",
+          "Pipeline caller serialization and response-object reuse constraints are unread."
+        ]
+      },
+      {
+        "id": "network_pipeline_future_delivered",
+        "meaning": "A future received from doneCh has undergone one decodeResponse attempt and a preceding call to future.respond with that attempt's error. Delivery can represent success or failure.",
+        "identity": {
+          "pipeline": "The netPipeline supplying Consumer",
+          "future": "The particular appendFuture received from doneCh"
+        },
+        "established_by": [],
+        "consumed_by": [],
+        "validity_context": "Successful delivery through doneCh; this does not assert that every submitted future will be delivered.",
+        "representation": [
+          "AppendFuture value received through Consumer"
+        ],
+        "invalidators": [],
+        "reinterpreters": [],
+        "durability": "Volatile channel delivery.",
+        "recovery": "No reconstruction or replay of delivered futures is shown.",
+        "source_ids": [
+          "net_transport.go:780:912",
+          "transport.go:81:141"
+        ],
+        "unknowns": [
+          "Future.Error synchronization is unread.",
+          "The interface requires Error to return before Response is used and limits response validity to success; caller compliance is unread.",
+          "Protocol-level progress or contact consumers are unread."
+        ]
+      }
+    ],
+    "surfaces": [
+      {
+        "entry_point": "NetworkTransport.AppendEntries / AppendEntriesPipeline / SetHeartbeatHandler",
+        "disposition": "mapped",
+        "behavior_ids": [
+          "network_append_rpc",
+          "network_append_dispatch",
+          "network_pipeline_submit",
+          "network_pipeline_decode",
+          "network_pipeline_close"
+        ],
+        "reason": "The supplied network implementation supports a bounded mapping of synchronous exchange, heartbeat routing, pipeline handoff, response processing, and shutdown. Protocol acceptance and caller interpretation remain explicit unknowns.",
+        "source_ids": [
+          "transport.go:1:80",
+          "transport.go:81:141",
+          "net_transport.go:280:320",
+          "net_transport.go:430:530",
+          "net_transport.go:600:780",
+          "net_transport.go:780:912"
+        ],
+        "high_consequence": true
+      },
+      {
+        "entry_point": "InmemTransport.AppendEntries / AppendEntriesPipeline / SetHeartbeatHandler",
+        "disposition": "deferred",
+        "behavior_ids": [],
+        "reason": "Registration is a no-op. AppendEntries delegates to unread makeRPC and copies the returned response after nil error. Pipeline creation checks peers[target] under a lock, then delegates to unread newInmemPipeline. Recover makeRPC and inmemPipeline submission, completion, and shutdown before assigning transport-completion facts to this variant.",
+        "source_ids": [
+          "inmem_transport.go:60:125",
+          "transport.go:1:80",
+          "transport.go:81:141"
+        ],
+        "high_consequence": true
+      }
+    ],
+    "remove_behavior_ids": [],
+    "remove_fact_ids": [],
+    "remove_surface_entry_points": [
+      "Transport.AppendEntries / AppendEntriesPipeline / SetHeartbeatHandler"
+    ],
+    "rationale": "Split the composite frontier into the sourced network implementation and a specific deferred in-memory remainder. Record only weak transport facts supported by actual code, separating submission, successful decoding, and future delivery. Preserve the interface cancellation expectation as an unresolved boundary rather than declaring either compliance or a defect. No global activity summary, target profile, normative claim, or unrelated surface is changed."
+  },
+  "limitations": [
+    "The selected transport variant and its caller configuration are unknown.",
+    "Protocol handlers, replication consumers, future synchronization, and the in-memory RPC and pipeline implementations remain unread.",
+    "No replication-progress, authority, durability, cancellation-completeness, or correctness conclusion follows from this descriptive refinement.",
+    "No execution, test, calibration, or reproduction was performed."
+  ]
+}

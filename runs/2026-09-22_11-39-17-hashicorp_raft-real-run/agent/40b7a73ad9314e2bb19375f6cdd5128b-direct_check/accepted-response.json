@@ -1,0 +1,246 @@
+{
+  "reading_purpose": "context",
+  "plan": {
+    "description": "Observe repeated Close and independent Open results after closing the sink's underlying file descriptor before its first Close. Add observable experiment-legality conditions while preserving the selected scope and oracle.",
+    "claim_id": "O_snapshot_close_publication",
+    "scope": {
+      "description": "Sequential calls on one built-in FileSnapshotSink: successful creation and writes, an injected finalization failure before publication, observation of that error, and a second Close. Compare the second result with independent store availability immediately afterward.",
+      "assumptions": [
+        "The initial finalization failure occurs before directory publication.",
+        "No concurrent writer, cancellation, external file deletion, snapshot replacement, or retention operation intervenes.",
+        "The availability observation itself encounters no newly injected storage fault.",
+        "The expectation interprets Close's documented successful end as a finalization result, including repeated calls; this applicability interpretation requires correspondence review."
+      ],
+      "excluded": [
+        "Whether an application Persist implementation legally suppresses the first Close error",
+        "Reachability of metadata advancement or log reclamation through takeSnapshot",
+        "Crash durability and recovery after restart",
+        "Failures occurring after directory publication",
+        "Overall consensus safety or actual loss of recoverable history"
+      ],
+      "parameters": {}
+    },
+    "binding_ids": [
+      "binding_snapshot_close",
+      "binding_snapshot_id",
+      "binding_snapshot_open"
+    ],
+    "harness": {
+      "kind": "go_test",
+      "source": "package raft\n\nimport (\n \"encoding/json\"\n \"fmt\"\n \"io\"\n \"os\"\n \"path/filepath\"\n \"testing\"\n)\n\n// Only peer encoding is used by this store-only experiment.\ntype assuranceSnapshotTransport struct { Transport }\nfunc (assuranceSnapshotTransport) EncodePeer(_ ServerID, address ServerAddress) []byte {\n return []byte(address)\n}\n\nfunc TestAssuranceSnapshotRepeatedClosePublication(t *testing.T) {\n emit := func(event map[string]interface{}) {\n  t.Helper()\n  b, err := json.Marshal(event)\n  if err != nil { t.Fatal(err) }\n  fmt.Println(\"CA_EVENT \" + string(b))\n }\n errorText := func(err error) string {\n  if err == nil { return \"\" }\n  return err.Error()\n }\n store, err := NewFileSnapshotStore(t.TempDir(), 1, io.Discard)\n if err != nil { t.Fatalf(\"create store: %v\", err) }\n configuration := Configuration{Servers: []Server{{Suffrage: Voter, ID: ServerID(\"node-1\"), Address: ServerAddress(\"local-1\")}}}\n configurationErr := checkConfiguration(configuration)\n if configurationErr != nil { t.Fatal(configurationErr) }\n raw, createErr := store.Create(1, 10, 2, configuration, 1, assuranceSnapshotTransport{})\n if createErr != nil { t.Fatalf(\"create snapshot: %v\", createErr) }\n sink, ok := raw.(*FileSnapshotSink)\n if !ok { t.Fatal(\"unexpected sink implementation\") }\n defer sink.stateFile.Close()\n id := sink.ID()\n op := \"snapshot-operation-1\"\n payload := []byte(\"snapshot-state\")\n n, writeErr := sink.Write(payload)\n emit(map[string]interface{}{\"event\":\"snapshot_write\", \"operation_id\":op, \"snapshot_id\":id, \"written\":n, \"requested\":len(payload), \"error\":errorText(writeErr)})\n if writeErr != nil || n != len(payload) { t.Fatalf(\"write prerequisite: n=%d err=%v\", n, writeErr) }\n // Inject a resource failure without changing Close, finalize, or Open.\n injectionErr := sink.stateFile.Close()\n if injectionErr != nil { t.Fatalf(\"fault injection: %v\", injectionErr) }\n firstErr := sink.Close()\n _, firstStatErr := os.Stat(filepath.Join(store.path, id))\n firstMissing := os.IsNotExist(firstStatErr)\n emit(map[string]interface{}{\"event\":\"first_close\", \"operation_id\":op, \"snapshot_id\":id, \"success\":firstErr == nil, \"error\":errorText(firstErr), \"published_directory_missing\":firstMissing, \"stat_error\":errorText(firstStatErr)})\n if firstErr == nil || !firstMissing { t.Fatal(\"pre-publication failure prerequisite was not reached\") }\n secondErr := sink.Close()\n emit(map[string]interface{}{\"event\":\"second_close\", \"operation_id\":op, \"snapshot_id\":id, \"success\":secondErr == nil, \"error\":errorText(secondErr), \"observed_first_error\":errorText(firstErr)})\n meta, reader, openErr := store.Open(id)\n _, finalStatErr := os.Stat(filepath.Join(store.path, id))\n metaID := \"\"\n if meta != nil { metaID = meta.ID }\n emit(map[string]interface{}{\n  \"event\":\"snapshot_open\", \"operation_id\":op, \"snapshot_id\":id,\n  \"open_success\":openErr == nil && reader != nil,\n  \"open_error\":errorText(openErr), \"open_not_exist\":os.IsNotExist(openErr),\n  \"returned_meta_id\":metaID, \"second_close_success\":secondErr == nil,\n  \"published_directory_missing\":os.IsNotExist(finalStatErr), \"stat_error\":errorText(finalStatErr),\n  \"create_success\":createErr == nil, \"configuration_valid\":configurationErr == nil,\n  \"write_success\":writeErr == nil && n == len(payload),\n  \"injection_success\":injectionErr == nil,\n  \"first_close_failed\":firstErr != nil, \"first_publication_missing\":firstMissing,\n  \"sync_enabled\":!store.noSync && !sink.noSync,\n  \"snapshot_version\":int(sink.meta.Version), \"retention\":store.retain,\n  \"configuration_index_valid\":sink.meta.ConfigurationIndex <= sink.meta.Index,\n })\n if reader != nil {\n  if err := reader.Close(); err != nil { t.Fatalf(\"reader cleanup: %v\", err) }\n }\n}\n",
+      "description": "Synchronous Create, Write, Close, ID, and Open calls establish sequential order and expose actual results. Package-local access closes the actual state-file descriptor before finalization; no asynchronous schedule control is claimed. Stat independently observes whether the publication directory exists. The result event carries measured setup and fault-prerequisite fields for legality checks. Version 1, retention 1, index 10, term 2, and configuration index 1 are concrete inputs within the unchanged scope.",
+      "semantic_changes": [
+        "The harness directly closes the private stateFile descriptor after successful Write to inject a pre-publication resource failure. This adaptation is not a public caller operation or proof of a production storage-fault history.",
+        "A minimal Transport adapter supplies peer-address encoding during Create. No transport, election, replication, or application Persist behavior is exercised.",
+        "No target source or protocol branch is modified. The harness observes that synchronization remains enabled.",
+        "Compared with the previous proposal, setup and injection return values are retained and emitted on the result event to support observable legality conditions."
+      ],
+      "prerequisites": [
+        {
+          "alias": "first",
+          "event": "first_close",
+          "conditions": [
+            {
+              "field": "success",
+              "op": "eq",
+              "value": false,
+              "reference": null
+            },
+            {
+              "field": "published_directory_missing",
+              "op": "eq",
+              "value": true,
+              "reference": null
+            }
+          ]
+        },
+        {
+          "alias": "completion",
+          "event": "second_close",
+          "conditions": [
+            {
+              "field": "observed_first_error",
+              "op": "eq",
+              "value": null,
+              "reference": "first.error"
+            }
+          ]
+        }
+      ],
+      "legality": {
+        "source_ids": [
+          "file_snapshot.go:1:396",
+          "file_snapshot.go:397:551",
+          "configuration.go:1:350"
+        ],
+        "expectation_ids": [
+          "file_snapshot.go:1:396",
+          "file_snapshot.go:397:551",
+          "snapshot.go:1:278"
+        ],
+        "binding_ids": [
+          "binding_snapshot_close",
+          "binding_snapshot_id",
+          "binding_snapshot_open"
+        ],
+        "derivation": "Create accepts version 1 and the constructor requires positive retention. Actual checkConfiguration validates the supplied membership. The harness records successful Create, complete Write, successful descriptor closure, enabled synchronization, and a configuration index no greater than the snapshot index. The acquired implementation buffers writes over stateFile and returns from failed finalization before reaching rename. The first Close error and absent published directory are observed prerequisites. Legal conditions constrain these measured experiment inputs and prerequisites; they neither assume the second Close result nor require Open to fail. They do not establish that private descriptor closure is an authorized production fault.",
+        "applicability": "A bounded store-level fault-injection experiment using actual sink and store methods. The legality predicates establish the measured experimental setup. Attribution to a legal production execution remains conditional on the applicability of the injected resource failure.",
+        "unresolved": [
+          "Internal descriptor closure is not an ordinary public API operation; equivalence to a particular production storage fault is not established.",
+          "Repeated Close may acknowledge closure rather than successful publication.",
+          "The minimal transport adapter establishes only the peer encoding used by this store operation."
+        ],
+        "conflicts": [],
+        "alternatives": [
+          "If descriptor closure falls outside the applicable fault contract, retain the observations as an adapted experiment and require a supported fault mechanism before attributing a real execution.",
+          "If repeated Close only acknowledges closure, retain the measured return-to-availability relation without attributing a contract violation."
+        ]
+      },
+      "legal_conditions": [
+        {
+          "field": "create_success",
+          "op": "eq",
+          "value": true,
+          "reference": null
+        },
+        {
+          "field": "configuration_valid",
+          "op": "eq",
+          "value": true,
+          "reference": null
+        },
+        {
+          "field": "write_success",
+          "op": "eq",
+          "value": true,
+          "reference": null
+        },
+        {
+          "field": "injection_success",
+          "op": "eq",
+          "value": true,
+          "reference": null
+        },
+        {
+          "field": "first_close_failed",
+          "op": "eq",
+          "value": true,
+          "reference": null
+        },
+        {
+          "field": "first_publication_missing",
+          "op": "eq",
+          "value": true,
+          "reference": null
+        },
+        {
+          "field": "sync_enabled",
+          "op": "eq",
+          "value": true,
+          "reference": null
+        },
+        {
+          "field": "snapshot_version",
+          "op": "eq",
+          "value": 1,
+          "reference": null
+        },
+        {
+          "field": "retention",
+          "op": "eq",
+          "value": 1,
+          "reference": null
+        },
+        {
+          "field": "configuration_index_valid",
+          "op": "eq",
+          "value": true,
+          "reference": null
+        }
+      ],
+      "observation_changes": []
+    },
+    "monitors": [
+      {
+        "id": "monitor_snapshot_close_publication",
+        "checker_id": "check_snapshot_close_publication",
+        "event": "snapshot_open",
+        "binding_ids": [
+          "binding_snapshot_close",
+          "binding_snapshot_id",
+          "binding_snapshot_open"
+        ],
+        "grounding": {
+          "source_ids": [
+            "file_snapshot.go:1:396",
+            "file_snapshot.go:397:551"
+          ],
+          "expectation_ids": [
+            "file_snapshot.go:1:396",
+            "file_snapshot.go:397:551",
+            "snapshot.go:1:278"
+          ],
+          "binding_ids": [
+            "binding_snapshot_close",
+            "binding_snapshot_id",
+            "binding_snapshot_open"
+          ],
+          "derivation": "Close is documented as indicating a successful end; ID is documented as usable with Open after finalization. Under the selected interpretation, a successful repeated Close requires an available snapshot. Open independently reads published metadata and validates state bytes. The checker compares actual availability with the prior correlated second Close success. The unconditional already-closed branch is the behavior under investigation, not independent normative evidence. Its discrepancy with the selected interpretation is not itself a conflict between normative sources.",
+          "applicability": "Applies after the observed first pre-publication Close failure, for the same uniquely identified sink operation, when the second Close returns success and the experiment-legality conditions hold.",
+          "unresolved": [
+            "The successful-end interpretation for repeated calls requires correspondence review.",
+            "An adapted local observation cannot establish application-level reachability or a recovery consequence."
+          ],
+          "conflicts": [],
+          "alternatives": [
+            "The idempotence comment may support an acknowledgment-only interpretation of repeated Close."
+          ]
+        },
+        "applicability_conditions": [
+          {
+            "field": "second_close_success",
+            "op": "eq",
+            "value": null,
+            "reference": "completion.success"
+          }
+        ]
+      }
+    ],
+    "observable_properties": [
+      {
+        "checker_id": "check_snapshot_close_publication",
+        "kind": "event_assertion",
+        "trigger": {
+          "field": "second_close_success",
+          "op": "eq",
+          "value": true,
+          "reference": null
+        },
+        "assertion": {
+          "field": "open_success",
+          "op": "eq",
+          "value": null,
+          "reference": "completion.success"
+        },
+        "identity_fields": [
+          "operation_id",
+          "snapshot_id"
+        ],
+        "history_field": null,
+        "description": "After the correlated first pre-publication Close failure, if the second Close succeeds, independent Open of that sink's ID must succeed under the selected successful-finalization interpretation. Missing publication and Open error fields distinguish the measured failure mechanism."
+      }
+    ],
+    "uncertainties": [
+      "The repeated-call success contract remains disputed; a failed comparison alone does not resolve its applicability.",
+      "Observable legality predicates establish experimental inputs and reached prerequisites, not the production legality of private descriptor closure.",
+      "Successful buffered Write does not establish durable state; the experiment intentionally fails subsequent finalization.",
+      "This check establishes neither Persist error suppression nor metadata advancement, log deletion, or loss of recoverable history.",
+      "Absent or nonuniquely correlated prerequisites leave the comparison unknown.",
+      "An Open failure must be assessed with the emitted filesystem observations; an unrelated storage error would not establish missing publication.",
+      "The isolated sequential harness introduces no intervening cancellation, replacement, external deletion, retention call, or additional injected fault; uncontrolled environmental interference remains outside its demonstrated controls."
+    ]
+  },
+  "gap": "",
+  "requests": [],
+  "fallback": "none"
+}

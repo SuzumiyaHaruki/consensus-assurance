@@ -216,7 +216,7 @@ def test_new_cached_attachments_are_progress(focused):
         assert candidate.status==('blocked' if n==3 else 'active')
 
 
-def test_reviewed_evidence_block_is_accepted_without_repair(focused,tmp_path):
+def test_no_local_normative_basis_remains_evidence_blocked(focused,tmp_path):
     """13:43:11 shape: concrete source exhausted, responsibility still unattributed."""
     from consensus_assurance.adapters.agents.backend import MockAgent
     e,q,_=focused
@@ -235,7 +235,7 @@ def test_reviewed_evidence_block_is_accepted_without_repair(focused,tmp_path):
     assert e.state.pending_output_repair is None and not e.state.repair_sessions and e.state.usage['agent_calls']==1
     from consensus_assurance.reporting.chinese import render_report
     report=render_report(e.state,e.root).read_text()
-    assert '候选因证据/适用合同不足延期' in report and reply.selection_rationale in report
+    assert '没有足够依据形成局部可归因检查' in report and reply.selection_rationale in report
 
 
 @pytest.mark.parametrize('invalid',['initial_block','active_exhausted','unreviewed_block','unknowns_empty','wrong_check','ready_without_obligation','blank_reason'])
@@ -383,6 +383,58 @@ def test_initial_source_token_repairs_only_source_ids(focused):
     assert session['resolved_diagnostics'][0]['paths']==['/audit_question/source_ids']
 
 
+def fork_ready_local_obligation(focused):
+    from regression_support import bounded_derivation
+    e,q,responses=focused
+    parent=begin(e,q,[ReadRequest(file='counter.py',start_line=1,end_line=2,reason='Inspect the local consumer boundary')])
+    discovery.continue_candidate(e,parent)
+    original=parent.question.model_copy(deep=True)
+    child=q.model_copy(update={'question':'Does the consumer establish documented completion before interpreting the result?',
+        'importance':'A local result must satisfy its interface contract before consumption; broader recovery remains unassessed',
+        'contexts':['one local operation'],'event_paths':['producer completion -> consumer interpretation'],
+        'unknowns':['Broader failure reachability and system consequence are excluded'],
+        'requests':[],'preferred_check':'local_model','disposition':'ready_for_check',
+        'trigger_rationale':'Compare the actual producer completion with the independent interface expectation'})
+    reply=Derivation.model_validate(bounded_derivation(responses[1]))
+    reply.candidate_id=None;reply.audit_question=child;reply.fork_from_candidate_id=parent.id
+    reply.fork_reason='The sourced local completion relation is independently checkable while the Parent consequence remains unresolved'
+    discovery.accept_derivation(e,reply,'fork-and-escalate')
+    saved_parent=next(c for c in e.state.question_candidates if c.id==parent.id)
+    return e,saved_parent,original,next(c for c in e.state.question_candidates if c.parent_candidate_id==parent.id)
+
+
+def test_parent_forks_and_escalates_local_obligation_in_one_reply(focused):
+    e,parent,original,child=fork_ready_local_obligation(focused)
+    assert parent.status=='paused' and parent.question==original
+    assert child.status=='escalated' and child.obligation_id
+    unit=next(u for u in e.state.units if child.obligation_id in u.obligation_ids)
+    assert unit.audit_question==child.question and unit.status=='pending'
+    assert child.fork_reason==parent.stop_reason and not e.state.evidence
+
+
+def test_child_result_does_not_close_parent_or_promote_consequence(focused,tmp_path):
+    from consensus_assurance.core.types import Evidence,Origin,Assessment
+    e,parent,original,child=fork_ready_local_obligation(focused)
+    unit=next(u for u in e.state.units if child.obligation_id in u.obligation_ids);unit.status='checked'
+    e.state.evidence.append(Evidence(check_id='local-check',model_id=None,snapshot_id=e.state.snapshot.id,
+        claim_id=child.obligation_id,origin=Origin.EXECUTED,level='implementation_test',scope=unit.scope,
+        description='Only the child local relation was observed',assessment=Assessment.INCONCLUSIVE))
+    assert parent.status=='paused' and parent.question==original and parent.obligation_id is None
+    assert all(x.claim_id!=parent.obligation_id for x in e.state.evidence)
+    report=__import__('consensus_assurance.reporting.chinese',fromlist=['render_report']).render_report(e.state,tmp_path).read_text()
+    assert f"Parent `{parent.id}`" in report and 'Parent 原问题及未决项保持独立' in report
+
+
+def test_ready_child_check_precedes_enrichment_and_surface(focused):
+    from consensus_assurance.workflow.inquiry import enqueue,choose_task
+    from consensus_assurance.workflow.graph import select_unit
+    e,_,_,child=fork_ready_local_obligation(focused)
+    enqueue(e.state,'spec_refine','Record reusable owner','child-feedback',target_ids=['consumer'],
+        diagnostics=[{'code':'audit_spec_semantics','category':'semantic','object_ids':['consumer'],'material_ids':child.question.source_ids,'message':'Record reusable owner','allowed':['semantic_revision']}])
+    assert choose_task(e) is None
+    assert select_unit(e.state).obligation_ids==[child.obligation_id]
+
+
 def test_explicit_fork_then_resume_original_id(focused):
     e,q,_=focused
     parent=begin(e,q,[request('counter.py')])
@@ -406,6 +458,29 @@ def test_explicit_fork_then_resume_original_id(focused):
     assert discovery.active_candidate(e.state).question==saved_parent.question
     discovery.continue_candidate(e,discovery.active_candidate(e.state))
     assert discovery.active_candidate(e.state).stage=='analyze'
+
+
+def test_stale_inquiry_read_reuses_material_and_reports_analysis_pending(focused,tmp_path):
+    from consensus_assurance.workflow.inquiry import enqueue,process_task
+    from consensus_assurance.adapters.agents.backend import MockAgent
+    from consensus_assurance.core.proposals import SpecRefinement
+    from consensus_assurance.workflow.materials import uncovered_requests
+    from consensus_assurance.reporting.chinese import render_report
+    e,q,_=focused
+    material=next(m for m in e.state.materials if m.file=='counter.py')
+    material.end_line=material.start_line;material.text=material.text.splitlines()[0]
+    partial=ReadRequest(file='counter.py',start_line=material.start_line,end_line=material.start_line+1,reason='Read only the missing suffix')
+    remaining=uncovered_requests(e.state,[partial])
+    assert [(r.start_line,r.end_line) for r in remaining]==[(material.start_line+1,material.start_line+1)]
+    covered=ReadRequest(file='counter.py',start_line=1,end_line=1,reason='Interpret the acquired local boundary')
+    task=enqueue(e.state,'spec_refine','Interpret already acquired source','stale-read',requests=[covered])
+    assert not uncovered_requests(e.state,task.requests)
+    assert '源码已取得，分析待处理' in render_report(e.state,tmp_path).read_text()
+    e.read=lambda *args,**kwargs: (_ for _ in ()).throw(AssertionError('covered source must not be read again'))
+    e.agent=MockAgent();e.agent.responses=[SpecRefinement(understanding='The current inventory already represents this boundary',delta=AuditSpecDelta(rationale='No descriptive change is needed'),limitations=[]).model_dump(mode='json')]
+    process_task(e,task)
+    saved=next(t for t in e.state.inquiry_tasks if t.id==task.id)
+    assert saved.status=='completed' and saved.stage=='done' and e.state.usage['agent_calls']==1
 
 
 

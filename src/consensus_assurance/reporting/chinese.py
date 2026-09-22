@@ -141,7 +141,11 @@ def inquiry_lines(state):
     lines += ["", "| 后续任务 | 类型 | 状态/步骤 | 原因与阻塞 |", "| --- | --- | --- | --- |"]
     for task in state.inquiry_tasks:
         kind='扩展职责/交接覆盖' if task.kind=='spec_refine' else '语义复核'
-        lines.append(f"| `{task.id[:8]}` | {kind} | {task.status}/{task.stage} | {text(task.reason)}；{text(task.stop_reason)} |")
+        stage=task.stage
+        if stage=='read':
+            from consensus_assurance.workflow.materials import uncovered_requests
+            stage='read（仍待读取）' if uncovered_requests(state,task.requests) else 'analyze（源码已取得，分析待处理）'
+        lines.append(f"| `{task.id[:8]}` | {kind} | {task.status}/{stage} | {text(task.reason)}；{text(task.stop_reason)} |")
     current={x.id:getattr(x,'version',1) for x in [*state.claims,*state.bindings,*state.units,*state.relations,*state.models]}
     verdicts={'no_issue_found':'本次范围内暂未发现语义问题','needs_reading':'需要补读','disputed':'解释仍有争议','revision_needed':'需要修订'}
     aspects={'applicability':'适用性','decomposition':'义务及支撑关系','checker_correspondence':'checker 语义对应'}
@@ -224,16 +228,27 @@ def render_report(state, root):
     from consensus_assurance.workflow.discovery import candidate_blockage
     blockages=[candidate_blockage(state,c) for c in state.question_candidates]
     lines.append('候选受阻分类：'+ '；'.join(k+'='+str(blockages.count(k)) for k in ('evidence_blocked','workflow_blocked','resource_blocked')))
+    children={c.id:[x for x in state.question_candidates if x.parent_candidate_id==c.id] for c in state.question_candidates}
     for candidate in state.question_candidates:
         q=candidate.question
         if candidate_blockage(state,candidate)=='evidence_blocked':
-            lines.append('候选因证据/适用合同不足延期；未解释关闭，未确认缺陷，不是性质证据。')
+            lines.append('当前问题及已识别的局部关系都没有足够依据形成局部可归因检查；候选延期，未确认缺陷。')
+        if candidate.status=='explained':
+            lines.append('当前选定怀疑：已由记录的来源与保护机制解释。')
+            adjacent=q.unknowns or ['当前记录未结构化列出相邻问题']
+            lines.append('相邻但未检查的问题：'+str(adjacent)+'；不由本候选结论覆盖，需以独立来源和判别条件另行调查。')
         lines += [f"- 候选 `{candidate.id}`：Fact {q.fact_ids}；生命周期 {q.obligation_relation_kind}；状态 {candidate.status} / {q.disposition}；受阻分类 {candidate_blockage(state,candidate) or '无'}。",
             f"  问题：{q.question}；意义：{q.importance}。",
             f"  适用上下文：{q.contexts}；事件路径：{q.event_paths}；来源：{q.source_ids}。",
             f"  已有保护/反证：{q.counterevidence}；剩余判别与限制：{q.unknowns}。",
             f"  选择/缩窄依据：{q.trigger_rationale}；历史问题版本：{len(candidate.history)}。",
             f"  升级义务：{candidate.obligation_id or '未生成'}；候选结论或受阻原因：{candidate.stop_reason or '继续获取证据'}。"]
+        if candidate.parent_candidate_id:
+            parent=next((x for x in state.question_candidates if x.id==candidate.parent_candidate_id),None)
+            unit=next((u for u in state.units if candidate.obligation_id in u.obligation_ids),None)
+            lines.append(f"  Parent `{candidate.parent_candidate_id}`；fork 原因：{candidate.fork_reason}；Parent 未决：{parent.question.unknowns if parent else '历史 Parent 不可用'}；child 局部义务/检查：{candidate.obligation_id or '未生成'} / {unit.status if unit else '未形成 AuditUnit'}。")
+        if children[candidate.id]:
+            lines.append('  Child：'+str([{'id':c.id,'fork_reason':c.fork_reason,'local_obligation':c.obligation_id} for c in children[candidate.id]])+'；Parent 原问题及未决项保持独立。')
     if state.audit_spec_path:
         from consensus_assurance.workflow.audit_spec import load,audit_object_key
         from consensus_assurance.core.types import ConsensusAuditSpec

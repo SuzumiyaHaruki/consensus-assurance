@@ -260,6 +260,34 @@ def validate_read_requests(state,repo,response):
     if errors:raise DiagnosticError(errors)
 
 
+def uncovered_requests(state, requests):
+    """Subtract source already acquired for the current snapshot from requests."""
+    current={file:digest for file,digest in state.snapshot.files.items()}
+    acquired={}
+    for material in state.materials:
+        if current.get(material.file)==material.content_digest:
+            acquired.setdefault(material.file,[]).append((material.start_line,material.end_line))
+    result=[]
+    for request in requests:
+        cursor=request.start_line
+        for start,end in sorted(acquired.get(request.file,[])):
+            if end<cursor or start>request.end_line:continue
+            if cursor<start:
+                result.append(request.model_copy(update={'start_line':cursor,'end_line':min(request.end_line,start-1)}))
+            cursor=max(cursor,end+1)
+            if cursor>request.end_line:break
+        if cursor<=request.end_line:result.append(request.model_copy(update={'start_line':cursor}))
+    return result
+
+
+def request_material_ids(state, requests):
+    """Return current-version material identities contributing to requested ranges."""
+    current=state.snapshot.files
+    return list(dict.fromkeys(m.id for request in requests for m in state.materials
+        if m.file==request.file and m.content_digest==current.get(m.file)
+        and m.start_line<=request.end_line and request.start_line<=m.end_line))
+
+
 def compact_index(state,repo,files=None):
     visible=state.snapshot.readable_files if state.snapshot.readable_files is not None else state.snapshot.files
     for file in visible:

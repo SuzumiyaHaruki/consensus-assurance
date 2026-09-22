@@ -1,0 +1,1988 @@
+{
+  "version": 3,
+  "target_profile": {
+    "system_boundary": "The github.com/hashicorp/raft library, including its protocol coordination, FSM scheduling, and built-in storage and transport implementations. Application FSM semantics and separately maintained storage implementations are outside the concrete supplied implementation, while their library interfaces remain in scope.",
+    "protocol_contexts": [
+      "Candidate, follower, and leader states with election terms.",
+      "Leader-local commitment tracking over voter ServerIDs and log indexes.",
+      "Protocol-version-dependent membership encodings.",
+      "Snapshot versions, snapshot log index and term, and configuration index.",
+      "Ordinary elections, optional pre-vote, and leadership-transfer election entry."
+    ],
+    "external_interfaces": [
+      "Apply, ApplyLog, Barrier, VerifyLeader, and configuration query APIs.",
+      "Transport RPCs, optional WithPreVote, and optional heartbeat fast-pass handler.",
+      "FSM, BatchingFSM, FSMSnapshot, and optional ConfigurationStore callbacks.",
+      "Log-store StoreLogs, FirstIndex, LastIndex, and DeleteRange calls.",
+      "Snapshot-store Create and Open, and snapshot-sink Close and Cancel.",
+      "Observer channels and filtering."
+    ],
+    "ownership": [
+      "runCandidate executes candidate event handling on the main protocol loop.",
+      "commitment serializes its voter-match map and commit index with a mutex.",
+      "runFSM owns local application/snapshot position variables and invokes application callbacks.",
+      "takeSnapshot requests FSM capture and obtains configuration state through futures.",
+      "installSnapshot coordinates streaming, sink finalization, FSM restore acknowledgement, and protocol metadata updates.",
+      "FileSnapshotSink owns file finalization and publication operations."
+    ],
+    "selection_injection": [
+      "runFSM selects batching and configuration-storage behavior by type assertion against the supplied FSM.",
+      "installSnapshot selects full log removal versus bounded compaction using MonotonicLogStore and IsMonotonic.",
+      "Transport permits either a heartbeat callback fast path or delivery through Consumer; the activated transport is unknown.",
+      "A built-in FileSnapshotSink implementation is present and remains in scope; constructor selection and the currently selected snapshot store are unread.",
+      "README identifies separately maintained MDB and Bbolt storage adapters; it does not establish which adapter is selected.",
+      "Constructor assembly, adapter ownership, and startup selection require api.go source."
+    ],
+    "variants": [
+      "Single-entry FSM callbacks versus BatchingFSM.ApplyBatch.",
+      "ConfigurationStore present versus absent in the single-entry FSM path.",
+      "Pre-vote enabled versus disabled, with leadership transfer bypassing pre-vote.",
+      "Configuration log encoding below protocol version 2 versus version 2 or later.",
+      "Snapshot version 0 peer decoding versus newer configuration decoding.",
+      "Monotonic log-store cleanup versus trailing-log compaction.",
+      "File snapshot synchronization enabled versus noSync, with parent-directory synchronization skipped on Windows."
+    ],
+    "source_ids": [
+      "README.md:1:80",
+      "transport.go:1:80",
+      "config.go:1:80",
+      "api.go:800:898",
+      "commitment.go:1:104",
+      "raft.go:285:441",
+      "raft.go:1203:1291",
+      "raft.go:1814:1955",
+      "fsm.go:1:80",
+      "fsm.go:81:240",
+      "snapshot.go:125:278",
+      "file_snapshot.go:397:500"
+    ],
+    "unknowns": [
+      "Actual constructor arguments, deployment configuration, and selected storage and transport variants.",
+      "Startup reconstruction of terms, votes, snapshots, log indexes, and configurations.",
+      "Persistence and partial-error semantics of selected log and stable stores.",
+      "Replication success correlation, pipeline behavior, and heartbeat-derived evidence consumers.",
+      "Precise FSM event-loop dispatch after line 240 and future synchronization semantics.",
+      "No supplied execution observations establish calibration or protocol correctness."
+    ]
+  },
+  "activities": [
+    {
+      "class_id": "A1",
+      "applicability": "applicable",
+      "purpose": "Admit log work and advance leader-local decisions from reported replication progress.",
+      "realization_summary": "Local dispatch assigns indexes and terms, calls StoreLogs, and reports local progress. commitment calculates a voter order statistic and advances only at or above startIndex. Remote progress establishment and the commit-index consumer remain unread.",
+      "entry_points": [
+        "Raft.dispatchLogs",
+        "commitment.match",
+        "commitment.recalculate"
+      ],
+      "behavior_ids": [
+        "B3",
+        "network_append_rpc",
+        "network_append_dispatch",
+        "network_pipeline_submit",
+        "network_pipeline_decode",
+        "network_pipeline_close"
+      ],
+      "variants": [
+        "Changing voter map",
+        "StoreLogs success or error"
+      ],
+      "unknowns": [
+        "Remote match producers and main-loop commit processing"
+      ],
+      "source_ids": [
+        "raft.go:1203:1291",
+        "commitment.go:1:104"
+      ]
+    },
+    {
+      "class_id": "A2",
+      "applicability": "applicable",
+      "purpose": "Change local authority and election context.",
+      "realization_summary": "Candidate handling tallies pre-votes and votes, invokes election helpers, handles newer terms, rejects leader-only operations, and requests local role changes.",
+      "entry_points": [
+        "Raft.runCandidate",
+        "Raft.installSnapshot"
+      ],
+      "behavior_ids": [
+        "candidate_campaign_control",
+        "election_campaign_dispatch",
+        "prevote_campaign_dispatch"
+      ],
+      "variants": [
+        "Pre-vote",
+        "Direct election",
+        "Leadership-transfer election"
+      ],
+      "unknowns": [
+        "Vote producers, term persistence, role-setter effects, and leader lease handling"
+      ],
+      "source_ids": [
+        "raft.go:285:441",
+        "raft.go:1814:1955"
+      ]
+    },
+    {
+      "class_id": "A3",
+      "applicability": "applicable",
+      "purpose": "Restore replica state and resume protocol participation.",
+      "realization_summary": "Remote snapshot installation waits for an FSM restore future before updating snapshot, application, and configuration metadata. Startup recovery and incremental catch-up are deferred.",
+      "entry_points": [
+        "Raft.installSnapshot",
+        "runFSM restore closure"
+      ],
+      "behavior_ids": [
+        "B10",
+        "B11"
+      ],
+      "variants": [
+        "Legacy snapshot metadata",
+        "Monotonic log store"
+      ],
+      "unknowns": [
+        "Startup recovery, append-based catch-up, and behavior after partial application restore failure"
+      ],
+      "source_ids": [
+        "raft.go:1814:1955",
+        "fsm.go:81:240"
+      ]
+    },
+    {
+      "class_id": "A4",
+      "applicability": "applicable",
+      "purpose": "Construct, expose, and consume membership configurations.",
+      "realization_summary": "appendConfigurationEntry computes a proposed configuration, dispatches its log, updates latest configuration, replaces commitment voters, and adjusts replication. Snapshot installation replaces latest and committed configuration metadata.",
+      "entry_points": [
+        "Raft.appendConfigurationEntry",
+        "commitment.setConfiguration",
+        "Raft.GetConfiguration"
+      ],
+      "behavior_ids": [
+        "B4",
+        "B5"
+      ],
+      "variants": [
+        "Legacy peer encoding",
+        "LogConfiguration encoding"
+      ],
+      "unknowns": [
+        "Change admission serialization, nextConfiguration validation, and committed-configuration advancement"
+      ],
+      "source_ids": [
+        "raft.go:1203:1291",
+        "commitment.go:1:104",
+        "api.go:800:898",
+        "raft.go:1814:1955"
+      ]
+    },
+    {
+      "class_id": "A5",
+      "applicability": "applicable",
+      "purpose": "Schedule decided work and invoke application callbacks with corresponding completion results.",
+      "realization_summary": "runFSM defines single and batched application handlers, restore, and snapshot capture. Application callback implementation is external, but filtering, ordering, positions, and future completion are library responsibilities.",
+      "entry_points": [
+        "Raft.runFSM"
+      ],
+      "behavior_ids": [
+        "B6"
+      ],
+      "variants": [
+        "FSM",
+        "BatchingFSM",
+        "ConfigurationStore"
+      ],
+      "unknowns": [
+        "Complete event-loop dispatch and processLogs producer behavior"
+      ],
+      "source_ids": [
+        "fsm.go:1:80",
+        "fsm.go:81:240"
+      ]
+    },
+    {
+      "class_id": "A6",
+      "applicability": "applicable",
+      "purpose": "Store logs and create, publish, compact, and recover snapshot evidence.",
+      "realization_summary": "Normal log dispatch calls StoreLogs. Snapshot creation persists an FSM capture, closes the sink, updates snapshot metadata, and compacts logs. FileSnapshotSink separately finalizes files, publishes a directory, and reaps older snapshots.",
+      "entry_points": [
+        "Raft.dispatchLogs",
+        "Raft.takeSnapshot",
+        "Raft.compactLogsWithTrailing",
+        "FileSnapshotSink.Close",
+        "FileSnapshotSink.Cancel"
+      ],
+      "behavior_ids": [
+        "B2",
+        "B7",
+        "B8",
+        "B9",
+        "persist_vote_storage_sequence"
+      ],
+      "variants": [
+        "Synchronization options",
+        "Trailing-log retention",
+        "Full monotonic-store cleanup"
+      ],
+      "unknowns": [
+        "Store contracts, snapshot opening and selection, metadata writing, retention, and restart behavior"
+      ],
+      "source_ids": [
+        "raft.go:1203:1291",
+        "snapshot.go:125:278",
+        "file_snapshot.go:397:500"
+      ]
+    },
+    {
+      "class_id": "A7",
+      "applicability": "applicable",
+      "purpose": "Expose admission, completion, leadership verification, and barrier semantics to callers.",
+      "realization_summary": "ApplyLog and Barrier return futures after enqueueing or immediate admission errors. FSM handlers complete associated futures after callback processing. VerifyLeader only enqueues a request in the supplied API code.",
+      "entry_points": [
+        "Raft.Apply",
+        "Raft.ApplyLog",
+        "Raft.Barrier",
+        "Raft.VerifyLeader"
+      ],
+      "behavior_ids": [
+        "B1"
+      ],
+      "variants": [
+        "Positive enqueue timeout",
+        "No timer",
+        "Shutdown",
+        "Leadership loss and restore errors described by API comments"
+      ],
+      "unknowns": [
+        "Future implementation, verification completion, retry identity, and caller deduplication responsibilities"
+      ],
+      "source_ids": [
+        "api.go:1:80",
+        "api.go:800:898",
+        "fsm.go:81:240"
+      ]
+    }
+  ],
+  "behaviors": [
+    {
+      "id": "B1",
+      "primary_activity": "A7",
+      "execution_owner": "Caller goroutine executing ApplyLog or Barrier",
+      "protocol_context": "A particular Raft instance and newly allocated logFuture",
+      "trigger": "Caller submits a command or barrier",
+      "legal_preconditions": [
+        "Leader execution is required by API documentation, but leadership is not checked in these enqueue functions."
+      ],
+      "implementation_guards": [
+        "Positive timeout enables a timer.",
+        "Select includes shutdown and applyCh send."
+      ],
+      "reads": [
+        "Submitted Data and Extensions",
+        "shutdownCh"
+      ],
+      "writes": [
+        "Initialized logFuture with LogCommand or LogBarrier"
+      ],
+      "durable_effects": [],
+      "external_effects": [
+        "Returns the submitted future on send, or an immediate error future."
+      ],
+      "important_branches": [
+        "Timeout",
+        "Shutdown",
+        "Successful channel send"
+      ],
+      "async_boundaries": [
+        "applyCh send separates caller admission from protocol handling."
+      ],
+      "produces_fact_ids": [
+        "F1"
+      ],
+      "consumes_fact_ids": [],
+      "cross_activity_effects": {
+        "A1": "Makes a logFuture available to protocol admission handling."
+      },
+      "existing_protections": [
+        "Caller-provided index, term, and type are not copied into ApplyLog's command log."
+      ],
+      "source_ids": [
+        "api.go:800:898"
+      ],
+      "unknowns": [
+        "Channel buffering and non-candidate consumers",
+        "Future completion synchronization"
+      ]
+    },
+    {
+      "id": "B2",
+      "primary_activity": "A6",
+      "execution_owner": "Leader protocol execution calling dispatchLogs",
+      "protocol_context": "Current local term, log tail, and leaderState",
+      "trigger": "Dispatch of a batch of logFuture objects",
+      "legal_preconditions": [
+        "The function is described as leader-only; callers other than appendConfigurationEntry are unread."
+      ],
+      "implementation_guards": [
+        "StoreLogs error prevents the subsequent match and last-log updates."
+      ],
+      "reads": [
+        "Current term",
+        "Last log index",
+        "Replication states"
+      ],
+      "writes": [
+        "Future log indexes, terms, timestamps",
+        "Inflight list",
+        "Last-log metadata"
+      ],
+      "durable_effects": [
+        "Calls logs.StoreLogs; actual persistence depends on the store contract and implementation."
+      ],
+      "external_effects": [
+        "Responds with storage errors",
+        "Calls setState(Follower) on storage error",
+        "Notifies replicators after storage success"
+      ],
+      "important_branches": [
+        "Storage error after inflight insertion",
+        "Storage success before local match report"
+      ],
+      "async_boundaries": [
+        "Replicator trigger notifications"
+      ],
+      "produces_fact_ids": [
+        "F2"
+      ],
+      "consumes_fact_ids": [],
+      "cross_activity_effects": {
+        "A1": "Reports the final assigned index to commitment.match after StoreLogs returns nil.",
+        "A2": "Requests follower state on local storage failure.",
+        "A7": "Completes dispatched futures with the storage error on failure."
+      },
+      "existing_protections": [
+        "Local match reporting occurs after StoreLogs returns nil."
+      ],
+      "source_ids": [
+        "raft.go:1203:1291"
+      ],
+      "unknowns": [
+        "Partial StoreLogs effects",
+        "Inflight cleanup after failure",
+        "setState effects"
+      ]
+    },
+    {
+      "id": "B3",
+      "primary_activity": "A1",
+      "execution_owner": "Leader or replication caller under commitment mutex",
+      "protocol_context": "One commitment object with startIndex and current voter map",
+      "trigger": "commitment.match(server, matchIndex)",
+      "legal_preconditions": [
+        "The method comment expects completed storage and agreement through the reported index; remote establishment is unread."
+      ],
+      "implementation_guards": [
+        "Server must exist in the voter map.",
+        "Reported index must exceed the previous value."
+      ],
+      "reads": [
+        "Voter match map",
+        "startIndex",
+        "commitIndex"
+      ],
+      "writes": [
+        "Per-voter match index",
+        "commitIndex"
+      ],
+      "durable_effects": [],
+      "external_effects": [
+        "Asynchronously notifies commitCh on index advancement."
+      ],
+      "important_branches": [
+        "Unknown server or non-increasing report is ignored.",
+        "Empty map cannot advance.",
+        "Quorum order statistic must exceed commitIndex and reach startIndex."
+      ],
+      "async_boundaries": [
+        "commitCh notification does not itself execute committed entries."
+      ],
+      "produces_fact_ids": [
+        "F3"
+      ],
+      "consumes_fact_ids": [
+        "F2"
+      ],
+      "cross_activity_effects": {},
+      "existing_protections": [
+        "Mutex serialization",
+        "Monotonic per-voter reports",
+        "startIndex threshold"
+      ],
+      "source_ids": [
+        "commitment.go:1:104",
+        "raft.go:1203:1291"
+      ],
+      "unknowns": [
+        "F2 covers only local dispatch reports; remote report establishment is unknown.",
+        "Consumer of commitCh is unread."
+      ]
+    },
+    {
+      "id": "B4",
+      "primary_activity": "A4",
+      "execution_owner": "Caller of commitment.setConfiguration under commitment mutex",
+      "protocol_context": "Existing commitment object and replacement Configuration",
+      "trigger": "Replacement of commitment voter configuration",
+      "legal_preconditions": [
+        "Caller selection and timing beyond appendConfigurationEntry are unknown."
+      ],
+      "implementation_guards": [
+        "Only Voter entries populate the replacement map."
+      ],
+      "reads": [
+        "Replacement servers",
+        "Old per-server match indexes",
+        "Existing commitIndex and startIndex"
+      ],
+      "writes": [
+        "Replacement voter map",
+        "Possibly increased commitIndex"
+      ],
+      "durable_effects": [],
+      "external_effects": [
+        "May notify commitCh through recalculate."
+      ],
+      "important_branches": [
+        "Retained IDs inherit progress.",
+        "New IDs default to zero.",
+        "Removed IDs disappear.",
+        "Existing commitIndex is not reset."
+      ],
+      "async_boundaries": [
+        "Optional commit notification"
+      ],
+      "produces_fact_ids": [
+        "F3"
+      ],
+      "consumes_fact_ids": [],
+      "cross_activity_effects": {
+        "A1": "Changes the voter population used for subsequent commitment arithmetic."
+      },
+      "existing_protections": [
+        "Mutex serialization",
+        "startIndex threshold remains in force"
+      ],
+      "source_ids": [
+        "commitment.go:1:104"
+      ],
+      "unknowns": [
+        "Full membership transition admission and ordering"
+      ]
+    },
+    {
+      "id": "B5",
+      "primary_activity": "A4",
+      "execution_owner": "Leader protocol execution calling appendConfigurationEntry",
+      "protocol_context": "Latest configuration/index and protocolVersion",
+      "trigger": "Configuration change future",
+      "legal_preconditions": [
+        "Admission to this helper is unread."
+      ],
+      "implementation_guards": [
+        "nextConfiguration error returns before dispatch."
+      ],
+      "reads": [
+        "Latest configuration and index",
+        "Change request",
+        "Protocol version"
+      ],
+      "writes": [
+        "Configuration future log",
+        "Latest configuration",
+        "Commitment voter map"
+      ],
+      "durable_effects": [
+        "Delegates log storage to dispatchLogs."
+      ],
+      "external_effects": [
+        "Responds on configuration-construction error",
+        "Calls startStopReplication"
+      ],
+      "important_branches": [
+        "Legacy encoding below version 2",
+        "Modern configuration encoding",
+        "After dispatchLogs returns, configuration updates proceed without a returned status check."
+      ],
+      "async_boundaries": [
+        "Dispatch starts replication work indirectly."
+      ],
+      "produces_fact_ids": [],
+      "consumes_fact_ids": [],
+      "cross_activity_effects": {
+        "A1": "Replaces commitment voters after the configuration dispatch call."
+      },
+      "existing_protections": [
+        "nextConfiguration validation call"
+      ],
+      "source_ids": [
+        "raft.go:1203:1291"
+      ],
+      "unknowns": [
+        "Validation semantics",
+        "Admission serialization",
+        "Effects of continuing after dispatchLogs storage failure"
+      ]
+    },
+    {
+      "id": "B6",
+      "primary_activity": "A5",
+      "execution_owner": "runFSM goroutine, applySingle or applyBatch closure",
+      "protocol_context": "commitTuple inputs and detected FSM interfaces",
+      "trigger": "Application of supplied commit tuples",
+      "legal_preconditions": [
+        "FSM interface comments require committed input; the actual producer path is unread."
+      ],
+      "implementation_guards": [
+        "Single path checks ConfigurationStore.",
+        "Batch path checks response count against filtered input length."
+      ],
+      "reads": [
+        "Log types and identities",
+        "Associated futures",
+        "FSM capabilities"
+      ],
+      "writes": [
+        "Local lastIndex and lastTerm",
+        "Future response values"
+      ],
+      "durable_effects": [
+        "Application-defined callback effects; no library persistence guarantee follows from callback return alone."
+      ],
+      "external_effects": [
+        "Invokes Apply, StoreConfiguration, or ApplyBatch",
+        "Responds nil to associated futures after processing"
+      ],
+      "important_branches": [
+        "Single commands invoke Apply.",
+        "Single configuration without ConfigurationStore returns without advancing local position, while deferred future completion still executes.",
+        "Batch filtering sends commands and configurations, excluding barriers.",
+        "Batch position advances to the last input tuple, including filtered tuples.",
+        "Mismatched batch response length panics."
+      ],
+      "async_boundaries": [
+        "Application callbacks and future completion are separate from protocol-loop execution."
+      ],
+      "produces_fact_ids": [
+        "F4"
+      ],
+      "consumes_fact_ids": [],
+      "cross_activity_effects": {
+        "A7": "Associates callback responses with submitted futures and completes them."
+      },
+      "existing_protections": [
+        "Ordered traversal",
+        "Filtered response correlation",
+        "Response-count check"
+      ],
+      "source_ids": [
+        "fsm.go:1:80",
+        "fsm.go:81:240"
+      ],
+      "unknowns": [
+        "Event-loop dispatch tail",
+        "processLogs filtering and ordering",
+        "Barrier producer-to-consumer path"
+      ]
+    },
+    {
+      "id": "B7",
+      "primary_activity": "A6",
+      "execution_owner": "runFSM goroutine, snapshot closure",
+      "protocol_context": "Current FSM-local lastIndex and lastTerm",
+      "trigger": "reqSnapshotFuture handled by snapshot closure",
+      "legal_preconditions": [],
+      "implementation_guards": [
+        "Rejects lastIndex == 0."
+      ],
+      "reads": [
+        "FSM-local position",
+        "FSM.Snapshot result"
+      ],
+      "writes": [
+        "Snapshot request index, term, snapshot object, and completion"
+      ],
+      "durable_effects": [],
+      "external_effects": [
+        "Invokes FSM.Snapshot"
+      ],
+      "important_branches": [
+        "Nothing to snapshot",
+        "Snapshot callback error",
+        "Snapshot callback success"
+      ],
+      "async_boundaries": [
+        "Future completion hands the capture to snapshot persistence work."
+      ],
+      "produces_fact_ids": [
+        "F5"
+      ],
+      "consumes_fact_ids": [],
+      "cross_activity_effects": {},
+      "existing_protections": [
+        "Position and capture are assembled by the FSM execution owner."
+      ],
+      "source_ids": [
+        "fsm.go:1:80",
+        "fsm.go:81:240"
+      ],
+      "unknowns": [
+        "Actual application snapshot isolation",
+        "Complete FSM event-loop serialization"
+      ]
+    },
+    {
+      "id": "B8",
+      "primary_activity": "A6",
+      "execution_owner": "Caller of takeSnapshot",
+      "protocol_context": "FSM capture and separately obtained committed configuration",
+      "trigger": "Local snapshot attempt",
+      "legal_preconditions": [],
+      "implementation_guards": [
+        "Checks snapshot and configuration futures.",
+        "Requires capture index >= committed configuration index.",
+        "Checks Create, Persist, and Close errors."
+      ],
+      "reads": [
+        "FSM capture",
+        "Committed configuration",
+        "Protocol version",
+        "Log bounds and trailing retention"
+      ],
+      "writes": [
+        "Last-snapshot metadata on successful Persist and Close"
+      ],
+      "durable_effects": [
+        "Persists capture through selected sink",
+        "Requests deletion through compactLogs"
+      ],
+      "external_effects": [
+        "Always releases an acquired successful capture on function exit",
+        "Returns snapshot ID only after compaction succeeds"
+      ],
+      "important_branches": [
+        "Persist error invokes Cancel.",
+        "Close error returns before metadata update.",
+        "Compaction error occurs after metadata update."
+      ],
+      "async_boundaries": [
+        "FSM snapshot future",
+        "Main-loop configuration future",
+        "Application Persist may overlap later FSM application per interface contract."
+      ],
+      "produces_fact_ids": [],
+      "consumes_fact_ids": [
+        "F5"
+      ],
+      "cross_activity_effects": {
+        "A3": "Creates snapshot material intended for later recovery, with readability and restart selection still unread."
+      },
+      "existing_protections": [
+        "Capture/configuration index check",
+        "Error checks before compaction",
+        "Compaction bound never exceeds snapshot index"
+      ],
+      "source_ids": [
+        "snapshot.go:125:278",
+        "fsm.go:1:80"
+      ],
+      "unknowns": [
+        "Selected sink semantics",
+        "Snapshot readability after publication",
+        "Exact error handling by callers"
+      ]
+    },
+    {
+      "id": "B9",
+      "primary_activity": "A6",
+      "execution_owner": "Caller executing FileSnapshotSink.Close",
+      "protocol_context": "A particular file snapshot sink and its closed flag",
+      "trigger": "Close invocation",
+      "legal_preconditions": [
+        "Sink construction and prior calls are not supplied."
+      ],
+      "implementation_guards": [
+        "Returns nil immediately when closed is already true.",
+        "Sets closed before finalization.",
+        "Checks each finalization, metadata, rename, synchronization, and reaping error."
+      ],
+      "reads": [
+        "closed",
+        "noSync",
+        "runtime.GOOS",
+        "Temporary and parent directories"
+      ],
+      "writes": [
+        "closed",
+        "Metadata size and CRC through finalize",
+        "Snapshot directory name"
+      ],
+      "durable_effects": [
+        "Flushes data",
+        "Optionally syncs state file",
+        "Calls writeMeta",
+        "Renames directory",
+        "Conditionally syncs parent directory",
+        "Calls ReapSnapshots"
+      ],
+      "external_effects": [
+        "Returns nil or the encountered error"
+      ],
+      "important_branches": [
+        "Already-closed invocation performs no publication work.",
+        "Finalize failure attempts temporary-directory removal.",
+        "Metadata, rename, synchronization, or reaping failure returns after closed was set.",
+        "Cancel also returns immediately when closed is true."
+      ],
+      "async_boundaries": [],
+      "produces_fact_ids": [
+        "F6"
+      ],
+      "consumes_fact_ids": [],
+      "cross_activity_effects": {},
+      "existing_protections": [
+        "Ordered finalization before rename",
+        "Optional file and directory synchronization",
+        "Checks publication-stage errors"
+      ],
+      "source_ids": [
+        "file_snapshot.go:397:500"
+      ],
+      "unknowns": [
+        "writeMeta and ReapSnapshots implementation",
+        "Open/List eligibility",
+        "Constructor options",
+        "Concurrent-call contract",
+        "Result of repeated Close after an earlier error"
+      ]
+    },
+    {
+      "id": "B10",
+      "primary_activity": "A3",
+      "execution_owner": "runFSM goroutine, restore closure",
+      "protocol_context": "restoreFuture snapshot ID",
+      "trigger": "Processing a restore request",
+      "legal_preconditions": [],
+      "implementation_guards": [
+        "Checks snapshot Open and fsmRestoreAndMeasure errors."
+      ],
+      "reads": [
+        "Snapshot metadata and data stream"
+      ],
+      "writes": [
+        "FSM-local lastIndex and lastTerm after successful restore helper"
+      ],
+      "durable_effects": [
+        "Application-defined restore effects"
+      ],
+      "external_effects": [
+        "Responds to restore future",
+        "Closes opened stream"
+      ],
+      "important_branches": [
+        "Open failure",
+        "Restore helper failure",
+        "Successful metadata adoption"
+      ],
+      "async_boundaries": [
+        "Restore future completion"
+      ],
+      "produces_fact_ids": [
+        "F7"
+      ],
+      "consumes_fact_ids": [],
+      "cross_activity_effects": {
+        "A5": "Replaces FSM-local application position after restore helper success."
+      },
+      "existing_protections": [
+        "Position update follows restore helper success."
+      ],
+      "source_ids": [
+        "fsm.go:81:240"
+      ],
+      "unknowns": [
+        "fsmRestoreAndMeasure implementation",
+        "Snapshot Open validation",
+        "Partial callback effects on failure"
+      ]
+    },
+    {
+      "id": "B11",
+      "primary_activity": "A3",
+      "execution_owner": "Protocol RPC handler executing installSnapshot",
+      "protocol_context": "InstallSnapshot request term, version, log position, size, and configuration",
+      "trigger": "InstallSnapshot RPC",
+      "legal_preconditions": [
+        "RPC dispatch and sender validation are unread."
+      ],
+      "implementation_guards": [
+        "Snapshot version bounds",
+        "Rejects older term",
+        "Checks stream copy and exact size",
+        "Checks Close and restore future errors"
+      ],
+      "reads": [
+        "Current term",
+        "Request metadata",
+        "RPC stream",
+        "Store capabilities"
+      ],
+      "writes": [
+        "Leader metadata",
+        "Potential follower state and term",
+        "Last-applied and snapshot metadata",
+        "Latest and committed configuration",
+        "Last contact"
+      ],
+      "durable_effects": [
+        "Creates and closes snapshot sink",
+        "Requests old-log deletion or compaction"
+      ],
+      "external_effects": [
+        "Responds to RPC after draining remaining stream",
+        "Requests FSM restore",
+        "Logs cleanup errors and continues"
+      ],
+      "important_branches": [
+        "Newer term requests follower state.",
+        "Stream error or size mismatch invokes Cancel.",
+        "Restore failure prevents later metadata updates.",
+        "Cleanup errors do not prevent Success=true."
+      ],
+      "async_boundaries": [
+        "fsmMutateCh send",
+        "restoreFuture.Error wait"
+      ],
+      "produces_fact_ids": [],
+      "consumes_fact_ids": [
+        "F7"
+      ],
+      "cross_activity_effects": {
+        "A4": "Adopts snapshot configuration as both latest and committed after restore acknowledgement.",
+        "A6": "Performs store-dependent log cleanup after snapshot adoption.",
+        "A2": "Processes newer request terms and leader identity."
+      },
+      "existing_protections": [
+        "Persistence-stage error checks precede restore request.",
+        "Restore acknowledgement precedes protocol metadata adoption."
+      ],
+      "source_ids": [
+        "raft.go:1814:1955"
+      ],
+      "unknowns": [
+        "Binding between request metadata and opened snapshot metadata",
+        "Same-term role handling by surrounding dispatch",
+        "Restart interpretation after cleanup errors"
+      ]
+    },
+    {
+      "id": "candidate_campaign_control",
+      "primary_activity": "A2",
+      "execution_owner": "Raft candidate loop",
+      "protocol_context": "One runCandidate invocation while local state remains Candidate.",
+      "trigger": "Entry into runCandidate.",
+      "legal_preconditions": [],
+      "implementation_guards": [
+        "Pre-vote runs only when preVoteDisabled is false and candidateFromLeadershipTransfer is false.",
+        "The loop continues while getState() returns Candidate.",
+        "Pre-vote responses above the invocation's initially computed next term request follower transition and term update.",
+        "Vote responses above getCurrentTerm() request follower transition and term update."
+      ],
+      "reads": [
+        "Current term and state.",
+        "ElectionTimeout, preVoteDisabled, and candidateFromLeadershipTransfer.",
+        "quorumSize() result.",
+        "Campaign-local response channels."
+      ],
+      "writes": [
+        "Local granted and refused counters.",
+        "Election timer and active campaign channels.",
+        "candidateFromLeadershipTransfer is reset by a deferred store."
+      ],
+      "durable_effects": [
+        "Invokes setCurrentTerm on a higher-term response; its implementation and durability semantics are not supplied."
+      ],
+      "external_effects": [
+        "Processes incoming RPCs through processRPC.",
+        "Rejects configuration changes, apply, verify, restore, and leadership-transfer requests with ErrNotLeader.",
+        "Returns a cloned configuration on configurationsCh and ErrCantBootstrap on bootstrapCh.",
+        "Calls setState(Leader) and setLeader after the granted-vote threshold is reached."
+      ],
+      "important_branches": [
+        "A successful pre-vote tally disables prevoteCh, resets the election timer, and invokes electSelf.",
+        "A refused pre-vote threshold only logs failure; the loop continues until another selected event.",
+        "Granted vote results increment a scalar count; this loop does not deduplicate voterID or explicitly reject lower-term grants.",
+        "Election timeout returns; restart depends on the caller, whose implementation is not attached.",
+        "Follower notification refreshes the timer only if ElectionTimeout changed.",
+        "Shutdown returns."
+      ],
+      "async_boundaries": [
+        "select receives RPCs, campaign results, client requests, notifications, timeout, and shutdown.",
+        "Remote result establishment occurs in separate goroutines."
+      ],
+      "produces_fact_ids": [],
+      "consumes_fact_ids": [
+        "local_election_vote_enqueued",
+        "local_prevote_enqueued"
+      ],
+      "cross_activity_effects": {
+        "A7": "Candidate-side handling rejects the listed leader-only requests with ErrNotLeader.",
+        "A4": "Candidate-side handling rejects configuration changes and serves a cloned configuration through configurationsCh."
+      },
+      "existing_protections": [
+        "Campaign response channels are obtained separately for each invocation.",
+        "Higher-term responses cause an early return after transition-helper calls.",
+        "The leadership-transfer flag is reset on exit.",
+        "An election timeout bounds waiting in the candidate loop."
+      ],
+      "source_ids": [
+        "raft.go:285:441"
+      ],
+      "unknowns": [
+        "quorumSize, setState, setLeader, setCurrentTerm, and processRPC implementations are not attached.",
+        "Remote response validity, transport identity correlation, and configuration uniqueness are not established by the scalar tally.",
+        "Leader transition completion and subsequent leader initialization are not established by the observed call sites."
+      ]
+    },
+    {
+      "id": "election_campaign_dispatch",
+      "primary_activity": "A2",
+      "execution_owner": "Caller of electSelf, synchronously within candidate campaign control",
+      "protocol_context": "Election request construction over configurations.latest.Servers.",
+      "trigger": "runCandidate invokes electSelf directly or after reaching the pre-vote threshold.",
+      "legal_preconditions": [],
+      "implementation_guards": [
+        "Only entries with Suffrage == Voter are selected.",
+        "The local ServerID branch requires persistVote to return nil before enqueueing its granted result."
+      ],
+      "reads": [
+        "getCurrentTerm(), getLastEntry(), getRPCHeader(), and encoded local peer identity.",
+        "candidateFromLeadershipTransfer.",
+        "configurations.latest.Servers."
+      ],
+      "writes": [
+        "A new response channel buffered to the number of configured servers.",
+        "A RequestVoteRequest containing next term, last-entry metadata, and leadership-transfer flag."
+      ],
+      "durable_effects": [
+        "Calls setCurrentTerm before constructing and dispatching the request.",
+        "Calls persistVote for a selected local voter."
+      ],
+      "external_effects": [
+        "Schedules a RequestVote goroutine for each selected nonlocal voter."
+      ],
+      "important_branches": [
+        "On local persistVote error, electSelf returns nil without enqueueing the local granted result.",
+        "Remote goroutines scheduled before a local persistence error are not cancelled here.",
+        "If no selected server matches localID, no local vote is enqueued."
+      ],
+      "async_boundaries": [
+        "Each selected nonlocal voter is handled by a separate r.goFunc callback.",
+        "Local results are enqueued for later candidate-loop consumption."
+      ],
+      "produces_fact_ids": [
+        "local_election_vote_enqueued"
+      ],
+      "consumes_fact_ids": [
+        "vote_storage_calls_succeeded"
+      ],
+      "cross_activity_effects": {
+        "A6": "Election dispatch invokes term storage and local vote storage before publishing the local granted result."
+      },
+      "existing_protections": [
+        "Voter filtering.",
+        "Local granted-result publication follows successful return from persistVote.",
+        "Response buffering is sized from the configured server list."
+      ],
+      "source_ids": [
+        "raft.go:1976:2140"
+      ],
+      "unknowns": [
+        "setCurrentTerm failure behavior and storage durability remain unresolved.",
+        "Configuration validity and uniqueness are not established in this source.",
+        "Remote response production is retained as a separate deferred responsibility."
+      ]
+    },
+    {
+      "id": "prevote_campaign_dispatch",
+      "primary_activity": "A2",
+      "execution_owner": "Main-thread caller of preElectSelf, as required by its supplied comment",
+      "protocol_context": "Pre-election request construction over configurations.latest.Servers.",
+      "trigger": "runCandidate selects the pre-vote path.",
+      "legal_preconditions": [
+        "The supplied function comment requires invocation from the main thread."
+      ],
+      "implementation_guards": [
+        "Transport must implement WithPreVote or the function panics.",
+        "Only entries with Suffrage == Voter are selected."
+      ],
+      "reads": [
+        "Current term, last-entry metadata, RPC header, and configurations.latest.Servers."
+      ],
+      "writes": [
+        "A new response channel buffered to the number of configured servers.",
+        "A RequestPreVoteRequest proposing current term plus one.",
+        "A granted local result when the selected voter ID equals localID."
+      ],
+      "durable_effects": [],
+      "external_effects": [
+        "Schedules a RequestPreVote goroutine for each selected nonlocal voter."
+      ],
+      "important_branches": [
+        "The local-voter branch enqueues a grant without calling persistVote.",
+        "This function does not call setCurrentTerm.",
+        "If no selected server matches localID, no local pre-vote is enqueued."
+      ],
+      "async_boundaries": [
+        "Nonlocal requests execute in separate r.goFunc callbacks.",
+        "The local result is consumed later by runCandidate."
+      ],
+      "produces_fact_ids": [
+        "local_prevote_enqueued"
+      ],
+      "consumes_fact_ids": [],
+      "cross_activity_effects": {},
+      "existing_protections": [
+        "Explicit transport-capability check.",
+        "Voter filtering.",
+        "A separate response channel for this pre-vote invocation."
+      ],
+      "source_ids": [
+        "raft.go:1976:2140"
+      ],
+      "unknowns": [
+        "The remote compatibility fallback and transport response guarantees require separate actor-level interpretation.",
+        "No persistent vote or acquired authority is established by the local pre-vote result."
+      ]
+    },
+    {
+      "id": "persist_vote_storage_sequence",
+      "primary_activity": "A6",
+      "execution_owner": "Synchronous caller of Raft.persistVote",
+      "protocol_context": "Writing the last-vote term and candidate through the selected stable store.",
+      "trigger": "persistVote(term, candidate) is called.",
+      "legal_preconditions": [],
+      "implementation_guards": [
+        "The candidate write is attempted only if SetUint64(keyLastVoteTerm, term) returns nil."
+      ],
+      "reads": [
+        "Supplied term and candidate bytes.",
+        "Selected r.stable implementation."
+      ],
+      "writes": [
+        "keyLastVoteTerm through SetUint64.",
+        "keyLastVoteCand through Set."
+      ],
+      "durable_effects": [
+        "Requests two sequential stable-store writes; actual crash durability and atomicity depend on the store implementation."
+      ],
+      "external_effects": [
+        "Returns the first encountered storage error or nil after both calls return nil."
+      ],
+      "important_branches": [
+        "First-write error prevents the second call.",
+        "Second-write error is returned without an explicit rollback in this helper."
+      ],
+      "async_boundaries": [],
+      "produces_fact_ids": [
+        "vote_storage_calls_succeeded"
+      ],
+      "consumes_fact_ids": [],
+      "cross_activity_effects": {
+        "A2": "Its successful return permits electSelf to enqueue the local granted vote."
+      },
+      "existing_protections": [
+        "Both storage calls are checked for errors.",
+        "Errors propagate to the caller."
+      ],
+      "source_ids": [
+        "raft.go:1976:2140"
+      ],
+      "unknowns": [
+        "The selected stable-store variant, failed-write effects, crash consistency, and recovery readers are not attached.",
+        "Successful return alone does not establish an atomic durable term-and-candidate record."
+      ]
+    },
+    {
+      "id": "network_append_rpc",
+      "primary_activity": "A1",
+      "execution_owner": "Calling goroutine executing NetworkTransport.AppendEntries and genericRPC",
+      "protocol_context": "One synchronous AppendEntries transport exchange",
+      "trigger": "AppendEntries(id, target, args, resp)",
+      "legal_preconditions": [],
+      "implementation_guards": [
+        "Connection acquisition must succeed.",
+        "A positive configured timeout installs a connection deadline."
+      ],
+      "reads": [
+        "ServerID, target address, request, timeout, and connection codec state"
+      ],
+      "writes": [
+        "Encoded request on the connection",
+        "Decoded response into the caller-provided response object"
+      ],
+      "durable_effects": [],
+      "external_effects": [
+        "Sends an AppendEntries RPC and returns a transport or remote RPC error."
+      ],
+      "important_branches": [
+        "Connection acquisition or send failure returns immediately.",
+        "Response error-string or payload decoding failure releases the connection.",
+        "A decoded nonempty remote error returns an error even though the payload was decoded.",
+        "Successfully decoded exchanges permit connection reuse, including exchanges carrying a remote error.",
+        "The wrapper does not inspect protocol response fields before returning."
+      ],
+      "async_boundaries": [
+        "Network request and response exchange"
+      ],
+      "produces_fact_ids": [
+        "network_append_response_decoded"
+      ],
+      "consumes_fact_ids": [],
+      "cross_activity_effects": {},
+      "existing_protections": [
+        "Configured connection deadline",
+        "Release on encoding, flushing, or decoding failure",
+        "Connection pool insertion checks shutdown and pool capacity"
+      ],
+      "source_ids": [
+        "net_transport.go:430:530",
+        "net_transport.go:780:912"
+      ],
+      "unknowns": [
+        "Address-provider selection and connection acquisition internals are not supplied.",
+        "Protocol consumers and their interpretation of response fields are unread."
+      ]
+    },
+    {
+      "id": "network_append_dispatch",
+      "primary_activity": "A1",
+      "execution_owner": "Inbound connection handler executing NetworkTransport.handleCommand",
+      "protocol_context": "Decoded inbound AppendEntries request on one connection",
+      "trigger": "handleConn reads an rpcAppendEntries command",
+      "legal_preconditions": [],
+      "implementation_guards": [
+        "Request decoding must succeed.",
+        "Heartbeat classification requires nonzero Term, nonnil selected leader address, zero PrevLogEntry and PrevLogTerm, no Entries, and zero LeaderCommitIndex.",
+        "The selected leader address is RPCHeader.Addr, falling back to Leader when the header address has zero length."
+      ],
+      "reads": [
+        "Decoded request fields",
+        "heartbeatFn under heartbeatFnLock",
+        "shutdownCh",
+        "Per-request response channel"
+      ],
+      "writes": [
+        "RPC.Command and a buffered per-request response channel",
+        "Encoded response error string and response payload"
+      ],
+      "durable_effects": [],
+      "external_effects": [
+        "Invokes the registered heartbeat callback directly when the predicate matches and a callback exists.",
+        "Otherwise sends the RPC to consumeCh.",
+        "Encodes the handler-provided response, then handleConn flushes it."
+      ],
+      "important_branches": [
+        "SetHeartbeatHandler replaces the callback under the same lock used to retrieve it.",
+        "The callback runs after releasing heartbeatFnLock.",
+        "A classified heartbeat without a callback follows ordinary channel dispatch.",
+        "Channel dispatch and response waiting can terminate on transport shutdown.",
+        "The direct callback invocation has no enclosing shutdown select.",
+        "Encoding or flushing failure ends the connection handler."
+      ],
+      "async_boundaries": [
+        "Handoff to consumeCh or callback-owned processing",
+        "Waiting for RPCResponse on the request-specific channel",
+        "Network response flush"
+      ],
+      "produces_fact_ids": [],
+      "consumes_fact_ids": [],
+      "cross_activity_effects": {},
+      "existing_protections": [
+        "Synchronized callback registration and retrieval",
+        "Per-request buffered response channel",
+        "Sequential command processing and response flushing within each connection"
+      ],
+      "source_ids": [
+        "transport.go:1:80",
+        "net_transport.go:280:320",
+        "net_transport.go:600:780"
+      ],
+      "unknowns": [
+        "The registered callback and ordinary protocol consumer are unread.",
+        "Dispatch and response serialization do not establish the meaning of protocol acceptance or contact updates.",
+        "Stream-context cancellation is checked between commands; interruption of an already executing callback depends on unread callback behavior."
+      ]
+    },
+    {
+      "id": "network_pipeline_submit",
+      "primary_activity": "A1",
+      "execution_owner": "Caller executing NetworkTransport.AppendEntriesPipeline and netPipeline.AppendEntries",
+      "protocol_context": "AppendEntries pipeline over one acquired connection",
+      "trigger": "Pipeline construction followed by submission of an AppendEntries request",
+      "legal_preconditions": [],
+      "implementation_guards": [
+        "Pipeline construction rejects maxInFlight below minInFlightForPipelining.",
+        "Connection acquisition must succeed.",
+        "A positive timeout installs a write deadline for submission."
+      ],
+      "reads": [
+        "maxInFlight",
+        "Request and response pointers",
+        "Transport timeout",
+        "Pipeline shutdown channel"
+      ],
+      "writes": [
+        "Future start time and retained request and response pointers",
+        "Encoded request on the connection",
+        "Future handed to inprogressCh"
+      ],
+      "durable_effects": [],
+      "external_effects": [
+        "Flushes the encoded request before attempting the decoder handoff.",
+        "Returns a future after successful handoff."
+      ],
+      "important_branches": [
+        "Construction allocates inprogressCh and doneCh with capacity maxInFlight minus two and starts decodeResponses.",
+        "Send failure returns no future.",
+        "After successful send, submission can block on inprogressCh.",
+        "Shutdown selected during handoff returns ErrPipelineShutdown even though sendRPC already succeeded."
+      ],
+      "async_boundaries": [
+        "Network transmission",
+        "inprogressCh handoff to the decoder goroutine"
+      ],
+      "produces_fact_ids": [
+        "network_pipeline_submitted"
+      ],
+      "consumes_fact_ids": [],
+      "cross_activity_effects": {},
+      "existing_protections": [
+        "Minimum pipeline concurrency check",
+        "Bounded handoff channel providing backpressure",
+        "Configured write deadline",
+        "Send failure releases the connection"
+      ],
+      "source_ids": [
+        "net_transport.go:430:530",
+        "net_transport.go:780:912"
+      ],
+      "unknowns": [
+        "Caller serialization and concurrent submission expectations are unread.",
+        "Future initialization implementation is unread.",
+        "Successful flushing does not establish remote receipt or protocol acceptance."
+      ]
+    },
+    {
+      "id": "network_pipeline_decode",
+      "primary_activity": "A1",
+      "execution_owner": "netPipeline.decodeResponses goroutine",
+      "protocol_context": "Ordered response processing on a pipeline connection",
+      "trigger": "Receipt of a future from inprogressCh",
+      "legal_preconditions": [],
+      "implementation_guards": [
+        "A positive timeout installs a read deadline."
+      ],
+      "reads": [
+        "Future response pointer",
+        "Connection response stream",
+        "Pipeline shutdown channel"
+      ],
+      "writes": [
+        "Decoded payload into future.resp",
+        "Calls future.respond with the decoding or remote error",
+        "Sends the future to doneCh when selected"
+      ],
+      "durable_effects": [],
+      "external_effects": [
+        "Exposes delivered futures through Consumer."
+      ],
+      "important_branches": [
+        "Decoding failures release the connection.",
+        "A decoded remote error is passed to future.respond.",
+        "The decoder ignores decodeResponse's connection-reuse result.",
+        "Shutdown can terminate the loop before selecting a queued future or before delivering a processed future.",
+        "The loop has no explicit error-triggered exit after future.respond."
+      ],
+      "async_boundaries": [
+        "inprogressCh receive",
+        "Network response decoding",
+        "Future notification through an unread implementation",
+        "doneCh delivery"
+      ],
+      "produces_fact_ids": [
+        "network_append_response_decoded",
+        "network_pipeline_future_delivered"
+      ],
+      "consumes_fact_ids": [
+        "network_pipeline_submitted"
+      ],
+      "cross_activity_effects": {},
+      "existing_protections": [
+        "One decoder goroutine processes handed-off futures sequentially.",
+        "Configured read deadline",
+        "Shutdown alternative while delivering completed processing"
+      ],
+      "source_ids": [
+        "net_transport.go:780:912",
+        "transport.go:81:141"
+      ],
+      "unknowns": [
+        "The implementation of future.respond and Future.Error is unread; their synchronization and repeated-call behavior are not established.",
+        "Caller-owned request and response pointer lifetimes are unread.",
+        "Protocol consumers of delivered futures are unread."
+      ]
+    },
+    {
+      "id": "network_pipeline_close",
+      "primary_activity": "A1",
+      "execution_owner": "Caller executing netPipeline.Close",
+      "protocol_context": "Shutdown of one network AppendEntries pipeline",
+      "trigger": "Close()",
+      "legal_preconditions": [],
+      "implementation_guards": [
+        "shutdownLock serializes Close calls.",
+        "An already-set shutdown flag causes an immediate nil return."
+      ],
+      "reads": [
+        "Pipeline shutdown flag"
+      ],
+      "writes": [
+        "Sets shutdown to true",
+        "Closes shutdownCh"
+      ],
+      "durable_effects": [],
+      "external_effects": [
+        "Calls connection Release before publishing shutdown."
+      ],
+      "important_branches": [
+        "Repeated Close calls return without closing shutdownCh again.",
+        "Close does not explicitly drain pending futures or close doneCh in the supplied implementation."
+      ],
+      "async_boundaries": [
+        "Connection release can interact with active I/O.",
+        "Shutdown channel wakes submission and decoder select statements."
+      ],
+      "produces_fact_ids": [],
+      "consumes_fact_ids": [],
+      "cross_activity_effects": {},
+      "existing_protections": [
+        "Serialized, idempotent shutdown publication"
+      ],
+      "source_ids": [
+        "net_transport.go:780:912",
+        "transport.go:81:141"
+      ],
+      "unknowns": [
+        "The AppendPipeline interface describes cancellation of all inflight RPCs; terminal observability for each pending future requires the unread future implementation and actual caller lifecycle.",
+        "Connection Release internals are not supplied."
+      ]
+    }
+  ],
+  "facts": [
+    {
+      "id": "F1",
+      "meaning": "A particular newly created command or barrier future was sent on this Raft instance's applyCh; this establishes enqueueing only.",
+      "identity": {
+        "request": "logFuture object",
+        "instance": "Raft instance"
+      },
+      "established_by": [
+        "B1"
+      ],
+      "consumed_by": [],
+      "validity_context": "Successful send branch of ApplyLog or Barrier.",
+      "representation": [
+        "Returned logFuture",
+        "applyCh handoff"
+      ],
+      "invalidators": [],
+      "reinterpreters": [],
+      "durability": "Volatile.",
+      "recovery": "No recovery of enqueueing is shown.",
+      "source_ids": [
+        "api.go:800:898"
+      ],
+      "unknowns": [
+        "Actual consumers other than the observed candidate rejection path",
+        "No commitment or application assertion follows from this fact"
+      ]
+    },
+    {
+      "id": "F2",
+      "meaning": "StoreLogs returned nil for the exact batch assigned by dispatchLogs, before the corresponding local match report.",
+      "identity": {
+        "batch": "Assigned log indexes and term",
+        "store": "Selected r.logs instance"
+      },
+      "established_by": [
+        "B2"
+      ],
+      "consumed_by": [
+        "B3"
+      ],
+      "validity_context": "Successful StoreLogs branch in the current dispatch invocation.",
+      "representation": [
+        "Nil StoreLogs result",
+        "Subsequent local commitment.match call"
+      ],
+      "invalidators": [],
+      "reinterpreters": [],
+      "durability": "Acknowledgement is observed; stable-storage meaning is unknown until the selected store contract is read.",
+      "recovery": "Startup log reconstruction is unread.",
+      "source_ids": [
+        "raft.go:1203:1291"
+      ],
+      "unknowns": [
+        "Selected store's crash and partial-write semantics",
+        "Remote storage acknowledgements are not covered"
+      ]
+    },
+    {
+      "id": "F3",
+      "meaning": "At an advancement event, the current voter-map order statistic exceeded the previous commitIndex and reached startIndex, and commitment stored that value as commitIndex.",
+      "identity": {
+        "tracker": "commitment object",
+        "event": "Specific recalculation and voter-map contents",
+        "index": "Advanced commitIndex"
+      },
+      "established_by": [
+        "B3",
+        "B4"
+      ],
+      "consumed_by": [],
+      "validity_context": "Mutex-protected recalculation at advancement; this is an arithmetic assertion about reported progress, not independent proof of disk agreement.",
+      "representation": [
+        "commitIndex",
+        "matchIndexes",
+        "commitCh notification"
+      ],
+      "invalidators": [],
+      "reinterpreters": [
+        "B4"
+      ],
+      "durability": "Volatile leader-local state.",
+      "recovery": "Constructor comments describe a fresh commitment object per leadership term; caller implementation is unread.",
+      "source_ids": [
+        "commitment.go:1:104"
+      ],
+      "unknowns": [
+        "Remote report validity",
+        "Consumer interpretation of commitIndex",
+        "Configuration replacement can change the current voter map without decreasing the retained index"
+      ]
+    },
+    {
+      "id": "F4",
+      "meaning": "For a command tuple whose associated future is completed by the shown FSM handlers, the selected Apply or ApplyBatch callback returned and the corresponding response was assigned before respond(nil).",
+      "identity": {
+        "tuple": "Command log index, term, and associated future",
+        "callback": "Selected FSM application invocation"
+      },
+      "established_by": [
+        "B6"
+      ],
+      "consumed_by": [],
+      "validity_context": "Normal callback return, with valid batch response count when batching is enabled.",
+      "representation": [
+        "Future response",
+        "future.respond(nil)"
+      ],
+      "invalidators": [],
+      "reinterpreters": [],
+      "durability": "Callback completion does not independently establish durable application state.",
+      "recovery": "Application restoration is a separate path.",
+      "source_ids": [
+        "fsm.go:81:240"
+      ],
+      "unknowns": [
+        "Upstream commitment establishment",
+        "Client future visibility implementation",
+        "Application result semantics"
+      ]
+    },
+    {
+      "id": "F5",
+      "meaning": "FSM.Snapshot returned successfully and its capture object was associated with the FSM handler's current local index and term.",
+      "identity": {
+        "capture": "reqSnapshotFuture and returned FSMSnapshot",
+        "position": "req.index and req.term"
+      },
+      "established_by": [
+        "B7"
+      ],
+      "consumed_by": [
+        "B8"
+      ],
+      "validity_context": "Nonzero FSM-local index and successful Snapshot callback.",
+      "representation": [
+        "reqSnapshotFuture.snapshot",
+        "reqSnapshotFuture.index",
+        "reqSnapshotFuture.term"
+      ],
+      "invalidators": [],
+      "reinterpreters": [],
+      "durability": "Not persisted by capture alone.",
+      "recovery": "Requires later persistence and recovery selection, which are separate responsibilities.",
+      "source_ids": [
+        "fsm.go:1:80",
+        "fsm.go:81:240"
+      ],
+      "unknowns": [
+        "Whether the application capture correctly represents and preserves the associated state"
+      ]
+    },
+    {
+      "id": "F6",
+      "meaning": "This FileSnapshotSink has entered the closed state; subsequent Close or Cancel calls return nil without redoing finalization.",
+      "identity": {
+        "sink": "FileSnapshotSink object"
+      },
+      "established_by": [
+        "B9"
+      ],
+      "consumed_by": [],
+      "validity_context": "Close has passed its initial closed check and assigned closed=true. This fact does not assert successful publication.",
+      "representation": [
+        "s.closed"
+      ],
+      "invalidators": [],
+      "reinterpreters": [
+        "B9"
+      ],
+      "durability": "In-memory flag; file effects may be partial.",
+      "recovery": "No reconstruction of the flag is shown.",
+      "source_ids": [
+        "file_snapshot.go:397:500"
+      ],
+      "unknowns": [
+        "Cancel can also establish the flag; its behavior is not separately mapped.",
+        "Caller interpretation of repeated Close results",
+        "Snapshot usability after each failing publication stage"
+      ]
+    },
+    {
+      "id": "F7",
+      "meaning": "The FSM restore handler opened the requested snapshot, obtained a nil result from fsmRestoreAndMeasure, adopted the opened metadata's index and term, and responded nil.",
+      "identity": {
+        "request": "restoreFuture and snapshot ID",
+        "metadata": "Index and term returned by snapshots.Open"
+      },
+      "established_by": [
+        "B10"
+      ],
+      "consumed_by": [
+        "B11"
+      ],
+      "validity_context": "Successful restore closure path; the helper and application semantics remain dependencies.",
+      "representation": [
+        "FSM-local lastIndex and lastTerm",
+        "Successful restore future"
+      ],
+      "invalidators": [],
+      "reinterpreters": [],
+      "durability": "Acknowledged restore and volatile position update; application durability is unspecified.",
+      "recovery": "This is a restore acknowledgement boundary, not evidence of successful later restart.",
+      "source_ids": [
+        "fsm.go:81:240"
+      ],
+      "unknowns": [
+        "Restore helper implementation",
+        "Opened metadata correspondence to installSnapshot request",
+        "Startup restore consumers"
+      ]
+    },
+    {
+      "id": "vote_storage_calls_succeeded",
+      "meaning": "For this persistVote invocation, the term write and then the candidate write both returned nil.",
+      "identity": {
+        "invocation": "Specific persistVote call",
+        "values": "Supplied term and candidate bytes"
+      },
+      "established_by": [
+        "persist_vote_storage_sequence"
+      ],
+      "consumed_by": [
+        "election_campaign_dispatch"
+      ],
+      "validity_context": "A historical assertion about the completed calls, not a guarantee of current contents, atomicity, or crash durability.",
+      "representation": [
+        "nil return from persistVote"
+      ],
+      "invalidators": [],
+      "reinterpreters": [],
+      "durability": "The assertion concerns API completion; storage persistence semantics are unresolved.",
+      "recovery": "Recovery consumers are not attached.",
+      "source_ids": [
+        "raft.go:1976:2140"
+      ],
+      "unknowns": [
+        "Other callers and storage implementations remain unexamined."
+      ]
+    },
+    {
+      "id": "local_election_vote_enqueued",
+      "meaning": "electSelf enqueued a local Granted=true result after persistVote returned nil for the request term and RPCHeader.Addr.",
+      "identity": {
+        "campaign": "Specific electSelf response channel",
+        "voter": "r.localID",
+        "term": "req.Term"
+      },
+      "established_by": [
+        "election_campaign_dispatch"
+      ],
+      "consumed_by": [
+        "candidate_campaign_control"
+      ],
+      "validity_context": "The selected configuration entry has Voter suffrage and matches localID. This is a local result-publication assertion.",
+      "representation": [
+        "voteResult containing voterID=localID, Term=req.Term, and Granted=true"
+      ],
+      "invalidators": [],
+      "reinterpreters": [],
+      "durability": "The queued result is volatile; the preceding storage-call success has separately bounded meaning.",
+      "recovery": "No recovery of this channel result is shown.",
+      "source_ids": [
+        "raft.go:1976:2140",
+        "raft.go:285:441"
+      ],
+      "unknowns": [
+        "Durable self-vote recovery and configuration uniqueness are not established."
+      ]
+    },
+    {
+      "id": "local_prevote_enqueued",
+      "meaning": "preElectSelf enqueued a local Granted=true result for its proposed next term without persisting a vote in this function.",
+      "identity": {
+        "campaign": "Specific preElectSelf response channel",
+        "voter": "r.localID",
+        "term": "req.Term"
+      },
+      "established_by": [
+        "prevote_campaign_dispatch"
+      ],
+      "consumed_by": [
+        "candidate_campaign_control"
+      ],
+      "validity_context": "The selected configuration entry has Voter suffrage and matches localID. The result contributes to a pre-vote tally only.",
+      "representation": [
+        "preVoteResult containing voterID=localID, Term=req.Term, and Granted=true"
+      ],
+      "invalidators": [],
+      "reinterpreters": [],
+      "durability": "Volatile channel result.",
+      "recovery": "No recovery mechanism for the result is shown.",
+      "source_ids": [
+        "raft.go:1976:2140",
+        "raft.go:285:441"
+      ],
+      "unknowns": [
+        "The result does not establish a remote vote, persistent election vote, or completed authority transition."
+      ]
+    },
+    {
+      "id": "network_pipeline_submitted",
+      "meaning": "For a submission returning a nonnil future and nil error, sendRPC completed its encoding and flush, and that future was handed to inprogressCh. This establishes neither a received response nor remote acceptance.",
+      "identity": {
+        "pipeline": "The particular netPipeline instance and connection",
+        "submission": "The appendFuture allocated for this invocation, retaining its request and response pointers"
+      },
+      "established_by": [
+        "network_pipeline_submit"
+      ],
+      "consumed_by": [
+        "network_pipeline_decode"
+      ],
+      "validity_context": "Historical submission event for this future; it does not promise eventual delivery after shutdown.",
+      "representation": [
+        "Successful AppendEntries return",
+        "Future transferred through inprogressCh"
+      ],
+      "invalidators": [],
+      "reinterpreters": [],
+      "durability": "Volatile local event; no persistence is performed here.",
+      "recovery": "No reconstruction mechanism is shown.",
+      "source_ids": [
+        "net_transport.go:780:912"
+      ],
+      "unknowns": [
+        "Request pointer retention is not an immutable capture of its contents.",
+        "Caller consumption and retry interpretation remain unread."
+      ]
+    },
+    {
+      "id": "network_append_response_decoded",
+      "meaning": "When decodeResponse returns nil error for an AppendEntries exchange, both the remote error string and response payload were decoded, and the error string was empty. No protocol response-field predicate is checked by decodeResponse.",
+      "identity": {
+        "exchange": "The response decode position on the selected connection",
+        "response_destination": "The caller response pointer or selected future.resp"
+      },
+      "established_by": [
+        "network_append_rpc",
+        "network_pipeline_decode"
+      ],
+      "consumed_by": [],
+      "validity_context": "Successful decode event; response meaning depends on unread protocol handlers and consumers. Pipeline correlation is positional through the handed-off future order.",
+      "representation": [
+        "decodeResponse nil error",
+        "Decoded AppendEntriesResponse object"
+      ],
+      "invalidators": [],
+      "reinterpreters": [],
+      "durability": "Volatile response data; no durable acceptance is established.",
+      "recovery": "No recovery of this transport observation is shown.",
+      "source_ids": [
+        "net_transport.go:430:530",
+        "net_transport.go:780:912"
+      ],
+      "unknowns": [
+        "Actual protocol consumers and their context checks are unread.",
+        "Pipeline caller serialization and response-object reuse constraints are unread."
+      ]
+    },
+    {
+      "id": "network_pipeline_future_delivered",
+      "meaning": "A future received from doneCh has undergone one decodeResponse attempt and a preceding call to future.respond with that attempt's error. Delivery can represent success or failure.",
+      "identity": {
+        "pipeline": "The netPipeline supplying Consumer",
+        "future": "The particular appendFuture received from doneCh"
+      },
+      "established_by": [
+        "network_pipeline_decode"
+      ],
+      "consumed_by": [],
+      "validity_context": "Successful delivery through doneCh; this does not assert that every submitted future will be delivered.",
+      "representation": [
+        "AppendFuture value received through Consumer"
+      ],
+      "invalidators": [],
+      "reinterpreters": [],
+      "durability": "Volatile channel delivery.",
+      "recovery": "No reconstruction or replay of delivered futures is shown.",
+      "source_ids": [
+        "net_transport.go:780:912",
+        "transport.go:81:141"
+      ],
+      "unknowns": [
+        "Future.Error synchronization is unread.",
+        "The interface requires Error to return before Response is used and limits response validity to success; caller compliance is unread.",
+        "Protocol-level progress or contact consumers are unread."
+      ]
+    }
+  ],
+  "surfaces": [
+    {
+      "entry_point": "Apply / ApplyLog / Barrier",
+      "disposition": "mapped",
+      "behavior_ids": [
+        "B1"
+      ],
+      "reason": "Admission is mapped; end-to-end completion remains partial.",
+      "source_ids": [
+        "api.go:800:898"
+      ],
+      "high_consequence": true
+    },
+    {
+      "entry_point": "dispatchLogs / commitment.match / recalculate",
+      "disposition": "mapped",
+      "behavior_ids": [
+        "B2",
+        "B3"
+      ],
+      "reason": "Local store acknowledgement and commitment arithmetic are mapped; remote reports and commit consumers are deferred.",
+      "source_ids": [
+        "raft.go:1203:1291",
+        "commitment.go:1:104"
+      ],
+      "high_consequence": true
+    },
+    {
+      "entry_point": "appendConfigurationEntry / commitment.setConfiguration",
+      "disposition": "mapped",
+      "behavior_ids": [
+        "B4",
+        "B5"
+      ],
+      "reason": "Configuration dispatch and voter replacement are mapped, with admission and failure continuation unresolved.",
+      "source_ids": [
+        "raft.go:1203:1291",
+        "commitment.go:1:104"
+      ],
+      "high_consequence": true
+    },
+    {
+      "entry_point": "runFSM application closures",
+      "disposition": "mapped",
+      "behavior_ids": [
+        "B6"
+      ],
+      "reason": "Callback filtering, response association, and local position updates are observed.",
+      "source_ids": [
+        "fsm.go:81:240"
+      ],
+      "high_consequence": true
+    },
+    {
+      "entry_point": "runFSM snapshot / takeSnapshot",
+      "disposition": "mapped",
+      "behavior_ids": [
+        "B7",
+        "B8"
+      ],
+      "reason": "Capture and persistence coordination are mapped without asserting publication usability.",
+      "source_ids": [
+        "fsm.go:81:240",
+        "snapshot.go:125:278"
+      ],
+      "high_consequence": true
+    },
+    {
+      "entry_point": "FileSnapshotSink.Close",
+      "disposition": "mapped",
+      "behavior_ids": [
+        "B9"
+      ],
+      "reason": "Close lifecycle is mapped; metadata, opening, and retention dependencies remain unread.",
+      "source_ids": [
+        "file_snapshot.go:397:500"
+      ],
+      "high_consequence": true
+    },
+    {
+      "entry_point": "installSnapshot / runFSM restore",
+      "disposition": "mapped",
+      "behavior_ids": [
+        "B10",
+        "B11"
+      ],
+      "reason": "Restore acknowledgement and subsequent metadata adoption are distinct mapped behaviors.",
+      "source_ids": [
+        "raft.go:1814:1955",
+        "fsm.go:81:240"
+      ],
+      "high_consequence": true
+    },
+    {
+      "entry_point": "Raft.VerifyLeader",
+      "disposition": "deferred",
+      "behavior_ids": [],
+      "reason": "Only future enqueueing is supplied; verification response aggregation and completion are unknown.",
+      "source_ids": [
+        "api.go:800:898"
+      ],
+      "high_consequence": true
+    },
+    {
+      "entry_point": "Startup / bootstrap / snapshot recovery",
+      "disposition": "deferred",
+      "behavior_ids": [],
+      "reason": "Reconstruction and adapter selection are necessary recovery boundaries absent from supplied implementation ranges.",
+      "source_ids": [
+        "docs/README.md:1:80",
+        "api.go:1:80"
+      ],
+      "high_consequence": true
+    },
+    {
+      "entry_point": "compactLogsWithTrailing / removeOldLogs / FileSnapshotSink.Cancel",
+      "disposition": "deferred",
+      "behavior_ids": [],
+      "reason": "Deletion code is visible, but independent lifecycle mapping and store failure semantics remain incomplete.",
+      "source_ids": [
+        "snapshot.go:125:278",
+        "file_snapshot.go:397:500"
+      ],
+      "high_consequence": true
+    },
+    {
+      "entry_point": "Application FSM implementation",
+      "disposition": "externalized",
+      "behavior_ids": [],
+      "reason": "The library defines callback contracts; the selected application's deterministic transitions and snapshot implementation are not supplied.",
+      "source_ids": [
+        "fsm.go:1:80"
+      ],
+      "high_consequence": true
+    },
+    {
+      "entry_point": "Observer delivery",
+      "disposition": "deferred",
+      "behavior_ids": [],
+      "reason": "Blocking and filtering options are visible, but actual send ownership and progress effects are unread.",
+      "source_ids": [
+        "observer.go:1:80"
+      ],
+      "high_consequence": false
+    },
+    {
+      "entry_point": "runCandidate / electSelf / preElectSelf: synchronous campaign control and local votes",
+      "disposition": "mapped",
+      "behavior_ids": [
+        "candidate_campaign_control",
+        "election_campaign_dispatch",
+        "prevote_campaign_dispatch",
+        "persist_vote_storage_sequence"
+      ],
+      "reason": "Attached implementations support local dispatch, tally branches, self-result publication, client handling, and the sequential persistence helper. Mapping does not resolve called transition helpers or remote response guarantees.",
+      "source_ids": [
+        "raft.go:285:441",
+        "raft.go:1976:2140"
+      ],
+      "high_consequence": true
+    },
+    {
+      "entry_point": "electSelf / preElectSelf: remote response production and transition-helper semantics",
+      "disposition": "deferred",
+      "behavior_ids": [],
+      "reason": "Separately interpret remote goroutine results, including RequestVote error-to-refusal conversion and RequestPreVote unsupported-command error-to-grant conversion. Resolve transport correlation and the quorumSize, setCurrentTerm, setState, and setLeader declarations before asserting stronger support, durability, or completed-transition facts. The remote callback bodies are already attached; helper implementations require focused reading.",
+      "source_ids": [
+        "raft.go:285:441",
+        "raft.go:1976:2140"
+      ],
+      "high_consequence": true
+    },
+    {
+      "entry_point": "NetworkTransport.AppendEntries / AppendEntriesPipeline / SetHeartbeatHandler",
+      "disposition": "mapped",
+      "behavior_ids": [
+        "network_append_rpc",
+        "network_append_dispatch",
+        "network_pipeline_submit",
+        "network_pipeline_decode",
+        "network_pipeline_close"
+      ],
+      "reason": "The supplied network implementation supports a bounded mapping of synchronous exchange, heartbeat routing, pipeline handoff, response processing, and shutdown. Protocol acceptance and caller interpretation remain explicit unknowns.",
+      "source_ids": [
+        "transport.go:1:80",
+        "transport.go:81:141",
+        "net_transport.go:280:320",
+        "net_transport.go:430:530",
+        "net_transport.go:600:780",
+        "net_transport.go:780:912"
+      ],
+      "high_consequence": true
+    },
+    {
+      "entry_point": "InmemTransport.AppendEntries / AppendEntriesPipeline / SetHeartbeatHandler",
+      "disposition": "deferred",
+      "behavior_ids": [],
+      "reason": "Registration is a no-op. AppendEntries delegates to unread makeRPC and copies the returned response after nil error. Pipeline creation checks peers[target] under a lock, then delegates to unread newInmemPipeline. Recover makeRPC and inmemPipeline submission, completion, and shutdown before assigning transport-completion facts to this variant.",
+      "source_ids": [
+        "inmem_transport.go:60:125",
+        "transport.go:1:80",
+        "transport.go:81:141"
+      ],
+      "high_consequence": true
+    }
+  ]
+}
