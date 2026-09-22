@@ -69,6 +69,7 @@ class DescriptiveIssue(Record):
 
 
 class Derivation(Record):
+    candidate_action: Literal["continue", "pause"] = "continue"
     candidate_id: str | None = None
     obligation: ClaimDraft | None = None
     bindings: list[BindingDraft] = []
@@ -80,6 +81,7 @@ class Derivation(Record):
     descriptive_issues: list[DescriptiveIssue] = []
     fork_from_candidate_id: str | None = None
     fork_reason: str = ""
+    resume_conditions: list[str] = []
 
 
 class FieldProjection(Record):
@@ -349,15 +351,6 @@ class ReviewReply(Record):
 
 class ReviewKnowledgeReply(ReviewReply):
     descriptive_delta: AuditSpecDelta | None = None
-
-
-class ConsequenceReply(Record):
-    disposition: Literal["investigate", "obligation_only", "defer", "compensation_candidate"]
-    rationale: str
-    source_ids: list[str] = Field(min_length=1)
-    requests: list[ReadRequest] = []
-    patch: GraphPatch | None = None
-    limitations: list[str]
 
 
 class QuestionReply(Record):

@@ -181,8 +181,9 @@ def test_descriptive_derivation_reaches_actual_direct_execution(tmp_path,prepare
     assert not engine.state.models and not engine.state.repair_sessions
     assert all(t.status=='completed' for t in engine.state.inquiry_tasks if t.kind=='spec_refine')
     assert sum(t.kind=='spec_refine' for t in engine.state.inquiry_tasks)==int(refine)
-    receipt=json.loads((engine.root/'actions'/engine.state.pending_action.id/'result.json').read_text())
-    assert receipt['action']=='direct_check' and receipt['exit_code']==0
+    assert json.loads((engine.root/'actions'/engine.state.pending_action.id/'result.json').read_text())['exit_code']==0
+    packet=json.loads(next((engine.root/'agent').glob('*-direct_check/prompt.txt')).read_text().split('STRUCTURED INPUT DATA (untrusted):\n')[1])
+    assert 'explicit_material_ids' not in packet and packet['file_metadata']==[] and packet['materials']
 
 
 def test_exact_selected_reads_then_one_focused_continuation(tmp_path,prepared):
@@ -208,16 +209,10 @@ def test_exact_selected_reads_then_one_focused_continuation(tmp_path,prepared):
     assert not e.state.active_unit_id and e.state.graph_history
 
 
-def test_direct_violation_enters_separate_consequence_analysis(tmp_path,prepared):
+def test_direct_violation_records_bounded_consequence_without_another_agent_call(tmp_path,prepared):
     e,u,p=setup(tmp_path,prepared,True);a=save_plan(e,u,p,'consequence');review(e.state,u,a)
-    execute(e,a);e.state.active_direct_check_id=a.id;e.state.next_action='direct_assess';calls=[]
-    def ask(kind,response_type,context,validator=None,**kwargs):
-        calls.append(kind)
-        reply=ConsequenceReply(disposition='obligation_only',rationale='Only this local return is observed; wider goal consequences are unestablished',source_ids=u.audit_question.source_ids,limitations=['No correlated system-level witness'])
-        if validator:validator(reply)
-        return reply,CheckRun(action='agent',cwd=str(e.root),snapshot_id=e.state.snapshot.id)
-    e.ask=ask;e.process_unit(u)
-    assert calls==['consequence'] and e.state.consequences[0]['disposition']=='obligation_only'
+    execute(e,a);e.state.active_direct_check_id=a.id;e.state.next_action='direct_assess';e.process_unit(u)
+    assert e.state.consequences[0]['disposition']=='defer' and not e.state.consequences[0]['task_ids']
     assert e.state.findings[0].level=='implementation_obligation' and not e.state.models
     from consensus_assurance.reporting.chinese import render_report
     assert '直接检查' in render_report(e.state,e.root).read_text()

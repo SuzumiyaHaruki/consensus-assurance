@@ -1,5 +1,4 @@
 from pathlib import Path
-from datetime import datetime
 from consensus_assurance.core.types import ExecutionStatus
 
 STATUS = {"completed": "正常完成", "error": "执行错误", "timeout": "超时", "tool_missing": "工具缺失",
@@ -8,7 +7,6 @@ OUTCOME = {"holds": "有限范围搜索完成，无反例", "counterexample": "�
     "tests_failed": "所执行测试失败", "deadlock": "模型死锁诊断，性质检查未完成", "unknown": "结果未确定", "not_applicable": "不适用"}
 CALIBRATION = {"compatible": "有限观测轨迹可解释", "incompatible": "当前模型无法解释观测", "inconclusive": "不确定", "stale": "需重验", "not_scheduled": "未执行"}
 LEVEL = {"model": "模型层", "implementation_test": "实现实验层（不自动确认违反）", "framework_test": "mock 框架测试层", "trace_calibration": "有限轨迹校准层"}
-
 
 PROBES = {
     "agent_probe": "Codex 版本检查", "agent_capabilities": "Codex 参数检查",
@@ -82,41 +80,48 @@ def resource_lines(state):
     lines.append(f"缓存复用/重附加 {cached} 个；每包详情保留在 state.json，不重复展开。")
     interface=sum(any(d['code'].startswith('review_') for d in session.get('resolved_diagnostics',[])+session.get('diagnostics',[])) for session in state.repair_sessions.values())
     lines.append(f"复核接口修复会话 {interface}；实际 F2 语义修订 {sum(r.kind=='F2' and r.status=='applied' for r in state.revisions)}。二者不互相替代。")
-    lines += ['', '## 范围接回、复核复用与里程碑', '', '里程碑缺失不表示零耗时；离线、mock 与真实运行分开统计。']
-    for name,value in state.milestones.items():lines.append(f'- {name}：{value}')
-    lines.append(f"复核复用 {len(state.review_reuses)}；上下文准备失败 {state.usage.get('packet_preparation_failures',0)}；未发送包不计调用。")
-    acquired={id for id,p in state.read_plans.items() if p.get('scope_requested') and p['status']=='complete' and any(i['status']=='acquired' for i in p['items'])}
-    connected={u['proposal'].get('read_plan_id') for u in state.scope_updates.values() if u['status']=='accepted'} & acquired
     resources=[p['skill_resources'] for p in state.packet_receipts if p.get('skill_resources')]
+    lines += ['', '## 实际调用与材料归属', '', f"复核复用 {len(state.review_reuses)}；上下文准备失败 {state.usage.get('packet_preparation_failures',0)}；未发送包不计调用。"]
     if resources:lines.append(f"实际包加载技能清单版本：{sorted({r['manifest_version'] for r in resources})}。")
-    lines.append(f"需接回且已取得新材料的计划 {len(acquired)}；已接回 {len(connected)}；连接率 {str(len(connected))+'/'+str(len(acquired)) if acquired else '无可计算分母/历史未记录'}。这不是语义通过率或系统覆盖率。")
     sent=[p for p in state.packet_receipts if p['status'] in {'executed','accepted'} and not p.get('result_reused')]
     lines.append(f"发送源码累计 {sum(p.get('source_chars_sent',0) for p in sent)} 字符（跨调用重复计数）；schema {sum(p.get('wire_schema_bytes',0) for p in sent)} 字节；不换算 token 或费用。")
     tasks={t.id:t for t in state.inquiry_tasks};artifacts={a.id:a for a in state.direct_checks};models={m.id:m for m in state.models}
-    owners={id:('candidate',c.id) for c in state.question_candidates for id in c.check_ids}
-    owners.update({t.check_id:('candidate',t.candidate_id) if t.candidate_id else ('unit',t.unit_id) for t in state.inquiry_tasks if t.check_id and (t.candidate_id or t.unit_id)})
+    candidates={c.id:c for c in state.question_candidates}
+    def family(id):
+        seen=set()
+        while id in candidates and candidates[id].parent_candidate_id and id not in seen:
+            seen.add(id);id=candidates[id].parent_candidate_id
+        return ('problem',id)
+    obligation_owner={c.obligation_id:family(c.id) for c in state.question_candidates if c.obligation_id}
+    unit_owner={u.id:next((obligation_owner[id] for id in u.obligation_ids if id in obligation_owner),('unit',u.id)) for u in state.units}
+    owners={id:family(c.id) for c in state.question_candidates for id in c.check_ids}
+    owners.update({t.check_id:family(t.candidate_id) if t.candidate_id else unit_owner.get(t.unit_id,('unit',t.unit_id)) for t in state.inquiry_tasks if t.check_id and (t.candidate_id or t.unit_id)})
     for check in state.checks:
-        if check.direct_check_id in artifacts:owners.setdefault(check.id,('unit',artifacts[check.direct_check_id].unit_id))
-        if check.model_id in models:owners.setdefault(check.id,('unit',models[check.model_id].unit_id))
+        if check.direct_check_id in artifacts:owners.setdefault(check.id,unit_owner.get(artifacts[check.direct_check_id].unit_id,('unit',artifacts[check.direct_check_id].unit_id)))
+        if check.model_id in models:owners.setdefault(check.id,unit_owner.get(models[check.model_id].unit_id,('unit',models[check.model_id].unit_id)))
     rows={};row=lambda owner:rows.setdefault(owner,{'calls':0,'executions':0,'acquired':0,'sent':0,'result':''})
     for check in state.checks:
         owner=owners.get(check.id,('startup','shared') if check.action in PROBES else ('unknown','unattributed'));r=row(owner)
         r['calls']+=check.action=='agent' and not check.reused;r['executions']+=check.action in {'direct_check','model_check','experiment','replay'} and not check.reused
     for packet in sent:
-        task=tasks.get(packet.get('task_id'));owner=owners.get(packet.get('check_id')) or (('candidate',task.candidate_id) if task and task.candidate_id else ('unit',task.unit_id) if task and task.unit_id else ('unit',packet['unit_id']) if packet.get('unit_id') else ('unknown','unattributed') if task else ('startup','shared'))
+        task=tasks.get(packet.get('task_id'));owner=owners.get(packet.get('check_id')) or (family(task.candidate_id) if task and task.candidate_id else unit_owner.get(task.unit_id,('unit',task.unit_id)) if task and task.unit_id else unit_owner.get(packet.get('unit_id'),('unit',packet['unit_id'])) if packet.get('unit_id') else ('unknown','unattributed') if task else ('startup','shared'))
         row(owner)['sent']+=packet.get('source_chars_sent',0)
-    seen=set()
+    allocations=iter(state.material_allocations)
+    row(('startup','shared'))['acquired']=max(0,used['unique_chars']-sum(a.get('new_chars',0) for a in state.material_allocations))
     for history in state.reading_history:
-        related=history.get('related_ids',[]);owner=next((('candidate',x) for x in related if any(c.id==x for c in state.question_candidates)),None) or next((('unit',x) for x in related if any(u.id==x for u in state.units)),None) or (('unknown','unattributed') if related else ('startup','shared'))
-        for id in history.get('added_material_ids',[]):
-            if id not in seen:row(owner)['acquired']+=len(next((m.text for m in state.materials if m.id==id),''));seen.add(id)
+        related=history.get('related_ids',[]);owner=next((family(x) for x in related if x in candidates),None) or next((unit_owner[x] for x in related if x in unit_owner),None) or (('unknown','unattributed') if related else ('startup','shared'))
+        for _ in history.get('added_material_ids',[]):
+            row(owner)['acquired']+=next(allocations,{}).get('new_chars',0)
     for candidate in state.question_candidates:
         view=__import__('consensus_assurance.workflow.task_view',fromlist=['candidate_view']).candidate_view(state,candidate);result=view['current_result']
-        row(('candidate',candidate.id))['result']=(f"{result['outcome']}; blockers={len(result['blockers'])}; boundaries={len(result['boundaries'])}" if result else candidate.status)
-    for unit in state.units:row(('unit',unit.id))['result']='blocked' if any(r.get('bounded_complete') and r.get('blockers') and any(a.unit_id==unit.id and a.id==r.get('direct_check_id') for a in state.direct_checks) for r in state.monitor_results) else unit.status
+        item=row(family(candidate.id));value=(f"{result['outcome']}; blockers={len(result['blockers'])}; boundaries={len(result['boundaries'])}" if result else candidate.status)
+        item['result']='; '.join(dict.fromkeys(filter(None,[item['result'],value])))
+    for unit in state.units:
+        if unit_owner[unit.id][0]=='problem':continue
+        row(unit_owner[unit.id])['result']='blocked' if any(r.get('bounded_complete') and r.get('blockers') and any(a.unit_id==unit.id and a.id==r.get('direct_check_id') for a in state.direct_checks) for r in state.monitor_results) else unit.status
     lines += ['', '| 工作归属 | Agent 调用 | 工具执行 | 新取得片段字符 | 发送源码字符 | 当前结果 |','| --- | --- | --- | --- | --- | --- |']
     for owner,item in rows.items():lines.append(f"| {owner[0]}:{owner[1]} | {item['calls']} | {item['executions']} | {item['acquired']} | {item['sent']} | {item['result'] or '无结果'} |")
-    lines.append('统计从既有记录派生；共同启动单列，每项只归属一次，无法关联则列为 unknown。')
+    lines.append('统计从既有记录派生；Parent/child 合并为一个问题家族，共同启动单列，每项只归属一次，无法关联则列为 unknown。')
     return lines
 
 
@@ -189,9 +194,12 @@ def render_report(state, root):
         except ValueError:
             target = p
         return f"[{p.name}]({target})"
+    focus=state.config.get('activity_focus',[])
+    entry='regression' if state.mode=='mock' else state.analysis_mode
+    orientation=('；Activity 重点：`'+str(focus)+'`。这是有明确 Activity 重点的自主发现，不是具体定向命题。' if focus and entry=='autonomous' else '；Activity 重点：无。' if not focus else '；Activity 重点：`'+str(focus)+'`。')
     lines = ["# 共识义务驱动局部审计报告", "", f"运行标识：`{state.id}`；模式：**{'真实工具运行' if state.mode == 'real' else 'MOCK 框架测试，不能提供实现正确性证据'}**。",
         "", "问题的重要性解释系统后果，义务决定检查重点，实际代码决定模型行为。关系图用于选择与扩展，不自动推出整体正确性。",
-        "", f"分析入口：`{'regression' if state.mode == 'mock' else state.analysis_mode}`。regression 表示预设开发回归，不能计为自主发现验收。",
+        "", f"分析入口：`{entry}`{orientation} regression 表示预设开发回归，不能计为自主发现验收。",
         "", "## 分析输入与探索范围", "", f"仓库：`{state.snapshot.repo}`", f"提交：`{state.snapshot.commit or '无 Git 元数据'}`；分支：`{state.snapshot.branch or 'detached / unavailable'}`；脏工作区：`{state.snapshot.dirty}`。",
         f"快照：`{state.snapshot.id}`，纳入 {len(state.snapshot.files)} 个文件；读取 {len(state.materials)} 个材料片段，仍有未读范围的文件 {len(state.unexplored)} 个。完整清单见 [materials.json](materials.json)、[catalogue.json](catalogue.json) 和 [snapshot.json](snapshot.json)。",
         "候选不代表完整性；原始材料保留原文。", "", "## 义务与选择依据", ""]
@@ -218,7 +226,7 @@ def render_report(state, root):
             lines.append('相邻但未检查的问题：'+str(adjacent)+'；不由本候选结论覆盖，需以独立来源和判别条件另行调查。')
         lines += [f"- 候选 `{candidate.id}`：Fact {q.fact_ids}；{q.obligation_relation_kind}；{candidate.status}/{q.disposition}；受阻 {candidate_blockage(state,candidate) or '无'}。",
             f"  {q.question}；意义：{q.importance}；上下文/路径：{q.contexts}/{q.event_paths}；来源：{q.source_ids}。",
-            f"  提出时的保护与未知：{q.counterevidence}/{q.unknowns}；选择依据：{q.trigger_rationale}；义务：{candidate.obligation_id or '未生成'}；处置：{candidate.stop_reason or '继续获取证据'}；历史版本 {len(candidate.history)}。"]
+            f"  提出时的保护与未知：{q.counterevidence}/{q.unknowns}；选择依据：{q.trigger_rationale}；义务：{candidate.obligation_id or '未生成'}；处置：{candidate.stop_reason or '继续获取证据'}；恢复判别：{candidate.resume_conditions}；历史版本 {len(candidate.history)}。"]
         if result:lines.append(f"  当前局部结果：{result}；执行/证据关联：{current['check_ids']} / {current['evidence_ids']}；当前剩余判别：{current['remaining_discriminators']}。")
         if candidate.parent_candidate_id:
             parent=next((x for x in state.question_candidates if x.id==candidate.parent_candidate_id),None)
@@ -335,12 +343,17 @@ def render_report(state, root):
         completion=('有界检查完成' if result.get('bounded_complete') else '有界检查未完成') if result.get('direct_check_id') else '模型回放解释'
         lines += [f"观测判定 `{result.get('finding_id',result.get('direct_check_id','unknown'))}`：{completion}；实际结果 `{result.get('outcome',observed)}`；性质 `{observed}`；前提 `{result['prerequisites']['status']}`；确认层级 `{result['level']}`；当前归因阻塞：{result.get('blockers',result.get('limitations',[]))}；实验适配：{result.get('adaptations',[])}；范围边界：{result.get('boundaries',[])}。"]
     for decision in state.consequences:
-        lines.append(f"义务→更广泛后果处置：发现 `{decision['finding_id']}`；`{decision['disposition']}`；{decision['reason']}；后续 {decision['task_ids']}；限制 {decision['limitations']}。")
+        lines.append(f"义务→更广泛后果处置：发现 `{decision['finding_id']}`；`{decision['disposition']}`；{decision['reason']}；Parent {decision.get('parent_candidate_id') or '无'}；后续 {decision['task_ids']}；限制 {decision['limitations']}。")
     for revision in state.revisions:
         lines += [f"- {revision.kind}：{revision.rationale}；返回 `{revision.return_step}`；依赖 {revision.relation_ids}；状态 {revision.status}。"]
     if not state.revisions:
         lines.append("本次没有实际应用的语义修订；工具错误不冒充 F1—F4。")
+    budget=state.config.get('budget',{});from consensus_assurance.workflow.materials import material_usage
+    exhausted=[name for name,value in state.usage.items() if name in budget and value>=budget[name]]
+    if budget.get('total_seconds') is not None and state.elapsed_seconds>=budget['total_seconds']:exhausted.append('total_seconds')
+    if budget.get('material_chars') is not None and material_usage(state)['unique_chars']>=budget['material_chars']:exhausted.append('material_chars')
     lines += ["", "## 未决事项与停止原因", "", f"停止原因（原文）：{state.stop_reason}",
+        f"实际耗尽：{exhausted or '无已记录上限耗尽'}；合同或能力缺口仍以候选、单元和 gap 的原始记录为准。",
         f"控制器格式：{state.framework_revision or '历史运行未记录'}；阶段：{state.framework_stage}。",
         f"恢复位置：探索/复核任务 `{state.active_inquiry_id}`；单元 `{state.active_unit_id}`，模型 `{state.active_model_id}`，反例 `{state.active_finding_id}`，下一动作 `{state.next_action}`。"]
     lines += [f"- {gap}" for gap in dict.fromkeys(state.gaps)]
@@ -353,12 +366,6 @@ def render_report(state, root):
               f"审计单元 {len(state.units)}；范围扩展 {sum(x.kind == 'F3' for x in state.revisions)}；语义修订 {len(state.revisions)}；校准 {len(state.calibrations)}。",
               "完整命令、时间、版本与制品关联见 [state.json](state.json)，图、规格和计划视图在结束或生成报告时导出；事件见 [events.jsonl](events.jsonl)。", ""]
     lines += resource_lines(state)
-    first = next((c for c in state.checks if c.action == "model_check" and c.status == ExecutionStatus.COMPLETED), None)
-    if first and first.started_at:
-        seconds = (datetime.fromisoformat(first.started_at) - datetime.fromisoformat(state.created_at)).total_seconds()
-        previous_calls = sum(c.action == "agent" and bool(c.started_at) and c.started_at < first.started_at for c in state.checks)
-        lines += [f"首个经工具完成搜索确认可检查的模型：检查开始前约 {max(0, seconds):.2f} 秒，此前实际 agent 调用 {previous_calls} 次。",
-            f"实际工具累计时长：{sum((datetime.fromisoformat(c.ended_at)-datetime.fromisoformat(c.started_at)).total_seconds() for c in state.checks if c.started_at and c.ended_at):.2f} 秒；新模型版本 {sum(m.previous_id is not None for m in state.models)} 个。", ""]
     path = root / "report.md"
     path.write_text("\n".join(lines))
     return path

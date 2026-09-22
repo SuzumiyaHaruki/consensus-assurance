@@ -1,6 +1,3 @@
-"""Regression shape extracted from runs/2026-09-18_12-10-35-hashicorp_raft-real-run.
-Synthetic source preserves the F5 reserve/partial-read failure without runtime answers.
-"""
 import json
 import shutil
 from pathlib import Path
@@ -461,6 +458,33 @@ def test_explicit_fork_then_resume_original_id(focused):
     assert discovery.active_candidate(e.state).question==saved_parent.question
     discovery.continue_candidate(e,discovery.active_candidate(e.state))
     assert discovery.active_candidate(e.state).stage=='analyze'
+
+
+def test_candidate_can_pause_switch_and_resume_without_fork(focused):
+    e,q,_=focused
+    parent=begin(e,q,[request('counter.py')])
+    discovery.continue_candidate(e,parent)
+    original=parent.model_copy(deep=True)
+    alternate=q.model_copy(update={'question':'Does an independent consumer preserve the established context?',
+        'trigger_rationale':'The independent consumer has a smaller decisive source step'})
+    switch=Derivation(candidate_action='pause',candidate_id=parent.id,audit_question=alternate,
+        reading_requests=[request('counter.py')],resume_conditions=['A source establishes the original caller contract'],
+        selection_rationale='The original contract remains open, but the independent consumer currently has greater discriminatory value')
+    with pytest.raises(DiagnosticError) as exc:discovery.validate_derivation(e.state,switch.model_copy(update={'candidate_action':'continue'}))
+    assert exc.value.diagnostics[0].paths==['/resume_conditions']
+    discovery.accept_derivation(e,switch,'pause-and-switch')
+    saved=next(c for c in e.state.question_candidates if c.id==parent.id)
+    current=discovery.active_candidate(e.state)
+    assert saved.status=='paused' and saved.question==original.question and saved.material_ids==original.material_ids
+    assert saved.resume_conditions==switch.resume_conditions and current.id!=parent.id and current.parent_candidate_id is None
+    close=current.question.model_copy(update={'requests':[],'disposition':'explained_by_existing_mechanism','counterevidence':['The independent guard preserves context']})
+    discovery.accept_derivation(e,Derivation(candidate_id=current.id,audit_question=close,
+        selection_rationale='The acquired guard explains the independent question'),'close-independent')
+    discovery.accept_derivation(e,Derivation(candidate_id=parent.id,
+        selection_rationale='The original contract discriminator is now the best available continuation'),'resume-original')
+    assert discovery.active_candidate(e.state).id==parent.id
+    assert discovery.active_candidate(e.state).question==original.question
+    assert not discovery.active_candidate(e.state).resume_conditions
 
 
 def test_stale_inquiry_read_reuses_material_and_reports_analysis_pending(focused,tmp_path):

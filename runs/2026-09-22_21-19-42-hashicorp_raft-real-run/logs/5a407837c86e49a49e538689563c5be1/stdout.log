@@ -1,0 +1,174 @@
+{
+  "reading_purpose": "context",
+  "plan": {
+    "description": "Compare actual verification quorum notifications after one nonvoter notification and, in a separate fixture, one remote voter notification.",
+    "claim_id": "O_verify_voter_eligibility",
+    "binding_ids": [
+      "BD_verify_registration",
+      "BD_verify_quorum",
+      "BD_verify_worker_notification",
+      "BD_verify_vote_aggregation"
+    ],
+    "harness": {
+      "kind": "go_test",
+      "source": "package raft\n\nimport (\n \"encoding/json\"\n \"fmt\"\n \"testing\"\n)\n\nfunc TestAssuranceVerifyVoterEligibility(t *testing.T) {\n emit := func(fields map[string]interface{}) {\n  t.Helper()\n  b, err := json.Marshal(fields)\n  if err != nil { t.Fatal(err) }\n  fmt.Println(\"CA_EVENT \" + string(b))\n }\n for _, supporter := range []ServerID{\"nonvoter\", \"voter-a\"} {\n  t.Run(string(supporter), func(t *testing.T) {\n   op := \"verify-\" + string(supporter)\n   configuration := Configuration{Servers: []Server{\n    {ID: \"leader\", Address: \"leader\", Suffrage: Voter},\n    {ID: \"voter-a\", Address: \"voter-a\", Suffrage: Voter},\n    {ID: \"voter-b\", Address: \"voter-b\", Suffrage: Voter},\n    {ID: \"nonvoter\", Address: \"nonvoter\", Suffrage: Nonvoter},\n   }}\n   var r Raft\n   r.localID = \"leader\"\n   r.protocolVersion = 3\n   r.raftState.setState(Leader)\n   r.configurations = configurations{\n    latest: configuration.Clone(), committed: configuration.Clone(),\n    latestIndex: 1, committedIndex: 1,\n   }\n   r.verifyCh = make(chan *verifyFuture, 1)\n   r.leaderState.notify = make(map[*verifyFuture]struct{})\n   r.leaderState.replState = make(map[ServerID]*followerReplication)\n   for _, server := range configuration.Servers {\n    if server.ID == r.localID { continue }\n    r.leaderState.replState[server.ID] = &followerReplication{\n     peer: server,\n     notify: make(map[*verifyFuture]struct{}),\n     notifyCh: make(chan struct{}, 1),\n    }\n   }\n   v := &verifyFuture{}\n   v.init()\n   r.verifyLeader(v)\n   _, tracked := r.leaderState.notify[v]\n   registered := 0\n   for _, worker := range r.leaderState.replState {\n    worker.notifyLock.Lock()\n    _, ok := worker.notify[v]\n    worker.notifyLock.Unlock()\n    if ok { registered++ }\n   }\n   emit(map[string]interface{}{\n    \"event\": \"verification_registered\", \"op_id\": op, \"stage\": \"registered\",\n    \"tracked\": tracked, \"registered_workers\": registered,\n    \"initial_votes\": v.votes, \"implementation_quorum\": v.quorumSize,\n    \"leader_state\": r.getState().String(),\n   })\n   if !tracked || v.votes != 1 || len(r.verifyCh) != 0 {\n    t.Fatal(\"verification entry prerequisites were not established\")\n   }\n   worker := r.leaderState.replState[supporter]\n   if worker == nil { t.Fatal(\"supporting worker is absent\") }\n   supportingIDs := map[ServerID]bool{r.localID: true, worker.peer.ID: true}\n   voters, eligibleSupport := 0, 0\n   for _, server := range configuration.Servers {\n    if server.Suffrage == Voter {\n     voters++\n     if supportingIDs[server.ID] { eligibleSupport++ }\n    }\n   }\n   threshold := voters/2 + 1\n   eligibleQuorum := eligibleSupport >= threshold\n   emit(map[string]interface{}{\n    \"event\": \"support_input\", \"op_id\": op, \"registration_stage\": \"registered\",\n    \"supporter_id\": string(worker.peer.ID), \"supporter_suffrage\": worker.peer.Suffrage.String(),\n    \"positive\": true, \"voter_count\": voters, \"eligible_support\": eligibleSupport,\n    \"independent_threshold\": threshold, \"eligible_quorum\": eligibleQuorum,\n   })\n   worker.notifyAll(true)\n   notified := false\n   sameFuture := false\n   select {\n   case received := <-r.verifyCh:\n    notified = true\n    sameFuture = received == v\n   default:\n   }\n   if notified && !sameFuture { t.Fatal(\"notification could not be associated with the verification future\") }\n   emit(map[string]interface{}{\n    \"event\": \"verification_result\", \"op_id\": op, \"endpoint\": \"after_notify_all\",\n    \"notified\": notified, \"same_future\": sameFuture,\n    \"actual_votes\": v.votes, \"implementation_quorum\": v.quorumSize,\n   })\n  })\n }\n}\n",
+      "description": "Sequential package-local calls control registration and one identified worker's positive notification. A buffered verification channel permits the actual synchronous vote method to finish; a nonblocking receive after notifyAll returns observes its completed notification effect. Each fixture owns exactly one future and channel, and checks pointer identity for any notification. No asynchronous schedule control is required.",
+      "semantic_changes": [
+        "Construct only the leader state, stable configuration, worker maps, and channels consumed by the selected methods; do not run an election, replication goroutines, or the main leader loop.",
+        "Invoke the actual worker notifyAll(true) method at the accepted successful-response notification boundary. The positive input is controlled; no network response is claimed to have been observed.",
+        "Use a capacity-one verification channel instead of a concurrent main-loop receiver. This changes notification blocking, while retaining actual registration, counting, locking, and notification logic.",
+        "Observe quorum notification after notifyAll returns; do not synthesize future completion or claim a public VerifyLeader return."
+      ],
+      "prerequisites": [
+        {
+          "alias": "registration",
+          "event": "verification_registered",
+          "conditions": [
+            {
+              "field": "tracked",
+              "op": "eq",
+              "value": true,
+              "reference": null
+            },
+            {
+              "field": "initial_votes",
+              "op": "eq",
+              "value": 1,
+              "reference": null
+            },
+            {
+              "field": "leader_state",
+              "op": "eq",
+              "value": "Leader",
+              "reference": null
+            }
+          ]
+        },
+        {
+          "alias": "support",
+          "event": "support_input",
+          "conditions": [
+            {
+              "field": "registration_stage",
+              "op": "eq",
+              "value": null,
+              "reference": "registration.stage"
+            },
+            {
+              "field": "positive",
+              "op": "eq",
+              "value": true,
+              "reference": null
+            }
+          ]
+        }
+      ],
+      "legality": {
+        "source_ids": [
+          "raft.go:455:666",
+          "raft.go:827:1100",
+          "replication.go:1:202",
+          "replication.go:299:665",
+          "future.go:181:314",
+          "state.go:1:174",
+          "configuration.go:129:184"
+        ],
+        "expectation_ids": [
+          "api.go:950:1040",
+          "configuration.go:1:140"
+        ],
+        "binding_ids": [
+          "BD_verify_registration",
+          "BD_verify_quorum",
+          "BD_verify_worker_notification",
+          "BD_verify_vote_aggregation"
+        ],
+        "derivation": "The membership interface permits nonvoters, and startStopReplication constructs workers for every remote configured server. verifyLeader consumes the configuration and worker notification maps. Sequential invocation satisfies its main-thread restriction. notifyAll(true) is the actual notification used after successful replication and heartbeat responses. The fixture initializes the consumed state with three distinct voters and one nonvoter and keeps committed and latest configurations equal.",
+        "applicability": "Legal as the accepted local entry-state experiment with controlled positive notification inputs. The stopping point is the synchronous aggregation notification, before main-loop processing.",
+        "unresolved": [
+          "The fixture assumes the initialized leader episode and successful-response input boundary; it does not demonstrate their preceding distributed history.",
+          "The absence of concurrent lease processing limits conclusions to local participant eligibility."
+        ],
+        "conflicts": [],
+        "alternatives": [
+          "A transport-driven experiment could establish actual response production but would require additional initialization and control dependencies."
+        ]
+      }
+    },
+    "monitors": [
+      {
+        "id": "M_verify_voter_eligibility",
+        "checker_id": "C_verify_voter_eligibility",
+        "event": "verification_result",
+        "binding_ids": [
+          "BD_verify_registration",
+          "BD_verify_quorum",
+          "BD_verify_worker_notification",
+          "BD_verify_vote_aggregation"
+        ],
+        "grounding": {
+          "source_ids": [
+            "raft.go:827:1100",
+            "replication.go:1:202",
+            "future.go:181:314"
+          ],
+          "expectation_ids": [
+            "api.go:850:950",
+            "api.go:950:1040",
+            "configuration.go:1:140"
+          ],
+          "binding_ids": [
+            "BD_verify_registration",
+            "BD_verify_quorum",
+            "BD_verify_worker_notification",
+            "BD_verify_vote_aggregation"
+          ],
+          "derivation": "The accepted obligation derives voter eligibility from the leadership-assurance API, declared suffrage, and the voter-derived verification threshold. Independently enumerate configured Voter identities among the local leader and the one controlled supporter, then compute their majority threshold without calling quorumSize or using the future's votes. Compare this input-derived eligible-quorum boolean with receipt of the actual verification notification. With only positive inputs, notification is the selected threshold endpoint; the remote-voter case supplies the positive comparison.",
+          "applicability": "Each result belongs to a fresh verification operation in the unchanged mixed-suffrage fixture and follows exactly one positive remote notification.",
+          "unresolved": [
+            "Voter-only VerifyLeader participation is a derived interface relationship, not an explicit VerifyLeader-specific API sentence.",
+            "A measured eligibility discrepancy does not establish leadership loss, stale reads, or public API completion.",
+            "Separate voter-filtered lease checks remain a broader protection whose timing is not measured here."
+          ],
+          "conflicts": [],
+          "alternatives": [
+            "Nonvoter contact may supply supplementary information, but no separate voter-support prerequisite appears in the inspected aggregation path."
+          ]
+        },
+        "applicability_conditions": []
+      }
+    ],
+    "observable_properties": [
+      {
+        "checker_id": "C_verify_voter_eligibility",
+        "kind": "event_assertion",
+        "trigger": {
+          "field": "endpoint",
+          "op": "eq",
+          "value": "after_notify_all",
+          "reference": null
+        },
+        "assertion": {
+          "field": "notified",
+          "op": "eq",
+          "value": null,
+          "reference": "support.eligible_quorum"
+        },
+        "identity_fields": [
+          "op_id"
+        ],
+        "history_field": null,
+        "description": "After registration and one positive remote worker notification, actual quorum notification must agree with whether the distinct supporting Voter identities, including the local leader, satisfy the independently calculated voter majority. Nonvoter support must not substitute for voter support."
+      }
+    ],
+    "uncertainties": [
+      "Controlled boolean support represents the accepted response-notification boundary; the harness does not observe an actual AppendEntries exchange.",
+      "The requirement's voter-only applicability is derived from the supplied interface responsibilities and selected quorum mechanism.",
+      "Notification and externally effective VerifyLeader completion are distinct endpoints.",
+      "Election history, response freshness, membership transitions, pending step-down ordering, lease timing, and client consequences remain outside the measured comparison."
+    ]
+  },
+  "gap": "",
+  "requests": [],
+  "fallback": "none"
+}

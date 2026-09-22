@@ -22,7 +22,7 @@ def candidate_view(state,candidate):
     evidence=[e.id for e in records]
     return {'id':candidate.id,'parent_candidate_id':candidate.parent_candidate_id,'fork_reason':candidate.fork_reason,
         'question':candidate.question.question,'fact_ids':candidate.question.fact_ids,'lifecycle':candidate.question.obligation_relation_kind,
-        'status':candidate.status,'reason':candidate.stop_reason,'obligation_id':candidate.obligation_id,
+        'status':candidate.status,'reason':candidate.stop_reason,'resume_conditions':candidate.resume_conditions,'obligation_id':candidate.obligation_id,
         'unit_id':unit.id if unit else None,'unit_status':'blocked' if current and current['blockers'] else unit.status if unit else None,'archived_unit_status':unit.status if unit else None,'scope':result.get('scope') if result else unit.scope.model_dump(mode='json') if unit else {'contexts':candidate.question.contexts,'event_paths':candidate.question.event_paths},'check_ids':checks,'evidence_ids':evidence,
         'current_result':current,
         'remaining_discriminators':result.get('blockers',[])+result.get('boundaries',[]) if result else candidate.question.unknowns}
@@ -78,7 +78,7 @@ def local_workset(engine,unit):
             needed.update(task.added_material_ids)
             needed.update(state.task_attachments.get('inquiry:'+task.id,[]))
     return {'materials':[m.model_dump(mode='json') for m in state.materials if m.id in needed],
-        'required_material_ids':sorted(needed),'explicit_material_ids':sorted(explicit),
+        'required_material_ids':sorted(needed),
         'omitted_material_ids':[m.id for m in state.materials if m.id not in needed],
         'omission_reason':'Outside this unit, its selected dependency closure and current semantic issues; full history remains archived',
         'semantic_view':semantic,

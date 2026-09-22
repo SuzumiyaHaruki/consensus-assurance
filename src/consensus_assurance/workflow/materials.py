@@ -105,7 +105,7 @@ def initial_materials(repo, snapshot, budget, knowledge):
             continue
         end = min(len(lines), 80)
         item = read_material(repo, snapshot, ReadRequest(file=rel, start_line=1, end_line=end, reason="Initial repository survey"))
-        if count + len(item.text) > budget.material_chars // 3:
+        if count + len(item.text) > min(40000,budget.material_chars//3):
             continue
         result.append(item); count += len(item.text)
     if knowledge and len(result) < budget.material_chunks and count + len(knowledge) <= budget.material_chars:

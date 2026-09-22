@@ -125,8 +125,13 @@ def next_surface_refinement(state):
     if state.last_work_kind=='surface' and 'derived-spec:'+str(state.audit_spec_version) not in state.completed_steps:return None
     if any(u.status in {'pending','partial','selected'} and u.audit_question and u.audit_question.disposition=='ready_for_check' for u in state.units):return None
     attempted={entry for task in state.inquiry_tasks if task.admitted for entry in task.surface_entry_points}
-    exhausted={entry for task in state.inquiry_tasks if task.preparation_failures>state.config.get('budget',{}).get('context_preparations',2) for entry in task.surface_entry_points}
-    return next((s for s in spec.surfaces if s.high_consequence and s.disposition in {'deferred','UNCLASSIFIED_PROTOCOL_RESPONSIBILITY'} and s.entry_point not in attempted|exhausted),None)
+    exhausted={entry for task in state.inquiry_tasks if task.preparation_failures for entry in task.surface_entry_points}
+    available=[s for s in spec.surfaces if s.high_consequence and s.disposition in {'deferred','UNCLASSIFIED_PROTOCOL_RESPONSIBILITY'} and s.entry_point not in attempted|exhausted]
+    focus=set(state.config.get('activity_focus',[]));behaviors={b.id:b for b in spec.behaviors}
+    def priority(surface):
+        classes={behaviors[id].primary_activity for id in surface.behavior_ids if id in behaviors}
+        return (0 if focus and classes&focus else 1, surface.entry_point)
+    return min(available,key=priority,default=None)
 
 
 def merge_delta(state,task,delta):

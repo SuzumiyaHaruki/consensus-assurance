@@ -1,0 +1,105 @@
+{
+  "reading_purpose": "context",
+  "plan": {
+    "description": "Compare the actual getLastEntry result with independently inspected retained history immediately after a conflict replacement fails.",
+    "claim_id": "O_append_failure_retained_identity",
+    "binding_ids": ["BD_append_failure_retained_identity", "BD_last_entry_representation"],
+    "harness": {
+      "kind": "go_test",
+      "source": "package raft\n\nimport (\n \"encoding/json\"\n \"errors\"\n \"fmt\"\n \"io\"\n \"testing\"\n)\n\ntype assuranceIdentityTransport struct { Transport }\nfunc (*assuranceIdentityTransport) EncodePeer(_ ServerID, a ServerAddress) []byte { return []byte(a) }\nfunc (*assuranceIdentityTransport) DecodePeer(a []byte) ServerAddress { return ServerAddress(a) }\n\ntype assuranceIdentityStore struct {\n *InmemStore\n t *testing.T\n emit func(string, map[string]interface{}) int\n initialSeq, deleteSeq, failureSeq int\n armed bool\n}\nfunc (s *assuranceIdentityStore) DeleteRange(lo, hi uint64) error {\n err := s.InmemStore.DeleteRange(lo, hi)\n if err != nil { return err }\n for i := lo; i <= hi; i++ {\n  var l Log\n  if err := s.InmemStore.GetLog(i, &l); err != ErrLogNotFound { s.t.Fatalf(\"deletion inspection at %d: %v\", i, err) }\n }\n s.deleteSeq = s.emit(\"suffix_deleted\", map[string]interface{}{\"initial_seq\":s.initialSeq, \"min\":lo, \"max\":hi, \"removed\":true})\n return nil\n}\nfunc (s *assuranceIdentityStore) StoreLogs(logs []*Log) error {\n if !s.armed { return s.InmemStore.StoreLogs(logs) }\n if s.deleteSeq == 0 { s.t.Fatal(\"replacement fault reached without deletion\") }\n err := errors.New(\"assurance controlled replacement failure without writes\")\n s.failureSeq = s.emit(\"replacement_failed\", map[string]interface{}{\"delete_seq\":s.deleteSeq, \"error\":err.Error(), \"writes\":0, \"count\":len(logs)})\n return err\n}\n\nfunc TestAssuranceAppendFailureRetainedIdentity(t *testing.T) {\n seq := 0\n emit := func(event string, fields map[string]interface{}) int {\n  seq++\n  fields[\"event\"] = event\n  fields[\"op\"] = \"append-conflict-1\"\n  fields[\"seq\"] = seq\n  b, err := json.Marshal(fields)\n  if err != nil { t.Fatal(err) }\n  fmt.Println(\"CA_EVENT \" + string(b))\n  return seq\n }\n base := NewInmemStore()\n initial := []*Log{{Index:1, Term:1, Type:LogNoop}, {Index:2, Term:2, Type:LogNoop}, {Index:3, Term:2, Type:LogNoop}}\n if err := base.StoreLogs(initial); err != nil { t.Fatal(err) }\n store := &assuranceIdentityStore{InmemStore:base, t:t, emit:emit}\n conf := DefaultConfig()\n conf.LocalID = \"follower\"\n conf.LogOutput = io.Discard\n if err := ValidateConfig(conf); err != nil { t.Fatal(err) }\n snaps := NewInmemSnapshotStore()\n r := &Raft{logs:store, stable:NewInmemStore(), snapshots:snaps, trans:&assuranceIdentityTransport{}, localID:conf.LocalID, localAddr:\"follower\", logger:conf.getOrCreateLogger()}\n r.conf.Store(*conf)\n r.setState(Follower)\n r.setCurrentTerm(3)\n r.setLastLog(3, 2)\n r.setCommitIndex(1)\n r.setLastSnapshot(0, 0)\n idx, err := base.LastIndex()\n if err != nil { t.Fatal(err) }\n var terminal Log\n if err := base.GetLog(idx, &terminal); err != nil { t.Fatal(err) }\n ci, ct := r.getLastEntry()\n if ci != terminal.Index || ct != terminal.Term { t.Fatal(\"initial cache differs from retained log\") }\n metas, err := snaps.List()\n if err != nil || len(metas) != 0 { t.Fatalf(\"initial snapshots: %v, %v\", metas, err) }\n store.initialSeq = emit(\"initial_consistent\", map[string]interface{}{\"consistent\":true, \"index\":ci, \"term\":ct, \"commit_index\":r.getCommitIndex(), \"snapshot_count\":len(metas)})\n store.armed = true\n req := &AppendEntriesRequest{RPCHeader:RPCHeader{ProtocolVersion:conf.ProtocolVersion, ID:[]byte(\"leader\"), Addr:[]byte(\"leader\")}, Term:3, PrevLogEntry:1, PrevLogTerm:1, Entries:[]*Log{{Index:2, Term:3, Type:LogNoop}, {Index:3, Term:3, Type:LogNoop}}, LeaderCommitIndex:1}\n responses := make(chan RPCResponse, 1)\n rpc := RPC{Command:req, RespChan:responses}\n if err := r.checkRPCHeader(rpc); err != nil { t.Fatal(err) }\n r.appendEntries(rpc, req)\n var rr RPCResponse\n select { case rr = <-responses: default: t.Fatal(\"handler returned without response\") }\n resp, ok := rr.Response.(*AppendEntriesResponse)\n if !ok { t.Fatalf(\"unexpected response type %T\", rr.Response) }\n if store.failureSeq == 0 { t.Fatal(\"replacement failure prerequisite missing\") }\n idx, err = base.LastIndex()\n if err != nil { t.Fatal(err) }\n var retained Log\n if idx != 0 { if err := base.GetLog(idx, &retained); err != nil { t.Fatal(err) } }\n for i := uint64(2); i <= 3; i++ {\n  var l Log\n  if err := base.GetLog(i, &l); err != ErrLogNotFound { t.Fatalf(\"replacement unexpectedly retained at %d: %v\", i, err) }\n }\n metas, err = snaps.List()\n if err != nil { t.Fatal(err) }\n expectedIndex, expectedTerm := retained.Index, retained.Term\n for _, meta := range metas {\n  if meta.Index > expectedIndex { expectedIndex, expectedTerm = meta.Index, meta.Term }\n }\n rpcError := \"\"\n if rr.Error != nil { rpcError = rr.Error.Error() }\n retainedSeq := emit(\"retained_inspected\", map[string]interface{}{\"failure_seq\":store.failureSeq, \"handler_returned\":true, \"success\":resp.Success, \"rpc_error\":rpcError, \"identity\":fmt.Sprintf(\"%d/%d\", expectedIndex, expectedTerm), \"retained_index\":retained.Index, \"retained_term\":retained.Term, \"snapshot_count\":len(metas)})\n actualIndex, actualTerm := r.getLastEntry()\n emit(\"terminal_identity_observed\", map[string]interface{}{\"retained_seq\":retainedSeq, \"identity\":fmt.Sprintf(\"%d/%d\", actualIndex, actualTerm), \"index\":actualIndex, \"term\":actualTerm})\n}\n",
+      "description": "A synchronous same-package call controls one invocation without background goroutines. The store delegates actual deletion to InmemStore and injects a no-write StoreLogs error. Buffered RPC response delivery establishes handler completion. Direct backing-store reads and snapshot listing supply the independent terminal identity before reading getLastEntry.",
+      "semantic_changes": [
+        "Construct a bounded follower fixture directly instead of starting cluster background workers; initialize consistent cached and stored history.",
+        "Use an interface fault adapter whose replacement StoreLogs returns an error without writes; this does not establish exposure in any production adapter.",
+        "Use a transport adapter implementing only the peer encoding and decoding methods reached by this invocation; no network delivery or scheduling is modeled.",
+        "Emit observations around actual calls without modifying the handler or state accessor."
+      ],
+      "prerequisites": [
+        {
+          "alias": "initial",
+          "event": "initial_consistent",
+          "conditions": [
+            {"field": "consistent", "op": "eq", "value": true, "reference": null}
+          ]
+        },
+        {
+          "alias": "deleted",
+          "event": "suffix_deleted",
+          "conditions": [
+            {"field": "initial_seq", "op": "eq", "value": null, "reference": "initial.seq"},
+            {"field": "removed", "op": "eq", "value": true, "reference": null},
+            {"field": "min", "op": "eq", "value": 2, "reference": null},
+            {"field": "max", "op": "eq", "value": 3, "reference": null}
+          ]
+        },
+        {
+          "alias": "failed",
+          "event": "replacement_failed",
+          "conditions": [
+            {"field": "delete_seq", "op": "eq", "value": null, "reference": "deleted.seq"},
+            {"field": "writes", "op": "eq", "value": 0, "reference": null}
+          ]
+        },
+        {
+          "alias": "retained",
+          "event": "retained_inspected",
+          "conditions": [
+            {"field": "failure_seq", "op": "eq", "value": null, "reference": "failed.seq"},
+            {"field": "handler_returned", "op": "eq", "value": true, "reference": null}
+          ]
+        }
+      ],
+      "legality": {
+        "source_ids": ["raft.go:1440:1584", "raft.go:1:240", "raft.go:1900:2241", "api.go:80:240", "config.go:241:376", "inmem_store.go:1:133", "inmem_snapshot.go:1:113", "transport.go:1:141", "commands.go:1:150", "state.go:1:174"],
+        "expectation_ids": ["log.go:81:192", "state.go:1:174"],
+        "binding_ids": ["BD_append_failure_retained_identity", "BD_last_entry_representation"],
+        "derivation": "The interface separates inclusive deletion from error-returning replacement storage and supplies no rollback guarantee across these calls. The selected fault is explicitly assumed. The request has a matching retained predecessor, a current term, contiguous replacement entries, and a conflict strictly above commit index 1 and the absent snapshot boundary. Actual handler code supplies the mutation sequence. The documented accessor and cache meanings independently require correspondence with retained history.",
+        "applicability": "Single-threaded local handler-return comparison under the accepted interface fault scenario. The store and snapshot observations are independent of the cached terminal identity.",
+        "unresolved": ["Production adapter exposure and cluster-history reachability are not established."],
+        "conflicts": [],
+        "alternatives": ["A later successful replacement may repair metadata; no later invocation occurs in this experiment."]
+      }
+    },
+    "monitors": [
+      {
+        "id": "M_append_failure_retained_identity",
+        "checker_id": "C_append_failure_retained_identity",
+        "event": "terminal_identity_observed",
+        "binding_ids": ["BD_append_failure_retained_identity", "BD_last_entry_representation"],
+        "grounding": {
+          "source_ids": ["raft.go:1440:1584", "state.go:1:174", "inmem_store.go:1:133", "inmem_snapshot.go:1:113"],
+          "expectation_ids": ["state.go:1:174", "log.go:81:192"],
+          "binding_ids": ["BD_append_failure_retained_identity", "BD_last_entry_representation"],
+          "derivation": "getLastEntry is documented to return the last index and term in stable storage, choosing log or snapshot history. Compare its actual pair with the pair independently obtained from retained backing records and snapshot metadata after the handler returns. Decimal index/term serialization preserves both components exactly.",
+          "applicability": "The result follows the correlated retained inspection, successful suffix deletion, and injected no-write replacement failure. No mutation intervenes between retained inspection and accessor observation.",
+          "unresolved": ["A mismatch establishes only the accepted local representation discrepancy, not subsequent AppendEntries success or any commitment consequence."],
+          "conflicts": [],
+          "alternatives": ["The failing handler's negative response remains separately observed and does not answer whether cached retained-history identity is accurate."]
+        },
+        "applicability_conditions": [
+          {"field": "retained_seq", "op": "eq", "value": null, "reference": "retained.seq"}
+        ]
+      }
+    ],
+    "observable_properties": [
+      {
+        "checker_id": "C_append_failure_retained_identity",
+        "kind": "event_assertion",
+        "trigger": {"field": "event", "op": "eq", "value": "terminal_identity_observed", "reference": null},
+        "assertion": {"field": "identity", "op": "eq", "value": null, "reference": "retained.identity"},
+        "identity_fields": ["op"],
+        "history_field": null,
+        "description": "After AppendEntries successfully deletes a conflicting suffix and replacement StoreLogs returns an error without restoring that suffix, getLastEntry must identify the actual latest retained log or snapshot entry when control returns from the handler. It must not report the deleted terminal entry as retained history."
+      }
+    ],
+    "uncertainties": [
+      "The fault adapter establishes an explicit interface scenario, not a production storage failure reproduction.",
+      "Direct fixture initialization does not establish a complete legal cluster history or network schedule.",
+      "The concrete case has no retained snapshot; concurrent snapshot changes and partial replacement writes remain outside this experiment.",
+      "The comparison does not establish a later request consuming stale metadata, subsequent success, incorrect commitment, application, or client completion."
+    ]
+  },
+  "gap": "",
+  "requests": [],
+  "fallback": "none"
+}

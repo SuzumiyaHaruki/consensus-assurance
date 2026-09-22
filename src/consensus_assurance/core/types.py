@@ -167,6 +167,7 @@ class QuestionCandidate(Record):
     spec_task_ids: list[str] = []
     stagnation: int = 0
     stop_reason: str = ""
+    resume_conditions: list[str] = []
     obligation_id: str | None = None
 
 

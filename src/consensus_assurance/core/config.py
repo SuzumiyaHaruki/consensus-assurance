@@ -1,7 +1,7 @@
 from pathlib import Path
 from typing import Any, Literal
 from pydantic import Field, model_validator
-from .types import Record
+from .types import ActivityClass, Record
 
 
 class Budget(Record):
@@ -63,6 +63,7 @@ class Config(Record):
     tlc_jar: str | None = None
     budget: Budget = Budget()
     parameters: dict[str, Any] = {}
+    activity_focus: list[ActivityClass] = []
     directed_question: str | None = None
     fixture: str | None = None
     execution_isolation: Literal["bwrap", "workspace"] = "bwrap"

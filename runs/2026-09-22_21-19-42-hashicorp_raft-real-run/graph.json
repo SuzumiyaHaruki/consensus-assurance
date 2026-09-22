@@ -1,0 +1,508 @@
+{
+  "version": 3,
+  "claims": [
+    {
+      "id": "O_pipeline_response_validity",
+      "kind": "obligation",
+      "description": "When consuming an AppendFuture, Raft.pipelineDecode must wait for that future's Error method to return before accessing Response, and must not use a response from a failed future to report replication progress.",
+      "scope": {
+        "description": "The local AppendFuture consumption boundary in Raft.pipelineDecode, beginning with delivery of a future through AppendPipeline.Consumer and ending at response access or the resulting replication progress report. Check successful and failed completion separately.",
+        "assumptions": [
+          "The delivered future belongs to the pipeline and exposes its associated request.",
+          "The test invokes the actual pipelineDecode implementation with initialized replication state.",
+          "A controlled interface implementation may deliver a completed failed future; Consumer's contract does not restrict delivery to successful futures."
+        ],
+        "excluded": [
+          "Proof that a built-in follower produces an error together with Success=true in a legal cluster history",
+          "Proof of incorrect commitment, application, or client completion",
+          "Full request-response correlation across network failures",
+          "Other transport variants and deployment activation",
+          "Shutdown and peer-replacement correctness beyond the exercised consumption boundary"
+        ],
+        "parameters": {}
+      },
+      "source": "Candidate derived from attributed implementation responsibilities",
+      "source_ids": [
+        "replication.go:534:665",
+        "transport.go:1:141",
+        "future.go:1:314",
+        "net_transport.go:700:912"
+      ],
+      "pending": [
+        "Establish an executable observation of Response access ordering and progress reporting.",
+        "Keep artificial response contents on failed futures distinct from a demonstrated built-in transport execution."
+      ],
+      "assessment": "unassessed",
+      "candidate": true,
+      "grounding": {
+        "source_ids": [
+          "replication.go:534:665",
+          "future.go:1:314",
+          "net_transport.go:700:912"
+        ],
+        "expectation_ids": [
+          "transport.go:1:141",
+          "future.go:1:314"
+        ],
+        "binding_ids": [
+          "BD_pipeline_response_consumer",
+          "BD_pipeline_progress_report"
+        ],
+        "derivation": "AppendFuture.Response explicitly requires Error to have returned and states that the response is valid only on success. This applies directly because pipelineDecode consumes AppendFuture through AppendPipeline.Consumer. The decoder calls Response without calling Error, then interprets Term and Success before updating replication progress. Consumer readiness is not documented as success. The concrete network pipeline calls future.respond(err) and delivers the future without filtering err; decodeResponse can decode a response and still return an RPC error. These observations justify checking the interface consumption relation independently of whether a harmful failed response is reachable from a built-in follower.",
+        "applicability": "Applies to the actual pipelineDecode caller of the repository's AppendFuture interface. The normative basis is the explicit method contract, not a remembered consensus rule or the observed implementation itself.",
+        "unresolved": [
+          "Whether built-in producers can supply a failed response whose fields pass the decoder's guards under a legal execution",
+          "Whether any resulting report changes commitment in an actual cluster",
+          "Whether other transport implementations impose stronger delivery guarantees"
+        ],
+        "conflicts": [],
+        "alternatives": [
+          "Concrete network delivery orders completion before Consumer delivery, which can establish response availability, but does not establish successful completion or satisfy the explicit Error-call requirement.",
+          "Term and Success checks may reject many failed responses, but the interface does not grant validity to response fields after failure."
+        ]
+      },
+      "version": 1
+    },
+    {
+      "id": "O_append_failure_retained_identity",
+      "kind": "obligation",
+      "description": "After AppendEntries successfully deletes a conflicting suffix and replacement StoreLogs returns an error without restoring that suffix, getLastEntry must identify the actual latest retained log or snapshot entry when control returns from the handler. It must not report the deleted terminal entry as retained history.",
+      "scope": {
+        "description": "Local retained-history representation after one failing conflict-reconciliation invocation. Begin with consistent retained logs and cached metadata, successfully delete an uncommitted conflicting suffix, fail replacement storage without writing replacement entries, and compare getLastEntry against independently inspected retained storage and snapshot metadata immediately after handler return.",
+        "assumptions": [
+          "Initial cached last-log identity agrees with the actual LogStore.",
+          "The deleted suffix is above both the committed index and the retained snapshot index.",
+          "DeleteRange succeeds and removes the requested inclusive range.",
+          "The controlled StoreLogs failure writes no replacement entries; this is an explicit interface fault scenario, not an observed built-in adapter behavior.",
+          "No concurrent snapshot publication or other history mutation occurs during the comparison."
+        ],
+        "excluded": [
+          "Proof that a selected production adapter realizes this failure sequence",
+          "Proof of a legal cluster history producing a later request with the deleted predecessor identity",
+          "Subsequent AppendEntries success",
+          "Incorrect quorum commitment, application, or client completion",
+          "Crash durability and restart reconstruction",
+          "All possible partial-write outcomes"
+        ],
+        "parameters": {}
+      },
+      "source": "Candidate derived from attributed implementation responsibilities",
+      "source_ids": [
+        "raft.go:1440:1584",
+        "state.go:1:174",
+        "log.go:81:192"
+      ],
+      "pending": [
+        "Production adapter exposure and legal-history reachability remain unresolved.",
+        "The local comparison does not establish the parent question's subsequent-success or broader-consequence claims."
+      ],
+      "assessment": "unassessed",
+      "candidate": true,
+      "grounding": {
+        "source_ids": [
+          "raft.go:1440:1584",
+          "state.go:1:174",
+          "log.go:81:192",
+          "log_cache.go:1:95"
+        ],
+        "expectation_ids": [
+          "state.go:1:174",
+          "log.go:81:192"
+        ],
+        "binding_ids": [
+          "BD_append_failure_retained_identity",
+          "BD_last_entry_representation"
+        ],
+        "derivation": "The getLastEntry declaration explicitly describes its result as the last index and term in stable storage, selected from log or snapshot history. The state fields describe lastLogIndex and lastLogTerm as a cache of LogStore. LogStore.DeleteRange specifies inclusive deletion, while StoreLogs provides an error return and does not promise rollback of a preceding separate deletion. These statements supply the local representation expectation independently of the observed implementation. appendEntries deletes before replacement storage and returns on storage error before updating last-log metadata; its TODO explicitly identifies a possible stale state. An independent oracle can inspect the controlled store's actual retained records and the unchanged snapshot identity, without treating the cached result as truth.",
+        "applicability": "The cached identity is immediately relevant to the selected F4 establishment question because appendEntries uses getLastEntry instead of GetLog when the requested predecessor index equals the returned terminal index. Checking the representation after the failed invocation isolates a necessary local discriminator without asserting that a later matching request is reachable.",
+        "unresolved": [
+          "Which deployed or built-in adapter can produce the specified failure",
+          "Whether later protocol traffic can consume the deleted terminal identity in a legal history",
+          "Whether an intervening action repairs the representation before such consumption",
+          "Whether any mismatch affects leader progress or externally visible decisions"
+        ],
+        "conflicts": [],
+        "alternatives": [
+          "LogCache invalidates its entry cache before deletion and inserts entries only after successful storage, but these operations do not update raftState's separate terminal identity.",
+          "A later successful replacement may repair metadata; that does not establish correctness at the selected handler-return boundary."
+        ]
+      },
+      "version": 1
+    },
+    {
+      "id": "O_verify_voter_eligibility",
+      "kind": "obligation",
+      "description": "In an unchanged mixed-suffrage configuration with a local voter leader, positive support from Nonvoter replication workers must not substitute for voter support in satisfying VerifyLeader's voter-derived quorum threshold.",
+      "scope": {
+        "description": "Check the local participant-eligibility relation from verification registration through support aggregation and quorum notification. Use three voters, including the local leader, and one nonvoter. After registration, deliver positive support only from the nonvoter and observe whether it satisfies the threshold. Compare with an otherwise identical case delivering support from one remote voter.",
+        "assumptions": [
+          "Latest and committed configurations agree and remain unchanged throughout the check.",
+          "The local server is a voter in an initialized leader episode.",
+          "Replication workers correspond to the configured remote server identities.",
+          "Each controlled positive notification represents one successful append response for its identified worker.",
+          "The fixture establishes the local entry state; it does not establish a complete election or partition history."
+        ],
+        "excluded": [
+          "Proof of an election or partition history producing stale leadership",
+          "Response freshness and VerifyLeader linearization",
+          "Configuration changes, worker retirement, and suffrage changes during verification",
+          "Ordering between verification completion, negative support, and pending step-down",
+          "Proof of stale FSM reads, incorrect commitment, or client-visible data loss",
+          "Production deployment exposure"
+        ],
+        "parameters": {
+          "voter_count": 3,
+          "nonvoter_count": 1
+        }
+      },
+      "source": "Candidate derived from attributed implementation responsibilities",
+      "source_ids": [
+        "api.go:850:950",
+        "api.go:950:1040",
+        "configuration.go:1:140",
+        "raft.go:827:1100",
+        "replication.go:1:202",
+        "future.go:181:314"
+      ],
+      "pending": [],
+      "assessment": "unassessed",
+      "candidate": true,
+      "grounding": {
+        "source_ids": [
+          "raft.go:455:666",
+          "raft.go:827:1100",
+          "replication.go:1:202",
+          "future.go:181:314"
+        ],
+        "expectation_ids": [
+          "api.go:850:950",
+          "api.go:950:1040",
+          "configuration.go:1:140"
+        ],
+        "binding_ids": [
+          "BD_verify_registration",
+          "BD_verify_quorum",
+          "BD_verify_worker_notification",
+          "BD_verify_vote_aggregation"
+        ],
+        "derivation": "VerifyLeader's API promises leadership assurance for preventing stale data after leadership loss. AddNonvoter explicitly assigns no vote and excludes election and commitment participation; ServerSuffrage identifies voting eligibility. These declarations do not explicitly specify the VerifyLeader algorithm. The bounded eligibility requirement is derived by combining those interface responsibilities with the implementation's use of a voter-only quorum threshold: support from a participant outside that electorate cannot establish the corresponding voter quorum. Actual code separately shows registration with every replication worker and identity-free positive vote aggregation. This is an attributable local requirement and a concrete suspicion, not a conclusion that leadership was lost.",
+        "applicability": "AddNonvoter supports nonvoting members at protocol versions of at least 3. The selected case uses an unchanged configuration and a local voter, avoiding ambiguity from membership transitions. An independent oracle counts distinct supporting server IDs whose configuration suffrage is Voter, including the local self-vote, and compares that count with floor(voter_count/2)+1.",
+        "unresolved": [
+          "The API does not explicitly state voter-only VerifyLeader participation; the requirement is a derived relationship between leadership assurance, declared suffrage, and the selected quorum mechanism.",
+          "A local eligibility violation would not establish a legal history of lost leadership or a stale read.",
+          "Separate lease checks may affect whole-system execution timing but do not filter this local aggregation."
+        ],
+        "conflicts": [],
+        "alternatives": [
+          "Nonvoter support might be defended as supplementary evidence of contact, but the attached code provides no separate voter-support prerequisite before treating the threshold as satisfied.",
+          "The voter-filtered lease check can independently retire authority; its timing and sufficiency for the broader API guarantee remain outside this local check."
+        ]
+      },
+      "version": 1
+    }
+  ],
+  "bindings": [
+    {
+      "associations": [
+        {
+          "claim_id": "O_pipeline_response_validity",
+          "source_ids": [
+            "replication.go:534:665",
+            "transport.go:1:141"
+          ],
+          "rationale": "Direct consumer of the interface whose response-access and success requirements are checked."
+        }
+      ],
+      "anchor": {
+        "source_ids": [
+          "replication.go:534:665"
+        ],
+        "boundary_complete": true,
+        "kind": "declaration",
+        "material_id": "replication.go:534:665",
+        "start_line": 534,
+        "end_line": 534,
+        "symbol": "Raft.pipelineDecode"
+      },
+      "material_id": "replication.go:534:665",
+      "id": "BD_pipeline_response_consumer",
+      "file": "replication.go",
+      "symbol": "Raft.pipelineDecode",
+      "start_line": 534,
+      "end_line": 567,
+      "snapshot_id": "40df0f6c9adc43f489f882d41f88b87a",
+      "content_digest": "24106024107950339bd30fc4e24a0b4a0a97a1c0e01aa7b31bedf4a2ad30b054",
+      "basis": "agent_inference",
+      "description": "Receives a future, accesses Request and Response, checks response term and Success, and invokes updateLastAppended without consulting Error.",
+      "pending": [
+        "Executable observation remains necessary; no test or reproduction result is supplied."
+      ],
+      "excerpt": "func (r *Raft) pipelineDecode(s *followerReplication, p AppendPipeline, stopCh, finishCh chan struct{}) {\n\tdefer close(finishCh)\n\trespCh := p.Consumer()\n\tfor {\n\t\tselect {\n\t\tcase ready := <-respCh:\n\t\t\ts.peerLock.RLock()\n\t\t\tpeer := s.peer\n\t\t\ts.peerLock.RUnlock()\n\n\t\t\treq, resp := ready.Request(), ready.Response()\n\t\t\tappendStats(string(peer.ID), ready.Start(), float32(len(req.Entries)), r.noLegacyTelemetry)\n\n\t\t\t// Check for a newer term, stop running\n\t\t\tif resp.Term > req.Term {\n\t\t\t\tr.handleStaleTerm(s)\n\t\t\t\treturn\n\t\t\t}\n\n\t\t\t// Update the last contact\n\t\t\ts.setLastContact()\n\n\t\t\t// Abort pipeline if not successful\n\t\t\tif !resp.Success {\n\t\t\t\treturn\n\t\t\t}\n\n\t\t\t// Update our replication state\n\t\t\tupdateLastAppended(s, req)\n\t\tcase <-stopCh:\n\t\t\treturn\n\t\t}\n\t}\n}",
+      "version": 1
+    },
+    {
+      "associations": [
+        {
+          "claim_id": "O_pipeline_response_validity",
+          "source_ids": [
+            "replication.go:534:665"
+          ],
+          "rationale": "Direct stopping boundary for observing whether the consumer turns an invalid response into a replication progress report."
+        }
+      ],
+      "anchor": {
+        "source_ids": [
+          "replication.go:534:665"
+        ],
+        "boundary_complete": true,
+        "kind": "declaration",
+        "material_id": "replication.go:534:665",
+        "start_line": 655,
+        "end_line": 655,
+        "symbol": "updateLastAppended"
+      },
+      "material_id": "replication.go:534:665",
+      "id": "BD_pipeline_progress_report",
+      "file": "replication.go",
+      "symbol": "updateLastAppended",
+      "start_line": 655,
+      "end_line": 665,
+      "snapshot_id": "40df0f6c9adc43f489f882d41f88b87a",
+      "content_digest": "24106024107950339bd30fc4e24a0b4a0a97a1c0e01aa7b31bedf4a2ad30b054",
+      "basis": "agent_inference",
+      "description": "For nonempty requests, advances nextIndex and submits the last entry index to commitment.match; also notifies pending verification work.",
+      "pending": [
+        "The commitment accumulator and verification consumers are not independently checked by this obligation."
+      ],
+      "excerpt": "func updateLastAppended(s *followerReplication, req *AppendEntriesRequest) {\n\t// Mark any inflight logs as committed\n\tif logs := req.Entries; len(logs) > 0 {\n\t\tlast := logs[len(logs)-1]\n\t\tatomic.StoreUint64(&s.nextIndex, last.Index+1)\n\t\ts.commitment.match(s.peer.ID, last.Index)\n\t}\n\n\t// Notify still leader\n\ts.notifyAll(true)\n}",
+      "version": 1
+    },
+    {
+      "associations": [
+        {
+          "claim_id": "O_append_failure_retained_identity",
+          "source_ids": [
+            "raft.go:1440:1584",
+            "state.go:1:174",
+            "log.go:81:192"
+          ],
+          "rationale": "The handler mutates retained history and determines whether its cached terminal identity is refreshed before returning after replacement failure."
+        }
+      ],
+      "anchor": {
+        "source_ids": [
+          "raft.go:1440:1584"
+        ],
+        "boundary_complete": true,
+        "kind": "declaration",
+        "material_id": "raft.go:1440:1584",
+        "start_line": 1440,
+        "end_line": 1440,
+        "symbol": "Raft.appendEntries"
+      },
+      "material_id": "raft.go:1440:1584",
+      "id": "BD_append_failure_retained_identity",
+      "file": "raft.go",
+      "symbol": "Raft.appendEntries",
+      "start_line": 1440,
+      "end_line": 1580,
+      "snapshot_id": "40df0f6c9adc43f489f882d41f88b87a",
+      "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800",
+      "basis": "agent_inference",
+      "description": "Conflict deletion, replacement-storage error return, cached last-log update, and consumption of terminal identity during predecessor validation.",
+      "pending": [
+        "The concrete fault-producing adapter is not established.",
+        "A legal subsequent request is outside this local comparison."
+      ],
+      "excerpt": "func (r *Raft) appendEntries(rpc RPC, a *AppendEntriesRequest) {\n\tdefer metrics.MeasureSince([]string{\"raft\", \"rpc\", \"appendEntries\"}, time.Now())\n\t// Setup a response\n\tresp := &AppendEntriesResponse{\n\t\tRPCHeader:      r.getRPCHeader(),\n\t\tTerm:           r.getCurrentTerm(),\n\t\tLastLog:        r.getLastIndex(),\n\t\tSuccess:        false,\n\t\tNoRetryBackoff: false,\n\t}\n\tvar rpcErr error\n\tdefer func() {\n\t\trpc.Respond(resp, rpcErr)\n\t}()\n\n\t// Ignore an older term\n\tif a.Term < r.getCurrentTerm() {\n\t\treturn\n\t}\n\n\t// Increase the term if we see a newer one, also transition to follower\n\t// if we ever get an appendEntries call\n\tif a.Term > r.getCurrentTerm() || (r.getState() != Follower && !r.candidateFromLeadershipTransfer.Load()) {\n\t\t// Ensure transition to follower\n\t\tr.setState(Follower)\n\t\tr.setCurrentTerm(a.Term)\n\t\tresp.Term = a.Term\n\t}\n\n\t// Save the current leader\n\tif len(a.Addr) > 0 {\n\t\tr.setLeader(r.trans.DecodePeer(a.Addr), ServerID(a.ID))\n\t} else {\n\t\tr.setLeader(r.trans.DecodePeer(a.Leader), ServerID(a.ID))\n\t}\n\t// Verify the last log entry\n\tif a.PrevLogEntry > 0 {\n\t\tlastIdx, lastTerm := r.getLastEntry()\n\n\t\tvar prevLogTerm uint64\n\t\tif a.PrevLogEntry == lastIdx {\n\t\t\tprevLogTerm = lastTerm\n\t\t} else {\n\t\t\tvar prevLog Log\n\t\t\tif err := r.logs.GetLog(a.PrevLogEntry, &prevLog); err != nil {\n\t\t\t\tr.logger.Warn(\"failed to get previous log\",\n\t\t\t\t\t\"previous-index\", a.PrevLogEntry,\n\t\t\t\t\t\"last-index\", lastIdx,\n\t\t\t\t\t\"error\", err)\n\t\t\t\tresp.NoRetryBackoff = true\n\t\t\t\treturn\n\t\t\t}\n\t\t\tprevLogTerm = prevLog.Term\n\t\t}\n\n\t\tif a.PrevLogTerm != prevLogTerm {\n\t\t\tr.logger.Warn(\"previous log term mis-match\",\n\t\t\t\t\"ours\", prevLogTerm,\n\t\t\t\t\"remote\", a.PrevLogTerm)\n\t\t\tresp.NoRetryBackoff = true\n\t\t\treturn\n\t\t}\n\t}\n\n\t// Process any new entries\n\tif len(a.Entries) > 0 {\n\t\tstart := time.Now()\n\n\t\t// Delete any conflicting entries, skip any duplicates\n\t\tlastLogIdx, _ := r.getLastLog()\n\t\tvar newEntries []*Log\n\t\tfor i, entry := range a.Entries {\n\t\t\tif entry.Index > lastLogIdx {\n\t\t\t\tnewEntries = a.Entries[i:]\n\t\t\t\tbreak\n\t\t\t}\n\t\t\tvar storeEntry Log\n\t\t\tif err := r.logs.GetLog(entry.Index, &storeEntry); err != nil {\n\t\t\t\tr.logger.Warn(\"failed to get log entry\",\n\t\t\t\t\t\"index\", entry.Index,\n\t\t\t\t\t\"error\", err)\n\t\t\t\treturn\n\t\t\t}\n\t\t\tif entry.Term != storeEntry.Term {\n\t\t\t\tr.logger.Warn(\"clearing log suffix\", \"from\", entry.Index, \"to\", lastLogIdx)\n\t\t\t\tif err := r.logs.DeleteRange(entry.Index, lastLogIdx); err != nil {\n\t\t\t\t\tr.logger.Error(\"failed to clear log suffix\", \"error\", err)\n\t\t\t\t\treturn\n\t\t\t\t}\n\t\t\t\tif entry.Index <= r.configurations.latestIndex {\n\t\t\t\t\tr.setLatestConfiguration(r.configurations.committed, r.configurations.committedIndex)\n\t\t\t\t}\n\t\t\t\tnewEntries = a.Entries[i:]\n\t\t\t\tbreak\n\t\t\t}\n\t\t}\n\n\t\tif n := len(newEntries); n > 0 {\n\t\t\t// Append the new entries\n\t\t\tif err := r.logs.StoreLogs(newEntries); err != nil {\n\t\t\t\tr.logger.Error(\"failed to append to logs\", \"error\", err)\n\t\t\t\t// TODO: leaving r.getLastLog() in the wrong\n\t\t\t\t// state if there was a truncation above\n\t\t\t\treturn\n\t\t\t}\n\n\t\t\t// Handle any new configuration changes\n\t\t\tfor _, newEntry := range newEntries {\n\t\t\t\tif err := r.processConfigurationLogEntry(newEntry); err != nil {\n\t\t\t\t\tr.logger.Warn(\"failed to append entry\",\n\t\t\t\t\t\t\"index\", newEntry.Index,\n\t\t\t\t\t\t\"error\", err)\n\t\t\t\t\trpcErr = err\n\t\t\t\t\treturn\n\t\t\t\t}\n\t\t\t}\n\n\t\t\t// Update the lastLog\n\t\t\tlast := newEntries[n-1]\n\t\t\tr.setLastLog(last.Index, last.Term)\n\t\t}\n\n\t\tmetrics.MeasureSince([]string{\"raft\", \"rpc\", \"appendEntries\", \"storeLogs\"}, start)\n\t}\n\n\t// Update the commit index\n\tif a.LeaderCommitIndex > 0 && a.LeaderCommitIndex > r.getCommitIndex() {\n\t\tstart := time.Now()\n\t\tidx := min(a.LeaderCommitIndex, r.getLastIndex())\n\t\tr.setCommitIndex(idx)\n\t\tif r.configurations.latestIndex <= idx {\n\t\t\tr.setCommittedConfiguration(r.configurations.latest, r.configurations.latestIndex)\n\t\t}\n\t\tr.processLogs(idx, nil)\n\t\tmetrics.MeasureSince([]string{\"raft\", \"rpc\", \"appendEntries\", \"processLogs\"}, start)\n\t}\n\n\t// Everything went well, set success\n\tresp.Success = true\n\tr.setLastContact()\n}",
+      "version": 1
+    },
+    {
+      "associations": [
+        {
+          "claim_id": "O_append_failure_retained_identity",
+          "source_ids": [
+            "state.go:1:174"
+          ],
+          "rationale": "This accessor exposes the retained-history identity whose documented meaning supplies the independent comparison target."
+        }
+      ],
+      "anchor": {
+        "source_ids": [
+          "state.go:1:174"
+        ],
+        "boundary_complete": true,
+        "kind": "declaration",
+        "material_id": "state.go:1:174",
+        "start_line": 167,
+        "end_line": 167,
+        "symbol": "raftState.getLastEntry"
+      },
+      "material_id": "state.go:1:174",
+      "id": "BD_last_entry_representation",
+      "file": "state.go",
+      "symbol": "raftState.getLastEntry",
+      "start_line": 167,
+      "end_line": 174,
+      "snapshot_id": "40df0f6c9adc43f489f882d41f88b87a",
+      "content_digest": "9e73b5bcd67350db80c272c0d0f3f6c17afb24fb6e62b28e891c13e96107e189",
+      "basis": "agent_inference",
+      "description": "Selects the cached terminal log or snapshot identity without querying retained logs.",
+      "pending": [
+        "Snapshot identity is held fixed and initially consistent in this bounded check."
+      ],
+      "excerpt": "func (r *raftState) getLastEntry() (uint64, uint64) {\n\tr.lastLock.Lock()\n\tdefer r.lastLock.Unlock()\n\tif r.lastLogIndex >= r.lastSnapshotIndex {\n\t\treturn r.lastLogIndex, r.lastLogTerm\n\t}\n\treturn r.lastSnapshotIndex, r.lastSnapshotTerm\n}",
+      "version": 1
+    },
+    {
+      "associations": [
+        {
+          "claim_id": "O_verify_voter_eligibility",
+          "source_ids": [
+            "raft.go:827:1100"
+          ],
+          "rationale": "Directly selects which replication workers may contribute to the verification future."
+        }
+      ],
+      "anchor": {
+        "source_ids": [
+          "raft.go:827:1100"
+        ],
+        "boundary_complete": true,
+        "kind": "declaration",
+        "material_id": "raft.go:827:1100",
+        "start_line": 965,
+        "end_line": 965,
+        "symbol": "Raft.verifyLeader"
+      },
+      "material_id": "raft.go:827:1100",
+      "id": "BD_verify_registration",
+      "file": "raft.go",
+      "symbol": "Raft.verifyLeader",
+      "start_line": 965,
+      "end_line": 987,
+      "snapshot_id": "40df0f6c9adc43f489f882d41f88b87a",
+      "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800",
+      "basis": "agent_inference",
+      "description": "Initializes self-support and the quorum threshold, then registers the future with all replication workers.",
+      "pending": [
+        "Full legal-history establishment of the initialized leader episode remains outside the local check."
+      ],
+      "excerpt": "func (r *Raft) verifyLeader(v *verifyFuture) {\n\t// Current leader always votes for self\n\tv.votes = 1\n\n\t// Set the quorum size, hot-path for single node\n\tv.quorumSize = r.quorumSize()\n\tif v.quorumSize == 1 {\n\t\tv.respond(nil)\n\t\treturn\n\t}\n\n\t// Track this request\n\tv.notifyCh = r.verifyCh\n\tr.leaderState.notify[v] = struct{}{}\n\n\t// Trigger immediate heartbeats\n\tfor _, repl := range r.leaderState.replState {\n\t\trepl.notifyLock.Lock()\n\t\trepl.notify[v] = struct{}{}\n\t\trepl.notifyLock.Unlock()\n\t\tasyncNotifyCh(repl.notifyCh)\n\t}\n}",
+      "version": 1
+    },
+    {
+      "associations": [
+        {
+          "claim_id": "O_verify_voter_eligibility",
+          "source_ids": [
+            "raft.go:827:1100"
+          ],
+          "rationale": "Directly defines the electorate used to calculate the verification threshold."
+        }
+      ],
+      "anchor": {
+        "source_ids": [
+          "raft.go:827:1100"
+        ],
+        "boundary_complete": true,
+        "kind": "declaration",
+        "material_id": "raft.go:827:1100",
+        "start_line": 1086,
+        "end_line": 1086,
+        "symbol": "Raft.quorumSize"
+      },
+      "material_id": "raft.go:827:1100",
+      "id": "BD_verify_quorum",
+      "file": "raft.go",
+      "symbol": "Raft.quorumSize",
+      "start_line": 1086,
+      "end_line": 1094,
+      "snapshot_id": "40df0f6c9adc43f489f882d41f88b87a",
+      "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800",
+      "basis": "agent_inference",
+      "description": "Computes a majority threshold using only Voter configuration entries.",
+      "pending": [],
+      "excerpt": "func (r *Raft) quorumSize() int {\n\tvoters := 0\n\tfor _, server := range r.configurations.latest.Servers {\n\t\tif server.Suffrage == Voter {\n\t\t\tvoters++\n\t\t}\n\t}\n\treturn voters/2 + 1\n}",
+      "version": 1
+    },
+    {
+      "associations": [
+        {
+          "claim_id": "O_verify_voter_eligibility",
+          "source_ids": [
+            "replication.go:1:202"
+          ],
+          "rationale": "Directly converts a selected worker's support into verification votes without passing participant identity."
+        }
+      ],
+      "anchor": {
+        "source_ids": [
+          "replication.go:1:201",
+          "replication.go:1:202",
+          "replication.go:1:298"
+        ],
+        "boundary_complete": true,
+        "kind": "declaration",
+        "material_id": "replication.go:1:202",
+        "start_line": 100,
+        "end_line": 100,
+        "symbol": "followerReplication.notifyAll"
+      },
+      "material_id": "replication.go:1:202",
+      "id": "BD_verify_worker_notification",
+      "file": "replication.go",
+      "symbol": "followerReplication.notifyAll",
+      "start_line": 100,
+      "end_line": 111,
+      "snapshot_id": "40df0f6c9adc43f489f882d41f88b87a",
+      "content_digest": "24106024107950339bd30fc4e24a0b4a0a97a1c0e01aa7b31bedf4a2ad30b054",
+      "basis": "agent_inference",
+      "description": "Detaches pending registrations under a mutex and submits one boolean vote per detached future.",
+      "pending": [
+        "Response correlation and freshness are not established by this helper."
+      ],
+      "excerpt": "func (s *followerReplication) notifyAll(leader bool) {\n\t// Clear the waiting notifies minimizing lock time\n\ts.notifyLock.Lock()\n\tn := s.notify\n\ts.notify = make(map[*verifyFuture]struct{})\n\ts.notifyLock.Unlock()\n\n\t// Submit our votes\n\tfor v := range n {\n\t\tv.vote(leader)\n\t}\n}",
+      "version": 1
+    },
+    {
+      "associations": [
+        {
+          "claim_id": "O_verify_voter_eligibility",
+          "source_ids": [
+            "future.go:181:314"
+          ],
+          "rationale": "Directly consumes positive support and decides whether the quorum notification threshold has been reached."
+        }
+      ],
+      "anchor": {
+        "source_ids": [
+          "future.go:181:314",
+          "future.go:1:314"
+        ],
+        "boundary_complete": true,
+        "kind": "declaration",
+        "material_id": "future.go:181:314",
+        "start_line": 274,
+        "end_line": 274,
+        "symbol": "verifyFuture.vote"
+      },
+      "material_id": "future.go:181:314",
+      "id": "BD_verify_vote_aggregation",
+      "file": "future.go",
+      "symbol": "verifyFuture.vote",
+      "start_line": 274,
+      "end_line": 293,
+      "snapshot_id": "40df0f6c9adc43f489f882d41f88b87a",
+      "content_digest": "e3775d16c6cb24f9c9572ce452c27e87fcbf4b24baf666d14e838cc4b571ae9c",
+      "basis": "agent_inference",
+      "description": "Serializes support counting, notifies at the threshold or on negative support, and disables subsequent notifications.",
+      "pending": [
+        "Notification is distinct from API future completion and continued authority."
+      ],
+      "excerpt": "func (v *verifyFuture) vote(leader bool) {\n\tv.voteLock.Lock()\n\tdefer v.voteLock.Unlock()\n\n\t// Guard against having notified already\n\tif v.notifyCh == nil {\n\t\treturn\n\t}\n\n\tif leader {\n\t\tv.votes++\n\t\tif v.votes >= v.quorumSize {\n\t\t\tv.notifyCh <- v\n\t\t\tv.notifyCh = nil\n\t\t}\n\t} else {\n\t\tv.notifyCh <- v\n\t\tv.notifyCh = nil\n\t}\n}",
+      "version": 1
+    }
+  ],
+  "relations": []
+}

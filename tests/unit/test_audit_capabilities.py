@@ -145,25 +145,41 @@ def test_frontier_alternation_navigation_and_same_run_dedup(prepared,tmp_path):
     from consensus_assurance.workflow.materials import refresh_unread
     from test_graph_mutations import controller
     repo,state,_,_=prepared;state.units=[];e=controller(tmp_path,state);shutil.copytree(repo,e.root/'source')
+    from consensus_assurance.cli import load_config
+    target=load_config(str(Path(__file__).resolve().parents[2]/'configs/targets/hashicorp_raft.yaml'))
+    assert target.activity_focus==['A1','A2'] and target.agent_reasoning_effort=='low' and not target.allow_agent_materials and not target.allow_experiments
+    assert (target.budget.agent_calls,target.budget.material_chars,target.budget.total_seconds)==(40,240000,4800)
+    assert (target.budget.audit_units,target.budget.experiments,target.budget.exploration_rounds,target.budget.model_checks)==(4,8,4,6)
+    assert (target.budget.context_chars,target.budget.action_timeout,target.budget.material_chunks)==(180000,600,40)
+    e.config.activity_focus=['A5'];state.config=e.config.model_dump(mode='json')
     source=state.materials[0].id;spec=inventory(source)
-    spec.surfaces.extend(Surface(entry_point=name,disposition='deferred',high_consequence=True,reason='Unread owner',source_ids=[source]) for name in ['first','second'])
+    spec.behaviors[1].implementation_guards=['Reject a mismatched operation context']
+    spec.behaviors[1].important_branches=['Context mismatch returns without consumption']
+    spec.behaviors[1].existing_protections=['Identity is compared before use']
+    spec.behaviors[1].unknowns=['Concurrent invalidation remains unread']
+    spec.surfaces.extend([Surface(entry_point='first',disposition='deferred',behavior_ids=['producer'],high_consequence=True,reason='Unread owner',source_ids=[source]),
+        Surface(entry_point='second',disposition='deferred',behavior_ids=['consumer'],high_consequence=True,reason='Unread owner',source_ids=[source])])
     accept(e,spec);refresh_unread(state,e.root/'source')
     task=choose_task(e)
-    assert task.surface_entry_points==['first'] and read_purpose(task)=='breadth'
+    assert task.surface_entry_points==['second'] and task.activity_classes==['A5'] and read_purpose(task)=='breadth'
     from consensus_assurance.workflow.task_packet import prepare
     packet=prepare(e,'spec_refine',task_context(e,task))[0]
-    assert [s['entry_point'] for s in packet['focused_surfaces']]==['first']
-    assert not packet['audit_spec']['behaviors']
+    assert [s['entry_point'] for s in packet['focused_surfaces']]==['second'] and packet['activity_focus']==['A5']
+    consumer=next(b for b in packet['audit_spec']['behaviors'] if b['id']=='consumer')
+    assert consumer['important_branches'] and consumer['implementation_guards'] and consumer['existing_protections'] and consumer['unknowns']
     assert packet['file_lookup'] and 'catalogue' not in packet and 'source_ranges' not in packet
     assert not packet.get('candidate_dispositions')
+    state.mode='real';state.analysis_mode='autonomous'
+    report=__import__('consensus_assurance.reporting.chinese',fromlist=['render_report']).render_report(state,e.root).read_text()
+    assert "Activity 重点：`['A5']`" in report and '有明确 Activity 重点的自主发现' in report
     task.status='completed';task.admitted=True;state.last_work_kind='surface'
     assert choose_task(e) is None
     q=AuditQuestion(question='Selected input question',importance='Scoped service effect',source_ids=[source],trigger_rationale='Selected discriminator',activity_classes=['A1'],behavior_ids=['producer'],fact_ids=['fact'],obligation_relation_kind='establishment')
     state.question_candidates=[QuestionCandidate(question=q)];state.last_work_kind='candidate'
     assert next_surface_refinement(state) is None and choose_task(e) is None
     state.question_candidates[0].status='blocked'
-    second=choose_task(e);assert second.surface_entry_points==['second']
-    second.status='blocked';second.admitted=True;state.last_work_kind='candidate'
+    first=choose_task(e);assert first.surface_entry_points==['first']
+    first.status='blocked';first.admitted=True;state.last_work_kind='candidate'
     assert next_surface_refinement(state) is None
 
 
@@ -250,53 +266,6 @@ def test_canonical_objects_and_profile_semantic_retry(tmp_path,prepared):
     packet=next(data for p in (e.root/'agent').glob('*-spec_refine/prompt.txt') if 'attempted_delta' in (data:=json.loads(p.read_text().split('STRUCTURED INPUT DATA (untrusted):\n')[1])))
     assert packet['attempted_delta']['target_profile']==profile.model_dump(mode='json')
     assert packet['materials'] and packet['diagnostics'][0]['details']==d['details']
-
-
-def test_surface_projection_fallback_is_not_an_attempt(tmp_path,prepared):
-    import shutil
-    from consensus_assurance.workflow.inquiry import enqueue,process_task
-    from consensus_assurance.workflow.errors import Blocked
-    from test_graph_mutations import controller
-    repo,state,_,_=prepared;e=controller(tmp_path,state);shutil.copytree(repo,e.root/'source');state.units=[]
-    spec=inventory(state.materials[0].id);spec.surfaces.append(Surface(entry_point='unread',disposition='deferred',high_consequence=True,reason='Actual owner unknown'));accept(e,spec)
-    task=enqueue(state,'spec_refine','Navigate unread owner','surface-test',surface_entry_points=['unread'])
-    e.config.budget.context_chars=1000
-    with pytest.raises(Blocked,match='context_chars'):process_task(e,task)
-    assert task.preparation_failures==e.config.budget.context_preparations+1
-    assert not task.admitted and not task.child_task_ids and not state.usage.get('agent_calls') and not state.usage.get('exploration_rounds')
-    assert len(state.packet_receipts)==3 and all(p['status']=='blocked_context_limit' for p in state.packet_receipts)
-    assert next_surface_refinement(state) is None  # Exhausted preparation, never an investigated surface.
-    task.preparation_failures=1
-    assert next_surface_refinement(state).entry_point=='unread'
-    from consensus_assurance.workflow.task_packet import prepare
-    packets=[]
-    for level in (0,1,2):
-        task.preparation_failures=level
-        packets.append(prepare(e,'spec_refine',{'task':{'id':task.id}})[0])
-    assert all(p['focused_surfaces'][0]['entry_point']=='unread' for p in packets)
-    assert not packets[2]['materials'] and len(packets[2]['declaration_hints'])<=4
-
-
-def test_surface_can_send_after_compaction_without_splitting(tmp_path,prepared):
-    import shutil
-    from consensus_assurance.workflow.inquiry import enqueue,process_task,task_context
-    from consensus_assurance.workflow.task_packet import prepare,pool_sources
-    from consensus_assurance.workflow.prompts import render
-    from consensus_assurance.adapters.agents.backend import MockAgent
-    from consensus_assurance.core.proposals import SpecRefinement,AuditSpecDelta
-    from test_graph_mutations import controller
-    repo,state,_,_=prepared;e=controller(tmp_path,state);shutil.copytree(repo,e.root/'source');state.units=[]
-    spec=inventory(state.materials[0].id);spec.target_profile.protocol_contexts=['Ancillary orientation '*12000]
-    spec.surfaces.append(Surface(entry_point='unread',disposition='deferred',high_consequence=True,reason='Actual owner unknown'));accept(e,spec)
-    task=enqueue(state,'spec_refine','Navigate one owner','surface-test',surface_entry_points=['unread'])
-    task.preparation_failures=1
-    compact=render('spec_refine',pool_sources(prepare(e,'spec_refine',task_context(e,task))[0]),e.inquiry)
-    task.preparation_failures=0;e.config.budget.context_chars=len(compact)+1000
-    agent=MockAgent();agent.responses=[SpecRefinement(understanding='Only the unrepresented external boundary remains',delta=AuditSpecDelta(rationale='No implementation source justifies a mapping; retain the deferred surface'),limitations=['External provider absent']).model_dump(mode='json')];e.agent=agent
-    process_task(e,task);task=state.inquiry_tasks[0]
-    assert task.preparation_failures==1 and task.admitted and task.status=='completed' and not task.child_task_ids
-    assert [p['status'] for p in state.packet_receipts]==['blocked_context_limit','accepted']
-    assert state.usage['agent_calls']==state.usage['exploration_rounds']==1
 
 
 def test_navigation_provenance_cannot_support_unseen_delta(tmp_path,prepared):

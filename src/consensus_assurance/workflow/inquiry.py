@@ -102,16 +102,22 @@ def choose_task(engine):
     if ready and engine.config.budget.audit_units>state.usage.get('audit_units',0):return None
     if any(c.status=='active' for c in state.question_candidates):return None
     feedback=[t for t in pending if t.kind=='review' or t.candidate_id]
-    if feedback:return feedback[0]
+    if feedback:
+        focus=set(engine.config.activity_focus)
+        return min(feedback,key=lambda t:(0 if focus&set(t.activity_classes) else 1,state.inquiry_tasks.index(t)))
     if state.last_work_kind in {'candidate','local','review'}:
         enrichment=next((t for t in pending if t.diagnostics and not t.candidate_id),None)
         if enrichment:return enrichment
-    from .audit_spec import next_surface_refinement
+    from .audit_spec import load, next_surface_refinement
     from .budget import can_start_episode
     if can_start_episode(state,'surface') and state.usage.get('exploration_rounds',0)<engine.config.budget.exploration_rounds:
         surface=next_surface_refinement(state)
         if surface:
-            return enqueue(state,'spec_refine','Expand one source-grounded implementation surface','surface:'+surface.entry_point,surface_entry_points=[surface.entry_point])
+            spec=load(state)
+            behavior={b.id:b for b in spec.behaviors}
+            classes=list(dict.fromkeys(behavior[id].primary_activity for id in surface.behavior_ids if id in behavior))
+            return enqueue(state,'spec_refine','Expand one source-grounded implementation surface','surface:'+surface.entry_point,
+                activity_classes=classes,surface_entry_points=[surface.entry_point])
     if pending and state.last_work_kind!='surface' and (pending[0].admitted or can_start_episode(state,'surface')):return pending[0]
     return None
 

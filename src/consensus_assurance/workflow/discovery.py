@@ -11,6 +11,7 @@ from . import inquiry
 def context(engine, unit=None):
     result = {"capabilities": [c.model_dump(mode="json") for c in engine.state.capabilities],
         "parameters": engine.config.parameters, "remaining_seconds": engine.budget.remaining(),
+        "activity_focus": engine.config.activity_focus,
         "directed_question": engine.config.directed_question,
         "snapshot_id": engine.state.snapshot.id,
         "harness_kind": engine.implementation.harness_kind if engine.implementation else None,
@@ -38,7 +39,8 @@ def discover(engine):
         if not engine.state.materials and material_allowance(engine.state,engine.config.budget,"breadth")["available_chars"]==0:raise Blocked("No material capacity for a grounded initial plan; no agent request sent")
         inventory = catalogue(source, engine.state.snapshot)
         write_json(engine.root / "catalogue.json", inventory)
-        plan, _ = engine.ask("read", ReadingPlan, {"catalogue": inventory, "initial_materials": [m.model_dump(mode="json") for m in engine.state.materials]},purpose="breadth")
+        plan, _ = engine.ask("read", ReadingPlan, {"catalogue": inventory, "initial_materials": [m.model_dump(mode="json") for m in engine.state.materials],
+            "activity_focus":engine.config.activity_focus,"reading_goal":"Recover one sourced responsibility relation and its decisive dependencies; the material allowance is a ceiling, not a target"},purpose="breadth")
         engine.read(plan.requests,purpose="breadth",partial=True,plan_id="initial-reading",related_ids=plan.related_ids,reason=plan.rationale)
         engine.state.completed_steps.append("materials"); engine.advance("discover")
     if "understanding" not in engine.state.completed_steps:
@@ -100,6 +102,7 @@ def classify_derivation_outcome(state,reply):
     q=reply.audit_question;current=active_candidate(state)
     selected=next((c for c in state.question_candidates if c.id==reply.candidate_id),None)
     parent=next((c for c in state.question_candidates if c.id==reply.fork_from_candidate_id),None)
+    pausing=reply.candidate_action=='pause'
     if reply.candidate_id:
         if selected is None or selected.status not in {'active','paused','blocked'}:
             invalid_reference('/candidate_id','Select an existing active, paused or blocked candidate ID')
@@ -107,6 +110,10 @@ def classify_derivation_outcome(state,reply):
         if current and current.id!=selected.id:invalid_reference('/candidate_id','Pause the current question before resuming another ID')
     elif current and not reply.fork_from_candidate_id:
         invalid_reference('/candidate_id','Continue the selected question by its candidate_id')
+    if pausing:
+        if not current or selected is None or selected.id!=current.id:invalid_reference('/candidate_action','Pause requires the current active candidate ID')
+        if not reply.resume_conditions:invalid_reference('/resume_conditions','Pause needs concrete discriminators that justify resuming the same candidate')
+    elif reply.resume_conditions:invalid_reference('/resume_conditions','Resume conditions belong only to a pause decision')
     if reply.fork_from_candidate_id and parent is None:invalid_reference('/fork_from_candidate_id','Fork requires an existing parent ID')
     if parent and not reply.fork_reason.strip():invalid_reference('/fork_reason','Explain why the question needs a separate candidate')
     if reply.fork_reason and not parent:invalid_reference('/fork_from_candidate_id','Fork reason requires its parent candidate ID')
@@ -114,6 +121,9 @@ def classify_derivation_outcome(state,reply):
     graph=reply.obligation or reply.bindings or reply.dependencies or reply.context_claims
     if not reply.selection_rationale.strip():raise ValueError('Explain the bounded analysis outcome')
     if q is None:
+        if pausing:
+            if graph or reply.reading_requests or reply.descriptive_issues:raise ValueError('A pause without a replacement question cannot add semantic work')
+            return 'pause'
         if selected and not (graph or reply.reading_requests or reply.descriptive_issues):return 'resume'
         if not current and not (graph or reply.reading_requests or reply.descriptive_issues):return 'selection_exhausted'
         raise ValueError('Selection can stop only after candidates were considered, with no active question or proposed work')
@@ -123,12 +133,13 @@ def classify_derivation_outcome(state,reply):
         raise ValueError('Explained candidates need sourced protections, no graph objects and no pending reads')
     if not reply.obligation and (q.disposition=='ready_for_check' or reads and q.preferred_check!='source_review'):
         raise ValueError('Pre-obligation candidates use source_review for acquisition; a ready check requires its obligation')
-    if reply.obligation:return 'escalate'
-    if q.disposition=='explained_by_existing_mechanism':return 'explained'
-    if reads:return 'continue_read'
-    reviewed=selected and (selected.material_ids or selected.history or len(selected.check_ids)>1)
+    prefix='pause_and_' if pausing else ''
+    if reply.obligation:return prefix+'escalate'
+    if q.disposition=='explained_by_existing_mechanism':return prefix+'explained'
+    if reads:return prefix+'continue_read'
+    reviewed=not pausing and selected and (selected.material_ids or selected.history or len(selected.check_ids)>1)
     if reviewed and q.disposition=='needs_specific_evidence' and q.preferred_check=='source_review' and q.unknowns:
-        return 'blocked_evidence'
+        return prefix+'blocked_evidence'
     raise ValueError('An initial question needs actionable source or a grounded result; evidence-blocked requires a reviewed candidate and explicit unknowns')
 
 
@@ -180,7 +191,7 @@ def validate_derivation(state,reply):
         missing=[id for id in required&known if not includes(state,[id],attached)]
         if missing:issues.append(Diagnostic(code='derivation_source_missing',category='material',object_ids=[reply.obligation.id],material_ids=sorted(missing),message='Read and attach the actual obligation/code dependency source before escalation',allowed=['read']))
     if issues:raise DiagnosticError(issues)
-    if outcome!='escalate':return outcome
+    if outcome not in {'escalate','pause_and_escalate'}:return outcome
     try:validate_patch(state,derivation_graph(reply))
     except DiagnosticError as exc:
         patch=derivation_graph(reply)
@@ -218,8 +229,16 @@ def accept_derivation(engine,reply,check_id):
             state.completed_steps.append('derived-spec:'+str(state.audit_spec_version))
             return
         candidate=next((c for c in state.question_candidates if c.id==reply.candidate_id),None)
+        if reply.candidate_action=='pause':
+            candidate.status='paused';candidate.stop_reason=reply.selection_rationale
+            candidate.resume_conditions=list(reply.resume_conditions)
+            if outcome=='pause':
+                candidate.check_ids.append(check_id)
+                return
+            candidate=None;outcome=outcome.removeprefix('pause_and_')
         if outcome=='resume':
             candidate.status='active';candidate.stop_reason=''
+            candidate.resume_conditions=[]
             candidate.check_ids.append(check_id)
             return
         q=reply.audit_question.model_copy(deep=True)
@@ -285,7 +304,7 @@ def continue_candidate(engine,candidate):
             engine.checkpoint('candidate_reconnection_required');return
     if candidate.stage!='read':return
     receipt=engine.read(candidate.question.requests,purpose='depth',partial=True,plan_id=candidate.read_plan_id,
-        related_ids=candidate.question.fact_ids+candidate.question.behavior_ids,reason=candidate.question.question)
+        related_ids=[candidate.id]+candidate.question.fact_ids+candidate.question.behavior_ids,reason=candidate.question.question)
     candidate=active_candidate(state)
     from .sources import includes
     attached=[id for i in receipt['items'] if i['status']!='deferred' for id in i['material_ids']]

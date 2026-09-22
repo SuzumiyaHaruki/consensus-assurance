@@ -1,4 +1,4 @@
-"""Investigation input assembly and side-effect-free feedback acceptance."""
+"""Investigation input assembly and bounded result disposition."""
 from .feedback import apply_feedback
 from .artifacts import validate_bundle
 
@@ -47,33 +47,12 @@ def validate_replay(state, unit, bundle, finding, plan, implementation):
     return revised
 
 
-def consequence_needed(unit, finding):
-    return finding.level=='implementation_obligation'
-
-
-def validate_consequence(state, unit, reply):
-    from .graph import validate_patch
-    if not set(reply.source_ids)<={m.id for m in state.materials} or not reply.rationale.strip():
-        raise ValueError('Consequence plan must cite actual material and broader obligations')
-    if reply.disposition=='investigate' and not reply.requests and not reply.patch:
-        raise ValueError('Consequence investigation needs a bounded reading or joint-unit plan')
-    if reply.patch:
-        if not reply.patch.units:raise ValueError('Joint consequence scope needs an explicit unit')
-        for new in reply.patch.units:
-            if not new.audit_question or set(new.obligation_ids)&set(unit.obligation_ids):
-                raise ValueError('Joint unit must explain the broader obligation and actual audit question')
-        validate_patch(state,reply.patch)
-
-
-def record_consequence(engine, unit, finding, reply=None, reason=''):
-    from .inquiry import enqueue
-    from .graph import apply_patch
+def record_consequence(engine, unit, finding):
     if any(c['finding_id']==finding.id for c in engine.state.consequences):return
-    if reply and reply.patch:apply_patch(engine.state,reply.patch)
-    tasks=[]
-    if reply and reply.requests:
-        task=enqueue(engine.state,'spec_refine','Investigate local-to-broader obligation consequences and compensation: '+reply.rationale,'consequence:'+finding.id,target_ids=unit.obligation_ids,unit_id=unit.id,model_id=finding.model_id,requests=reply.requests)
-        tasks.append(task.id)
+    child=next((c for c in engine.state.question_candidates if c.obligation_id in unit.obligation_ids),None)
+    parent=next((c for c in engine.state.question_candidates if child and c.id==child.parent_candidate_id),None)
+    reason=('The existing parent candidate retains this broader discriminator; the child result is projected there without creating a duplicate inquiry task' if parent else
+        'The bounded obligation result is retained for ordinary candidate reselection; broader consequence needs a distinct sourced question')
     engine.state.consequences.append({'finding_id':finding.id,
-        'disposition':reply.disposition if reply else 'defer','reason':reply.rationale if reply else reason,'source_ids':reply.source_ids if reply else [],'task_ids':tasks,
-        'limitations':reply.limitations if reply else ['Only the evidenced obligation-level result is reported; broader consequence is unestablished']})
+        'disposition':'defer','reason':reason,'source_ids':unit.audit_question.source_ids if unit.audit_question else [],'task_ids':[], 'parent_candidate_id':parent.id if parent else None,
+        'limitations':['Only the evidenced obligation-level result is reported; broader consequence is unestablished']})

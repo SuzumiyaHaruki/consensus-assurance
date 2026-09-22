@@ -1,0 +1,302 @@
+{
+  "understanding": "The attached source resolves worker association with the leader commitment object. startStopReplication captures that object when constructing each worker, retains the worker for an existing server ID, and updates its peer record only when the address changes. Removal signals and deletes the worker without rebinding its commitment pointer. Leader cleanup clears leaderState references without clearing captured worker references or visibly joining workers. These observations establish ownership mechanisms, not termination completion, synchronization safety, or the semantics of removing and later reusing a server ID.",
+  "requests": [],
+  "delta": {
+    "target_profile": null,
+    "activities": [],
+    "behaviors": [
+      {
+        "id": "B1",
+        "primary_activity": "A2",
+        "execution_owner": "Raft main goroutine entering runLeader",
+        "protocol_context": "A new local leader-state episode",
+        "trigger": "Entry into runLeader",
+        "legal_preconditions": [
+          "The caller has selected leader execution; election justification is unread."
+        ],
+        "implementation_guards": [],
+        "reads": [
+          "Latest configuration",
+          "Last index",
+          "Configured NotifyCh"
+        ],
+        "writes": [
+          "Fresh leader commitment object, channels, inflight list, replication map, and verification map"
+        ],
+        "durable_effects": [
+          "Dispatches a no-op through an unread persistence helper."
+        ],
+        "external_effects": [
+          "Sends leadership notifications before setupLeaderState.",
+          "Calls startStopReplication and dispatchLogs."
+        ],
+        "important_branches": [
+          "Configured notification can block until delivered or shutdown.",
+          "Shutdown uses a best-effort notification attempt."
+        ],
+        "async_boundaries": [
+          "Leadership channels",
+          "Background metrics goroutine",
+          "Replication workers launched by startStopReplication with captured commitment and stepDown references"
+        ],
+        "produces_fact_ids": [
+          "F1"
+        ],
+        "consumes_fact_ids": [],
+        "cross_activity_effects": {
+          "A1": "Creates the commitment accumulator and dispatches an initial no-op."
+        },
+        "existing_protections": [
+          "A fresh commitment object starts with zero voter matches and a new startIndex.",
+          "setupLeaderState precedes the initial startStopReplication call."
+        ],
+        "source_ids": [
+          "raft.go:455:581",
+          "commitment.go:1:104",
+          "raft.go:455:666"
+        ],
+        "unknowns": [
+          "Election establishment and leader term identity",
+          "No-op persistence and dispatch failure behavior"
+        ]
+      },
+      {
+        "id": "B-worker-reconciliation",
+        "primary_activity": "A4",
+        "execution_owner": "Raft main goroutine executing startStopReplication",
+        "protocol_context": "Current leader state reconciled with configurations.latest, keyed by ServerID",
+        "trigger": "Call to startStopReplication",
+        "legal_preconditions": [
+          "The function comment requires main-thread invocation.",
+          "Leader-state initialization precedes the call shown in runLeader; other call ordering is not established here."
+        ],
+        "implementation_guards": [
+          "Skips the local server ID.",
+          "Creates a worker only when replState lacks the configured server ID.",
+          "Updates an existing worker's peer record only when its address differs.",
+          "Removes workers whose IDs are absent from the latest configuration."
+        ],
+        "reads": [
+          "configurations.latest.Servers",
+          "Last index",
+          "Current term",
+          "leaderState.commitment",
+          "leaderState.stepDown",
+          "leaderState.replState",
+          "Existing peer record under peerLock"
+        ],
+        "writes": [
+          "New worker state with captured commitment pointer, stepDown channel, currentTerm, and nextIndex equal to lastIdx plus one",
+          "replState entries keyed by ServerID",
+          "Existing worker peer record under peerLock when its address changes"
+        ],
+        "durable_effects": [],
+        "external_effects": [
+          "Launches replicate for each newly constructed worker and notifies its trigger channel.",
+          "Emits peer addition and removal observations.",
+          "Sends lastIdx to a removed worker's stop channel, closes the channel, and deletes its map entry.",
+          "Updates the peers metric."
+        ],
+        "important_branches": [
+          "Creation captures the current leader commitment object rather than looking it up for each response.",
+          "Existing-worker lookup and peer replacement use the same configured server ID; an address update preserves that logical ID.",
+          "An unchanged address leaves the existing peer record unchanged.",
+          "Address updates and removal do not assign a replacement commitment pointer.",
+          "Deletion from replState is not a visible worker join."
+        ],
+        "async_boundaries": [
+          "Replication goroutine launch",
+          "Trigger channel notification",
+          "Stop channel send and close",
+          "peerLock"
+        ],
+        "produces_fact_ids": [],
+        "consumes_fact_ids": [
+          "F1"
+        ],
+        "cross_activity_effects": {
+          "A1": "Binds newly constructed replication workers to the current leader commitment object used for subsequent progress submissions.",
+          "A2": "Captures the current term and leader stepDown channel in newly constructed worker state."
+        },
+        "existing_protections": [
+          "Existing workers are selected by logical ServerID.",
+          "Peer replacement occurs under peerLock.",
+          "Worker construction completes before its replication goroutine is launched.",
+          "Removal requests best-effort replication through the observed last index before worker exit."
+        ],
+        "source_ids": [
+          "raft.go:455:666",
+          "replication.go:1:298",
+          "replication.go:534:665"
+        ],
+        "unknowns": [
+          "Completion ordering of removed workers, heartbeat goroutines, pipelines, and outstanding RPCs",
+          "Legal removal and reintroduction histories for the same ServerID and interpretation of reports from overlapping worker lifetimes",
+          "Ordering of other callers relative to commitment.setConfiguration",
+          "Synchronization safety of all peer accesses; updateLastAppended reads s.peer.ID without taking peerLock",
+          "Full pipeline and snapshot paths may impose additional lifetime behavior"
+        ]
+      },
+      {
+        "id": "B10",
+        "primary_activity": "A2",
+        "execution_owner": "Main goroutine executing runLeader deferred cleanup",
+        "protocol_context": "Retirement of a leader-state episode",
+        "trigger": "runLeader exits",
+        "legal_preconditions": [
+          "Leader setup has registered the deferred cleanup."
+        ],
+        "implementation_guards": [
+          "Clears known leader identity only when it still names the local server."
+        ],
+        "reads": [
+          "Replication worker map",
+          "Inflight futures",
+          "Pending verification futures",
+          "Current leader identity"
+        ],
+        "writes": [
+          "Last contact",
+          "Cleared leaderState references",
+          "Possibly cleared leader identity"
+        ],
+        "durable_effects": [],
+        "external_effects": [
+          "Closes stop channels of workers still listed in replState.",
+          "Responds ErrLeadershipLost to inflight and pending verification futures.",
+          "Publishes leadership-loss notifications."
+        ],
+        "important_branches": [
+          "Worker stop requests are not visible joins.",
+          "Clearing leaderState.commitment does not clear the commitment pointers previously captured in worker objects.",
+          "Workers previously removed by startStopReplication are no longer present in the cleanup iteration.",
+          "Configured notification can block except for the shutdown best-effort branch."
+        ],
+        "async_boundaries": [
+          "Worker stop channels",
+          "Future responses",
+          "Leadership notifications"
+        ],
+        "produces_fact_ids": [],
+        "consumes_fact_ids": [],
+        "cross_activity_effects": {
+          "A1": "Clears the leader state's commitment and inflight references without visibly joining workers or rebinding their captured commitment references.",
+          "A7": "Completes still-pending leader operations with ErrLeadershipLost."
+        },
+        "existing_protections": [
+          "Preserves a replacement leader identity already learned from an RPC.",
+          "Signals all listed replication workers before clearing references.",
+          "Worker progress submissions use their captured commitment pointer rather than rereading leaderState.commitment."
+        ],
+        "source_ids": [
+          "raft.go:455:666",
+          "replication.go:1:298",
+          "replication.go:534:665"
+        ],
+        "unknowns": [
+          "Worker termination completion",
+          "Future response idempotence",
+          "When outstanding work ceases using old commitment references, including removed workers and pipeline or heartbeat work",
+          "Synchronization safety across cleanup and outstanding work"
+        ]
+      }
+    ],
+    "facts": [
+      {
+        "id": "F1",
+        "meaning": "A fresh leader commitment accumulator has been initialized with zero progress for the latest configuration's voters and startIndex equal to the observed last index plus one.",
+        "identity": {
+          "owner": "Local Raft instance",
+          "episode": "Specific setupLeaderState invocation and commitment object",
+          "configuration": "Latest configuration at initialization"
+        },
+        "established_by": [],
+        "consumed_by": [],
+        "validity_context": "Initialization result only; it does not establish election legality, remote support, or a committed entry.",
+        "representation": [
+          "leaderState.commitment",
+          "matchIndexes",
+          "startIndex"
+        ],
+        "invalidators": [
+          "B10"
+        ],
+        "reinterpreters": [
+          "B5"
+        ],
+        "durability": "Volatile leader bookkeeping.",
+        "recovery": "A subsequent leader episode constructs a new object.",
+        "source_ids": [
+          "raft.go:455:581",
+          "commitment.go:1:104",
+          "raft.go:455:666"
+        ],
+        "unknowns": [
+          "Worker association is established by construction in startStopReplication; completion of all uses of the captured object after removal or leader cleanup remains unknown.",
+          "Cleanup retires the leaderState reference but does not demonstrate destruction or quiescence of the captured object."
+        ]
+      },
+      {
+        "id": "F2",
+        "meaning": "An append response path observed Success without a response term greater than the associated request term, and for a nonempty request submitted its last entry index to commitment.match under s.peer.ID.",
+        "identity": {
+          "request": "The AppendEntries request used by updateLastAppended",
+          "term": "Request.Term",
+          "server": "s.peer.ID at match invocation",
+          "index": "Last request entry index",
+          "accumulator": "s.commitment object"
+        },
+        "established_by": [],
+        "consumed_by": [],
+        "validity_context": "A local response observation and submitted progress report. It does not independently establish durable remote prefix agreement, transport correlation, or continued authority.",
+        "representation": [
+          "AppendEntriesResponse.Success and Term",
+          "AppendEntriesRequest.Entries",
+          "commitment.match call"
+        ],
+        "invalidators": [],
+        "reinterpreters": [],
+        "durability": "Volatile event and bookkeeping.",
+        "recovery": "Later replication can submit new reports; restart reconstruction is unread.",
+        "source_ids": [
+          "replication.go:202:298",
+          "replication.go:534:665",
+          "replication.go:1:298",
+          "raft.go:455:666"
+        ],
+        "unknowns": [
+          "Transport correlation from follower response to leader observation is unread, so F4 is not connected directly as a consumed fact.",
+          "Leader self-match and snapshot-transfer reports are additional unread producers of commitment input.",
+          "The shown address-update path preserves logical ServerID, but synchronization safety of the unlocked s.peer.ID read in updateLastAppended remains unestablished.",
+          "Removal and later reuse of the same ServerID may involve distinct worker objects; legal histories and interpretation of outstanding reports remain unresolved.",
+          "Worker commitment pointers remain captured across the shown address-update, removal, and cleanup paths; termination and outstanding-result completion are not established."
+        ]
+      }
+    ],
+    "surfaces": [
+      {
+        "entry_point": "Raft.startStopReplication",
+        "disposition": "mapped",
+        "behavior_ids": [
+          "B-worker-reconciliation"
+        ],
+        "reason": "The attached implementation establishes worker construction, commitment capture, same-ID address updates, and removal signaling. Mapping does not establish worker quiescence or same-ID reuse semantics.",
+        "source_ids": [
+          "raft.go:455:666",
+          "replication.go:1:298",
+          "replication.go:534:665"
+        ],
+        "high_consequence": true
+      }
+    ],
+    "remove_behavior_ids": [],
+    "remove_fact_ids": [],
+    "remove_surface_entry_points": [],
+    "rationale": "The diagnostic source is already attached, so no additional acquisition is needed. Separate worker reconciliation from leader entry and cleanup, record its consumption of the initialized accumulator, and replace resolved association unknowns with precise remaining lifetime and synchronization gaps. Existing Fact meanings, identities, validity contexts, and normative applicability are unchanged. Global Activity summaries and unrelated surfaces remain unchanged."
+  },
+  "limitations": [
+    "This refinement describes observed ownership and reference handling; it establishes neither a defect nor implementation correctness.",
+    "Worker termination completion, pipeline and heartbeat shutdown, same-ID reuse legality, configuration-update ordering, and synchronization safety remain unresolved.",
+    "No normative obligation, experiment, calibration result, or broader consequence is established."
+  ]
+}

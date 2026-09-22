@@ -1,0 +1,2736 @@
+{
+  "version": 5,
+  "target_profile": {
+    "system_boundary": "The github.com/hashicorp/raft library, including its protocol loops and available repository implementations of storage and transport interfaces. Client FSM semantics and deployment adapter selection lie outside the recovered implementation boundary; library scheduling of those interfaces remains inside it.",
+    "protocol_contexts": [
+      "Leader state is initialized with a fresh commitment object and a start index equal to the last index plus one.",
+      "AppendEntries requests carry a replication-state term, previous-log identity, entries, and leader commit index.",
+      "Latest and committed configurations are tracked separately.",
+      "Protocol-version compatibility changes configuration representation and supported APIs according to config.go documentation."
+    ],
+    "external_interfaces": [
+      "Transport, optional WithPreVote, and AppendPipeline",
+      "LogStore and optional MonotonicLogStore",
+      "Client-provided FSM, optional BatchingFSM, and FSMSnapshot",
+      "RPC response channels",
+      "Client operation futures and leadership notification channels",
+      "StableStore and snapshot stores are named or referenced, but their interfaces and implementations are not yet recovered."
+    ],
+    "ownership": [
+      "The main leader loop consumes commitment notifications and asynchronous step-down requests.",
+      "Per-follower replication work performs synchronous AppendEntries calls.",
+      "A separate pipeline decoder processes completed append responses.",
+      "Commitment bookkeeping is protected by its own mutex.",
+      "Follower AppendEntries processing invokes storage and configuration helpers; actual dispatch ownership, including heartbeat fast-pass behavior, remains unread.",
+      "FSM interface comments specify serialized Apply and Snapshot calls and possible concurrent snapshot persistence; scheduler implementation remains unread."
+    ],
+    "selection_injection": [
+      "Transport permits a heartbeat fast-pass callback or delivery through Consumer; concrete support and callback installation are unread.",
+      "FSM and optional BatchingFSM are implemented by clients.",
+      "LogStore optionally advertises monotonic-index requirements, changing documented restore behavior.",
+      "Constructor wiring and selected storage, snapshot, and transport implementations are unknown.",
+      "The catalogue includes in-memory storage and transport, network transport, and file, in-memory, and discard snapshot implementations; filenames establish retrieval candidates only."
+    ],
+    "variants": [
+      "Synchronous and pipelined AppendEntries response processing are visible.",
+      "Missing-log replication falls back to snapshot transfer through an unread helper.",
+      "Voting and nonvoting participants are distinguished in commitment aggregation.",
+      "Leadership transfer has asynchronous coordination and a special candidate flag consulted by AppendEntries.",
+      "Optional pre-vote transport support is declared; activation is unknown.",
+      "Single-entry and batched FSM interfaces are declared.",
+      "Protocol-version and monotonic-log-store alternatives are documented; current selections are unknown."
+    ],
+    "source_ids": [
+      "README.md:1:80",
+      "transport.go:1:80",
+      "fsm.go:1:80",
+      "log.go:81:143",
+      "config.go:1:80",
+      "configuration.go:129:184",
+      "raft.go:455:581",
+      "raft.go:667:826",
+      "raft.go:1440:1584",
+      "replication.go:202:298",
+      "replication.go:534:665",
+      "commitment.go:1:104"
+    ],
+    "unknowns": [
+      "Exact build revision, constructor wiring, active configuration, and selected adapters are not supplied.",
+      "Storage failure atomicity and restart durability of built-in variants remain unread.",
+      "Election, pre-vote, heartbeat, lease, verification, and term-persistence implementations are incomplete or absent from the supplied ranges.",
+      "Offline compilation capability does not establish execution, calibration, or deterministic schedule control."
+    ]
+  },
+  "activities": [
+    {
+      "class_id": "A1",
+      "applicability": "applicable",
+      "purpose": "Replicate entries, aggregate voter progress, and advance local commitment.",
+      "realization_summary": "Recovered partially through AppendEntries handling, synchronous and pipeline response processing, commitment.match/recalculate, and leader-loop commitment consumption.",
+      "entry_points": [
+        "Raft.appendEntries",
+        "Raft.replicateTo",
+        "Raft.pipelineDecode",
+        "commitment.match",
+        "Raft.leaderLoop commitCh branch"
+      ],
+      "behavior_ids": [
+        "B2",
+        "B3",
+        "B4",
+        "B6",
+        "B-tcp-transport-create",
+        "B-rpc-respond"
+      ],
+      "variants": [
+        "Synchronous replication",
+        "Pipelined replication",
+        "Empty versus nonempty AppendEntries",
+        "Voter-filtered progress aggregation"
+      ],
+      "unknowns": [
+        "Leader dispatch persistence and self-match ordering",
+        "Heartbeat support processing",
+        "Pipeline completion error contract",
+        "Full commitment-to-application handoff"
+      ],
+      "source_ids": [
+        "raft.go:1440:1584",
+        "replication.go:202:298",
+        "replication.go:534:665",
+        "commitment.go:1:104",
+        "raft.go:667:826"
+      ]
+    },
+    {
+      "class_id": "A2",
+      "applicability": "applicable",
+      "purpose": "Establish and retire authority contexts and interpret responses relative to them.",
+      "realization_summary": "Leader entry and cleanup are visible. Replication responses with higher terms request step-down; the main loop subsequently changes role. Follower append processing also changes role and term through unread setters.",
+      "entry_points": [
+        "Raft.runLeader",
+        "Raft.handleStaleTerm",
+        "Raft.leaderLoop stepDown branch",
+        "Raft.appendEntries"
+      ],
+      "behavior_ids": [
+        "B1",
+        "B8",
+        "B9",
+        "B10"
+      ],
+      "variants": [
+        "Leadership transfer",
+        "Same-term append handling with candidateFromLeadershipTransfer",
+        "Higher-term append responses",
+        "Optional pre-vote"
+      ],
+      "unknowns": [
+        "Election and pre-vote establishment",
+        "Lease checks and heartbeat responses",
+        "Term persistence and state-setter side effects",
+        "Leadership-transfer worker behavior"
+      ],
+      "source_ids": [
+        "raft.go:455:581",
+        "raft.go:667:826",
+        "raft.go:1440:1584",
+        "replication.go:534:665",
+        "transport.go:1:80"
+      ]
+    },
+    {
+      "class_id": "A3",
+      "applicability": "applicable",
+      "purpose": "Catch up lagging replicas and reconstruct participation after restore or restart.",
+      "realization_summary": "Incremental replication retries earlier indices after rejection and invokes snapshot transfer when request construction returns ErrLogNotFound. Snapshot installation and startup recovery remain deferred.",
+      "entry_points": [
+        "Raft.replicateTo SEND_SNAP branch",
+        "Transport.InstallSnapshot",
+        "FSM.Restore"
+      ],
+      "behavior_ids": [],
+      "variants": [
+        "Incremental log catch-up",
+        "Snapshot catch-up",
+        "MonotonicLogStore restore alternative"
+      ],
+      "unknowns": [
+        "Snapshot publication and installation completion",
+        "Restart reconstruction",
+        "Resumption index and configuration selection after restore"
+      ],
+      "source_ids": [
+        "replication.go:202:298",
+        "transport.go:1:80",
+        "fsm.go:1:80",
+        "log.go:81:143"
+      ]
+    },
+    {
+      "class_id": "A4",
+      "applicability": "applicable",
+      "purpose": "Track participant versions and select participants used by commitment and replication.",
+      "realization_summary": "Latest and committed configurations are distinct. Commitment membership replacement preserves progress for retained voter IDs. Follower conflict deletion can reset latest configuration, and leader commitment can activate the latest configuration.",
+      "entry_points": [
+        "commitment.setConfiguration",
+        "Raft.appendEntries configuration handling",
+        "Raft.leaderLoop commitCh branch"
+      ],
+      "behavior_ids": [
+        "B5",
+        "B-worker-reconciliation"
+      ],
+      "variants": [
+        "Voter versus nonvoter",
+        "Committed versus latest configuration",
+        "Legacy and ID-based configuration encodings"
+      ],
+      "unknowns": [
+        "Admission and serialization of configuration changes",
+        "Call ordering between setConfiguration and replication membership changes",
+        "Configuration helper implementations and error semantics"
+      ],
+      "source_ids": [
+        "configuration.go:129:184",
+        "commitment.go:1:104",
+        "raft.go:1440:1584",
+        "raft.go:667:826",
+        "config.go:1:80"
+      ]
+    },
+    {
+      "class_id": "A5",
+      "applicability": "applicable",
+      "purpose": "Schedule committed entries and connect FSM execution to operation responses.",
+      "realization_summary": "Leader and follower paths invoke processLogs. FSM and BatchingFSM specify application responsibilities, but scheduling, filtering, and completion are unread. Client-defined state transitions are external to the library.",
+      "entry_points": [
+        "Raft.processLogs call sites",
+        "FSM.Apply",
+        "BatchingFSM.ApplyBatch",
+        "FSM.Restore"
+      ],
+      "behavior_ids": [],
+      "variants": [
+        "Single-entry application",
+        "Batch application",
+        "Barrier and non-command log types",
+        "Restore"
+      ],
+      "unknowns": [
+        "Actual queue ownership and execution ordering",
+        "Future response correlation",
+        "Restore interaction with queued application"
+      ],
+      "source_ids": [
+        "raft.go:667:826",
+        "raft.go:1440:1584",
+        "fsm.go:1:80",
+        "log.go:1:80"
+      ]
+    },
+    {
+      "class_id": "A6",
+      "applicability": "applicable",
+      "purpose": "Maintain log and snapshot representations used for replication and recovery.",
+      "realization_summary": "Follower reconciliation reads retained entries, deletes a conflicting suffix, stores replacement entries, and updates cached last-log metadata after configuration processing. Storage implementations, snapshot lifecycle, and restart reconstruction remain unread.",
+      "entry_points": [
+        "Raft.appendEntries",
+        "LogStore.StoreLogs",
+        "LogStore.DeleteRange",
+        "Raft.setPreviousLog",
+        "FSMSnapshot.Persist"
+      ],
+      "behavior_ids": [
+        "B7",
+        "inmem_log_store",
+        "inmem_log_read",
+        "inmem_log_delete",
+        "inmem_bytes_set",
+        "inmem_bytes_get",
+        "inmem_uint_set",
+        "inmem_uint_get",
+        "snapshot_file_create",
+        "snapshot_file_write",
+        "snapshot_file_close",
+        "snapshot_file_cancel",
+        "snapshot_file_list",
+        "snapshot_file_open",
+        "snapshot_file_reap",
+        "snapshot_inmem_create",
+        "snapshot_inmem_write",
+        "snapshot_inmem_read",
+        "snapshot_inmem_terminal_noop",
+        "snapshot_discard_operations",
+        "B-log-cache-store",
+        "B-log-cache-get",
+        "B-log-cache-delete"
+      ],
+      "variants": [
+        "Duplicate entries",
+        "Conflicting suffix replacement",
+        "Previous entry represented by snapshot metadata",
+        "Optional monotonic log storage"
+      ],
+      "unknowns": [
+        "Partial effects of failing deletion or storage",
+        "Cache reconstruction after errors or restart",
+        "Snapshot completion, retention, and reclamation ordering",
+        "Stable term and vote storage"
+      ],
+      "source_ids": [
+        "raft.go:1440:1584",
+        "replication.go:534:665",
+        "log.go:81:143",
+        "fsm.go:1:80"
+      ]
+    },
+    {
+      "class_id": "A7",
+      "applicability": "applicable",
+      "purpose": "Expose operation admission, completion, leadership verification, and barrier semantics.",
+      "realization_summary": "API error declarations and interface documentation describe client operations. Leader cleanup responds to inflight and verification futures with ErrLeadershipLost. Successful application and verification completion paths remain unread.",
+      "entry_points": [
+        "Apply",
+        "Barrier",
+        "VerifyLeader",
+        "LeadershipTransfer",
+        "Raft.runLeader cleanup"
+      ],
+      "behavior_ids": [],
+      "variants": [
+        "Leadership loss",
+        "Restore abortion",
+        "Enqueue timeout",
+        "Leadership-transfer rejection"
+      ],
+      "unknowns": [
+        "Admission and timeout boundaries",
+        "Success semantics of VerifyLeader",
+        "Future completion ordering",
+        "Caller retry and deduplication responsibilities"
+      ],
+      "source_ids": [
+        "api.go:1:80",
+        "docs/README.md:1:80",
+        "log.go:1:80",
+        "fsm.go:1:80",
+        "raft.go:455:581"
+      ]
+    }
+  ],
+  "behaviors": [
+    {
+      "id": "B1",
+      "primary_activity": "A2",
+      "execution_owner": "Raft main goroutine entering runLeader",
+      "protocol_context": "A new local leader-state episode",
+      "trigger": "Entry into runLeader",
+      "legal_preconditions": [
+        "The caller has selected leader execution; election justification is unread."
+      ],
+      "implementation_guards": [],
+      "reads": [
+        "Latest configuration",
+        "Last index",
+        "Configured NotifyCh"
+      ],
+      "writes": [
+        "Fresh leader commitment object, channels, inflight list, replication map, and verification map"
+      ],
+      "durable_effects": [
+        "Dispatches a no-op through an unread persistence helper."
+      ],
+      "external_effects": [
+        "Sends leadership notifications before setupLeaderState.",
+        "Calls startStopReplication and dispatchLogs."
+      ],
+      "important_branches": [
+        "Configured notification can block until delivered or shutdown.",
+        "Shutdown uses a best-effort notification attempt."
+      ],
+      "async_boundaries": [
+        "Leadership channels",
+        "Background metrics goroutine",
+        "Replication workers launched by startStopReplication with captured commitment and stepDown references"
+      ],
+      "produces_fact_ids": [
+        "F1"
+      ],
+      "consumes_fact_ids": [],
+      "cross_activity_effects": {
+        "A1": "Creates the commitment accumulator and dispatches an initial no-op."
+      },
+      "existing_protections": [
+        "A fresh commitment object starts with zero voter matches and a new startIndex.",
+        "setupLeaderState precedes the initial startStopReplication call."
+      ],
+      "source_ids": [
+        "raft.go:455:581",
+        "commitment.go:1:104",
+        "raft.go:455:666"
+      ],
+      "unknowns": [
+        "Election establishment and leader term identity",
+        "No-op persistence and dispatch failure behavior"
+      ]
+    },
+    {
+      "id": "B2",
+      "primary_activity": "A1",
+      "execution_owner": "Per-follower synchronous replication worker",
+      "protocol_context": "AppendEntries constructed using followerReplication.currentTerm",
+      "trigger": "replicateTo attempts to advance a peer toward lastIndex",
+      "legal_preconditions": [
+        "Replication state and peer selection have been initialized by unread code."
+      ],
+      "implementation_guards": [
+        "Request construction must succeed.",
+        "Transport call must return without error before response fields are processed.",
+        "A response term greater than the request term invokes handleStaleTerm and stops this path."
+      ],
+      "reads": [
+        "Peer under peerLock",
+        "nextIndex",
+        "Log or snapshot predecessor",
+        "Response term, success, LastLog, and NoRetryBackoff"
+      ],
+      "writes": [
+        "Last contact",
+        "Failure count",
+        "Pipeline eligibility",
+        "nextIndex",
+        "Commitment match through updateLastAppended"
+      ],
+      "durable_effects": [],
+      "external_effects": [
+        "Sends AppendEntries.",
+        "Calls notifyAll(true) after a successful response.",
+        "Invokes snapshot transfer when request construction returns ErrLogNotFound."
+      ],
+      "important_branches": [
+        "Transport errors increment failures and return.",
+        "Success with entries reports the last request entry index.",
+        "Success with no entries does not update commitment matching but still calls notifyAll(true).",
+        "Rejection moves nextIndex backward and controls retry backoff.",
+        "Stop is polled before additional replication."
+      ],
+      "async_boundaries": [
+        "Network RPC",
+        "Retry timer",
+        "Stop and shutdown channels",
+        "Commitment notification"
+      ],
+      "produces_fact_ids": [
+        "F2"
+      ],
+      "consumes_fact_ids": [],
+      "cross_activity_effects": {
+        "A2": "Higher response terms request asynchronous authority loss; successful replies notify pending verification work through an unread helper.",
+        "A3": "Missing history selects snapshot transfer instead of incremental replication."
+      },
+      "existing_protections": [
+        "Transport error is checked before response consumption.",
+        "Higher-term response is checked before progress update.",
+        "Commitment.match filters nonvoters and non-increasing reports."
+      ],
+      "source_ids": [
+        "replication.go:202:298",
+        "replication.go:534:665",
+        "commitment.go:1:104"
+      ],
+      "unknowns": [
+        "RPC response correlation and storage semantics behind Success",
+        "notifyAll consumers and aggregation",
+        "Peer replacement during outstanding work",
+        "Snapshot-transfer result establishment"
+      ]
+    },
+    {
+      "id": "B3",
+      "primary_activity": "A1",
+      "execution_owner": "Pipeline decoder goroutine",
+      "protocol_context": "An AppendPipeline associated with a follower replication state",
+      "trigger": "A future arrives on the pipeline Consumer channel",
+      "legal_preconditions": [
+        "Pipeline creation, completion-channel contract, and decoder launch are unread."
+      ],
+      "implementation_guards": [
+        "Response terms greater than request terms request step-down and terminate decoding.",
+        "Unsuccessful responses terminate decoding before updateLastAppended."
+      ],
+      "reads": [
+        "Future Request, Response, and Start",
+        "Current peer for metrics",
+        "Stop channel"
+      ],
+      "writes": [
+        "Last contact",
+        "nextIndex and commitment match through updateLastAppended"
+      ],
+      "durable_effects": [],
+      "external_effects": [
+        "Calls notifyAll(true) after successful response processing.",
+        "Closes finishCh when decoding exits."
+      ],
+      "important_branches": [
+        "Last contact is updated before checking Success.",
+        "The visible decoder does not call a future error method; the meaning of channel delivery requires the pipeline interface and implementation.",
+        "Empty successful requests notify verification work without advancing match progress."
+      ],
+      "async_boundaries": [
+        "Pipeline completion channel",
+        "Stop channel",
+        "finishCh closure"
+      ],
+      "produces_fact_ids": [
+        "F2"
+      ],
+      "consumes_fact_ids": [],
+      "cross_activity_effects": {
+        "A2": "Processes term-based authority-loss signals independently of the main leader loop."
+      },
+      "existing_protections": [
+        "Term and Success checks precede replication progress updates.",
+        "Uses the request returned by the completed future."
+      ],
+      "source_ids": [
+        "replication.go:534:665"
+      ],
+      "unknowns": [
+        "Pipeline error propagation and response initialization",
+        "Consumer channel closure semantics",
+        "Pipeline shutdown and outstanding-result lifetime",
+        "Whether concrete adapters preserve the request identity used here"
+      ]
+    },
+    {
+      "id": "B4",
+      "primary_activity": "A1",
+      "execution_owner": "Caller of commitment.match while holding the commitment mutex internally",
+      "protocol_context": "One commitment object and its current voter map",
+      "trigger": "A server progress report",
+      "legal_preconditions": [
+        "The semantic validity of the progress report is the producer's responsibility and is not established by this method."
+      ],
+      "implementation_guards": [
+        "Server must be in matchIndexes.",
+        "Reported index must exceed the retained index.",
+        "Recalculation requires a nonempty voter map.",
+        "Quorum order statistic must exceed commitIndex and reach startIndex."
+      ],
+      "reads": [
+        "matchIndexes",
+        "commitIndex",
+        "startIndex"
+      ],
+      "writes": [
+        "Per-voter match index",
+        "Commitment commitIndex"
+      ],
+      "durable_effects": [],
+      "external_effects": [
+        "Calls asyncNotifyCh when commitIndex advances."
+      ],
+      "important_branches": [
+        "Unknown voter and non-increasing reports are ignored.",
+        "The sorted index at (voterCount-1)/2 determines quorum progress.",
+        "No advancement occurs below startIndex."
+      ],
+      "async_boundaries": [
+        "Mutex",
+        "commitCh notification"
+      ],
+      "produces_fact_ids": [
+        "F3"
+      ],
+      "consumes_fact_ids": [
+        "F2"
+      ],
+      "cross_activity_effects": {},
+      "existing_protections": [
+        "Mutex serializes reads and updates.",
+        "Progress is monotonic within the object.",
+        "startIndex limits advancement."
+      ],
+      "source_ids": [
+        "commitment.go:1:104"
+      ],
+      "unknowns": [
+        "Leader self-match producer",
+        "Snapshot-path match producer",
+        "Actual durable agreement represented by each report"
+      ]
+    },
+    {
+      "id": "B5",
+      "primary_activity": "A4",
+      "execution_owner": "Caller of commitment.setConfiguration",
+      "protocol_context": "Existing leader commitment object receiving a new configuration",
+      "trigger": "setConfiguration(configuration)",
+      "legal_preconditions": [
+        "Configuration admission and caller ordering remain unread."
+      ],
+      "implementation_guards": [
+        "Only Voter entries populate the replacement match map."
+      ],
+      "reads": [
+        "Old match map",
+        "New configuration",
+        "Existing commitIndex and startIndex"
+      ],
+      "writes": [
+        "Replacement voter map",
+        "Possibly advanced commitIndex"
+      ],
+      "durable_effects": [],
+      "external_effects": [
+        "May notify commitCh through recalculation."
+      ],
+      "important_branches": [
+        "Retained voter IDs preserve previous progress.",
+        "New voter IDs begin at zero.",
+        "Removed voter IDs are omitted.",
+        "An empty voter map does not advance commitment."
+      ],
+      "async_boundaries": [
+        "Commitment mutex",
+        "Commitment notification"
+      ],
+      "produces_fact_ids": [
+        "F3"
+      ],
+      "consumes_fact_ids": [],
+      "cross_activity_effects": {
+        "A1": "Changes which reported indices participate in future commitment calculation without resetting commitIndex."
+      },
+      "existing_protections": [
+        "Map replacement and recalculation occur under the same mutex."
+      ],
+      "source_ids": [
+        "commitment.go:1:104"
+      ],
+      "unknowns": [
+        "Exact configuration version and transition legality at each call",
+        "Ordering with replication worker replacement",
+        "Whether and how voter identities can be reused"
+      ]
+    },
+    {
+      "id": "B6",
+      "primary_activity": "A1",
+      "execution_owner": "Main leader loop",
+      "protocol_context": "Current leaderState commitment object",
+      "trigger": "Receipt from leaderState.commitCh",
+      "legal_preconditions": [
+        "leaderLoop is executing; the select body can complete before its next loop-state check."
+      ],
+      "implementation_guards": [
+        "Latest configuration is activated only if its index crosses from above oldCommitIndex to at most the new commit index.",
+        "Inflight scan stops at the first index above commitIndex."
+      ],
+      "reads": [
+        "Commitment commitIndex",
+        "Local commit index",
+        "Latest configuration and index",
+        "Inflight log futures"
+      ],
+      "writes": [
+        "Local commit index",
+        "Committed configuration through a helper",
+        "Local stepDown flag if the committed configuration excludes the local vote"
+      ],
+      "durable_effects": [],
+      "external_effects": [
+        "Invokes processLogs for a nonempty committed inflight group."
+      ],
+      "important_branches": [
+        "Configuration activation and self-removal handling precede group processing.",
+        "The supplied range ends at processLogs; subsequent removal and step-down actions are unread."
+      ],
+      "async_boundaries": [
+        "commitCh",
+        "Application handoff inside unread processLogs"
+      ],
+      "produces_fact_ids": [],
+      "consumes_fact_ids": [
+        "F3"
+      ],
+      "cross_activity_effects": {
+        "A4": "Activates the latest configuration when its index enters the committed range.",
+        "A5": "Passes committed inflight entries and their futures to processLogs."
+      },
+      "existing_protections": [
+        "Reads the current accumulator under its getter lock rather than inferring an index from the notification.",
+        "Bounds the inflight group by commitIndex."
+      ],
+      "source_ids": [
+        "raft.go:667:826",
+        "commitment.go:1:104"
+      ],
+      "unknowns": [
+        "Remainder of the commit branch",
+        "processLogs execution and completion semantics",
+        "Interaction with concurrent authority-loss notification"
+      ]
+    },
+    {
+      "id": "B7",
+      "primary_activity": "A6",
+      "execution_owner": "AppendEntries handler; dispatcher ownership remains partially unknown",
+      "protocol_context": "Incoming append request relative to current term, retained history, and configuration",
+      "trigger": "Raft.appendEntries(rpc, a)",
+      "legal_preconditions": [
+        "Request structural validity and authorized protocol prehistory are not established by the supplied handler range."
+      ],
+      "implementation_guards": [
+        "Rejects request terms below current term.",
+        "Checks previous-entry term when PrevLogEntry is positive.",
+        "Reads overlapping entries and skips entries with matching terms.",
+        "Returns before Success on read, deletion, storage, or configuration-processing errors."
+      ],
+      "reads": [
+        "Current role and term",
+        "Leadership-transfer candidate flag",
+        "Last-entry and last-log metadata",
+        "Retained logs",
+        "Latest and committed configurations",
+        "LeaderCommitIndex"
+      ],
+      "writes": [
+        "Role, current term, and leader identity through helpers",
+        "Conflicting log suffix",
+        "Replacement entries",
+        "Latest configuration",
+        "Cached last-log index and term after successful storage and configuration processing",
+        "Commit index and last contact"
+      ],
+      "durable_effects": [
+        "Calls DeleteRange before StoreLogs for a conflicting suffix.",
+        "Calls StoreLogs for new entries; concrete durability and partial-failure behavior remain unknown.",
+        "Term persistence depends on unread setCurrentTerm."
+      ],
+      "external_effects": [
+        "Responds through RPC.Respond on all exits.",
+        "Calls processLogs after advancing follower commit index."
+      ],
+      "important_branches": [
+        "Same-term nonfollowers normally transition to follower, with an exception for leadership-transfer candidates.",
+        "Missing or mismatched previous entries set NoRetryBackoff.",
+        "Conflict deletion may reset latest configuration before replacement storage.",
+        "StoreLogs failure returns before cached last-log update; the source explicitly notes the possible stale-cache state after truncation.",
+        "Configuration-processing failure sets rpcErr after storage has succeeded.",
+        "Success is set only at the end of the visible handler."
+      ],
+      "async_boundaries": [
+        "Storage calls",
+        "Application helper",
+        "Response-channel send"
+      ],
+      "produces_fact_ids": [
+        "F4"
+      ],
+      "consumes_fact_ids": [],
+      "cross_activity_effects": {
+        "A1": "Produces append responses and advances follower commitment from the received leader index bounded by getLastIndex.",
+        "A2": "Processes request term and leader identity before log reconciliation.",
+        "A4": "Resets or processes latest configuration during suffix replacement and may activate it on commit advancement.",
+        "A5": "Invokes processLogs for an advanced follower commit index."
+      },
+      "existing_protections": [
+        "Old-term rejection",
+        "Previous-log term comparison",
+        "Storage errors prevent Success",
+        "Cached last-log update follows successful replacement storage and configuration processing"
+      ],
+      "source_ids": [
+        "raft.go:1440:1584",
+        "log.go:81:143"
+      ],
+      "unknowns": [
+        "Concrete storage error effects and cache recovery",
+        "setCurrentTerm durability",
+        "getLastEntry and getLastIndex representation rules",
+        "Transport dispatch and heartbeat specialization",
+        "Whether success implies the intended retained-prefix relation in all supported histories"
+      ]
+    },
+    {
+      "id": "B8",
+      "primary_activity": "A2",
+      "execution_owner": "Replication worker invoking handleStaleTerm",
+      "protocol_context": "Response term exceeds the corresponding append request term",
+      "trigger": "Synchronous or pipeline response term check",
+      "legal_preconditions": [
+        "The caller has compared response and request terms."
+      ],
+      "implementation_guards": [],
+      "reads": [
+        "Follower replication state"
+      ],
+      "writes": [],
+      "durable_effects": [],
+      "external_effects": [
+        "Calls notifyAll(false).",
+        "Calls asyncNotifyCh(s.stepDown)."
+      ],
+      "important_branches": [
+        "This helper does not visibly update the local term or role."
+      ],
+      "async_boundaries": [
+        "Step-down notification"
+      ],
+      "produces_fact_ids": [
+        "F5"
+      ],
+      "consumes_fact_ids": [],
+      "cross_activity_effects": {
+        "A7": "Sends a negative notification to pending verification work through an unread helper."
+      },
+      "existing_protections": [
+        "Separates replication-side detection from main-loop role mutation."
+      ],
+      "source_ids": [
+        "replication.go:202:298",
+        "replication.go:534:665"
+      ],
+      "unknowns": [
+        "asyncNotifyCh delivery semantics",
+        "Binding of s.stepDown to a leader episode",
+        "notifyAll completion semantics"
+      ]
+    },
+    {
+      "id": "B9",
+      "primary_activity": "A2",
+      "execution_owner": "Main leader loop",
+      "protocol_context": "Current leaderState.stepDown channel",
+      "trigger": "Step-down channel is selected",
+      "legal_preconditions": [
+        "The notification belongs to the current leaderState channel; worker binding remains unread."
+      ],
+      "implementation_guards": [],
+      "reads": [
+        "leaderState.stepDown"
+      ],
+      "writes": [
+        "Role through setState(Follower)"
+      ],
+      "durable_effects": [],
+      "external_effects": [],
+      "important_branches": [
+        "Other ready select branches may be processed before this branch.",
+        "The role setter and its side effects are unread."
+      ],
+      "async_boundaries": [
+        "Select on main-loop channels"
+      ],
+      "produces_fact_ids": [],
+      "consumes_fact_ids": [
+        "F5"
+      ],
+      "cross_activity_effects": {},
+      "existing_protections": [
+        "leaderLoop checks the role at its loop boundary."
+      ],
+      "source_ids": [
+        "raft.go:667:826"
+      ],
+      "unknowns": [
+        "Completion semantics of setState",
+        "Exact ordering of cleanup relative to outstanding replication work"
+      ]
+    },
+    {
+      "id": "B10",
+      "primary_activity": "A2",
+      "execution_owner": "Main goroutine executing runLeader deferred cleanup",
+      "protocol_context": "Retirement of a leader-state episode",
+      "trigger": "runLeader exits",
+      "legal_preconditions": [
+        "Leader setup has registered the deferred cleanup."
+      ],
+      "implementation_guards": [
+        "Clears known leader identity only when it still names the local server."
+      ],
+      "reads": [
+        "Replication worker map",
+        "Inflight futures",
+        "Pending verification futures",
+        "Current leader identity"
+      ],
+      "writes": [
+        "Last contact",
+        "Cleared leaderState references",
+        "Possibly cleared leader identity"
+      ],
+      "durable_effects": [],
+      "external_effects": [
+        "Closes stop channels of workers still listed in replState.",
+        "Responds ErrLeadershipLost to inflight and pending verification futures.",
+        "Publishes leadership-loss notifications."
+      ],
+      "important_branches": [
+        "Worker stop requests are not visible joins.",
+        "Clearing leaderState.commitment does not clear the commitment pointers previously captured in worker objects.",
+        "Workers previously removed by startStopReplication are no longer present in the cleanup iteration.",
+        "Configured notification can block except for the shutdown best-effort branch."
+      ],
+      "async_boundaries": [
+        "Worker stop channels",
+        "Future responses",
+        "Leadership notifications"
+      ],
+      "produces_fact_ids": [],
+      "consumes_fact_ids": [],
+      "cross_activity_effects": {
+        "A1": "Clears the leader state's commitment and inflight references without visibly joining workers or rebinding their captured commitment references.",
+        "A7": "Completes still-pending leader operations with ErrLeadershipLost."
+      },
+      "existing_protections": [
+        "Preserves a replacement leader identity already learned from an RPC.",
+        "Signals all listed replication workers before clearing references.",
+        "Worker progress submissions use their captured commitment pointer rather than rereading leaderState.commitment."
+      ],
+      "source_ids": [
+        "raft.go:455:666",
+        "replication.go:1:298",
+        "replication.go:534:665"
+      ],
+      "unknowns": [
+        "Worker termination completion",
+        "Future response idempotence",
+        "When outstanding work ceases using old commitment references, including removed workers and pipeline or heartbeat work",
+        "Synchronization safety across cleanup and outstanding work"
+      ]
+    },
+    {
+      "id": "inmem_log_store",
+      "primary_activity": "A6",
+      "execution_owner": "Calling goroutine holding the InmemStore write lock",
+      "protocol_context": "An initialized, test-only InmemStore instance",
+      "trigger": "StoreLog or StoreLogs",
+      "legal_preconditions": [],
+      "implementation_guards": [
+        "StoreLogs holds the instance write lock throughout the batch."
+      ],
+      "reads": [
+        "Each supplied Log pointer and its Index",
+        "lowIndex and highIndex"
+      ],
+      "writes": [
+        "logs[l.Index] = l",
+        "lowIndex becomes l.Index whenever lowIndex is zero",
+        "highIndex increases when l.Index exceeds it"
+      ],
+      "durable_effects": [],
+      "external_effects": [
+        "Returns nil after a normally completed batch."
+      ],
+      "important_branches": [
+        "StoreLog delegates to StoreLogs with one pointer.",
+        "An existing map key is overwritten.",
+        "An empty batch returns nil without changes.",
+        "No contiguity, ordering or nil-pointer validation is performed.",
+        "Stored Log objects are not copied."
+      ],
+      "async_boundaries": [],
+      "produces_fact_ids": [
+        "inmem_log_pointer_installed"
+      ],
+      "consumes_fact_ids": [],
+      "cross_activity_effects": {},
+      "existing_protections": [
+        "Instance locking serializes map updates against other store methods."
+      ],
+      "source_ids": [
+        "inmem_store.go:1:133"
+      ],
+      "unknowns": [
+        "Caller ordering, ownership and mutation discipline are not established by these sources.",
+        "Protocol interpretation of successful storage completion has not been inspected."
+      ]
+    },
+    {
+      "id": "inmem_log_read",
+      "primary_activity": "A6",
+      "execution_owner": "Calling goroutine holding the InmemStore read lock",
+      "protocol_context": "An initialized InmemStore instance",
+      "trigger": "FirstIndex, LastIndex or GetLog",
+      "legal_preconditions": [],
+      "implementation_guards": [
+        "Each method holds the instance read lock for its own operation."
+      ],
+      "reads": [
+        "lowIndex or highIndex",
+        "logs[index] and the referenced Log object"
+      ],
+      "writes": [
+        "GetLog shallow-copies the stored Log into the caller's destination when found."
+      ],
+      "durable_effects": [],
+      "external_effects": [
+        "FirstIndex and LastIndex return the corresponding metadata field with nil error.",
+        "GetLog returns ErrLogNotFound for an absent key and nil after a successful copy."
+      ],
+      "important_branches": [
+        "Index accessors do not compute extrema from the map.",
+        "A successful Log copy retains shared backing arrays for Data and Extensions."
+      ],
+      "async_boundaries": [
+        "Separate accessor calls are not one atomic read transaction."
+      ],
+      "produces_fact_ids": [],
+      "consumes_fact_ids": [
+        "inmem_log_pointer_installed"
+      ],
+      "cross_activity_effects": {},
+      "existing_protections": [
+        "Read locking excludes concurrent store-method writes during each call."
+      ],
+      "source_ids": [
+        "inmem_store.go:1:133",
+        "log.go:1:80",
+        "log.go:81:143"
+      ],
+      "unknowns": [
+        "A returned log is not established to be immutable after the call.",
+        "Whether maintained bounds identify actual retained entries depends on preceding operations; consumers have not been inspected."
+      ]
+    },
+    {
+      "id": "inmem_log_delete",
+      "primary_activity": "A6",
+      "execution_owner": "Calling goroutine holding the InmemStore write lock",
+      "protocol_context": "An initialized InmemStore instance with uint64 index metadata",
+      "trigger": "DeleteRange(min, max)",
+      "legal_preconditions": [],
+      "implementation_guards": [
+        "The instance write lock covers deletion and metadata updates."
+      ],
+      "reads": [
+        "min, max, lowIndex and highIndex"
+      ],
+      "writes": [
+        "Deletes map keys using the loop j := min; j <= max; j++.",
+        "Sets lowIndex to max + 1 when min <= lowIndex.",
+        "Sets highIndex to min - 1 when max >= highIndex.",
+        "Resets both bounds to zero if the resulting lowIndex exceeds highIndex."
+      ],
+      "durable_effects": [],
+      "external_effects": [
+        "Returns nil if the loop and subsequent updates complete."
+      ],
+      "important_branches": [
+        "Missing map keys do not cause an error.",
+        "Metadata updates use interval endpoints without scanning surviving keys.",
+        "The method has no explicit endpoint-order or arithmetic-boundary checks."
+      ],
+      "async_boundaries": [],
+      "produces_fact_ids": [],
+      "consumes_fact_ids": [],
+      "cross_activity_effects": {},
+      "existing_protections": [
+        "Deletion and metadata changes are serialized against other instance methods."
+      ],
+      "source_ids": [
+        "inmem_store.go:1:133",
+        "log.go:81:143"
+      ],
+      "unknowns": [
+        "Reachable caller ranges, including arithmetic boundary values and ranges spanning gaps, have not been inspected.",
+        "No conclusion about protocol consequences of maintained bounds is established."
+      ]
+    },
+    {
+      "id": "inmem_bytes_set",
+      "primary_activity": "A6",
+      "execution_owner": "Calling goroutine holding the InmemStore write lock",
+      "protocol_context": "The byte-valued map of an initialized InmemStore",
+      "trigger": "Set(key, val)",
+      "legal_preconditions": [],
+      "implementation_guards": [
+        "The instance write lock covers assignment."
+      ],
+      "reads": [
+        "key and val"
+      ],
+      "writes": [
+        "kv[string(key)] = val"
+      ],
+      "durable_effects": [],
+      "external_effects": [
+        "Returns nil after assignment."
+      ],
+      "important_branches": [
+        "Overwrites an existing value.",
+        "Accepts nil and empty slices.",
+        "Does not copy the value's backing array."
+      ],
+      "async_boundaries": [],
+      "produces_fact_ids": [
+        "inmem_bytes_installed"
+      ],
+      "consumes_fact_ids": [],
+      "cross_activity_effects": {},
+      "existing_protections": [
+        "Map assignment is serialized against other instance methods."
+      ],
+      "source_ids": [
+        "inmem_store.go:1:133"
+      ],
+      "unknowns": [
+        "Caller mutation and ownership of value backing arrays are uninspected."
+      ]
+    },
+    {
+      "id": "inmem_bytes_get",
+      "primary_activity": "A6",
+      "execution_owner": "Calling goroutine holding the InmemStore read lock",
+      "protocol_context": "The byte-valued map of an initialized InmemStore",
+      "trigger": "Get(key)",
+      "legal_preconditions": [],
+      "implementation_guards": [
+        "The instance read lock covers lookup."
+      ],
+      "reads": [
+        "kv[string(key)]"
+      ],
+      "writes": [],
+      "durable_effects": [],
+      "external_effects": [
+        "Returns nil and an error with text \"not found\" when the retrieved slice is nil.",
+        "Otherwise returns the stored slice with nil error."
+      ],
+      "important_branches": [
+        "An absent key and an explicitly stored nil slice take the same error branch.",
+        "A non-nil empty slice takes the success branch.",
+        "The returned slice is not copied."
+      ],
+      "async_boundaries": [],
+      "produces_fact_ids": [],
+      "consumes_fact_ids": [
+        "inmem_bytes_installed"
+      ],
+      "cross_activity_effects": {},
+      "existing_protections": [
+        "Read locking excludes store-method writes during lookup."
+      ],
+      "source_ids": [
+        "inmem_store.go:1:133",
+        "stable.go:1:18"
+      ],
+      "unknowns": [
+        "StableStore documents an empty byte slice for a missing key; the implementation returns nil with an error. Caller treatment and the applicable missing-key error expectation remain uninspected."
+      ]
+    },
+    {
+      "id": "inmem_uint_set",
+      "primary_activity": "A6",
+      "execution_owner": "Calling goroutine holding the InmemStore write lock",
+      "protocol_context": "The uint64-valued map of an initialized InmemStore",
+      "trigger": "SetUint64(key, val)",
+      "legal_preconditions": [],
+      "implementation_guards": [
+        "The instance write lock covers assignment."
+      ],
+      "reads": [
+        "key and val"
+      ],
+      "writes": [
+        "kvInt[string(key)] = val"
+      ],
+      "durable_effects": [],
+      "external_effects": [
+        "Returns nil after assignment."
+      ],
+      "important_branches": [
+        "Overwrites an existing value.",
+        "The uint64 map is distinct from the byte-valued map."
+      ],
+      "async_boundaries": [],
+      "produces_fact_ids": [
+        "inmem_uint_installed"
+      ],
+      "consumes_fact_ids": [],
+      "cross_activity_effects": {},
+      "existing_protections": [
+        "Scalar assignment is serialized against other instance methods."
+      ],
+      "source_ids": [
+        "inmem_store.go:1:133"
+      ],
+      "unknowns": [
+        "Protocol meanings of stored keys and consumers' persistence assumptions are uninspected."
+      ]
+    },
+    {
+      "id": "inmem_uint_get",
+      "primary_activity": "A6",
+      "execution_owner": "Calling goroutine holding the InmemStore read lock",
+      "protocol_context": "The uint64-valued map of an initialized InmemStore",
+      "trigger": "GetUint64(key)",
+      "legal_preconditions": [],
+      "implementation_guards": [
+        "The instance read lock covers lookup."
+      ],
+      "reads": [
+        "kvInt[string(key)]"
+      ],
+      "writes": [],
+      "durable_effects": [],
+      "external_effects": [
+        "Returns the map value with nil error."
+      ],
+      "important_branches": [
+        "Missing keys return zero with nil error, indistinguishable from an explicitly stored zero."
+      ],
+      "async_boundaries": [],
+      "produces_fact_ids": [],
+      "consumes_fact_ids": [
+        "inmem_uint_installed"
+      ],
+      "cross_activity_effects": {},
+      "existing_protections": [
+        "Read locking excludes store-method writes during lookup."
+      ],
+      "source_ids": [
+        "inmem_store.go:1:133",
+        "stable.go:1:18"
+      ],
+      "unknowns": [
+        "Protocol consumers of the zero-or-absent representation have not been inspected."
+      ]
+    },
+    {
+      "id": "snapshot_file_create",
+      "primary_activity": "A6",
+      "execution_owner": "Caller executing FileSnapshotStore.Create",
+      "protocol_context": "File-backed snapshot creation with caller-supplied index, term and configuration",
+      "trigger": "Create(version, index, term, configuration, configurationIndex, trans)",
+      "legal_preconditions": [],
+      "implementation_guards": [
+        "Rejects versions other than 1."
+      ],
+      "reads": [
+        "Store path and noSync setting",
+        "Caller-supplied snapshot metadata",
+        "Current time for the term-index-millisecond name"
+      ],
+      "writes": [
+        "Creates a directory whose name ends in .tmp.",
+        "Writes initial metadata, creates state.bin and initializes a buffered file/CRC writer."
+      ],
+      "durable_effects": [
+        "Creates filesystem artifacts; initial metadata synchronization is attempted unless noSync is set."
+      ],
+      "external_effects": [
+        "Returns a sink and nil only after initial metadata and state-file setup succeed."
+      ],
+      "important_branches": [
+        "Directory, metadata or state-file errors return without a common cleanup path.",
+        "The generated name uses time at millisecond resolution; uniqueness is not explicitly checked."
+      ],
+      "async_boundaries": [
+        "The returned sink is subsequently operated by its caller."
+      ],
+      "produces_fact_ids": [],
+      "consumes_fact_ids": [],
+      "cross_activity_effects": {},
+      "existing_protections": [
+        "Temporary directories are excluded by getSnapshots.",
+        "The store constructor requires retain >= 1, creates the storage directory and performs a create/close/remove permissions check."
+      ],
+      "source_ids": [
+        "file_snapshot.go:1:551",
+        "snapshot.go:1:120"
+      ],
+      "unknowns": [
+        "Caller serialization and uniqueness of concurrent or repeated creation inputs are not established.",
+        "encodePeers is called, but its implementation is not attached."
+      ]
+    },
+    {
+      "id": "snapshot_file_write",
+      "primary_activity": "A6",
+      "execution_owner": "Caller executing FileSnapshotSink.Write",
+      "protocol_context": "Writes to one file snapshot sink",
+      "trigger": "Write(bytes)",
+      "legal_preconditions": [],
+      "implementation_guards": [],
+      "reads": [
+        "Input bytes and sink buffer"
+      ],
+      "writes": [
+        "Passes bytes to the buffered MultiWriter targeting state.bin and the CRC accumulator."
+      ],
+      "durable_effects": [
+        "Buffer flushes can write state bytes; Write does not itself request synchronization."
+      ],
+      "external_effects": [
+        "Returns the buffered writer's byte count and error."
+      ],
+      "important_branches": [
+        "Write does not check the sink's closed flag."
+      ],
+      "async_boundaries": [],
+      "produces_fact_ids": [],
+      "consumes_fact_ids": [],
+      "cross_activity_effects": {},
+      "existing_protections": [],
+      "source_ids": [
+        "file_snapshot.go:1:551"
+      ],
+      "unknowns": [
+        "Caller enforcement of sink operation ordering is unread.",
+        "A successful buffered write alone does not establish finalization or publication."
+      ]
+    },
+    {
+      "id": "snapshot_file_close",
+      "primary_activity": "A6",
+      "execution_owner": "Caller executing FileSnapshotSink.Close",
+      "protocol_context": "Finalization and publication of one file snapshot sink",
+      "trigger": "Close()",
+      "legal_preconditions": [],
+      "implementation_guards": [
+        "Returns nil immediately if closed is already true.",
+        "Sets closed before attempting finalization."
+      ],
+      "reads": [
+        "Buffered state bytes, state-file size and accumulated CRC",
+        "noSync setting and operating system"
+      ],
+      "writes": [
+        "Flushes the buffer, optionally synchronizes state.bin, obtains its size and closes it.",
+        "Stores size and CRC in metadata and rewrites metadata.",
+        "Renames the temporary directory to its final name.",
+        "Calls ReapSnapshots after the applicable parent-directory synchronization."
+      ],
+      "durable_effects": [
+        "Attempts state-file and metadata synchronization unless noSync is set.",
+        "After rename, attempts parent-directory synchronization unless noSync is set or the operating system is Windows."
+      ],
+      "external_effects": [
+        "Returns stage errors or nil after completing the first-close sequence."
+      ],
+      "important_branches": [
+        "A finalize error triggers temporary-directory removal; a removal error replaces the finalize error returned to the caller.",
+        "Metadata or rename errors return without that cleanup branch.",
+        "Parent-directory or retention errors can occur after rename has published the directory.",
+        "A repeated Close returns nil even when the earlier Close failed."
+      ],
+      "async_boundaries": [],
+      "produces_fact_ids": [
+        "snapshot_file_rename_completed"
+      ],
+      "consumes_fact_ids": [],
+      "cross_activity_effects": {},
+      "existing_protections": [
+        "The normal publication sequence flushes state and writes final size/CRC metadata before rename.",
+        "Synchronization is enabled by default; noSync is described as a private testing field."
+      ],
+      "source_ids": [
+        "file_snapshot.go:1:551"
+      ],
+      "unknowns": [
+        "Crash durability depends on filesystem and operating-system behavior not established by these sources.",
+        "Caller interpretation of errors after publication and repeated Close success is unread.",
+        "Retention can subsequently remove a published snapshot; rename is not a guarantee of continued availability."
+      ]
+    },
+    {
+      "id": "snapshot_file_cancel",
+      "primary_activity": "A6",
+      "execution_owner": "Caller executing FileSnapshotSink.Cancel",
+      "protocol_context": "Cancellation of one file snapshot sink",
+      "trigger": "Cancel()",
+      "legal_preconditions": [],
+      "implementation_guards": [
+        "Returns nil immediately when closed is already true.",
+        "Sets closed before finalization."
+      ],
+      "reads": [
+        "Sink buffer, state file and temporary directory"
+      ],
+      "writes": [
+        "Runs finalize and, if it succeeds, removes the temporary directory."
+      ],
+      "durable_effects": [
+        "Finalization can flush and synchronize state before deletion.",
+        "Successful RemoveAll removes artifacts at the sink's temporary path."
+      ],
+      "external_effects": [
+        "Returns a finalize or removal error, or nil."
+      ],
+      "important_branches": [
+        "A finalize error prevents the removal attempt.",
+        "Cancel after any Close attempt returns nil without removing a published directory or retrying cleanup."
+      ],
+      "async_boundaries": [],
+      "produces_fact_ids": [],
+      "consumes_fact_ids": [],
+      "cross_activity_effects": {},
+      "existing_protections": [
+        "Cancellation does not rename the temporary directory into the published namespace."
+      ],
+      "source_ids": [
+        "file_snapshot.go:1:551"
+      ],
+      "unknowns": [
+        "Caller cleanup or retry behavior after cancellation errors is unread."
+      ]
+    },
+    {
+      "id": "snapshot_file_list",
+      "primary_activity": "A6",
+      "execution_owner": "Caller executing FileSnapshotStore.List",
+      "protocol_context": "Enumeration of file snapshot metadata",
+      "trigger": "List()",
+      "legal_preconditions": [],
+      "implementation_guards": [
+        "getSnapshots ignores non-directories and names ending in .tmp.",
+        "Unreadable metadata and unsupported metadata versions are skipped."
+      ],
+      "reads": [
+        "Snapshot directory entries and JSON metadata",
+        "Store retain count"
+      ],
+      "writes": [],
+      "durable_effects": [],
+      "external_effects": [
+        "Returns at most retain metadata entries sorted by descending term, then index, then ID."
+      ],
+      "important_branches": [
+        "Directory scan failure returns an error.",
+        "Listing does not open state.bin or verify its CRC."
+      ],
+      "async_boundaries": [],
+      "produces_fact_ids": [],
+      "consumes_fact_ids": [],
+      "cross_activity_effects": {},
+      "existing_protections": [
+        "Temporary and uninterpretable metadata entries are filtered."
+      ],
+      "source_ids": [
+        "file_snapshot.go:1:551",
+        "snapshot.go:1:120"
+      ],
+      "unknowns": [
+        "The interface asks for descending index order; actual sorting prioritizes term. Whether reachable snapshot sets distinguish these orders requires caller history.",
+        "List membership does not establish successful Open or application restorability."
+      ]
+    },
+    {
+      "id": "snapshot_file_open",
+      "primary_activity": "A6",
+      "execution_owner": "Caller executing FileSnapshotStore.Open",
+      "protocol_context": "Retrieval of file snapshot bytes by supplied ID",
+      "trigger": "Open(id)",
+      "legal_preconditions": [],
+      "implementation_guards": [
+        "Requires readable metadata and state file.",
+        "Reads the state file through CRC64 and compares the result with metadata CRC.",
+        "Requires a successful seek back to offset zero."
+      ],
+      "reads": [
+        "JSON metadata and complete state.bin contents"
+      ],
+      "writes": [
+        "Reader position"
+      ],
+      "durable_effects": [],
+      "external_effects": [
+        "Returns metadata and a buffered ReadCloser after validation and rewind.",
+        "Returned reader Close closes its file handle."
+      ],
+      "important_branches": [
+        "Read, CRC or seek failure closes the opened state file and returns an error.",
+        "Open does not call getSnapshots or repeat its temporary-name and version filters."
+      ],
+      "async_boundaries": [
+        "The caller consumes and closes the returned reader after Open returns."
+      ],
+      "produces_fact_ids": [
+        "snapshot_file_open_crc_observed"
+      ],
+      "consumes_fact_ids": [],
+      "cross_activity_effects": {},
+      "existing_protections": [
+        "Full-file CRC validation precedes successful return."
+      ],
+      "source_ids": [
+        "file_snapshot.go:1:551"
+      ],
+      "unknowns": [
+        "Application-format validity and restoration are outside this adapter check.",
+        "Concurrent file modification or deletion and caller handling are not established."
+      ]
+    },
+    {
+      "id": "snapshot_file_reap",
+      "primary_activity": "A6",
+      "execution_owner": "Caller executing FileSnapshotStore.ReapSnapshots, including FileSnapshotSink.Close",
+      "protocol_context": "Retention cleanup of eligible file snapshots",
+      "trigger": "ReapSnapshots()",
+      "legal_preconditions": [],
+      "implementation_guards": [
+        "Uses getSnapshots filtering and descending term/index/ID ordering.",
+        "Starts deletion at the configured retain position."
+      ],
+      "reads": [
+        "Eligible snapshot metadata and retention count"
+      ],
+      "writes": [
+        "Removes directories selected using metadata ID."
+      ],
+      "durable_effects": [
+        "Deletes snapshot artifacts beyond the retained prefix."
+      ],
+      "external_effects": [
+        "Returns the first scan or deletion error, or nil."
+      ],
+      "important_branches": [
+        "Earlier removals can complete before a later deletion error.",
+        "Eligibility does not include state-file CRC validation."
+      ],
+      "async_boundaries": [],
+      "produces_fact_ids": [],
+      "consumes_fact_ids": [],
+      "cross_activity_effects": {},
+      "existing_protections": [
+        "The constructor rejects retention counts below one.",
+        "Temporary and unreadable metadata directories are excluded from this cleanup selection."
+      ],
+      "source_ids": [
+        "file_snapshot.go:1:551"
+      ],
+      "unknowns": [
+        "Coordination with concurrent Open, Create and other retention calls is not established.",
+        "Retaining an eligible metadata entry does not establish that it is recoverable."
+      ]
+    },
+    {
+      "id": "snapshot_inmem_create",
+      "primary_activity": "A6",
+      "execution_owner": "Caller executing InmemSnapshotStore.Create",
+      "protocol_context": "Replacement of the one in-memory snapshot slot",
+      "trigger": "Create(version, index, term, configuration, configurationIndex, trans)",
+      "legal_preconditions": [],
+      "implementation_guards": [
+        "Rejects versions other than 1.",
+        "Holds the store write lock while replacing the slot."
+      ],
+      "reads": [
+        "Caller-supplied metadata and generated snapshot name"
+      ],
+      "writes": [
+        "Creates an empty sink, sets hasSnapshot to true and replaces latest."
+      ],
+      "durable_effects": [],
+      "external_effects": [
+        "Returns the sink already installed in the store."
+      ],
+      "important_branches": [
+        "A successful Create replaces the previous slot before any writes or Close.",
+        "Version rejection leaves the existing slot unchanged."
+      ],
+      "async_boundaries": [
+        "Sink writes and terminal calls occur after releasing the store lock."
+      ],
+      "produces_fact_ids": [
+        "snapshot_inmem_slot_installed"
+      ],
+      "consumes_fact_ids": [],
+      "cross_activity_effects": {},
+      "existing_protections": [
+        "Store-slot replacement is protected by a mutex."
+      ],
+      "source_ids": [
+        "inmem_snapshot.go:1:113",
+        "file_snapshot.go:1:551"
+      ],
+      "unknowns": [
+        "Selected callers and their sequencing of creation, persistence, enumeration and retrieval are unread.",
+        "The helper encodePeers implementation is not attached."
+      ]
+    },
+    {
+      "id": "snapshot_inmem_write",
+      "primary_activity": "A6",
+      "execution_owner": "Caller executing InmemSnapshotSink.Write",
+      "protocol_context": "Mutation of one in-memory sink",
+      "trigger": "Write(bytes)",
+      "legal_preconditions": [],
+      "implementation_guards": [],
+      "reads": [
+        "Input bytes and sink contents"
+      ],
+      "writes": [
+        "Appends bytes to the buffer and increments metadata Size by the returned count."
+      ],
+      "durable_effects": [],
+      "external_effects": [
+        "Returns the buffer write count and error."
+      ],
+      "important_branches": [
+        "No store mutex or closed-state guard is used."
+      ],
+      "async_boundaries": [],
+      "produces_fact_ids": [],
+      "consumes_fact_ids": [],
+      "cross_activity_effects": {},
+      "existing_protections": [],
+      "source_ids": [
+        "inmem_snapshot.go:1:113"
+      ],
+      "unknowns": [
+        "Whether legal callers overlap writes with List or Open is not established."
+      ]
+    },
+    {
+      "id": "snapshot_inmem_read",
+      "primary_activity": "A6",
+      "execution_owner": "Caller executing InmemSnapshotStore.List or Open",
+      "protocol_context": "Observation of the current in-memory snapshot slot",
+      "trigger": "List() or Open(id)",
+      "legal_preconditions": [],
+      "implementation_guards": [
+        "Both methods hold the store read lock during the call.",
+        "List checks hasSnapshot.",
+        "Open checks the requested ID against latest.meta.ID."
+      ],
+      "reads": [
+        "hasSnapshot, latest metadata and latest contents"
+      ],
+      "writes": [],
+      "durable_effects": [],
+      "external_effects": [
+        "List returns no entries before creation, otherwise a pointer to latest metadata.",
+        "Open returns the metadata pointer and an io.NopCloser around bytes.NewBuffer(latest.contents.Bytes())."
+      ],
+      "important_branches": [
+        "An ID mismatch returns an error.",
+        "Neither method checks completion or cancellation.",
+        "Open constructs a separate buffer object over the returned byte slice; the source does not perform an explicit byte copy."
+      ],
+      "async_boundaries": [
+        "Returned metadata and reader outlive the store read lock."
+      ],
+      "produces_fact_ids": [],
+      "consumes_fact_ids": [
+        "snapshot_inmem_slot_installed"
+      ],
+      "cross_activity_effects": {},
+      "existing_protections": [
+        "Read locks coordinate these calls with slot replacement.",
+        "Open correlates its requested ID with the current slot."
+      ],
+      "source_ids": [
+        "inmem_snapshot.go:1:113"
+      ],
+      "unknowns": [
+        "Store read locks do not cover sink Write; actual caller concurrency is unread.",
+        "No immutable or completed snapshot guarantee is established by these retrieval methods."
+      ]
+    },
+    {
+      "id": "snapshot_inmem_terminal_noop",
+      "primary_activity": "A6",
+      "execution_owner": "Caller executing InmemSnapshotSink.Close or Cancel",
+      "protocol_context": "Terminal method invocation on an in-memory sink",
+      "trigger": "Close() or Cancel()",
+      "legal_preconditions": [],
+      "implementation_guards": [],
+      "reads": [],
+      "writes": [],
+      "durable_effects": [],
+      "external_effects": [
+        "Returns nil."
+      ],
+      "important_branches": [
+        "Both methods leave bytes, metadata and store visibility unchanged.",
+        "Cancel does not restore a replaced snapshot or remove the current one."
+      ],
+      "async_boundaries": [],
+      "produces_fact_ids": [],
+      "consumes_fact_ids": [],
+      "cross_activity_effects": {},
+      "existing_protections": [],
+      "source_ids": [
+        "inmem_snapshot.go:1:113"
+      ],
+      "unknowns": [
+        "Caller interpretation of these terminal acknowledgements is unread."
+      ]
+    },
+    {
+      "id": "snapshot_discard_operations",
+      "primary_activity": "A6",
+      "execution_owner": "Caller executing DiscardSnapshotStore and DiscardSnapshotSink methods",
+      "protocol_context": "Adapter explicitly documented for testing and for retaining no snapshot",
+      "trigger": "Create, Write, Close, Cancel, List, Open or ID",
+      "legal_preconditions": [],
+      "implementation_guards": [],
+      "reads": [
+        "Write input length"
+      ],
+      "writes": [],
+      "durable_effects": [],
+      "external_effects": [
+        "Create returns a discard sink without version validation.",
+        "Write acknowledges the full input length; Close and Cancel return nil.",
+        "ID returns discard, List returns nil metadata and nil error, and Open always returns an unsupported-operation error."
+      ],
+      "important_branches": [
+        "Successful sink acknowledgements retain no bytes or snapshot metadata."
+      ],
+      "async_boundaries": [],
+      "produces_fact_ids": [],
+      "consumes_fact_ids": [],
+      "cross_activity_effects": {},
+      "existing_protections": [
+        "The adapter documentation expressly limits its intended use to testing and warns against production use."
+      ],
+      "source_ids": [
+        "discard_snapshot.go:1:67"
+      ],
+      "unknowns": [
+        "Actual activation and downstream log-truncation behavior are not established by this adapter source."
+      ]
+    },
+    {
+      "id": "B-log-cache-store",
+      "primary_activity": "A6",
+      "execution_owner": "Goroutine calling LogCache.StoreLog or StoreLogs",
+      "protocol_context": "A LogCache wrapping a caller-supplied LogStore with positive cache capacity.",
+      "trigger": "StoreLog or StoreLogs invocation",
+      "legal_preconditions": [],
+      "implementation_guards": [
+        "NewLogCache rejects nonpositive capacity.",
+        "StoreLogs returns a formatted error without updating cache slots when the backing StoreLogs returns an error."
+      ],
+      "reads": [
+        "Supplied log pointers and their Index fields",
+        "Backing StoreLogs result"
+      ],
+      "writes": [
+        "On backing-store success, assigns each supplied pointer to cache[Index modulo capacity] under the cache write lock."
+      ],
+      "durable_effects": [
+        "Delegates storage to the backing LogStore; persistence and partial-error semantics are not established by this wrapper."
+      ],
+      "external_effects": [
+        "Returns nil after completing cache assignments, or a formatted backing-store error."
+      ],
+      "important_branches": [
+        "StoreLog delegates through a singleton StoreLogs call.",
+        "Backing-store failure leaves cache slots unchanged by this invocation.",
+        "On success, later elements sharing a slot replace earlier assignments.",
+        "Stores supplied pointers without cloning the Log or its referenced data."
+      ],
+      "async_boundaries": [
+        "Backing-store execution precedes acquisition of the cache write lock; the lock does not serialize backing-store operations."
+      ],
+      "produces_fact_ids": [
+        "F-log-cache-store-success"
+      ],
+      "consumes_fact_ids": [],
+      "cross_activity_effects": {},
+      "existing_protections": [
+        "Cache publication is conditional on backing-store success.",
+        "Cache slot assignments are protected by a write lock."
+      ],
+      "source_ids": [
+        "log_cache.go:1:95"
+      ],
+      "unknowns": [
+        "Backing-store durability, atomicity and failure behavior depend on the selected implementation.",
+        "Caller ownership and mutation rules for supplied Log pointers and referenced data are unread.",
+        "Caller serialization of overlapping storage and deletion operations is unread."
+      ]
+    },
+    {
+      "id": "B-log-cache-get",
+      "primary_activity": "A6",
+      "execution_owner": "Goroutine calling LogCache.GetLog",
+      "protocol_context": "Lookup by requested log index within a constructed LogCache.",
+      "trigger": "GetLog(idx, log) invocation",
+      "legal_preconditions": [],
+      "implementation_guards": [
+        "A cache hit requires a nonnil slot pointer whose Index equals the requested index."
+      ],
+      "reads": [
+        "cache[idx modulo capacity] under the read lock",
+        "The selected pointer's Index and Log fields after releasing the read lock"
+      ],
+      "writes": [
+        "On a cache hit, shallow-copies the pointed-to Log into the caller's output."
+      ],
+      "durable_effects": [],
+      "external_effects": [
+        "Returns nil on a cache hit.",
+        "On a miss, forwards GetLog to the backing store and returns its result."
+      ],
+      "important_branches": [
+        "An index mismatch prevents a ring-slot collision from being treated as a hit.",
+        "A backing-store lookup does not populate the cache in this method."
+      ],
+      "async_boundaries": [
+        "The slot pointer is obtained under the read lock, but index validation and copying occur after unlocking."
+      ],
+      "produces_fact_ids": [],
+      "consumes_fact_ids": [],
+      "cross_activity_effects": {},
+      "existing_protections": [
+        "Exact index validation distinguishes entries sharing a ring slot.",
+        "The cache lock protects reading the slot pointer."
+      ],
+      "source_ids": [
+        "log_cache.go:1:95"
+      ],
+      "unknowns": [
+        "A hit alone does not establish that the returned contents still match a particular successful backing-store write; pointer ownership and concurrent operations need caller and store source.",
+        "Protocol consumers of the returned log are outside this reading."
+      ]
+    },
+    {
+      "id": "B-log-cache-delete",
+      "primary_activity": "A6",
+      "execution_owner": "Goroutine calling LogCache.DeleteRange",
+      "protocol_context": "Deletion through the cache wrapper.",
+      "trigger": "DeleteRange(min, max) invocation",
+      "legal_preconditions": [],
+      "implementation_guards": [],
+      "reads": [
+        "Current cache capacity",
+        "Requested deletion bounds"
+      ],
+      "writes": [
+        "Replaces the entire cache with an empty slice of equal capacity under the write lock."
+      ],
+      "durable_effects": [
+        "Invokes backing-store DeleteRange after releasing the cache lock; actual deletion and failure semantics remain implementation-dependent."
+      ],
+      "external_effects": [
+        "Returns the backing-store deletion result."
+      ],
+      "important_branches": [
+        "Invalidates all slots regardless of requested range.",
+        "A backing-store error does not restore the previous cache."
+      ],
+      "async_boundaries": [
+        "Cache invalidation and backing-store deletion are separate operations.",
+        "An overlapping StoreLogs invocation can publish cache entries after the invalidation."
+      ],
+      "produces_fact_ids": [],
+      "consumes_fact_ids": [],
+      "cross_activity_effects": {},
+      "existing_protections": [
+        "Clears cached entries before requesting backing-store deletion."
+      ],
+      "source_ids": [
+        "log_cache.go:1:95"
+      ],
+      "unknowns": [
+        "Legal concurrent call histories and backing-store deletion guarantees require additional source.",
+        "Cache clearing does not establish completion of durable reclamation."
+      ]
+    },
+    {
+      "id": "B-tcp-transport-create",
+      "primary_activity": "A1",
+      "execution_owner": "Caller of a built-in TCP transport factory",
+      "protocol_context": "Construction of NetworkTransport over a plain TCPStreamLayer; transport infrastructure shared by multiple protocol responsibilities.",
+      "trigger": "NewTCPTransport, NewTCPTransportWithLogger or NewTCPTransportWithConfig invocation",
+      "legal_preconditions": [],
+      "implementation_guards": [
+        "Returns a TCP listen error before creating a transport.",
+        "Requires the selected advertised address to be a TCP address with a nonnil, non-unspecified IP."
+      ],
+      "reads": [
+        "Bind address",
+        "Optional advertised address",
+        "Pool, timeout and logging arguments or caller-supplied configuration"
+      ],
+      "writes": [
+        "Creates a TCPStreamLayer holding the listener and advertised address.",
+        "The config variant assigns the created stream to config.Stream before calling NewNetworkTransportWithConfig."
+      ],
+      "durable_effects": [],
+      "external_effects": [
+        "Opens a TCP listener.",
+        "Closes the listener on either advertised-address validation failure.",
+        "Passes the stream to the corresponding NetworkTransport constructor and returns its result."
+      ],
+      "important_branches": [
+        "Addr uses the supplied advertised address when nonnil and otherwise the listener address.",
+        "Factory variants select writer-based logging, logger-based logging or configuration-based construction."
+      ],
+      "async_boundaries": [
+        "NetworkTransport constructor internals and any goroutines they start are unread."
+      ],
+      "produces_fact_ids": [],
+      "consumes_fact_ids": [],
+      "cross_activity_effects": {},
+      "existing_protections": [
+        "Rejects unusable advertised addresses.",
+        "Releases the listener on the shown validation failures."
+      ],
+      "source_ids": [
+        "tcp_transport.go:1:120"
+      ],
+      "unknowns": [
+        "Which factory or adapter is selected by a deployment is not established.",
+        "NetworkTransport lifecycle, request processing and shutdown ownership require its implementation.",
+        "Address validation does not establish remote reachability."
+      ]
+    },
+    {
+      "id": "B-rpc-respond",
+      "primary_activity": "A1",
+      "execution_owner": "Goroutine invoking RPC.Respond",
+      "protocol_context": "An RPC carrying a response channel; concrete request handling is not established here.",
+      "trigger": "Respond(resp, err) invocation",
+      "legal_preconditions": [],
+      "implementation_guards": [],
+      "reads": [
+        "RPC.RespChan",
+        "Supplied response and error"
+      ],
+      "writes": [],
+      "durable_effects": [],
+      "external_effects": [
+        "Sends RPCResponse containing both supplied values to RespChan."
+      ],
+      "important_branches": [
+        "The method permits a response, an error or both without interpreting their protocol meaning."
+      ],
+      "async_boundaries": [
+        "The channel send may block; this method has no timeout or cancellation branch.",
+        "Completion of the send does not itself establish transmission to a remote peer."
+      ],
+      "produces_fact_ids": [],
+      "consumes_fact_ids": [],
+      "cross_activity_effects": {},
+      "existing_protections": [],
+      "source_ids": [
+        "transport.go:1:141"
+      ],
+      "unknowns": [
+        "Channel construction, receiving actor, shutdown behavior and subsequent wire response handling are unread."
+      ]
+    },
+    {
+      "id": "B-worker-reconciliation",
+      "primary_activity": "A4",
+      "execution_owner": "Raft main goroutine executing startStopReplication",
+      "protocol_context": "Current leader state reconciled with configurations.latest, keyed by ServerID",
+      "trigger": "Call to startStopReplication",
+      "legal_preconditions": [
+        "The function comment requires main-thread invocation.",
+        "Leader-state initialization precedes the call shown in runLeader; other call ordering is not established here."
+      ],
+      "implementation_guards": [
+        "Skips the local server ID.",
+        "Creates a worker only when replState lacks the configured server ID.",
+        "Updates an existing worker's peer record only when its address differs.",
+        "Removes workers whose IDs are absent from the latest configuration."
+      ],
+      "reads": [
+        "configurations.latest.Servers",
+        "Last index",
+        "Current term",
+        "leaderState.commitment",
+        "leaderState.stepDown",
+        "leaderState.replState",
+        "Existing peer record under peerLock"
+      ],
+      "writes": [
+        "New worker state with captured commitment pointer, stepDown channel, currentTerm, and nextIndex equal to lastIdx plus one",
+        "replState entries keyed by ServerID",
+        "Existing worker peer record under peerLock when its address changes"
+      ],
+      "durable_effects": [],
+      "external_effects": [
+        "Launches replicate for each newly constructed worker and notifies its trigger channel.",
+        "Emits peer addition and removal observations.",
+        "Sends lastIdx to a removed worker's stop channel, closes the channel, and deletes its map entry.",
+        "Updates the peers metric."
+      ],
+      "important_branches": [
+        "Creation captures the current leader commitment object rather than looking it up for each response.",
+        "Existing-worker lookup and peer replacement use the same configured server ID; an address update preserves that logical ID.",
+        "An unchanged address leaves the existing peer record unchanged.",
+        "Address updates and removal do not assign a replacement commitment pointer.",
+        "Deletion from replState is not a visible worker join."
+      ],
+      "async_boundaries": [
+        "Replication goroutine launch",
+        "Trigger channel notification",
+        "Stop channel send and close",
+        "peerLock"
+      ],
+      "produces_fact_ids": [],
+      "consumes_fact_ids": [
+        "F1"
+      ],
+      "cross_activity_effects": {
+        "A1": "Binds newly constructed replication workers to the current leader commitment object used for subsequent progress submissions.",
+        "A2": "Captures the current term and leader stepDown channel in newly constructed worker state."
+      },
+      "existing_protections": [
+        "Existing workers are selected by logical ServerID.",
+        "Peer replacement occurs under peerLock.",
+        "Worker construction completes before its replication goroutine is launched.",
+        "Removal requests best-effort replication through the observed last index before worker exit."
+      ],
+      "source_ids": [
+        "raft.go:455:666",
+        "replication.go:1:298",
+        "replication.go:534:665"
+      ],
+      "unknowns": [
+        "Completion ordering of removed workers, heartbeat goroutines, pipelines, and outstanding RPCs",
+        "Legal removal and reintroduction histories for the same ServerID and interpretation of reports from overlapping worker lifetimes",
+        "Ordering of other callers relative to commitment.setConfiguration",
+        "Synchronization safety of all peer accesses; updateLastAppended reads s.peer.ID without taking peerLock",
+        "Full pipeline and snapshot paths may impose additional lifetime behavior"
+      ]
+    }
+  ],
+  "facts": [
+    {
+      "id": "F1",
+      "meaning": "A fresh leader commitment accumulator has been initialized with zero progress for the latest configuration's voters and startIndex equal to the observed last index plus one.",
+      "identity": {
+        "owner": "Local Raft instance",
+        "episode": "Specific setupLeaderState invocation and commitment object",
+        "configuration": "Latest configuration at initialization"
+      },
+      "established_by": [
+        "B1"
+      ],
+      "consumed_by": [
+        "B-worker-reconciliation"
+      ],
+      "validity_context": "Initialization result only; it does not establish election legality, remote support, or a committed entry.",
+      "representation": [
+        "leaderState.commitment",
+        "matchIndexes",
+        "startIndex"
+      ],
+      "invalidators": [
+        "B10"
+      ],
+      "reinterpreters": [
+        "B5"
+      ],
+      "durability": "Volatile leader bookkeeping.",
+      "recovery": "A subsequent leader episode constructs a new object.",
+      "source_ids": [
+        "raft.go:455:581",
+        "commitment.go:1:104",
+        "raft.go:455:666"
+      ],
+      "unknowns": [
+        "Worker association is established by construction in startStopReplication; completion of all uses of the captured object after removal or leader cleanup remains unknown.",
+        "Cleanup retires the leaderState reference but does not demonstrate destruction or quiescence of the captured object."
+      ]
+    },
+    {
+      "id": "F2",
+      "meaning": "An append response path observed Success without a response term greater than the associated request term, and for a nonempty request submitted its last entry index to commitment.match under s.peer.ID.",
+      "identity": {
+        "request": "The AppendEntries request used by updateLastAppended",
+        "term": "Request.Term",
+        "server": "s.peer.ID at match invocation",
+        "index": "Last request entry index",
+        "accumulator": "s.commitment object"
+      },
+      "established_by": [
+        "B2",
+        "B3"
+      ],
+      "consumed_by": [
+        "B4"
+      ],
+      "validity_context": "A local response observation and submitted progress report. It does not independently establish durable remote prefix agreement, transport correlation, or continued authority.",
+      "representation": [
+        "AppendEntriesResponse.Success and Term",
+        "AppendEntriesRequest.Entries",
+        "commitment.match call"
+      ],
+      "invalidators": [],
+      "reinterpreters": [],
+      "durability": "Volatile event and bookkeeping.",
+      "recovery": "Later replication can submit new reports; restart reconstruction is unread.",
+      "source_ids": [
+        "replication.go:202:298",
+        "replication.go:534:665",
+        "replication.go:1:298",
+        "raft.go:455:666"
+      ],
+      "unknowns": [
+        "Transport correlation from follower response to leader observation is unread, so F4 is not connected directly as a consumed fact.",
+        "Leader self-match and snapshot-transfer reports are additional unread producers of commitment input.",
+        "The shown address-update path preserves logical ServerID, but synchronization safety of the unlocked s.peer.ID read in updateLastAppended remains unestablished.",
+        "Removal and later reuse of the same ServerID may involve distinct worker objects; legal histories and interpretation of outstanding reports remain unresolved.",
+        "Worker commitment pointers remain captured across the shown address-update, removal, and cleanup paths; termination and outstanding-result completion are not established."
+      ]
+    },
+    {
+      "id": "F3",
+      "meaning": "The commitment object has advanced commitIndex to a voter-map quorum order statistic that exceeds its previous value and reaches startIndex.",
+      "identity": {
+        "accumulator": "Specific commitment object",
+        "index": "Advanced commitIndex",
+        "membership": "Voter map used by that recalculation"
+      },
+      "established_by": [
+        "B4",
+        "B5"
+      ],
+      "consumed_by": [
+        "B6"
+      ],
+      "validity_context": "An assertion about reported-index aggregation at advancement time. Later membership replacement retains commitIndex, so this is not an assertion about a quorum of every subsequent configuration.",
+      "representation": [
+        "commitment.commitIndex",
+        "commitCh notification"
+      ],
+      "invalidators": [],
+      "reinterpreters": [
+        "B5"
+      ],
+      "durability": "Volatile; no durable write occurs in recalculation.",
+      "recovery": "A new leader object starts with commitIndex zero and rebuilds reported progress.",
+      "source_ids": [
+        "commitment.go:1:104",
+        "raft.go:667:826"
+      ],
+      "unknowns": [
+        "Actual durability represented by the input reports",
+        "Legality and version identity of configurations supplied to setConfiguration",
+        "Startup reconstruction of the node's separate commit index"
+      ]
+    },
+    {
+      "id": "F4",
+      "meaning": "The follower AppendEntries handler reached its success branch after passing visible term and predecessor checks and completing every storage and configuration-processing call it attempted without a reported error.",
+      "identity": {
+        "replica": "Receiving Raft instance",
+        "request": "Specific appendEntries invocation",
+        "context": "Request term, previous-log identity, and supplied entries"
+      },
+      "established_by": [
+        "B7"
+      ],
+      "consumed_by": [],
+      "validity_context": "Historical handler completion. Some requests require no storage write. Cached metadata and adapter semantics must be inspected before strengthening this into a durable prefix assertion.",
+      "representation": [
+        "AppendEntriesResponse.Success = true",
+        "Deferred RPC.Respond"
+      ],
+      "invalidators": [],
+      "reinterpreters": [],
+      "durability": "The response itself is not durable; effects depend on the selected store.",
+      "recovery": "No recovery assertion is established by this fact.",
+      "source_ids": [
+        "raft.go:1440:1584",
+        "log.go:81:143"
+      ],
+      "unknowns": [
+        "Response delivery and request correlation",
+        "Selected LogStore durability and failure atomicity",
+        "Retained-prefix interpretation after earlier partial failures",
+        "Exact downstream consumer association through transport"
+      ]
+    },
+    {
+      "id": "F5",
+      "meaning": "A replication response with a term above its request term caused the worker to invoke negative verification notification and request main-loop step-down.",
+      "identity": {
+        "worker": "Specific followerReplication instance",
+        "request_term": "Compared AppendEntriesRequest.Term",
+        "channel": "s.stepDown"
+      },
+      "established_by": [
+        "B8"
+      ],
+      "consumed_by": [
+        "B9"
+      ],
+      "validity_context": "Authority-loss request only. It does not establish that the role changed, the term was persisted, or all old work stopped.",
+      "representation": [
+        "notifyAll(false)",
+        "asyncNotifyCh(s.stepDown)"
+      ],
+      "invalidators": [],
+      "reinterpreters": [],
+      "durability": "Volatile notification.",
+      "recovery": "Restart and term recovery are unread.",
+      "source_ids": [
+        "replication.go:202:298",
+        "replication.go:534:665",
+        "raft.go:667:826"
+      ],
+      "unknowns": [
+        "Worker-to-leader-channel binding",
+        "Notification helper behavior",
+        "Term persistence and completed role transition"
+      ]
+    },
+    {
+      "id": "inmem_log_pointer_installed",
+      "meaning": "A normally completed StoreLogs call installed the last supplied pointer for each encountered index in this instance's log map.",
+      "identity": {
+        "store": "InmemStore instance",
+        "index": "Log.Index evaluated at assignment",
+        "value": "Last pointer assigned to that index by the call"
+      },
+      "established_by": [
+        "inmem_log_store"
+      ],
+      "consumed_by": [
+        "inmem_log_read"
+      ],
+      "validity_context": "At completion within the write-locked operation and until a subsequent overwrite or deletion. This asserts pointer installation, not immutable contents or accurate map extrema.",
+      "representation": [
+        "logs map[uint64]*Log"
+      ],
+      "invalidators": [
+        "inmem_log_store",
+        "inmem_log_delete"
+      ],
+      "reinterpreters": [],
+      "durability": "Volatile memory only.",
+      "recovery": "NewInmemStore initializes empty maps and zero bounds; no reload mechanism is present in this implementation.",
+      "source_ids": [
+        "inmem_store.go:1:133"
+      ],
+      "unknowns": [
+        "Caller mutation can change referenced contents without another store call; those caller behaviors are not mapped.",
+        "No protocol consumer or restart guarantee is established."
+      ]
+    },
+    {
+      "id": "inmem_bytes_installed",
+      "meaning": "A completed Set call installed the supplied slice in the byte-valued map under the string-converted key.",
+      "identity": {
+        "store": "InmemStore instance",
+        "key": "string(key) at assignment"
+      },
+      "established_by": [
+        "inmem_bytes_set"
+      ],
+      "consumed_by": [
+        "inmem_bytes_get"
+      ],
+      "validity_context": "Until a later Set for the same key. Installation does not establish immutable bytes or successful Get when the supplied slice is nil.",
+      "representation": [
+        "kv map[string][]byte"
+      ],
+      "invalidators": [
+        "inmem_bytes_set"
+      ],
+      "reinterpreters": [],
+      "durability": "Volatile memory with shared slice backing storage.",
+      "recovery": "A new instance starts with an empty byte-valued map.",
+      "source_ids": [
+        "inmem_store.go:1:133"
+      ],
+      "unknowns": [
+        "Mutations through caller-held or returned slices are not represented by mapped caller behaviors."
+      ]
+    },
+    {
+      "id": "inmem_uint_installed",
+      "meaning": "A completed SetUint64 call installed the supplied scalar under the string-converted key in the uint64 map.",
+      "identity": {
+        "store": "InmemStore instance",
+        "key": "string(key) at assignment",
+        "value": "Supplied uint64 value"
+      },
+      "established_by": [
+        "inmem_uint_set"
+      ],
+      "consumed_by": [
+        "inmem_uint_get"
+      ],
+      "validity_context": "Until a subsequent SetUint64 for the same key; byte-valued Set operations address a separate map.",
+      "representation": [
+        "kvInt map[string]uint64"
+      ],
+      "invalidators": [
+        "inmem_uint_set"
+      ],
+      "reinterpreters": [],
+      "durability": "Volatile memory only.",
+      "recovery": "A new instance starts with an empty uint64 map; missing-key reads return zero.",
+      "source_ids": [
+        "inmem_store.go:1:133"
+      ],
+      "unknowns": [
+        "Actual protocol consumers and their interpretation of zero remain uninspected."
+      ]
+    },
+    {
+      "id": "snapshot_file_rename_completed",
+      "meaning": "For this sink's publication attempt, finalization and final metadata writing succeeded and the temporary-directory rename to the final path returned successfully. Later Close stages may still fail.",
+      "identity": {
+        "object": "FileSnapshotSink instance and publication attempt",
+        "snapshot": "store path, generated ID, index and term"
+      },
+      "established_by": [
+        "snapshot_file_close"
+      ],
+      "consumed_by": [],
+      "validity_context": "Historical assertion at the successful rename branch; it does not assert successful overall Close, crash durability or continued file availability.",
+      "representation": [
+        "Successful os.Rename in FileSnapshotSink.Close",
+        "Final metadata includes size and CRC obtained during finalize"
+      ],
+      "invalidators": [],
+      "reinterpreters": [],
+      "durability": "Rename precedes the applicable parent-directory synchronization. No unconditional crash-durability guarantee is inferred.",
+      "recovery": "List rediscovers eligible metadata; Open separately validates state bytes. Neither requires an in-memory record of Close success.",
+      "source_ids": [
+        "file_snapshot.go:1:551"
+      ],
+      "unknowns": [
+        "No protocol-level consumer of this publication event has been inspected.",
+        "ReapSnapshots or outside filesystem changes can remove the representation without changing the historical event."
+      ]
+    },
+    {
+      "id": "snapshot_file_open_crc_observed",
+      "meaning": "During a successful Open call, the bytes read from the selected state file produced the CRC recorded in the decoded metadata, and rewinding the file succeeded.",
+      "identity": {
+        "retrieval": "FileSnapshotStore instance, requested ID and Open invocation"
+      },
+      "established_by": [
+        "snapshot_file_open"
+      ],
+      "consumed_by": [],
+      "validity_context": "Applies to the validation read performed by that Open invocation; it does not establish application validity, metadata authenticity or immutability of future reads.",
+      "representation": [
+        "Successful full-state io.Copy into CRC64",
+        "Equality with metadata CRC",
+        "Successful seek before returning the buffered reader"
+      ],
+      "invalidators": [],
+      "reinterpreters": [],
+      "durability": "An observation during retrieval, not a persistence operation.",
+      "recovery": "A later Open repeats the file read and CRC comparison.",
+      "source_ids": [
+        "file_snapshot.go:1:551"
+      ],
+      "unknowns": [
+        "Consumers that restore or transmit the returned bytes are not attached.",
+        "Concurrent mutation assumptions are unresolved."
+      ]
+    },
+    {
+      "id": "snapshot_inmem_slot_installed",
+      "meaning": "A successful version-1 Create installed the returned sink as latest and set hasSnapshot, making the slot available to enumeration before any completion acknowledgement.",
+      "identity": {
+        "store": "InmemSnapshotStore instance",
+        "generation": "Returned sink object and its generated ID"
+      },
+      "established_by": [
+        "snapshot_inmem_create"
+      ],
+      "consumed_by": [
+        "snapshot_inmem_read"
+      ],
+      "validity_context": "Current-slot assertion from successful Create until another successful Create replaces latest; writes change the slot's contents but do not establish completion.",
+      "representation": [
+        "hasSnapshot == true",
+        "latest points to the returned sink"
+      ],
+      "invalidators": [
+        "snapshot_inmem_create"
+      ],
+      "reinterpreters": [],
+      "durability": "Volatile process memory only.",
+      "recovery": "No restart recovery is implemented by this adapter; construction begins with hasSnapshot false.",
+      "source_ids": [
+        "inmem_snapshot.go:1:113"
+      ],
+      "unknowns": [
+        "Protocol consumers and selected deployment usage are unread.",
+        "Close and Cancel leave this assertion unchanged."
+      ]
+    },
+    {
+      "id": "F-log-cache-store-success",
+      "meaning": "For a StoreLogs invocation returning nil, the backing StoreLogs call returned nil before the wrapper completed its cache assignments for the supplied entries.",
+      "identity": {
+        "wrapper": "The particular LogCache instance",
+        "invocation": "The particular StoreLogs call and its supplied ordered log-pointer slice"
+      },
+      "established_by": [
+        "B-log-cache-store"
+      ],
+      "consumed_by": [],
+      "validity_context": "A historical assertion about this invocation's ordering and return result. It does not assert durable persistence, immutable log contents or continuing residency in cache slots.",
+      "representation": [
+        "Successful backing-store return followed by locked cache assignments and nil wrapper return"
+      ],
+      "invalidators": [],
+      "reinterpreters": [],
+      "durability": "The wrapper retains no durable receipt of this assertion; durability of the log data depends on the backing store.",
+      "recovery": "No cache recovery mechanism is shown. A newly constructed cache starts empty.",
+      "source_ids": [
+        "log_cache.go:1:95"
+      ],
+      "unknowns": [
+        "Protocol callers and their interpretation of this success return are unread.",
+        "Later mutation of supplied objects and concurrent operations do not change the historical return ordering but may change observable cache contents."
+      ]
+    }
+  ],
+  "surfaces": [
+    {
+      "entry_point": "Raft.runLeader and setupLeaderState",
+      "disposition": "mapped",
+      "behavior_ids": [
+        "B1",
+        "B10"
+      ],
+      "reason": "Initialization and cleanup are recovered; election entry and worker lifetime remain incomplete.",
+      "source_ids": [
+        "raft.go:455:581"
+      ],
+      "high_consequence": true
+    },
+    {
+      "entry_point": "Raft.replicateTo",
+      "disposition": "mapped",
+      "behavior_ids": [
+        "B2"
+      ],
+      "reason": "Synchronous request, response, retry, and snapshot-fallback control flow is visible.",
+      "source_ids": [
+        "replication.go:202:298",
+        "replication.go:534:665"
+      ],
+      "high_consequence": true
+    },
+    {
+      "entry_point": "Raft.pipelineDecode",
+      "disposition": "mapped",
+      "behavior_ids": [
+        "B3"
+      ],
+      "reason": "Response consumption is visible, but concrete completion and error semantics are deferred.",
+      "source_ids": [
+        "replication.go:534:665"
+      ],
+      "high_consequence": true
+    },
+    {
+      "entry_point": "commitment.match, recalculate, and setConfiguration",
+      "disposition": "mapped",
+      "behavior_ids": [
+        "B4",
+        "B5"
+      ],
+      "reason": "Local aggregation and membership replacement are recovered without assuming report validity.",
+      "source_ids": [
+        "commitment.go:1:104"
+      ],
+      "high_consequence": true
+    },
+    {
+      "entry_point": "Raft.leaderLoop commitment and stepDown branches",
+      "disposition": "mapped",
+      "behavior_ids": [
+        "B6",
+        "B9"
+      ],
+      "reason": "Notification consumers are partially visible; later commit processing and other select branches remain deferred.",
+      "source_ids": [
+        "raft.go:667:826"
+      ],
+      "high_consequence": true
+    },
+    {
+      "entry_point": "Raft.appendEntries",
+      "disposition": "mapped",
+      "behavior_ids": [
+        "B7"
+      ],
+      "reason": "Visible reconciliation includes storage failure exits and cached metadata updates; dispatcher and storage variants remain unknown.",
+      "source_ids": [
+        "raft.go:1440:1584"
+      ],
+      "high_consequence": true
+    },
+    {
+      "entry_point": "Raft.handleStaleTerm",
+      "disposition": "mapped",
+      "behavior_ids": [
+        "B8"
+      ],
+      "reason": "Maps a higher-response-term observation to a requested transition, without treating notification as completed role loss.",
+      "source_ids": [
+        "replication.go:534:665"
+      ],
+      "high_consequence": true
+    },
+    {
+      "entry_point": "Heartbeat worker, heartbeat fast-pass, notifyAll, and VerifyLeader",
+      "disposition": "deferred",
+      "behavior_ids": [],
+      "reason": "Independent contact and support updates may share consumers with append processing; their context checks and completion meanings are unread.",
+      "source_ids": [
+        "transport.go:1:80",
+        "replication.go:534:665",
+        "docs/README.md:1:80"
+      ],
+      "high_consequence": true
+    },
+    {
+      "entry_point": "Election, pre-vote, follower timeout, and leader lease paths",
+      "disposition": "deferred",
+      "behavior_ids": [],
+      "reason": "Authority establishment and contact-loss handling cannot be inferred from leader entry or protocol documentation.",
+      "source_ids": [
+        "README.md:1:80",
+        "transport.go:1:80",
+        "raft.go:667:826"
+      ],
+      "high_consequence": true
+    },
+    {
+      "entry_point": "NewRaft, restart reconstruction, and stable storage",
+      "disposition": "deferred",
+      "behavior_ids": [],
+      "reason": "Constructor selection and durable authority/history reconstruction are not recovered.",
+      "source_ids": [
+        "raft.go:1440:1584",
+        "README.md:1:80"
+      ],
+      "high_consequence": true
+    },
+    {
+      "entry_point": "Leadership-transfer coordinator and worker",
+      "disposition": "deferred",
+      "behavior_ids": [],
+      "reason": "The visible coordinator distinguishes timeout, worker completion, and leaving the leader loop. Worker behavior and admission consumers are unread, so no completion fact is asserted.",
+      "source_ids": [
+        "raft.go:667:826"
+      ],
+      "high_consequence": true
+    },
+    {
+      "entry_point": "Configuration admission, processConfigurationLogEntry, and startStopReplication",
+      "disposition": "deferred",
+      "behavior_ids": [],
+      "reason": "Configuration bookkeeping is visible but proposal serialization, activation ordering, and participant worker replacement are incomplete.",
+      "source_ids": [
+        "configuration.go:129:184",
+        "raft.go:455:581",
+        "raft.go:1440:1584"
+      ],
+      "high_consequence": true
+    },
+    {
+      "entry_point": "processLogs, FSM scheduler, ApplyFuture, and Barrier completion",
+      "disposition": "deferred",
+      "behavior_ids": [],
+      "reason": "Call sites and interface expectations do not establish scheduling or application completion.",
+      "source_ids": [
+        "fsm.go:1:80",
+        "log.go:1:80",
+        "raft.go:667:826",
+        "raft.go:1440:1584"
+      ],
+      "high_consequence": true
+    },
+    {
+      "entry_point": "Snapshot capture, publication, installation, restore, and compaction",
+      "disposition": "deferred",
+      "behavior_ids": [],
+      "reason": "Snapshot fallback and interfaces are visible; usable recovery evidence and reclamation ordering are not.",
+      "source_ids": [
+        "replication.go:202:298",
+        "fsm.go:1:80",
+        "log.go:81:143"
+      ],
+      "high_consequence": true
+    },
+    {
+      "entry_point": "Client FSM state transitions",
+      "disposition": "externalized",
+      "behavior_ids": [],
+      "reason": "The FSM interface explicitly assigns state-machine implementation to clients; library scheduling remains in scope.",
+      "source_ids": [
+        "fsm.go:1:80"
+      ],
+      "high_consequence": true
+    },
+    {
+      "entry_point": "Observer delivery and metrics",
+      "disposition": "deferred",
+      "behavior_ids": [],
+      "reason": "Observer declarations permit blocking delivery, so emission sites must be inspected before treating all observation work as consequence-free infrastructure.",
+      "source_ids": [
+        "observer.go:1:80"
+      ],
+      "high_consequence": false
+    },
+    {
+      "entry_point": "InmemStore: NewInmemStore and LogStore/StableStore methods",
+      "disposition": "mapped",
+      "behavior_ids": [
+        "inmem_log_store",
+        "inmem_log_read",
+        "inmem_log_delete",
+        "inmem_bytes_set",
+        "inmem_bytes_get",
+        "inmem_uint_set",
+        "inmem_uint_get"
+      ],
+      "reason": "The complete implementation establishes construction with empty maps, method synchronization, volatile completion, aliasing, metadata updates and lookup branches. Its comments explicitly restrict intended use to tests. Mapping does not establish correctness or deployment activation.",
+      "source_ids": [
+        "inmem_store.go:1:133",
+        "log.go:1:80",
+        "log.go:81:143",
+        "stable.go:1:18"
+      ],
+      "high_consequence": true
+    },
+    {
+      "entry_point": "Built-in snapshot adapters: FileSnapshotStore and FileSnapshotSink",
+      "disposition": "mapped",
+      "behavior_ids": [
+        "snapshot_file_create",
+        "snapshot_file_write",
+        "snapshot_file_close",
+        "snapshot_file_cancel",
+        "snapshot_file_list",
+        "snapshot_file_open",
+        "snapshot_file_reap"
+      ],
+      "reason": "The complete attached implementation supports construction, staging, writes, publication, cancellation, metadata enumeration, validated retrieval and retention mapping. Mapping does not establish active selection or protocol-level recovery guarantees.",
+      "source_ids": [
+        "file_snapshot.go:1:551",
+        "snapshot.go:1:120"
+      ],
+      "high_consequence": true
+    },
+    {
+      "entry_point": "Built-in snapshot adapters: InmemSnapshotStore and InmemSnapshotSink",
+      "disposition": "mapped",
+      "behavior_ids": [
+        "snapshot_inmem_create",
+        "snapshot_inmem_write",
+        "snapshot_inmem_read",
+        "snapshot_inmem_terminal_noop"
+      ],
+      "reason": "The attached implementation establishes replacement and visibility at Create, mutable in-memory contents, ID-based retrieval and no-op terminal methods. It does not establish a completion-gated or durable snapshot representation.",
+      "source_ids": [
+        "inmem_snapshot.go:1:113"
+      ],
+      "high_consequence": true
+    },
+    {
+      "entry_point": "Built-in snapshot adapters: DiscardSnapshotStore and DiscardSnapshotSink",
+      "disposition": "mapped",
+      "behavior_ids": [
+        "snapshot_discard_operations"
+      ],
+      "reason": "The complete adapter intentionally retains no snapshot, acknowledges sink operations, lists no snapshots and rejects Open. Its documentation limits intended use to testing.",
+      "source_ids": [
+        "discard_snapshot.go:1:67"
+      ],
+      "high_consequence": true
+    },
+    {
+      "entry_point": "LogCache construction, StoreLog/StoreLogs, GetLog and DeleteRange",
+      "disposition": "mapped",
+      "behavior_ids": [
+        "B-log-cache-store",
+        "B-log-cache-get",
+        "B-log-cache-delete"
+      ],
+      "reason": "The exact wrapper source establishes positive-capacity construction, backing-store-before-cache publication, index-checked lookup and whole-cache invalidation before delegated deletion. FirstIndex and LastIndex delegate directly; IsMonotonic forwards the optional backing-store capability and otherwise returns false. These observations do not resolve backing-store guarantees or caller concurrency.",
+      "source_ids": [
+        "log_cache.go:1:95"
+      ],
+      "high_consequence": true
+    },
+    {
+      "entry_point": "NewTCPTransport, NewTCPTransportWithLogger and NewTCPTransportWithConfig",
+      "disposition": "mapped",
+      "behavior_ids": [
+        "B-tcp-transport-create"
+      ],
+      "reason": "The factory and validation paths are supplied in full. The calls into NetworkTransport constructors identify dependencies, without resolving those implementations.",
+      "source_ids": [
+        "tcp_transport.go:1:120"
+      ],
+      "high_consequence": false
+    },
+    {
+      "entry_point": "TCPStreamLayer.Dial, Accept, Close and Addr",
+      "disposition": "infrastructure",
+      "behavior_ids": [],
+      "reason": "Dial delegates to net.DialTimeout using TCP and the supplied timeout; Accept and Close delegate to the listener. Addr chooses the explicit advertised address or listener address. These primitives do not establish RPC completion or protocol acceptance.",
+      "source_ids": [
+        "tcp_transport.go:1:120"
+      ],
+      "high_consequence": false
+    },
+    {
+      "entry_point": "RPC.Respond",
+      "disposition": "mapped",
+      "behavior_ids": [
+        "B-rpc-respond"
+      ],
+      "reason": "The source establishes response-channel submission only; remote delivery and protocol interpretation remain separate responsibilities.",
+      "source_ids": [
+        "transport.go:1:141"
+      ],
+      "high_consequence": true
+    },
+    {
+      "entry_point": "Built-in transport execution, pipeline completion and adapter caller selection",
+      "disposition": "deferred",
+      "behavior_ids": [],
+      "reason": "Read concrete NetworkTransport and InmemTransport implementations and library constructor selection before mapping request delivery, heartbeat dispatch, pipeline completion, cancellation and shutdown. The interface permits heartbeat fallback to Consumer, defines optional pre-vote/close/peer capabilities, and restricts AppendFuture.Response access to after Error returns and successful completion. These interface statements do not establish concrete implementation behavior or activation.",
+      "source_ids": [
+        "transport.go:1:141",
+        "tcp_transport.go:1:120"
+      ],
+      "high_consequence": true
+    },
+    {
+      "entry_point": "LogCache backing-store selection and snapshot-related deletion callers",
+      "disposition": "deferred",
+      "behavior_ids": [],
+      "reason": "Read selected backing-store implementations and callers to recover mutation ownership, concurrent-call constraints, persistence-error semantics and snapshot persistence/restoration sequencing before reclamation. Wrapper source alone cannot establish these directly connected responsibilities.",
+      "source_ids": [
+        "log_cache.go:1:95"
+      ],
+      "high_consequence": true
+    },
+    {
+      "entry_point": "Raft.startStopReplication",
+      "disposition": "mapped",
+      "behavior_ids": [
+        "B-worker-reconciliation"
+      ],
+      "reason": "The attached implementation establishes worker construction, commitment capture, same-ID address updates, and removal signaling. Mapping does not establish worker quiescence or same-ID reuse semantics.",
+      "source_ids": [
+        "raft.go:455:666",
+        "replication.go:1:298",
+        "replication.go:534:665"
+      ],
+      "high_consequence": true
+    }
+  ]
+}

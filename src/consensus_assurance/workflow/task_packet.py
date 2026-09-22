@@ -70,7 +70,6 @@ def descriptive_projection(engine,kind,context,task):
     view=slice_for(state,question,object_ids=seeds)
     draft=json.loads(Path(task.draft_path).read_text()) if task and task.draft_path else {}
     view=view or draft.get('audit_spec',draft)
-    level=task.preparation_failures if task and task.surface_entry_points else 0
     focus=question.model_dump(mode='json') if question else {'object_keys':seeds,'reason':task.reason if task else 'Select a bounded Fact lifecycle'}
     wanted=set(context.get('current_material_ids',[]))|{m['id'] for m in context.get('materials',[])}
     if candidate:
@@ -78,21 +77,21 @@ def descriptive_projection(engine,kind,context,task):
         wanted.update(id for t in state.inquiry_tasks if t.id in candidate.spec_task_ids and t.status=='completed' for id in t.material_ids)
         wanted.update(id for item in state.read_plans.get(candidate.read_plan_id,{}).get('items',[]) if item['status']!='deferred' for id in item['material_ids'])
     if task:wanted.update(id for d in task.diagnostics for id in d['material_ids'])
-    if level and not task.added_material_ids:wanted={id for id in wanted if any(m.id==id and not m.file.lower().endswith('readme.md') for m in state.materials)}
-    if level>=2 and not task.added_material_ids:wanted.clear()
     profile=(view or {}).get('target_profile',{})
-    orientation={k:profile[k] for k in ('system_boundary','protocol_contexts') if k in profile and (not level or k=='system_boundary')}
+    orientation={k:profile[k] for k in ('system_boundary','protocol_contexts') if k in profile}
     local={k:v for k,v in (view or {}).items() if k!='target_profile'}
     if 'target_profile' in seeds:local['target_profile']=profile
     if not question and not seeds:
-        local={k:[{field:o[field] for field in fields if field in o} for o in local.get(k,[])] for k,fields in {'activities':['class_id','realization_summary','unknowns'],'behaviors':['id','primary_activity','execution_owner','trigger','produces_fact_ids','consumes_fact_ids'],'facts':['id','meaning','identity','validity_context','source_ids']}.items()}
-    if level>=2:local={'surfaces':[s for s in (view or {}).get('surfaces',[]) if 'surface:'+s['entry_point'] in seeds]}
-    if task and level>=2:
-        local['activities']=[a for a in (view or {}).get('activities',[]) if a['class_id'] in task.target_ids+task.activity_classes]
+        fields={'activities':['class_id','applicability','purpose','realization_summary','entry_points','unknowns','source_ids'],
+            'behaviors':['id','primary_activity','execution_owner','protocol_context','trigger','legal_preconditions','implementation_guards','important_branches','async_boundaries','produces_fact_ids','consumes_fact_ids','existing_protections','unknowns','source_ids'],
+            'facts':['id','meaning','identity','established_by','consumed_by','validity_context','invalidators','reinterpreters','durability','recovery','unknowns','source_ids'],
+            'surfaces':['entry_point','disposition','behavior_ids','reason','source_ids','high_consequence']}
+        local={k:[{field:o[field] for field in selected if field in o} for o in local.get(k,[])] for k,selected in fields.items()}
     result={**context,'focus':focus,'orientation':orientation,'audit_spec':local,
+        'activity_focus':engine.config.activity_focus,
         'directed_question':engine.config.directed_question,'parameters':engine.config.parameters,
         'materials':[m.model_dump(mode='json') for m in state.materials if m.id in wanted],
-        'required_material_ids':sorted(wanted),'projection_level':level,
+        'required_material_ids':sorted(wanted),
         'source_rule':'Orientation, provenance IDs and declaration hints are navigation, not source evidence. Only attached exact source supports current implementation judgments.'}
     if task:
         result.update(task=task.model_dump(mode='json',exclude={'repair_session','context_dependencies','material_ids','diagnostics'}),diagnostics=task.diagnostics)
@@ -129,7 +128,7 @@ def prepare(engine,kind,context):
     # The global index is a lookup aid, not full catalogue or source text.
     index=compact_index(state,engine.root/'source') if state.snapshot else []
     files={m['file'] for key in ('materials','new_materials','initial_materials') for m in packet.get(key,[])}
-    packet['file_lookup']=[{'file':x['file'],'lines':x.get('lines'),'unavailable':x.get('unavailable')} for x in index if kind in {'read','discover','derive','spec_refine','targeted_read'} or x['file'] in files]
+    packet['file_lookup']=[{'file':x['file'],'lines':x.get('lines'),**({'unavailable':x['unavailable']} if x.get('unavailable') else {})} for x in index if kind in {'read','discover','derive','spec_refine','targeted_read'} or x['file'] in files]
     if task and task.surface_entry_points:
         import re
         from .materials import catalogue
@@ -139,7 +138,7 @@ def prepare(engine,kind,context):
     for key in ('catalogue','source_ranges','unread_ranges','current_material_ids'):
         if kind in {'derive','spec_refine'}:packet.pop(key,None)
     packet['lookup_request']='Request a focused ReadingPlan for an unlisted path or symbol; omitted files are not absent from the repository'
-    packet['file_metadata']=[{**x,'attached_ranges':[[m['start_line'],m['end_line']] for key in ('materials','new_materials','initial_materials') for m in packet.get(key,[]) if m['file']==x['file']]} for x in index if x['file'] in files]
+    packet['file_metadata']=[{**x,'attached_ranges':[[m['start_line'],m['end_line']] for key in ('materials','new_materials','initial_materials') for m in packet.get(key,[]) if m['file']==x['file']]} for x in index if x['file'] in files and kind!='direct_check']
     if kind in {'derive','graph_patch'}:
         from .locations import declaration_index
         from .associations import graph_contract

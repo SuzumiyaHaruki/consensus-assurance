@@ -17,7 +17,7 @@ from consensus_assurance.adapters.storage.snapshot import capture
 from .graph import select_unit
 from .artifacts import save_bundle
 from .modeling import validate_build_reply, obligation_progress, coverage_limitations
-from .investigation import feedback_context, validate_feedback, validate_replay, consequence_needed, validate_consequence, record_consequence
+from .investigation import feedback_context, validate_feedback, validate_replay, record_consequence
 from .budget import BudgetTracker, BudgetExhausted
 from .feedback import apply_feedback
 
@@ -498,22 +498,14 @@ class Engine:
                 record=assess_execution(self.state,model,bundle,experiment,calibration,finding,extract_events(experiment))
                 path=self.root/"findings"/finding.id/(experiment.id+".json"); write_json(path,record); finding.confirmation_path=str(path)
                 if record["confirmed"]:
-                    if consequence_needed(unit,finding):self.advance("consequence_plan");continue
+                    if finding.level=='implementation_obligation':self.advance("consequence_plan");continue
                     self.finish_unit(unit);return
                 if record["prerequisites"]["status"]=="not_reached": self.advance("feedback_F4")
                 else: self.advance("diagnose")
             elif phase=="consequence_plan":
-                from consensus_assurance.core.proposals import ConsequenceReply
-                from .transactions import commit_graph
                 if any(c['finding_id']==finding.id for c in self.state.consequences):
                     self.finish_unit(unit);return
-                try:
-                    if not self.state.pending_action or not self.state.pending_action.kind.startswith("agent:consequence"):
-                        self.budget.take("consequence_investigations")
-                    reply,check=self.ask("consequence",ConsequenceReply,{**self.context(unit),"finding":finding.model_dump(mode="json"),"assessment":next((r for r in reversed(self.state.monitor_results) if r['finding_id']==finding.id),None)},lambda p:validate_consequence(self.state,unit,p))
-                    commit_graph(self,"consequence-"+check.id,reply.model_dump(mode="json"),lambda proxy:record_consequence(proxy,unit,finding,reply))
-                except (BudgetExhausted,Blocked,ValueError) as exc:
-                    record_consequence(self,unit,finding,reason=str(exc))
+                record_consequence(self,unit,finding)
                 self.finish_unit(unit);return
             elif phase in {"feedback_F1","feedback_F4","diagnose"}:
                 kind=phase.removeprefix("feedback_")

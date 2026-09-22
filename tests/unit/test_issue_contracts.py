@@ -35,4 +35,4 @@ def test_manifest_applies_same_domain_method_to_first_build_and_revisions():
         assert expected<=set(loaded['paths']) and len(loaded['paths'])==len(set(loaded['paths']))
         text=render(kind,{},'Identify support and its actual context')
         assert 'pending' in text and 'Identify support and its actual context' in text
-    assert set(manifest()['tasks'])=={'read','discover','derive','build','retry','diagnose','F1','F2','F3','F4','targeted_read','graph_patch','replay','technical','spec_refine','semantic_review','consequence','scope_review','harness','direct_check','question'}
+    assert set(manifest()['tasks'])=={'read','discover','derive','build','retry','diagnose','F1','F2','F3','F4','targeted_read','graph_patch','replay','technical','spec_refine','semantic_review','scope_review','harness','direct_check','question'}

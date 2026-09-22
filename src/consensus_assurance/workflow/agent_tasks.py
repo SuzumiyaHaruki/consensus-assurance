@@ -171,8 +171,6 @@ def ask(engine,kind,response_type,context,validator=None,*,purpose="depth"):
                 sent['child_task_ids']=split_model_context(engine,kind)
             write_json(engine.root/'packets'/(sent['id']+'.json'),sent)
             engine.checkpoint('context_limit')
-            if review_task and review_task.surface_entry_points and not session and review_task.preparation_failures<=engine.config.budget.context_preparations:
-                continue
             raise Blocked(f'Required context exceeds context_chars ({kind}: {len(prompt)} > {engine.config.budget.context_chars}); split the task or explicitly revise the limit; no payload sent')
         if review_task and not review_task.admitted:
             from .inquiry import inquiry_resource
