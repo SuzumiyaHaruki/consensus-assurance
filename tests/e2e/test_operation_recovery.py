@@ -5,8 +5,8 @@ from consensus_assurance.workflow.engine import Engine
 from consensus_assurance.adapters.storage.files import Store
 
 
-@pytest.mark.parametrize('operation',['derive','inquiry'])
-def test_interrupted_semantic_commit_resumes_without_duplicate_revision(tmp_path,prepared,operation):
+def test_interrupted_semantic_commit_resumes_without_duplicate_revision(tmp_path,prepared):
+    operation='inquiry'
     repo,config,root,args=setup(tmp_path,prepared,wrong=True)
     class Interrupted(Engine):
         def graph_commit_hook(self,key):

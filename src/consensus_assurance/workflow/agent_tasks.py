@@ -2,7 +2,7 @@
 import json
 from pathlib import Path
 from consensus_assurance.core.types import CheckRun,uid
-from consensus_assurance.core.proposals import BuildReply
+from consensus_assurance.core.proposals import BuildReply, DirectCheckReply, HarnessReply
 from consensus_assurance.core.diagnostics import Diagnostic,DiagnosticError
 from consensus_assurance.adapters.storage.files import write_json
 from .prompts import render
@@ -12,6 +12,27 @@ from .materials import validate_read_requests, attachment_key
 
 
 from .output_repair import save_session
+
+
+def continue_generation(engine, kind, logical_task, raw, check, reason, session, requests=()):
+    """Keep an unaccepted check in its original generation task and bounded session."""
+    if session is None:
+        folder=engine.root/'repair-sessions'/uid()
+        write_json(folder/'original.json',raw)
+        session={'id':folder.name,'task':kind,'logical_task':logical_task,'mode':'check_generation',
+            'original_path':str(folder/'original.json'),'attempt':0,'version':0,'stagnation':0}
+    else:
+        previous=json.loads(Path(session['current_path']).read_text())
+        session['stagnation']=session['stagnation']+1 if previous==raw else 0
+        session['version']+=1
+    session.update(status='building',error=reason,current_path=str(engine.root/'repair-sessions'/session['id']/f"candidate-{session['version']}.json"),
+        read_requests=[r.model_dump(mode='json') for r in requests])
+    write_json(Path(session['current_path']),raw)
+    write_json(Path(check.cwd)/'generation-error.json',{'reason':reason,'requests':session['read_requests']})
+    from .inquiry import release_action
+    release_action(engine)
+    save_session(engine,session)
+    return session
 
 
 def diagnostics_for(exc,candidate,kind,version,limit):
@@ -26,7 +47,7 @@ def diagnostics_for(exc,candidate,kind,version,limit):
 
 def ask(engine,kind,response_type,context,validator=None,*,purpose="depth"):
     state=engine.state
-    model_output=response_type is BuildReply
+    artifact_output=response_type in {BuildReply, DirectCheckReply, HarnessReply}
     context={**context,'read_purpose':purpose}
     if not engine.agent.mock and not engine.config.allow_agent_materials:raise Blocked('Agent material transmission disabled by configuration; no repository payload was sent')
     from .audit_spec import SpecIssue
@@ -51,9 +72,9 @@ def ask(engine,kind,response_type,context,validator=None,*,purpose="depth"):
     session=state.pending_output_repair
     if session and session.get('task')!=kind:raise Blocked('Another repair session is pending')
     if session and 'id' not in session:raise Blocked('Historical repair needs an explicit migrated child run; original artifacts preserved')
-    logical_task={'unit_id':state.active_unit_id,'model_id':state.active_model_id,'finding_id':state.active_finding_id,'inquiry_id':state.active_inquiry_id,'candidate_id':next((c.id for c in state.question_candidates if c.status=='active'),None)}
+    logical_task={'unit_id':state.active_unit_id,'model_id':state.active_model_id,'finding_id':state.active_finding_id,'inquiry_id':state.active_inquiry_id,'direct_check_id':state.active_direct_check_id,'candidate_id':next((c.id for c in state.question_candidates if c.status=='active'),None)}
     if session and session.get('logical_task',logical_task)!=logical_task:raise Blocked('The repair session belongs to another logical task')
-    if session and not model_output and session.get('read_plan_id') and session.get('read_requests'):
+    if session and not artifact_output and session.get('read_plan_id') and session.get('read_requests'):
         obtained=engine.read(session['read_requests'],purpose=purpose,plan_id=session['read_plan_id'],related_ids=session.get('read_related_ids',[]),reason=session.get('read_rationale','Resume requested repair context'))
         if obtained['status']!='complete':save_session(engine,session);raise Blocked('Repair reading plan still has unmet ranges; no new agent call was sent')
         session['requested_material_ids']=[id for i in obtained['items'] for id in i['material_ids'] if i['status']!='deferred']
@@ -80,14 +101,14 @@ def ask(engine,kind,response_type,context,validator=None,*,purpose="depth"):
         import time
         preparation_started=time.monotonic()
         context,review_task=prepare(engine,kind,seed_context)
-        if session and model_output:
+        if session and artifact_output:
             if session['attempt']>=engine.config.budget.repair_attempts or session['stagnation']>=engine.config.budget.repair_stagnation:
                 session['status']='blocked';save_session(engine,session)
-                raise Blocked('Model generation remains unfinished: '+session['error'])
+                raise Blocked('Check generation remains unfinished: '+session['error'])
             if session.get('read_requests'):
                 session.setdefault('read_plan_id',uid())
                 obtained=engine.read(session['read_requests'],purpose=purpose,plan_id=session['read_plan_id'],reason=session['error'])
-                if obtained['status']!='complete':raise Blocked('Model continuation requires the deferred source ranges')
+                if obtained['status']!='complete':raise Blocked('Check continuation requires the deferred source ranges')
                 session['read_requests']=[];session.pop('read_plan_id')
                 save_session(engine,session)
             attached=set(state.task_attachments.get(attachment_key(state),[]))
@@ -135,8 +156,8 @@ def ask(engine,kind,response_type,context,validator=None,*,purpose="depth"):
         directory=engine.root/'agent'/(uid()+'-'+kind)
         from .task_packet import pool_sources
         request=pool_sources(request)
-        prompt=render('retry' if session and not model_output else kind,request,engine.inquiry)
-        sent=receipt(engine,kind,request,prompt,schema,review_task,repair=bool(session and not model_output))
+        prompt=render('retry' if session and not artifact_output else kind,request,engine.inquiry)
+        sent=receipt(engine,kind,request,prompt,schema,review_task,repair=bool(session and not artifact_output))
         sent['preparation_seconds']=time.monotonic()-preparation_started
         if len(prompt)>engine.config.budget.context_chars:
             sent['status']='blocked_context_limit'
@@ -174,14 +195,14 @@ def ask(engine,kind,response_type,context,validator=None,*,purpose="depth"):
             elif kind=='scope_review':
                 engine.budget.take('semantic_reviews')
             return engine.agent.analyze(engine.runner,prompt,directory,state.snapshot.id,engine.budget.timeout(),schema)
-        payload=engine.action('agent:'+kind+(':repair' if session and not model_output else ''),'agent_calls',invoke,{'prompt':prompt,'response_type':schema.__name__})
+        payload=engine.action('agent:'+kind+(':repair' if session and not artifact_output else ''),'agent_calls',invoke,{'prompt':prompt,'response_type':schema.__name__})
         sent['result_reused']=not invoked
         sent['status']='action_returned';sent['action_id']=state.pending_action.id if state.pending_action else None
         check=CheckRun.model_validate(payload[0]);sent['check_id']=check.id;sent['status']='reused_result' if any(p.get('check_id')==check.id for p in state.packet_receipts if p is not sent) else 'executed';write_json(engine.root/'packets'/(sent['id']+'.json'),sent);check.parameters['agent_task']=kind;engine.record(check);cwd=Path(check.cwd)
         raw=payload[1]
         if raw is None and check.reason!='Structured agent output is invalid':raise Blocked(f'Agent blocked: {check.status.value}; {check.reason}')
-        if session and model_output:session['attempt']+=1
-        if session and not model_output:
+        if session and artifact_output:session['attempt']+=1
+        if session and not artifact_output:
             session['attempt']+=1
             try:
                 if raw is None:
@@ -245,25 +266,27 @@ def ask(engine,kind,response_type,context,validator=None,*,purpose="depth"):
                 if session['patch_failures']>=max(1,engine.config.budget.repeated_error_revisions):session['blocked']=True
                 state.pending_action=None;save_session(engine,session);continue
         else:
-            if raw is None or model_output:
+            if raw is None or artifact_output:
                 decoded=cwd/'decoded-response.json';raw=json.loads(decoded.read_text()) if decoded.exists() else raw
-            if raw is None and model_output and (cwd/'raw-response.txt').exists():raw=(cwd/'raw-response.txt').read_text()
+            if raw is None and artifact_output and (cwd/'raw-response.txt').exists():raw=(cwd/'raw-response.txt').read_text()
             if raw is None:raise Blocked('Unparseable original output; preserved logs cannot be repaired without a candidate')
             merged=raw
         try:
             response=response_type.model_validate(merged)
             validate(response)
-            if model_output:
-                if session and response.requests and response.bundle is None and response.draft is None:
+            if artifact_output:
+                if session and response.requests and not any(getattr(response,k,None) for k in ('bundle','draft','plan','harness')) and getattr(response,'reading_purpose','context')!='dependency':
                     session['read_requests']=[r.model_dump(mode='json') for r in response.requests]
                     session['error']=response.gap
                     from .inquiry import release_action
                     release_action(engine);save_session(engine,session)
                     continue
-                core=[p for p in response.draft.pending_work if p.component in {'behavior','properties'}] if response.draft else []
-                if core:
-                    from .modeling import continue_generation
-                    session=continue_generation(engine,kind,logical_task,merged,check,'Complete pending model work: '+'; '.join(p.reason for p in core),session,[r for p in core for r in p.requests])
+                draft=getattr(response,'draft',None)
+                core=[p for p in draft.pending_work if p.component in {'behavior','properties'}] if draft else []
+                unfinished=not response.requests and not any(getattr(response,k,None) for k in ('bundle','draft','plan','harness')) and getattr(response,'fallback','none')=='none'
+                if core or unfinished:
+                    reason='Complete pending model work: '+'; '.join(p.reason for p in core) if core else response.gap
+                    session=continue_generation(engine,kind,logical_task,merged,check,reason,session,[r for p in core for r in p.requests])
                     continue
             write_json(cwd/'accepted-response.json',response)
             sent['status']='accepted';write_json(engine.root/'packets'/(sent['id']+'.json'),sent)
@@ -280,8 +303,7 @@ def ask(engine,kind,response_type,context,validator=None,*,purpose="depth"):
             return response,check
         except ValueError as exc:
             if isinstance(exc,SpecIssue):raise
-            if model_output:
-                from .modeling import continue_generation
+            if artifact_output:
                 session=continue_generation(engine,kind,logical_task,merged,check,str(exc),session)
                 continue
             if session is None:

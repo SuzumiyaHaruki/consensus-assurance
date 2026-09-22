@@ -65,7 +65,7 @@ def test_accepted_graph_review_and_read_repairs_reach_real_tlc(tmp_path,prepared
     assert {s['task'] for s in sessions}=={'build'}
     assert any(t.trigger.endswith(':missing_aspects') for t in state.inquiry_tasks)
     assert all(s['status']=='accepted' for s in sessions)
-    assert all(s['mode']=='model_generation' for s in sessions)
+    assert all(s['mode']=='check_generation' for s in sessions)
     assert any('limits.py:1:2' in h['added_material_ids'] for h in state.reading_history)
     assert any(i.status=='disputed' for r in state.semantic_reviews for i in r.items)
     assert state.usage['agent_calls']<=20

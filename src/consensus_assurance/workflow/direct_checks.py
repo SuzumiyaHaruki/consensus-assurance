@@ -3,7 +3,7 @@ import json
 from pathlib import Path
 from consensus_assurance.core.proposals import DirectCheckReply, DirectCheckPlan, QuestionReply
 from consensus_assurance.core.types import DirectCheckArtifact, CheckRun, Evidence, Finding, Origin, Assessment, Investigation, ExecutionStatus, uid
-from consensus_assurance.core.events import compare, match_prerequisites
+from consensus_assurance.core.events import compare, match_prerequisites, event_requirements
 from consensus_assurance.adapters.storage.files import write_json
 from consensus_assurance.adapters.storage.snapshot import capture
 from consensus_assurance.adapters.runners.experiment import run_experiment, extract_events
@@ -35,6 +35,7 @@ def route(unit):
 
 def validate_plan(state,unit,plan,implementation):
     if plan.claim_id not in unit.obligation_ids:raise ValueError('Direct check must select one unit obligation')
+    if plan.scope!=unit.scope:raise ValueError('Changing accepted check scope requires explicit scope revision')
     if not set(plan.binding_ids)<=set(unit.binding_ids):raise ValueError('Direct check uses nonselected bindings')
     for binding in state.bindings:
         if binding.id in plan.binding_ids and (binding.snapshot_id!=state.snapshot.id or state.snapshot.files.get(binding.file)!=binding.content_digest):
@@ -59,12 +60,9 @@ def validate_plan(state,unit,plan,implementation):
         if not monitor.binding_ids or not set(monitor.binding_ids)<=set(plan.binding_ids):raise ValueError('Monitor needs selected source bindings')
         if not monitor.applicability_conditions:raise ValueError('Monitor needs observed applicability conditions')
         if p.trigger.reference:raise ValueError('Direct trigger must select an actual event field')
-        if p.assertion.reference and (p.assertion.reference.partition('.')[0] not in {r.alias for r in plan.harness.prerequisites[:-1]} or not p.assertion.reference.partition('.')[2]):
-            raise ValueError('Direct comparison must reference a prior correlated prerequisite event')
-        witness=[r for r in plan.harness.prerequisites[1:] if r.event==monitor.event]
-        aliases={r.alias for r in plan.harness.prerequisites}
-        if not any(all(any(c.field==key and c.op=='eq' and c.reference and c.reference.partition('.')[0] in aliases and c.reference.partition('.')[2]==key for c in r.conditions) for key in p.identity_fields) for r in witness):
-            raise ValueError('Monitor witness must correlate each identity to prerequisite events')
+        event_requirements(plan.harness.prerequisites,p.assertion.reference)
+        if p.assertion.field in p.identity_fields:
+            raise ValueError('The compared value cannot also establish independent operation identity')
 
 
 def validate_revision(state,unit,revision):
@@ -133,19 +131,21 @@ def execute(engine,artifact):
 
 def assess(state,unit,artifact,plan,check,events):
     prerequisite=match_prerequisites(events,plan.harness.prerequisites)
-    aliases={r.alias:events[index] for r,index in zip(plan.harness.prerequisites,prerequisite['matched_indices'])} if prerequisite['status']=='matched' else {}
     properties={p.checker_id:p for p in plan.observable_properties}
-    results=[monitor_events(events,m,properties[m.checker_id],aliases=aliases) for m in plan.monitors]
+    results=[monitor_events(events,m,properties[m.checker_id],plan.harness.prerequisites) for m in plan.monitors]
     limitations=list(plan.uncertainties)
     claim=next(c for c in state.claims if c.id==plan.claim_id)
     ids=set(artifact.graph_versions)|{a.id for a in state.direct_checks if a.unit_id in {unit.id,unit.previous_id}}
-    correspondence=[r for r in state.semantic_reviews if r.target_versions.get(artifact.id)==artifact.version and any(i.target_id==artifact.id and i.aspect=='checker_correspondence' and i.status=='no_issue_found' and not i.limitations for i in r.items)]
+    correspondence=[r for r in state.semantic_reviews if r.target_versions.get(artifact.id)==artifact.version and any(i.target_id==artifact.id and i.aspect=='checker_correspondence' and i.status=='no_issue_found' and not i.counterevidence for i in r.items)]
     if not correspondence:limitations.append('Direct oracle correspondence is unreviewed')
     issues=[i for i in state.review_issues if i.target_id in ids]
-    disputed=any(i.target_id in ids and (i.status!='no_issue_found' or i.limitations or i.counterevidence)
+    disputed=any(i.target_id in ids and (i.status!='no_issue_found' or i.counterevidence)
         and not any(x.review_id==r.id and x.target_id==i.target_id and x.aspect==i.aspect and x.resolved_by for x in issues)
         for r in state.semantic_reviews for i in r.items)
     if any(not i.resolved_by for i in issues) or disputed:limitations.append('Unresolved semantic counterevidence')
+    limitations.extend(limit for r in state.semantic_reviews for i in r.items if i.target_id in ids
+        and not any(x.review_id==r.id and x.target_id==i.target_id and x.aspect==i.aspect and x.resolved_by for x in issues)
+        for limit in i.limitations)
     if check.status==ExecutionStatus.TIMEOUT:limitations.append('External timeout; target behavior and harness completion are unestablished')
     elif check.status!=ExecutionStatus.COMPLETED:limitations.append('Execution tool or build failed: '+check.reason)
     elif check.exit_code!=0:limitations.append('Nonzero direct test exit ('+check.parameters.get('failure_class','unclassified')+'); inspect raw stack and target path before attribution')
@@ -158,21 +158,17 @@ def assess(state,unit,artifact,plan,check,events):
     for basis in [claim.grounding,plan.harness.legality]+[m.grounding for m in plan.monitors]:limitations.extend(basis.unresolved+basis.conflicts)
     for condition in plan.harness.legal_conditions:
         if not events or not all(compare(e,condition) is True for e in events):limitations.append('Observable execution legality not established')
-    correlated=True
     for monitor,result in zip(plan.monitors,results):
         local=[]
         matched=[i for i,e in enumerate(events) if e.get('event')==monitor.event and compare(e,properties[monitor.checker_id].trigger) is True]
         if result['missing_indices']:local.append('Required observed fields missing')
         if not matched or any(not all(compare(events[i],c) is True for c in monitor.applicability_conditions) for i in matched):local.append('Observable applicability not established')
-        if not set(matched)<=set(prerequisite['matched_indices']):
-            correlated=False;local.append('Observed checks are outside the correlated prerequisite execution')
         result['limitations']=local
     violated=any(r['outcome']=='violated' for r in results)
     clean=not limitations and all(not r['limitations'] and r['outcome']!='unknown' for r in results)
-    observed=(check.status==ExecutionStatus.COMPLETED and check.exit_code==0 and check.origin==Origin.EXECUTED
+    observed=(check.status==ExecutionStatus.COMPLETED and check.origin==Origin.EXECUTED
         and state.mode!='mock' and check.snapshot_id==artifact.snapshot_id and check.direct_check_id==artifact.id
-        and correlated and prerequisite['status']=='matched' and all(r['outcome']!='unknown' and not r['missing_indices']
-            and set(r['witness_indices'])<=set(prerequisite['matched_indices']) for r in results))
+        and prerequisite['status']=='matched' and all(r['outcome']!='unknown' and not r['missing_indices'] for r in results))
     confirmed=clean and violated and observed
     record={'direct_check_id':artifact.id,'experiment_check_id':check.id,'prerequisites':prerequisite,'properties':results,
         'limitations':limitations,'confirmed':confirmed,'outcome':('violated' if violated else 'holds') if observed else 'unknown',

@@ -20,7 +20,9 @@ class StagedAgent(ScopeAgent):
             bundle=copy.deepcopy(self.data[5]);h=bundle['harness']
             # The generated harness actually consumes the newly supplied assembly input.
             h['source']='from zz_assembly import START\nassert START == 0\n'+h['source']
-            response={'harness':h,'observation':bundle['observation'],'monitors':bundle.get('monitors',[]),'gap':''}
+            response={'harness':h,'observation':None if self.harness_calls==1 else bundle['observation'],'monitors':bundle.get('monitors',[]),'gap':''}
+            if self.harness_calls==2:
+                assert packet['previous_reply']['observation'] is None and packet['generation_error']
             directory.mkdir(parents=True,exist_ok=True);(directory/'prompt.txt').write_text(prompt)
             write_json(directory/'response.json',response);write_json(directory/'decoded-response.json',response)
             check=runner.run([sys.executable,'-c','print("Controlled staged assembly response")'],directory,'agent',snapshot_id,timeout);check.origin=Origin.MOCK
@@ -51,7 +53,7 @@ def test_saved_model_then_new_assembly_source_actual_harness_and_calibration(tmp
     assert any(c.status=='compatible' and c.model_id==last.id for c in state.calibrations),state.stop_reason
     assert not any(c.model_id==first.id for c in state.calibrations)
     assert any(c.action=='experiment' and c.outcome=='tests_passed' for c in state.checks)
-    assert agent.harness_calls==1
+    assert agent.harness_calls==2
     assert state.usage['agent_calls']<=20 and state.usage['model_checks']<=cfg.budget.model_checks
     assert all(e.level=='framework_test' for e in state.evidence)
     assert (repo/'zz_assembly.py').read_text()=='START = 0\n'
@@ -112,7 +114,7 @@ def test_generation_continues_without_reads_then_real_syntax_repair_and_search(t
     assert not state.calibrations and not any(c.action=='experiment' for c in state.checks)
     assert 'harness' in state.stop_reason and 'remaining agent calls=0' in state.stop_reason
     session=next(iter(state.repair_sessions.values()))
-    assert session['mode']=='model_generation' and session['attempt']==2 and session['status']=='accepted'
+    assert session['mode']=='check_generation' and session['attempt']==2 and session['status']=='accepted'
     original=json.loads(Path(session['original_path']).read_text())
     assert original['draft']==malformed and len(state.read_plans)==original_reads
     assert not any(e.level.startswith('implementation') for e in state.evidence)

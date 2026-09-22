@@ -310,7 +310,7 @@ def test_episode_admission_and_blockage_classification(focused):
     assert inquiry_resource(surface)=='exploration_rounds'
     c.spec_task_ids=[];c.status='active';e.state.usage['agent_calls']+=1
     assert candidate_blockage(e.state,c)=='resource_blocked'
-    assert FRAMEWORK_REVISION==manifest()['version']=='model-continuation-v10'
+    assert FRAMEWORK_REVISION==manifest()['version']
 
 
 @pytest.mark.parametrize('decision,effect,empty,expected',[
@@ -423,5 +423,16 @@ def test_pending_feedback_merges_opinions_without_blocking_candidate(focused):
     c.status='explained';e.state.last_work_kind='candidate'
     required.status='completed'
     assert choose_task(e).id==first.id
-    e.state.active_unit_id='ready';e.state.next_action='build'
-    assert choose_task(e) is None
+    e.state.active_unit_id='ready'
+    for action in ['build','direct_check','direct_execute','harness']:
+        e.state.next_action=action
+        assert choose_task(e) is None
+    from consensus_assurance.workflow.inquiry import apply_task_response
+    from consensus_assurance.core.proposals import SpecRefinement,AuditSpecDelta
+    from consensus_assurance.core.types import CheckRun
+    calls=e.state.usage.get('agent_calls',0)
+    apply_task_response(e,first.id,SpecRefinement(understanding='The current descriptions already cover these source observations',delta=AuditSpecDelta(rationale='No descriptive changes needed'),limitations=[]),CheckRun(action='agent',cwd=str(e.root),snapshot_id=e.state.snapshot.id))
+    repeat=enqueue(e.state,'spec_refine','Covered observation','later-check',target_ids=['producer'],diagnostics=opinion('Check ownership'))
+    assert repeat.id==first.id and repeat.status=='completed' and e.state.usage.get('agent_calls',0)==calls
+    fresh=enqueue(e.state,'spec_refine','New evidence','review-a',target_ids=['producer'],diagnostics=opinion('A different source branch contradicts the owner'))
+    assert fresh.id!=first.id and fresh.status=='pending'

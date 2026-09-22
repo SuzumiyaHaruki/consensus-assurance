@@ -12,8 +12,10 @@ def test_environment_and_agent_are_not_property_unknown(tmp_path, prepared):
         CheckRun(action='agent', cwd=str(tmp_path), snapshot_id=state.snapshot.id,
                  status=ExecutionStatus.TIMEOUT, reason='Action timeout exceeded'),
     ]
+    state.stop_reason='Authentication unavailable'
     before = state.model_dump(mode='json')
     text = render_report(state, tmp_path).read_text()
+    assert 'Authentication unavailable' in text and state.snapshot.id in text and 'MOCK' in text
     assert '结果未确定' not in text
     assert '不适用：未检查性质' in text
     assert '结构化回复已返回；不代表关系图或模型已被接受' in text

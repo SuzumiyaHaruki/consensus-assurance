@@ -4,30 +4,6 @@ from pathlib import Path
 from .artifacts import materialize_bundle, validate_bundle
 
 
-def continue_generation(engine, kind, logical_task, raw, check, reason, session, requests=()):
-    """Keep unfinished generation in its original task, outside field replacement."""
-    from consensus_assurance.core.types import uid
-    from consensus_assurance.adapters.storage.files import write_json
-    from .output_repair import save_session
-    if session is None:
-        folder=engine.root/'repair-sessions'/uid()
-        write_json(folder/'original.json',raw)
-        session={'id':folder.name,'task':kind,'logical_task':logical_task,'mode':'model_generation',
-            'original_path':str(folder/'original.json'),'attempt':0,'version':0,'stagnation':0}
-    else:
-        previous=json.loads(Path(session['current_path']).read_text())
-        session['stagnation']=session['stagnation']+1 if previous==raw else 0
-        session['version']+=1
-    session.update(status='building',error=reason,current_path=str(engine.root/'repair-sessions'/session['id']/f"candidate-{session['version']}.json"),
-        read_requests=[r.model_dump(mode='json') for r in requests])
-    write_json(Path(session['current_path']),raw)
-    write_json(Path(check.cwd)/'generation-error.json',{'reason':reason,'requests':session['read_requests']})
-    from .inquiry import release_action
-    release_action(engine)
-    save_session(engine,session)
-    return session
-
-
 def validate_technical_repair(current, repaired, phase):
     if repaired.checker_specs() != current.checker_specs() or repaired.scope != current.scope:
         raise ValueError('Technical repair changed property scope or attribution; semantic revision required')

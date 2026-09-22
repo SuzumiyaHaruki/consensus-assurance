@@ -1,0 +1,277 @@
+{
+  "understanding": "The supplied code supports a partial decomposition of the composite surface: VerifyLeader API admission, main-thread verification initialization, and the leadership-transfer worker. Verification initialization registers a request and notifies replication workers, with a quorum-size-one response shortcut. The transfer worker waits on replication progress and then invokes TimeoutNow; its nil completion can also result from cancellation. Multi-peer verification completion and completed authority transfer remain unresolved.",
+  "requests": [],
+  "delta": {
+    "target_profile": null,
+    "activities": [],
+    "behaviors": [
+      {
+        "id": "verify_leader_api_admission",
+        "primary_activity": "A7",
+        "execution_owner": "Caller executing Raft.VerifyLeader",
+        "protocol_context": "Public leadership-verification API",
+        "trigger": "Caller invokes VerifyLeader.",
+        "legal_preconditions": [],
+        "implementation_guards": [
+          "Select between shutdownCh and sending the initialized future to verifyCh."
+        ],
+        "reads": [
+          "r.shutdownCh",
+          "r.verifyCh"
+        ],
+        "writes": [
+          "New verifyFuture initialized through init().",
+          "verify_leader metric increment."
+        ],
+        "durable_effects": [],
+        "external_effects": [
+          "Returns errorFuture{ErrRaftShutdown} when the shutdown branch is selected.",
+          "Returns the submitted verifyFuture when the channel-send branch is selected."
+        ],
+        "important_branches": [
+          "Admission does not inspect the local role in the supplied API body.",
+          "Successful channel submission is distinct from future completion."
+        ],
+        "async_boundaries": [
+          "Channel handoff to the unread verifyCh receiver.",
+          "Future completion occurs separately from API return."
+        ],
+        "produces_fact_ids": [],
+        "consumes_fact_ids": [],
+        "cross_activity_effects": [],
+        "existing_protections": [
+          "Shutdown participates in admission selection."
+        ],
+        "source_ids": [
+          "api.go:870:895"
+        ],
+        "unknowns": [
+          "Role-specific verifyCh handling and future completion implementation are not attached.",
+          "The API comment describes preventing stale FSM reads; the supplied body alone does not establish that guarantee."
+        ]
+      },
+      {
+        "id": "verify_leader_initialize",
+        "primary_activity": "A2",
+        "execution_owner": "Raft main thread, as required by the verifyLeader comment",
+        "protocol_context": "Initialization of one verifyFuture using current leaderState",
+        "trigger": "Invocation of Raft.verifyLeader(v).",
+        "legal_preconditions": [
+          "The function comment requires invocation from the main thread."
+        ],
+        "implementation_guards": [
+          "Branches on r.quorumSize() == 1."
+        ],
+        "reads": [
+          "r.quorumSize() result",
+          "r.leaderState.replState",
+          "r.verifyCh"
+        ],
+        "writes": [
+          "Sets v.votes to 1 and v.quorumSize to the computed value.",
+          "For the non-singleton branch, sets v.notifyCh and inserts v into r.leaderState.notify.",
+          "Inserts v into each iterated replication state's notify map under notifyLock."
+        ],
+        "durable_effects": [],
+        "external_effects": [
+          "Calls v.respond(nil) immediately when quorumSize is 1.",
+          "Otherwise calls asyncNotifyCh on each iterated replication state's notifyCh."
+        ],
+        "important_branches": [
+          "The quorum-size-one branch returns before request tracking or replication notifications.",
+          "The other branch registers the request without completing it in this function."
+        ],
+        "async_boundaries": [
+          "Replication workers receive notifications independently.",
+          "Later voting and completion are outside the attached function."
+        ],
+        "produces_fact_ids": [
+          "verification_request_registered"
+        ],
+        "consumes_fact_ids": [],
+        "cross_activity_effects": [
+          {
+            "key": "A7",
+            "value": "The singleton branch invokes the response method on the supplied verification future."
+          }
+        ],
+        "existing_protections": [
+          "Main-thread ownership is explicitly required by the function comment.",
+          "Each replication notification map insertion is protected by notifyLock."
+        ],
+        "source_ids": [
+          "raft.go:950:1030"
+        ],
+        "unknowns": [
+          "The caller's role checks and enforcement of main-thread ownership are unread.",
+          "quorumSize implementation, voter filtering, response correlation, vote aggregation and cleanup are unread.",
+          "The semantics of respond and asyncNotifyCh are not established by these call sites."
+        ]
+      },
+      {
+        "id": "leadership_transfer_worker",
+        "primary_activity": "A2",
+        "execution_owner": "Execution context invoking Raft.leadershipTransfer; spawning context is unread",
+        "protocol_context": "Transfer attempt for supplied server ID, address and followerReplication",
+        "trigger": "Invocation of leadershipTransfer with stopCh and doneCh.",
+        "legal_preconditions": [],
+        "implementation_guards": [
+          "Checks stopCh before starting work.",
+          "While atomic.LoadUint64(&repl.nextIndex) <= r.getLastIndex(), requests replication work and waits for its result or stopCh."
+        ],
+        "reads": [
+          "stopCh",
+          "repl.nextIndex through an atomic load",
+          "r.getLastIndex()",
+          "Replication deferError result",
+          "TimeoutNow RPC return error"
+        ],
+        "writes": [
+          "Creates and initializes a deferError for each replication-loop iteration."
+        ],
+        "durable_effects": [],
+        "external_effects": [
+          "Sends a deferError to repl.triggerDeferErrorCh.",
+          "Invokes r.trans.TimeoutNow for the supplied target after the loop exits.",
+          "Sends nil to doneCh on either observed cancellation branch.",
+          "Sends replication errors or the final TimeoutNow result to doneCh, wrapping TimeoutNow errors with target information."
+        ],
+        "important_branches": [
+          "Initial cancellation returns without requesting replication or sending TimeoutNow.",
+          "Cancellation while waiting for replication returns nil.",
+          "A replication error terminates the worker.",
+          "A nil TimeoutNow return leads to nil on doneCh but does not itself demonstrate a completed authority transition."
+        ],
+        "async_boundaries": [
+          "The triggerDeferErrorCh send occurs before the select that observes stopCh.",
+          "Replication completion is received through err.errCh.",
+          "TimeoutNow is a synchronous transport call at this call site.",
+          "doneCh delivery is a channel send."
+        ],
+        "produces_fact_ids": [],
+        "consumes_fact_ids": [],
+        "cross_activity_effects": [],
+        "existing_protections": [
+          "Checks the supplied replication progress against the current local last index before sending TimeoutNow.",
+          "Propagates replication errors and TimeoutNow errors.",
+          "Observes cancellation before work and while waiting for a replication result."
+        ],
+        "source_ids": [
+          "raft.go:950:1030"
+        ],
+        "unknowns": [
+          "Caller serialization, target selection, role checks and channel ownership are unread.",
+          "The producers and precise meaning of nextIndex and replication completion are unread.",
+          "The transport's TimeoutNow completion semantics and the receiver's authority-transition behavior are unread.",
+          "How the doneCh consumer distinguishes cancellation from a nil RPC result is unread.",
+          "The comment explains why this worker does not reset a lease; the actual lease mechanism and its consumers are not attached."
+        ]
+      }
+    ],
+    "facts": [
+      {
+        "id": "verification_request_registered",
+        "meaning": "For the non-singleton branch, this verification request has been registered in the leader notification map and in each replication notification map iterated by verifyLeader. Registration does not establish peer support or successful authority verification.",
+        "identity": [
+          {
+            "key": "request",
+            "value": "The supplied *verifyFuture v"
+          },
+          {
+            "key": "registration_context",
+            "value": "leaderState and replication states accessed during this verifyLeader invocation"
+          }
+        ],
+        "validity_context": "Established after the non-singleton registration loop finishes, subject to subsequent notification-map processing. No term, configuration-version or peer-support guarantee is inferred.",
+        "representation": [
+          "r.leaderState.notify[v]",
+          "repl.notify[v] for each iterated repl",
+          "v.notifyCh = r.verifyCh"
+        ],
+        "invalidators": [],
+        "reinterpreters": [],
+        "durability": "In-memory request tracking; no persistence operation is present in this function.",
+        "recovery": "No recovery behavior is established by the supplied source.",
+        "source_ids": [
+          "raft.go:950:1030"
+        ],
+        "unknowns": [
+          "Consumers, removal paths and role-transition cleanup are unread.",
+          "Registration lifetime across concurrent replication processing is unresolved.",
+          "The path from registered requests to votes and final future completion is unread."
+        ]
+      }
+    ],
+    "surfaces": [
+      {
+        "entry_point": "Raft.VerifyLeader API admission",
+        "disposition": "mapped",
+        "behavior_ids": [
+          "verify_leader_api_admission"
+        ],
+        "reason": "The supplied API body establishes initialization, channel admission and shutdown return paths.",
+        "source_ids": [
+          "api.go:870:895"
+        ],
+        "high_consequence": true
+      },
+      {
+        "entry_point": "Raft.verifyLeader initialization",
+        "disposition": "mapped",
+        "behavior_ids": [
+          "verify_leader_initialize"
+        ],
+        "reason": "The supplied function establishes the singleton response shortcut and non-singleton request registration.",
+        "source_ids": [
+          "raft.go:950:1030"
+        ],
+        "high_consequence": true
+      },
+      {
+        "entry_point": "Raft.leadershipTransfer worker",
+        "disposition": "mapped",
+        "behavior_ids": [
+          "leadership_transfer_worker"
+        ],
+        "reason": "The worker's replication wait, cancellation, RPC invocation and result delivery are attached; caller and receiver semantics remain separate.",
+        "source_ids": [
+          "raft.go:950:1030"
+        ],
+        "high_consequence": true
+      },
+      {
+        "entry_point": "VerifyLeader vote aggregation and final completion",
+        "disposition": "deferred",
+        "behavior_ids": [],
+        "reason": "Read verifyCh dispatch, replication notification consumers, verifyFuture voting/respond implementation and role-loss cleanup to recover what completed verification establishes.",
+        "source_ids": [
+          "api.go:870:895",
+          "raft.go:950:1030"
+        ],
+        "high_consequence": true
+      },
+      {
+        "entry_point": "Leadership transfer orchestration and authority transition completion",
+        "disposition": "deferred",
+        "behavior_ids": [],
+        "reason": "Read the worker caller and doneCh consumer, replication-progress producers, and TimeoutNow receiver to distinguish worker completion, cancellation and completed authority transition.",
+        "source_ids": [
+          "raft.go:950:1030"
+        ],
+        "high_consequence": true
+      }
+    ],
+    "remove_behavior_ids": [],
+    "remove_fact_ids": [],
+    "remove_surface_entry_points": [
+      "VerifyLeader completion and leadership transfer"
+    ],
+    "rationale": "Split the composite frontier into three sourced local behaviors and two explicit deferred continuations. Record request registration at its observed strength without inventing a dispatcher edge, peer-support fact or completed leadership-transfer guarantee. No global Activity, TargetProfile or normative claim is changed."
+  },
+  "limitations": [
+    "Only the two attached exact source ranges support this refinement.",
+    "Mapped children describe local code paths, not complete verification or transfer coverage.",
+    "Future implementation, notification consumers, replication-progress establishment, transfer orchestration and TimeoutNow receiver semantics remain unread.",
+    "No execution, calibration or correctness conclusion is supplied."
+  ]
+}

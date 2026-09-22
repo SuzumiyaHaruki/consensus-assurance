@@ -5,35 +5,42 @@ from .graph_diagnostics import validate_grounding
 from consensus_assurance.core.events import MISSING, field, compare, match_prerequisites
 
 
-def monitor_events(events, monitor, prop, aliases=None):
+def monitor_events(events, monitor, prop, requirements=None):
     if prop is None:
         return {'monitor_id':monitor.id,'checker_id':monitor.checker_id,'outcome':'unknown',
             'witness_indices':[],'missing_indices':[],'reason':'No shared observable property'}
-    if prop.kind == 'stable_support':
-        return monitor_support(events, monitor, prop)
-
-    results, missing = [], []
+    results, missing, correlations = [], [], {}
     for index,event in enumerate(events):
         if event.get('event') != monitor.event: continue
-        selectors = [compare(event,c) for c in [prop.trigger]]
-        if any(x is None for x in selectors): missing.append(index); continue
-        if not all(selectors): continue
-        if any(field(event,p) is MISSING for p in prop.identity_fields): missing.append(index); continue
-        value = compare(event,prop.assertion,aliases)
+        active = compare(event,prop.trigger)
+        if active is False: continue
+        if active is None or any(field(event,k) is MISSING for k in prop.identity_fields):
+            missing.append(index); continue
+        aliases = {}
+        if requirements is not None:
+            linked = match_prerequisites(events,requirements,index,prop.identity_fields)
+            correlations[str(index)] = linked
+            if linked['status']!='matched': missing.append(index); continue
+            aliases = {alias:events[i] for alias,i in linked['alias_indices'].items()}
+        value = compare(event,prop.assertion,aliases) if prop.kind=='event_assertion' else True
         if value is None: missing.append(index)
         else: results.append((index,value))
     violations = [index for index,value in results if value is False]
+    if prop.kind=='stable_support':
+        support = monitor_support(events,monitor,prop)
+        violations = support['witness_indices']; missing.extend(support['missing_indices'])
     return {'monitor_id':monitor.id,'checker_id':monitor.checker_id,
         'outcome':'violated' if violations else 'unknown' if missing or not results else 'holds',
-        'witness_indices':violations,'missing_indices':missing,
-        'reason':'Only explicitly observed scalar assertions are evaluated; hidden model states are not evidence'}
+        'witness_indices':violations,'missing_indices':sorted(set(missing)),
+        'evaluated_indices':[index for index,value in results],'correlations':correlations,
+        'reason':'Actual result fields are compared after independent prerequisite association'}
 
 
 def assess_execution(state, model, bundle, experiment, calibration, finding, events):
     prerequisite = match_prerequisites(events,bundle.harness.prerequisites)
     specs = {c.invariant:c for c in model.checkers}
     properties={p.checker_id:p for p in bundle.observable_properties}
-    results = [monitor_events(events,m,properties.get(m.checker_id)) for m in bundle.monitors if m.checker_id == finding.checker_id]
+    results = [monitor_events(events,m,properties.get(m.checker_id),bundle.harness.prerequisites) for m in bundle.monitors if m.checker_id == finding.checker_id]
     from .inquiry import semantic_limitations
     limitations = semantic_limitations(state,model)
     from pathlib import Path
@@ -93,9 +100,8 @@ def assess_execution(state, model, bundle, experiment, calibration, finding, eve
         if not monitor.applicability_conditions: local.append('No observable applicability conditions')
         for index in result['witness_indices']:
             if not all(compare(events[index],c) is True for c in monitor.applicability_conditions): local.append('Property applicability is not established at the observed violation')
-        # A fully observed witness must belong to the actual correlated prerequisite operation.
-        if result['witness_indices'] and not set(result['witness_indices']) <= set(prerequisite['matched_indices']):
-            local.append('Violation witness is not part of the correlated counterexample execution')
+        if result['missing_indices']:
+            local.append('Result fields or unambiguous prerequisite association are missing')
         if claim and any(g.claim_id==claim.id for g in bundle.consequence_observations):
             mapping=next((g for g in bundle.consequence_observations if g.claim_id==claim.id),None)
             local.extend(consequence_witness_limitations(mapping,events,result['witness_indices']))

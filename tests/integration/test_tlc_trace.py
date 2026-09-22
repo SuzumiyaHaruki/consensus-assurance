@@ -131,21 +131,24 @@ def test_F4_actual_async_order_is_checked(tmp_path):
     from consensus_assurance.adapters.runners.process import ProcessRunner
     from consensus_assurance.adapters.runners.experiment import extract_events
     from consensus_assurance.core.events import match_prerequisites
-    from consensus_assurance.core.proposals import EventRequirement
+    from consensus_assurance.core.proposals import EventRequirement, Comparison
     runner = ProcessRunner(tmp_path)
     scripts = [
         "import threading,json; started=threading.Event();changed=threading.Event()\n"
-        "def emit(e): print('CA_EVENT '+json.dumps({'event':e}),flush=True)\n"
+        "def emit(e): print('CA_EVENT '+json.dumps({'event':e,'operation':'one'}),flush=True)\n"
         "def worker():\n emit('started'); started.set(); changed.wait(); emit('completed')\n"
         "thread=threading.Thread(target=worker);thread.start();started.wait();emit('context_changed');changed.set();thread.join()\n",
         "import threading,json\n"
-        "def emit(e): print('CA_EVENT '+json.dumps({'event':e}),flush=True)\n"
+        "def emit(e): print('CA_EVENT '+json.dumps({'event':e,'operation':'one'}),flush=True)\n"
         "def worker(): emit('started');emit('completed')\n"
         "emit('context_changed');thread=threading.Thread(target=worker);thread.start();thread.join()\n"
     ]
     outcomes = []
+    requirements=[EventRequirement(alias='started',event='started'),
+        EventRequirement(alias='context_changed',event='context_changed',conditions=[Comparison(field='operation',reference='started.operation')]),
+        EventRequirement(alias='completed',event='completed',conditions=[Comparison(field='operation',reference='context_changed.operation')])]
     for script in scripts:
         check = runner.run([sys.executable,'-c',script],tmp_path,'experiment','fixture',5)
         assert check.exit_code == 0
-        outcomes.append(match_prerequisites(extract_events(check),[EventRequirement(alias=e,event=e) for e in ['started','context_changed','completed']])['status']=='matched')
+        outcomes.append(match_prerequisites(extract_events(check),requirements)['status']=='matched')
     assert outcomes == [True, False]

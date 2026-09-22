@@ -106,7 +106,7 @@ class Comparison(Record):
 class EventRequirement(Record):
     alias: str
     event: str
-    conditions: list[Comparison] = []
+    conditions: list[Comparison] = Field(default_factory=list,description="Prerequisite conditions; alias references declare causal predecessors, list position does not")
 
 
 class ObservableProperty(Record):
@@ -114,7 +114,7 @@ class ObservableProperty(Record):
     kind: Literal["event_assertion", "stable_support"] = "event_assertion"
     trigger: Comparison
     assertion: Comparison
-    identity_fields: list[str] = []
+    identity_fields: list[str] = Field(default_factory=list,description="Independent operation identity shared by prerequisites and result; never the value being compared or a context expected to change")
     history_field: str | None = None
     description: str
 
@@ -142,7 +142,6 @@ class Harness(Record):
     kind: str = Field(description="Harness kind advertised by the configured execution backend")
     source: str = Field(min_length=1, description="Executable experiment source, calling actual target code; no fabricated expected observations")
     description: str
-    prerequisite_events: list[str] = Field(description="Ordered events required for candidate replay; not claims that they occurred")
     semantic_changes: list[str] = Field(description="Instrumentation and adaptation differences; never alter protocol logic to create a real finding")
     prerequisites: list[EventRequirement] = []
     legality: Grounding = Grounding()

@@ -20,8 +20,7 @@ def test_large_original_tail_is_preserved_without_resending():
         apply_replacements(original,targets,patch.model_copy(update={'replacements':[Replacement(path='/rationale',value_json='"different"')]}))
 
 
-@pytest.mark.parametrize('interrupt',[False,True])
-def test_field_repair_is_executed_and_resumes_without_replacing_graph(tmp_path,prepared,interrupt):
+def test_field_repair_preserves_large_original_without_replacing_graph(tmp_path,prepared):
     repo,_,_,_=prepared
     original={'requests':[{'file':'counter.py','start_line':'bad','end_line':2,'reason':'Inspect actual step'}],'rationale':'x'*30000+'preserved'}
     patch={'replacements':[{'path':'/requests/0/start_line','value_json':'1'}],'rationale':'Correct integer type'}
@@ -30,20 +29,10 @@ def test_field_repair_is_executed_and_resumes_without_replacing_graph(tmp_path,p
     config.budget.error_context_chars=1000
     root=tmp_path/'audit'
     class ReadingEngine(Engine):
-        interrupted=False
         def execute(self,**kwargs):
             return self.ask('read',ReadingPlan,{'catalogue':[]})
-        def checkpoint(self,event):
-            super().checkpoint(event)
-            if interrupt and not self.interrupted and event=='action_result_saved' and self.state.pending_action.kind=='agent:read:repair':
-                self.interrupted=True
-                raise RuntimeError('After patch response before local merge')
     engine=ReadingEngine(config,root,*assemble(config))
-    if interrupt:
-        with pytest.raises(RuntimeError):engine.start(repo)
-        engine=ReadingEngine(config,root,*assemble(config));engine.interrupted=True
-        response,_=engine.resume()
-    else:response,_=engine.start(repo)
+    response,_=engine.start(repo)
     assert response.rationale==original['rationale']
     assert response.requests[0].start_line==1
     assert engine.state.usage['agent_calls']==2

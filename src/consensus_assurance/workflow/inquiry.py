@@ -15,13 +15,20 @@ def enabled(engine):
 
 def enqueue(state, kind, reason, trigger, activity_classes=(), target_ids=(), unit_id=None, model_id=None, requests=(), surface_entry_points=(), candidate_id=None, diagnostics=()):
     signature=(kind,trigger,tuple(activity_classes),tuple(target_ids),unit_id,model_id,tuple(surface_entry_points),candidate_id)
+    def opinion(d): return {k:d[k] for k in ('object_ids','material_ids','message')}
+    sources={m.file for m in state.materials if any(m.id in d['material_ids'] for d in diagnostics)}
     for task in state.inquiry_tasks:
-        if (kind==task.kind=='spec_refine' and diagnostics and task.status=='pending'
-                and task.candidate_id==candidate_id and (set(task.target_ids)==set(target_ids)
-                    or candidate_id is None and set(task.target_ids)&set(target_ids))):
-            task.diagnostics.extend(diagnostics)
-            task.target_ids=list(dict.fromkeys(task.target_ids+list(target_ids)))
-            return task
+        if kind==task.kind=='spec_refine' and diagnostics and task.candidate_id==candidate_id:
+            if task.status=='completed' and all(opinion(d) in [opinion(old) for old in task.diagnostics] for d in diagnostics):
+                from .audit_spec import load,audit_object_index
+                current=audit_object_index(load(state))
+                if task.context_dependencies=={id:current.get(id) for id in task.target_ids}:return task
+            related=set(task.target_ids)&set(target_ids) or sources&{m.file for m in state.materials if any(m.id in d['material_ids'] for d in task.diagnostics)}
+            if task.status=='pending' and (set(task.target_ids)==set(target_ids) or candidate_id is None and related):
+                task.diagnostics.extend(d for d in diagnostics if opinion(d) not in [opinion(old) for old in task.diagnostics])
+                task.target_ids=list(dict.fromkeys(task.target_ids+list(target_ids)))
+                return task
+            continue
         if signature==(task.kind,task.trigger,tuple(task.activity_classes),tuple(task.target_ids),task.unit_id,task.model_id,tuple(task.surface_entry_points),task.candidate_id):
             return task
     task=InquiryTask(surface_entry_points=list(surface_entry_points),kind=kind,reason=reason,trigger=trigger,
@@ -85,7 +92,7 @@ def choose_task(engine):
             task.status='blocked';task.stop_reason='Budget exhausted or disabled: '+resource
     pending=[t for t in pending if t.status=='pending' and not t.superseded_by]
     if state.active_unit_id:
-        if state.next_action in {'select','build','technical_repair','model_syntax','model_explore','harness'}:return None
+        if state.next_action in {'select','build','technical_repair','model_syntax','model_explore','harness','direct_check','direct_execute'}:return None
         local=[t for t in pending if t.unit_id==state.active_unit_id]
         # Executable checks precede generic inquiry; explicit selected reviews still run.
         return next((t for t in local if t.kind=='review'),None)
@@ -280,8 +287,11 @@ def apply_task_response(engine,task_id,reply,check):
     state=engine.state;task=next(t for t in state.inquiry_tasks if t.id==task_id)
     versions={i:getattr(objects(state)[i],'version',1) for i in task.target_ids if i in objects(state)}
     if task.kind=='spec_refine':
-        from .audit_spec import accept,merge_delta
-        accept(engine,merge_delta(state,task,reply.delta))
+        from .audit_spec import accept,merge_delta,load,audit_object_index
+        revised=merge_delta(state,task,reply.delta)
+        if revised!=load(state):accept(engine,revised)
+        current=audit_object_index(load(state))
+        task.context_dependencies={id:current.get(id) for id in task.target_ids}
         state.gaps.extend(reply.limitations)
         material_reviews(engine,None,task.added_material_ids)
         for unit in state.units:
@@ -381,7 +391,7 @@ def wake_changed(engine):
     for unit in state.units:
         saved=state.deferred_units.get(unit.id)
         if unit.status!='blocked' or not saved or not saved.get('basis'):continue
-        if (saved.get('pending_output_repair') or {}).get('mode')=='model_generation':continue
+        if (saved.get('pending_output_repair') or {}).get('mode')=='check_generation':continue
         if saved['basis']==local_basis(state,unit):continue
         if saved.get('pending_output_repair',{} ) and saved['pending_output_repair'].get('blocked'):continue
         unit.status='selected';state.active_unit_id=unit.id;state.active_model_id=saved['model_id'];state.active_finding_id=saved['finding_id'];state.active_direct_check_id=saved.get('direct_check_id')

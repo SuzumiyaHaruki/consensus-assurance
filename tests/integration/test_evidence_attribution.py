@@ -77,7 +77,7 @@ def test_actual_contract_and_observation_determine_confirmation(tlc,tmp_path,mod
         for missing in ['snapshot','correlation','legality','calibration']:
             e=exp.model_copy(deep=True);b=bundle.model_copy(deep=True);c=cal.model_copy(deep=True)
             if missing=='snapshot': e.snapshot_id='different'
-            if missing=='correlation': b.harness.prerequisites[1].conditions[0]=Comparison(field='operation',value='wrong')
+            if missing=='correlation': b.harness.prerequisites[0].conditions=[Comparison(field='operation',value='wrong')]
             if missing=='legality': b.harness.legality.unresolved=['External store contract unknown']
             if missing=='calibration': c.status='inconclusive'
             assert not assess_execution(state,model,b,e,c,finding,extract_events(e))['confirmed']

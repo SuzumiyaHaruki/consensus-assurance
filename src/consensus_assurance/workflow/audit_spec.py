@@ -156,7 +156,7 @@ def merge_delta(state,task,delta):
     fs.update(id for b in new_bs for id in b.produces_fact_ids+b.consumes_fact_ids)
     bs.update(id for f in new_fs for id in f.established_by+f.consumed_by+f.invalidators+f.reinterpreters)
     bs.update(b.id for b in delta.behaviors if set(b.produces_fact_ids+b.consumes_fact_ids)&{f.id for f in new_fs})
-    classes={b.primary_activity for b in old.behaviors+delta.behaviors if b.id in bs or b in new_bs}|(set(focus)&{'A'+str(n) for n in range(1,8)})
+    classes=set(task.target_ids+task.activity_classes)&{a.class_id for a in old.activities}
     allowed={'behaviors':bs,'facts':fs,'activities':classes,'surfaces':surfaces|{audit_object_key(s) for s in old.surfaces if set(s.behavior_ids)&bs}}
     for collection,remove in [('activities',[]),('behaviors',delta.remove_behavior_ids),('facts',delta.remove_fact_ids),('surfaces',['surface:'+s for s in delta.remove_surface_entry_points])]:
         before={audit_object_key(o):o for o in getattr(old,collection)};updates=getattr(delta,collection);ids=[audit_object_key(o) for o in updates]
@@ -166,7 +166,7 @@ def merge_delta(state,task,delta):
             if id not in allowed[collection]:reject([id],'Removal is outside this descriptive focus')
         for obj in updates:
             id=audit_object_key(obj)
-            if task.context_receipt_id and obj!=before.get(id) and (collection in {'behaviors','facts'} or collection=='surfaces' and obj.disposition=='mapped') and not any(includes(state,[source],task.material_ids) for source in obj.source_ids):reject([id],'Current implementation assertions need attached exact source; request the missing range before interpretation')
+            if task.context_receipt_id and obj!=before.get(id) and (collection in {'activities','behaviors','facts'} or collection=='surfaces' and obj.disposition=='mapped') and not any(includes(state,[source],task.material_ids) for source in obj.source_ids):reject([id],'Current implementation assertions need attached exact source; request the missing range before interpretation')
             if id in before and obj!=before[id] and id not in allowed[collection]:reject([audit_object_key(obj)],'Existing object change is outside this descriptive focus; queue separate sourced feedback')
         merged={id:obj for id,obj in before.items() if id not in remove};merged.update({audit_object_key(o):o for o in updates})
         raw[collection]=[o.model_dump(mode='json') for o in merged.values()]

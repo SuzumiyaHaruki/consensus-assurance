@@ -80,7 +80,6 @@ def test_F2_requires_normative_basis_and_invalidates(dependency_prepared):
 def test_F4_changes_only_experiment(dependency_prepared):
     _, state, bundle, _ = dependency_prepared; add_check(state)
     changed = bundle.model_copy(deep=True)
-    changed.harness.prerequisite_events = ["started", "context_changed", "completed"]
     apply_feedback(state, state.units[0], bundle, feedback(state, "F4", changed))
     assert state.revisions[-1].return_step == "experiment"
     changed.behavior += "\nExtra == TRUE"

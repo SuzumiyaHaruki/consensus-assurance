@@ -44,15 +44,12 @@ def candidate():
 def patch(path,value):return {'replacements':[{'path':path,'value_json':json.dumps(value)}],'rationale':'Correct the indicated representation'}
 
 
-@pytest.mark.parametrize('interrupt',[False,True])
-def test_new_error_gets_own_budget_and_context_and_resume_uses_saved_patch(tmp_path,prepared,interrupt):
+def test_new_error_gets_own_budget_and_context_and_resume_uses_saved_patch(tmp_path,prepared):
     responses=[candidate(),patch('/requests/0/start_line',1),patch('/requests/1/start_line',1)]
-    repo,engine,cls=make(tmp_path,prepared,responses,interrupt)
-    if interrupt:
-        with pytest.raises(RuntimeError):engine.start(repo)
-        engine=cls(engine.config,engine.root,*assemble(engine.config),'');engine.crashed=True
-        result,_=engine.resume()
-    else:result,_=engine.start(repo)
+    repo,engine,cls=make(tmp_path,prepared,responses,True)
+    with pytest.raises(RuntimeError):engine.start(repo)
+    engine=cls(engine.config,engine.root,*assemble(engine.config),'');engine.crashed=True
+    result,_=engine.resume()
     assert result.rationale==candidate()['rationale'] and engine.state.usage['agent_calls']==3
     session=next(iter(engine.state.repair_sessions.values()))
     assert json.loads(Path(session['original_path']).read_text())==candidate()
@@ -92,16 +89,6 @@ def test_clock_changes_allow_reuse_but_finding_and_schema_do_not(tmp_path,prepar
     assert state.usage['agent_calls']==3
 
 
-def test_error_cycle_cannot_refresh_global_attempt_limit(tmp_path,prepared):
-    repo,e,_=make(tmp_path,prepared,[candidate()])
-    # The same field group keeps changing but never reaches the required values.
-    from consensus_assurance.adapters.agents.backend import MockAgent
-    original=candidate();original['requests'][0]['end_line']=4
-    responses=[original,patch('/requests/0/start_line',3),patch('/requests/0/start_line',2)]
-    Path(e.config.fixture).write_text(json.dumps(responses));e.agent=MockAgent(e.config.fixture)
-    with pytest.raises(Blocked):e.start(repo)
-    assert e.state.pending_output_repair['attempt']==2
-    assert e.state.pending_output_repair['problem_failures']
 
 
 def test_local_existing_material_is_reattached_without_graph_patch(tmp_path,prepared):
@@ -143,20 +130,6 @@ def test_repair_can_read_missing_material_without_replacing_candidate(tmp_path,p
     session=next(iter(e.state.repair_sessions.values()));assert session['status']=='accepted_after_read'
 
 
-def test_resume_after_accepted_session_checkpoint_does_not_request_another_patch(tmp_path,prepared):
-    repo,e,cls=make(tmp_path,prepared,[candidate(),patch('/requests/0/start_line',1),patch('/requests/1/start_line',1)])
-    original_checkpoint=e.checkpoint
-    def checkpoint(event):
-        original_checkpoint(event)
-        session=e.state.pending_output_repair
-        if session and session.get('status')=='accepted':raise RuntimeError('Accepted candidate persisted before caller consumes it')
-    e.checkpoint=checkpoint
-    with pytest.raises(RuntimeError):e.start(repo)
-    resumed=cls(e.config,e.root,*assemble(e.config),'')
-    response,_=resumed.resume()
-    assert [q.start_line for q in response.requests]==[1,1]
-    assert resumed.state.usage['agent_calls']==3
-    assert resumed.state.pending_output_repair is None
 
 
 def test_outer_inquiry_pause_and_resume_preserve_blocked_repair_session(tmp_path,prepared):

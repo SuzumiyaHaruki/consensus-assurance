@@ -1,0 +1,382 @@
+{
+  "understanding": "The supplied code supports a partial mapping of network ingress, ordinary RPC dispatch, heartbeat dispatch, and AppendEntries processing. NetworkTransport invokes a registered heartbeat callback synchronously instead of using its consumer channel. Ordinary dispatch calls checkRPCHeader; processHeartbeat does not visibly call it. Callback registration and actual execution ownership remain unresolved. AppendEntries success records completion of the visible handler path, not independently established crash durability, FSM completion, or leader-side interpretation.",
+  "requests": [],
+  "delta": {
+    "target_profile": null,
+    "activities": [],
+    "behaviors": [
+      {
+        "id": "network_rpc_ingress",
+        "primary_activity": "A1",
+        "execution_owner": "NetworkTransport.handleConn caller, executing handleCommand synchronously for each command on one connection; caller creation is unread.",
+        "protocol_context": "Network RPC decoding, heartbeat classification, dispatch, and response encoding.",
+        "trigger": "An inbound connection supplies an RPC type byte and encoded request.",
+        "legal_preconditions": [],
+        "implementation_guards": [
+          "Unknown RPC types and decoding errors terminate command processing.",
+          "Heartbeat classification requires nonzero term, a non-nil selected leader address, zero predecessor index and term, no entries, and zero leader commit index.",
+          "The heartbeat callback is retrieved under heartbeatFnLock.",
+          "Consumer-channel dispatch and response waiting select against transport shutdown."
+        ],
+        "reads": [
+          "RPC type and encoded request",
+          "heartbeatFn under heartbeatFnLock",
+          "shutdownCh",
+          "Per-request respCh"
+        ],
+        "writes": [
+          "RPC.Command and RPC.RespChan",
+          "RPC.Reader as io.LimitReader for InstallSnapshot",
+          "Encoded response error string and response object"
+        ],
+        "durable_effects": [],
+        "external_effects": [
+          "Calls a registered heartbeat callback synchronously for classified heartbeats.",
+          "Otherwise sends the RPC to consumeCh.",
+          "Encodes the received RPCResponse; handleConn subsequently flushes the connection writer.",
+          "Closes the connection when handleConn exits."
+        ],
+        "important_branches": [
+          "A classified heartbeat without a registered callback uses the ordinary consumer channel.",
+          "InstallSnapshot attaches a size-limited stream reader.",
+          "RequestVote, RequestPreVote, InstallSnapshot, and TimeoutNow are decoded and dispatched without their protocol semantics being established here.",
+          "Encoding or flushing can fail after local RPC processing has completed."
+        ],
+        "async_boundaries": [
+          "Consumer-channel handoff to an unread receiver",
+          "Waiting on the per-request buffered response channel",
+          "Network response encoding and flushing after handler response"
+        ],
+        "produces_fact_ids": [],
+        "consumes_fact_ids": [],
+        "cross_activity_effects": [
+          {
+            "key": "A2",
+            "value": "Routes vote, pre-vote, and leadership-transfer requests to protocol processing."
+          },
+          {
+            "key": "A3",
+            "value": "Supplies the snapshot request and bounded snapshot stream to the consumer."
+          }
+        ],
+        "existing_protections": [
+          "Each command receives a separate response channel.",
+          "Heartbeat classification excludes log entries, predecessor checks, and commit-index advancement.",
+          "Transport shutdown can interrupt consumer enqueue or response waiting."
+        ],
+        "source_ids": [
+          "net_transport.go:600:810",
+          "transport.go:1:141"
+        ],
+        "unknowns": [
+          "The handleConn caller and its concurrency policy are not attached.",
+          "The registered callback and consumer-channel receiver are not attached.",
+          "Transport selection and alternative built-in transport behavior remain unread.",
+          "Successful flush does not establish that the remote caller received or accepted the response."
+        ]
+      },
+      {
+        "id": "ordinary_rpc_dispatch",
+        "primary_activity": "A1",
+        "execution_owner": "Raft.processRPC caller; its scheduling and serialization are not established by the attached source.",
+        "protocol_context": "Ordinary Raft RPC dispatch.",
+        "trigger": "processRPC receives an RPC.",
+        "legal_preconditions": [],
+        "implementation_guards": [
+          "Calls checkRPCHeader before type dispatch.",
+          "Returns a response containing the header-check error if validation fails.",
+          "Rejects unexpected command types."
+        ],
+        "reads": [
+          "RPC.Command",
+          "checkRPCHeader result"
+        ],
+        "writes": [],
+        "durable_effects": [],
+        "external_effects": [
+          "Calls appendEntries, requestVote, requestPreVote, installSnapshot, or timeoutNow according to command type.",
+          "Responds directly on header-check failure or unexpected command type."
+        ],
+        "important_branches": [
+          "Header rejection prevents invocation of the selected handler.",
+          "Successful header checking selects a concrete handler but does not establish that handler's semantic result."
+        ],
+        "async_boundaries": [
+          "RPC.Respond sends to the supplied response channel."
+        ],
+        "produces_fact_ids": [],
+        "consumes_fact_ids": [],
+        "cross_activity_effects": [
+          {
+            "key": "A2",
+            "value": "Dispatches RequestVote, RequestPreVote, and TimeoutNow after the header check."
+          },
+          {
+            "key": "A3",
+            "value": "Dispatches InstallSnapshot after the header check."
+          }
+        ],
+        "existing_protections": [
+          "Header-check error returns before dispatch.",
+          "Explicit command-type switch rejects unsupported commands."
+        ],
+        "source_ids": [
+          "raft.go:1390:1602",
+          "transport.go:1:141"
+        ],
+        "unknowns": [
+          "The checks performed by checkRPCHeader are unread.",
+          "RequestVote, RequestPreVote, InstallSnapshot, and TimeoutNow handler bodies are unread.",
+          "The consumer loop invoking processRPC is not attached."
+        ]
+      },
+      {
+        "id": "heartbeat_rpc_dispatch",
+        "primary_activity": "A2",
+        "execution_owner": "Raft.processHeartbeat caller; the comment requires the main thread, but callback registration and actual scheduling are unread.",
+        "protocol_context": "Alternate heartbeat handler accepting AppendEntriesRequest.",
+        "trigger": "processHeartbeat receives an RPC.",
+        "legal_preconditions": [
+          "The source comment specifies main-thread invocation; actual enforcement is unresolved."
+        ],
+        "implementation_guards": [
+          "Returns without responding when shutdownCh is already ready.",
+          "Accepts only AppendEntriesRequest command types."
+        ],
+        "reads": [
+          "shutdownCh",
+          "RPC.Command"
+        ],
+        "writes": [],
+        "durable_effects": [],
+        "external_effects": [
+          "Calls appendEntries for AppendEntriesRequest.",
+          "Responds with an error for other command types."
+        ],
+        "important_branches": [
+          "No checkRPCHeader call is visible in this handler.",
+          "This handler checks command type but does not independently enforce NetworkTransport's empty-heartbeat predicate.",
+          "The shutdown branch returns without producing an RPCResponse."
+        ],
+        "async_boundaries": [
+          "Actual transport-to-handler handoff is unresolved.",
+          "RPC.Respond sends to the supplied response channel for unexpected commands."
+        ],
+        "produces_fact_ids": [],
+        "consumes_fact_ids": [],
+        "cross_activity_effects": [
+          {
+            "key": "A1",
+            "value": "Delegates accepted AppendEntriesRequest objects to the same appendEntries handler used by ordinary dispatch."
+          }
+        ],
+        "existing_protections": [
+          "Shutdown check",
+          "Command-type rejection",
+          "Delegation retains appendEntries term and predecessor checks."
+        ],
+        "source_ids": [
+          "raft.go:1390:1602",
+          "transport.go:1:141"
+        ],
+        "unknowns": [
+          "Whether NetworkTransport's registered callback directly invokes this method is not established.",
+          "Whether another layer validates headers or enforces execution ownership is unresolved.",
+          "The observed dispatch asymmetry alone does not establish a defect or an applicable violated requirement."
+        ]
+      },
+      {
+        "id": "append_entries_processing",
+        "primary_activity": "A1",
+        "execution_owner": "Raft.appendEntries caller; both visible Raft dispatch handlers call it, while actual caller serialization remains unresolved.",
+        "protocol_context": "One incoming AppendEntriesRequest and its deferred AppendEntriesResponse.",
+        "trigger": "appendEntries is called with an RPC and AppendEntriesRequest.",
+        "legal_preconditions": [
+          "The source comment specifies main-thread invocation.",
+          "Permitted request histories and entry-shape constraints are not established by this excerpt."
+        ],
+        "implementation_guards": [
+          "Rejects a request whose term is lower than the current term.",
+          "For a nonzero predecessor index, retrieves its term from cached last-entry metadata or GetLog and rejects a mismatch or read failure.",
+          "Skips existing incoming entries whose stored terms match.",
+          "Returns before Success=true on observed log read, deletion, storage, or configuration-processing errors."
+        ],
+        "reads": [
+          "Request term, leader address and ID, predecessor index and term, entries, and leader commit index",
+          "Current term and role",
+          "candidateFromLeadershipTransfer",
+          "Last-entry, last-log, last-index, and commit-index metadata",
+          "Stored logs",
+          "Latest and committed configuration metadata"
+        ],
+        "writes": [
+          "Follower state and current term when the transition condition holds",
+          "Leader identity",
+          "Conflicting log suffix and new log entries through LogStore methods",
+          "Latest and committed configuration metadata",
+          "Last-log metadata after new-entry storage and configuration processing",
+          "Commit index",
+          "Success response field and last-contact metadata on the final path"
+        ],
+        "durable_effects": [
+          "Calls DeleteRange before StoreLogs when replacing a conflicting suffix.",
+          "StoreLogs must return nil before newly stored entries reach the handler's success path; backend durability and partial-failure semantics are unread.",
+          "Calls setCurrentTerm on the transition path; its persistence behavior is unread."
+        ],
+        "external_effects": [
+          "Defers RPC.Respond for all normal returns.",
+          "Calls processLogs after raising the commit index.",
+          "LogStore and configuration helpers may be invoked before a later rejection."
+        ],
+        "important_branches": [
+          "A higher term causes follower and term setters; an equal term also takes this path for a non-follower unless candidateFromLeadershipTransfer is set.",
+          "Leader identity is updated before predecessor validation.",
+          "Predecessor lookup failure or term mismatch sets NoRetryBackoff=true.",
+          "A conflicting suffix can be deleted before replacement storage fails; the source explicitly notes that last-log metadata may then remain wrong.",
+          "Configuration processing can fail after StoreLogs succeeds and before last-log metadata is updated.",
+          "Commit advancement uses min(LeaderCommitIndex, getLastIndex()), may update committed configuration, and calls processLogs.",
+          "An empty request with no predecessor or commit advancement can succeed without GetLog, DeleteRange, StoreLogs, or processLogs.",
+          "LastLog is captured when the response is initialized rather than refreshed after appending entries.",
+          "Most rejection branches leave rpcErr nil; configuration-processing failure assigns it."
+        ],
+        "async_boundaries": [
+          "Deferred response-channel send",
+          "processLogs scheduling and application boundaries are unread."
+        ],
+        "produces_fact_ids": [
+          "append_entries_handler_success"
+        ],
+        "consumes_fact_ids": [],
+        "cross_activity_effects": [
+          {
+            "key": "A2",
+            "value": "May request follower state and term updates, records leader identity, and updates last contact on success."
+          },
+          {
+            "key": "A4",
+            "value": "Rolls latest configuration back when truncating across its index and processes newly stored configuration entries before success."
+          },
+          {
+            "key": "A5",
+            "value": "Invokes processLogs at the computed commit index; completion of FSM effects is unresolved."
+          },
+          {
+            "key": "A6",
+            "value": "Reads predecessor and duplicate evidence, deletes conflicting history, and stores a replacement suffix before success."
+          }
+        ],
+        "existing_protections": [
+          "Lower-term rejection",
+          "Conditional predecessor-term validation",
+          "Stored-term comparison before suffix replacement",
+          "Storage and configuration errors prevent the success flag",
+          "Commit-index update is capped by getLastIndex()."
+        ],
+        "source_ids": [
+          "raft.go:1390:1602",
+          "transport.go:1:141"
+        ],
+        "unknowns": [
+          "LogStore contracts, concrete adapter selection, durability, and partial-write behavior are unread.",
+          "State, term, leader, contact, and log-metadata setter implementations are unread.",
+          "The actual producers and validity contexts of cached metadata are unresolved.",
+          "processLogs semantics and FSM completion are unread.",
+          "Leader-side response consumers are unread.",
+          "Atomicity across deletion, replacement storage, configuration updates, and cached metadata is not established."
+        ]
+      }
+    ],
+    "facts": [
+      {
+        "id": "append_entries_handler_success",
+        "meaning": "For one invocation that reaches Success=true and updates last contact, the visible AppendEntries checks completed without taking a rejection return: any requested predecessor check passed, any required replacement storage returned nil, configuration processing of newly stored entries returned nil, and any selected commit-update/processLogs call completed its visible invocation. Requests with no predecessor, entries, or commit advancement establish only the corresponding restricted handler completion.",
+        "identity": [
+          {
+            "key": "request",
+            "value": "The AppendEntriesRequest supplied to this appendEntries invocation"
+          },
+          {
+            "key": "response",
+            "value": "The AppendEntriesResponse created by the invocation and submitted through its RPC.RespChan"
+          },
+          {
+            "key": "receiver",
+            "value": "The receiving Raft instance"
+          }
+        ],
+        "validity_context": "A historical assertion about completion of this invocation's visible handler path. It does not assert durable retention after crashes, continuing authority, a matching log prefix for an empty heartbeat, FSM completion, or remote receipt.",
+        "representation": [
+          "AppendEntriesResponse.Success=true",
+          "setLastContact call before deferred RPC.Respond"
+        ],
+        "invalidators": [],
+        "reinterpreters": [],
+        "durability": "The response is an in-memory object passed through a channel. Any underlying log durability depends on unread store implementations.",
+        "recovery": "No recovery or reconstruction mechanism for this invocation-level assertion is established by the attached sources.",
+        "source_ids": [
+          "raft.go:1390:1602",
+          "transport.go:1:141"
+        ],
+        "unknowns": [
+          "Remote replication and heartbeat consumers may interpret success differently; their code is unread.",
+          "The request has no independently established wire correlation identifier in the supplied material; correlation here is scoped to the local invocation and response channel.",
+          "No stronger persistent-history or application-completion fact is established."
+        ]
+      }
+    ],
+    "surfaces": [
+      {
+        "entry_point": "NetworkTransport.handleConn / handleCommand ingress and response routing",
+        "disposition": "mapped",
+        "behavior_ids": [
+          "network_rpc_ingress"
+        ],
+        "reason": "Attached code establishes decoding, heartbeat classification, callback versus consumer-channel routing, response waiting, encoding, and flushing. Handler activation and caller scheduling remain explicit unknowns.",
+        "source_ids": [
+          "net_transport.go:600:810",
+          "transport.go:1:141"
+        ],
+        "high_consequence": true
+      },
+      {
+        "entry_point": "Raft.processRPC / processHeartbeat / appendEntries local processing",
+        "disposition": "mapped",
+        "behavior_ids": [
+          "ordinary_rpc_dispatch",
+          "heartbeat_rpc_dispatch",
+          "append_entries_processing"
+        ],
+        "reason": "Attached code supports local dispatch and AppendEntries branch behavior, including storage ordering and partial-error effects. This mapping does not establish helper semantics or actual execution serialization.",
+        "source_ids": [
+          "raft.go:1390:1602",
+          "transport.go:1:141"
+        ],
+        "high_consequence": true
+      },
+      {
+        "entry_point": "RPC ingress remainder: handler wiring, header validation, vote and snapshot handlers, and AppendEntries dependencies",
+        "disposition": "deferred",
+        "behavior_ids": [],
+        "reason": "Read callback registration and consumer-loop ownership to resolve fast-pass execution; checkRPCHeader to establish validation semantics; requestVote, requestPreVote, installSnapshot, and timeoutNow bodies for their independent outcomes; and AppendEntries storage, metadata, processLogs, and response consumers before asserting stronger lifecycle facts.",
+        "source_ids": [
+          "raft.go:1390:1602",
+          "net_transport.go:600:810",
+          "transport.go:1:141"
+        ],
+        "high_consequence": true
+      }
+    ],
+    "remove_behavior_ids": [],
+    "remove_fact_ids": [],
+    "remove_surface_entry_points": [
+      "processRPC, AppendEntries, RequestVote, InstallSnapshot and heartbeat fast-pass"
+    ],
+    "rationale": "Replace the composite deferred frontier with sourced local mappings and a distinct unresolved remainder. Keep transport routing, ordinary dispatch, heartbeat dispatch, and AppendEntries processing separate by owner or trigger. Record only invocation-scoped handler success, retaining empty-heartbeat limitations, partial-storage effects, unresolved helper semantics, and the distinction between local response submission and remote consumption. No global activity, target-profile, or normative claim changes are proposed."
+  },
+  "limitations": [
+    "Only attached source ranges support this refinement; declaration hints and earlier provenance were not treated as semantic evidence.",
+    "Actual heartbeat callback wiring and serialization remain unresolved despite main-thread comments on the Raft handlers.",
+    "Persistence-before-success is observed as method-call ordering, not demonstrated crash durability.",
+    "No tests, execution, calibration, correctness conclusion, or confirmed defect are claimed."
+  ]
+}

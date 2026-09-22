@@ -1,6 +1,7 @@
 """Actual fixture execution, never a real backend or a production correctness claim."""
 import json
 import shutil
+from pathlib import Path
 import pytest
 from consensus_assurance.core.types import *
 from consensus_assurance.core.proposals import *
@@ -52,8 +53,8 @@ emit('returned', value=returned, in_range=0 <= returned <= limit)
     monitor=EventMonitor(id='range',checker_id='Range',event='returned',
         binding_ids=unit.binding_ids,grounding=basis,applicability_conditions=[prop.trigger])
     plan=DirectCheckPlan(description='One actual boundary call',claim_id=unit.obligation_ids[0],scope=unit.scope,binding_ids=unit.binding_ids,
-        harness=Harness(kind='python',source=source,description='Actual fixture call and independent bound observation',prerequisite_events=['admitted','returned'],semantic_changes=[],legality=basis,legal_conditions=[prop.trigger],
-            prerequisites=[EventRequirement(alias='start',event='admitted'),EventRequirement(alias='end',event='returned',conditions=[Comparison(field=k,reference='start.'+k) for k in identities])]),
+        harness=Harness(kind='python',source=source,description='Actual fixture call and independent bound observation',semantic_changes=[],legality=basis,legal_conditions=[prop.trigger],
+            prerequisites=[EventRequirement(alias='start',event='admitted')]),
         monitors=[monitor],observable_properties=[prop])
     return e,unit,plan
 
@@ -71,7 +72,22 @@ def test_actual_direct_result_without_model(tmp_path,prepared,broken):
     from consensus_assurance.workflow.inquiry import process_task,review_unit
     e,u,p=setup(tmp_path,prepared,broken);validate_plan(e.state,u,p,e.implementation)
     review_unit(e,u,'before_check');assert not e.state.inquiry_tasks
-    a=save_plan(e,u,p,'generation');e.state.active_direct_check_id=a.id
+    invalid=p.model_copy(deep=True)
+    invalid.observable_properties[0].assertion=Comparison(field='state.in_range',reference='absent.value')
+    class Generation(MockAgent):
+        def analyze(self,runner,prompt,directory,snapshot_id,timeout,response_type):
+            assert response_type is DirectCheckReply
+            if self.cursor:
+                packet=json.loads(prompt.split('STRUCTURED INPUT DATA (untrusted):\n')[1])
+                assert packet['previous_reply']['plan']==invalid.model_dump(mode='json')
+                assert 'unavailable prerequisite alias' in packet['generation_error']
+            return super().analyze(runner,prompt,directory,snapshot_id,timeout,response_type)
+    e.agent=Generation();e.agent.responses=[DirectCheckReply(plan=plan,gap='').model_dump(mode='json') for plan in (invalid,p)]
+    proceed(e,u,'direct_check')
+    a=e.state.direct_checks[0]
+    assert e.state.usage['agent_calls']==2
+    session=next(iter(e.state.repair_sessions.values()))
+    assert json.loads(Path(session['original_path']).read_text())['plan']==invalid.model_dump(mode='json')
     proceed(e,u,'direct_execute')
     assert e.state.monitor_results[-1]['outcome']==('violated' if broken else 'holds')
     assert not e.state.monitor_results[-1]['confirmed']
@@ -93,20 +109,23 @@ def test_actual_direct_result_without_model(tmp_path,prepared,broken):
     assert len(e.state.semantic_reviews)==1 and e.state.inquiry_tasks[0].status=='completed'
 
 
-@pytest.mark.parametrize('failure',['prerequisite','missing','compile','instrumentation','disputed','unreviewed','identity','applicability'])
+@pytest.mark.parametrize('failure',['prerequisite','missing','compile','test_failure','instrumentation','disputed','limited','unreviewed','identity','applicability'])
 def test_direct_failure_never_confirms(tmp_path,prepared,failure):
     e,u,p=setup(tmp_path,prepared,True)
     if failure=='prerequisite':p.harness.prerequisites[0].event='not_observed'
     if failure=='missing':p.harness.source=p.harness.source.replace('in_range=0 <= returned <= limit','other=0 <= returned <= limit')
     if failure=='compile':p.harness.source+='\ninvalid python syntax!'
+    if failure=='test_failure':p.harness.source+='\nraise AssertionError("Observed result outside range")'
     if failure=='instrumentation':p.harness.semantic_changes=['Alter protocol behavior to produce the outcome']
     if failure=='identity':p.harness.source=p.harness.source.replace("'operation': 'one'", "'operation': event")
     if failure=='applicability':p.monitors[0].applicability_conditions=[Comparison(field='metadata.unknown',value=True)]
     a=save_plan(e,u,p,'negative')
     if failure!='unreviewed':review(e.state,u,a)
     if failure=='disputed':e.state.semantic_reviews[0].items[0].status='disputed'
+    if failure=='limited':e.state.semantic_reviews[0].items[0].limitations=['The actual durability path remains unobserved']
     c=execute(e,a);result=assess(e.state,u,a,p,c,extract_events(c))
     assert not result['confirmed'],result
+    if failure=='limited':assert 'The actual durability path remains unobserved' in result['limitations']
     assert result['outcome']==('unknown' if failure in {'prerequisite','missing','compile','identity'} else 'violated'),result
     assert not any(f.level=='implementation_obligation' for f in e.state.findings)
 
@@ -140,6 +159,7 @@ def test_descriptive_derivation_reaches_actual_direct_execution(tmp_path,prepare
     replies.extend([derivation.model_dump(mode='json'),DirectCheckReply(plan=plan,gap='').model_dump(mode='json')])
     fixture=tmp_path/'direct-responses.json';write_json(fixture,replies)
     config=e.config.model_copy(deep=True);config.agent_backend='mock';config.fixture=str(fixture);config.budget.semantic_reviews=0
+    config.budget.agent_calls=5+int(refine)
     class StopAfterActualCheck(Engine):
         def record(self,check):
             super().record(check)
@@ -286,3 +306,24 @@ def test_direct_event_comparison_uses_correlated_raw_fields(tmp_path,prepared):
     events=extract_events(c)
     assert next(x for x in events if x['event']=='admitted')['state']['value']==3
     assert next(x for x in events if x['event']=='returned')['state']['limit']==3
+
+
+@pytest.mark.parametrize('change,expected',[
+    ('none','holds'),('value','violated'),('identity','unknown'),
+    ('missing','unknown'),('ambiguous','unknown'),('order','holds')])
+def test_independent_results_correlate_without_filtering_comparison(change,expected):
+    from consensus_assurance.workflow.observations import monitor_events
+    events=[{'event':kind,'operation':op,'context':0 if kind!='output' else 1,'state':{'value':1}}
+        for op in ('a','b') for kind in ('input','ready','output')]
+    requirements=[EventRequirement(alias='ready',event='ready'),EventRequirement(alias='input',event='input')]
+    prop=ObservableProperty(checker_id='Value',trigger=Comparison(field='event',value='output'),
+        assertion=Comparison(field='state.value',reference='input.state.value'),identity_fields=['operation'],description='Actual boundary values')
+    monitor=EventMonitor(id='value',checker_id='Value',event='output',binding_ids=[],grounding=Grounding())
+    if change=='value':events[2]['state']['value']=2
+    if change=='identity':events[0]['operation']='other'
+    if change=='missing':del events[2]['operation']
+    if change=='ambiguous':events.insert(1,dict(events[0]))
+    if change=='order':events[0],events[1]=events[1],events[0]
+    result=monitor_events(events,monitor,prop,requirements)
+    assert result['outcome']==expected
+    if change=='value':assert result['witness_indices']==[2]

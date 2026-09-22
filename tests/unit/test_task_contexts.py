@@ -1,8 +1,9 @@
 from pathlib import Path
 from importlib.resources import files
 import sys
-import pytest
-from consensus_assurance.workflow.prompts import render, loaded_resources
+import json
+import ast
+from consensus_assurance.workflow.prompts import render, loaded_resources, manifest
 from consensus_assurance.workflow.investigation import feedback_context, validate_replay
 from consensus_assurance.workflow.artifacts import save_bundle
 from consensus_assurance.workflow.engine import Engine
@@ -14,14 +15,22 @@ from consensus_assurance.core.proposals import ReplayPlan
 from consensus_assurance.adapters.runners.python import PythonBackend
 
 
-@pytest.mark.parametrize('kind',['build','F1','F3','technical'])
-def test_modeling_guidance_is_in_every_actual_render(kind):
-    text=render(kind,{'file':'/目录/源文件.go'})
-    paths=loaded_resources(kind,{})['paths']
-    assert 'skills/local-modeling/references/context-history.md' in paths
-    assert ('skills/evidence-review/references/experiments.md' in paths)==(kind in {'F1','technical'})
-    assert all(files('consensus_assurance').joinpath('resources',p).read_text() in text for p in paths)
-    assert '/目录/源文件.go' in text
+def test_manifest_resources_and_untrusted_context_are_actually_rendered():
+    context={'file':'/目录/源文件.go','quotation':'原始来源说明','original_task':'build'}
+    for kind in manifest()['tasks']:
+        text=render(kind,context)
+        instructions,data=text.split('STRUCTURED INPUT DATA (untrusted):\n')
+        assert json.loads(data)==context
+        assert all(files('consensus_assurance').joinpath('resources',p).read_text() in instructions for p in loaded_resources(kind,context)['paths'])
+
+
+def test_core_and_workflow_do_not_import_target_plugins():
+    root=Path(__file__).resolve().parents[2]/'src/consensus_assurance'
+    for package in ('core','workflow'):
+        for path in (root/package).rglob('*.py'):
+            for node in ast.walk(ast.parse(path.read_text())):
+                if isinstance(node,ast.ImportFrom):assert 'plugins' not in (node.module or '').split('.')
+                if isinstance(node,ast.Import):assert all('plugins' not in a.name.split('.') for a in node.names)
 
 
 def test_diagnosis_and_F1_receive_real_trace_and_calibration_output(tmp_path,prepared):

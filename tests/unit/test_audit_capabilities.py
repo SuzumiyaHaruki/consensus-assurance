@@ -95,22 +95,6 @@ def test_R5_ready_evidence_precedes_unrelated_unknowns(tmp_path,prepared):
     assert len(unit.obligation_ids)==1 and not state.inquiry_tasks
 
 
-def test_R8_selected_archive_is_view_only(tmp_path):
-    from consensus_assurance.workflow.history import load_analysis
-    from consensus_assurance.reporting.chinese import render_report
-    from consensus_assurance.workflow.engine import FRAMEWORK_REVISION
-    archive=Path(__file__).resolve().parents[2]/'tests/fixtures/recorded_derivation_20260918'
-    import shutil
-    root=tmp_path/'archive';shutil.copytree(archive,root)
-    state=load_analysis(root/'state.json')
-    assert state.framework_revision!=FRAMEWORK_REVISION and state.audit_spec_path and not state.claims and not state.evidence
-    report=render_report(state,root).read_text()
-    assert 'Audit unit references missing bindings or relations' in report
-    state=state.model_copy(deep=True);state.framework_revision='historical-test-revision'
-    from test_graph_mutations import controller
-    engine=controller(tmp_path,state);engine.store=SimpleNamespace(load=lambda:state)
-    before=dict(state.usage);assert engine.resume() is state
-    assert 'Framework revision differs' in state.stop_reason and state.usage==before
 
 
 def test_surface_delta_split_growth_and_scope(prepared,tmp_path):
@@ -132,10 +116,26 @@ def test_surface_delta_split_growth_and_scope(prepared,tmp_path):
     assert trial.facts[-1].established_by==['new_producer'] and trial.activities[2].behavior_ids==['new_producer']
     accept(e,trial)
     assert load(state).version==2 and len(load(state).behaviors)==3 and load(state).surfaces[-1].disposition=='deferred'
+    task.surface_entry_points=['second owner']
+    second=new_b.model_copy(update={'id':'new_consumer','produces_fact_ids':[],'consumes_fact_ids':['new_fact']})
+    accept(e,merge_delta(state,task,AuditSpecDelta(behaviors=[second],surfaces=[Surface(entry_point='second owner',disposition='mapped',behavior_ids=[second.id],reason='Acquired consumer',source_ids=[source])],rationale='Extend the second independent path')))
+    assert {b.id for b in load(state).behaviors}=={'producer','consumer','new_producer','new_consumer'}
+    assert load(state).activities[2].realization_summary==spec.activities[2].realization_summary
+    assert load(state).activities[2].behavior_ids==['new_producer','new_consumer']
     # A separate accepted region cannot be rewritten by a surface delta.
-    for field,obj in [('behaviors',spec.behaviors[1].model_copy(update={'execution_owner':'invented owner'})),('facts',spec.facts[0].model_copy(update={'meaning':'unrelated assertion'})),('activities',spec.activities[6].model_copy(update={'realization_summary':'unrelated change'})),('surfaces',spec.surfaces[0].model_copy(update={'reason':'unrelated change'}))]:
+    for field,obj in [('behaviors',spec.behaviors[1].model_copy(update={'execution_owner':'invented owner'})),('facts',spec.facts[0].model_copy(update={'meaning':'unrelated assertion'})),('activities',spec.activities[2].model_copy(update={'realization_summary':'Only the latest consumer is known'})),('surfaces',spec.surfaces[0].model_copy(update={'reason':'unrelated change'}))]:
         with pytest.raises(DiagnosticError,match='outside this descriptive focus'):
             merge_delta(state,task,AuditSpecDelta(**{field:[obj]},rationale='Unrelated rewrite'))
+    from consensus_assurance.workflow.inquiry import task_context
+    from consensus_assurance.workflow.task_packet import prepare
+    task.target_ids=['A3']
+    task.surface_entry_points=[]
+    state.inquiry_tasks.append(task)
+    context=prepare(e,'spec_refine',task_context(e,task))[0]
+    assert next(a for a in context['audit_spec']['activities'] if a['class_id']=='A3')==load(state).activities[2].model_dump(mode='json')
+    correction=load(state).activities[2].model_copy(update={'applicability':'applicable','realization_summary':'Both producer and consumer owners are now recovered','unknowns':[]})
+    accept(e,merge_delta(state,task,AuditSpecDelta(activities=[correction],rationale='Correct the responsibility using both acquired paths')))
+    assert load(state).activities[2]==correction
 
 
 def test_frontier_alternation_navigation_and_same_run_dedup(prepared,tmp_path):

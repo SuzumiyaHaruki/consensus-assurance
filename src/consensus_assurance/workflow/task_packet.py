@@ -76,6 +76,8 @@ def descriptive_projection(engine,kind,context,task):
     if not question and not seeds:
         local={k:[{field:o[field] for field in fields if field in o} for o in local.get(k,[])] for k,fields in {'activities':['class_id','realization_summary','unknowns'],'behaviors':['id','primary_activity','execution_owner','trigger','produces_fact_ids','consumes_fact_ids'],'facts':['id','meaning','identity','validity_context','source_ids']}.items()}
     if level>=2:local={'surfaces':[s for s in (view or {}).get('surfaces',[]) if 'surface:'+s['entry_point'] in seeds]}
+    if task and level>=2:
+        local['activities']=[a for a in (view or {}).get('activities',[]) if a['class_id'] in task.target_ids+task.activity_classes]
     result={**context,'focus':focus,'orientation':orientation,'audit_spec':local,
         'directed_question':engine.config.directed_question,'parameters':engine.config.parameters,
         'materials':[m.model_dump(mode='json') for m in state.materials if m.id in wanted],
@@ -104,7 +106,7 @@ def prepare(engine,kind,context):
     task=next((t for t in state.inquiry_tasks if t.id==context.get('task',{}).get('id',state.active_inquiry_id)),None) if kind!='derive' else None
     if kind in {'spec_refine','derive'}:packet=descriptive_projection(engine,kind,context,task)
     elif kind=='semantic_review' and task:packet=review_projection(engine,task)
-    if kind in {'derive','build','F3','technical','harness'}:
+    if kind in {'derive','build','F3','technical','harness','direct_check'}:
         packet['pending_enrichment']=[{'id':t.id,'target_ids':t.target_ids,'opinions':[{k:d[k] for k in ('message','material_ids')} for d in t.diagnostics]} for t in state.inquiry_tasks if t.kind=='spec_refine' and not t.candidate_id and t.status=='pending' and t.diagnostics]
     if kind=='semantic_review':
         if task:
