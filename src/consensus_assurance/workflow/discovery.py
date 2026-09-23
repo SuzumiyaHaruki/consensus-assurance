@@ -2,7 +2,7 @@
 from pathlib import Path
 from consensus_assurance.core.proposals import Discovery, Derivation, GraphPatch
 from consensus_assurance.adapters.storage.files import write_json
-from .materials import catalogue, initial_materials, ReadingPlan, uid, material_allowance
+from .materials import initial_materials, ReadingPlan, uid, material_allowance
 from .graph import apply_patch, validate_patch
 from .errors import Blocked
 from . import inquiry
@@ -37,9 +37,7 @@ def discover(engine):
                 if m.kind=='protocol_candidate':engine.state.materials.append(m)
 
         if not engine.state.materials and material_allowance(engine.state,engine.config.budget,"breadth")["available_chars"]==0:raise Blocked("No material capacity for a grounded initial plan; no agent request sent")
-        inventory = catalogue(source, engine.state.snapshot)
-        write_json(engine.root / "catalogue.json", inventory)
-        plan, _ = engine.ask("read", ReadingPlan, {"catalogue": inventory, "initial_materials": [m.model_dump(mode="json") for m in engine.state.materials],
+        plan, _ = engine.ask("read", ReadingPlan, {"initial_materials": [m.model_dump(mode="json") for m in engine.state.materials],
             "activity_focus":engine.config.activity_focus,"reading_goal":"Recover one sourced responsibility relation and its decisive dependencies; the material allowance is a ceiling, not a target"},purpose="breadth")
         engine.read(plan.requests,purpose="breadth",partial=True,plan_id="initial-reading",related_ids=plan.related_ids,reason=plan.rationale)
         engine.state.completed_steps.append("materials"); engine.advance("discover")
@@ -271,7 +269,7 @@ def accept_derivation(engine,reply,check_id):
                 candidate_id=candidate.id if issue.candidate_effect=='requires_recheck' else None,
                 diagnostics=[{'code':'audit_spec_semantics','category':'semantic','object_ids':issue.object_ids,'material_ids':issue.source_ids,'message':issue.reason,'allowed':['read','semantic_revision'],'details':{'check_id':check_id}}])
             if issue.candidate_effect=='requires_recheck':candidate.spec_task_ids.append(task.id)
-        requests=list({(r.file,r.start_line,r.end_line):r for r in reply.reading_requests+q.requests}.values())
+        requests=list({(r.file,r.start_line,r.end_line,r.symbol,r.literal):r for r in reply.reading_requests+q.requests}.values())
         q.requests=requests
         if candidate.spec_task_ids:
             candidate.stage='read' if requests else 'analyze'
@@ -369,7 +367,6 @@ def derive(engine):
 
 
 def targeted_read(engine, unit, gap, relation_ids=None, requests=None, update_required=True):
-    source = engine.root/"source"
     if engine.state.targeted_gap is None:
         engine.state.targeted_gap={"plan_id":uid(),"requests":[q.model_dump(mode="json") if hasattr(q,"model_dump") else q for q in (requests or [])],"gap":gap,"related_ids":unit.obligation_ids if unit else [],
             "update_required":update_required,"relation_ids":relation_ids or [],"stage":"read","new_material_ids":[]}
@@ -379,7 +376,7 @@ def targeted_read(engine, unit, gap, relation_ids=None, requests=None, update_re
         if task["requests"]:
             reading=ReadingPlan.model_validate({"requests":task["requests"],"rationale":gap,"related_ids":task["related_ids"],"gap":gap})
         else:
-            reading,_=engine.ask("targeted_read",ReadingPlan,{"gap":task,"catalogue":catalogue(source,engine.state.snapshot),
+            reading,_=engine.ask("targeted_read",ReadingPlan,{"gap":task,
                 "already_read":[{"id":m.id,"file":m.file,"start":m.start_line,"end":m.end_line} for m in engine.state.materials],
                 "relevant_bindings":[b.model_dump() for b in engine.state.bindings if unit and b.id in unit.binding_ids]})
         reading.related_ids=task["related_ids"]; reading.gap=gap

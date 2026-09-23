@@ -11,7 +11,7 @@ from consensus_assurance.workflow.graph import apply_graph, apply_patch
 from consensus_assurance.workflow.graph_diagnostics import validate_grounding
 from consensus_assurance.workflow.artifacts import validate_tla
 from consensus_assurance.workflow.observations import match_prerequisites, monitor_events
-from consensus_assurance.workflow.materials import ReadingPlan, ReadRequest,  catalogue
+from consensus_assurance.workflow.materials import ReadingPlan, ReadRequest
 from regression_support import add_reads
 from consensus_assurance.adapters.storage.snapshot import capture
 from consensus_assurance.adapters.agents.backend import strict_schema, wire_value
@@ -163,11 +163,6 @@ def test_error_context_contains_bounded_original_text(tmp_path,prepared):
     assert log.read_text()==original
 
 
-def test_catalogue_is_independent_of_execution_backend(tmp_path):
-    repo=tmp_path/'repo';repo.mkdir();(repo/'core.go').write_text('func produce() {}\n')
-    assert catalogue(repo,capture(repo))[0]['symbols'][0]['declaration']=='func produce() {}'
-
-
 @pytest.mark.parametrize('module',[None,'module another.example/module\n'])
 def test_explicit_module_identity_requires_safe_build_input(tmp_path,module):
     from consensus_assurance.workflow.engine import Engine
@@ -183,7 +178,6 @@ def test_binary_only_build_inputs_are_not_agent_materials(tmp_path):
     repo=tmp_path/'repo';repo.mkdir();(repo/'payload.bin').write_bytes(b'data\x00payload')
     snapshot=capture(repo)
     assert snapshot.readable_files==[]
-    assert catalogue(repo,snapshot)==[]
     assert initial_materials(repo,snapshot,Config().budget,'')==[]
 
 

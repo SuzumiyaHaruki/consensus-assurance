@@ -11,7 +11,6 @@ def review_projection(engine,task):
     state=engine.state; available=objects(state)
     seeds=set(task.target_ids)
     wanted,closure=material_closure(state,seeds)
-    wanted.update(task.added_material_ids)
     wanted.update(state.task_attachments.get('inquiry:'+task.id,[]))
     for issue in state.review_issues:
         if (issue.target_id in closure or issue.id in task.resolution_issue_ids) and not issue.resolved_by:wanted.update(issue.source_ids)
@@ -142,22 +141,11 @@ def prepare(engine,kind,context):
                 from .errors import Blocked
                 raise Blocked('Review requires unavailable exact source ranges: '+', '.join(missing))
     # The global index is a lookup aid, not full catalogue or source text.
-    index=compact_index(state,engine.root/'source') if state.snapshot else []
-    files={m['file'] for key in ('materials','new_materials','initial_materials') for m in packet.get(key,[])}
-    packet['file_lookup']=[{'file':x['file'],'lines':x.get('lines'),**({'unavailable':x['unavailable']} if x.get('unavailable') else {})} for x in index if kind in {'read','discover','derive','spec_refine','targeted_read'} or x['file'] in files]
-    if kind in {'build','direct_check','harness'} and files:
-        from .materials import catalogue
-        packet['declaration_hints']=[{'file':entry['file'],**symbol} for entry in catalogue(engine.root/'source',state.snapshot) if entry['file'] in files for symbol in entry['symbols'][:6]][:36]
-    if task and task.surface_entry_points:
-        import re
-        from .materials import catalogue
-        terms=set(re.findall(r'[a-z][a-z0-9]*', re.sub(r'\b\w+\.', '', ' '.join(task.surface_entry_points+[e for a in packet.get('audit_spec',{}).get('activities',[]) for e in a.get('entry_points',[])])).lower()))-{'and','the','helpers','consumers'}
-        hints=[{'file':f['file'],**symbol} for f in catalogue(engine.root/'source',state.snapshot) for symbol in f['symbols'] if terms&set(re.findall(r'[a-z][a-z0-9]*',(f['file']+' '+symbol['declaration']).lower()))]
-        packet['declaration_hints']=sorted(hints,key=lambda h:(-len(terms&set(re.findall(r'[a-z][a-z0-9]*',h['declaration'].lower()))),h['file'],h['line']))[:(4 if task.preparation_failures>=2 else 24)]
+    index=compact_index(state,engine.root/'source') if state.snapshot and kind in {'read','discover','derive','spec_refine','targeted_read','semantic_review'} else []
+    packet['file_lookup']=[{'file':x['file'],'lines':x.get('lines'),**({'unavailable':x['unavailable']} if x.get('unavailable') else {})} for x in index]
     for key in ('catalogue','source_ranges','unread_ranges','current_material_ids'):
         if kind in {'derive','spec_refine'}:packet.pop(key,None)
-    packet['lookup_request']='Request a focused ReadingPlan for an unlisted path or symbol; omitted files are not absent from the repository'
-    packet['file_metadata']=[{**x,'attached_ranges':[[m['start_line'],m['end_line']] for key in ('materials','new_materials','initial_materials') for m in packet.get(key,[]) if m['file']==x['file']]} for x in index if x['file'] in files]
+    packet['lookup_request']='Use a ReadRequest with symbol or literal and optional file to locate actual snapshot source; use file/start_line/end_line to read a known range. A lookup line is not a complete definition unless its receipt says so.'
     if kind in {'derive','graph_patch'}:
         from .locations import declaration_index
         from .associations import graph_contract
@@ -203,7 +191,7 @@ def receipt(engine,kind,packet,prompt,schema,task=None,repair=False):
         text=json.dumps(value,ensure_ascii=False,indent=2)
         return {'chars':len(text),'bytes':len(text.encode())}
     groups={'sources':{'materials','new_materials','initial_materials','source_text_pool'},'current_graph':{'unit','claims','bindings','relations','review_contract'},
-        'semantic_view':{'semantic_view','open_issues','resolved_issues'},'catalogue':{'file_lookup','file_metadata','catalogue','audit_spec'}}
+        'semantic_view':{'semantic_view','open_issues','resolved_issues'},'catalogue':{'file_lookup','audit_spec'}}
     sections={name:size({k:v for k,v in packet.items() if k in keys}) for name,keys in groups.items()}
     instructions=prompt.split('STRUCTURED INPUT DATA (untrusted):\n',1)[0]
     sections['instructions']={'chars':len(instructions),'bytes':len(instructions.encode())}

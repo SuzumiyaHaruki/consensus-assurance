@@ -180,6 +180,8 @@ def process_task(engine, task):
         from .materials import uncovered_requests,request_material_ids
         requested=list(task.requests);remaining=uncovered_requests(state,requested)
         task.added_material_ids=list(dict.fromkeys(task.added_material_ids+request_material_ids(state,requested)))
+        for owner in ['inquiry:'+task.id]+(['unit:'+task.unit_id] if task.unit_id else []):
+            state.task_attachments[owner]=list(dict.fromkeys(state.task_attachments.get(owner,[])+task.added_material_ids))
         if remaining:
             from consensus_assurance.core.types import uid
             if not task.read_plan_id or task.read_plan_id in state.read_plans:task.read_plan_id=uid()
@@ -203,8 +205,8 @@ def process_task(engine, task):
             if task.status=='blocked':task.stop_reason='Descriptive semantic refinement made no progress; diagnostics and attempted delta retained'
             release_action(engine);engine.checkpoint('descriptive_refinement_remains_open');return
         if reply.requests:
-            old=set(task.material_ids)
-            if all(q.file+':'+str(q.start_line)+':'+str(q.end_line) in old for q in reply.requests):
+            from .materials import uncovered_requests
+            if not uncovered_requests(state,reply.requests):
                 raise Blocked('Exploration repeated already available ranges without producing a new interpretation')
             task.requests=reply.requests;task.read_plan_id=None;task.stage='read';release_action(engine);engine.checkpoint('inquiry_reading_requested');return
     else:

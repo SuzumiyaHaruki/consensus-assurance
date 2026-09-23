@@ -1,7 +1,7 @@
 """Bounded recoverable repair sessions keep candidate and patch provenance separate."""
 import json
 from pathlib import Path
-from consensus_assurance.core.types import CheckRun,uid
+from consensus_assurance.core.types import CheckRun,ReadRequest,uid
 from consensus_assurance.core.proposals import BuildReply, DirectCheckReply, HarnessReply
 from consensus_assurance.core.diagnostics import Diagnostic,DiagnosticError
 from consensus_assurance.adapters.storage.files import write_json
@@ -14,8 +14,9 @@ from .materials import validate_read_requests, attachment_key
 from .output_repair import save_session
 
 
-def continue_generation(engine, kind, logical_task, raw, check, reason, session, requests=()):
+def continue_generation(engine, kind, logical_task, raw, check, reason, session, requests=(), invalid=False):
     """Keep an unaccepted check in its original generation task and bounded session."""
+    previous=None
     if session is None:
         folder=engine.root/'repair-sessions'/uid()
         write_json(folder/'original.json',raw)
@@ -23,12 +24,22 @@ def continue_generation(engine, kind, logical_task, raw, check, reason, session,
             'original_path':str(folder/'original.json'),'attempt':0,'version':0,'stagnation':0}
     else:
         previous=json.loads(Path(session['current_path']).read_text())
-        session['stagnation']=session['stagnation']+1 if previous==raw else 0
         session['version']+=1
+    if requests:
+        sent=next((r for r in reversed(engine.state.packet_receipts) if r.get('check_id')==check.id),{})
+        requested={json.dumps(r.model_dump(exclude={'reason'},exclude_none=True),sort_keys=True) for r in requests}
+        supplied={id for item in session.get('read_receipt',{}).get('items',[]) if json.dumps(ReadRequest.model_validate(item['request']).model_dump(exclude={'reason'},exclude_none=True),sort_keys=True) in requested for id in item['material_ids']}
+        key={'requests':sorted((r.model_dump(exclude={'reason'},exclude_none=True) for r in requests),key=lambda r:json.dumps(r,sort_keys=True)),
+            'supplied_material_ids':sorted(supplied&set(sent.get('material_ids',[])))}
+        seen=session.setdefault('seen_generation_inputs',[])
+        session['stagnation']=session.get('stagnation',0)+1 if key in seen else 0
+        if key not in seen:seen.append(key)
+    else:
+        session['stagnation']=session.get('stagnation',0)+1 if previous is not None and previous==raw else 0
     session.update(status='building',error=reason,current_path=str(engine.root/'repair-sessions'/session['id']/f"candidate-{session['version']}.json"),
-        read_requests=[r.model_dump(mode='json') for r in requests])
+        read_requests=[r.model_dump(mode='json') for r in requests],validation_error=reason if invalid else '')
     write_json(Path(session['current_path']),raw)
-    write_json(Path(check.cwd)/'generation-error.json',{'reason':reason,'requests':session['read_requests']})
+    write_json(Path(check.cwd)/'generation-error.json',{'gap':reason if not invalid else '', 'validation_error':session['validation_error'],'requests':session['read_requests']})
     from .inquiry import release_action
     release_action(engine)
     save_session(engine,session)
@@ -89,7 +100,7 @@ def ask(engine,kind,response_type,context,validator=None,*,purpose="depth"):
         else:
             session['status']='accepted_after_read';session['accepted_check']=session['read_check']
         state.pending_action=None;save_session(engine,session)
-    if session and session.get('status') in {'accepted','accepted_after_read'} and session.get('accepted_check'):
+    if session and session.get('status') in {'accepted','accepted_after_read','routed'} and session.get('accepted_check'):
         response=response_type.model_validate_json(Path(session['current_path']).read_text())
         validate(response)
         state.pending_output_repair=None
@@ -100,7 +111,6 @@ def ask(engine,kind,response_type,context,validator=None,*,purpose="depth"):
     while True:
         import time
         preparation_started=time.monotonic()
-        context,review_task=prepare(engine,kind,seed_context)
         if session and artifact_output:
             if session['attempt']>=engine.config.budget.repair_attempts or session['stagnation']>=engine.config.budget.repair_stagnation:
                 session['status']='blocked';save_session(engine,session)
@@ -109,13 +119,16 @@ def ask(engine,kind,response_type,context,validator=None,*,purpose="depth"):
                 session.setdefault('read_plan_id',uid())
                 obtained=engine.read(session['read_requests'],purpose=purpose,plan_id=session['read_plan_id'],related_ids=[id for id in logical_task.values() if id],reason=session['error'])
                 if obtained['status']!='complete':raise Blocked('Check continuation requires the deferred source ranges')
-                session['requested_material_ids']=[id for item in obtained['items'] if item['status']!='deferred' for id in item['material_ids']]
+                session['read_receipt']=obtained
                 session['read_requests']=[];session.pop('read_plan_id')
                 save_session(engine,session)
-            attached=set(session.get('requested_material_ids',[]))
-            context['attached_materials']=[m.model_dump(mode='json') for m in state.materials if m.id in attached]
-            request={**context,'previous_reply':json.loads(Path(session['current_path']).read_text()),'generation_error':session['error'],
-                'requested_material_ids':session.get('requested_material_ids',[])}
+        unit=next((u for u in state.units if u.id==state.active_unit_id),None)
+        context={**seed_context,**engine.context(unit),'read_purpose':purpose} if artifact_output and unit else seed_context
+        context,review_task=prepare(engine,kind,context)
+        if session and artifact_output:
+            request={**context,'previous_reply':json.loads(Path(session['current_path']).read_text()),
+                'construction_gap':session['error'] if not session.get('validation_error') else '',
+                'generation_error':session.get('validation_error',''),'read_receipt':session.get('read_receipt')}
             schema=response_type
         elif session:
             if session['attempt']>=engine.config.budget.repair_attempts or session.get('blocked'):
@@ -276,7 +289,8 @@ def ask(engine,kind,response_type,context,validator=None,*,purpose="depth"):
             if artifact_output:
                 draft=getattr(response,'draft',None)
                 core=[p for p in draft.pending_work if p.component in {'behavior','properties'}] if draft else []
-                unfinished=not any(getattr(response,k,None) for k in ('bundle','draft','plan','harness')) and (getattr(response,'fallback','none')=='none' or bool(response.requests))
+                dependency_handoff=response.requests and getattr(response,'reading_purpose','context')=='dependency' and kind in {'build','F3'}
+                unfinished=not dependency_handoff and not any(getattr(response,k,None) for k in ('bundle','draft','plan','harness')) and (getattr(response,'fallback','none')=='none' or bool(response.requests))
                 if core or unfinished:
                     reason='Complete pending model work: '+'; '.join(p.reason for p in core) if core else response.gap
                     session=continue_generation(engine,kind,logical_task,merged,check,reason,session,list(response.requests)+[r for p in core for r in p.requests])
@@ -288,7 +302,7 @@ def ask(engine,kind,response_type,context,validator=None,*,purpose="depth"):
                 state.milestones.setdefault('bundle_accepted',now())
             engine.checkpoint('agent_response_accepted')
             if session:
-                session['status']='accepted';session['accepted_check']=check.model_dump(mode='json');session['resolved_diagnostics']=session.get('diagnostics',[]);session['diagnostics']=[];session['error']='';session['version']+=1
+                session['status']='accepted' if not artifact_output or any(getattr(response,k,None) for k in ('bundle','draft','plan','harness')) else 'routed';session['accepted_check']=check.model_dump(mode='json');session['resolved_diagnostics']=session.get('diagnostics',[]);session['diagnostics']=[];session['error']='';session['version']+=1
                 session['current_path']=str(engine.root/'repair-sessions'/session['id']/f"candidate-{session['version']}.json")
                 write_json(Path(session['current_path']),merged)
                 save_session(engine,session)
@@ -298,7 +312,7 @@ def ask(engine,kind,response_type,context,validator=None,*,purpose="depth"):
             if isinstance(exc,SpecIssue):raise
             if artifact_output:
                 if session:session['attempt']+=1
-                session=continue_generation(engine,kind,logical_task,merged,check,str(exc),session)
+                session=continue_generation(engine,kind,logical_task,merged,check,str(exc),session,invalid=True)
                 continue
             if session is None:
                 id=uid();folder=engine.root/'repair-sessions'/id

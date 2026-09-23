@@ -19,7 +19,7 @@ def extent(declaration):
     return declaration["end"] if declaration["end"] is not None else declaration["known_end"]
 
 
-def declarations(material):
+def declarations(material, include_calls=True):
     text=material.text;offset=material.start_line-1;result=[]
     if material.file.endswith('.py'):
         try:tree=ast.parse(text)
@@ -76,10 +76,11 @@ def declarations(material):
                 pos=match.end()+member.start()+len(member[0])-len(member[0].lstrip())
                 result.append({'symbol':member[1],'start':line(pos),'signature_end':line(pos),'end':line(end) if end else None,'known_end':material.end_line,'closed':end is not None,'owner_start':line(match.start()),'kind':'declaration'})
         # Call-site anchors record syntax only, not resolved callee behavior.
-        for match in re.finditer(r'\b(\w+)\s*\(',masked):
-            if any(d['start']==line(match.start()) and d['symbol']==match[1] for d in result):continue
-            end=closing(masked,match.end()-1,'(',')')
-            if end is not None:result.append({'symbol':match[1],'start':line(match.start()),'signature_end':line(match.start()),'end':line(end),'closed':True,'kind':'callsite'})
+        if include_calls:
+            for match in re.finditer(r'\b(\w+)\s*\(',masked):
+                if any(d['start']==line(match.start()) and d['symbol']==match[1] for d in result):continue
+                end=closing(masked,match.end()-1,'(',')')
+                if end is not None:result.append({'symbol':match[1],'start':line(match.start()),'signature_end':line(match.start()),'end':line(end),'closed':True,'kind':'callsite'})
     return result
 
 

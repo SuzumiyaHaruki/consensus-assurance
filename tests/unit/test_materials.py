@@ -41,6 +41,22 @@ def test_denied_path_and_bad_encoding_are_distinct(prepared):
     assert caught.value.diagnostics[0].code=='read_encoding'
 
 
+def test_lookup_reads_shifted_definition_and_reports_ambiguity(prepared):
+    repo,state,_,_=prepared
+    (repo/'moved.go').write_text(''.join(f'func unrelated{i}() {{}}\n' for i in range(9))+
+        'type Alpha struct{}\ntype Beta struct{}\nfunc (a *Alpha) Handle() {}\nfunc (b *Beta) Handle() {}\nvar initialized = 7\n')
+    state.snapshot=capture(repo)
+    def find(**kwargs):return ReadRequest(reason='Locate actual source',**kwargs)
+    receipt,items=plan_read(state,repo,[find(symbol='Alpha.Handle'),find(literal='var initialized = 7')],Budget())
+    assert receipt.status=='complete' and all(i.status=='acquired' for i in receipt.items)
+    assert items[0].start_line>6 and items[0].text.startswith('func (a *Alpha) Handle()')
+    assert items[1].text=='var initialized = 7'
+    ambiguous,_=plan_read(state,repo,[find(symbol='Handle'),find(symbol='Absent')],Budget())
+    assert [i.status for i in ambiguous.items]==['unresolved','unresolved']
+    assert [i.file_metadata['lookup']['match_count'] for i in ambiguous.items]==[2,0]
+    with pytest.raises(DiagnosticError):preflight(state,repo,[find(file='../private.go',symbol='Handle')])
+
+
 def test_breadth_defers_large_plan_and_depth_gets_small_dependency(prepared):
     repo,state,_,_=prepared
     (repo/'large.txt').write_text('L'*700+'\n');(repo/'small.txt').write_text('s'*199+'\n');state.snapshot=capture(repo)

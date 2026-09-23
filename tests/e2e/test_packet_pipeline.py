@@ -8,6 +8,7 @@ from coverage_support import setup_workflow as setup
 from consensus_assurance.core.types import Origin
 from consensus_assurance.adapters.storage.files import write_json
 from consensus_assurance.workflow.engine import Engine
+from consensus_assurance.workflow.sources import all_materials
 
 
 class PacketAgent(CoverageAgent):
@@ -30,9 +31,9 @@ class PacketAgent(CoverageAgent):
             assert meta or packet['lookup_request']
             # Deliberately invalid synthetic request: an unlisted path must get actual EOF diagnostics too.
             invalid_end=meta['lines']+1 if meta else 1000000
-            response={'bundle':None,'gap':'Read the complete actual input normalization dependency',
+            response={'bundle':None,'gap':'Read the complete actual input normalization dependency','reading_purpose':'context',
                 'requests':[{'file':'limits.py','start_line':1,'end_line':invalid_end,'reason':'Inspect the dependency before modeling'}]}
-        elif name=='BuildReply' and packet.get('previous_reply',{}).get('requests') and not any(m['file']=='limits.py' for m in packet.get('attached_materials',[])):
+        elif name=='BuildReply' and packet.get('previous_reply',{}).get('requests') and not any(m['file']=='limits.py' for m in all_materials(packet)):
             response=packet['previous_reply']
             request=response['requests'][0]
             valid=next(r for r in self.source_responses[0]['requests'] if r['file']==request['file'])

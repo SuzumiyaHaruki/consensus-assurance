@@ -63,11 +63,6 @@ def local_workset(engine,unit):
     needed,ids=material_closure(state,[unit.id]);ids.update(relevant_model_ids(state,unit));semantic,sources=semantic_view(state,ids)
     needed.update(sources)
     explicit=set(state.task_attachments.get('unit:'+unit.id,[]));needed.update(explicit)
-    # Completed review reading belongs to the reviewed unit as well as its inquiry.
-    for task in state.inquiry_tasks:
-        if task.unit_id==unit.id and (task.unit_version is None or task.unit_version==unit.version):
-            needed.update(task.added_material_ids)
-            needed.update(state.task_attachments.get('inquiry:'+task.id,[]))
     return {'materials':[m.model_dump(mode='json') for m in state.materials if m.id in needed],
         'required_material_ids':sorted(needed),
         'omitted_material_ids':[m.id for m in state.materials if m.id not in needed],

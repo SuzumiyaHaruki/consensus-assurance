@@ -96,7 +96,7 @@ def test_generation_continues_without_reads_then_real_syntax_repair_and_search(t
             packet=json.loads(prompt.split('STRUCTURED INPUT DATA (untrusted):\n')[1])
             if self.cursor in (1,2):
                 assert packet['previous_reply']['draft']==self.responses[self.cursor-1]['draft']
-                assert packet['generation_error'] and packet['materials']
+                assert (packet['generation_error'] if self.cursor==1 else packet['construction_gap']) and packet['materials']
                 assert 'repair_targets' not in packet and not state.models
             if self.cursor==3:
                 assert 'Model syntax error' in packet['failure']['reason']
@@ -114,7 +114,7 @@ def test_generation_continues_without_reads_then_real_syntax_repair_and_search(t
     assert not state.calibrations and not any(c.action=='experiment' for c in state.checks)
     assert 'harness' in state.stop_reason and 'remaining agent calls=0' in state.stop_reason
     session=next(iter(state.repair_sessions.values()))
-    assert session['mode']=='check_generation' and session['attempt']==2 and session['status']=='accepted'
+    assert session['mode']=='check_generation' and session['attempt']==0 and session['status']=='accepted'
     original=json.loads(Path(session['original_path']).read_text())
     assert original['draft']==malformed and len(state.read_plans)==original_reads
     assert not any(e.level.startswith('implementation') for e in state.evidence)

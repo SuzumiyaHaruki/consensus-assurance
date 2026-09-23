@@ -67,61 +67,6 @@ def review(state,unit,artifact):
         material_ids=contract['required_material_ids'],items=[SemanticCheck(target_id=artifact.id,aspect='checker_correspondence',status='no_issue_found',source_ids=contract['required_material_ids'],rationale='The fixture contract, actual call, prerequisites and independent oracle agree within the supplied local scope')],origin='mock'))
 
 
-@pytest.mark.parametrize('broken',[False,True])
-def test_actual_direct_result_without_model(tmp_path,prepared,broken):
-    from consensus_assurance.adapters.agents.backend import MockAgent
-    from consensus_assurance.workflow.inquiry import process_task,review_unit
-    e,u,p=setup(tmp_path,prepared,broken);validate_plan(e.state,u,p,e.implementation)
-    review_unit(e,u,'before_check');assert not e.state.inquiry_tasks
-    invalid=p.model_copy(deep=True)
-    invalid.observable_properties[0].assertion=Comparison(field='state.in_range',reference='absent.value')
-    class Generation(MockAgent):
-        def analyze(self,runner,prompt,directory,snapshot_id,timeout,response_type):
-            assert response_type is DirectCheckReply
-            if self.cursor:
-                packet=json.loads(prompt.split('STRUCTURED INPUT DATA (untrusted):\n')[1])
-                assert packet['previous_reply']['plan']==invalid.model_dump(mode='json')
-                assert 'unavailable prerequisite alias' in packet['generation_error']
-            return super().analyze(runner,prompt,directory,snapshot_id,timeout,response_type)
-    e.agent=Generation();e.agent.responses=[DirectCheckReply(plan=plan,gap='').model_dump(mode='json') for plan in (invalid,p)]
-    proceed(e,u,'direct_check')
-    a=e.state.direct_checks[0]
-    assert a.scope==u.scope and 'scope' not in json.loads(Path(a.plan_path).read_text())
-    assert e.state.usage['agent_calls']==2
-    session=next(iter(e.state.repair_sessions.values()))
-    assert json.loads(Path(session['original_path']).read_text())['plan']==invalid.model_dump(mode='json')
-    claim=next(c for c in e.state.claims if c.id==u.obligation_ids[0])
-    claim.pending=['Execute the selected path and observe its correlated return']
-    proceed(e,u,'direct_execute')
-    assert e.state.monitor_results[-1]['outcome']==('violated' if broken else 'holds')
-    assert claim.pending and claim.pending[0] not in e.state.monitor_results[-1]['boundaries']
-    from consensus_assurance.workflow.modeling import obligation_progress
-    assert obligation_progress(e.state,u)==({u.obligation_ids[0]:[next(c for c in e.state.checks if c.action=='direct_check').id]},u.obligation_ids)
-    assert not e.state.monitor_results[-1]['confirmed']
-    assert len(e.state.inquiry_tasks)==1 and e.state.inquiry_tasks[0].target_ids==[a.id]
-    contract=target_contract(e.state,a)
-    e.agent=MockAgent();e.agent.responses=[ReviewReply(items=[SemanticCheck(target_id=a.id,aspect='checker_correspondence',status='no_issue_found',source_ids=contract['required_material_ids'],rationale='The selected contract applies to this legal local call; correlated returns and the independent range comparison implement it. Network and durability are outside this check.')],limitations=[]).model_dump(mode='json')]
-    process_task(e,e.state.inquiry_tasks[0])
-    c=next(c for c in e.state.checks if c.action=='direct_check')
-    result=e.state.monitor_results[-1]
-    assert obligation_progress(e.state,u)==({u.obligation_ids[0]:[c.id]},[])
-    assert target_contract(e.state,a)['object_type']=='direct_check'
-    assert not e.state.models and c.direct_check_id==a.id and c.model_id is None
-    assert result['confirmed']==broken,result
-    assert 'Cluster-wide consequences outside this finite call' in result['boundaries']
-    assert result['adaptations']==['Emit actual event values after the target call']
-    assert result['outcome']==('violated' if broken else 'holds'),result
-    assert e.state.evidence[-1].level=='implementation_test'
-    assert len([r for r in e.state.monitor_results if r['experiment_check_id']==c.id])==1
-    assert len([x for x in e.state.evidence if x.check_id==c.id and x.checker_id=='Range'])==1
-    assert all(claim.assessment==Assessment.UNASSESSED for claim in e.state.claims)
-    if broken:
-        assert e.state.findings[-1].level=='implementation_obligation'
-        assert e.state.findings[-1].direct_check_id==a.id
-        assert len([x for x in e.state.findings if x.check_id==c.id and x.checker_id=='Range'])==1
-    assert len(e.state.semantic_reviews)==1 and e.state.inquiry_tasks[0].status=='completed'
-
-
 def test_review_attaches_saved_plan_sources_and_blocks_missing_ones(tmp_path,prepared):
     from consensus_assurance.workflow.inquiry import enqueue,task_context
     from consensus_assurance.workflow.task_packet import prepare
@@ -142,33 +87,83 @@ def test_review_attaches_saved_plan_sources_and_blocks_missing_ones(tmp_path,pre
         prepare(e,'semantic_review',task_context(e,task))
 
 
-def test_direct_construction_keeps_partial_design_through_read_and_validation(tmp_path,prepared):
+@pytest.mark.parametrize('broken',[False,True])
+def test_direct_construction_keeps_partial_design_through_read_and_validation(tmp_path,prepared,broken):
     from consensus_assurance.adapters.agents.backend import MockAgent
+    from consensus_assurance.workflow.sources import all_materials
+    from consensus_assurance.workflow.inquiry import process_task
+    from consensus_assurance.workflow.modeling import obligation_progress
     repo=prepared[0]
-    (repo/'helper.py').write_text('def helper(value):\n    return value\n')
-    e,u,plan=setup(tmp_path,prepared)
-    request=ReadRequest(file='helper.py',start_line=1,end_line=2,reason='Inspect the called helper before completing the harness')
+    (repo/'helper_a.py').write_text(''.join(f'def unused{i}(): return {i}\n' for i in range(9))+
+        'from helper_b import cap\nfrom counter import step\ndef bounded_step(value, limit):\n    return step(value, cap(limit))\n')
+    (repo/'helper_b.py').write_text('def cap(limit):\n    return limit\n')
+    e,u,plan=setup(tmp_path,prepared,broken=broken)
+    plan.harness.source=plan.harness.source.replace('from counter import step','from helper_a import bounded_step as step')
     invalid=plan.model_copy(deep=True)
     invalid.observable_properties[0].assertion=Comparison(field='state.in_range',reference='absent.value')
     class Generation(MockAgent):
         def analyze(self,runner,prompt,directory,snapshot_id,timeout,response_type):
             packet=json.loads(prompt.split('STRUCTURED INPUT DATA (untrusted):\n')[1])
-            if self.cursor:
-                assert packet['previous_reply']['partial_design']=='Call the selected boundary and observe its return'
-                assert any(m['file']=='helper.py' for m in packet['attached_materials'])
+            source='\n'.join(m.get('text','') for m in all_materials(packet))
+            assert 'def step(' in source
+            if self.cursor>=1:assert 'def bounded_step(' in source
+            if self.cursor>=2:assert 'def cap(' in source
+            if self.cursor>=3:assert 'unavailable prerequisite alias' in packet['generation_error']
             return super().analyze(runner,prompt,directory,snapshot_id,timeout,response_type)
     e.agent=Generation()
     e.agent.responses=[
-        DirectCheckReply(gap='Need the helper',partial_design='Call the selected boundary and observe its return',requests=[request],fallback='source_review').model_dump(mode='json'),
+        {'gap':'Locate the called wrapper','partial_design':'Call the selected boundary and observe its return',
+         'requests':[{'symbol':'bounded_step','reason':'Find the wrapper definition'}],'fallback':'source_review'},
+        {'gap':'Locate the wrapper dependency','partial_design':'Call the selected boundary and observe its return',
+         'requests':[{'symbol':'cap','reason':'Find the value normalization definition'}]},
         DirectCheckReply(gap='',partial_design='Call the selected boundary and observe its return',plan=invalid).model_dump(mode='json'),
         DirectCheckReply(gap='',partial_design='Call the selected boundary and observe its return',plan=plan).model_dump(mode='json')]
     proceed(e,u,'direct_check')
-    assert len(e.state.direct_checks)==1 and e.state.usage['agent_calls']==3
+    assert len(e.state.direct_checks)==1 and e.state.usage['agent_calls']==4
+    artifact=e.state.direct_checks[0]
+    assert artifact.scope==u.scope and 'scope' not in json.loads(Path(artifact.plan_path).read_text())
     session=next(iter(e.state.repair_sessions.values()))
     assert session['attempt']==1 and not session.get('read_plan_id')
-    assert any(plan['status']=='complete' and plan['original_requests'][0]['file']=='helper.py' for plan in e.state.read_plans.values())
+    assert {m.file for m in e.state.materials}>={'helper_a.py','helper_b.py'}
     assert not e.state.pending_output_repair
-    assert any(m.file=='helper.py' for m in e.state.materials)
+    claim=next(c for c in e.state.claims if c.id==u.obligation_ids[0])
+    claim.pending=['Execute and observe the correlated return']
+    proceed(e,u,'direct_execute')
+    result=e.state.monitor_results[-1]
+    assert result['outcome']==('violated' if broken else 'holds') and not result['confirmed']
+    assert claim.pending[0] not in result['boundaries']
+    contract=target_contract(e.state,artifact)
+    e.agent=MockAgent();e.agent.responses=[ReviewReply(items=[SemanticCheck(target_id=artifact.id,aspect='checker_correspondence',status='no_issue_found',
+        source_ids=contract['required_material_ids'],rationale='Actual fixture call, correlated events and independent range oracle agree within this local scope')],limitations=[]).model_dump(mode='json')]
+    process_task(e,e.state.inquiry_tasks[0])
+    check=next(c for c in e.state.checks if c.action=='direct_check')
+    result=e.state.monitor_results[-1]
+    assert check.status==ExecutionStatus.COMPLETED and check.direct_check_id==artifact.id
+    assert obligation_progress(e.state,u)==({u.obligation_ids[0]:[check.id]},[])
+    assert result['confirmed']==broken and 'Cluster-wide consequences outside this finite call' in result['boundaries']
+    assert e.state.evidence[-1].level=='implementation_test' and len([r for r in e.state.evidence if r.check_id==check.id])==1
+    assert not e.state.models and len([r for r in e.state.monitor_results if r['experiment_check_id']==check.id])==1
+    if broken:
+        assert e.state.findings[-1].level=='implementation_obligation'
+        e.state.active_direct_check_id=artifact.id;e.state.next_action='direct_assess';e.process_unit(u)
+        assert not e.state.consequences and u.status=='checked'
+        from consensus_assurance.reporting.chinese import render_report
+        assert '直接检查' in render_report(e.state,e.root).read_text()
+
+
+def test_missing_lookup_stops_without_accepting_a_check(tmp_path,prepared):
+    from consensus_assurance.adapters.agents.backend import MockAgent
+    from consensus_assurance.workflow.errors import Blocked
+    e,u,_=setup(tmp_path,prepared)
+    response={'gap':'The requested definition is absent','partial_design':'Keep the selected comparison',
+        'requests':[{'symbol':'missing_dependency','reason':'Locate the required definition'}]}
+    e.agent=MockAgent();e.agent.responses=[{**response,'gap':f'Missing definition, wording {i}'} for i in range(3)]
+    with pytest.raises(Blocked,match='generation remains unfinished'):
+        proceed(e,u,'direct_check')
+    session=e.state.pending_output_repair
+    assert session['status']=='blocked' and session['stagnation']==2
+    assert session['read_receipt']['items'][0]['file_metadata']['lookup']['match_count']==0
+    assert e.state.usage['agent_calls']==3 and not e.state.direct_checks and not e.state.evidence
 
 
 def test_completion_is_independent_of_forbidden_response_access(tmp_path):
@@ -305,15 +300,6 @@ def test_exact_selected_reads_then_one_focused_continuation(tmp_path,prepared):
     assert e.state.usage.get('exploration_rounds',0)==0
     assert next(p for p in e.state.read_plans.values() if p['original_requests'][0]['file']=='adapter.py')['purpose']=='depth'
     assert not e.state.active_unit_id and e.state.graph_history
-
-
-def test_direct_violation_finishes_at_local_scope_without_another_agent_call(tmp_path,prepared):
-    e,u,p=setup(tmp_path,prepared,True);a=save_plan(e,u,p,'consequence');review(e.state,u,a)
-    execute(e,a);e.state.active_direct_check_id=a.id;e.state.next_action='direct_assess';e.process_unit(u)
-    assert not e.state.consequences and u.status=='checked'
-    assert e.state.findings[0].level=='implementation_obligation' and not e.state.models
-    from consensus_assurance.reporting.chinese import render_report
-    assert '直接检查' in render_report(e.state,e.root).read_text()
 
 
 def test_new_direct_artifact_does_not_hide_prior_oracle_dispute(tmp_path,prepared):

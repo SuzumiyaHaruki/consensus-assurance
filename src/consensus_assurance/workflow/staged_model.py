@@ -56,7 +56,7 @@ def proceed(engine, unit, model, draft, phase):
         from .sources import ranges
         supplied=[m for m in engine.state.materials if m.id in engine.state.task_attachments.get('unit:'+unit.id,[])]
         spans=ranges(supplied)
-        needed=[r for r in requests if not any(file==r.file and any(a<=r.start_line<=r.end_line<=z for a,z in parts) for (file,version),parts in spans.items())]
+        needed=[r for r in requests if r.start_line is None or not any(file==r.file and any(a<=r.start_line<=r.end_line<=z for a,z in parts) for (file,version),parts in spans.items())]
         if needed:
             engine.targeted_read(unit,'Complete the saved model implementation experiment',requests=needed,update_required=False)
         bundle=None

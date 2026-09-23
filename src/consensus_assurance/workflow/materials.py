@@ -18,17 +18,6 @@ class ReadingPlan(Record):
     gap: str = ""
 
 
-def catalogue(repo, snapshot):
-    entries = []
-    for rel in sorted(snapshot.readable_files if snapshot.readable_files is not None else snapshot.files):
-        path = repo / rel
-        lines = path.read_text(errors="replace").splitlines()
-        symbols = [{"line": i+1, "declaration": line[:180]} for i, line in enumerate(lines)
-                   if re.match(r"^(?:func |type |def |class )", line)]
-        entries.append({"file": rel, "lines": len(lines), "symbols": symbols[:100]})
-    return entries
-
-
 def material_kind(path, text):
     if path.endswith((".md", ".rst")):
         return "document_statement"
@@ -56,19 +45,45 @@ def metadata(repo,snapshot,file):
     return {'file':file,'lines':len(lines),'content_digest':snapshot.files[file],'snapshot_id':snapshot.id,'encoding':'utf-8'},lines
 
 
+def locate(repo,snapshot,request):
+    """Find exact declarations or literal lines in authorized snapshot files."""
+    from .locations import declarations,matches_symbol
+    files=[request.file] if request.file else sorted(snapshot.readable_files if snapshot.readable_files is not None else snapshot.files)
+    matches=[]
+    for file in files:
+        info,lines=metadata(repo,snapshot,file)
+        if request.symbol:
+            if not file.endswith(('.go','.py')):continue
+            if not lines:continue
+            source=Material(id='',file=file,start_line=1,end_line=len(lines),kind='code_observation',text='\n'.join(lines),content_digest=info['content_digest'])
+            matches.extend({'file':file,'start_line':d['start'],'end_line':d['end'],'kind':'declaration'} for d in declarations(source,include_calls=False)
+                if d['kind']=='declaration' and matches_symbol(d,request.symbol))
+        else:
+            matches.extend({'file':file,'start_line':i,'end_line':i,'kind':'literal_line'} for i,line in enumerate(lines,1) if request.literal in line)
+    return {'kind':'symbol' if request.symbol else 'literal','query':request.symbol or request.literal,
+        'match_count':len(matches),'matches':matches[:24],'truncated':len(matches)>24,
+        'scope':'Complete declaration' if request.symbol else 'Matching line only; request more context if needed'}
+
+
 def preflight(state,repo,requests,path='/requests'):
     rows=[];errors=[]
     for i,raw in enumerate(requests):
         req=ReadRequest.model_validate(raw);info={'file':req.file,'snapshot_id':state.snapshot.id}
         try:
-            info,lines=metadata(repo,state.snapshot,req.file)
-            if req.start_line>req.end_line or req.end_line>len(lines):
+            lookup=locate(repo,state.snapshot,req) if req.symbol or req.literal else None
+            match=lookup['matches'][0] if lookup and lookup['match_count']==1 and lookup['matches'][0]['end_line'] is not None else None
+            resolved=req.model_copy(update={k:match[k] for k in ('file','start_line','end_line')} | {'symbol':None,'literal':None}) if match else req
+            if lookup and not match:
+                rows.append((req,None,{'file':req.file,'snapshot_id':state.snapshot.id,'lookup':lookup},None));continue
+            info,lines=metadata(repo,state.snapshot,resolved.file)
+            if lookup:info['lookup']=lookup
+            if resolved.start_line>resolved.end_line or resolved.end_line>len(lines):
                 raise IndexError('Requested source range does not exist; actual file has '+str(len(lines))+' lines')
-            rows.append((req,info,lines))
+            rows.append((req,resolved,info,lines))
         except (ValueError,OSError,IndexError) as exc:
             code='read_range' if isinstance(exc,IndexError) else 'read_encoding' if isinstance(exc,UnicodeError) else 'read_permission' if isinstance(exc,PermissionError) else 'read_path' if isinstance(exc,FileNotFoundError) else 'read_snapshot'
-            fields=['start_line','end_line'] if code=='read_range' else ['file']
-            errors.append(Diagnostic(code=code,category='material',object_ids=[req.file],paths=[path+'/'+str(i)+'/'+f for f in fields],message=str(exc),allowed=['representation','read'],
+            fields=['start_line','end_line'] if code=='read_range' else ['file' if req.file else 'symbol' if req.symbol else 'literal']
+            errors.append(Diagnostic(code=code,category='material',object_ids=[req.file] if req.file else [],paths=[path+'/'+str(i)+'/'+f for f in fields],message=str(exc),allowed=['representation','read'],
                 details={'original_request':req.model_dump(mode='json'),'file_metadata':info,'legal_range':[1,info.get('lines',0)],'no_clamping':True}))
     if errors:raise DiagnosticError(errors)
     return rows
@@ -77,7 +92,8 @@ def preflight(state,repo,requests,path='/requests'):
 def read_material(repo,snapshot,request):
     class Input:pass
     state=Input();state.snapshot=snapshot
-    req,info,lines=preflight(state,repo,[request])[0]
+    _,req,info,lines=preflight(state,repo,[request])[0]
+    if req is None:raise ValueError('Source lookup did not identify one complete range')
     text='\n'.join(lines[req.start_line-1:req.end_line])
     return Material(id=f"{req.file}:{req.start_line}:{req.end_line}",file=req.file,start_line=req.start_line,end_line=req.end_line,
         kind=material_kind(req.file,text),text=text,content_digest=info['content_digest'])
@@ -116,7 +132,7 @@ def initial_materials(repo, snapshot, budget, knowledge):
 
 class ReadItem(Record):
     request: ReadRequest
-    status: Literal['acquired','cached','deferred']
+    status: Literal['acquired','cached','deferred','unresolved']
     material_ids: list[str] = []
     new_chars: int = 0
     new_chunks: int = 0
@@ -188,22 +204,24 @@ def plan_read(state,repo,requests,budget,*,purpose='depth',partial=False,plan_id
     outcomes=[];new_materials=[]
     # Preserve authored priority, including when a prefix must be deferred.
     ordered=list(enumerate(rows));deferred=False
-    for index,(req,info,lines) in ordered:
+    for index,(original,req,info,lines) in ordered:
+        if req is None:
+            outcomes.append((index,ReadItem(request=original,status='unresolved',reason='Lookup did not identify one complete source range',file_metadata=info)));continue
         additions={(info['content_digest'],req.file,i):lines[i-1] for i in range(req.start_line,req.end_line+1) if (info['content_digest'],req.file,i) not in cached}
         cost=sum(len(t)+1 for t in additions.values());chunks=usage_of({**cached,**additions})['unique_chunks']-usage_of(cached)['unique_chunks']
         mid=f'{req.file}:{req.start_line}:{req.end_line}'
         if (deferred or cost>available or chunks>chunk_room) and cost:
             deferred=True
-            outcome=ReadItem(request=req,status='deferred',new_chars=cost,new_chunks=max(0,chunks),reason='Unique material allowance or protected reserve is insufficient; the entire request remains pending',file_metadata=info)
+            outcome=ReadItem(request=original,status='deferred',new_chars=cost,new_chunks=max(0,chunks),reason='Unique material allowance or protected reserve is insufficient; the entire request remains pending',file_metadata=info)
         else:
             text='\n'.join(lines[req.start_line-1:req.end_line])
             if mid not in {m.id for m in state.materials}:new_materials.append(Material(id=mid,file=req.file,start_line=req.start_line,end_line=req.end_line,kind=material_kind(req.file,text),text=text,content_digest=info['content_digest']))
-            outcome=ReadItem(request=req,status='acquired' if cost else 'cached',material_ids=[mid],new_chars=cost,new_chunks=max(0,chunks),file_metadata=info)
+            outcome=ReadItem(request=original,status='acquired' if cost else 'cached',material_ids=[mid],new_chars=cost,new_chunks=max(0,chunks),file_metadata=info)
             cached.update(additions);available-=cost;chunk_room-=chunks
         outcomes.append((index,outcome))
     items=[x for _,x in sorted(outcomes)]
     status='complete' if all(x.status!='deferred' for x in items) else 'partial' if any(x.status!='deferred' for x in items) else 'deferred'
-    receipt=ReadReceipt(id=plan_id or uid(),snapshot_id=state.snapshot.id,purpose=purpose,status=status,items=items,partial_policy='independent_ranges_with_explicit_defer' if partial else 'all_required_before_next_stage',related_ids=list(related_ids),reason=reason,original_requests=[q for q,_,_ in rows],allowance=allowance)
+    receipt=ReadReceipt(id=plan_id or uid(),snapshot_id=state.snapshot.id,purpose=purpose,status=status,items=items,partial_policy='independent_ranges_with_explicit_defer' if partial else 'all_required_before_next_stage',related_ids=list(related_ids),reason=reason,original_requests=[q for q,_,_,_ in rows],allowance=allowance)
     return receipt,new_materials
 
 
@@ -225,7 +243,7 @@ def apply_read(state,receipt,new_materials):
             state.task_attachments[owner]=list(dict.fromkeys(state.task_attachments.get(owner,[])+attached))
     state.reading_history.append({'plan_id':receipt.id,'attempt':receipt.attempt,'related_ids':receipt.related_ids,'gap':receipt.reason,'rationale':receipt.reason,
         'requests':[q.model_dump(mode='json') for q in receipt.original_requests],'added_material_ids':[id for item in receipt.items if item.status=='acquired' for id in item.material_ids],
-        'reattached_material_ids':[id for item in receipt.items if item.status=='cached' for id in item.material_ids],'unavailable':[item.model_dump(mode='json') for item in receipt.items if item.status=='deferred']})
+        'reattached_material_ids':[id for item in receipt.items if item.status=='cached' for id in item.material_ids],'unavailable':[item.model_dump(mode='json') for item in receipt.items if item.status in {'deferred','unresolved'}]})
     for item in receipt.items:
         if item.status=='deferred':state.gaps.append('Deferred read '+item.request.file+': '+item.reason)
     return encoded
@@ -246,7 +264,7 @@ def request_groups(value,path=''):
     if isinstance(value,dict):
         for key,child in value.items():
             route=path+'/'+key
-            if key in {'requests','reading_requests'} and isinstance(child,list) and all(isinstance(q,dict) and {'file','start_line','end_line'}<=set(q) for q in child):yield route,child
+            if key in {'requests','reading_requests'} and isinstance(child,list) and all(isinstance(q,dict) and ({'file','start_line','end_line'}<=set(q) or 'symbol' in q or 'literal' in q) for q in child):yield route,child
             else:yield from request_groups(child,route)
     elif isinstance(value,list):
         for i,child in enumerate(value):yield from request_groups(child,path+'/'+str(i))
@@ -269,6 +287,11 @@ def uncovered_requests(state, requests):
             acquired.setdefault(material.file,[]).append((material.start_line,material.end_line))
     result=[]
     for request in requests:
+        if request.symbol or request.literal:
+            if not any(plan['snapshot_id']==state.snapshot.id and any(item['status'] in {'acquired','cached'} and
+                ReadRequest.model_validate(item['request']).model_dump(exclude={'reason'})==request.model_dump(exclude={'reason'}) for item in plan['items'])
+                for plan in state.read_plans.values()):result.append(request)
+            continue
         cursor=request.start_line
         for start,end in sorted(acquired.get(request.file,[])):
             if end<cursor or start>request.end_line:continue
@@ -283,9 +306,12 @@ def uncovered_requests(state, requests):
 def request_material_ids(state, requests):
     """Return current-version material identities contributing to requested ranges."""
     current=state.snapshot.files
-    return list(dict.fromkeys(m.id for request in requests for m in state.materials
+    ids=[id for plan in state.read_plans.values() if plan['snapshot_id']==state.snapshot.id for item in plan['items']
+        if item['status'] in {'acquired','cached'} and any(ReadRequest.model_validate(item['request']).model_dump(exclude={'reason'})==r.model_dump(exclude={'reason'}) for r in requests if r.symbol or r.literal)
+        for id in item['material_ids']]
+    return list(dict.fromkeys(ids+[m.id for request in requests if request.start_line is not None for m in state.materials
         if m.file==request.file and m.content_digest==current.get(m.file)
-        and m.start_line<=request.end_line and request.start_line<=m.end_line))
+        and m.start_line<=request.end_line and request.start_line<=m.end_line]))
 
 
 def compact_index(state,repo,files=None):

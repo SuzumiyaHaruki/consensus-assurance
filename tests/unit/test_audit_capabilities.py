@@ -232,7 +232,7 @@ def test_focused_projection_at_repository_scale(tmp_path,prepared):
     import shutil
     from consensus_assurance.workflow.task_packet import prepare,pool_sources
     from consensus_assurance.workflow.prompts import render
-    from consensus_assurance.workflow.materials import catalogue,ReadingPlan
+    from consensus_assurance.workflow.materials import ReadingPlan
     from regression_support import add_reads
     from consensus_assurance.workflow.inquiry import enqueue,task_context
     from consensus_assurance.adapters.storage.snapshot import capture
@@ -252,11 +252,9 @@ def test_focused_projection_at_repository_scale(tmp_path,prepared):
     accept(e,spec);task=enqueue(state,'spec_refine','Inspect election context','surface-test',surface_entry_points=['election.handler_0_0'])
     task.material_ids=['election.py:1:20']
     packet,_=prepare(e,'spec_refine',task_context(e,task));text=render('spec_refine',pool_sources(packet),e.inquiry)
-    assert len(catalogue(source,state.snapshot))==88
-    assert sum(len(f['symbols']) for f in catalogue(source,state.snapshot))==884
     assert len(text)<120000 and len(packet['file_lookup'])==88
     assert [m['file'] for m in packet['materials']]==['election.py']
-    assert len(packet['declaration_hints'])<=24 and not {'catalogue','source_ranges','unread_ranges'}&packet.keys()
+    assert 'declaration_hints' not in packet and not {'catalogue','source_ranges','unread_ranges'}&packet.keys()
     assert len(load(state).target_profile.source_ids)==10
 
 
@@ -336,7 +334,7 @@ def test_composite_surface_retains_schedulable_remainder(tmp_path,prepared,mode)
 def test_variant_visibility_is_a_subset_of_safe_build_files(tmp_path,variant):
     from consensus_assurance.cli import load_config,main
     from consensus_assurance.adapters.storage.snapshot import capture
-    from consensus_assurance.workflow.materials import metadata,catalogue,initial_materials
+    from consensus_assurance.workflow.materials import metadata,initial_materials
     repo=tmp_path/'source';repo.mkdir()
     families=['paxos','n2paxos','swift','epaxos','fastpaxos','curp']
     for family in families+['replica']:
@@ -352,7 +350,6 @@ def test_variant_visibility_is_a_subset_of_safe_build_files(tmp_path,variant):
     for f in families:
         if f!=variant:
             with pytest.raises(PermissionError):metadata(repo,snapshot,f'{f}/node.go')
-    assert {f['file'] for f in catalogue(repo,snapshot)}==set(snapshot.readable_files)
     assert {m.file for m in initial_materials(repo,snapshot,config.budget,'')}<=set(snapshot.readable_files)
     assert main(['inspect','--config',str(cfg),'--repo',str(repo),'--runs-dir',str(tmp_path/'inspect')])==0
     saved=json.loads(next((tmp_path/'inspect').glob('*/snapshot.json')).read_text())

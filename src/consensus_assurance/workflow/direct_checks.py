@@ -279,8 +279,6 @@ def proceed(engine,unit,phase):
             'execution_gap':state.pending_feedback,
             'checker_issue':next((i.model_dump(mode='json') for i in state.review_issues if state.pending_feedback and i.id==state.pending_feedback.get('issue_id')),None)},lambda p:validate_reply(state,unit,p,engine.implementation,previous))
         if reply.plan is None:
-            if reply.requests:
-                raise Blocked('Unfinished direct construction returned outside its generation session')
             state.gaps.append(reply.gap)
             if reply.fallback in {'local_model','source_review'}:
                 state.question_continuations.setdefault(unit.id,{})['fallback']={'kind':reply.fallback,'check_id':call.id,'reason':reply.gap}

@@ -3,7 +3,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Literal
 from uuid import uuid4
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_serializer, model_validator
 
 
 def uid() -> str:
@@ -19,10 +19,25 @@ class Record(BaseModel):
 
 
 class ReadRequest(Record):
-    file: str
-    start_line: int = Field(ge=1)
-    end_line: int = Field(ge=1)
+    file: str | None = None
+    start_line: int | None = Field(default=None, ge=1)
+    end_line: int | None = Field(default=None, ge=1)
+    symbol: str | None = Field(default=None, min_length=1, max_length=200)
+    literal: str | None = Field(default=None, min_length=1, max_length=200)
     reason: str
+
+    @model_validator(mode="after")
+    def source_selector(self):
+        if bool(self.symbol)+bool(self.literal)>1:raise ValueError('Select one source lookup kind')
+        if self.symbol or self.literal:
+            if self.start_line is not None or self.end_line is not None:raise ValueError('Lookup cannot prescribe source line numbers')
+        elif not self.file or self.start_line is None or self.end_line is None:
+            raise ValueError('Range read requires a file and both line numbers')
+        return self
+
+    @model_serializer(mode='wrap')
+    def compact(self,handler):
+        return {key:value for key,value in handler(self).items() if value is not None}
 
 
 ActivityClass = Literal["A1", "A2", "A3", "A4", "A5", "A6", "A7"]
