@@ -13,7 +13,6 @@ def review_projection(engine,task):
     wanted,closure=material_closure(state,seeds)
     wanted.update(task.added_material_ids)
     wanted.update(state.task_attachments.get('inquiry:'+task.id,[]))
-    wanted.update(task.material_ids)
     for issue in state.review_issues:
         if (issue.target_id in closure or issue.id in task.resolution_issue_ids) and not issue.resolved_by:wanted.update(issue.source_ids)
     pending_scope=[u for u in state.scope_updates.values() if u['status']=='needs_F2_or_investigation' and u['proposal']['unit_id']==task.unit_id]
@@ -46,6 +45,14 @@ def review_projection(engine,task):
             if checks:
                 result['observed_events']=extract_events(checks[-1])
                 result['raw_log_path']=checks[-1].stdout
+            if artifact.previous_id:
+                old=next(a for a in state.direct_checks if a.id==artifact.previous_id)
+                prior=load_plan(old.plan_path)
+                result['prior_direct_check']={'artifact_id':old.id,'observable_properties':[p.model_dump(mode='json') for p in prior.observable_properties],
+                    'monitors':[m.model_dump(mode='json') for m in prior.monitors],
+                    'harness_source':prior.harness.source if prior.harness.source!=plan.harness.source else None,
+                    'assessment':next((r for r in reversed(state.monitor_results) if r.get('direct_check_id')==old.id),None),
+                    'input_changes':next((r.after.get('input_changes',[]) for r in reversed(state.revisions) if r.kind=='encoding' and r.after.get('direct_check_id')==artifact.id),[])}
     result['materials']=[m.model_dump(mode='json') for m in state.materials if m.id in wanted]
     result['omitted_material_ids']=[m.id for m in state.materials if m.id not in wanted]
     result['required_material_ids']=sorted(wanted)
@@ -69,10 +76,11 @@ def descriptive_projection(engine,kind,context,task):
     draft=json.loads(Path(task.draft_path).read_text()) if task and task.draft_path else {}
     view=view or draft.get('audit_spec',draft)
     focus=question.model_dump(mode='json') if question else {'object_keys':seeds,'reason':task.reason if task else 'Select a bounded Fact lifecycle'}
-    wanted=set(context.get('current_material_ids',[]))|{m['id'] for m in context.get('materials',[])}
+    wanted=set(context.get('current_material_ids',[]))
+    if kind!='derive' or not candidate:wanted.update(m['id'] for m in context.get('materials',[]))
     if candidate:
-        wanted.update(question.source_ids)
-        wanted.update(id for t in state.inquiry_tasks if t.id in candidate.spec_task_ids and t.status=='completed' for id in t.material_ids)
+        if not candidate.read_plan_id:wanted.update(question.source_ids)
+        wanted.update(id for t in state.inquiry_tasks if t.id in candidate.spec_task_ids and t.status=='completed' for id in t.added_material_ids)
         wanted.update(id for item in state.read_plans.get(candidate.read_plan_id,{}).get('items',[]) if item['status']!='deferred' for id in item['material_ids'])
     if task:wanted.update(id for d in task.diagnostics for id in d['material_ids'])
     profile=(view or {}).get('target_profile',{})
@@ -99,10 +107,14 @@ def descriptive_projection(engine,kind,context,task):
         result['phase']='interpret' if task.added_material_ids else 'navigate'
     if candidate:
         result.pop('focus')
-        result.update(selected_question=focus,source_receipt=state.read_plans.get(candidate.read_plan_id))
+        result.update(selected_question=focus,source_receipt=state.read_plans.get(candidate.read_plan_id),
+            prior_material_ids=[id for id in candidate.material_ids if id not in wanted],
+            material_note='Prior citations remain archived navigation; request exact source again when a current conclusion needs it')
     if kind=='derive':
         from .task_view import candidate_view
-        result['candidate_dispositions']=[candidate_view(state,c) for c in state.question_candidates]
+        result['candidate_dispositions']=[candidate_view(state,c) if c.id==(candidate.id if candidate else None) else
+            {k:v for k,v in candidate_view(state,c).items() if k in {'id','parent_candidate_id','status','reason','question','fact_ids','lifecycle','obligation_id','unit_id','current_result','evidence_ids','check_ids'}}
+            for c in state.question_candidates]
     result['existing_objects']=[{'id':o.id,'version':o.version} for name in ('claims','bindings','relations','units') for o in getattr(state,name)] if kind=='derive' else []
     return result
 
@@ -204,9 +216,10 @@ def receipt(engine,kind,packet,prompt,schema,task=None,repair=False):
         'duplicate_material_occurrences':len(ids)-len(set(ids)),'status':'prepared'}
     engine.state.packet_receipts.append(item)
     if task:
-        task.context_receipt_id=item['id'];task.material_ids=list(dict.fromkeys((task.material_ids if repair else [])+item['material_ids']))
+        prior=list(task.material_ids)
+        task.context_receipt_id=item['id'];task.material_ids=item['material_ids']
         item['review_material_ids']=task.material_ids
-        item['prior_analysis_material_ids']=[id for id in task.material_ids if id not in item['material_ids']]
+        item['prior_analysis_material_ids']=[id for id in prior if id not in item['material_ids']]
         item['source_availability_note']='material_ids are sent now; prior_analysis_material_ids only support retained historical analysis, not new source observations'
     write_json(engine.root/'packets'/(item['id']+'.schema.json'),wire)
     write_json(engine.root/'packets'/(item['id']+'.json'),item)

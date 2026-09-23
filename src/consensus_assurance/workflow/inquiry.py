@@ -351,6 +351,16 @@ def apply_task_response(engine,task_id,reply,check):
         if any(a.id in task.target_ids for a in state.direct_checks):
             from .direct_checks import refresh_assessments
             refresh_assessments(state,{a.id for a in state.direct_checks if a.unit_id==task.unit_id})
+            correction=next((i for i in state.review_issues if not i.resolved_by and i.target_id in task.target_ids and i.aspect=='checker_correspondence'
+                and any(item.target_id==i.target_id and item.aspect==i.aspect and item.status=='revision_needed' for item in reply.items)),None)
+            if correction and not reply.requests and state.active_unit_id in {None,task.unit_id} and state.usage.get('agent_calls',0)<engine.config.budget.agent_calls:
+                artifact=next(a for a in state.direct_checks if a.id==correction.target_id)
+                execution=next((c for c in reversed(state.checks) if c.direct_check_id==artifact.id),None)
+                unit=next((u for u in state.units if u.id==task.unit_id),None)
+                if execution and unit:
+                    state.active_unit_id=unit.id;unit.status='selected';state.active_direct_check_id=artifact.id
+                    state.pending_feedback={'kind':'encoding','issue_id':correction.id,'check_id':execution.id,'failure':correction.explanation}
+                    state.next_action='direct_check';state.deferred_units.pop(unit.id,None)
         if reply.requests and focus:
             follow.resolution_issue_ids=[i.id for i in state.review_issues if not i.resolved_by and i.target_id in targets and i.aspect in follow.requested_aspects[i.target_id]]
     task.repair_session=None;task.check_id=check.id;task.status='blocked' if task.stop_reason=='Focused review still omitted required aspects' else 'completed';task.stage='done';state.active_inquiry_id=None

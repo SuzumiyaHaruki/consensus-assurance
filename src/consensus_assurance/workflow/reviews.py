@@ -75,9 +75,17 @@ def validate_resolutions(state, task, reply):
     for id in reply.resolves_issue_ids:
         issue=next((i for i in state.review_issues if i.id==id and i.resolved_by is None),None)
         if issue is None:raise ValueError('Resolution references an unavailable open issue')
-        if issue.needs_recheck and not any(c.model_id==task.model_id and c.action=='model_check' and c.status.value=='completed' and c.outcome in {'holds','counterexample'} and c.search_fingerprint==next((m.search_fingerprint for m in state.models if m.id==task.model_id),None) for c in state.checks):raise ValueError('Encoding issue resolution requires an actual matching model recheck')
+        if issue.needs_recheck and issue.model_id and not any(c.model_id==task.model_id and c.action=='model_check' and c.status.value=='completed' and c.outcome in {'holds','counterexample'} and c.search_fingerprint==next((m.search_fingerprint for m in state.models if m.id==task.model_id),None) for c in state.checks):raise ValueError('Encoding issue resolution requires an actual matching model recheck')
         resolution_target=issue.target_id
-        if issue.id in task.resolution_issue_ids and issue.model_id!=task.model_id:
+        direct=next((a for a in state.direct_checks if a.id in task.target_ids and a.previous_id==issue.target_id),None)
+        if direct and issue.id in task.resolution_issue_ids:
+            from .direct_checks import load_plan
+            old=next(a for a in state.direct_checks if a.id==issue.target_id)
+            checked=any(c.direct_check_id==direct.id and c.action=='direct_check' and c.status.value=='completed' and c.exit_code==0 for c in state.checks)
+            if not checked or load_plan(old.plan_path).observable_properties==load_plan(direct.plan_path).observable_properties and load_plan(old.plan_path).monitors==load_plan(direct.plan_path).monitors:
+                raise ValueError('Old direct checker issue needs a changed oracle and actual new execution')
+            resolution_target=direct.id
+        elif issue.id in task.resolution_issue_ids and issue.model_id!=task.model_id:
             from .encoding import issue_models
             from pathlib import Path
             model=next((m for m in state.models if m.id==task.model_id),None)
@@ -137,7 +145,7 @@ def record_dispositions(state,review,reply,followup_ids):
         if issue.id in reply.resolves_issue_ids:
             issue.resolved_by=review.id;issue.resolution_model_id=review.model_id
             issue.resolution_basis=next((r.model_dump(mode='json') for r in reply.resolutions if r.issue_id==issue.id),{'rationale':reply.resolution_rationale})
-            issue.resolution_checks=[c.id for c in state.checks if c.model_id==review.model_id and c.action=='model_check']
+            issue.resolution_checks=[c.id for c in state.checks if (c.action=='model_check' and c.model_id==review.model_id) or (c.action=='direct_check' and c.direct_check_id in review.target_versions and c.status.value=='completed' and c.exit_code==0)]
     for item in reply.items:
         if item.status=='no_issue_found':continue
         disposition='reading' if reply.requests else 'revision' if reply.revision else 'investigation' if followup_ids else 'blocked'

@@ -23,7 +23,7 @@ def focused(tmp_path,prepared):
     accept(e,inventory(source))
     q=AuditQuestion(question='Can a late success hide an earlier failed publication?',importance='History remains recoverable',source_ids=[source],activity_classes=['A1','A5'],behavior_ids=['producer','consumer'],fact_ids=['fact'],obligation_relation_kind='consumption',preferred_check='source_review',disposition='needs_specific_evidence',counterevidence=['Caller propagates an original error'],unknowns=['Caller contract still unread'],trigger_rationale='Inspect the remaining caller discriminator')
     from consensus_assurance.workflow.task_packet import receipt
-    receipt(e,'derive',{'materials':[m.model_dump(mode='json') for m in e.state.materials]},'offline source',Derivation)
+    receipt(e,'derive',{'materials':[m.model_dump(mode='json') for m in e.state.materials]},'offline source',Derivation)['status']='executed'
     return e,q,responses
 
 
@@ -84,7 +84,8 @@ def test_partial_receipt_reaches_reasoning_then_explained(focused,tmp_path):
     from consensus_assurance.reporting.chinese import render_report
     (tmp_path/'report').mkdir()
     report=render_report(e.state,tmp_path/'report').read_text()
-    assert '候选问题与已有保护' in report and 'Acquired caller propagates' in report and 'Caller contract still unread' not in report
+    assert '候选问题与已有保护' in report and 'Acquired caller propagates' in report
+    assert '提出时的保护与未知' in report and 'Caller contract still unread' in report and '当前未决：[]' in report
 
 
 def test_zero_progress_is_bounded(focused):
@@ -219,7 +220,7 @@ def test_no_local_normative_basis_remains_evidence_blocked(focused,tmp_path):
     e,q,_=focused
     candidate=begin(e,q,[ReadRequest(file='counter.py',start_line=1,end_line=2,reason='Review the caller')])
     discovery.continue_candidate(e,candidate)
-    reply=Derivation(candidate_id=current_id(e),audit_question=q.model_copy(update={'unknowns':['Applicable contract does not assign error propagation']}),selection_rationale='Caller and interface sources were reviewed; no exact remaining range can assign this responsibility')
+    reply=Derivation(candidate_id=current_id(e),audit_question=q.model_copy(update={'source_ids':list(dict.fromkeys(q.source_ids+candidate.material_ids)),'unknowns':['Applicable contract does not assign error propagation']}),selection_rationale='Caller and interface sources were reviewed; no exact remaining range can assign this responsibility')
     agent=MockAgent();agent.responses=[reply.model_dump(mode='json')];e.agent=agent
     result,check=discovery.ask_derivation(e,discovery.derive_context(e))
     assert discovery.validate_derivation(e.state,result)=='blocked_evidence'
@@ -287,6 +288,15 @@ def test_three_narrowings_keep_history_out_of_current_packet(focused):
     assert len(c.history)==3 and not c.question.unknowns and c.history[0].unknowns==original['unknowns']
     packet=selected_packet(e)
     assert not packet['selected_question']['unknowns'] and 'history' not in packet
+    e.config.budget.context_chars=1000;e.state.config=e.config.model_dump(mode='json')
+    before=e.state.usage.get('agent_calls',0);before_sources=list(c.material_ids)
+    discovery.derive(e)
+    assert c.status=='blocked' and e.state.usage.get('agent_calls',0)==before
+    failed=e.state.packet_receipts[-1]
+    assert failed['status']=='blocked_context_limit' and failed['candidate_id']==c.id
+    assert c.history and set(before_sources)<=set(c.material_ids)
+    discovery.derive(e)
+    assert e.state.packet_receipts[-1]['id']==failed['id']
 
 
 def test_episode_admission_and_blockage_classification(focused):

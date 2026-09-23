@@ -51,18 +51,6 @@ def execution_summary(check):
     return check.action, product, ("性质检查未完成或无法归属" if check.outcome == "unknown" else "限于实际 checker 和模型范围；详见逐项结果")
 
 
-def progress_lines(state):
-    return ["", "## 本次流程进度", "",
-        "工具调用完成、分析产物被接受、性质得到证据支持是不同状态。恢复时重复的版本检查不是重复验证协议。", "",
-        "| 阶段 | 已记录的进度 |", "| --- | --- |",
-        f"| 材料阅读 | {'已完成首轮阅读' if 'materials' in state.completed_steps else '首轮阅读尚未完成'}；保存 {len(state.materials)} 个片段 |",
-        f"| 义务与代码关系 | {'发现结果已被工作流接受' if 'discovery' in state.completed_steps else '尚未完成发现结果的工作流接受'}；当前图有 {len(state.claims)} 项主张、{len(state.units)} 个审计单元 |",
-        f"| 直接实现检查 | 已保存 {len(state.direct_checks)} 个制品；完成 {sum(c.action=='direct_check' and c.status==ExecutionStatus.COMPLETED for c in state.checks)} 次执行；不等于整体性质成立 |",
-        f"| 局部模型 | 已保存 {len(state.models)} 个模型版本；保存不代表检查通过 |",
-        f"| 轨迹校准 | {len(state.calibrations)} 条校准记录；不等同于性质判定 |",
-        "", "若 agent 回复完成而目标发现仍未被接受，不能把该回复视为已成立的关系图。历史记录未保存具体拒绝原因时，报告不补造原因。"]
-
-
 def resource_lines(state):
     from consensus_assurance.core.config import Budget
     from consensus_assurance.workflow.materials import material_usage,material_allowance
@@ -163,25 +151,6 @@ def inquiry_lines(state):
     return lines
 
 
-def audit_lines(state):
-    lines=['', '## 义务与有界审计结论']
-    for unit in state.units:
-        q=unit.audit_question
-        for claim in state.claims:
-            if claim.id in unit.obligation_ids:lines.append(f"{claim.id} — {claim.description}")
-        code=[f"{b.symbol} @ {b.file}:{b.start_line}-{b.end_line}" for b in state.bindings if b.id in unit.binding_ids]
-        blocked=any(r.get('bounded_complete') and r.get('blockers') and any(a.unit_id==unit.id and a.id==r.get('direct_check_id') for a in state.direct_checks) for r in state.monitor_results)
-        lines += ['代码：'+'；'.join(code),f"问题：{q.question if q else '尚未形成'}",f"方法：{q.preferred_check if q else '未选'}；当前状态：{'blocked' if blocked else unit.status}（归档 {unit.status}）"]
-        evidence=[e for e in state.evidence if e.claim_id in unit.obligation_ids]
-        lines.append('证据：'+('; '.join(e.id+': '+str(e.assessment)+' / '+e.applicability for e in evidence) if evidence else '尚无；不能宣称正确'))
-        if q:
-            lines.append('已有保护/反证：'+str(q.counterevidence)+'；未决：'+str(q.unknowns))
-            if q.disposition=='explained_by_existing_mechanism':lines.append('疑点已由所述机制解释；仅限当前来源与适用范围。')
-            if q.disposition=='needs_specific_evidence':lines.append('下一步需要：'+str([r.model_dump() for r in q.requests]))
-    if not state.units:lines.append('尚无已受理的有界审计问题或结论。')
-    return lines
-
-
 def export_views(state, root):
     from consensus_assurance.adapters.storage.files import write_json
     from consensus_assurance.workflow.audit_spec import load, audit_progress
@@ -215,8 +184,6 @@ def render_report(state, root):
         "", "## 分析输入与探索范围", "", f"仓库：`{state.snapshot.repo}`", f"提交：`{state.snapshot.commit or '无 Git 元数据'}`；分支：`{state.snapshot.branch or 'detached / unavailable'}`；脏工作区：`{state.snapshot.dirty}`。",
         f"快照：`{state.snapshot.id}`，纳入 {len(state.snapshot.files)} 个文件；读取 {len(state.materials)} 个材料片段，仍有未读范围的文件 {len(state.unexplored)} 个。完整清单见 [materials.json](materials.json)、[catalogue.json](catalogue.json) 和 [snapshot.json](snapshot.json)。",
         "候选不代表完整性；原始材料保留原文。", "", "## 义务与选择依据", ""]
-    insert_at = lines.index("## 分析输入与探索范围")
-    lines[insert_at:insert_at] = audit_lines(state) + progress_lines(state) + [""]
     lines += ["领域引导与参考："]
     for guidance in state.guidance:
         lines += [f"- `{guidance['source']}`：{guidance['text'] or '未提供协议参考清单'}"]
@@ -229,13 +196,14 @@ def render_report(state, root):
     from consensus_assurance.workflow.discovery import candidate_blockage
     from consensus_assurance.workflow.task_view import candidate_view
     for candidate in state.question_candidates:
-        q=candidate.question;current=candidate_view(state,candidate);result=current['current_result']
+        q=candidate.question;original=candidate.history[0] if candidate.history else q
+        current=candidate_view(state,candidate);result=current['current_result']
         if candidate.status=='explained':
             adjacent=q.unknowns or ['当前记录未结构化列出相邻问题']
             lines.append('相邻但未检查的问题：'+str(adjacent)+'；不由本候选结论覆盖，需以独立来源和判别条件另行调查。')
         lines += [f"- 候选 `{candidate.id}`：Fact {q.fact_ids}；{q.obligation_relation_kind}；{candidate.status}/{q.disposition}；受阻 {candidate_blockage(state,candidate) or '无'}。",
             f"  {q.question}；意义：{q.importance}；上下文/路径：{q.contexts}/{q.event_paths}；来源：{q.source_ids}。",
-            f"  提出时的保护与未知：{q.counterevidence}/{q.unknowns}；选择依据：{q.trigger_rationale}；义务：{candidate.obligation_id or '未生成'}；处置：{candidate.stop_reason or '继续获取证据'}；恢复判别：{candidate.resume_conditions}；历史版本 {len(candidate.history)}。"]
+            f"  提出时的保护与未知：{original.counterevidence}/{original.unknowns}；当前保护/反证：{q.counterevidence}；当前未决：{q.unknowns}；选择依据：{q.trigger_rationale}；义务：{candidate.obligation_id or '未生成'}；处置：{candidate.stop_reason or '继续获取证据'}；恢复判别：{candidate.resume_conditions}；历史版本 {len(candidate.history)}。"]
         if result:lines.append(f"  当前局部结果：{result}；执行/证据关联：{current['check_ids']} / {current['evidence_ids']}；当前剩余判别：{current['remaining_discriminators']}。")
         if candidate.parent_candidate_id:
             parent=next((x for x in state.question_candidates if x.id==candidate.parent_candidate_id),None)
@@ -265,7 +233,7 @@ def render_report(state, root):
             for obj in draft.get('facts',[]):lines.append(f"草稿事实 {obj['id']}：{obj.get('meaning','')}；未知 {obj.get('unknowns',[])}。")
     for claim in state.claims:
         lines += [f"- `{claim.id}`（{claim.kind}，{claim.assessment.value}）：{claim.description}",
-                  f"  来源：{', '.join(claim.source_ids)}；待确认：{'；'.join(claim.pending) or '见范围假设'}。"]
+                  f"  来源：{', '.join(claim.source_ids)}；原始待核查记录：{'；'.join(claim.pending) or '见范围假设'}；当前执行进度见候选局部结果。"]
         lines += [f"  语义版本：{claim.version}；行为材料 {claim.grounding.source_ids}；职责依据 {claim.grounding.expectation_ids}；绑定 {claim.grounding.binding_ids}。",
                   f"  推导：{claim.grounding.derivation}；适用性：{claim.grounding.applicability}；未决/冲突：{claim.grounding.unresolved + claim.grounding.conflicts}。"]
     if not state.claims:
@@ -337,7 +305,7 @@ def render_report(state, root):
     for e in state.evidence:
         lines += ["", f"证据 `{e.id}`：{LEVEL[e.level]}，`{e.assessment.value}`；执行 `{e.check_id}`；关联主张 `{e.claim_id}` v{e.claim_version}；checker `{e.checker_id}`；适用性 `{e.applicability}`。",
             f"范围：{e.scope.description}；限制（原文）：{e.description}" + (f"；过期原因：{e.stale_reason}" if e.stale_reason else "")]
-    lines += ["", "## 候选发现与 F1—F4", ""]
+    lines += ["", "## 候选发现与修订", ""]
     if not state.findings:
         lines.append("本次尚无记录的候选违反。这不代表实现没有缺陷。")
     for f in state.findings:
@@ -345,16 +313,22 @@ def render_report(state, root):
                   f"  调查记录：{'；'.join(f.investigation_notes) or '尚待调查'}"]
         if f.confirmation_path:
             lines += [f"  实际观测、前提、合法性及性质判定：{link(f.confirmation_path)}；checker `{f.checker_id}`。"]
+    current_checks=set()
+    for candidate in state.question_candidates:
+        artifact=next((a for a in reversed(state.direct_checks) if a.claim_id==candidate.obligation_id),None)
+        result=next((r for r in reversed(state.monitor_results) if artifact and r.get('direct_check_id')==artifact.id),None)
+        if result:current_checks.add(result['experiment_check_id'])
     for result in state.monitor_results:
         observed='；'.join(p['checker_id']+'='+p['outcome'] for p in result['properties'])
         completion=('有界检查完成' if result.get('bounded_complete') else '有界检查未完成') if result.get('direct_check_id') else '模型回放解释'
-        lines += [f"观测判定 `{result.get('finding_id',result.get('direct_check_id','unknown'))}`：{completion}；实际结果 `{result.get('outcome',observed)}`；性质 `{observed}`；前提 `{result['prerequisites']['status']}`；确认层级 `{result['level']}`；当前归因阻塞：{result.get('blockers',result.get('limitations',[]))}；实验适配：{result.get('adaptations',[])}；范围边界：{result.get('boundaries',[])}。"]
+        label='当前' if result.get('experiment_check_id') in current_checks else '历史' if result.get('direct_check_id') else '模型'
+        lines += [f"{label}观测判定 `{result.get('finding_id',result.get('direct_check_id','unknown'))}`：{completion}；实际结果 `{result.get('outcome',observed)}`；性质 `{observed}`；前提 `{result['prerequisites']['status']}`；确认层级 `{result['level']}`；归因阻塞：{result.get('blockers',result.get('limitations',[]))}；实验适配：{result.get('adaptations',[])}；范围边界：{result.get('boundaries',[])}。"]
     for decision in state.consequences:
         lines.append(f"义务→更广泛后果处置：发现 `{decision['finding_id']}`；`{decision['disposition']}`；{decision['reason']}；Parent {decision.get('parent_candidate_id') or '无'}；后续 {decision['task_ids']}；限制 {decision['limitations']}。")
     for revision in state.revisions:
         lines += [f"- {revision.kind}：{revision.rationale}；返回 `{revision.return_step}`；依赖 {revision.relation_ids}；状态 {revision.status}。"]
     if not state.revisions:
-        lines.append("本次没有实际应用的语义修订；工具错误不冒充 F1—F4。")
+        lines.append("本次没有实际应用的修订；工具错误不冒充修订。")
     budget=state.config.get('budget',{});from consensus_assurance.workflow.materials import material_usage
     exhausted=[name for name,value in state.usage.items() if name in budget and value>=budget[name]]
     if budget.get('total_seconds') is not None and state.elapsed_seconds>=budget['total_seconds']:exhausted.append('total_seconds')
@@ -370,7 +344,7 @@ def render_report(state, root):
               "", "## 实际运行统计", "", f"累计执行时间：{state.elapsed_seconds:.2f} 秒；预算计数：`{state.usage}`。",
               "Agent CLI 报告："+("；".join(f"model={model}，reasoning_effort={effort or '未记录'}" for model,effort in reported) if reported else "未记录。"),
               f"首个已保存模型前耗时：{state.first_model_seconds if state.first_model_seconds is not None else '尚无模型'}；模型仍须通过实际工具检查。",
-              f"审计单元 {len(state.units)}；范围扩展 {sum(x.kind == 'F3' for x in state.revisions)}；语义修订 {len(state.revisions)}；校准 {len(state.calibrations)}。",
+              f"审计单元 {len(state.units)}；范围扩展 {sum(x.kind == 'F3' for x in state.revisions)}；已应用修订 {sum(x.status=='applied' for x in state.revisions)}；校准 {len(state.calibrations)}。",
               "完整命令、时间、版本与制品关联见 [state.json](state.json)，图、规格和计划视图在结束或生成报告时导出；事件见 [events.jsonl](events.jsonl)。", ""]
     lines += resource_lines(state)
     path = root / "report.md"

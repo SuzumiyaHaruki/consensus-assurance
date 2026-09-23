@@ -87,17 +87,26 @@ def validate_revision(state,unit,revision):
 
 
 def validate_reply(state,unit,reply,implementation,previous=None):
+    if reply.encoding_revision and (not state.pending_feedback or state.pending_feedback.get('kind')!='encoding' or reply.encoding_revision.issue_id!=state.pending_feedback.get('issue_id') or reply.encoding_revision.old_direct_check_id!=state.active_direct_check_id):
+        raise ValueError('Encoding correction must address the active checker issue in this unit')
     if reply.plan:
         if reply.requests or reply.fallback!='none':raise ValueError('Return a plan or a gap/fallback, not competing routes')
         validate_plan(state,unit,reply.plan,implementation)
         if previous:
-            left=previous.model_dump();right=reply.plan.model_dump()
-            left.pop('harness');right.pop('harness')
-            if left!=right:raise ValueError('Technical/F4 direct repair must preserve the selected claim and oracle; use F2/F3 for semantics')
+            if reply.encoding_revision:
+                from .encoding import validate_direct_encoding
+                artifact=next((a for a in state.direct_checks if a.id==reply.encoding_revision.old_direct_check_id),None)
+                validate_direct_encoding(state,artifact,previous,reply.plan,reply.encoding_revision)
+            else:
+                left=previous.model_dump();right=reply.plan.model_dump()
+                left.pop('harness');right.pop('harness')
+                if left!=right:raise ValueError('Technical/F4 direct repair must preserve the selected claim and oracle; use F2/F3 for semantics')
+        elif reply.encoding_revision:raise ValueError('Encoding correction requires the saved original plan')
+    elif reply.encoding_revision:raise ValueError('Encoding correction requires a complete corrected plan')
     elif not reply.gap.strip():raise ValueError('Missing direct plan requires a concrete gap')
 
 
-def save_plan(engine,unit,plan,operation_id):
+def save_plan(engine,unit,plan,operation_id,previous=None):
     state=engine.state
     existing=next((a for a in state.direct_checks if a.operation_id==operation_id),None)
     if existing:return existing
@@ -112,7 +121,7 @@ def save_plan(engine,unit,plan,operation_id):
         snapshot_id=state.snapshot.id,unit_id=unit.id,claim_id=plan.claim_id,binding_ids=plan.binding_ids,
         graph_versions={o.id:o.version for o in state.claims+state.bindings+state.relations+state.units if o.id in ids},
         origin=Origin.MOCK if state.mode=='mock' else Origin.PRESET if state.analysis_mode=='regression' else Origin.AGENT,
-        scope=unit.scope,operation_id=operation_id)
+        scope=unit.scope,operation_id=operation_id,previous_id=previous.id if previous else None)
     state.direct_checks.append(artifact)
     return artifact
 
@@ -267,7 +276,8 @@ def proceed(engine,unit,phase):
     if phase=='direct_check':
         previous=plan if state.pending_feedback else None
         reply,call=engine.ask('direct_check',DirectCheckReply,{**engine.context(unit),'previous_plan':previous.model_dump(mode='json') if previous else None,
-            'execution_gap':state.pending_feedback},lambda p:validate_reply(state,unit,p,engine.implementation,previous))
+            'execution_gap':state.pending_feedback,
+            'checker_issue':next((i.model_dump(mode='json') for i in state.review_issues if state.pending_feedback and i.id==state.pending_feedback.get('issue_id')),None)},lambda p:validate_reply(state,unit,p,engine.implementation,previous))
         if reply.plan is None:
             if reply.requests:
                 raise Blocked('Unfinished direct construction returned outside its generation session')
@@ -277,7 +287,16 @@ def proceed(engine,unit,phase):
                 engine.advance('build' if reply.fallback=='local_model' else 'question');return
             engine.finish_unit(unit,'blocked');return
         prior=artifact;cause=state.pending_feedback
-        artifact=save_plan(engine,unit,reply.plan,call.id)
+        artifact=save_plan(engine,unit,reply.plan,call.id,prior if reply.encoding_revision else None)
+        if prior and reply.encoding_revision:
+            from .transactions import commit_graph
+            from consensus_assurance.core.types import Revision
+            def record_encoding(proxy):
+                proxy.budget.take('revisions')
+                proxy.state.revisions.append(Revision(kind='encoding',rationale=reply.encoding_revision.rationale,
+                    evidence_ids=[cause['check_id']],target_ids=[prior.id],before={'plan':plan.model_dump(mode='json'),'issue_id':reply.encoding_revision.issue_id},
+                    after={'plan':reply.plan.model_dump(mode='json'),'direct_check_id':artifact.id,'input_changes':reply.encoding_revision.input_changes},return_step='experiment'))
+            commit_graph(engine,'direct-encoding-'+call.id,{'before':prior.id,'after':artifact.id,'issue_id':reply.encoding_revision.issue_id},record_encoding)
         if prior and cause and cause['kind']=='F4':
             from .transactions import commit_graph
             from consensus_assurance.core.types import Revision
@@ -296,8 +315,10 @@ def proceed(engine,unit,phase):
         write_json(engine.root/'direct-checks'/artifact.operation_id/(check.id+'-assessment.json'),record)
         from .inquiry import enabled,enqueue
         if enabled(engine) and check.status==ExecutionStatus.COMPLETED:
-            enqueue(state,'review','Review the whole direct check against its obligation, actual calls and observations',
+            task=enqueue(state,'review','Review the whole direct check against its obligation, actual calls and observations',
                 'direct_check:'+artifact.id,target_ids=[artifact.id],unit_id=unit.id)
+            if artifact.previous_id:
+                task.resolution_issue_ids=[i.id for i in state.review_issues if not i.resolved_by and i.target_id==artifact.previous_id and i.aspect=='checker_correspondence']
         engine.advance('direct_assess');return
     check=next(c for c in reversed(state.checks) if c.direct_check_id==artifact.id)
     record=next((r for r in reversed(state.monitor_results) if r.get('direct_check_id')==artifact.id and r.get('experiment_check_id')==check.id),None)

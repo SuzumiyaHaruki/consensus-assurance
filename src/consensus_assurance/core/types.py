@@ -479,6 +479,7 @@ class DirectCheckArtifact(Record):
     origin: Origin
     scope: Scope
     operation_id: str
+    previous_id: str | None = None
 
 
 class CheckRun(Record):
@@ -635,7 +636,7 @@ class Calibration(Record):
 
 class Revision(Record):
     id: str = Field(default_factory=uid)
-    kind: Literal["F1", "F2", "F3", "F4"]
+    kind: Literal["F1", "F2", "F3", "F4", "encoding"]
     rationale: str
     evidence_ids: list[str]
     target_ids: list[str]

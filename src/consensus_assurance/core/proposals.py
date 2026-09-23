@@ -240,7 +240,10 @@ class ReplayPlan(Record):
 
 
 class EncodingRevision(Record):
-    old_model_id: str
+    old_model_id: str | None = None
+    old_direct_check_id: str | None = None
+    issue_id: str | None = None
+    input_changes: list[str] = []
     source_ids: list[str] = Field(min_length=1)
     rationale: str
 
@@ -376,6 +379,7 @@ class DirectCheckPlan(Record):
 
 class DirectCheckReply(Record):
     reading_purpose: Literal["dependency", "context"] = "dependency"
+    encoding_revision: EncodingRevision | None = None
     plan: DirectCheckPlan | None = None
     gap: str
     partial_design: str = ""

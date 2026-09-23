@@ -53,6 +53,19 @@ def test_review_reading_is_consumed_by_its_unit_but_not_an_unrelated_unit(tmp_pa
     assert not any(m['file']=='setup_detail.py' for m in e.context(other)['materials'])
 
 
+def test_repair_receipt_keeps_prior_source_as_history_only(tmp_path,prepared):
+    from consensus_assurance.workflow.inquiry import enqueue
+    from consensus_assurance.workflow.task_packet import receipt
+    from consensus_assurance.core.proposals import ReviewReply
+    _,state,_,_=prepared;e=controller(tmp_path,state)
+    task=enqueue(state,'review','Inspect current source','source-swap',target_ids=[state.units[0].id],unit_id=state.units[0].id)
+    old=list(task.material_ids)
+    current=next(m for m in state.materials if m.id not in old)
+    sent=receipt(e,'semantic_review',{'materials':[current.model_dump(mode='json')]},'offline current source',ReviewReply,task,repair=True)
+    assert task.material_ids==[current.id]
+    assert sent['prior_analysis_material_ids']==[id for id in old if id!=current.id]
+
+
 def test_deferred_wake_is_based_on_serializable_dependency_change(tmp_path,prepared):
     from consensus_assurance.workflow.inquiry import pause_unit,wake_changed
     repo,state,_,_=prepared

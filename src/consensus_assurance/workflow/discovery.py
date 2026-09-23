@@ -162,8 +162,8 @@ def validate_derivation(state,reply):
         if not set(issue.object_ids)<=objects or not set(issue.source_ids)<=known or not issue.reason.strip():
             issues.append(Diagnostic(code='descriptive_issue',category='material',object_ids=issue.object_ids,paths=[f'/descriptive_issues/{i}'],material_ids=sorted(known&set(issue.source_ids)),message='Describe an existing inventory object issue with acquired source and reason',allowed=['representation','read']))
     q=reply.audit_question;current=active_candidate(state)
-    attached=set(current.material_ids if current else [])
-    attached.update(next((r['material_ids'] for r in reversed(state.packet_receipts) if r['kind']=='derive'),[]))
+    receipts=[r for r in state.packet_receipts if r['kind']=='derive' and (not current or r.get('candidate_id')==current.id)]
+    attached=set(next((r['material_ids'] for r in reversed(receipts) if r['status'] not in {'blocked_context_limit','prepared'}),[])) if receipts else set(current.material_ids if current else [])|set(next((r['material_ids'] for r in reversed(state.packet_receipts) if r['kind']=='derive' and r['status'] not in {'blocked_context_limit','prepared'}),[]))
     try:
         if spec is None:raise ValueError('An accepted inventory is required')
         outcome=classify_derivation_outcome(state,reply)
@@ -175,12 +175,12 @@ def validate_derivation(state,reply):
     except ValueError as exc:
         questions=[x for x in (q,current.question if current else None) if x]
         refs={id for x in questions for id in x.fact_ids+x.behavior_ids}
-        sources={id for x in questions for id in x.source_ids}|set(current.material_ids if current else [])
+        sources={id for x in questions for id in x.source_ids}|attached
         issues.append(Diagnostic(code='question_identity',category='semantic',object_ids=sorted(refs),material_ids=sorted(sources&known),paths=['/audit_question'],message=str(exc),allowed=['read','semantic_revision']))
     if q:
         invalid=set(q.source_ids)-known
         from .sources import includes
-        missing=not q.source_ids or not includes(state,q.source_ids,attached)
+        missing=not attached or not any(includes(state,[id],attached) for id in q.source_ids)
         terminal=reply.obligation or not (reply.reading_requests+q.requests)
         if invalid or terminal and missing:
             issues.append(Diagnostic(code='question_source_reference' if invalid else 'question_source_missing',category='material',
@@ -337,6 +337,7 @@ def ask_derivation(engine,packet):
 
 def derive(engine):
     if 'derived-spec:'+str(engine.state.audit_spec_version) in engine.state.completed_steps:return
+    if 'derive-context-deferred:'+str(engine.state.audit_spec_version) in engine.state.completed_steps:return
     if engine.state.derivation_path:
         path=Path(engine.state.derivation_path);check_id=path.stem.removeprefix('derivation-')
         if 'derive-'+check_id not in engine.state.applied_operations:
@@ -350,7 +351,16 @@ def derive(engine):
             continue_candidate(engine,candidate)
             if active_candidate(engine.state) is None:break
         packet=derive_context(engine)
-        proposal,check=ask_derivation(engine,packet)
+        try:proposal,check=ask_derivation(engine,packet)
+        except Blocked as exc:
+            if not str(exc).startswith('Required context exceeds context_chars (derive:'):raise
+            marker='derive-context-deferred:'+str(engine.state.audit_spec_version)
+            if marker not in engine.state.completed_steps:engine.state.completed_steps.append(marker)
+            if candidate:
+                candidate.status='blocked';candidate.stop_reason=str(exc)
+                candidate.resume_conditions=['Reprepare this discriminator with required exact source after the packet workset changes']
+            engine.state.gaps.append(str(exc));inquiry.release_action(engine)
+            engine.checkpoint('selected_derivation_context_deferred');return
         if accept_derivation(engine,proposal,check.id):
             inquiry.release_action(engine);engine.checkpoint('derivation_episode_committed');return
         inquiry.release_action(engine);engine.checkpoint('candidate_continuation_saved')

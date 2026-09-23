@@ -25,6 +25,19 @@ def test_encoding_correction_preserves_meaning_and_behavior(tmp_path,prepared,ch
         with pytest.raises(ValueError):validate_encoding(state,old,bundle,new,revision)
 
 
+def test_feedback_rejects_invalid_bundle_before_commit(prepared):
+    from consensus_assurance.core.proposals import Feedback
+    from consensus_assurance.workflow.investigation import validate_feedback
+    _,state,bundle,_=prepared;unit=state.units[0]
+    invalid=bundle.model_copy(deep=True)
+    invalid.checked_claim_ids=['absent-obligation']
+    feedback=Feedback(kind='F1',rationale='Recheck the actual mapping',evidence_ids=[],target_ids=[],relation_ids=[],
+        new_basis='',graph=None,bundle=invalid)
+    with pytest.raises(ValueError,match='Checker claims'):
+        validate_feedback(state,unit,bundle,feedback,PythonBackend(),'F1')
+    assert not state.revisions
+
+
 @pytest.mark.parametrize('variation',['harness','unrelated','no_check'])
 def test_old_issue_cannot_be_cleared_by_unrelated_or_unexecuted_model(tmp_path,prepared,variation):
     from consensus_assurance.core.types import ReviewIssue,InquiryTask,SemanticCheck

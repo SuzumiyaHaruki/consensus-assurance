@@ -109,10 +109,10 @@ def ask(engine,kind,response_type,context,validator=None,*,purpose="depth"):
                 session.setdefault('read_plan_id',uid())
                 obtained=engine.read(session['read_requests'],purpose=purpose,plan_id=session['read_plan_id'],related_ids=[id for id in logical_task.values() if id],reason=session['error'])
                 if obtained['status']!='complete':raise Blocked('Check continuation requires the deferred source ranges')
-                session['requested_material_ids']=list(dict.fromkeys(session.get('requested_material_ids',[])+[id for item in obtained['items'] if item['status']!='deferred' for id in item['material_ids']]))
+                session['requested_material_ids']=[id for item in obtained['items'] if item['status']!='deferred' for id in item['material_ids']]
                 session['read_requests']=[];session.pop('read_plan_id')
                 save_session(engine,session)
-            attached=set(state.task_attachments.get(attachment_key(state),[]))
+            attached=set(session.get('requested_material_ids',[]))
             context['attached_materials']=[m.model_dump(mode='json') for m in state.materials if m.id in attached]
             request={**context,'previous_reply':json.loads(Path(session['current_path']).read_text()),'generation_error':session['error'],
                 'requested_material_ids':session.get('requested_material_ids',[])}

@@ -109,9 +109,10 @@ def slice_for(state,question=None,classes=(),object_ids=()):
     fs.update(f.id for f in spec.facts if f.id in object_ids)
     selected=set(classes)|set(question.activity_classes if question else [])|{a.class_id for a in spec.activities if a.class_id in object_ids}
     if not question:bs.update(b.id for b in spec.behaviors if b.primary_activity in selected)
-    fs.update(f.id for f in spec.facts if set(f.established_by+f.consumed_by)&bs)
-    for f in spec.facts:
-        if f.id in fs:bs.update(f.established_by+f.consumed_by+f.invalidators+f.reinterpreters)
+    if not question:
+        fs.update(f.id for f in spec.facts if set(f.established_by+f.consumed_by)&bs)
+        for f in spec.facts:
+            if f.id in fs:bs.update(f.established_by+f.consumed_by+f.invalidators+f.reinterpreters)
     selected.update(b.primary_activity for b in spec.behaviors if b.id in bs)
     return {'version':spec.version,'target_profile':spec.target_profile.model_dump(mode='json'),'activities':[a.model_dump(mode='json') for a in spec.activities if a.class_id in selected],
         'behaviors':[b.model_dump(mode='json') for b in spec.behaviors if b.id in bs],'facts':[f.model_dump(mode='json') for f in spec.facts if f.id in fs],

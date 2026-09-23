@@ -203,6 +203,23 @@ emit("completed",done=True,valid=future.error_seen and not future.bad_order and 
     assert monitor_events([events[0],missing],monitor,prop,requirements)['outcome']=='unknown'
 
 
+@pytest.mark.parametrize('eligible,success,expected',[(False,False,'holds'),(False,True,'violated'),(True,False,'unknown'),(True,True,'unknown')])
+def test_necessary_support_oracle_does_not_require_sufficient_completion(eligible,success,expected):
+    from consensus_assurance.workflow.observations import monitor_events
+    requirements=[EventRequirement(alias='input',event='admitted')]
+    prop=ObservableProperty(checker_id='Support',trigger=Comparison(field='event',value='returned'),
+        assertion=Comparison(field='state.success',value=False),identity_fields=['operation','context'],
+        description='Success requires eligible support')
+    monitor=EventMonitor(id='support',checker_id='Support',event='returned',binding_ids=['fixture'],grounding=Grounding(),
+        applicability_conditions=[Comparison(field='state.eligible_support',value=False)])
+    events=[{'event':'admitted','operation':'one','context':'fixed','state':{'eligible_support':eligible}},
+        {'event':'returned','operation':'one','context':'fixed','state':{'eligible_support':eligible,'success':success}}]
+    assert monitor_events(events,monitor,prop,requirements)['outcome']==expected
+    if not eligible:
+        assert monitor_events(events[:1],monitor,prop,requirements)['outcome']=='unknown'
+        assert monitor_events([events[0],{k:v for k,v in events[1].items() if k!='operation'}],monitor,prop,requirements)['outcome']=='unknown'
+
+
 @pytest.mark.parametrize('failure',['prerequisite','missing','compile','test_failure','disputed','unreviewed','identity','applicability'])
 def test_direct_failure_never_confirms(tmp_path,prepared,failure):
     e,u,p=setup(tmp_path,prepared,True)
@@ -305,6 +322,77 @@ def test_new_direct_artifact_does_not_hide_prior_oracle_dispute(tmp_path,prepare
     new=save_plan(e,u,p,'new');review(e.state,u,new)
     c=execute(e,new);result=assess(e.state,u,new,p,c,extract_events(c))
     assert not result['confirmed'] and any('Open review issue' in x and 'wrong return boundary' in x for x in result['blockers'])
+
+
+def test_reviewed_direct_encoding_correction_reexecutes_and_resolves_only_its_issue(tmp_path,prepared):
+    from consensus_assurance.adapters.agents.backend import MockAgent
+    from consensus_assurance.workflow.inquiry import enqueue,process_task
+    e,u,correct=setup(tmp_path,prepared,True)
+    wrong=correct.model_copy(deep=True)
+    wrong.observable_properties[0].assertion=Comparison(field='state.value',reference='start.state.limit')
+    old=save_plan(e,u,wrong,'wrong-oracle')
+    original=execute(e,old);assess(e.state,u,old,wrong,original,extract_events(original))
+    e.state.active_unit_id=None;u.status='blocked';e.state.usage['audit_units']=e.config.budget.audit_units
+    task=enqueue(e.state,'review','Inspect actual checker','oracle-review',target_ids=[old.id],unit_id=u.id)
+    sources=target_contract(e.state,old)['required_material_ids']
+    challenge=SemanticCheck(target_id=old.id,aspect='checker_correspondence',status='revision_needed',source_ids=sources,
+        counterevidence=['Equality to capacity is stronger than the selected range safety claim'],rationale='The checker rejects legal non-capacity results')
+    e.agent=MockAgent();e.agent.responses=[ReviewReply(items=[challenge],limitations=[]).model_dump(mode='json')]
+    process_task(e,task)
+    issue=next(i for i in e.state.review_issues if i.target_id==old.id)
+    assert e.state.inquiry_tasks[0].check_id==e.state.semantic_reviews[-1].check_id
+    assert e.state.next_action=='direct_check' and e.state.active_unit_id==u.id and e.state.pending_feedback['issue_id']==issue.id
+    assert e.state.usage['audit_units']==e.config.budget.audit_units and e.state.units[0].status=='selected'
+    correction=EncodingRevision(old_direct_check_id=old.id,issue_id=issue.id,source_ids=issue.source_ids,
+        rationale='Use the sourced range safety assertion instead of equality to capacity')
+    def ask(kind,response_type,context,validator=None,**kwargs):
+        reply=DirectCheckReply(plan=correct,gap='',encoding_revision=correction)
+        assert context['checker_issue']['id']==issue.id
+        if validator:validator(reply)
+        return reply,CheckRun(action='agent',cwd=str(e.root),snapshot_id=e.state.snapshot.id)
+    e.ask=ask;proceed(e,u,'direct_check')
+    revised=next(a for a in e.state.direct_checks if a.id!=old.id)
+    assert revised.previous_id==old.id and revised.plan_path!=old.plan_path
+    assert e.state.revisions[-1].kind=='encoding' and e.state.next_action=='direct_execute'
+    proceed(e,u,'direct_execute')
+    new_check=next(c for c in e.state.checks if c.direct_check_id==revised.id)
+    assert new_check.id!=original.id and issue.resolved_by is None
+    review_task=next(t for t in e.state.inquiry_tasks if revised.id in t.target_ids)
+    assert review_task.resolution_issue_ids==[issue.id]
+    accepted=SemanticCheck(target_id=revised.id,aspect='checker_correspondence',status='no_issue_found',source_ids=sources,
+        rationale='The new actual run compares the observed result to the accepted range condition')
+    resolution=IssueResolution(issue_id=issue.id,target_version=issue.target_version,original_question=issue.explanation,
+        source_ids=sources,rationale='The new assertion removed the stronger equality and the new run reached the same return',
+        residual_issue_ids=[],scope_limitations=[])
+    e.agent=MockAgent();e.agent.responses=[ReviewReply(items=[accepted],resolves_issue_ids=[issue.id],resolutions=[resolution],
+        resolution_rationale='Address the original oracle discrepancy with the new executed artifact',limitations=[]).model_dump(mode='json')]
+    e.ask=Engine.ask.__get__(e,Engine)
+    process_task(e,review_task)
+    issue=next(i for i in e.state.review_issues if i.id==issue.id)
+    assert issue.resolved_by and issue.resolution_checks==[new_check.id]
+    current=next(r for r in e.state.monitor_results if r['direct_check_id']==revised.id)
+    assert current['confirmed'] and 'Cluster-wide consequences outside this finite call' in current['boundaries']
+    assert len([c for c in e.state.checks if c.action=='direct_check'])==2
+    assert Path(old.plan_path).exists() and Path(original.stdout).exists()
+    assert next(r for r in e.state.monitor_results if r['direct_check_id']==old.id)['experiment_check_id']==original.id
+
+
+def test_direct_encoding_observation_change_must_be_declared(tmp_path,prepared):
+    from consensus_assurance.workflow.direct_checks import validate_reply
+    e,u,old_plan=setup(tmp_path,prepared);old=save_plan(e,u,old_plan,'observation-old');execute(e,old)
+    issue=ReviewIssue(review_id='review',target_id=old.id,target_version=old.version,aspect='checker_correspondence',
+        source_ids=u.audit_question.source_ids,explanation='The old observation field is not independent',disposition='blocked',reason='Correct observed input')
+    e.state.review_issues.append(issue);e.state.active_direct_check_id=old.id
+    e.state.pending_feedback={'kind':'encoding','issue_id':issue.id,'check_id':next(c.id for c in e.state.checks if c.direct_check_id==old.id)}
+    fixed=old_plan.model_copy(deep=True)
+    fixed.harness.source=fixed.harness.source.replace('in_range=0 <= returned <= limit','range_observed=0 <= returned <= limit')
+    fixed.harness.semantic_changes.append('Emit the independently computed range observation')
+    fixed.observable_properties[0].assertion=Comparison(field='state.range_observed',value=True)
+    revision=EncodingRevision(old_direct_check_id=old.id,issue_id=issue.id,source_ids=issue.source_ids,rationale='Use the separately observed result')
+    with pytest.raises(ValueError,match='declared'):
+        validate_reply(e.state,u,DirectCheckReply(plan=fixed,gap='',encoding_revision=revision),e.implementation,old_plan)
+    revision.input_changes=['Add an independent range observation to the result event']
+    validate_reply(e.state,u,DirectCheckReply(plan=fixed,gap='',encoding_revision=revision),e.implementation,old_plan)
 
 
 def test_new_review_issue_updates_the_single_current_result(tmp_path,prepared):
