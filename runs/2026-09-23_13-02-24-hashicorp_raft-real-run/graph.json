@@ -1,0 +1,148 @@
+{
+  "version": 1,
+  "claims": [
+    {
+      "id": "O_append_predecessor_retention",
+      "kind": "obligation",
+      "description": "After successful conflicting-suffix deletion followed by replacement StoreLogs failure, a subsequent AppendEntries invocation must not succeed by validating a nonzero predecessor against cached last-entry metadata when that predecessor is absent from retained logs and is not represented by the current snapshot boundary.",
+      "scope": {
+        "description": "Receiver-local predecessor validation across two sequential AppendEntries invocations, retaining the original deletion-then-storage-error prehistory. Observe the second response against independently inspected retained history.",
+        "assumptions": [
+          "Initial cached last-log metadata agrees with retained logs.",
+          "The conflicting suffix lies above the committed index and snapshot boundary.",
+          "DeleteRange succeeds and removes the specified suffix.",
+          "The following StoreLogs returns an error without restoring the deleted predecessor; this is an explicit injected fault case, not an observed property of a deployed adapter.",
+          "The subsequent request has an acceptable term, uses the deleted former last-log index and term as its predecessor, has no entries, and does not advance commitment.",
+          "No intervening restore, restart, successful append, or other metadata repair occurs."
+        ],
+        "excluded": [
+          "Proof that a legal sender history produces the subsequent request.",
+          "Production adapter failure behavior and deployment exposure.",
+          "Crash durability, quorum advancement, decided-entry loss, and client-visible consequences.",
+          "Predecessors legitimately represented by the current snapshot boundary."
+        ],
+        "parameters": {}
+      },
+      "source": "Candidate derived from attributed implementation responsibilities",
+      "source_ids": [
+        "raft.go:1440:1584",
+        "state.go:1:174",
+        "log.go:112:144"
+      ],
+      "pending": [
+        "Establish executable fixture prerequisites and inspect actual responses and retained storage.",
+        "Determine separately whether the stipulated subsequent request is reachable in a legal sender history."
+      ],
+      "assessment": "unassessed",
+      "candidate": true,
+      "grounding": {
+        "source_ids": [
+          "raft.go:1440:1584",
+          "state.go:1:174",
+          "log.go:112:144",
+          "inmem_store.go:1:133"
+        ],
+        "expectation_ids": [
+          "state.go:1:174",
+          "log.go:112:144",
+          "raft.go:1440:1584"
+        ],
+        "binding_ids": [
+          "BIND_append_predecessor_retention",
+          "BIND_last_entry_retention"
+        ],
+        "derivation": "The state helper explicitly describes getLastEntry as returning the last index and term in stable storage, and identifies lastLog fields as a cache of LogStore. LogStore attributes inclusive deletion and indexed lookup to its implementations. appendEntries consumes that cache as a substitute for GetLog when validating a matching predecessor index. Together these establish a local producer/consumer expectation: cached identity used for successful predecessor validation must still represent retained history. This expectation is distinct from the observed guards. The handler deletes the suffix before replacement storage, returns on storage error without updating last-log metadata, and later permits the cached predecessor branch without a storage lookup. An independent oracle can inspect GetLog and the snapshot boundary at the second response. The source supports a concrete suspicion, not an executed violation.",
+        "applicability": "Applies to the selected receiver success boundary under the explicit storage-error prehistory. InmemStore provides inspectable deletion and lookup behavior but its StoreLogs always returns nil; a fault-injecting wrapper is required for this local check. Such injection does not establish production exposure or legal sender reachability.",
+        "unresolved": [
+          "Actual experiment outcome.",
+          "Legal sender history and dispatch reachability for the subsequent request.",
+          "Selected production adapter and its error semantics.",
+          "Remote interpretation and broader consensus consequences."
+        ],
+        "conflicts": [],
+        "alternatives": [
+          "An intervening metadata reconstruction could prevent the sequence in a full execution; the bounded check excludes such an intervention and does not establish its absence in deployed histories.",
+          "A snapshot boundary could legitimately supply the predecessor; the check places the deleted predecessor strictly above it."
+        ]
+      },
+      "version": 1
+    }
+  ],
+  "bindings": [
+    {
+      "associations": [
+        {
+          "claim_id": "O_append_predecessor_retention",
+          "source_ids": [
+            "raft.go:1440:1584"
+          ],
+          "rationale": "Directly checks the handler's deletion/error prehistory and subsequent cached predecessor validation through the success response."
+        }
+      ],
+      "anchor": {
+        "source_ids": [
+          "raft.go:1440:1584"
+        ],
+        "boundary_complete": true,
+        "kind": "declaration",
+        "material_id": "raft.go:1440:1584",
+        "start_line": 1440,
+        "end_line": 1440,
+        "symbol": "Raft.appendEntries"
+      },
+      "material_id": "raft.go:1440:1584",
+      "id": "BIND_append_predecessor_retention",
+      "file": "raft.go",
+      "symbol": "Raft.appendEntries",
+      "start_line": 1440,
+      "end_line": 1580,
+      "snapshot_id": "2a981dc4b1154c50b8029f5aac0de371",
+      "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800",
+      "basis": "agent_inference",
+      "description": "Two invocations span successful suffix deletion, replacement storage failure, cached predecessor validation, and the subsequent response.",
+      "pending": [
+        "Full dispatch and legal sender reachability remain unchecked."
+      ],
+      "excerpt": "func (r *Raft) appendEntries(rpc RPC, a *AppendEntriesRequest) {\n\tdefer metrics.MeasureSince([]string{\"raft\", \"rpc\", \"appendEntries\"}, time.Now())\n\t// Setup a response\n\tresp := &AppendEntriesResponse{\n\t\tRPCHeader:      r.getRPCHeader(),\n\t\tTerm:           r.getCurrentTerm(),\n\t\tLastLog:        r.getLastIndex(),\n\t\tSuccess:        false,\n\t\tNoRetryBackoff: false,\n\t}\n\tvar rpcErr error\n\tdefer func() {\n\t\trpc.Respond(resp, rpcErr)\n\t}()\n\n\t// Ignore an older term\n\tif a.Term < r.getCurrentTerm() {\n\t\treturn\n\t}\n\n\t// Increase the term if we see a newer one, also transition to follower\n\t// if we ever get an appendEntries call\n\tif a.Term > r.getCurrentTerm() || (r.getState() != Follower && !r.candidateFromLeadershipTransfer.Load()) {\n\t\t// Ensure transition to follower\n\t\tr.setState(Follower)\n\t\tr.setCurrentTerm(a.Term)\n\t\tresp.Term = a.Term\n\t}\n\n\t// Save the current leader\n\tif len(a.Addr) > 0 {\n\t\tr.setLeader(r.trans.DecodePeer(a.Addr), ServerID(a.ID))\n\t} else {\n\t\tr.setLeader(r.trans.DecodePeer(a.Leader), ServerID(a.ID))\n\t}\n\t// Verify the last log entry\n\tif a.PrevLogEntry > 0 {\n\t\tlastIdx, lastTerm := r.getLastEntry()\n\n\t\tvar prevLogTerm uint64\n\t\tif a.PrevLogEntry == lastIdx {\n\t\t\tprevLogTerm = lastTerm\n\t\t} else {\n\t\t\tvar prevLog Log\n\t\t\tif err := r.logs.GetLog(a.PrevLogEntry, &prevLog); err != nil {\n\t\t\t\tr.logger.Warn(\"failed to get previous log\",\n\t\t\t\t\t\"previous-index\", a.PrevLogEntry,\n\t\t\t\t\t\"last-index\", lastIdx,\n\t\t\t\t\t\"error\", err)\n\t\t\t\tresp.NoRetryBackoff = true\n\t\t\t\treturn\n\t\t\t}\n\t\t\tprevLogTerm = prevLog.Term\n\t\t}\n\n\t\tif a.PrevLogTerm != prevLogTerm {\n\t\t\tr.logger.Warn(\"previous log term mis-match\",\n\t\t\t\t\"ours\", prevLogTerm,\n\t\t\t\t\"remote\", a.PrevLogTerm)\n\t\t\tresp.NoRetryBackoff = true\n\t\t\treturn\n\t\t}\n\t}\n\n\t// Process any new entries\n\tif len(a.Entries) > 0 {\n\t\tstart := time.Now()\n\n\t\t// Delete any conflicting entries, skip any duplicates\n\t\tlastLogIdx, _ := r.getLastLog()\n\t\tvar newEntries []*Log\n\t\tfor i, entry := range a.Entries {\n\t\t\tif entry.Index > lastLogIdx {\n\t\t\t\tnewEntries = a.Entries[i:]\n\t\t\t\tbreak\n\t\t\t}\n\t\t\tvar storeEntry Log\n\t\t\tif err := r.logs.GetLog(entry.Index, &storeEntry); err != nil {\n\t\t\t\tr.logger.Warn(\"failed to get log entry\",\n\t\t\t\t\t\"index\", entry.Index,\n\t\t\t\t\t\"error\", err)\n\t\t\t\treturn\n\t\t\t}\n\t\t\tif entry.Term != storeEntry.Term {\n\t\t\t\tr.logger.Warn(\"clearing log suffix\", \"from\", entry.Index, \"to\", lastLogIdx)\n\t\t\t\tif err := r.logs.DeleteRange(entry.Index, lastLogIdx); err != nil {\n\t\t\t\t\tr.logger.Error(\"failed to clear log suffix\", \"error\", err)\n\t\t\t\t\treturn\n\t\t\t\t}\n\t\t\t\tif entry.Index <= r.configurations.latestIndex {\n\t\t\t\t\tr.setLatestConfiguration(r.configurations.committed, r.configurations.committedIndex)\n\t\t\t\t}\n\t\t\t\tnewEntries = a.Entries[i:]\n\t\t\t\tbreak\n\t\t\t}\n\t\t}\n\n\t\tif n := len(newEntries); n > 0 {\n\t\t\t// Append the new entries\n\t\t\tif err := r.logs.StoreLogs(newEntries); err != nil {\n\t\t\t\tr.logger.Error(\"failed to append to logs\", \"error\", err)\n\t\t\t\t// TODO: leaving r.getLastLog() in the wrong\n\t\t\t\t// state if there was a truncation above\n\t\t\t\treturn\n\t\t\t}\n\n\t\t\t// Handle any new configuration changes\n\t\t\tfor _, newEntry := range newEntries {\n\t\t\t\tif err := r.processConfigurationLogEntry(newEntry); err != nil {\n\t\t\t\t\tr.logger.Warn(\"failed to append entry\",\n\t\t\t\t\t\t\"index\", newEntry.Index,\n\t\t\t\t\t\t\"error\", err)\n\t\t\t\t\trpcErr = err\n\t\t\t\t\treturn\n\t\t\t\t}\n\t\t\t}\n\n\t\t\t// Update the lastLog\n\t\t\tlast := newEntries[n-1]\n\t\t\tr.setLastLog(last.Index, last.Term)\n\t\t}\n\n\t\tmetrics.MeasureSince([]string{\"raft\", \"rpc\", \"appendEntries\", \"storeLogs\"}, start)\n\t}\n\n\t// Update the commit index\n\tif a.LeaderCommitIndex > 0 && a.LeaderCommitIndex > r.getCommitIndex() {\n\t\tstart := time.Now()\n\t\tidx := min(a.LeaderCommitIndex, r.getLastIndex())\n\t\tr.setCommitIndex(idx)\n\t\tif r.configurations.latestIndex <= idx {\n\t\t\tr.setCommittedConfiguration(r.configurations.latest, r.configurations.latestIndex)\n\t\t}\n\t\tr.processLogs(idx, nil)\n\t\tmetrics.MeasureSince([]string{\"raft\", \"rpc\", \"appendEntries\", \"processLogs\"}, start)\n\t}\n\n\t// Everything went well, set success\n\tresp.Success = true\n\tr.setLastContact()\n}",
+      "version": 1
+    },
+    {
+      "associations": [
+        {
+          "claim_id": "O_append_predecessor_retention",
+          "source_ids": [
+            "state.go:1:174"
+          ],
+          "rationale": "Directly supplies the cached predecessor identity whose agreement with retained history is checked."
+        }
+      ],
+      "anchor": {
+        "source_ids": [
+          "state.go:1:174"
+        ],
+        "boundary_complete": true,
+        "kind": "declaration",
+        "material_id": "state.go:1:174",
+        "start_line": 167,
+        "end_line": 167,
+        "symbol": "raftState.getLastEntry"
+      },
+      "material_id": "state.go:1:174",
+      "id": "BIND_last_entry_retention",
+      "file": "state.go",
+      "symbol": "raftState.getLastEntry",
+      "start_line": 167,
+      "end_line": 174,
+      "snapshot_id": "2a981dc4b1154c50b8029f5aac0de371",
+      "content_digest": "9e73b5bcd67350db80c272c0d0f3f6c17afb24fb6e62b28e891c13e96107e189",
+      "basis": "agent_inference",
+      "description": "Returns cached log or snapshot identity without consulting retained logs.",
+      "pending": [
+        "Locking protects the metadata read but does not itself establish agreement with storage after deletion."
+      ],
+      "excerpt": "func (r *raftState) getLastEntry() (uint64, uint64) {\n\tr.lastLock.Lock()\n\tdefer r.lastLock.Unlock()\n\tif r.lastLogIndex >= r.lastSnapshotIndex {\n\t\treturn r.lastLogIndex, r.lastLogTerm\n\t}\n\treturn r.lastSnapshotIndex, r.lastSnapshotTerm\n}",
+      "version": 1
+    }
+  ],
+  "relations": []
+}
