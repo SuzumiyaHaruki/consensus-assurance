@@ -276,7 +276,7 @@ def ask(engine,kind,response_type,context,validator=None,*,purpose="depth"):
             if artifact_output:
                 draft=getattr(response,'draft',None)
                 core=[p for p in draft.pending_work if p.component in {'behavior','properties'}] if draft else []
-                unfinished=not any(getattr(response,k,None) for k in ('bundle','draft','plan','harness')) and getattr(response,'fallback','none')=='none'
+                unfinished=not any(getattr(response,k,None) for k in ('bundle','draft','plan','harness')) and (getattr(response,'fallback','none')=='none' or bool(response.requests))
                 if core or unfinished:
                     reason='Complete pending model work: '+'; '.join(p.reason for p in core) if core else response.gap
                     session=continue_generation(engine,kind,logical_task,merged,check,reason,session,list(response.requests)+[r for p in core for r in p.requests])

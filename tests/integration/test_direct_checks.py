@@ -159,7 +159,7 @@ def test_direct_construction_keeps_partial_design_through_read_and_validation(tm
             return super().analyze(runner,prompt,directory,snapshot_id,timeout,response_type)
     e.agent=Generation()
     e.agent.responses=[
-        DirectCheckReply(gap='Need the helper',partial_design='Call the selected boundary and observe its return',requests=[request]).model_dump(mode='json'),
+        DirectCheckReply(gap='Need the helper',partial_design='Call the selected boundary and observe its return',requests=[request],fallback='source_review').model_dump(mode='json'),
         DirectCheckReply(gap='',partial_design='Call the selected boundary and observe its return',plan=invalid).model_dump(mode='json'),
         DirectCheckReply(gap='',partial_design='Call the selected boundary and observe its return',plan=plan).model_dump(mode='json')]
     proceed(e,u,'direct_check')
