@@ -118,22 +118,6 @@ def slice_for(state,question=None,classes=(),object_ids=()):
         'surfaces':[s.model_dump(mode='json') for s in spec.surfaces if set(s.behavior_ids)&bs or audit_object_key(s) in object_ids]}
 
 
-def next_surface_refinement(state):
-    """Choose one unattempted frontier entry; selection never changes the inventory."""
-    spec=load(state)
-    if spec is None or any(c.status=='active' for c in state.question_candidates):return None
-    if state.last_work_kind=='surface' and 'derived-spec:'+str(state.audit_spec_version) not in state.completed_steps:return None
-    if any(u.status in {'pending','partial','selected'} and u.audit_question and u.audit_question.disposition=='ready_for_check' for u in state.units):return None
-    attempted={entry for task in state.inquiry_tasks if task.admitted for entry in task.surface_entry_points}
-    exhausted={entry for task in state.inquiry_tasks if task.preparation_failures for entry in task.surface_entry_points}
-    available=[s for s in spec.surfaces if s.high_consequence and s.disposition in {'deferred','UNCLASSIFIED_PROTOCOL_RESPONSIBILITY'} and s.entry_point not in attempted|exhausted]
-    focus=set(state.config.get('activity_focus',[]));behaviors={b.id:b for b in spec.behaviors}
-    def priority(surface):
-        classes={behaviors[id].primary_activity for id in surface.behavior_ids if id in behaviors}
-        return (0 if focus and classes&focus else 1, surface.entry_point)
-    return min(available,key=priority,default=None)
-
-
 def merge_delta(state,task,delta):
     """Apply a focused wire delta on a copy; ordinary full validation still decides acceptance."""
     import json
@@ -144,7 +128,7 @@ def merge_delta(state,task,delta):
         old=ConsensusAuditSpec.model_validate(draft.get('audit_spec',draft))
     if old is None:raise ValueError('Descriptive delta needs an accepted inventory or an initial draft')
     raw=old.model_dump(mode='json');issues=[];before_index=audit_object_index(old);proposed=audit_object_index(delta)
-    focus=list(dict.fromkeys(task.target_ids+task.activity_classes+['surface:'+s for s in task.surface_entry_points]))
+    focus=list(dict.fromkeys(task.target_ids+['surface:'+s for s in task.surface_entry_points]))
     def reject(ids,message):
         for key in ids:
             prior=before_index.get(key);after=proposed.get(key)
@@ -152,17 +136,17 @@ def merge_delta(state,task,delta):
             issues.append(Diagnostic(code='audit_spec_semantics',category='semantic',object_ids=[key],paths=['/delta'+path] if path else ['/delta'],
                 material_ids=sorted((audit_object_sources(prior)|audit_object_sources(after))&{m.id for m in state.materials}),message=message,
                 details={'old':prior,'proposed':after,'focus':focus},allowed=['read','semantic_revision']))
-    view=(slice_for(state,object_ids=focus) or old.model_dump(mode='json')) if focus else {k:[] for k in ('behaviors','facts','surfaces')}
-    bs={o['id'] for o in view['behaviors']};fs={o['id'] for o in view['facts']}
-    surfaces={audit_object_key(o) for o in view['surfaces']}
+    bs={b.id for b in old.behaviors if b.id in task.target_ids}
+    fs={f.id for f in old.facts if f.id in task.target_ids}
+    surfaces={id for id in focus if id.startswith('surface:')}
     # New objects may connect directly to existing producers/consumers, without granting global rewrite authority.
     new_bs=[b for b in delta.behaviors if b.id not in {b.id for b in old.behaviors}]
     new_fs=[f for f in delta.facts if f.id not in {f.id for f in old.facts}]
     fs.update(id for b in new_bs for id in b.produces_fact_ids+b.consumes_fact_ids)
     bs.update(id for f in new_fs for id in f.established_by+f.consumed_by+f.invalidators+f.reinterpreters)
     bs.update(b.id for b in delta.behaviors if set(b.produces_fact_ids+b.consumes_fact_ids)&{f.id for f in new_fs})
-    classes=set(task.target_ids+task.activity_classes)&{a.class_id for a in old.activities}
-    allowed={'behaviors':bs,'facts':fs,'activities':classes,'surfaces':surfaces|{audit_object_key(s) for s in old.surfaces if set(s.behavior_ids)&bs}}
+    classes=set(task.target_ids)&{a.class_id for a in old.activities}
+    allowed={'behaviors':bs,'facts':fs,'activities':classes,'surfaces':surfaces}
     for collection,remove in [('activities',[]),('behaviors',delta.remove_behavior_ids),('facts',delta.remove_fact_ids),('surfaces',['surface:'+s for s in delta.remove_surface_entry_points])]:
         before={audit_object_key(o):o for o in getattr(old,collection)};updates=getattr(delta,collection);ids=[audit_object_key(o) for o in updates]
         if len(ids)!=len(set(ids)) or len(remove)!=len(set(remove)) or set(ids)&set(remove):reject(ids+remove,'Duplicate or conflicting delta identities')

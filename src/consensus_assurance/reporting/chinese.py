@@ -52,7 +52,6 @@ def execution_summary(check):
 
 
 def progress_lines(state):
-    checks = [c for c in state.checks if c.action == "model_check"]
     return ["", "## 本次流程进度", "",
         "工具调用完成、分析产物被接受、性质得到证据支持是不同状态。恢复时重复的版本检查不是重复验证协议。", "",
         "| 阶段 | 已记录的进度 |", "| --- | --- |",
@@ -61,8 +60,6 @@ def progress_lines(state):
         f"| 直接实现检查 | 已保存 {len(state.direct_checks)} 个制品；完成 {sum(c.action=='direct_check' and c.status==ExecutionStatus.COMPLETED for c in state.checks)} 次执行；不等于整体性质成立 |",
         f"| 局部模型 | 已保存 {len(state.models)} 个模型版本；保存不代表检查通过 |",
         f"| 轨迹校准 | {len(state.calibrations)} 条校准记录；不等同于性质判定 |",
-        f"| 模型搜索 | {len(checks)} 次执行记录；逐项结果见下方，未执行不计通过 |",
-        f"| 性质证据 | {len(state.evidence)} 条直接证据；范围与层级见证据记录 |",
         "", "若 agent 回复完成而目标发现仍未被接受，不能把该回复视为已成立的关系图。历史记录未保存具体拒绝原因时，报告不补造原因。"]
 
 
@@ -94,8 +91,21 @@ def resource_lines(state):
         return ('problem',id)
     obligation_owner={c.obligation_id:family(c.id) for c in state.question_candidates if c.obligation_id}
     unit_owner={u.id:next((obligation_owner[id] for id in u.obligation_ids if id in obligation_owner),('unit',u.id)) for u in state.units}
+    def task_owner(task):
+        if task.candidate_id:return family(task.candidate_id)
+        if task.unit_id:return unit_owner.get(task.unit_id,('unit',task.unit_id))
+        if task.surface_entry_points:return ('frontier',','.join(task.surface_entry_points))
+        return ('startup','shared') if task.kind=='spec_refine' else ('unknown','unattributed')
     owners={id:family(c.id) for c in state.question_candidates for id in c.check_ids}
-    owners.update({t.check_id:family(t.candidate_id) if t.candidate_id else unit_owner.get(t.unit_id,('unit',t.unit_id)) for t in state.inquiry_tasks if t.check_id and (t.candidate_id or t.unit_id)})
+    owners.update({t.check_id:task_owner(t) for t in state.inquiry_tasks if t.check_id})
+    packets={p['check_id']:p for p in state.packet_receipts if p.get('check_id')}
+    def packet_owner(packet):
+        task=tasks.get(packet.get('task_id'))
+        if task:return task_owner(task)
+        if packet.get('candidate_id') in candidates:return family(packet['candidate_id'])
+        if packet.get('unit_id'):return unit_owner.get(packet['unit_id'],('unit',packet['unit_id']))
+        return ('startup','shared') if packet['kind'] in {'read','discover','spec_refine'} else ('unknown','unattributed')
+    owners.update({id:packet_owner(packet) for id,packet in packets.items() if id not in owners})
     for check in state.checks:
         if check.direct_check_id in artifacts:owners.setdefault(check.id,unit_owner.get(artifacts[check.direct_check_id].unit_id,('unit',artifacts[check.direct_check_id].unit_id)))
         if check.model_id in models:owners.setdefault(check.id,unit_owner.get(models[check.model_id].unit_id,('unit',models[check.model_id].unit_id)))
@@ -104,14 +114,16 @@ def resource_lines(state):
         owner=owners.get(check.id,('startup','shared') if check.action in PROBES else ('unknown','unattributed'));r=row(owner)
         r['calls']+=check.action=='agent' and not check.reused;r['executions']+=check.action in {'direct_check','model_check','experiment','replay'} and not check.reused
     for packet in sent:
-        task=tasks.get(packet.get('task_id'));owner=owners.get(packet.get('check_id')) or (family(task.candidate_id) if task and task.candidate_id else unit_owner.get(task.unit_id,('unit',task.unit_id)) if task and task.unit_id else unit_owner.get(packet.get('unit_id'),('unit',packet['unit_id'])) if packet.get('unit_id') else ('unknown','unattributed') if task else ('startup','shared'))
+        owner=owners.get(packet.get('check_id'),packet_owner(packet))
         row(owner)['sent']+=packet.get('source_chars_sent',0)
-    allocations=iter(state.material_allocations)
     row(('startup','shared'))['acquired']=max(0,used['unique_chars']-sum(a.get('new_chars',0) for a in state.material_allocations))
-    for history in state.reading_history:
-        related=history.get('related_ids',[]);owner=next((family(x) for x in related if x in candidates),None) or next((unit_owner[x] for x in related if x in unit_owner),None) or (('unknown','unattributed') if related else ('startup','shared'))
-        for _ in history.get('added_material_ids',[]):
-            row(owner)['acquired']+=next(allocations,{}).get('new_chars',0)
+    histories={h['plan_id']:h for h in state.reading_history if h.get('plan_id')}
+    for allocation in state.material_allocations:
+        history=histories.get(allocation.get('plan_id'),{})
+        related=history.get('related_ids',[])
+        owner=next((family(x) for x in related if x in candidates),None) or next((unit_owner[x] for x in related if x in unit_owner),None)
+        if owner is None:owner=('startup','shared') if not related or all(x in {'A1','A2','A3','A4','A5','A6','A7'} for x in related) else ('unknown','unattributed')
+        row(owner)['acquired']+=allocation.get('new_chars',0)
     for candidate in state.question_candidates:
         view=__import__('consensus_assurance.workflow.task_view',fromlist=['candidate_view']).candidate_view(state,candidate);result=view['current_result']
         item=row(family(candidate.id));value=(f"{result['outcome']}; blockers={len(result['blockers'])}; boundaries={len(result['boundaries'])}" if result else candidate.status)
@@ -215,10 +227,7 @@ def render_report(state, root):
     if not state.question_candidates:
         lines.append('未记录结构化候选问题。')
     from consensus_assurance.workflow.discovery import candidate_blockage
-    blockages=[candidate_blockage(state,c) for c in state.question_candidates]
-    lines.append('候选受阻分类：'+ '；'.join(k+'='+str(blockages.count(k)) for k in ('evidence_blocked','workflow_blocked','resource_blocked')))
     from consensus_assurance.workflow.task_view import candidate_view
-    children={c.id:[candidate_view(state,x) for x in state.question_candidates if x.parent_candidate_id==c.id] for c in state.question_candidates}
     for candidate in state.question_candidates:
         q=candidate.question;current=candidate_view(state,candidate);result=current['current_result']
         if candidate.status=='explained':
@@ -230,9 +239,7 @@ def render_report(state, root):
         if result:lines.append(f"  当前局部结果：{result}；执行/证据关联：{current['check_ids']} / {current['evidence_ids']}；当前剩余判别：{current['remaining_discriminators']}。")
         if candidate.parent_candidate_id:
             parent=next((x for x in state.question_candidates if x.id==candidate.parent_candidate_id),None)
-            lines.append(f"  Parent `{candidate.parent_candidate_id}`；fork 原因：{candidate.fork_reason}；Parent 未决：{parent.question.unknowns if parent else '历史 Parent 不可用'}；child 局部义务/检查：{candidate.obligation_id or '未生成'} / {current['unit_status'] or '未形成 AuditUnit'}。")
-        if children[candidate.id]:
-            lines.append('  Child 当前贡献：'+str(children[candidate.id])+'；Parent 原问题及未决项保持独立。')
+            lines.append(f"  Parent `{candidate.parent_candidate_id}`；fork 原因：{candidate.fork_reason}；Parent 未决：{parent.question.unknowns if parent else '历史 Parent 不可用'}；child 局部义务/检查：{candidate.obligation_id or '未生成'} / {current['unit_status'] or '未形成 AuditUnit'}；Parent 原问题及未决项保持独立。")
     if state.audit_spec_path:
         from consensus_assurance.workflow.audit_spec import load,audit_object_key
         from consensus_assurance.core.types import ConsensusAuditSpec

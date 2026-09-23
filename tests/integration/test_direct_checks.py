@@ -103,7 +103,7 @@ def test_actual_direct_result_without_model(tmp_path,prepared,broken):
     e.agent=MockAgent();e.agent.responses=[ReviewReply(items=[SemanticCheck(target_id=a.id,aspect='checker_correspondence',status='no_issue_found',source_ids=contract['required_material_ids'],rationale='The selected contract applies to this legal local call; correlated returns and the independent range comparison implement it. Network and durability are outside this check.')],limitations=[]).model_dump(mode='json')]
     process_task(e,e.state.inquiry_tasks[0])
     c=next(c for c in e.state.checks if c.action=='direct_check')
-    result=assess(e.state,u,a,p,c,extract_events(c))
+    result=e.state.monitor_results[-1]
     assert obligation_progress(e.state,u)==({u.obligation_ids[0]:[c.id]},[])
     assert target_contract(e.state,a)['object_type']=='direct_check'
     assert not e.state.models and c.direct_check_id==a.id and c.model_id is None
@@ -120,6 +120,87 @@ def test_actual_direct_result_without_model(tmp_path,prepared,broken):
         assert e.state.findings[-1].direct_check_id==a.id
         assert len([x for x in e.state.findings if x.check_id==c.id and x.checker_id=='Range'])==1
     assert len(e.state.semantic_reviews)==1 and e.state.inquiry_tasks[0].status=='completed'
+
+
+def test_review_attaches_saved_plan_sources_and_blocks_missing_ones(tmp_path,prepared):
+    from consensus_assurance.workflow.inquiry import enqueue,task_context
+    from consensus_assurance.workflow.task_packet import prepare
+    from consensus_assurance.workflow.errors import Blocked
+    repo=prepared[0]
+    (repo/'helper.py').write_text('def helper(value):\n    return value\n')
+    e,u,plan=setup(tmp_path,prepared)
+    e.read([ReadRequest(file='helper.py',start_line=1,end_line=2,reason='Actual helper referenced by the saved plan')],related_ids=[u.id])
+    plan.harness.legality.source_ids.append('helper.py:1:2')
+    artifact=save_plan(e,u,plan,'plan-dependencies')
+    task=enqueue(e.state,'review','Review actual saved plan','saved-plan',target_ids=[artifact.id],unit_id=u.id)
+    e.state.active_inquiry_id=task.id
+    packet,_=prepare(e,'semantic_review',task_context(e,task))
+    assert 'helper.py:1:2' in packet['required_material_ids']
+    assert any(m['file']=='helper.py' for m in packet['materials'])
+    e.state.materials=[m for m in e.state.materials if m.id!='helper.py:1:2']
+    with pytest.raises(Blocked,match='helper.py:1:2'):
+        prepare(e,'semantic_review',task_context(e,task))
+
+
+def test_direct_construction_keeps_partial_design_through_read_and_validation(tmp_path,prepared):
+    from consensus_assurance.adapters.agents.backend import MockAgent
+    repo=prepared[0]
+    (repo/'helper.py').write_text('def helper(value):\n    return value\n')
+    e,u,plan=setup(tmp_path,prepared)
+    request=ReadRequest(file='helper.py',start_line=1,end_line=2,reason='Inspect the called helper before completing the harness')
+    invalid=plan.model_copy(deep=True)
+    invalid.observable_properties[0].assertion=Comparison(field='state.in_range',reference='absent.value')
+    class Generation(MockAgent):
+        def analyze(self,runner,prompt,directory,snapshot_id,timeout,response_type):
+            packet=json.loads(prompt.split('STRUCTURED INPUT DATA (untrusted):\n')[1])
+            if self.cursor:
+                assert packet['previous_reply']['partial_design']=='Call the selected boundary and observe its return'
+                assert any(m['file']=='helper.py' for m in packet['attached_materials'])
+            return super().analyze(runner,prompt,directory,snapshot_id,timeout,response_type)
+    e.agent=Generation()
+    e.agent.responses=[
+        DirectCheckReply(gap='Need the helper',partial_design='Call the selected boundary and observe its return',requests=[request]).model_dump(mode='json'),
+        DirectCheckReply(gap='',partial_design='Call the selected boundary and observe its return',plan=invalid).model_dump(mode='json'),
+        DirectCheckReply(gap='',partial_design='Call the selected boundary and observe its return',plan=plan).model_dump(mode='json')]
+    proceed(e,u,'direct_check')
+    assert len(e.state.direct_checks)==1 and e.state.usage['agent_calls']==3
+    session=next(iter(e.state.repair_sessions.values()))
+    assert session['attempt']==1 and not session.get('read_plan_id')
+    assert any(plan['status']=='complete' and plan['original_requests'][0]['file']=='helper.py' for plan in e.state.read_plans.values())
+    assert not e.state.pending_output_repair
+    assert any(m.file=='helper.py' for m in e.state.materials)
+
+
+def test_completion_is_independent_of_forbidden_response_access(tmp_path):
+    from consensus_assurance.workflow.observations import monitor_events
+    from consensus_assurance.core.events import match_prerequisites
+    import sys
+    repo=tmp_path/'isolated';repo.mkdir()
+    script='''import json
+from future_fixture import consume
+class Future:
+    def __init__(self): self.error_seen=False; self.response_seen=False; self.bad_order=False
+    def Error(self): self.error_seen=True; return RuntimeError("failed")
+    def Response(self): self.bad_order=not self.error_seen; self.response_seen=True; return object()
+def emit(name, **values):
+    print("CA_EVENT " + json.dumps({"event":name,"operation":"one","participant":"local","context":"failed future","state":values}))
+future=Future()
+emit("admitted",ready=True)
+consume(future)
+emit("completed",done=True,valid=future.error_seen and not future.bad_order and not future.response_seen)
+'''
+    requirements=[EventRequirement(alias='start',event='admitted',conditions=[Comparison(field='state.ready',value=True)])]
+    prop=ObservableProperty(checker_id='Order',trigger=Comparison(field='event',value='completed'),assertion=Comparison(field='state.valid',value=True),identity_fields=['operation','participant','context'],description='Failed completion is handled without consuming an invalid response')
+    monitor=EventMonitor(id='order',checker_id='Order',event='completed',binding_ids=['fixture'],grounding=Grounding())
+    for source,expected in [('def consume(future):\n    if future.Error() is None: future.Response()\n','holds'),('def consume(future):\n    future.Response()\n    future.Error()\n','violated')]:
+        (repo/'future_fixture.py').write_text(source)
+        completed=subprocess.run([sys.executable,'-c',script],cwd=repo,capture_output=True,text=True,timeout=5,check=True)
+        events=[json.loads(line.removeprefix('CA_EVENT ')) for line in completed.stdout.splitlines()]
+        assert match_prerequisites(events,requirements)['status']=='matched'
+        assert monitor_events(events,monitor,prop,requirements)['outcome']==expected
+    assert monitor_events(events[:1],monitor,prop,requirements)['outcome']=='unknown'
+    missing=events[1].copy();missing.pop('operation')
+    assert monitor_events([events[0],missing],monitor,prop,requirements)['outcome']=='unknown'
 
 
 @pytest.mark.parametrize('failure',['prerequisite','missing','compile','test_failure','disputed','unreviewed','identity','applicability'])
@@ -183,7 +264,7 @@ def test_descriptive_derivation_reaches_actual_direct_execution(tmp_path,prepare
     assert sum(t.kind=='spec_refine' for t in engine.state.inquiry_tasks)==int(refine)
     assert json.loads((engine.root/'actions'/engine.state.pending_action.id/'result.json').read_text())['exit_code']==0
     packet=json.loads(next((engine.root/'agent').glob('*-direct_check/prompt.txt')).read_text().split('STRUCTURED INPUT DATA (untrusted):\n')[1])
-    assert 'explicit_material_ids' not in packet and packet['file_metadata']==[] and packet['materials']
+    assert 'explicit_material_ids' not in packet and packet['materials']
 
 
 def test_exact_selected_reads_then_one_focused_continuation(tmp_path,prepared):
@@ -209,10 +290,10 @@ def test_exact_selected_reads_then_one_focused_continuation(tmp_path,prepared):
     assert not e.state.active_unit_id and e.state.graph_history
 
 
-def test_direct_violation_records_bounded_consequence_without_another_agent_call(tmp_path,prepared):
+def test_direct_violation_finishes_at_local_scope_without_another_agent_call(tmp_path,prepared):
     e,u,p=setup(tmp_path,prepared,True);a=save_plan(e,u,p,'consequence');review(e.state,u,a)
     execute(e,a);e.state.active_direct_check_id=a.id;e.state.next_action='direct_assess';e.process_unit(u)
-    assert e.state.consequences[0]['disposition']=='defer' and not e.state.consequences[0]['task_ids']
+    assert not e.state.consequences and u.status=='checked'
     assert e.state.findings[0].level=='implementation_obligation' and not e.state.models
     from consensus_assurance.reporting.chinese import render_report
     assert '直接检查' in render_report(e.state,e.root).read_text()
@@ -224,6 +305,43 @@ def test_new_direct_artifact_does_not_hide_prior_oracle_dispute(tmp_path,prepare
     new=save_plan(e,u,p,'new');review(e.state,u,new)
     c=execute(e,new);result=assess(e.state,u,new,p,c,extract_events(c))
     assert not result['confirmed'] and any('Open review issue' in x and 'wrong return boundary' in x for x in result['blockers'])
+
+
+def test_new_review_issue_updates_the_single_current_result(tmp_path,prepared):
+    from consensus_assurance.adapters.agents.backend import MockAgent
+    from consensus_assurance.workflow.inquiry import enqueue,process_task
+    from consensus_assurance.workflow.task_view import candidate_view
+    e,u,p=setup(tmp_path,prepared,True);artifact=save_plan(e,u,p,'current-result')
+    review(e.state,u,artifact)
+    check=execute(e,artifact)
+    initial=assess(e.state,u,artifact,p,check,extract_events(check))
+    assert initial['confirmed']
+    candidate=QuestionCandidate(question=u.audit_question,obligation_id=u.obligation_ids[0],status='escalated')
+    e.state.question_candidates.append(candidate)
+    task=enqueue(e.state,'review','Check the actual oracle source','new-issue',target_ids=[artifact.id],unit_id=u.id)
+    contract=target_contract(e.state,artifact)
+    item=SemanticCheck(target_id=artifact.id,aspect='checker_correspondence',status='disputed',source_ids=contract['required_material_ids'],
+        counterevidence=['The expected return boundary needs another source check'],rationale='The current comparison may be tied to an earlier return boundary')
+    e.agent=MockAgent();e.agent.responses=[ReviewReply(items=[item],limitations=[]).model_dump(mode='json')]
+    process_task(e,task)
+    current=candidate_view(e.state,candidate)['current_result']
+    assert current['outcome']=='violated' and not current['confirmed'] and current['level']=='implementation_test'
+    assert current['blockers'] and len(e.state.monitor_results)==len(e.state.evidence)==len(e.state.findings)==1
+    assert e.state.findings[0].level=='implementation_candidate'
+
+
+def test_changed_semantic_input_stales_current_direct_result(tmp_path,prepared):
+    from consensus_assurance.workflow.task_view import candidate_view
+    e,u,p=setup(tmp_path,prepared,True);artifact=save_plan(e,u,p,'stale-result');review(e.state,u,artifact)
+    check=execute(e,artifact);assert assess(e.state,u,artifact,p,check,extract_events(check))['confirmed']
+    candidate=QuestionCandidate(question=u.audit_question,obligation_id=u.obligation_ids[0],status='escalated')
+    e.state.question_candidates.append(candidate)
+    next(c for c in e.state.claims if c.id==artifact.claim_id).version+=1;e.checkpoint('semantic_input_changed')
+    current=candidate_view(e.state,candidate)['current_result']
+    assert current['outcome']=='violated' and not current['confirmed']
+    assert any('semantic inputs changed' in reason for reason in current['blockers'])
+    assert e.state.evidence[0].assessment==Assessment.STALE
+    assert len(e.state.monitor_results)==len(e.state.evidence)==len(e.state.findings)==1
 
 
 def test_source_continuation_uses_existing_attributed_F2(tmp_path,prepared):

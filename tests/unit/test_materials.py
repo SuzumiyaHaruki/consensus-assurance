@@ -88,6 +88,22 @@ def test_blank_lines_remain_in_unique_range_accounting(prepared):
     assert again.items[0].status=='cached'
 
 
+def test_report_attributes_calls_and_acquisition_by_saved_identity(prepared):
+    from consensus_assurance.core.types import CheckRun,InquiryTask
+    from consensus_assurance.reporting.chinese import resource_lines
+    _,state,_,_=prepared;unit=state.units[0]
+    call=CheckRun(action='agent',cwd='.',snapshot_id=state.snapshot.id)
+    state.checks=[call]
+    task=InquiryTask(id='focused-review',kind='review',reason='Review the selected obligation',trigger='unit',unit_id=unit.id,check_id=call.id)
+    state.inquiry_tasks=[task]
+    state.packet_receipts=[{'status':'executed','check_id':call.id,'kind':'semantic_review','task_id':task.id,'unit_id':unit.id,'source_chars_sent':37}]
+    state.material_allocations=[{'plan_id':'other','new_chars':23,'purpose':'breadth'}, {'plan_id':'focused','new_chars':17,'purpose':'depth'}]
+    state.reading_history=[{'plan_id':'focused','related_ids':[unit.id]}, {'plan_id':'other','related_ids':['A1']}]
+    lines=resource_lines(state)
+    assert any(f'unit:{unit.id} | 1 | 0 | 17 | 37 |' in line for line in lines)
+    assert not any('unknown:unattributed | 1 |' in line for line in lines)
+
+
 import json,shutil
 import pytest
 from consensus_assurance.core.types import Material

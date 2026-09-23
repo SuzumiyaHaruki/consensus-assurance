@@ -1,21 +1,12 @@
 """Derived current worksets. Immutable audit records remain in state and raw artifacts."""
-from .reviews import material_closure, review_objects, issue_challenges
+from .reviews import material_closure, review_objects
 
 
 def candidate_view(state,candidate):
     unit=next((u for u in state.units if candidate.obligation_id in u.obligation_ids),None)
-    artifacts=[a for a in state.direct_checks if unit and a.unit_id==unit.id]
+    artifacts=[a for a in state.direct_checks if unit and a.unit_id==unit.id and a.claim_id==candidate.obligation_id]
     result=next((r for r in reversed(state.monitor_results) if any(a.id==r.get('direct_check_id') for a in artifacts)),None)
     current={k:result.get(k) for k in ('outcome','bounded_complete','confirmed','blockers','boundaries','level')} if result else None
-    if current:
-        issues=[i for i in state.review_issues if not i.resolved_by and any(a.id==i.target_id for a in artifacts)]
-        reviews=[i for r in state.semantic_reviews for i in r.items if any(a.id==i.target_id for a in artifacts) and i.aspect=='checker_correspondence']
-        try:
-            from .direct_checks import load_plan
-            uncertainties=load_plan(next(a for a in artifacts if a.id==result['direct_check_id']).plan_path).uncertainties
-        except (OSError,ValueError,StopIteration):uncertainties=[]
-        if issues:current['blockers']=['Issue '+i.id+': '+'; '.join(issue_challenges(state,i)) for i in issues]
-        if reviews:current['boundaries']=list(dict.fromkeys(unit.scope.excluded+uncertainties+reviews[-1].limitations))
     records=[e for e in state.evidence if e.claim_id==candidate.obligation_id and (not result or e.check_id==result['experiment_check_id'])]
     checks=list(dict.fromkeys(candidate.check_ids+[e.check_id for e in records]+([result['experiment_check_id']] if result else [])+
         [t.check_id for t in state.inquiry_tasks if t.check_id and (t.candidate_id==candidate.id or unit and t.unit_id==unit.id)]))
@@ -25,7 +16,7 @@ def candidate_view(state,candidate):
         'status':candidate.status,'reason':candidate.stop_reason,'resume_conditions':candidate.resume_conditions,'obligation_id':candidate.obligation_id,
         'unit_id':unit.id if unit else None,'unit_status':'blocked' if current and current['blockers'] else unit.status if unit else None,'archived_unit_status':unit.status if unit else None,'scope':result.get('scope') if result else unit.scope.model_dump(mode='json') if unit else {'contexts':candidate.question.contexts,'event_paths':candidate.question.event_paths},'check_ids':checks,'evidence_ids':evidence,
         'current_result':current,
-        'remaining_discriminators':result.get('blockers',[])+result.get('boundaries',[]) if result else candidate.question.unknowns}
+        'remaining_discriminators':result.get('blockers',[]) if result else candidate.question.unknowns}
 
 
 def semantic_view(state,ids):

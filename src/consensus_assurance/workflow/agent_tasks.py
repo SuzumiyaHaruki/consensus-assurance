@@ -107,13 +107,15 @@ def ask(engine,kind,response_type,context,validator=None,*,purpose="depth"):
                 raise Blocked('Check generation remains unfinished: '+session['error'])
             if session.get('read_requests'):
                 session.setdefault('read_plan_id',uid())
-                obtained=engine.read(session['read_requests'],purpose=purpose,plan_id=session['read_plan_id'],reason=session['error'])
+                obtained=engine.read(session['read_requests'],purpose=purpose,plan_id=session['read_plan_id'],related_ids=[id for id in logical_task.values() if id],reason=session['error'])
                 if obtained['status']!='complete':raise Blocked('Check continuation requires the deferred source ranges')
+                session['requested_material_ids']=list(dict.fromkeys(session.get('requested_material_ids',[])+[id for item in obtained['items'] if item['status']!='deferred' for id in item['material_ids']]))
                 session['read_requests']=[];session.pop('read_plan_id')
                 save_session(engine,session)
             attached=set(state.task_attachments.get(attachment_key(state),[]))
             context['attached_materials']=[m.model_dump(mode='json') for m in state.materials if m.id in attached]
-            request={**context,'previous_reply':json.loads(Path(session['current_path']).read_text()),'generation_error':session['error']}
+            request={**context,'previous_reply':json.loads(Path(session['current_path']).read_text()),'generation_error':session['error'],
+                'requested_material_ids':session.get('requested_material_ids',[])}
             schema=response_type
         elif session:
             if session['attempt']>=engine.config.budget.repair_attempts or session.get('blocked'):
@@ -199,7 +201,6 @@ def ask(engine,kind,response_type,context,validator=None,*,purpose="depth"):
         check=CheckRun.model_validate(payload[0]);sent['check_id']=check.id;sent['status']='reused_result' if any(p.get('check_id')==check.id for p in state.packet_receipts if p is not sent) else 'executed';write_json(engine.root/'packets'/(sent['id']+'.json'),sent);check.parameters['agent_task']=kind;engine.record(check);cwd=Path(check.cwd)
         raw=payload[1]
         if raw is None and check.reason!='Structured agent output is invalid':raise Blocked(f'Agent blocked: {check.status.value}; {check.reason}')
-        if session and artifact_output:session['attempt']+=1
         if session and not artifact_output:
             session['attempt']+=1
             try:
@@ -273,18 +274,12 @@ def ask(engine,kind,response_type,context,validator=None,*,purpose="depth"):
             response=response_type.model_validate(merged)
             validate(response)
             if artifact_output:
-                if session and response.requests and not any(getattr(response,k,None) for k in ('bundle','draft','plan','harness')) and getattr(response,'reading_purpose','context')!='dependency':
-                    session['read_requests']=[r.model_dump(mode='json') for r in response.requests]
-                    session['error']=response.gap
-                    from .inquiry import release_action
-                    release_action(engine);save_session(engine,session)
-                    continue
                 draft=getattr(response,'draft',None)
                 core=[p for p in draft.pending_work if p.component in {'behavior','properties'}] if draft else []
-                unfinished=not response.requests and not any(getattr(response,k,None) for k in ('bundle','draft','plan','harness')) and getattr(response,'fallback','none')=='none'
+                unfinished=not any(getattr(response,k,None) for k in ('bundle','draft','plan','harness')) and getattr(response,'fallback','none')=='none'
                 if core or unfinished:
                     reason='Complete pending model work: '+'; '.join(p.reason for p in core) if core else response.gap
-                    session=continue_generation(engine,kind,logical_task,merged,check,reason,session,[r for p in core for r in p.requests])
+                    session=continue_generation(engine,kind,logical_task,merged,check,reason,session,list(response.requests)+[r for p in core for r in p.requests])
                     continue
             write_json(cwd/'accepted-response.json',response)
             sent['status']='accepted';write_json(engine.root/'packets'/(sent['id']+'.json'),sent)
@@ -302,6 +297,7 @@ def ask(engine,kind,response_type,context,validator=None,*,purpose="depth"):
         except ValueError as exc:
             if isinstance(exc,SpecIssue):raise
             if artifact_output:
+                if session:session['attempt']+=1
                 session=continue_generation(engine,kind,logical_task,merged,check,str(exc),session)
                 continue
             if session is None:

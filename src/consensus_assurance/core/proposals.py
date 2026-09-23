@@ -78,6 +78,7 @@ class Derivation(Record):
     audit_question: AuditQuestion | None = None
     selection_rationale: str
     reading_requests: list[ReadRequest] = Field(default_factory=list, max_length=8)
+    frontier_entry_point: str | None = None
     descriptive_issues: list[DescriptiveIssue] = []
     fork_from_candidate_id: str | None = None
     fork_reason: str = ""
@@ -216,6 +217,7 @@ class HarnessReply(Record):
     monitors: list[EventMonitor] = []
     consequence_observations: list[ConsequenceObservation] = []
     gap: str
+    partial_design: str = ""
     requests: list[ReadRequest] = []
 
 
@@ -249,6 +251,7 @@ class BuildReply(Record):
     bundle: Bundle | None
     draft: ModelDraft | None = None
     gap: str
+    partial_design: str = ""
     requests: list[ReadRequest] = []
 
 
@@ -375,5 +378,6 @@ class DirectCheckReply(Record):
     reading_purpose: Literal["dependency", "context"] = "dependency"
     plan: DirectCheckPlan | None = None
     gap: str
+    partial_design: str = ""
     requests: list[ReadRequest] = []
     fallback: Literal["none", "source_review", "local_model"] = "none"

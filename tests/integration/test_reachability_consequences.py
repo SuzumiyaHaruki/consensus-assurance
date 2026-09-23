@@ -5,7 +5,6 @@ import pytest
 from consensus_assurance.core.types import ReachabilityRequirement, AuditQuestion, Claim, Finding, Origin, QuestionCandidate
 from consensus_assurance.workflow.artifacts import save_bundle,validate_bundle
 from consensus_assurance.workflow.modeling import obligation_progress,coverage_limitations
-from consensus_assurance.workflow.investigation import record_consequence
 from consensus_assurance.workflow.engine import Engine
 from consensus_assurance.workflow.budget import BudgetTracker
 from consensus_assurance.core.config import Config
@@ -51,30 +50,6 @@ def test_missing_trigger_or_changed_model_never_counts_as_reached(tmp_path,prepa
     assert result.status=='unknown' and check.status.value=='not_scheduled'
 
 
-
-
-def test_consequence_disposition_is_bounded_and_idempotent(tmp_path,prepared):
-    _,state,_,_=prepared;cfg=Config(execution_backend='python',agent_backend='mock')
-    engine=Engine(cfg,tmp_path/'engine',*assemble(cfg),'');engine.state=state;engine.budget=BudgetTracker(cfg.budget,state);unit=state.units[0]
-    finding=Finding(claim_id=unit.obligation_ids[0],model_id='model',check_id='search',origin=Origin.EXECUTED,description='Controlled evidence linkage only',trace_path='trace',level='implementation_obligation')
-    record_consequence(engine,unit,finding)
-    record_consequence(engine,unit,finding)
-    assert len(state.consequences)==1 and not state.inquiry_tasks and state.consequences[0]['disposition']=='defer'
-    assert finding.level=='implementation_obligation'
-
-
-def test_child_consequence_reuses_existing_parent_without_duplicate_task(tmp_path,prepared):
-    _,state,_,_=prepared;cfg=Config(execution_backend='python',agent_backend='mock')
-    engine=Engine(cfg,tmp_path/'engine',*assemble(cfg),'');engine.state=state;engine.budget=BudgetTracker(cfg.budget,state);unit=state.units[0]
-    q=AuditQuestion(question='Does the broader consumer retain the result?',importance='Consumer safety depends on retained support',
-        activity_classes=['A1'],behavior_ids=['use'],fact_ids=['input'],obligation_relation_kind='consumption',trigger_rationale='Inspect the broader consumer')
-    parent=QuestionCandidate(question=q,status='paused',stop_reason='A local child tests one necessary discriminator')
-    child=QuestionCandidate(question=q,status='escalated',parent_candidate_id=parent.id,obligation_id=unit.obligation_ids[0])
-    state.question_candidates=[parent,child]
-    finding=Finding(claim_id=unit.obligation_ids[0],model_id='model',check_id='search',origin=Origin.EXECUTED,
-        description='Only the child relation was observed',trace_path='trace',level='implementation_obligation')
-    record_consequence(engine,unit,finding)
-    assert not state.inquiry_tasks and state.consequences[0]['parent_candidate_id']==parent.id
 
 
 @pytest.mark.parametrize('status',['tool_missing','timeout'])

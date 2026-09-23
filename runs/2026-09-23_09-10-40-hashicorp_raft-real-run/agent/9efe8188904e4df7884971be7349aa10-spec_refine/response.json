@@ -1,0 +1,319 @@
+{
+  "understanding": "The attached source establishes heartbeat startup ownership, synchronized contact timestamp assignment and access, and lease consumption as a connectivity check. The transport-success observation remains weaker than completed contact establishment. The rejected changes to existing Surfaces are outside the descriptive focus and are omitted.",
+  "requests": [],
+  "delta": {
+    "target_profile": null,
+    "activities": [],
+    "behaviors": [
+      {
+        "id": "B_heartbeat_startup",
+        "primary_activity": "A2",
+        "execution_owner": "Replication goroutine executing Raft.replicate",
+        "protocol_context": "One replicate invocation with a supplied followerReplication object",
+        "trigger": "Entry into Raft.replicate",
+        "legal_preconditions": [
+          "A caller supplies the followerReplication object; construction and generation ownership remain unresolved."
+        ],
+        "implementation_guards": [
+          "Allocates an invocation-local stopHeartbeat channel.",
+          "Defers closing stopHeartbeat until replicate returns."
+        ],
+        "reads": ["Supplied followerReplication object"],
+        "writes": ["Invocation-local stopHeartbeat channel"],
+        "durable_effects": [],
+        "external_effects": [
+          "Dispatches a closure calling r.heartbeat(s, stopHeartbeat) through r.goFunc.",
+          "Closes stopHeartbeat when replicate returns."
+        ],
+        "important_branches": [
+          "Heartbeat dispatch precedes the replication loop.",
+          "CommitTimeout invokes replicateTo separately to propagate logs and commit information.",
+          "Closing stopHeartbeat signals stopping; it does not demonstrate completion of an outstanding heartbeat transport call."
+        ],
+        "async_boundaries": ["Heartbeat is dispatched separately through r.goFunc."],
+        "produces_fact_ids": [],
+        "consumes_fact_ids": [],
+        "cross_activity_effects": [],
+        "existing_protections": [
+          "Per-invocation stop channel",
+          "Deferred stop-channel closure"
+        ],
+        "source_ids": ["replication.go:1:202"],
+        "unknowns": [
+          "The goFunc implementation is unread.",
+          "Replication-object initialization, replacement, and leader-generation teardown ordering remain unresolved.",
+          "No heartbeat-worker join is shown in replicate."
+        ]
+      },
+      {
+        "id": "B_heartbeat_response",
+        "primary_activity": "A2",
+        "execution_owner": "Independent follower heartbeat goroutine executing Raft.heartbeat",
+        "protocol_context": "One followerReplication object; a reusable AppendEntries request initialized with s.currentTerm and no log entries",
+        "trigger": "Notification on s.notifyCh or randomized heartbeat interval",
+        "legal_preconditions": [
+          "Raft.replicate dispatches the worker through r.goFunc with its invocation-local stopHeartbeat channel.",
+          "Replication-object construction and generation ownership remain unresolved."
+        ],
+        "implementation_guards": [
+          "Transport errors enter bounded exponential backoff without refreshing contact or notifying verification results.",
+          "Checks stopCh while awaiting a trigger and during error backoff.",
+          "Copies peer identity and address under peerLock."
+        ],
+        "reads": [
+          "s.currentTerm when constructing the request",
+          "s.peer under peerLock",
+          "HeartbeatTimeout",
+          "Transport error and resp.Success",
+          "s.LastContact() for failed-heartbeat observation"
+        ],
+        "writes": [
+          "Worker-local failure counter",
+          "Reused response object"
+        ],
+        "durable_effects": [],
+        "external_effects": [
+          "Calls Transport.AppendEntries with the captured peer identity and address.",
+          "On transport success, synchronously calls setLastContact and subsequently notifyAll(resp.Success).",
+          "notifyAll detaches the pending verification map under notifyLock, then calls vote on each detached future.",
+          "Emits failed and resumed heartbeat observations and timing metrics."
+        ],
+        "important_branches": [
+          "Refreshes contact on transport success regardless of resp.Success.",
+          "Does not inspect resp.Term.",
+          "Ordinary replication, snapshot responses, and pipeline decoding check for a higher response term before refreshing contact.",
+          "Does not recheck stopCh between a successful transport return and contact refresh."
+        ],
+        "async_boundaries": [
+          "Runs separately from replication, allowing heartbeats while replication is blocked on disk IO.",
+          "Blocking transport call",
+          "Verification vote calls occur after releasing notifyLock."
+        ],
+        "produces_fact_ids": ["F_heartbeat_exchange_observed"],
+        "consumes_fact_ids": [],
+        "cross_activity_effects": [
+          {
+            "key": "A7",
+            "value": "Forwards resp.Success to each detached pending verification future's vote method; tally semantics and eventual client completion remain unresolved."
+          }
+        ],
+        "existing_protections": [
+          "Transport errors exclude contact refresh and verification notification.",
+          "Peer access uses a read lock.",
+          "Error backoff is interruptible by stopCh.",
+          "Contact timestamps and pending verification maps use separate locks."
+        ],
+        "source_ids": ["replication.go:1:202", "replication.go:203:665"],
+        "unknowns": [
+          "Transport correlation and response-object population guarantees remain unread.",
+          "Worker-generation teardown and outstanding-call completion ordering remain unresolved.",
+          "verifyFuture.vote is unread.",
+          "The missing response-term check alone establishes no authority or client-contract violation."
+        ]
+      },
+      {
+        "id": "B_heartbeat_contact_establishment",
+        "primary_activity": "A2",
+        "execution_owner": "Heartbeat goroutine synchronously executing followerReplication.setLastContact",
+        "protocol_context": "Contact refresh for the heartbeat worker's followerReplication object",
+        "trigger": "Heartbeat invokes setLastContact after Transport.AppendEntries returns nil",
+        "legal_preconditions": [
+          "The heartbeat transport-success branch has been reached.",
+          "The helper receiver is the worker's followerReplication object."
+        ],
+        "implementation_guards": [
+          "Holds lastContactLock exclusively while sampling time.Now() and assigning lastContact.",
+          "Adds no response-term, Success, generation, or stop-channel validation."
+        ],
+        "reads": ["Local time through time.Now()"],
+        "writes": ["s.lastContact"],
+        "durable_effects": [],
+        "external_effects": [],
+        "important_branches": [
+          "Records local helper execution time, not RPC start time or a remote timestamp.",
+          "Stores no exchange identity, response term, or Success value.",
+          "Other replication paths call the same helper; their writes are not heartbeat observations."
+        ],
+        "async_boundaries": [
+          "Lock acquisition can wait for concurrent readers or writers.",
+          "Executes synchronously within the heartbeat worker."
+        ],
+        "produces_fact_ids": ["F_heartbeat_contact_timestamp_recorded"],
+        "consumes_fact_ids": ["F_heartbeat_exchange_observed"],
+        "cross_activity_effects": [],
+        "existing_protections": [
+          "Exclusive timestamp assignment",
+          "Corresponding read lock in LastContact"
+        ],
+        "source_ids": ["replication.go:1:202", "replication.go:203:665"],
+        "unknowns": [
+          "Initial timestamp assignment and replication-object replacement remain unresolved.",
+          "The timestamp does not retain producing-exchange identity.",
+          "Completion ordering relative to generation teardown remains unresolved."
+        ]
+      },
+      {
+        "id": "B_leader_lease_check",
+        "primary_activity": "A2",
+        "execution_owner": "Raft main goroutine executing checkLeaderLease from leaderLoop",
+        "protocol_context": "Current leaderState replication map and latest membership configuration",
+        "trigger": "Leader-loop lease timer fires",
+        "legal_preconditions": [
+          "The caller is executing the leader loop.",
+          "Each remote voter lookup is expected to yield a followerReplication object; construction and replacement ordering remain unresolved."
+        ],
+        "implementation_guards": [
+          "Counts only latest-configuration Voters.",
+          "Counts the local voter without a remote lookup.",
+          "LastContact copies lastContact under lastContactLock.RLock.",
+          "Counts a remote voter when now.Sub(f.LastContact()) <= LeaderLeaseTimeout.",
+          "Invokes setState(Follower) when contacted < quorumSize()."
+        ],
+        "reads": [
+          "r.configurations.latest.Servers",
+          "r.leaderState.replState by server ID",
+          "f.LastContact()",
+          "LeaderLeaseTimeout sampled once per check",
+          "Current time sampled before iterating voters",
+          "Latest-configuration voter count through quorumSize()"
+        ],
+        "writes": [
+          "Invokes setState(Follower) on insufficient contact.",
+          "The caller resets the lease timer using the maximum counted contact age and a minimum check interval."
+        ],
+        "durable_effects": [],
+        "external_effects": [
+          "Logs stale contacts and insufficient quorum contact.",
+          "Emits contact-age and lease-timeout metrics."
+        ],
+        "important_branches": [
+          "Non-voters contribute neither contacts nor quorum voters.",
+          "Returned maximum age excludes contacts outside the lease interval.",
+          "The consumer examines timestamps without originating response terms or Success values.",
+          "Heartbeat timestamps are one possible input; LastContact does not distinguish producer paths or initialization.",
+          "Source comments describe a connectivity check and distinguish this lease from a clock-based read-only-query lease."
+        ],
+        "async_boundaries": [
+          "Timer selection occurs in the main loop.",
+          "Concurrent workers can refresh contact between the check's time sample and individual locked reads."
+        ],
+        "produces_fact_ids": [],
+        "consumes_fact_ids": ["F_heartbeat_contact_timestamp_recorded"],
+        "cross_activity_effects": [],
+        "existing_protections": [
+          "Voter filtering",
+          "Finite contact-age threshold",
+          "Synchronized timestamp access",
+          "Main-thread membership and quorum calculation",
+          "Minimum timer interval"
+        ],
+        "source_ids": [
+          "raft.go:827:1100",
+          "replication.go:1:202",
+          "config.go:1:260"
+        ],
+        "unknowns": [
+          "The heartbeat fact is consumed only when the selected field value comes from that heartbeat write; the field exposes no provenance.",
+          "Initialization and replication-state replacement ordering remain unresolved.",
+          "Other contact-producing paths are visible, but their complete fact lifecycles are outside this refinement.",
+          "Raft.setState wrapper behavior and observer ordering remain unresolved.",
+          "Connectivity interpretation establishes neither verification completion nor exclusive leadership."
+        ]
+      }
+    ],
+    "facts": [
+      {
+        "id": "F_heartbeat_exchange_observed",
+        "meaning": "A heartbeat worker received a nil error from Transport.AppendEntries and reached the branch that invokes contact refresh and forwards response.Success. This establishes a local transport-call outcome, not same-term acceptance, remote durability, or continuing authority.",
+        "identity": [
+          {
+            "key": "worker",
+            "value": "The heartbeat invocation and its followerReplication object"
+          },
+          {
+            "key": "exchange",
+            "value": "One Transport.AppendEntries call using that iteration's captured peer ID and address"
+          },
+          {
+            "key": "request_context",
+            "value": "Reusable heartbeat request initialized with s.currentTerm"
+          }
+        ],
+        "validity_context": "Historical local observation at the transport-success branch. The code does not qualify this observation by response term or response.Success.",
+        "representation": [
+          "Nil transport error",
+          "Execution of the heartbeat success branch"
+        ],
+        "invalidators": [],
+        "reinterpreters": [],
+        "durability": "Transient worker execution; no persistence is shown.",
+        "recovery": "No recovery or replay of this exchange observation is shown.",
+        "source_ids": ["replication.go:299:645", "replication.go:1:202"],
+        "unknowns": [
+          "The transport's request-response correlation contract is unread.",
+          "Contact establishment is represented separately; reaching this branch does not itself establish completed timestamp assignment.",
+          "notifyAll's map detachment and vote calls are visible, but verifyFuture.vote semantics remain unread."
+        ]
+      },
+      {
+        "id": "F_heartbeat_contact_timestamp_recorded",
+        "meaning": "A heartbeat-triggered setLastContact invocation assigned a locally sampled time.Now() value to its followerReplication object's lastContact field under the contact lock. This records local contact-refresh processing without establishing same-term acceptance, replication success, remote durability, or continuing authority.",
+        "identity": [
+          {
+            "key": "replication_object",
+            "value": "The followerReplication object receiving the heartbeat-triggered helper call"
+          },
+          {
+            "key": "write",
+            "value": "One lastContact assignment within that helper invocation"
+          },
+          {
+            "key": "timestamp",
+            "value": "The time.Now() value sampled while holding lastContactLock"
+          }
+        ],
+        "validity_context": "The write is a historical establishment event. Its timestamp is available through LastContact after lock release until another write replaces the field. Lease consumption applies only when the corresponding object and field value are selected; neither heartbeat provenance nor exchange identity is encoded.",
+        "representation": [
+          "followerReplication.lastContact",
+          "Assignment protected by lastContactLock",
+          "LastContact returns a copy under lastContactLock.RLock"
+        ],
+        "invalidators": [],
+        "reinterpreters": [],
+        "durability": "Volatile shared memory; no persistence is shown.",
+        "recovery": "Initialization or re-establishment after restart or replication-object replacement remains unresolved.",
+        "source_ids": [
+          "replication.go:1:202",
+          "replication.go:203:665",
+          "raft.go:827:1100"
+        ],
+        "unknowns": [
+          "Later writes replace the field value without invalidating this historical write event.",
+          "Ordinary replication, snapshot responses, and pipeline decoding also write the field; their producer lifecycles are not added here.",
+          "Initialization, object-generation replacement, and teardown ordering remain unresolved.",
+          "The representation alone cannot identify which response path produced the timestamp."
+        ]
+      }
+    ],
+    "surfaces": [
+      {
+        "entry_point": "Raft.replicate heartbeat startup and deferred stopHeartbeat closure",
+        "disposition": "mapped",
+        "behavior_ids": ["B_heartbeat_startup"],
+        "reason": "Maps the directly connected heartbeat dispatch and stop-signal ownership without claiming complete replication or generation teardown coverage.",
+        "source_ids": ["replication.go:1:202"],
+        "high_consequence": true
+      }
+    ],
+    "remove_behavior_ids": [],
+    "remove_fact_ids": [],
+    "remove_surface_entry_points": [],
+    "rationale": "The delta is against the current inventory. Attached exact source supports the focused Behavior corrections and explicit intervening timestamp establishment. F_heartbeat_exchange_observed retains its meaning, identity, and validity context. The lease consumes the new timestamp fact conditionally on reading that write. The two existing Surface changes rejected by diagnostics are omitted; existing Surfaces, Activities, and TargetProfile remain unchanged. The new startup Surface describes only the directly connected addition. No normative claim or correctness conclusion is introduced."
+  },
+  "limitations": [
+    "Initialization, transport correlation, generation replacement, and teardown completion remain unresolved.",
+    "Verification vote semantics and the Raft.setState wrapper remain unread.",
+    "Existing Surface descriptions still contain helper-related wording; their correction requires separate descriptive focus under the supplied diagnostics.",
+    "This refinement records source-grounded implementation behavior, not a verified guarantee or reproduced violation."
+  ]
+}

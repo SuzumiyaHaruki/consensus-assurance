@@ -20,6 +20,17 @@ def material_closure(state, ids):
     objects=review_objects(state)
     from .sources import dependency_closure
     wanted,visited=dependency_closure(objects,ids)
+    for id in ids:
+        artifact=objects.get(id)
+        if artifact is None or not hasattr(artifact,'plan_path'):continue
+        from .direct_checks import load_plan
+        plan=load_plan(artifact.plan_path)
+        dependencies=[plan.claim_id,*plan.binding_ids,*(binding for monitor in plan.monitors for binding in monitor.binding_ids)]
+        for basis in [plan.harness.legality,*(monitor.grounding for monitor in plan.monitors)]:
+            wanted.update(basis.source_ids+basis.expectation_ids)
+            dependencies.extend(basis.binding_ids)
+        source_ids,_=dependency_closure(objects,dependencies)
+        wanted.update(source_ids)
     for id in visited:
         obj=objects[id]
         if hasattr(obj,'file'):

@@ -1,0 +1,269 @@
+[
+  {
+    "direct_check_id": null,
+    "id": "18376deeb66340bfb7d46efeb348d099",
+    "action": "agent",
+    "status": "completed",
+    "outcome": "unknown",
+    "origin": "executed",
+    "command": [
+      "codex",
+      "exec",
+      "--ephemeral",
+      "--sandbox",
+      "read-only",
+      "--skip-git-repo-check",
+      "--output-schema",
+      "/home/nitro/Desktop/consensus-assurance/runs/2026-09-23_09-10-40-hashicorp_raft-real-run/agent/cc2d772bb3bb40d8b7b739db09366da2-direct_check/proposal.schema.json",
+      "--output-last-message",
+      "/home/nitro/Desktop/consensus-assurance/runs/2026-09-23_09-10-40-hashicorp_raft-real-run/agent/cc2d772bb3bb40d8b7b739db09366da2-direct_check/response.json",
+      "-c",
+      "model_reasoning_effort=\"low\"",
+      "-"
+    ],
+    "cwd": "/home/nitro/Desktop/consensus-assurance/runs/2026-09-23_09-10-40-hashicorp_raft-real-run/agent/cc2d772bb3bb40d8b7b739db09366da2-direct_check",
+    "started_at": "2026-09-23T01:31:51.659201+00:00",
+    "ended_at": "2026-09-23T01:34:08.035551+00:00",
+    "exit_code": 0,
+    "stdout": "/home/nitro/Desktop/consensus-assurance/runs/2026-09-23_09-10-40-hashicorp_raft-real-run/logs/18376deeb66340bfb7d46efeb348d099/stdout.log",
+    "stderr": "/home/nitro/Desktop/consensus-assurance/runs/2026-09-23_09-10-40-hashicorp_raft-real-run/logs/18376deeb66340bfb7d46efeb348d099/stderr.log",
+    "reason": "",
+    "tool_version": "codex-cli 0.153.0",
+    "model_id": null,
+    "snapshot_id": "5f759884c4f9410eabf0d135ec4a3308",
+    "parameters": {
+      "agent_model": "gpt-6-astra",
+      "agent_reasoning_effort": "low"
+    },
+    "artifacts": [],
+    "input_versions": {},
+    "reused": false,
+    "search_statistics": {},
+    "violated_invariant": null,
+    "checker_results": [],
+    "pending_action_id": "96c92504bd1349468ffb1df2a35c7437",
+    "search_fingerprint": "",
+    "reused_from": null
+  },
+  {
+    "reading_purpose": "dependency",
+    "plan": {
+      "description": "Measure the accepted conditional predecessor-integrity obligation through actual sequential appendEntries calls, with a retained-predecessor control.",
+      "claim_id": "O_append_predecessor_integrity",
+      "binding_ids": [
+        "BIND_append_predecessor_integrity",
+        "BIND_last_entry_representation"
+      ],
+      "harness": {
+        "kind": "go_test",
+        "source": "package raft\n\nimport (\n \"encoding/json\"\n \"errors\"\n \"fmt\"\n \"io\"\n \"testing\"\n)\n\ntype assuranceTransport struct { Transport }\nfunc (assuranceTransport) EncodePeer(_ ServerID, a ServerAddress) []byte { return []byte(a) }\nfunc (assuranceTransport) DecodePeer(a []byte) ServerAddress { return ServerAddress(a) }\n\ntype assuranceFaultStore struct {\n *InmemStore\n armed bool\n deleted bool\n failed bool\n deleteMin uint64\n deleteMax uint64\n}\nfunc (s *assuranceFaultStore) DeleteRange(lo, hi uint64) error {\n err := s.InmemStore.DeleteRange(lo, hi)\n if err == nil { s.deleted = true; s.deleteMin = lo; s.deleteMax = hi }\n return err\n}\nfunc (s *assuranceFaultStore) StoreLogs(logs []*Log) error {\n if s.armed {\n  s.failed = true\n  return errors.New(\"assurance injected replacement write failure without rollback\")\n }\n return s.InmemStore.StoreLogs(logs)\n}\nfunc assuranceEmit(t *testing.T, v map[string]interface{}) {\n t.Helper()\n b, err := json.Marshal(v)\n if err != nil { t.Fatal(err) }\n fmt.Println(\"CA_EVENT \" + string(b))\n}\nfunc assuranceCall(t *testing.T, r *Raft, a *AppendEntriesRequest) *AppendEntriesResponse {\n t.Helper()\n ch := make(chan RPCResponse, 1)\n rpc := RPC{Command: a, RespChan: ch}\n if err := r.checkRPCHeader(rpc); err != nil { t.Fatalf(\"header rejected: %v\", err) }\n r.appendEntries(rpc, a)\n select {\n case result := <-ch:\n  if result.Error != nil { t.Fatalf(\"RPC error: %v\", result.Error) }\n  response, ok := result.Response.(*AppendEntriesResponse)\n  if !ok { t.Fatalf(\"unexpected response type %T\", result.Response) }\n  return response\n default:\n  t.Fatal(\"handler returned without its response\")\n  return nil\n }\n}\nfunc TestAssurancePredecessorIntegrity(t *testing.T) {\n for _, scenario := range []string{\"deleted_endpoint\", \"retained_predecessor\"} {\n  t.Run(scenario, func(t *testing.T) {\n   store := &assuranceFaultStore{InmemStore: NewInmemStore()}\n   for index := uint64(1); index <= 3; index++ {\n    if err := store.InmemStore.StoreLog(&Log{Index: index, Term: 1, Type: LogNoop}); err != nil { t.Fatal(err) }\n   }\n   conf := Config{ProtocolVersion: 3, LocalID: ServerID(\"receiver\"), LogOutput: io.Discard}\n   r := &Raft{logs: store, stable: store.InmemStore, trans: assuranceTransport{}, localID: conf.LocalID, localAddr: ServerAddress(\"receiver\"), protocolVersion: conf.ProtocolVersion, logger: conf.getOrCreateLogger(), leaderAddr: ServerAddress(\"sender\"), leaderID: ServerID(\"sender\")}\n   r.conf.Store(conf)\n   r.raftState.setState(Follower)\n   r.setCurrentTerm(2)\n   r.setLastLog(3, 1)\n   r.setCommitIndex(1)\n   r.setLastApplied(1)\n   for index := uint64(1); index <= 3; index++ {\n    var entry Log\n    if err := store.InmemStore.GetLog(index, &entry); err != nil || entry.Index != index || entry.Term != 1 { t.Fatalf(\"initial storage mismatch at %d: %v\", index, err) }\n   }\n   initialIndex, initialTerm := r.getLastLog()\n   if initialIndex != 3 || initialTerm != 1 { t.Fatal(\"initial metadata mismatch\") }\n   header := RPCHeader{ProtocolVersion: 3, ID: []byte(\"sender\"), Addr: []byte(\"sender\")}\n   first := &AppendEntriesRequest{RPCHeader: header, Term: 2, PrevLogEntry: 1, PrevLogTerm: 1, Entries: []*Log{{Index: 2, Term: 2, Type: LogNoop}, {Index: 3, Term: 2, Type: LogNoop}}, LeaderCommitIndex: 0}\n   store.armed = true\n   firstResponse := assuranceCall(t, r, first)\n   if !store.deleted || store.deleteMin != 2 || store.deleteMax != 3 || !store.failed || firstResponse.Success { t.Fatal(\"required deletion/error prehistory was not reached\") }\n   var retained Log\n   if err := store.InmemStore.GetLog(1, &retained); err != nil || retained.Term != 1 { t.Fatal(\"retained prefix missing\") }\n   for _, index := range []uint64{2, 3} {\n    var entry Log\n    if err := store.InmemStore.GetLog(index, &entry); !errors.Is(err, ErrLogNotFound) { t.Fatalf(\"deleted entry %d lookup: %v\", index, err) }\n   }\n   prev := uint64(3)\n   if scenario == \"retained_predecessor\" { prev = 1 }\n   second := &AppendEntriesRequest{RPCHeader: header, Term: 2, PrevLogEntry: prev, PrevLogTerm: 1, LeaderCommitIndex: 0}\n   if err := r.checkRPCHeader(RPC{Command: second}); err != nil { t.Fatal(err) }\n   var predecessor Log\n   lookupErr := store.InmemStore.GetLog(second.PrevLogEntry, &predecessor)\n   if lookupErr != nil && !errors.Is(lookupErr, ErrLogNotFound) { t.Fatal(lookupErr) }\n   snapshotIndex, snapshotTerm := r.getLastSnapshot()\n   cachedIndex, cachedTerm := r.getLastLog()\n   represented := (lookupErr == nil && predecessor.Index == second.PrevLogEntry && predecessor.Term == second.PrevLogTerm) || (snapshotIndex == second.PrevLogEntry && snapshotTerm == second.PrevLogTerm)\n   if snapshotIndex != 0 || r.getCommitIndex() != 1 { t.Fatal(\"snapshot or commit prerequisite differs\") }\n   op := \"predecessor-\" + scenario\n   assuranceEmit(t, map[string]interface{}{\"event\":\"predecessor_input\", \"operation_id\":op, \"scenario\":scenario, \"first_success\":firstResponse.Success, \"delete_completed\":store.deleted, \"delete_min\":store.deleteMin, \"delete_max\":store.deleteMax, \"write_failed\":store.failed, \"prev_index\":second.PrevLogEntry, \"prev_term\":second.PrevLogTerm, \"request_term\":second.Term, \"entry_count\":len(second.Entries), \"leader_commit\":second.LeaderCommitIndex, \"represented\":represented, \"lookup_missing\":errors.Is(lookupErr, ErrLogNotFound), \"snapshot_index\":snapshotIndex, \"snapshot_term\":snapshotTerm, \"cached_index\":cachedIndex, \"cached_term\":cachedTerm})\n   response := assuranceCall(t, r, second)\n   var finalEntry Log\n   finalErr := store.InmemStore.GetLog(second.PrevLogEntry, &finalEntry)\n   if finalErr != nil && !errors.Is(finalErr, ErrLogNotFound) { t.Fatal(finalErr) }\n   finalSnapshotIndex, finalSnapshotTerm := r.getLastSnapshot()\n   finalCachedIndex, finalCachedTerm := r.getLastLog()\n   assuranceEmit(t, map[string]interface{}{\"event\":\"predecessor_result\", \"operation_id\":op, \"scenario\":scenario, \"completed\":true, \"success\":response.Success, \"response_term\":response.Term, \"lookup_missing\":errors.Is(finalErr, ErrLogNotFound), \"stored_index\":finalEntry.Index, \"stored_term\":finalEntry.Term, \"snapshot_index\":finalSnapshotIndex, \"snapshot_term\":finalSnapshotTerm, \"cached_index\":finalCachedIndex, \"cached_term\":finalCachedTerm, \"commit_index\":r.getCommitIndex()})\n   if scenario == \"retained_predecessor\" && (!represented || !response.Success) { t.Error(\"retained matching predecessor control did not succeed\") }\n  })\n }\n}\n",
+        "description": "Synchronous handler invocation controls local call order. Each call uses a dedicated buffered RPC response channel and returns before subsequent inspection. The fault adapter performs actual InmemStore deletion and injects a write error without rollback. No asynchronous scheduling capability is assumed. The endpoint is the second completed handler response and independently inspected final state.",
+        "semantic_changes": [
+          "Construct an isolated receiver with consistent initial storage and metadata instead of starting a full node; no background processing runs.",
+          "Use a transport substitute solely for peer address encoding and decoding. Actual RPC.Respond delivers each response through a dedicated channel; network dispatch is excluded.",
+          "Inject the accepted conditional StoreLogs failure through a LogStore adapter after actual successful deletion. This does not characterize a production adapter.",
+          "Initialize configuration using the Config value representation demonstrated by NewRaft's conf.Store(*conf). Only configuration fields used by the exercised handler path are supplied.",
+          "Emit observations around actual target calls without modifying handler logic. The generated Go test leaves the forbidden-path comparison to the declared event property."
+        ],
+        "prerequisites": [
+          {
+            "alias": "input",
+            "event": "predecessor_input",
+            "conditions": [
+              {
+                "field": "scenario",
+                "op": "eq",
+                "value": "deleted_endpoint",
+                "reference": null
+              },
+              {
+                "field": "first_success",
+                "op": "eq",
+                "value": false,
+                "reference": null
+              },
+              {
+                "field": "delete_completed",
+                "op": "eq",
+                "value": true,
+                "reference": null
+              },
+              {
+                "field": "write_failed",
+                "op": "eq",
+                "value": true,
+                "reference": null
+              },
+              {
+                "field": "delete_min",
+                "op": "eq",
+                "value": 2,
+                "reference": null
+              },
+              {
+                "field": "delete_max",
+                "op": "eq",
+                "value": 3,
+                "reference": null
+              },
+              {
+                "field": "prev_index",
+                "op": "eq",
+                "value": 3,
+                "reference": null
+              },
+              {
+                "field": "prev_term",
+                "op": "eq",
+                "value": 1,
+                "reference": null
+              },
+              {
+                "field": "lookup_missing",
+                "op": "eq",
+                "value": true,
+                "reference": null
+              },
+              {
+                "field": "represented",
+                "op": "eq",
+                "value": false,
+                "reference": null
+              },
+              {
+                "field": "snapshot_index",
+                "op": "eq",
+                "value": 0,
+                "reference": null
+              },
+              {
+                "field": "entry_count",
+                "op": "eq",
+                "value": 0,
+                "reference": null
+              },
+              {
+                "field": "leader_commit",
+                "op": "eq",
+                "value": 0,
+                "reference": null
+              }
+            ]
+          }
+        ],
+        "legality": {
+          "source_ids": [
+            "api.go:81:240",
+            "api.go:240:640",
+            "config.go:1:260",
+            "transport.go:1:80",
+            "raft.go:1:140",
+            "raft.go:1440:1584",
+            "raft.go:1821:2241",
+            "state.go:1:174",
+            "inmem_store.go:1:133"
+          ],
+          "expectation_ids": [
+            "commands.go:1:130",
+            "log.go:1:192"
+          ],
+          "binding_ids": [
+            "BIND_append_predecessor_integrity",
+            "BIND_last_entry_representation"
+          ],
+          "derivation": "The acquired constructor establishes Config-value storage and follower initialization. The receiving handler, response channel interface, state accessors, and InmemStore implementation support this sequential local experiment. Requests use supported protocol version 3, current term 2, nonzero well-formed predecessors, and zero leader commit. Deletion starts above commit index 1. The injected write failure is an explicit accepted interface condition. Initial metadata matches actual stored logs; suspected stale metadata is produced only by the first actual handler invocation.",
+          "applicability": "Legal for the accepted conditional local handler boundary. Actual checkRPCHeader calls validate headers. This construction does not establish a reachable distributed sender history or constructor-valid deployment configuration.",
+          "unresolved": [
+            "Production adapter failure exposure",
+            "Legal distributed history generating the second request",
+            "Full-node dispatch and intervening repair behavior"
+          ],
+          "conflicts": [],
+          "alternatives": [
+            "A production store may not exhibit the injected failure semantics.",
+            "Full-node processing may prevent or repair this intermediate state."
+          ]
+        }
+      },
+      "monitors": [
+        {
+          "id": "monitor_append_predecessor_integrity",
+          "checker_id": "check_append_predecessor_integrity",
+          "event": "predecessor_result",
+          "binding_ids": [
+            "BIND_append_predecessor_integrity",
+            "BIND_last_entry_representation"
+          ],
+          "grounding": {
+            "source_ids": [
+              "raft.go:1440:1584",
+              "state.go:1:174",
+              "inmem_store.go:1:133",
+              "transport.go:1:80"
+            ],
+            "expectation_ids": [
+              "commands.go:1:130",
+              "log.go:1:192",
+              "state.go:1:174"
+            ],
+            "binding_ids": [
+              "BIND_append_predecessor_integrity",
+              "BIND_last_entry_representation"
+            ],
+            "derivation": "The predecessor fields are documented as integrity inputs, LogStore defines lookup and inclusive deletion, and getLastEntry describes a stored-history endpoint. These responsibilities support rejecting a predecessor absent from both retained storage and the snapshot boundary. The prerequisite independently measures that absence after actual deletion and write failure; the result obtains Success from the actual response after handler completion. Correlation uses a harness operation identity and a dedicated response channel, independently of the compared success value or predecessor contents.",
+            "applicability": "The absent-predecessor second invocation after the observed partial-failure prehistory. The retained-predecessor control checks a representative permitted path separately.",
+            "unresolved": [
+              "Distributed sender reachability and downstream consequences remain outside this measurement."
+            ],
+            "conflicts": [],
+            "alternatives": [
+              "A retained matching predecessor or matching snapshot boundary would provide legitimate integrity evidence; the prerequisite excludes both."
+            ]
+          },
+          "applicability_conditions": [
+            {
+              "field": "completed",
+              "op": "eq",
+              "value": true,
+              "reference": null
+            }
+          ]
+        }
+      ],
+      "observable_properties": [
+        {
+          "checker_id": "check_append_predecessor_integrity",
+          "kind": "event_assertion",
+          "trigger": {
+            "field": "scenario",
+            "op": "eq",
+            "value": "deleted_endpoint",
+            "reference": null
+          },
+          "assertion": {
+            "field": "success",
+            "op": "eq",
+            "value": false,
+            "reference": null
+          },
+          "identity_fields": [
+            "operation_id"
+          ],
+          "history_field": null,
+          "description": "After the correlated actual deletion/write-failure prehistory and an admitted request whose predecessor is absent from retained logs and the snapshot boundary, the completed second handler response must have Success=false."
+        }
+      ],
+      "uncertainties": [
+        "The injected adapter fault is conditional evidence, not an observation of production storage behavior.",
+        "The second request is tested at the receiving interface; its generation in a legal distributed sender history remains unresolved.",
+        "Direct invocation excludes concurrent node activity, transport dispatch, restart, snapshot installation, and intervening repair.",
+        "An empty-request response does not establish advancement of commitment.match, application, client-visible loss, or overall consensus failure.",
+        "The control's Go assertion is a test expectation for a retained matching predecessor; it is separate from the selected obligation comparison."
+      ]
+    },
+    "gap": "",
+    "partial_design": "The constructor receipt resolves the previous configuration-representation dependency: api.go:240:640 stores *conf by value. The completed design retains the selected obligation, both bindings, actual deletion/error prehistory, independent storage oracle, correlated second response, and retained-predecessor control.",
+    "requests": [],
+    "fallback": "none"
+  }
+]

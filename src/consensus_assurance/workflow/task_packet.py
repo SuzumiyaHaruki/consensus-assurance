@@ -18,10 +18,7 @@ def review_projection(engine,task):
         if (issue.target_id in closure or issue.id in task.resolution_issue_ids) and not issue.resolved_by:wanted.update(issue.source_ids)
     pending_scope=[u for u in state.scope_updates.values() if u['status']=='needs_F2_or_investigation' and u['proposal']['unit_id']==task.unit_id]
     for p in pending_scope:wanted.update(p['proposal']['source_ids'])
-    task.unit_version=next((u.version for u in state.units if u.id==task.unit_id),None)
     result={'pending_scope_updates':pending_scope,'task':task.model_dump(mode='json',exclude={'context_receipt_id','context_dependencies','admitted','preparation_failures','child_task_ids'}),
-        'materials':[m.model_dump(mode='json') for m in state.materials if m.id in wanted],
-        'omitted_material_ids':[m.id for m in state.materials if m.id not in wanted],
         'remaining_seconds':engine.budget.remaining(),
         'target_objects':[available[i].model_dump(mode='json') for i in task.target_ids if i in available and i!=task.unit_id],
         **{name:[o.model_dump(mode='json') for o in getattr(state,name) if o.id in closure and o.id not in task.target_ids and o.id!=task.unit_id] for name in ('claims','bindings','relations','units')},
@@ -34,8 +31,6 @@ def review_projection(engine,task):
         result['semantic_view'],extra=semantic_view(state,closure)
         result['semantic_view'].pop('open_issues')
         wanted.update(extra)
-        result['materials']=[m.model_dump(mode='json') for m in state.materials if m.id in wanted]
-        result['required_material_ids']=sorted(wanted)
     for artifact in state.direct_checks:
         if artifact.id in task.target_ids:
             from .direct_checks import load_plan
@@ -51,6 +46,9 @@ def review_projection(engine,task):
             if checks:
                 result['observed_events']=extract_events(checks[-1])
                 result['raw_log_path']=checks[-1].stdout
+    result['materials']=[m.model_dump(mode='json') for m in state.materials if m.id in wanted]
+    result['omitted_material_ids']=[m.id for m in state.materials if m.id not in wanted]
+    result['required_material_ids']=sorted(wanted)
     if task.model_id:
         model=next((m for m in state.models if m.id==task.model_id),None)
         if model:
@@ -125,10 +123,19 @@ def prepare(engine,kind,context):
                 if c['target_id'] in task.requested_aspects:c['required_aspects']=task.requested_aspects[c['target_id']]
             packet['required_review_pairs']=[{'target_id':c['target_id'],'aspect':a} for c in packet['review_contract'] for a in c['required_aspects']]
             task.context_dependencies={c['target_id']:c for c in packet['review_contract']}
+            from .sources import citation_status
+            supplied=[m['id'] for m in packet.get('materials',[])]
+            missing=[id for id,status in citation_status(state,packet.get('required_material_ids',[]),supplied).items() if status!='provided']
+            if missing:
+                from .errors import Blocked
+                raise Blocked('Review requires unavailable exact source ranges: '+', '.join(missing))
     # The global index is a lookup aid, not full catalogue or source text.
     index=compact_index(state,engine.root/'source') if state.snapshot else []
     files={m['file'] for key in ('materials','new_materials','initial_materials') for m in packet.get(key,[])}
     packet['file_lookup']=[{'file':x['file'],'lines':x.get('lines'),**({'unavailable':x['unavailable']} if x.get('unavailable') else {})} for x in index if kind in {'read','discover','derive','spec_refine','targeted_read'} or x['file'] in files]
+    if kind in {'build','direct_check','harness'} and files:
+        from .materials import catalogue
+        packet['declaration_hints']=[{'file':entry['file'],**symbol} for entry in catalogue(engine.root/'source',state.snapshot) if entry['file'] in files for symbol in entry['symbols'][:6]][:36]
     if task and task.surface_entry_points:
         import re
         from .materials import catalogue
@@ -138,7 +145,7 @@ def prepare(engine,kind,context):
     for key in ('catalogue','source_ranges','unread_ranges','current_material_ids'):
         if kind in {'derive','spec_refine'}:packet.pop(key,None)
     packet['lookup_request']='Request a focused ReadingPlan for an unlisted path or symbol; omitted files are not absent from the repository'
-    packet['file_metadata']=[{**x,'attached_ranges':[[m['start_line'],m['end_line']] for key in ('materials','new_materials','initial_materials') for m in packet.get(key,[]) if m['file']==x['file']]} for x in index if x['file'] in files and kind!='direct_check']
+    packet['file_metadata']=[{**x,'attached_ranges':[[m['start_line'],m['end_line']] for key in ('materials','new_materials','initial_materials') for m in packet.get(key,[]) if m['file']==x['file']]} for x in index if x['file'] in files]
     if kind in {'derive','graph_patch'}:
         from .locations import declaration_index
         from .associations import graph_contract
@@ -191,6 +198,7 @@ def receipt(engine,kind,packet,prompt,schema,task=None,repair=False):
     sections['all_data']=size(packet);sections['wire_schema']=size(wire)
     item={'sections':sections,'required_material_ids':packet.get('required_material_ids',[]),'missing_required_material_ids':[id for id,status in citation_status(engine.state,packet.get('required_material_ids',[]),ids).items() if status!='provided'],'skill_resources':loaded_resources('retry' if repair else kind,packet),'id':uid(),'kind':kind,'task_id':task.id if task else engine.state.active_inquiry_id,'unit_id':engine.state.active_unit_id,
         'material_ids':list(dict.fromkeys(ids)),'materials':[{k:m.get(k) for k in ('id','file','start_line','end_line','content_digest')} for m in materials],
+        'candidate_id':next((c.id for c in engine.state.question_candidates if c.status=='active'),None),
         'review_contract':packet.get('review_contract',[]),'omitted_material_ids':packet.get('omitted_material_ids',[]),
         'source_chars_sent':source_size(packet),'prompt_chars':len(prompt),'prompt_bytes':len(prompt.encode()),'wire_schema_bytes':len(json.dumps(wire,ensure_ascii=False,indent=2).encode()),'wire_schema_chars':len(json.dumps(wire,ensure_ascii=False,indent=2)),'schema_size_basis':'Exact prepared JSON file serialization; not backend token consumption',
         'duplicate_material_occurrences':len(ids)-len(set(ids)),'status':'prepared'}

@@ -4,7 +4,7 @@ from pathlib import Path
 from types import SimpleNamespace
 import pytest
 from consensus_assurance.core.types import ConsensusAuditSpec,Activity,Behavior,Fact,Surface,TargetProfile,AuditQuestion
-from consensus_assurance.workflow.audit_spec import validate,accept,SpecIssue,load,next_surface_refinement
+from consensus_assurance.workflow.audit_spec import validate,accept,SpecIssue,load
 
 
 def inventory(source,variant='local'):
@@ -90,7 +90,7 @@ def test_R5_ready_evidence_precedes_unrelated_unknowns(tmp_path,prepared):
     question=dict(question='Does this established input satisfy the selected obligation?',importance='Observable service consequence',source_ids=[state.materials[0].id],activity_classes=['A1','A5'],behavior_ids=['producer','consumer'],fact_ids=['fact'],obligation_relation_kind='consumption',trigger_rationale='Exercise the actual input consumption')
     unit=state.units[0];unit.audit_question=AuditQuestion(**question,disposition='ready_for_check',preferred_check='direct_test')
     other=unit.model_copy(deep=True);other.id='needs-source';other.obligation_ids=['input_obligation'];other.audit_question.disposition='needs_specific_evidence';other.audit_question.priority=3;state.units.append(other)
-    assert select_unit(state).id==unit.id and next_surface_refinement(state) is None
+    assert select_unit(state).id==unit.id
     assert choose_task(controller(tmp_path,state)) is None
     assert len(unit.obligation_ids)==1 and not state.inquiry_tasks
 
@@ -138,10 +138,12 @@ def test_surface_delta_split_growth_and_scope(prepared,tmp_path):
     assert load(state).activities[2]==correction
 
 
-def test_frontier_alternation_navigation_and_same_run_dedup(prepared,tmp_path):
+def test_explicit_frontier_selection_preserves_navigation_and_focus(prepared,tmp_path):
     import shutil
     from consensus_assurance.core.types import QuestionCandidate
-    from consensus_assurance.workflow.inquiry import choose_task,task_context,read_purpose
+    from consensus_assurance.workflow.inquiry import choose_task,task_context,read_purpose,enqueue
+    from consensus_assurance.core.proposals import Derivation
+    from consensus_assurance.workflow.discovery import classify_derivation_outcome
     from consensus_assurance.workflow.materials import refresh_unread
     from test_graph_mutations import controller
     repo,state,_,_=prepared;state.units=[];e=controller(tmp_path,state);shutil.copytree(repo,e.root/'source')
@@ -160,8 +162,13 @@ def test_frontier_alternation_navigation_and_same_run_dedup(prepared,tmp_path):
     spec.surfaces.extend([Surface(entry_point='first',disposition='deferred',behavior_ids=['producer'],high_consequence=True,reason='Unread owner',source_ids=[source]),
         Surface(entry_point='second',disposition='deferred',behavior_ids=['consumer'],high_consequence=True,reason='Unread owner',source_ids=[source])])
     accept(e,spec);refresh_unread(state,e.root/'source')
-    task=choose_task(e)
-    assert task.surface_entry_points==['second'] and task.activity_classes==['A5'] and read_purpose(task)=='breadth'
+    assert choose_task(e) is None
+
+
+    selection=Derivation(frontier_entry_point='second',selection_rationale='The known consumer source and context guard make this frontier worth reading')
+    assert classify_derivation_outcome(state,selection)=='frontier'
+    task=enqueue(state,'spec_refine',selection.selection_rationale,'selected:second',activity_classes=['A5'],target_ids=['surface:second'],surface_entry_points=['second'])
+    assert choose_task(e).id==task.id and read_purpose(task)=='breadth'
     from consensus_assurance.workflow.task_packet import prepare
     packet=prepare(e,'spec_refine',task_context(e,task))[0]
     assert [s['entry_point'] for s in packet['focused_surfaces']]==['second'] and packet['activity_focus']==['A5']
@@ -172,15 +179,32 @@ def test_frontier_alternation_navigation_and_same_run_dedup(prepared,tmp_path):
     state.mode='real';state.analysis_mode='autonomous'
     report=__import__('consensus_assurance.reporting.chinese',fromlist=['render_report']).render_report(state,e.root).read_text()
     assert "Activity 重点：`['A5']`" in report and '有明确 Activity 重点的自主发现' in report
-    task.status='completed';task.admitted=True;state.last_work_kind='surface'
+    task.status='completed';task.admitted=True
     assert choose_task(e) is None
     q=AuditQuestion(question='Selected input question',importance='Scoped service effect',source_ids=[source],trigger_rationale='Selected discriminator',activity_classes=['A1'],behavior_ids=['producer'],fact_ids=['fact'],obligation_relation_kind='establishment')
-    state.question_candidates=[QuestionCandidate(question=q)];state.last_work_kind='candidate'
-    assert next_surface_refinement(state) is None and choose_task(e) is None
+    state.question_candidates=[QuestionCandidate(question=q)]
+    assert choose_task(e) is None
     state.question_candidates[0].status='blocked'
-    first=choose_task(e);assert first.surface_entry_points==['first']
-    first.status='blocked';first.admitted=True;state.last_work_kind='candidate'
-    assert next_surface_refinement(state) is None
+    assert choose_task(e) is None
+
+
+def test_activity_relevance_does_not_grant_global_rewrite(prepared,tmp_path):
+    from consensus_assurance.core.proposals import AuditSpecDelta,Derivation
+    from consensus_assurance.core.types import InquiryTask
+    from consensus_assurance.workflow.audit_spec import merge_delta
+    from consensus_assurance.workflow.discovery import classify_derivation_outcome
+    from test_graph_mutations import controller
+    _,state,_,_=prepared;e=controller(tmp_path,state);source=state.materials[0].id
+    spec=inventory(source)
+    spec.surfaces.append(Surface(entry_point='unmapped owner',disposition='deferred',reason='The owner is unread',high_consequence=True,source_ids=[source]))
+    accept(e,spec)
+    assert classify_derivation_outcome(state,Derivation(frontier_entry_point='unmapped owner',selection_rationale='A sourced entry point may matter to the current focus'))=='frontier'
+    changed=spec.activities[0].model_copy(update={'realization_summary':'New global conclusion'})
+    task=InquiryTask(kind='spec_refine',reason='Read the selected frontier',trigger='frontier',activity_classes=['A1'],surface_entry_points=['unmapped owner'],material_ids=[source],context_receipt_id='current')
+    with pytest.raises(SpecIssue,match='outside this descriptive focus'):
+        merge_delta(state,task,AuditSpecDelta(activities=[changed],rationale='Local reading cannot replace a global responsibility'))
+    task.target_ids=['A1']
+    assert merge_delta(state,task,AuditSpecDelta(activities=[changed],rationale='Explicitly revise the complete selected activity')).activities[0]==changed
 
 
 @pytest.mark.parametrize('failure',['duplicate','dangling','unacquired','accepted_fact'])
@@ -304,8 +328,7 @@ def test_composite_surface_retains_schedulable_remainder(tmp_path,prepared,mode)
         with pytest.raises(SpecIssue,match='attached exact source'):merge_delta(state,task,delta)
         return
     accept(e,merge_delta(state,task,delta))
-    pending=next_surface_refinement(state)
-    assert (pending.entry_point if pending else None)==('remaining owner' if mode=='partial' else None)
+    assert ('remaining owner' in {s.entry_point for s in load(state).surfaces}) is (mode=='partial')
     assert len(load(state).surfaces)==(2 if mode=='partial' else 1)
 
 

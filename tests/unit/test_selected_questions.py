@@ -197,7 +197,7 @@ def test_resumed_partial_continuation_explains_then_selects_next(focused):
         return reply,CheckRun(id='closed',action='agent',status=ExecutionStatus.COMPLETED,cwd=str(e.root),snapshot_id=e.state.snapshot.id)
     e.ask=ask
     discovery.derive(e)
-    assert len(seen)==1 and e.state.last_work_kind=='candidate'
+    assert len(seen)==1 and e.state.question_candidates[0].status=='explained'
     with pytest.raises(RuntimeError,match='Next candidate'):discovery.derive(e)
     assert not e.state.claims and not e.state.units and not e.state.models
     assert e.state.question_candidates[0].status=='explained' and not e.state.inquiry_tasks
@@ -522,7 +522,7 @@ def test_pending_feedback_merges_opinions_without_blocking_candidate(focused):
     assert first.candidate_id is None and not c.spec_task_ids and choose_task(e) is None
     overlap=enqueue(e.state,'spec_refine','Check shared consumer','review-d',target_ids=['producer','consumer'],diagnostics=opinion('Check shared consumer'))
     assert overlap.id==first.id and len(first.diagnostics)==3 and first.target_ids==['producer','consumer']
-    c.status='explained';e.state.last_work_kind='candidate'
+    c.status='explained'
     required.status='completed'
     assert choose_task(e).id==first.id
     e.state.active_unit_id='ready'

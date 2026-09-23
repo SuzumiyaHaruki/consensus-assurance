@@ -121,12 +121,21 @@ def classify_derivation_outcome(state,reply):
     graph=reply.obligation or reply.bindings or reply.dependencies or reply.context_claims
     if not reply.selection_rationale.strip():raise ValueError('Explain the bounded analysis outcome')
     if q is None:
+        if reply.frontier_entry_point:
+            if selected or current or graph or reply.descriptive_issues or pausing:
+                raise ValueError('A frontier read is a separate selection without candidate or graph edits')
+            from .audit_spec import load
+            spec=load(state)
+            if not spec or not any(s.entry_point==reply.frontier_entry_point and s.disposition in {'deferred','UNCLASSIFIED_PROTOCOL_RESPONSIBILITY'} for s in spec.surfaces):
+                invalid_reference('/frontier_entry_point','Select an existing unresolved surface')
+            return 'frontier'
         if pausing:
             if graph or reply.reading_requests or reply.descriptive_issues:raise ValueError('A pause without a replacement question cannot add semantic work')
             return 'pause'
         if selected and not (graph or reply.reading_requests or reply.descriptive_issues):return 'resume'
         if not current and not (graph or reply.reading_requests or reply.descriptive_issues):return 'selection_exhausted'
         raise ValueError('Selection can stop only after candidates were considered, with no active question or proposed work')
+    if reply.frontier_entry_point:invalid_reference('/frontier_entry_point','Frontier reading cannot replace the selected candidate')
     reads=reply.reading_requests+q.requests
     if not reply.obligation and graph:raise ValueError('A pre-obligation candidate cannot create graph objects')
     if q.disposition=='explained_by_existing_mechanism' and (graph or reads or not q.counterevidence):
@@ -224,9 +233,14 @@ def accept_derivation(engine,reply,check_id):
         state=proxy.state
         outcome=validate_derivation(state,reply)
         if outcome=='selection_exhausted':
-            state.last_work_kind='candidate'
             state.gaps.append('No additional tractable candidate selected: '+reply.selection_rationale)
             state.completed_steps.append('derived-spec:'+str(state.audit_spec_version))
+            return
+        if outcome=='frontier':
+            from .audit_spec import load
+            surface=next(s for s in load(state).surfaces if s.entry_point==reply.frontier_entry_point)
+            inquiry.enqueue(state,'spec_refine',reply.selection_rationale,check_id+':frontier',
+                target_ids=['surface:'+surface.entry_point],surface_entry_points=[surface.entry_point],requests=reply.reading_requests)
             return
         candidate=next((c for c in state.question_candidates if c.id==reply.candidate_id),None)
         if reply.candidate_action=='pause':
@@ -329,7 +343,7 @@ def derive(engine):
             if accept_derivation(engine,Derivation.model_validate_json(path.read_text()),check_id):
                 inquiry.release_action(engine);engine.checkpoint('derivation_episode_committed');return
             if active_candidate(engine.state) is None:
-                engine.state.last_work_kind='candidate';return
+                return
     while True:
         candidate=active_candidate(engine.state)
         if candidate:
@@ -341,7 +355,6 @@ def derive(engine):
             inquiry.release_action(engine);engine.checkpoint('derivation_episode_committed');return
         inquiry.release_action(engine);engine.checkpoint('candidate_continuation_saved')
         if active_candidate(engine.state) is None:break
-    engine.state.last_work_kind='candidate'
     inquiry.release_action(engine);engine.checkpoint('candidate_episode_finished')
 
 

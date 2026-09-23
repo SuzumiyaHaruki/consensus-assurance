@@ -17,7 +17,7 @@ from consensus_assurance.adapters.storage.snapshot import capture
 from .graph import select_unit
 from .artifacts import save_bundle
 from .modeling import validate_build_reply, obligation_progress, coverage_limitations
-from .investigation import feedback_context, validate_feedback, validate_replay, record_consequence
+from .investigation import feedback_context, validate_feedback, validate_replay
 from .budget import BudgetTracker, BudgetExhausted
 from .feedback import apply_feedback
 
@@ -49,6 +49,9 @@ class Engine:
                 evidence.applicability='recheck_required';evidence.assessment=Assessment.STALE;evidence.stale_reason='Direct-check semantic inputs changed'
         for finding in self.state.findings:
             if finding.direct_check_id in stale:finding.applicability='recheck_required'
+        if stale:
+            from .direct_checks import refresh_assessments
+            refresh_assessments(self.state,stale,stale_only=True)
         from consensus_assurance.core.types import now
         observed={
             'initial_graph':'discovery' in self.state.completed_steps,
@@ -460,7 +463,6 @@ class Engine:
                 if check.outcome=="counterexample" and not failed:
                     raise Blocked("Reported invariant cannot be attributed to a configured claim; other properties remain unknown")
                 inquiry.review_unit(self,unit,'after_search:'+check.id,model)
-                self.state.last_work_kind="local"
                 if failed:
                     self.state.active_finding_id=failed.id; failed.stage=Investigation.REACHABILITY_PENDING
                     self.advance("replay_plan")
@@ -498,15 +500,9 @@ class Engine:
                 record=assess_execution(self.state,model,bundle,experiment,calibration,finding,extract_events(experiment))
                 path=self.root/"findings"/finding.id/(experiment.id+".json"); write_json(path,record); finding.confirmation_path=str(path)
                 if record["confirmed"]:
-                    if finding.level=='implementation_obligation':self.advance("consequence_plan");continue
                     self.finish_unit(unit);return
                 if record["prerequisites"]["status"]=="not_reached": self.advance("feedback_F4")
                 else: self.advance("diagnose")
-            elif phase=="consequence_plan":
-                if any(c['finding_id']==finding.id for c in self.state.consequences):
-                    self.finish_unit(unit);return
-                record_consequence(self,unit,finding)
-                self.finish_unit(unit);return
             elif phase in {"feedback_F1","feedback_F4","diagnose"}:
                 kind=phase.removeprefix("feedback_")
                 context=feedback_context(self,unit,model,bundle,experiment,calibration,finding)
@@ -588,7 +584,6 @@ class Engine:
                             current_task.repair_session=self.state.pending_output_repair
                             self.state.active_inquiry_id=None;self.state.pending_output_repair=None
                             inquiry.release_action(self);self.state.gaps.append(str(exc))
-                            if task.surface_entry_points:self.state.last_work_kind='surface'
                             self.checkpoint("inquiry_task_blocked")
                             if str(exc).startswith("Agent blocked:"): raise
                         continue
@@ -618,7 +613,6 @@ class Engine:
                             if candidate.status in {"pending","partial"}:
                                 candidate.status="blocked";candidate.recheck_reasons.append("Audit-unit budget exhausted")
                                 candidate.obligation_checks,candidate.remaining_obligation_ids=obligation_progress(self.state,candidate)
-                        self.state.last_work_kind="local"
                         continue
                     raise BudgetExhausted("Audit-unit budget exhausted")
                 unit = select_unit(self.state)
@@ -628,7 +622,6 @@ class Engine:
                 self.budget.take("audit_units"); self.state.active_unit_id=unit.id; self.checkpoint("relation_driven_selection")
                 if inquiry.enabled(self):
                     self.state.next_action="select"
-                    self.state.last_work_kind="local"
                     continue
                 self.process_unit(unit)
         except (BudgetExhausted, Blocked, ValueError, OSError) as exc:

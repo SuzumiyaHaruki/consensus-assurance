@@ -156,6 +156,9 @@ def compute_assessment(state,unit,artifact,plan,check,events):
         except (OSError,ValueError):related=set()
         if checker_ids&related:related_artifacts.append(candidate.id)
     blockers=[]
+    versions={o.id:o.version for o in state.claims+state.bindings+state.relations+state.units}
+    if any(versions.get(id)!=version for id,version in artifact.graph_versions.items()):
+        blockers.append('Direct-check semantic inputs changed; execution requires rechecking')
     reviews=[i for r in state.semantic_reviews if r.target_versions.get(artifact.id)==artifact.version
         for i in r.items if i.target_id==artifact.id and i.aspect=='checker_correspondence']
     current_review=reviews[-1] if reviews else None
@@ -212,7 +215,7 @@ def persist_assessment(state,artifact,plan,check,record):
         outcome=r['outcome'],reason=r['reason']) for r in record['properties']]
     for result in record['properties']:
         if not result['comparison_complete']:continue
-        assessment=Assessment.CHALLENGED if result['confirmed'] else Assessment.INCONCLUSIVE
+        assessment=Assessment.STALE if 'Direct-check semantic inputs changed; execution requires rechecking' in record['blockers'] else Assessment.CHALLENGED if result['confirmed'] else Assessment.INCONCLUSIVE
         evidence=next((e for e in state.evidence if e.check_id==check.id and e.direct_check_id==artifact.id and e.checker_id==result['checker_id']),None)
         description=('Finite measured '+result['outcome']+' comparison for direct check '+artifact.id+
             '; current attribution is stored in its monitor result; broader consequences remain outside this evidence')
@@ -242,6 +245,19 @@ def assess(state,unit,artifact,plan,check,events):
     return persist_assessment(state,artifact,plan,check,compute_assessment(state,unit,artifact,plan,check,events))
 
 
+def refresh_assessments(state,artifact_ids,stale_only=False):
+    from consensus_assurance.adapters.runners.experiment import extract_events
+    units={u.id:u for u in state.units}
+    for artifact in state.direct_checks:
+        if artifact.id not in artifact_ids or artifact.unit_id not in units:continue
+        plan=load_plan(artifact.plan_path)
+        for check in state.checks:
+            if check.direct_check_id!=artifact.id:continue
+            if stale_only and any(r.get('experiment_check_id')==check.id and
+                    'Direct-check semantic inputs changed; execution requires rechecking' in r.get('blockers',[]) for r in state.monitor_results):continue
+            assess(state,units[artifact.unit_id],artifact,plan,check,extract_events(check))
+
+
 def proceed(engine,unit,phase):
     if engine.implementation is None:raise Blocked('Direct execution unavailable: no execution backend configured')
     state=engine.state
@@ -254,13 +270,7 @@ def proceed(engine,unit,phase):
             'execution_gap':state.pending_feedback},lambda p:validate_reply(state,unit,p,engine.implementation,previous))
         if reply.plan is None:
             if reply.requests:
-                if reply.reading_purpose=='dependency':
-                    engine.targeted_read(unit,reply.gap,requests=reply.requests)
-                    state.active_direct_check_id=None;engine.advance('select')
-                else:
-                    engine.read(reply.requests,purpose='depth',plan_id='direct-read-'+call.id,related_ids=[unit.id],reason=reply.gap)
-                    engine.advance('direct_check')
-                return
+                raise Blocked('Unfinished direct construction returned outside its generation session')
             state.gaps.append(reply.gap)
             if reply.fallback in {'local_model','source_review'}:
                 state.question_continuations.setdefault(unit.id,{})['fallback']={'kind':reply.fallback,'check_id':call.id,'reason':reply.gap}
@@ -290,10 +300,11 @@ def proceed(engine,unit,phase):
                 'direct_check:'+artifact.id,target_ids=[artifact.id],unit_id=unit.id)
         engine.advance('direct_assess');return
     check=next(c for c in reversed(state.checks) if c.direct_check_id==artifact.id)
-    record=assess(state,unit,artifact,plan,check,extract_events(check))
+    record=next((r for r in reversed(state.monitor_results) if r.get('direct_check_id')==artifact.id and r.get('experiment_check_id')==check.id),None)
+    if record is None:record=assess(state,unit,artifact,plan,check,extract_events(check))
     write_json(engine.root/'direct-checks'/artifact.operation_id/(check.id+'-assessment.json'),record)
     if record['confirmed']:
-        state.active_finding_id=record['finding_id'];engine.advance('consequence_plan');return
+        state.active_finding_id=record['finding_id'];engine.finish_unit(unit,'checked');return
     if record['bounded_complete']:
         engine.finish_unit(unit,'checked' if not record['blockers'] else 'blocked');return
     if check.status==ExecutionStatus.ERROR or check.status==ExecutionStatus.COMPLETED and check.exit_code==0 and record['prerequisites']['status']=='not_reached':

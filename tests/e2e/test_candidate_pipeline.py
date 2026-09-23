@@ -57,8 +57,8 @@ def test_evidence_blocked_candidate_does_not_end_autonomous_selection(tmp_path,p
         assert second_record.obligation_id==state.units[0].obligation_ids[0]
 
 
-def test_progressive_frontier_prevents_candidate_monopoly(tmp_path,prepared):
-    """15-00-06 run shape: candidate loop starved high-consequence deferred surfaces."""
+def test_selected_frontier_continues_after_candidate_disposition(tmp_path,prepared):
+    """An explicit frontier choice survives candidate disposition and name ordering."""
     from consensus_assurance.core.types import AuditQuestion,ReadRequest,Surface,Behavior,Fact
     from consensus_assurance.core.proposals import SpecRefinement,AuditSpecDelta
     from regression_support import descriptive_inventory
@@ -77,9 +77,8 @@ def test_progressive_frontier_prevents_candidate_monopoly(tmp_path,prepared):
     def select(question,requests):return Derivation(audit_question=question,reading_requests=requests,selection_rationale='One bounded source discriminator').model_dump(mode='json')
     def explain(question):return select(question.model_copy(update={'disposition':'explained_by_existing_mechanism'}),[])
     replies=[responses[0],description.model_dump(mode='json'),
-        SpecRefinement(understanding='The external provider is absent',delta=AuditSpecDelta(rationale='Retain deferred boundary; no source supports a mapping'),limitations=['External provider unavailable']).model_dump(mode='json'),
         select(q,[ReadRequest(file='counter.py',start_line=1,end_line=10,reason='Review scoped operation')]),explain(q),
-        SpecRefinement(understanding='Navigate to the unread restore owner',requests=[reading],limitations=[]).model_dump(mode='json'),
+        Derivation(frontier_entry_point='recovery boundary',reading_requests=[reading],selection_rationale='The unread restore declaration is the next concrete dependency').model_dump(mode='json'),
         SpecRefinement(understanding='Recover the synchronous restore owner',delta=AuditSpecDelta(behaviors=[behavior],facts=[fact],surfaces=[Surface(entry_point='recovery boundary',disposition='mapped',behavior_ids=['restore'],reason='Acquired declaration and return',source_ids=[actual],high_consequence=True)],rationale='Add the previously absent recovery path'),limitations=['Consumer remains external']).model_dump(mode='json'),
         select(later,[reading]),explain(later),Derivation(selection_rationale='No further tractable discriminator is supported').model_dump(mode='json')]
     fixture=tmp_path/'progressive.json';fixture.write_text(json.dumps(replies))
@@ -89,9 +88,9 @@ def test_progressive_frontier_prevents_candidate_monopoly(tmp_path,prepared):
     assert [c.status for c in state.question_candidates]==['explained','explained'],state.stop_reason
     assert state.audit_spec_version==2 and not state.repair_sessions
     tasks=[t for t in state.inquiry_tasks if t.surface_entry_points]
-    assert [t.surface_entry_points for t in tasks]==[['external boundary'],['recovery boundary']]
+    assert [t.surface_entry_points for t in tasks]==[['recovery boundary']]
     assert all(t.status=='completed' for t in tasks)
     assert not state.claims and not state.units and not state.evidence
-    assert [c.parameters.get('agent_task') for c in state.checks if c.parameters.get('agent_task')]==['read','discover','spec_refine','derive','derive','spec_refine','spec_refine','derive','derive','derive']
+    assert [c.parameters.get('agent_task') for c in state.checks if c.parameters.get('agent_task')]==['read','discover','derive','derive','derive','spec_refine','derive','derive','derive']
     from consensus_assurance.workflow.audit_spec import load
     assert load(state).surfaces[-2].disposition=='deferred' and load(state).facts[-1].established_by==['restore']

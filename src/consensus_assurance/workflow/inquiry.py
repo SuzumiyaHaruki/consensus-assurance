@@ -105,20 +105,8 @@ def choose_task(engine):
     if feedback:
         focus=set(engine.config.activity_focus)
         return min(feedback,key=lambda t:(0 if focus&set(t.activity_classes) else 1,state.inquiry_tasks.index(t)))
-    if state.last_work_kind in {'candidate','local','review'}:
-        enrichment=next((t for t in pending if t.diagnostics and not t.candidate_id),None)
-        if enrichment:return enrichment
-    from .audit_spec import load, next_surface_refinement
     from .budget import can_start_episode
-    if can_start_episode(state,'surface') and state.usage.get('exploration_rounds',0)<engine.config.budget.exploration_rounds:
-        surface=next_surface_refinement(state)
-        if surface:
-            spec=load(state)
-            behavior={b.id:b for b in spec.behaviors}
-            classes=list(dict.fromkeys(behavior[id].primary_activity for id in surface.behavior_ids if id in behavior))
-            return enqueue(state,'spec_refine','Expand one source-grounded implementation surface','surface:'+surface.entry_point,
-                activity_classes=classes,surface_entry_points=[surface.entry_point])
-    if pending and state.last_work_kind!='surface' and (pending[0].admitted or can_start_episode(state,'surface')):return pending[0]
+    if pending and (pending[0].admitted or can_start_episode(state,'surface')):return pending[0]
     return None
 
 
@@ -241,7 +229,7 @@ def pause_unit(engine, reason):
     state.gaps.append(reason)
     state.active_unit_id=None;state.active_model_id=None;state.active_finding_id=None;state.active_direct_check_id=None
     state.pending_output_repair=None;state.pending_feedback=None;state.targeted_gap=None
-    release_action(engine);state.next_action='select';state.last_work_kind='local'
+    release_action(engine);state.next_action='select'
     engine.checkpoint('local_work_deferred_for_other_tasks')
 
 
@@ -359,13 +347,15 @@ def apply_task_response(engine,task_id,reply,check):
             targets=list(dict.fromkeys(i.target_id for i in focus)) or task.target_ids
             follow=enqueue(state,'review','Follow up only the unresolved aspects using the requested source',task.id+':followup',target_ids=targets,unit_id=task.unit_id,model_id=task.model_id,requests=reply.requests)
             follow.requested_aspects={id:list(dict.fromkeys(i.aspect for i in focus if i.target_id==id)) or task.requested_aspects.get(id,list(required_aspects(objects(state)[id]))) for id in targets}
-            follow.resolution_issue_ids=[i.id for i in state.review_issues if not i.resolved_by and i.target_id in targets and i.aspect in follow.requested_aspects[i.target_id]]
         record_dispositions(state,review,reply,[t.id for t in state.inquiry_tasks if t.id not in followup_before])
+        if any(a.id in task.target_ids for a in state.direct_checks):
+            from .direct_checks import refresh_assessments
+            refresh_assessments(state,{a.id for a in state.direct_checks if a.unit_id==task.unit_id})
         if reply.requests and focus:
             follow.resolution_issue_ids=[i.id for i in state.review_issues if not i.resolved_by and i.target_id in targets and i.aspect in follow.requested_aspects[i.target_id]]
     task.repair_session=None;task.check_id=check.id;task.status='blocked' if task.stop_reason=='Focused review still omitted required aspects' else 'completed';task.stage='done';state.active_inquiry_id=None
     settle_parents(state)
-    state.last_work_kind='surface' if task.surface_entry_points else task.kind;release_action(engine)
+    release_action(engine)
 
 
 def split_context_task(engine,task):
