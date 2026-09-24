@@ -1,0 +1,9 @@
+# Native investigation submission
+
+Investigate within the captured source snapshot using your own search, reading, and draft edits. Choose a bounded question before requiring an obligation. Keep source expectations, code behavior, test assertions, and hypotheses distinct. A source citation is a path, line range, content version, and reason; it is not semantic proof.
+
+Submit a complete `submission.json` from the draft workspace only when the current decision or artifact is ready for controller validation. Use the supplied schema. `candidate_id` continues an accepted question; `parent_candidate_id` creates a distinct child while preserving the parent. Do not combine them. A pause needs concrete resume conditions. An explained question needs sourced counterevidence and remains analysis, not executable evidence.
+
+For direct checks, put plan metadata in JSON with empty `harness.source` and the actual harness in a separate source file. For local models, first accept an obligation and unit; then provide model metadata with separate Behavior and Properties TLA+ files. A complete Bundle also needs a separate harness source file. Use ModelDraft with explicit pending components when implementation assembly is missing. A checker correction names its previous artifact and open issue, preserves the obligation, and awaits a fresh formal execution and review.
+
+Use the controller's returned raw execution and assessment to continue the same investigation. Inspect actual target calls, fault prehistory, completion, identity and independent oracle. Formal execution, calibration and semantic attribution are separate. Name only issues whose specific evidence has been reconsidered; retain other uncertainty. If a submission is rejected, inspect its complete saved bytes, all diagnostics and current candidate registry, then revise the whole draft. An unaccepted draft has no effect on prior accepted objects.

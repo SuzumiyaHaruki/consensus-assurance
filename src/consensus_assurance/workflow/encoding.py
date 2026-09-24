@@ -41,9 +41,12 @@ def validate_direct_encoding(state,artifact,previous,repaired,revision):
         if left.model_copy(update={'applicability_conditions':right.applicability_conditions})!=right:
             raise ValueError('Direct encoding correction cannot change the observation endpoint or grounding')
     for id in old:
-        if old[id].model_copy(update={'assertion':new[id].assertion,'description':new[id].description})!=new[id]:
-            raise ValueError('Direct encoding correction cannot change trigger, identity or property kind')
-    if not any(old[id].assertion!=new[id].assertion for id in old) and not any(a.applicability_conditions!=b.applicability_conditions for a,b in zip(previous.monitors,repaired.monitors)):
+        if old[id].model_copy(update={'assertion':new[id].assertion,'description':new[id].description,
+                'kind':new[id].kind,'antecedent':new[id].antecedent})!=new[id]:
+            raise ValueError('Direct encoding correction cannot change trigger or identity')
+        if new[id].kind not in {'event_assertion','event_implication'}:
+            raise ValueError('Direct encoding correction needs a supported result predicate')
+    if not any((old[id].assertion,old[id].kind,old[id].antecedent)!=(new[id].assertion,new[id].kind,new[id].antecedent) for id in old) and not any(a.applicability_conditions!=b.applicability_conditions for a,b in zip(previous.monitors,repaired.monitors)):
         raise ValueError('Direct encoding correction needs an actual oracle change')
 
 

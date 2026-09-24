@@ -363,6 +363,62 @@ def test_reviewed_direct_encoding_correction_reexecutes_and_resolves_only_its_is
     assert next(r for r in e.state.monitor_results if r['direct_check_id']==old.id)['experiment_check_id']==original.id
 
 
+def test_native_session_revises_executes_and_reviews_saved_checker(tmp_path,prepared):
+    from consensus_assurance.workflow.native import execute as native_execute
+    e,u,correct=setup(tmp_path,prepared,False)
+    wrong=correct.model_copy(deep=True)
+    wrong.observable_properties[0].assertion=Comparison(field='state.value',reference='start.state.limit')
+    old=save_plan(e,u,wrong,'native-old')
+    original=execute(e,old)
+    assess(e.state,u,old,wrong,original,extract_events(original))
+    issue=ReviewIssue(review_id='initial-review',target_id=old.id,target_version=old.version,
+        aspect='checker_correspondence',source_ids=u.audit_question.source_ids,
+        explanation='Equality to capacity is stronger than the selected range safety claim',
+        disposition='revision',reason='Use a predicate matching the claim',needs_recheck=True)
+    e.state.review_issues.append(issue)
+    e.state.analysis_mode='autonomous'
+    cfg=e.config.model_dump(mode='json');cfg['execution_isolation']='bwrap'
+    e.config=Config.model_validate(cfg)
+    class NativeFixture:
+        name='codex';mock=False;available=True
+        turn=0
+        def investigate(self,runner,prompt,directory,snapshot_id,timeout,session_id=None):
+            self.turn+=1
+            if self.turn==1:
+                raw=correct.model_dump(mode='json')
+                raw['harness']['source']=''
+                (directory/'correct.json').write_text(json.dumps(raw))
+                (directory/'check.py').write_text(correct.harness.source)
+                value={'action':'revise_check','previous_check_id':old.id,
+                    'encoding_revision':EncodingRevision(old_direct_check_id=old.id,issue_id=issue.id,
+                        source_ids=issue.source_ids,rationale='Replace equality with the sourced range safety predicate').model_dump(mode='json'),
+                    'plan_path':'correct.json','harness_path':'check.py','rationale':'Correct the actual oracle and rerun it'}
+            elif self.turn==2:
+                revised=next(a for a in e.state.direct_checks if a.previous_id==old.id)
+                items=[SemanticCheck(target_id=revised.id,aspect=aspect,status='no_issue_found',
+                    source_ids=issue.source_ids,rationale='The new executed result compares actual return with the sourced range safety predicate')
+                    for aspect in ('applicability','decomposition','checker_correspondence')]
+                value={'action':'review','review_check_id':revised.id,'review_items':[item.model_dump(mode='json') for item in items],
+                    'resolves_issue_ids':[issue.id],'resolution_rationale':'The corrected checker was executed on the same bounded fixture',
+                    'rationale':'Review all three aspects against the saved new execution'}
+            else:
+                value={'action':'stop','rationale':'The bounded correction is complete; broader paths remain outside this fixture'}
+            (directory/'submission.json').write_text(json.dumps(value))
+            return (CheckRun(action='native_agent',cwd=str(directory),snapshot_id=snapshot_id,
+                status=ExecutionStatus.COMPLETED,exit_code=0),session_id or 'offline-session',
+                {'submission':'submission.json','summary':'Offline native adapter sequence'})
+    e.agent=NativeFixture()
+    e.state.tools={'agent':'offline-native'}
+    e.config.budget.agent_calls=4
+    native_execute(e)
+    revised=next(a for a in e.state.direct_checks if a.previous_id==old.id)
+    assert revised.id!=old.id
+    assert len([c for c in e.state.checks if c.direct_check_id==revised.id])==1
+    assert next(i for i in e.state.review_issues if i.id==issue.id).resolved_by
+    assert Path(old.plan_path).exists() and Path(original.stdout).exists()
+    assert e.state.native_session_id=='offline-session'
+
+
 def test_direct_encoding_observation_change_must_be_declared(tmp_path,prepared):
     from consensus_assurance.workflow.direct_checks import validate_reply
     e,u,old_plan=setup(tmp_path,prepared);old=save_plan(e,u,old_plan,'observation-old');execute(e,old)

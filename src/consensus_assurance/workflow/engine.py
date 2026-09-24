@@ -84,12 +84,21 @@ class Engine:
         write_json(self.root / "config.json", self.config)
         write_json(self.root / "snapshot.json", snapshot)
         self.checkpoint("created")
+        if self.agent.name == "codex":
+            if plan_only:
+                self.state.stop_reason="Snapshot prepared; native investigation requires run"
+                self.checkpoint("native_plan_only")
+                return self.state
+            from .native import execute
+            return execute(self)
         return self.execute(plan_only=plan_only)
 
-    def resume(self, action_timeout=None, repair_attempts=None):
+    def resume(self, action_timeout=None, repair_attempts=None, native_turn_timeout=None):
         if repair_attempts is not None and (not isinstance(repair_attempts,int) or repair_attempts<0):raise ValueError("Repair attempt limit must be a nonnegative integer")
         if action_timeout is not None and (not math.isfinite(action_timeout) or action_timeout <= 0):
             raise ValueError("Action timeout must be a finite positive number")
+        if native_turn_timeout is not None and (not math.isfinite(native_turn_timeout) or native_turn_timeout <= 0):
+            raise ValueError("Native turn timeout must be a finite positive number")
         self.state = self.store.load()
         self.budget = BudgetTracker(self.config.budget, self.state)
         self.runner.deadline = time.monotonic() + self.budget.remaining()
@@ -113,6 +122,12 @@ class Engine:
             self.state.config = self.config.model_dump(mode="json")
             self.budget.limits = self.config.budget
             self.checkpoint(f"resume_action_timeout_changed:{old_timeout}:{action_timeout}")
+        if native_turn_timeout is not None and native_turn_timeout != self.config.budget.native_turn_timeout:
+            old_timeout=self.config.budget.native_turn_timeout
+            data=self.config.model_dump(mode="json");data["budget"]["native_turn_timeout"]=native_turn_timeout
+            self.config=Config.model_validate(data);self.state.config=self.config.model_dump(mode="json")
+            self.budget.limits=self.config.budget
+            self.checkpoint(f"resume_native_turn_timeout_changed:{old_timeout}:{native_turn_timeout}")
         if self.agent.mock:
             completed_agent_results = list((self.root / "actions").glob("*/result.json"))
             self.agent.cursor = sum(1 for path in completed_agent_results
@@ -152,6 +167,9 @@ class Engine:
                 self.state.action_history.append(pending.model_copy(deep=True))
                 self.state.pending_action = None
                 self.checkpoint("blocked_agent_request_scheduled_for_retry")
+        if self.agent.name == "codex":
+            from .native import execute
+            return execute(self)
         if inquiry.enabled(self): inquiry.resume_deferred(self)
         self.checkpoint("resumed_history_reused_without_reexecution")
         return self.execute(probed=True)

@@ -147,7 +147,7 @@ def save_bundle(root, state, unit, bundle, implementation, previous=None, reason
     artifacts = {str(p): digest(p.read_bytes()) for p in files}
     from .inputs import semantic_ids
     semantic_references=semantic_ids(state,unit)
-    model = ModelArtifact(stage="complete" if complete else "model_only", pending_components=[] if complete else [p.component for p in bundle.pending_work], version=version, kind="implementation_abstraction", origin=Origin.MOCK if state.mode == "mock" else Origin.PRESET if state.analysis_mode == "regression" else Origin.AGENT,
+    model = ModelArtifact(operation_id=transaction_key,stage="complete" if complete else "model_only", pending_components=[] if complete else [p.component for p in bundle.pending_work], version=version, kind="implementation_abstraction", origin=Origin.MOCK if state.mode == "mock" else Origin.PRESET if state.analysis_mode == "regression" else Origin.AGENT,
         claim_id=specs[0].claim_id, snapshot_id=state.snapshot.id, path=str(checker), config_path=str(cfg),
         content_digest=digest(checker.read_bytes()), config_digest=digest(cfg.read_bytes()), scope=bundle.scope,
         initial_state=bundle.initial_state, variables=bundle.variables, actions=bundle.actions,

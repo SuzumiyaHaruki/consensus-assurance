@@ -72,6 +72,7 @@ def main(argv=None):
         if name == "resume":
             p.add_argument("--repair-attempts",type=int,help="显式调整任务总修复上限；不重置已用次数或单问题失败记录")
             p.add_argument("--action-timeout", type=float, help="调整后续单动作超时（秒）；保留总预算和已用次数")
+            p.add_argument("--native-turn-timeout", type=float, help="调整后续单次原生 Codex 调查最长时长（秒）；不改变正式执行超时或总预算")
     args = parser.parse_args(argv)
     try:
         if args.command in {"resume", "report"}:
@@ -91,10 +92,10 @@ def main(argv=None):
             if args.command == "estimate":
                 repo = locate_repo(args.repo, config.repo_path)
                 b = config.budget
-                minimum = 2 + b.audit_units + min(b.semantic_reviews, b.audit_units)
+                minimum = 1 if config.agent_backend=="codex" else 2 + b.audit_units + min(b.semantic_reviews, b.audit_units)
                 print(json.dumps({"仓库":str(repo),"材料发送":False,"执行目标代码":False,
                     "agent调用上限":b.agent_calls,"粗略计划下限":minimum,
-                    "预算说明":"首轮阅读与发现各一次；每单元一次建模，启用时每单元至少一次复核。补读、其他复核、修复、实验与后果调查另需预算；不是账单。",
+                    "预算说明":"原生路径按 CLI turn、总时长和正式执行计数；源码浏览发生在原生会话内，旧材料字符和 packet 额度仅用于离线旧阶段。不是账单。" if config.agent_backend=="codex" else "旧阶段离线估算；不是账单。",
                     "计划可能受限":minimum>b.agent_calls,"预算":b.model_dump(mode="json")},ensure_ascii=False,indent=2))
                 return 0
             root = create_run_directory(config, args.command)
@@ -118,7 +119,8 @@ def main(argv=None):
         with (root / ".run.lock").open("w") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             if args.command == "resume":
-                state = engine.resume(action_timeout=args.action_timeout,repair_attempts=args.repair_attempts)
+                state = engine.resume(action_timeout=args.action_timeout,repair_attempts=args.repair_attempts,
+                    native_turn_timeout=args.native_turn_timeout)
                 if state.framework_revision!=FRAMEWORK_REVISION:
                     print(state.stop_reason);return 2
             else:
@@ -127,7 +129,8 @@ def main(argv=None):
             report = render_report(state, root)
         print(f"运行模式：{state.mode}；报告：{report}")
         print(f"停止原因：{state.stop_reason}")
-        return 0 if state.stop_reason.startswith(("No pending", "Plan generated")) else 2
+        return 0 if state.stop_reason.startswith(("No pending", "Plan generated",
+            "No further investigation selected", "Snapshot prepared")) else 2
     except (ValueError, FileNotFoundError, BlockingIOError, OSError) as exc:
         print(f"无法继续：{exc}", file=sys.stderr)
         return 2

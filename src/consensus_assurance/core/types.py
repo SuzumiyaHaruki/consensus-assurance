@@ -445,6 +445,7 @@ class ConstraintSource(Record):
 
 
 class ModelArtifact(Record):
+    operation_id: str | None = None
     stage: Literal["model_only", "complete"] = "complete"
     pending_components: list[str] = []
     id: str = Field(default_factory=uid)
@@ -670,6 +671,10 @@ class Capability(Record):
 
 
 class Analysis(Record):
+    native_session_id: str | None = None
+    native_current: dict[str, Any] = {}
+    native_turns: list[dict[str, Any]] = []
+    native_method_paths: list[str] = []
     question_candidates: list[QuestionCandidate] = []
     direct_checks: list[DirectCheckArtifact] = []
     active_direct_check_id: str | None = None

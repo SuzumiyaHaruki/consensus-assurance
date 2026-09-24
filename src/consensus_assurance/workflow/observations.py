@@ -27,7 +27,11 @@ def monitor_events(events, monitor, prop, requirements=None):
             missing.append(index); continue
         if any(value is False for value in applicability):
             outside.append(index); continue
-        value = compare(event,prop.assertion,aliases) if prop.kind=='event_assertion' else True
+        if prop.kind == 'event_implication':
+            antecedent = compare(event,prop.antecedent,aliases) if prop.antecedent else None
+            value = True if antecedent is False else (compare(event,prop.assertion,aliases) if antecedent is True else None)
+        else:
+            value = compare(event,prop.assertion,aliases) if prop.kind=='event_assertion' else True
         if value is None: missing.append(index)
         else: results.append((index,value))
     violations = [index for index,value in results if value is False]

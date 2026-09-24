@@ -60,21 +60,27 @@ def validate_plan(state,unit,plan,implementation):
     if set(props)!={m.checker_id for m in plan.monitors}:errors.append('Direct property/monitor mismatch')
     for monitor in plan.monitors:
         p=props.get(monitor.checker_id)
-        # History predicates need a complete observed history contract. Initially
-        # keep this route to scalar event assertions; unsupported paths are gaps.
-        if p is None or p.kind!='event_assertion':
-            errors.append('Direct monitor '+monitor.id+' requires the supported shared event assertion')
+        if p is None or p.kind not in {'event_assertion','event_implication'}:
+            errors.append('Direct monitor '+monitor.id+' requires a supported shared event property')
             continue
+        if (p.kind=='event_implication') != (p.antecedent is not None):
+            errors.append('Direct implication needs exactly one observed antecedent')
         if not p.identity_fields:
             errors.append('Direct monitor '+monitor.id+' needs shared operation/participant/context identity')
         if not monitor.binding_ids or not set(monitor.binding_ids)<=set(plan.binding_ids):errors.append('Monitor '+monitor.id+' needs selected source bindings')
         if p.trigger.reference:errors.append('Direct trigger '+p.checker_id+' must select an actual event field')
+        if p.antecedent and p.antecedent.reference:
+            errors.append('Direct implication antecedent must inspect the actual result event')
         try:event_requirements(plan.harness.prerequisites,p.assertion.reference)
         except ValueError as exc:errors.append(p.checker_id+': '+str(exc))
         if p.assertion.field in p.identity_fields:
             errors.append(p.checker_id+': the compared value cannot also establish independent operation identity')
         if p.trigger.field==p.assertion.field or any(c.field==p.assertion.field for c in monitor.applicability_conditions):
             errors.append(p.checker_id+': trigger/applicability cannot filter on the result field being checked')
+        if p.antecedent and (p.antecedent.field in p.identity_fields or
+                p.antecedent.field==p.trigger.field or
+                any(c.field==p.antecedent.field for c in monitor.applicability_conditions)):
+            errors.append(p.checker_id+': implication result cannot establish identity or applicability')
     if errors:raise ValueError('; '.join(dict.fromkeys(errors)))
 
 

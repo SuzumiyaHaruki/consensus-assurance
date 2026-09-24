@@ -168,6 +168,8 @@ def export_views(state, root):
 def render_report(state, root):
     root = Path(root)
     export_views(state,root)
+    if state.mode == "real" and (state.native_method_paths or state.native_turns):
+        return render_native_report(state,root)
     def link(path):
         if not path:
             return "无"
@@ -350,5 +352,51 @@ def render_report(state, root):
               "完整命令、时间、版本与制品关联见 [state.json](state.json)，图、规格和计划视图在结束或生成报告时导出；事件见 [events.jsonl](events.jsonl)。", ""]
     lines += resource_lines(state)
     path = root / "report.md"
+    path.write_text("\n".join(lines))
+    return path
+
+
+def render_native_report(state, root):
+    def link(value):
+        if not value:return "无"
+        path=Path(value)
+        try:relative=path.relative_to(root)
+        except ValueError:relative=path
+        return f"[{path.name}]({relative})"
+    lines=["# 共识义务驱动局部审计报告", "",
+        f"运行标识：`{state.id}`；模式：真实 Codex 原生调查；分析入口：`{state.analysis_mode}`。",
+        f"源码基准：`{state.snapshot.repo}`；提交 `{state.snapshot.commit or '无 Git 元数据'}`；快照 `{state.snapshot.id}`（{len(state.snapshot.files)} 个文件）。",
+        f"框架版本：`{state.framework_revision}`；Codex 会话：`{state.native_session_id or '未建立'}`。",
+        "", "## 调查与局部检查", ""]
+    if not state.question_candidates:lines.append("尚未受理候选；未受理草稿不是证据。")
+    for candidate in state.question_candidates:
+        question=candidate.question
+        lines.append(f"- 候选 `{candidate.id}`：{candidate.status}；{question.question}；意义：{question.importance}。来源 {question.source_ids}；反证 {question.counterevidence}；未知 {question.unknowns}；父候选 {candidate.parent_candidate_id or '无'}；恢复条件 {candidate.resume_conditions}。")
+    for artifact in state.direct_checks:
+        lines.append(f"- 检查 `{artifact.id}`：义务 `{artifact.claim_id}`；版本 {artifact.version}；前版 {artifact.previous_id or '无'}；计划 {link(artifact.plan_path)}；harness {link(artifact.harness_path)}。")
+        for check in state.checks:
+            if check.direct_check_id!=artifact.id:continue
+            record=next((r for r in state.monitor_results if r.get('direct_check_id')==artifact.id and r.get('experiment_check_id')==check.id),None)
+            lines.append(f"  正式执行 `{check.id}`：{check.status.value}/{check.outcome}；输出 {link(check.stdout)}；局部比较 {record.get('outcome','unknown') if record else '未评估'}；确认 {record.get('confirmed',False) if record else False}；归因阻塞 {record.get('blockers',[]) if record else ['未评估']}；边界 {record.get('boundaries',[]) if record else []}。")
+    for model in state.models:
+        lines.append(f"- 模型 `{model.id}`：{model.stage}；前版 {model.previous_id or '无'}；Behavior {link(model.path)}；Properties {link(model.checker_path)}；范围 {model.scope.model_dump(mode='json')}。")
+        for check in state.checks:
+            if check.model_id==model.id:
+                lines.append(f"  工具执行 `{check.id}`：{check.action}，{check.status.value}/{check.outcome}；原始输出 {link(check.stdout)}。模型检查与实现校准是不同证据。")
+    if not state.direct_checks and not state.models:lines.append("没有正式执行的检查；原生 Agent 的叙述或草稿不构成实现证据。")
+    lines += ["", "## 修订与未决", ""]
+    for revision in state.revisions:lines.append(f"- `{revision.id}` {revision.kind}：{revision.rationale}；旧结果保留，新输入需重执行与复核。")
+    for issue in state.review_issues:
+        lines.append(f"- 复核问题 `{issue.id}`：{issue.aspect}；{issue.explanation}；{'未决' if not issue.resolved_by else '由 '+issue.resolved_by+' 解决'}。")
+    lines.append("停止原因："+state.stop_reason)
+    lines += ["- "+gap for gap in dict.fromkeys(state.gaps)]
+    lines += ["", "## 实际调用与边界", "",
+        f"CLI 调用 {state.usage.get('agent_calls',0)} 次；正式实验 {state.usage.get('experiments',0)} 次；耗时 {state.elapsed_seconds:.2f} 秒。原生工具事件数只计已记录事件，不等于 CLI 调用次数。",
+        "旧材料字符配额、分片与 breadth/depth 预留不用于原生主线；实际源码读取字符数未知，不据此推算 token 或费用。"]
+    for turn in state.native_turns:
+        check=next((c for c in state.checks if c.id==turn['check_id']),None)
+        lines.append(f"- 原生调用 `{turn['check_id']}`：会话 `{turn['session_id']}`；工具事件 {turn['tool_events']}；模型 `{check.parameters.get('agent_model','未知') if check else '未知'}`；effort `{check.parameters.get('agent_reasoning_effort','未知') if check else '未知'}`；usage {turn['usage'] if turn['usage'] is not None else '未知'}；日志 {link(check.stdout) if check else '无'}。")
+    lines.append(f"可信方法资源：{state.native_method_paths}；原始提交、错误及执行身份保存在运行目录。正式测试结果只说明固定制品在干净副本内的实际输出，不自动证明更广泛共识结论。")
+    path=root/"report.md"
     path.write_text("\n".join(lines))
     return path

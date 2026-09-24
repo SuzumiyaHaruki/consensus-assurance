@@ -13,6 +13,7 @@ class Budget(Record):
     repeated_error_revisions: int = Field(default=1, ge=0)
     replays: int = Field(default=1, ge=0)
     action_timeout: float = Field(default=120, gt=0)
+    native_turn_timeout: float = Field(default=900, gt=0)
     total_seconds: float = Field(default=900, gt=0)
 
     experiments: int = Field(default=4, ge=0)
@@ -56,6 +57,7 @@ class Config(Record):
     repo_path: str | None = None
     agent_backend: str = "codex"
     agent_reasoning_effort: str | None = None
+    agent_model: str | None = None
     verifier_backend: str = "tlc"
     output_language: Literal["zh-CN"] = "zh-CN"
     runs_dir: str = "runs"

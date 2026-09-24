@@ -114,9 +114,10 @@ class EventRequirement(Record):
 
 class ObservableProperty(Record):
     checker_id: str
-    kind: Literal["event_assertion", "stable_support"] = "event_assertion"
+    kind: Literal["event_assertion", "event_implication", "stable_support"] = "event_assertion"
     trigger: Comparison
     assertion: Comparison
+    antecedent: Comparison | None = None
     identity_fields: list[str] = Field(default_factory=list,description="Independent operation identity shared by prerequisites and result; never the value being compared or a context expected to change")
     history_field: str | None = None
     description: str
@@ -373,7 +374,7 @@ class DirectCheckPlan(Record):
     binding_ids: list[str] = Field(min_length=1)
     harness: Harness
     monitors: list[EventMonitor] = Field(min_length=1)
-    observable_properties: list[ObservableProperty] = Field(min_length=1, description="Direct route supports event_assertion only. Assertions may compare an observed field with a prior correlated prerequisite field; history properties require a local_model fallback.")
+    observable_properties: list[ObservableProperty] = Field(min_length=1, description="Direct route supports event_assertion and event_implication. Correlate prerequisite fields by alias; history properties require a local_model fallback.")
     uncertainties: list[str] = []
 
 

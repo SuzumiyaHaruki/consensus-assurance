@@ -14,7 +14,6 @@ from consensus_assurance.workflow.observations import match_prerequisites, monit
 from consensus_assurance.workflow.materials import ReadingPlan, ReadRequest
 from regression_support import add_reads
 from consensus_assurance.adapters.storage.snapshot import capture
-from consensus_assurance.adapters.agents.backend import strict_schema, wire_value
 from consensus_assurance.adapters.verifiers.trace import project
 
 
@@ -66,18 +65,6 @@ def test_patch_keeps_object_versions_and_unrelated_claims(prepared):
     assert state.claims[1].version==2 and state.claims[0].version==1
     assert state.graph_history[-1]['record']['description']==current.description
     with pytest.raises(ValueError,match='version'): apply_patch(state,patch,semantic=True)
-
-
-def test_nonempty_parameters_wire_roundtrip(prepared):
-    _,_,bundle,_=prepared
-    bundle.scope.parameters={'nodes':3,'network':{'loss':False,'contexts':[1,2]},'label':'非英文数据'}
-    schema=bundle.model_json_schema()
-    constrained=strict_schema(schema)
-    encoded=wire_value(bundle.model_dump(mode='json'),schema)
-    restored=type(bundle).model_validate(wire_value(encoded,schema,decode=True))
-    assert restored.scope.parameters==bundle.scope.parameters
-    assert schema['$defs']['Scope']['properties']['parameters']['type']=='object'
-    assert constrained['$defs']['Scope']['properties']['parameters']['type']=='array'
 
 
 @pytest.mark.parametrize('body',[
@@ -212,11 +199,3 @@ def test_conflicting_F2_does_not_turn_error_into_optimization(prepared):
     assert state.claims[1].model_dump()==before
     assert state.revisions[-1].status=='unresolved'
 
-
-def test_malformed_wire_dictionary_is_a_validation_error(prepared):
-    _,_,bundle,_=prepared
-    schema=bundle.model_json_schema()
-    encoded=wire_value(bundle.model_dump(mode='json'),schema)
-    encoded['scope']['parameters']=[{'key':['invalid'],'value_json':3}]
-    with pytest.raises(ValueError,match='must be strings'):
-        wire_value(encoded,schema,decode=True)

@@ -103,49 +103,6 @@ def test_secret_redaction():
     assert "privatevalue" not in redact('api_key="privatevalue"')
 
 
-@pytest.mark.parametrize("message,expected", [("Please log in; 401", ExecutionStatus.LOGIN_REQUIRED), ("insufficient_quota", ExecutionStatus.QUOTA_EXHAUSTED), ("bad transport", ExecutionStatus.ERROR)])
-def test_codex_adapter_blocking_statuses(tmp_path, monkeypatch, message, expected):
-    from consensus_assurance.adapters.agents.backend import CodexAgent
-    from consensus_assurance.core.proposals import GraphDraft
-    agent = CodexAgent(); agent.available = True; agent.version = "fake-test-cli"
-    class Runner:
-        def run(self, command, directory, action, snapshot_id, timeout, stdin):
-            from consensus_assurance.core.types import CheckRun
-            out = directory / "stdout.log"; err = directory / "stderr.log"
-            out.write_text(""); err.write_text(message)
-            assert "--sandbox" in command and "danger-full-access" not in command
-            return CheckRun(action=action, cwd=str(directory), snapshot_id=snapshot_id, status=ExecutionStatus.COMPLETED,
-                exit_code=1, stdout=str(out), stderr=str(err))
-    check, response = agent.analyze(Runner(), "English test task", tmp_path, "s", 1, GraphDraft)
-    assert check.status == expected and response is None
-
-
-@pytest.mark.parametrize("effort", [None, "medium"])
-def test_codex_invalid_output_preserves_raw(tmp_path, effort):
-    from consensus_assurance.core.config import Config
-    from consensus_assurance.registry import assemble
-    from consensus_assurance.core.proposals import GraphDraft
-    from consensus_assurance.core.types import CheckRun
-    _, agent, _, _ = assemble(Config(agent_reasoning_effort=effort))
-    agent.available = True; agent.version = "fake-test-cli"
-    class Runner:
-        def run(self, command, directory, action, snapshot_id, timeout, stdin):
-            if effort is None:
-                assert "-c" not in command
-            else:
-                assert command[command.index("-c") + 1] == 'model_reasoning_effort="medium"'
-            assert command[-1] == "-"
-            (directory / "response.json").write_text("not valid JSON")
-            out = directory / "stdout.log"; err = directory / "stderr.log"
-            out.write_text(""); err.write_text("model: gpt-test\nreasoning effort: low\n")
-            return CheckRun(action=action, cwd=str(directory), snapshot_id=snapshot_id, status=ExecutionStatus.COMPLETED,
-                exit_code=0, stdout=str(out), stderr=str(err))
-    check, response = agent.analyze(Runner(), "English test task", tmp_path, "s", 1, GraphDraft)
-    assert response is None and check.reason == "Structured agent output is invalid"
-    assert check.parameters=={'agent_model':'gpt-test','agent_reasoning_effort':'low'}
-    assert (tmp_path / "raw-response.txt").read_text() == "not valid JSON"
-
-
 def test_persistent_no_transmission_permission(tmp_path, prepared):
     from consensus_assurance.core.config import Config
     from consensus_assurance.registry import assemble

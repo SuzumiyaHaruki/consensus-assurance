@@ -7,7 +7,7 @@ from consensus_assurance.plugins.protocols.toy.pack import knowledge as toy_know
 
 EXECUTION_BACKENDS = {"go_module": GoModuleBackend, "python": PythonBackend, "none": lambda target, timeout: None}
 KNOWLEDGE = {"raft": raft_knowledge, "toy": toy_knowledge, "none": lambda: ""}
-AGENTS = {"codex": lambda cfg: CodexAgent(cfg.agent_reasoning_effort), "mock": lambda cfg: MockAgent(cfg.fixture)}
+AGENTS = {"codex": lambda cfg: CodexAgent(cfg.agent_reasoning_effort, cfg.agent_model), "mock": lambda cfg: MockAgent(cfg.fixture)}
 VERIFIERS = {"tlc": lambda cfg: TLCVerifier(cfg.tlc_jar)}
 
 
