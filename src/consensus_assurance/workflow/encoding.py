@@ -19,8 +19,10 @@ def validate_encoding(state,previous,current,repaired,revision):
 
 
 def validate_direct_encoding(state,artifact,previous,repaired,revision):
+    from .reviews import lineage
+    ancestors = lineage(state, artifact) if artifact else set()
     issue=next((i for i in state.review_issues if i.id==revision.issue_id and not i.resolved_by),None)
-    if artifact is None or revision.old_model_id or revision.old_direct_check_id!=artifact.id or not issue or issue.target_id!=artifact.id or issue.target_version!=artifact.version or issue.aspect!='checker_correspondence':
+    if artifact is None or revision.old_model_id or revision.old_direct_check_id!=artifact.id or not issue or issue.target_id not in ancestors or issue.aspect!='checker_correspondence':
         raise ValueError('Direct encoding correction must name the current artifact and its open checker issue')
     if not revision.rationale.strip() or not set(revision.source_ids)<={m.id for m in state.materials} or not set(issue.source_ids)&set(revision.source_ids):
         raise ValueError('Direct encoding correction needs actual source and the disputed issue basis')
@@ -30,8 +32,8 @@ def validate_direct_encoding(state,artifact,previous,repaired,revision):
     if previous.claim_id!=repaired.claim_id or previous.binding_ids!=repaired.binding_ids or previous.uncertainties!=repaired.uncertainties or previous.description!=repaired.description:
         raise ValueError('Direct encoding correction cannot change claim, source, scenario or execution inputs')
     before=previous.harness.model_dump();after=repaired.harness.model_dump()
-    for field in ('source','semantic_changes'):before.pop(field);after.pop(field)
-    if before!=after or (previous.harness.source!=repaired.harness.source)!=bool(revision.input_changes) or (previous.harness.semantic_changes!=repaired.harness.semantic_changes)!=bool(revision.input_changes):
+    for field in ('source','files','semantic_changes'):before.pop(field);after.pop(field)
+    if before!=after or ((previous.harness.source,previous.harness.files)!=(repaired.harness.source,repaired.harness.files))!=bool(revision.input_changes) or (previous.harness.semantic_changes!=repaired.harness.semantic_changes)!=bool(revision.input_changes):
         raise ValueError('Observation input changes must be declared and preserve harness prerequisites, legality and scope')
     old={p.checker_id:p for p in previous.observable_properties}
     new={p.checker_id:p for p in repaired.observable_properties}
@@ -48,13 +50,3 @@ def validate_direct_encoding(state,artifact,previous,repaired,revision):
             raise ValueError('Direct encoding correction needs a supported result predicate')
     if not any((old[id].assertion,old[id].kind,old[id].antecedent)!=(new[id].assertion,new[id].kind,new[id].antecedent) for id in old) and not any(a.applicability_conditions!=b.applicability_conditions for a,b in zip(previous.monitors,repaired.monitors)):
         raise ValueError('Direct encoding correction needs an actual oracle change')
-
-
-def issue_models(state,issue,current):
-    old=next((m for m in state.models if m.id==issue.model_id),None)
-    lineage=set();parent=current.previous_id
-    while parent and parent not in lineage:
-        lineage.add(parent);model=next((m for m in state.models if m.id==parent),None);parent=model.previous_id if model else None
-    if old is None or old.id not in lineage:return None
-    if old.checkers!=current.checkers or old.scope!=current.scope or old.graph_versions!=current.graph_versions:return None
-    return old

@@ -25,7 +25,7 @@ def write_set(state,patch):
         for new in getattr(patch,name):
             if new.id in seen:raise ValueError('Duplicate or cross-type patch ID')
             seen.add(new.id)
-            if any(new.id==x.id for x in [*state.models,*state.evidence,*state.inquiry_tasks,*state.semantic_reviews]):raise ValueError('ID cannot be reused across object types: '+new.id)
+            if any(new.id==x.id for x in [*state.models,*state.evidence,*state.semantic_reviews]):raise ValueError('ID cannot be reused across object types: '+new.id)
             if new.id not in current:continue
             collection,old=current[new.id]
             if collection!=name:raise ValueError('ID cannot be reused across object types: '+new.id)

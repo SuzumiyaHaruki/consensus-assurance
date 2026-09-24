@@ -1,5 +1,0 @@
-# Candidate consistency and controlled repair
-
-A physical Binding carries source snapshot, verified declaration and behavior range. Binding associations supply its attributed obligation mapping. A selected direct location associated with the checked obligation needs no Relation. Additional producer code requires a selected directed depends_all, conditional_on or boundary path from that obligation to the producer obligation or binding. Keep unverified guarantees in Binding.pending and Relation.pending/grounding; support is not another checked obligation. Do not invent scope/maps/direct edges to fill a list.
-
-Use typed diagnostics and the complete saved candidate. Representation repair preserves intended code, obligation meaning, applicability and counterevidence. A call site is not a resolved declaration. Request exact source if unavailable. Sourced scope expansion uses the existing ScopeUpdate; changing accepted semantic meaning requires attributed F2. Do not remove an inconvenient path or broaden checked obligations to pass validation. Raw candidates and failed attempts remain archived.

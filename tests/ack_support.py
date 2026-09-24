@@ -4,7 +4,7 @@ from consensus_assurance.core.types import *
 from consensus_assurance.core.proposals import *
 from consensus_assurance.core.config import Config
 from consensus_assurance.adapters.storage.snapshot import capture
-from consensus_assurance.workflow.materials import read_material, ReadRequest
+from regression_support import read_material, ReadRequest
 
 ROOT=Path(__file__).resolve().parent
 

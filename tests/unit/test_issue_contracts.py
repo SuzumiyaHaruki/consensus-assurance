@@ -2,8 +2,6 @@ import copy,json
 import pytest
 from consensus_assurance.core.proposals import ConditionDisposition,GraphPatch
 from consensus_assurance.workflow.feedback import apply_feedback
-from consensus_assurance.workflow.output_repair import diagnostic_targets
-from consensus_assurance.workflow.prompts import loaded_resources,render,manifest
 from test_graph_mutations import revision_for
 from consensus_assurance.workflow.scope_updates import from_patch,validate_scope_update
 
@@ -24,15 +22,3 @@ def test_F2_cannot_rename_unaddressed_condition(prepared):
     before=s.model_dump()
     with pytest.raises(ValueError):apply_feedback(s,s.units[0],None,f)
     assert s.model_dump()==before
-
-
-
-
-def test_manifest_applies_same_domain_method_to_first_build_and_revisions():
-    expected={'skills/local-modeling/guide.md','skills/local-modeling/references/context-history.md'}
-    for kind in ['build','F1','F3','technical','diagnose']:
-        loaded=loaded_resources(kind,{})
-        assert expected<=set(loaded['paths']) and len(loaded['paths'])==len(set(loaded['paths']))
-        text=render(kind,{},'Identify support and its actual context')
-        assert 'pending' in text and 'Identify support and its actual context' in text
-    assert set(manifest()['tasks'])=={'read','discover','derive','build','retry','diagnose','F1','F2','F3','F4','targeted_read','graph_patch','replay','technical','spec_refine','semantic_review','scope_review','harness','direct_check','question'}

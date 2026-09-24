@@ -6,10 +6,6 @@ from consensus_assurance.workflow.artifacts import save_bundle
 from consensus_assurance.adapters.runners.python import PythonBackend
 
 
-
-
-
-
 @pytest.mark.parametrize('change',['valid','constant','behavior','meaning'])
 def test_encoding_correction_preserves_meaning_and_behavior(tmp_path,prepared,change):
     _,state,bundle,_=prepared;u=state.units[0]
@@ -40,9 +36,10 @@ def test_feedback_rejects_invalid_bundle_before_commit(prepared):
 
 @pytest.mark.parametrize('variation',['harness','unrelated','no_check'])
 def test_old_issue_cannot_be_cleared_by_unrelated_or_unexecuted_model(tmp_path,prepared,variation):
-    from consensus_assurance.core.types import ReviewIssue,InquiryTask,SemanticCheck
+    from consensus_assurance.core.types import ReviewIssue,SemanticCheck
     from consensus_assurance.core.proposals import ReviewReply
-    from consensus_assurance.workflow.reviews import validate_resolutions
+    from consensus_assurance.workflow.reviews import accept_review
+    from consensus_assurance.core.submissions import ReviewSubmission
     _,state,bundle,_=prepared;u=state.units[0];old=save_bundle(tmp_path,state,u,bundle,PythonBackend())
     updated=bundle.model_copy(deep=True)
     if variation=='harness':updated.harness.source+='\n# Formatting\n'
@@ -50,10 +47,10 @@ def test_old_issue_cannot_be_cleared_by_unrelated_or_unexecuted_model(tmp_path,p
     new=save_bundle(tmp_path,state,u,updated,PythonBackend(),old if variation!='unrelated' else None)
     issue=ReviewIssue(review_id='oldreview',target_id=old.id,target_version=old.version,aspect='checker_correspondence',model_id=old.id,source_ids=state.claims[1].source_ids,explanation='The checker needs a correspondence investigation',disposition='blocked',reason='Actual correction and execution required')
     state.review_issues.append(issue)
-    task=InquiryTask(kind='review',reason='Review the new artifact',trigger='test',target_ids=[new.id],target_versions={new.id:new.version},model_id=new.id,resolution_issue_ids=[issue.id])
     item=SemanticCheck(target_id=new.id,aspect='checker_correspondence',status='no_issue_found',source_ids=issue.source_ids,rationale='Candidate explanation' + "\n" + 'Alternative encodings' + "\n" + 'A claim of correctness does not replace actual rechecking')
-    reply=ReviewReply(items=[item],resolves_issue_ids=[issue.id],resolution_rationale='Attempt to resolve without sufficient related execution',limitations=[])
-    with pytest.raises(ValueError):validate_resolutions(state,task,reply)
+    reply=ReviewSubmission(action='review',artifact_id=new.id,review_items=[item],rationale='Attempt without actual reexecution',
+        resolutions=[dict(issue_id=issue.id,target_version=issue.target_version,original_question=issue.explanation,source_ids=issue.source_ids,rationale='Attempt resolution',residual_issue_ids=[],scope_limitations=[])])
+    with pytest.raises(ValueError):accept_review(state,reply,'test-operation')
     assert issue.resolved_by is None
 
 

@@ -25,30 +25,6 @@ def apply_graph(state, proposal, audit_spec=None):
     state.gaps.extend(proposal.conflicts+proposal.unexplored+proposal.gaps)
 
 
-def select_unit(state):
-    pending = [u for u in state.units if u.status in {"pending", "partial"} and not (u.audit_question and u.audit_question.disposition=="explained_by_existing_mechanism")]
-    pending.sort(key=lambda u: (bool(u.audit_question and u.audit_question.disposition not in {None,'ready_for_check'}), -getattr(u.audit_question,'priority',0), sum(bool(v.audit_question and u.audit_question and set(v.audit_question.activity_classes)&set(u.audit_question.activity_classes)) for v in state.units if v.status in {'checked','blocked'})))
-    if not pending:
-        return None
-    # Prefer a pending producer of a required boundary over its consumer.
-    selected = pending[0]
-    used, visited = [], {selected.id}
-    while not (selected.audit_question and selected.audit_question.disposition=='ready_for_check'):
-        obligations = set(selected.obligation_ids)
-        dependency = next(((edge, unit) for edge in state.relations
-            if edge.source in obligations and edge.kind in {"depends_all", "boundary"}
-            for unit in pending if edge.target in unit.obligation_ids and unit.id not in visited), None)
-        if not dependency:
-            break
-        edge, selected = dependency
-        used.append(edge.id); visited.add(selected.id)
-    selected.status = "selected"
-    state.selections.append({"unit_id": selected.id, "relation_ids": list(dict.fromkeys(selected.relation_ids + used)),
-        "binding_ids": selected.binding_ids, "rationale": "Prefer ready evidence; otherwise follow required producers and the justified priority",
-        "graph_version": state.graph_version})
-    return selected
-
-
 def expand_unit(state, unit, relation_ids):
     from .scope_updates import from_patch,apply_scope_update
     from consensus_assurance.core.proposals import GraphPatch,UnitDraft

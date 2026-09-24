@@ -1,4 +1,4 @@
-"""Physical source coverage shared by acquisition, packets, citations and review reuse.
+"""Physical source coverage shared by bindings, citations and review.
 
 Material is the source reference: file, content version and inclusive line range.
 Citation identity is retained; coverage never follows filenames alone.
@@ -29,29 +29,6 @@ def citation_status(state,ids,provided_ids):
     return {id:'unknown' if id not in known else 'provided' if covered(known[id],provided) else 'cached_not_provided' for id in ids}
 
 def includes(state,needed,provided):return all(v=='provided' for v in citation_status(state,needed,provided).values())
-
-
-def all_materials(context):
-    found={};views={};descriptors=[]
-    def walk(value):
-        if isinstance(value,dict):
-            if 'source_text_pool' in value:
-                for m in value['source_text_pool']:views[m.get('view_id',m.get('id'))]=m
-            if {'id','file','start_line','end_line'}<=set(value):
-                if 'source_view_id' in value:descriptors.append(value)
-                elif 'text' in value and not value['id'].startswith('source-view-'):found[value['id']]=value
-            for k,v in value.items():
-                if k not in {'raw_output','prompt','text','source_text_pool'}:walk(v)
-        elif isinstance(value,list):
-            for v in value:walk(v)
-    walk(context)
-    for m in descriptors:
-        view=views.get(m['source_view_id'])
-        if view and view['file']==m['file'] and view['start_line']<=m['start_line']<=m['end_line']<=view['end_line']:
-            material={k:v for k,v in m.items() if k!='source_view_id'}
-            material['text']='\n'.join(view['text'].split('\n')[m['start_line']-view['start_line']:m['end_line']-view['start_line']+1]);found[m['id']]=material
-    return list(found.values())
-
 
 
 def dependency_closure(objects,seeds):
@@ -96,48 +73,3 @@ def source_views(materials):
                 text='\n'.join(lines[n] for n in range(start,end+1)),kind=contributors[0].kind)
             result.append((view,contributors))
     return result
-
-
-def validate_view_citations(response, context):
-    """A text-view alias is not a source identity; require an explicit scoped correction."""
-    from consensus_assurance.core.diagnostics import Diagnostic, DiagnosticError
-    from .output_repair import pointer
-    views={v.get('view_id',v.get('id')):v for v in context.get('source_text_pool',[])}
-    materials=all_materials(context);diagnostics=[]
-    def walk(node, route=()):
-        if isinstance(node,dict):
-            for key,value in node.items():
-                citation=key in {'source_ids','expectation_ids','material_id'} or (key=='source_ids' and route and route[-1]=='grounding')
-                if citation:
-                    aliases=[v for v in (value if isinstance(value,list) else [value]) if isinstance(v,str) and v in views]
-                    if aliases:
-                        choices={a:[m['id'] for m in materials if m['file']==views[a]['file'] and m['content_digest']==views[a]['content_digest'] and views[a]['start_line']<=m['start_line']<=m['end_line']<=views[a]['end_line']] for a in aliases}
-                        diagnostics.append(Diagnostic(code='source_view_citation',category='material',paths=[pointer(route+(key,))],
-                            material_ids=list(dict.fromkeys(i for ids in choices.values() for i in ids)),allowed=['representation'],
-                            message='Text view aliases are not source IDs; select actual contributing ranges without inventing or broadening evidence',details={'alias_candidates':choices}))
-                walk(value,route+(key,))
-        elif isinstance(node,list):
-            for i,value in enumerate(node):walk(value,route+(i,))
-    walk(response.model_dump(mode='json'))
-    if diagnostics:raise DiagnosticError(diagnostics)
-
-
-def citation_ranges(response, state):
-    """Resolve only physical citations fully covered in the captured content version."""
-    import re
-    found={};known={m.id for m in state.materials}
-    def walk(node):
-        if isinstance(node,dict):
-            for key,value in node.items():
-                if key in {'source_ids','expectation_ids','material_id'}:
-                    for id in value if isinstance(value,list) else [value]:
-                        match=re.fullmatch(r'(.+):(\d+):(\d+)',id) if isinstance(id,str) else None
-                        if match and id not in known:
-                            file,start,end=match.groups();version=state.snapshot.files.get(file)
-                            ref=dict(file=file,start_line=int(start),end_line=int(end),content_digest=version)
-                            if version and 1<=ref['start_line']<=ref['end_line'] and covered(ref,state.materials):found[id]=ref
-                else:walk(value)
-        elif isinstance(node,list):
-            for value in node:walk(value)
-    walk(response.model_dump(mode='json'))
-    return found

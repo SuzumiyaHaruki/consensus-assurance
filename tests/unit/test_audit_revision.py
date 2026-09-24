@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 
 from consensus_assurance.core.config import Config
-from consensus_assurance.core.proposals import BuildReply, Feedback, ReadRequest, Comparison, ReplayPlan
+from consensus_assurance.core.proposals import Feedback, ReadRequest, Comparison, ReplayPlan
 from consensus_assurance.core.types import CheckRun, CheckerResult, ExecutionStatus
 from consensus_assurance.workflow.artifacts import save_bundle, validate_bundle
 from consensus_assurance.workflow.modeling import validate_technical_repair, obligation_progress
@@ -27,13 +27,6 @@ def test_technical_repair_cannot_weaken_same_named_property(prepared):
         validate_technical_repair(bundle,repaired,'experiment')
 
 
-def test_shared_read_request_types_have_concrete_wire_fields():
-    assert BuildReply.model_fields['requests'].annotation == list[ReadRequest]
-    assert Feedback.model_fields['requests'].annotation == list[ReadRequest]
-    request=ReadRequest(file='producer.rs',start_line=4,end_line=8,reason='Find the input producer')
-    assert BuildReply(bundle=None,gap='Producer unknown',requests=[request]).requests[0]==request
-
-
 def test_pure_bundle_validation_has_no_files_or_state_changes(tmp_path,prepared):
     _,state,bundle,_=prepared
     before=state.model_dump(); files_before=set(tmp_path.rglob("*"))
@@ -41,26 +34,6 @@ def test_pure_bundle_validation_has_no_files_or_state_changes(tmp_path,prepared)
     with pytest.raises(ValueError,match='missing Init'):
         validate_bundle(state,state.units[0],bad,PythonBackend())
     assert set(tmp_path.rglob("*"))==files_before and state.model_dump()==before
-
-
-def test_unchecked_obligation_remains_partial_and_schedulable(tmp_path,prepared):
-    from consensus_assurance.workflow.engine import Engine
-    from consensus_assurance.workflow.budget import BudgetTracker
-    from consensus_assurance.workflow.graph import select_unit
-    _,state,bundle,_=prepared
-    unit=state.units[0]
-    unit.obligation_ids.append('input_obligation')
-    model=save_bundle(tmp_path,state,unit,bundle,PythonBackend())
-    spec=model.checkers[0]
-    check=CheckRun(action='model_check',status=ExecutionStatus.COMPLETED,outcome='holds',cwd=str(tmp_path),snapshot_id=state.snapshot.id,model_id=model.id,search_fingerprint=model.search_fingerprint,checker_results=[CheckerResult(invariant=spec.invariant,claim_id=spec.claim_id,scope=spec.scope,outcome='holds')])
-    state.checks.append(check)
-    engine=Engine(Config(),tmp_path,PythonBackend(),None,None,'','')
-    engine.state=state;engine.budget=BudgetTracker(Config().budget,state)
-    engine.finish_unit(unit)
-    assert unit.status=='partial'
-    assert unit.remaining_obligation_ids==['input_obligation']
-    assert select_unit(state) is not None
-    assert state.claims[0].assessment.value=='unassessed'
 
 
 @pytest.mark.parametrize('point',['partial','complete'])
@@ -109,7 +82,6 @@ def test_f2_relation_dependency_requeues_unrelated_completed_unit(tmp_path,depen
     apply_feedback(state,unit,bundle,f)
     assert next(u for u in state.units if u.id=='other').status=='pending'
     assert next(u for u in state.units if u.id=='other').recheck_reasons
-
 
 
 def test_later_bundle_cannot_hide_an_unfinished_checker_of_same_obligation(tmp_path,prepared):

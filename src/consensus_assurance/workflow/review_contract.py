@@ -11,6 +11,8 @@ POLICY={
  'direct_check': {'checker_correspondence':'Review the entire selected obligation, question, source bindings, assumptions and scope together with the saved property, actual calls, oracle, correlated observations and legality. State concrete issues within this whole check instead of requesting separate object/aspect approvals. No model or calibration is required; an assertion or matching ID alone is not correspondence.'},
  'model': {'checker_correspondence':'Compare actual behavior and checker/oracle encoding with the attributed claim, trigger, observations, scope and contrary evidence; tool completion alone is not correspondence.'}}
 OPTIONAL={'binding':{'applicability':'Evaluate whether the code mapping applies to the current implementation configuration.'},'unit':{'applicability':'Evaluate whether the unit scope is applicable under the supplied execution conditions.'}}
+for kind in ('direct_check', 'model'):
+    OPTIONAL[kind] = {key: value for key, value in POLICY['obligation'].items()}
 
 
 def category(obj):
@@ -60,14 +62,3 @@ def validate_contract(state,task,reply):
         for source,status in citation_status(state,item.source_ids,supplied).items():
             if status!='provided':issue('review_unknown_source' if status=='unknown' else 'review_unavailable_source',item.target_id,'Citation '+source+': '+status+'; correct the reference or attach the actual range',i)
     if errors:raise DiagnosticError(errors)
-
-
-def same_basis(a,b):
-    return a.get('version')==b.get('version') and a.get('dependency_versions')==b.get('dependency_versions') and a.get('source_ranges')==b.get('source_ranges')
-
-
-def missing_pairs(state,task,items):
-    from .reviews import review_objects
-    objects=review_objects(state)
-    return {id:sorted(missing) for id in task.target_ids if id in objects
-        if (missing:=set(task.requested_aspects.get(id,required_aspects(objects[id])))-{i.aspect for i in items if i.target_id==id})}

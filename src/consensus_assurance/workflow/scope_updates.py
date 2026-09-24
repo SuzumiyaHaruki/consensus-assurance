@@ -116,21 +116,3 @@ def apply_scope_update(state,update):
         before={'unit':old.model_dump(mode='json'),'question':update.original_question},after={'unit_id':new.id,'scope_update':update.model_dump(mode='json'),'affected_model_ids':affected},return_step='build'))
     adopt(state,trial)
     return next(u for u in state.units if u.id==new_id)
-
-
-def accept(engine,update):
-    from .transactions import commit_graph
-    from . import inquiry
-    def commit(proxy):
-        proxy.budget.take('revisions')
-        new=apply_scope_update(proxy.state,update)
-        proxy.state.deferred_units.pop(update.unit_id,None)
-        proxy.state.active_unit_id=new.id;proxy.state.active_model_id=None;proxy.state.active_finding_id=None;proxy.state.next_action='build'
-        proxy.state.scope_updates[update.id]={'status':'accepted','proposal':update.model_dump(mode='json'),'new_unit_id':new.id}
-        inherited=proxy.state.task_attachments.get('unit:'+update.unit_id,[])
-        proxy.state.task_attachments['unit:'+new.id]=list(dict.fromkeys(inherited+update.source_ids))
-        proxy.state.targeted_gap=None
-        inquiry.release_action(proxy)
-        inquiry.review_unit(proxy,new,'before_model')
-    commit_graph(engine,'scope-'+update.id,update.model_dump(mode='json'),commit)
-    return next(u for u in engine.state.units if u.id==engine.state.active_unit_id)

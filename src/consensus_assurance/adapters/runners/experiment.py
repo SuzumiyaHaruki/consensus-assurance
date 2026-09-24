@@ -22,7 +22,7 @@ def sandbox_command(command, workspace, mode, read_only_roots=()):
     executable = shutil.which("bwrap")
     if not executable:
         raise FileNotFoundError("bubblewrap is required by execution_isolation=bwrap")
-    args = [executable, "--die-with-parent", "--new-session", "--ro-bind", "/", "/",
+    args = [executable, "--die-with-parent", "--new-session", "--unshare-net", "--ro-bind", "/", "/",
             "--tmpfs", "/home", "--tmpfs", "/root", "--tmpfs", "/tmp", "--dev", "/dev", "--proc", "/proc"]
     # Only the experiment workspace is writable; raw run logs and source repositories are hidden.
     args += ["--bind", str(workspace), str(workspace)]
@@ -35,6 +35,35 @@ def sandbox_command(command, workspace, mode, read_only_roots=()):
         args += ["--ro-bind", str(tool_root), str(tool_root)]
     args += ["--chdir", str(workspace), "--", str(exe), *command[1:]]
     return args
+
+
+def install_harness(workspace, filename, harness, target_files, *, write=True):
+    """Assemble fixed generated inputs without replacing any captured target file."""
+    raw = [(filename, harness.source), *harness.files.items()]
+    files = {str(Path(name)):content for name, content in raw}
+    if len(files) != len(raw):
+        raise ValueError("Helper files cannot replace the primary harness")
+    for name, content in files.items():
+        path = Path(name)
+        if (path.is_absolute() or not path.parts or ".." in path.parts or
+                name in target_files or path.name in {"go.mod", "go.sum", "pyproject.toml", "setup.py", "sitecustomize.py"}):
+            raise ValueError("Generated file cannot replace target or dependency definitions: " + name)
+        if any(str(parent) in files for parent in path.parents):
+            raise ValueError("Generated paths contain a file/directory collision")
+        destination = workspace / path
+        if any(p.is_symlink() for p in [destination, *destination.parents] if p.is_relative_to(workspace)):
+            raise ValueError("Generated input traverses a symlink")
+        if any(parent.exists() and not parent.is_dir() for parent in destination.parents if parent.is_relative_to(workspace)):
+            raise ValueError("Generated input parent is not a directory")
+        if destination.exists() and destination.read_text() != content:
+            raise ValueError("Existing execution input differs from its saved artifact")
+    if not write:
+        return []
+    for name, content in files.items():
+        destination = workspace / name
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text(content)
+    return [str(workspace / name) for name in files]
 
 
 def run_experiment(runner, command, workspace, snapshot_id, timeout, mode, action="experiment", adapter=None):

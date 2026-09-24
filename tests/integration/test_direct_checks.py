@@ -10,11 +10,11 @@ from consensus_assurance.core.config import Config
 from consensus_assurance.registry import assemble
 from consensus_assurance.workflow.engine import Engine,FRAMEWORK_REVISION
 from consensus_assurance.workflow.budget import BudgetTracker
-from consensus_assurance.workflow.direct_checks import save_plan,execute,assess,validate_plan,proceed
+from consensus_assurance.workflow.direct_checks import save_plan,execute,assess,validate_plan
 from consensus_assurance.workflow.review_contract import target_contract
 from consensus_assurance.adapters.runners.experiment import extract_events
 from consensus_assurance.adapters.storage.snapshot import capture
-from consensus_assurance.workflow.materials import read_material
+from regression_support import read_material
 
 
 def setup(tmp_path,prepared,broken=False):
@@ -65,105 +65,6 @@ def review(state,unit,artifact):
     contract=target_contract(state,artifact)
     state.semantic_reviews.append(SemanticReview(task_id='controlled',check_id='controlled',target_versions={artifact.id:artifact.version},context_dependencies={artifact.id:contract},
         material_ids=contract['required_material_ids'],items=[SemanticCheck(target_id=artifact.id,aspect='checker_correspondence',status='no_issue_found',source_ids=contract['required_material_ids'],rationale='The fixture contract, actual call, prerequisites and independent oracle agree within the supplied local scope')],origin='mock'))
-
-
-def test_review_attaches_saved_plan_sources_and_blocks_missing_ones(tmp_path,prepared):
-    from consensus_assurance.workflow.inquiry import enqueue,task_context
-    from consensus_assurance.workflow.task_packet import prepare
-    from consensus_assurance.workflow.errors import Blocked
-    repo=prepared[0]
-    (repo/'helper.py').write_text('def helper(value):\n    return value\n')
-    e,u,plan=setup(tmp_path,prepared)
-    e.read([ReadRequest(file='helper.py',start_line=1,end_line=2,reason='Actual helper referenced by the saved plan')],related_ids=[u.id])
-    plan.harness.legality.source_ids.append('helper.py:1:2')
-    artifact=save_plan(e,u,plan,'plan-dependencies')
-    task=enqueue(e.state,'review','Review actual saved plan','saved-plan',target_ids=[artifact.id],unit_id=u.id)
-    e.state.active_inquiry_id=task.id
-    packet,_=prepare(e,'semantic_review',task_context(e,task))
-    assert 'helper.py:1:2' in packet['required_material_ids']
-    assert any(m['file']=='helper.py' for m in packet['materials'])
-    e.state.materials=[m for m in e.state.materials if m.id!='helper.py:1:2']
-    with pytest.raises(Blocked,match='helper.py:1:2'):
-        prepare(e,'semantic_review',task_context(e,task))
-
-
-@pytest.mark.parametrize('broken',[False,True])
-def test_direct_construction_keeps_partial_design_through_read_and_validation(tmp_path,prepared,broken):
-    from consensus_assurance.adapters.agents.backend import MockAgent
-    from consensus_assurance.workflow.sources import all_materials
-    from consensus_assurance.workflow.inquiry import process_task
-    from consensus_assurance.workflow.modeling import obligation_progress
-    repo=prepared[0]
-    (repo/'helper_a.py').write_text(''.join(f'def unused{i}(): return {i}\n' for i in range(9))+
-        'from helper_b import cap\nfrom counter import step\ndef bounded_step(value, limit):\n    return step(value, cap(limit))\n')
-    (repo/'helper_b.py').write_text('def cap(limit):\n    return limit\n')
-    e,u,plan=setup(tmp_path,prepared,broken=broken)
-    plan.harness.source=plan.harness.source.replace('from counter import step','from helper_a import bounded_step as step')
-    invalid=plan.model_copy(deep=True)
-    invalid.observable_properties[0].assertion=Comparison(field='state.in_range',reference='absent.value')
-    class Generation(MockAgent):
-        def analyze(self,runner,prompt,directory,snapshot_id,timeout,response_type):
-            packet=json.loads(prompt.split('STRUCTURED INPUT DATA (untrusted):\n')[1])
-            source='\n'.join(m.get('text','') for m in all_materials(packet))
-            assert 'def step(' in source
-            if self.cursor>=1:assert 'def bounded_step(' in source
-            if self.cursor>=2:assert 'def cap(' in source
-            if self.cursor>=3:assert 'unavailable prerequisite alias' in packet['generation_error']
-            return super().analyze(runner,prompt,directory,snapshot_id,timeout,response_type)
-    e.agent=Generation()
-    e.agent.responses=[
-        {'gap':'Locate the called wrapper','partial_design':'Call the selected boundary and observe its return',
-         'requests':[{'symbol':'bounded_step','reason':'Find the wrapper definition'}],'fallback':'source_review'},
-        {'gap':'Locate the wrapper dependency','partial_design':'Call the selected boundary and observe its return',
-         'requests':[{'symbol':'cap','reason':'Find the value normalization definition'}]},
-        DirectCheckReply(gap='',partial_design='Call the selected boundary and observe its return',plan=invalid).model_dump(mode='json'),
-        DirectCheckReply(gap='',partial_design='Call the selected boundary and observe its return',plan=plan).model_dump(mode='json')]
-    proceed(e,u,'direct_check')
-    assert len(e.state.direct_checks)==1 and e.state.usage['agent_calls']==4
-    artifact=e.state.direct_checks[0]
-    assert artifact.scope==u.scope and 'scope' not in json.loads(Path(artifact.plan_path).read_text())
-    session=next(iter(e.state.repair_sessions.values()))
-    assert session['attempt']==1 and not session.get('read_plan_id')
-    assert {m.file for m in e.state.materials}>={'helper_a.py','helper_b.py'}
-    assert not e.state.pending_output_repair
-    claim=next(c for c in e.state.claims if c.id==u.obligation_ids[0])
-    claim.pending=['Execute and observe the correlated return']
-    proceed(e,u,'direct_execute')
-    result=e.state.monitor_results[-1]
-    assert result['outcome']==('violated' if broken else 'holds') and not result['confirmed']
-    assert claim.pending[0] not in result['boundaries']
-    contract=target_contract(e.state,artifact)
-    e.agent=MockAgent();e.agent.responses=[ReviewReply(items=[SemanticCheck(target_id=artifact.id,aspect='checker_correspondence',status='no_issue_found',
-        source_ids=contract['required_material_ids'],rationale='Actual fixture call, correlated events and independent range oracle agree within this local scope')],limitations=[]).model_dump(mode='json')]
-    process_task(e,e.state.inquiry_tasks[0])
-    check=next(c for c in e.state.checks if c.action=='direct_check')
-    result=e.state.monitor_results[-1]
-    assert check.status==ExecutionStatus.COMPLETED and check.direct_check_id==artifact.id
-    assert obligation_progress(e.state,u)==({u.obligation_ids[0]:[check.id]},[])
-    assert result['confirmed']==broken and 'Cluster-wide consequences outside this finite call' in result['boundaries']
-    assert e.state.evidence[-1].level=='implementation_test' and len([r for r in e.state.evidence if r.check_id==check.id])==1
-    assert not e.state.models and len([r for r in e.state.monitor_results if r['experiment_check_id']==check.id])==1
-    if broken:
-        assert e.state.findings[-1].level=='implementation_obligation'
-        e.state.active_direct_check_id=artifact.id;e.state.next_action='direct_assess';e.process_unit(u)
-        assert not e.state.consequences and u.status=='checked'
-        from consensus_assurance.reporting.chinese import render_report
-        assert '直接检查' in render_report(e.state,e.root).read_text()
-
-
-def test_missing_lookup_stops_without_accepting_a_check(tmp_path,prepared):
-    from consensus_assurance.adapters.agents.backend import MockAgent
-    from consensus_assurance.workflow.errors import Blocked
-    e,u,_=setup(tmp_path,prepared)
-    response={'gap':'The requested definition is absent','partial_design':'Keep the selected comparison',
-        'requests':[{'symbol':'missing_dependency','reason':'Locate the required definition'}]}
-    e.agent=MockAgent();e.agent.responses=[{**response,'gap':f'Missing definition, wording {i}'} for i in range(3)]
-    with pytest.raises(Blocked,match='generation remains unfinished'):
-        proceed(e,u,'direct_check')
-    session=e.state.pending_output_repair
-    assert session['status']=='blocked' and session['stagnation']==2
-    assert session['read_receipt']['items'][0]['file_metadata']['lookup']['match_count']==0
-    assert e.state.usage['agent_calls']==3 and not e.state.direct_checks and not e.state.evidence
 
 
 def test_completion_is_independent_of_forbidden_response_access(tmp_path):
@@ -233,75 +134,6 @@ def test_direct_failure_never_confirms(tmp_path,prepared,failure):
     assert not any(f.level=='implementation_obligation' for f in e.state.findings)
 
 
-def test_controlled_schedule_has_typed_model_fallback(tmp_path,prepared):
-    e,u,p=setup(tmp_path,prepared);u.audit_question.preferred_check='controlled_schedule'
-    e.ask=lambda *args,**kwargs:(DirectCheckReply(gap='Adapter has no deterministic pause point; sleep is insufficient',fallback='local_model'),CheckRun(action='agent',cwd=str(e.root),snapshot_id=e.state.snapshot.id))
-    proceed(e,u,'direct_check')
-    assert e.state.next_action=='build' and not e.state.direct_checks and not e.state.models
-    from consensus_assurance.workflow.artifacts import save_bundle
-    from consensus_assurance.workflow.inquiry import review_unit
-    model=save_bundle(e.root,e.state,u,prepared[2],e.implementation)
-    review_unit(e,u,'after_search',model)
-    assert any(model.id in t.target_ids for t in e.state.inquiry_tasks)
-
-
-@pytest.mark.parametrize('refine',[False,True])
-def test_descriptive_derivation_reaches_actual_direct_execution(tmp_path,prepared,refine):
-    from consensus_assurance.core.proposals import Discovery
-    from test_audit_capabilities import inventory
-    from consensus_assurance.adapters.agents.backend import MockAgent
-    from consensus_assurance.adapters.storage.files import write_json
-    e,u,plan=setup(tmp_path,prepared);responses=prepared[3]
-    spec=inventory('counter.py:1:10')
-    initial=spec.model_copy(deep=True)
-    if refine:initial.behaviors[0].produces_fact_ids=['missing']
-    derivation=GraphDraft.model_validate(responses[1]);derivation.units[0].audit_question=u.audit_question
-    q=derivation.units[0].audit_question;q.activity_classes=['A1','A5'];q.behavior_ids=['producer','consumer'];q.fact_ids=['fact'];q.obligation_relation_kind='consumption'
-    replies=[responses[0],Discovery(understanding='Controlled descriptive input',audit_spec=initial).model_dump(mode='json')]
-    if refine:replies.append(SpecRefinement(understanding='Separate the established input from the unknown producer',delta=AuditSpecDelta(behaviors=[spec.behaviors[0]],rationale='Restore the sourced producer edge'),limitations=['Unverified durability remains explicit']).model_dump(mode='json'))
-    replies.extend([derivation.model_dump(mode='json'),DirectCheckReply(plan=plan,gap='').model_dump(mode='json')])
-    fixture=tmp_path/'direct-responses.json';write_json(fixture,replies)
-    config=e.config.model_copy(deep=True);config.agent_backend='mock';config.fixture=str(fixture);config.budget.semantic_reviews=0
-    config.budget.agent_calls=5+int(refine)
-    class StopAfterActualCheck(Engine):
-        def record(self,check):
-            super().record(check)
-            if check.action=='direct_check':raise RuntimeError('Stop after actual direct execution receipt')
-    impl,_,verifier,knowledge=assemble(config)
-    engine=StopAfterActualCheck(config,tmp_path/'whole',impl,MockAgent(fixture),verifier,knowledge,'')
-    with pytest.raises(RuntimeError,match='actual direct'):engine.start(prepared[0])
-    assert engine.state.usage['agent_calls']==5+int(refine)
-    assert not engine.state.models and not engine.state.repair_sessions
-    assert all(t.status=='completed' for t in engine.state.inquiry_tasks if t.kind=='spec_refine')
-    assert sum(t.kind=='spec_refine' for t in engine.state.inquiry_tasks)==int(refine)
-    assert json.loads((engine.root/'actions'/engine.state.pending_action.id/'result.json').read_text())['exit_code']==0
-    packet=json.loads(next((engine.root/'agent').glob('*-direct_check/prompt.txt')).read_text().split('STRUCTURED INPUT DATA (untrusted):\n')[1])
-    assert 'explicit_material_ids' not in packet and packet['materials']
-
-
-def test_exact_selected_reads_then_one_focused_continuation(tmp_path,prepared):
-    # Prepare the unread source before capturing this new fixture analysis.
-    (prepared[0]/'adapter.py').write_text('owns_snapshot = True\n')
-    e,u,p=setup(tmp_path,prepared)
-    q=u.audit_question;q.disposition='needs_specific_evidence';q.preferred_check=None
-    q.requests=[ReadRequest(file='adapter.py',start_line=1,end_line=1,reason='Selected consumer ownership discriminator')]
-    e.state.next_action='question';calls=[]
-    def ask(kind,response_type,context,validator=None,**kwargs):
-        calls.append(kind)
-        assert any(m['file']=='adapter.py' for m in context['materials'])
-        answered=q.model_copy(deep=True);answered.requests=[];answered.disposition='explained_by_existing_mechanism'
-        answered.source_ids.append('adapter.py:1:1');answered.trigger_rationale='The actual adapter owns the representation; this explains only the selected ownership suspicion'
-        reply=QuestionReply(question=answered,explanation='Source establishes the previously missing owner')
-        if validator:validator(reply)
-        return reply,CheckRun(action='agent',cwd=str(e.root),snapshot_id=e.state.snapshot.id)
-    e.ask=ask
-    e.process_unit(u)
-    assert calls==['question'] and not e.state.models and not e.state.direct_checks
-    assert e.state.usage.get('exploration_rounds',0)==0
-    assert next(p for p in e.state.read_plans.values() if p['original_requests'][0]['file']=='adapter.py')['purpose']=='depth'
-    assert not e.state.active_unit_id and e.state.graph_history
-
-
 def test_new_direct_artifact_does_not_hide_prior_oracle_dispute(tmp_path,prepared):
     e,u,p=setup(tmp_path,prepared,True);old=save_plan(e,u,p,'old');review(e.state,u,old)
     e.state.review_issues.append(ReviewIssue(review_id='old',target_id=old.id,target_version=1,aspect='checker_correspondence',source_ids=u.audit_question.source_ids,explanation='Oracle may use the wrong return boundary',disposition='investigation',reason='Must resolve the specific dispute'))
@@ -310,187 +142,34 @@ def test_new_direct_artifact_does_not_hide_prior_oracle_dispute(tmp_path,prepare
     assert not result['confirmed'] and any('Open review issue' in x and 'wrong return boundary' in x for x in result['blockers'])
 
 
-def test_reviewed_direct_encoding_correction_reexecutes_and_resolves_only_its_issue(tmp_path,prepared):
-    from consensus_assurance.adapters.agents.backend import MockAgent
-    from consensus_assurance.workflow.inquiry import enqueue,process_task
-    e,u,correct=setup(tmp_path,prepared,True)
-    wrong=correct.model_copy(deep=True)
-    wrong.observable_properties[0].assertion=Comparison(field='state.value',reference='start.state.limit')
-    old=save_plan(e,u,wrong,'wrong-oracle')
-    original=execute(e,old);assess(e.state,u,old,wrong,original,extract_events(original))
-    e.state.active_unit_id=None;u.status='blocked';e.state.usage['audit_units']=e.config.budget.audit_units
-    task=enqueue(e.state,'review','Inspect actual checker','oracle-review',target_ids=[old.id],unit_id=u.id)
-    sources=target_contract(e.state,old)['required_material_ids']
-    challenge=SemanticCheck(target_id=old.id,aspect='checker_correspondence',status='revision_needed',source_ids=sources,
-        counterevidence=['Equality to capacity is stronger than the selected range safety claim'],rationale='The checker rejects legal non-capacity results')
-    e.agent=MockAgent();e.agent.responses=[ReviewReply(items=[challenge],limitations=[]).model_dump(mode='json')]
-    process_task(e,task)
-    issue=next(i for i in e.state.review_issues if i.target_id==old.id)
-    assert e.state.inquiry_tasks[0].check_id==e.state.semantic_reviews[-1].check_id
-    assert e.state.next_action=='direct_check' and e.state.active_unit_id==u.id and e.state.pending_feedback['issue_id']==issue.id
-    assert e.state.usage['audit_units']==e.config.budget.audit_units and e.state.units[0].status=='selected'
-    correction=EncodingRevision(old_direct_check_id=old.id,issue_id=issue.id,source_ids=issue.source_ids,
-        rationale='Use the sourced range safety assertion instead of equality to capacity')
-    def ask(kind,response_type,context,validator=None,**kwargs):
-        reply=DirectCheckReply(plan=correct,gap='',encoding_revision=correction)
-        assert context['checker_issue']['id']==issue.id
-        if validator:validator(reply)
-        return reply,CheckRun(action='agent',cwd=str(e.root),snapshot_id=e.state.snapshot.id)
-    e.ask=ask;proceed(e,u,'direct_check')
-    revised=next(a for a in e.state.direct_checks if a.id!=old.id)
-    assert revised.previous_id==old.id and revised.plan_path!=old.plan_path
-    assert e.state.revisions[-1].kind=='encoding' and e.state.next_action=='direct_execute'
-    proceed(e,u,'direct_execute')
-    new_check=next(c for c in e.state.checks if c.direct_check_id==revised.id)
-    assert new_check.id!=original.id and issue.resolved_by is None
-    review_task=next(t for t in e.state.inquiry_tasks if revised.id in t.target_ids)
-    assert review_task.resolution_issue_ids==[issue.id]
-    accepted=SemanticCheck(target_id=revised.id,aspect='checker_correspondence',status='no_issue_found',source_ids=sources,
-        rationale='The new actual run compares the observed result to the accepted range condition')
-    resolution=IssueResolution(issue_id=issue.id,target_version=issue.target_version,original_question=issue.explanation,
-        source_ids=sources,rationale='The new assertion removed the stronger equality and the new run reached the same return',
-        residual_issue_ids=[],scope_limitations=[])
-    e.agent=MockAgent();e.agent.responses=[ReviewReply(items=[accepted],resolves_issue_ids=[issue.id],resolutions=[resolution],
-        resolution_rationale='Address the original oracle discrepancy with the new executed artifact',limitations=[]).model_dump(mode='json')]
-    e.ask=Engine.ask.__get__(e,Engine)
-    process_task(e,review_task)
-    issue=next(i for i in e.state.review_issues if i.id==issue.id)
-    assert issue.resolved_by and issue.resolution_checks==[new_check.id]
-    current=next(r for r in e.state.monitor_results if r['direct_check_id']==revised.id)
-    assert current['confirmed'] and 'Cluster-wide consequences outside this finite call' in current['boundaries']
-    assert len([c for c in e.state.checks if c.action=='direct_check'])==2
-    assert Path(old.plan_path).exists() and Path(original.stdout).exists()
-    assert next(r for r in e.state.monitor_results if r['direct_check_id']==old.id)['experiment_check_id']==original.id
-
-
-def test_native_session_revises_executes_and_reviews_saved_checker(tmp_path,prepared):
-    from consensus_assurance.workflow.native import execute as native_execute
-    e,u,correct=setup(tmp_path,prepared,False)
-    wrong=correct.model_copy(deep=True)
-    wrong.observable_properties[0].assertion=Comparison(field='state.value',reference='start.state.limit')
-    old=save_plan(e,u,wrong,'native-old')
-    original=execute(e,old)
-    assess(e.state,u,old,wrong,original,extract_events(original))
-    issue=ReviewIssue(review_id='initial-review',target_id=old.id,target_version=old.version,
-        aspect='checker_correspondence',source_ids=u.audit_question.source_ids,
-        explanation='Equality to capacity is stronger than the selected range safety claim',
-        disposition='revision',reason='Use a predicate matching the claim',needs_recheck=True)
-    e.state.review_issues.append(issue)
-    e.state.analysis_mode='autonomous'
-    cfg=e.config.model_dump(mode='json');cfg['execution_isolation']='bwrap'
-    e.config=Config.model_validate(cfg)
-    class NativeFixture:
-        name='codex';mock=False;available=True
-        turn=0
-        def investigate(self,runner,prompt,directory,snapshot_id,timeout,session_id=None):
-            self.turn+=1
-            if self.turn==1:
-                raw=correct.model_dump(mode='json')
-                raw['harness']['source']=''
-                (directory/'correct.json').write_text(json.dumps(raw))
-                (directory/'check.py').write_text(correct.harness.source)
-                value={'action':'revise_check','previous_check_id':old.id,
-                    'encoding_revision':EncodingRevision(old_direct_check_id=old.id,issue_id=issue.id,
-                        source_ids=issue.source_ids,rationale='Replace equality with the sourced range safety predicate').model_dump(mode='json'),
-                    'plan_path':'correct.json','harness_path':'check.py','rationale':'Correct the actual oracle and rerun it'}
-            elif self.turn==2:
-                revised=next(a for a in e.state.direct_checks if a.previous_id==old.id)
-                items=[SemanticCheck(target_id=revised.id,aspect=aspect,status='no_issue_found',
-                    source_ids=issue.source_ids,rationale='The new executed result compares actual return with the sourced range safety predicate')
-                    for aspect in ('applicability','decomposition','checker_correspondence')]
-                value={'action':'review','review_check_id':revised.id,'review_items':[item.model_dump(mode='json') for item in items],
-                    'resolves_issue_ids':[issue.id],'resolution_rationale':'The corrected checker was executed on the same bounded fixture',
-                    'rationale':'Review all three aspects against the saved new execution'}
-            else:
-                value={'action':'stop','rationale':'The bounded correction is complete; broader paths remain outside this fixture'}
-            (directory/'submission.json').write_text(json.dumps(value))
-            return (CheckRun(action='native_agent',cwd=str(directory),snapshot_id=snapshot_id,
-                status=ExecutionStatus.COMPLETED,exit_code=0),session_id or 'offline-session',
-                {'submission':'submission.json','summary':'Offline native adapter sequence'})
-    e.agent=NativeFixture()
-    e.state.tools={'agent':'offline-native'}
-    e.config.budget.agent_calls=4
-    native_execute(e)
-    revised=next(a for a in e.state.direct_checks if a.previous_id==old.id)
-    assert revised.id!=old.id
-    assert len([c for c in e.state.checks if c.direct_check_id==revised.id])==1
-    assert next(i for i in e.state.review_issues if i.id==issue.id).resolved_by
-    assert Path(old.plan_path).exists() and Path(original.stdout).exists()
-    assert e.state.native_session_id=='offline-session'
-
-
 def test_direct_encoding_observation_change_must_be_declared(tmp_path,prepared):
-    from consensus_assurance.workflow.direct_checks import validate_reply
+    from consensus_assurance.workflow.encoding import validate_direct_encoding
     e,u,old_plan=setup(tmp_path,prepared);old=save_plan(e,u,old_plan,'observation-old');execute(e,old)
     issue=ReviewIssue(review_id='review',target_id=old.id,target_version=old.version,aspect='checker_correspondence',
         source_ids=u.audit_question.source_ids,explanation='The old observation field is not independent',disposition='blocked',reason='Correct observed input')
     e.state.review_issues.append(issue);e.state.active_direct_check_id=old.id
-    e.state.pending_feedback={'kind':'encoding','issue_id':issue.id,'check_id':next(c.id for c in e.state.checks if c.direct_check_id==old.id)}
     fixed=old_plan.model_copy(deep=True)
     fixed.harness.source=fixed.harness.source.replace('in_range=0 <= returned <= limit','range_observed=0 <= returned <= limit')
     fixed.harness.semantic_changes.append('Emit the independently computed range observation')
     fixed.observable_properties[0].assertion=Comparison(field='state.range_observed',value=True)
     revision=EncodingRevision(old_direct_check_id=old.id,issue_id=issue.id,source_ids=issue.source_ids,rationale='Use the separately observed result')
     with pytest.raises(ValueError,match='declared'):
-        validate_reply(e.state,u,DirectCheckReply(plan=fixed,gap='',encoding_revision=revision),e.implementation,old_plan)
+        validate_direct_encoding(e.state,old,old_plan,fixed,revision)
     revision.input_changes=['Add an independent range observation to the result event']
-    validate_reply(e.state,u,DirectCheckReply(plan=fixed,gap='',encoding_revision=revision),e.implementation,old_plan)
-
-
-def test_new_review_issue_updates_the_single_current_result(tmp_path,prepared):
-    from consensus_assurance.adapters.agents.backend import MockAgent
-    from consensus_assurance.workflow.inquiry import enqueue,process_task
-    from consensus_assurance.workflow.task_view import candidate_view
-    e,u,p=setup(tmp_path,prepared,True);artifact=save_plan(e,u,p,'current-result')
-    review(e.state,u,artifact)
-    check=execute(e,artifact)
-    initial=assess(e.state,u,artifact,p,check,extract_events(check))
-    assert initial['confirmed']
-    candidate=QuestionCandidate(question=u.audit_question,obligation_id=u.obligation_ids[0],status='escalated')
-    e.state.question_candidates.append(candidate)
-    task=enqueue(e.state,'review','Check the actual oracle source','new-issue',target_ids=[artifact.id],unit_id=u.id)
-    contract=target_contract(e.state,artifact)
-    item=SemanticCheck(target_id=artifact.id,aspect='checker_correspondence',status='disputed',source_ids=contract['required_material_ids'],
-        counterevidence=['The expected return boundary needs another source check'],rationale='The current comparison may be tied to an earlier return boundary')
-    e.agent=MockAgent();e.agent.responses=[ReviewReply(items=[item],limitations=[]).model_dump(mode='json')]
-    process_task(e,task)
-    current=candidate_view(e.state,candidate)['current_result']
-    assert current['outcome']=='violated' and not current['confirmed'] and current['level']=='implementation_test'
-    assert current['blockers'] and len(e.state.monitor_results)==len(e.state.evidence)==len(e.state.findings)==1
-    assert e.state.findings[0].level=='implementation_candidate'
+    validate_direct_encoding(e.state,old,old_plan,fixed,revision)
 
 
 def test_changed_semantic_input_stales_current_direct_result(tmp_path,prepared):
-    from consensus_assurance.workflow.task_view import candidate_view
     e,u,p=setup(tmp_path,prepared,True);artifact=save_plan(e,u,p,'stale-result');review(e.state,u,artifact)
     check=execute(e,artifact);assert assess(e.state,u,artifact,p,check,extract_events(check))['confirmed']
     candidate=QuestionCandidate(question=u.audit_question,obligation_id=u.obligation_ids[0],status='escalated')
     e.state.question_candidates.append(candidate)
     next(c for c in e.state.claims if c.id==artifact.claim_id).version+=1;e.checkpoint('semantic_input_changed')
-    current=candidate_view(e.state,candidate)['current_result']
+    current=next(r for r in e.state.monitor_results if r.get('direct_check_id')==artifact.id)
     assert current['outcome']=='violated' and not current['confirmed']
     assert any('semantic inputs changed' in reason for reason in current['blockers'])
     assert e.state.evidence[0].assessment==Assessment.STALE
     assert len(e.state.monitor_results)==len(e.state.evidence)==len(e.state.findings)==1
-
-
-def test_source_continuation_uses_existing_attributed_F2(tmp_path,prepared):
-    from consensus_assurance.workflow.direct_checks import continue_question
-    e,u,p=setup(tmp_path,prepared);claim=next(c for c in e.state.claims if c.id==u.obligation_ids[0])
-    draft=ClaimDraft(**{k:v for k,v in claim.model_dump(mode='json').items() if k in ClaimDraft.model_fields})
-    draft.description+=' within the explicitly selected finite input scope'
-    revision=SemanticRevision(rationale='Attribute the finite configured contract',evidence_ids=claim.source_ids,target_ids=[claim.id],new_basis='The supplied fixture defines the bounded input contract',
-        patch=GraphPatch(claims=[draft],expected_versions={claim.id:claim.version},rationale='Explicit semantic refinement'),
-        changes=[JudgmentChange(target_id=claim.id,field='description',old_value_json=json.dumps(claim.description),new_value_json=json.dumps(draft.description))],
-        old_judgment=claim.description,new_judgment=draft.description,grounding=claim.grounding)
-    def ask(kind,response_type,context,validator=None,**kwargs):
-        response=QuestionReply(question=u.audit_question,explanation='Explicit F2 before another check',revision=revision)
-        if validator:validator(response)
-        return response,CheckRun(action='agent',cwd=str(e.root),snapshot_id=e.state.snapshot.id)
-    e.ask=ask;continue_question(e,u)
-    assert e.state.revisions[-1].kind=='F2' and e.state.revisions[-1].status=='applied'
-    assert next(c for c in e.state.claims if c.id==claim.id).version==2
-    assert e.state.next_action=='select' and not e.state.models
 
 
 def test_stale_binding_cannot_ground_direct_execution(tmp_path,prepared):
@@ -499,63 +178,6 @@ def test_stale_binding_cannot_ground_direct_execution(tmp_path,prepared):
     with pytest.raises(ValueError,match='selected source snapshot'):
         validate_plan(e.state,u,p,e.implementation)
     assert not e.state.direct_checks and not e.state.evidence
-
-
-def test_direct_F4_keeps_failed_prerequisite_and_revision_history(tmp_path,prepared):
-    e,u,p=setup(tmp_path,prepared);p.harness.prerequisites[0].event='unreached'
-    old=save_plan(e,u,p,'before-F4');failed=execute(e,old)
-    e.state.active_direct_check_id=old.id
-    proceed(e,u,'direct_assess')
-    assert e.state.pending_feedback['kind']=='F4'
-    fixed=p.model_copy(deep=True);fixed.harness.prerequisites[0].event='admitted'
-    def ask(kind,response_type,context,validator=None,**kwargs):
-        reply=DirectCheckReply(plan=fixed,gap='')
-        if validator:validator(reply)
-        return reply,CheckRun(action='agent',cwd=str(e.root),snapshot_id=e.state.snapshot.id)
-    e.ask=ask;proceed(e,u,'direct_check')
-    revision=e.state.revisions[-1]
-    assert revision.kind=='F4' and revision.evidence_ids==[failed.id]
-    assert revision.before['direct_check_id']==old.id and revision.after['direct_check_id']!=old.id
-    assert e.state.usage['revisions']==1 and e.state.usage['replays']==1
-    assert e.state.monitor_results[0]['prerequisites']['status']=='not_reached'
-    assert not e.state.models and not e.state.evidence
-
-
-def test_exhausted_review_budget_keeps_one_completed_direct_result(tmp_path,prepared):
-    e,u,p=setup(tmp_path,prepared,True);a=save_plan(e,u,p,'budget-end')
-    e.state.active_direct_check_id=a.id
-    proceed(e,u,'direct_execute')
-    task=next(t for t in e.state.inquiry_tasks if t.unit_id==u.id)
-    task.status='blocked';task.stop_reason='Budget exhausted or disabled: semantic_reviews'
-    proceed(e,u,'direct_assess')
-    checks=[c for c in e.state.checks if c.direct_check_id==a.id]
-    results=[r for r in e.state.monitor_results if r['direct_check_id']==a.id]
-    assert len(checks)==len(results)==1 and results[0]['bounded_complete']
-    assert u.status=='blocked' and task.status=='blocked' and not e.state.models
-    assert any('attribution remains pending' in x for x in u.coverage_limitations)
-
-
-def test_question_narrowing_preserves_structural_identity_and_counterevidence(tmp_path,prepared):
-    e,u,p=setup(tmp_path,prepared)
-    q=u.audit_question;q.disposition='concrete_suspicion';q.preferred_check='direct_test'
-    q.activity_classes=['A6'];q.behavior_ids=['producer'];q.fact_ids=['representation'];q.obligation_relation_kind='preservation'
-    q.counterevidence=['Consumer contract remains unverified'];q.unknowns=['Injected adapter applicability']
-    def ask(kind,response_type,context,validator=None,**kwargs):
-        narrowed=q.model_copy(deep=True);narrowed.question='Which consumer contract requires preserving this same representation?'
-        narrowed.importance='Consequences depend on the same original recovery contract'
-        narrowed.disposition='needs_specific_evidence';narrowed.preferred_check='source_review'
-        reply=QuestionReply(question=narrowed,explanation='Narrow applicability before executing')
-        validator(reply)
-        wrong=reply.model_copy(deep=True);wrong.question.fact_ids=['different_fact']
-        with pytest.raises(ValueError,match='structural'):validator(wrong)
-        wrong=reply.model_copy(deep=True);wrong.question.counterevidence=[]
-        with pytest.raises(ValueError,match='counterevidence'):validator(wrong)
-        return reply,CheckRun(action='agent',cwd=str(e.root),snapshot_id=e.state.snapshot.id)
-    e.ask=ask
-    from consensus_assurance.workflow.direct_checks import continue_question
-    continue_question(e,u)
-    assert e.state.units[0].audit_question.preferred_check=='source_review'
-    assert e.state.units[0].audit_question.counterevidence==q.counterevidence
 
 
 def test_direct_event_comparison_uses_correlated_raw_fields(tmp_path,prepared):

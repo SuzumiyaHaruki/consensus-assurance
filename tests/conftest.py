@@ -7,7 +7,7 @@ from consensus_assurance.core.config import Config
 from consensus_assurance.core.types import Analysis
 from consensus_assurance.core.proposals import Bundle, GraphDraft
 from consensus_assurance.adapters.storage.snapshot import capture
-from consensus_assurance.workflow.materials import initial_materials,  ReadingPlan
+from regression_support import ReadingPlan
 from regression_support import add_reads
 from consensus_assurance.workflow.graph import apply_graph
 from consensus_assurance.adapters.verifiers.tlc import TLCVerifier
@@ -27,7 +27,6 @@ def prepared(tmp_path):
     fixture.write_text(json.dumps(responses))
     config = Config(protocol="toy", execution_backend="python", agent_backend="mock", fixture=str(fixture))
     state = Analysis(mode="mock", analysis_mode="regression", config=config.model_dump(mode="json"), snapshot=snapshot)
-    state.materials = initial_materials(repo, snapshot, config.budget, "Toy fixture normative context")
     add_reads(state, repo, ReadingPlan.model_validate(responses[0]), config.budget)
     apply_graph(state, GraphDraft.model_validate(responses[1]))
     return repo, state, Bundle.model_validate(responses[2]), responses
@@ -44,40 +43,6 @@ def tlc(tmp_path):
     if not probe["available"]:
         pytest.skip("TLC capability probe failed")
     return verifier, runner
-
-
-@pytest.fixture(autouse=True)
-def verification_fixture_inventory(monkeypatch):
-    """Materialize the descriptive step in scripted downstream fixture playback."""
-    from consensus_assurance.adapters.agents.backend import MockAgent
-    from regression_support import descriptive_inventory,bounded_derivation,fixture_reachability
-    original=MockAgent.__init__
-    def initialize(self,fixture=None):
-        original(self,fixture)
-        responses=[];structured=False
-        for reply in self.responses:
-            if isinstance(reply,dict) and reply.get('units') and 'claims' in reply and 'expected_versions' not in reply and len(self.responses)>1 and 'requests' in self.responses[0]:
-                if len(responses)==1 and 'requests' in responses[0]:
-                    source=reply['claims'][0]['source_ids'][0]
-                    responses.append(descriptive_inventory(source).model_dump(mode='json'))
-                response=bounded_derivation(reply);structured=response['audit_question']['fact_ids']==['fixture_value']
-                from regression_support import selection_derivation
-                selection=selection_derivation(response)
-                responses.extend([selection,response])
-            elif structured and isinstance(reply,dict) and 'behavior' in reply:responses.append(fixture_reachability(reply))
-            else:responses.append(reply)
-        self.responses=responses
-    monkeypatch.setattr(MockAgent,'__init__',initialize)
-    analyze=MockAgent.analyze
-    def select_id(self,runner,prompt,directory,snapshot_id,timeout,response_type):
-        if response_type.__name__=='Derivation' and self.cursor<len(self.responses):
-            packet=json.loads(prompt.split('STRUCTURED INPUT DATA (untrusted):\n')[1])
-            reply=self.responses[self.cursor]
-            if packet.get('candidate_id') and not reply.get('candidate_id') and not reply.get('fork_from_candidate_id'):
-                self.responses[self.cursor]={**reply,'candidate_id':packet['candidate_id']}
-        return analyze(self,runner,prompt,directory,snapshot_id,timeout,response_type)
-    monkeypatch.setattr(MockAgent,'analyze',select_id)
-
 
 
 @pytest.fixture

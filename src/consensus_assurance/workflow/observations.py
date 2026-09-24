@@ -50,7 +50,7 @@ def assess_execution(state, model, bundle, experiment, calibration, finding, eve
     specs = {c.invariant:c for c in model.checkers}
     properties={p.checker_id:p for p in bundle.observable_properties}
     results = [monitor_events(events,m,properties.get(m.checker_id),bundle.harness.prerequisites) for m in bundle.monitors if m.checker_id == finding.checker_id]
-    from .inquiry import semantic_limitations
+    from .reviews import semantic_limitations
     blockers = semantic_limitations(state,model)
     boundaries=list(bundle.uncertainties)
     from pathlib import Path
@@ -64,7 +64,7 @@ def assess_execution(state, model, bundle, experiment, calibration, finding, eve
     if experiment.status != ExecutionStatus.COMPLETED or experiment.exit_code != 0: blockers.append('Experiment did not complete successfully')
     if experiment.snapshot_id != model.snapshot_id or experiment.model_id != model.id: blockers.append('Experiment input association mismatch')
     if experiment.input_versions != model.artifact_digests: blockers.append('Experiment artifact versions do not match')
-    if state.mode == 'mock' or model.origin in {Origin.MOCK, Origin.SYNTHETIC, Origin.MUTATION} or experiment.origin != Origin.EXECUTED: blockers.append('Mock, synthetic, imported or mutation execution cannot confirm the original implementation')
+    if state.mode == 'mock' or model.origin in {Origin.MOCK, Origin.SYNTHETIC, Origin.MUTATION, Origin.IMPORTED} or experiment.origin != Origin.EXECUTED: blockers.append('Mock, synthetic, imported or mutation execution cannot confirm the original implementation')
     if not calibration or calibration.status != 'compatible' or calibration.model_id != model.id or calibration.experiment_check_id != experiment.id:
         blockers.append('Exact experiment has not completed code calibration')
     if prerequisite['status'] != 'matched': blockers.append('Candidate prerequisites are not established')

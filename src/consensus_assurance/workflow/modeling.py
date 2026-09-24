@@ -16,37 +16,6 @@ def validate_technical_repair(current, repaired, phase):
             raise ValueError('Compilation repair may change only the harness')
 
 
-def validate_build_reply(state, unit, reply, implementation, current=None, phase=None):
-    if reply.bundle is not None and reply.draft is not None:
-        raise ValueError('Return one complete bundle or one staged model, not competing artifacts')
-    model=reply.draft or reply.bundle
-    if model is None:
-        if not reply.gap.strip():
-            raise ValueError('A missing model needs a concrete material or modeling gap')
-        return
-    if reply.requests:
-        raise ValueError('Return a model or focused reading requests; stage missing-component requests under pending_work')
-    if reply.draft is not None:
-        if not {'harness','observation'} <= {p.component for p in reply.draft.pending_work}:
-            raise ValueError('Model-only output must acknowledge missing harness and observation components')
-        from consensus_assurance.core.proposals import ModelDraft
-        if current is not None and not isinstance(current,ModelDraft):
-            raise ValueError('Technical repair cannot discard an existing harness or observation map')
-    if current is not None:
-        if reply.encoding_revision and phase=='search':
-            previous=next((m for m in state.models if m.id==reply.encoding_revision.old_model_id),None)
-            if previous is None:raise ValueError('Encoding repair references an unavailable original model')
-            from .encoding import validate_encoding
-            validate_encoding(state,previous,current,model,reply.encoding_revision)
-        else:validate_technical_repair(current,model,phase)
-    if reply.draft and any(p.component in {'behavior','properties'} for p in reply.draft.pending_work):
-        materialize_bundle(model)
-        return
-    model=validate_bundle(state,unit,model,implementation)
-    if reply.draft is not None:reply.draft=model
-    else:reply.bundle=model
-
-
 def obligation_progress(state, unit):
     import json
     expected={claim:{} for claim in unit.obligation_ids}
@@ -79,18 +48,26 @@ def obligation_progress(state, unit):
             if any(r.id not in latest or latest[r.id].status!='reachable' for r in requirements):complete=False
             if not result or result.outcome not in {'holds','violated'}:complete=False
             else:ids.append(check.id)
-        if complete:
-            covered[claim]=list(dict.fromkeys(ids));completed.add(claim)
-    versions={x.id:x.version for x in [*state.claims,*state.bindings,*state.relations,*state.units]}
+        if complete:covered[claim]=list(dict.fromkeys(ids))
+        from .reviews import semantic_limitations
+        if any(semantic_limitations(state, m) for m, _ in slots.values()):complete=False
+        if complete:completed.add(claim)
+    superseded={a.previous_id for a in state.direct_checks if a.previous_id}
+    direct={claim:[] for claim in unit.obligation_ids}
     for artifact in state.direct_checks:
-        if artifact.unit_id!=unit.id or artifact.claim_id not in unit.obligation_ids:continue
-        if any(versions.get(k)!=v for k,v in artifact.graph_versions.items()):continue
-        records=[r for r in state.monitor_results if r.get('direct_check_id')==artifact.id]
-        if not records:continue
-        record=records[-1];check_id=record.get('experiment_check_id')
+        if artifact.unit_id!=unit.id or artifact.claim_id not in direct or artifact.id in superseded:continue
+        if any(versions.get(k)!=v for k,v in artifact.graph_versions.items()):
+            direct[artifact.claim_id].append(False)
+            continue
+        record=next((r for r in reversed(state.monitor_results) if r.get('direct_check_id')==artifact.id),{})
+        check_id=record.get('experiment_check_id')
         if any(p.get('comparison_complete') for p in record.get('properties',[])) and check_id:
             covered[artifact.claim_id]=list(dict.fromkeys(covered.get(artifact.claim_id,[])+[check_id]))
-        if record.get('bounded_complete') and not record.get('blockers'):completed.add(artifact.claim_id)
+        direct[artifact.claim_id].append(bool(record.get('reviewed_complete')))
+    for claim,scenarios in direct.items():
+        if scenarios:
+            if all(scenarios):completed.add(claim)
+            else:completed.discard(claim)
     return covered,[c for c in unit.obligation_ids if c not in completed]
 
 

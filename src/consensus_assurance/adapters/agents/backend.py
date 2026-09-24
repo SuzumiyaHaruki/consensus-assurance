@@ -8,36 +8,6 @@ from consensus_assurance.adapters.runners.process import output
 from consensus_assurance.adapters.storage.files import write_json, redact
 
 
-def strict_schema(schema):
-    """Legacy mock-stage schema conversion retained until its offline fixtures migrate."""
-    import copy
-    schema = copy.deepcopy(schema)
-    maps = {"properties", "$defs", "definitions", "patternProperties", "dependentSchemas"}
-    children = {"items", "additionalProperties", "contains", "not", "if", "then", "else", "propertyNames"}
-    alternatives = {"anyOf", "oneOf", "allOf", "prefixItems"}
-    def visit(node):
-        if isinstance(node, list):return [visit(v) for v in node]
-        if not isinstance(node, dict):return node
-        if node.get("type") == "object" and "properties" not in node:
-            typed=isinstance(node.get("additionalProperties"),dict) and bool(node["additionalProperties"])
-            field="value" if typed else "value_json"
-            return {"type":"array", "description":node.get("description", "")+" Dictionary entries; keys must be unique. "+("Use typed values." if typed else "value_json encodes a JSON value."), "items":
-                {"type":"object","properties":{"key":visit({"type":"string",**node.get("propertyNames",{})}),field:visit(node["additionalProperties"]) if typed else {"type":"string"}},
-                 "required":["key",field],"additionalProperties":False}}
-        out = {}
-        for key, value in node.items():
-            if key in {"default", "x-controller-derived"}:continue
-            if key in maps and isinstance(value, dict):
-                out[key] = {name:visit(child) for name,child in value.items() if not (key=="properties" and child.get("x-controller-derived"))}
-            elif key in children or key in alternatives:out[key] = visit(value)
-            else:out[key] = value
-        if out.get("type") == "object":
-            out["required"] = list(out.get("properties",{}))
-            out["additionalProperties"] = False
-        return out
-    return visit(schema)
-
-
 def classify_failure(text: str) -> ExecutionStatus:
     low = text.lower()
     if any(s in low for s in ["insufficient_quota", "quota exceeded", "usage limit", "rate limit", "quota exhausted", "credits exhausted"]):
@@ -73,7 +43,7 @@ class CodexAgent:
         help_run = runner.run(["codex", "exec", "--help"], runner.root, "agent_capabilities", "environment", 10)
         resume_run = runner.run(["codex", "exec", "resume", "--help"], runner.root, "agent_resume_capabilities", "environment", 10)
         text = output(help_run)
-        required = ["--output-schema", "--output-last-message", "--skip-git-repo-check", "--json", "--ignore-user-config", "--ignore-rules"]
+        required = ["--output-schema", "--output-last-message", "--skip-git-repo-check", "--json", "--ignore-user-config"]
         self.available = (version.status == ExecutionStatus.COMPLETED and version.exit_code == 0
             and all(s in text for s in required) and "SESSION_ID" in output(resume_run))
         self.version = output(version).strip()
@@ -89,10 +59,16 @@ class CodexAgent:
         filesystem={":root":"deny",":minimal":"read",":tmpdir":"deny",":slash_tmp":"deny",
             str(root/"native-source"):"read",str(directory):"write",
             str(root/"direct-checks"):"read",str(root/"native-submissions"):"read",
-            str(root/"state.json"):"read",str(root/"native-submission.schema.json"):"read",
+            str(root/"state.json"):"read",str(root/"research.json"):"read",
+            str(root/"native-submission.schema.json"):"read",str(root/"product-schemas.json"):"read",
+            str(root/"native-method.md"):"read",
+            **{str(root/name):"read" for name in ("logs","models","findings","audit-spec","actions")},
+            **{str(path):"read" for path in getattr(self,"read_only_roots",[]) if path.is_dir()},
             str(codex_home/"tmp"/"arg0"):"read",str(Path(executable).resolve().parent):"read"}
         inline="{"+",".join(json.dumps(key)+"="+json.dumps(value) for key,value in filesystem.items())+"}"
-        environment={"GOCACHE":str(directory/"go-cache"),"GOMODCACHE":str(directory/"go-mod-cache")}
+        environment={"GOCACHE":str(directory/"go-cache"),"GOMODCACHE":str(directory/"go-mod-cache"),
+            "TMPDIR":str(directory/"tmp"),"GOPROXY":"off","GOSUMDB":"off","GOTOOLCHAIN":"local","GOFLAGS":"-mod=readonly"}
+        environment.update(getattr(self,"tool_environment",{}))
         return ["-c",'default_permissions="ca_native"',
             "-c","permissions.ca_native.filesystem="+inline,
             "-c","permissions.ca_native.network.enabled=false",
@@ -118,31 +94,56 @@ class CodexAgent:
             "--proc","/proc","--dev","/dev","--","codex"]
 
     def permission_probe(self, runner, directory, snapshot_id, options):
-        """Fail closed before model access if the local CLI cannot enforce this profile."""
-        source=runner.root/"native-source"
-        sample=next((p for p in source.rglob("*") if p.is_file() and not p.is_symlink()),None)
-        if sample is None:
+        """Positive controls and explicit denied operations; a crashed probe proves nothing."""
+        source = next((p for p in (runner.root / "native-source").rglob("*") if p.is_file()), None)
+        if source is None:
             return False, []
-        canary=runner.root/"native-private-canary"
-        forbidden=source/".native-write-canary"
-        allowed=directory/".native-write-canary"
-        canary.write_text("private probe")
-        def run(args):
-            return runner.run([*self.sandbox_command(runner.root),"sandbox","-P","ca_native",*options,"-C",str(directory),*args],
-                directory,"native_permission_probe",snapshot_id,10)
+        private = runner.root / "native-private-canary"
+        private.write_text("private permission canary")
+        protected = [source]
+        for folder in ("logs", "models", "direct-checks"):
+            path = runner.root / folder / "permission-canary"
+            path.parent.mkdir(exist_ok=True)
+            path.write_text("retained permission canary")
+            protected.append(path)
+        script = directory / ".permission-probe.py"
+        script.write_text(
+            "import errno, pathlib, socket\n"
+            "def denied(label, fn):\n"
+            "    try: fn()\n"
+            "    except OSError as exc:\n"
+            "        if exc.errno not in (errno.EACCES, errno.EPERM, errno.EROFS, errno.ENOENT): raise\n"
+            "        print('DENIED:' + label)\n"
+            "    else: raise RuntimeError('UNSAFE:' + label)\n"
+            + "protected = " + repr([str(p) for p in protected]) + "\n"
+            "for i, name in enumerate(protected):\n"
+            "    path = pathlib.Path(name); path.read_bytes(); print('READ:' + str(i))\n"
+            "    denied('write:' + str(i), lambda: path.open('a'))\n"
+            + "denied('private', lambda: pathlib.Path(" + repr(str(private)) + ").read_bytes())\n"
+            "denied('network', lambda: socket.socket(socket.AF_INET, socket.SOCK_STREAM).connect(('127.0.0.1', 9)))\n"
+            + "pathlib.Path(" + repr(str(directory / '.write-control')) + ").write_text('allowed')\n"
+            "print('PERMISSIONS_VERIFIED')\n")
         try:
-            checks=[run(["cat",str(sample)]),run(["cat",str(canary)]),
-                run(["sh","-c",'printf blocked > "$1"',"sh",str(forbidden)]),
-                run(["sh","-c",'printf allowed > "$1"',"sh",str(allowed)])]
-            permitted=(checks[0].status==ExecutionStatus.COMPLETED and checks[0].exit_code==0 and
-                checks[1].exit_code!=0 and checks[2].exit_code!=0 and
-                checks[3].status==ExecutionStatus.COMPLETED and checks[3].exit_code==0 and
-                allowed.read_text()=="allowed" and not forbidden.exists())
-            return permitted,checks
+            check = runner.run([*self.sandbox_command(runner.root), "sandbox", "-P", "ca_native", *options,
+                "-C", str(directory), "/usr/bin/python3", str(script)], directory,
+                "native_permission_probe", snapshot_id, 15)
+            verified = check.status == ExecutionStatus.COMPLETED and check.exit_code == 0 and "PERMISSIONS_VERIFIED" in output(check)
+            check.parameters['permission_result'] = 'verified' if verified else 'inconclusive_or_unsafe'
+            return verified, [check]
         finally:
-            canary.unlink(missing_ok=True)
-            allowed.unlink(missing_ok=True)
-            forbidden.unlink(missing_ok=True)
+            for path in [private, script, directory / '.write-control', *protected[1:]]:
+                path.unlink(missing_ok=True)
+
+    def prepare(self, runner, directory, snapshot_id):
+        (directory / "tmp").mkdir(parents=True, exist_ok=True)
+        options = self.permission_options(runner.root, directory)
+        key = (str(runner.root), tuple(options), getattr(self, 'version', 'unknown'))
+        if getattr(self, '_permission_key', None) == key:
+            return True, []
+        permitted, checks = self.permission_probe(runner, directory, snapshot_id, options)
+        if permitted:
+            self._permission_key = key
+        return permitted, checks
 
     def investigate(self, runner, prompt, directory, snapshot_id, timeout, session_id=None):
         """Run one native Codex turn and retain the exact session and tool events."""
@@ -156,18 +157,13 @@ class CodexAgent:
                 status=ExecutionStatus.TOOL_MISSING if getattr(self, "missing", False) else ExecutionStatus.ERROR,
                 reason="Native Codex capability probe failed"), None, None
         options=self.permission_options(runner.root,directory)
-        permitted,permission_checks=self.permission_probe(runner,directory,snapshot_id,options)
-        if not permitted:
-            check=CheckRun(action="native_agent",cwd=str(directory),snapshot_id=snapshot_id,
-                status=ExecutionStatus.ERROR,reason="Native filesystem profile could not be verified; no model payload sent")
-            check.parameters["permission_probe"]=[{"id":probe.id,"status":probe.status.value,"exit_code":probe.exit_code} for probe in permission_checks]
-            check.artifacts=[p for probe in permission_checks for p in [probe.stdout,probe.stderr] if p]
-            return check,session_id,None
-        response = runner.root / "native-last-response.json"
-        response.unlink(missing_ok=True)
+        if getattr(self, '_permission_key', None) != (str(runner.root), tuple(options), getattr(self, 'version', 'unknown')):
+            raise RuntimeError("Native permission profile must be prepared before reserving a model call")
+        response = runner.root / "actions" / (runner.active_action_id or "standalone") / "native-response.json"
+        response.parent.mkdir(parents=True, exist_ok=True)
         command = [*self.sandbox_command(runner.root), "exec"]
         if session_id:
-            command += ["resume", "--skip-git-repo-check", "--ignore-user-config", "--ignore-rules", "--json",
+            command += ["resume", "--skip-git-repo-check", "--ignore-user-config", "--json",
                 "--output-schema", str(schema), "--output-last-message", str(response)]
             command += options
             if self.reasoning_effort is not None:
@@ -177,7 +173,7 @@ class CodexAgent:
             command += [session_id, "-"]
         else:
             command += ["--skip-git-repo-check",
-                "--ignore-user-config", "--ignore-rules", "--json", "--output-schema", str(schema),
+                "--ignore-user-config", "--json", "--output-schema", str(schema),
                 "--output-last-message", str(response)]
             command += options
             if self.reasoning_effort is not None:
@@ -186,6 +182,10 @@ class CodexAgent:
                 command += ["-m", self.model]
             command += ["-"]
         check = runner.run(command, directory, "native_agent", snapshot_id, timeout, stdin=prompt)
+        return self.decode(check, response, session_id)
+
+    def decode(self, check, response, session_id=None):
+        """Decode a durable native receipt without invoking another model turn."""
         check.tool_version = getattr(self, "version", "unknown")
         events = []
         if check.stdout and Path(check.stdout).is_file():
@@ -208,12 +208,18 @@ class CodexAgent:
                     ("session not found","thread not found","no session found")):
                 check.parameters["native_session_unavailable"]=True
         completed = [e for e in events if e.get("type") == "turn.completed"]
+        if completed and not (actual_id or session_id):
+            check.status = ExecutionStatus.ERROR
+            check.reason = "Native turn completed without a recoverable session identity"
         check.parameters.update({"native_session_id":actual_id or session_id,
+            "native_response_path":str(response),
             "native_turn_completed":bool(completed),
-            "native_tool_events":sum(e.get("type", "").startswith("item.") for e in events),
+            "native_tool_events":len({e['item']['id'] for e in events if e.get('type') == 'item.completed'
+                and isinstance(e.get('item'),dict) and e['item'].get('id') and e['item'].get('type') in
+                {'command_execution','file_change','mcp_tool_call','web_search'}}),
             "native_usage":completed[-1].get("usage") if completed else None,
             "native_sandbox":"ca_native: root deny, captured source/evidence read, draft write, tool network off",
-            "permission_probe":[{"id":probe.id,"status":probe.status.value,"exit_code":probe.exit_code} for probe in permission_checks],
+            "permission_probe":"verified before model call; cached for this process/profile",
             "agent_model":self.model or "CLI default; inspect raw native events",
             "agent_reasoning_effort":self.reasoning_effort or "CLI default"})
         if check.status != ExecutionStatus.COMPLETED or not completed:
@@ -223,44 +229,46 @@ class CodexAgent:
             return check, actual_id or session_id, None
         try:
             result = json.loads(response.read_text())
-            if not isinstance(result, dict) or set(result) != {"submission", "summary"}:
+            if (not isinstance(result, dict) or set(result) != {"submission", "summary"}
+                    or not all(isinstance(value, str) for value in result.values())):
                 raise ValueError("Native final response has the wrong shape")
             return check, actual_id or session_id, result
         except (OSError, ValueError) as exc:
-            check.status = ExecutionStatus.ERROR
             check.reason = "Native final response invalid: " + str(exc)
-            return check, actual_id or session_id, None
+            check.parameters["native_response_error"] = check.reason
+            return check, actual_id or session_id, {"submission":"", "summary":check.reason}
 
 class MockAgent:
+    """Explicit file-product playback through the same native product boundary."""
     name = "mock"
     mock = True
+
     def __init__(self, fixture=None):
         self.fixture = Path(fixture).resolve() if fixture else None
         self.cursor = 0
         self.responses = json.loads(self.fixture.read_text()) if self.fixture else []
+        self.available = bool(self.responses)
 
     def probe(self, runner):
-        return {"available": bool(self.responses), "version": "mock/2", "checks": [], "reason": "Explicit fixture playback; framework testing only"}
+        return {"available":self.available, "version":"native-fixture/1", "checks":[],
+            "reason":"Explicit product playback; no autonomous discovery evidence"}
 
-    def analyze(self, runner, prompt, directory, snapshot_id, timeout, response_type):
-        import sys
-        directory.mkdir(parents=True, exist_ok=True)
-        (directory / "prompt.txt").write_text(prompt)
+    def investigate(self, runner, prompt, directory, snapshot_id, timeout, session_id=None):
         if self.cursor >= len(self.responses):
-            return CheckRun(action="agent", cwd=str(directory), snapshot_id=snapshot_id, origin=Origin.MOCK,
-                status=ExecutionStatus.ERROR, reason="Mock fixture exhausted or unspecified"), None
-        item = self.responses[self.cursor]; self.cursor += 1
-        if response_type.__name__ == "BuildReply" and "behavior" in item:
-            item={"bundle":item,"gap":"","requests":[]}
-        check = runner.run([sys.executable, "-c", "print('explicit mock fixture playback')"], directory, "agent", snapshot_id, timeout)
-        check.origin = Origin.MOCK; check.tool_version = "mock/2"
-        write_json(directory / "response.json", item)
-        write_json(directory / "decoded-response.json", item)
-        try:
-            return check, response_type.model_validate(item)
-        except ValueError as exc:
-            if hasattr(exc, "errors"):
-                write_json(directory / "validation-details.json", exc.errors(include_url=False, include_context=False))
-            check.status = ExecutionStatus.ERROR; check.reason = "Structured agent output is invalid"
-            (directory / "validation-error.txt").write_text(str(exc))
-            return check, None
+            return CheckRun(action="native_agent", status=ExecutionStatus.ERROR,
+                snapshot_id=snapshot_id, origin=Origin.MOCK, reason="Native fixture exhausted"), session_id, None
+        item = self.responses[self.cursor]
+        self.cursor += 1
+        from consensus_assurance.workflow.native import draft_file
+        for name, content in item.get("files", {}).items():
+            relative = Path(name)
+            if relative.is_absolute() or ".." in relative.parts:
+                raise ValueError("Fixture path escapes draft")
+            path = directory / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content)
+            draft_file(directory, name)
+        write_json(directory / "submission.json", item["submission"])
+        return CheckRun(action="native_agent", cwd=str(directory), snapshot_id=snapshot_id,
+            origin=Origin.MOCK, status=ExecutionStatus.COMPLETED, exit_code=0), session_id or "fixture-session", {
+            "submission":"submission.json", "summary":"Explicit fixture product"}

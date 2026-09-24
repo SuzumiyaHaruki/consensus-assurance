@@ -1,13 +1,13 @@
+from consensus_assurance.workflow.reviews import semantic_limitations
 """Repository-type reproductions of the four audited boundary failures."""
 import json
 import shutil
 from pathlib import Path
 import pytest
-from consensus_assurance.core.proposals import ClaimDraft,GraphPatch,Feedback,JudgmentChange,ReviewReply,SemanticRevision
-from consensus_assurance.core.types import CheckRun,CheckerResult,ExecutionStatus,InquiryTask,SemanticReview,SemanticCheck
+from consensus_assurance.core.proposals import ClaimDraft,GraphPatch,Feedback,JudgmentChange,ReviewReply
+from consensus_assurance.core.types import CheckRun,CheckerResult,ExecutionStatus,SemanticReview,SemanticCheck
 from consensus_assurance.workflow.artifacts import save_bundle
 from consensus_assurance.workflow.modeling import obligation_progress
-from consensus_assurance.workflow.inquiry import validate_review,semantic_limitations
 from consensus_assurance.adapters.runners.python import PythonBackend
 
 
@@ -23,17 +23,6 @@ def revision_for(state, ids):
     return Feedback(kind='F2',rationale='Candidate correction',evidence_ids=basis.expectation_ids or basis.source_ids,target_ids=[ids[0]],relation_ids=[],new_basis='Actual materials support the requested correction',graph=None,bundle=None,patch=GraphPatch(claims=drafts,expected_versions={i:1 for i in ids},rationale='Correction'),changes=changes,old_judgment=state.claims[1].description,new_judgment=drafts[0].description,grounding=basis)
 
 
-def test_review_cannot_modify_an_unreviewed_obligation(prepared):
-    _,state,_,_=prepared
-    a,b=state.claims[1:3]
-    task=InquiryTask(kind='review',reason='Review A only',trigger='test',target_ids=[a.id],unit_id=state.units[0].id)
-    items=[SemanticCheck(target_id=a.id,aspect=aspect,status='revision_needed',source_ids=a.source_ids,rationale='The selected responsibility needs correction' + "\n" + 'Other mechanisms remain possible' + "\n" + 'The old requirement can be stronger than the current contract') for aspect in ['applicability','decomposition']]
-    reply=ReviewReply(items=items,revision=SemanticRevision.model_validate(revision_for(state,[a.id,b.id]).model_dump(exclude={'graph','bundle'})),limitations=[])
-    before=state.model_dump()
-    with pytest.raises(ValueError):validate_review(state,task,reply)
-    assert state.model_dump()==before
-
-
 def test_same_named_stronger_unexecuted_model_is_not_covered(tmp_path,prepared):
     _,state,bundle,_=prepared;unit=state.units[0]
     old=save_bundle(tmp_path,state,unit,bundle,PythonBackend())
@@ -44,52 +33,6 @@ def test_same_named_stronger_unexecuted_model_is_not_covered(tmp_path,prepared):
     save_bundle(tmp_path,state,unit,stronger,PythonBackend(),previous=old)
     checked,missing=obligation_progress(state,unit)
     assert spec.claim_id in missing and spec.claim_id not in checked
-
-
-def test_actual_dependency_selected_unit_build_is_explicitly_exploratory(tmp_path,prepared):
-    from consensus_assurance.core.config import Config
-    from consensus_assurance.core.types import Relation
-    from consensus_assurance.workflow.engine import Engine
-    from consensus_assurance.workflow.budget import BudgetTracker
-    from consensus_assurance.workflow.errors import Blocked
-    from consensus_assurance.registry import assemble
-    _,state,_,_=prepared
-    consumer=state.units[0]
-    producer=consumer.model_copy(deep=True);producer.id='producer';producer.obligation_ids=['input_obligation'];producer.binding_ids=['input_binding'];producer.relation_ids=['producer_support']
-    state.relations.append(Relation(id='producer_support',source=consumer.obligation_ids[0],target='input_obligation',kind='depends_all',rationale='Goal depends on producer',grounding=state.claims[0].grounding))
-    state.units.append(producer);state.completed_steps=['capabilities','materials','understanding','discovery']
-    root=tmp_path/'selection';shutil.copytree(state.snapshot.repo,root/'source')
-    config=Config(execution_backend='python',agent_backend='mock',allow_experiments=False);config.budget.exploration_rounds=0;config.budget.semantic_reviews=4;config.budget.audit_units=1
-    built=[]
-    class ObserveBuild(Engine):
-        def ask(self,kind,response_type,context,validator=None,**kwargs):
-            if kind=='semantic_review':
-                items=[]
-                for obj in context['target_objects']:
-                    aspects=['applicability','decomposition'] if obj.get('kind')=='obligation' else ['applicability'] if obj.get('kind')=='obligation' else ['decomposition']
-                    for aspect in aspects:items.append(SemanticCheck(target_id=obj['id'],aspect=aspect,status='no_issue_found',source_ids=[next(m.id for m in state.materials if m.file=='README.md')],rationale='Scoped fixture evidence' + "\n" + 'Other mechanisms are not excluded' + "\n" + 'Review actual producer context'))
-                return ReviewReply(items=items,limitations=[]),CheckRun(action='agent',status=ExecutionStatus.COMPLETED,cwd=str(root),snapshot_id=state.snapshot.id)
-            if kind=='build':
-                built.append(self.state.active_unit_id)
-                assert self.state.units[-1].semantic_readiness['status']=='unreviewed'
-                assert not self.state.semantic_reviews
-                raise Blocked('End controlled selection test')
-            raise AssertionError(kind)
-    engine=ObserveBuild(config,root,*assemble(config),'');engine.state=state;engine.budget=BudgetTracker(config.budget,state)
-    engine.execute(probed=True)
-    assert built==['producer']
-
-
-def test_equivalent_explicit_review_can_replace_old_budget_blockage(tmp_path,prepared):
-    _,state,bundle,_=prepared
-    model=save_bundle(tmp_path,state,state.units[0],bundle,PythonBackend())
-    claim=next(c for c in state.claims if c.id==model.claim_id)
-    old=InquiryTask(id='old',kind='review',reason='Review contract',trigger='before_model',target_ids=[claim.id],target_versions={claim.id:claim.version},status='blocked',stop_reason='Budget exhausted or disabled: semantic_reviews')
-    state.inquiry_tasks.append(old)
-    items=[SemanticCheck(target_id=claim.id,aspect=aspect,status='no_issue_found',source_ids=claim.source_ids,rationale='Actual contract rechecked' + "\n" + 'Alternate mechanisms considered' + "\n" + 'No issue found in the specified scope') for aspect in ['applicability','decomposition']]
-    extra={'supersedes_task_ids':['old']} if 'supersedes_task_ids' in SemanticReview.model_fields else {}
-    state.semantic_reviews.append(SemanticReview(task_id='new',check_id='check',target_versions={claim.id:claim.version},material_ids=claim.source_ids,items=items,origin='mock',**extra))
-    assert not any('unfinished' in x for x in semantic_limitations(state,model))
 
 
 import json
@@ -126,7 +69,6 @@ def test_actual_write_set_rejects_every_unreviewed_object(dependency_prepared,ex
     assert state.model_dump()==before
 
 
-
 def test_cross_type_collision_and_incomplete_changes_are_atomic(prepared):
     _,state,bundle,_=prepared
     candidate=ClaimDraft(**{k:v for k,v in state.claims[0].model_dump().items() if k in ClaimDraft.model_fields})
@@ -136,12 +78,6 @@ def test_cross_type_collision_and_incomplete_changes_are_atomic(prepared):
     f=revision_for(state,[state.claims[1].id]);f.changes=[]
     with pytest.raises(ValueError,match='changes must'):apply_feedback(state,state.units[0],bundle,f)
     assert state.model_dump()==before
-
-
-def complete_search(state,model,root):
-    check=CheckRun(action='model_check',status=ExecutionStatus.COMPLETED,outcome='holds',cwd=str(root),snapshot_id=state.snapshot.id,model_id=model.id,search_fingerprint=model.search_fingerprint,origin=Origin.MOCK,checker_results=[CheckerResult(invariant=s.invariant,claim_id=s.claim_id,scope=s.scope,outcome='holds') for s in model.checkers])
-    state.checks.append(check)
-    return check
 
 
 @pytest.mark.parametrize('change',['harness','constants','behavior','faults','property'])
@@ -221,3 +157,9 @@ def test_selected_relation_closure_contains_endpoint_contract(dependency_prepare
     relation=next(r for r in state.relations if r.target==state.claims[2].id)
     materials,_=material_closure(state,[relation.id])
     assert m.id in materials
+
+
+def complete_search(state,model,root):
+    check=CheckRun(action='model_check',status=ExecutionStatus.COMPLETED,outcome='holds',cwd=str(root),snapshot_id=state.snapshot.id,model_id=model.id,search_fingerprint=model.search_fingerprint,origin=Origin.MOCK,checker_results=[CheckerResult(invariant=s.invariant,claim_id=s.claim_id,scope=s.scope,outcome='holds') for s in model.checkers])
+    state.checks.append(check)
+    return check

@@ -119,60 +119,6 @@ def slice_for(state,question=None,classes=(),object_ids=()):
         'surfaces':[s.model_dump(mode='json') for s in spec.surfaces if set(s.behavior_ids)&bs or audit_object_key(s) in object_ids]}
 
 
-def merge_delta(state,task,delta):
-    """Apply a focused wire delta on a copy; ordinary full validation still decides acceptance."""
-    import json
-    from .sources import includes
-    old=load(state)
-    if old is None and task.draft_path:
-        draft=json.loads(Path(task.draft_path).read_text())
-        old=ConsensusAuditSpec.model_validate(draft.get('audit_spec',draft))
-    if old is None:raise ValueError('Descriptive delta needs an accepted inventory or an initial draft')
-    raw=old.model_dump(mode='json');issues=[];before_index=audit_object_index(old);proposed=audit_object_index(delta)
-    focus=list(dict.fromkeys(task.target_ids+['surface:'+s for s in task.surface_entry_points]))
-    def reject(ids,message):
-        for key in ids:
-            prior=before_index.get(key);after=proposed.get(key)
-            path=audit_object_path(delta,key)
-            issues.append(Diagnostic(code='audit_spec_semantics',category='semantic',object_ids=[key],paths=['/delta'+path] if path else ['/delta'],
-                material_ids=sorted((audit_object_sources(prior)|audit_object_sources(after))&{m.id for m in state.materials}),message=message,
-                details={'old':prior,'proposed':after,'focus':focus},allowed=['read','semantic_revision']))
-    bs={b.id for b in old.behaviors if b.id in task.target_ids}
-    fs={f.id for f in old.facts if f.id in task.target_ids}
-    surfaces={id for id in focus if id.startswith('surface:')}
-    # New objects may connect directly to existing producers/consumers, without granting global rewrite authority.
-    new_bs=[b for b in delta.behaviors if b.id not in {b.id for b in old.behaviors}]
-    new_fs=[f for f in delta.facts if f.id not in {f.id for f in old.facts}]
-    fs.update(id for b in new_bs for id in b.produces_fact_ids+b.consumes_fact_ids)
-    bs.update(id for f in new_fs for id in f.established_by+f.consumed_by+f.invalidators+f.reinterpreters)
-    bs.update(b.id for b in delta.behaviors if set(b.produces_fact_ids+b.consumes_fact_ids)&{f.id for f in new_fs})
-    classes=set(task.target_ids)&{a.class_id for a in old.activities}
-    allowed={'behaviors':bs,'facts':fs,'activities':classes,'surfaces':surfaces}
-    for collection,remove in [('activities',[]),('behaviors',delta.remove_behavior_ids),('facts',delta.remove_fact_ids),('surfaces',['surface:'+s for s in delta.remove_surface_entry_points])]:
-        before={audit_object_key(o):o for o in getattr(old,collection)};updates=getattr(delta,collection);ids=[audit_object_key(o) for o in updates]
-        if len(ids)!=len(set(ids)) or len(remove)!=len(set(remove)) or set(ids)&set(remove):reject(ids+remove,'Duplicate or conflicting delta identities')
-        if set(remove)-before.keys():reject(remove,'Cannot remove an absent descriptive object')
-        for id in remove:
-            if id not in allowed[collection]:reject([id],'Removal is outside this descriptive focus')
-        for obj in updates:
-            id=audit_object_key(obj)
-            if task.context_receipt_id and obj!=before.get(id) and (collection in {'activities','behaviors','facts'} or collection=='surfaces' and obj.disposition=='mapped') and not any(includes(state,[source],task.material_ids) for source in obj.source_ids):reject([id],'Current implementation assertions need attached exact source; request the missing range before interpretation')
-            if id in before and obj!=before[id] and id not in allowed[collection]:reject([audit_object_key(obj)],'Existing object change is outside this descriptive focus; queue separate sourced feedback')
-        merged={id:obj for id,obj in before.items() if id not in remove};merged.update({audit_object_key(o):o for o in updates})
-        raw[collection]=[o.model_dump(mode='json') for o in merged.values()]
-    if delta.target_profile is not None:
-        basis=set(task.material_ids+task.added_material_ids)|{id for d in task.diagnostics for id in d['material_ids']}
-        if delta.target_profile!=old.target_profile and ('target_profile' not in focus or not audit_object_sources(delta.target_profile)&basis):
-            reject(['target_profile'],'Global orientation needs explicit profile focus and current source support; keep local knowledge in the focused behaviors or return a narrower delta')
-            issues[-1].paths=['/delta/target_profile/'+k for k in type(old.target_profile).model_fields if getattr(old.target_profile,k)!=getattr(delta.target_profile,k)]
-        raw['target_profile']=delta.target_profile.model_dump(mode='json')
-    if issues:raise SpecIssue(issues)
-    for a in raw['activities']:a.pop('behavior_ids',None)
-    for f in raw['facts']:
-        f.pop('established_by',None);f.pop('consumed_by',None)
-    return validate(state,ConsensusAuditSpec.model_validate(raw))
-
-
 def reachability_refs(question):
     return set(sum((getattr(question,k) for k in REFS),[])) if question else set()
 

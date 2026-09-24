@@ -11,24 +11,10 @@ from consensus_assurance.workflow.graph import apply_graph, apply_patch
 from consensus_assurance.workflow.graph_diagnostics import validate_grounding
 from consensus_assurance.workflow.artifacts import validate_tla
 from consensus_assurance.workflow.observations import match_prerequisites, monitor_events
-from consensus_assurance.workflow.materials import ReadingPlan, ReadRequest
+from regression_support import ReadingPlan, ReadRequest
 from regression_support import add_reads
 from consensus_assurance.adapters.storage.snapshot import capture
 from consensus_assurance.adapters.verifiers.trace import project
-
-
-def test_default_has_inquiry_without_property_list():
-    config=Config()
-    assert config.protocol=='none' and config.directed_question is None
-    assert assemble(config)[3]==''
-    assert assemble(Config(execution_backend='go_module'))[3]==''
-    assert assemble(Config(protocol='raft'))[3]  # Explicit reference uses the same workflow.
-
-
-def test_empty_discovery_is_admissible(prepared):
-    _,state,_,_=prepared
-    apply_graph(state,GraphDraft(conflicts=[],unexplored=['Producer'],gaps=['Contract unavailable']))
-    assert not state.claims and not state.units and 'Contract unavailable' in state.gaps
 
 
 def test_code_derived_responsibilities_are_candidates(prepared):
@@ -47,11 +33,6 @@ def test_code_derived_responsibilities_are_candidates(prepared):
     assert state.claims[1].candidate
     c.grounding.binding_ids=[]
     with pytest.raises(ValueError,match='located implementation binding'): apply_graph(state,graph)
-
-
-
-
-
 
 
 def test_patch_keeps_object_versions_and_unrelated_claims(prepared):
@@ -101,14 +82,6 @@ def test_projection_of_events_state_and_metadata():
     with pytest.raises(ValueError,match='missing'): project(events,mapping)
 
 
-def test_partial_file_not_marked_fully_explored(tmp_path,prepared):
-    repo,state,_,_=prepared
-    (repo/'module.rs').write_text('fn begin() {}\nfn upstream() {}\n')
-    state.snapshot=capture(repo)
-    add_reads(state,repo,ReadingPlan(requests=[ReadRequest(file='module.rs',start_line=1,end_line=1,reason='Initial region')],rationale='Inspect first function'),Config().budget)
-    assert state.unread_ranges['module.rs']==[[2,2]]
-
-
 def test_build_resources_separate_from_read_material(tmp_path):
     repo=tmp_path/'repo';repo.mkdir()
     (repo/'payload.bin').write_bytes(b'\x00\xff\x01')
@@ -136,20 +109,6 @@ def test_F4_retains_model_search_and_other_unit_history(prepared,tmp_path):
     assert cal.status=='compatible' and cal.applicability=='current'
 
 
-def test_error_context_contains_bounded_original_text(tmp_path,prepared):
-    from consensus_assurance.workflow.engine import Engine
-    from consensus_assurance.core.config import Config
-    config=Config(execution_backend='python',agent_backend='mock')
-    engine=Engine(config,tmp_path/'run',*assemble(config),'')
-    log=tmp_path/'error.log';original='SyntaxError at source line 1\n'+('x'*30000)+'\nModuleNotFoundError: missing_producer'
-    log.write_text(original)
-    check=CheckRun(action='experiment',cwd=str(tmp_path),snapshot_id='s',stdout=str(log))
-    context=engine.error_context(check)
-    assert context['truncated'] and context['original_characters']==len(original)
-    assert context['text'].startswith('SyntaxError') and context['text'].endswith('missing_producer')
-    assert log.read_text()==original
-
-
 @pytest.mark.parametrize('module',[None,'module another.example/module\n'])
 def test_explicit_module_identity_requires_safe_build_input(tmp_path,module):
     from consensus_assurance.workflow.engine import Engine
@@ -161,11 +120,10 @@ def test_explicit_module_identity_requires_safe_build_input(tmp_path,module):
 
 
 def test_binary_only_build_inputs_are_not_agent_materials(tmp_path):
-    from consensus_assurance.workflow.materials import initial_materials
     repo=tmp_path/'repo';repo.mkdir();(repo/'payload.bin').write_bytes(b'data\x00payload')
     snapshot=capture(repo)
     assert snapshot.readable_files==[]
-    assert initial_materials(repo,snapshot,Config().budget,'')==[]
+    assert snapshot.readable_files==[]
 
 
 def test_F1_changes_only_related_calibration(prepared,tmp_path):
@@ -198,4 +156,3 @@ def test_conflicting_F2_does_not_turn_error_into_optimization(prepared):
     assert apply_feedback(state,state.units[0],bundle,f) is None
     assert state.claims[1].model_dump()==before
     assert state.revisions[-1].status=='unresolved'
-

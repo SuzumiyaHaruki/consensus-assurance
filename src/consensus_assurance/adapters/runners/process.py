@@ -17,6 +17,13 @@ class ProcessRunner:
 
     def run(self, command: list[str], cwd: Path, action: str, snapshot_id: str,
             timeout: float = 60, stdin: str | None = None, env: dict | None = None) -> CheckRun:
+        if self.active_action_id:
+            for path in (self.root / "logs").glob("*/check.json"):
+                saved = CheckRun.model_validate_json(path.read_text())
+                if (saved.pending_action_id == self.active_action_id and saved.ended_at
+                        and saved.command == command and saved.cwd == str(cwd.resolve())
+                        and saved.action == action and saved.snapshot_id == snapshot_id):
+                    return saved
         if self.deadline is not None:
             timeout = min(timeout, self.deadline - time.monotonic())
         if timeout <= 0:

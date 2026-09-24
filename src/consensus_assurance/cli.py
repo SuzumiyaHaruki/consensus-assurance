@@ -92,10 +92,10 @@ def main(argv=None):
             if args.command == "estimate":
                 repo = locate_repo(args.repo, config.repo_path)
                 b = config.budget
-                minimum = 1 if config.agent_backend=="codex" else 2 + b.audit_units + min(b.semantic_reviews, b.audit_units)
+                minimum = 1
                 print(json.dumps({"仓库":str(repo),"材料发送":False,"执行目标代码":False,
                     "agent调用上限":b.agent_calls,"粗略计划下限":minimum,
-                    "预算说明":"原生路径按 CLI turn、总时长和正式执行计数；源码浏览发生在原生会话内，旧材料字符和 packet 额度仅用于离线旧阶段。不是账单。" if config.agent_backend=="codex" else "旧阶段离线估算；不是账单。",
+                    "预算说明":"按 CLI turn、总时长和正式执行计数；源码浏览发生在原生会话内。这不是 token 账单。",
                     "计划可能受限":minimum>b.agent_calls,"预算":b.model_dump(mode="json")},ensure_ascii=False,indent=2))
                 return 0
             root = create_run_directory(config, args.command)

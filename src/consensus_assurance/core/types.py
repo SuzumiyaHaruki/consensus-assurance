@@ -117,7 +117,7 @@ class Surface(Record):
 class ConsensusAuditSpec(Record):
     version: int = 1
     target_profile: TargetProfile
-    activities: list[Activity] = Field(min_length=7, max_length=7)
+    activities: list[Activity] = Field(default_factory=list, max_length=7)
     behaviors: list[Behavior] = []
     facts: list[Fact] = []
     surfaces: list[Surface] = []
@@ -141,8 +141,8 @@ class ConsensusAuditSpec(Record):
 
     @model_validator(mode="after")
     def seven_coordinates(self):
-        if {a.class_id for a in self.activities} != {"A1", "A2", "A3", "A4", "A5", "A6", "A7"}:
-            raise ValueError("Specify each of the seven activity classes exactly once")
+        if len({a.class_id for a in self.activities}) != len(self.activities):
+            raise ValueError("Activity coordinates must be unique; an incomplete map is allowed")
         return self
 
 
@@ -204,43 +204,6 @@ class ReachabilityResult(Record):
     status: Literal["reachable", "unreachable", "unknown"]
     search_fingerprint: str
     reason: str
-
-
-class InquiryTask(Record):
-    surface_entry_points: list[str] = []
-    candidate_id: str | None = None
-    draft_path: str | None = None
-    diagnostics: list[dict] = []
-    admitted: bool = False
-    preparation_failures: int = 0
-    semantic_failures: int = 0
-    parent_task_id: str | None = None
-    child_task_ids: list[str] = []
-    requested_aspects: dict[str, list[str]] = {}
-    expected_contribution: str = ""
-    context_receipt_id: str | None = None
-    context_dependencies: dict = {}
-    read_plan_id: str | None = None
-    repair_session: dict | None = None
-    resolution_issue_ids: list[str] = []
-    id: str = Field(default_factory=uid)
-    kind: Literal["spec_refine", "review"]
-    reason: str
-    trigger: str
-    activity_classes: list[ActivityClass] = []
-    target_ids: list[str] = []
-    target_versions: dict[str, int] = {}
-    unit_id: str | None = None
-    model_id: str | None = None
-    requests: list[ReadRequest] = []
-    status: Literal["pending", "running", "completed", "blocked"] = "pending"
-    stage: Literal["read", "analyze", "done"] = "read"
-    added_material_ids: list[str] = []
-    stop_reason: str = ""
-    check_id: str | None = None
-    unit_version: int | None = None
-    material_ids: list[str] = []
-    superseded_by: str | None = None
 
 
 class SemanticCheck(Record):
@@ -377,7 +340,6 @@ class PendingAction(Record):
     check_ids: list[str] = []
 
 
-
 class Claim(Record):
     id: str
     kind: Literal["obligation", "assumption"]
@@ -406,7 +368,6 @@ class BindingAssociation(Record):
     claim_id: str
     source_ids: list[str]
     rationale: str
-
 
 
 class AssociatedCode(Record):
@@ -678,19 +639,11 @@ class Analysis(Record):
     question_candidates: list[QuestionCandidate] = []
     direct_checks: list[DirectCheckArtifact] = []
     active_direct_check_id: str | None = None
-    question_continuations: dict[str, dict] = {}
     scope_updates: dict[str, dict] = {}
     milestones: dict[str, str] = {}
-    review_reuses: list[dict] = []
-    read_plans: dict[str, dict] = {}
-    material_allocations: list[dict] = []
-    task_attachments: dict[str, list[str]] = {}
-    packet_receipts: list[dict] = []
     file_index: dict[str, dict] = {}
     trigger_retry_tasks: list[dict] = []
     framework_revision: str | None = None
-    framework_stage: str = "new_run"
-    repair_sessions: dict[str, dict] = {}
     schema_version: str = "2"
     id: str = Field(default_factory=uid)
     mode: Literal["real", "mock"]
@@ -704,7 +657,6 @@ class Analysis(Record):
     evidence: list[Evidence] = []
     findings: list[Finding] = []
     relations: list[Relation] = []
-    completed_steps: list[str] = []
     usage: dict[str, int] = {}
     elapsed_seconds: float = 0
     stop_reason: str = "Not started"
@@ -717,16 +669,11 @@ class Analysis(Record):
     revisions: list[Revision] = []
     capabilities: list[Capability] = []
     selections: list[dict] = []
-    derivation_path: str | None = None
     created_at: str = Field(default_factory=now)
     first_model_seconds: float | None = None
     parent_run: str | None = None
-    pending_feedback: dict | None = None
-    pending_output_repair: dict | None = None
     graph_version: int = 0
     graph_history: list[dict] = []
-    reading_history: list[dict] = []
-    unread_ranges: dict[str, list[list[int]]] = {}
     guidance: list[dict] = []
     active_unit_id: str | None = None
     active_model_id: str | None = None
@@ -734,22 +681,14 @@ class Analysis(Record):
     next_action: str = "select"
     pending_action: PendingAction | None = None
     action_history: list[PendingAction] = []
-    targeted_gap: dict | None = None
     monitor_results: list[dict] = []
     audit_spec_path: str | None = None
     audit_spec_version: int = 0
-    inquiry_tasks: list[InquiryTask] = []
     semantic_reviews: list[SemanticReview] = []
     review_issues: list[ReviewIssue] = []
     reachability_results: list[ReachabilityResult] = []
     consequences: list[dict[str, Any]] = []
     applied_operations: dict[str, dict[str, Any]] = {}
-    active_inquiry_id: str | None = None
-    inquiry_selections: list[dict] = []
-    last_work_kind: str = "local"
-    deferred_units: dict[str, dict] = {}
-
-
 
 
     def add_evidence(self, evidence: Evidence):

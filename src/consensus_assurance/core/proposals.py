@@ -1,6 +1,6 @@
 from typing import Literal
-from pydantic import Field, model_validator
-from .types import AssociatedCode, Record, Scope, ConstraintSource, Grounding, CheckerSpec, ReadRequest, ConsensusAuditSpec, TargetProfile, Activity, Behavior, Fact, Surface, SemanticCheck, AuditQuestion, ReachabilityRequirement
+from pydantic import Field
+from .types import AssociatedCode, Record, Scope, ConstraintSource, Grounding, CheckerSpec, ReadRequest, SemanticCheck, AuditQuestion, ReachabilityRequirement
 
 
 class ClaimDraft(Record):
@@ -55,36 +55,6 @@ class GraphDraft(Record):
     gaps: list[str] = []
 
 
-class Discovery(Record):
-    understanding: str
-    audit_spec: ConsensusAuditSpec
-    reading_requests: list[ReadRequest] = Field(default_factory=list, max_length=8)
-
-
-class DescriptiveIssue(Record):
-    candidate_effect: Literal["requires_recheck", "independent_enrichment"]
-    object_ids: list[str] = Field(min_length=1)
-    source_ids: list[str] = Field(min_length=1)
-    reason: str
-
-
-class Derivation(Record):
-    candidate_action: Literal["continue", "pause"] = "continue"
-    candidate_id: str | None = None
-    obligation: ClaimDraft | None = None
-    bindings: list[BindingDraft] = []
-    dependencies: list[RelationDraft] = []
-    context_claims: list[ClaimDraft] = []
-    audit_question: AuditQuestion | None = None
-    selection_rationale: str
-    reading_requests: list[ReadRequest] = Field(default_factory=list, max_length=8)
-    frontier_entry_point: str | None = None
-    descriptive_issues: list[DescriptiveIssue] = []
-    fork_from_candidate_id: str | None = None
-    fork_reason: str = ""
-    resume_conditions: list[str] = []
-
-
 class FieldProjection(Record):
     model_field: str
     raw_field: str
@@ -133,6 +103,7 @@ class EventMonitor(Record):
 
 
 class Harness(Record):
+    files: dict[str, str] = Field(default_factory=dict, description="Additional generated files with relative destinations and fixed source text")
     kind: str = Field(description="Harness kind advertised by the configured execution backend")
     source: str = Field(min_length=1, description="Executable experiment source, calling actual target code; no fabricated expected observations")
     description: str
@@ -212,16 +183,6 @@ class ModelDraft(ModelCore):
     pending_work: list[ComponentWork] = Field(min_length=1, description="Explicit missing components; core behavior gaps prohibit execution")
 
 
-class HarnessReply(Record):
-    harness: Harness | None
-    observation: ObservationMap | None
-    monitors: list[EventMonitor] = []
-    consequence_observations: list[ConsequenceObservation] = []
-    gap: str
-    partial_design: str = ""
-    requests: list[ReadRequest] = []
-
-
 class GraphPatch(Record):
     claims: list[ClaimDraft] = Field(default_factory=list,max_length=15)
     bindings: list[BindingDraft] = Field(default_factory=list,max_length=20)
@@ -247,16 +208,6 @@ class EncodingRevision(Record):
     input_changes: list[str] = []
     source_ids: list[str] = Field(min_length=1)
     rationale: str
-
-
-class BuildReply(Record):
-    reading_purpose: Literal["dependency", "context"] = Field(default="dependency", description="context only requests material attachment; dependency requires grounded scope reconnection before building")
-    encoding_revision: EncodingRevision | None = None
-    bundle: Bundle | None
-    draft: ModelDraft | None = None
-    gap: str
-    partial_design: str = ""
-    requests: list[ReadRequest] = []
 
 
 class JudgmentChange(Record):
@@ -292,48 +243,6 @@ class Feedback(Record):
     requests: list[ReadRequest] = []
 
 
-class SemanticRevision(Record):
-    """Review-time F2 proposal; model/experiment revisions have their own later tasks."""
-    kind: Literal['F2'] = 'F2'
-    rationale: str
-    evidence_ids: list[str]
-    target_ids: list[str]
-    relation_ids: list[str] = []
-    new_basis: str
-    patch: GraphPatch
-    changes: list[JudgmentChange]
-    old_judgment: str
-    new_judgment: str
-    grounding: Grounding
-    condition_dispositions: list[ConditionDisposition] = []
-    requests: list[ReadRequest] = []
-
-
-class AuditSpecDelta(Record):
-    target_profile: TargetProfile | None = None
-    activities: list[Activity] = []
-    behaviors: list[Behavior] = []
-    facts: list[Fact] = []
-    surfaces: list[Surface] = []
-    remove_behavior_ids: list[str] = []
-    remove_fact_ids: list[str] = []
-    remove_surface_entry_points: list[str] = []
-    rationale: str = Field(min_length=1)
-
-
-class SpecRefinement(Record):
-    understanding: str
-    requests: list[ReadRequest] = Field(default_factory=list, max_length=12)
-    delta: AuditSpecDelta | None = None
-    limitations: list[str]
-
-    @model_validator(mode='after')
-    def one_response(self):
-        if bool(self.requests) == (self.delta is not None):
-            raise ValueError('Return either focused requests or a descriptive delta')
-        return self
-
-
 class IssueResolution(Record):
     condition_dispositions: list[ConditionDisposition] = []
     issue_id: str
@@ -346,26 +255,8 @@ class IssueResolution(Record):
 
 
 class ReviewReply(Record):
-    resolutions: list[IssueResolution] = []
-    resolves_issue_ids: list[str] = []
-    supersedes_task_ids: list[str] = []
-    resolution_rationale: str = ""
-    items: list[SemanticCheck] = Field(min_length=1,max_length=30)
-    requests: list[ReadRequest] = Field(default_factory=list,max_length=12)
-    revision: SemanticRevision | None = None
-    limitations: list[str]
-
-
-class ReviewKnowledgeReply(ReviewReply):
-    descriptive_delta: AuditSpecDelta | None = None
-
-
-class QuestionReply(Record):
-    revision: SemanticRevision | None = None
-    question: AuditQuestion
-    explanation: str
-    requests: list[ReadRequest] = []
-    patch: GraphPatch | None = None
+    items: list[SemanticCheck] = Field(min_length=1, max_length=30)
+    limitations: list[str] = []
 
 
 class DirectCheckPlan(Record):
@@ -376,13 +267,3 @@ class DirectCheckPlan(Record):
     monitors: list[EventMonitor] = Field(min_length=1)
     observable_properties: list[ObservableProperty] = Field(min_length=1, description="Direct route supports event_assertion and event_implication. Correlate prerequisite fields by alias; history properties require a local_model fallback.")
     uncertainties: list[str] = []
-
-
-class DirectCheckReply(Record):
-    reading_purpose: Literal["dependency", "context"] = "dependency"
-    encoding_revision: EncodingRevision | None = None
-    plan: DirectCheckPlan | None = None
-    gap: str
-    partial_design: str = ""
-    requests: list[ReadRequest] = []
-    fallback: Literal["none", "source_review", "local_model"] = "none"

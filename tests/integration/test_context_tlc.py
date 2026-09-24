@@ -18,7 +18,7 @@ def test_old_operation_completes_on_owned_context_not_current_object(prepared,tl
     obj=runpy.run_path(str(target))['Contexts']();obj.start();original_owner=obj.pending_owner['identity'];obj.switch();obj.complete(isolated)
     assert (obj.completed_on==original_owner)==isolated
     from consensus_assurance.adapters.storage.snapshot import capture
-    from consensus_assurance.workflow.materials import read_material
+    from regression_support import read_material
     from consensus_assurance.core.types import ReadRequest
     state.snapshot=capture(Path(state.snapshot.repo))
     material=read_material(Path(state.snapshot.repo),state.snapshot,ReadRequest(file='context_handoff.py',start_line=2,end_line=len(target.read_text().splitlines()),reason='Controlled callback ownership scenario'))

@@ -2,7 +2,7 @@ import copy
 import pytest
 from consensus_assurance.core.types import AuditUnit, CheckRun, ExecutionStatus, Calibration, Origin
 from consensus_assurance.core.proposals import GraphDraft, Feedback, GraphPatch
-from consensus_assurance.workflow.graph import apply_graph, select_unit, expand_unit
+from consensus_assurance.workflow.graph import apply_graph, expand_unit
 from consensus_assurance.workflow.feedback import apply_feedback
 
 
@@ -13,19 +13,6 @@ def feedback(state, kind, bundle=None, graph=None, evidence=None, **kwargs):
 
 def add_check(state):
     state.checks.append(CheckRun(id="observed", action="experiment", cwd="/tmp", snapshot_id=state.snapshot.id, status=ExecutionStatus.COMPLETED))
-
-
-def test_relation_changes_selection(dependency_prepared):
-    _, state, _, _ = dependency_prepared
-    producer = state.units[0].model_copy(deep=True)
-    producer.id = "producer_unit"; producer.obligation_ids = ["input_obligation"]; producer.binding_ids = ["input_binding"]
-    producer.relation_ids = ["supports_input", "maps_input"]
-    state.units.append(producer)
-    without = state.model_copy(deep=True)
-    without.relations = [e for e in without.relations if e.id != "input_dependency"]
-    assert select_unit(without).id == "counter_unit"
-    assert select_unit(state).id == "producer_unit"
-    assert "input_dependency" in state.selections[-1]["relation_ids"]
 
 
 def test_F3_adds_actual_dependency_bindings(dependency_prepared):

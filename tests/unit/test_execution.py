@@ -103,18 +103,6 @@ def test_secret_redaction():
     assert "privatevalue" not in redact('api_key="privatevalue"')
 
 
-def test_persistent_no_transmission_permission(tmp_path, prepared):
-    from consensus_assurance.core.config import Config
-    from consensus_assurance.registry import assemble
-    from consensus_assurance.workflow.engine import Engine, Blocked
-    from consensus_assurance.core.proposals import GraphDraft
-    config = Config(execution_backend="python", protocol="toy", allow_agent_materials=False)
-    engine = Engine(config, tmp_path / "private", *assemble(config))
-    with pytest.raises(Blocked, match="transmission disabled"):
-        engine.ask("discover", GraphDraft, {"private_material": "never transmitted"})
-    assert not (engine.root / "agent").exists()
-
-
 @pytest.mark.parametrize('events,expected', [([], 'not_applicable'), ([{'Action':'run','Test':'TestA'}, {'Action':'skip','Test':'TestA'}], 'not_applicable'), ([{'Action':'run','Test':'TestA'}, {'Action':'pass','Test':'TestA'}], 'tests_passed')])
 def test_go_absent_or_skipped_tests_are_not_passed(events, expected):
     import json

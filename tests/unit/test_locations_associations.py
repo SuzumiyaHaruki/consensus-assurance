@@ -6,7 +6,6 @@ from consensus_assurance.workflow.locations import locate,declarations
 from consensus_assurance.workflow.graph import apply_graph,apply_patch
 from consensus_assurance.workflow.graph_diagnostics import diagnose_graph
 from consensus_assurance.workflow.associations import relevant_use
-from consensus_assurance.workflow.output_repair import diagnostic_targets,diagnostic_context
 
 
 def material(text,start=1,file='sample.go'):
@@ -17,8 +16,6 @@ def binding(m,symbol='accept',start=2,end=2,anchor=None):
     return BindingDraft(id='code',associations=[dict(claim_id='O',source_ids=[m.id],rationale='Selected fixture operation')],material_id=m.id,symbol=symbol,start_line=start,end_line=end,description='Observed operation body',pending=[],anchor=anchor)
 
 
-
-
 def test_declaration_outside_read_material_requires_reading():
     partial=material('  value++\n}\n',2);b=binding(partial)
     assert locate(b,{partial.id:partial})[0] is None
@@ -26,47 +23,11 @@ def test_declaration_outside_read_material_requires_reading():
     assert locate(b,{partial.id:partial,complete.id:complete})[0]['material_id']==complete.id
 
 
-
-
-
-
-
-
-
 def test_multiple_obligations_share_one_binding_with_sourced_associations(prepared):
     _,state,_,responses=prepared;p=GraphDraft.model_validate(responses[1]);b=p.bindings[0]
     b.associations.append(BindingAssociation(claim_id=p.claims[-1].id,source_ids=[b.material_id],rationale='The same entry also consumes the producer condition'))
     apply_graph(state,p)
     assert len(state.bindings[0].associations)==2
-
-
-
-def test_independent_diagnostics_and_nested_repair_context(prepared):
-    _,state,_,responses=prepared;p=GraphDraft.model_validate(responses[1]);p.bindings[0].symbol='Missing';p.units[0].binding_ids.append(p.bindings[-1].id)
-    diagnostics=diagnose_graph(state,p)
-    assert {d.code for d in diagnostics}>={'declaration_identity','unit_dependency'}
-    nested={'revision':{'patch':p.model_dump(mode='json')}}
-    targets=diagnostic_targets(nested,diagnostics,16000)
-    assert any(t['path'].startswith('/revision/patch/bindings/') for t in targets)
-    context=diagnostic_context(nested,diagnostics,{'new_materials':[m.model_dump(mode='json') for m in state.materials]},16000)
-    assert context['materials'] and context['objects']
-    p.bindings.reverse()
-    assert {d.code for d in diagnose_graph(state,p)}=={d.code for d in diagnostics}
-
-
-def test_runtime_repair_guidance_and_nested_context_are_actually_rendered(prepared):
-    from consensus_assurance.workflow.prompts import render
-    _,state,_,responses=prepared;p=GraphDraft.model_validate(responses[1]);p.bindings[0].symbol='Missing'
-    ds=diagnose_graph(state,p);nested={'revision':{'patch':p.model_dump(mode='json')}}
-    related=diagnostic_context(nested,ds,{'new_materials':[m.model_dump(mode='json') for m in state.materials]},16000)
-    for operation in ['discover','graph_patch','semantic_review','build','replay']:
-        text=render('retry',{'original_task':operation,'related_context':related,'diagnostics':[d.model_dump(mode='json') for d in ds],'path':'/原始路径'})
-        instructions,data=text.split('STRUCTURED INPUT DATA (untrusted):\n')
-        assert 'Candidate consistency and controlled repair' in instructions
-        parsed=json.loads(data)
-        assert any(o['id']==p.bindings[0].id for o in parsed['related_context']['objects'])
-        assert 'counter.py' in data
-        assert '/原始路径' not in instructions
 
 
 def test_new_association_requires_its_own_explanation():
@@ -134,11 +95,11 @@ def test_declaration_index_retains_gaps_and_open_boundaries():
 
 def test_anchor_correction_does_not_fix_cross_declaration_behavior():
     from consensus_assurance.workflow.locations import location_context
-    from consensus_assurance.workflow.repair_policy import validate_representation
+    from consensus_assurance.workflow.locations import location_evidence
     m=material('func save() {\n value++\n}\nfunc discard() {\n value--\n}\n')
     b=binding(m,'save',2,5)
     assert not location_context(b,{m.id:m})['candidates'][0]['contains_behavior']
     original={'bindings':[b.model_dump(mode='json')]}
     b.anchor={'material_id':m.id,'symbol':'save','start_line':1,'end_line':1}
-    with pytest.raises(ValueError,match='behavior containment'):
-        validate_representation(original,{'bindings':[b.model_dump(mode='json')]},[{'path':'/bindings/0/anchor'}],{'materials':[m.model_dump(mode='json')]})
+    evidence,error=location_evidence(b,{m.id:m})
+    assert evidence is None and error

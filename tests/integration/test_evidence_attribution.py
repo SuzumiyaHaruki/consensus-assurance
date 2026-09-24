@@ -57,6 +57,13 @@ def test_actual_contract_and_observation_determine_confirmation(tlc,tmp_path,mod
     assert search.outcome==('holds' if mode=='memory' else 'counterexample')
     selected='MemoryAck' if mode=='memory' else 'DurableAck'
     finding=Finding(claim_id='memory' if mode=='memory' else 'durable',checker_id=selected,model_id=model.id,check_id=search.id,origin=Origin.EXECUTED,description='Controlled sample candidate',trace_path=search.stdout)
+    before_review=assess_execution(state,model,bundle,exp,cal,finding,extract_events(exp))
+    assert not before_review['confirmed']
+    from consensus_assurance.core.submissions import ReviewSubmission
+    from consensus_assurance.workflow.reviews import accept_review
+    accept_review(state,ReviewSubmission(action='review',artifact_id=model.id,rationale='Controlled fixture correspondence judgment',
+        review_items=[dict(target_id=model.id,aspect='checker_correspondence',status='no_issue_found',
+            source_ids=[m.id for m in state.materials],rationale='The selected fixture contract, actual call and event projections use the saved predicate; the judgment does not remove incomplete observations or conflicting source conditions')]),'controlled-review')
     record=assess_execution(state,model,bundle,exp,cal,finding,extract_events(exp))
     from consensus_assurance.adapters.storage.files import write_json
     write_json(runner.root/'observation-assessment.json',{

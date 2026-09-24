@@ -104,7 +104,7 @@ def diagnose_graph(state,proposal,audit_spec=None):
             from .direct_checks import validate_question as validate_route
             try:validate_route(q)
             except ValueError as exc:emit('audit_question','semantic',[u.id],[f'/units/{i}/audit_question'],sources,str(exc),['read','semantic_revision'])
-        if state.analysis_mode!='regression':
+        if q and (q.behavior_ids or q.fact_ids):
             try:
                 if not spec:raise ValueError('A generated question requires accepted implementation understanding')
                 validate_question(spec,q)
