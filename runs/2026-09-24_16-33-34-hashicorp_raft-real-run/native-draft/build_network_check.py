@@ -1,0 +1,56 @@
+import json
+from pathlib import Path
+r=json.load(open('../research.json'))
+old=r['claims'][0]
+source_list=json.load(open('submission.json'))['sources']
+# Reuse acquired code material identifiers without changing their meaning.
+more=[('pipeline-interface','transport.go',109,140,'interface_statement'),('pipeline-result','replication.go',534,566,'code_observation'),('replication-update','replication.go',646,665,'code_observation'),('future-completion','future.go',90,135,'code_observation'),('append-future-access','future.go',295,314,'code_observation'),('commitment-contract','commitment.go',11,34,'interface_statement'),('commitment-match-contract','commitment.go',73,76,'interface_statement'),('commitment-update','commitment.go',66,104,'code_observation'),('commitment-construction','commitment.go',35,47,'code_observation')]
+for id,file,start,end,kind in more: source_list.append(dict(id=id,file=file,start_line=start,end_line=end,kind=kind))
+claimid='failed-network-future-no-match-promotion'
+bids=['network-producer-binding','network-consumer-binding','network-match-update-binding']
+limits=[
+ 'The endpoint is peer match evidence promotion from an errored AppendFuture, not false follower durability or an unsafe commit.',
+ 'The original full response is a scripted successful acknowledgement. Its partial Success=true may reflect a real success; this check cannot show that the request was not stored.',
+ 'Follower protocol handling, election and prior log history are not executed. The request and payload are legal transport inputs, with a scripted peer and net.Pipe replacing a deployment connection.',
+ 'The completed future is delivered to pipelineDecode via an adapted channel. A separate synthetic completed rejection provides termination independently of whether the measured future advances match.',
+ 'Only one peer report is active, no local leader match is supplied, and configuration/term do not change. No quorum or client completion result is claimed.',
+ 'The three cases are empty response, all but the final byte, and full response under the pinned codec and fixed fields; other codecs, encodings and faults are not covered.',
+ 'The prior reviewed failed-future access finding and cross-incarnation ownership explanation remain unchanged.'
+]
+g={
+ 'source_ids':['network-pipeline-complete-path','network-response-envelope','pipeline-result','replication-update','commitment-update'],
+ 'expectation_ids':['pipeline-interface','commitment-match-contract'], 'binding_ids':bids,
+ 'derivation':'The AppendFuture interface makes Response valid only on successful completion. updateLastAppended consumes that response as a successful AppendEntries RPC and reports the request index to commitment.match; the match interface represents a stored matching prefix. At this specific acceptance boundary, response fields from a future whose actual Error is non-nil do not constitute an interface-valid success report. The local obligation is not to promote those fields to new match evidence. It is an interface-grounded acceptance condition, not the stronger assertion that a transport error means the follower did not store the request. In the isolated single-input fixture, absence of promotion is tested by equality to the independently measured prior peer match.',
+ 'applicability':'Actual netPipeline.AppendEntries produces the future, actual decodeResponse handles the prefix and produces its error, and actual pipelineDecode/updateLastAppended may mutate the same peer commitment entry. The response validity obligation applies at this interface even when partial fields happen to describe a true acknowledgement.',
+ 'unresolved':limits,'conflicts':[],
+ 'alternatives':['Success=false on a zero-valued error response prevents match promotion in the empty-input control.','A partial Success=true can originate from a genuinely successful full reply; evidence promotion need not imply false stored-prefix information.','Current code also checks reply term and voter membership, and commitment has a quorum/startIndex guard; these do not establish complete-response validity.']}
+q={'disposition':'ready_for_check','preferred_check':'direct_test','question':'For one completed network AppendFuture with a decode error, can pipelineDecode increase that peer\'s match evidence using partially decoded response fields? Compare the same peer entry before and after one measured future, with empty and intact response controls.','importance':'Peer match evidence feeds quorum aggregation. Promotion of a response outside its declared validity condition exposes that evidence to partially decoded fields. The selected local check does not establish false durability, an invalid quorum or an unsafe decision.','source_ids':[x['id'] for x in source_list],
+ 'participants':['Actual netPipeline producer','Actual pipelineDecode consumer','Scripted network peer','One peer entry in an isolated commitment object'],
+ 'objects':['Identified request and AppendFuture','Caller-owned response allocation','Encoded response byte prefix','Peer match index before and after consumption'],
+ 'contexts':['A1 support consumption at the transport/replication boundary','Term 4, request log index 2, fixed two-voter fixture','EOF after sending a prefix of a normally encoded response','No other producer updates commitment during measurement'],
+ 'event_paths':['Encode an ordinary successful response using target encoder settings and error-envelope order.','Send a real AppendEntries through netPipeline over net.Pipe; the peer decodes the request and sends zero bytes, a prefix missing the final byte, or all bytes.','The actual producer completes decoding and publishes the same future. Measure the prior peer match before delivery to the consumer.','Deliver that future and a separately completed rejection to actual pipelineDecode; wait for finishCh independently of the match result.','Read actual Error status and final peer match after completion, and compare against the same operation\'s prior match.'],
+ 'activity_classes':['A1'],'behavior_ids':[],'fact_ids':[],'obligation_relation_kind':'consumption',
+ 'counterevidence':g['alternatives'],'unknowns':limits,'priority':2,
+ 'trigger_rationale':'Exploration 26d62810a2424d6e81825bb9c5f1bea8 observed raw Success=true with EOF and Term=0 for prefixes 63-68 of a 69-byte response; full decoding yielded Term=4 and no error. This guides the concrete input but is not formal property evidence. The new check follows that same actual producer output into the match consumer; it does not combine unrelated isolated observations into a protocol-history claim.'}
+claim={'id':claimid,'kind':'obligation','description':'In an isolated pipelineDecode consumption with no other match producer, an AppendFuture whose Error result is non-nil must not promote its partial response fields into an increased peer match entry; that entry must equal its value before this consumption.','source_ids':['pipeline-interface','commitment-match-contract','pipeline-result','replication-update'],
+ 'scope':{'description':'Local acceptance of completed but errored network AppendFuture fields as new peer match evidence.','assumptions':['No concurrent peer-match producer in this isolated fixture.','The ready-channel adapter preserves the actual completed future identity.','EOF may interrupt delivery of an otherwise normally encoded response.'],'excluded':limits,'parameters':{'term':4,'request_index':2,'prefix_cases':['empty','last_byte_missing','intact']}},'pending':[],'grounding':g}
+bindings=[]
+for bid,mid,symbol,start,end,desc in [
+ (bids[0],'network-pipeline-complete-path','decodeResponses',841,860,'Publishes futures with actual network decode status.'),
+ (bids[1],'pipeline-result','pipelineDecode',534,566,'Consumes response term/success and dispatches match updates.'),
+ (bids[2],'replication-update','updateLastAppended',655,665,'Promotes request last index into peer match evidence.')]:
+ bindings.append({'id':bid,'material_id':mid,'symbol':symbol,'start_line':start,'end_line':end,'description':desc,'pending':[],'associations':[{'claim_id':claimid,'source_ids':['pipeline-interface',mid],'rationale':desc}]})
+candidate={'action':'obligation','parent_candidate_id':'8054c48a352a465c960a9e2ba469d266','question':q,'obligation':claim,'bindings':bindings,'sources':[],
+ 'rationale':'Fork a distinct local consumer-effect question from the completed interface-access question. The parent observation stays unchanged. Source-grounded response validity and match acceptance supply the expectation; actual same-future network decoding supplies the input. Wider protocol history remains excluded.'}
+plan={'description':'Check whether actual network decode failures promote partial response fields into peer match evidence.','claim_id':claimid,'binding_ids':bids,
+ 'harness':{'kind':'go_test','source':'','files':{},'description':'Three net.Pipe cases execute actual network submission, decoding, future completion and pipelineDecode consumption. Observe prior peer match, independent error and final match for the same request/future. A synthetic rejection terminates the loop independently of the measured outcome.','semantic_changes':['Directly constructed minimal commitment/replication state replaces leader election and the sending loop.','Scripted peer decodes the actual request and sends encoded response prefixes; no follower log or FSM implementation is exercised.','Delivery adapter only queues the original completed future and an unmeasured stopping rejection; target code and dependencies are unchanged.'],
+ 'prerequisites':[{'alias':'ready','event':'network_future_ready','conditions':[{'field':'published','op':'eq','value':True}]}],'legality':g},
+ 'monitors':[{'id':'network-match-monitor','checker_id':'failed-network-match-unchanged','event':'network_consumer_completed','binding_ids':bids,'grounding':g,'applicability_conditions':[]}],
+ 'observable_properties':[{'checker_id':'failed-network-match-unchanged','kind':'event_implication','trigger':{'field':'completed','op':'eq','value':True},'antecedent':{'field':'future_failed','op':'eq','value':True},'assertion':{'field':'peer_match','op':'eq','reference':'ready.before_match'},'identity_fields':['operation_id'],'description':'A failed completed future must leave its isolated peer match entry equal to the independently observed pre-consumption value. Success imposes no progress requirement.'}], 'uncertainties':limits}
+sub={'action':'check','rationale':'Submit the same-history producer-to-consumer local check motivated by actual exploratory prefix observations. The oracle compares independently observed match state and completion error, without asserting that a failed decode implies absent durable support.','sources':source_list,'candidate':candidate,'plan_path':'network_match_plan.json','harness_path':'network_match_test.go','files':{}}
+Path('network_match_plan.json').write_text(json.dumps(plan,indent=2)+'\n'); Path('submission.json').write_text(json.dumps(sub,indent=2)+'\n')
+import jsonschema
+jsonschema.validate(sub,json.load(open('../native-submission.schema.json')))
+plan['harness']['source']=Path('network_match_test.go').read_text()
+jsonschema.validate(plan,json.load(open('../product-schemas.json'))['DirectCheckPlan'])
+print('Complete network match check and assembled plan validated.')

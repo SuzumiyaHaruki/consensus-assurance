@@ -1,0 +1,165 @@
+{
+  "description": "Measure failed-future Response access in actual pipelineDecode with real built-in timeout futures and a successful producer control.",
+  "claim_id": "failed-pipeline-response-not-consumed",
+  "binding_ids": [
+    "pipeline-consumer-binding",
+    "inmem-producer-binding"
+  ],
+  "harness": {
+    "files": {},
+    "kind": "go_test",
+    "source": "package raft\n\nimport (\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"testing\"\n\t\"time\"\n)\n\n// The wrapper delegates every operation and only counts response access.\ntype assuranceObservedFuture struct {\n\tAppendFuture\n\tresponseCalls int\n}\n\nfunc (f *assuranceObservedFuture) Response() *AppendEntriesResponse {\n\tf.responseCalls++\n\treturn f.AppendFuture.Response()\n}\n\n// Only the ready-future channel is adapted. Futures come from the built-in pipeline.\ntype assuranceReadyPipeline struct {\n\tAppendPipeline\n\tready chan AppendFuture\n}\n\nfunc (p *assuranceReadyPipeline) Consumer() <-chan AppendFuture { return p.ready }\n\nfunc assuranceEvent(t *testing.T, event map[string]interface{}) {\n\tt.Helper()\n\tb, err := json.Marshal(event)\n\tif err != nil {\n\t\tt.Fatal(err)\n\t}\n\tfmt.Println(\"CA_EVENT \" + string(b))\n}\n\nfunc assuranceAwaitFuture(t *testing.T, p AppendPipeline) AppendFuture {\n\tt.Helper()\n\tselect {\n\tcase f := <-p.Consumer():\n\t\treturn f\n\tcase <-time.After(3 * time.Second):\n\t\tt.Fatal(\"built-in pipeline did not publish a completed future\")\n\t\treturn nil\n\t}\n}\n\nfunc assuranceAwaitRPC(t *testing.T, peer *InmemTransport) RPC {\n\tt.Helper()\n\tselect {\n\tcase rpc := <-peer.Consumer():\n\t\treturn rpc\n\tcase <-time.After(3 * time.Second):\n\t\tt.Fatal(\"request was not admitted by the peer transport\")\n\t\treturn RPC{}\n\t}\n}\n\nfunc TestAssurancePipelineFailedFutureResponse(t *testing.T) {\n\tfor _, scenario := range []string{\"timeout\", \"success\"} {\n\t\tt.Run(scenario, func(t *testing.T) {\n\t\t\t_, sender := NewInmemTransportWithTimeout(\"sender\", 100*time.Millisecond)\n\t\t\tpeerAddr, peer := NewInmemTransportWithTimeout(\"peer\", time.Second)\n\t\t\tdefer sender.Close()\n\t\t\tdefer peer.Close()\n\t\t\tsender.Connect(peerAddr, peer)\n\t\t\tp, err := sender.AppendEntriesPipeline(\"peer\", peerAddr)\n\t\t\tif err != nil {\n\t\t\t\tt.Fatal(err)\n\t\t\t}\n\t\t\tdefer p.Close()\n\n\t\t\treq := &AppendEntriesRequest{Term: 4, Entries: []*Log{{Index: 2, Term: 4, Type: LogNoop}}}\n\t\t\tsubmitted, err := p.AppendEntries(req, new(AppendEntriesResponse))\n\t\t\tif err != nil {\n\t\t\t\tt.Fatal(err)\n\t\t\t}\n\t\t\trpc := assuranceAwaitRPC(t, peer)\n\t\t\tif rpc.Command != req {\n\t\t\t\tt.Fatal(\"transport changed request identity\")\n\t\t\t}\n\t\t\tassuranceEvent(t, map[string]interface{}{\n\t\t\t\t\"event\": \"request_admitted\", \"operation_id\": scenario,\n\t\t\t\t\"admitted\": true, \"withhold_response\": scenario == \"timeout\",\n\t\t\t})\n\t\t\tif scenario == \"success\" {\n\t\t\t\trpc.Respond(&AppendEntriesResponse{Term: 4, LastLog: 2, Success: true}, nil)\n\t\t\t}\n\t\t\t// Withholding the timeout response models delay beyond the transport deadline.\n\t\t\tready := assuranceAwaitFuture(t, p)\n\t\t\tif ready != submitted {\n\t\t\t\tt.Fatal(\"pipeline published a different future\")\n\t\t\t}\n\n\t\t\t// A separately completed rejection ends decoding independently of the measured access.\n\t\t\tstopReq := &AppendEntriesRequest{Term: 4}\n\t\t\tstopper, err := p.AppendEntries(stopReq, new(AppendEntriesResponse))\n\t\t\tif err != nil {\n\t\t\t\tt.Fatal(err)\n\t\t\t}\n\t\t\tstopRPC := assuranceAwaitRPC(t, peer)\n\t\t\tstopRPC.Respond(&AppendEntriesResponse{Term: 4, Success: false}, nil)\n\t\t\tstopReady := assuranceAwaitFuture(t, p)\n\t\t\tif stopReady != stopper {\n\t\t\t\tt.Fatal(\"stop future identity mismatch\")\n\t\t\t}\n\t\t\tobserved := &assuranceObservedFuture{AppendFuture: ready}\n\t\t\tadapted := &assuranceReadyPipeline{AppendPipeline: p, ready: make(chan AppendFuture, 2)}\n\t\t\tadapted.ready <- observed\n\t\t\tadapted.ready <- stopReady\n\t\t\tassuranceEvent(t, map[string]interface{}{\n\t\t\t\t\"event\": \"future_ready\", \"operation_id\": scenario, \"published\": true,\n\t\t\t})\n\n\t\t\tconfig := Configuration{Servers: []Server{{ID: \"sender\", Suffrage: Voter}, {ID: \"peer\", Suffrage: Voter}}}\n\t\t\tc := newCommitment(make(chan struct{}, 1), config, 1)\n\t\t\ts := &followerReplication{\n\t\t\t\tpeer:       Server{ID: \"peer\", Address: peerAddr, Suffrage: Voter},\n\t\t\t\tcommitment: c, notify: make(map[*verifyFuture]struct{}),\n\t\t\t}\n\t\t\tr := &Raft{noLegacyTelemetry: true}\n\t\t\tstop := make(chan struct{})\n\t\t\tfinish := make(chan struct{})\n\t\t\tgo r.pipelineDecode(s, adapted, stop, finish)\n\t\t\tselect {\n\t\t\tcase <-finish:\n\t\t\tcase <-time.After(3 * time.Second):\n\t\t\t\tclose(stop)\n\t\t\t\tt.Fatal(\"pipeline consumer did not complete\")\n\t\t\t}\n\t\t\t// Observe the real completion status after the consumer has finished.\n\t\t\t// Reading it earlier could satisfy the interface precondition on its behalf.\n\t\t\tfutureErr := ready.Error()\n\t\t\tif (futureErr != nil) != (scenario == \"timeout\") {\n\t\t\t\tt.Fatalf(\"unexpected producer result for %s: %v\", scenario, futureErr)\n\t\t\t}\n\t\t\tassuranceEvent(t, map[string]interface{}{\n\t\t\t\t\"event\": \"consumer_completed\", \"operation_id\": scenario,\n\t\t\t\t\"completed\": true, \"future_failed\": futureErr != nil,\n\t\t\t\t\"response_calls\": observed.responseCalls,\n\t\t\t\t\"commit_index\":   c.getCommitIndex(),\n\t\t\t})\n\t\t})\n\t}\n}\n",
+    "description": "TestAssurancePipelineFailedFutureResponse admits one request per scenario, obtains its real completed future without inspecting response/status, invokes the actual pipeline consumer with a delegating Response counter, and observes completion and status. A subsequent completed rejection stops the success path independently of the property.",
+    "semantic_changes": [
+      "No target source or dependency changes.",
+      "Direct invocation of pipelineDecode substitutes the leader lifecycle and sending loop.",
+      "Scripted peer replies for success and stopping rejection substitute follower handling. Timeout error production uses the actual built-in producer.",
+      "A channel adapter schedules already-completed futures and a method wrapper counts Response access without changing return values."
+    ],
+    "prerequisites": [
+      {
+        "alias": "admitted",
+        "event": "request_admitted",
+        "conditions": [
+          {
+            "field": "admitted",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          }
+        ]
+      },
+      {
+        "alias": "ready",
+        "event": "future_ready",
+        "conditions": [
+          {
+            "field": "published",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          },
+          {
+            "field": "operation_id",
+            "op": "eq",
+            "value": null,
+            "reference": "admitted.operation_id"
+          }
+        ]
+      }
+    ],
+    "legality": {
+      "source_ids": [
+        "pipeline-result",
+        "inmem-pipeline-producer",
+        "inmem-pipeline-submit",
+        "append-future-access",
+        "ordinary-result-control"
+      ],
+      "expectation_ids": [
+        "pipeline-interface",
+        "future-status-contract"
+      ],
+      "binding_ids": [
+        "pipeline-consumer-binding",
+        "inmem-producer-binding"
+      ],
+      "derivation": "AppendFuture.Response explicitly has a successful-Error-return precondition (transport.go:137-140); Future.Error supplies actual completion status. A completed future whose Error returns non-nil therefore has no valid Response to consume. The obligation is the necessary safety condition that a failed future is not accessed via Response, not a requirement to consume every successful future. Receipt from Consumer can establish completion but cannot erase a non-nil result: the built-in inmem producer publishes a timeout future after respond(error), and the network producer likewise publishes after decode errors. This expectation is an interface-use responsibility, distinct from durable-prefix or consensus correctness.",
+      "applicability": "pipelineDecode receives AppendFuture through AppendPipeline.Consumer and calls its Response method. The selected concrete producer is built-in InmemTransport under a withheld response exceeding its configured timeout; the failure is generated by actual producer code, not assigned by the harness.",
+      "unresolved": [
+        "This check ends at AppendFuture.Response interface access. It does not establish invalid log matching, a false quorum, loss of leader authority, or an unsafe application.",
+        "The local consumer is invoked directly with minimal Raft/followerReplication state; election, log persistence and the full replication sender loop are not executed.",
+        "The successful control peer is scripted at the RPC interface. Its acknowledgement is not evidence of durable follower storage.",
+        "Ready futures are collected from the real InmemTransport pipeline and delivered through a delegating channel adapter in original order. Delayed scheduling after completion is permitted, but a full deployment schedule is not reproduced.",
+        "NetworkTransport publishes error-bearing futures too by source reading; this check does not execute that transport or byte decoding.",
+        "The existing zero-valued timeout response has Success=false and may prevent match advancement despite invalid interface access. The check must not promote the access result to a commit-safety finding."
+      ],
+      "conflicts": [],
+      "alternatives": [
+        "The ready channel synchronizes completion and may eliminate waiting, but does not make an errored response valid.",
+        "A zero-valued timeout response and !resp.Success can prevent log progress even if the Response access precondition is violated."
+      ]
+    }
+  },
+  "monitors": [
+    {
+      "id": "failed-future-access-monitor",
+      "checker_id": "failed-future-no-response",
+      "event": "consumer_completed",
+      "binding_ids": [
+        "pipeline-consumer-binding",
+        "inmem-producer-binding"
+      ],
+      "grounding": {
+        "source_ids": [
+          "pipeline-result",
+          "inmem-pipeline-producer",
+          "inmem-pipeline-submit",
+          "append-future-access",
+          "ordinary-result-control"
+        ],
+        "expectation_ids": [
+          "pipeline-interface",
+          "future-status-contract"
+        ],
+        "binding_ids": [
+          "pipeline-consumer-binding",
+          "inmem-producer-binding"
+        ],
+        "derivation": "AppendFuture.Response explicitly has a successful-Error-return precondition (transport.go:137-140); Future.Error supplies actual completion status. A completed future whose Error returns non-nil therefore has no valid Response to consume. The obligation is the necessary safety condition that a failed future is not accessed via Response, not a requirement to consume every successful future. Receipt from Consumer can establish completion but cannot erase a non-nil result: the built-in inmem producer publishes a timeout future after respond(error), and the network producer likewise publishes after decode errors. This expectation is an interface-use responsibility, distinct from durable-prefix or consensus correctness.",
+        "applicability": "pipelineDecode receives AppendFuture through AppendPipeline.Consumer and calls its Response method. The selected concrete producer is built-in InmemTransport under a withheld response exceeding its configured timeout; the failure is generated by actual producer code, not assigned by the harness.",
+        "unresolved": [
+          "This check ends at AppendFuture.Response interface access. It does not establish invalid log matching, a false quorum, loss of leader authority, or an unsafe application.",
+          "The local consumer is invoked directly with minimal Raft/followerReplication state; election, log persistence and the full replication sender loop are not executed.",
+          "The successful control peer is scripted at the RPC interface. Its acknowledgement is not evidence of durable follower storage.",
+          "Ready futures are collected from the real InmemTransport pipeline and delivered through a delegating channel adapter in original order. Delayed scheduling after completion is permitted, but a full deployment schedule is not reproduced.",
+          "NetworkTransport publishes error-bearing futures too by source reading; this check does not execute that transport or byte decoding.",
+          "The existing zero-valued timeout response has Success=false and may prevent match advancement despite invalid interface access. The check must not promote the access result to a commit-safety finding."
+        ],
+        "conflicts": [],
+        "alternatives": [
+          "The ready channel synchronizes completion and may eliminate waiting, but does not make an errored response valid.",
+          "A zero-valued timeout response and !resp.Success can prevent log progress even if the Response access precondition is violated."
+        ]
+      },
+      "applicability_conditions": []
+    }
+  ],
+  "observable_properties": [
+    {
+      "checker_id": "failed-future-no-response",
+      "kind": "event_implication",
+      "trigger": {
+        "field": "completed",
+        "op": "eq",
+        "value": true,
+        "reference": null
+      },
+      "assertion": {
+        "field": "response_calls",
+        "op": "eq",
+        "value": 0,
+        "reference": null
+      },
+      "antecedent": {
+        "field": "future_failed",
+        "op": "eq",
+        "value": true,
+        "reference": null
+      },
+      "identity_fields": [
+        "operation_id"
+      ],
+      "history_field": null,
+      "description": "For each completed operation, a non-nil actual future error implies zero Response calls by the consumer. A successful control is permitted and does not require Response access or progress."
+    }
+  ],
+  "uncertainties": [
+    "This check ends at AppendFuture.Response interface access. It does not establish invalid log matching, a false quorum, loss of leader authority, or an unsafe application.",
+    "The local consumer is invoked directly with minimal Raft/followerReplication state; election, log persistence and the full replication sender loop are not executed.",
+    "The successful control peer is scripted at the RPC interface. Its acknowledgement is not evidence of durable follower storage.",
+    "Ready futures are collected from the real InmemTransport pipeline and delivered through a delegating channel adapter in original order. Delayed scheduling after completion is permitted, but a full deployment schedule is not reproduced.",
+    "NetworkTransport publishes error-bearing futures too by source reading; this check does not execute that transport or byte decoding.",
+    "The existing zero-valued timeout response has Success=false and may prevent match advancement despite invalid interface access. The check must not promote the access result to a commit-safety finding."
+  ]
+}

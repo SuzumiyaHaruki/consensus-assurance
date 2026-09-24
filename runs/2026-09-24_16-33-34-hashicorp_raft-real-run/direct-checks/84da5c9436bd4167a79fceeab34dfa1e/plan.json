@@ -1,0 +1,155 @@
+{
+  "description": "Check whether actual network decode failures promote partial response fields into peer match evidence.",
+  "claim_id": "failed-network-future-no-match-promotion",
+  "binding_ids": [
+    "network-producer-binding",
+    "network-consumer-binding",
+    "network-match-update-binding"
+  ],
+  "harness": {
+    "files": {},
+    "kind": "go_test",
+    "source": "package raft\n\nimport (\n\t\"bufio\"\n\t\"bytes\"\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"net\"\n\t\"testing\"\n\t\"time\"\n\n\t\"github.com/hashicorp/go-msgpack/v2/codec\"\n)\n\ntype assuranceNetworkDelivery struct {\n\tAppendPipeline\n\tready chan AppendFuture\n}\n\nfunc (p *assuranceNetworkDelivery) Consumer() <-chan AppendFuture { return p.ready }\nfunc assuranceNetworkEvent(t *testing.T, e map[string]interface{}) {\n\tt.Helper()\n\tb, err := json.Marshal(e)\n\tif err != nil {\n\t\tt.Fatal(err)\n\t}\n\tfmt.Println(\"CA_EVENT \" + string(b))\n}\nfunc TestAssuranceNetworkFailedFutureMatch(t *testing.T) {\n\t// Use the same encoder settings and envelope order as handleConn/handleCommand.\n\tvar wire bytes.Buffer\n\tenc := codec.NewEncoder(&wire, &codec.MsgpackHandle{BasicHandle: codec.BasicHandle{TimeNotBuiltin: true}})\n\tif err := enc.Encode(\"\"); err != nil {\n\t\tt.Fatal(err)\n\t}\n\treply := &AppendEntriesResponse{RPCHeader: RPCHeader{ProtocolVersion: 3}, Term: 4, LastLog: 2, Success: true}\n\tif err := enc.Encode(reply); err != nil {\n\t\tt.Fatal(err)\n\t}\n\tencoded := append([]byte(nil), wire.Bytes()...)\n\n\tfor _, cut := range []int{0, len(encoded) - 1, len(encoded)} {\n\t\tleft, right := net.Pipe()\n\t\tconn := &netConn{\n\t\t\tconn: left,\n\t\t\tw:    bufio.NewWriter(left),\n\t\t\tdec:  codec.NewDecoder(bufio.NewReader(left), &codec.MsgpackHandle{}),\n\t\t}\n\t\tconn.enc = codec.NewEncoder(conn.w, &codec.MsgpackHandle{BasicHandle: codec.BasicHandle{TimeNotBuiltin: true}})\n\t\tpipeline := newNetPipeline(&NetworkTransport{timeout: time.Second}, conn, 2)\n\t\tpeerDone := make(chan error, 1)\n\t\tprefix := encoded[:cut]\n\t\tgo func() {\n\t\t\tdefer right.Close()\n\t\t\t_ = right.SetDeadline(time.Now().Add(2 * time.Second))\n\t\t\treader := bufio.NewReader(right)\n\t\t\ttyp, err := reader.ReadByte()\n\t\t\tif err != nil {\n\t\t\t\tpeerDone <- err\n\t\t\t\treturn\n\t\t\t}\n\t\t\tif typ != rpcAppendEntries {\n\t\t\t\tpeerDone <- fmt.Errorf(\"unexpected RPC type: %d\", typ)\n\t\t\t\treturn\n\t\t\t}\n\t\t\tvar req AppendEntriesRequest\n\t\t\tif err := codec.NewDecoder(reader, &codec.MsgpackHandle{}).Decode(&req); err != nil {\n\t\t\t\tpeerDone <- err\n\t\t\t\treturn\n\t\t\t}\n\t\t\tif req.Term != 4 || len(req.Entries) != 1 || req.Entries[0].Index != 2 {\n\t\t\t\tpeerDone <- fmt.Errorf(\"unexpected request identity\")\n\t\t\t\treturn\n\t\t\t}\n\t\t\tif len(prefix) > 0 {\n\t\t\t\tif _, err := right.Write(prefix); err != nil {\n\t\t\t\t\tpeerDone <- err\n\t\t\t\t\treturn\n\t\t\t\t}\n\t\t\t}\n\t\t\tpeerDone <- nil\n\t\t}()\n\t\treq := &AppendEntriesRequest{Term: 4, Entries: []*Log{{Index: 2, Term: 4, Type: LogNoop}}}\n\t\t// Retain the caller-owned response allocation to inspect partial decoder writes.\n\t\traw := new(AppendEntriesResponse)\n\t\tf, err := pipeline.AppendEntries(req, raw)\n\t\tif err != nil {\n\t\t\tpipeline.Close()\n\t\t\tt.Fatal(err)\n\t\t}\n\t\tselect {\n\t\tcase ready := <-pipeline.Consumer():\n\t\t\tif ready != f {\n\t\t\t\tpipeline.Close()\n\t\t\t\tt.Fatal(\"future identity changed\")\n\t\t\t}\n\t\tcase <-time.After(3 * time.Second):\n\t\t\tpipeline.Close()\n\t\t\tt.Fatal(\"network pipeline did not complete\")\n\t\t}\n\t\tconfig := Configuration{Servers: []Server{{ID: \"sender\", Suffrage: Voter}, {ID: \"peer\", Suffrage: Voter}}}\n\t\tc := newCommitment(make(chan struct{}, 1), config, 1)\n\t\ts := &followerReplication{peer: Server{ID: \"peer\", Suffrage: Voter}, commitment: c, notify: make(map[*verifyFuture]struct{})}\n\t\tc.Lock()\n\t\tbeforeMatch := c.matchIndexes[\"peer\"]\n\t\tc.Unlock()\n\t\top := fmt.Sprintf(\"prefix-%d\", cut)\n\t\tassuranceNetworkEvent(t, map[string]interface{}{\n\t\t\t\"event\": \"network_future_ready\", \"operation_id\": op, \"published\": true,\n\t\t\t\"before_match\": beforeMatch, \"prefix_bytes\": cut, \"full_bytes\": len(encoded),\n\t\t})\n\t\t// This rejection is only a stopping input, not a measured network response.\n\t\tstopper := &appendFuture{args: &AppendEntriesRequest{Term: 4}, resp: &AppendEntriesResponse{Term: 4, Success: false}, start: time.Now()}\n\t\tstopper.init()\n\t\tstopper.respond(nil)\n\t\tdelivery := &assuranceNetworkDelivery{AppendPipeline: pipeline, ready: make(chan AppendFuture, 2)}\n\t\tdelivery.ready <- f\n\t\tdelivery.ready <- stopper\n\t\tstop := make(chan struct{})\n\t\tfinish := make(chan struct{})\n\t\tr := &Raft{noLegacyTelemetry: true}\n\t\tgo r.pipelineDecode(s, delivery, stop, finish)\n\t\tselect {\n\t\tcase <-finish:\n\t\tcase <-time.After(3 * time.Second):\n\t\t\tclose(stop)\n\t\t\tpipeline.Close()\n\t\t\tt.Fatal(\"consumer did not finish\")\n\t\t}\n\t\t// The independent error status is inspected after consumer completion.\n\t\tfutureErr := f.Error()\n\t\tc.Lock()\n\t\tafterMatch := c.matchIndexes[\"peer\"]\n\t\tc.Unlock()\n\t\tif err := <-peerDone; err != nil {\n\t\t\tpipeline.Close()\n\t\t\tt.Fatal(err)\n\t\t}\n\t\terrorText := \"\"\n\t\tif futureErr != nil {\n\t\t\terrorText = futureErr.Error()\n\t\t}\n\t\tevent := map[string]interface{}{\n\t\t\t\"event\": \"network_consumer_completed\", \"operation_id\": fmt.Sprintf(\"prefix-%d\", cut),\n\t\t\t\"prefix_bytes\": cut, \"full_bytes\": len(encoded), \"future_failed\": futureErr != nil,\n\t\t\t\"error_text\": errorText, \"raw_success\": raw.Success, \"raw_term\": raw.Term,\n\t\t\t\"raw_last_log\": raw.LastLog, \"completed\": true, \"peer_match\": afterMatch, \"commit_index\": c.getCommitIndex(),\n\t\t}\n\t\tb, err := json.Marshal(event)\n\t\tif err != nil {\n\t\t\tpipeline.Close()\n\t\t\tt.Fatal(err)\n\t\t}\n\t\tfmt.Println(\"CA_EVENT \" + string(b))\n\t\tpipeline.Close()\n\t}\n}\n",
+    "description": "Three net.Pipe cases execute actual network submission, decoding, future completion and pipelineDecode consumption. Observe prior peer match, independent error and final match for the same request/future. A synthetic rejection terminates the loop independently of the measured outcome.",
+    "semantic_changes": [
+      "Directly constructed minimal commitment/replication state replaces leader election and the sending loop.",
+      "Scripted peer decodes the actual request and sends encoded response prefixes; no follower log or FSM implementation is exercised.",
+      "Delivery adapter only queues the original completed future and an unmeasured stopping rejection; target code and dependencies are unchanged."
+    ],
+    "prerequisites": [
+      {
+        "alias": "ready",
+        "event": "network_future_ready",
+        "conditions": [
+          {
+            "field": "published",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          }
+        ]
+      }
+    ],
+    "legality": {
+      "source_ids": [
+        "network-pipeline-complete-path",
+        "network-response-envelope",
+        "pipeline-result",
+        "replication-update",
+        "commitment-update"
+      ],
+      "expectation_ids": [
+        "pipeline-interface",
+        "commitment-match-contract"
+      ],
+      "binding_ids": [
+        "network-producer-binding",
+        "network-consumer-binding",
+        "network-match-update-binding"
+      ],
+      "derivation": "The AppendFuture interface makes Response valid only on successful completion. updateLastAppended consumes that response as a successful AppendEntries RPC and reports the request index to commitment.match; the match interface represents a stored matching prefix. At this specific acceptance boundary, response fields from a future whose actual Error is non-nil do not constitute an interface-valid success report. The local obligation is not to promote those fields to new match evidence. It is an interface-grounded acceptance condition, not the stronger assertion that a transport error means the follower did not store the request. In the isolated single-input fixture, absence of promotion is tested by equality to the independently measured prior peer match.",
+      "applicability": "Actual netPipeline.AppendEntries produces the future, actual decodeResponse handles the prefix and produces its error, and actual pipelineDecode/updateLastAppended may mutate the same peer commitment entry. The response validity obligation applies at this interface even when partial fields happen to describe a true acknowledgement.",
+      "unresolved": [
+        "The endpoint is peer match evidence promotion from an errored AppendFuture, not false follower durability or an unsafe commit.",
+        "The original full response is a scripted successful acknowledgement. Its partial Success=true may reflect a real success; this check cannot show that the request was not stored.",
+        "Follower protocol handling, election and prior log history are not executed. The request and payload are legal transport inputs, with a scripted peer and net.Pipe replacing a deployment connection.",
+        "The completed future is delivered to pipelineDecode via an adapted channel. A separate synthetic completed rejection provides termination independently of whether the measured future advances match.",
+        "Only one peer report is active, no local leader match is supplied, and configuration/term do not change. No quorum or client completion result is claimed.",
+        "The three cases are empty response, all but the final byte, and full response under the pinned codec and fixed fields; other codecs, encodings and faults are not covered.",
+        "The prior reviewed failed-future access finding and cross-incarnation ownership explanation remain unchanged."
+      ],
+      "conflicts": [],
+      "alternatives": [
+        "Success=false on a zero-valued error response prevents match promotion in the empty-input control.",
+        "A partial Success=true can originate from a genuinely successful full reply; evidence promotion need not imply false stored-prefix information.",
+        "Current code also checks reply term and voter membership, and commitment has a quorum/startIndex guard; these do not establish complete-response validity."
+      ]
+    }
+  },
+  "monitors": [
+    {
+      "id": "network-match-monitor",
+      "checker_id": "failed-network-match-unchanged",
+      "event": "network_consumer_completed",
+      "binding_ids": [
+        "network-producer-binding",
+        "network-consumer-binding",
+        "network-match-update-binding"
+      ],
+      "grounding": {
+        "source_ids": [
+          "network-pipeline-complete-path",
+          "network-response-envelope",
+          "pipeline-result",
+          "replication-update",
+          "commitment-update"
+        ],
+        "expectation_ids": [
+          "pipeline-interface",
+          "commitment-match-contract"
+        ],
+        "binding_ids": [
+          "network-producer-binding",
+          "network-consumer-binding",
+          "network-match-update-binding"
+        ],
+        "derivation": "The AppendFuture interface makes Response valid only on successful completion. updateLastAppended consumes that response as a successful AppendEntries RPC and reports the request index to commitment.match; the match interface represents a stored matching prefix. At this specific acceptance boundary, response fields from a future whose actual Error is non-nil do not constitute an interface-valid success report. The local obligation is not to promote those fields to new match evidence. It is an interface-grounded acceptance condition, not the stronger assertion that a transport error means the follower did not store the request. In the isolated single-input fixture, absence of promotion is tested by equality to the independently measured prior peer match.",
+        "applicability": "Actual netPipeline.AppendEntries produces the future, actual decodeResponse handles the prefix and produces its error, and actual pipelineDecode/updateLastAppended may mutate the same peer commitment entry. The response validity obligation applies at this interface even when partial fields happen to describe a true acknowledgement.",
+        "unresolved": [
+          "The endpoint is peer match evidence promotion from an errored AppendFuture, not false follower durability or an unsafe commit.",
+          "The original full response is a scripted successful acknowledgement. Its partial Success=true may reflect a real success; this check cannot show that the request was not stored.",
+          "Follower protocol handling, election and prior log history are not executed. The request and payload are legal transport inputs, with a scripted peer and net.Pipe replacing a deployment connection.",
+          "The completed future is delivered to pipelineDecode via an adapted channel. A separate synthetic completed rejection provides termination independently of whether the measured future advances match.",
+          "Only one peer report is active, no local leader match is supplied, and configuration/term do not change. No quorum or client completion result is claimed.",
+          "The three cases are empty response, all but the final byte, and full response under the pinned codec and fixed fields; other codecs, encodings and faults are not covered.",
+          "The prior reviewed failed-future access finding and cross-incarnation ownership explanation remain unchanged."
+        ],
+        "conflicts": [],
+        "alternatives": [
+          "Success=false on a zero-valued error response prevents match promotion in the empty-input control.",
+          "A partial Success=true can originate from a genuinely successful full reply; evidence promotion need not imply false stored-prefix information.",
+          "Current code also checks reply term and voter membership, and commitment has a quorum/startIndex guard; these do not establish complete-response validity."
+        ]
+      },
+      "applicability_conditions": []
+    }
+  ],
+  "observable_properties": [
+    {
+      "checker_id": "failed-network-match-unchanged",
+      "kind": "event_implication",
+      "trigger": {
+        "field": "completed",
+        "op": "eq",
+        "value": true,
+        "reference": null
+      },
+      "assertion": {
+        "field": "peer_match",
+        "op": "eq",
+        "value": null,
+        "reference": "ready.before_match"
+      },
+      "antecedent": {
+        "field": "future_failed",
+        "op": "eq",
+        "value": true,
+        "reference": null
+      },
+      "identity_fields": [
+        "operation_id"
+      ],
+      "history_field": null,
+      "description": "A failed completed future must leave its isolated peer match entry equal to the independently observed pre-consumption value. Success imposes no progress requirement."
+    }
+  ],
+  "uncertainties": [
+    "The endpoint is peer match evidence promotion from an errored AppendFuture, not false follower durability or an unsafe commit.",
+    "The original full response is a scripted successful acknowledgement. Its partial Success=true may reflect a real success; this check cannot show that the request was not stored.",
+    "Follower protocol handling, election and prior log history are not executed. The request and payload are legal transport inputs, with a scripted peer and net.Pipe replacing a deployment connection.",
+    "The completed future is delivered to pipelineDecode via an adapted channel. A separate synthetic completed rejection provides termination independently of whether the measured future advances match.",
+    "Only one peer report is active, no local leader match is supplied, and configuration/term do not change. No quorum or client completion result is claimed.",
+    "The three cases are empty response, all but the final byte, and full response under the pinned codec and fixed fields; other codecs, encodings and faults are not covered.",
+    "The prior reviewed failed-future access finding and cross-incarnation ownership explanation remain unchanged."
+  ]
+}
