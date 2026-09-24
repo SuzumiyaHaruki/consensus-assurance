@@ -597,14 +597,15 @@ class Engine:
                         if not inquiry.enabled(self) or str(exc).startswith("Agent blocked:"): raise
                         inquiry.pause_unit(self,str(exc))
                     continue
-                if self.state.audit_spec_path and not any(u.status in {'pending','partial'} for u in self.state.units) and not any(s in self.state.completed_steps for s in ('derived-spec:'+str(self.state.audit_spec_version),'derive-context-deferred:'+str(self.state.audit_spec_version))):
+                from .discovery import derivation_deferred
+                if self.state.audit_spec_path and not any(u.status in {'pending','partial'} for u in self.state.units) and 'derived-spec:'+str(self.state.audit_spec_version) not in self.state.completed_steps and not derivation_deferred(self.state):
                     from .budget import can_start_episode
                     if not can_start_episode(self.state,'candidate'):
                         self.state.stop_reason='Insufficient calls for another candidate';break
                     derive(self);continue
                 if not any(u.status in {"pending", "partial"} for u in self.state.units):
                     self.state.stop_reason = "No pending executable audit units; unresolved gaps remain"
-                    if 'derive-context-deferred:'+str(self.state.audit_spec_version) in self.state.completed_steps:
+                    if derivation_deferred(self.state):
                         self.state.stop_reason='Candidate context deferred at the packet limit; other executable work is exhausted'
                     elif inquiry.enabled(self) and any(t.status in {"blocked","pending","running"} for t in self.state.inquiry_tasks):
                         self.state.stop_reason="Inquiry work remains incomplete; exploration or review is blocked by budget, evidence or capability"

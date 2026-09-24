@@ -24,9 +24,15 @@ def declarations(material, include_calls=True):
     if material.file.endswith('.py'):
         try:tree=ast.parse(text)
         except SyntaxError:return []
-        for node in ast.walk(tree):
-            if isinstance(node,(ast.FunctionDef,ast.AsyncFunctionDef,ast.ClassDef)):
-                result.append({'symbol':node.name,'start':offset+node.lineno,'signature_end':max(offset+node.lineno,offset+(node.body[0].lineno-1 if node.body else node.lineno)),'end':offset+node.end_lineno,'kind':'declaration'})
+        def visit(node,owner=None):
+            for child in ast.iter_child_nodes(node):
+                if isinstance(child,(ast.FunctionDef,ast.AsyncFunctionDef,ast.ClassDef)):
+                    result.append({'owner':owner,'symbol':child.name,'start':offset+child.lineno,
+                        'signature_end':max(offset+child.lineno,offset+(child.body[0].lineno-1 if child.body else child.lineno)),
+                        'end':offset+child.end_lineno,'kind':'declaration'})
+                    visit(child,(owner+'.' if owner else '')+child.name)
+                else:visit(child,owner)
+        visit(tree)
     elif material.file.endswith('.go'):
         masked=code_mask(text)
         line=lambda pos:masked.count('\n',0,pos)+offset+1

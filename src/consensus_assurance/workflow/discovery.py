@@ -2,7 +2,7 @@
 from pathlib import Path
 from consensus_assurance.core.proposals import Discovery, Derivation, GraphPatch
 from consensus_assurance.adapters.storage.files import write_json
-from .materials import initial_materials, ReadingPlan, uid, material_allowance
+from .materials import initial_materials, ReadingPlan, uid, material_allowance, request_identity
 from .graph import apply_patch, validate_patch
 from .errors import Blocked
 from . import inquiry
@@ -80,6 +80,20 @@ def candidate_blockage(state,candidate):
 def derive_context(engine):
     state=engine.state;candidate=active_candidate(state)
     return {'candidate_id':candidate.id if candidate else None,'remaining_seconds':engine.budget.remaining()}
+
+
+def derivation_workset(state):
+    """Semantic inputs that can make a previously oversized derive packet useful."""
+    return {'audit_spec_version':state.audit_spec_version,'graph_version':state.graph_version,
+        'context_limit':state.config.get('budget',{}).get('context_chars'),
+        'candidates':[[c.id,c.status,c.stage,c.read_plan_id,len(c.history),c.question.source_ids] for c in state.question_candidates],
+        'material_ids':[m.id for m in state.materials],
+        'attachments':state.task_attachments.get('candidate:'+active_candidate(state).id,[]) if active_candidate(state) else state.task_attachments.get('discovery',[])}
+
+
+def derivation_deferred(state):
+    return any(p['kind']=='derive' and p['status']=='blocked_context_limit' and
+        p.get('workset')==derivation_workset(state) for p in reversed(state.packet_receipts))
 
 
 def derivation_graph(reply):
@@ -178,8 +192,10 @@ def validate_derivation(state,reply):
     if q:
         invalid=set(q.source_ids)-known
         from .sources import includes
-        missing=not attached or not any(includes(state,[id],attached) for id in q.source_ids)
         terminal=reply.obligation or not (reply.reading_requests+q.requests)
+        selected_read=state.read_plans.get(current.read_plan_id,{}) if current else {}
+        unresolved=terminal and any(item['status']=='unresolved' for item in selected_read.get('items',[]))
+        missing=not q.source_ids or not attached or not includes(state,q.source_ids,attached) or unresolved
         if invalid or terminal and missing:
             issues.append(Diagnostic(code='question_source_reference' if invalid else 'question_source_missing',category='material',
                 object_ids=q.fact_ids+q.behavior_ids,paths=['/audit_question/source_ids'],material_ids=sorted(set(attached)&known),
@@ -269,7 +285,7 @@ def accept_derivation(engine,reply,check_id):
                 candidate_id=candidate.id if issue.candidate_effect=='requires_recheck' else None,
                 diagnostics=[{'code':'audit_spec_semantics','category':'semantic','object_ids':issue.object_ids,'material_ids':issue.source_ids,'message':issue.reason,'allowed':['read','semantic_revision'],'details':{'check_id':check_id}}])
             if issue.candidate_effect=='requires_recheck':candidate.spec_task_ids.append(task.id)
-        requests=list({(r.file,r.start_line,r.end_line,r.symbol,r.literal):r for r in reply.reading_requests+q.requests}.values())
+        requests=list({request_identity(r):r for r in reply.reading_requests+q.requests}.values())
         q.requests=requests
         if candidate.spec_task_ids:
             candidate.stage='read' if requests else 'analyze'
@@ -335,7 +351,7 @@ def ask_derivation(engine,packet):
 
 def derive(engine):
     if 'derived-spec:'+str(engine.state.audit_spec_version) in engine.state.completed_steps:return
-    if 'derive-context-deferred:'+str(engine.state.audit_spec_version) in engine.state.completed_steps:return
+    if derivation_deferred(engine.state):return
     if engine.state.derivation_path:
         path=Path(engine.state.derivation_path);check_id=path.stem.removeprefix('derivation-')
         if 'derive-'+check_id not in engine.state.applied_operations:
@@ -352,8 +368,6 @@ def derive(engine):
         try:proposal,check=ask_derivation(engine,packet)
         except Blocked as exc:
             if not str(exc).startswith('Required context exceeds context_chars (derive:'):raise
-            marker='derive-context-deferred:'+str(engine.state.audit_spec_version)
-            if marker not in engine.state.completed_steps:engine.state.completed_steps.append(marker)
             if candidate:
                 candidate.status='blocked';candidate.stop_reason=str(exc)
                 candidate.resume_conditions=['Reprepare this discriminator with required exact source after the packet workset changes']
@@ -385,7 +399,7 @@ def targeted_read(engine, unit, gap, relation_ids=None, requests=None, update_re
         receipt=engine.read(reading.requests,plan_id=task['plan_id'],related_ids=task['related_ids'],reason=gap)
         task=engine.state.targeted_gap
         receipt['scope_requested']=task.get('update_required',True)
-        task['receipt_id']=receipt['id'];task['unfulfilled']=[item for item in receipt['items'] if item['status']=='deferred']
+        task['receipt_id']=receipt['id'];task['unfulfilled']=[item for item in receipt['items'] if item['status'] in {'deferred','unresolved'}]
         task['new_material_ids']=list(dict.fromkeys(task.get('new_material_ids',[])+[id for item in receipt['items'] if item['status']=='acquired' for id in item['material_ids']]))
         task['reattached_material_ids']=[id for item in receipt['items'] if item['status']=='cached' for id in item['material_ids']]
         if task['unfulfilled']:

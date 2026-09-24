@@ -8,7 +8,7 @@ from consensus_assurance.adapters.storage.files import write_json
 from .prompts import render
 from .errors import Blocked
 from .output_repair import OutputRepair,repair_targets,apply_replacements,diagnostic_targets,diagnostic_context
-from .materials import validate_read_requests, attachment_key
+from .materials import validate_read_requests, attachment_key, read_complete
 
 
 from .output_repair import save_session
@@ -87,7 +87,7 @@ def ask(engine,kind,response_type,context,validator=None,*,purpose="depth"):
     if session and session.get('logical_task',logical_task)!=logical_task:raise Blocked('The repair session belongs to another logical task')
     if session and not artifact_output and session.get('read_plan_id') and session.get('read_requests'):
         obtained=engine.read(session['read_requests'],purpose=purpose,plan_id=session['read_plan_id'],related_ids=session.get('read_related_ids',[]),reason=session.get('read_rationale','Resume requested repair context'))
-        if obtained['status']!='complete':save_session(engine,session);raise Blocked('Repair reading plan still has unmet ranges; no new agent call was sent')
+        if not read_complete(obtained):save_session(engine,session);raise Blocked('Repair reading plan still has unmet ranges; no new agent call was sent')
         session['requested_material_ids']=[id for i in obtained['items'] for id in i['material_ids'] if i['status']!='deferred']
         session.pop('read_plan_id')
         try:
@@ -118,7 +118,6 @@ def ask(engine,kind,response_type,context,validator=None,*,purpose="depth"):
             if session.get('read_requests'):
                 session.setdefault('read_plan_id',uid())
                 obtained=engine.read(session['read_requests'],purpose=purpose,plan_id=session['read_plan_id'],related_ids=[id for id in logical_task.values() if id],reason=session['error'])
-                if obtained['status']!='complete':raise Blocked('Check continuation requires the deferred source ranges')
                 session['read_receipt']=obtained
                 session['read_requests']=[];session.pop('read_plan_id')
                 save_session(engine,session)
@@ -234,7 +233,7 @@ def ask(engine,kind,response_type,context,validator=None,*,purpose="depth"):
                     session['read_check']=check.model_dump(mode='json');session['read_related_ids']=[id for d in diags for id in d.object_ids];session['read_rationale']=patch.rationale
                     save_session(engine,session)
                     obtained=engine.read(patch.requests,purpose=purpose,plan_id=session['read_plan_id'],related_ids=[id for d in diags for id in d.object_ids],reason=patch.rationale)
-                    if obtained['status']!='complete':save_session(engine,session);raise Blocked('Requested repair material is deferred; the original reading plan remains pending')
+                    if not read_complete(obtained):save_session(engine,session);raise Blocked('Requested repair material remains unresolved; the original reading plan remains pending')
                     session['requested_material_ids']=[id for i in obtained['items'] for id in i['material_ids'] if i['status']!='deferred']
                     from .sources import ranges,all_materials
                     provided=[{'file':file,'content_digest':version,'ranges':spans} for (file,version),spans in sorted(ranges(all_materials(related)).items())]
@@ -287,6 +286,8 @@ def ask(engine,kind,response_type,context,validator=None,*,purpose="depth"):
             response=response_type.model_validate(merged)
             validate(response)
             if artifact_output:
+                if session and session.get('read_receipt') and not read_complete(session['read_receipt']) and any(getattr(response,k,None) for k in ('bundle','draft','plan','harness')):
+                    raise ValueError('Required source lookup remains unresolved; request a corrected selector before accepting the artifact')
                 draft=getattr(response,'draft',None)
                 core=[p for p in draft.pending_work if p.component in {'behavior','properties'}] if draft else []
                 dependency_handoff=response.requests and getattr(response,'reading_purpose','context')=='dependency' and kind in {'build','F3'}

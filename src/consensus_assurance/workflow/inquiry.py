@@ -124,6 +124,11 @@ def task_context(engine,task):
 
 def validate_spec_refinement(state,reply,task):
     if reply.requests:return
+    if task.read_plan_id:
+        from .materials import read_complete
+        receipt=state.read_plans.get(task.read_plan_id)
+        if receipt and not read_complete(receipt):
+            raise Blocked('Requested inventory source remains unresolved; revise the read selector before applying a delta')
     from .audit_spec import merge_delta
     merge_delta(state,task,reply.delta)
 
@@ -177,7 +182,7 @@ def process_task(engine, task):
         state.inquiry_selections.append({'task_id':task.id,'kind':task.kind,'reason':task.reason,'trigger':task.trigger,'planned_target_versions':planned_versions,'execution_target_versions':task.target_versions})
 
     if task.stage=='read':
-        from .materials import uncovered_requests,request_material_ids
+        from .materials import uncovered_requests,request_material_ids,read_complete
         requested=list(task.requests);remaining=uncovered_requests(state,requested)
         task.added_material_ids=list(dict.fromkeys(task.added_material_ids+request_material_ids(state,requested)))
         for owner in ['inquiry:'+task.id]+(['unit:'+task.unit_id] if task.unit_id else []):
@@ -188,7 +193,7 @@ def process_task(engine, task):
             receipt=engine.read(remaining,purpose=read_purpose(task),partial=read_purpose(task)=='breadth',plan_id=task.read_plan_id,related_ids=task.target_ids+task.activity_classes+([task.unit_id] if task.unit_id else []),reason=task.reason)
             task=next(t for t in state.inquiry_tasks if t.id==task.id)
             task.added_material_ids=list(dict.fromkeys(task.added_material_ids+[id for item in receipt['items'] if item['status']!='deferred' for id in item['material_ids']]))
-            if receipt['status']!='complete' and not task.candidate_id:
+            if not read_complete(receipt) and not task.candidate_id:
                 raise Blocked('Requested inquiry material is deferred within its protected allowance; unmet requests remain in the receipt')
         task.stage='analyze';release_action(engine)
     if task.repair_session and not state.pending_output_repair:state.pending_output_repair=task.repair_session
@@ -205,9 +210,13 @@ def process_task(engine, task):
             if task.status=='blocked':task.stop_reason='Descriptive semantic refinement made no progress; diagnostics and attempted delta retained'
             release_action(engine);engine.checkpoint('descriptive_refinement_remains_open');return
         if reply.requests:
-            from .materials import uncovered_requests
-            if not uncovered_requests(state,reply.requests):
+            from .materials import requests_provided,request_identity,read_complete
+            sent=next((p for p in reversed(state.packet_receipts) if p['id']==task.context_receipt_id and p.get('check_id')==check.id),None)
+            if sent and requests_provided(state,reply.requests,sent['material_ids']):
                 raise Blocked('Exploration repeated already available ranges without producing a new interpretation')
+            prior=state.read_plans.get(task.read_plan_id)
+            if prior and not read_complete(prior) and {request_identity(r) for r in reply.requests}=={request_identity(r) for r in task.requests}:
+                raise Blocked('Exploration repeated an unresolved source selector without new material')
             task.requests=reply.requests;task.read_plan_id=None;task.stage='read';release_action(engine);engine.checkpoint('inquiry_reading_requested');return
     else:
         schema=ReviewKnowledgeReply if task.unit_id and state.audit_spec_path else ReviewReply

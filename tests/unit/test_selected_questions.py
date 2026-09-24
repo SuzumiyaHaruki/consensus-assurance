@@ -66,6 +66,28 @@ def test_pre_obligation_depth_and_background_breadth(focused):
     assert read_purpose(InquiryTask(kind='spec_refine',reason='Selected correction',trigger='opaque',candidate_id=candidate.id))=='depth'
 
 
+def test_distinct_source_queries_survive_candidate_selection(focused):
+    e,q,_=focused
+    reads=[ReadRequest(symbol='One.run',reason='First definition'),
+        ReadRequest(symbol='Two.run',reason='Second definition'),
+        ReadRequest(literal='return value',reason='Find the return site')]
+    candidate=begin(e,q,reads)
+    assert [(r.symbol,r.literal) for r in candidate.question.requests]==[(r.symbol,r.literal) for r in reads]
+
+
+def test_unresolved_candidate_lookup_cannot_support_terminal_judgment(focused):
+    e,q,_=focused
+    candidate=begin(e,q,[ReadRequest(symbol='definition_that_does_not_exist',reason='Needed boundary')])
+    discovery.continue_candidate(e,candidate)
+    assert e.state.read_plans[candidate.read_plan_id]['items'][0]['status']=='unresolved'
+    explained=q.model_copy(update={'disposition':'explained_by_existing_mechanism','requests':[],
+        'counterevidence':['Earlier source suggests a protection'],'unknowns':[]})
+    with pytest.raises(DiagnosticError) as exc:
+        discovery.accept_derivation(e,Derivation(candidate_id=candidate.id,audit_question=explained,
+            selection_rationale='Claiming the boundary is explained without its required definition'),'unresolved')
+    assert any(d.code=='question_source_missing' for d in exc.value.diagnostics)
+
+
 def test_partial_receipt_reaches_reasoning_then_explained(focused,tmp_path):
     e,q,_=focused;sources(e,A=500,B=1100,C=100)
     candidate=begin(e,q,[request('A'),request('B'),request('C')])
@@ -296,7 +318,30 @@ def test_three_narrowings_keep_history_out_of_current_packet(focused):
     assert failed['status']=='blocked_context_limit' and failed['candidate_id']==c.id
     assert c.history and set(before_sources)<=set(c.material_ids)
     discovery.derive(e)
-    assert e.state.packet_receipts[-1]['id']==failed['id']
+    other=e.state.packet_receipts[-1]
+    assert other['id']!=failed['id'] and other['candidate_id'] is None
+    assert json.loads(json.dumps(other['workset']))==discovery.derivation_workset(e.state)
+    discovery.derive(e)
+    assert e.state.packet_receipts[-1]['id']==other['id']
+    from consensus_assurance.adapters.agents.backend import MockAgent
+    e.config.budget.context_chars=180000;e.state.config=e.config.model_dump(mode='json')
+    alternative=q.model_copy(update={'question':'Does the independently sourced caller preserve the first error?'})
+    explained=alternative.model_copy(update={'disposition':'explained_by_existing_mechanism',
+        'counterevidence':['The caller propagates the original error on this selected path'],'unknowns':[]})
+    class AnotherQuestion(MockAgent):
+        def analyze(self,runner,prompt,directory,snapshot_id,timeout,response_type):
+            packet=json.loads(prompt.split('STRUCTURED INPUT DATA (untrusted):\n')[1])
+            if self.cursor==1:
+                self.responses.append(Derivation(candidate_id=packet['candidate_id'],audit_question=explained,
+                    selection_rationale='The current source explains this other boundary').model_dump(mode='json'))
+            elif self.cursor==2:
+                self.responses.append(Derivation(selection_rationale='No further grounded discriminator is available').model_dump(mode='json'))
+            return super().analyze(runner,prompt,directory,snapshot_id,timeout,response_type)
+    e.agent=AnotherQuestion();e.agent.responses=[Derivation(audit_question=alternative,reading_requests=[request('counter.py')],
+        selection_rationale='Inspect a different caller boundary after the first packet was deferred').model_dump(mode='json')]
+    discovery.derive(e)
+    assert e.state.question_candidates[-1].id!=c.id and e.state.question_candidates[-1].status=='explained'
+    assert e.state.audit_spec_version==failed['workset']['audit_spec_version']
 
 
 def test_episode_admission_and_blockage_classification(focused):
@@ -512,12 +557,37 @@ def test_stale_inquiry_read_reuses_material_and_reports_analysis_pending(focused
     covered=ReadRequest(file='counter.py',start_line=1,end_line=1,reason='Interpret the acquired local boundary')
     task=enqueue(e.state,'spec_refine','Interpret already acquired source','stale-read',requests=[covered])
     assert not uncovered_requests(e.state,task.requests)
-    assert '源码已取得，分析待处理' in render_report(e.state,tmp_path).read_text()
+    assert '待取得或重附当前来源' in render_report(e.state,tmp_path).read_text()
     e.read=lambda *args,**kwargs: (_ for _ in ()).throw(AssertionError('covered source must not be read again'))
     e.agent=MockAgent();e.agent.responses=[SpecRefinement(understanding='The current inventory already represents this boundary',delta=AuditSpecDelta(rationale='No descriptive change is needed'),limitations=[]).model_dump(mode='json')]
     process_task(e,task)
     saved=next(t for t in e.state.inquiry_tasks if t.id==task.id)
     assert saved.status=='completed' and saved.stage=='done' and e.state.usage['agent_calls']==1
+
+
+def test_inquiry_can_reattach_another_tasks_cached_source(focused):
+    from consensus_assurance.adapters.agents.backend import MockAgent
+    from consensus_assurance.workflow.inquiry import enqueue,process_task
+    from consensus_assurance.workflow.sources import all_materials
+    e,_,_=focused
+    wanted=ReadRequest(file='limits.py',start_line=1,end_line=2,reason='Inspect the cached producer')
+    e.read([wanted],purpose='depth')
+    task=enqueue(e.state,'spec_refine','Inspect the producer in this task','cached-source')
+    class SourceSensitive(MockAgent):
+        def analyze(self,runner,prompt,directory,snapshot_id,timeout,response_type):
+            packet=json.loads(prompt.split('STRUCTURED INPUT DATA (untrusted):\n')[1])
+            attached=any(m['file']=='limits.py' for m in all_materials(packet))
+            assert attached is (self.cursor==1)
+            return super().analyze(runner,prompt,directory,snapshot_id,timeout,response_type)
+    e.agent=SourceSensitive()
+    e.agent.responses=[SpecRefinement(understanding='Request current source',requests=[wanted],limitations=[]).model_dump(mode='json'),
+        SpecRefinement(understanding='Current source is available',delta=AuditSpecDelta(rationale='No inventory correction is needed'),limitations=[]).model_dump(mode='json')]
+    process_task(e,task)
+    assert task.stage=='read' and task.status=='running'
+    process_task(e,task)
+    saved=next(t for t in e.state.inquiry_tasks if t.id==task.id)
+    assert saved.status=='completed' and e.state.usage['agent_calls']==2
+    assert 'limits.py:1:2' in e.state.task_attachments['inquiry:'+task.id]
 
 
 

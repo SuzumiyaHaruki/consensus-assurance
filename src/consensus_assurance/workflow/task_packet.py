@@ -78,7 +78,7 @@ def descriptive_projection(engine,kind,context,task):
     wanted=set(context.get('current_material_ids',[]))
     if kind!='derive' or not candidate:wanted.update(m['id'] for m in context.get('materials',[]))
     if candidate:
-        if not candidate.read_plan_id:wanted.update(question.source_ids)
+        wanted.update(question.source_ids)
         wanted.update(id for t in state.inquiry_tasks if t.id in candidate.spec_task_ids and t.status=='completed' for id in t.added_material_ids)
         wanted.update(id for item in state.read_plans.get(candidate.read_plan_id,{}).get('items',[]) if item['status']!='deferred' for id in item['material_ids'])
     if task:wanted.update(id for d in task.diagnostics for id in d['material_ids'])
@@ -154,7 +154,10 @@ def prepare(engine,kind,context):
     packet['material_budget']={'used':material_usage(state),'breadth':material_allowance(state,engine.config.budget,'breadth'),'depth':material_allowance(state,engine.config.budget,'depth')}
     packet['remaining_agent_calls']=max(0,engine.config.budget.agent_calls-state.usage.get('agent_calls',0))
     packet['context_limit_chars']=engine.config.budget.context_chars
-    packet['reading_status']=[{'id':id,'status':p['status'],'unfulfilled':[i for i in p['items'] if i['status']=='deferred']} for id,p in state.read_plans.items() if p['status']!='complete' and (not task or id==task.read_plan_id)]
+    candidate=next((c for c in state.question_candidates if c.status=='active'),None) if kind=='derive' else None
+    current_plans={task.read_plan_id if task else candidate.read_plan_id if candidate else None}
+    packet['reading_status']=[{'id':id,'status':p['status'],'unfulfilled':[i for i in p['items'] if i['status'] in {'deferred','unresolved'}]} for id,p in state.read_plans.items()
+        if any(i['status'] in {'deferred','unresolved'} for i in p['items']) and (kind not in {'derive','spec_refine'} or id in current_plans)]
     def strip_excerpts(value):
         if isinstance(value,dict):
             if 'excerpt' in value and 'associations' in value:
@@ -202,6 +205,9 @@ def receipt(engine,kind,packet,prompt,schema,task=None,repair=False):
         'review_contract':packet.get('review_contract',[]),'omitted_material_ids':packet.get('omitted_material_ids',[]),
         'source_chars_sent':source_size(packet),'prompt_chars':len(prompt),'prompt_bytes':len(prompt.encode()),'wire_schema_bytes':len(json.dumps(wire,ensure_ascii=False,indent=2).encode()),'wire_schema_chars':len(json.dumps(wire,ensure_ascii=False,indent=2)),'schema_size_basis':'Exact prepared JSON file serialization; not backend token consumption',
         'duplicate_material_occurrences':len(ids)-len(set(ids)),'status':'prepared'}
+    if kind=='derive':
+        from .discovery import derivation_workset
+        item['workset']=derivation_workset(engine.state)
     engine.state.packet_receipts.append(item)
     if task:
         prior=list(task.material_ids)

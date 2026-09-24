@@ -342,7 +342,8 @@ def continue_question(engine,unit):
             read_id=session.setdefault('read_plan_id',uid())
 
             receipt=engine.read(session['requests'],purpose='depth',plan_id=read_id,related_ids=[unit.id],reason=q.question)
-            if receipt['status']!='complete':raise Blocked('Selected question dependency read remains incomplete')
+            from .materials import read_complete
+            if not read_complete(receipt):raise Blocked('Selected question dependency read remains incomplete')
         session=state.question_continuations[key]
         session['stage']='continue'
     def validate(reply):
@@ -388,7 +389,8 @@ def continue_question(engine,unit):
         current.version+=1;proxy.state.graph_version+=1
         proxy.state.question_continuations[key].update(stage='completed',check_id=check.id,explanation=reply.explanation)
         next_phase=route(current)
-        repeated=bool(current.audit_question.requests) and all(any(r.file==old.file and r.start_line==old.start_line and r.end_line==old.end_line for old in q.requests) for r in current.audit_question.requests)
+        from .materials import request_identity
+        repeated=bool(current.audit_question.requests) and all(request_identity(r) in {request_identity(old) for old in q.requests} for r in current.audit_question.requests)
         if next_phase=='question' and (not current.audit_question.requests or repeated):
             current.status='blocked';proxy.state.gaps.append(reply.explanation);proxy.state.active_unit_id=None;proxy.state.next_action='select'
         else:proxy.state.next_action=next_phase

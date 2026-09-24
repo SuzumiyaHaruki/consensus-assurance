@@ -1,0 +1,1393 @@
+{
+  "input": {
+    "candidate_action": "continue",
+    "candidate_id": "5f78930b6dd142febc6e1889616feec5",
+    "obligation": null,
+    "bindings": [],
+    "dependencies": [],
+    "context_claims": [],
+    "audit_question": {
+      "disposition": null,
+      "preferred_check": "source_review",
+      "requests": [
+        {
+          "file": "state.go",
+          "start_line": 1,
+          "end_line": 174,
+          "reason": "Determine how getLastEntry, getLastLog, and setLastLog obtain and maintain the metadata used to accept a predecessor after suffix deletion followed by a failed append."
+        },
+        {
+          "file": "log.go",
+          "start_line": 1,
+          "end_line": 192,
+          "reason": "Recover the LogStore contract, including deletion, StoreLogs errors, and any guarantees relevant to metadata remaining valid after partial completion."
+        },
+        {
+          "file": "replication.go",
+          "symbol": "Raft.setPreviousLog",
+          "reason": "Determine which predecessor identities a subsequent legitimate sequential request can carry."
+        },
+        {
+          "file": "replication.go",
+          "symbol": "Raft.setNewLogs",
+          "reason": "Determine request entry ordering and endpoint construction before assessing prefix agreement."
+        }
+      ],
+      "question": "When sequential replication consumes F_sequential_success_response for a nonempty request, does receiver Success establish the prefix agreement attributed by updateLastAppended? In particular, can successful suffix deletion followed by StoreLogs failure leave last-entry metadata that a later request uses to validate a predecessor no longer present in the log?",
+      "importance": "A successful response without the requested prefix could be consumed as voter support through commitment.match. The immediate investigation concerns receiver prefix establishment and its endpoint interpretation. Legal-history reachability, published commitment, application effects, and consensus safety remain separate questions.",
+      "source_ids": [
+        "raft.go:1440:1580",
+        "replication.go:202:295",
+        "replication.go:570:583",
+        "replication.go:655:665",
+        "commitment.go:1:104"
+      ],
+      "participants": [
+        "Leader sequential replication execution",
+        "Follower AppendEntries receiver",
+        "Follower LogStore",
+        "Leader-local commitment accumulator"
+      ],
+      "objects": [
+        "AppendEntries request and response",
+        "Follower log prefix",
+        "Follower last-entry metadata",
+        "Follower replication endpoint report"
+      ],
+      "contexts": [
+        "Nonempty sequential AppendEntries request",
+        "Request term and predecessor identity",
+        "Successful conflicting-suffix deletion followed by StoreLogs failure",
+        "Subsequent AppendEntries processing"
+      ],
+      "event_paths": [
+        "setupAppendEntries -> replicateTo -> appendEntries -> updateLastAppended -> commitment.match",
+        "appendEntries conflict -> DeleteRange success -> StoreLogs error -> later appendEntries predecessor validation"
+      ],
+      "activity_classes": [
+        "A1",
+        "A2",
+        "A6"
+      ],
+      "behavior_ids": [
+        "B_sequential_replication",
+        "B_record_append_success",
+        "B_aggregate_match"
+      ],
+      "fact_ids": [
+        "F_sequential_success_response"
+      ],
+      "obligation_relation_kind": "consumption",
+      "counterevidence": [
+        "The receiver initializes Success=false and returns without setting it true on predecessor mismatch, GetLog failure, DeleteRange failure, StoreLogs failure, or configuration-processing failure.",
+        "For ordinary duplicate processing, the receiver compares entry terms; for a new suffix, it calls StoreLogs before setting Success=true.",
+        "Sequential replication checks transport errors and higher response terms before consuming Success.",
+        "updateLastAppended reports an endpoint only for nonempty requests. commitment.match filters unknown voters and non-increasing reports, and recalculation enforces startIndex.",
+        "The predecessor shortcut obtains its term from getLastEntry when the requested predecessor equals the cached endpoint; whether that metadata remains valid after mutation errors is unresolved."
+      ],
+      "unknowns": [
+        "Whether getLastEntry can return metadata for entries removed by successful DeleteRange after subsequent StoreLogs failure.",
+        "The LogStore contract and available backend semantics for successful deletion and failed or partially completed storage.",
+        "Whether every successful nonempty branch establishes agreement through the reported endpoint, including requests after earlier mutation failures.",
+        "Whether legitimate sequential request construction can reach a discrepant predecessor state; request ordering and continuity remain unread.",
+        "Transport request/response correlation guarantees.",
+        "Peer replacement and continued ownership of the replication context when the response is consumed.",
+        "Legal reachability and downstream consequences of any local discrepancy."
+      ],
+      "priority": 1,
+      "trigger_rationale": "The attached receiver source resolves immediate error replies: they do not establish Success. It also exposes a specific remaining discriminator: deletion precedes storage, the storage-error branch returns before setLastLog, and predecessor validation can bypass GetLog through getLastEntry. The code comment acknowledges potentially stale metadata, but neither that comment nor the ordering establishes a later false success."
+    },
+    "selection_rationale": "Continue the same response-to-prefix investigation. Immediate storage-error responses are protected by Success=false, but subsequent-request interpretation depends on unread metadata and storage contracts. Reading those dependencies can distinguish a repaired or harmless cache from a prefix-validation gap. The previously checked pipeline interface discrepancy does not establish this receiver behavior or its reachability, and its retained scope limitations remain unchanged.",
+    "reading_requests": [
+      {
+        "file": "state.go",
+        "start_line": 1,
+        "end_line": 174,
+        "reason": "Recover last-log and last-entry metadata access and mutation semantics for the deletion-success/storage-failure path."
+      },
+      {
+        "file": "log.go",
+        "start_line": 1,
+        "end_line": 192,
+        "reason": "Recover the applicable LogStore interface contract before attributing guarantees to storage completion or failure."
+      },
+      {
+        "file": "replication.go",
+        "symbol": "Raft.setPreviousLog",
+        "reason": "Recover predecessor construction for legitimate sequential requests."
+      },
+      {
+        "file": "replication.go",
+        "symbol": "Raft.setNewLogs",
+        "reason": "Recover entry continuity and endpoint construction for the same request path."
+      }
+    ],
+    "frontier_entry_point": null,
+    "descriptive_issues": [],
+    "fork_from_candidate_id": null,
+    "fork_reason": "",
+    "resume_conditions": []
+  },
+  "before": {
+    "question_candidates": [
+      {
+        "id": "bdf8c4eaa87444a18b3fe7f7a8f386b3",
+        "question": {
+          "disposition": "ready_for_check",
+          "preferred_check": "direct_test",
+          "requests": [],
+          "question": "When F_append_endpoint_reported is consumed as voter support, do all callers of updateLastAppended correlate the reported endpoint with a successful response from the attributed peer in the owning replication context, or can an alternative response path supply a report that exceeds what its response establishes? The immediate check is whether pipelineDecode satisfies AppendFuture's error-validation precondition before interpreting its response.",
+          "importance": "Invalid response interpretation could supply unsupported voter progress to commitment aggregation. The immediate check establishes only whether the consumer respects the future interface; legal-history reachability and effects on published commitment or application remain separate.",
+          "source_ids": [
+            "replication.go:202:295",
+            "replication.go:655:665",
+            "replication.go:33:96",
+            "replication.go:446:508",
+            "replication.go:490:580",
+            "commitment.go:1:104",
+            "transport.go:1:141",
+            "future.go:14:23",
+            "future.go:297:302",
+            "net_transport.go:750:912"
+          ],
+          "participants": [
+            "Sequential replication execution",
+            "Pipeline response decoder",
+            "Append pipeline completion producer",
+            "AppendEntries responder",
+            "Leader-local commitment accumulator"
+          ],
+          "objects": [
+            "followerReplication",
+            "AppendEntries request and response",
+            "Append pipeline future",
+            "Voter endpoint report",
+            "commitment"
+          ],
+          "contexts": [
+            "Sequential replication",
+            "Pipelined replication",
+            "Peer identity and replication-context lifetime"
+          ],
+          "event_paths": [
+            "AppendEntries response validation -> updateLastAppended -> commitment.match",
+            "AppendPipeline.Consumer delivery -> Error status validation -> Response access -> term and success checks -> updateLastAppended"
+          ],
+          "activity_classes": [
+            "A1",
+            "A2"
+          ],
+          "behavior_ids": [
+            "B_sequential_replication",
+            "B_record_append_success",
+            "B_aggregate_match"
+          ],
+          "fact_ids": [
+            "F_append_endpoint_reported"
+          ],
+          "obligation_relation_kind": "consumption",
+          "counterevidence": [
+            "Sequential replication returns on transport error and higher response term, and reports progress only on Success.",
+            "pipelineDecode obtains request and response from the same future, rejects higher response terms, and returns on !resp.Success before reporting an endpoint.",
+            "pipelineSend supplies a fresh AppendEntriesResponse for each request; errors leaving its zero-valued Success unchanged do not produce endpoint reports.",
+            "The network pipeline publishes completion before delivering the future, supporting completion ordering but not an error-free result.",
+            "pipelineReplicate requests decoder shutdown and normally waits for finishCh; shutdownCh provides an alternative exit.",
+            "updateLastAppended reports endpoints only for nonempty requests.",
+            "commitment.match filters nonvoters and non-increasing reports; recalculation requires a majority endpoint above commitIndex and at least startIndex."
+          ],
+          "unknowns": [
+            "Whether failed or partially decoded responses can contain Success=true in an actual legal execution.",
+            "The concrete appendFuture accessors and deferError completion implementation remain unread.",
+            "Whether there are updateLastAppended callers outside the earlier file-scoped lookup.",
+            "Whether reported peer identity remains correlated with the RPC target during peer updates.",
+            "How replication-state term and commitment ownership constrain delayed responses.",
+            "The receiver-side meaning of AppendEntries.Success.",
+            "Whether a potentially weaker local report is reachable in a legal execution.",
+            "Whether any local mismatch can affect published commitment or application."
+          ],
+          "priority": 1,
+          "trigger_rationale": "The new network source resolves the completion-producer discriminator: decodeResponses does not filter errors before delivering futures, and decodeResponse decodes the response before returning a nonempty remote error. This does not prove Success=true on error, but it rules out treating delivery as a universal nil-error guarantee. The documented Response precondition therefore supports an immediate local check with an independent invocation-order oracle. A passing bounded check would support only its exercised interface cases; a failure would establish a local contract mismatch; a blocked check would leave this discriminator unresolved. None would independently establish the broader commitment consequence."
+        },
+        "history": [
+          {
+            "disposition": null,
+            "preferred_check": "source_review",
+            "requests": [
+              {
+                "file": "replication.go",
+                "start_line": 202,
+                "end_line": 295,
+                "reason": "Acquire the sequential response-validation path and its request context as the comparison point."
+              },
+              {
+                "file": "replication.go",
+                "start_line": 655,
+                "end_line": 665,
+                "reason": "Acquire the endpoint-report helper and verify which identity and commitment object receive the report."
+              },
+              {
+                "file": "replication.go",
+                "literal": "updateLastAppended(",
+                "reason": "Locate every caller to determine whether alternative response paths establish the prerequisites for endpoint reporting."
+              },
+              {
+                "file": "replication.go",
+                "symbol": "followerReplication",
+                "reason": "Acquire the replication-state declaration, including ownership and lifetime documentation for peer identity, term, and commitment."
+              },
+              {
+                "file": "commitment.go",
+                "start_line": 1,
+                "end_line": 104,
+                "reason": "Acquire the actual report consumer, its stated support meaning, and its filtering and advancement protections."
+              }
+            ],
+            "question": "When F_append_endpoint_reported is consumed as voter support, do all callers of updateLastAppended correlate the reported endpoint with a successful response from the attributed peer in the owning replication context, or can an alternative response path supply a report that exceeds what its response establishes?",
+            "importance": "Incorrect attribution of an append endpoint could let commitment aggregation count support that the identified voter has not established. This investigation first distinguishes the local response-to-report relation; legal reachability and effects on published commitment or application remain separate questions.",
+            "source_ids": [],
+            "participants": [
+              "Replication execution",
+              "AppendEntries responder",
+              "Leader-local commitment accumulator"
+            ],
+            "objects": [
+              "followerReplication",
+              "AppendEntries request and response",
+              "Voter endpoint report",
+              "commitment"
+            ],
+            "contexts": [
+              "Sequential replication",
+              "Alternative callers of updateLastAppended",
+              "Peer identity and replication-context lifetime"
+            ],
+            "event_paths": [
+              "AppendEntries response validation -> updateLastAppended -> commitment.match"
+            ],
+            "activity_classes": [
+              "A1",
+              "A2"
+            ],
+            "behavior_ids": [
+              "B_sequential_replication",
+              "B_record_append_success",
+              "B_aggregate_match"
+            ],
+            "fact_ids": [
+              "F_append_endpoint_reported"
+            ],
+            "obligation_relation_kind": "consumption",
+            "counterevidence": [
+              "The inventory records transport-error and higher-response-term checks before sequential success processing; exact source must be reattached before relying on these protections.",
+              "The inventory records endpoint reporting only for nonempty requests, voter filtering, monotonic reports, and a startIndex threshold; their applicability to alternative callers remains to be examined."
+            ],
+            "unknowns": [
+              "The complete caller set and response guards for updateLastAppended.",
+              "Whether reported peer identity remains correlated with the RPC target during peer updates.",
+              "How replication-state term and commitment ownership constrain delayed responses.",
+              "The receiver-side meaning of AppendEntries.Success.",
+              "Whether a potentially weaker local report is reachable in a legal execution.",
+              "Whether any local mismatch can affect published commitment or application."
+            ],
+            "priority": 1,
+            "trigger_rationale": "The accepted inventory identifies a helper that relies on caller validation, while only its sequential caller has been inspected. Comparing its actual callers against the same report consumer can distinguish equivalent protections from a concrete semantic gap without assuming that asynchronous differences constitute a defect."
+          },
+          {
+            "disposition": null,
+            "preferred_check": "source_review",
+            "requests": [
+              {
+                "file": "replication.go",
+                "start_line": 490,
+                "end_line": 580,
+                "reason": "Resolve the outstanding caller lookup at line 562 by acquiring surrounding response processing, guards, request correlation, and declaration context. If the enclosing declaration extends outside this range, retain that boundary as an explicit follow-up."
+              }
+            ],
+            "question": "When F_append_endpoint_reported is consumed as voter support, do all callers of updateLastAppended correlate the reported endpoint with a successful response from the attributed peer in the owning replication context, or can an alternative response path supply a report that exceeds what its response establishes?",
+            "importance": "Incorrect attribution of an append endpoint could let commitment aggregation count support that the identified voter has not established. The immediate discriminator is the local response-to-report relation; legal reachability and effects on published commitment or application remain separate questions.",
+            "source_ids": [
+              "replication.go:202:295",
+              "replication.go:655:665",
+              "replication.go:33:96",
+              "commitment.go:1:104"
+            ],
+            "participants": [
+              "Replication execution",
+              "AppendEntries responder",
+              "Leader-local commitment accumulator"
+            ],
+            "objects": [
+              "followerReplication",
+              "AppendEntries request and response",
+              "Voter endpoint report",
+              "commitment"
+            ],
+            "contexts": [
+              "Sequential replication",
+              "Alternative callers of updateLastAppended",
+              "Peer identity and replication-context lifetime"
+            ],
+            "event_paths": [
+              "AppendEntries response validation -> updateLastAppended -> commitment.match"
+            ],
+            "activity_classes": [
+              "A1",
+              "A2"
+            ],
+            "behavior_ids": [
+              "B_sequential_replication",
+              "B_record_append_success",
+              "B_aggregate_match"
+            ],
+            "fact_ids": [
+              "F_append_endpoint_reported"
+            ],
+            "obligation_relation_kind": "consumption",
+            "counterevidence": [
+              "Raft.replicateTo returns on transport error and handles resp.Term > req.Term before success processing; only resp.Success invokes updateLastAppended.",
+              "updateLastAppended reports an endpoint only for a nonempty request.",
+              "commitment.match ignores nonvoters and non-increasing reports; recalculate requires a majority endpoint greater than commitIndex and at least startIndex.",
+              "followerReplication documents currentTerm as the owning leader's term and stopCh as the notification for leadership loss or follower removal. These declarations do not establish how delayed responses are constrained."
+            ],
+            "unknowns": [
+              "Response guards and request correlation at the alternative updateLastAppended call located at replication.go line 562; the lookup supplied navigation only.",
+              "Whether there are callers outside the file-scoped lookup.",
+              "Whether reported peer identity remains correlated with the RPC target during peer updates.",
+              "How replication-state term and commitment ownership constrain delayed responses.",
+              "The receiver-side meaning of AppendEntries.Success.",
+              "Whether a potentially weaker local report is reachable in a legal execution.",
+              "Whether any local mismatch can affect published commitment or application."
+            ],
+            "priority": 1,
+            "trigger_rationale": "The acquired helper relies on caller validation, while commitment.match documents disk agreement as the meaning of its input and does not validate response context itself. The lookup identified an unread alternative call at line 562. Its guards are the next concrete discriminator; the existence of another caller alone is not evidence of a defect."
+          },
+          {
+            "disposition": null,
+            "preferred_check": "source_review",
+            "requests": [
+              {
+                "file": "transport.go",
+                "start_line": 1,
+                "end_line": 141,
+                "reason": "Acquire AppendPipeline.Consumer and AppendEntries contracts, including completion, error handling, response validity, and available transport interfaces."
+              },
+              {
+                "file": "future.go",
+                "symbol": "AppendFuture",
+                "reason": "Determine whether Request and Response are valid upon Consumer delivery or require a successful Error result first."
+              },
+              {
+                "file": "net_transport.go",
+                "literal": "Consumer",
+                "reason": "Locate the built-in pipeline consumer and its completion producer to inspect whether failed or partially decoded responses can be delivered."
+              },
+              {
+                "file": "replication.go",
+                "symbol": "Raft.pipelineReplicate",
+                "reason": "Acquire pipeline construction, peer selection, decoder ownership, and termination to establish the actual transport boundary and response-context lifetime."
+              }
+            ],
+            "question": "When F_append_endpoint_reported is consumed as voter support, do all callers of updateLastAppended correlate the reported endpoint with a successful response from the attributed peer in the owning replication context, or can an alternative response path supply a report that exceeds what its response establishes?",
+            "importance": "An incorrectly attributed or insufficiently established append endpoint could supply unsupported voter progress to commitment aggregation. The immediate investigation concerns response-to-report validity; legal reachability and effects on published commitment or application remain separate.",
+            "source_ids": [
+              "replication.go:202:295",
+              "replication.go:655:665",
+              "replication.go:33:96",
+              "commitment.go:1:104",
+              "replication.go:490:580"
+            ],
+            "participants": [
+              "Sequential replication execution",
+              "Pipeline response decoder",
+              "Append pipeline completion producer",
+              "AppendEntries responder",
+              "Leader-local commitment accumulator"
+            ],
+            "objects": [
+              "followerReplication",
+              "AppendEntries request and response",
+              "Append pipeline future",
+              "Voter endpoint report",
+              "commitment"
+            ],
+            "contexts": [
+              "Sequential replication",
+              "Pipelined replication",
+              "Peer identity and replication-context lifetime"
+            ],
+            "event_paths": [
+              "AppendEntries response validation -> updateLastAppended -> commitment.match",
+              "AppendPipeline.Consumer delivery -> Request and Response access -> term and success checks -> updateLastAppended"
+            ],
+            "activity_classes": [
+              "A1",
+              "A2"
+            ],
+            "behavior_ids": [
+              "B_sequential_replication",
+              "B_record_append_success",
+              "B_aggregate_match"
+            ],
+            "fact_ids": [
+              "F_append_endpoint_reported"
+            ],
+            "obligation_relation_kind": "consumption",
+            "counterevidence": [
+              "Sequential replication returns on transport error, checks for a higher response term, and invokes updateLastAppended only on Success.",
+              "The acquired pipelineDecode declaration also checks for a higher response term and returns on !resp.Success before invoking updateLastAppended.",
+              "pipelineDecode obtains both the request and response from the same delivered future; whether the interface guarantees their validity at delivery remains unread.",
+              "updateLastAppended reports an endpoint only for nonempty requests.",
+              "commitment.match filters nonvoters and non-increasing reports; recalculation requires the majority endpoint to exceed commitIndex and reach startIndex.",
+              "followerReplication documents leader-term ownership and stop notification on leadership loss or follower removal, but these declarations alone do not establish delayed-response isolation."
+            ],
+            "unknowns": [
+              "Whether Consumer delivery establishes successful completion and valid response contents, or whether the consumer must inspect a future error before interpreting Response.",
+              "Whether built-in pipeline implementations deliver failed or partially decoded responses, and what response fields mean in those cases.",
+              "Whether there are updateLastAppended callers outside the earlier file-scoped lookup.",
+              "Whether reported peer identity remains correlated with the RPC target during peer updates.",
+              "How replication-state term and commitment ownership constrain delayed responses.",
+              "The receiver-side meaning of AppendEntries.Success.",
+              "Whether a potentially weaker local report is reachable in a legal execution.",
+              "Whether any local mismatch can affect published commitment or application."
+            ],
+            "priority": 1,
+            "trigger_rationale": "The alternative caller is now resolved: pipelineDecode includes term and Success guards, so absence of those guards is not supported. Unlike the sequential path, it accesses a delivered future's response without an explicit completion-error check in the acquired declaration. This difference warrants inspection of the future and Consumer contracts and their producer; it does not yet establish a missing validation requirement."
+          },
+          {
+            "disposition": "concrete_suspicion",
+            "preferred_check": "source_review",
+            "requests": [
+              {
+                "file": "net_transport.go",
+                "start_line": 750,
+                "end_line": 912,
+                "reason": "Resolve the ambiguous Consumer lookup at lines 893–894 and inspect the surrounding pipeline completion producer, response decoding, error publication, and shutdown ordering. Determine whether failed futures can reach the replication decoder with Success populated."
+              },
+              {
+                "file": "future.go",
+                "symbol": "Future",
+                "reason": "Read the inherited Error contract. AppendFuture itself is already acquired in transport.go; the unsuccessful future.go lookup does not require repeating that lookup."
+              },
+              {
+                "file": "future.go",
+                "symbol": "appendFuture",
+                "reason": "Locate the concrete append future and its Request, Response, and completion representation to distinguish response availability from successful completion."
+              }
+            ],
+            "question": "When F_append_endpoint_reported is consumed as voter support, do all callers of updateLastAppended correlate the reported endpoint with a successful response from the attributed peer in the owning replication context, or can an alternative response path supply a report that exceeds what its response establishes?",
+            "importance": "An insufficiently established or incorrectly attributed endpoint could supply unsupported voter progress to commitment aggregation. The immediate discriminator is the validity of a pipeline response used to report progress. Legal-history reachability and effects on published commitment or application remain separate.",
+            "source_ids": [
+              "replication.go:202:295",
+              "replication.go:655:665",
+              "replication.go:33:96",
+              "replication.go:446:508",
+              "replication.go:490:580",
+              "commitment.go:1:104",
+              "transport.go:1:141"
+            ],
+            "participants": [
+              "Sequential replication execution",
+              "Pipeline response decoder",
+              "Append pipeline completion producer",
+              "AppendEntries responder",
+              "Leader-local commitment accumulator"
+            ],
+            "objects": [
+              "followerReplication",
+              "AppendEntries request and response",
+              "Append pipeline future",
+              "Voter endpoint report",
+              "commitment"
+            ],
+            "contexts": [
+              "Sequential replication",
+              "Pipelined replication",
+              "Peer identity and replication-context lifetime"
+            ],
+            "event_paths": [
+              "AppendEntries response validation -> updateLastAppended -> commitment.match",
+              "AppendPipeline.Consumer delivery -> Request and Response access -> term and success checks -> updateLastAppended"
+            ],
+            "activity_classes": [
+              "A1",
+              "A2"
+            ],
+            "behavior_ids": [
+              "B_sequential_replication",
+              "B_record_append_success",
+              "B_aggregate_match"
+            ],
+            "fact_ids": [
+              "F_append_endpoint_reported"
+            ],
+            "obligation_relation_kind": "consumption",
+            "counterevidence": [
+              "Sequential replication returns on transport error and higher response term, and reports progress only on Success.",
+              "pipelineDecode obtains request and response from the same future, rejects higher response terms, and returns on !resp.Success before reporting an endpoint.",
+              "pipelineSend supplies a fresh AppendEntriesResponse for each request; no response reuse is established by this caller.",
+              "pipelineReplicate requests decoder shutdown and normally waits for finishCh; shutdownCh provides an alternative exit. This does not by itself establish all delayed-response isolation.",
+              "updateLastAppended reports endpoints only for nonempty requests.",
+              "commitment.match filters nonvoters and non-increasing reports; recalculation requires a majority endpoint above commitIndex and at least startIndex.",
+              "Consumer describes delivered futures as ready, which may indicate completion, but does not explicitly guarantee error-free completion."
+            ],
+            "unknowns": [
+              "Whether built-in pipeline completion producers deliver failed or partially decoded responses, and whether Success can be populated in those responses.",
+              "Whether Consumer delivery supplies any implementation-specific guarantee that explains omission of Error despite the explicit Response interface precondition.",
+              "The inherited Future.Error contract and concrete appendFuture completion representation.",
+              "Whether there are updateLastAppended callers outside the earlier file-scoped lookup.",
+              "Whether reported peer identity remains correlated with the RPC target during peer updates.",
+              "How replication-state term and commitment ownership constrain delayed responses.",
+              "The receiver-side meaning of AppendEntries.Success.",
+              "Whether a potentially weaker local report is reachable in a legal execution.",
+              "Whether any local mismatch can affect published commitment or application."
+            ],
+            "priority": 1,
+            "trigger_rationale": "The acquired AppendFuture.Response contract explicitly requires Error to return before Response is called and makes the response valid only on success. The acquired pipelineDecode calls Response without calling Error. This supplies a concrete interface-level concern beyond cross-path asymmetry. The next read resolves whether actual completion producers prevent invalid responses from influencing endpoint reports; it does not assume that the omission establishes unsupported commitment."
+          }
+        ],
+        "check_ids": [
+          "8e19fb2cd2994ec8b4d6724f761f0f87",
+          "0542f1aaea104522b29838a81ea53bbe",
+          "d6eb4d1d68674050bdf5a14341a2383a",
+          "310600b0edf04baaa64423f0416eea47",
+          "8e328777bfee4422b794e66b61be1264"
+        ],
+        "status": "escalated",
+        "parent_candidate_id": null,
+        "fork_reason": "",
+        "stage": "analyze",
+        "read_plan_id": "263f9d54afa448f491e44ec1938e316e",
+        "material_ids": [
+          "replication.go:202:295",
+          "replication.go:655:665",
+          "replication.go:33:96",
+          "commitment.go:1:104",
+          "replication.go:490:580",
+          "transport.go:1:141",
+          "replication.go:446:508",
+          "net_transport.go:750:912",
+          "future.go:14:23",
+          "future.go:297:302"
+        ],
+        "spec_task_ids": [],
+        "stagnation": 0,
+        "stop_reason": "",
+        "resume_conditions": [],
+        "obligation_id": "O_pipeline_response_validity"
+      },
+      {
+        "id": "5f78930b6dd142febc6e1889616feec5",
+        "question": {
+          "disposition": null,
+          "preferred_check": "source_review",
+          "requests": [
+            {
+              "file": "raft.go",
+              "symbol": "Raft.appendEntries",
+              "reason": "Locate the complete receiver declaration and inspect predecessor validation, conflicting-entry handling, storage errors, and the conditions establishing Success."
+            },
+            {
+              "file": "replication.go",
+              "start_line": 202,
+              "end_line": 295,
+              "reason": "Attach the actual sequential response consumer, including term checks, rejection handling, and snapshot fallback."
+            },
+            {
+              "file": "replication.go",
+              "symbol": "Raft.setupAppendEntries",
+              "reason": "Identify the request context, predecessor identity, and entries whose endpoint a successful response can support."
+            },
+            {
+              "file": "replication.go",
+              "start_line": 655,
+              "end_line": 665,
+              "reason": "Attach the endpoint-reporting consumer to determine precisely which stronger assertion requires investigation."
+            },
+            {
+              "file": "commitment.go",
+              "start_line": 1,
+              "end_line": 104,
+              "reason": "Recover the attributed meaning expected of match reports and distinguish that expectation from aggregation guards."
+            }
+          ],
+          "question": "When the sequential replication path consumes F_sequential_success_response for a nonempty request, what receiver-side log agreement does Success establish, and is that agreement sufficient for the endpoint subsequently attributed to the follower by updateLastAppended? The immediate discriminator is whether receiver success branches validate or establish the requested prefix before replying, including conflict and storage-error branches.",
+          "importance": "A response interpreted as stronger replica support than the receiver established could affect quorum bookkeeping. This investigation first concerns the local response-to-endpoint relation; legal-history reachability, published commitment, application effects, and consensus safety remain separate consequences.",
+          "source_ids": [],
+          "participants": [
+            "Leader sequential replication execution",
+            "Follower AppendEntries receiver",
+            "Leader-local commitment accumulator"
+          ],
+          "objects": [
+            "AppendEntries request and response",
+            "Follower log prefix",
+            "Follower replication endpoint report"
+          ],
+          "contexts": [
+            "Nonempty sequential AppendEntries request",
+            "Request term and predecessor identity",
+            "Receiver conflict handling and storage completion"
+          ],
+          "event_paths": [
+            "setupAppendEntries -> replicateTo -> receiver appendEntries -> response validation -> updateLastAppended -> commitment.match"
+          ],
+          "activity_classes": [
+            "A1",
+            "A2",
+            "A6"
+          ],
+          "behavior_ids": [
+            "B_sequential_replication",
+            "B_record_append_success",
+            "B_aggregate_match"
+          ],
+          "fact_ids": [
+            "F_sequential_success_response"
+          ],
+          "obligation_relation_kind": "consumption",
+          "counterevidence": [
+            "The supplied inventory records transport-error and higher-response-term checks before sequential success interpretation; their exact source must be attached before relying on them.",
+            "The inventory records that empty requests do not report an endpoint and that commitment filters reports by voter identity and monotonicity. These protections constrain the question but do not independently establish receiver log agreement."
+          ],
+          "unknowns": [
+            "The exact receiver-side meaning and establishment conditions of Success.",
+            "Whether every successful nonempty branch establishes agreement through the reported endpoint.",
+            "How conflicting entries, partial storage failure, and duplicate requests affect success establishment.",
+            "The storage interface guarantee and available backend semantics if the receiver delegates a necessary guarantee to storage.",
+            "Request construction and transport correlation assumptions.",
+            "Peer replacement and continued ownership of the replication context when the response is consumed.",
+            "Legal reachability and downstream consequences of any local discrepancy."
+          ],
+          "priority": 1,
+          "trigger_rationale": "The accepted Fact records a successful response observation while explicitly leaving its receiver-side producer unresolved. Its known consumer reports a concrete endpoint, providing a bounded producer/consumer discriminator without presuming a defect or a durability guarantee."
+        },
+        "history": [],
+        "check_ids": [
+          "f2a33b04c10748e9a5062ba218357d2c"
+        ],
+        "status": "active",
+        "parent_candidate_id": null,
+        "fork_reason": "",
+        "stage": "analyze",
+        "read_plan_id": "42ba8902ec474af58913661b08da01cc",
+        "material_ids": [
+          "raft.go:1440:1580",
+          "replication.go:202:295",
+          "replication.go:570:583",
+          "replication.go:655:665",
+          "commitment.go:1:104"
+        ],
+        "spec_task_ids": [],
+        "stagnation": 0,
+        "stop_reason": "",
+        "resume_conditions": [],
+        "obligation_id": null
+      }
+    ],
+    "applied_operations": {
+      "inquiry-26707e1bf516433cae277cb391d149da": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-09-24_10-23-51-hashicorp_raft-real-run/graph-commits/inquiry-26707e1bf516433cae277cb391d149da.json"
+      },
+      "derive-8e19fb2cd2994ec8b4d6724f761f0f87": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-09-24_10-23-51-hashicorp_raft-real-run/graph-commits/derive-8e19fb2cd2994ec8b4d6724f761f0f87.json"
+      },
+      "derive-0542f1aaea104522b29838a81ea53bbe": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-09-24_10-23-51-hashicorp_raft-real-run/graph-commits/derive-0542f1aaea104522b29838a81ea53bbe.json"
+      },
+      "derive-d6eb4d1d68674050bdf5a14341a2383a": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-09-24_10-23-51-hashicorp_raft-real-run/graph-commits/derive-d6eb4d1d68674050bdf5a14341a2383a.json"
+      },
+      "derive-310600b0edf04baaa64423f0416eea47": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-09-24_10-23-51-hashicorp_raft-real-run/graph-commits/derive-310600b0edf04baaa64423f0416eea47.json"
+      },
+      "derive-8e328777bfee4422b794e66b61be1264": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-09-24_10-23-51-hashicorp_raft-real-run/graph-commits/derive-8e328777bfee4422b794e66b61be1264.json"
+      },
+      "inquiry-856e50a8e5ac4211b1be62473035b3f9": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-09-24_10-23-51-hashicorp_raft-real-run/graph-commits/inquiry-856e50a8e5ac4211b1be62473035b3f9.json"
+      },
+      "derive-f2a33b04c10748e9a5062ba218357d2c": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-09-24_10-23-51-hashicorp_raft-real-run/graph-commits/derive-f2a33b04c10748e9a5062ba218357d2c.json"
+      }
+    }
+  },
+  "after": {
+    "question_candidates": [
+      {
+        "id": "bdf8c4eaa87444a18b3fe7f7a8f386b3",
+        "question": {
+          "disposition": "ready_for_check",
+          "preferred_check": "direct_test",
+          "requests": [],
+          "question": "When F_append_endpoint_reported is consumed as voter support, do all callers of updateLastAppended correlate the reported endpoint with a successful response from the attributed peer in the owning replication context, or can an alternative response path supply a report that exceeds what its response establishes? The immediate check is whether pipelineDecode satisfies AppendFuture's error-validation precondition before interpreting its response.",
+          "importance": "Invalid response interpretation could supply unsupported voter progress to commitment aggregation. The immediate check establishes only whether the consumer respects the future interface; legal-history reachability and effects on published commitment or application remain separate.",
+          "source_ids": [
+            "replication.go:202:295",
+            "replication.go:655:665",
+            "replication.go:33:96",
+            "replication.go:446:508",
+            "replication.go:490:580",
+            "commitment.go:1:104",
+            "transport.go:1:141",
+            "future.go:14:23",
+            "future.go:297:302",
+            "net_transport.go:750:912"
+          ],
+          "participants": [
+            "Sequential replication execution",
+            "Pipeline response decoder",
+            "Append pipeline completion producer",
+            "AppendEntries responder",
+            "Leader-local commitment accumulator"
+          ],
+          "objects": [
+            "followerReplication",
+            "AppendEntries request and response",
+            "Append pipeline future",
+            "Voter endpoint report",
+            "commitment"
+          ],
+          "contexts": [
+            "Sequential replication",
+            "Pipelined replication",
+            "Peer identity and replication-context lifetime"
+          ],
+          "event_paths": [
+            "AppendEntries response validation -> updateLastAppended -> commitment.match",
+            "AppendPipeline.Consumer delivery -> Error status validation -> Response access -> term and success checks -> updateLastAppended"
+          ],
+          "activity_classes": [
+            "A1",
+            "A2"
+          ],
+          "behavior_ids": [
+            "B_sequential_replication",
+            "B_record_append_success",
+            "B_aggregate_match"
+          ],
+          "fact_ids": [
+            "F_append_endpoint_reported"
+          ],
+          "obligation_relation_kind": "consumption",
+          "counterevidence": [
+            "Sequential replication returns on transport error and higher response term, and reports progress only on Success.",
+            "pipelineDecode obtains request and response from the same future, rejects higher response terms, and returns on !resp.Success before reporting an endpoint.",
+            "pipelineSend supplies a fresh AppendEntriesResponse for each request; errors leaving its zero-valued Success unchanged do not produce endpoint reports.",
+            "The network pipeline publishes completion before delivering the future, supporting completion ordering but not an error-free result.",
+            "pipelineReplicate requests decoder shutdown and normally waits for finishCh; shutdownCh provides an alternative exit.",
+            "updateLastAppended reports endpoints only for nonempty requests.",
+            "commitment.match filters nonvoters and non-increasing reports; recalculation requires a majority endpoint above commitIndex and at least startIndex."
+          ],
+          "unknowns": [
+            "Whether failed or partially decoded responses can contain Success=true in an actual legal execution.",
+            "The concrete appendFuture accessors and deferError completion implementation remain unread.",
+            "Whether there are updateLastAppended callers outside the earlier file-scoped lookup.",
+            "Whether reported peer identity remains correlated with the RPC target during peer updates.",
+            "How replication-state term and commitment ownership constrain delayed responses.",
+            "The receiver-side meaning of AppendEntries.Success.",
+            "Whether a potentially weaker local report is reachable in a legal execution.",
+            "Whether any local mismatch can affect published commitment or application."
+          ],
+          "priority": 1,
+          "trigger_rationale": "The new network source resolves the completion-producer discriminator: decodeResponses does not filter errors before delivering futures, and decodeResponse decodes the response before returning a nonempty remote error. This does not prove Success=true on error, but it rules out treating delivery as a universal nil-error guarantee. The documented Response precondition therefore supports an immediate local check with an independent invocation-order oracle. A passing bounded check would support only its exercised interface cases; a failure would establish a local contract mismatch; a blocked check would leave this discriminator unresolved. None would independently establish the broader commitment consequence."
+        },
+        "history": [
+          {
+            "disposition": null,
+            "preferred_check": "source_review",
+            "requests": [
+              {
+                "file": "replication.go",
+                "start_line": 202,
+                "end_line": 295,
+                "reason": "Acquire the sequential response-validation path and its request context as the comparison point."
+              },
+              {
+                "file": "replication.go",
+                "start_line": 655,
+                "end_line": 665,
+                "reason": "Acquire the endpoint-report helper and verify which identity and commitment object receive the report."
+              },
+              {
+                "file": "replication.go",
+                "literal": "updateLastAppended(",
+                "reason": "Locate every caller to determine whether alternative response paths establish the prerequisites for endpoint reporting."
+              },
+              {
+                "file": "replication.go",
+                "symbol": "followerReplication",
+                "reason": "Acquire the replication-state declaration, including ownership and lifetime documentation for peer identity, term, and commitment."
+              },
+              {
+                "file": "commitment.go",
+                "start_line": 1,
+                "end_line": 104,
+                "reason": "Acquire the actual report consumer, its stated support meaning, and its filtering and advancement protections."
+              }
+            ],
+            "question": "When F_append_endpoint_reported is consumed as voter support, do all callers of updateLastAppended correlate the reported endpoint with a successful response from the attributed peer in the owning replication context, or can an alternative response path supply a report that exceeds what its response establishes?",
+            "importance": "Incorrect attribution of an append endpoint could let commitment aggregation count support that the identified voter has not established. This investigation first distinguishes the local response-to-report relation; legal reachability and effects on published commitment or application remain separate questions.",
+            "source_ids": [],
+            "participants": [
+              "Replication execution",
+              "AppendEntries responder",
+              "Leader-local commitment accumulator"
+            ],
+            "objects": [
+              "followerReplication",
+              "AppendEntries request and response",
+              "Voter endpoint report",
+              "commitment"
+            ],
+            "contexts": [
+              "Sequential replication",
+              "Alternative callers of updateLastAppended",
+              "Peer identity and replication-context lifetime"
+            ],
+            "event_paths": [
+              "AppendEntries response validation -> updateLastAppended -> commitment.match"
+            ],
+            "activity_classes": [
+              "A1",
+              "A2"
+            ],
+            "behavior_ids": [
+              "B_sequential_replication",
+              "B_record_append_success",
+              "B_aggregate_match"
+            ],
+            "fact_ids": [
+              "F_append_endpoint_reported"
+            ],
+            "obligation_relation_kind": "consumption",
+            "counterevidence": [
+              "The inventory records transport-error and higher-response-term checks before sequential success processing; exact source must be reattached before relying on these protections.",
+              "The inventory records endpoint reporting only for nonempty requests, voter filtering, monotonic reports, and a startIndex threshold; their applicability to alternative callers remains to be examined."
+            ],
+            "unknowns": [
+              "The complete caller set and response guards for updateLastAppended.",
+              "Whether reported peer identity remains correlated with the RPC target during peer updates.",
+              "How replication-state term and commitment ownership constrain delayed responses.",
+              "The receiver-side meaning of AppendEntries.Success.",
+              "Whether a potentially weaker local report is reachable in a legal execution.",
+              "Whether any local mismatch can affect published commitment or application."
+            ],
+            "priority": 1,
+            "trigger_rationale": "The accepted inventory identifies a helper that relies on caller validation, while only its sequential caller has been inspected. Comparing its actual callers against the same report consumer can distinguish equivalent protections from a concrete semantic gap without assuming that asynchronous differences constitute a defect."
+          },
+          {
+            "disposition": null,
+            "preferred_check": "source_review",
+            "requests": [
+              {
+                "file": "replication.go",
+                "start_line": 490,
+                "end_line": 580,
+                "reason": "Resolve the outstanding caller lookup at line 562 by acquiring surrounding response processing, guards, request correlation, and declaration context. If the enclosing declaration extends outside this range, retain that boundary as an explicit follow-up."
+              }
+            ],
+            "question": "When F_append_endpoint_reported is consumed as voter support, do all callers of updateLastAppended correlate the reported endpoint with a successful response from the attributed peer in the owning replication context, or can an alternative response path supply a report that exceeds what its response establishes?",
+            "importance": "Incorrect attribution of an append endpoint could let commitment aggregation count support that the identified voter has not established. The immediate discriminator is the local response-to-report relation; legal reachability and effects on published commitment or application remain separate questions.",
+            "source_ids": [
+              "replication.go:202:295",
+              "replication.go:655:665",
+              "replication.go:33:96",
+              "commitment.go:1:104"
+            ],
+            "participants": [
+              "Replication execution",
+              "AppendEntries responder",
+              "Leader-local commitment accumulator"
+            ],
+            "objects": [
+              "followerReplication",
+              "AppendEntries request and response",
+              "Voter endpoint report",
+              "commitment"
+            ],
+            "contexts": [
+              "Sequential replication",
+              "Alternative callers of updateLastAppended",
+              "Peer identity and replication-context lifetime"
+            ],
+            "event_paths": [
+              "AppendEntries response validation -> updateLastAppended -> commitment.match"
+            ],
+            "activity_classes": [
+              "A1",
+              "A2"
+            ],
+            "behavior_ids": [
+              "B_sequential_replication",
+              "B_record_append_success",
+              "B_aggregate_match"
+            ],
+            "fact_ids": [
+              "F_append_endpoint_reported"
+            ],
+            "obligation_relation_kind": "consumption",
+            "counterevidence": [
+              "Raft.replicateTo returns on transport error and handles resp.Term > req.Term before success processing; only resp.Success invokes updateLastAppended.",
+              "updateLastAppended reports an endpoint only for a nonempty request.",
+              "commitment.match ignores nonvoters and non-increasing reports; recalculate requires a majority endpoint greater than commitIndex and at least startIndex.",
+              "followerReplication documents currentTerm as the owning leader's term and stopCh as the notification for leadership loss or follower removal. These declarations do not establish how delayed responses are constrained."
+            ],
+            "unknowns": [
+              "Response guards and request correlation at the alternative updateLastAppended call located at replication.go line 562; the lookup supplied navigation only.",
+              "Whether there are callers outside the file-scoped lookup.",
+              "Whether reported peer identity remains correlated with the RPC target during peer updates.",
+              "How replication-state term and commitment ownership constrain delayed responses.",
+              "The receiver-side meaning of AppendEntries.Success.",
+              "Whether a potentially weaker local report is reachable in a legal execution.",
+              "Whether any local mismatch can affect published commitment or application."
+            ],
+            "priority": 1,
+            "trigger_rationale": "The acquired helper relies on caller validation, while commitment.match documents disk agreement as the meaning of its input and does not validate response context itself. The lookup identified an unread alternative call at line 562. Its guards are the next concrete discriminator; the existence of another caller alone is not evidence of a defect."
+          },
+          {
+            "disposition": null,
+            "preferred_check": "source_review",
+            "requests": [
+              {
+                "file": "transport.go",
+                "start_line": 1,
+                "end_line": 141,
+                "reason": "Acquire AppendPipeline.Consumer and AppendEntries contracts, including completion, error handling, response validity, and available transport interfaces."
+              },
+              {
+                "file": "future.go",
+                "symbol": "AppendFuture",
+                "reason": "Determine whether Request and Response are valid upon Consumer delivery or require a successful Error result first."
+              },
+              {
+                "file": "net_transport.go",
+                "literal": "Consumer",
+                "reason": "Locate the built-in pipeline consumer and its completion producer to inspect whether failed or partially decoded responses can be delivered."
+              },
+              {
+                "file": "replication.go",
+                "symbol": "Raft.pipelineReplicate",
+                "reason": "Acquire pipeline construction, peer selection, decoder ownership, and termination to establish the actual transport boundary and response-context lifetime."
+              }
+            ],
+            "question": "When F_append_endpoint_reported is consumed as voter support, do all callers of updateLastAppended correlate the reported endpoint with a successful response from the attributed peer in the owning replication context, or can an alternative response path supply a report that exceeds what its response establishes?",
+            "importance": "An incorrectly attributed or insufficiently established append endpoint could supply unsupported voter progress to commitment aggregation. The immediate investigation concerns response-to-report validity; legal reachability and effects on published commitment or application remain separate.",
+            "source_ids": [
+              "replication.go:202:295",
+              "replication.go:655:665",
+              "replication.go:33:96",
+              "commitment.go:1:104",
+              "replication.go:490:580"
+            ],
+            "participants": [
+              "Sequential replication execution",
+              "Pipeline response decoder",
+              "Append pipeline completion producer",
+              "AppendEntries responder",
+              "Leader-local commitment accumulator"
+            ],
+            "objects": [
+              "followerReplication",
+              "AppendEntries request and response",
+              "Append pipeline future",
+              "Voter endpoint report",
+              "commitment"
+            ],
+            "contexts": [
+              "Sequential replication",
+              "Pipelined replication",
+              "Peer identity and replication-context lifetime"
+            ],
+            "event_paths": [
+              "AppendEntries response validation -> updateLastAppended -> commitment.match",
+              "AppendPipeline.Consumer delivery -> Request and Response access -> term and success checks -> updateLastAppended"
+            ],
+            "activity_classes": [
+              "A1",
+              "A2"
+            ],
+            "behavior_ids": [
+              "B_sequential_replication",
+              "B_record_append_success",
+              "B_aggregate_match"
+            ],
+            "fact_ids": [
+              "F_append_endpoint_reported"
+            ],
+            "obligation_relation_kind": "consumption",
+            "counterevidence": [
+              "Sequential replication returns on transport error, checks for a higher response term, and invokes updateLastAppended only on Success.",
+              "The acquired pipelineDecode declaration also checks for a higher response term and returns on !resp.Success before invoking updateLastAppended.",
+              "pipelineDecode obtains both the request and response from the same delivered future; whether the interface guarantees their validity at delivery remains unread.",
+              "updateLastAppended reports an endpoint only for nonempty requests.",
+              "commitment.match filters nonvoters and non-increasing reports; recalculation requires the majority endpoint to exceed commitIndex and reach startIndex.",
+              "followerReplication documents leader-term ownership and stop notification on leadership loss or follower removal, but these declarations alone do not establish delayed-response isolation."
+            ],
+            "unknowns": [
+              "Whether Consumer delivery establishes successful completion and valid response contents, or whether the consumer must inspect a future error before interpreting Response.",
+              "Whether built-in pipeline implementations deliver failed or partially decoded responses, and what response fields mean in those cases.",
+              "Whether there are updateLastAppended callers outside the earlier file-scoped lookup.",
+              "Whether reported peer identity remains correlated with the RPC target during peer updates.",
+              "How replication-state term and commitment ownership constrain delayed responses.",
+              "The receiver-side meaning of AppendEntries.Success.",
+              "Whether a potentially weaker local report is reachable in a legal execution.",
+              "Whether any local mismatch can affect published commitment or application."
+            ],
+            "priority": 1,
+            "trigger_rationale": "The alternative caller is now resolved: pipelineDecode includes term and Success guards, so absence of those guards is not supported. Unlike the sequential path, it accesses a delivered future's response without an explicit completion-error check in the acquired declaration. This difference warrants inspection of the future and Consumer contracts and their producer; it does not yet establish a missing validation requirement."
+          },
+          {
+            "disposition": "concrete_suspicion",
+            "preferred_check": "source_review",
+            "requests": [
+              {
+                "file": "net_transport.go",
+                "start_line": 750,
+                "end_line": 912,
+                "reason": "Resolve the ambiguous Consumer lookup at lines 893–894 and inspect the surrounding pipeline completion producer, response decoding, error publication, and shutdown ordering. Determine whether failed futures can reach the replication decoder with Success populated."
+              },
+              {
+                "file": "future.go",
+                "symbol": "Future",
+                "reason": "Read the inherited Error contract. AppendFuture itself is already acquired in transport.go; the unsuccessful future.go lookup does not require repeating that lookup."
+              },
+              {
+                "file": "future.go",
+                "symbol": "appendFuture",
+                "reason": "Locate the concrete append future and its Request, Response, and completion representation to distinguish response availability from successful completion."
+              }
+            ],
+            "question": "When F_append_endpoint_reported is consumed as voter support, do all callers of updateLastAppended correlate the reported endpoint with a successful response from the attributed peer in the owning replication context, or can an alternative response path supply a report that exceeds what its response establishes?",
+            "importance": "An insufficiently established or incorrectly attributed endpoint could supply unsupported voter progress to commitment aggregation. The immediate discriminator is the validity of a pipeline response used to report progress. Legal-history reachability and effects on published commitment or application remain separate.",
+            "source_ids": [
+              "replication.go:202:295",
+              "replication.go:655:665",
+              "replication.go:33:96",
+              "replication.go:446:508",
+              "replication.go:490:580",
+              "commitment.go:1:104",
+              "transport.go:1:141"
+            ],
+            "participants": [
+              "Sequential replication execution",
+              "Pipeline response decoder",
+              "Append pipeline completion producer",
+              "AppendEntries responder",
+              "Leader-local commitment accumulator"
+            ],
+            "objects": [
+              "followerReplication",
+              "AppendEntries request and response",
+              "Append pipeline future",
+              "Voter endpoint report",
+              "commitment"
+            ],
+            "contexts": [
+              "Sequential replication",
+              "Pipelined replication",
+              "Peer identity and replication-context lifetime"
+            ],
+            "event_paths": [
+              "AppendEntries response validation -> updateLastAppended -> commitment.match",
+              "AppendPipeline.Consumer delivery -> Request and Response access -> term and success checks -> updateLastAppended"
+            ],
+            "activity_classes": [
+              "A1",
+              "A2"
+            ],
+            "behavior_ids": [
+              "B_sequential_replication",
+              "B_record_append_success",
+              "B_aggregate_match"
+            ],
+            "fact_ids": [
+              "F_append_endpoint_reported"
+            ],
+            "obligation_relation_kind": "consumption",
+            "counterevidence": [
+              "Sequential replication returns on transport error and higher response term, and reports progress only on Success.",
+              "pipelineDecode obtains request and response from the same future, rejects higher response terms, and returns on !resp.Success before reporting an endpoint.",
+              "pipelineSend supplies a fresh AppendEntriesResponse for each request; no response reuse is established by this caller.",
+              "pipelineReplicate requests decoder shutdown and normally waits for finishCh; shutdownCh provides an alternative exit. This does not by itself establish all delayed-response isolation.",
+              "updateLastAppended reports endpoints only for nonempty requests.",
+              "commitment.match filters nonvoters and non-increasing reports; recalculation requires a majority endpoint above commitIndex and at least startIndex.",
+              "Consumer describes delivered futures as ready, which may indicate completion, but does not explicitly guarantee error-free completion."
+            ],
+            "unknowns": [
+              "Whether built-in pipeline completion producers deliver failed or partially decoded responses, and whether Success can be populated in those responses.",
+              "Whether Consumer delivery supplies any implementation-specific guarantee that explains omission of Error despite the explicit Response interface precondition.",
+              "The inherited Future.Error contract and concrete appendFuture completion representation.",
+              "Whether there are updateLastAppended callers outside the earlier file-scoped lookup.",
+              "Whether reported peer identity remains correlated with the RPC target during peer updates.",
+              "How replication-state term and commitment ownership constrain delayed responses.",
+              "The receiver-side meaning of AppendEntries.Success.",
+              "Whether a potentially weaker local report is reachable in a legal execution.",
+              "Whether any local mismatch can affect published commitment or application."
+            ],
+            "priority": 1,
+            "trigger_rationale": "The acquired AppendFuture.Response contract explicitly requires Error to return before Response is called and makes the response valid only on success. The acquired pipelineDecode calls Response without calling Error. This supplies a concrete interface-level concern beyond cross-path asymmetry. The next read resolves whether actual completion producers prevent invalid responses from influencing endpoint reports; it does not assume that the omission establishes unsupported commitment."
+          }
+        ],
+        "check_ids": [
+          "8e19fb2cd2994ec8b4d6724f761f0f87",
+          "0542f1aaea104522b29838a81ea53bbe",
+          "d6eb4d1d68674050bdf5a14341a2383a",
+          "310600b0edf04baaa64423f0416eea47",
+          "8e328777bfee4422b794e66b61be1264"
+        ],
+        "status": "escalated",
+        "parent_candidate_id": null,
+        "fork_reason": "",
+        "stage": "analyze",
+        "read_plan_id": "263f9d54afa448f491e44ec1938e316e",
+        "material_ids": [
+          "replication.go:202:295",
+          "replication.go:655:665",
+          "replication.go:33:96",
+          "commitment.go:1:104",
+          "replication.go:490:580",
+          "transport.go:1:141",
+          "replication.go:446:508",
+          "net_transport.go:750:912",
+          "future.go:14:23",
+          "future.go:297:302"
+        ],
+        "spec_task_ids": [],
+        "stagnation": 0,
+        "stop_reason": "",
+        "resume_conditions": [],
+        "obligation_id": "O_pipeline_response_validity"
+      },
+      {
+        "id": "5f78930b6dd142febc6e1889616feec5",
+        "question": {
+          "disposition": null,
+          "preferred_check": "source_review",
+          "requests": [
+            {
+              "file": "state.go",
+              "start_line": 1,
+              "end_line": 174,
+              "reason": "Determine how getLastEntry, getLastLog, and setLastLog obtain and maintain the metadata used to accept a predecessor after suffix deletion followed by a failed append."
+            },
+            {
+              "file": "log.go",
+              "start_line": 1,
+              "end_line": 192,
+              "reason": "Recover the LogStore contract, including deletion, StoreLogs errors, and any guarantees relevant to metadata remaining valid after partial completion."
+            },
+            {
+              "file": "replication.go",
+              "symbol": "Raft.setPreviousLog",
+              "reason": "Determine which predecessor identities a subsequent legitimate sequential request can carry."
+            },
+            {
+              "file": "replication.go",
+              "symbol": "Raft.setNewLogs",
+              "reason": "Determine request entry ordering and endpoint construction before assessing prefix agreement."
+            }
+          ],
+          "question": "When sequential replication consumes F_sequential_success_response for a nonempty request, does receiver Success establish the prefix agreement attributed by updateLastAppended? In particular, can successful suffix deletion followed by StoreLogs failure leave last-entry metadata that a later request uses to validate a predecessor no longer present in the log?",
+          "importance": "A successful response without the requested prefix could be consumed as voter support through commitment.match. The immediate investigation concerns receiver prefix establishment and its endpoint interpretation. Legal-history reachability, published commitment, application effects, and consensus safety remain separate questions.",
+          "source_ids": [
+            "raft.go:1440:1580",
+            "replication.go:202:295",
+            "replication.go:570:583",
+            "replication.go:655:665",
+            "commitment.go:1:104"
+          ],
+          "participants": [
+            "Leader sequential replication execution",
+            "Follower AppendEntries receiver",
+            "Follower LogStore",
+            "Leader-local commitment accumulator"
+          ],
+          "objects": [
+            "AppendEntries request and response",
+            "Follower log prefix",
+            "Follower last-entry metadata",
+            "Follower replication endpoint report"
+          ],
+          "contexts": [
+            "Nonempty sequential AppendEntries request",
+            "Request term and predecessor identity",
+            "Successful conflicting-suffix deletion followed by StoreLogs failure",
+            "Subsequent AppendEntries processing"
+          ],
+          "event_paths": [
+            "setupAppendEntries -> replicateTo -> appendEntries -> updateLastAppended -> commitment.match",
+            "appendEntries conflict -> DeleteRange success -> StoreLogs error -> later appendEntries predecessor validation"
+          ],
+          "activity_classes": [
+            "A1",
+            "A2",
+            "A6"
+          ],
+          "behavior_ids": [
+            "B_sequential_replication",
+            "B_record_append_success",
+            "B_aggregate_match"
+          ],
+          "fact_ids": [
+            "F_sequential_success_response"
+          ],
+          "obligation_relation_kind": "consumption",
+          "counterevidence": [
+            "The receiver initializes Success=false and returns without setting it true on predecessor mismatch, GetLog failure, DeleteRange failure, StoreLogs failure, or configuration-processing failure.",
+            "For ordinary duplicate processing, the receiver compares entry terms; for a new suffix, it calls StoreLogs before setting Success=true.",
+            "Sequential replication checks transport errors and higher response terms before consuming Success.",
+            "updateLastAppended reports an endpoint only for nonempty requests. commitment.match filters unknown voters and non-increasing reports, and recalculation enforces startIndex.",
+            "The predecessor shortcut obtains its term from getLastEntry when the requested predecessor equals the cached endpoint; whether that metadata remains valid after mutation errors is unresolved."
+          ],
+          "unknowns": [
+            "Whether getLastEntry can return metadata for entries removed by successful DeleteRange after subsequent StoreLogs failure.",
+            "The LogStore contract and available backend semantics for successful deletion and failed or partially completed storage.",
+            "Whether every successful nonempty branch establishes agreement through the reported endpoint, including requests after earlier mutation failures.",
+            "Whether legitimate sequential request construction can reach a discrepant predecessor state; request ordering and continuity remain unread.",
+            "Transport request/response correlation guarantees.",
+            "Peer replacement and continued ownership of the replication context when the response is consumed.",
+            "Legal reachability and downstream consequences of any local discrepancy."
+          ],
+          "priority": 1,
+          "trigger_rationale": "The attached receiver source resolves immediate error replies: they do not establish Success. It also exposes a specific remaining discriminator: deletion precedes storage, the storage-error branch returns before setLastLog, and predecessor validation can bypass GetLog through getLastEntry. The code comment acknowledges potentially stale metadata, but neither that comment nor the ordering establishes a later false success."
+        },
+        "history": [
+          {
+            "disposition": null,
+            "preferred_check": "source_review",
+            "requests": [
+              {
+                "file": "raft.go",
+                "symbol": "Raft.appendEntries",
+                "reason": "Locate the complete receiver declaration and inspect predecessor validation, conflicting-entry handling, storage errors, and the conditions establishing Success."
+              },
+              {
+                "file": "replication.go",
+                "start_line": 202,
+                "end_line": 295,
+                "reason": "Attach the actual sequential response consumer, including term checks, rejection handling, and snapshot fallback."
+              },
+              {
+                "file": "replication.go",
+                "symbol": "Raft.setupAppendEntries",
+                "reason": "Identify the request context, predecessor identity, and entries whose endpoint a successful response can support."
+              },
+              {
+                "file": "replication.go",
+                "start_line": 655,
+                "end_line": 665,
+                "reason": "Attach the endpoint-reporting consumer to determine precisely which stronger assertion requires investigation."
+              },
+              {
+                "file": "commitment.go",
+                "start_line": 1,
+                "end_line": 104,
+                "reason": "Recover the attributed meaning expected of match reports and distinguish that expectation from aggregation guards."
+              }
+            ],
+            "question": "When the sequential replication path consumes F_sequential_success_response for a nonempty request, what receiver-side log agreement does Success establish, and is that agreement sufficient for the endpoint subsequently attributed to the follower by updateLastAppended? The immediate discriminator is whether receiver success branches validate or establish the requested prefix before replying, including conflict and storage-error branches.",
+            "importance": "A response interpreted as stronger replica support than the receiver established could affect quorum bookkeeping. This investigation first concerns the local response-to-endpoint relation; legal-history reachability, published commitment, application effects, and consensus safety remain separate consequences.",
+            "source_ids": [],
+            "participants": [
+              "Leader sequential replication execution",
+              "Follower AppendEntries receiver",
+              "Leader-local commitment accumulator"
+            ],
+            "objects": [
+              "AppendEntries request and response",
+              "Follower log prefix",
+              "Follower replication endpoint report"
+            ],
+            "contexts": [
+              "Nonempty sequential AppendEntries request",
+              "Request term and predecessor identity",
+              "Receiver conflict handling and storage completion"
+            ],
+            "event_paths": [
+              "setupAppendEntries -> replicateTo -> receiver appendEntries -> response validation -> updateLastAppended -> commitment.match"
+            ],
+            "activity_classes": [
+              "A1",
+              "A2",
+              "A6"
+            ],
+            "behavior_ids": [
+              "B_sequential_replication",
+              "B_record_append_success",
+              "B_aggregate_match"
+            ],
+            "fact_ids": [
+              "F_sequential_success_response"
+            ],
+            "obligation_relation_kind": "consumption",
+            "counterevidence": [
+              "The supplied inventory records transport-error and higher-response-term checks before sequential success interpretation; their exact source must be attached before relying on them.",
+              "The inventory records that empty requests do not report an endpoint and that commitment filters reports by voter identity and monotonicity. These protections constrain the question but do not independently establish receiver log agreement."
+            ],
+            "unknowns": [
+              "The exact receiver-side meaning and establishment conditions of Success.",
+              "Whether every successful nonempty branch establishes agreement through the reported endpoint.",
+              "How conflicting entries, partial storage failure, and duplicate requests affect success establishment.",
+              "The storage interface guarantee and available backend semantics if the receiver delegates a necessary guarantee to storage.",
+              "Request construction and transport correlation assumptions.",
+              "Peer replacement and continued ownership of the replication context when the response is consumed.",
+              "Legal reachability and downstream consequences of any local discrepancy."
+            ],
+            "priority": 1,
+            "trigger_rationale": "The accepted Fact records a successful response observation while explicitly leaving its receiver-side producer unresolved. Its known consumer reports a concrete endpoint, providing a bounded producer/consumer discriminator without presuming a defect or a durability guarantee."
+          }
+        ],
+        "check_ids": [
+          "f2a33b04c10748e9a5062ba218357d2c",
+          "3a09b68b921a493eb539acddeee68479"
+        ],
+        "status": "active",
+        "parent_candidate_id": null,
+        "fork_reason": "",
+        "stage": "read",
+        "read_plan_id": "e7185ddb7b63488eaa82f9769748fec8",
+        "material_ids": [
+          "raft.go:1440:1580",
+          "replication.go:202:295",
+          "replication.go:570:583",
+          "replication.go:655:665",
+          "commitment.go:1:104"
+        ],
+        "spec_task_ids": [],
+        "stagnation": 0,
+        "stop_reason": "",
+        "resume_conditions": [],
+        "obligation_id": null
+      }
+    ],
+    "applied_operations": {
+      "inquiry-26707e1bf516433cae277cb391d149da": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-09-24_10-23-51-hashicorp_raft-real-run/graph-commits/inquiry-26707e1bf516433cae277cb391d149da.json"
+      },
+      "derive-8e19fb2cd2994ec8b4d6724f761f0f87": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-09-24_10-23-51-hashicorp_raft-real-run/graph-commits/derive-8e19fb2cd2994ec8b4d6724f761f0f87.json"
+      },
+      "derive-0542f1aaea104522b29838a81ea53bbe": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-09-24_10-23-51-hashicorp_raft-real-run/graph-commits/derive-0542f1aaea104522b29838a81ea53bbe.json"
+      },
+      "derive-d6eb4d1d68674050bdf5a14341a2383a": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-09-24_10-23-51-hashicorp_raft-real-run/graph-commits/derive-d6eb4d1d68674050bdf5a14341a2383a.json"
+      },
+      "derive-310600b0edf04baaa64423f0416eea47": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-09-24_10-23-51-hashicorp_raft-real-run/graph-commits/derive-310600b0edf04baaa64423f0416eea47.json"
+      },
+      "derive-8e328777bfee4422b794e66b61be1264": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-09-24_10-23-51-hashicorp_raft-real-run/graph-commits/derive-8e328777bfee4422b794e66b61be1264.json"
+      },
+      "inquiry-856e50a8e5ac4211b1be62473035b3f9": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-09-24_10-23-51-hashicorp_raft-real-run/graph-commits/inquiry-856e50a8e5ac4211b1be62473035b3f9.json"
+      },
+      "derive-f2a33b04c10748e9a5062ba218357d2c": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-09-24_10-23-51-hashicorp_raft-real-run/graph-commits/derive-f2a33b04c10748e9a5062ba218357d2c.json"
+      },
+      "derive-3a09b68b921a493eb539acddeee68479": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-09-24_10-23-51-hashicorp_raft-real-run/graph-commits/derive-3a09b68b921a493eb539acddeee68479.json"
+      }
+    }
+  }
+}

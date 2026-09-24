@@ -18,6 +18,24 @@ class ReadingPlan(Record):
     gap: str = ""
 
 
+def request_identity(request):
+    """The source selector, independent of prose explaining the read."""
+    q=ReadRequest.model_validate(request)
+    return (q.file,q.start_line,q.end_line,q.symbol,q.literal)
+
+
+def request_label(request):
+    q=ReadRequest.model_validate(request)
+    scope=q.file or '<authorized snapshot>'
+    if q.symbol:return scope+' symbol='+q.symbol
+    if q.literal:return scope+' literal='+repr(q.literal)
+    return f'{scope}:{q.start_line}–{q.end_line}'
+
+
+def read_complete(receipt):
+    return receipt['status']=='complete' and all(item['status'] not in {'deferred','unresolved'} for item in receipt['items'])
+
+
 def material_kind(path, text):
     if path.endswith((".md", ".rst")):
         return "document_statement"
@@ -56,8 +74,8 @@ def locate(repo,snapshot,request):
             if not file.endswith(('.go','.py')):continue
             if not lines:continue
             source=Material(id='',file=file,start_line=1,end_line=len(lines),kind='code_observation',text='\n'.join(lines),content_digest=info['content_digest'])
-            matches.extend({'file':file,'start_line':d['start'],'end_line':d['end'],'kind':'declaration'} for d in declarations(source,include_calls=False)
-                if d['kind']=='declaration' and matches_symbol(d,request.symbol))
+            matches.extend({'file':file,'start_line':d.get('owner_start',d['start']),'end_line':d['end'],'kind':d['kind']} for d in declarations(source,include_calls=False)
+                if d['kind'] in {'declaration','interface_member'} and matches_symbol(d,request.symbol))
         else:
             matches.extend({'file':file,'start_line':i,'end_line':i,'kind':'literal_line'} for i,line in enumerate(lines,1) if request.literal in line)
     return {'kind':'symbol' if request.symbol else 'literal','query':request.symbol or request.literal,
@@ -76,7 +94,9 @@ def preflight(state,repo,requests,path='/requests'):
             if lookup and not match:
                 rows.append((req,None,{'file':req.file,'snapshot_id':state.snapshot.id,'lookup':lookup},None));continue
             info,lines=metadata(repo,state.snapshot,resolved.file)
-            if lookup:info['lookup']=lookup
+            if lookup:
+                info['lookup']=lookup
+                info['resolved_range']={'file':resolved.file,'start_line':resolved.start_line,'end_line':resolved.end_line}
             if resolved.start_line>resolved.end_line or resolved.end_line>len(lines):
                 raise IndexError('Requested source range does not exist; actual file has '+str(len(lines))+' lines')
             rows.append((req,resolved,info,lines))
@@ -206,7 +226,9 @@ def plan_read(state,repo,requests,budget,*,purpose='depth',partial=False,plan_id
     ordered=list(enumerate(rows));deferred=False
     for index,(original,req,info,lines) in ordered:
         if req is None:
-            outcomes.append((index,ReadItem(request=original,status='unresolved',reason='Lookup did not identify one complete source range',file_metadata=info)));continue
+            lookup=info['lookup']
+            reason='No matching source' if lookup['match_count']==0 else 'Ambiguous source lookup' if lookup['match_count']>1 else 'Matched declaration has no complete boundary'
+            outcomes.append((index,ReadItem(request=original,status='unresolved',reason=reason,file_metadata=info)));continue
         additions={(info['content_digest'],req.file,i):lines[i-1] for i in range(req.start_line,req.end_line+1) if (info['content_digest'],req.file,i) not in cached}
         cost=sum(len(t)+1 for t in additions.values());chunks=usage_of({**cached,**additions})['unique_chunks']-usage_of(cached)['unique_chunks']
         mid=f'{req.file}:{req.start_line}:{req.end_line}'
@@ -245,7 +267,7 @@ def apply_read(state,receipt,new_materials):
         'requests':[q.model_dump(mode='json') for q in receipt.original_requests],'added_material_ids':[id for item in receipt.items if item.status=='acquired' for id in item.material_ids],
         'reattached_material_ids':[id for item in receipt.items if item.status=='cached' for id in item.material_ids],'unavailable':[item.model_dump(mode='json') for item in receipt.items if item.status in {'deferred','unresolved'}]})
     for item in receipt.items:
-        if item.status=='deferred':state.gaps.append('Deferred read '+item.request.file+': '+item.reason)
+        if item.status in {'deferred','unresolved'}:state.gaps.append(item.status.title()+' read '+request_label(item.request)+': '+item.reason)
     return encoded
 
 
@@ -289,7 +311,7 @@ def uncovered_requests(state, requests):
     for request in requests:
         if request.symbol or request.literal:
             if not any(plan['snapshot_id']==state.snapshot.id and any(item['status'] in {'acquired','cached'} and
-                ReadRequest.model_validate(item['request']).model_dump(exclude={'reason'})==request.model_dump(exclude={'reason'}) for item in plan['items'])
+                request_identity(item['request'])==request_identity(request) for item in plan['items'])
                 for plan in state.read_plans.values()):result.append(request)
             continue
         cursor=request.start_line
@@ -307,11 +329,24 @@ def request_material_ids(state, requests):
     """Return current-version material identities contributing to requested ranges."""
     current=state.snapshot.files
     ids=[id for plan in state.read_plans.values() if plan['snapshot_id']==state.snapshot.id for item in plan['items']
-        if item['status'] in {'acquired','cached'} and any(ReadRequest.model_validate(item['request']).model_dump(exclude={'reason'})==r.model_dump(exclude={'reason'}) for r in requests if r.symbol or r.literal)
+        if item['status'] in {'acquired','cached'} and any(request_identity(item['request'])==request_identity(r) for r in requests if r.symbol or r.literal)
         for id in item['material_ids']]
     return list(dict.fromkeys(ids+[m.id for request in requests if request.start_line is not None for m in state.materials
         if m.file==request.file and m.content_digest==current.get(m.file)
         and m.start_line<=request.end_line and request.start_line<=m.end_line]))
+
+
+def requests_provided(state,requests,material_ids):
+    """Check actual current source coverage, not global cache availability."""
+    from .sources import covered,includes
+    provided=[m for m in state.materials if m.id in material_ids]
+    for request in requests:
+        if request.symbol or request.literal:
+            ids=request_material_ids(state,[request])
+            if not ids or not includes(state,ids,material_ids):return False
+        elif not covered({'file':request.file,'content_digest':state.snapshot.files.get(request.file),
+            'start_line':request.start_line,'end_line':request.end_line},provided):return False
+    return True
 
 
 def compact_index(state,repo,files=None):

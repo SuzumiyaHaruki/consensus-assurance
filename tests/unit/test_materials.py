@@ -57,6 +57,41 @@ def test_lookup_reads_shifted_definition_and_reports_ambiguity(prepared):
     with pytest.raises(DiagnosticError):preflight(state,repo,[find(file='../private.go',symbol='Handle')])
 
 
+def test_lookup_defer_and_unresolved_are_reportable(tmp_path,prepared):
+    from consensus_assurance.reporting.chinese import resource_lines
+    repo,state,_,_=prepared
+    (repo/'large.py').write_text('def selected():\n'+'    value = 1\n'*25+'    return value\n')
+    state.snapshot=capture(repo);state.materials=[]
+    wanted=ReadRequest(symbol='selected',reason='Read the complete selected definition')
+    receipt,items=plan_read(state,repo,[wanted],Budget(material_chars=100))
+    assert receipt.status=='deferred' and receipt.items[0].status=='deferred'
+    apply_read(state,receipt,items)
+    assert 'selected' in '\n'.join(resource_lines(state)) and '定位 large.py:1–27' in '\n'.join(resource_lines(state))
+    missing,_=plan_read(state,repo,[ReadRequest(symbol='absent',reason='Locate the absent definition')],Budget())
+    assert missing.items[0].status=='unresolved' and not missing.items[0].material_ids
+    from consensus_assurance.workflow.materials import read_complete
+    assert missing.status=='complete' and not read_complete(missing.model_dump(mode='json'))
+    apply_read(state,missing,[])
+    assert '查询未解决' in '\n'.join(resource_lines(state))
+
+
+def test_qualified_python_and_go_member_lookup(prepared):
+    repo,state,_,_=prepared
+    (repo/'members.py').write_text('class One:\n    def run(self):\n        return 1\nclass Two:\n    def run(self):\n        return 2\n')
+    (repo/'members.go').write_text('package sample\ntype Reader interface {\n    Read() error\n}\nconst (\n    First = 1\n    Second = 2\n)\n')
+    state.snapshot=capture(repo)
+    queries=[ReadRequest(symbol=name,reason='Locate full owner context') for name in ('One.run','Reader.Read','Second')]
+    receipt,items=plan_read(state,repo,queries,Budget())
+    assert all(i.status=='acquired' for i in receipt.items)
+    assert items[0].text.startswith('    def run') and 'return 1' in items[0].text
+    assert items[1].text.startswith('type Reader interface') and 'Read() error' in items[1].text
+    assert items[2].text.startswith('const (') and 'Second = 2' in items[2].text
+    (repo/'unfinished.go').write_text('package sample\nconst (\n    Open = 1\n')
+    state.snapshot=capture(repo)
+    unfinished,_=plan_read(state,repo,[ReadRequest(file='unfinished.go',symbol='Open',reason='Check declaration boundary')],Budget())
+    assert unfinished.items[0].status=='unresolved' and 'no complete boundary' in unfinished.items[0].reason
+
+
 def test_breadth_defers_large_plan_and_depth_gets_small_dependency(prepared):
     repo,state,_,_=prepared
     (repo/'large.txt').write_text('L'*700+'\n');(repo/'small.txt').write_text('s'*199+'\n');state.snapshot=capture(repo)

@@ -53,14 +53,17 @@ def execution_summary(check):
 
 def resource_lines(state):
     from consensus_assurance.core.config import Budget
-    from consensus_assurance.workflow.materials import material_usage,material_allowance
+    from consensus_assurance.workflow.materials import material_usage,material_allowance,request_label
     budget=Budget.model_validate({k:v for k,v in state.config.get("budget",{}).items() if k in Budget.model_fields})
     used=material_usage(state);breadth=material_allowance(state,budget,'breadth');depth=material_allowance(state,budget,'depth')
     lines=['','## 材料、上下文与实际产物','','字符不是 token 或费用。',
         f"唯一材料 {used['unique_chars']}/{budget.material_chars} 字符；区间并集 {used['unique_chunks']}/{budget.material_chunks}。广度当前可分配 {breadth['available_chars']}、为深度保留 {breadth['reserved_for_other_chars']}；深度可分配 {depth['available_chars']}、为广度保留 {depth['reserved_for_other_chars']}。"]
-    deferred=[(id,item) for id,p in state.read_plans.items() for item in p['items'] if item['status']=='deferred']
-    for id,item in deferred:
-        q=item['request'];lines.append(f"延期读取 `{id}`：{q['file']}:{q['start_line']}–{q['end_line']}；预计新增 {item['new_chars']} 字符；{item['reason']}")
+    unavailable=[(id,item) for id,p in state.read_plans.items() for item in p['items'] if item['status'] in {'deferred','unresolved'}]
+    for id,item in unavailable:
+        resolved=item.get('file_metadata',{}).get('resolved_range')
+        location=f"；定位 {resolved['file']}:{resolved['start_line']}–{resolved['end_line']}" if resolved else ''
+        label='延期读取' if item['status']=='deferred' else '查询未解决'
+        lines.append(f"{label} `{id}`：{request_label(item['request'])}{location}；预计新增 {item['new_chars']} 字符；{item['reason']}")
     cached=sum(len(h.get('reattached_material_ids',[])) for h in state.reading_history)
     lines.append(f"缓存复用/重附加 {cached} 个；每包详情保留在 state.json，不重复展开。")
     interface=sum(any(d['code'].startswith('review_') for d in session.get('resolved_diagnostics',[])+session.get('diagnostics',[])) for session in state.repair_sessions.values())
@@ -142,8 +145,7 @@ def inquiry_lines(state):
         kind='扩展职责/交接覆盖' if task.kind=='spec_refine' else '语义复核'
         stage=task.stage
         if stage=='read':
-            from consensus_assurance.workflow.materials import uncovered_requests
-            stage='read（仍待读取）' if uncovered_requests(state,task.requests) else 'analyze（源码已取得，分析待处理）'
+            stage='read（待取得或重附当前来源）'
         lines.append(f"| `{task.id[:8]}` | {kind} | {task.status}/{stage} | {text(task.reason)}；{text(task.stop_reason)} |")
     lines += ["", f"语义复核 {len(state.semantic_reviews)} 次；完整判断、来源和历史边界保留在 state.json。当前控制问题如下："]
     for issue in state.review_issues:
