@@ -36,7 +36,7 @@ def test_new_dependency_requires_executable_scope_continuation(dependency_prepar
 
 def test_F3_is_possible_before_first_model(dependency_prepared):
     _,state,_,_=dependency_prepared;u=state.units[0]
-    f=Feedback(kind='F3',rationale='Inspect an actual dependency before building',evidence_ids=[state.materials[0].id],target_ids=[u.id],relation_ids=['input_dependency'],new_basis='',graph=None,bundle=None)
+    f=Feedback(kind='F3',rationale='Inspect an actual dependency before building',evidence_ids=[state.materials[0].id],target_ids=[u.id],relation_ids=['input_dependency'],new_basis='')
     result=apply_feedback(state,u,None,f)
     assert result.previous_id==u.id
 

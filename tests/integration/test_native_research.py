@@ -2,7 +2,7 @@
 import json
 from pathlib import Path
 import pytest
-from native_support import first, partial_map, products, engine_for, check_step, review_step, stop, feedback, defer
+from native_support import first, partial_map, products, engine_for, check_step, review_step, stop, feedback
 
 
 def diagnostics(engine):
@@ -64,10 +64,10 @@ def test_unmapped_surface_explore_then_partial_map_combined_atomicity(tmp_path):
         assert not (e.root/'audit-spec'/'v2.json').exists()
         assert not state['evidence']
         sub,files=combined(state)
-        sub['candidate']['question']['audit_spec_version']=2
+        sub['candidate']['question']['audit_spec_version']=1
         return sub,files
     def broken(state):
-        sub,files=combined(state,True);sub['candidate']['question']['audit_spec_version']=2
+        sub,files=combined(state,True);sub['candidate']['question']['audit_spec_version']=1
         return sub,files
     e,repo=engine_for(tmp_path,[map_step(spec),explore,broken,corrected,review_step(),stop])
     state=e.start(repo)
@@ -92,7 +92,7 @@ def test_cross_activity_producer_connects_to_focus_without_quota(tmp_path):
     state=e.start(repo)
     assert len(state.units)==1 and not diagnostics(e)
     from consensus_assurance.workflow.research import view
-    assert view(state)['frontier']['uninvestigated_focus']==['A2']
+    assert view(state)['frontier']['uninvestigated_core']==['A2']
 
 
 def test_graph_cannot_create_unowned_unit_but_support_graph_is_allowed(tmp_path):
@@ -126,25 +126,17 @@ def test_continuation_accepts_same_text_new_source_but_not_rewording(tmp_path):
     assert len(diagnostics(e))==1 and 'wording' in str(diagnostics(e))
 
 
-def test_pause_and_result_feedback_required_before_switch_or_stop(tmp_path):
+def test_pending_feedback_does_not_block_an_independent_candidate(tmp_path):
     def pause(state):
         return dict(action='pause',candidate_id=state['question_candidates'][0]['id'],question=state['question_candidates'][0]['question'],
             rationale='Need unexamined consumer code',resume_conditions=['Read actual consumer']),{}
-    def independent(state):
-        sub,files=first(state);sub['feedback']=feedback(state)
-        return sub,files
-    def omit_feedback(state):
-        sub,files=first(state)
-        return sub,files
-    def bad_stop(state):
-        return dict(action='stop',scope='run',reason='insufficient_basis',ref_ids=['code'],rationale='Try leaving pending review'),{}
-    e,repo=engine_for(tmp_path,[question_step,pause,omit_feedback,independent,check_step(),bad_stop,review_step(),stop])
+    e,repo=engine_for(tmp_path,[question_step,pause,first,check_step(),review_step(),stop])
     state=e.start(repo)
     assert state.question_candidates[0].status=='paused'
-    assert state.units[0].status=='checked' and len(diagnostics(e))==2
+    assert state.units[0].status=='checked' and not diagnostics(e)
     from consensus_assurance.workflow.research import view
-    assert not view(state)['feedback_due']
-    assert view(state)['paused_candidates']
+    assert 'feedback_due' not in view(state)
+
 
 
 def test_unrelated_map_update_preserves_check_and_focus_stop_is_bounded(tmp_path):
@@ -185,13 +177,13 @@ def test_used_fact_semantics_require_atomic_f2_reconnection(tmp_path):
         if authorized:
             unit=saved.units[0]
             draft=UnitDraft(**{k:v for k,v in unit.model_dump().items() if k in UnitDraft.model_fields})
-            draft.audit_question.audit_spec_version=2
+            draft.audit_question.audit_spec_version=1
             patch=GraphPatch(units=[draft],expected_versions={unit.id:unit.version},rationale=sub['rationale'])
             writes=write_set(saved,patch)
             fb=dict(kind='F2',rationale=sub['rationale'],evidence_ids=['code','doc'],target_ids=[unit.id],relation_ids=[],
                 new_basis='The acquired contract applies only to admitted inputs; reconnect the scoped question explicitly',
                 old_judgment='Only delivery is described',new_judgment='The local contract-bound return is described',
-                graph=None,bundle=None,patch=patch.model_dump(mode='json'),grounding=products()[0]['obligation']['grounding'],
+                patch=patch.model_dump(mode='json'),grounding=products()[0]['obligation']['grounding'],
                 changes=[dict(target_id=id,field=k,old_value_json=json.dumps(a),new_value_json=json.dumps(b)) for (id,k),(a,b) in writes.items()])
             sub.update(action='semantic_revision',unit_id=unit.id,feedback_path='feedback.json')
             files['feedback.json']=json.dumps(fb)
@@ -244,7 +236,7 @@ def test_scope_reconnects_added_fact_dependency_and_keeps_old_scope(tmp_path):
             description='Actual dependent consumer',pending=['No distributed consequence check'])
         draft=UnitDraft(**{k:v for k,v in old.model_dump().items() if k in UnitDraft.model_fields})
         draft.binding_ids.append(binding.id)
-        draft.audit_question.audit_spec_version=2
+        draft.audit_question.audit_spec_version=1
         draft.audit_question.behavior_ids.append('consume');draft.audit_question.source_ids.append('consumer')
         patch=GraphPatch(bindings=[binding],units=[draft],expected_versions={old.id:old.version},rationale='Include actual consumer without changing the principal Fact or normative claim')
         update=from_patch(saved,old,patch)
@@ -290,9 +282,8 @@ def test_review_can_supply_feedback_without_an_extra_turn(tmp_path):
         sub['feedback']['ref_ids'].append(state['direct_checks'][-1]['id'])
         return sub,{}
     def finish(state):
-        from consensus_assurance.workflow.research import feedback_due
         from consensus_assurance.core.types import Analysis
-        assert not feedback_due(Analysis.model_validate(state))
+        assert "feedback_due" not in state
         sub,_=stop(state);sub.pop('feedback')
         return sub,{}
     e,repo=engine_for(tmp_path,[first,check_step(),review,finish])
@@ -323,7 +314,7 @@ def test_shared_fact_can_reconnect_paused_and_active_candidates_atomically(tmp_p
     def reconnect(state):
         spec=json.loads(Path(state['audit_spec_path']).read_text())
         spec['facts'][0]['validity_context']='The return value remains associated with this one completed call'
-        questions={c['id']:{**c['question'],'audit_spec_version':2} for c in state['question_candidates']}
+        questions={c['id']:{**c['question'],'audit_spec_version':1} for c in state['question_candidates']}
         return dict(action='research',map_path='map.json',reconnect_questions=questions,
             map_changes={'result':dict(impact='meaning',source_ids=['code'],rationale='Clarify the bounded lifetime before deriving either obligation')},
             rationale='Reconnect both sourced hypotheses to the revised Fact without changing their status'),{'map.json':json.dumps(spec)}

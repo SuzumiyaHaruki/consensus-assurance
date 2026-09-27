@@ -102,7 +102,7 @@ class TLCVerifier:
         check = runner.run(command, directory, "model_check", model.snapshot_id, timeout)
         check.tool_version = self.version
         check.model_id = model.id
-        check.parameters = model.scope.parameters
+        check.parameters.update(model.scope.parameters)
         check.artifacts = [model.path, model.config_path]
         check.input_versions = model.artifact_digests
         from .input_identity import execution_fingerprint

@@ -78,6 +78,8 @@ def run_experiment(runner, command, workspace, snapshot_id, timeout, mode, actio
         return CheckRun(action=action, cwd=str(workspace), snapshot_id=snapshot_id,
             status=ExecutionStatus.TOOL_MISSING, reason=str(exc),artifacts=[str(input_manifest)] if input_manifest else [])
     check = runner.run(argv, workspace, action, snapshot_id, timeout, env=clean_environment(workspace, adapter))
+    if adapter:check.parameters['execution_backend'] = {'name':adapter.name,'version':adapter.version,
+        'support_files':list(getattr(adapter,'support_files',lambda:{})())}
     if check.status == ExecutionStatus.COMPLETED:
         text = output(check)
         if "bwrap:" in text:

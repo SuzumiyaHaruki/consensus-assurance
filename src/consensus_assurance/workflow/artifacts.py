@@ -11,8 +11,8 @@ from consensus_assurance.adapters.verifiers.tla_syntax import tla_code, validate
 
 def materialize_bundle(bundle):
     if bundle.properties == "GENERATE_FROM_OBSERVABLE_PROPERTIES":
-        if isinstance(bundle, ModelDraft):
-            raise ValueError("ModelDraft requires native MODULE Properties; automatic generation requires a complete Bundle observation map")
+        if not getattr(bundle,'observation',None):
+            raise ValueError("Shared property generation requires an explicit observation map")
         from consensus_assurance.adapters.verifiers.observable import properties_source
         if not bundle.observable_properties:
             raise ValueError("Shared property generation requires nonempty observable_properties")
@@ -28,10 +28,12 @@ def validate_bundle(state, unit, bundle, implementation):
     specs = bundle.checker_specs()
     checked_ids = {c.claim_id for c in specs}
     invariants = [c.invariant for c in specs]
-    if not set(checked_ids) <= set(unit.obligation_ids):
+    if unit.obligation_ids and (not set(checked_ids) <= set(unit.obligation_ids)):
         raise ValueError("Checker claims must belong to the selected observable audit unit")
-    if not set(unit.obligation_ids) & set(checked_ids):
+    if unit.obligation_ids and not set(unit.obligation_ids) & set(checked_ids):
         raise ValueError("Model must check a selected obligation")
+    if not unit.obligation_ids and checked_ids != {None}:
+        raise ValueError('History exploration has no normative checker claim; omit checked_claim_ids')
     if isinstance(bundle, Bundle) and (implementation is None or bundle.harness.kind != implementation.harness_kind):
         raise ValueError("Harness kind is incompatible with the configured execution backend")
     validate_tla(bundle.behavior, "Behavior"); validate_tla(bundle.properties, "Properties")
@@ -58,7 +60,9 @@ def validate_bundle(state, unit, bundle, implementation):
         elif not set(constraint.binding_ids)<=set(selected):
             error="Constraint binding_ids must select existing unit bindings"
         elif constraint.source_kind == "code_observation":
-            if not constraint.binding_ids:
+            if not constraint.source_ids:
+                error="Code observation requires captured source citations"
+            elif unit.obligation_ids and not constraint.binding_ids:
                 error="Code observation requires selected binding_ids, separate from material source_ids"
             elif not all(covered(selected[id],[m for m in state.materials if m.id in constraint.source_ids]) for id in constraint.binding_ids):
                 error="Constraint material sources must cover each selected binding material"
@@ -80,7 +84,7 @@ def validate_bundle(state, unit, bundle, implementation):
         for name in names:
             if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*",name) or not re.search(r"\b"+name+r"\s*==",tla_code(bundle.behavior)):
                 raise ValueError("Reachability requires an actual named Behavior operator")
-        if not requirement.claim_ids or not reachability_refs(requirement)<=selected_refs:raise ValueError("Reachability must link claims and selected behavior/fact references")
+        if unit.obligation_ids and not requirement.claim_ids or not reachability_refs(requirement)<=selected_refs:raise ValueError("Reachability must link selected research references and any accepted claims")
         if not set(requirement.claim_ids)<=checked_ids:raise ValueError("Reachability requirement references an unchecked claim")
     def context_error(message):
         from consensus_assurance.core.diagnostics import Diagnostic,DiagnosticError
@@ -153,7 +157,8 @@ def save_bundle(root, state, unit, bundle, implementation, previous=None, reason
         initial_state=bundle.initial_state, variables=bundle.variables, actions=bundle.actions,
         properties=invariants, constraints=bundle.constraints, binding_ids=unit.binding_ids,
         extension_schema={"type": "object", "description": "Tool-specific TLA metadata; constants are saved verbatim"}, extension_version="2",
-        unit_id=unit.id, checker_path=str(checker), mapping_path=str(mapping) if complete else "", harness_path=str(harness) if complete else "", bundle_path=str(proposal),
+        unit_id=unit.id if unit.obligation_ids else '', research_ref=None if unit.obligation_ids else unit.id,
+        checker_path=str(checker), mapping_path=str(mapping) if complete else "", harness_path=str(harness) if complete else "", bundle_path=str(proposal),
         artifact_digests=artifacts, checkers=specs, graph_versions={x.id:x.version for x in [*state.claims,*state.bindings,*state.relations,*state.units] if x.id in semantic_references}, previous_id=previous.id if previous else None, revision_reason=reason)
     from .inputs import search_inputs
     from consensus_assurance.adapters.verifiers.input_identity import fingerprint

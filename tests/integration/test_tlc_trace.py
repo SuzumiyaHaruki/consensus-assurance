@@ -86,8 +86,9 @@ def test_F1_repaired_behavior_recalibrates_same_property(tlc, prepared):
     calibration, checks = verifier.calibrate(runner, before, incorrect, experiment, 20)
     state.checks.extend(checks); state.calibrations.append(calibration)
     assert calibration.status == "incompatible"
-    fix = Feedback(kind="F1",rationale="Observed increment is one, not two",evidence_ids=[calibration.id],target_ids=[before.id],relation_ids=[],new_basis="",graph=None,bundle=correct)
-    revised = apply_feedback(state,state.units[0],incorrect,fix)
+    from consensus_assurance.workflow.modeling import validate_technical_repair
+    validate_technical_repair(incorrect, correct)
+    revised = correct
     after = save_bundle(runner.root,state,state.units[0],revised,PythonBackend(),before,"F1 correction")
     recalibration, _ = verifier.calibrate(runner,after,revised,experiment,20)
     assert recalibration.status == "compatible"
@@ -109,8 +110,7 @@ def test_F2_normative_revision_executes_new_checker(tlc, prepared):
     assert old_check.outcome == 'counterexample'
     graph = GraphDraft.model_validate(responses[1])
     graph.claims[1].description = 'The documented boundary is the supplied capacity, including capacity itself'
-    correction = Feedback(kind='F2',rationale='The old checker excluded the documented capacity value',evidence_ids=[next(m.id for m in state.materials if m.file=='README.md')],target_ids=['step_obligation'],relation_ids=[],new_basis='The fixture documents reaching capacity before reset; the old strict boundary was unsupported',graph=graph,bundle=None)
-    correction.graph = None
+    correction = Feedback(kind='F2',rationale='The old checker excluded the documented capacity value',evidence_ids=[next(m.id for m in state.materials if m.file=='README.md')],target_ids=['step_obligation'],relation_ids=[],new_basis='The fixture documents reaching capacity before reset; the old strict boundary was unsupported')
     correction.patch = GraphPatch(claims=[graph.claims[1]],expected_versions={graph.claims[1].id:1},rationale=correction.new_basis)
     correction.old_judgment = state.claims[1].description
     correction.new_judgment = graph.claims[1].description

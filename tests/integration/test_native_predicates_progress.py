@@ -16,10 +16,11 @@ def model_review(state):
 
 @pytest.mark.parametrize('success,qualified',[(False,False),(False,True),(True,False),(True,True)])
 def test_actual_tlc_shared_implication_truth_table_matches_monitor(tmp_path,tlc,success,qualified):
-    from consensus_assurance.core.proposals import Bundle
+    from consensus_assurance.core.proposals import ModelDraft,EventRequirement
     from consensus_assurance.adapters.verifiers.observable import correspondence
     from consensus_assurance.workflow.observations import monitor_events
     from native_support import products
+    observations=[]
     def bundle(state):
         sub,files=model_product(state,draft=False)
         raw=json.loads(files['model.json'])
@@ -28,7 +29,6 @@ def test_actual_tlc_shared_implication_truth_table_matches_monitor(tmp_path,tlc,
             assertion=dict(field='state.qualified',value=True),identity_fields=['operation'],description='Success requires qualified support; failure remains permitted')]
         basis=products()[1]['harness']['legality']
         raw['monitors']=[dict(id='implication',checker_id='Bounded',event='returned',binding_ids=['binding'],grounding=basis)]
-        raw['harness'].update(legality=basis,prerequisites=[dict(alias='start',event='admitted')])
         raw['observation']['fields']=[dict(model_field='event',raw_field='event',source='event'),
             dict(model_field='success',raw_field='success'),dict(model_field='qualified',raw_field='qualified')]
         raw['observation']['required_events']=['returned']
@@ -37,31 +37,42 @@ def test_actual_tlc_shared_implication_truth_table_matches_monitor(tmp_path,tlc,
         files['Properties.tla']='GENERATE_FROM_OBSERVABLE_PROPERTIES'
         events=[{'event':'admitted','operation':'one','state':{}},
             {'event':'returned','operation':'one','state':{'success':success,'qualified':qualified}}]
-        files['check.py']='\n'.join('print('+repr('CA_EVENT '+json.dumps(event))+')' for event in events)+'\n'
+        observations[:] = events
         files['model.json']=json.dumps(raw)
         return sub,files
-    e,repo=engine_for(tmp_path,[first,bundle,model_review,stop]);e.verifier=tlc[0]
+    def direct(state):
+        from native_support import check_step
+        sub,files=check_step()(state)
+        plan=json.loads(files['plan.json'])
+        _,model_files=bundle(state)
+        raw=json.loads(model_files['model.json'])
+        plan.update(monitors=raw['monitors'],observable_properties=raw['observable_properties'])
+        plan['harness']['prerequisites']=[dict(alias='start',event='admitted')]
+        files['plan.json']=json.dumps(plan)
+        files['check.py']='\n'.join('print('+repr('CA_EVENT '+json.dumps(event))+')' for event in observations)+'\n'
+        return sub,files
+    e,repo=engine_for(tmp_path,[first,bundle,direct,model_review,stop]);e.verifier=tlc[0]
     e.config.budget.model_checks=4;e.config.budget.calibration_checks=4
     state=e.start(repo)
     assert len(state.models)==1,state.native_current
     artifact=state.models[0]
-    saved=Bundle.model_validate_json(Path(artifact.bundle_path).read_text())
+    saved=ModelDraft.model_validate_json(Path(artifact.bundle_path).read_text())
     assert correspondence(saved,saved.monitors[0]) is None
     check=next(c for c in state.checks if c.action=='model_check')
     assert check.status.value=='completed'
     violated=success and not qualified
     assert check.outcome==('counterexample' if violated else 'holds')
     from consensus_assurance.adapters.runners.experiment import extract_events
-    experiment=next(c for c in state.checks if c.action=='experiment')
+    experiment=next(c for c in state.checks if c.action=='direct_check')
     events=extract_events(experiment)
-    monitored=monitor_events(events,saved.monitors[0],saved.observable_properties[0],saved.harness.prerequisites)
+    monitored=monitor_events(events,saved.monitors[0],saved.observable_properties[0],[EventRequirement(alias='start',event='admitted')])
     assert monitored['outcome']==('violated' if violated else 'holds')
-    assert monitor_events(events[:1],saved.monitors[0],saved.observable_properties[0],saved.harness.prerequisites)['outcome']=='unknown'
+    assert monitor_events(events[:1],saved.monitors[0],saved.observable_properties[0],[EventRequirement(alias='start',event='admitted')])['outcome']=='unknown'
     incomplete=json.loads(json.dumps(events))
     incomplete[-1]['state'].pop('qualified')
-    assert monitor_events(incomplete,saved.monitors[0],saved.observable_properties[0],saved.harness.prerequisites)['outcome']=='unknown'
+    assert monitor_events(incomplete,saved.monitors[0],saved.observable_properties[0],[EventRequirement(alias='start',event='admitted')])['outcome']=='unknown'
     for event in events:event.pop('operation',None)
-    assert monitor_events(events,saved.monitors[0],saved.observable_properties[0],saved.harness.prerequisites)['outcome']=='unknown'
+    assert monitor_events(events,saved.monitors[0],saved.observable_properties[0],[EventRequirement(alias='start',event='admitted')])['outcome']=='unknown'
 
 
 def test_independent_model_timeout_cannot_be_overwritten_but_revision_can_replace_it(tmp_path,tlc):

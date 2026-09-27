@@ -91,13 +91,6 @@ def feedback(state, **overrides):
         rationale='The source map already expresses the bounded call; no structural generalization from a test',**overrides)
 
 
-def defer(state):
-    from consensus_assurance.workflow.research import pending_work
-    from consensus_assurance.core.types import Analysis
-    return [dict(target_id=w['id'],rationale='End this bounded scripted transport fixture with local work still incomplete',
-        resume_conditions=['Explicitly schedule the saved artifact repair or review']) for w in pending_work(Analysis.model_validate(state))]
-
-
 def check_step(broken=False, revise=False):
     def step(state):
         _, plan, harness = products()
@@ -125,7 +118,7 @@ def review_step(status='no_issue_found',aspect='checker_correspondence'):
 def stop(state):
     return dict(action='stop',scope='run',reason='insufficient_basis',ref_ids=['code','doc'],
         rationale='End the bounded fixture with remaining work visible; no autonomous claim',
-        feedback=feedback(state),deferred_work=defer(state)),{}
+        feedback=feedback(state)),{}
 
 
 def engine_for(tmp_path, steps):

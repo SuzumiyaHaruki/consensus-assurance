@@ -4,15 +4,13 @@ import shutil
 import time
 from pathlib import Path
 from consensus_assurance.core.config import Config
-from consensus_assurance.core.types import (Analysis, Assessment, Calibration, CheckRun, Evidence,
+from consensus_assurance.core.types import (Analysis, Assessment, CheckRun, Evidence,
     ExecutionStatus, Finding, Origin, Relation, uid, PendingAction, Record)
 from consensus_assurance.ports.interfaces import AgentBackend, ExecutionBackend, VerifierBackend
 from consensus_assurance.adapters.runners.process import ProcessRunner, output
-from consensus_assurance.adapters.runners.experiment import run_experiment, install_harness
 from consensus_assurance.adapters.storage.files import Store, write_json
 from consensus_assurance.adapters.storage.snapshot import capture
 from .budget import BudgetTracker
-from .errors import Blocked
 from .prompts import manifest
 
 FRAMEWORK_REVISION = manifest()['version']
@@ -39,20 +37,6 @@ class Engine:
         if stale:
             from .direct_checks import refresh_assessments
             refresh_assessments(self.state,stale,stale_only=True)
-        from consensus_assurance.core.types import now
-        observed={
-            'initial_graph':bool(self.state.units),
-            'scope_adopted':any(x['status']=='accepted' for x in self.state.scope_updates.values()),
-            'scope_ready':any(u.semantic_readiness.get('status')=='reviewed' for u in self.state.units),
-            'model_registered':bool(self.state.models),
-            'model_draft_saved':any(m.stage=='model_only' for m in self.state.models),
-            'harness_ready':any(m.stage=='complete' for m in self.state.models),
-            'model_tool_execution':any(c.action=='model_check' and c.started_at for c in self.state.checks),
-            'completed_search':any(c.action=='model_check' and c.status.value=='completed' and c.outcome in {'holds','counterexample'} for c in self.state.checks),
-            'calibration_recorded':bool(self.state.calibrations),
-            'implementation_evidence':any(e.level=='implementation_test' and e.origin.value=='executed' for e in self.state.evidence)}
-        for key,seen in observed.items():
-            if seen:self.state.milestones.setdefault(key,now())
         self.store.save(self.state, event)
 
     def start(self, repo, plan_only=False):
@@ -142,18 +126,16 @@ class Engine:
         self.checkpoint("execution_recorded")
 
     def probe_tools(self):
-        for name, backend in [("agent", self.agent), ("verifier", self.verifier)]:
-            if backend is None:
-                continue
-            self.budget.timeout()
-            result = backend.probe(self.runner)
-            self.state.tools[name] = result["version"]
-            for check in result["checks"]:
-                self.record(check)
-                if check.action == "java_probe":
-                    self.state.tools["java"] = output(check).strip()
-            if not result["available"]:
-                self.state.gaps.append(result["reason"])
+        self.budget.timeout()
+        result = self.agent.probe(self.runner)
+        self.state.tools['agent'] = result['version']
+        for check in result['checks']:self.record(check)
+        if not result['available']:self.state.gaps.append(result['reason'])
+        if self.verifier and 'verifier' in self.state.tools:
+            result = self.verifier.probe(self.runner)
+            self.state.tools['verifier'] = result['version']
+            for check in result['checks']:self.record(check)
+            if not result['available']:self.state.gaps.append(result['reason'])
         if self.implementation is None:return
         check = self.runner.run(self.implementation.version_command(), self.root, "implementation_tool_probe", self.state.snapshot.id, self.budget.timeout())
         self.record(check)
@@ -212,32 +194,6 @@ class Engine:
         self.state.next_action = stage
         self.checkpoint("next_action_" + stage)
 
-    def experiment(self, model, bundle, replay=False):
-        if not self.config.allow_experiments or self.implementation is None:
-            raise Blocked("Target execution disabled or no execution backend configured; probes and replay unavailable")
-        def execute():
-            workspace=self.workspace()
-            paths=install_harness(workspace,self.implementation.harness_filename,bundle.harness,self.state.snapshot.files)
-            check=run_experiment(self.runner,self.implementation.experiment_command(),workspace,self.state.snapshot.id,
-                self.budget.timeout(),self.config.execution_isolation,"replay" if replay else "experiment",adapter=self.implementation)
-            check.model_id=model.id; check.input_versions=model.artifact_digests
-            check.tool_version=self.state.tools.get("implementation","unknown")
-            check.origin=Origin.MOCK if self.state.mode=="mock" else Origin.EXECUTED
-            check.artifacts.extend([*paths,model.mapping_path])
-            return check
-        check=CheckRun.model_validate(self.action("replay" if replay else "experiment","experiments",execute,{"model_id":model.id,"bundle_path":model.bundle_path}))
-        self.record(check)
-        return check
-
-    def calibrate(self, model, bundle, experiment):
-        result=self.action("calibrate","calibration_checks",lambda:self.verifier.calibrate(self.runner,model,bundle,experiment,self.budget.timeout()),
-            {"experiment_check_id":experiment.id,"model_id":model.id})
-        record=Calibration.model_validate(result[0])
-        for raw in result[1]: self.record(CheckRun.model_validate(raw))
-        if not any(c.id==record.id for c in self.state.calibrations): self.state.calibrations.append(record)
-        self.checkpoint("trace_calibration_recorded")
-        return record
-
     def search(self, unit, model, bundle, calibration):
         from .inputs import reusable_search
         source=reusable_search(self.state,model)
@@ -254,6 +210,7 @@ class Engine:
         check.origin=Origin.MOCK if self.state.mode=="mock" else Origin.EXECUTED
         self.record(check)
         for result in check.checker_results:
+            if result.claim_id is None:continue
             if result.outcome=="unknown" or check.status!=ExecutionStatus.COMPLETED or check.search_fingerprint!=model.search_fingerprint: continue
             if any(e.check_id==check.id and e.checker_id==result.invariant for e in self.state.evidence): continue
             claim=next(c for c in self.state.claims if c.id==result.claim_id)

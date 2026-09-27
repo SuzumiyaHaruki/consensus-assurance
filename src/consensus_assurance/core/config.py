@@ -41,13 +41,13 @@ class TargetConfig(Record):
 
 class Config(Record):
     protocol: str = "none"
-    execution_backend: Literal["none", "go_module", "python"] = "none"
+    execution_backend: str = "none"
     target: TargetConfig = TargetConfig()
     repo_path: str | None = None
     agent_backend: str = "codex"
     agent_reasoning_effort: str | None = None
     agent_model: str | None = None
-    verifier_backend: str = "tlc"
+    verifier_backend: Literal["none", "tlc"] = "none"
     output_language: Literal["zh-CN"] = "zh-CN"
     runs_dir: str = "runs"
     tlc_jar: str | None = None

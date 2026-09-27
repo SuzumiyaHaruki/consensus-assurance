@@ -166,6 +166,8 @@ class ModelCore(Record):
             return self.checkers
         if len(self.checked_claim_ids) == 1 and self.invariants:
             return [CheckerSpec(invariant=i, claim_id=self.checked_claim_ids[0], scope=self.scope) for i in self.invariants]
+        if not self.checked_claim_ids and self.invariants:
+            return [CheckerSpec(invariant=i, claim_id=None, scope=self.scope) for i in self.invariants]
         raise ValueError("Explicit invariant-to-claim mappings are required; list positions are not a mapping")
 
 
@@ -181,7 +183,8 @@ class ComponentWork(Record):
 
 
 class ModelDraft(ModelCore):
-    pending_work: list[ComponentWork] = Field(min_length=1, description="Explicit missing components; core behavior gaps prohibit execution")
+    observation: ObservationMap | None = None
+    pending_work: list[ComponentWork] = Field(default_factory=list, description="Remaining model gaps; behavior/properties gaps prohibit execution. No harness is required for model exploration")
 
 
 class GraphPatch(Record):
@@ -192,14 +195,6 @@ class GraphPatch(Record):
     expected_versions: dict[str, int] = {}
     rationale: str
     gaps: list[str] = []
-
-
-class ReplayPlan(Record):
-    harness: Harness
-    monitors: list[EventMonitor] | None = None
-    observation: ObservationMap | None = None
-    checker_id: str
-    rationale: str
 
 
 class EncodingRevision(Record):
@@ -228,14 +223,12 @@ class ConditionDisposition(Record):
 
 class Feedback(Record):
     condition_dispositions: list[ConditionDisposition] = []
-    kind: Literal["F1", "F2", "F3", "F4", "unresolved"]
+    kind: Literal["F2", "F3", "unresolved"]
     rationale: str
     evidence_ids: list[str]
     target_ids: list[str]
     relation_ids: list[str]
     new_basis: str = Field(description="For F2, why the old semantic judgment is invalid and what new material establishes")
-    graph: GraphDraft | None
-    bundle: Bundle | None
     patch: GraphPatch | None = None
     changes: list[JudgmentChange] = []
     old_judgment: str = ""

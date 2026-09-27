@@ -1,0 +1,163 @@
+{
+  "description": "Conditional no-contact lease consumption after actual timeout: pipeline path and ordinary comparison, each with its own constructed local prefix.",
+  "claim_id": "obligation-expired-contact-lease",
+  "binding_ids": [
+    "binding-lease-consumer"
+  ],
+  "harness": {
+    "files": {
+      "assurance_support_test.go": "package raft\n\nimport (\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"sync\"\n\t\"sync/atomic\"\n\t\"testing\"\n\t\"time\"\n)\n\n// AssuranceMessage identifies one actual RPC and its delivery boundary.\n// Payload records actual input/output; callers supply their own discriminator.\ntype AssuranceMessage struct {\n\tID       uint64 `json:\"message_id\"`\n\tSender   string `json:\"sender\"`\n\tReceiver string `json:\"receiver\"`\n\tKind     string `json:\"kind\"`\n\tPhase    string `json:\"event\"`\n\tPayload  string `json:\"payload\"`\n\tError    string `json:\"error,omitempty\"`\n}\n\ntype AssuranceCluster struct {\n\tNodes      []*Raft\n\tTransports []*InmemTransport\n\tdone       chan struct{}\n\tworkers    sync.WaitGroup\n\tsequence   uint64\n\temit       sync.Mutex\n\tgate       func(AssuranceMessage) <-chan struct{}\n}\n\ntype assuranceTransport struct {\n\t*InmemTransport\n\tinbox chan RPC\n}\n\nfunc (t *assuranceTransport) Consumer() <-chan RPC { return t.inbox }\n\nfunc (c *AssuranceCluster) boundary(m AssuranceMessage) bool {\n\tc.emit.Lock()\n\traw, err := json.Marshal(m)\n\tif err != nil {\n\t\tc.emit.Unlock()\n\t\tpanic(err)\n\t}\n\tfmt.Println(\"CA_EVENT \" + string(raw))\n\tc.emit.Unlock()\n\tvar release <-chan struct{}\n\tif c.gate != nil {\n\t\trelease = c.gate(m)\n\t}\n\tif release != nil {\n\t\tselect {\n\t\tcase <-release:\n\t\tcase <-c.done:\n\t\t\treturn false\n\t\t}\n\t}\n\tselect {\n\tcase <-c.done:\n\t\treturn false\n\tdefault:\n\t\treturn true\n\t}\n}\n\nfunc (c *AssuranceCluster) forward(t *assuranceTransport, receiver ServerID, rpc RPC) {\n\tdefer c.workers.Done()\n\tdata, err := json.Marshal(rpc.Command)\n\tif err != nil {\n\t\tpanic(err)\n\t}\n\tm := AssuranceMessage{ID: atomic.AddUint64(&c.sequence, 1), Receiver: string(receiver),\n\t\tKind: fmt.Sprintf(\"%T\", rpc.Command), Phase: \"request_delivery\", Payload: string(data)}\n\tif h, ok := rpc.Command.(WithRPCHeader); ok {\n\t\tm.Sender = string(h.GetRPCHeader().ID)\n\t}\n\tif !c.boundary(m) {\n\t\treturn\n\t}\n\tresponse := make(chan RPCResponse, 1)\n\tactual := rpc\n\tactual.RespChan = response\n\tselect {\n\tcase t.inbox <- actual:\n\tcase <-c.done:\n\t\treturn\n\t}\n\tvar result RPCResponse\n\tselect {\n\tcase result = <-response:\n\tcase <-c.done:\n\t\treturn\n\t}\n\tdata, err = json.Marshal(result.Response)\n\tif err != nil {\n\t\tpanic(err)\n\t}\n\tm.Phase, m.Payload = \"reply_delivery\", string(data)\n\tif result.Error != nil {\n\t\tm.Error = result.Error.Error()\n\t}\n\tif !c.boundary(m) {\n\t\treturn\n\t}\n\tselect {\n\tcase rpc.RespChan <- result:\n\tcase <-c.done:\n\t}\n}\n\n// Configurations, FSMs and timeouts are experiment inputs, never hidden answers.\n// Bootstrap uses the public API; every election and reply comes from real workers.\nfunc NewAssuranceCluster(t *testing.T, configs []*Config, fsm func(int) FSM,\n\trpcTimeout time.Duration, gate func(AssuranceMessage) <-chan struct{}) *AssuranceCluster {\n\tt.Helper()\n\tc := &AssuranceCluster{done: make(chan struct{}), gate: gate}\n\tt.Cleanup(func() {\n\t\tclose(c.done)\n\t\tfutures := make([]Future, 0, len(c.Nodes))\n\t\tfor _, node := range c.Nodes {\n\t\t\tfutures = append(futures, node.Shutdown())\n\t\t}\n\t\tfor _, transport := range c.Transports {\n\t\t\ttransport.Close()\n\t\t}\n\t\tfinished := make(chan struct{})\n\t\tgo func() {\n\t\t\tfor _, future := range futures {\n\t\t\t\tfuture.Error()\n\t\t\t}\n\t\t\tc.workers.Wait()\n\t\t\tclose(finished)\n\t\t}()\n\t\tselect {\n\t\tcase <-finished:\n\t\tcase <-time.After(5 * time.Second):\n\t\t\tt.Error(\"Raft helper cleanup timed out\")\n\t\t}\n\t})\n\tconfiguration := Configuration{}\n\tfor _, conf := range configs {\n\t\t_, transport := NewInmemTransportWithTimeout(ServerAddress(conf.LocalID), rpcTimeout)\n\t\tc.Transports = append(c.Transports, transport)\n\t\tconfiguration.Servers = append(configuration.Servers, Server{ID: conf.LocalID,\n\t\t\tAddress: transport.LocalAddr(), Suffrage: Voter})\n\t}\n\tfor i, transport := range c.Transports {\n\t\tfor j, peer := range c.Transports {\n\t\t\tif i != j {\n\t\t\t\ttransport.Connect(peer.LocalAddr(), peer)\n\t\t\t}\n\t\t}\n\t}\n\tfor i, transport := range c.Transports {\n\t\tconf := *configs[i]\n\t\tstore, snapshots := NewInmemStore(), NewInmemSnapshotStore()\n\t\tproxy := &assuranceTransport{InmemTransport: transport, inbox: make(chan RPC)}\n\t\tif err := BootstrapCluster(&conf, store, store, snapshots, proxy, configuration); err != nil {\n\t\t\tt.Fatal(err)\n\t\t}\n\t\tc.workers.Add(1)\n\t\tgo func(receiver ServerID, tr *assuranceTransport) {\n\t\t\tdefer c.workers.Done()\n\t\t\tfor {\n\t\t\t\tselect {\n\t\t\t\tcase rpc := <-tr.InmemTransport.Consumer():\n\t\t\t\t\tc.workers.Add(1)\n\t\t\t\t\tgo c.forward(tr, receiver, rpc)\n\t\t\t\tcase <-c.done:\n\t\t\t\t\treturn\n\t\t\t\t}\n\t\t\t}\n\t\t}(conf.LocalID, proxy)\n\t\tnode, err := NewRaft(&conf, fsm(i), store, store, snapshots, proxy)\n\t\tif err != nil {\n\t\t\tt.Fatal(err)\n\t\t}\n\t\tc.Nodes = append(c.Nodes, node)\n\t}\n\treturn c\n}\n"
+    },
+    "kind": "go_test",
+    "source": "package raft\n\nimport (\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"testing\"\n\t\"time\"\n\n\t\"github.com/hashicorp/go-hclog\"\n)\n\nfunc assuranceContactEvent(t *testing.T, e map[string]interface{}) {\n\tt.Helper()\n\tb, err := json.Marshal(e)\n\tif err != nil {\n\t\tt.Fatal(err)\n\t}\n\tfmt.Println(\"CA_EVENT \" + string(b))\n}\n\n// This is a conditional local-state exploration, not a cluster election history.\n// No receiving Raft runs: queued requests receive no processing or reply.\nfunc TestAssuranceContactTimeoutLeaseCheck(t *testing.T) {\n\tfor _, mode := range []string{\"pipeline_timeout\", \"ordinary_timeout\"} {\n\t\tt.Run(mode, func(t *testing.T) {\n\t\t\taddr, sender := NewInmemTransportWithTimeout(ServerAddress(\"sender-\"+mode), 40*time.Millisecond)\n\t\t\tpeerAddr, receiver := NewInmemTransportWithTimeout(ServerAddress(\"receiver-\"+mode), 40*time.Millisecond)\n\t\t\tdefer sender.Close()\n\t\t\tdefer receiver.Close()\n\t\t\tsender.Connect(peerAddr, receiver)\n\t\t\tconf := DefaultConfig()\n\t\t\tconf.LocalID = ServerID(addr)\n\t\t\tconf.LeaderLeaseTimeout = 2 * time.Second\n\t\t\told := time.Now().Add(-4 * time.Second)\n\t\t\tpeer := Server{ID: ServerID(peerAddr), Address: peerAddr, Suffrage: Voter}\n\t\t\ts := &followerReplication{peer: peer, currentTerm: 1, nextIndex: 1,\n\t\t\t\tlastContact: old, notify: make(map[*verifyFuture]struct{}), stepDown: make(chan struct{}, 1)}\n\t\t\tr := &Raft{localID: ServerID(addr), localAddr: addr, trans: sender,\n\t\t\t\tlogger: hclog.NewNullLogger(), shutdownCh: make(chan struct{}), logs: NewInmemStore()}\n\t\t\tr.conf.Store(*conf)\n\t\t\tr.raftState.setState(Leader)\n\t\t\tr.configurations.latest = Configuration{Servers: []Server{\n\t\t\t\t{ID: r.localID, Address: addr, Suffrage: Voter}, peer,\n\t\t\t}}\n\t\t\tr.leaderState.replState = map[ServerID]*followerReplication{peer.ID: s}\n\t\t\tassuranceContactEvent(t, map[string]interface{}{\"event\": \"local_prefix\", \"operation\": mode,\n\t\t\t\t\"state\": r.State().String(), \"contact_ns\": old.UnixNano(), \"lease_ns\": int64(conf.LeaderLeaseTimeout),\n\t\t\t\t\"initialization\": \"constructed local state; no election; no remote Raft worker\"})\n\n\t\t\tvar request *AppendEntriesRequest\n\t\t\tfutureError := \"\"\n\t\t\tif mode == \"pipeline_timeout\" {\n\t\t\t\tp, err := sender.AppendEntriesPipeline(peer.ID, peerAddr)\n\t\t\t\tif err != nil {\n\t\t\t\t\tt.Fatal(err)\n\t\t\t\t}\n\t\t\t\tdefer p.Close()\n\t\t\t\trequest = &AppendEntriesRequest{Term: 1}\n\t\t\t\tfuture, err := p.AppendEntries(request, new(AppendEntriesResponse))\n\t\t\t\tif err != nil {\n\t\t\t\t\tt.Fatal(err)\n\t\t\t\t}\n\t\t\t\tcompleted := make(chan error, 1)\n\t\t\t\tgo func() { completed <- future.Error() }()\n\t\t\t\tselect {\n\t\t\t\tcase err = <-completed:\n\t\t\t\t\tif err != nil {\n\t\t\t\t\t\tfutureError = err.Error()\n\t\t\t\t\t}\n\t\t\t\tcase <-time.After(3 * time.Second):\n\t\t\t\t\tt.Fatal(\"future completion timeout\")\n\t\t\t\t}\n\t\t\t\tassuranceContactEvent(t, map[string]interface{}{\"event\": \"transport_completion\", \"operation\": mode,\n\t\t\t\t\t\"error\": futureError, \"same_request\": future.Request() == request, \"contact_ns\": s.LastContact().UnixNano()})\n\t\t\t\tstop, finish := make(chan struct{}), make(chan struct{})\n\t\t\t\tgo r.pipelineDecode(s, p, stop, finish)\n\t\t\t\tselect {\n\t\t\t\tcase <-finish:\n\t\t\t\tcase <-time.After(3 * time.Second):\n\t\t\t\t\tclose(stop)\n\t\t\t\t\tt.Fatal(\"decoder completion timeout\")\n\t\t\t\t}\n\t\t\t} else {\n\t\t\t\tcompleted := make(chan bool, 1)\n\t\t\t\tgo func() { completed <- r.replicateTo(s, 0) }()\n\t\t\t\tselect {\n\t\t\t\tcase shouldStop := <-completed:\n\t\t\t\t\tassuranceContactEvent(t, map[string]interface{}{\"event\": \"replication_completion\", \"operation\": mode,\n\t\t\t\t\t\t\"should_stop\": shouldStop, \"failures\": s.failures})\n\t\t\t\tcase <-time.After(3 * time.Second):\n\t\t\t\t\tt.Fatal(\"ordinary replication completion timeout\")\n\t\t\t\t}\n\t\t\t}\n\t\t\t// Inspect the one admitted request only after completion; do not respond.\n\t\t\tvar received RPC\n\t\t\tselect {\n\t\t\tcase received = <-receiver.Consumer():\n\t\t\tdefault:\n\t\t\t\tt.Fatal(\"missing admitted request\")\n\t\t\t}\n\t\t\tactual, ok := received.Command.(*AppendEntriesRequest)\n\t\t\tif !ok {\n\t\t\t\tt.Fatal(\"unexpected RPC type\")\n\t\t\t}\n\t\t\tif request != nil && actual != request {\n\t\t\t\tt.Fatal(\"request identity mismatch\")\n\t\t\t}\n\t\t\tbeforeLease := s.LastContact()\n\t\t\tassuranceContactEvent(t, map[string]interface{}{\"event\": \"consumer_completion\", \"operation\": mode,\n\t\t\t\t\"request_term\": actual.Term, \"contact_before_ns\": old.UnixNano(), \"contact_after_ns\": beforeLease.UnixNano(),\n\t\t\t\t\"contact_changed\": !beforeLease.Equal(old), \"contact_age_ns\": int64(time.Since(beforeLease)), \"pipeline_error\": futureError})\n\t\t\tr.checkLeaderLease()\n\t\t\tassuranceContactEvent(t, map[string]interface{}{\"event\": \"lease_result\", \"operation\": mode,\n\t\t\t\t\"state\": r.State().String(), \"contact_ns\": s.LastContact().UnixNano()})\n\t\t})\n\t}\n}\n",
+    "description": "Two independent local operations. Construct two-voter Leader and expired peer marker; actual in-memory transport admits an unanswered request. Pipeline case awaits actual future error and runs actual pipelineDecode to completion; ordinary case runs replicateTo to completion. Inspect admitted request without responding, then invoke actual checkLeaderLease and emit public State. No full Raft workers or election prefix.",
+    "semantic_changes": [
+      "Construct local Raft state directly rather than bootstrap/elect; this is the accepted conditional premise.",
+      "Receiver transport has no receiver Raft worker and sends no response. This prevents new contact independently of the tested marker.",
+      "Call pipelineDecode/replicateTo and checkLeaderLease explicitly; omit main loop, heartbeat, snapshots and verification to isolate effect. This does not establish deployed role retention.",
+      "Read LastContact under its lock and State through public API; only emit measured fields and declared setup. No protocol source is modified."
+    ],
+    "prerequisites": [
+      {
+        "alias": "prefix",
+        "event": "local_prefix",
+        "conditions": [
+          {
+            "field": "state",
+            "op": "eq",
+            "value": "Leader",
+            "reference": null
+          },
+          {
+            "field": "lease_ns",
+            "op": "eq",
+            "value": 2000000000,
+            "reference": null
+          }
+        ]
+      },
+      {
+        "alias": "completed",
+        "event": "consumer_completion",
+        "conditions": [
+          {
+            "field": "contact_before_ns",
+            "op": "eq",
+            "value": null,
+            "reference": "prefix.contact_ns"
+          },
+          {
+            "field": "request_term",
+            "op": "eq",
+            "value": 1,
+            "reference": null
+          }
+        ]
+      }
+    ],
+    "legality": {
+      "source_ids": [
+        "src-inmem-constructor",
+        "src-inmem-pipeline-send",
+        "src-inmem-pipeline-timeout",
+        "src-request-construction",
+        "src-local-state-setter",
+        "src-lease"
+      ],
+      "expectation_ids": [
+        "src-lease-contract"
+      ],
+      "binding_ids": [
+        "binding-lease-consumer"
+      ],
+      "derivation": "Constructor and pipeline APIs admit requests. With a buffered receiver transport and no receiver Raft, admitted input can time out without remote processing or response. Local Leader state and expired contact are conditional initial premises; no claim that constructor alone establishes them. One queued request per separate transport pair fixes identity; pipeline returned future.Request is compared to that exact request. Completion precedes lease consumption in each operation.",
+      "applicability": "Fixed two Voters, expired four-second-old marker and two-second lease. Real forty-millisecond timeout; isolated local comparison only.",
+      "unresolved": [
+        "Proof of a legal election/startup history",
+        "Automatic lease scheduling or total role-retention duration",
+        "Crash recovery and durable storage",
+        "Application stale reads, client success, or incorrect log commitment",
+        "Higher-term negative-response requirement"
+      ],
+      "conflicts": [],
+      "alternatives": [
+        "Ordinary replicateTo propagates transport timeout and preserves old contact.",
+        "Heartbeat replies, including negative replies, can constitute actual contact; not excluded by this obligation.",
+        "Fallback replication, incoming RPCs and negative VerifyLeader responses may force role loss independently; their absence is explicit local scope."
+      ]
+    }
+  },
+  "monitors": [
+    {
+      "id": "monitor-lease-no-contact",
+      "checker_id": "lease-no-contact",
+      "event": "lease_result",
+      "binding_ids": [
+        "binding-lease-consumer"
+      ],
+      "grounding": {
+        "source_ids": [
+          "src-inmem-pipeline-timeout",
+          "src-inmem-pipeline-send",
+          "src-pipeline-reply",
+          "src-append-reply",
+          "src-lease"
+        ],
+        "expectation_ids": [
+          "src-lease-contract",
+          "src-pipeline-contract"
+        ],
+        "binding_ids": [
+          "binding-lease-consumer"
+        ],
+        "derivation": "Config.LeaderLeaseTimeout explicitly promises step-down when the interval elapses without quorum contact. For two Voters, self alone is insufficient. With prior remote contact already expired and an unanswered request never processed by a receiver, no new remote contact exists. Therefore after the timeout consumer completes, a lease decision must not count that completion as contact and must step down. AppendFuture.Response additionally restricts validity to successful Error completion, supporting rejection of failed-future response fields as evidence, but the observed endpoint comparison is the lease decision rather than just API usage. The oracle does not come from the pipeline-versus-ordinary difference.",
+        "applicability": "Applies to the actual in-repository in-memory transport implementation and actual checkLeaderLease consumer under stated conditional premises. The config contract is public; its implementation uses contact recency and majority of Voters. A rejected real reply may still be contact and is outside the no-reply antecedent.",
+        "unresolved": [
+          "Whether this conditional prefix occurs in one legal full-node history with protective workers active.",
+          "Whether a single refresh postpones externally observable leadership loss; the local invocation alone establishes neither a timing bound nor an application failure."
+        ],
+        "conflicts": [],
+        "alternatives": [
+          "Ordinary replicateTo propagates transport timeout and preserves old contact.",
+          "Heartbeat replies, including negative replies, can constitute actual contact; not excluded by this obligation.",
+          "Fallback replication, incoming RPCs and negative VerifyLeader responses may force role loss independently; their absence is explicit local scope."
+        ]
+      },
+      "applicability_conditions": []
+    }
+  ],
+  "observable_properties": [
+    {
+      "checker_id": "lease-no-contact",
+      "kind": "event_assertion",
+      "trigger": {
+        "field": "event",
+        "op": "eq",
+        "value": "lease_result",
+        "reference": null
+      },
+      "assertion": {
+        "field": "state",
+        "op": "eq",
+        "value": "Follower",
+        "reference": null
+      },
+      "antecedent": null,
+      "identity_fields": [
+        "operation"
+      ],
+      "history_field": null,
+      "description": "For each completed isolated no-contact timeout scenario with constructed expired-contact Leader prefix, the subsequent actual lease decision must produce Follower. Leader is the forbidden endpoint; timeout of the test does not count as a violation."
+    }
+  ],
+  "uncertainties": [
+    "Proof of a legal election/startup history",
+    "Automatic lease scheduling or total role-retention duration",
+    "Crash recovery and durable storage",
+    "Application stale reads, client success, or incorrect log commitment",
+    "Higher-term negative-response requirement",
+    "Operation labels associate separate scenarios, not one shared history.",
+    "The prior contact is constructed as expired; no legal full-node initial prefix is proved.",
+    "No claim that rejecting a real heartbeat response is required: no-response and negative-response are different contexts."
+  ]
+}

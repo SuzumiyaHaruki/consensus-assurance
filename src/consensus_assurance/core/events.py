@@ -48,7 +48,7 @@ def match_prerequisites(events, requirements, witness_index=None, identity_field
     try: ordered = event_requirements(requirements)
     except ValueError as exc:
         return {'status':'unknown','reason':str(exc),'matched_indices':[], 'alias_indices':{}}
-    missing, matches = False, []
+    missing, matches, absent = False, [], set()
     witness = events[witness_index] if witness_index is not None else None
     witness_stream = witness.get('_ca_stream') if witness is not None else None
     def search(step, indices):
@@ -69,12 +69,19 @@ def match_prerequisites(events, requirements, witness_index=None, identity_field
             if any(v is False for v in identity): continue
             checks = identity + [compare(event,c,aliases) for c in req.conditions]
             if any(v is False for v in checks): continue
-            if any(v is None for v in checks): missing = True; continue
+            if any(v is None for v in checks):
+                missing = True
+                absent.update(req.alias+'.'+k for k,v in zip(identity_fields,identity) if v is None)
+                absent.update(req.alias+'.'+c.field+(' / '+c.reference if c.reference else '')
+                    for c in req.conditions if compare(event,c,aliases) is None)
+                continue
             search(step+1,{**indices,req.alias:index})
             if len(matches) >= (2 if witness is not None else 1): return
     search(0,{})
     ambiguous = witness is not None and (len(matches)>1 or missing)
     status = 'unknown' if ambiguous else 'matched' if matches else 'unknown' if missing else 'not_reached'
     indices = matches[0] if status=='matched' else {}
-    return {'status':status,'reason':'Ambiguous prerequisite association or missing fields' if ambiguous else 'Declared prerequisites established' if indices else 'Missing fields' if missing else 'No corresponding prerequisite events reached',
+    reason = ('Ambiguous prerequisite association' if ambiguous else 'Declared prerequisites established' if indices
+        else 'Missing prerequisite fields' if missing else 'No corresponding prerequisite events reached: '+', '.join(r.alias+'/'+r.event for r in ordered))
+    return {'status':status,'reason':reason+('; missing '+', '.join(sorted(absent)) if absent else ''),
         'matched_indices':list(indices.values()),'alias_indices':indices}

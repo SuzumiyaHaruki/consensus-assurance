@@ -27,17 +27,10 @@ class ResearchFeedback(Record):
     rationale: str = Field(min_length=1)
 
 
-class WorkDisposition(Record):
-    target_id: str
-    rationale: str = Field(min_length=1)
-    resume_conditions: list[str] = Field(min_length=1)
-
-
 class Submission(Record):
     rationale: str = Field(min_length=1)
     sources: list[SourceRange] = []
     feedback: ResearchFeedback | None = None
-    deferred_work: list[WorkDisposition] = []
 
 
 class MappedSubmission(Submission):
@@ -53,7 +46,6 @@ class CandidateSubmission(MappedSubmission):
     parent_candidate_id: str | None = None
     question: AuditQuestion
     resume_conditions: list[str] = []
-    counterevidence_resolution: str = ""
     result_implications: dict[Literal["holds", "violated", "incomplete"], str] = {}
     obligation: ClaimDraft | None = None
     bindings: list[BindingDraft] = []
@@ -104,16 +96,18 @@ class CheckSubmission(Submission):
 
 class ModelSubmission(Submission):
     action: Literal["model"]
-    unit_id: str
+    unit_id: str | None = None
+    research_ref: str | None = Field(default=None,description="Accepted Candidate or surface:<entry_point> for pre-obligation history exploration")
     model_path: str
     behavior_path: str
     properties_path: str
-    harness_path: str | None = None
-    files: dict[str, str] = {}
     previous_model_id: str | None = None
     encoding_revision: EncodingRevision | None = None
-    change: Literal["technical", "F1", "F4"] = "technical"
-    replay_finding_id: str | None = None
+    @model_validator(mode="after")
+    def owner(self):
+        if bool(self.unit_id) == bool(self.research_ref):
+            raise ValueError('Select one accepted Unit or research reference; exploration does not invent an obligation')
+        return self
 
 
 class ResearchSubmission(MappedSubmission):

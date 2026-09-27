@@ -1,19 +1,13 @@
 """Pure model acceptance and execution coverage policies."""
 import json
 from pathlib import Path
-from .artifacts import materialize_bundle, validate_bundle
 
 
-def validate_technical_repair(current, repaired, phase):
+def validate_technical_repair(current, repaired):
     if repaired.checker_specs() != current.checker_specs() or repaired.scope != current.scope:
         raise ValueError('Technical repair changed property scope or attribution; semantic revision required')
     if repaired.properties != current.properties or repaired.observable_properties != current.observable_properties:
         raise ValueError('Technical repair cannot change property text, even with identical checker IDs; use explicit semantic investigation')
-    if phase != 'search':
-        left, right = current.model_dump(), repaired.model_dump()
-        left.pop('harness'); right.pop('harness')
-        if left != right:
-            raise ValueError('Compilation repair may change only the harness')
 
 
 def obligation_progress(state, unit):
@@ -63,7 +57,7 @@ def obligation_progress(state, unit):
             continue
         record=next((r for r in reversed(state.monitor_results) if r.get('direct_check_id')==artifact.id),{})
         check_id=record.get('experiment_check_id')
-        if any(p.get('comparison_complete') for p in record.get('properties',[])) and check_id:
+        if any(p.get('comparison_complete') or p.get('witness_complete') for p in record.get('properties',[])) and check_id:
             covered[artifact.claim_id]=list(dict.fromkeys(covered.get(artifact.claim_id,[])+[check_id]))
         direct[artifact.claim_id].append(bool(record.get('reviewed_complete')))
     for claim,scenarios in direct.items():
@@ -90,15 +84,15 @@ def coverage_limitations(state,unit):
         for req in model.reachability_requirements:
             result=next((r for r in reversed(state.reachability_results) if r.model_id==model.id and r.requirement_id==req.id),None)
             if result is None or result.status!='reachable':limits.append('Trigger '+req.id+' is '+(result.status if result else 'unchecked'))
-        cals=[c for c in state.calibrations if c.model_id==model.id]
-        if not cals or cals[-1].status!='compatible':limits.append('Model '+model.id+' has no completed compatible implementation calibration')
+        limits.append('Model '+model.id+' explores bounded history only; implementation observations require a separate direct check')
     for artifact in direct:
         result=next((r for r in reversed(state.monitor_results) if r.get('direct_check_id')==artifact.id),None)
         if result is None:limits.append('Direct check '+artifact.id+' has no saved machine assessment')
         elif result.get('bounded_complete') and result.get('blockers'):
             limits.append('Bounded direct comparison completed; local attribution remains pending: '+'; '.join(result['blockers']))
         elif not result.get('bounded_complete'):
-            limits.append('Direct check '+artifact.id+' is incomplete: '+'; '.join(result.get('blockers',[])))
+            reasons=result.get('blockers',[])+[s for p in result.get('properties',[]) for s in p.get('limitations',[])]
+            limits.append('Direct check '+artifact.id+' is incomplete: '+'; '.join(reasons or ['No completed applicable comparison']))
     return limits
 
 

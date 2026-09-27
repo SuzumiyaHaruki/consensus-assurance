@@ -10,20 +10,20 @@ def category(p):
     if s.startswith('runs/'):return 'run_artifacts'
     if s.startswith('tests/'):return 'tests'
     if s.startswith('src/') and '/resources/' in s:return 'skills_and_resources'
-    if s.startswith('src/') and p.suffix=='.py':return 'production_python'
+    if s.startswith(('src/','scripts/')) and p.suffix in {'.py','.go','.sh','.tla'}:return 'production_logic'
     if s.startswith('docs/') and (p.name.startswith('第') or p.name in {'本次验收.md','最终任务书.md'}):return 'historical_documents'
     if s.startswith('docs/') or p.name in {'README.md','AGENTS.md'}:return 'current_documents'
 
 stats={};modules=[]
-for base in ['src','tests','docs','runs','README.md','AGENTS.md']:
+for base in ['src','tests','docs','runs','scripts','README.md','AGENTS.md']:
     path=root/base
     for p in path.rglob('*') if path.is_dir() else [path]:
         if not p.is_file() or any(x in p.parts for x in ('__pycache__','.execution')) or '.egg-info' in str(p):continue
         group=category(p)
         if not group:continue
-        b=p.read_bytes();entry=stats.setdefault(group,dict(files=0,bytes=0,lines=0))
-        entry['files']+=1;entry['bytes']+=len(b);entry['lines']+=len(b.splitlines())
-        if group=='production_python':
+        b=p.read_bytes();entry=stats.setdefault(group,dict(files=0,bytes=0,lines=0,nonblank=0))
+        entry['files']+=1;entry['bytes']+=len(b);entry['lines']+=len(b.splitlines());entry['nonblank']+=sum(bool(line.strip()) for line in b.splitlines())
+        if group=='production_logic' and p.suffix=='.py':
             tree=ast.parse(b);calls=sorted({ast.unparse(n.func) for n in ast.walk(tree) if isinstance(n,ast.Call)})
             modules.append(dict(path=str(p.relative_to(root)),lines=len(b.splitlines()),calls=calls))
 result={'categories':stats,'largest_modules':sorted(modules,key=lambda m:m['lines'],reverse=True)[:12],

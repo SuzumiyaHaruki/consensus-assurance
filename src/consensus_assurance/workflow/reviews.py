@@ -109,8 +109,8 @@ def accept_review(state, submission, operation_id):
                 raise ValueError('Checker issue requires a changed oracle and actual matching reexecution')
     review = SemanticReview(task_id='native:' + operation_id, check_id=operation_id,
         target_versions={artifact.id:artifact.version}, material_ids=sources, items=reply.items,
-        origin='mock' if state.mode == 'mock' else 'agent', unit_id=artifact.unit_id,
-        unit_version=next(u.version for u in state.units if u.id == artifact.unit_id),
+        origin='mock' if state.mode == 'mock' else 'agent', unit_id=artifact.unit_id or None,
+        unit_version=next((u.version for u in state.units if u.id == artifact.unit_id), None),
         model_id=artifact.id if hasattr(artifact, 'bundle_path') else None,
         resolves_issue_ids=[r.issue_id for r in submission.resolutions])
     state.semantic_reviews.append(review)

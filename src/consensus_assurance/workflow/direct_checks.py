@@ -2,7 +2,7 @@
 import json
 from pathlib import Path
 from consensus_assurance.core.proposals import DirectCheckPlan
-from consensus_assurance.core.types import DirectCheckArtifact, CheckRun, CheckerResult, Evidence, Finding, Origin, Assessment, Investigation, ExecutionStatus, uid
+from consensus_assurance.core.types import DirectCheckArtifact, CheckRun, CheckerResult, Evidence, Finding, Origin, Assessment, Investigation, ExecutionStatus
 from consensus_assurance.core.events import match_prerequisites, event_requirements
 from consensus_assurance.adapters.storage.files import write_json
 from consensus_assurance.adapters.storage.snapshot import capture
@@ -158,12 +158,7 @@ def compute_assessment(state,unit,artifact,plan,check,events):
     blockers.extend(claim.grounding.conflicts+plan.harness.legality.conflicts+
         [item for monitor in plan.monitors for item in monitor.grounding.conflicts])
     for result in results:
-        local=[]
-        if result['missing_indices']:local.append('Required observed fields, event identity, or prerequisite association are missing')
-        if result['outcome']=='unknown' and not result['missing_indices']:local.append('No applicable result event was reached')
-        result['limitations']=local
-        result['comparison_complete']=result['outcome'] in {'holds','violated'} and not local
-        result['confirmed']=result['outcome']=='violated' and result['comparison_complete'] and not blockers and not provenance_blockers
+        result['confirmed']=result['witness_complete'] and not blockers and not provenance_blockers
     execution_complete=check.status==ExecutionStatus.COMPLETED and check.exit_code==0 and associated and prerequisite['status']=='matched' and not parsing and not check.parameters.get('changed_target_files')
     bounded_complete=execution_complete and bool(results) and all(r['comparison_complete'] for r in results)
     semantic_boundaries=(current_review.limitations if current_review else claim.grounding.unresolved+plan.harness.legality.unresolved+
@@ -178,7 +173,7 @@ def compute_assessment(state,unit,artifact,plan,check,events):
         'reviewed_complete':bounded_complete and not blockers,
         'bounded_complete':bounded_complete,'confirmed':any(r['confirmed'] for r in results),'outcome':outcome,
         'level':'implementation_obligation' if any(r['confirmed'] for r in results) else 'implementation_test',
-        'claim_id':claim.id,'claim_version':claim.version}
+        'claim_id':claim.id,'claim_version':claim.version,'framework_revision':state.framework_revision}
 
 
 def persist_assessment(state,artifact,plan,check,record):
@@ -189,7 +184,7 @@ def persist_assessment(state,artifact,plan,check,record):
     check.checker_results=[CheckerResult(invariant=r['checker_id'],claim_id=claim.id,scope=artifact.scope,
         outcome=r['outcome'],reason=r['reason']) for r in record['properties']]
     for result in record['properties']:
-        if not result['comparison_complete']:continue
+        if not (result['comparison_complete'] or result['witness_complete']):continue
         assessment=Assessment.STALE if 'Direct-check semantic inputs changed; execution requires rechecking' in record['blockers'] else Assessment.CHALLENGED if result['confirmed'] else Assessment.INCONCLUSIVE
         evidence=next((e for e in state.evidence if e.check_id==check.id and e.direct_check_id==artifact.id and e.checker_id==result['checker_id']),None)
         description=('Finite measured '+result['outcome']+' comparison for direct check '+artifact.id+

@@ -24,16 +24,19 @@ class ProcessRunner:
                         and saved.command == command and saved.cwd == str(cwd.resolve())
                         and saved.action == action and saved.snapshot_id == snapshot_id):
                     return saved
-        if self.deadline is not None:
-            timeout = min(timeout, self.deadline - time.monotonic())
+        remaining = self.deadline - time.monotonic() if self.deadline is not None else float('inf')
+        limit = 'total_seconds' if remaining <= timeout else 'native_turn_timeout' if action == 'native_agent' else 'action_timeout'
+        timeout = min(timeout, remaining)
         if timeout <= 0:
             return CheckRun(action=action, command=command, cwd=str(cwd), snapshot_id=snapshot_id,
-                status=ExecutionStatus.CANCELLED, reason="Total runtime budget exhausted before execution")
+                status=ExecutionStatus.CANCELLED, reason="Total runtime budget exhausted before execution",
+                parameters={"timeout_limit":"total_seconds", "timeout_seconds":timeout})
         cwd = cwd.resolve()
         if not cwd.is_relative_to(self.root):
             raise ValueError("Execution directory must be inside the run directory")
         cwd.mkdir(parents=True, exist_ok=True)
-        run = CheckRun(action=action, command=command, cwd=str(cwd), snapshot_id=snapshot_id, pending_action_id=self.active_action_id)
+        run = CheckRun(action=action, command=command, cwd=str(cwd), snapshot_id=snapshot_id, pending_action_id=self.active_action_id,
+            parameters={'timeout_limit':limit, 'timeout_seconds':timeout})
         logs = self.root / "logs" / run.id
         logs.mkdir(parents=True)
         run.transition(ExecutionStatus.RUNNING)

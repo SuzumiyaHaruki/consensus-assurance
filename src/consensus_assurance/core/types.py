@@ -41,6 +41,15 @@ class ReadRequest(Record):
 
 
 ActivityClass = Literal["A1", "A2", "A3", "A4", "A5", "A6", "A7"]
+ACTIVITY_ROLES = {
+    "A1": {"role":"core", "relation":"Qualified support for decision formation and legal advancement"},
+    "A2": {"role":"core", "relation":"Context validity and acquisition, transfer or loss of authority"},
+    "A3": {"role":"support", "relation":"Recovery and resynchronization of eligible participation"},
+    "A4": {"role":"support", "relation":"Configuration and participant eligibility"},
+    "A5": {"role":"support", "relation":"Decision application and consumption"},
+    "A6": {"role":"support", "relation":"History, persistence and reconstruction of support"},
+    "A7": {"role":"support", "relation":"Client contracts, invocation intervals and observed completion"},
+}
 Lifecycle = Literal["establishment", "preservation", "consumption", "recovery"]
 
 
@@ -132,7 +141,7 @@ class ConsensusAuditSpec(Record):
         get=lambda x,k,default=None:x.get(k,default) if isinstance(x,dict) else getattr(x,k,default)
         def derived(collection,fields):
             for i,obj in enumerate(value.get(collection,[])):
-                additions={key:build(obj) for key,build in fields.items() if key not in (obj if isinstance(obj,dict) else obj.model_fields_set)}
+                additions={key:build(obj) for key,build in fields.items()}
                 if isinstance(obj,dict):obj.update(additions)
                 elif additions:value[collection][i]=obj.model_copy(update=additions)
         derived('activities',{'behavior_ids':lambda a:[get(b,'id') for b in behaviors if get(b,'primary_activity')==get(a,'class_id')]})
@@ -161,6 +170,8 @@ class AuditQuestion(Record):
     activity_classes: list[ActivityClass] = []
     behavior_ids: list[str] = []
     fact_ids: list[str] = []
+    supporting_behavior_ids: dict[str, str] = Field(default_factory=dict,
+        description="Behavior ID to sourced prehistory, context or consequence support; not a direct principal Fact edge")
     obligation_relation_kind: Lifecycle | None = None
     counterevidence: list[str] = []
     unknowns: list[str] = []
@@ -192,7 +203,7 @@ class ReachabilityRequirement(Record):
     identity_operator: str | None = None
     id: str
     operator: str
-    claim_ids: list[str] = Field(min_length=1)
+    claim_ids: list[str] = Field(default_factory=list, description="Accepted claims when present; exploratory histories create no obligation")
     behavior_ids: list[str] = []
     fact_ids: list[str] = []
     description: str
@@ -316,13 +327,13 @@ class Grounding(Record):
 
 class CheckerSpec(Record):
     invariant: str
-    claim_id: str
+    claim_id: str | None
     scope: Scope
 
 
 class CheckerResult(Record):
     invariant: str
-    claim_id: str
+    claim_id: str | None
     scope: Scope
     outcome: Literal["holds", "violated", "unknown"] = "unknown"
     reason: str = "Not independently completed"
@@ -414,7 +425,8 @@ class ModelArtifact(Record):
     version: int = Field(ge=1)
     kind: Literal["reference", "implementation_abstraction"]
     origin: Origin
-    claim_id: str
+    claim_id: str | None
+    research_ref: str | None = None
     snapshot_id: str
     path: str
     config_path: str

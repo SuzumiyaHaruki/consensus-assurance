@@ -65,6 +65,7 @@ def main(argv=None):
         p.add_argument("--config"); p.add_argument("--repo")
         p.add_argument("--agent-backend", choices=["codex", "mock"])
         p.add_argument("--tlc-jar"); p.add_argument("--runs-dir")
+        p.add_argument("--verifier-backend", choices=["none","tlc"], help="可选历史模型工具；默认不要求 Java/TLC")
         p.add_argument("--question", help="可选定向问题；默认不指定目标")
     for name in ("resume", "report"):
         p = sub.add_parser(name); p.add_argument("--run", required=True)
@@ -88,7 +89,7 @@ def main(argv=None):
             config = Config.model_validate(state.config)
         else:
             config = load_config(args.config, {"agent_backend": args.agent_backend, "tlc_jar": args.tlc_jar,
-                "runs_dir": args.runs_dir, "directed_question": args.question})
+                "runs_dir": args.runs_dir, "directed_question": args.question, "verifier_backend":args.verifier_backend})
             if args.command == "estimate":
                 repo = locate_repo(args.repo, config.repo_path)
                 b = config.budget
@@ -102,13 +103,14 @@ def main(argv=None):
         implementation, agent, verifier, knowledge = assemble(config)
         if args.command == "doctor":
             runner = ProcessRunner(root)
-            results = {"agent": agent.probe(runner), "verifier": verifier.probe(runner)}
+            results = {"agent": agent.probe(runner)}
+            if verifier:results['verifier']=verifier.probe(runner)
             for result in results.values():
                 result["checks"] = [c.model_dump(mode="json") for c in result["checks"]]
             results["implementation"] = runner.run(implementation.version_command(), root, "implementation_probe", "environment", 10).model_dump(mode="json") if implementation else {"available":False,"reason":"No execution backend configured"}
             write_json(root / "doctor.json", results)
             print(f"环境诊断已保存：{root / 'doctor.json'}")
-            return 0 if all(results[k]["available"] for k in ("agent", "verifier")) else 2
+            return 0 if all(results[k]["available"] for k in results if k!='implementation') else 2
         if args.command == "inspect":
             from consensus_assurance.adapters.storage.snapshot import capture
             repo = locate_repo(args.repo, config.repo_path)

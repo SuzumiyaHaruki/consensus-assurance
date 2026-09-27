@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 
 from consensus_assurance.core.config import Config
-from consensus_assurance.core.proposals import Feedback, ReadRequest, Comparison, ReplayPlan
+from consensus_assurance.core.proposals import Feedback, ReadRequest, Comparison
 from consensus_assurance.core.types import CheckRun, CheckerResult, ExecutionStatus
 from consensus_assurance.workflow.artifacts import save_bundle, validate_bundle
 from consensus_assurance.workflow.modeling import validate_technical_repair, obligation_progress
@@ -19,12 +19,10 @@ def test_technical_repair_cannot_weaken_same_named_property(prepared):
     assert repaired.properties != bundle.properties
     assert repaired.checker_specs()==bundle.checker_specs()
     with pytest.raises(ValueError,match='property text'):
-        validate_technical_repair(bundle,repaired,'search')
+        validate_technical_repair(bundle,repaired)
     repaired=bundle.model_copy(deep=True)
     repaired.behavior += '\n'
-    validate_technical_repair(bundle,repaired,'search')
-    with pytest.raises(ValueError,match='only the harness'):
-        validate_technical_repair(bundle,repaired,'experiment')
+    validate_technical_repair(bundle,repaired)
 
 
 def test_pure_bundle_validation_has_no_files_or_state_changes(tmp_path,prepared):
@@ -75,7 +73,7 @@ def test_f2_relation_dependency_requeues_unrelated_completed_unit(tmp_path,depen
     new_edge=RelationDraft(**{k:v for k,v in edge.model_dump().items() if k in RelationDraft.model_fields});new_edge.rationale='New applicability of this dependency'
     patch=GraphPatch(claims=[changed],relations=[new_edge],expected_versions={claim.id:claim.version,edge.id:edge.version},rationale='Reconsider dependency')
     basis=claim.grounding.model_copy(deep=True);basis.unresolved=[];basis.conflicts=[]
-    f=Feedback(kind='F2',rationale='Applicable contract changed',evidence_ids=claim.source_ids,target_ids=[claim.id],relation_ids=[],new_basis='New evidence reinterprets the contract',graph=None,bundle=None,patch=patch,old_judgment=claim.description,new_judgment=changed.description,grounding=basis)
+    f=Feedback(kind='F2',rationale='Applicable contract changed',evidence_ids=claim.source_ids,target_ids=[claim.id],relation_ids=[],new_basis='New evidence reinterprets the contract',patch=patch,old_judgment=claim.description,new_judgment=changed.description,grounding=basis)
     from regression_support import declared_changes
     f.target_ids.append(edge.id)
     declared_changes(state,f)

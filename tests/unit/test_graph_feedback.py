@@ -8,7 +8,7 @@ from consensus_assurance.workflow.feedback import apply_feedback
 
 def feedback(state, kind, bundle=None, graph=None, evidence=None, **kwargs):
     return Feedback(kind=kind, rationale="Observed evidence requires a scoped revision", evidence_ids=evidence or ["observed"],
-        target_ids=[state.units[0].id], relation_ids=kwargs.get("relation_ids", []), new_basis=kwargs.get("new_basis", ""), graph=graph, bundle=bundle)
+        target_ids=[state.units[0].id], relation_ids=kwargs.get("relation_ids", []), new_basis=kwargs.get("new_basis", ""))
 
 
 def add_check(state):
@@ -30,15 +30,6 @@ def test_F3_rejects_unrelated_or_empty_expansion(dependency_prepared):
     with pytest.raises(ValueError): expand_unit(state, state.units[0], ["maps_input"])
 
 
-def test_F1_preserves_property(dependency_prepared):
-    _, state, bundle, _ = dependency_prepared; add_check(state)
-    changed = bundle.model_copy(deep=True)
-    changed.observation.max_internal_steps = 4
-    result = apply_feedback(state, state.units[0], bundle, feedback(state, "F1", changed))
-    assert result.observation.max_internal_steps == 4
-    assert state.revisions[-1].return_step == "build"
-    changed.properties += "\nWeakened == TRUE"
-    with pytest.raises(ValueError): apply_feedback(state, state.units[0], bundle, feedback(state, "F1", changed))
 
 
 def test_F2_requires_normative_basis_and_invalidates(dependency_prepared):
@@ -48,7 +39,6 @@ def test_F2_requires_normative_basis_and_invalidates(dependency_prepared):
     f = feedback(state, "F2", graph=revised, new_basis="The document assigns normalization to the caller")
     with pytest.raises(ValueError): apply_feedback(state, state.units[0], bundle, f)
     f.evidence_ids = [next(m.id for m in state.materials if m.file=='README.md')]
-    f.graph = None
     f.patch = GraphPatch(claims=[revised.claims[1]],expected_versions={revised.claims[1].id:1},rationale=f.new_basis)
     f.target_ids = [revised.claims[1].id]
     f.old_judgment = state.claims[1].description
@@ -64,13 +54,6 @@ def test_F2_requires_normative_basis_and_invalidates(dependency_prepared):
     assert state.revisions[-1].return_step == "understand"
 
 
-def test_F4_changes_only_experiment(dependency_prepared):
-    _, state, bundle, _ = dependency_prepared; add_check(state)
-    changed = bundle.model_copy(deep=True)
-    apply_feedback(state, state.units[0], bundle, feedback(state, "F4", changed))
-    assert state.revisions[-1].return_step == "experiment"
-    changed.behavior += "\nExtra == TRUE"
-    with pytest.raises(ValueError): apply_feedback(state, state.units[0], bundle, feedback(state, "F4", changed))
 
 
 def test_fake_binding_and_normative_inference_rejected(dependency_prepared):

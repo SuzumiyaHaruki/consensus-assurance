@@ -29,50 +29,28 @@ Bounded == value <= 2
         actions=['Next'],constraints=[dict(constraint='Abstract the actual branch and finite capacity',source_kind='code_observation',source_ids=['code'],binding_ids=['binding'],justification='The two actual branches wrap at capacity')],
         scope=state['units'][0]['scope'],uncertainties=['The model checker bound is intentionally narrower in this tool fixture'],
         reachability=[dict(id='reached',operator='Reached',claim_ids=['bounded'],behavior_ids=['call'],fact_ids=['result'],description='An actual increment can occur')])
-    harness='''import json
-from target import step
-value=0
-print('CA_EVENT '+json.dumps({'event':'initial','state':{'value':value}}))
-for i in range(4):
-    value=step(value,3)
-    print('CA_EVENT '+json.dumps({'event':'step','state':{'value':value}}))
-'''
-    if draft:
-        raw['pending_work']=[dict(component='harness',reason='Not assembled'),dict(component='observation',reason='Not projected')]
-    else:
-        raw['harness']=dict(kind='python',source='',description='Actual calls in a copied fixture',semantic_changes=[])
-        raw['observation']=dict(fields=[dict(model_field='value',raw_field='value')],required_events=['initial','step'],description='Actual returned values')
-    submission=dict(action='model',unit_id=state['units'][0]['id'],model_path='model.json',behavior_path='Behavior.tla',properties_path='Properties.tla',rationale='Exercise the actual model tools',change=change)
+    raw['observation']=dict(fields=[dict(model_field='value',raw_field='value')],required_events=['initial','step'],description='Actual returned values')
+    submission=dict(action='model',unit_id=state['units'][0]['id'],model_path='model.json',behavior_path='Behavior.tla',properties_path='Properties.tla',rationale='Exercise the actual model tools')
     if previous:submission['previous_model_id']=state['models'][-1]['id']
     files={'model.json':json.dumps(raw),'Behavior.tla':behavior,'Properties.tla':properties}
-    if not draft:
-        submission['harness_path']='check.py';files['check.py']=harness
-    if replay:submission['replay_finding_id']=state['findings'][-1]['id']
     return submission,files
 
 
-def test_model_draft_search_then_assembly_calibration_and_replay(tmp_path,tlc):
-    verifier,_=tlc
-    e,repo=engine_for(tmp_path,[first,
-        lambda state:model_product(state),
-        lambda state:model_product(state,draft=False,previous=True),
-        lambda state:model_product(state,draft=False,previous=True,change='F4',replay=True),stop])
-    e.verifier=verifier
-    e.config.budget.model_checks=8;e.config.budget.reachability_checks=4;e.config.budget.calibration_checks=8
+
+
+def test_optional_history_search_then_separate_direct_evidence(tmp_path,tlc):
+    from native_support import check_step,review_step
+    e,repo=engine_for(tmp_path,[first,model_product,check_step(),review_step(),stop])
+    e.verifier=tlc[0]
     state=e.start(repo)
-    assert len(state.models)==3, (state.stop_reason,state.native_current)
+    assert len(state.models)==1,(state.stop_reason,state.native_current)
     assert state.models[0].stage=='model_only'
-    assert all(Path(m.path).is_file() for m in state.models)
-    searches=[c for c in state.checks if c.action=='model_check']
-    assert len(searches)==3 and searches[0].outcome=='counterexample'
-    assert searches[1].reused_from==searches[0].id
-    assert all(c.status.value=='completed' for c in state.checks if c.action=='model_syntax')
-    assert state.reachability_results and all(r.status=='reachable' for r in state.reachability_results)
-    assert len(state.calibrations)==2 and all(c.status=='compatible' for c in state.calibrations)
-    replay=next(c for c in state.checks if c.action=='replay')
-    assert replay.exit_code==0 and replay.model_id==state.models[-1].id
-    assert state.monitor_results and all(not r['confirmed'] for r in state.monitor_results)
-    assert any(f.replay_check_id==replay.id for f in state.findings)
+    search=next(c for c in state.checks if c.action=='model_check')
+    assert search.outcome=='counterexample'
+    assert state.reachability_results[0].status=='reachable'
+    assert not state.calibrations and not any(c.action=='replay' for c in state.checks)
+    assert len(state.monitor_results)==1 and state.monitor_results[0]['direct_check_id']
+    assert not any(f.stage.value=='reproduced' for f in state.findings)
 
 
 def test_f1_changes_search_inputs_and_preserves_checker(tmp_path,tlc):
@@ -99,7 +77,7 @@ def test_incomplete_core_and_actual_syntax_error_can_be_repaired(tmp_path,tlc):
     def incomplete(state):
         sub,files=model_product(state)
         raw=json.loads(files['model.json'])
-        raw['pending_work'].append(dict(component='behavior',reason='Unresolved actual branch'))
+        raw.setdefault('pending_work',[]).append(dict(component='behavior',reason='Unresolved actual branch'))
         files['model.json']=json.dumps(raw)
         return sub,files
     def syntax_error(state):
@@ -118,44 +96,6 @@ def test_incomplete_core_and_actual_syntax_error_can_be_repaired(tmp_path,tlc):
     assert len(list((e.root/'native-submissions').glob('*/diagnostics.json')))==1
 
 
-@pytest.mark.parametrize('variant',['correlated','unreached','incompatible'])
-def test_native_replay_assesses_actual_correlated_observations(tmp_path,tlc,variant):
-    verifier,_=tlc
-    def bundle(state,replay=False):
-        sub,files=model_product(state,draft=False,previous=replay,change='F4' if replay else 'technical',replay=replay)
-        raw=json.loads(files['model.json']);basis=products()[1]['harness']['legality']
-        raw['harness'].update(legality=basis,prerequisites=[dict(alias='start',event='initial',conditions=[dict(field='state.value',value=0)])])
-        raw['observable_properties']=[dict(checker_id='Bounded',kind='event_assertion',
-            trigger=dict(field='state.value',value=3),assertion=dict(field='state.in_range',value=True),
-            identity_fields=['operation'],description='An actual result at three violates the fixture bound of two')]
-        raw['monitors']=[dict(id='range',checker_id='Bounded',event='step',binding_ids=['binding'],grounding=basis)]
-        raw['observation']['fields'].append(dict(model_field='in_range',raw_field='in_range'))
-        files['model.json']=json.dumps(raw)
-        files['Behavior.tla']=files['Behavior.tla'].replace('Obs == [value |-> value]','Obs == [value |-> value, in_range |-> value <= 2]')
-        files['Properties.tla']='GENERATE_FROM_OBSERVABLE_PROPERTIES'
-        files['check.py']=files['check.py'].replace("'state':{'value':value}","'operation':'one','state':{'value':value,'in_range':value <= 2}")
-        if replay and variant=='unreached':files['check.py']=files['check.py'].replace('value=0','value=1')
-        if replay and variant=='incompatible':files['check.py']=files['check.py'].replace('step(value,3)','step(value,4)')
-        return sub,files
-    def review(state):
-        return dict(action='review',artifact_id=state['models'][-1]['id'],rationale='Controlled fixture correspondence, not autonomous review',
-            review_items=[dict(target_id=state['models'][-1]['id'],aspect='checker_correspondence',status='no_issue_found',source_ids=['code','doc'],
-                rationale='The shared bound compares the actual result, source contract and correlated initial call; calibration and reached prerequisites remain separate mechanical requirements')]),{}
-    e,repo=engine_for(tmp_path,[first,bundle,lambda state:bundle(state,True),review,stop])
-    (repo/'README.md').write_text('This explicit regression fixture requires every legal returned value to be at most two.\n')
-    e.verifier=verifier;e.config.budget.model_checks=8;e.config.budget.calibration_checks=8
-    state=e.start(repo)
-    assert len(state.models)==2,(state.stop_reason,state.native_current)
-    replay=next(c for c in state.checks if c.action=='replay')
-    result=next(r for r in state.monitor_results if r['experiment_check_id']==replay.id)
-    calibration=next(c for c in state.calibrations if c.id==result['calibration_id'])
-    assert replay.exit_code==0 and not result['confirmed']
-    if variant=='unreached':assert result['prerequisites']['status']=='not_reached'
-    elif variant=='incompatible':assert calibration.status!='compatible'
-    else:
-        assert calibration.status=='compatible' and result['prerequisites']['status']=='matched'
-        assert result['properties'][0]['outcome']=='violated' and not result['properties'][0]['blockers']
-        assert len(result['blockers'])==1 and result['blockers'][0].startswith('Mock, synthetic')
 
 
 def test_native_f3_preserves_old_unit_and_checks_new_dependency_scope(tmp_path,tlc):
@@ -183,3 +123,52 @@ def test_native_f3_preserves_old_unit_and_checks_new_dependency_scope(tmp_path,t
     assert 'producer' in new.binding_ids and 'producer' not in old.binding_ids
     assert state.models[0].unit_id==new.id
     assert any(c.action=='model_check' and c.status.value=='completed' for c in state.checks)
+
+
+@pytest.mark.parametrize('owner',['candidate','surface'])
+def test_pre_obligation_history_search_has_no_invented_claim(tmp_path,tlc,owner):
+    from test_native_research import question_step,map_step
+    from native_support import partial_map
+    def explore(state):
+        seed=dict(state,units=[dict(id='unused',scope={'description':'Exploratory call history'})])
+        sub,files=model_product(seed)
+        sub.pop('unit_id')
+        sub['research_ref']=state['question_candidates'][0]['id'] if owner=='candidate' else 'surface:entry'
+        raw=json.loads(files['model.json']);raw['checked_claim_ids']=[]
+        raw['constraints'][0]['binding_ids']=[]
+        for req in raw['reachability']:
+            req['claim_ids']=[]
+            if owner=='surface':req['behavior_ids']=req['fact_ids']=[]
+        files['model.json']=json.dumps(raw)
+        return sub,files
+    spec=partial_map();spec['surfaces']=[dict(entry_point='entry',disposition='deferred',source_ids=['code'],reason='History discriminator not yet selected')]
+    def review_history(state):
+        model=state['models'][0]['id']
+        return dict(action='review',artifact_id=model,rationale='Review exploratory history only',review_items=[dict(
+            target_id=model,aspect='checker_correspondence',status='no_issue_found',source_ids=['code'],
+            rationale='The source-derived bounded history proposes a call sequence; it asserts no implementation correctness')]),{}
+    def finish(state):
+        sub,files=stop(state)
+        sub['ref_ids']=[next(c['id'] for c in state['checks'] if c['action']=='model_check')]
+        return sub,files
+    e,repo=engine_for(tmp_path,[question_step if owner=='candidate' else map_step(spec),explore,review_history,finish]);e.verifier=tlc[0]
+    state=e.start(repo)
+    assert len(state.models)==1,state.native_current
+    assert not state.units and not state.claims and not state.evidence and not state.findings
+    assert state.models[0].research_ref and state.models[0].claim_id is None
+    from consensus_assurance.workflow.review_contract import target_contract
+    assert target_contract(state,state.models[0])['required_material_ids']==['code']
+    assert state.semantic_reviews[0].unit_id is None and state.semantic_reviews[0].unit_version is None
+    assert not list((e.root/'native-submissions').glob('*/diagnostics.json'))
+    assert any(c.action=='model_check' and c.outcome=='counterexample' for c in state.checks)
+
+
+def test_selected_missing_model_tool_retains_draft_without_claiming_execution(tmp_path):
+    from consensus_assurance.adapters.verifiers.tlc import TLCVerifier
+    e,repo=engine_for(tmp_path,[first,model_product,stop]);e.verifier=TLCVerifier(str(tmp_path/'missing.jar'))
+    state=e.start(repo)
+    assert len(state.models)==1 and not state.evidence
+    assert not any(c.action=='model_check' for c in state.checks)
+    assert any('TLC JAR' in gap for gap in state.gaps)
+    assert state.run_stop['reason']=='insufficient_basis'
+    assert state.usage['agent_calls']==3 and Path(state.models[0].bundle_path).exists()

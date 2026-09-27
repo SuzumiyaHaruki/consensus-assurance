@@ -22,7 +22,7 @@ def test_existing_unit_actual_compile_repair_review_progress(tmp_path):
     assert (repo/'target.py').read_text().endswith('else 0\n')
     assert not (repo/'helper.py').exists()
     index=json.loads((e.root/'research.json').read_text())
-    assert index['units'] and index['claims'] and index['bindings']
+    assert index['units'] and index['claims'] and index['artifacts']
     assert index['implementation']['harness_kind']=='python'
 
 
@@ -230,7 +230,7 @@ def test_candidate_parent_conflict_and_paused_return_keep_one_active_question(tm
     assert state.question_candidates[2].parent_candidate_id==state.question_candidates[0].id
     assert state.question_candidates[0].status=='paused' and state.units[0].status=='checked'
     assert not any(c.status=='active' for c in state.question_candidates)
-    assert len(list((e.root/'native-submissions').glob('*/diagnostics.json')))==2
+    assert len(list((e.root/'native-submissions').glob('*/diagnostics.json')))==1
 
 
 def test_accepted_execution_gap_is_not_reclassified_as_submission_rejection(tmp_path,monkeypatch):

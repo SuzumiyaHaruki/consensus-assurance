@@ -63,86 +63,52 @@ def export_views(state, root):
 
 
 def render_native_report(state, root):
-    def link(value):
-        if not value:return "无"
-        path=Path(value)
-        try:relative=path.relative_to(root)
-        except ValueError:relative=path
-        return f"[{path.name}]({relative})"
-    lines=["# 共识义务驱动局部审计报告", "",
-        f"运行标识：`{state.id}`；模式：{state.mode} 原生提交路径；分析入口：`{state.analysis_mode}`。",
-        f"源码基准：`{state.snapshot.repo}`；提交 `{state.snapshot.commit or '无 Git 元数据'}`；快照 `{state.snapshot.id}`（{len(state.snapshot.files)} 个文件）。",
-        f"框架版本：`{state.framework_revision}`；Codex 会话：`{state.native_session_id or '未建立'}`。",
-        "", "## 调查与局部检查", ""]
     from consensus_assurance.workflow.research import view
-    research=view(state)
-    lines.append(f"地图：{link(state.audit_spec_path)}；当前版本 {state.audit_spec_version}；研究重点 {research['activity_focus']}。")
-    if research['understanding_status']=='unregistered':lines.append('理解尚未登记：工作笔记不是已受理地图；不能据此推断没有研究前沿。')
-    if not state.question_candidates:lines.append("尚未受理候选；未受理草稿不是证据。")
-    for candidate in state.question_candidates:
-        question=candidate.question
-        lines.append(f"- 候选 `{candidate.id}`：{candidate.status}；{question.question}；意义：{question.importance}。来源 {question.source_ids}；反证 {question.counterevidence}；未知 {question.unknowns}；父候选 {candidate.parent_candidate_id or '无'}；恢复条件 {candidate.resume_conditions}。")
-        lines.append(f"  责任 {question.activity_classes} → Behavior {question.behavior_ids} → Fact {question.fact_ids}/{question.obligation_relation_kind}；依据地图版本 {question.audit_spec_version or '未登记'}；路径 {question.event_paths}；上下文 {question.contexts}；方法 {question.preferred_check}；选题理由 {question.trigger_rationale}。")
-        if candidate.status=='explained':lines.append('  源码解释只关闭所述怀疑，不产生执行 Evidence；相邻未知仍保留。')
-        for unit in state.units:
-            if unit.candidate_id!=candidate.id:continue
-            claims=[c for c in state.claims if c.id in unit.obligation_ids]
-            lines.append(f"  Unit `{unit.id}` v{unit.version}：{unit.status}；义务 {unit.obligation_ids}；支持绑定 {unit.binding_ids}；依赖 {unit.relation_ids}；范围 {unit.scope.model_dump(mode='json')}。局部 checked 不自动回答父问题。")
-            for claim in claims:lines.append(f"  要求 `{claim.id}`：{claim.description}；要求来源 {claim.grounding.expectation_ids}；推导 {claim.grounding.derivation}；适用性 {claim.grounding.applicability}；未决 {claim.grounding.unresolved}。")
-            for artifact in state.direct_checks+state.models:
-                if artifact.unit_id!=unit.id:continue
-                checks=[c.id for c in state.checks if c.direct_check_id==artifact.id or c.model_id==artifact.id]
-                reviews=[r for r in state.semantic_reviews if artifact.id in r.target_versions]
-                lines.append(f"  固定制品 `{artifact.id}` → 实际执行 {checks} → Review {[r.id for r in reviews]}；复核判断 {[(i.aspect,i.status,i.rationale) for r in reviews for i in r.items]}。")
-        for selection in state.selections:
-            refs=set(selection.get('candidate_ids',[]))|set(selection.get('feedback',{}).get('ref_ids',[]))
-            if candidate.id in refs:lines.append(f"  已受理决定 `{selection['operation_id']}`：{selection['action']}；{selection['rationale']}；理解回流 {selection.get('feedback',{})}。")
-    for unit in state.units:
-        lines.append(f"- 单元 `{unit.id}`：{unit.status}；已记录检查 {unit.obligation_checks}；未完成义务 {unit.remaining_obligation_ids}；边界 {unit.coverage_limitations}。")
-    for artifact in state.direct_checks:
-        lines.append(f"- 检查 `{artifact.id}`：义务 `{artifact.claim_id}`；版本 {artifact.version}；前版 {artifact.previous_id or '无'}；计划 {link(artifact.plan_path)}；harness {link(artifact.harness_path)}。")
-        for check in state.checks:
-            if check.direct_check_id!=artifact.id:continue
-            record=next((r for r in state.monitor_results if r.get('direct_check_id')==artifact.id and r.get('experiment_check_id')==check.id),None)
-            lines.append(f"  正式执行 `{check.id}`：{check.status.value}/{check.outcome}；输出 {link(check.stdout)}；局部比较 {record.get('outcome','unknown') if record else '未评估'}；确认 {record.get('confirmed',False) if record else False}；归因阻塞 {record.get('blockers',[]) if record else ['未评估']}；边界 {record.get('boundaries',[]) if record else []}。")
-    for model in state.models:
-        lines.append(f"- 模型 `{model.id}`：{model.stage}；前版 {model.previous_id or '无'}；Behavior {link(str(Path(model.path).parent / 'Behavior.tla'))}；Properties {link(model.checker_path)}；范围 {model.scope.model_dump(mode='json')}。")
-        for check in state.checks:
-            if check.model_id==model.id:
-                lines.append(f"  工具执行 `{check.id}`：{check.action}，{check.status.value}/{check.outcome}；原始输出 {link(check.stdout)}。模型检查与实现校准是不同证据。")
-        for calibration in state.calibrations:
-            if calibration.model_id == model.id:
-                lines.append(f"  校准 `{calibration.id}`：{calibration.status}；实际实验 `{calibration.experiment_check_id}`；{calibration.reason}。")
-        for result in state.monitor_results:
-            if result.get('model_id') == model.id:
-                lines.append(f"  实现归因：{result.get('level')}；确认 {result.get('confirmed',False)}；阻塞 {result.get('blockers',[])}；边界 {result.get('boundaries',[])}；实验 `{result.get('experiment_check_id')}`。")
-    if not state.direct_checks and not state.models:lines.append("没有正式执行的检查；原生 Agent 的叙述或草稿不构成实现证据。")
-    lines += ["", "## 修订与未决", ""]
-    for revision in state.revisions:lines.append(f"- `{revision.id}` {revision.kind}：{revision.rationale}；旧结果保留，新输入需重执行与复核。")
+    research = view(state)
+    def link(value):
+        if not value:return '无'
+        path = Path(value)
+        return f'[{path.name}]({path.relative_to(root) if path.is_relative_to(root) else path})'
+    lines = ['# 共识执行见证审计报告', '',
+        f'运行 `{state.id}`；模式 {state.mode}/{state.analysis_mode}；框架 `{state.framework_revision}`。',
+        f'源码 `{state.snapshot.repo}`；提交 `{state.snapshot.commit}`；快照 `{state.snapshot.id}`。',
+        f'地图 {link(state.audit_spec_path)}；版本 {state.audit_spec_version}；本次子方向 {research["activity_focus"]}。',
+        '方法以两个核心维度组织研究，五类支撑提供前史、适用依据与观察终点；局部 checked 不代表整体正确。',
+        '', '## 调查与局部检查', '']
+    if research['understanding_status']=='unregistered':lines.append('理解尚未登记；未受理草稿不是证据。')
+    for candidate in research['candidates']:
+        q = candidate['question']
+        lines.append(f'- 候选 `{candidate["id"]}`：{candidate["status"]}；{q["question"]}；意义 {q["importance"]}。')
+        lines.append(f'  核心与支撑 {q["activity_classes"]}；直接 Behavior {q["behavior_ids"]}；因果支撑 {q["supporting_behavior_ids"]}；Fact {q["fact_ids"]}/{q["obligation_relation_kind"]}；依据 v{q["audit_spec_version"]}。')
+        lines.append(f'  来源 {q["source_ids"]}；路径 {q["event_paths"]}；反证 {q["counterevidence"]}；未知 {q["unknowns"]}；父候选 {candidate["parent_candidate_id"]}；恢复条件 {candidate["resume_conditions"]}。')
+    for claim in research['claims']:
+        lines.append(f'- 要求 `{claim["id"]}`：{claim["description"]}；适用依据 {claim["grounding"]}；未决 {claim["pending"]}。')
+    for unit in research['units']:
+        lines.append(f'- Unit `{unit["id"]}`：{unit["status"]}；Candidate `{unit["candidate_id"]}`；范围 {unit["scope"]}；未完成义务 {unit["remaining_obligation_ids"]}；原因 {unit["coverage_limitations"]}。')
+    for artifact in research['artifacts']:
+        lines.append(f'- 制品 `{artifact["id"]}` v{artifact["version"]}；前版 {artifact["previous_id"]}；固定输入 {link(artifact.get("plan_path") or artifact.get("bundle_path"))}。')
+    for record in research['assessments']:
+        lines.append(f'- 执行 `{record["experiment_check_id"]}`：归因确认 {record["confirmed"]}；范围检查完整 {record.get("bounded_complete",False)}；归因阻塞 {record["blockers"]}；边界／未测后果 {record["boundaries"]}。')
+        for result in record['properties']:
+            lines.append(f'  checker `{result["checker_id"]}`：{result["outcome"]}；有效见证 {result.get("valid_witness_indices",[])}；覆盖完整 {result.get("comparison_complete",False)}；范围外 {result.get("outside_applicability_indices",[])}；具体缺口 {result.get("limitations",[])}。')
+    lines += ['', '## 修订与未决', '', f'当前待办：{research["pending_work"]}。',
+        f'研究前沿：{research["frontier"]}。地图条目和已检查 Unit 数不是责任覆盖率。',
+        f'最近决定与结果反馈：{research["latest_decision"]}。', '停止原因：'+state.stop_reason,
+        f'停止范围与依据：{research["stop"]}。']
     for issue in state.review_issues:
-        lines.append(f"- 复核问题 `{issue.id}`：{issue.aspect}；{issue.explanation}；{'未决' if not issue.resolved_by else '由 '+issue.resolved_by+' 解决'}。")
-    for diagnostic in sorted((root / "native-submissions").glob("*/diagnostics.json")):
-        lines.append(f"- 未受理提交：原始字节 {link(str(diagnostic.parent / 'raw.json') if (diagnostic.parent / 'raw.json').is_file() else None)}；诊断 {link(str(diagnostic))}。它没有改变已受理产物。")
-    lines.append("停止原因："+state.stop_reason)
-    lines.append(f"停止范围与依据：{research['stop'] or '历史记录未提供范围化停止；不追补当时不存在的决定'}。")
-    lines.append(f"当前待办：{research['pending_work']}；暂停候选 {[c['id'] for c in research['paused_candidates']]}；待回流节点 {research['feedback_due']}。")
-    lines.append(f"研究前沿：{research['frontier']}。未登记不表示不存在；地图条目与已检查 Unit 数不是责任覆盖率。")
-    for selection in state.selections:
-        if selection.get('feedback'):lines.append(f"- 结果回流 `{selection['operation_id']}`：{selection['feedback']}；后续选择 {selection['action']}；延期工作 {selection.get('deferred_work',[])}。")
-    lines += ["- "+gap for gap in dict.fromkeys(state.gaps)]
-    lines += ["", "## 实际调用与边界", "",
-        f"CLI 调用 {state.usage.get('agent_calls',0)} 次；正式实验 {state.usage.get('experiments',0)} 次；耗时 {state.elapsed_seconds:.2f} 秒。原生工具事件数只计已记录事件，不等于 CLI 调用次数。",
-        "读取与上下文管理由 Codex 原生会话负责；实际源码读取字符数未知，不据此推算 token 或费用。"]
+        lines.append(f'- 复核问题 `{issue.id}`：{issue.explanation}；来源 {issue.source_ids}；解决依据 {issue.resolved_by or "未决"}。')
+    for diagnostic in sorted((root/'native-submissions').glob('*/diagnostics.json')):
+        lines.append(f'- 未受理提交：原稿 {link(diagnostic.parent/"raw.json")}；诊断 {link(diagnostic)}。')
+    lines += ['', '## 实际调用与边界', '',
+        f'CLI 调用 {state.usage.get("agent_calls",0)} 次；目标执行 {state.usage.get("experiments",0)} 次；耗时 {state.elapsed_seconds:.2f} 秒。',
+        '工具事件不等于调用次数；原始 usage 及来源保留在状态文件，累计／单 turn 口径未核实时不相加、不估算费用。']
     for check in state.checks:
-        if not check.model_id and not check.direct_check_id:
-            label, outcome, boundary = execution_summary(check)
-            lines.append(f"- {label}：{outcome}；{boundary}；原始输出 {link(check.stdout)}。")
-    for turn in state.native_turns:
-        check=next((c for c in state.checks if c.id==turn['check_id']),None)
-        lines.append(f"- 原生调用 `{turn['check_id']}`：会话 `{turn['session_id']}`；工具事件 {turn['tool_events']}；模型 `{check.parameters.get('agent_model','未知') if check else '未知'}`；effort `{check.parameters.get('agent_reasoning_effort','未知') if check else '未知'}`；usage {turn['usage'] if turn['usage'] is not None else '未知'}；日志 {link(check.stdout) if check else '无'}。")
-    lines.append(f"可信方法资源：{state.native_method_paths}；原始提交、错误及执行身份保存在运行目录。正式测试结果只说明固定制品在干净副本内的实际输出，不自动证明更广泛共识结论。")
-    path=root/"report.md"
-    path.write_text("\n".join(lines))
+        label, result, boundary = execution_summary(check)
+        lines.append(f'- `{check.id}` {label}：{result}；{boundary}；输出 {link(check.stdout)}；期限 {check.parameters.get("timeout_limit","未记录")}。')
+    lines += ['- '+gap for gap in dict.fromkeys(state.gaps)]
+    lines.append(f'实际方法资源：{state.native_method_paths}；完整来源、历史、单项复核、修订及原始 usage 见 {link(root/"state.json")}。模型轨迹和脚本化产品不构成实现确认或原生自主发现。')
+    path = root/'report.md'
+    path.write_text('\n'.join(lines))
     return path
 
 

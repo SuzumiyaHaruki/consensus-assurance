@@ -1,6 +1,5 @@
 import pytest
-from consensus_assurance.core.proposals import ConsequenceObservation,ConsequenceWitnessEvent,EncodingRevision
-from consensus_assurance.workflow.observations import consequence_witness_limitations
+from consensus_assurance.core.proposals import EncodingRevision
 from consensus_assurance.workflow.encoding import validate_encoding
 from consensus_assurance.workflow.artifacts import save_bundle
 from consensus_assurance.adapters.runners.python import PythonBackend
@@ -23,14 +22,12 @@ def test_encoding_correction_preserves_meaning_and_behavior(tmp_path,prepared,ch
 
 def test_feedback_rejects_invalid_bundle_before_commit(prepared):
     from consensus_assurance.core.proposals import Feedback
-    from consensus_assurance.workflow.investigation import validate_feedback
+    from consensus_assurance.workflow.artifacts import validate_bundle
     _,state,bundle,_=prepared;unit=state.units[0]
     invalid=bundle.model_copy(deep=True)
     invalid.checked_claim_ids=['absent-obligation']
-    feedback=Feedback(kind='F1',rationale='Recheck the actual mapping',evidence_ids=[],target_ids=[],relation_ids=[],
-        new_basis='',graph=None,bundle=invalid)
     with pytest.raises(ValueError,match='Checker claims'):
-        validate_feedback(state,unit,bundle,feedback,PythonBackend(),'F1')
+        validate_bundle(state,unit,invalid,PythonBackend())
     assert not state.revisions
 
 
@@ -56,11 +53,12 @@ def test_old_issue_cannot_be_cleared_by_unrelated_or_unexecuted_model(tmp_path,p
 
 @pytest.mark.parametrize('variation',['same','context','operation','unrelated_event','future'])
 def test_R6_consequence_requires_correlated_participants(variation):
-    from consensus_assurance.core.types import Grounding
-    mapping=ConsequenceObservation(claim_id='broader_obligation',identity_fields=['operation','context'],required_participants=['a','b'],required_events=['accepted','returned'],binding_ids=['observed'],grounding=Grounding(),witness_events=[ConsequenceWitnessEvent(participant='a',event='accepted'),ConsequenceWitnessEvent(participant='b',event='returned')])
+    from consensus_assurance.core.events import match_prerequisites
+    from consensus_assurance.core.proposals import EventRequirement, Comparison
+    requirement=EventRequirement(alias='producer',event='accepted',conditions=[Comparison(field='participant',value='a')])
     events=[{'participant':'a','event':'accepted','operation':'x','context':1},{'participant':'b','event':'returned','operation':'x','context':1}];index=1
     if variation=='context':events[0]['context']=2
     if variation=='operation':events[0]['operation']='y'
     if variation=='unrelated_event':events[0]['event']='unrelated'
     if variation=='future':events.reverse();index=0
-    assert bool(consequence_witness_limitations(mapping,events,[index])) is (variation!='same')
+    assert (match_prerequisites(events,[requirement],index,['operation','context'])['status']=='matched') is (variation=='same')

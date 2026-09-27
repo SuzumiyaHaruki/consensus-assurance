@@ -1,0 +1,154 @@
+{
+  "description": "Conditional no-contact lease consumption after actual timeout: pipeline path and ordinary comparison, each with its own constructed local prefix.",
+  "claim_id": "obligation-expired-contact-lease",
+  "binding_ids": [
+    "binding-lease-consumer"
+  ],
+  "harness": {
+    "kind": "go_test",
+    "source": "",
+    "files": {},
+    "description": "Two independent local operations. Construct two-voter Leader and expired peer marker; actual in-memory transport admits an unanswered request. Pipeline case awaits actual future error and runs actual pipelineDecode to completion; ordinary case runs replicateTo to completion. Inspect admitted request without responding, then invoke actual checkLeaderLease and emit public State. No full Raft workers or election prefix.",
+    "semantic_changes": [
+      "Construct local Raft state directly rather than bootstrap/elect; this is the accepted conditional premise.",
+      "Receiver transport has no receiver Raft worker and sends no response. This prevents new contact independently of the tested marker.",
+      "Call pipelineDecode/replicateTo and checkLeaderLease explicitly; omit main loop, heartbeat, snapshots and verification to isolate effect. This does not establish deployed role retention.",
+      "Read LastContact under its lock and State through public API; only emit measured fields and declared setup. No protocol source is modified."
+    ],
+    "prerequisites": [
+      {
+        "alias": "prefix",
+        "event": "local_prefix",
+        "conditions": [
+          {
+            "field": "state",
+            "op": "eq",
+            "value": "Leader"
+          },
+          {
+            "field": "lease_ns",
+            "op": "eq",
+            "value": 2000000000
+          }
+        ]
+      },
+      {
+        "alias": "completed",
+        "event": "consumer_completion",
+        "conditions": [
+          {
+            "field": "contact_before_ns",
+            "op": "eq",
+            "reference": "prefix.contact_ns"
+          },
+          {
+            "field": "request_term",
+            "op": "eq",
+            "value": 1
+          }
+        ]
+      }
+    ],
+    "legality": {
+      "source_ids": [
+        "src-inmem-constructor",
+        "src-inmem-pipeline-send",
+        "src-inmem-pipeline-timeout",
+        "src-request-construction",
+        "src-local-state-setter",
+        "src-lease",
+        "src-default-and-valid-config"
+      ],
+      "expectation_ids": [
+        "src-lease-contract"
+      ],
+      "binding_ids": [
+        "binding-lease-consumer"
+      ],
+      "derivation": "Constructor and pipeline APIs admit requests. With a buffered receiver transport and no receiver Raft, admitted input can time out without remote processing or response. Local Leader state and expired contact are conditional initial premises; no claim that constructor alone establishes them. One queued request per separate transport pair fixes identity; pipeline returned future.Request is compared to that exact request. Completion precedes lease consumption in each operation. HeartbeatTimeout and ElectionTimeout are both set to 2s to satisfy the 2s lease, and ValidateConfig must return nil before any local prefix event. This validates configuration only, not the constructed state history.",
+      "applicability": "Fixed two Voters, expired four-second-old marker and two-second lease. Real forty-millisecond timeout; isolated local comparison only.",
+      "unresolved": [
+        "Proof of a legal election/startup history",
+        "Automatic lease scheduling or total role-retention duration",
+        "Crash recovery and durable storage",
+        "Application stale reads, client success, or incorrect log commitment",
+        "Higher-term negative-response requirement"
+      ],
+      "conflicts": [],
+      "alternatives": [
+        "Ordinary replicateTo propagates transport timeout and preserves old contact.",
+        "Heartbeat replies, including negative replies, can constitute actual contact; not excluded by this obligation.",
+        "Fallback replication, incoming RPCs and negative VerifyLeader responses may force role loss independently; their absence is explicit local scope."
+      ]
+    }
+  },
+  "monitors": [
+    {
+      "id": "monitor-lease-no-contact",
+      "checker_id": "lease-no-contact",
+      "event": "lease_result",
+      "binding_ids": [
+        "binding-lease-consumer"
+      ],
+      "grounding": {
+        "source_ids": [
+          "src-inmem-pipeline-timeout",
+          "src-inmem-pipeline-send",
+          "src-pipeline-reply",
+          "src-append-reply",
+          "src-lease"
+        ],
+        "expectation_ids": [
+          "src-lease-contract",
+          "src-pipeline-contract"
+        ],
+        "binding_ids": [
+          "binding-lease-consumer"
+        ],
+        "derivation": "Config.LeaderLeaseTimeout explicitly promises step-down when the interval elapses without quorum contact. For two Voters, self alone is insufficient. With prior remote contact already expired and an unanswered request never processed by a receiver, no new remote contact exists. Therefore after the timeout consumer completes, a lease decision must not count that completion as contact and must step down. AppendFuture.Response additionally restricts validity to successful Error completion, supporting rejection of failed-future response fields as evidence, but the observed endpoint comparison is the lease decision rather than just API usage. The oracle does not come from the pipeline-versus-ordinary difference.",
+        "applicability": "Applies to the actual in-repository in-memory transport implementation and actual checkLeaderLease consumer under stated conditional premises. The config contract is public; its implementation uses contact recency and majority of Voters. A rejected real reply may still be contact and is outside the no-reply antecedent.",
+        "unresolved": [
+          "Whether this conditional prefix occurs in one legal full-node history with protective workers active.",
+          "Whether a single refresh postpones externally observable leadership loss; the local invocation alone establishes neither a timing bound nor an application failure."
+        ],
+        "conflicts": [],
+        "alternatives": [
+          "Ordinary replicateTo propagates transport timeout and preserves old contact.",
+          "Heartbeat replies, including negative replies, can constitute actual contact; not excluded by this obligation.",
+          "Fallback replication, incoming RPCs and negative VerifyLeader responses may force role loss independently; their absence is explicit local scope."
+        ]
+      },
+      "applicability_conditions": []
+    }
+  ],
+  "observable_properties": [
+    {
+      "checker_id": "lease-no-contact",
+      "kind": "event_assertion",
+      "trigger": {
+        "field": "event",
+        "op": "eq",
+        "value": "lease_result"
+      },
+      "assertion": {
+        "field": "state",
+        "op": "eq",
+        "value": "Follower"
+      },
+      "identity_fields": [
+        "operation"
+      ],
+      "description": "For each completed isolated no-contact timeout scenario with constructed expired-contact Leader prefix, the subsequent actual lease decision must produce Follower. Leader is the forbidden endpoint; timeout of the test does not count as a violation."
+    }
+  ],
+  "uncertainties": [
+    "Proof of a legal election/startup history",
+    "Automatic lease scheduling or total role-retention duration",
+    "Crash recovery and durable storage",
+    "Application stale reads, client success, or incorrect log commitment",
+    "Higher-term negative-response requirement",
+    "Operation labels associate separate scenarios, not one shared history.",
+    "The prior contact is constructed as expired; no legal full-node initial prefix is proved.",
+    "No claim that rejecting a real heartbeat response is required: no-response and negative-response are different contexts."
+  ]
+}

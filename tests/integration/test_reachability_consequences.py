@@ -32,7 +32,7 @@ def test_original_holds_and_actual_trigger_coverage_remain_separate(tlc,prepared
     assert result.status==expected,check.reason
     assert (unit.obligation_ids[0] in obligation_progress(state,unit)[0]) is (expected=='reachable')
     assert search.outcome=='holds' and not state.findings
-    assert any('calibration' in limitation for limitation in coverage_limitations(state,unit))
+    assert any('implementation observations require a separate direct check' in limitation for limitation in coverage_limitations(state,unit))
     write_json(runner.root/'coverage-result.json',{'fixture':'bounded-support-use','search':search.model_dump(mode='json'),'reachability':result.model_dump(mode='json'),'trigger_check':check.model_dump(mode='json'),'state':state.model_dump(mode='json')})
 
 

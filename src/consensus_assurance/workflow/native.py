@@ -8,7 +8,7 @@ from consensus_assurance.adapters.storage.files import digest, write_json
 from consensus_assurance.adapters.runners.experiment import extract_events, install_harness, run_experiment
 from consensus_assurance.core.submissions import (NativeSubmission, SourceRange, CandidateSubmission,
     CheckSubmission, ModelSubmission, ResearchSubmission, SemanticSubmission, ReviewSubmission, ExploreSubmission)
-from consensus_assurance.core.proposals import (DirectCheckPlan, Bundle, ModelDraft, Feedback,
+from consensus_assurance.core.proposals import (DirectCheckPlan, ModelDraft, Feedback,
     Harness, GraphPatch, UnitDraft)
 from consensus_assurance.core.types import (Material, QuestionCandidate, Revision, ConsensusAuditSpec,
     CheckRun, ExecutionStatus)
@@ -78,6 +78,12 @@ def harness_files(inputs, submission, raw):
     raw["files"] = {name: inputs.read(path) for name, path in submission.files.items()}
 
 
+def add_support(implementation, harness):
+    support = getattr(implementation, 'support_files', lambda:{})()
+    if set(support) & set(harness.files):raise ValueError('Submitted files cannot replace selected backend support')
+    harness.files.update(support)
+
+
 def plan_from_files(inputs, submission):
     raw = inputs.json(submission.plan_path)
     harness_files(inputs, submission, raw["harness"])
@@ -90,19 +96,27 @@ def model_from_files(inputs, submission):
         raise ValueError("Supply Behavior and Properties through separate source files")
     raw["behavior"] = inputs.read(submission.behavior_path)
     raw["properties"] = inputs.read(submission.properties_path)
-    if "pending_work" in raw:
-        if submission.harness_path or submission.files:
-            raise ValueError("ModelDraft cannot contain an executable harness")
-        return ModelDraft.model_validate(raw)
-    harness_files(inputs, submission, raw["harness"])
-    return Bundle.model_validate(raw)
+    return ModelDraft.model_validate(raw)
 
 
 def require_unit(state, id):
-    unit = next((u for u in state.units if u.id == id), None)
+    unit = next((u for u in state.units if u.status != 'revised' and (u.id == id or u.candidate_id == id)), None)
     if unit is None:
         raise ValueError("Select an accepted audit unit")
     return unit
+
+
+def model_owner(state, unit_id, research_ref, scope):
+    if unit_id:return require_unit(state,unit_id)
+    from .audit_spec import load, audit_object_index
+    from consensus_assurance.core.types import AuditUnit
+    candidate = next((c for c in state.question_candidates if c.id==research_ref),None)
+    surface = audit_object_index(load(state)).get(research_ref,{})
+    if candidate is None and not surface.get('entry_point'):
+        raise ValueError('Model exploration requires an accepted Candidate or mapped/deferred Surface')
+    # A transient scope view reuses model validation; it creates no Unit or claim.
+    return AuditUnit(id=research_ref,obligation_ids=[],binding_ids=[],relation_ids=[],scope=scope,
+        rationale='Exploratory history only',audit_question=candidate.question if candidate else None)
 
 
 def candidate(engine, submission, operation_id, spec=None):
@@ -112,8 +126,10 @@ def candidate(engine, submission, operation_id, spec=None):
     if submission.candidate_id and current is None or submission.parent_candidate_id and parent is None:
         raise ValueError("Candidate ID must name a saved investigation")
     selected = {c.id for c in (current, parent) if c}
-    if any(c.status == "active" and c.id not in selected for c in state.question_candidates):
-        raise ValueError("Continue, pause or explicitly fork the active candidate")
+    for other in state.question_candidates:
+        if other.status == "active" and other.id not in selected:
+            other.status, other.stop_reason = 'paused', submission.rationale
+            other.resume_conditions = other.question.unknowns or ['Revisit the saved discriminator with its retained sources']
     q = submission.question
     validate_question(q)
     known = {m.id for m in state.materials}
@@ -127,10 +143,10 @@ def candidate(engine, submission, operation_id, spec=None):
     if submission.action == "explained" and (not q.counterevidence or q.disposition != "explained_by_existing_mechanism"):
         raise ValueError("Explained disposition needs scoped sourced counterevidence")
     if current:
-        acknowledged={ref for s in state.selections[:-1] for ref in s.get('feedback',{}).get('ref_ids',[])}
-        results={c.id for c in state.checks if c.model_id or c.direct_check_id}|{r.id for r in state.semantic_reviews}
-        new_results=(set(submission.feedback.ref_ids)-acknowledged)&results if submission.feedback else set()
-        progress=bool(set(q.source_ids)-set(current.question.source_ids) or new_results or
+        from .research import source_refs
+        answered = submission.feedback and source_refs(state,submission.feedback.ref_ids)
+        changed_answer = any(getattr(q,k)!=getattr(current.question,k) for k in ('unknowns','counterevidence','disposition'))
+        progress=bool(set(q.source_ids)-set(current.question.source_ids) or answered and changed_answer or
             q.audit_spec_version!=current.question.audit_spec_version or any(getattr(q,k)!=getattr(current.question,k)
             for k in ('fact_ids','behavior_ids','obligation_relation_kind','contexts','event_paths')))
         if submission.action == "continue" and current.status == "active" and not progress:
@@ -139,9 +155,8 @@ def candidate(engine, submission, operation_id, spec=None):
             raise ValueError("An accepted obligation's question needs an attributed semantic revision")
         if ((not set(current.question.counterevidence) <= set(q.counterevidence) or
                 not set(current.question.unknowns) <= set(q.unknowns)) and
-                (not submission.counterevidence_resolution.strip() or not submission.feedback or not
-                 set(submission.feedback.ref_ids)&known)):
-            raise ValueError("Explain the source-grounded resolution of removed counterevidence")
+                not answered):
+            raise ValueError("Use feedback.answered with retained source ownership to explain changed counterevidence or unknowns")
         current.history.append(current.question.model_copy(deep=True))
         current.question = q
         current.resume_conditions = []
@@ -194,17 +209,17 @@ def validate_model_revision(state, prior, model, submission):
     if submission.encoding_revision:
         from .encoding import validate_encoding
         validate_encoding(state, prior, old, model, submission.encoding_revision)
-    elif isinstance(old, ModelDraft) and isinstance(model, Bundle):
-        if any(getattr(old, k) != getattr(model, k) for k in type(old).model_fields
-               if k not in {"pending_work", "monitors", "consequence_observations"}):
-            raise ValueError("Harness assembly must preserve saved model components")
     else:
         from .modeling import validate_technical_repair
-        validate_technical_repair(old, model, "experiment" if submission.change == "F4" else "search")
+        validate_technical_repair(old, model)
 
 
 def accept(engine, submission, inputs, operation_id):
     """Runs on a transaction copy; rejected products never mutate accepted research."""
+    if submission.action == 'stop' and submission.reason in {'resource_limit','user_stop','tool_gap'}:
+        from .research import stop_record
+        stop_record(engine, submission.model_dump(mode='json'), operation_id)
+        return
     if isinstance(submission,CheckSubmission) and submission.candidate:
         outer,inner=submission.feedback,submission.candidate.feedback
         if outer and inner and outer!=inner:raise ValueError('Combined submission has conflicting research feedback')
@@ -227,12 +242,39 @@ def accept(engine, submission, inputs, operation_id):
             spec=proposed.model_copy(deep=True)
             spec.version=state.audit_spec_version+1
     elif changes:raise ValueError('Map change declarations require a complete map file')
+    def question_version(q):
+        if proposed is not None:
+            if q.audit_spec_version not in {None,proposed.version}:
+                raise ValueError(f'Question base version must match submitted map base {proposed.version}; got {q.audit_spec_version}')
+            q.audit_spec_version=spec.version
+        elif q.audit_spec_version is None and spec:
+            q.audit_spec_version=spec.version
+    def patch_versions(patch, declarations=None):
+        from consensus_assurance.core.proposals import JudgmentChange
+        for draft in patch.units:
+            if not draft.audit_question:continue
+            original=draft.audit_question.model_dump(mode='json')
+            question_version(draft.audit_question)
+            if declarations is None or original==draft.audit_question.model_dump(mode='json'):continue
+            declared=next((d for d in declarations if d.target_id==draft.id and d.field=='audit_question'),None)
+            if declared and json.loads(declared.new_value_json)!=original:raise ValueError('Declared question differs from its submitted patch')
+            if declared is None:
+                old=next((u for u in state.units if u.id==draft.id),None)
+                if old is None:continue
+                basis=old.audit_question.model_dump(mode='json')
+                if dict(original,audit_spec_version=basis['audit_spec_version'])!=basis:
+                    raise ValueError('Question semantic changes require their own declaration; only version metadata is controller-derived')
+                declared=JudgmentChange(target_id=draft.id,field='audit_question',old_value_json=old.audit_question.model_dump_json(),new_value_json='null')
+                declarations.append(declared)
+            declared.new_value_json=draft.audit_question.model_dump_json()
+    if isinstance(mapped,CandidateSubmission):question_version(mapped.question)
     from .research import record_decision
     decision=record_decision(engine,submission,operation_id,map_changed=bool(proposed and proposed!=audit_spec.load(state)))
     decision['map_changes']={k:v.model_dump(mode='json') for k,v in changes.items()}
     decision['accepted_versions']={'audit_spec':spec.version if spec else 0}
     def validate_objects():
         for id,q in getattr(mapped,'reconnect_questions',{}).items():
+            question_version(q)
             prior=next((c for c in research_before.question_candidates if c.id==id),None)
             c=next((c for c in state.question_candidates if c.id==id),None)
             if not proposed or proposed==audit_spec.load(research_before) or not prior or not c:
@@ -240,14 +282,13 @@ def accept(engine, submission, inputs, operation_id):
             validate_question(q)
             audit_spec.require_basis(state,q,spec,engine.config.activity_focus)
             if not q.source_ids or not set(q.source_ids)<={m.id for m in state.materials}:raise ValueError('Reconnected question needs actual acquired sources')
-            if not set(prior.question.counterevidence)<=set(q.counterevidence) or not set(prior.question.unknowns)<=set(q.unknowns):
-                raise ValueError('Map reconnection preserves unresolved counterevidence; resolve it through an explicit Candidate disposition')
+            from .research import source_refs
+            if (not set(prior.question.counterevidence)<=set(q.counterevidence) or not set(prior.question.unknowns)<=set(q.unknowns)) and not (submission.feedback and source_refs(state,submission.feedback.ref_ids)):
+                raise ValueError('Reconnection answers require sourced feedback, preserving earlier questions in history')
             if c.question!=q:
                 c.history.append(c.question.model_copy(deep=True));c.question=q
         audit_spec.validate_reconnections(research_before,state,spec,changes)
         audit_spec.validate_units(state,spec,engine.config.activity_focus)
-        for c in state.question_candidates:
-            audit_spec.require_basis(state,c.question,spec,engine.config.activity_focus)
         if len(state.claims)+len(state.bindings)+len(state.relations)+len(state.units)>engine.config.budget.graph_objects:
             raise ValueError('Accepted graph object budget exceeded')
     current = {"phase":"accepted", "operation_id":operation_id, "action":submission.action}
@@ -260,6 +301,7 @@ def accept(engine, submission, inputs, operation_id):
         if not engine.config.allow_experiments:
             raise ValueError("Formal execution is not authorized")
         plan = plan_from_files(inputs, submission)
+        add_support(engine.implementation, plan.harness)
         validate_plan(state, unit, plan, engine.implementation)
         install_harness(engine.root / "source", engine.implementation.harness_filename, plan.harness,
             state.snapshot.files, write=False)
@@ -281,75 +323,52 @@ def accept(engine, submission, inputs, operation_id):
         state.active_unit_id, state.active_direct_check_id = unit.id, artifact.id
     elif isinstance(submission, ModelSubmission):
         from .artifacts import validate_bundle, save_bundle, load_model
-        unit = require_unit(state, submission.unit_id)
-        model = validate_bundle(state, unit, model_from_files(inputs, submission), engine.implementation)
-        if isinstance(model, Bundle):
-            if not engine.config.allow_experiments:
-                raise ValueError("Executable model requires experiment authorization")
-            install_harness(engine.root / "source", engine.implementation.harness_filename, model.harness,
-                state.snapshot.files, write=False)
+        if engine.verifier is None:raise ValueError('Model tool is not configured; select verifier_backend=tlc for a new run')
+        draft = model_from_files(inputs, submission)
+        unit = model_owner(state,submission.unit_id,submission.research_ref,draft.scope)
+        model = validate_bundle(state, unit, draft, engine.implementation)
         previous = next((m for m in state.models if m.id == submission.previous_model_id), None)
         if submission.previous_model_id:
-            if previous is None or previous.unit_id != unit.id:
+            if previous is None or (previous.unit_id or previous.research_ref) != unit.id:
                 raise ValueError("Previous model must belong to the selected unit")
             validate_model_revision(state, previous, model, submission)
             engine.budget.take("revisions")
-        if submission.replay_finding_id:
-            finding = next((f for f in state.findings if f.id == submission.replay_finding_id), None)
-            if (not isinstance(model, Bundle) or finding is None or previous is None
-                    or finding.model_id != previous.id or finding.checker_id not in {c.invariant for c in model.checker_specs()}):
-                raise ValueError("Replay requires the actual preceding model counterexample and its checker")
-            from .artifacts import load_model
-            from .investigation import validate_replay
-            from consensus_assurance.core.proposals import ReplayPlan
-            validate_replay(state, unit, load_model(previous), finding, ReplayPlan(harness=model.harness,
-                monitors=model.monitors, observation=model.observation, checker_id=finding.checker_id,
-                rationale=submission.rationale), engine.implementation)
-            before = load_model(previous).model_dump(); after = model.model_dump()
-            for value in (before, after):
-                for field in ("harness", "monitors", "observation"):
-                    value.pop(field, None)
-            if before != after:
-                raise ValueError("Replay may adapt the harness, not change the searched model")
-            engine.budget.take("replays")
-            current["replay_finding_id"] = finding.id
         validate_objects()
         artifact = save_bundle(engine.root, state, unit, model, engine.implementation, previous,
             submission.rationale, transaction_key=operation_id, validated=True)
         if previous:
             old = load_model(previous)
-            left, right = old.model_dump(), model.model_dump()
-            left.pop("harness", None); right.pop("harness", None)
-            kind = "encoding" if submission.encoding_revision else "F4" if left == right else "F1"
+            kind = "encoding" if submission.encoding_revision else "F1"
             if model.behavior != old.behavior or model.properties != old.properties:
                 state.affect([previous.id], submission.rationale)
             state.revisions.append(Revision(kind=kind,
                 rationale=submission.rationale, target_ids=[previous.id], evidence_ids=[c.id for c in state.checks if c.model_id == previous.id],
                 before={"model_id":previous.id}, after={"model_id":artifact.id}, return_step="experiment"))
-        state.active_unit_id, state.active_model_id = unit.id, artifact.id
+        state.active_unit_id, state.active_model_id = artifact.unit_id or None, artifact.id
         current["model_id"] = artifact.id
     elif isinstance(submission, ResearchSubmission):
         if submission.graph_path:
             from .graph import apply_patch
             patch = GraphPatch.model_validate(inputs.json(submission.graph_path))
+            patch_versions(patch)
             apply_patch(state, patch, audit_spec=spec)
             for unit in patch.units:
                 engine.budget.take("audit_units")
         if submission.scope_path:
             from .scope_updates import ScopeUpdate, apply_scope_update
             update = ScopeUpdate.model_validate(inputs.json(submission.scope_path))
+            patch_versions(update.patch, update.changes)
             engine.budget.take("revisions")
             new = apply_scope_update(state, update, audit_spec=spec)
             state.scope_updates[update.id] = {"status":"accepted", "proposal":update.model_dump(mode="json"), "new_unit_id":new.id}
             reconnect_candidate(state,new)
     elif isinstance(submission, SemanticSubmission):
-        from .investigation import validate_feedback
         from .feedback import apply_feedback
         unit = require_unit(state, submission.unit_id)
         feedback = Feedback.model_validate(inputs.json(submission.feedback_path))
         if feedback.kind not in {"F2", "F3"} or feedback.requests:
             raise ValueError("Semantic submission needs complete attributed F2/F3; use native reads first")
-        validate_feedback(state, unit, None, feedback, engine.implementation, feedback.kind, audit_spec=spec)
+        if feedback.patch:patch_versions(feedback.patch, feedback.changes)
         engine.budget.take("revisions")
         apply_feedback(state, unit, None, feedback, audit_spec=spec)
         revised_ids={u.id for u in feedback.patch.units} if feedback.patch else {unit.id}
@@ -365,6 +384,7 @@ def accept(engine, submission, inputs, operation_id):
         harness = Harness(kind=engine.implementation.harness_kind, source=inputs.read(submission.harness_path),
             files={name:inputs.read(path) for name, path in submission.files.items()},
             description=submission.question, semantic_changes=[])
+        add_support(engine.implementation, harness)
         install_harness(engine.root / "source", engine.implementation.harness_filename, harness,
             state.snapshot.files, write=False)
         current["harness"] = harness.model_dump(mode="json")
@@ -372,16 +392,9 @@ def accept(engine, submission, inputs, operation_id):
         state.stop_reason = f"Scoped stop ({submission.scope}/{submission.reason}): " + submission.rationale
     # Forced/resource exits are always possible, even with incomplete historical understanding.
     if submission.action not in {'stop','explore','review'}:validate_objects()
-    if proposed is not None:audit_spec.accept(engine,proposed,changes)
+    if proposed is not None:audit_spec.accept(engine,proposed)
     decision=state.selections[-1]
-    if submission.feedback:
-        from .research import feedback_aliases
-        decision['feedback_nodes'] += [r.id for r in state.semantic_reviews if r.check_id==operation_id
-            and set(submission.feedback.ref_ids)&feedback_aliases(state,r.id)]
     decision['candidate_ids']=[c.id for c in state.question_candidates if operation_id in c.check_ids]
-    if submission.feedback and submission.action in {'pause','explained'}:
-        if set(submission.feedback.ref_ids)&set(submission.question.source_ids+decision['candidate_ids']):
-            decision['feedback_nodes'].append(operation_id)
     decision['accepted_versions']={'audit_spec':state.audit_spec_version,
         'units':{u.id:u.version for u in state.units if u not in research_before.units},
         'artifacts':{a.id:a.version for a in state.models+state.direct_checks if a not in research_before.models+research_before.direct_checks}}
@@ -396,11 +409,11 @@ def reconnect_candidate(state,unit):
         c.question=unit.audit_question.model_copy(deep=True)
 
 
-def method_text():
+def method_text(kind='native'):
     from importlib.resources import files
     from .prompts import loaded_resources
     root = files("consensus_assurance").joinpath("resources")
-    paths = loaded_resources("native")["paths"]
+    paths = loaded_resources(kind)["paths"]
     return paths, "\n".join(root.joinpath(p).read_text() for p in paths)
 
 
@@ -410,12 +423,13 @@ def prompt(engine, draft, method):
     context = {**view(state), "run_id":state.id, "snapshot_id":state.snapshot.id,
         "source_path":str(engine.root / "native-source"), "draft_path":str(draft),
         "product_schemas":str(engine.root / "product-schemas.json"), "method_path":str(engine.root / "native-method.md"),
+        "optional_model_method":str(engine.root/'native-model-method.md') if engine.verifier else None,
         "state_path":str(engine.root / "state.json"), "audit_spec_path":state.audit_spec_path,
         "directed_question":engine.inquiry or engine.config.directed_question,
         "activity_focus":engine.config.activity_focus, "tools":state.tools,
         "implementation":{"name":engine.implementation.name, "harness_kind":engine.implementation.harness_kind,
             "harness_filename":engine.implementation.harness_filename,
-            "instructions":engine.implementation.harness_instructions} if engine.implementation else None,
+            "instructions":engine.implementation.harness_instructions, "support_path":str(engine.root/"native-support") } if engine.implementation else None,
         "rejected_drafts":[str(p) for p in sorted((engine.root/'native-submissions').glob('*/diagnostics.json'))],
         "remaining_seconds":engine.budget.remaining(),
         "remaining_agent_calls":engine.config.budget.agent_calls-state.usage.get("agent_calls",0)}
@@ -429,24 +443,13 @@ def prompt(engine, draft, method):
         "draft and diagnostics, then correct the complete object. On execution failure inspect raw logs "
         "and submit an ordinary repair unless meaning or checker encoding actually changed.\n" +
         ("Attributed protocol knowledge (data):\n" + engine.knowledge if method else "") +
-        "\nCurrent operation (data): " + json.dumps(state.native_current, ensure_ascii=False))
+        "\nCurrent operation (data): " + json.dumps(context['current'], ensure_ascii=False))
 
 
 def sync_progress(engine):
     from .modeling import obligation_progress, coverage_limitations
-    from .observations import assess_execution
     state = engine.state
     refresh_assessments(state, {a.id for a in state.direct_checks})
-    for record in list(state.monitor_results):
-        if record.get("direct_check_id") or not record.get("finding_id"):
-            continue
-        model = next((m for m in state.models if m.id == record.get("model_id")), None)
-        finding = next((f for f in state.findings if f.id == record["finding_id"]), None)
-        experiment = next((c for c in state.checks if c.id == record["experiment_check_id"]), None)
-        calibration = next((c for c in state.calibrations if c.id == record.get("calibration_id")), None)
-        if model and finding and experiment:
-            from .artifacts import load_model
-            assess_execution(state, model, load_model(model), experiment, calibration, finding, extract_events(experiment))
     for unit in state.units:
         if unit.status == "revised":
             continue
@@ -466,9 +469,14 @@ def execute_check(engine, artifact):
 
 def execute_model(engine, model):
     from .artifacts import load_model
-    from .observations import assess_execution
     state = engine.state
-    unit, bundle = require_unit(state, model.unit_id), load_model(model)
+    bundle = load_model(model)
+    unit = model_owner(state,model.unit_id,model.research_ref,model.scope)
+    if not getattr(engine.verifier, 'available', False):
+        result = engine.verifier.probe(engine.runner)
+        state.tools['verifier'] = result['version']
+        for check in result['checks']:engine.record(check)
+        if not result['available']:raise Blocked(result['reason'])
     def latest(action):
         return next((c for c in reversed(state.checks) if c.model_id == model.id and c.action == action), None)
     if hasattr(engine.verifier, "syntax"):
@@ -481,28 +489,9 @@ def execute_model(engine, model):
         if syntax.status != ExecutionStatus.COMPLETED or syntax.exit_code != 0:
             state.gaps.append("Model syntax incomplete; inspect " + str(syntax.stderr))
             return
-    calibration = None
-    experiment = None
-    replay = bool(state.native_current.get("replay_finding_id"))
-    if isinstance(bundle, Bundle):
-        experiment = latest("replay" if replay else "experiment") or engine.experiment(model, bundle, replay=replay)
-        if experiment.status == ExecutionStatus.COMPLETED and experiment.exit_code == 0:
-            calibration = next((c for c in state.calibrations if c.experiment_check_id == experiment.id), None)
-            calibration = calibration or engine.calibrate(model, bundle, experiment)
-    check = latest("model_check") or engine.search(unit, model, bundle, calibration)
+    check = latest("model_check") or engine.search(unit, model, bundle, None)
     if check.status == ExecutionStatus.COMPLETED and bundle.reachability:
         engine.check_triggers(model, bundle)
-    if experiment:
-        original_id = state.native_current.get("replay_finding_id")
-        if original_id:
-            original = next(f for f in state.findings if f.id == original_id)
-            original.replay_check_id = experiment.id
-            note = "Replay in model " + model.id + "; current assessment and search retain their own input versions"
-            if note not in original.investigation_notes:
-                original.investigation_notes.append(note)
-        for finding in state.findings:
-            if finding.model_id == model.id:
-                assess_execution(state, model, bundle, experiment, calibration, finding, extract_events(experiment))
 
 
 def execute_accepted(engine):
@@ -626,7 +615,14 @@ def accept_received(engine, draft):
         raw_path = archive / 'raw.json'
         if not raw_path.exists():
             raw_path.write_bytes(draft_bytes(draft, result['submission']))
-        submission = NativeSubmission.model_validate(json.loads(raw_path.read_bytes()))
+        raw = json.loads(raw_path.read_bytes())
+        if raw.get('action') == 'stop' and raw.get('reason') in {'resource_limit','user_stop','tool_gap'}:
+            from .research import stop_record
+            stop_record(engine, raw, operation_id)
+            write_json(archive / 'accepted.json', {'action':'stop','semantic_changes_applied':False})
+            engine.checkpoint('native_forced_stop')
+            return True
+        submission = NativeSubmission.model_validate(raw)
         inputs = Inputs(draft, archive)
         commit_graph(engine, 'native-' + operation_id, submission.model_dump(mode='json'),
             lambda proxy:accept(proxy, submission, inputs, operation_id))
@@ -649,9 +645,17 @@ def execute(engine):
     draft = engine.root / 'native-draft'
     draft.mkdir(exist_ok=True)
     paths, methods = method_text()
-    write_schemas(engine.root)
+    for name, content in getattr(engine.implementation, 'support_files', lambda:{})().items():
+        path = engine.root/'native-support'/name
+        path.parent.mkdir(parents=True,exist_ok=True)
+        path.write_text(content)
+    write_schemas(engine.root, bool(engine.verifier))
     (engine.root / 'native-method.md').write_text(methods)
     state.native_method_paths = paths
+    if engine.verifier:
+        optional_paths, optional_method = method_text('model')
+        (engine.root/'native-model-method.md').write_text(optional_method)
+        state.native_method_paths = list(dict.fromkeys(paths+optional_paths))
     write_json(engine.root / 'native-submission.schema.json', NativeSubmission.model_json_schema())
     # Remaining calls govern new inference, never recovery of an already durable receipt.
     pending = state.pending_action
@@ -736,19 +740,22 @@ def execute(engine):
         if state.stop_reason == 'Not started':
             state.stop_reason = 'Native investigation reached the authorized total time budget'
         if state.native_current.get('action')!='stop':
-            state.run_stop={'operation_id':state.native_current.get('operation_id',state.id),
-                'action':'stop','scope':'run','reason':'tool_gap' if state.native_current.get('phase')=='failed' else stop_cause,
-                'rationale':state.stop_reason,'origin':'controller','ref_ids':[],
-                'remaining_seconds':engine.budget.remaining(),
-                'remaining_agent_calls':engine.config.budget.agent_calls-state.usage.get('agent_calls',0)}
-        else:
+            from .research import stop_record
+            last = state.checks[-1] if state.checks else None
+            reason = ('resource_limit' if engine.budget.remaining() <= 0 or last and last.status == ExecutionStatus.TIMEOUT
+                else 'user_stop' if last and last.status == ExecutionStatus.CANCELLED
+                else 'tool_gap' if state.native_current.get('phase') == 'failed' else stop_cause)
+            stop_record(engine, {'reason':reason, 'rationale':state.stop_reason},
+                state.native_current.get('operation_id',state.id), controller=True)
+        elif not state.run_stop:
             state.run_stop=next(s for s in reversed(state.selections) if s.get('action')=='stop')
         engine.checkpoint('native_stopped')
     return state
 
 
-def write_schemas(root):
+def write_schemas(root, model_enabled=False):
     from .scope_updates import ScopeUpdate
-    schemas = {kind.__name__:kind.model_json_schema() for kind in
-        (DirectCheckPlan, ModelDraft, Bundle, ConsensusAuditSpec, GraphPatch, ScopeUpdate, Feedback)}
+    products = [DirectCheckPlan, ConsensusAuditSpec, GraphPatch, ScopeUpdate, Feedback]
+    if model_enabled:products.append(ModelDraft)
+    schemas = {kind.__name__:kind.model_json_schema() for kind in products}
     write_json(root / "product-schemas.json", schemas)

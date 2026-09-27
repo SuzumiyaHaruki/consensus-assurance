@@ -45,7 +45,7 @@ def test_stage_schemas_and_technical_repairs_do_not_authorize_semantic_edits(pre
     _,state,bundle,_=prepared;draft=draft_of(bundle)
     changed=draft.model_copy(deep=True);changed.properties=changed.properties.replace('value <= 3','TRUE')
     with pytest.raises(ValueError,match='property text'):
-        validate_technical_repair(draft,changed,'search')
+        validate_technical_repair(draft,changed)
 
 
 def test_tlc_help_exit_is_capability_information_not_a_property_verdict(tmp_path):

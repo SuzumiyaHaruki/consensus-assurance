@@ -8,6 +8,8 @@ from test_graph_mutations import controller
 
 def setup(tmp_path,prepared):
     _,state,bundle,_=prepared;e=controller(tmp_path,state)
+    from consensus_assurance.adapters.verifiers.tlc import TLCVerifier
+    e.verifier=TLCVerifier(None)
     import re
     bundle.behavior=re.sub(r'=+\s*$', 'Used == value = 1\n====\n',bundle.behavior)
     bundle.reachability=[ReachabilityRequirement(id='used',operator='Used',claim_ids=[state.units[0].obligation_ids[0]],description='Exercise an increment')]

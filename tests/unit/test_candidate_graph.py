@@ -95,18 +95,6 @@ def test_build_resources_separate_from_read_material(tmp_path):
     assert 'credentials.json' not in snap.files and snap.exclusion_reasons
 
 
-def test_F4_retains_model_search_and_other_unit_history(prepared,tmp_path):
-    from consensus_assurance.workflow.artifacts import save_bundle
-    from consensus_assurance.workflow.feedback import apply_feedback
-    from consensus_assurance.adapters.runners.python import PythonBackend
-    _,state,bundle,_=prepared
-    model=save_bundle(tmp_path,state,state.units[0],bundle,PythonBackend())
-    state.checks.append(CheckRun(id='execution',action='experiment',cwd=str(tmp_path),snapshot_id=state.snapshot.id,status=ExecutionStatus.COMPLETED))
-    cal=Calibration(model_id=model.id,experiment_check_id='execution',mapping_path='m',trace_path='t',status='compatible',reason='Observed',origin=Origin.MOCK)
-    state.calibrations.append(cal)
-    revised=bundle.model_copy(deep=True);revised.harness.description='Reordered experiment only'
-    apply_feedback(state,state.units[0],bundle,Feedback(kind='F4',rationale='Prerequisites missed',evidence_ids=['execution'],target_ids=[model.id],relation_ids=[],new_basis='',graph=None,bundle=revised))
-    assert cal.status=='compatible' and cal.applicability=='current'
 
 
 @pytest.mark.parametrize('module',[None,'module another.example/module\n'])
@@ -126,21 +114,6 @@ def test_binary_only_build_inputs_are_not_agent_materials(tmp_path):
     assert snapshot.readable_files==[]
 
 
-def test_F1_changes_only_related_calibration(prepared,tmp_path):
-    from consensus_assurance.workflow.artifacts import save_bundle
-    from consensus_assurance.workflow.feedback import apply_feedback
-    from consensus_assurance.adapters.runners.python import PythonBackend
-    _,state,bundle,_=prepared
-    model=save_bundle(tmp_path,state,state.units[0],bundle,PythonBackend())
-    other=model.model_copy(update={'id':'other-model','unit_id':'other-unit'})
-    state.models.append(other)
-    state.checks.append(CheckRun(id='observed',action='experiment',cwd=str(tmp_path),snapshot_id=state.snapshot.id,status=ExecutionStatus.COMPLETED))
-    for item in [model,other]:
-        state.calibrations.append(Calibration(model_id=item.id,experiment_check_id='observed',mapping_path='mapping',trace_path='trace',status='compatible',reason='Earlier execution',origin=Origin.MOCK))
-    revised=bundle.model_copy(deep=True);revised.observation.max_internal_steps=4
-    apply_feedback(state,state.units[0],bundle,Feedback(kind='F1',rationale='Explicit internal step bound mismatch',evidence_ids=['observed'],target_ids=[model.id],relation_ids=[],new_basis='',graph=None,bundle=revised))
-    assert [c.status for c in state.calibrations]==['stale','compatible']
-    assert state.checks[-1].status==ExecutionStatus.COMPLETED
 
 
 def test_conflicting_F2_does_not_turn_error_into_optimization(prepared):
@@ -149,7 +122,7 @@ def test_conflicting_F2_does_not_turn_error_into_optimization(prepared):
     changed=GraphDraft.model_validate(responses[1]).claims[1]
     changed.description='A weaker proposed obligation'
     basis=changed.grounding.model_copy(deep=True);basis.unresolved=[];basis.conflicts=['The current interface still promises the stronger guarantee']
-    f=Feedback(kind='F2',rationale='Proposed design tradeoff requires resolving contrary evidence',evidence_ids=[next(m.id for m in state.materials if m.file=='README.md')],target_ids=['step_obligation'],relation_ids=[],old_judgment=state.claims[1].description,new_judgment=changed.description,new_basis='Conflicting design notes',grounding=basis,patch=GraphPatch(claims=[changed],expected_versions={changed.id:1},rationale='Proposed change'),graph=None,bundle=None)
+    f=Feedback(kind='F2',rationale='Proposed design tradeoff requires resolving contrary evidence',evidence_ids=[next(m.id for m in state.materials if m.file=='README.md')],target_ids=['step_obligation'],relation_ids=[],old_judgment=state.claims[1].description,new_judgment=changed.description,new_basis='Conflicting design notes',grounding=basis,patch=GraphPatch(claims=[changed],expected_versions={changed.id:1},rationale='Proposed change'))
     before=state.claims[1].model_dump()
     from regression_support import declared_changes
     declared_changes(state,f)

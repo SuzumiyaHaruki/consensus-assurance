@@ -260,6 +260,6 @@ func TestLongEvent(t *testing.T) {
     prop=ObservableProperty(checker_id='Value',trigger=Comparison(field='event',value='output'),assertion=Comparison(field='state.value',reference='input.state.value'),identity_fields=['operation'],description='Same-stream comparison')
     monitor=EventMonitor(id='value',checker_id='Value',event='output',binding_ids=[],grounding=Grounding())
     outcome=monitor_events(separated,monitor,prop,[EventRequirement(alias='input',event='input')])
-    assert outcome['outcome']=='unknown' and outcome['missing_indices']==[1]
+    assert outcome['outcome']=='unknown' and outcome['missing_indices']==[0,1]
     invalid=next(e for e in separated if e['event']=='invalid_observation')
     assert invalid['_ca_observation']['location']['line']=='end-of-stream'

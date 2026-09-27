@@ -62,6 +62,7 @@ class CodexAgent:
             str(root/"state.json"):"read",str(root/"research.json"):"read",
             str(root/"native-submission.schema.json"):"read",str(root/"product-schemas.json"):"read",
             str(root/"native-method.md"):"read",
+            str(root/"native-model-method.md"):"read",str(root/"native-support"):"read",
             **{str(root/name):"read" for name in ("logs","models","findings","audit-spec","actions")},
             **{str(path):"read" for path in getattr(self,"read_only_roots",[]) if path.is_dir()},
             str(codex_home/"tmp"/"arg0"):"read",str(Path(executable).resolve().parent):"read"}

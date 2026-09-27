@@ -1,0 +1,875 @@
+{
+  "input": {
+    "rationale": "Next discriminator replaces the assumed failed-future producer with real InmemTransport pipeline execution. Each isolated scenario constructs a Leader state with expired contact and two Voters; it does not use BootstrapCluster/NewRaft or claim a legal election prefix. Receiver transport admits the request but no receiver Raft or reply producer runs, so no reply can be delivered. Pipeline future Error is awaited independently before real pipelineDecode reads the queued future. Ordinary replicateTo is the comparison path. Main loop, heartbeat, snapshot and verification workers are omitted to isolate the local writer/consumer effect; their absence prevents inference of cluster role duration. Raw marker times, completion/error, stable operation label and request identity are observed before a manual lease invocation. No application consequence, normative violation or property Evidence is claimed. Exploration finishes on actual future/decoder completion with bounded tool timeouts, not on a desired state.",
+    "sources": [
+      {
+        "id": "src-request-construction",
+        "file": "replication.go",
+        "start_line": 570,
+        "end_line": 625,
+        "kind": "code_observation"
+      },
+      {
+        "id": "src-local-state-setter",
+        "file": "state.go",
+        "start_line": 79,
+        "end_line": 95,
+        "kind": "code_observation"
+      },
+      {
+        "id": "src-config-load",
+        "file": "api.go",
+        "start_line": 709,
+        "end_line": 711,
+        "kind": "code_observation"
+      },
+      {
+        "id": "src-future-completion",
+        "file": "future.go",
+        "start_line": 90,
+        "end_line": 131,
+        "kind": "code_observation"
+      },
+      {
+        "id": "src-inmem-constructor",
+        "file": "inmem_transport.go",
+        "start_line": 49,
+        "end_line": 70,
+        "kind": "code_observation"
+      }
+    ],
+    "feedback": null,
+    "action": "explore",
+    "question": "For the accepted contact-marker candidate, does a real in-memory pipeline timeout (same returned future and queued request) refresh followerReplication.lastContact on actual pipelineDecode consumption, and does that differ from ordinary replicateTo timeout when each is followed by checkLeaderLease under the same explicitly constructed two-voter local-state premise?",
+    "harness_path": "contact_timeout_explore_test.go",
+    "files": {}
+  },
+  "before": {
+    "native_current": {
+      "phase": "received",
+      "operation_id": "bac65f648bdd4f26b07a61c3753eeac7",
+      "result": {
+        "submission": "submission-explore.json",
+        "summary": "Prepared a bounded exploration comparing real pipeline and ordinary RPC timeouts, contact-marker changes, and subsequent lease decisions. Explicitly scopes constructed local state and omitted workers; no elected-cluster history or violation is claimed."
+      },
+      "failures": 0,
+      "status": "completed",
+      "reason": "",
+      "session_unavailable": false
+    },
+    "materials": [
+      {
+        "id": "src-contact",
+        "file": "replication.go",
+        "start_line": 31,
+        "end_line": 141,
+        "kind": "code_observation",
+        "text": "// followerReplication is in charge of sending snapshots and log entries from\n// this leader during this particular term to a remote follower.\ntype followerReplication struct {\n\t// currentTerm and nextIndex must be kept at the top of the struct so\n\t// they're 64 bit aligned which is a requirement for atomic ops on 32 bit\n\t// platforms.\n\n\t// currentTerm is the term of this leader, to be included in AppendEntries\n\t// requests.\n\tcurrentTerm uint64\n\n\t// nextIndex is the index of the next log entry to send to the follower,\n\t// which may fall past the end of the log.\n\tnextIndex uint64\n\n\t// peer contains the network address and ID of the remote follower.\n\tpeer Server\n\t// peerLock protects 'peer'\n\tpeerLock sync.RWMutex\n\n\t// commitment tracks the entries acknowledged by followers so that the\n\t// leader's commit index can advance. It is updated on successful\n\t// AppendEntries responses.\n\tcommitment *commitment\n\n\t// stopCh is notified/closed when this leader steps down or the follower is\n\t// removed from the cluster. In the follower removed case, it carries a log\n\t// index; replication should be attempted with a best effort up through that\n\t// index, before exiting.\n\tstopCh chan uint64\n\n\t// triggerCh is notified every time new entries are appended to the log.\n\ttriggerCh chan struct{}\n\n\t// triggerDeferErrorCh is used to provide a backchannel. By sending a\n\t// deferErr, the sender can be notified when the replication is done.\n\ttriggerDeferErrorCh chan *deferError\n\n\t// lastContact is updated to the current time whenever any response is\n\t// received from the follower (successful or not). This is used to check\n\t// whether the leader should step down (Raft.checkLeaderLease()).\n\tlastContact time.Time\n\t// lastContactLock protects 'lastContact'.\n\tlastContactLock sync.RWMutex\n\n\t// failures counts the number of failed RPCs since the last success, which is\n\t// used to apply backoff.\n\tfailures uint64\n\n\t// notifyCh is notified to send out a heartbeat, which is used to check that\n\t// this server is still leader.\n\tnotifyCh chan struct{}\n\t// notify is a map of futures to be resolved upon receipt of an\n\t// acknowledgement, then cleared from this map.\n\tnotify map[*verifyFuture]struct{}\n\t// notifyLock protects 'notify'.\n\tnotifyLock sync.Mutex\n\n\t// stepDown is used to indicate to the leader that we\n\t// should step down based on information from a follower.\n\tstepDown chan struct{}\n\n\t// allowPipeline is used to determine when to pipeline the AppendEntries RPCs.\n\t// It is private to this replication goroutine.\n\tallowPipeline bool\n}\n\n// notifyAll is used to notify all the waiting verify futures\n// if the follower believes we are still the leader.\nfunc (s *followerReplication) notifyAll(leader bool) {\n\t// Clear the waiting notifies minimizing lock time\n\ts.notifyLock.Lock()\n\tn := s.notify\n\ts.notify = make(map[*verifyFuture]struct{})\n\ts.notifyLock.Unlock()\n\n\t// Submit our votes\n\tfor v := range n {\n\t\tv.vote(leader)\n\t}\n}\n\n// cleanNotify is used to delete notify, .\nfunc (s *followerReplication) cleanNotify(v *verifyFuture) {\n\ts.notifyLock.Lock()\n\tdelete(s.notify, v)\n\ts.notifyLock.Unlock()\n}\n\n// LastContact returns the time of last contact.\nfunc (s *followerReplication) LastContact() time.Time {\n\ts.lastContactLock.RLock()\n\tlast := s.lastContact\n\ts.lastContactLock.RUnlock()\n\treturn last\n}\n\n// setLastContact sets the last contact to the current time.\nfunc (s *followerReplication) setLastContact() {\n\ts.lastContactLock.Lock()\n\ts.lastContact = time.Now()\n\ts.lastContactLock.Unlock()\n}\n\n// replicate is a long running routine that replicates log entries to a single\n// follower.\nfunc (r *Raft) replicate(s *followerReplication) {\n\t// Start an async heartbeating routing\n\tstopHeartbeat := make(chan struct{})\n\tdefer close(stopHeartbeat)\n\tr.goFunc(func() { r.heartbeat(s, stopHeartbeat) })",
+        "content_digest": "24106024107950339bd30fc4e24a0b4a0a97a1c0e01aa7b31bedf4a2ad30b054"
+      },
+      {
+        "id": "src-heartbeat",
+        "file": "replication.go",
+        "start_line": 385,
+        "end_line": 440,
+        "kind": "code_observation",
+        "text": "// heartbeat is used to periodically invoke AppendEntries on a peer\n// to ensure they don't time out. This is done async of replicate(),\n// since that routine could potentially be blocked on disk IO.\nfunc (r *Raft) heartbeat(s *followerReplication, stopCh chan struct{}) {\n\tvar failures uint64\n\treq := AppendEntriesRequest{\n\t\tRPCHeader: r.getRPCHeader(),\n\t\tTerm:      s.currentTerm,\n\t\t// this is needed for retro compatibility, before RPCHeader.Addr was added\n\t\tLeader: r.trans.EncodePeer(r.localID, r.localAddr),\n\t}\n\n\tvar resp AppendEntriesResponse\n\tfor {\n\t\t// Wait for the next heartbeat interval or forced notify\n\t\tselect {\n\t\tcase <-s.notifyCh:\n\t\tcase <-randomTimeout(r.config().HeartbeatTimeout / 10):\n\t\tcase <-stopCh:\n\t\t\treturn\n\t\t}\n\n\t\ts.peerLock.RLock()\n\t\tpeer := s.peer\n\t\ts.peerLock.RUnlock()\n\n\t\tstart := time.Now()\n\t\tif err := r.trans.AppendEntries(peer.ID, peer.Address, &req, &resp); err != nil {\n\t\t\tnextBackoffTime := cappedExponentialBackoff(failureWait, failures, maxFailureScale, r.config().HeartbeatTimeout/2)\n\t\t\tr.logger.Error(\"failed to heartbeat to\", \"peer\", peer.Address, \"backoff time\",\n\t\t\t\tnextBackoffTime, \"error\", err)\n\t\t\tr.observe(FailedHeartbeatObservation{PeerID: peer.ID, LastContact: s.LastContact()})\n\t\t\tfailures++\n\t\t\tselect {\n\t\t\tcase <-time.After(nextBackoffTime):\n\t\t\tcase <-stopCh:\n\t\t\t\treturn\n\t\t\t}\n\t\t} else {\n\t\t\tif failures > 0 {\n\t\t\t\tr.observe(ResumedHeartbeatObservation{PeerID: peer.ID})\n\t\t\t}\n\t\t\ts.setLastContact()\n\t\t\tfailures = 0\n\t\t\tlabels := []metrics.Label{{Name: \"peer_id\", Value: string(peer.ID)}}\n\t\t\tmetrics.MeasureSinceWithLabels([]string{\"raft\", \"replication\", \"heartbeat\"}, start, labels)\n\n\t\t\tif !r.noLegacyTelemetry {\n\t\t\t\t// Duplicated information. Kept for backward compatibility.\n\t\t\t\tmetrics.MeasureSince([]string{\"raft\", \"replication\", \"heartbeat\", string(peer.ID)}, start)\n\t\t\t}\n\n\t\t\ts.notifyAll(resp.Success)\n\t\t}\n\t}\n}",
+        "content_digest": "24106024107950339bd30fc4e24a0b4a0a97a1c0e01aa7b31bedf4a2ad30b054"
+      },
+      {
+        "id": "src-append-reply",
+        "file": "replication.go",
+        "start_line": 199,
+        "end_line": 263,
+        "kind": "code_observation",
+        "text": "// replicateTo is a helper to replicate(), used to replicate the logs up to a\n// given last index.\n// If the follower log is behind, we take care to bring them up to date.\nfunc (r *Raft) replicateTo(s *followerReplication, lastIndex uint64) (shouldStop bool) {\n\t// Create the base request\n\tvar req AppendEntriesRequest\n\tvar resp AppendEntriesResponse\n\tvar start time.Time\n\tvar peer Server\n\nSTART:\n\t// Prevent an excessive retry rate on errors\n\tif s.failures > 0 {\n\t\tselect {\n\t\tcase <-time.After(backoff(failureWait, s.failures, maxFailureScale)):\n\t\tcase <-r.shutdownCh:\n\t\t}\n\t}\n\n\ts.peerLock.RLock()\n\tpeer = s.peer\n\ts.peerLock.RUnlock()\n\n\t// Setup the request\n\tif err := r.setupAppendEntries(s, &req, atomic.LoadUint64(&s.nextIndex), lastIndex); err == ErrLogNotFound {\n\t\tgoto SEND_SNAP\n\t} else if err != nil {\n\t\treturn\n\t}\n\n\t// Make the RPC call\n\tstart = time.Now()\n\tif err := r.trans.AppendEntries(peer.ID, peer.Address, &req, &resp); err != nil {\n\t\tr.logger.Error(\"failed to appendEntries to\", \"peer\", peer, \"error\", err)\n\t\ts.failures++\n\t\treturn\n\t}\n\tappendStats(string(peer.ID), start, float32(len(req.Entries)), r.noLegacyTelemetry)\n\n\t// Check for a newer term, stop running\n\tif resp.Term > req.Term {\n\t\tr.handleStaleTerm(s)\n\t\treturn true\n\t}\n\n\t// Update the last contact\n\ts.setLastContact()\n\n\t// Update s based on success\n\tif resp.Success {\n\t\t// Update our replication state\n\t\tupdateLastAppended(s, &req)\n\n\t\t// Clear any failures, allow pipelining\n\t\ts.failures = 0\n\t\ts.allowPipeline = true\n\t} else {\n\t\tatomic.StoreUint64(&s.nextIndex, max(min(s.nextIndex-1, resp.LastLog+1), 1))\n\t\tif resp.NoRetryBackoff {\n\t\t\ts.failures = 0\n\t\t} else {\n\t\t\ts.failures++\n\t\t}\n\t\tr.logger.Warn(\"appendEntries rejected, sending older logs\", \"peer\", peer, \"next\", atomic.LoadUint64(&s.nextIndex))\n\t}",
+        "content_digest": "24106024107950339bd30fc4e24a0b4a0a97a1c0e01aa7b31bedf4a2ad30b054"
+      },
+      {
+        "id": "src-snapshot-reply",
+        "file": "replication.go",
+        "start_line": 340,
+        "end_line": 382,
+        "kind": "code_observation",
+        "text": "\n\tr.logger.Info(\"installing snapshot on\", \"peer\", peer.ID, \"id\", snapID, \"size\", req.Size)\n\t// Make the call\n\tstart := time.Now()\n\tvar resp InstallSnapshotResponse\n\tif err := r.trans.InstallSnapshot(peer.ID, peer.Address, &req, &resp, snapshot); err != nil {\n\t\tr.logger.Error(\"failed to install snapshot\", \"peer\", peer.ID, \"id\", snapID, \"error\", err)\n\t\ts.failures++\n\t\treturn false, err\n\t}\n\tlabels := []metrics.Label{{Name: \"peer_id\", Value: string(peer.ID)}}\n\tmetrics.MeasureSinceWithLabels([]string{\"raft\", \"replication\", \"installSnapshot\"}, start, labels)\n\n\tif !r.noLegacyTelemetry {\n\t\t// Duplicated information. Kept for backward compatibility.\n\t\tmetrics.MeasureSince([]string{\"raft\", \"replication\", \"installSnapshot\", string(peer.ID)}, start)\n\t}\n\n\t// Check for a newer term, stop running\n\tif resp.Term > req.Term {\n\t\tr.handleStaleTerm(s)\n\t\treturn true, nil\n\t}\n\n\t// Update the last contact\n\ts.setLastContact()\n\n\t// Check for success\n\tif resp.Success {\n\t\t// Update the indexes\n\t\tatomic.StoreUint64(&s.nextIndex, meta.Index+1)\n\t\ts.commitment.match(peer.ID, meta.Index)\n\n\t\t// Clear any failures\n\t\ts.failures = 0\n\n\t\t// Notify we are still leader\n\t\ts.notifyAll(true)\n\t} else {\n\t\ts.failures++\n\t\tr.logger.Warn(\"installSnapshot rejected to\", \"peer\", peer.ID, \"id\", snapID)\n\t}\n\treturn false, nil",
+        "content_digest": "24106024107950339bd30fc4e24a0b4a0a97a1c0e01aa7b31bedf4a2ad30b054"
+      },
+      {
+        "id": "src-pipeline-reply",
+        "file": "replication.go",
+        "start_line": 533,
+        "end_line": 567,
+        "kind": "code_observation",
+        "text": "// pipelineDecode is used to decode the responses of pipelined requests.\nfunc (r *Raft) pipelineDecode(s *followerReplication, p AppendPipeline, stopCh, finishCh chan struct{}) {\n\tdefer close(finishCh)\n\trespCh := p.Consumer()\n\tfor {\n\t\tselect {\n\t\tcase ready := <-respCh:\n\t\t\ts.peerLock.RLock()\n\t\t\tpeer := s.peer\n\t\t\ts.peerLock.RUnlock()\n\n\t\t\treq, resp := ready.Request(), ready.Response()\n\t\t\tappendStats(string(peer.ID), ready.Start(), float32(len(req.Entries)), r.noLegacyTelemetry)\n\n\t\t\t// Check for a newer term, stop running\n\t\t\tif resp.Term > req.Term {\n\t\t\t\tr.handleStaleTerm(s)\n\t\t\t\treturn\n\t\t\t}\n\n\t\t\t// Update the last contact\n\t\t\ts.setLastContact()\n\n\t\t\t// Abort pipeline if not successful\n\t\t\tif !resp.Success {\n\t\t\t\treturn\n\t\t\t}\n\n\t\t\t// Update our replication state\n\t\t\tupdateLastAppended(s, req)\n\t\tcase <-stopCh:\n\t\t\treturn\n\t\t}\n\t}\n}",
+        "content_digest": "24106024107950339bd30fc4e24a0b4a0a97a1c0e01aa7b31bedf4a2ad30b054"
+      },
+      {
+        "id": "src-stale-stepdown",
+        "file": "replication.go",
+        "start_line": 645,
+        "end_line": 665,
+        "kind": "code_observation",
+        "text": "// handleStaleTerm is used when a follower indicates that we have a stale term.\nfunc (r *Raft) handleStaleTerm(s *followerReplication) {\n\tr.logger.Error(\"peer has newer term, stopping replication\", \"peer\", s.peer)\n\ts.notifyAll(false) // No longer leader\n\tasyncNotifyCh(s.stepDown)\n}\n\n// updateLastAppended is used to update follower replication state after a\n// successful AppendEntries RPC.\n// TODO: This isn't used during InstallSnapshot, but the code there is similar.\nfunc updateLastAppended(s *followerReplication, req *AppendEntriesRequest) {\n\t// Mark any inflight logs as committed\n\tif logs := req.Entries; len(logs) > 0 {\n\t\tlast := logs[len(logs)-1]\n\t\tatomic.StoreUint64(&s.nextIndex, last.Index+1)\n\t\ts.commitment.match(s.peer.ID, last.Index)\n\t}\n\n\t// Notify still leader\n\ts.notifyAll(true)\n}",
+        "content_digest": "24106024107950339bd30fc4e24a0b4a0a97a1c0e01aa7b31bedf4a2ad30b054"
+      },
+      {
+        "id": "src-initialize",
+        "file": "raft.go",
+        "start_line": 580,
+        "end_line": 614,
+        "kind": "code_observation",
+        "text": "// it'll instruct the replication routines to try to replicate to the current\n// index. This must only be called from the main thread.\nfunc (r *Raft) startStopReplication() {\n\tinConfig := make(map[ServerID]bool, len(r.configurations.latest.Servers))\n\tlastIdx := r.getLastIndex()\n\n\t// Start replication goroutines that need starting\n\tfor _, server := range r.configurations.latest.Servers {\n\t\tif server.ID == r.localID {\n\t\t\tcontinue\n\t\t}\n\n\t\tinConfig[server.ID] = true\n\n\t\ts, ok := r.leaderState.replState[server.ID]\n\t\tif !ok {\n\t\t\tr.logger.Info(\"added peer, starting replication\", \"peer\", server.ID)\n\t\t\ts = &followerReplication{\n\t\t\t\tpeer:                server,\n\t\t\t\tcommitment:          r.leaderState.commitment,\n\t\t\t\tstopCh:              make(chan uint64, 1),\n\t\t\t\ttriggerCh:           make(chan struct{}, 1),\n\t\t\t\ttriggerDeferErrorCh: make(chan *deferError, 1),\n\t\t\t\tcurrentTerm:         r.getCurrentTerm(),\n\t\t\t\tnextIndex:           lastIdx + 1,\n\t\t\t\tlastContact:         time.Now(),\n\t\t\t\tnotify:              make(map[*verifyFuture]struct{}),\n\t\t\t\tnotifyCh:            make(chan struct{}, 1),\n\t\t\t\tstepDown:            r.leaderState.stepDown,\n\t\t\t}\n\n\t\t\tr.leaderState.replState[server.ID] = s\n\t\t\tr.goFunc(func() { r.replicate(s) })\n\t\t\tasyncNotifyCh(s.triggerCh)\n\t\t\tr.observe(PeerObservation{Peer: server, Removed: false})",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "src-lease",
+        "file": "raft.go",
+        "start_line": 1032,
+        "end_line": 1094,
+        "kind": "code_observation",
+        "text": "// checkLeaderLease is used to check if we can contact a quorum of nodes\n// within the last leader lease interval. If not, we need to step down,\n// as we may have lost connectivity. Returns the maximum duration without\n// contact. This must only be called from the main thread.\nfunc (r *Raft) checkLeaderLease() time.Duration {\n\t// Track contacted nodes, we can always contact ourself\n\tcontacted := 0\n\n\t// Store lease timeout for this one check invocation as we need to refer to it\n\t// in the loop and would be confusing if it ever becomes reloadable and\n\t// changes between iterations below.\n\tleaseTimeout := r.config().LeaderLeaseTimeout\n\n\t// Check each follower\n\tvar maxDiff time.Duration\n\tnow := time.Now()\n\tfor _, server := range r.configurations.latest.Servers {\n\t\tif server.Suffrage == Voter {\n\t\t\tif server.ID == r.localID {\n\t\t\t\tcontacted++\n\t\t\t\tcontinue\n\t\t\t}\n\t\t\tf := r.leaderState.replState[server.ID]\n\t\t\tdiff := now.Sub(f.LastContact())\n\t\t\tif diff <= leaseTimeout {\n\t\t\t\tcontacted++\n\t\t\t\tif diff > maxDiff {\n\t\t\t\t\tmaxDiff = diff\n\t\t\t\t}\n\t\t\t} else {\n\t\t\t\t// Log at least once at high value, then debug. Otherwise it gets very verbose.\n\t\t\t\tif diff <= 3*leaseTimeout {\n\t\t\t\t\tr.logger.Warn(\"failed to contact\", \"server-id\", server.ID, \"time\", diff)\n\t\t\t\t} else {\n\t\t\t\t\tr.logger.Debug(\"failed to contact\", \"server-id\", server.ID, \"time\", diff)\n\t\t\t\t}\n\t\t\t}\n\t\t\tmetrics.AddSample([]string{\"raft\", \"leader\", \"lastContact\"}, float32(diff/time.Millisecond))\n\t\t}\n\t}\n\n\t// Verify we can contact a quorum\n\tquorum := r.quorumSize()\n\tif contacted < quorum {\n\t\tr.logger.Warn(\"failed to contact quorum of nodes, stepping down\")\n\t\tr.setState(Follower)\n\t\tmetrics.IncrCounter([]string{\"raft\", \"transition\", \"leader_lease_timeout\"}, 1)\n\t}\n\treturn maxDiff\n}\n\n// quorumSize is used to return the quorum size. This must only be called on\n// the main thread.\n// TODO: revisit usage\nfunc (r *Raft) quorumSize() int {\n\tvoters := 0\n\tfor _, server := range r.configurations.latest.Servers {\n\t\tif server.Suffrage == Voter {\n\t\t\tvoters++\n\t\t}\n\t}\n\treturn voters/2 + 1\n}",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "src-lease-contract",
+        "file": "config.go",
+        "start_line": 201,
+        "end_line": 205,
+        "kind": "interface_statement",
+        "text": "\t// LeaderLeaseTimeout is used to control how long the \"lease\" lasts\n\t// for being the leader without being able to contact a quorum\n\t// of nodes. If we reach this interval without contact, we will\n\t// step down as leader.\n\tLeaderLeaseTimeout time.Duration",
+        "content_digest": "e5d01350da2438f2580c57b065d2bfcef93e710c4487b8947fccb1e172b48f7a"
+      },
+      {
+        "id": "src-lease-purpose",
+        "file": "raft.go",
+        "start_line": 1015,
+        "end_line": 1022,
+        "kind": "document_statement",
+        "text": "\t// Step ?: the thesis describes in chap 6.4.1: Using clocks to reduce\n\t// messaging for read-only queries. If this is implemented, the lease\n\t// has to be reset as well, in case leadership is transferred. This\n\t// implementation also has a lease, but it serves another purpose and\n\t// doesn't need to be reset. The lease mechanism in our raft lib, is\n\t// setup in a similar way to the one in the thesis, but in practice\n\t// it's a timer that just tells the leader how often to check\n\t// heartbeats are still coming in.",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "src-reject-old",
+        "file": "raft.go",
+        "start_line": 1438,
+        "end_line": 1467,
+        "kind": "code_observation",
+        "text": "// appendEntries is invoked when we get an append entries RPC call. This must\n// only be called from the main thread.\nfunc (r *Raft) appendEntries(rpc RPC, a *AppendEntriesRequest) {\n\tdefer metrics.MeasureSince([]string{\"raft\", \"rpc\", \"appendEntries\"}, time.Now())\n\t// Setup a response\n\tresp := &AppendEntriesResponse{\n\t\tRPCHeader:      r.getRPCHeader(),\n\t\tTerm:           r.getCurrentTerm(),\n\t\tLastLog:        r.getLastIndex(),\n\t\tSuccess:        false,\n\t\tNoRetryBackoff: false,\n\t}\n\tvar rpcErr error\n\tdefer func() {\n\t\trpc.Respond(resp, rpcErr)\n\t}()\n\n\t// Ignore an older term\n\tif a.Term < r.getCurrentTerm() {\n\t\treturn\n\t}\n\n\t// Increase the term if we see a newer one, also transition to follower\n\t// if we ever get an appendEntries call\n\tif a.Term > r.getCurrentTerm() || (r.getState() != Follower && !r.candidateFromLeadershipTransfer.Load()) {\n\t\t// Ensure transition to follower\n\t\tr.setState(Follower)\n\t\tr.setCurrentTerm(a.Term)\n\t\tresp.Term = a.Term\n\t}",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "src-verify",
+        "file": "raft.go",
+        "start_line": 848,
+        "end_line": 870,
+        "kind": "code_observation",
+        "text": "\t\tcase v := <-r.verifyCh:\n\t\t\tr.mainThreadSaturation.working()\n\t\t\tif v.quorumSize == 0 {\n\t\t\t\t// Just dispatched, start the verification\n\t\t\t\tr.verifyLeader(v)\n\t\t\t} else if v.votes < v.quorumSize {\n\t\t\t\t// Early return, means there must be a new leader\n\t\t\t\tr.logger.Warn(\"new leader elected, stepping down\")\n\t\t\t\tr.setState(Follower)\n\t\t\t\tdelete(r.leaderState.notify, v)\n\t\t\t\tfor _, repl := range r.leaderState.replState {\n\t\t\t\t\trepl.cleanNotify(v)\n\t\t\t\t}\n\t\t\t\tv.respond(ErrNotLeader)\n\n\t\t\t} else {\n\t\t\t\t// Quorum of members agree, we are still leader\n\t\t\t\tdelete(r.leaderState.notify, v)\n\t\t\t\tfor _, repl := range r.leaderState.replState {\n\t\t\t\t\trepl.cleanNotify(v)\n\t\t\t\t}\n\t\t\t\tv.respond(nil)\n\t\t\t}",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "src-register-verify",
+        "file": "raft.go",
+        "start_line": 963,
+        "end_line": 987,
+        "kind": "code_observation",
+        "text": "// verifyLeader must be called from the main thread for safety.\n// Causes the followers to attempt an immediate heartbeat.\nfunc (r *Raft) verifyLeader(v *verifyFuture) {\n\t// Current leader always votes for self\n\tv.votes = 1\n\n\t// Set the quorum size, hot-path for single node\n\tv.quorumSize = r.quorumSize()\n\tif v.quorumSize == 1 {\n\t\tv.respond(nil)\n\t\treturn\n\t}\n\n\t// Track this request\n\tv.notifyCh = r.verifyCh\n\tr.leaderState.notify[v] = struct{}{}\n\n\t// Trigger immediate heartbeats\n\tfor _, repl := range r.leaderState.replState {\n\t\trepl.notifyLock.Lock()\n\t\trepl.notify[v] = struct{}{}\n\t\trepl.notifyLock.Unlock()\n\t\tasyncNotifyCh(repl.notifyCh)\n\t}\n}",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "src-verify-vote",
+        "file": "future.go",
+        "start_line": 272,
+        "end_line": 293,
+        "kind": "code_observation",
+        "text": "// vote is used to respond to a verifyFuture.\n// This may block when responding on the notifyCh.\nfunc (v *verifyFuture) vote(leader bool) {\n\tv.voteLock.Lock()\n\tdefer v.voteLock.Unlock()\n\n\t// Guard against having notified already\n\tif v.notifyCh == nil {\n\t\treturn\n\t}\n\n\tif leader {\n\t\tv.votes++\n\t\tif v.votes >= v.quorumSize {\n\t\t\tv.notifyCh <- v\n\t\t\tv.notifyCh = nil\n\t\t}\n\t} else {\n\t\tv.notifyCh <- v\n\t\tv.notifyCh = nil\n\t}\n}",
+        "content_digest": "e3775d16c6cb24f9c9572ce452c27e87fcbf4b24baf666d14e838cc4b571ae9c"
+      },
+      {
+        "id": "src-leader-cleanup",
+        "file": "raft.go",
+        "start_line": 501,
+        "end_line": 533,
+        "kind": "code_observation",
+        "text": "\t// Cleanup state on step down\n\tdefer func() {\n\t\tclose(stopCh)\n\n\t\t// Since we were the leader previously, we update our\n\t\t// last contact time when we step down, so that we are not\n\t\t// reporting a last contact time from before we were the\n\t\t// leader. Otherwise, to a client it would seem our data\n\t\t// is extremely stale.\n\t\tr.setLastContact()\n\n\t\t// Stop replication\n\t\tfor _, p := range r.leaderState.replState {\n\t\t\tclose(p.stopCh)\n\t\t}\n\n\t\t// Respond to all inflight operations\n\t\tfor e := r.leaderState.inflight.Front(); e != nil; e = e.Next() {\n\t\t\te.Value.(*logFuture).respond(ErrLeadershipLost)\n\t\t}\n\n\t\t// Respond to any pending verify requests\n\t\tfor future := range r.leaderState.notify {\n\t\t\tfuture.respond(ErrLeadershipLost)\n\t\t}\n\n\t\t// Clear all the state\n\t\tr.leaderState.commitCh = nil\n\t\tr.leaderState.commitment = nil\n\t\tr.leaderState.inflight = nil\n\t\tr.leaderState.replState = nil\n\t\tr.leaderState.notify = nil\n\t\tr.leaderState.stepDown = nil",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "src-stepdown-consume",
+        "file": "raft.go",
+        "start_line": 680,
+        "end_line": 689,
+        "kind": "code_observation",
+        "text": "\t\tr.mainThreadSaturation.sleeping()\n\n\t\tselect {\n\t\tcase rpc := <-r.rpcCh:\n\t\t\tr.mainThreadSaturation.working()\n\t\t\tr.processRPC(rpc)\n\n\t\tcase <-r.leaderState.stepDown:\n\t\t\tr.mainThreadSaturation.working()\n\t\t\tr.setState(Follower)",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "src-lease-timer",
+        "file": "raft.go",
+        "start_line": 934,
+        "end_line": 947,
+        "kind": "code_observation",
+        "text": "\t\tcase <-lease:\n\t\t\tr.mainThreadSaturation.working()\n\t\t\t// Check if we've exceeded the lease, potentially stepping down\n\t\t\tmaxDiff := r.checkLeaderLease()\n\n\t\t\t// Next check interval should adjust for the last node we've\n\t\t\t// contacted, without going negative\n\t\t\tcheckInterval := r.config().LeaderLeaseTimeout - maxDiff\n\t\t\tif checkInterval < minCheckInterval {\n\t\t\t\tcheckInterval = minCheckInterval\n\t\t\t}\n\n\t\t\t// Renew the lease timer\n\t\t\tlease = time.After(checkInterval)",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "src-verify-contract",
+        "file": "api.go",
+        "start_line": 880,
+        "end_line": 892,
+        "kind": "interface_statement",
+        "text": "// VerifyLeader is used to ensure this peer is still the leader. It may be used\n// to prevent returning stale data from the FSM after the peer has lost\n// leadership.\nfunc (r *Raft) VerifyLeader() Future {\n\tmetrics.IncrCounter([]string{\"raft\", \"verify_leader\"}, 1)\n\tverifyFuture := &verifyFuture{}\n\tverifyFuture.init()\n\tselect {\n\tcase <-r.shutdownCh:\n\t\treturn errorFuture{ErrRaftShutdown}\n\tcase r.verifyCh <- verifyFuture:\n\t\treturn verifyFuture\n\t}",
+        "content_digest": "499a72c01096912e85d16381f4640ac6d29f8c2b91cabbdae8530bdcbeb89a4a"
+      },
+      {
+        "id": "src-replication-progress",
+        "file": "replication.go",
+        "start_line": 135,
+        "end_line": 197,
+        "kind": "code_observation",
+        "text": "// replicate is a long running routine that replicates log entries to a single\n// follower.\nfunc (r *Raft) replicate(s *followerReplication) {\n\t// Start an async heartbeating routing\n\tstopHeartbeat := make(chan struct{})\n\tdefer close(stopHeartbeat)\n\tr.goFunc(func() { r.heartbeat(s, stopHeartbeat) })\n\nRPC:\n\tshouldStop := false\n\tfor !shouldStop {\n\t\tselect {\n\t\tcase maxIndex := <-s.stopCh:\n\t\t\t// Make a best effort to replicate up to this index\n\t\t\tif maxIndex > 0 {\n\t\t\t\tr.replicateTo(s, maxIndex)\n\t\t\t}\n\t\t\treturn\n\t\tcase deferErr := <-s.triggerDeferErrorCh:\n\t\t\tlastLogIdx, _ := r.getLastLog()\n\t\t\tshouldStop = r.replicateTo(s, lastLogIdx)\n\t\t\tif !shouldStop {\n\t\t\t\tdeferErr.respond(nil)\n\t\t\t} else {\n\t\t\t\tdeferErr.respond(fmt.Errorf(\"replication failed\"))\n\t\t\t}\n\t\tcase <-s.triggerCh:\n\t\t\tlastLogIdx, _ := r.getLastLog()\n\t\t\tshouldStop = r.replicateTo(s, lastLogIdx)\n\t\t// This is _not_ our heartbeat mechanism but is to ensure\n\t\t// followers quickly learn the leader's commit index when\n\t\t// raft commits stop flowing naturally. The actual heartbeats\n\t\t// can't do this to keep them unblocked by disk IO on the\n\t\t// follower. See https://github.com/hashicorp/raft/issues/282.\n\t\tcase <-randomTimeout(r.config().CommitTimeout):\n\t\t\tlastLogIdx, _ := r.getLastLog()\n\t\t\tshouldStop = r.replicateTo(s, lastLogIdx)\n\t\t}\n\n\t\t// If things looks healthy, switch to pipeline mode\n\t\tif !shouldStop && s.allowPipeline {\n\t\t\tgoto PIPELINE\n\t\t}\n\t}\n\treturn\n\nPIPELINE:\n\t// Disable until re-enabled\n\ts.allowPipeline = false\n\n\t// Replicates using a pipeline for high performance. This method\n\t// is not able to gracefully recover from errors, and so we fall back\n\t// to standard mode on failure.\n\tif err := r.pipelineReplicate(s); err != nil {\n\t\tif err != ErrPipelineReplicationNotSupported {\n\t\t\ts.peerLock.RLock()\n\t\t\tpeer := s.peer\n\t\t\ts.peerLock.RUnlock()\n\t\t\tr.logger.Error(\"failed to start pipeline replication to\", \"peer\", peer, \"error\", err)\n\t\t}\n\t}\n\tgoto RPC\n}",
+        "content_digest": "24106024107950339bd30fc4e24a0b4a0a97a1c0e01aa7b31bedf4a2ad30b054"
+      },
+      {
+        "id": "src-pipeline-progress",
+        "file": "replication.go",
+        "start_line": 442,
+        "end_line": 530,
+        "kind": "code_observation",
+        "text": "// pipelineReplicate is used when we have synchronized our state with the follower,\n// and want to switch to a higher performance pipeline mode of replication.\n// We only pipeline AppendEntries commands, and if we ever hit an error, we fall\n// back to the standard replication which can handle more complex situations.\nfunc (r *Raft) pipelineReplicate(s *followerReplication) error {\n\ts.peerLock.RLock()\n\tpeer := s.peer\n\ts.peerLock.RUnlock()\n\n\t// Create a new pipeline\n\tpipeline, err := r.trans.AppendEntriesPipeline(peer.ID, peer.Address)\n\tif err != nil {\n\t\treturn err\n\t}\n\tdefer pipeline.Close()\n\n\t// Log start and stop of pipeline\n\tr.logger.Info(\"pipelining replication\", \"peer\", peer)\n\tdefer r.logger.Info(\"aborting pipeline replication\", \"peer\", peer)\n\n\t// Create a shutdown and finish channel\n\tstopCh := make(chan struct{})\n\tfinishCh := make(chan struct{})\n\n\t// Start a dedicated decoder\n\tr.goFunc(func() { r.pipelineDecode(s, pipeline, stopCh, finishCh) })\n\n\t// Start pipeline sends at the last good nextIndex\n\tnextIndex := atomic.LoadUint64(&s.nextIndex)\n\n\tshouldStop := false\nSEND:\n\tfor !shouldStop {\n\t\tselect {\n\t\tcase <-finishCh:\n\t\t\tbreak SEND\n\t\tcase maxIndex := <-s.stopCh:\n\t\t\t// Make a best effort to replicate up to this index\n\t\t\tif maxIndex > 0 {\n\t\t\t\tr.pipelineSend(s, pipeline, &nextIndex, maxIndex)\n\t\t\t}\n\t\t\tbreak SEND\n\t\tcase deferErr := <-s.triggerDeferErrorCh:\n\t\t\tlastLogIdx, _ := r.getLastLog()\n\t\t\tshouldStop = r.pipelineSend(s, pipeline, &nextIndex, lastLogIdx)\n\t\t\tif !shouldStop {\n\t\t\t\tdeferErr.respond(nil)\n\t\t\t} else {\n\t\t\t\tdeferErr.respond(fmt.Errorf(\"replication failed\"))\n\t\t\t}\n\t\tcase <-s.triggerCh:\n\t\t\tlastLogIdx, _ := r.getLastLog()\n\t\t\tshouldStop = r.pipelineSend(s, pipeline, &nextIndex, lastLogIdx)\n\t\tcase <-randomTimeout(r.config().CommitTimeout):\n\t\t\tlastLogIdx, _ := r.getLastLog()\n\t\t\tshouldStop = r.pipelineSend(s, pipeline, &nextIndex, lastLogIdx)\n\t\t}\n\t}\n\n\t// Stop our decoder, and wait for it to finish\n\tclose(stopCh)\n\tselect {\n\tcase <-finishCh:\n\tcase <-r.shutdownCh:\n\t}\n\treturn nil\n}\n\n// pipelineSend is used to send data over a pipeline. It is a helper to\n// pipelineReplicate.\nfunc (r *Raft) pipelineSend(s *followerReplication, p AppendPipeline, nextIdx *uint64, lastIndex uint64) (shouldStop bool) {\n\t// Create a new append request\n\treq := new(AppendEntriesRequest)\n\tif err := r.setupAppendEntries(s, req, *nextIdx, lastIndex); err != nil {\n\t\treturn true\n\t}\n\n\t// Pipeline the append entries\n\tif _, err := p.AppendEntries(req, new(AppendEntriesResponse)); err != nil {\n\t\tr.logger.Error(\"failed to pipeline appendEntries\", \"peer\", s.peer, \"error\", err)\n\t\treturn true\n\t}\n\n\t// Increase the next send log to avoid re-sending old logs\n\tif n := len(req.Entries); n > 0 {\n\t\tlast := req.Entries[n-1]\n\t\tatomic.StoreUint64(nextIdx, last.Index+1)\n\t}\n\treturn false",
+        "content_digest": "24106024107950339bd30fc4e24a0b4a0a97a1c0e01aa7b31bedf4a2ad30b054"
+      },
+      {
+        "id": "src-pipeline-contract",
+        "file": "transport.go",
+        "start_line": 109,
+        "end_line": 140,
+        "kind": "interface_statement",
+        "text": "// AppendPipeline is used for pipelining AppendEntries requests. It is used\n// to increase the replication throughput by masking latency and better\n// utilizing bandwidth.\ntype AppendPipeline interface {\n\t// AppendEntries is used to add another request to the pipeline.\n\t// The send may block which is an effective form of back-pressure.\n\tAppendEntries(args *AppendEntriesRequest, resp *AppendEntriesResponse) (AppendFuture, error)\n\n\t// Consumer returns a channel that can be used to consume\n\t// response futures when they are ready.\n\tConsumer() <-chan AppendFuture\n\n\t// Close closes the pipeline and cancels all inflight RPCs\n\tClose() error\n}\n\n// AppendFuture is used to return information about a pipelined AppendEntries request.\ntype AppendFuture interface {\n\tFuture\n\n\t// Start returns the time that the append request was started.\n\t// It is always OK to call this method.\n\tStart() time.Time\n\n\t// Request holds the parameters of the AppendEntries call.\n\t// It is always OK to call this method.\n\tRequest() *AppendEntriesRequest\n\n\t// Response holds the results of the AppendEntries call.\n\t// This method must only be called after the Error\n\t// method returns, and will only be valid on success.\n\tResponse() *AppendEntriesResponse",
+        "content_digest": "e7ee18e82646ef6c26a4cbad105c94494ef11a92468c3cd594db342e0be100b1"
+      },
+      {
+        "id": "src-inmem-pipeline-timeout",
+        "file": "inmem_transport.go",
+        "start_line": 259,
+        "end_line": 309,
+        "kind": "code_observation",
+        "text": "func newInmemPipeline(trans *InmemTransport, peer *InmemTransport, addr ServerAddress) *inmemPipeline {\n\ti := &inmemPipeline{\n\t\ttrans:        trans,\n\t\tpeer:         peer,\n\t\tpeerAddr:     addr,\n\t\tdoneCh:       make(chan AppendFuture, 16),\n\t\tinprogressCh: make(chan *inmemPipelineInflight, 16),\n\t\tshutdownCh:   make(chan struct{}),\n\t}\n\tgo i.decodeResponses()\n\treturn i\n}\n\nfunc (i *inmemPipeline) decodeResponses() {\n\ttimeout := i.trans.timeout\n\tfor {\n\t\tselect {\n\t\tcase inp := <-i.inprogressCh:\n\t\t\tvar timeoutCh <-chan time.Time\n\t\t\tif timeout > 0 {\n\t\t\t\ttimeoutCh = time.After(timeout)\n\t\t\t}\n\n\t\t\tselect {\n\t\t\tcase rpcResp := <-inp.respCh:\n\t\t\t\t// Copy the result back\n\t\t\t\t*inp.future.resp = *rpcResp.Response.(*AppendEntriesResponse)\n\t\t\t\tinp.future.respond(rpcResp.Error)\n\n\t\t\t\tselect {\n\t\t\t\tcase i.doneCh <- inp.future:\n\t\t\t\tcase <-i.shutdownCh:\n\t\t\t\t\treturn\n\t\t\t\t}\n\n\t\t\tcase <-timeoutCh:\n\t\t\t\tinp.future.respond(fmt.Errorf(\"command timed out\"))\n\t\t\t\tselect {\n\t\t\t\tcase i.doneCh <- inp.future:\n\t\t\t\tcase <-i.shutdownCh:\n\t\t\t\t\treturn\n\t\t\t\t}\n\n\t\t\tcase <-i.shutdownCh:\n\t\t\t\treturn\n\t\t\t}\n\t\tcase <-i.shutdownCh:\n\t\t\treturn\n\t\t}\n\t}\n}",
+        "content_digest": "80d9e25c23cce532a687eafe5197c076d440b5a2be443bc9b3897b4e2fa09774"
+      },
+      {
+        "id": "src-inmem-pipeline-send",
+        "file": "inmem_transport.go",
+        "start_line": 311,
+        "end_line": 362,
+        "kind": "code_observation",
+        "text": "func (i *inmemPipeline) AppendEntries(args *AppendEntriesRequest, resp *AppendEntriesResponse) (AppendFuture, error) {\n\t// Create a new future\n\tfuture := &appendFuture{\n\t\tstart: time.Now(),\n\t\targs:  args,\n\t\tresp:  resp,\n\t}\n\tfuture.init()\n\n\t// Handle a timeout\n\tvar timeout <-chan time.Time\n\tif i.trans.timeout > 0 {\n\t\ttimeout = time.After(i.trans.timeout)\n\t}\n\n\t// Send the RPC over\n\trespCh := make(chan RPCResponse, 1)\n\trpc := RPC{\n\t\tCommand:  args,\n\t\tRespChan: respCh,\n\t}\n\n\t// Check if we have been already shutdown, otherwise the random choose\n\t// made by select statement below might pick consumerCh even if\n\t// shutdownCh was closed.\n\ti.shutdownLock.RLock()\n\tshutdown := i.shutdown\n\ti.shutdownLock.RUnlock()\n\tif shutdown {\n\t\treturn nil, ErrPipelineShutdown\n\t}\n\n\tselect {\n\tcase i.peer.consumerCh <- rpc:\n\tcase <-timeout:\n\t\treturn nil, fmt.Errorf(\"command enqueue timeout\")\n\tcase <-i.shutdownCh:\n\t\treturn nil, ErrPipelineShutdown\n\t}\n\n\t// Send to be decoded\n\tselect {\n\tcase i.inprogressCh <- &inmemPipelineInflight{future, respCh}:\n\t\treturn future, nil\n\tcase <-i.shutdownCh:\n\t\treturn nil, ErrPipelineShutdown\n\t}\n}\n\nfunc (i *inmemPipeline) Consumer() <-chan AppendFuture {\n\treturn i.doneCh\n}",
+        "content_digest": "80d9e25c23cce532a687eafe5197c076d440b5a2be443bc9b3897b4e2fa09774"
+      },
+      {
+        "id": "src-inmem-rpc",
+        "file": "inmem_transport.go",
+        "start_line": 166,
+        "end_line": 200,
+        "kind": "code_observation",
+        "text": "func (i *InmemTransport) makeRPC(target ServerAddress, args interface{}, r io.Reader, timeout time.Duration) (rpcResp RPCResponse, err error) {\n\ti.RLock()\n\tpeer, ok := i.peers[target]\n\ti.RUnlock()\n\n\tif !ok {\n\t\terr = fmt.Errorf(\"failed to connect to peer: %v\", target)\n\t\treturn\n\t}\n\n\t// Send the RPC over\n\trespCh := make(chan RPCResponse, 1)\n\treq := RPC{\n\t\tCommand:  args,\n\t\tReader:   r,\n\t\tRespChan: respCh,\n\t}\n\tselect {\n\tcase peer.consumerCh <- req:\n\tcase <-time.After(timeout):\n\t\terr = fmt.Errorf(\"send timed out\")\n\t\treturn\n\t}\n\n\t// Wait for a response\n\tselect {\n\tcase rpcResp = <-respCh:\n\t\tif rpcResp.Error != nil {\n\t\t\terr = rpcResp.Error\n\t\t}\n\tcase <-time.After(timeout):\n\t\terr = fmt.Errorf(\"command timed out\")\n\t}\n\treturn\n}",
+        "content_digest": "80d9e25c23cce532a687eafe5197c076d440b5a2be443bc9b3897b4e2fa09774"
+      },
+      {
+        "id": "src-inmem-append",
+        "file": "inmem_transport.go",
+        "start_line": 102,
+        "end_line": 113,
+        "kind": "code_observation",
+        "text": "// AppendEntries implements the Transport interface.\nfunc (i *InmemTransport) AppendEntries(id ServerID, target ServerAddress, args *AppendEntriesRequest, resp *AppendEntriesResponse) error {\n\trpcResp, err := i.makeRPC(target, args, nil, i.timeout)\n\tif err != nil {\n\t\treturn err\n\t}\n\n\t// Copy the result back\n\tout := rpcResp.Response.(*AppendEntriesResponse)\n\t*resp = *out\n\treturn nil\n}",
+        "content_digest": "80d9e25c23cce532a687eafe5197c076d440b5a2be443bc9b3897b4e2fa09774"
+      },
+      {
+        "id": "src-lease-test",
+        "file": "raft_test.go",
+        "start_line": 1771,
+        "end_line": 1818,
+        "kind": "test_expectation",
+        "text": "func TestRaft_LeaderLeaseExpire(t *testing.T) {\n\t// Make a cluster\n\tconf := inmemConfig(t)\n\tc := MakeCluster(2, t, conf)\n\tdefer c.Close()\n\n\t// Get the leader\n\tleader := c.Leader()\n\n\t// Wait until we have a followers\n\tlimit := time.Now().Add(c.longstopTimeout)\n\tvar followers []*Raft\n\tfor time.Now().Before(limit) && len(followers) != 1 {\n\t\tc.WaitEvent(nil, c.conf.CommitTimeout)\n\t\tfollowers = c.GetInState(Follower)\n\t}\n\tif len(followers) != 1 {\n\t\tt.Fatalf(\"expected a followers: %v\", followers)\n\t}\n\n\t// Disconnect the follower now\n\tfollower := followers[0]\n\tt.Logf(\"[INFO] Disconnecting %v\", follower)\n\tc.Disconnect(follower.localAddr)\n\n\t// Watch the leaderCh\n\ttimeout := time.After(conf.LeaderLeaseTimeout * 2)\nLOOP:\n\tfor {\n\t\tselect {\n\t\tcase v := <-leader.LeaderCh():\n\t\t\tif !v {\n\t\t\t\tbreak LOOP\n\t\t\t}\n\t\tcase <-timeout:\n\t\t\tt.Fatalf(\"timeout stepping down as leader\")\n\t\t}\n\t}\n\n\t// Ensure the last contact of the leader is non-zero\n\tif leader.LastContact().IsZero() {\n\t\tt.Fatalf(\"expected non-zero contact time\")\n\t}\n\n\t// Should be no leaders\n\tif len(c.GetInState(Leader)) != 0 {\n\t\tt.Fatalf(\"expected step down\")\n\t}",
+        "content_digest": "51962412636d46873abcb6dba5a4603504d480f2f7c8b2b2cc1f561b652b6f6c"
+      },
+      {
+        "id": "src-rejoin-test",
+        "file": "raft_test.go",
+        "start_line": 1746,
+        "end_line": 1768,
+        "kind": "test_expectation",
+        "text": "\t// Rejoin. The follower will have a higher term than the leader,\n\t// this will cause the leader to step down, and a new round of elections\n\t// to take place. We should eventually re-stabilize.\n\tfuture = leader.AddVoter(follower.localID, follower.localAddr, 0, 0)\n\tif err := future.Error(); err != nil && err != ErrLeadershipLost {\n\t\tt.Fatalf(\"err: %v\", err)\n\t}\n\n\t// We should level back up to the proper number of peers. We add a\n\t// stability check here to make sure the cluster gets to a state where\n\t// there's a solid leader.\n\tleader = c.Leader()\n\tif configuration := c.getConfiguration(leader); len(configuration.Servers) != 3 {\n\t\tt.Fatalf(\"missing peers: %v\", configuration)\n\t}\n\tif configuration := c.getConfiguration(followers[1]); len(configuration.Servers) != 3 {\n\t\tt.Fatalf(\"missing peers: %v\", configuration)\n\t}\n\n\t// Should be a follower now.\n\tif follower.State() != Follower {\n\t\tt.Fatalf(\"bad state: %v\", follower.State())\n\t}",
+        "content_digest": "51962412636d46873abcb6dba5a4603504d480f2f7c8b2b2cc1f561b652b6f6c"
+      },
+      {
+        "id": "src-network-pipeline-completion",
+        "file": "net_transport.go",
+        "start_line": 839,
+        "end_line": 861,
+        "kind": "code_observation",
+        "text": "// decodeResponses is a long running routine that decodes the responses\n// sent on the connection.\nfunc (n *netPipeline) decodeResponses() {\n\ttimeout := n.trans.timeout\n\tfor {\n\t\tselect {\n\t\tcase future := <-n.inprogressCh:\n\t\t\tif timeout > 0 {\n\t\t\t\tn.conn.conn.SetReadDeadline(time.Now().Add(timeout))\n\t\t\t}\n\n\t\t\t_, err := decodeResponse(n.conn, future.resp)\n\t\t\tfuture.respond(err)\n\t\t\tselect {\n\t\t\tcase n.doneCh <- future:\n\t\t\tcase <-n.shutdownCh:\n\t\t\t\treturn\n\t\t\t}\n\t\tcase <-n.shutdownCh:\n\t\t\treturn\n\t\t}\n\t}\n}",
+        "content_digest": "523d3ae139061c4cb2efa2c340e98e902db0c9637f3f7aed19735486a97f53bf"
+      },
+      {
+        "id": "src-state-api",
+        "file": "api.go",
+        "start_line": 1101,
+        "end_line": 1118,
+        "kind": "interface_statement",
+        "text": "// State returns the state of this raft peer.\nfunc (r *Raft) State() RaftState {\n\treturn r.getState()\n}\n\n// LeaderCh is used to get a channel which delivers signals on acquiring or\n// losing leadership. It sends true if we become the leader, and false if we\n// lose it.\n//\n// Receivers can expect to receive a notification only if leadership\n// transition has occurred.\n//\n// If receivers aren't ready for the signal, signals may drop and only the\n// latest leadership transition. For example, if a receiver receives subsequent\n// `true` values, they may deduce that leadership was lost and regained while\n// the receiver was processing first leadership transition.\nfunc (r *Raft) LeaderCh() <-chan bool {\n\treturn r.leaderCh",
+        "content_digest": "499a72c01096912e85d16381f4640ac6d29f8c2b91cabbdae8530bdcbeb89a4a"
+      }
+    ],
+    "selections": [
+      {
+        "operation_id": "3ccc77abce8a4ce092f02cdcafa76598",
+        "action": "continue",
+        "rationale": "Register the initial partial map and preserve a concrete A2 contact-marker question. Code establishes heterogeneous marker qualification; documentation weakens a naive successful-acknowledgement interpretation. No obligation or Evidence is claimed. Next discriminator is applicability of higher-term response handling and whether independent replication or incoming RPC processing necessarily closes the suspected window.",
+        "feedback": {},
+        "map_changes": {},
+        "accepted_versions": {
+          "audit_spec": 1,
+          "units": {},
+          "artifacts": {}
+        },
+        "candidate_ids": [
+          "724543233ad047a280de6cb77cfdb6fd"
+        ]
+      },
+      {
+        "operation_id": "d06de1eb07974fc5a51cfb9971bc37ad",
+        "action": "continue",
+        "rationale": "Continue the same principal contact-marker lifecycle. The heartbeat-rejection variant has no acquired immediate-role-loss requirement; pipeline timeout is a stronger discriminator because it can create a fresh marker without a delivered reply, and the response interface explicitly limits validity to successful completion. Register this newly read dependency before constructing a local executed comparison. Do not infer a lease failure solely from the interface mismatch.",
+        "feedback": {
+          "ref_ids": [
+            "724543233ad047a280de6cb77cfdb6fd",
+            "src-lease-contract",
+            "src-lease-purpose",
+            "src-pipeline-reply"
+          ],
+          "answered": "The contact-only contract does not demand successful heartbeat acceptance. Newly read producer code also shows that pipeline readiness does not imply response success: timeouts publish futures, while the existing consumer reads response fields directly. Ordinary periodic replication is an alternate step-down route, not a proven finite bound under arbitrary delays.",
+          "remaining": [
+            "Requirement gap narrowed: AppendFuture.Response explicitly requires Error completion and success; the lease contract concerns actual contact, but an API mismatch alone is not a completed authority-loss finding.",
+            "Local execution gap: run a real in-memory pipeline timeout, correlate its request/future identity, observe Error and marker before/after actual pipelineDecode consumption.",
+            "Initial-prefix and same-history gaps: full cluster election, pipeline activation and isolated no-contact interval have not been executed. Remote processing without reply remains possible.",
+            "Endpoint gap: whether this refresh changes a scheduled lease decision or public leadership-loss timing remains unobserved; fallback replication and negative verification remain protective alternatives."
+          ],
+          "understanding": "updated",
+          "rationale": "Choose the actual pipeline-timeout edge as the next local discriminator because it removes the unsupported assumption that a rejection is not contact. Retain the prior higher-term variant and its unresolved requirement rather than declaring it correct or violated."
+        },
+        "map_changes": {
+          "b-pipeline-contact": {
+            "impact": "dependency",
+            "rationale": "Reconnect actual failed-future producer to existing pipeline contact writer. This directly affects the current marker lifecycle and adds a timeout variant; it does not establish a full leader history or application consequence.",
+            "source_ids": [
+              "src-inmem-pipeline-timeout",
+              "src-pipeline-contract",
+              "src-pipeline-progress"
+            ]
+          },
+          "fact-peer-contact-marker": {
+            "impact": "meaning",
+            "rationale": "Explicitly records the discovered absence of a delivered reply on one refresh path. Identity and generation scope remain unchanged; current question is reconnected and no Unit or Evidence exists to revise.",
+            "source_ids": [
+              "src-inmem-pipeline-timeout",
+              "src-pipeline-contract"
+            ]
+          },
+          "b-append-contact": {
+            "impact": "clarification",
+            "rationale": "Preserve contrary evidence: ordinary timeout errors do not refresh marker, and periodic replication can eventually expose newer terms. No bounded eventuality is inferred.",
+            "source_ids": [
+              "src-inmem-append",
+              "src-inmem-rpc",
+              "src-replication-progress"
+            ]
+          },
+          "surface:Pipeline transport completion/error contract": {
+            "impact": "dependency",
+            "rationale": "Changes the deferred surface to a partially mapped concrete producer/consumer dependency. In-memory failed-future publication directly affects the current contact-marker question; network completion is contrary to treating readiness as success but its failure histories are not claimed as executed or covered.",
+            "source_ids": [
+              "src-pipeline-contract",
+              "src-inmem-pipeline-timeout",
+              "src-network-pipeline-completion"
+            ]
+          },
+          "target_profile": {
+            "impact": "dependency",
+            "rationale": "Adds the in-memory pipeline timeout variant and its actual source dependencies within the existing package and contact-marker boundary. This variant affects the current witness plan because transport completion need not deliver a response; it does not expand the claim to a legal elected-cluster prefix or application consequence.",
+            "source_ids": [
+              "src-pipeline-contract",
+              "src-inmem-pipeline-timeout"
+            ]
+          }
+        },
+        "accepted_versions": {
+          "audit_spec": 2,
+          "units": {},
+          "artifacts": {}
+        },
+        "candidate_ids": [
+          "724543233ad047a280de6cb77cfdb6fd"
+        ]
+      }
+    ],
+    "applied_operations": {
+      "native-3ccc77abce8a4ce092f02cdcafa76598": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-09-27_13-22-02-hashicorp_raft-real-run/graph-commits/native-3ccc77abce8a4ce092f02cdcafa76598.json"
+      },
+      "native-d06de1eb07974fc5a51cfb9971bc37ad": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-09-27_13-22-02-hashicorp_raft-real-run/graph-commits/native-d06de1eb07974fc5a51cfb9971bc37ad.json"
+      }
+    }
+  },
+  "after": {
+    "native_current": {
+      "phase": "accepted",
+      "operation_id": "bac65f648bdd4f26b07a61c3753eeac7",
+      "action": "explore",
+      "harness": {
+        "files": {
+          "assurance_support_test.go": "package raft\n\nimport (\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"sync\"\n\t\"sync/atomic\"\n\t\"testing\"\n\t\"time\"\n)\n\n// AssuranceMessage identifies one actual RPC and its delivery boundary.\n// Payload records actual input/output; callers supply their own discriminator.\ntype AssuranceMessage struct {\n\tID       uint64 `json:\"message_id\"`\n\tSender   string `json:\"sender\"`\n\tReceiver string `json:\"receiver\"`\n\tKind     string `json:\"kind\"`\n\tPhase    string `json:\"event\"`\n\tPayload  string `json:\"payload\"`\n\tError    string `json:\"error,omitempty\"`\n}\n\ntype AssuranceCluster struct {\n\tNodes      []*Raft\n\tTransports []*InmemTransport\n\tdone       chan struct{}\n\tworkers    sync.WaitGroup\n\tsequence   uint64\n\temit       sync.Mutex\n\tgate       func(AssuranceMessage) <-chan struct{}\n}\n\ntype assuranceTransport struct {\n\t*InmemTransport\n\tinbox chan RPC\n}\n\nfunc (t *assuranceTransport) Consumer() <-chan RPC { return t.inbox }\n\nfunc (c *AssuranceCluster) boundary(m AssuranceMessage) bool {\n\tc.emit.Lock()\n\traw, err := json.Marshal(m)\n\tif err != nil {\n\t\tc.emit.Unlock()\n\t\tpanic(err)\n\t}\n\tfmt.Println(\"CA_EVENT \" + string(raw))\n\tc.emit.Unlock()\n\tvar release <-chan struct{}\n\tif c.gate != nil {\n\t\trelease = c.gate(m)\n\t}\n\tif release != nil {\n\t\tselect {\n\t\tcase <-release:\n\t\tcase <-c.done:\n\t\t\treturn false\n\t\t}\n\t}\n\tselect {\n\tcase <-c.done:\n\t\treturn false\n\tdefault:\n\t\treturn true\n\t}\n}\n\nfunc (c *AssuranceCluster) forward(t *assuranceTransport, receiver ServerID, rpc RPC) {\n\tdefer c.workers.Done()\n\tdata, err := json.Marshal(rpc.Command)\n\tif err != nil {\n\t\tpanic(err)\n\t}\n\tm := AssuranceMessage{ID: atomic.AddUint64(&c.sequence, 1), Receiver: string(receiver),\n\t\tKind: fmt.Sprintf(\"%T\", rpc.Command), Phase: \"request_delivery\", Payload: string(data)}\n\tif h, ok := rpc.Command.(WithRPCHeader); ok {\n\t\tm.Sender = string(h.GetRPCHeader().ID)\n\t}\n\tif !c.boundary(m) {\n\t\treturn\n\t}\n\tresponse := make(chan RPCResponse, 1)\n\tactual := rpc\n\tactual.RespChan = response\n\tselect {\n\tcase t.inbox <- actual:\n\tcase <-c.done:\n\t\treturn\n\t}\n\tvar result RPCResponse\n\tselect {\n\tcase result = <-response:\n\tcase <-c.done:\n\t\treturn\n\t}\n\tdata, err = json.Marshal(result.Response)\n\tif err != nil {\n\t\tpanic(err)\n\t}\n\tm.Phase, m.Payload = \"reply_delivery\", string(data)\n\tif result.Error != nil {\n\t\tm.Error = result.Error.Error()\n\t}\n\tif !c.boundary(m) {\n\t\treturn\n\t}\n\tselect {\n\tcase rpc.RespChan <- result:\n\tcase <-c.done:\n\t}\n}\n\n// Configurations, FSMs and timeouts are experiment inputs, never hidden answers.\n// Bootstrap uses the public API; every election and reply comes from real workers.\nfunc NewAssuranceCluster(t *testing.T, configs []*Config, fsm func(int) FSM,\n\trpcTimeout time.Duration, gate func(AssuranceMessage) <-chan struct{}) *AssuranceCluster {\n\tt.Helper()\n\tc := &AssuranceCluster{done: make(chan struct{}), gate: gate}\n\tt.Cleanup(func() {\n\t\tclose(c.done)\n\t\tfutures := make([]Future, 0, len(c.Nodes))\n\t\tfor _, node := range c.Nodes {\n\t\t\tfutures = append(futures, node.Shutdown())\n\t\t}\n\t\tfor _, transport := range c.Transports {\n\t\t\ttransport.Close()\n\t\t}\n\t\tfinished := make(chan struct{})\n\t\tgo func() {\n\t\t\tfor _, future := range futures {\n\t\t\t\tfuture.Error()\n\t\t\t}\n\t\t\tc.workers.Wait()\n\t\t\tclose(finished)\n\t\t}()\n\t\tselect {\n\t\tcase <-finished:\n\t\tcase <-time.After(5 * time.Second):\n\t\t\tt.Error(\"Raft helper cleanup timed out\")\n\t\t}\n\t})\n\tconfiguration := Configuration{}\n\tfor _, conf := range configs {\n\t\t_, transport := NewInmemTransportWithTimeout(ServerAddress(conf.LocalID), rpcTimeout)\n\t\tc.Transports = append(c.Transports, transport)\n\t\tconfiguration.Servers = append(configuration.Servers, Server{ID: conf.LocalID,\n\t\t\tAddress: transport.LocalAddr(), Suffrage: Voter})\n\t}\n\tfor i, transport := range c.Transports {\n\t\tfor j, peer := range c.Transports {\n\t\t\tif i != j {\n\t\t\t\ttransport.Connect(peer.LocalAddr(), peer)\n\t\t\t}\n\t\t}\n\t}\n\tfor i, transport := range c.Transports {\n\t\tconf := *configs[i]\n\t\tstore, snapshots := NewInmemStore(), NewInmemSnapshotStore()\n\t\tproxy := &assuranceTransport{InmemTransport: transport, inbox: make(chan RPC)}\n\t\tif err := BootstrapCluster(&conf, store, store, snapshots, proxy, configuration); err != nil {\n\t\t\tt.Fatal(err)\n\t\t}\n\t\tc.workers.Add(1)\n\t\tgo func(receiver ServerID, tr *assuranceTransport) {\n\t\t\tdefer c.workers.Done()\n\t\t\tfor {\n\t\t\t\tselect {\n\t\t\t\tcase rpc := <-tr.InmemTransport.Consumer():\n\t\t\t\t\tc.workers.Add(1)\n\t\t\t\t\tgo c.forward(tr, receiver, rpc)\n\t\t\t\tcase <-c.done:\n\t\t\t\t\treturn\n\t\t\t\t}\n\t\t\t}\n\t\t}(conf.LocalID, proxy)\n\t\tnode, err := NewRaft(&conf, fsm(i), store, store, snapshots, proxy)\n\t\tif err != nil {\n\t\t\tt.Fatal(err)\n\t\t}\n\t\tc.Nodes = append(c.Nodes, node)\n\t}\n\treturn c\n}\n"
+        },
+        "kind": "go_test",
+        "source": "package raft\n\nimport (\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"testing\"\n\t\"time\"\n\n\t\"github.com/hashicorp/go-hclog\"\n)\n\nfunc assuranceContactEvent(t *testing.T, e map[string]interface{}) {\n\tt.Helper()\n\tb, err := json.Marshal(e)\n\tif err != nil {\n\t\tt.Fatal(err)\n\t}\n\tfmt.Println(\"CA_EVENT \" + string(b))\n}\n\n// This is a conditional local-state exploration, not a cluster election history.\n// No receiving Raft runs: queued requests receive no processing or reply.\nfunc TestAssuranceContactTimeoutExploration(t *testing.T) {\n\tfor _, mode := range []string{\"pipeline_timeout\", \"ordinary_timeout\"} {\n\t\tt.Run(mode, func(t *testing.T) {\n\t\t\taddr, sender := NewInmemTransportWithTimeout(ServerAddress(\"sender-\"+mode), 40*time.Millisecond)\n\t\t\tpeerAddr, receiver := NewInmemTransportWithTimeout(ServerAddress(\"receiver-\"+mode), 40*time.Millisecond)\n\t\t\tdefer sender.Close()\n\t\t\tdefer receiver.Close()\n\t\t\tsender.Connect(peerAddr, receiver)\n\t\t\tconf := DefaultConfig()\n\t\t\tconf.LocalID = ServerID(addr)\n\t\t\tconf.LeaderLeaseTimeout = 2 * time.Second\n\t\t\told := time.Now().Add(-4 * time.Second)\n\t\t\tpeer := Server{ID: ServerID(peerAddr), Address: peerAddr, Suffrage: Voter}\n\t\t\ts := &followerReplication{peer: peer, currentTerm: 1, nextIndex: 1,\n\t\t\t\tlastContact: old, notify: make(map[*verifyFuture]struct{}), stepDown: make(chan struct{}, 1)}\n\t\t\tr := &Raft{localID: ServerID(addr), localAddr: addr, trans: sender,\n\t\t\t\tlogger: hclog.NewNullLogger(), shutdownCh: make(chan struct{}), logs: NewInmemStore()}\n\t\t\tr.conf.Store(*conf)\n\t\t\tr.raftState.setState(Leader)\n\t\t\tr.configurations.latest = Configuration{Servers: []Server{\n\t\t\t\t{ID: r.localID, Address: addr, Suffrage: Voter}, peer,\n\t\t\t}}\n\t\t\tr.leaderState.replState = map[ServerID]*followerReplication{peer.ID: s}\n\t\t\tassuranceContactEvent(t, map[string]interface{}{\"event\": \"local_prefix\", \"operation\": mode,\n\t\t\t\t\"state\": r.State().String(), \"contact_ns\": old.UnixNano(), \"lease_ns\": int64(conf.LeaderLeaseTimeout),\n\t\t\t\t\"initialization\": \"constructed local state; no election; no remote Raft worker\"})\n\n\t\t\tvar request *AppendEntriesRequest\n\t\t\tfutureError := \"\"\n\t\t\tif mode == \"pipeline_timeout\" {\n\t\t\t\tp, err := sender.AppendEntriesPipeline(peer.ID, peerAddr)\n\t\t\t\tif err != nil {\n\t\t\t\t\tt.Fatal(err)\n\t\t\t\t}\n\t\t\t\tdefer p.Close()\n\t\t\t\trequest = &AppendEntriesRequest{Term: 1}\n\t\t\t\tfuture, err := p.AppendEntries(request, new(AppendEntriesResponse))\n\t\t\t\tif err != nil {\n\t\t\t\t\tt.Fatal(err)\n\t\t\t\t}\n\t\t\t\tcompleted := make(chan error, 1)\n\t\t\t\tgo func() { completed <- future.Error() }()\n\t\t\t\tselect {\n\t\t\t\tcase err = <-completed:\n\t\t\t\t\tif err != nil {\n\t\t\t\t\t\tfutureError = err.Error()\n\t\t\t\t\t}\n\t\t\t\tcase <-time.After(3 * time.Second):\n\t\t\t\t\tt.Fatal(\"future completion timeout\")\n\t\t\t\t}\n\t\t\t\tassuranceContactEvent(t, map[string]interface{}{\"event\": \"transport_completion\", \"operation\": mode,\n\t\t\t\t\t\"error\": futureError, \"same_request\": future.Request() == request, \"contact_ns\": s.LastContact().UnixNano()})\n\t\t\t\tstop, finish := make(chan struct{}), make(chan struct{})\n\t\t\t\tgo r.pipelineDecode(s, p, stop, finish)\n\t\t\t\tselect {\n\t\t\t\tcase <-finish:\n\t\t\t\tcase <-time.After(3 * time.Second):\n\t\t\t\t\tclose(stop)\n\t\t\t\t\tt.Fatal(\"decoder completion timeout\")\n\t\t\t\t}\n\t\t\t} else {\n\t\t\t\tcompleted := make(chan bool, 1)\n\t\t\t\tgo func() { completed <- r.replicateTo(s, 0) }()\n\t\t\t\tselect {\n\t\t\t\tcase shouldStop := <-completed:\n\t\t\t\t\tassuranceContactEvent(t, map[string]interface{}{\"event\": \"replication_completion\", \"operation\": mode,\n\t\t\t\t\t\t\"should_stop\": shouldStop, \"failures\": s.failures})\n\t\t\t\tcase <-time.After(3 * time.Second):\n\t\t\t\t\tt.Fatal(\"ordinary replication completion timeout\")\n\t\t\t\t}\n\t\t\t}\n\t\t\t// Inspect the one admitted request only after completion; do not respond.\n\t\t\tvar received RPC\n\t\t\tselect {\n\t\t\tcase received = <-receiver.Consumer():\n\t\t\tdefault:\n\t\t\t\tt.Fatal(\"missing admitted request\")\n\t\t\t}\n\t\t\tactual, ok := received.Command.(*AppendEntriesRequest)\n\t\t\tif !ok {\n\t\t\t\tt.Fatal(\"unexpected RPC type\")\n\t\t\t}\n\t\t\tif request != nil && actual != request {\n\t\t\t\tt.Fatal(\"request identity mismatch\")\n\t\t\t}\n\t\t\tbeforeLease := s.LastContact()\n\t\t\tassuranceContactEvent(t, map[string]interface{}{\"event\": \"consumer_completion\", \"operation\": mode,\n\t\t\t\t\"request_term\": actual.Term, \"contact_before_ns\": old.UnixNano(), \"contact_after_ns\": beforeLease.UnixNano(),\n\t\t\t\t\"contact_changed\": !beforeLease.Equal(old), \"contact_age_ns\": int64(time.Since(beforeLease)), \"pipeline_error\": futureError})\n\t\t\tr.checkLeaderLease()\n\t\t\tassuranceContactEvent(t, map[string]interface{}{\"event\": \"lease_result\", \"operation\": mode,\n\t\t\t\t\"state\": r.State().String(), \"contact_ns\": s.LastContact().UnixNano()})\n\t\t})\n\t}\n}\n",
+        "description": "For the accepted contact-marker candidate, does a real in-memory pipeline timeout (same returned future and queued request) refresh followerReplication.lastContact on actual pipelineDecode consumption, and does that differ from ordinary replicateTo timeout when each is followed by checkLeaderLease under the same explicitly constructed two-voter local-state premise?",
+        "semantic_changes": [],
+        "prerequisites": [],
+        "legality": {
+          "source_ids": [],
+          "expectation_ids": [],
+          "binding_ids": [],
+          "derivation": "",
+          "applicability": "",
+          "unresolved": [],
+          "conflicts": [],
+          "alternatives": []
+        }
+      }
+    },
+    "materials": [
+      {
+        "id": "src-contact",
+        "file": "replication.go",
+        "start_line": 31,
+        "end_line": 141,
+        "kind": "code_observation",
+        "text": "// followerReplication is in charge of sending snapshots and log entries from\n// this leader during this particular term to a remote follower.\ntype followerReplication struct {\n\t// currentTerm and nextIndex must be kept at the top of the struct so\n\t// they're 64 bit aligned which is a requirement for atomic ops on 32 bit\n\t// platforms.\n\n\t// currentTerm is the term of this leader, to be included in AppendEntries\n\t// requests.\n\tcurrentTerm uint64\n\n\t// nextIndex is the index of the next log entry to send to the follower,\n\t// which may fall past the end of the log.\n\tnextIndex uint64\n\n\t// peer contains the network address and ID of the remote follower.\n\tpeer Server\n\t// peerLock protects 'peer'\n\tpeerLock sync.RWMutex\n\n\t// commitment tracks the entries acknowledged by followers so that the\n\t// leader's commit index can advance. It is updated on successful\n\t// AppendEntries responses.\n\tcommitment *commitment\n\n\t// stopCh is notified/closed when this leader steps down or the follower is\n\t// removed from the cluster. In the follower removed case, it carries a log\n\t// index; replication should be attempted with a best effort up through that\n\t// index, before exiting.\n\tstopCh chan uint64\n\n\t// triggerCh is notified every time new entries are appended to the log.\n\ttriggerCh chan struct{}\n\n\t// triggerDeferErrorCh is used to provide a backchannel. By sending a\n\t// deferErr, the sender can be notified when the replication is done.\n\ttriggerDeferErrorCh chan *deferError\n\n\t// lastContact is updated to the current time whenever any response is\n\t// received from the follower (successful or not). This is used to check\n\t// whether the leader should step down (Raft.checkLeaderLease()).\n\tlastContact time.Time\n\t// lastContactLock protects 'lastContact'.\n\tlastContactLock sync.RWMutex\n\n\t// failures counts the number of failed RPCs since the last success, which is\n\t// used to apply backoff.\n\tfailures uint64\n\n\t// notifyCh is notified to send out a heartbeat, which is used to check that\n\t// this server is still leader.\n\tnotifyCh chan struct{}\n\t// notify is a map of futures to be resolved upon receipt of an\n\t// acknowledgement, then cleared from this map.\n\tnotify map[*verifyFuture]struct{}\n\t// notifyLock protects 'notify'.\n\tnotifyLock sync.Mutex\n\n\t// stepDown is used to indicate to the leader that we\n\t// should step down based on information from a follower.\n\tstepDown chan struct{}\n\n\t// allowPipeline is used to determine when to pipeline the AppendEntries RPCs.\n\t// It is private to this replication goroutine.\n\tallowPipeline bool\n}\n\n// notifyAll is used to notify all the waiting verify futures\n// if the follower believes we are still the leader.\nfunc (s *followerReplication) notifyAll(leader bool) {\n\t// Clear the waiting notifies minimizing lock time\n\ts.notifyLock.Lock()\n\tn := s.notify\n\ts.notify = make(map[*verifyFuture]struct{})\n\ts.notifyLock.Unlock()\n\n\t// Submit our votes\n\tfor v := range n {\n\t\tv.vote(leader)\n\t}\n}\n\n// cleanNotify is used to delete notify, .\nfunc (s *followerReplication) cleanNotify(v *verifyFuture) {\n\ts.notifyLock.Lock()\n\tdelete(s.notify, v)\n\ts.notifyLock.Unlock()\n}\n\n// LastContact returns the time of last contact.\nfunc (s *followerReplication) LastContact() time.Time {\n\ts.lastContactLock.RLock()\n\tlast := s.lastContact\n\ts.lastContactLock.RUnlock()\n\treturn last\n}\n\n// setLastContact sets the last contact to the current time.\nfunc (s *followerReplication) setLastContact() {\n\ts.lastContactLock.Lock()\n\ts.lastContact = time.Now()\n\ts.lastContactLock.Unlock()\n}\n\n// replicate is a long running routine that replicates log entries to a single\n// follower.\nfunc (r *Raft) replicate(s *followerReplication) {\n\t// Start an async heartbeating routing\n\tstopHeartbeat := make(chan struct{})\n\tdefer close(stopHeartbeat)\n\tr.goFunc(func() { r.heartbeat(s, stopHeartbeat) })",
+        "content_digest": "24106024107950339bd30fc4e24a0b4a0a97a1c0e01aa7b31bedf4a2ad30b054"
+      },
+      {
+        "id": "src-heartbeat",
+        "file": "replication.go",
+        "start_line": 385,
+        "end_line": 440,
+        "kind": "code_observation",
+        "text": "// heartbeat is used to periodically invoke AppendEntries on a peer\n// to ensure they don't time out. This is done async of replicate(),\n// since that routine could potentially be blocked on disk IO.\nfunc (r *Raft) heartbeat(s *followerReplication, stopCh chan struct{}) {\n\tvar failures uint64\n\treq := AppendEntriesRequest{\n\t\tRPCHeader: r.getRPCHeader(),\n\t\tTerm:      s.currentTerm,\n\t\t// this is needed for retro compatibility, before RPCHeader.Addr was added\n\t\tLeader: r.trans.EncodePeer(r.localID, r.localAddr),\n\t}\n\n\tvar resp AppendEntriesResponse\n\tfor {\n\t\t// Wait for the next heartbeat interval or forced notify\n\t\tselect {\n\t\tcase <-s.notifyCh:\n\t\tcase <-randomTimeout(r.config().HeartbeatTimeout / 10):\n\t\tcase <-stopCh:\n\t\t\treturn\n\t\t}\n\n\t\ts.peerLock.RLock()\n\t\tpeer := s.peer\n\t\ts.peerLock.RUnlock()\n\n\t\tstart := time.Now()\n\t\tif err := r.trans.AppendEntries(peer.ID, peer.Address, &req, &resp); err != nil {\n\t\t\tnextBackoffTime := cappedExponentialBackoff(failureWait, failures, maxFailureScale, r.config().HeartbeatTimeout/2)\n\t\t\tr.logger.Error(\"failed to heartbeat to\", \"peer\", peer.Address, \"backoff time\",\n\t\t\t\tnextBackoffTime, \"error\", err)\n\t\t\tr.observe(FailedHeartbeatObservation{PeerID: peer.ID, LastContact: s.LastContact()})\n\t\t\tfailures++\n\t\t\tselect {\n\t\t\tcase <-time.After(nextBackoffTime):\n\t\t\tcase <-stopCh:\n\t\t\t\treturn\n\t\t\t}\n\t\t} else {\n\t\t\tif failures > 0 {\n\t\t\t\tr.observe(ResumedHeartbeatObservation{PeerID: peer.ID})\n\t\t\t}\n\t\t\ts.setLastContact()\n\t\t\tfailures = 0\n\t\t\tlabels := []metrics.Label{{Name: \"peer_id\", Value: string(peer.ID)}}\n\t\t\tmetrics.MeasureSinceWithLabels([]string{\"raft\", \"replication\", \"heartbeat\"}, start, labels)\n\n\t\t\tif !r.noLegacyTelemetry {\n\t\t\t\t// Duplicated information. Kept for backward compatibility.\n\t\t\t\tmetrics.MeasureSince([]string{\"raft\", \"replication\", \"heartbeat\", string(peer.ID)}, start)\n\t\t\t}\n\n\t\t\ts.notifyAll(resp.Success)\n\t\t}\n\t}\n}",
+        "content_digest": "24106024107950339bd30fc4e24a0b4a0a97a1c0e01aa7b31bedf4a2ad30b054"
+      },
+      {
+        "id": "src-append-reply",
+        "file": "replication.go",
+        "start_line": 199,
+        "end_line": 263,
+        "kind": "code_observation",
+        "text": "// replicateTo is a helper to replicate(), used to replicate the logs up to a\n// given last index.\n// If the follower log is behind, we take care to bring them up to date.\nfunc (r *Raft) replicateTo(s *followerReplication, lastIndex uint64) (shouldStop bool) {\n\t// Create the base request\n\tvar req AppendEntriesRequest\n\tvar resp AppendEntriesResponse\n\tvar start time.Time\n\tvar peer Server\n\nSTART:\n\t// Prevent an excessive retry rate on errors\n\tif s.failures > 0 {\n\t\tselect {\n\t\tcase <-time.After(backoff(failureWait, s.failures, maxFailureScale)):\n\t\tcase <-r.shutdownCh:\n\t\t}\n\t}\n\n\ts.peerLock.RLock()\n\tpeer = s.peer\n\ts.peerLock.RUnlock()\n\n\t// Setup the request\n\tif err := r.setupAppendEntries(s, &req, atomic.LoadUint64(&s.nextIndex), lastIndex); err == ErrLogNotFound {\n\t\tgoto SEND_SNAP\n\t} else if err != nil {\n\t\treturn\n\t}\n\n\t// Make the RPC call\n\tstart = time.Now()\n\tif err := r.trans.AppendEntries(peer.ID, peer.Address, &req, &resp); err != nil {\n\t\tr.logger.Error(\"failed to appendEntries to\", \"peer\", peer, \"error\", err)\n\t\ts.failures++\n\t\treturn\n\t}\n\tappendStats(string(peer.ID), start, float32(len(req.Entries)), r.noLegacyTelemetry)\n\n\t// Check for a newer term, stop running\n\tif resp.Term > req.Term {\n\t\tr.handleStaleTerm(s)\n\t\treturn true\n\t}\n\n\t// Update the last contact\n\ts.setLastContact()\n\n\t// Update s based on success\n\tif resp.Success {\n\t\t// Update our replication state\n\t\tupdateLastAppended(s, &req)\n\n\t\t// Clear any failures, allow pipelining\n\t\ts.failures = 0\n\t\ts.allowPipeline = true\n\t} else {\n\t\tatomic.StoreUint64(&s.nextIndex, max(min(s.nextIndex-1, resp.LastLog+1), 1))\n\t\tif resp.NoRetryBackoff {\n\t\t\ts.failures = 0\n\t\t} else {\n\t\t\ts.failures++\n\t\t}\n\t\tr.logger.Warn(\"appendEntries rejected, sending older logs\", \"peer\", peer, \"next\", atomic.LoadUint64(&s.nextIndex))\n\t}",
+        "content_digest": "24106024107950339bd30fc4e24a0b4a0a97a1c0e01aa7b31bedf4a2ad30b054"
+      },
+      {
+        "id": "src-snapshot-reply",
+        "file": "replication.go",
+        "start_line": 340,
+        "end_line": 382,
+        "kind": "code_observation",
+        "text": "\n\tr.logger.Info(\"installing snapshot on\", \"peer\", peer.ID, \"id\", snapID, \"size\", req.Size)\n\t// Make the call\n\tstart := time.Now()\n\tvar resp InstallSnapshotResponse\n\tif err := r.trans.InstallSnapshot(peer.ID, peer.Address, &req, &resp, snapshot); err != nil {\n\t\tr.logger.Error(\"failed to install snapshot\", \"peer\", peer.ID, \"id\", snapID, \"error\", err)\n\t\ts.failures++\n\t\treturn false, err\n\t}\n\tlabels := []metrics.Label{{Name: \"peer_id\", Value: string(peer.ID)}}\n\tmetrics.MeasureSinceWithLabels([]string{\"raft\", \"replication\", \"installSnapshot\"}, start, labels)\n\n\tif !r.noLegacyTelemetry {\n\t\t// Duplicated information. Kept for backward compatibility.\n\t\tmetrics.MeasureSince([]string{\"raft\", \"replication\", \"installSnapshot\", string(peer.ID)}, start)\n\t}\n\n\t// Check for a newer term, stop running\n\tif resp.Term > req.Term {\n\t\tr.handleStaleTerm(s)\n\t\treturn true, nil\n\t}\n\n\t// Update the last contact\n\ts.setLastContact()\n\n\t// Check for success\n\tif resp.Success {\n\t\t// Update the indexes\n\t\tatomic.StoreUint64(&s.nextIndex, meta.Index+1)\n\t\ts.commitment.match(peer.ID, meta.Index)\n\n\t\t// Clear any failures\n\t\ts.failures = 0\n\n\t\t// Notify we are still leader\n\t\ts.notifyAll(true)\n\t} else {\n\t\ts.failures++\n\t\tr.logger.Warn(\"installSnapshot rejected to\", \"peer\", peer.ID, \"id\", snapID)\n\t}\n\treturn false, nil",
+        "content_digest": "24106024107950339bd30fc4e24a0b4a0a97a1c0e01aa7b31bedf4a2ad30b054"
+      },
+      {
+        "id": "src-pipeline-reply",
+        "file": "replication.go",
+        "start_line": 533,
+        "end_line": 567,
+        "kind": "code_observation",
+        "text": "// pipelineDecode is used to decode the responses of pipelined requests.\nfunc (r *Raft) pipelineDecode(s *followerReplication, p AppendPipeline, stopCh, finishCh chan struct{}) {\n\tdefer close(finishCh)\n\trespCh := p.Consumer()\n\tfor {\n\t\tselect {\n\t\tcase ready := <-respCh:\n\t\t\ts.peerLock.RLock()\n\t\t\tpeer := s.peer\n\t\t\ts.peerLock.RUnlock()\n\n\t\t\treq, resp := ready.Request(), ready.Response()\n\t\t\tappendStats(string(peer.ID), ready.Start(), float32(len(req.Entries)), r.noLegacyTelemetry)\n\n\t\t\t// Check for a newer term, stop running\n\t\t\tif resp.Term > req.Term {\n\t\t\t\tr.handleStaleTerm(s)\n\t\t\t\treturn\n\t\t\t}\n\n\t\t\t// Update the last contact\n\t\t\ts.setLastContact()\n\n\t\t\t// Abort pipeline if not successful\n\t\t\tif !resp.Success {\n\t\t\t\treturn\n\t\t\t}\n\n\t\t\t// Update our replication state\n\t\t\tupdateLastAppended(s, req)\n\t\tcase <-stopCh:\n\t\t\treturn\n\t\t}\n\t}\n}",
+        "content_digest": "24106024107950339bd30fc4e24a0b4a0a97a1c0e01aa7b31bedf4a2ad30b054"
+      },
+      {
+        "id": "src-stale-stepdown",
+        "file": "replication.go",
+        "start_line": 645,
+        "end_line": 665,
+        "kind": "code_observation",
+        "text": "// handleStaleTerm is used when a follower indicates that we have a stale term.\nfunc (r *Raft) handleStaleTerm(s *followerReplication) {\n\tr.logger.Error(\"peer has newer term, stopping replication\", \"peer\", s.peer)\n\ts.notifyAll(false) // No longer leader\n\tasyncNotifyCh(s.stepDown)\n}\n\n// updateLastAppended is used to update follower replication state after a\n// successful AppendEntries RPC.\n// TODO: This isn't used during InstallSnapshot, but the code there is similar.\nfunc updateLastAppended(s *followerReplication, req *AppendEntriesRequest) {\n\t// Mark any inflight logs as committed\n\tif logs := req.Entries; len(logs) > 0 {\n\t\tlast := logs[len(logs)-1]\n\t\tatomic.StoreUint64(&s.nextIndex, last.Index+1)\n\t\ts.commitment.match(s.peer.ID, last.Index)\n\t}\n\n\t// Notify still leader\n\ts.notifyAll(true)\n}",
+        "content_digest": "24106024107950339bd30fc4e24a0b4a0a97a1c0e01aa7b31bedf4a2ad30b054"
+      },
+      {
+        "id": "src-initialize",
+        "file": "raft.go",
+        "start_line": 580,
+        "end_line": 614,
+        "kind": "code_observation",
+        "text": "// it'll instruct the replication routines to try to replicate to the current\n// index. This must only be called from the main thread.\nfunc (r *Raft) startStopReplication() {\n\tinConfig := make(map[ServerID]bool, len(r.configurations.latest.Servers))\n\tlastIdx := r.getLastIndex()\n\n\t// Start replication goroutines that need starting\n\tfor _, server := range r.configurations.latest.Servers {\n\t\tif server.ID == r.localID {\n\t\t\tcontinue\n\t\t}\n\n\t\tinConfig[server.ID] = true\n\n\t\ts, ok := r.leaderState.replState[server.ID]\n\t\tif !ok {\n\t\t\tr.logger.Info(\"added peer, starting replication\", \"peer\", server.ID)\n\t\t\ts = &followerReplication{\n\t\t\t\tpeer:                server,\n\t\t\t\tcommitment:          r.leaderState.commitment,\n\t\t\t\tstopCh:              make(chan uint64, 1),\n\t\t\t\ttriggerCh:           make(chan struct{}, 1),\n\t\t\t\ttriggerDeferErrorCh: make(chan *deferError, 1),\n\t\t\t\tcurrentTerm:         r.getCurrentTerm(),\n\t\t\t\tnextIndex:           lastIdx + 1,\n\t\t\t\tlastContact:         time.Now(),\n\t\t\t\tnotify:              make(map[*verifyFuture]struct{}),\n\t\t\t\tnotifyCh:            make(chan struct{}, 1),\n\t\t\t\tstepDown:            r.leaderState.stepDown,\n\t\t\t}\n\n\t\t\tr.leaderState.replState[server.ID] = s\n\t\t\tr.goFunc(func() { r.replicate(s) })\n\t\t\tasyncNotifyCh(s.triggerCh)\n\t\t\tr.observe(PeerObservation{Peer: server, Removed: false})",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "src-lease",
+        "file": "raft.go",
+        "start_line": 1032,
+        "end_line": 1094,
+        "kind": "code_observation",
+        "text": "// checkLeaderLease is used to check if we can contact a quorum of nodes\n// within the last leader lease interval. If not, we need to step down,\n// as we may have lost connectivity. Returns the maximum duration without\n// contact. This must only be called from the main thread.\nfunc (r *Raft) checkLeaderLease() time.Duration {\n\t// Track contacted nodes, we can always contact ourself\n\tcontacted := 0\n\n\t// Store lease timeout for this one check invocation as we need to refer to it\n\t// in the loop and would be confusing if it ever becomes reloadable and\n\t// changes between iterations below.\n\tleaseTimeout := r.config().LeaderLeaseTimeout\n\n\t// Check each follower\n\tvar maxDiff time.Duration\n\tnow := time.Now()\n\tfor _, server := range r.configurations.latest.Servers {\n\t\tif server.Suffrage == Voter {\n\t\t\tif server.ID == r.localID {\n\t\t\t\tcontacted++\n\t\t\t\tcontinue\n\t\t\t}\n\t\t\tf := r.leaderState.replState[server.ID]\n\t\t\tdiff := now.Sub(f.LastContact())\n\t\t\tif diff <= leaseTimeout {\n\t\t\t\tcontacted++\n\t\t\t\tif diff > maxDiff {\n\t\t\t\t\tmaxDiff = diff\n\t\t\t\t}\n\t\t\t} else {\n\t\t\t\t// Log at least once at high value, then debug. Otherwise it gets very verbose.\n\t\t\t\tif diff <= 3*leaseTimeout {\n\t\t\t\t\tr.logger.Warn(\"failed to contact\", \"server-id\", server.ID, \"time\", diff)\n\t\t\t\t} else {\n\t\t\t\t\tr.logger.Debug(\"failed to contact\", \"server-id\", server.ID, \"time\", diff)\n\t\t\t\t}\n\t\t\t}\n\t\t\tmetrics.AddSample([]string{\"raft\", \"leader\", \"lastContact\"}, float32(diff/time.Millisecond))\n\t\t}\n\t}\n\n\t// Verify we can contact a quorum\n\tquorum := r.quorumSize()\n\tif contacted < quorum {\n\t\tr.logger.Warn(\"failed to contact quorum of nodes, stepping down\")\n\t\tr.setState(Follower)\n\t\tmetrics.IncrCounter([]string{\"raft\", \"transition\", \"leader_lease_timeout\"}, 1)\n\t}\n\treturn maxDiff\n}\n\n// quorumSize is used to return the quorum size. This must only be called on\n// the main thread.\n// TODO: revisit usage\nfunc (r *Raft) quorumSize() int {\n\tvoters := 0\n\tfor _, server := range r.configurations.latest.Servers {\n\t\tif server.Suffrage == Voter {\n\t\t\tvoters++\n\t\t}\n\t}\n\treturn voters/2 + 1\n}",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "src-lease-contract",
+        "file": "config.go",
+        "start_line": 201,
+        "end_line": 205,
+        "kind": "interface_statement",
+        "text": "\t// LeaderLeaseTimeout is used to control how long the \"lease\" lasts\n\t// for being the leader without being able to contact a quorum\n\t// of nodes. If we reach this interval without contact, we will\n\t// step down as leader.\n\tLeaderLeaseTimeout time.Duration",
+        "content_digest": "e5d01350da2438f2580c57b065d2bfcef93e710c4487b8947fccb1e172b48f7a"
+      },
+      {
+        "id": "src-lease-purpose",
+        "file": "raft.go",
+        "start_line": 1015,
+        "end_line": 1022,
+        "kind": "document_statement",
+        "text": "\t// Step ?: the thesis describes in chap 6.4.1: Using clocks to reduce\n\t// messaging for read-only queries. If this is implemented, the lease\n\t// has to be reset as well, in case leadership is transferred. This\n\t// implementation also has a lease, but it serves another purpose and\n\t// doesn't need to be reset. The lease mechanism in our raft lib, is\n\t// setup in a similar way to the one in the thesis, but in practice\n\t// it's a timer that just tells the leader how often to check\n\t// heartbeats are still coming in.",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "src-reject-old",
+        "file": "raft.go",
+        "start_line": 1438,
+        "end_line": 1467,
+        "kind": "code_observation",
+        "text": "// appendEntries is invoked when we get an append entries RPC call. This must\n// only be called from the main thread.\nfunc (r *Raft) appendEntries(rpc RPC, a *AppendEntriesRequest) {\n\tdefer metrics.MeasureSince([]string{\"raft\", \"rpc\", \"appendEntries\"}, time.Now())\n\t// Setup a response\n\tresp := &AppendEntriesResponse{\n\t\tRPCHeader:      r.getRPCHeader(),\n\t\tTerm:           r.getCurrentTerm(),\n\t\tLastLog:        r.getLastIndex(),\n\t\tSuccess:        false,\n\t\tNoRetryBackoff: false,\n\t}\n\tvar rpcErr error\n\tdefer func() {\n\t\trpc.Respond(resp, rpcErr)\n\t}()\n\n\t// Ignore an older term\n\tif a.Term < r.getCurrentTerm() {\n\t\treturn\n\t}\n\n\t// Increase the term if we see a newer one, also transition to follower\n\t// if we ever get an appendEntries call\n\tif a.Term > r.getCurrentTerm() || (r.getState() != Follower && !r.candidateFromLeadershipTransfer.Load()) {\n\t\t// Ensure transition to follower\n\t\tr.setState(Follower)\n\t\tr.setCurrentTerm(a.Term)\n\t\tresp.Term = a.Term\n\t}",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "src-verify",
+        "file": "raft.go",
+        "start_line": 848,
+        "end_line": 870,
+        "kind": "code_observation",
+        "text": "\t\tcase v := <-r.verifyCh:\n\t\t\tr.mainThreadSaturation.working()\n\t\t\tif v.quorumSize == 0 {\n\t\t\t\t// Just dispatched, start the verification\n\t\t\t\tr.verifyLeader(v)\n\t\t\t} else if v.votes < v.quorumSize {\n\t\t\t\t// Early return, means there must be a new leader\n\t\t\t\tr.logger.Warn(\"new leader elected, stepping down\")\n\t\t\t\tr.setState(Follower)\n\t\t\t\tdelete(r.leaderState.notify, v)\n\t\t\t\tfor _, repl := range r.leaderState.replState {\n\t\t\t\t\trepl.cleanNotify(v)\n\t\t\t\t}\n\t\t\t\tv.respond(ErrNotLeader)\n\n\t\t\t} else {\n\t\t\t\t// Quorum of members agree, we are still leader\n\t\t\t\tdelete(r.leaderState.notify, v)\n\t\t\t\tfor _, repl := range r.leaderState.replState {\n\t\t\t\t\trepl.cleanNotify(v)\n\t\t\t\t}\n\t\t\t\tv.respond(nil)\n\t\t\t}",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "src-register-verify",
+        "file": "raft.go",
+        "start_line": 963,
+        "end_line": 987,
+        "kind": "code_observation",
+        "text": "// verifyLeader must be called from the main thread for safety.\n// Causes the followers to attempt an immediate heartbeat.\nfunc (r *Raft) verifyLeader(v *verifyFuture) {\n\t// Current leader always votes for self\n\tv.votes = 1\n\n\t// Set the quorum size, hot-path for single node\n\tv.quorumSize = r.quorumSize()\n\tif v.quorumSize == 1 {\n\t\tv.respond(nil)\n\t\treturn\n\t}\n\n\t// Track this request\n\tv.notifyCh = r.verifyCh\n\tr.leaderState.notify[v] = struct{}{}\n\n\t// Trigger immediate heartbeats\n\tfor _, repl := range r.leaderState.replState {\n\t\trepl.notifyLock.Lock()\n\t\trepl.notify[v] = struct{}{}\n\t\trepl.notifyLock.Unlock()\n\t\tasyncNotifyCh(repl.notifyCh)\n\t}\n}",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "src-verify-vote",
+        "file": "future.go",
+        "start_line": 272,
+        "end_line": 293,
+        "kind": "code_observation",
+        "text": "// vote is used to respond to a verifyFuture.\n// This may block when responding on the notifyCh.\nfunc (v *verifyFuture) vote(leader bool) {\n\tv.voteLock.Lock()\n\tdefer v.voteLock.Unlock()\n\n\t// Guard against having notified already\n\tif v.notifyCh == nil {\n\t\treturn\n\t}\n\n\tif leader {\n\t\tv.votes++\n\t\tif v.votes >= v.quorumSize {\n\t\t\tv.notifyCh <- v\n\t\t\tv.notifyCh = nil\n\t\t}\n\t} else {\n\t\tv.notifyCh <- v\n\t\tv.notifyCh = nil\n\t}\n}",
+        "content_digest": "e3775d16c6cb24f9c9572ce452c27e87fcbf4b24baf666d14e838cc4b571ae9c"
+      },
+      {
+        "id": "src-leader-cleanup",
+        "file": "raft.go",
+        "start_line": 501,
+        "end_line": 533,
+        "kind": "code_observation",
+        "text": "\t// Cleanup state on step down\n\tdefer func() {\n\t\tclose(stopCh)\n\n\t\t// Since we were the leader previously, we update our\n\t\t// last contact time when we step down, so that we are not\n\t\t// reporting a last contact time from before we were the\n\t\t// leader. Otherwise, to a client it would seem our data\n\t\t// is extremely stale.\n\t\tr.setLastContact()\n\n\t\t// Stop replication\n\t\tfor _, p := range r.leaderState.replState {\n\t\t\tclose(p.stopCh)\n\t\t}\n\n\t\t// Respond to all inflight operations\n\t\tfor e := r.leaderState.inflight.Front(); e != nil; e = e.Next() {\n\t\t\te.Value.(*logFuture).respond(ErrLeadershipLost)\n\t\t}\n\n\t\t// Respond to any pending verify requests\n\t\tfor future := range r.leaderState.notify {\n\t\t\tfuture.respond(ErrLeadershipLost)\n\t\t}\n\n\t\t// Clear all the state\n\t\tr.leaderState.commitCh = nil\n\t\tr.leaderState.commitment = nil\n\t\tr.leaderState.inflight = nil\n\t\tr.leaderState.replState = nil\n\t\tr.leaderState.notify = nil\n\t\tr.leaderState.stepDown = nil",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "src-stepdown-consume",
+        "file": "raft.go",
+        "start_line": 680,
+        "end_line": 689,
+        "kind": "code_observation",
+        "text": "\t\tr.mainThreadSaturation.sleeping()\n\n\t\tselect {\n\t\tcase rpc := <-r.rpcCh:\n\t\t\tr.mainThreadSaturation.working()\n\t\t\tr.processRPC(rpc)\n\n\t\tcase <-r.leaderState.stepDown:\n\t\t\tr.mainThreadSaturation.working()\n\t\t\tr.setState(Follower)",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "src-lease-timer",
+        "file": "raft.go",
+        "start_line": 934,
+        "end_line": 947,
+        "kind": "code_observation",
+        "text": "\t\tcase <-lease:\n\t\t\tr.mainThreadSaturation.working()\n\t\t\t// Check if we've exceeded the lease, potentially stepping down\n\t\t\tmaxDiff := r.checkLeaderLease()\n\n\t\t\t// Next check interval should adjust for the last node we've\n\t\t\t// contacted, without going negative\n\t\t\tcheckInterval := r.config().LeaderLeaseTimeout - maxDiff\n\t\t\tif checkInterval < minCheckInterval {\n\t\t\t\tcheckInterval = minCheckInterval\n\t\t\t}\n\n\t\t\t// Renew the lease timer\n\t\t\tlease = time.After(checkInterval)",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "src-verify-contract",
+        "file": "api.go",
+        "start_line": 880,
+        "end_line": 892,
+        "kind": "interface_statement",
+        "text": "// VerifyLeader is used to ensure this peer is still the leader. It may be used\n// to prevent returning stale data from the FSM after the peer has lost\n// leadership.\nfunc (r *Raft) VerifyLeader() Future {\n\tmetrics.IncrCounter([]string{\"raft\", \"verify_leader\"}, 1)\n\tverifyFuture := &verifyFuture{}\n\tverifyFuture.init()\n\tselect {\n\tcase <-r.shutdownCh:\n\t\treturn errorFuture{ErrRaftShutdown}\n\tcase r.verifyCh <- verifyFuture:\n\t\treturn verifyFuture\n\t}",
+        "content_digest": "499a72c01096912e85d16381f4640ac6d29f8c2b91cabbdae8530bdcbeb89a4a"
+      },
+      {
+        "id": "src-replication-progress",
+        "file": "replication.go",
+        "start_line": 135,
+        "end_line": 197,
+        "kind": "code_observation",
+        "text": "// replicate is a long running routine that replicates log entries to a single\n// follower.\nfunc (r *Raft) replicate(s *followerReplication) {\n\t// Start an async heartbeating routing\n\tstopHeartbeat := make(chan struct{})\n\tdefer close(stopHeartbeat)\n\tr.goFunc(func() { r.heartbeat(s, stopHeartbeat) })\n\nRPC:\n\tshouldStop := false\n\tfor !shouldStop {\n\t\tselect {\n\t\tcase maxIndex := <-s.stopCh:\n\t\t\t// Make a best effort to replicate up to this index\n\t\t\tif maxIndex > 0 {\n\t\t\t\tr.replicateTo(s, maxIndex)\n\t\t\t}\n\t\t\treturn\n\t\tcase deferErr := <-s.triggerDeferErrorCh:\n\t\t\tlastLogIdx, _ := r.getLastLog()\n\t\t\tshouldStop = r.replicateTo(s, lastLogIdx)\n\t\t\tif !shouldStop {\n\t\t\t\tdeferErr.respond(nil)\n\t\t\t} else {\n\t\t\t\tdeferErr.respond(fmt.Errorf(\"replication failed\"))\n\t\t\t}\n\t\tcase <-s.triggerCh:\n\t\t\tlastLogIdx, _ := r.getLastLog()\n\t\t\tshouldStop = r.replicateTo(s, lastLogIdx)\n\t\t// This is _not_ our heartbeat mechanism but is to ensure\n\t\t// followers quickly learn the leader's commit index when\n\t\t// raft commits stop flowing naturally. The actual heartbeats\n\t\t// can't do this to keep them unblocked by disk IO on the\n\t\t// follower. See https://github.com/hashicorp/raft/issues/282.\n\t\tcase <-randomTimeout(r.config().CommitTimeout):\n\t\t\tlastLogIdx, _ := r.getLastLog()\n\t\t\tshouldStop = r.replicateTo(s, lastLogIdx)\n\t\t}\n\n\t\t// If things looks healthy, switch to pipeline mode\n\t\tif !shouldStop && s.allowPipeline {\n\t\t\tgoto PIPELINE\n\t\t}\n\t}\n\treturn\n\nPIPELINE:\n\t// Disable until re-enabled\n\ts.allowPipeline = false\n\n\t// Replicates using a pipeline for high performance. This method\n\t// is not able to gracefully recover from errors, and so we fall back\n\t// to standard mode on failure.\n\tif err := r.pipelineReplicate(s); err != nil {\n\t\tif err != ErrPipelineReplicationNotSupported {\n\t\t\ts.peerLock.RLock()\n\t\t\tpeer := s.peer\n\t\t\ts.peerLock.RUnlock()\n\t\t\tr.logger.Error(\"failed to start pipeline replication to\", \"peer\", peer, \"error\", err)\n\t\t}\n\t}\n\tgoto RPC\n}",
+        "content_digest": "24106024107950339bd30fc4e24a0b4a0a97a1c0e01aa7b31bedf4a2ad30b054"
+      },
+      {
+        "id": "src-pipeline-progress",
+        "file": "replication.go",
+        "start_line": 442,
+        "end_line": 530,
+        "kind": "code_observation",
+        "text": "// pipelineReplicate is used when we have synchronized our state with the follower,\n// and want to switch to a higher performance pipeline mode of replication.\n// We only pipeline AppendEntries commands, and if we ever hit an error, we fall\n// back to the standard replication which can handle more complex situations.\nfunc (r *Raft) pipelineReplicate(s *followerReplication) error {\n\ts.peerLock.RLock()\n\tpeer := s.peer\n\ts.peerLock.RUnlock()\n\n\t// Create a new pipeline\n\tpipeline, err := r.trans.AppendEntriesPipeline(peer.ID, peer.Address)\n\tif err != nil {\n\t\treturn err\n\t}\n\tdefer pipeline.Close()\n\n\t// Log start and stop of pipeline\n\tr.logger.Info(\"pipelining replication\", \"peer\", peer)\n\tdefer r.logger.Info(\"aborting pipeline replication\", \"peer\", peer)\n\n\t// Create a shutdown and finish channel\n\tstopCh := make(chan struct{})\n\tfinishCh := make(chan struct{})\n\n\t// Start a dedicated decoder\n\tr.goFunc(func() { r.pipelineDecode(s, pipeline, stopCh, finishCh) })\n\n\t// Start pipeline sends at the last good nextIndex\n\tnextIndex := atomic.LoadUint64(&s.nextIndex)\n\n\tshouldStop := false\nSEND:\n\tfor !shouldStop {\n\t\tselect {\n\t\tcase <-finishCh:\n\t\t\tbreak SEND\n\t\tcase maxIndex := <-s.stopCh:\n\t\t\t// Make a best effort to replicate up to this index\n\t\t\tif maxIndex > 0 {\n\t\t\t\tr.pipelineSend(s, pipeline, &nextIndex, maxIndex)\n\t\t\t}\n\t\t\tbreak SEND\n\t\tcase deferErr := <-s.triggerDeferErrorCh:\n\t\t\tlastLogIdx, _ := r.getLastLog()\n\t\t\tshouldStop = r.pipelineSend(s, pipeline, &nextIndex, lastLogIdx)\n\t\t\tif !shouldStop {\n\t\t\t\tdeferErr.respond(nil)\n\t\t\t} else {\n\t\t\t\tdeferErr.respond(fmt.Errorf(\"replication failed\"))\n\t\t\t}\n\t\tcase <-s.triggerCh:\n\t\t\tlastLogIdx, _ := r.getLastLog()\n\t\t\tshouldStop = r.pipelineSend(s, pipeline, &nextIndex, lastLogIdx)\n\t\tcase <-randomTimeout(r.config().CommitTimeout):\n\t\t\tlastLogIdx, _ := r.getLastLog()\n\t\t\tshouldStop = r.pipelineSend(s, pipeline, &nextIndex, lastLogIdx)\n\t\t}\n\t}\n\n\t// Stop our decoder, and wait for it to finish\n\tclose(stopCh)\n\tselect {\n\tcase <-finishCh:\n\tcase <-r.shutdownCh:\n\t}\n\treturn nil\n}\n\n// pipelineSend is used to send data over a pipeline. It is a helper to\n// pipelineReplicate.\nfunc (r *Raft) pipelineSend(s *followerReplication, p AppendPipeline, nextIdx *uint64, lastIndex uint64) (shouldStop bool) {\n\t// Create a new append request\n\treq := new(AppendEntriesRequest)\n\tif err := r.setupAppendEntries(s, req, *nextIdx, lastIndex); err != nil {\n\t\treturn true\n\t}\n\n\t// Pipeline the append entries\n\tif _, err := p.AppendEntries(req, new(AppendEntriesResponse)); err != nil {\n\t\tr.logger.Error(\"failed to pipeline appendEntries\", \"peer\", s.peer, \"error\", err)\n\t\treturn true\n\t}\n\n\t// Increase the next send log to avoid re-sending old logs\n\tif n := len(req.Entries); n > 0 {\n\t\tlast := req.Entries[n-1]\n\t\tatomic.StoreUint64(nextIdx, last.Index+1)\n\t}\n\treturn false",
+        "content_digest": "24106024107950339bd30fc4e24a0b4a0a97a1c0e01aa7b31bedf4a2ad30b054"
+      },
+      {
+        "id": "src-pipeline-contract",
+        "file": "transport.go",
+        "start_line": 109,
+        "end_line": 140,
+        "kind": "interface_statement",
+        "text": "// AppendPipeline is used for pipelining AppendEntries requests. It is used\n// to increase the replication throughput by masking latency and better\n// utilizing bandwidth.\ntype AppendPipeline interface {\n\t// AppendEntries is used to add another request to the pipeline.\n\t// The send may block which is an effective form of back-pressure.\n\tAppendEntries(args *AppendEntriesRequest, resp *AppendEntriesResponse) (AppendFuture, error)\n\n\t// Consumer returns a channel that can be used to consume\n\t// response futures when they are ready.\n\tConsumer() <-chan AppendFuture\n\n\t// Close closes the pipeline and cancels all inflight RPCs\n\tClose() error\n}\n\n// AppendFuture is used to return information about a pipelined AppendEntries request.\ntype AppendFuture interface {\n\tFuture\n\n\t// Start returns the time that the append request was started.\n\t// It is always OK to call this method.\n\tStart() time.Time\n\n\t// Request holds the parameters of the AppendEntries call.\n\t// It is always OK to call this method.\n\tRequest() *AppendEntriesRequest\n\n\t// Response holds the results of the AppendEntries call.\n\t// This method must only be called after the Error\n\t// method returns, and will only be valid on success.\n\tResponse() *AppendEntriesResponse",
+        "content_digest": "e7ee18e82646ef6c26a4cbad105c94494ef11a92468c3cd594db342e0be100b1"
+      },
+      {
+        "id": "src-inmem-pipeline-timeout",
+        "file": "inmem_transport.go",
+        "start_line": 259,
+        "end_line": 309,
+        "kind": "code_observation",
+        "text": "func newInmemPipeline(trans *InmemTransport, peer *InmemTransport, addr ServerAddress) *inmemPipeline {\n\ti := &inmemPipeline{\n\t\ttrans:        trans,\n\t\tpeer:         peer,\n\t\tpeerAddr:     addr,\n\t\tdoneCh:       make(chan AppendFuture, 16),\n\t\tinprogressCh: make(chan *inmemPipelineInflight, 16),\n\t\tshutdownCh:   make(chan struct{}),\n\t}\n\tgo i.decodeResponses()\n\treturn i\n}\n\nfunc (i *inmemPipeline) decodeResponses() {\n\ttimeout := i.trans.timeout\n\tfor {\n\t\tselect {\n\t\tcase inp := <-i.inprogressCh:\n\t\t\tvar timeoutCh <-chan time.Time\n\t\t\tif timeout > 0 {\n\t\t\t\ttimeoutCh = time.After(timeout)\n\t\t\t}\n\n\t\t\tselect {\n\t\t\tcase rpcResp := <-inp.respCh:\n\t\t\t\t// Copy the result back\n\t\t\t\t*inp.future.resp = *rpcResp.Response.(*AppendEntriesResponse)\n\t\t\t\tinp.future.respond(rpcResp.Error)\n\n\t\t\t\tselect {\n\t\t\t\tcase i.doneCh <- inp.future:\n\t\t\t\tcase <-i.shutdownCh:\n\t\t\t\t\treturn\n\t\t\t\t}\n\n\t\t\tcase <-timeoutCh:\n\t\t\t\tinp.future.respond(fmt.Errorf(\"command timed out\"))\n\t\t\t\tselect {\n\t\t\t\tcase i.doneCh <- inp.future:\n\t\t\t\tcase <-i.shutdownCh:\n\t\t\t\t\treturn\n\t\t\t\t}\n\n\t\t\tcase <-i.shutdownCh:\n\t\t\t\treturn\n\t\t\t}\n\t\tcase <-i.shutdownCh:\n\t\t\treturn\n\t\t}\n\t}\n}",
+        "content_digest": "80d9e25c23cce532a687eafe5197c076d440b5a2be443bc9b3897b4e2fa09774"
+      },
+      {
+        "id": "src-inmem-pipeline-send",
+        "file": "inmem_transport.go",
+        "start_line": 311,
+        "end_line": 362,
+        "kind": "code_observation",
+        "text": "func (i *inmemPipeline) AppendEntries(args *AppendEntriesRequest, resp *AppendEntriesResponse) (AppendFuture, error) {\n\t// Create a new future\n\tfuture := &appendFuture{\n\t\tstart: time.Now(),\n\t\targs:  args,\n\t\tresp:  resp,\n\t}\n\tfuture.init()\n\n\t// Handle a timeout\n\tvar timeout <-chan time.Time\n\tif i.trans.timeout > 0 {\n\t\ttimeout = time.After(i.trans.timeout)\n\t}\n\n\t// Send the RPC over\n\trespCh := make(chan RPCResponse, 1)\n\trpc := RPC{\n\t\tCommand:  args,\n\t\tRespChan: respCh,\n\t}\n\n\t// Check if we have been already shutdown, otherwise the random choose\n\t// made by select statement below might pick consumerCh even if\n\t// shutdownCh was closed.\n\ti.shutdownLock.RLock()\n\tshutdown := i.shutdown\n\ti.shutdownLock.RUnlock()\n\tif shutdown {\n\t\treturn nil, ErrPipelineShutdown\n\t}\n\n\tselect {\n\tcase i.peer.consumerCh <- rpc:\n\tcase <-timeout:\n\t\treturn nil, fmt.Errorf(\"command enqueue timeout\")\n\tcase <-i.shutdownCh:\n\t\treturn nil, ErrPipelineShutdown\n\t}\n\n\t// Send to be decoded\n\tselect {\n\tcase i.inprogressCh <- &inmemPipelineInflight{future, respCh}:\n\t\treturn future, nil\n\tcase <-i.shutdownCh:\n\t\treturn nil, ErrPipelineShutdown\n\t}\n}\n\nfunc (i *inmemPipeline) Consumer() <-chan AppendFuture {\n\treturn i.doneCh\n}",
+        "content_digest": "80d9e25c23cce532a687eafe5197c076d440b5a2be443bc9b3897b4e2fa09774"
+      },
+      {
+        "id": "src-inmem-rpc",
+        "file": "inmem_transport.go",
+        "start_line": 166,
+        "end_line": 200,
+        "kind": "code_observation",
+        "text": "func (i *InmemTransport) makeRPC(target ServerAddress, args interface{}, r io.Reader, timeout time.Duration) (rpcResp RPCResponse, err error) {\n\ti.RLock()\n\tpeer, ok := i.peers[target]\n\ti.RUnlock()\n\n\tif !ok {\n\t\terr = fmt.Errorf(\"failed to connect to peer: %v\", target)\n\t\treturn\n\t}\n\n\t// Send the RPC over\n\trespCh := make(chan RPCResponse, 1)\n\treq := RPC{\n\t\tCommand:  args,\n\t\tReader:   r,\n\t\tRespChan: respCh,\n\t}\n\tselect {\n\tcase peer.consumerCh <- req:\n\tcase <-time.After(timeout):\n\t\terr = fmt.Errorf(\"send timed out\")\n\t\treturn\n\t}\n\n\t// Wait for a response\n\tselect {\n\tcase rpcResp = <-respCh:\n\t\tif rpcResp.Error != nil {\n\t\t\terr = rpcResp.Error\n\t\t}\n\tcase <-time.After(timeout):\n\t\terr = fmt.Errorf(\"command timed out\")\n\t}\n\treturn\n}",
+        "content_digest": "80d9e25c23cce532a687eafe5197c076d440b5a2be443bc9b3897b4e2fa09774"
+      },
+      {
+        "id": "src-inmem-append",
+        "file": "inmem_transport.go",
+        "start_line": 102,
+        "end_line": 113,
+        "kind": "code_observation",
+        "text": "// AppendEntries implements the Transport interface.\nfunc (i *InmemTransport) AppendEntries(id ServerID, target ServerAddress, args *AppendEntriesRequest, resp *AppendEntriesResponse) error {\n\trpcResp, err := i.makeRPC(target, args, nil, i.timeout)\n\tif err != nil {\n\t\treturn err\n\t}\n\n\t// Copy the result back\n\tout := rpcResp.Response.(*AppendEntriesResponse)\n\t*resp = *out\n\treturn nil\n}",
+        "content_digest": "80d9e25c23cce532a687eafe5197c076d440b5a2be443bc9b3897b4e2fa09774"
+      },
+      {
+        "id": "src-lease-test",
+        "file": "raft_test.go",
+        "start_line": 1771,
+        "end_line": 1818,
+        "kind": "test_expectation",
+        "text": "func TestRaft_LeaderLeaseExpire(t *testing.T) {\n\t// Make a cluster\n\tconf := inmemConfig(t)\n\tc := MakeCluster(2, t, conf)\n\tdefer c.Close()\n\n\t// Get the leader\n\tleader := c.Leader()\n\n\t// Wait until we have a followers\n\tlimit := time.Now().Add(c.longstopTimeout)\n\tvar followers []*Raft\n\tfor time.Now().Before(limit) && len(followers) != 1 {\n\t\tc.WaitEvent(nil, c.conf.CommitTimeout)\n\t\tfollowers = c.GetInState(Follower)\n\t}\n\tif len(followers) != 1 {\n\t\tt.Fatalf(\"expected a followers: %v\", followers)\n\t}\n\n\t// Disconnect the follower now\n\tfollower := followers[0]\n\tt.Logf(\"[INFO] Disconnecting %v\", follower)\n\tc.Disconnect(follower.localAddr)\n\n\t// Watch the leaderCh\n\ttimeout := time.After(conf.LeaderLeaseTimeout * 2)\nLOOP:\n\tfor {\n\t\tselect {\n\t\tcase v := <-leader.LeaderCh():\n\t\t\tif !v {\n\t\t\t\tbreak LOOP\n\t\t\t}\n\t\tcase <-timeout:\n\t\t\tt.Fatalf(\"timeout stepping down as leader\")\n\t\t}\n\t}\n\n\t// Ensure the last contact of the leader is non-zero\n\tif leader.LastContact().IsZero() {\n\t\tt.Fatalf(\"expected non-zero contact time\")\n\t}\n\n\t// Should be no leaders\n\tif len(c.GetInState(Leader)) != 0 {\n\t\tt.Fatalf(\"expected step down\")\n\t}",
+        "content_digest": "51962412636d46873abcb6dba5a4603504d480f2f7c8b2b2cc1f561b652b6f6c"
+      },
+      {
+        "id": "src-rejoin-test",
+        "file": "raft_test.go",
+        "start_line": 1746,
+        "end_line": 1768,
+        "kind": "test_expectation",
+        "text": "\t// Rejoin. The follower will have a higher term than the leader,\n\t// this will cause the leader to step down, and a new round of elections\n\t// to take place. We should eventually re-stabilize.\n\tfuture = leader.AddVoter(follower.localID, follower.localAddr, 0, 0)\n\tif err := future.Error(); err != nil && err != ErrLeadershipLost {\n\t\tt.Fatalf(\"err: %v\", err)\n\t}\n\n\t// We should level back up to the proper number of peers. We add a\n\t// stability check here to make sure the cluster gets to a state where\n\t// there's a solid leader.\n\tleader = c.Leader()\n\tif configuration := c.getConfiguration(leader); len(configuration.Servers) != 3 {\n\t\tt.Fatalf(\"missing peers: %v\", configuration)\n\t}\n\tif configuration := c.getConfiguration(followers[1]); len(configuration.Servers) != 3 {\n\t\tt.Fatalf(\"missing peers: %v\", configuration)\n\t}\n\n\t// Should be a follower now.\n\tif follower.State() != Follower {\n\t\tt.Fatalf(\"bad state: %v\", follower.State())\n\t}",
+        "content_digest": "51962412636d46873abcb6dba5a4603504d480f2f7c8b2b2cc1f561b652b6f6c"
+      },
+      {
+        "id": "src-network-pipeline-completion",
+        "file": "net_transport.go",
+        "start_line": 839,
+        "end_line": 861,
+        "kind": "code_observation",
+        "text": "// decodeResponses is a long running routine that decodes the responses\n// sent on the connection.\nfunc (n *netPipeline) decodeResponses() {\n\ttimeout := n.trans.timeout\n\tfor {\n\t\tselect {\n\t\tcase future := <-n.inprogressCh:\n\t\t\tif timeout > 0 {\n\t\t\t\tn.conn.conn.SetReadDeadline(time.Now().Add(timeout))\n\t\t\t}\n\n\t\t\t_, err := decodeResponse(n.conn, future.resp)\n\t\t\tfuture.respond(err)\n\t\t\tselect {\n\t\t\tcase n.doneCh <- future:\n\t\t\tcase <-n.shutdownCh:\n\t\t\t\treturn\n\t\t\t}\n\t\tcase <-n.shutdownCh:\n\t\t\treturn\n\t\t}\n\t}\n}",
+        "content_digest": "523d3ae139061c4cb2efa2c340e98e902db0c9637f3f7aed19735486a97f53bf"
+      },
+      {
+        "id": "src-state-api",
+        "file": "api.go",
+        "start_line": 1101,
+        "end_line": 1118,
+        "kind": "interface_statement",
+        "text": "// State returns the state of this raft peer.\nfunc (r *Raft) State() RaftState {\n\treturn r.getState()\n}\n\n// LeaderCh is used to get a channel which delivers signals on acquiring or\n// losing leadership. It sends true if we become the leader, and false if we\n// lose it.\n//\n// Receivers can expect to receive a notification only if leadership\n// transition has occurred.\n//\n// If receivers aren't ready for the signal, signals may drop and only the\n// latest leadership transition. For example, if a receiver receives subsequent\n// `true` values, they may deduce that leadership was lost and regained while\n// the receiver was processing first leadership transition.\nfunc (r *Raft) LeaderCh() <-chan bool {\n\treturn r.leaderCh",
+        "content_digest": "499a72c01096912e85d16381f4640ac6d29f8c2b91cabbdae8530bdcbeb89a4a"
+      },
+      {
+        "id": "src-request-construction",
+        "file": "replication.go",
+        "start_line": 570,
+        "end_line": 625,
+        "kind": "code_observation",
+        "text": "func (r *Raft) setupAppendEntries(s *followerReplication, req *AppendEntriesRequest, nextIndex, lastIndex uint64) error {\n\treq.RPCHeader = r.getRPCHeader()\n\treq.Term = s.currentTerm\n\t// this is needed for retro compatibility, before RPCHeader.Addr was added\n\treq.Leader = r.trans.EncodePeer(r.localID, r.localAddr)\n\treq.LeaderCommitIndex = r.getCommitIndex()\n\tif err := r.setPreviousLog(req, nextIndex); err != nil {\n\t\treturn err\n\t}\n\tif err := r.setNewLogs(req, nextIndex, lastIndex); err != nil {\n\t\treturn err\n\t}\n\treturn nil\n}\n\n// setPreviousLog is used to setup the PrevLogEntry and PrevLogTerm for an\n// AppendEntriesRequest given the next index to replicate.\nfunc (r *Raft) setPreviousLog(req *AppendEntriesRequest, nextIndex uint64) error {\n\t// Guard for the first index, since there is no 0 log entry\n\t// Guard against the previous index being a snapshot as well\n\tlastSnapIdx, lastSnapTerm := r.getLastSnapshot()\n\tif nextIndex == 1 {\n\t\treq.PrevLogEntry = 0\n\t\treq.PrevLogTerm = 0\n\n\t} else if (nextIndex - 1) == lastSnapIdx {\n\t\treq.PrevLogEntry = lastSnapIdx\n\t\treq.PrevLogTerm = lastSnapTerm\n\n\t} else {\n\t\tvar l Log\n\t\tif err := r.logs.GetLog(nextIndex-1, &l); err != nil {\n\t\t\tr.logger.Error(\"failed to get log\", \"index\", nextIndex-1, \"error\", err)\n\t\t\treturn err\n\t\t}\n\n\t\t// Set the previous index and term (0 if nextIndex is 1)\n\t\treq.PrevLogEntry = l.Index\n\t\treq.PrevLogTerm = l.Term\n\t}\n\treturn nil\n}\n\n// setNewLogs is used to setup the logs which should be appended for a request.\nfunc (r *Raft) setNewLogs(req *AppendEntriesRequest, nextIndex, lastIndex uint64) error {\n\t// Append up to MaxAppendEntries or up to the lastIndex. we need to use a\n\t// consistent value for maxAppendEntries in the lines below in case it ever\n\t// becomes reloadable.\n\tmaxAppendEntries := r.config().MaxAppendEntries\n\treq.Entries = make([]*Log, 0, maxAppendEntries)\n\tmaxIndex := min(nextIndex+uint64(maxAppendEntries)-1, lastIndex)\n\tfor i := nextIndex; i <= maxIndex; i++ {\n\t\toldLog := new(Log)\n\t\tif err := r.logs.GetLog(i, oldLog); err != nil {\n\t\t\tr.logger.Error(\"failed to get log\", \"index\", i, \"error\", err)\n\t\t\treturn err",
+        "content_digest": "24106024107950339bd30fc4e24a0b4a0a97a1c0e01aa7b31bedf4a2ad30b054"
+      },
+      {
+        "id": "src-local-state-setter",
+        "file": "state.go",
+        "start_line": 79,
+        "end_line": 95,
+        "kind": "code_observation",
+        "text": "func (r *raftState) getState() RaftState {\n\tstateAddr := (*uint32)(&r.state)\n\treturn RaftState(atomic.LoadUint32(stateAddr))\n}\n\nfunc (r *raftState) setState(s RaftState) {\n\tstateAddr := (*uint32)(&r.state)\n\tatomic.StoreUint32(stateAddr, uint32(s))\n}\n\nfunc (r *raftState) getCurrentTerm() uint64 {\n\treturn atomic.LoadUint64(&r.currentTerm)\n}\n\nfunc (r *raftState) setCurrentTerm(term uint64) {\n\tatomic.StoreUint64(&r.currentTerm, term)\n}",
+        "content_digest": "9e73b5bcd67350db80c272c0d0f3f6c17afb24fb6e62b28e891c13e96107e189"
+      },
+      {
+        "id": "src-config-load",
+        "file": "api.go",
+        "start_line": 709,
+        "end_line": 711,
+        "kind": "code_observation",
+        "text": "func (r *Raft) config() Config {\n\treturn r.conf.Load().(Config)\n}",
+        "content_digest": "499a72c01096912e85d16381f4640ac6d29f8c2b91cabbdae8530bdcbeb89a4a"
+      },
+      {
+        "id": "src-future-completion",
+        "file": "future.go",
+        "start_line": 90,
+        "end_line": 131,
+        "kind": "code_observation",
+        "text": "// deferError can be embedded to allow a future\n// to provide an error in the future.\ntype deferError struct {\n\terr        error\n\terrCh      chan error\n\tresponded  bool\n\tShutdownCh chan struct{}\n}\n\nfunc (d *deferError) init() {\n\td.errCh = make(chan error, 1)\n}\n\nfunc (d *deferError) Error() error {\n\tif d.err != nil {\n\t\t// Note that when we've received a nil error, this\n\t\t// won't trigger, but the channel is closed after\n\t\t// send so we'll still return nil below.\n\t\treturn d.err\n\t}\n\tif d.errCh == nil {\n\t\tpanic(\"waiting for response on nil channel\")\n\t}\n\tselect {\n\tcase d.err = <-d.errCh:\n\tcase <-d.ShutdownCh:\n\t\td.err = ErrRaftShutdown\n\t}\n\treturn d.err\n}\n\nfunc (d *deferError) respond(err error) {\n\tif d.errCh == nil {\n\t\treturn\n\t}\n\tif d.responded {\n\t\treturn\n\t}\n\td.errCh <- err\n\tclose(d.errCh)\n\td.responded = true\n}",
+        "content_digest": "e3775d16c6cb24f9c9572ce452c27e87fcbf4b24baf666d14e838cc4b571ae9c"
+      },
+      {
+        "id": "src-inmem-constructor",
+        "file": "inmem_transport.go",
+        "start_line": 49,
+        "end_line": 70,
+        "kind": "code_observation",
+        "text": "// NewInmemTransportWithTimeout is used to initialize a new transport and\n// generates a random local address if none is specified. The given timeout\n// will be used to decide how long to wait for a connected peer to process the\n// RPCs that we're sending it. See also Connect() and Consumer().\nfunc NewInmemTransportWithTimeout(addr ServerAddress, timeout time.Duration) (ServerAddress, *InmemTransport) {\n\tif string(addr) == \"\" {\n\t\taddr = NewInmemAddr()\n\t}\n\ttrans := &InmemTransport{\n\t\tconsumerCh: make(chan RPC, 16),\n\t\tlocalAddr:  addr,\n\t\tpeers:      make(map[ServerAddress]*InmemTransport),\n\t\ttimeout:    timeout,\n\t}\n\treturn addr, trans\n}\n\n// NewInmemTransport is used to initialize a new transport\n// and generates a random local address if none is specified\nfunc NewInmemTransport(addr ServerAddress) (ServerAddress, *InmemTransport) {\n\treturn NewInmemTransportWithTimeout(addr, 500*time.Millisecond)\n}",
+        "content_digest": "80d9e25c23cce532a687eafe5197c076d440b5a2be443bc9b3897b4e2fa09774"
+      }
+    ],
+    "selections": [
+      {
+        "operation_id": "3ccc77abce8a4ce092f02cdcafa76598",
+        "action": "continue",
+        "rationale": "Register the initial partial map and preserve a concrete A2 contact-marker question. Code establishes heterogeneous marker qualification; documentation weakens a naive successful-acknowledgement interpretation. No obligation or Evidence is claimed. Next discriminator is applicability of higher-term response handling and whether independent replication or incoming RPC processing necessarily closes the suspected window.",
+        "feedback": {},
+        "map_changes": {},
+        "accepted_versions": {
+          "audit_spec": 1,
+          "units": {},
+          "artifacts": {}
+        },
+        "candidate_ids": [
+          "724543233ad047a280de6cb77cfdb6fd"
+        ]
+      },
+      {
+        "operation_id": "d06de1eb07974fc5a51cfb9971bc37ad",
+        "action": "continue",
+        "rationale": "Continue the same principal contact-marker lifecycle. The heartbeat-rejection variant has no acquired immediate-role-loss requirement; pipeline timeout is a stronger discriminator because it can create a fresh marker without a delivered reply, and the response interface explicitly limits validity to successful completion. Register this newly read dependency before constructing a local executed comparison. Do not infer a lease failure solely from the interface mismatch.",
+        "feedback": {
+          "ref_ids": [
+            "724543233ad047a280de6cb77cfdb6fd",
+            "src-lease-contract",
+            "src-lease-purpose",
+            "src-pipeline-reply"
+          ],
+          "answered": "The contact-only contract does not demand successful heartbeat acceptance. Newly read producer code also shows that pipeline readiness does not imply response success: timeouts publish futures, while the existing consumer reads response fields directly. Ordinary periodic replication is an alternate step-down route, not a proven finite bound under arbitrary delays.",
+          "remaining": [
+            "Requirement gap narrowed: AppendFuture.Response explicitly requires Error completion and success; the lease contract concerns actual contact, but an API mismatch alone is not a completed authority-loss finding.",
+            "Local execution gap: run a real in-memory pipeline timeout, correlate its request/future identity, observe Error and marker before/after actual pipelineDecode consumption.",
+            "Initial-prefix and same-history gaps: full cluster election, pipeline activation and isolated no-contact interval have not been executed. Remote processing without reply remains possible.",
+            "Endpoint gap: whether this refresh changes a scheduled lease decision or public leadership-loss timing remains unobserved; fallback replication and negative verification remain protective alternatives."
+          ],
+          "understanding": "updated",
+          "rationale": "Choose the actual pipeline-timeout edge as the next local discriminator because it removes the unsupported assumption that a rejection is not contact. Retain the prior higher-term variant and its unresolved requirement rather than declaring it correct or violated."
+        },
+        "map_changes": {
+          "b-pipeline-contact": {
+            "impact": "dependency",
+            "rationale": "Reconnect actual failed-future producer to existing pipeline contact writer. This directly affects the current marker lifecycle and adds a timeout variant; it does not establish a full leader history or application consequence.",
+            "source_ids": [
+              "src-inmem-pipeline-timeout",
+              "src-pipeline-contract",
+              "src-pipeline-progress"
+            ]
+          },
+          "fact-peer-contact-marker": {
+            "impact": "meaning",
+            "rationale": "Explicitly records the discovered absence of a delivered reply on one refresh path. Identity and generation scope remain unchanged; current question is reconnected and no Unit or Evidence exists to revise.",
+            "source_ids": [
+              "src-inmem-pipeline-timeout",
+              "src-pipeline-contract"
+            ]
+          },
+          "b-append-contact": {
+            "impact": "clarification",
+            "rationale": "Preserve contrary evidence: ordinary timeout errors do not refresh marker, and periodic replication can eventually expose newer terms. No bounded eventuality is inferred.",
+            "source_ids": [
+              "src-inmem-append",
+              "src-inmem-rpc",
+              "src-replication-progress"
+            ]
+          },
+          "surface:Pipeline transport completion/error contract": {
+            "impact": "dependency",
+            "rationale": "Changes the deferred surface to a partially mapped concrete producer/consumer dependency. In-memory failed-future publication directly affects the current contact-marker question; network completion is contrary to treating readiness as success but its failure histories are not claimed as executed or covered.",
+            "source_ids": [
+              "src-pipeline-contract",
+              "src-inmem-pipeline-timeout",
+              "src-network-pipeline-completion"
+            ]
+          },
+          "target_profile": {
+            "impact": "dependency",
+            "rationale": "Adds the in-memory pipeline timeout variant and its actual source dependencies within the existing package and contact-marker boundary. This variant affects the current witness plan because transport completion need not deliver a response; it does not expand the claim to a legal elected-cluster prefix or application consequence.",
+            "source_ids": [
+              "src-pipeline-contract",
+              "src-inmem-pipeline-timeout"
+            ]
+          }
+        },
+        "accepted_versions": {
+          "audit_spec": 2,
+          "units": {},
+          "artifacts": {}
+        },
+        "candidate_ids": [
+          "724543233ad047a280de6cb77cfdb6fd"
+        ]
+      },
+      {
+        "operation_id": "bac65f648bdd4f26b07a61c3753eeac7",
+        "action": "explore",
+        "rationale": "Next discriminator replaces the assumed failed-future producer with real InmemTransport pipeline execution. Each isolated scenario constructs a Leader state with expired contact and two Voters; it does not use BootstrapCluster/NewRaft or claim a legal election prefix. Receiver transport admits the request but no receiver Raft or reply producer runs, so no reply can be delivered. Pipeline future Error is awaited independently before real pipelineDecode reads the queued future. Ordinary replicateTo is the comparison path. Main loop, heartbeat, snapshot and verification workers are omitted to isolate the local writer/consumer effect; their absence prevents inference of cluster role duration. Raw marker times, completion/error, stable operation label and request identity are observed before a manual lease invocation. No application consequence, normative violation or property Evidence is claimed. Exploration finishes on actual future/decoder completion with bounded tool timeouts, not on a desired state.",
+        "feedback": {},
+        "map_changes": {},
+        "accepted_versions": {
+          "audit_spec": 2,
+          "units": {},
+          "artifacts": {}
+        },
+        "candidate_ids": []
+      }
+    ],
+    "applied_operations": {
+      "native-3ccc77abce8a4ce092f02cdcafa76598": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-09-27_13-22-02-hashicorp_raft-real-run/graph-commits/native-3ccc77abce8a4ce092f02cdcafa76598.json"
+      },
+      "native-d06de1eb07974fc5a51cfb9971bc37ad": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-09-27_13-22-02-hashicorp_raft-real-run/graph-commits/native-d06de1eb07974fc5a51cfb9971bc37ad.json"
+      },
+      "native-bac65f648bdd4f26b07a61c3753eeac7": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-09-27_13-22-02-hashicorp_raft-real-run/graph-commits/native-bac65f648bdd4f26b07a61c3753eeac7.json"
+      }
+    }
+  }
+}
