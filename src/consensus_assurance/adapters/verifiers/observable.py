@@ -34,9 +34,13 @@ def properties_source(properties, mapping):
     lines = ['---------------- MODULE Properties ----------------', 'EXTENDS Behavior, Sequences']
     for p in properties:
         name = identifier(p.checker_id)
-        if p.kind == 'event_assertion':
+        if (p.kind == 'event_implication') != (p.antecedent is not None):
+            raise ValueError('Shared implication needs exactly one observed antecedent')
+        if p.kind in {'event_assertion', 'event_implication'}:
             body = '~' + scalar(p.trigger, mapping) + ' \\/ ' + scalar(p.assertion, mapping)
-        else:
+            if p.kind == 'event_implication':
+                body = '~' + scalar(p.trigger, mapping) + ' \\/ (~' + scalar(p.antecedent, mapping) + ' \\/ ' + scalar(p.assertion, mapping) + ')'
+        elif p.kind == 'stable_support':
             if p.assertion.op != 'eq' or p.assertion.reference or p.trigger.reference:
                 raise ValueError('Stable support compares effective objects for equality without alias expressions')
             if not p.history_field or not p.identity_fields:
@@ -49,6 +53,8 @@ def properties_source(properties, mapping):
             active = lambda x: x + '.' + p.trigger.field + (' = ' if p.trigger.op == 'eq' else ' /= ') + literal(p.trigger.value)
             same = ' /\\ '.join(left+'.'+f+' = '+right+'.'+f for f in p.identity_fields)
             body = r'\A i, j \in 1..Len(' + history + ') : (i < j /\\ ' + active(left) + ' /\\ ' + active(right) + ' /\\ ' + same + ') => (' + left+'.'+p.assertion.field+' = '+right+'.'+p.assertion.field+')'
+        else:
+            raise ValueError('Unsupported shared observable property kind: ' + p.kind)
         lines.append(name + ' == ' + body)
     lines.append('====================================================')
     return '\n'.join(lines) + '\n'

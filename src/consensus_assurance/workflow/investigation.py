@@ -3,7 +3,7 @@ from .feedback import apply_feedback
 from .artifacts import validate_bundle
 
 
-def validate_feedback(state, unit, bundle, feedback, implementation, requested_kind):
+def validate_feedback(state, unit, bundle, feedback, implementation, requested_kind, audit_spec=None):
     if feedback.kind == "unresolved":
         if not feedback.rationale.strip(): raise ValueError("Unresolved feedback needs a concrete limitation")
         return
@@ -17,7 +17,7 @@ def validate_feedback(state, unit, bundle, feedback, implementation, requested_k
         feedback.bundle=validate_bundle(state,unit,feedback.bundle,implementation)
     copied = state.model_copy(deep=True)
     copied_unit = next(u for u in copied.units if u.id == unit.id)
-    apply_feedback(copied,copied_unit,bundle,feedback)
+    apply_feedback(copied,copied_unit,bundle,feedback,audit_spec=audit_spec)
 
 
 def validate_replay(state, unit, bundle, finding, plan, implementation):

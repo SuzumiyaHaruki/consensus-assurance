@@ -50,7 +50,7 @@ def reject(update,code,message,writes):
         message=message,allowed=['semantic_revision','stop'],details={'actual_fields':[{'object_id':id,'field':f,'old':a,'new':b} for (id,f),(a,b) in writes.items()],'next_action':'Record a scoped F2 or unresolved investigation; never silently apply a mixed patch'})])
 
 
-def validate_scope_update(state,update):
+def validate_scope_update(state,update,audit_spec=None):
     unit=next((u for u in state.units if u.id==update.unit_id),None)
     if unit is None or unit.version!=update.unit_version:raise ValueError('Scope source unit/version no longer matches')
     writes=write_set(state,update.patch)
@@ -63,12 +63,12 @@ def validate_scope_update(state,update):
     draft=update.patch.units[0]
     if not set(unit.binding_ids)<=set(draft.binding_ids) or not set(unit.relation_ids)<=set(draft.relation_ids):reject(update,'scope_removed_path','Removing existing code or dependency paths requires semantic investigation',writes)
     if not update.source_ids or not set(update.source_ids)<={m.id for m in state.materials}:raise ValueError('Scope update requires actually acquired sources')
-    from .audit_spec import IDENTITY
-    if unit.audit_question and (not draft.audit_question or any(getattr(draft.audit_question,k)!=getattr(unit.audit_question,k) for k in IDENTITY)):reject(update,'scope_question_changed','Replacing the audit question requires explicit semantic review',writes)
+    if unit.candidate_id!=draft.candidate_id:reject(update,'scope_question_changed','Scope expansion preserves its Candidate identity',writes)
+    if unit.audit_question and (not draft.audit_question or any(getattr(draft.audit_question,k)!=getattr(unit.audit_question,k) for k in ('fact_ids','obligation_relation_kind')) or any(not set(getattr(unit.audit_question,k))<=set(getattr(draft.audit_question,k)) for k in ('behavior_ids','activity_classes'))):reject(update,'scope_question_changed','Replacing the principal Fact/lifecycle or removing responsibility paths requires F2',writes)
     refined={f for id,f in writes if f in {'audit_question'}}
     from .graph import apply_patch
     candidate=new_candidate_patch(state,update)
-    try:apply_patch(state.model_copy(deep=True),candidate)
+    try:apply_patch(state.model_copy(deep=True),candidate,audit_spec=audit_spec)
     except DiagnosticError as exc:
         # Explicit provenance, not ID-prefix guessing or merged-array coordinates.
         identities={candidate.units[0].id:update.unit_id}
@@ -93,8 +93,8 @@ def new_candidate_patch(state,update):
     return patch
 
 
-def apply_scope_update(state,update):
-    needed=validate_scope_update(state,update)
+def apply_scope_update(state,update,audit_spec=None):
+    needed=validate_scope_update(state,update,audit_spec)
     if needed:reject(update,'scope_review_needed','Review the changed event/coverage interpretation before adoption',write_set(state,update.patch))
     trial=state.model_copy(deep=True);old=next(u for u in trial.units if u.id==update.unit_id)
     new_id=old.id+'.scope.'+update.id
@@ -102,7 +102,7 @@ def apply_scope_update(state,update):
     if existing:return existing
     patch=new_candidate_patch(trial,update)
     from .graph import apply_patch
-    apply_patch(trial,patch)
+    apply_patch(trial,patch,audit_spec=audit_spec)
     old=next(u for u in trial.units if u.id==update.unit_id);new=next(u for u in trial.units if u.id==new_id)
     new.previous_id=old.id;new.version=old.version+1
     new.semantic_readiness={};new.remaining_obligation_ids=list(new.obligation_ids)

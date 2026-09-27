@@ -1,7 +1,7 @@
 """The public CLI uses the same file products as the real native transport."""
 import json
 from pathlib import Path
-from native_support import products, check_step
+from native_support import first, check_step
 from consensus_assurance.cli import main
 from consensus_assurance.core.config import Config, Budget
 
@@ -12,8 +12,9 @@ def test_cli_native_fixture_execution_and_report(tmp_path,capsys):
     (repo/'README.md').write_text('Legal local return remains within capacity.\n')
     submission,files=check_step()({'units':[{'id':'unit-bounded'}]})
     fixture=tmp_path/'native.json'
-    fixture.write_text(json.dumps([{'submission':products()[0]}, {'submission':submission,'files':files},
-        {'submission':{'action':'stop','rationale':'Explicit fixture finished'}}]))
+    candidate,map_files=first({})
+    fixture.write_text(json.dumps([{'submission':candidate,'files':map_files}, {'submission':submission,'files':files},
+        {'submission':{'action':'stop','scope':'run','reason':'user_stop','rationale':'Explicit fixture boundary; pending review remains visible'}}]))
     config=Config(agent_backend='mock',fixture=str(fixture),execution_backend='python',execution_isolation='workspace',
         runs_dir=str(tmp_path/'runs'),budget=Budget(agent_calls=3,total_seconds=60))
     path=tmp_path/'config.yaml';path.write_text(config.model_dump_json())

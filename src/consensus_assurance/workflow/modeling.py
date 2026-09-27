@@ -20,20 +20,22 @@ def obligation_progress(state, unit):
     import json
     expected={claim:{} for claim in unit.obligation_ids}
     versions={x.id:x.version for x in [*state.claims,*state.bindings,*state.relations,*state.units]}
+    superseded={m.previous_id for m in state.models if m.previous_id}
     for model in state.models:
         if model.unit_id!=unit.id:continue
-        if any(versions.get(k)!=v for k,v in model.graph_versions.items()):continue
-        if any(e.model_id==model.id and e.applicability=='recheck_required' for e in state.evidence):continue
+        if model.id in superseded:continue
         for spec in model.checkers:
             if spec.claim_id in expected:
-                expected[spec.claim_id][(spec.invariant,json.dumps(spec.scope.model_dump(mode='json'),sort_keys=True))]=(model,spec)
+                expected[spec.claim_id][(model.id,spec.invariant)]=(model,spec)
     covered={};completed=set()
     for claim,slots in expected.items():
         ids=[]; complete=bool(slots)
         for model,spec in slots.values():
             checks=[c for c in state.checks if c.model_id==model.id and c.action=='model_check']
             check=checks[-1] if checks else None
-            valid=bool(check and model.search_fingerprint and check.search_fingerprint==model.search_fingerprint and check.status.value=='completed')
+            valid=bool(check and model.search_fingerprint and check.search_fingerprint==model.search_fingerprint and check.status.value=='completed'
+                and all(versions.get(k)==v for k,v in model.graph_versions.items())
+                and not any(e.model_id==model.id and e.applicability=='recheck_required' for e in state.evidence))
             if valid and check.reused_from:
                 source=next((c for c in state.checks if c.id==check.reused_from),None)
                 valid=bool(source and source.search_fingerprint==check.search_fingerprint and source.status.value=='completed')
@@ -66,15 +68,15 @@ def obligation_progress(state, unit):
         direct[artifact.claim_id].append(bool(record.get('reviewed_complete')))
     for claim,scenarios in direct.items():
         if scenarios:
-            if all(scenarios):completed.add(claim)
+            if all(scenarios) and (not expected[claim] or claim in completed):completed.add(claim)
             else:completed.discard(claim)
     return covered,[c for c in unit.obligation_ids if c not in completed]
 
 
 def coverage_limitations(state,unit):
     limits=[]
-    models=[m for m in state.models if m.unit_id==unit.id]
-    direct=[a for a in state.direct_checks if a.unit_id==unit.id]
+    models=[m for m in state.models if m.unit_id==unit.id and m.id not in {x.previous_id for x in state.models}]
+    direct=[a for a in state.direct_checks if a.unit_id==unit.id and a.id not in {x.previous_id for x in state.direct_checks}]
     if not unit.audit_question:limits.append('Audit question is not structured; effective interaction coverage is unestablished')
     from .audit_spec import reachability_refs
     for ref in reachability_refs(unit.audit_question):

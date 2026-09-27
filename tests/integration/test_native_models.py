@@ -28,7 +28,7 @@ Bounded == value <= 2
         invariants=['Bounded'],checked_claim_ids=['bounded'],initial_state='Zero initial value',variables=['value'],
         actions=['Next'],constraints=[dict(constraint='Abstract the actual branch and finite capacity',source_kind='code_observation',source_ids=['code'],binding_ids=['binding'],justification='The two actual branches wrap at capacity')],
         scope=state['units'][0]['scope'],uncertainties=['The model checker bound is intentionally narrower in this tool fixture'],
-        reachability=[dict(id='reached',operator='Reached',claim_ids=['bounded'],description='An actual increment can occur')])
+        reachability=[dict(id='reached',operator='Reached',claim_ids=['bounded'],behavior_ids=['call'],fact_ids=['result'],description='An actual increment can occur')])
     harness='''import json
 from target import step
 value=0

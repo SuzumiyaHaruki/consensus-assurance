@@ -38,6 +38,8 @@ def products():
         derivation='Return after an actual legal invocation remains bounded', applicability='One legal local call')
     question = dict(question='Does a boundary call return within capacity?',importance='A bad returned value misleads the consumer',
         source_ids=['code','doc'],disposition='ready_for_check',preferred_check='direct_test',
+        audit_spec_version=1,activity_classes=['A1'],behavior_ids=['call'],fact_ids=['result'],
+        obligation_relation_kind='establishment',contexts=['One legal synchronous invocation'],
         event_paths=['admitted -> called -> returned'],trigger_rationale='Read the actual return and independent bound')
     obligation = dict(action='obligation',question=question,rationale='Check a bounded actual call',
         sources=[dict(id='code',file='target.py',start_line=1,end_line=2,kind='code_observation'),
@@ -65,7 +67,35 @@ print('CA_EVENT '+json.dumps({'event':'returned','operation':'one','state':{'in_
 
 
 def first(state):
-    return products()[0], {}
+    sub=products()[0]
+    sub['map_path']='map.json'
+    return sub, {'map.json':json.dumps(partial_map())}
+
+
+def partial_map():
+    return dict(version=1,target_profile=dict(system_boundary='One local operation',source_ids=['code']),
+        activities=[dict(class_id='A1',applicability='applicable',purpose='Produce a local result',
+            realization_summary='A synchronous call returns a bounded value',source_ids=['code'])],
+        behaviors=[dict(id='call',primary_activity='A1',execution_owner='caller',protocol_context='one request',
+            trigger='invoke',produces_fact_ids=['result'],source_ids=['code'],existing_protections=['Capacity branch'])],
+        facts=[dict(id='result',meaning='The invocation delivered a return value',identity={'operation':'one'},
+            validity_context='one completion',representation=['return'],durability='volatile',recovery='none',
+            unknowns=['Consumer outside boundary'],source_ids=['code'])])
+
+
+def feedback(state, **overrides):
+    refs=[s['operation_id'] for s in state.get('selections',[]) if s['action'] in {'pause','explained'}]
+    refs += [r['id'] for r in state['semantic_reviews']]
+    return dict(ref_ids=list(dict.fromkeys(refs+['code','doc'])),answered='The local return discriminator is bounded by this invocation',
+        remaining=['Unexecuted consumer and distributed consequences'],understanding='unchanged',
+        rationale='The source map already expresses the bounded call; no structural generalization from a test',**overrides)
+
+
+def defer(state):
+    from consensus_assurance.workflow.research import pending_work
+    from consensus_assurance.core.types import Analysis
+    return [dict(target_id=w['id'],rationale='End this bounded scripted transport fixture with local work still incomplete',
+        resume_conditions=['Explicitly schedule the saved artifact repair or review']) for w in pending_work(Analysis.model_validate(state))]
 
 
 def check_step(broken=False, revise=False):
@@ -77,6 +107,7 @@ def check_step(broken=False, revise=False):
             plan_path='plan.json',harness_path='check.py',files={'helper.py':'helper.py'},rationale='Repair compilation' if revise else 'Execute the accepted obligation')
         if revise:
             submission['previous_check_id']=state['direct_checks'][-1]['id']
+        if state.get('semantic_reviews'):submission['feedback']=feedback(state)
         return submission, {'plan.json':json.dumps(plan),'check.py':harness,'helper.py':'def legal(value, limit):\n    return 0 <= value <= limit\n'}
     return step
 
@@ -92,7 +123,9 @@ def review_step(status='no_issue_found',aspect='checker_correspondence'):
 
 
 def stop(state):
-    return {'action':'stop','rationale':'Bounded fixture is complete; no autonomous claim'},{}
+    return dict(action='stop',scope='run',reason='insufficient_basis',ref_ids=['code','doc'],
+        rationale='End the bounded fixture with remaining work visible; no autonomous claim',
+        feedback=feedback(state),deferred_work=defer(state)),{}
 
 
 def engine_for(tmp_path, steps):

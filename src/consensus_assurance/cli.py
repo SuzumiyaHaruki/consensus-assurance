@@ -130,7 +130,7 @@ def main(argv=None):
         print(f"运行模式：{state.mode}；报告：{report}")
         print(f"停止原因：{state.stop_reason}")
         return 0 if state.stop_reason.startswith(("No pending", "Plan generated",
-            "No further investigation selected", "Snapshot prepared")) else 2
+            "No further investigation selected", "Scoped stop (", "Snapshot prepared")) else 2
     except (ValueError, FileNotFoundError, BlockingIOError, OSError) as exc:
         print(f"无法继续：{exc}", file=sys.stderr)
         return 2

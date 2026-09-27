@@ -35,6 +35,7 @@ class RelationDraft(Record):
 
 
 class UnitDraft(Record):
+    candidate_id: str | None = None
     audit_question: AuditQuestion | None = None
     id: str
     obligation_ids: list[str] = Field(min_length=1, max_length=1)

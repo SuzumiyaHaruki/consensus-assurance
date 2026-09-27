@@ -1,0 +1,291 @@
+{
+  "version": 1,
+  "target_profile": {
+    "system_boundary": "The repository Go raft package, including replication and lease consumers plus built-in storage and transport variants. Application FSM and deployment adapter selection remain caller responsibilities; built-in implementations are inside the available audit boundary.",
+    "protocol_contexts": [
+      "Raft current term and per-follower replication currentTerm",
+      "Peer ServerID/address and latest configuration voter membership",
+      "Per-replication-object lastContact timestamp"
+    ],
+    "external_interfaces": [
+      "FSM",
+      "LogStore",
+      "StableStore",
+      "SnapshotStore",
+      "Transport"
+    ],
+    "ownership": [
+      "replicate launches a separate heartbeat goroutine for a followerReplication object",
+      "checkLeaderLease is owned by the main Raft thread",
+      "NewRaft restores current term and last log through injected stores"
+    ],
+    "selection_injection": [
+      "NewRaft receives all five interfaces from its caller; no deployed adapter choice is supplied.",
+      "NetworkTransport selects an injected stream and timeout; InmemTransport has its own queue and timeout."
+    ],
+    "variants": [
+      "Ordinary AppendEntries and pipelined AppendEntries response processing",
+      "Pre-vote disabled by configuration or missing WithPreVote transport capability",
+      "BatchApplyCh optionally buffers admission",
+      "Built-in InmemStore, InmemSnapshotStore and FileSnapshotStore constructors; their failure semantics remain unexpanded",
+      "NetworkTransport and InmemTransport; the latter does not support heartbeat fast-path registration"
+    ],
+    "source_ids": [
+      "s-constructor",
+      "s-spawn",
+      "s-repl-context",
+      "s-network",
+      "s-inmem-transport",
+      "s-memory-store",
+      "s-memory-snapshot",
+      "s-file-snapshot"
+    ],
+    "unknowns": [
+      "Concrete deployed configuration, adapters and FSM are unspecified.",
+      "Startup, storage failure semantics, snapshot publication and network fast-path dispatch need deeper reading."
+    ]
+  },
+  "activities": [
+    {
+      "class_id": "A2",
+      "applicability": "applicable",
+      "purpose": "Authority maintenance and interpretation of peer responses",
+      "realization_summary": "Heartbeat response completion feeds the lease connectivity consumer; stale AppendEntries rejection has been read separately.",
+      "entry_points": [
+        "Raft.heartbeat",
+        "Raft.checkLeaderLease",
+        "Raft.appendEntries"
+      ],
+      "source_ids": [
+        "s-heartbeat",
+        "s-lease",
+        "s-receiver"
+      ],
+      "unknowns": [
+        "Election, transfer, full step-down and verification completion paths remain partial."
+      ]
+    },
+    {
+      "class_id": "A1",
+      "applicability": "applicable",
+      "purpose": "Replication support and decision progression",
+      "realization_summary": "Successful ordinary/pipelined responses call updateLastAppended, which reports match index to commitment; decision aggregation is not yet recovered.",
+      "entry_points": [
+        "Raft.replicateTo",
+        "Raft.pipelineDecode",
+        "updateLastAppended"
+      ],
+      "source_ids": [
+        "s-append-response",
+        "s-pipeline-response",
+        "s-stale"
+      ],
+      "unknowns": [
+        "commitment.match and decision consumers remain unread."
+      ]
+    }
+  ],
+  "behaviors": [
+    {
+      "id": "b-heartbeat-contact",
+      "primary_activity": "A2",
+      "execution_owner": "Per-follower heartbeat goroutine launched by replicate",
+      "protocol_context": "One followerReplication object with fixed request term s.currentTerm; peer address read under peerLock on each iteration",
+      "trigger": "notifyCh or randomized HeartbeatTimeout/10 timer",
+      "legal_preconditions": [
+        "replicate has started this heartbeat worker"
+      ],
+      "implementation_guards": [
+        "stopCh ends the worker",
+        "Transport errors enter backoff without refreshing contact"
+      ],
+      "reads": [
+        "s.currentTerm",
+        "s.peer",
+        "AppendEntriesResponse.Success"
+      ],
+      "writes": [
+        "s.lastContact via setLastContact",
+        "heartbeat-local failures"
+      ],
+      "external_effects": [
+        "AppendEntries RPC",
+        "notifyAll(resp.Success) after transport success"
+      ],
+      "important_branches": [
+        "Any error-free response refreshes contact without a response-term comparison",
+        "An unsuccessful response still refreshes contact but supplies false to notifyAll"
+      ],
+      "async_boundaries": [
+        "Blocking Transport.AppendEntries call",
+        "Separate worker from ordinary replication",
+        "stopCh/timer/notification select"
+      ],
+      "produces_fact_ids": [
+        "f-heartbeat-contact"
+      ],
+      "existing_protections": [
+        "Verification notification uses response Success, not mere RPC completion",
+        "Ordinary replication separately detects newer response terms"
+      ],
+      "source_ids": [
+        "s-heartbeat",
+        "s-spawn",
+        "s-append-response"
+      ],
+      "unknowns": [
+        "Transport response production, timing and cancellation under network fast path need exact reading."
+      ]
+    },
+    {
+      "id": "b-lease-consume",
+      "primary_activity": "A2",
+      "execution_owner": "Raft main thread",
+      "protocol_context": "Latest configuration voter set and current leaderState replication objects",
+      "trigger": "checkLeaderLease invocation",
+      "reads": [
+        "configurations.latest.Servers",
+        "followerReplication.LastContact()",
+        "LeaderLeaseTimeout"
+      ],
+      "writes": [
+        "Raft state becomes Follower if recent contacted voters are below quorum"
+      ],
+      "implementation_guards": [
+        "Counts only Voter servers",
+        "Counts local server directly",
+        "Counts remote timestamps only within leaseTimeout"
+      ],
+      "consumes_fact_ids": [
+        "f-heartbeat-contact"
+      ],
+      "source_ids": [
+        "s-lease"
+      ],
+      "unknowns": [
+        "Other contact producers and replication object replacement are not fully mapped.",
+        "This consumer establishes a connectivity decision; stronger authority validity is not established by its timestamp check."
+      ]
+    },
+    {
+      "id": "b-reject-old-append",
+      "primary_activity": "A2",
+      "execution_owner": "Raft AppendEntries handler",
+      "protocol_context": "Receiver current term exceeds request term",
+      "trigger": "appendEntries receives an older-term request",
+      "implementation_guards": [
+        "a.Term < r.getCurrentTerm()"
+      ],
+      "reads": [
+        "receiver current term",
+        "receiver last log index"
+      ],
+      "external_effects": [
+        "Respond with current term, Success=false, and nil RPC error"
+      ],
+      "source_ids": [
+        "s-receiver"
+      ],
+      "unknowns": [
+        "Concurrent fast-path execution and its dispatch restrictions need investigation."
+      ]
+    }
+  ],
+  "facts": [
+    {
+      "id": "f-heartbeat-contact",
+      "meaning": "For this replication object, a heartbeat AppendEntries RPC completed without a transport error and refreshed contact time. This does not assert acceptance of the sender as leader or successful log replication.",
+      "identity": {
+        "replication_object": "followerReplication instance",
+        "peer": "peer identity read for this RPC",
+        "request_term": "s.currentTerm"
+      },
+      "validity_context": "Volatile contact observation for the same replication object; lease consumer bounds age separately.",
+      "representation": [
+        "followerReplication.lastContact"
+      ],
+      "durability": "Volatile timestamp protected by lastContactLock; no persistence claimed.",
+      "recovery": "No recovery semantics established; initialization and object replacement remain unread.",
+      "source_ids": [
+        "s-heartbeat",
+        "s-repl-context",
+        "s-lease"
+      ],
+      "unknowns": [
+        "Other timestamp producers exist and are not included as producers of this heartbeat-specific fact.",
+        "Address/configuration replacement and initial contact assignments remain to be mapped."
+      ]
+    }
+  ],
+  "surfaces": [
+    {
+      "entry_point": "Raft.heartbeat",
+      "disposition": "mapped",
+      "behavior_ids": [
+        "b-heartbeat-contact"
+      ],
+      "reason": "Mapped only error-free heartbeat contact production.",
+      "source_ids": [
+        "s-heartbeat"
+      ],
+      "high_consequence": true
+    },
+    {
+      "entry_point": "Raft.checkLeaderLease",
+      "disposition": "mapped",
+      "behavior_ids": [
+        "b-lease-consume"
+      ],
+      "reason": "Mapped timestamp consumption, not overall authority correctness.",
+      "source_ids": [
+        "s-lease"
+      ],
+      "high_consequence": true
+    },
+    {
+      "entry_point": "Raft.appendEntries",
+      "disposition": "mapped",
+      "behavior_ids": [
+        "b-reject-old-append"
+      ],
+      "reason": "Only older-term rejection branch is recovered.",
+      "source_ids": [
+        "s-receiver"
+      ],
+      "high_consequence": true
+    },
+    {
+      "entry_point": "Raft.verifyLeader",
+      "disposition": "deferred",
+      "behavior_ids": [],
+      "reason": "Read initial request setup; future vote aggregation and completion require expansion.",
+      "source_ids": [
+        "s-verify",
+        "s-verify-result"
+      ],
+      "high_consequence": true
+    },
+    {
+      "entry_point": "Raft.replicateTo / Raft.pipelineDecode",
+      "disposition": "deferred",
+      "behavior_ids": [],
+      "reason": "Term guards provide counterevidence; full worker and step-down lifetime need tracing.",
+      "source_ids": [
+        "s-append-response",
+        "s-pipeline-response",
+        "s-stale"
+      ],
+      "high_consequence": true
+    },
+    {
+      "entry_point": "NewRaft storage restoration",
+      "disposition": "deferred",
+      "behavior_ids": [],
+      "reason": "Constructor read, but built-in failure and recovery semantics remain unexpanded.",
+      "source_ids": [
+        "s-constructor"
+      ],
+      "high_consequence": true
+    }
+  ]
+}

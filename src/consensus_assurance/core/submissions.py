@@ -13,18 +13,48 @@ class SourceRange(Record):
     kind: Literal["document_statement", "interface_statement", "test_expectation", "code_observation", "protocol_candidate"]
 
 
+class UnderstandingChange(Record):
+    impact: Literal["clarification", "meaning", "dependency"]
+    rationale: str = Field(min_length=1)
+    source_ids: list[str] = Field(min_length=1)
+
+
+class ResearchFeedback(Record):
+    ref_ids: list[str] = Field(min_length=1)
+    answered: str = Field(min_length=1)
+    remaining: list[str]
+    understanding: Literal["updated", "unchanged", "deferred"]
+    rationale: str = Field(min_length=1)
+
+
+class WorkDisposition(Record):
+    target_id: str
+    rationale: str = Field(min_length=1)
+    resume_conditions: list[str] = Field(min_length=1)
+
+
 class Submission(Record):
     rationale: str = Field(min_length=1)
     sources: list[SourceRange] = []
+    feedback: ResearchFeedback | None = None
+    deferred_work: list[WorkDisposition] = []
 
 
-class CandidateSubmission(Submission):
+class MappedSubmission(Submission):
+    map_path: str | None = None
+    map_changes: dict[str, UnderstandingChange] = {}
+    reconnect_questions: dict[str, AuditQuestion] = Field(default_factory=dict,
+        description="Explicit complete questions for saved Candidates sharing the changed map basis; Unit semantics still require F2/F3")
+
+
+class CandidateSubmission(MappedSubmission):
     action: Literal["continue", "pause", "explained", "obligation"]
     candidate_id: str | None = None
     parent_candidate_id: str | None = None
     question: AuditQuestion
     resume_conditions: list[str] = []
     counterevidence_resolution: str = ""
+    result_implications: dict[Literal["holds", "violated", "incomplete"], str] = {}
     obligation: ClaimDraft | None = None
     bindings: list[BindingDraft] = []
 
@@ -32,6 +62,9 @@ class CandidateSubmission(Submission):
     def shape(self):
         if self.candidate_id and self.parent_candidate_id:
             raise ValueError("Continue an existing candidate or fork from a parent; do not express both")
+        if self.parent_candidate_id and (set(self.result_implications) != {"holds", "violated", "incomplete"}
+                or not all(v.strip() for v in self.result_implications.values())):
+            raise ValueError("A child must explain each bounded result's effect and inference limits on its parent")
         if self.action == "pause" and (not self.candidate_id or not self.resume_conditions):
             raise ValueError("Pause needs an existing candidate and concrete resume conditions")
         if self.action != "pause" and self.resume_conditions:
@@ -83,20 +116,19 @@ class ModelSubmission(Submission):
     replay_finding_id: str | None = None
 
 
-class ResearchSubmission(Submission):
+class ResearchSubmission(MappedSubmission):
     action: Literal["research"]
-    map_path: str | None = None
     graph_path: str | None = None
     scope_path: str | None = None
 
     @model_validator(mode="after")
     def shape(self):
-        if sum(bool(p) for p in (self.map_path, self.graph_path, self.scope_path)) != 1:
-            raise ValueError("Research submission needs exactly one map, graph addition or scoped update")
+        if self.graph_path and self.scope_path or not any((self.map_path, self.graph_path, self.scope_path)):
+            raise ValueError("Research needs a map, graph addition or scoped update; a map may accompany one graph operation")
         return self
 
 
-class SemanticSubmission(Submission):
+class SemanticSubmission(MappedSubmission):
     action: Literal["semantic_revision"]
     unit_id: str
     feedback_path: str
@@ -118,6 +150,10 @@ class ExploreSubmission(Submission):
 
 class StopSubmission(Submission):
     action: Literal["stop"]
+    scope: Literal["candidate", "family", "focus", "run"]
+    reason: Literal["bounded_completed", "insufficient_basis", "tool_gap", "resource_limit", "user_stop", "no_actionable_direction"]
+    ref_ids: list[str] = []
+    frontier_comparison: str = ""
 
 
 PRODUCTS = TypeAdapter(Annotated[Union[CandidateSubmission, CheckSubmission, ModelSubmission,

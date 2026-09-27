@@ -2,7 +2,7 @@
 import json
 from pathlib import Path
 import pytest
-from native_support import ScriptedAgent, products, first, check_step, review_step, stop, engine_for
+from native_support import ScriptedAgent, products, first, check_step, review_step, stop, engine_for, partial_map, feedback
 
 
 def test_existing_unit_actual_compile_repair_review_progress(tmp_path):
@@ -195,35 +195,40 @@ def test_native_receipt_failure_routes_preserve_or_stop_the_session(tmp_path,fau
 
 def test_candidate_parent_conflict_and_paused_return_keep_one_active_question(tmp_path):
     def initial(state):
-        sub=products()[0]
+        sub,files=first(state)
         sub.update(action='continue',obligation=None,bindings=[])
         sub['question'].update(disposition='needs_specific_evidence',unknowns=['Unexamined consumer'])
-        return sub,{}
+        return sub,files
     def pause(index):
         def step(state):
             current=state['question_candidates'][index]
             return dict(action='pause',candidate_id=current['id'],question=current['question'],
-                resume_conditions=['Inspect the remaining consumer'],rationale='Retain this boundary'),{}
+                resume_conditions=['Inspect the remaining consumer'],rationale='Retain this boundary',feedback=feedback(state)),{}
         return step
     def independent(state):
-        sub,_=initial(state);sub['question']['question']='Is a different local caller bounded?'
-        return sub,{}
+        sub,files=initial(state);sub['question']['question']='Is a different local caller bounded?'
+        sub['feedback']=feedback(state)
+        return sub,files
     def resume_parent(state):
-        sub,_=initial(state);sub['candidate_id']=state['question_candidates'][0]['id']
-        return sub,{}
+        sub,files=initial(state);sub['candidate_id']=state['question_candidates'][0]['id']
+        sub['feedback']=feedback(state)
+        return sub,files
     def conflicting_child(state):
         sub=products()[0];sub['candidate_id']=sub['parent_candidate_id']=state['question_candidates'][0]['id']
         return sub,{}
     def child(state):
         assert len(state['question_candidates'])==2 and not state['units']
         sub=products()[0];sub['parent_candidate_id']=state['question_candidates'][0]['id']
+        sub['feedback']=feedback(state)
+        sub['result_implications']={k:'Refine the local return discriminator; unexecuted consumer remains unknown' for k in ('holds','violated','incomplete')}
         return sub,{}
-    e,repo=engine_for(tmp_path,[initial,pause(0),independent,resume_parent,pause(1),resume_parent,conflicting_child,child,check_step(),stop])
+    e,repo=engine_for(tmp_path,[initial,pause(0),independent,resume_parent,pause(1),resume_parent,conflicting_child,child,check_step(),review_step(),stop])
     state=e.start(repo)
     assert len(state.question_candidates)==3 and len(state.units)==1,state.native_current
     assert state.usage['audit_units']==1 and len(state.direct_checks)==1
     assert state.question_candidates[0].question.unknowns==['Unexamined consumer']
     assert state.question_candidates[2].parent_candidate_id==state.question_candidates[0].id
+    assert state.question_candidates[0].status=='paused' and state.units[0].status=='checked'
     assert not any(c.status=='active' for c in state.question_candidates)
     assert len(list((e.root/'native-submissions').glob('*/diagnostics.json')))==2
 
@@ -262,9 +267,7 @@ def test_unknown_execution_retries_with_a_new_identity_and_clean_workspace(tmp_p
 
 def test_partial_map_then_references_and_persistent_resume(tmp_path):
     def research(state):
-        spec=dict(target_profile=dict(system_boundary='One local operation',source_ids=['code']),
-            activities=[],behaviors=[dict(id='call',primary_activity='A1',execution_owner='caller',protocol_context='one request',trigger='invoke',produces_fact_ids=['result'],consumes_fact_ids=[],source_ids=['code'])],
-            facts=[dict(id='result',meaning='Bounded return from the actual call',identity={'operation':'one'},validity_context='one completion',established_by=['call'],consumed_by=[],representation=['return'],durability='volatile',recovery='none',unknowns=['Consumer outside boundary'],source_ids=['code'])])
+        spec=partial_map()
         return dict(action='research',map_path='map.json',sources=products()[0]['sources'],rationale='Save only the relevant fact'),{'map.json':json.dumps(spec)}
     def with_refs(state):
         value=products()[0]
@@ -276,7 +279,7 @@ def test_partial_map_then_references_and_persistent_resume(tmp_path):
     def refine(state):
         value,files=research(state)
         spec=json.loads(Path(state['audit_spec_path']).read_text())
-        spec['behaviors'][0]['execution_owner']='synchronous local caller'
+        spec['surfaces']=[dict(entry_point='Unexamined consumer',disposition='deferred',reason='Consumer has not been examined',source_ids=['code'])]
         files['map.json']=json.dumps(spec)
         return value,files
     e,repo=engine_for(tmp_path,[research,missing_fact,with_refs,check_step(),refine,stop])

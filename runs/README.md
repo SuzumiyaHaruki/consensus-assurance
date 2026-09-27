@@ -1,17 +1,20 @@
 # 保留运行
 
-当前 Git 仅追踪用户指定的 [2026-09-24 16:33 HashiCorp 真实运行](2026-09-24_16-33-34-hashicorp_raft-real-run/report.md)。目标为 `/home/nitro/Desktop/hashicorp-raft`，源码提交 `c0dc6a0b2c7e889f31e5ab2f7ed90ceb159acffe`，快照记录工作区无修改。采用 A1/A2 重点、`gpt-6-astra` / `low`、框架版本 `native-products-v22`。
+当前 Git 仅追踪用户指定的 [2026-09-27 10:33 HashiCorp 真实运行](2026-09-27_10-33-24-hashicorp_raft-real-run/report.md)。目标为 `/home/nitro/Desktop/hashicorp-raft`，源码提交 `c0dc6a0b2c7e889f31e5ab2f7ed90ceb159acffe`，快照记录工作区无修改。采用 A1/A2 重点、`gpt-6-astra` / `low`、框架版本 `native-products-v23`。
 
 | 项目 | 实际记录 |
 | --- | --- |
-| Agent 调用与耗时 | 8/40 次；1331.92/1500 秒（约 22.2 分钟） |
-| 候选与检查 | 4 个候选；2 个审计单元；2 次正式直接检查、1 次探索执行 |
-| 局部模型与校准 | 均为 0 |
-| 局部结果 | 失败的内存 timeout future 被调用 Response；带部分 Success=true 的网络响应在 EOF 解码失败后仍推进 peer match |
-| 停止原因 | Agent 主动结束已完成的局部检查；未建立支持继续扩展到不安全决定的具体前提 |
+| Agent 调用与耗时 | 16/40 次；1500.06/1500 秒，耗尽 25 分钟总预算 |
+| 研究地图与候选 | 2 个地图版本；2 个候选，分别为 explained、escalated |
+| 检查与复核 | 4 次探索执行、1 次正式直接检查、1 次对应性复核 |
+| 模型与校准 | 均为 0 |
+| 当前结果 | 1 个 pending Unit；Evidence 0，Finding 0；无已确认问题 |
+| 停止 | 最后一次原生调用只剩约 26 秒并超时；原记录分类为 tool_gap，实际限制为总时间 |
 
-第二项检查中，截断响应使 peer match 从 0 推进到 2；空输入对照保持 0，完整响应对照推进到 2 且无错误。所有观察到的 commit index 均为 0。生成完整响应的端点是脚本化 fixture，未关联真实 follower 存储执行，因此上述结果只限于局部接口使用与响应接受，不能据此确认虚假持久支持、错误 quorum 决定或共识安全失败。原始源码解释、探索输出、正式检查、复核、未知和范围限制分别保留，具体依据见原报告和 state.json。
+正式输出记录：在手工初始化的三投票者场景中，F 实际当选 term 8 leader 后，L 的公开 `VerifyLeader().Error()` 仍借此前产生、延迟交付的 term 7 回复返回成功。这是有条件的局部观察；构造器启动、L 的初始当选、完整 worker 并发和应用读取后果尚未执行。
 
-按用户要求，将 Git 追踪从 `2026-09-24_10-23-51-hashicorp_raft-real-run` 切换到本次运行。此前追踪的运行保留在本地，也可从 Git 历史取得；此切换不删除其他实验。
+检查器记录 `violated`，但同时因 `fresh` 对照事件被错误地先做前置条件关联而标记不完整，因此没有生成 Evidence。原计划已有场景适用条件；问题在检查器的判断顺序。研究索引遗漏具体不完整原因、停止提交被对象校验拒绝，也增加了收尾成本。详见 [实验分析](../docs/实验分析-2026-09-27-HashiCorp.md)，其中区分实际观察、框架问题和未验证的系统后果。
 
-归档排除临时锁、`.execution` 缓存、可重建的 `experiments/**/workspace` 和本地权限配置；保留源快照、原生草稿、正式制品、实验输入差异、结果和日志。其他 runs 不纳入 Git。归档不作为 runtime discovery 答案；不同框架版本需要显式迁移或新运行。
+按用户要求，将 Git 追踪从 `2026-09-24_16-33-34-hashicorp_raft-real-run` 切换到本次运行。此前追踪的运行保留在本地，也可从 Git 历史取得；此切换不删除其他实验。
+
+归档排除临时锁、`.execution` 缓存、原生草稿临时目录、可重建的 `experiments/**/workspace` 和本地权限配置；保留源快照、原生草稿、正式制品、实验输入差异、结果和日志。其他 runs 不纳入 Git。归档不作为 runtime discovery 答案；不同框架版本需要显式迁移或新运行。

@@ -29,7 +29,8 @@ def monitor_events(events, monitor, prop, requirements=None):
             outside.append(index); continue
         if prop.kind == 'event_implication':
             antecedent = compare(event,prop.antecedent,aliases) if prop.antecedent else None
-            value = True if antecedent is False else (compare(event,prop.assertion,aliases) if antecedent is True else None)
+            consequent = compare(event,prop.assertion,aliases)
+            value = None if antecedent is None or consequent is None else not antecedent or consequent
         else:
             value = compare(event,prop.assertion,aliases) if prop.kind=='event_assertion' else True
         if value is None: missing.append(index)

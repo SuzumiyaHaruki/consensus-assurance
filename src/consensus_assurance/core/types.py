@@ -147,6 +147,7 @@ class ConsensusAuditSpec(Record):
 
 
 class AuditQuestion(Record):
+    audit_spec_version: int | None = Field(default=None, ge=1)
     disposition: Literal["explained_by_existing_mechanism", "concrete_suspicion", "needs_specific_evidence", "ready_for_check"] | None = None
     preferred_check: Literal["source_review", "direct_test", "controlled_schedule", "local_model"] | None = None
     requests: list[ReadRequest] = []
@@ -580,6 +581,7 @@ class Material(Record):
 
 class AuditUnit(Record):
     id: str
+    candidate_id: str | None = None
     obligation_ids: list[str]
     binding_ids: list[str]
     relation_ids: list[str]
@@ -660,6 +662,7 @@ class Analysis(Record):
     usage: dict[str, int] = {}
     elapsed_seconds: float = 0
     stop_reason: str = "Not started"
+    run_stop: dict[str, Any] = {}
     gaps: list[str] = []
     tools: dict[str, str] = {}
     materials: list[Material] = []

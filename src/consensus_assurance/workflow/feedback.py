@@ -4,7 +4,7 @@ from .graph_diagnostics import validate_grounding
 from .mutations import adopt, validate_changes
 
 
-def _apply_feedback(state, unit, current, feedback):
+def _apply_feedback(state, unit, current, feedback, audit_spec=None):
     bundle=getattr(feedback,'bundle',None)
     graph=getattr(feedback,'graph',None)
     known = {c.id for c in state.checks} | {c.id for c in state.calibrations} | {m.id for m in state.materials}
@@ -53,7 +53,7 @@ def _apply_feedback(state, unit, current, feedback):
         originals={obj.id:obj for obj in [*state.claims,*state.bindings,*state.relations,*state.units]}
         replaced={obj.id for name in ('claims','bindings','relations','units') for obj in getattr(feedback.patch,name)}
         before["semantic_objects"]={key:originals[key].model_dump(mode="json") for key in replaced if key in originals}
-        changed = apply_patch(state, feedback.patch, semantic=True)
+        changed = apply_patch(state, feedback.patch, semantic=True, audit_spec=audit_spec)
         affected = [m.id for m in state.models if changed & (set(m.binding_ids) | {c.claim_id for c in m.checkers} | set(m.graph_versions))]
         before["old_judgment"] = feedback.old_judgment
         result, step = None, "understand"
@@ -93,9 +93,9 @@ def _apply_feedback(state, unit, current, feedback):
     return result
 
 
-def apply_feedback(state, unit, current, feedback):
+def apply_feedback(state, unit, current, feedback, audit_spec=None):
     trial=state.model_copy(deep=True)
     copied=next((u for u in trial.units if unit and u.id==unit.id),None)
-    result=_apply_feedback(trial,copied,current,feedback)
+    result=_apply_feedback(trial,copied,current,feedback,audit_spec)
     adopt(state,trial)
     return result

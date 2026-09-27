@@ -1,0 +1,450 @@
+{
+  "version": 1,
+  "target_profile": {
+    "system_boundary": "The repository Go raft package, including replication and lease consumers plus built-in storage and transport variants. Application FSM and deployment adapter selection remain caller responsibilities; built-in implementations are inside the available audit boundary.",
+    "protocol_contexts": [
+      "Raft current term and per-follower replication currentTerm",
+      "Peer ServerID/address and latest configuration voter membership",
+      "Per-replication-object lastContact timestamp"
+    ],
+    "external_interfaces": [
+      "FSM",
+      "LogStore",
+      "StableStore",
+      "SnapshotStore",
+      "Transport"
+    ],
+    "ownership": [
+      "replicate launches a separate heartbeat goroutine for a followerReplication object",
+      "checkLeaderLease is owned by the main Raft thread",
+      "NewRaft restores current term and last log through injected stores"
+    ],
+    "selection_injection": [
+      "NewRaft receives all five interfaces from its caller; no deployed adapter choice is supplied.",
+      "NetworkTransport selects an injected stream and timeout; InmemTransport has its own queue and timeout."
+    ],
+    "variants": [
+      "Ordinary AppendEntries and pipelined AppendEntries response processing",
+      "Pre-vote disabled by configuration or missing WithPreVote transport capability",
+      "BatchApplyCh optionally buffers admission",
+      "Built-in InmemStore, InmemSnapshotStore and FileSnapshotStore constructors; their failure semantics remain unexpanded",
+      "NetworkTransport and InmemTransport; the latter does not support heartbeat fast-path registration"
+    ],
+    "source_ids": [
+      "s-constructor",
+      "s-spawn",
+      "s-repl-context",
+      "s-network",
+      "s-inmem-transport",
+      "s-memory-store",
+      "s-memory-snapshot",
+      "s-file-snapshot"
+    ],
+    "unknowns": [
+      "Concrete deployed configuration, adapters and FSM are unspecified.",
+      "Startup, storage failure semantics, snapshot publication and network fast-path dispatch need deeper reading."
+    ]
+  },
+  "activities": [
+    {
+      "class_id": "A2",
+      "applicability": "applicable",
+      "purpose": "Authority maintenance and interpretation of peer responses",
+      "realization_summary": "Heartbeat response completion feeds the lease connectivity consumer; stale AppendEntries rejection has been read separately.",
+      "entry_points": [
+        "Raft.heartbeat",
+        "Raft.checkLeaderLease",
+        "Raft.appendEntries"
+      ],
+      "variants": [],
+      "unknowns": [
+        "Election, transfer, full step-down and verification completion paths remain partial."
+      ],
+      "source_ids": [
+        "s-heartbeat",
+        "s-lease",
+        "s-receiver"
+      ]
+    },
+    {
+      "class_id": "A1",
+      "applicability": "applicable",
+      "purpose": "Replication support and decision progression",
+      "realization_summary": "Successful ordinary/pipelined responses call updateLastAppended, which reports match index to commitment; decision aggregation is not yet recovered.",
+      "entry_points": [
+        "Raft.replicateTo",
+        "Raft.pipelineDecode",
+        "updateLastAppended"
+      ],
+      "variants": [],
+      "unknowns": [
+        "commitment.match and decision consumers remain unread."
+      ],
+      "source_ids": [
+        "s-append-response",
+        "s-pipeline-response",
+        "s-stale"
+      ]
+    },
+    {
+      "class_id": "A7",
+      "applicability": "applicable",
+      "purpose": "Client verification completion semantics",
+      "realization_summary": "Leader loop converts counted verification support into successful future completion; public API describes prevention of stale data after leadership loss.",
+      "entry_points": [
+        "Raft.VerifyLeader",
+        "leaderLoop verification result branch"
+      ],
+      "source_ids": [
+        "s-verify-api",
+        "s-verify-result-full"
+      ],
+      "unknowns": [
+        "Application read ordering, FSM freshness, future delivery and shutdown paths remain partial."
+      ]
+    }
+  ],
+  "behaviors": [
+    {
+      "id": "b-heartbeat-contact",
+      "primary_activity": "A2",
+      "execution_owner": "Per-follower heartbeat goroutine launched by replicate",
+      "protocol_context": "One followerReplication object with fixed request term s.currentTerm; peer address read under peerLock on each iteration",
+      "trigger": "notifyCh or randomized HeartbeatTimeout/10 timer",
+      "legal_preconditions": [
+        "replicate has started this heartbeat worker"
+      ],
+      "implementation_guards": [
+        "stopCh ends the worker",
+        "Transport errors enter backoff without refreshing contact"
+      ],
+      "reads": [
+        "s.currentTerm",
+        "s.peer",
+        "AppendEntriesResponse.Success"
+      ],
+      "writes": [
+        "s.lastContact via setLastContact",
+        "heartbeat-local failures"
+      ],
+      "durable_effects": [],
+      "external_effects": [
+        "AppendEntries RPC",
+        "notifyAll(resp.Success) after transport success"
+      ],
+      "important_branches": [
+        "Any error-free response refreshes contact without a response-term comparison",
+        "An unsuccessful response still refreshes contact but supplies false to notifyAll"
+      ],
+      "async_boundaries": [
+        "Blocking Transport.AppendEntries call",
+        "Separate worker from ordinary replication",
+        "stopCh/timer/notification select"
+      ],
+      "produces_fact_ids": [
+        "f-heartbeat-contact"
+      ],
+      "consumes_fact_ids": [],
+      "cross_activity_effects": {},
+      "existing_protections": [
+        "Verification notification uses response Success, not mere RPC completion",
+        "Ordinary replication separately detects newer response terms"
+      ],
+      "source_ids": [
+        "s-heartbeat",
+        "s-spawn",
+        "s-append-response"
+      ],
+      "unknowns": [
+        "Transport response production, timing and cancellation under network fast path need exact reading."
+      ]
+    },
+    {
+      "id": "b-lease-consume",
+      "primary_activity": "A2",
+      "execution_owner": "Raft main thread",
+      "protocol_context": "Latest configuration voter set and current leaderState replication objects",
+      "trigger": "checkLeaderLease invocation",
+      "legal_preconditions": [],
+      "implementation_guards": [
+        "Counts only Voter servers",
+        "Counts local server directly",
+        "Counts remote timestamps only within leaseTimeout"
+      ],
+      "reads": [
+        "configurations.latest.Servers",
+        "followerReplication.LastContact()",
+        "LeaderLeaseTimeout"
+      ],
+      "writes": [
+        "Raft state becomes Follower if recent contacted voters are below quorum"
+      ],
+      "durable_effects": [],
+      "external_effects": [],
+      "important_branches": [],
+      "async_boundaries": [],
+      "produces_fact_ids": [],
+      "consumes_fact_ids": [
+        "f-heartbeat-contact"
+      ],
+      "cross_activity_effects": {},
+      "existing_protections": [],
+      "source_ids": [
+        "s-lease"
+      ],
+      "unknowns": [
+        "Other contact producers and replication object replacement are not fully mapped.",
+        "This consumer establishes a connectivity decision; stronger authority validity is not established by its timestamp check."
+      ]
+    },
+    {
+      "id": "b-reject-old-append",
+      "primary_activity": "A2",
+      "execution_owner": "Raft AppendEntries handler",
+      "protocol_context": "Receiver current term exceeds request term",
+      "trigger": "appendEntries receives an older-term request",
+      "legal_preconditions": [],
+      "implementation_guards": [
+        "a.Term < r.getCurrentTerm()"
+      ],
+      "reads": [
+        "receiver current term",
+        "receiver last log index"
+      ],
+      "writes": [],
+      "durable_effects": [],
+      "external_effects": [
+        "Respond with current term, Success=false, and nil RPC error"
+      ],
+      "important_branches": [],
+      "async_boundaries": [],
+      "produces_fact_ids": [],
+      "consumes_fact_ids": [],
+      "cross_activity_effects": {},
+      "existing_protections": [],
+      "source_ids": [
+        "s-receiver"
+      ],
+      "unknowns": [
+        "Concurrent fast-path execution and its dispatch restrictions need investigation."
+      ]
+    },
+    {
+      "id": "b-verify-positive-threshold",
+      "primary_activity": "A2",
+      "execution_owner": "Response-processing goroutine calling verifyFuture.vote(true)",
+      "protocol_context": "One verifyFuture object with nonnil notifyCh and threshold initialized by verifyLeader",
+      "trigger": "A positive vote call while this future remains active",
+      "legal_preconditions": [
+        "verifyLeader initialized self-vote, quorumSize and notifyCh for a multi-voter configuration",
+        "A replication notification dispatcher captured this future in its pending set"
+      ],
+      "implementation_guards": [
+        "voteLock serializes votes",
+        "nil notifyCh suppresses later votes",
+        "Threshold notification is sent only when votes >= quorumSize"
+      ],
+      "reads": [
+        "v.notifyCh",
+        "v.votes",
+        "v.quorumSize"
+      ],
+      "writes": [
+        "Increment v.votes",
+        "Clear v.notifyCh after sending threshold notification"
+      ],
+      "external_effects": [
+        "Send the same future pointer to main-thread verifyCh"
+      ],
+      "async_boundaries": [
+        "Channel send while voteLock is held",
+        "Pending-set capture in notifyAll happens under a separate lock"
+      ],
+      "produces_fact_ids": [
+        "f-verify-threshold"
+      ],
+      "source_ids": [
+        "s-vote-result",
+        "s-verify",
+        "s-notify-votes"
+      ],
+      "unknowns": [
+        "Full provenance and time of each supporting peer response are not represented by vote parameters.",
+        "Negative-vote notifications follow a separate branch and do not establish this positive-threshold fact.",
+        "Other response producers, configurations and replication-object lifetimes are only partially read."
+      ]
+    },
+    {
+      "id": "b-verify-success-consume",
+      "primary_activity": "A7",
+      "execution_owner": "Raft leader main loop",
+      "protocol_context": "Received verification future with nonzero quorumSize and votes >= quorumSize",
+      "trigger": "Receive future pointer from verifyCh in leader loop",
+      "implementation_guards": [
+        "Zero quorumSize routes to initial registration",
+        "Below-threshold notification routes to ErrNotLeader and Follower transition"
+      ],
+      "reads": [
+        "v.votes",
+        "v.quorumSize"
+      ],
+      "writes": [
+        "Remove future from leaderState.notify and all follower pending sets"
+      ],
+      "external_effects": [
+        "v.respond(nil) completes verification successfully"
+      ],
+      "consumes_fact_ids": [
+        "f-verify-threshold"
+      ],
+      "cross_activity_effects": {
+        "A2": "Interprets threshold support as continued leadership for this verification operation."
+      },
+      "source_ids": [
+        "s-verify-result-full"
+      ],
+      "unknowns": [
+        "Future.Error delivery and all leader-loop exits have not been expanded.",
+        "Successful verification does not itself apply the FSM or observe a client read."
+      ]
+    }
+  ],
+  "facts": [
+    {
+      "id": "f-heartbeat-contact",
+      "meaning": "For this replication object, a heartbeat AppendEntries RPC completed without a transport error and refreshed contact time. This does not assert acceptance of the sender as leader or successful log replication.",
+      "identity": {
+        "replication_object": "followerReplication instance",
+        "peer": "peer identity read for this RPC",
+        "request_term": "s.currentTerm"
+      },
+      "validity_context": "Volatile contact observation for the same replication object; lease consumer bounds age separately.",
+      "representation": [
+        "followerReplication.lastContact"
+      ],
+      "invalidators": [],
+      "reinterpreters": [],
+      "durability": "Volatile timestamp protected by lastContactLock; no persistence claimed.",
+      "recovery": "No recovery semantics established; initialization and object replacement remain unread.",
+      "source_ids": [
+        "s-heartbeat",
+        "s-repl-context",
+        "s-lease"
+      ],
+      "unknowns": [
+        "Other timestamp producers exist and are not included as producers of this heartbeat-specific fact.",
+        "Address/configuration replacement and initial contact assignments remain to be mapped."
+      ]
+    },
+    {
+      "id": "f-verify-threshold",
+      "meaning": "For this verifyFuture object, positive vote calls have raised its counter to at least the threshold captured at registration, and that object has been sent to the verification result channel. This states counted support, not freshness or correctness of peer authority.",
+      "identity": {
+        "verification": "verifyFuture pointer",
+        "threshold": "quorumSize captured by verifyLeader"
+      },
+      "validity_context": "One active multi-voter verification object; positive branch under voteLock before notifyCh is cleared.",
+      "representation": [
+        "v.votes",
+        "v.quorumSize",
+        "future pointer sent on r.verifyCh"
+      ],
+      "durability": "Volatile; no persisted verification support.",
+      "recovery": "No restoration of this future established; leader-exit cancellation remains unexpanded.",
+      "source_ids": [
+        "s-vote-result",
+        "s-verify",
+        "s-verify-result-full"
+      ],
+      "unknowns": [
+        "Upstream peer response production and registration-relative age need mapping.",
+        "Membership and term are not fields on verifyFuture; lifetime protection requires separate reading."
+      ]
+    }
+  ],
+  "surfaces": [
+    {
+      "entry_point": "Raft.heartbeat",
+      "disposition": "mapped",
+      "behavior_ids": [
+        "b-heartbeat-contact"
+      ],
+      "reason": "Mapped only error-free heartbeat contact production.",
+      "source_ids": [
+        "s-heartbeat"
+      ],
+      "high_consequence": true
+    },
+    {
+      "entry_point": "Raft.checkLeaderLease",
+      "disposition": "mapped",
+      "behavior_ids": [
+        "b-lease-consume"
+      ],
+      "reason": "Mapped timestamp consumption, not overall authority correctness.",
+      "source_ids": [
+        "s-lease"
+      ],
+      "high_consequence": true
+    },
+    {
+      "entry_point": "Raft.appendEntries",
+      "disposition": "mapped",
+      "behavior_ids": [
+        "b-reject-old-append"
+      ],
+      "reason": "Only older-term rejection branch is recovered.",
+      "source_ids": [
+        "s-receiver"
+      ],
+      "high_consequence": true
+    },
+    {
+      "entry_point": "Raft.verifyLeader",
+      "disposition": "deferred",
+      "behavior_ids": [],
+      "reason": "Read initial request setup; future vote aggregation and completion require expansion.",
+      "source_ids": [
+        "s-verify",
+        "s-verify-result"
+      ],
+      "high_consequence": true
+    },
+    {
+      "entry_point": "Raft.replicateTo / Raft.pipelineDecode",
+      "disposition": "deferred",
+      "behavior_ids": [],
+      "reason": "Term guards provide counterevidence; full worker and step-down lifetime need tracing.",
+      "source_ids": [
+        "s-append-response",
+        "s-pipeline-response",
+        "s-stale"
+      ],
+      "high_consequence": true
+    },
+    {
+      "entry_point": "NewRaft storage restoration",
+      "disposition": "deferred",
+      "behavior_ids": [],
+      "reason": "Constructor read, but built-in failure and recovery semantics remain unexpanded.",
+      "source_ids": [
+        "s-constructor"
+      ],
+      "high_consequence": true
+    },
+    {
+      "entry_point": "verifyFuture.vote / leaderLoop verification completion",
+      "disposition": "mapped",
+      "behavior_ids": [
+        "b-verify-positive-threshold",
+        "b-verify-success-consume"
+      ],
+      "reason": "Positive threshold establishment and success consumption are mapped; upstream response provenance remains partial.",
+      "source_ids": [
+        "s-vote-result",
+        "s-verify-result-full"
+      ],
+      "high_consequence": true
+    }
+  ]
+}
