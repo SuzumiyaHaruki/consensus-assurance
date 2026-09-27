@@ -2,19 +2,47 @@
 import json
 from pathlib import Path
 import pytest
-from consensus_assurance.adapters.agents.backend import CodexAgent, classify_failure
+from consensus_assurance.adapters.agents.backend import CodexAgent, failure_reason
 from consensus_assurance.core.types import CheckRun, ExecutionStatus, Analysis
 from consensus_assurance.workflow.native import NativeSubmission, prepare_native_source, source_materials, SourceRange
 from consensus_assurance.adapters.storage.snapshot import capture
 
 
-@pytest.mark.parametrize('message,expected',[('Please log in; 401',ExecutionStatus.LOGIN_REQUIRED),
-    ('insufficient_quota',ExecutionStatus.QUOTA_EXHAUSTED),('bad transport',ExecutionStatus.ERROR)])
-def test_native_auth_quota_failure(message,expected):
-    assert classify_failure(message)==expected
+@pytest.mark.parametrize('terminal,exit_code,status,lost',[
+    ({'type':'turn.failed','error':{'message':'This content was flagged for possible cybersecurity risk.'}},1,ExecutionStatus.ERROR,False),
+    ({'type':'turn.failed','error':{'message':'Transport stopped'}},0,ExecutionStatus.ERROR,False),
+    ({'type':'error','message':'HTTP 401 Unauthorized'},1,ExecutionStatus.LOGIN_REQUIRED,False),
+    ({'type':'turn.failed','error':{'code':'insufficient_quota','message':'Account exhausted'}},1,ExecutionStatus.QUOTA_EXHAUSTED,False),
+    ({'type':'error','message':'thread not found'},1,ExecutionStatus.ERROR,True),
+    (None,1,ExecutionStatus.ERROR,False)])
+def test_native_failure_uses_transport_diagnostics_not_tool_output(tmp_path,terminal,exit_code,status,lost):
+    events=[{'type':'thread.started','thread_id':'saved'},
+        {'type':'item.completed','item':{'id':'tool','type':'command_execution',
+            'aggregated_output':'401 case request: login required; quota exceeded; thread not found'}}]
+    if terminal: events.append(terminal)
+    log=tmp_path/'events.jsonl';log.write_text('\n'.join(json.dumps(e) for e in events))
+    check=CheckRun(action='native_agent',cwd=str(tmp_path),snapshot_id='fixture',
+        status=ExecutionStatus.COMPLETED,exit_code=exit_code,stdout=str(log))
+    check,session,result=CodexAgent().decode(check,tmp_path/'absent.json','saved')
+    assert check.status==status and session=='saved' and result is None
+    assert bool(check.parameters.get('native_session_unavailable'))==lost
+    if terminal:
+        error=terminal.get('error') or terminal
+        assert error['message'] in check.reason
+    else:
+        assert check.reason=='Agent execution blocked; inspect raw logs'
+    assert 'case request' not in check.reason
 
 
-def test_resume_uses_exact_id_and_counts_unique_completed_tool_items(tmp_path,monkeypatch):
+def test_native_failure_reason_preserves_schema_diagnostic_and_redacts_secrets():
+    error='ERROR: '+json.dumps({'error':{'code':'invalid_json_schema','message':'Unsupported schema'}})
+    assert failure_reason(error)=='Agent output schema rejected (invalid_json_schema): Unsupported schema'
+    reason=failure_reason('Transport failed: api_key=fixture-secret '+('x'*1200))
+    assert 'fixture-secret' not in reason and '[REDACTED]' in reason and len(reason)<1100
+
+
+@pytest.mark.parametrize('session_id',[None,'exact-session'])
+def test_new_session_or_exact_resume_counts_unique_completed_tool_items(tmp_path,monkeypatch,session_id):
     monkeypatch.setattr('shutil.which',lambda name:'/usr/bin/'+name)
     class Runner:
         root=tmp_path
@@ -36,12 +64,14 @@ def test_resume_uses_exact_id_and_counts_unique_completed_tool_items(tmp_path,mo
     agent.sandbox_command=lambda root:['codex']
     agent.permission_probe=lambda *a:(True,[])
     agent.prepare(runner,tmp_path/'draft','snapshot')
-    check,session,result=agent.investigate(runner,'Continue',tmp_path/'draft','snapshot',10,'exact-session')
+    check,session,result=agent.investigate(runner,'Investigate',tmp_path/'draft','snapshot',10,session_id)
     assert session=='exact-session' and result['submission']=='submission.json'
-    assert runner.command[:3]==['codex','exec','resume']
-    assert '--ignore-rules' not in runner.command and '--ephemeral' not in runner.command
+    assert runner.command[:2]==['codex','exec'] and ('resume' in runner.command)==bool(session_id)
+    assert not {'--ignore-rules','--ephemeral','--last','fork'} & set(runner.command)
+    assert '--ignore-user-config' in runner.command
+    assert {'memories.use_memories=false','memories.generate_memories=false'} <= set(runner.command)
     assert check.parameters['native_tool_events']==1 and check.parameters['native_usage']['input_tokens']==10
-    assert 'exact-session' in runner.command and 'model_reasoning_effort="low"' in runner.command
+    assert ('exact-session' in runner.command)==bool(session_id) and 'model_reasoning_effort="low"' in runner.command
 
 
 def test_probe_bootstrap_crash_does_not_prove_denial(tmp_path,monkeypatch):
@@ -61,11 +91,14 @@ def test_probe_bootstrap_crash_does_not_prove_denial(tmp_path,monkeypatch):
 
 def test_effective_profile_exposes_results_and_retains_root_network_boundary(tmp_path,monkeypatch):
     monkeypatch.setattr('shutil.which',lambda name:'/usr/bin/'+name)
+    monkeypatch.setenv('TMPDIR',str(tmp_path/'host-tmp'))
     options='\n'.join(CodexAgent().permission_options(tmp_path,tmp_path/'draft'))
     for path in ('logs','models','direct-checks','actions','state.json','research.json','product-schemas.json','native-method.md'):
         assert json.dumps(str(tmp_path/path))+'="read"' in options
     assert '":root"="deny"' in options and 'network.enabled=false' in options
     assert json.dumps(str(tmp_path/'draft'))+'="write"' in options
+    assert json.dumps(str(tmp_path/'host-tmp'))+'="deny"' in options
+    assert '":tmpdir"' not in options and '":slash_tmp"="deny"' in options
 
 
 def test_source_view_only_exposes_authorized_snapshot_and_rejects_stale_range(tmp_path):

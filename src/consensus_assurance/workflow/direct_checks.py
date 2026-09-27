@@ -50,6 +50,11 @@ def validate_plan(state,unit,plan,implementation):
     if len(props)!=len(plan.observable_properties) or len({m.id for m in plan.monitors})!=len(plan.monitors):errors.append('Duplicate direct property or monitor')
     if set(props)!={m.checker_id for m in plan.monitors}:errors.append('Direct property/monitor mismatch')
     for monitor in plan.monitors:
+        admission=next((r for r in plan.harness.prerequisites if r.alias==monitor.admission_alias),None)
+        if admission is None:
+            errors.append('Monitor '+monitor.id+' needs an explicit admission_alias from harness.prerequisites')
+        if any(r.event==monitor.event for r in plan.harness.prerequisites):
+            errors.append('Monitor '+monitor.id+' cannot use its result event as a prerequisite or admission')
         p=props.get(monitor.checker_id)
         if p is None or p.kind not in {'event_assertion','event_implication'}:
             errors.append('Direct monitor '+monitor.id+' requires a supported shared event property')

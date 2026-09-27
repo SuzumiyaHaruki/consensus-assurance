@@ -38,7 +38,7 @@ def setup(tmp_path,prepared,broken=False):
         disposition='ready_for_check',preferred_check='direct_test',event_paths=['legal input -> actual call -> correlated observed return'],trigger_rationale='Observe actual return and independent range predicate')
     cfg=Config(execution_backend='python',allow_experiments=True,allow_agent_materials=True,execution_isolation='workspace')
     state.config=cfg.model_dump(mode='json')
-    e=Engine(cfg,tmp_path/'direct',*assemble(cfg),'');e.state=state;e.budget=BudgetTracker(cfg.budget,state)
+    e=Engine(cfg,tmp_path/'direct',*assemble(cfg));e.state=state;e.budget=BudgetTracker(cfg.budget,state)
     shutil.copytree(repo,e.root/'source');state.active_unit_id=unit.id
     source='''import json
 from counter import step
@@ -52,7 +52,7 @@ emit('returned', value=returned, in_range=0 <= returned <= limit)
     identities=['operation','participant','context']
     prop=ObservableProperty(checker_id='Range',trigger=Comparison(field='event',value='returned'),assertion=Comparison(field='state.in_range',value=True),identity_fields=identities,description='Observed result remains in the documented capacity range')
     monitor=EventMonitor(id='range',checker_id='Range',event='returned',
-        binding_ids=unit.binding_ids,grounding=basis)
+        binding_ids=unit.binding_ids,grounding=basis,admission_alias='start')
     plan=DirectCheckPlan(description='One actual boundary call',claim_id=unit.obligation_ids[0],binding_ids=unit.binding_ids,
         harness=Harness(kind='python',source=source,description='Actual fixture call and independent bound observation',semantic_changes=['Emit actual event values after the target call'],legality=basis,
             prerequisites=[EventRequirement(alias='start',event='admitted',conditions=[Comparison(field='state.input_valid',value=True)])]),
@@ -87,7 +87,7 @@ emit("completed",done=True,valid=future.error_seen and not future.bad_order and 
 '''
     requirements=[EventRequirement(alias='start',event='admitted',conditions=[Comparison(field='state.ready',value=True)])]
     prop=ObservableProperty(checker_id='Order',trigger=Comparison(field='event',value='completed'),assertion=Comparison(field='state.valid',value=True),identity_fields=['operation','participant','context'],description='Failed completion is handled without consuming an invalid response')
-    monitor=EventMonitor(id='order',checker_id='Order',event='completed',binding_ids=['fixture'],grounding=Grounding())
+    monitor=EventMonitor(id='order',checker_id='Order',event='completed',binding_ids=['fixture'],grounding=Grounding(),admission_alias='start')
     for source,expected in [('def consume(future):\n    if future.Error() is None: future.Response()\n','holds'),('def consume(future):\n    future.Response()\n    future.Error()\n','violated')]:
         (repo/'future_fixture.py').write_text(source)
         completed=subprocess.run([sys.executable,'-c',script],cwd=repo,capture_output=True,text=True,timeout=5,check=True)
@@ -106,7 +106,7 @@ def test_necessary_support_oracle_does_not_require_sufficient_completion(eligibl
     prop=ObservableProperty(checker_id='Support',trigger=Comparison(field='event',value='returned'),
         assertion=Comparison(field='state.success',value=False),identity_fields=['operation','context'],
         description='Success requires eligible support')
-    monitor=EventMonitor(id='support',checker_id='Support',event='returned',binding_ids=['fixture'],grounding=Grounding(),
+    monitor=EventMonitor(id='support',checker_id='Support',event='returned',binding_ids=['fixture'],grounding=Grounding(),admission_alias='input',
         applicability_conditions=[Comparison(field='state.eligible_support',value=False)])
     events=[{'event':'admitted','operation':'one','context':'fixed','state':{'eligible_support':eligible}},
         {'event':'returned','operation':'one','context':'fixed','state':{'eligible_support':eligible,'success':success}}]
@@ -146,7 +146,7 @@ def test_direct_encoding_observation_change_must_be_declared(tmp_path,prepared):
     from consensus_assurance.workflow.encoding import validate_direct_encoding
     e,u,old_plan=setup(tmp_path,prepared);old=save_plan(e,u,old_plan,'observation-old');execute(e,old)
     issue=ReviewIssue(review_id='review',target_id=old.id,target_version=old.version,aspect='checker_correspondence',
-        source_ids=u.audit_question.source_ids,explanation='The old observation field is not independent',disposition='blocked',reason='Correct observed input')
+        source_ids=u.audit_question.source_ids,explanation='The old observation field is not independent',disposition='blocked',reason='Correct observed input',challenged_components=['observation'])
     e.state.review_issues.append(issue);e.state.active_direct_check_id=old.id
     fixed=old_plan.model_copy(deep=True)
     fixed.harness.source=fixed.harness.source.replace('in_range=0 <= returned <= limit','range_observed=0 <= returned <= limit')
@@ -207,7 +207,7 @@ def test_independent_results_correlate_without_filtering_comparison(change,expec
     requirements=[EventRequirement(alias='ready',event='ready'),EventRequirement(alias='input',event='input')]
     prop=ObservableProperty(checker_id='Value',trigger=Comparison(field='event',value='output'),
         assertion=Comparison(field='state.value',reference='input.state.value'),identity_fields=['operation'],description='Actual boundary values')
-    monitor=EventMonitor(id='value',checker_id='Value',event='output',binding_ids=[],grounding=Grounding())
+    monitor=EventMonitor(id='value',checker_id='Value',event='output',binding_ids=[],grounding=Grounding(),admission_alias='input')
     if change=='value':events[2]['state']['value']=2
     if change=='identity':events[0]['operation']='other'
     if change=='missing':del events[2]['operation']
@@ -258,7 +258,7 @@ func TestLongEvent(t *testing.T) {
     interleaved=tmp_path/'interleaved.stdout';interleaved.write_text('\n'.join(json.dumps(x) for x in envelopes)+'\n')
     separated=extract_events(check.model_copy(update={'stdout':str(interleaved)}))
     prop=ObservableProperty(checker_id='Value',trigger=Comparison(field='event',value='output'),assertion=Comparison(field='state.value',reference='input.state.value'),identity_fields=['operation'],description='Same-stream comparison')
-    monitor=EventMonitor(id='value',checker_id='Value',event='output',binding_ids=[],grounding=Grounding())
+    monitor=EventMonitor(id='value',checker_id='Value',event='output',binding_ids=[],grounding=Grounding(),admission_alias='input')
     outcome=monitor_events(separated,monitor,prop,[EventRequirement(alias='input',event='input')])
     assert outcome['outcome']=='unknown' and outcome['missing_indices']==[0,1]
     invalid=next(e for e in separated if e['event']=='invalid_observation')

@@ -99,7 +99,7 @@ def test_reuse_requires_identical_search_inputs_and_explicit_receipt(tmp_path,pr
     reusable=reusable_search(state,second)
     if change!='harness':assert reusable is None;return
     assert reusable.id==source.id
-    engine=Engine(Config(),tmp_path,PythonBackend(),None,None,'','');engine.state=state;engine.budget=BudgetTracker(Config().budget,state)
+    engine=Engine(Config(),tmp_path,PythonBackend(),None,None,'');engine.state=state;engine.budget=BudgetTracker(Config().budget,state)
     result=engine.search(unit,second,changed,None)
     assert result.reused_from==source.id and result.model_id==second.id and result.id!=source.id
     assert unit.obligation_ids[0] in obligation_progress(state,unit)[0]
@@ -120,7 +120,7 @@ def test_reused_counterexample_keeps_current_attribution_without_reexecuting(tmp
     new=save_bundle(tmp_path,state,unit,revised,PythonBackend(),old)
     receipt=source.model_copy(update={'id':uid(),'model_id':new.id,'reused':True,'reused_from':source.id,'input_versions':new.artifact_digests},deep=True)
     state.checks.append(receipt)
-    engine=Engine(Config(),tmp_path,PythonBackend(),None,None,'','');engine.state=state;engine.budget=BudgetTracker(Config().budget,state)
+    engine=Engine(Config(),tmp_path,PythonBackend(),None,None,'');engine.state=state;engine.budget=BudgetTracker(Config().budget,state)
     assert engine.search(unit,new,revised,None).id==receipt.id
     assert len(state.findings)==1 and state.findings[0].model_id==new.id
     assert state.findings[0].claim_id==old.checkers[0].claim_id
@@ -139,7 +139,7 @@ from consensus_assurance.workflow.reviews import material_closure
 
 def controller(tmp_path,state):
     cfg=Config(execution_backend='python',agent_backend='mock',allow_experiments=False)
-    engine=Engine(cfg,tmp_path/'engine',*assemble(cfg),'');engine.state=state;engine.budget=BudgetTracker(cfg.budget,state)
+    engine=Engine(cfg,tmp_path/'engine',*assemble(cfg));engine.state=state;engine.budget=BudgetTracker(cfg.budget,state)
     return engine
 
 

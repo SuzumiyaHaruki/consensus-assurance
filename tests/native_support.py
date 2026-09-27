@@ -55,7 +55,7 @@ def products():
             prerequisites=[dict(alias='start',event='admitted',conditions=[dict(field='state.legal',value=True)])]),
         observable_properties=[dict(checker_id='Bounded',kind='event_assertion',trigger=dict(field='event',value='returned'),
             assertion=dict(field='state.in_range',value=True),identity_fields=['operation'],description='Return within capacity')],
-        monitors=[dict(id='bound',checker_id='Bounded',event='returned',binding_ids=['binding'],grounding=basis)])
+        monitors=[dict(id='bound',checker_id='Bounded',event='returned',binding_ids=['binding'],grounding=basis,admission_alias='start')])
     harness="""import json
 from target import step
 from helper import legal
@@ -111,6 +111,7 @@ def review_step(status='no_issue_found',aspect='checker_correspondence'):
         item=dict(target_id=artifact['id'],aspect=aspect,status=status,source_ids=['code','doc'],
             rationale='Actual source, legality, result and independent bound agree within this local call')
         if status in {'disputed','revision_needed'}:item['counterevidence']=['The current assumption needs a distinct source check']
+        if status=='revision_needed':item['challenged_components']=['oracle']
         return dict(action='review',artifact_id=artifact['id'],review_items=[item],rationale='Review the saved execution'),{}
     return step
 
@@ -118,6 +119,7 @@ def review_step(status='no_issue_found',aspect='checker_correspondence'):
 def stop(state):
     return dict(action='stop',scope='run',reason='insufficient_basis',ref_ids=['code','doc'],
         rationale='End the bounded fixture with remaining work visible; no autonomous claim',
+        frontier_comparison='The scripted exercise ends here; unexecuted directions remain outside this fixture budget',
         feedback=feedback(state)),{}
 
 

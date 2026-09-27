@@ -2,7 +2,7 @@
 import json
 from pathlib import Path
 import pytest
-from native_support import ScriptedAgent, products, first, check_step, review_step, stop, engine_for, partial_map, feedback
+from native_support import products, first, check_step, review_step, stop, engine_for, partial_map, feedback
 
 
 def test_existing_unit_actual_compile_repair_review_progress(tmp_path):
@@ -98,7 +98,7 @@ def test_same_version_reading_and_independent_issues(tmp_path):
         other=next(i for i in state['review_issues'] if i['aspect']=='applicability')
         item=dict(target_id=artifact,aspect='checker_correspondence',status='no_issue_found',source_ids=['code','doc'],rationale='The actual README bounds the observed return for the explicitly admitted input')
         return dict(action='review',artifact_id=artifact,review_items=[item],rationale='Answer the named reading issue',
-            resolutions=[dict(issue_id=issue['id'],target_version=issue['target_version'],original_question=issue['explanation'],source_ids=['code','doc'],rationale=item['rationale'],residual_issue_ids=[other['id']],scope_limitations=['Unrelated callers remain outside the observed invocation'])]),{}
+            resolutions=[dict(issue_id=issue['id'],source_ids=['code','doc'],rationale=item['rationale'],residual_issue_ids=[other['id']],scope_limitations=['Unrelated callers remain outside the observed invocation'])]),{}
     e,repo=engine_for(tmp_path,[first,check_step(),issues,resolve,stop])
     state=e.start(repo)
     assert len(state.direct_checks)==1
@@ -322,9 +322,9 @@ def test_checker_correction_across_intermediate_harness_version(tmp_path):
         return sub,files
     def resolve(state):
         sub,_=review_step()(state);issue=state['review_issues'][0]
-        sub['resolutions']=[dict(issue_id=issue['id'],target_version=issue['target_version'],original_question=issue['explanation'],source_ids=['code','doc'],rationale='The revised necessary predicate completed a new actual execution without demanding success',residual_issue_ids=[],scope_limitations=['No distributed consequence'])]
+        sub['resolutions']=[dict(issue_id=issue['id'],source_ids=['code','doc'],rationale='The revised necessary predicate completed a new actual execution without demanding success',residual_issue_ids=[],scope_limitations=['No distributed consequence'])]
         return sub,{}
-    e,repo=engine_for(tmp_path,[first,flawed,dispute,ordinary,corrected,resolve,stop])
+    e,repo=engine_for(tmp_path,[first,flawed,dispute,ordinary,resolve,corrected,resolve,stop])
     state=e.start(repo)
     assert len(state.direct_checks)==3,(state.stop_reason,state.native_current)
     assert [a.version for a in state.direct_checks]==[1,2,3]
@@ -334,9 +334,12 @@ def test_checker_correction_across_intermediate_harness_version(tmp_path):
     assert state.monitor_results[-1]['outcome']=='holds'
     assert state.units[0].status=='checked'
 
+    errors=[json.loads(p.read_text()) for p in (e.root/'native-submissions').glob('*/diagnostics.json')]
+    assert len(errors)==1
+    assert any(d['details'].get('unchanged_components')==['oracle'] for d in errors[0]['diagnostics'])
+
 
 def test_isolated_runner_sees_fixed_submitted_helpers(tmp_path):
-    from consensus_assurance.workflow.native import execute_accepted
     e,repo=engine_for(tmp_path,[first,check_step(),stop])
     e.config.execution_isolation='bwrap'
     original=e.checkpoint
@@ -363,3 +366,77 @@ def test_unreached_prerequisite_repairs_without_checker_issue(tmp_path):
     assert state.monitor_results[0]['prerequisites']['status']=='not_reached'
     assert state.monitor_results[-1]['prerequisites']['status']=='matched'
     assert state.units[0].status=='checked'
+
+
+def test_configuration_repair_closes_its_issue_without_changing_oracle(tmp_path):
+    def original(state):
+        sub,files=check_step()(state)
+        files['check.py']='duration = 0\n'+files['check.py']
+        return sub,files
+    def challenge(state):
+        sub,_=review_step('revision_needed')(state)
+        sub['sources']=[dict(id='configuration-source',file='target.py',start_line=3,end_line=5,kind='code_observation')]
+        sub['review_items'][0].update(challenged_components=['configuration'],source_ids=['configuration-source','doc'],
+            rationale='The setup uses an invalid duration and bypasses the actual validator',
+            counterevidence=['The real validation function rejects nonpositive duration'])
+        return sub,{}
+    def repair(state):
+        sub,files=check_step(revise=True)(state)
+        files['check.py']='from target import validate_config\nduration = validate_config(1)\n'+files['check.py']
+        plan=json.loads(files['plan.json']);plan['description']='Same comparison with validated setup'
+        plan['harness']['legality']['derivation']+='; the setup now invokes the actual validation function'
+        files['plan.json']=json.dumps(plan)
+        return sub,files
+    def resolve(state):
+        sub,_=review_step()(state)
+        sub['review_items'][0]['source_ids']=['configuration-source','code','doc']
+        sub['resolutions']=[dict(issue_id=state['review_issues'][0]['id'],source_ids=['configuration-source'],
+            evidence_ids=[state['direct_checks'][-1]['id']],rationale='The new fixed input calls validation before any operation, and the fresh execution reaches the same independent result',
+            residual_issue_ids=[],scope_limitations=['No distributed consequence'])]
+        return sub,{}
+    e,repo=engine_for(tmp_path,[first,original,challenge,repair,resolve,stop])
+    with (repo/'target.py').open('a') as stream:stream.write('def validate_config(duration):\n    if duration <= 0: raise ValueError("invalid duration")\n    return duration\n')
+    state=e.start(repo)
+    assert not list((e.root/'native-submissions').glob('*/diagnostics.json')),state.native_current
+    assert state.review_issues[0].resolved_by
+    old,new=[json.loads(Path(a.plan_path).read_text()) for a in state.direct_checks]
+    assert old['observable_properties']==new['observable_properties'] and old['monitors']==new['monitors']
+    assert len([c for c in state.checks if c.direct_check_id])==2 and state.units[0].status=='checked'
+    assert old['harness']['source'].startswith('duration = 0')
+    assert state.review_issues[0].source_ids==['configuration-source','doc']
+
+
+def test_deadline_preserves_accepted_unexecuted_check_across_resume(tmp_path):
+    e,repo=engine_for(tmp_path,[first,check_step(),stop])
+    original=e.checkpoint
+    def checkpoint(event):
+        if event=='semantic_operation_committed' and e.state.native_current.get('direct_check_id'):
+            # Simulate expiry between durable acceptance and formal execution.
+            e.budget.previous=e.config.budget.total_seconds
+        original(event)
+    e.checkpoint=checkpoint
+    state=e.start(repo)
+    assert state.native_current['phase']=='accepted' and len(state.direct_checks)==1
+    assert not any(c.action=='direct_check' for c in state.checks)
+    assert state.run_stop['reason']=='resource_limit' and state.usage.get('experiments',0)==0
+    e.checkpoint=original
+    recovered=e.resume()
+    assert recovered.native_current['phase']=='accepted'
+    assert recovered.usage.get('experiments',0)==0 and recovered.usage['agent_calls']==2
+
+
+def test_resolution_reports_independent_reference_errors_together(tmp_path):
+    def dispute(state):
+        return review_step('disputed')(state)
+    def invalid(state):
+        sub,_=review_step()(state)
+        sub['resolutions']=[dict(issue_id=state['review_issues'][0]['id'],source_ids=['not-a-material'],
+            evidence_ids=['not-an-execution'],rationale='Unresolved source claim',residual_issue_ids=[],scope_limitations=[])]
+        return sub,{}
+    e,repo=engine_for(tmp_path,[first,check_step(),dispute,invalid,stop]);state=e.start(repo)
+    diagnostics=[json.loads(p.read_text()) for p in (e.root/'native-submissions').glob('*/diagnostics.json')]
+    assert len(diagnostics)==1
+    details=[d['details'] for d in diagnostics[0]['diagnostics']]
+    assert any(d.get('unknown_material_ids')==['not-a-material'] for d in details)
+    assert any(d.get('unknown_evidence_ids')==['not-an-execution'] for d in details)
+    assert not state.review_issues[0].resolved_by

@@ -1,6 +1,5 @@
 """Offline v23 interpretation and generic witness/coverage semantics; no target execution."""
 import copy
-import json
 from pathlib import Path
 import pytest
 from consensus_assurance.core.proposals import Comparison, EventRequirement, EventMonitor, ObservableProperty
@@ -14,21 +13,20 @@ from test_direct_checks import setup, review
 def test_original_v23_seven_events_have_an_independent_outside_control(tmp_path):
     fixture=Path(__file__).parents[1]/'fixtures/v23-verification'
     plan=load_plan(fixture/'plan.json')
+    # Explicit offline interpretation of the public invocation; archive bytes stay unchanged.
+    plan.monitors[0].admission_alias='admission'
     events=extract_events(CheckRun(action='offline',cwd=str(tmp_path),snapshot_id='v23',stdout=str(fixture/'stdout.log')))
     assert len(events)==7
     result=monitor_events(events,plan.monitors[0],plan.observable_properties[0],plan.harness.prerequisites)
     assert result['witness_indices']==result['valid_witness_indices']==[3]
     assert result['outside_applicability_indices']==[6] and result['missing_indices']==[]
-    from consensus_assurance.workflow.engine import FRAMEWORK_REVISION
-    (tmp_path/'v24-interpretation.json').write_text(json.dumps(dict(framework_revision=FRAMEWORK_REVISION,
-        source_revision='native-products-v23',target_executed=False,result=result)))
 
 
 def inputs():
     prop=ObservableProperty(checker_id='Need',kind='event_implication',trigger=Comparison(field='event',value='result'),
         antecedent=Comparison(field='success',value=True),assertion=Comparison(field='qualified',value=True),
         identity_fields=['operation','generation'],description='Observed success requires actual qualification')
-    monitor=EventMonitor(id='need',checker_id='Need',event='result',binding_ids=[],grounding=Grounding(),
+    monitor=EventMonitor(id='need',checker_id='Need',event='result',binding_ids=[],grounding=Grounding(),admission_alias='start',
         applicability_conditions=[Comparison(field='enabled',value=True),Comparison(field='context',reference='start.context')])
     req=[EventRequirement(alias='start',event='start')]
     events=[dict(event='start',operation='one',generation=1,context='active',enabled=True),
@@ -85,3 +83,23 @@ def test_partial_valid_witness_is_retained_idempotently_without_completing_unit(
     assert obligation_progress(e.state,unit)[1]==unit.obligation_ids
     polluted=assess(e.state,unit,artifact,plan,check,events+[dict(event='invalid_observation')])
     assert not polluted['confirmed'] and polluted['parsing_errors']
+
+
+def test_admission_and_independent_prerequisite_permutation():
+    prop,monitor,requirements,events=inputs()
+    requirements.append(EventRequirement(alias='ready',event='ready'))
+    events.insert(1,dict(events[0],event='ready'))
+    events.append(dict(events[0],operation='unfinished'))
+    outcomes=[monitor_events(events,monitor,prop,order) for order in [requirements,list(reversed(requirements))]]
+    for result in outcomes:
+        assert result['outcome']=='violated' and result['witness_complete'] and not result['comparison_complete']
+        assert result['missing_indices']==[3]
+    monitor.admission_alias=None
+    assert monitor_events(events,monitor,prop,requirements)['outcome']=='unknown'
+    assert monitor_events([],monitor,prop,requirements)['outcome']=='unknown'
+    monitor.admission_alias='start'
+    requirements[1].conditions=[Comparison(field='context',reference='start.context')]
+    reversed_events=[events[1],events[0],*events[2:]]
+    assert monitor_events(reversed_events,monitor,prop,requirements)['outcome']=='unknown'
+    result=monitor_events(events[:3]+[events[0]],monitor,prop,requirements)
+    assert result['outcome']=='unknown' and result['missing_indices']==[3]

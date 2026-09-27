@@ -29,7 +29,7 @@ def test_multiple_invariants_are_attributed_individually(tlc,tmp_path,reversed_o
     from consensus_assurance.workflow.budget import BudgetTracker
     from consensus_assurance.core.config import Config
     from consensus_assurance.adapters.agents.backend import MockAgent
-    engine=Engine(Config(),runner.root,PythonBackend(),MockAgent(),verifier,'','')
+    engine=Engine(Config(),runner.root,PythonBackend(),MockAgent(),verifier,'')
     engine.state=state;engine.budget=BudgetTracker(Config().budget,state)
     engine.search(unit,model,bundle,None)
     assert [f.claim_id for f in state.findings]==['durable']

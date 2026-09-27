@@ -46,7 +46,7 @@ def test_old_issue_cannot_be_cleared_by_unrelated_or_unexecuted_model(tmp_path,p
     state.review_issues.append(issue)
     item=SemanticCheck(target_id=new.id,aspect='checker_correspondence',status='no_issue_found',source_ids=issue.source_ids,rationale='Candidate explanation' + "\n" + 'Alternative encodings' + "\n" + 'A claim of correctness does not replace actual rechecking')
     reply=ReviewSubmission(action='review',artifact_id=new.id,review_items=[item],rationale='Attempt without actual reexecution',
-        resolutions=[dict(issue_id=issue.id,target_version=issue.target_version,original_question=issue.explanation,source_ids=issue.source_ids,rationale='Attempt resolution',residual_issue_ids=[],scope_limitations=[])])
+        resolutions=[dict(issue_id=issue.id,source_ids=issue.source_ids,rationale='Attempt resolution',residual_issue_ids=[],scope_limitations=[])])
     with pytest.raises(ValueError):accept_review(state,reply,'test-operation')
     assert issue.resolved_by is None
 

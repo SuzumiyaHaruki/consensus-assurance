@@ -1,4 +1,5 @@
 """Tool selection and timeout boundaries, without a real Codex or target process."""
+import ast
 import json
 import subprocess
 import sys
@@ -14,6 +15,12 @@ from consensus_assurance.core.proposals import Harness
 
 
 def test_default_direct_schema_and_assembly_do_not_load_target_or_model_method(tmp_path):
+    root=Path(__file__).resolve().parents[2]/'src/consensus_assurance'
+    for package in ('core','workflow'):
+        for path in (root/package).rglob('*.py'):
+            for node in ast.walk(ast.parse(path.read_text())):
+                if isinstance(node,ast.ImportFrom):assert 'plugins' not in (node.module or '').split('.')
+                if isinstance(node,ast.Import):assert all('plugins' not in a.name.split('.') for a in node.names)
     code='''import sys
 from consensus_assurance.core.config import Config
 from consensus_assurance.registry import assemble

@@ -17,7 +17,7 @@ from test_graph_mutations import revision_for
 
 def engine_for(tmp_path,state):
     cfg=Config(execution_backend='python',agent_backend='mock',allow_experiments=False)
-    engine=Engine(cfg,tmp_path/'engine',*assemble(cfg),'')
+    engine=Engine(cfg,tmp_path/'engine',*assemble(cfg))
     engine.state=state;engine.budget=BudgetTracker(cfg.budget,state)
     shutil.copytree(state.snapshot.repo,engine.root/'source')
     return engine

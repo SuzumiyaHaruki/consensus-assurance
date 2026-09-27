@@ -23,7 +23,8 @@ class ResearchFeedback(Record):
     ref_ids: list[str] = Field(min_length=1)
     answered: str = Field(min_length=1)
     remaining: list[str]
-    understanding: Literal["updated", "unchanged", "deferred"]
+    understanding: Literal["updated", "unchanged", "deferred"] | None = Field(default=None,
+        description="Research understanding across turns, not a declaration that this submission changes the map")
     rationale: str = Field(min_length=1)
 
 
@@ -148,6 +149,7 @@ class StopSubmission(Submission):
     reason: Literal["bounded_completed", "insufficient_basis", "tool_gap", "resource_limit", "user_stop", "no_actionable_direction"]
     ref_ids: list[str] = []
     frontier_comparison: str = ""
+    resume_conditions: list[str] = []
 
 
 PRODUCTS = TypeAdapter(Annotated[Union[CandidateSubmission, CheckSubmission, ModelSubmission,

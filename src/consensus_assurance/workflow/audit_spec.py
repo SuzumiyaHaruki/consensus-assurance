@@ -81,8 +81,16 @@ def validate(state, spec, changes=None):
         changed={key for key in before if object_content(before[key])!=object_content(after.get(key))}
         used={id for c in state.question_candidates if c.status!='explained' for id in c.question.fact_ids}
         added_producers={b.id for b in spec.behaviors if b.id not in before and set(b.produces_fact_ids)&used}
-        if set(changes)!=changed|added_producers:
-            raise ValueError('Map changes must explain modified objects and added producers of current principal Facts: '+', '.join(sorted(changed|added_producers)))
+        required=changed|added_producers
+        missing=required-set(changes)
+        unknown=set(changes)-before.keys()-after.keys()
+        if missing or unknown:
+            raise ValueError('Map change explanations: missing='+str(sorted(missing))+'; unknown='+str(sorted(unknown))+
+                '; derived modified/removed/affected producers='+str(sorted(required))+
+                '; independent additions need no duplicate declaration')
+        # Independent additions and unchanged declarations are mechanical surplus,
+        # not an undeclared semantic modification. Derive the actual changed set.
+        for key in set(changes)-required:changes.pop(key)
         structural={'identity','validity_context','primary_activity','execution_owner','protocol_context','produces_fact_ids','consumes_fact_ids','invalidators','reinterpreters'}
         for key,change in changes.items():
             if not set(change.source_ids)<=known:raise ValueError('Map change needs acquired source evidence: '+key)

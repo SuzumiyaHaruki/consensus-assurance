@@ -1,6 +1,6 @@
 # consensus-assurance
 
-使用 Codex 原生 Agent 的 CFT 实现审计方法与证据工具。围绕两个核心正确性维度，沿五类实现支撑恢复实际行为与事实，以有来源的问题和合法执行见证限定结论。
+使用 Codex 原生 Agent 的 CFT 实现审计方法与证据工具。保留 Activity → Behavior → Fact → Candidate → Obligation → 检查／复核 → 理解回流；A1/A2 主导研究，五类支撑按实际依赖展开。局部问题处置后回到地图继续选题，合法执行见证用于限定结论。
 
 ## 快速入口
 
@@ -19,6 +19,8 @@ export PATH="$HOME/.local/bin:$PATH"
 
 `budget.native_turn_timeout` 限制单次原生调查，`budget.action_timeout` 限制正式工具动作，`budget.total_seconds` 限制整次运行；`agent_calls`、`experiments` 和 `model_checks` 分别计数。旧的材料分片、packet、指针修复和阶段调度已退出生产树；源码阅读和上下文管理交给 Codex。`allow_agent_materials: false` 会在发送源码前停止原生调查；正式目标执行还要求 `allow_experiments: true` 和 `execution_isolation: bwrap`。离线替身使用相同提交入口；它不验证真实 Codex 的自主构造效果。
 
+Candidate／family／focus 的局部停止保留未决工作并继续原生会话；整次运行停止单独记录。`research.json` 给出已映射关系的未知、问题交接及剩余能力。增加总时长不会自动增加正式执行、Unit、复核或修订额度。
+
 默认 `verifier_backend: none`，直接检查无需 Java/TLC。要探索关键历史，在新运行中显式选择 `--verifier-backend tlc --tlc-jar /实际路径/tla2tools.jar`；模型方法届时按需加载，轨迹不自动确认实现。
 
 ## 目标配置
@@ -30,5 +32,4 @@ configs/targets 中包含 HashiCorp Raft 与 SwiftPaxos 的 Paxos、N²Paxos、S
 - [审计方法](docs/审计方法.md)：概念、分解路线、有限证据与方法来源。
 - [运行工作流](docs/运行工作流.md)：继续、暂停、知识回流及代码入口。
 - [环境要求](docs/环境要求.md)：安装、运行、目标接入、隔离与测试。
-- [本轮验证记录](docs/合法执行见证改造.md)：能力、验证层次与未验证事项。
 - [运行索引](runs/README.md)：用户指定归档及其实际结果。

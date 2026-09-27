@@ -1,0 +1,546 @@
+{
+  "version": 1,
+  "target_profile": {
+    "system_boundary": "Captured hashicorp Raft implementation; initial partial map limited to reported log replication support and its commitment consumer.",
+    "protocol_contexts": [
+      "Per-leadership commitment instance",
+      "Per-follower synchronous and pipelined replication",
+      "Follower append handler"
+    ],
+    "external_interfaces": [],
+    "ownership": [
+      "Leader main loop consumes commitment; replication goroutines report peer progress; commitment mutex serializes aggregation."
+    ],
+    "selection_injection": [
+      "LogStore and transport implementations are not yet profiled; injection does not externalize in-repository implementations."
+    ],
+    "variants": [],
+    "source_ids": [
+      "src_commitment",
+      "src_leader_setup",
+      "src_rpc_match",
+      "src_append_producer"
+    ],
+    "unknowns": [
+      "Recovery, membership eligibility, authority transitions and public completion are not covered by this partial map."
+    ]
+  },
+  "activities": [
+    {
+      "class_id": "A1",
+      "applicability": "applicable",
+      "purpose": "Qualified support for decision formation and legal advancement",
+      "realization_summary": "Voter match aggregation and leader consumption are partially mapped.",
+      "entry_points": [],
+      "variants": [],
+      "unknowns": [],
+      "source_ids": [
+        "src_commitment",
+        "src_commit_consumer"
+      ]
+    },
+    {
+      "class_id": "A2",
+      "applicability": "applicable",
+      "purpose": "Context validity and acquisition, transfer or loss of authority",
+      "realization_summary": "Fresh per-leadership support object is mapped; acquisition and loss paths remain unknown.",
+      "entry_points": [],
+      "variants": [],
+      "unknowns": [],
+      "source_ids": [
+        "src_leader_setup"
+      ]
+    },
+    {
+      "class_id": "A6",
+      "applicability": "applicable",
+      "purpose": "History, persistence and reconstruction of support",
+      "realization_summary": "Leader storage and follower append success feed replication support.",
+      "entry_points": [],
+      "variants": [],
+      "unknowns": [],
+      "source_ids": [
+        "src_local_match",
+        "src_append_producer"
+      ]
+    }
+  ],
+  "behaviors": [
+    {
+      "id": "B_commit",
+      "primary_activity": "A1",
+      "execution_owner": "commitment object under its mutex",
+      "protocol_context": "One leader commitment object and its current voter map",
+      "trigger": "match or setConfiguration invokes recalculate",
+      "legal_preconditions": [],
+      "implementation_guards": [
+        "Nonempty voter map",
+        "Sorted majority index exceeds previous commitIndex and is at least startIndex"
+      ],
+      "reads": [
+        "Per-voter monotone match indexes",
+        "startIndex",
+        "previous commitIndex"
+      ],
+      "writes": [
+        "commitIndex"
+      ],
+      "durable_effects": [],
+      "external_effects": [
+        "Coalescing notification on commitCh"
+      ],
+      "important_branches": [],
+      "async_boundaries": [],
+      "produces_fact_ids": [
+        "F_commit"
+      ],
+      "consumes_fact_ids": [],
+      "cross_activity_effects": {},
+      "existing_protections": [
+        "Nonvoters do not enter matchIndexes",
+        "Reports that do not increase a registered voter index are ignored"
+      ],
+      "source_ids": [
+        "src_commitment"
+      ],
+      "unknowns": [
+        "Truth and temporal validity of all producer reports are not established by this arithmetic",
+        "Configuration changes retain matching ServerID entries; membership transition legality requires separate reading"
+      ]
+    },
+    {
+      "id": "B_consume_commit",
+      "primary_activity": "A1",
+      "execution_owner": "Raft leader main loop",
+      "protocol_context": "Current leaderState on commitCh selection",
+      "trigger": "Commit notification selected",
+      "legal_preconditions": [],
+      "implementation_guards": [],
+      "reads": [
+        "Current commitment index",
+        "Inflight entries and latest configuration"
+      ],
+      "writes": [
+        "Raft commit index",
+        "Committed configuration"
+      ],
+      "durable_effects": [],
+      "external_effects": [
+        "processLogs for inflight entries through commit index"
+      ],
+      "important_branches": [
+        "Committed removal of local voting eligibility sets stepDown"
+      ],
+      "async_boundaries": [],
+      "produces_fact_ids": [],
+      "consumes_fact_ids": [
+        "F_commit"
+      ],
+      "cross_activity_effects": {},
+      "existing_protections": [],
+      "source_ids": [
+        "src_commit_consumer"
+      ],
+      "unknowns": [
+        "processLogs and FSM completion not mapped",
+        "Leadership loss cleanup and cross-generation isolation require reading"
+      ]
+    },
+    {
+      "id": "B_setup",
+      "primary_activity": "A2",
+      "execution_owner": "Raft leader main loop",
+      "protocol_context": "Leader state initialization",
+      "trigger": "setupLeaderState",
+      "legal_preconditions": [],
+      "implementation_guards": [],
+      "reads": [],
+      "writes": [
+        "Fresh commitment object with zero match indexes and startIndex=getLastIndex()+1",
+        "Fresh replication-state map and stepDown channel"
+      ],
+      "durable_effects": [],
+      "external_effects": [],
+      "important_branches": [],
+      "async_boundaries": [],
+      "produces_fact_ids": [],
+      "consumes_fact_ids": [],
+      "cross_activity_effects": {
+        "A1": "Resets reported replication support and installs the minimum index needed for commitment in this leadership context"
+      },
+      "existing_protections": [],
+      "source_ids": [
+        "src_leader_setup",
+        "src_commitment"
+      ],
+      "unknowns": [
+        "Election and no-op dispatch prefix not yet mapped"
+      ]
+    },
+    {
+      "id": "B_local_store",
+      "primary_activity": "A6",
+      "execution_owner": "Raft leader main loop",
+      "protocol_context": "Current term and current commitment object",
+      "trigger": "dispatchLogs",
+      "legal_preconditions": [],
+      "implementation_guards": [],
+      "reads": [
+        "Current term and last log index"
+      ],
+      "writes": [
+        "Assigned log term/index",
+        "Inflight queue",
+        "Local log store",
+        "Local match index after StoreLogs succeeds"
+      ],
+      "durable_effects": [
+        "Calls injected LogStore.StoreLogs; durability contract not yet read"
+      ],
+      "external_effects": [],
+      "important_branches": [
+        "Store failure responds with error and sets Follower before returning without match"
+      ],
+      "async_boundaries": [],
+      "produces_fact_ids": [],
+      "consumes_fact_ids": [],
+      "cross_activity_effects": {
+        "A1": "Successful local storage contributes the local voter report to quorum computation"
+      },
+      "existing_protections": [],
+      "source_ids": [
+        "src_local_match"
+      ],
+      "unknowns": [
+        "Injected store fault and durability contracts remain unread"
+      ]
+    },
+    {
+      "id": "B_rpc_match",
+      "primary_activity": "A1",
+      "execution_owner": "Per-follower replication goroutine",
+      "protocol_context": "followerReplication commitment pointer and request term",
+      "trigger": "AppendEntries returns without transport error",
+      "legal_preconditions": [],
+      "implementation_guards": [],
+      "reads": [
+        "Request entries and response Term/Success"
+      ],
+      "writes": [
+        "nextIndex and peer match index after nonempty successful request"
+      ],
+      "durable_effects": [],
+      "external_effects": [],
+      "important_branches": [
+        "Higher response term calls handleStaleTerm and stops",
+        "Negative reply backs off nextIndex without match",
+        "Empty successful append notifies verification but adds no match report"
+      ],
+      "async_boundaries": [
+        "Transport request and reply",
+        "Shared commitment mutex"
+      ],
+      "produces_fact_ids": [],
+      "consumes_fact_ids": [],
+      "cross_activity_effects": {},
+      "existing_protections": [
+        "Rejects higher-term replies before registering match",
+        "Uses request last entry index, not follower LastLog"
+      ],
+      "source_ids": [
+        "src_rpc_match",
+        "src_match_update"
+      ],
+      "unknowns": [
+        "Transport correlation, stale-term handling, and generation cleanup not yet mapped"
+      ]
+    },
+    {
+      "id": "B_pipeline_match",
+      "primary_activity": "A1",
+      "execution_owner": "Pipeline decoder goroutine",
+      "protocol_context": "Pipeline request/response pair and followerReplication commitment pointer",
+      "trigger": "Future arrives from pipeline Consumer",
+      "legal_preconditions": [],
+      "implementation_guards": [],
+      "reads": [
+        "Future Request and Response"
+      ],
+      "writes": [
+        "nextIndex and peer match index for successful nonempty request"
+      ],
+      "durable_effects": [],
+      "external_effects": [],
+      "important_branches": [
+        "Higher term stops via handleStaleTerm",
+        "Unsuccessful response aborts decoder",
+        "Stop channel ends decoder"
+      ],
+      "async_boundaries": [
+        "AppendPipeline.Consumer future delivery"
+      ],
+      "produces_fact_ids": [],
+      "consumes_fact_ids": [
+        "F_pipeline_ready"
+      ],
+      "cross_activity_effects": {},
+      "existing_protections": [
+        "Requires response Success and rejects higher response term",
+        "Built-in producers publish after recording completion, so receipt provides completion ordering even though it does not check error status.",
+        "Real follower append handler error paths do not assign Success true."
+      ],
+      "source_ids": [
+        "src_pipeline_match",
+        "src_match_update",
+        "src_pipeline_interface",
+        "src_inmem_pipeline",
+        "src_net_pipeline",
+        "src_pipeline_launch",
+        "src_pipeline_send"
+      ],
+      "unknowns": [
+        "The decoder reads Response without invoking Error although the interface requires Error to return first. A measured call-order check is selected; invalid commitment is not inferred.",
+        "Success with a nonnil error from a legal real follower and permitted network fault is not established; in-memory timeout leaves a fresh response zero-valued.",
+        "Election prefix, leadership loss, and application consequences remain outside the local interface proposition."
+      ]
+    },
+    {
+      "id": "B_append_success",
+      "primary_activity": "A6",
+      "execution_owner": "Follower Raft main thread",
+      "protocol_context": "AppendEntries request against current term, local log and configuration",
+      "trigger": "appendEntries RPC",
+      "legal_preconditions": [],
+      "implementation_guards": [],
+      "reads": [
+        "Current term",
+        "Previous entry term",
+        "Stored entry terms"
+      ],
+      "writes": [
+        "Conflicting suffix deletion",
+        "New entries through StoreLogs",
+        "Configuration state",
+        "Last log and commit index"
+      ],
+      "durable_effects": [],
+      "external_effects": [
+        "Deferred Respond with Success true only after handler reaches its final success assignment"
+      ],
+      "important_branches": [
+        "Older term, predecessor mismatch and log read/write errors return without success",
+        "Duplicates matched by index and term skip storage",
+        "LeaderCommitIndex advances processing through min(remote commit, local last index)"
+      ],
+      "async_boundaries": [],
+      "produces_fact_ids": [],
+      "consumes_fact_ids": [],
+      "cross_activity_effects": {
+        "A1": "Provides the successful reply used by replication workers as support for request entries"
+      },
+      "existing_protections": [
+        "StoreLogs completes before Success becomes true",
+        "Previous-log term check before new-entry processing"
+      ],
+      "source_ids": [
+        "src_append_producer"
+      ],
+      "unknowns": [
+        "Protocol provenance of well-formed contiguous requests not yet mapped",
+        "Crash durability is conditional on LogStore",
+        "Later suffix invalidation and election protection not mapped"
+      ]
+    },
+    {
+      "id": "B_inmem_ready",
+      "primary_activity": "A6",
+      "execution_owner": "In-memory pipeline decoder",
+      "protocol_context": "One AppendFuture associated with the request pointer and response pointer supplied to AppendEntries",
+      "trigger": "Decoder receives queued in-progress request",
+      "reads": [
+        "Request-associated reply channel or ordered network stream"
+      ],
+      "writes": [
+        "Future response fields and completion error"
+      ],
+      "async_boundaries": [
+        "inprogressCh to decoder",
+        "doneCh to Raft pipelineDecode"
+      ],
+      "produces_fact_ids": [
+        "F_pipeline_ready"
+      ],
+      "important_branches": [
+        "Reply channel: copy response then record RPC error before publishing future",
+        "Timeout: record timeout without copying a response, then publish future",
+        "Shutdown: return without publishing remaining futures"
+      ],
+      "cross_activity_effects": {
+        "A1": "Supplies completion objects whose response fields pipelineDecode uses to decide whether to register voter replication support"
+      },
+      "existing_protections": [
+        "Completion error is recorded before publication",
+        "A fresh response is allocated for each Raft pipeline send"
+      ],
+      "source_ids": [
+        "src_inmem_pipeline",
+        "src_future_completion",
+        "src_pipeline_send"
+      ],
+      "unknowns": [
+        "No network fault experiment has established partially decoded Success under error",
+        "This local completion fact does not establish a legal election or application history"
+      ]
+    },
+    {
+      "id": "B_net_ready",
+      "primary_activity": "A6",
+      "execution_owner": "Network pipeline decoder",
+      "protocol_context": "One AppendFuture associated with the request pointer and response pointer supplied to AppendEntries",
+      "trigger": "Decoder receives queued in-progress request",
+      "reads": [
+        "Request-associated reply channel or ordered network stream"
+      ],
+      "writes": [
+        "Future response fields and completion error"
+      ],
+      "async_boundaries": [
+        "inprogressCh to decoder",
+        "doneCh to Raft pipelineDecode"
+      ],
+      "produces_fact_ids": [
+        "F_pipeline_ready"
+      ],
+      "important_branches": [
+        "Decode error string and response into caller-owned response, record returned error, then publish future",
+        "Decode failure releases connection but still publishes errored future",
+        "Shutdown may prevent publication"
+      ],
+      "cross_activity_effects": {
+        "A1": "Supplies completion objects whose response fields pipelineDecode uses to decide whether to register voter replication support"
+      },
+      "existing_protections": [
+        "Completion error is recorded before publication",
+        "A fresh response is allocated for each Raft pipeline send"
+      ],
+      "source_ids": [
+        "src_net_pipeline",
+        "src_net_decode",
+        "src_future_completion",
+        "src_pipeline_send"
+      ],
+      "unknowns": [
+        "No network fault experiment has established partially decoded Success under error",
+        "This local completion fact does not establish a legal election or application history"
+      ]
+    }
+  ],
+  "facts": [
+    {
+      "id": "F_commit",
+      "meaning": "This commitment object advanced to an index supported by a strict majority of its currently registered voter match values, and that index is at least its configured startIndex. This states reported support, not independently proven durable replication.",
+      "identity": {
+        "object": "commitment instance",
+        "index": "commitIndex",
+        "membership": "voter map at the advancing recalculation"
+      },
+      "validity_context": "Historical calculation at advancement within one commitment object; later membership changes can alter the voter map without decreasing commitIndex.",
+      "representation": [
+        "commitment.commitIndex",
+        "commitCh notification prompts a fresh read"
+      ],
+      "invalidators": [],
+      "reinterpreters": [],
+      "durability": "In-memory derived value; not itself a persisted quorum certificate.",
+      "recovery": "Fresh commitment allocation resets match indexes and commitIndex; full recovery path is unmapped.",
+      "source_ids": [
+        "src_commitment",
+        "src_leader_setup",
+        "src_commit_consumer"
+      ],
+      "unknowns": [
+        "Alternate match producers include snapshot success; snapshot installation and report meaning remain unmapped",
+        "Match report truth and legal configuration transitions remain obligations to investigate, not assumed facts"
+      ]
+    },
+    {
+      "id": "F_pipeline_ready",
+      "meaning": "The built-in pipeline decoder has recorded completion status for this request-associated future and published it to Consumer. The status may be an error; readiness alone does not establish a valid successful AppendEntries response.",
+      "identity": {
+        "future": "AppendFuture instance",
+        "request": "Request pointer captured by pipeline AppendEntries",
+        "pipeline": "Transport pipeline instance"
+      },
+      "validity_context": "Completion and publication of one in-progress future, prior to consumer inspection.",
+      "representation": [
+        "AppendFuture from doneCh",
+        "deferError completion channel",
+        "Request and Response pointers"
+      ],
+      "durability": "In-memory completion notification; no independent persistence guarantee.",
+      "recovery": "Pipeline lifecycle is transient; reconstruction across restart is not asserted.",
+      "source_ids": [
+        "src_inmem_pipeline",
+        "src_net_pipeline",
+        "src_net_decode",
+        "src_future_completion",
+        "src_pipeline_interface"
+      ],
+      "unknowns": [
+        "Custom transport producers have not been read; this fact describes the two built-in producers only.",
+        "A completed future can contain unusable response data on error; legal partial-decode histories remain unexplored."
+      ]
+    }
+  ],
+  "surfaces": [
+    {
+      "entry_point": "commitment.setConfiguration",
+      "disposition": "deferred",
+      "behavior_ids": [],
+      "reason": "Membership replacement changes eligible reports while preserving commitIndex; legality and transition serialization require further reading.",
+      "source_ids": [
+        "src_commitment",
+        "src_config_match"
+      ],
+      "high_consequence": true
+    },
+    {
+      "entry_point": "Raft.sendLatestSnapshot",
+      "disposition": "deferred",
+      "behavior_ids": [],
+      "reason": "Alternate producer registers snapshot index after successful reply; receiver completion and snapshot lineage are not mapped.",
+      "source_ids": [
+        "src_snapshot_match"
+      ],
+      "high_consequence": true
+    },
+    {
+      "entry_point": "Raft.pipelineDecode / AppendPipeline.Consumer",
+      "disposition": "mapped",
+      "behavior_ids": [
+        "B_inmem_ready",
+        "B_net_ready",
+        "B_pipeline_match"
+      ],
+      "reason": "Built-in completion producers and decoder are mapped. The selected local question concerns required Error-before-Response access; broader erroneous-support reachability remains unknown.",
+      "source_ids": [
+        "src_pipeline_interface",
+        "src_inmem_pipeline",
+        "src_net_pipeline",
+        "src_pipeline_match"
+      ],
+      "high_consequence": true
+    },
+    {
+      "entry_point": "Raft.processLogs",
+      "disposition": "deferred",
+      "behavior_ids": [],
+      "reason": "Application consumption endpoint is visible as a call but its implementation is not mapped.",
+      "source_ids": [
+        "src_commit_consumer",
+        "src_append_producer"
+      ],
+      "high_consequence": true
+    }
+  ]
+}

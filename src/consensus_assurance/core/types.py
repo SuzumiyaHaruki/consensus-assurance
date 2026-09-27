@@ -51,6 +51,8 @@ ACTIVITY_ROLES = {
     "A7": {"role":"support", "relation":"Client contracts, invocation intervals and observed completion"},
 }
 Lifecycle = Literal["establishment", "preservation", "consumption", "recovery"]
+Concern = Literal["consensus_safety", "bounded_liveness", "implementation_semantics"]
+RepairComponent = Literal["configuration", "initialization", "driver", "observation", "oracle", "expectation", "scope"]
 
 
 class TargetProfile(Record):
@@ -185,7 +187,7 @@ class QuestionCandidate(Record):
     question: AuditQuestion
     history: list[AuditQuestion] = []
     check_ids: list[str] = []
-    status: Literal["active", "explained", "escalated", "blocked", "paused"] = "active"
+    status: Literal["active", "explained", "escalated", "blocked", "paused", "closed"] = "active"
     parent_candidate_id: str | None = None
     fork_reason: str = ""
     stage: Literal["read", "analyze"] = "analyze"
@@ -226,6 +228,8 @@ class SemanticCheck(Record):
     rationale: str
     counterevidence: list[str] = []
     limitations: list[str] = []
+    challenged_components: list[RepairComponent] = Field(default_factory=list,
+        description="Components requiring repair, distinct from the review aspect; revision_needed must name them")
 
 
 class SemanticReview(Record):
@@ -252,7 +256,7 @@ class ReviewIssue(Record):
     resolution_basis: dict = {}
     prior_review_ids: list[str] = []
     parent_issue_id: str | None = None
-    needs_recheck: bool = False
+    challenged_components: list[RepairComponent] = []
     id: str = Field(default_factory=uid)
     review_id: str
     target_id: str
@@ -355,6 +359,7 @@ class PendingAction(Record):
 class Claim(Record):
     id: str
     kind: Literal["obligation", "assumption"]
+    concern: Concern = "implementation_semantics"
     description: str
     scope: Scope
     source: str

@@ -59,6 +59,10 @@ def validate_contract(state,task,reply):
             issue('review_contradictory_judgment',item.target_id,'no_issue_found cannot include current counterevidence; use a negative status or explain alternatives in rationale',i)
         if item.status in {'disputed','revision_needed'} and not item.counterevidence:
             issue('review_missing_challenge',item.target_id,'A negative judgment needs counterevidence; put scope boundaries in limitations',i)
+        if item.status == 'revision_needed' and not item.challenged_components:
+            issue('review_missing_component',item.target_id,'Name the challenged configuration, initialization, driver, observation, oracle, expectation or scope; the review aspect does not determine the repair',i)
+        if item.status == 'no_issue_found' and item.challenged_components:
+            issue('review_contradictory_component',item.target_id,'A current repair challenge requires a negative judgment',i)
         for source,status in citation_status(state,item.source_ids,supplied).items():
             if status!='provided':issue('review_unknown_source' if status=='unknown' else 'review_unavailable_source',item.target_id,'Citation '+source+': '+status+'; correct the reference or attach the actual range',i)
     if errors:raise DiagnosticError(errors)

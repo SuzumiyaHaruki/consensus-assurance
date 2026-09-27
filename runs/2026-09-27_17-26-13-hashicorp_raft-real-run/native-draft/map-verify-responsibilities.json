@@ -1,0 +1,1042 @@
+{
+  "version": 3,
+  "target_profile": {
+    "system_boundary": "Captured hashicorp Raft implementation; initial partial map limited to reported log replication support and its commitment consumer.",
+    "protocol_contexts": [
+      "Per-leadership commitment instance",
+      "Per-follower synchronous and pipelined replication",
+      "Follower append handler"
+    ],
+    "external_interfaces": [],
+    "ownership": [
+      "Leader main loop consumes commitment; replication goroutines report peer progress; commitment mutex serializes aggregation."
+    ],
+    "selection_injection": [
+      "LogStore and transport implementations are not yet profiled; injection does not externalize in-repository implementations."
+    ],
+    "variants": [],
+    "source_ids": [
+      "src_commitment",
+      "src_leader_setup",
+      "src_rpc_match",
+      "src_append_producer"
+    ],
+    "unknowns": [
+      "Recovery, membership eligibility, authority transitions and public completion are not covered by this partial map."
+    ]
+  },
+  "activities": [
+    {
+      "class_id": "A1",
+      "applicability": "applicable",
+      "purpose": "Qualified support for decision formation and legal advancement",
+      "realization_summary": "Voter match aggregation and leader consumption are partially mapped.",
+      "entry_points": [],
+      "variants": [],
+      "unknowns": [],
+      "source_ids": [
+        "src_commitment",
+        "src_commit_consumer"
+      ]
+    },
+    {
+      "class_id": "A2",
+      "applicability": "applicable",
+      "purpose": "Context validity and acquisition, transfer or loss of authority",
+      "realization_summary": "Fresh per-leadership support object is mapped; acquisition and loss paths remain unknown.",
+      "entry_points": [],
+      "variants": [],
+      "unknowns": [],
+      "source_ids": [
+        "src_leader_setup"
+      ]
+    },
+    {
+      "class_id": "A6",
+      "applicability": "applicable",
+      "purpose": "History, persistence and reconstruction of support",
+      "realization_summary": "Leader storage and follower append success feed replication support.",
+      "entry_points": [],
+      "variants": [],
+      "unknowns": [],
+      "source_ids": [
+        "src_local_match",
+        "src_append_producer"
+      ]
+    },
+    {
+      "class_id": "A3",
+      "applicability": "applicable",
+      "purpose": "Recovery and resynchronization of eligible participation",
+      "realization_summary": "Snapshot receiver completion and its restore wait are mapped.",
+      "entry_points": [],
+      "variants": [],
+      "unknowns": [],
+      "source_ids": [
+        "src_install_snapshot"
+      ]
+    },
+    {
+      "class_id": "A5",
+      "applicability": "applicable",
+      "purpose": "Decision application and consumption",
+      "realization_summary": "FSM restore completion supports snapshot resynchronization; ordinary Apply path remains unmapped.",
+      "entry_points": [],
+      "variants": [],
+      "unknowns": [],
+      "source_ids": [
+        "src_fsm_restore",
+        "src_fsm_contract"
+      ]
+    },
+    {
+      "class_id": "A4",
+      "applicability": "applicable",
+      "purpose": "Configuration and participant eligibility",
+      "realization_summary": "Public configuration changes select voting eligibility; leader activation updates voter-only commitment membership and all-member replication workers.",
+      "entry_points": [
+        "nextConfiguration",
+        "appendConfigurationEntry",
+        "startStopReplication"
+      ],
+      "source_ids": [
+        "src_config_transition",
+        "src_config_activation",
+        "src_replication_members",
+        "src_member_roles"
+      ],
+      "unknowns": [
+        "Membership persistence-error paths and full transition safety remain unreviewed."
+      ]
+    },
+    {
+      "class_id": "A7",
+      "applicability": "applicable",
+      "purpose": "Client contracts, invocation intervals and observed completion",
+      "realization_summary": "VerifyLeader exposes a Future whose success is documented to ensure continuing leadership; invocation and completion bound the selected authority check.",
+      "entry_points": [
+        "VerifyLeader"
+      ],
+      "source_ids": [
+        "src_verify_api",
+        "src_verify_finish"
+      ],
+      "unknowns": [
+        "Application reads and their ordering are not mapped."
+      ]
+    }
+  ],
+  "behaviors": [
+    {
+      "id": "B_commit",
+      "primary_activity": "A1",
+      "execution_owner": "commitment object under its mutex",
+      "protocol_context": "One leader commitment object and its current voter map",
+      "trigger": "match or setConfiguration invokes recalculate",
+      "legal_preconditions": [],
+      "implementation_guards": [
+        "Nonempty voter map",
+        "Sorted majority index exceeds previous commitIndex and is at least startIndex"
+      ],
+      "reads": [
+        "Per-voter monotone match indexes",
+        "startIndex",
+        "previous commitIndex"
+      ],
+      "writes": [
+        "commitIndex"
+      ],
+      "durable_effects": [],
+      "external_effects": [
+        "Coalescing notification on commitCh"
+      ],
+      "important_branches": [],
+      "async_boundaries": [],
+      "produces_fact_ids": [
+        "F_commit"
+      ],
+      "consumes_fact_ids": [],
+      "cross_activity_effects": {},
+      "existing_protections": [
+        "Nonvoters do not enter matchIndexes",
+        "Reports that do not increase a registered voter index are ignored"
+      ],
+      "source_ids": [
+        "src_commitment"
+      ],
+      "unknowns": [
+        "Truth and temporal validity of all producer reports are not established by this arithmetic",
+        "Configuration changes retain matching ServerID entries; membership transition legality requires separate reading"
+      ]
+    },
+    {
+      "id": "B_consume_commit",
+      "primary_activity": "A1",
+      "execution_owner": "Raft leader main loop",
+      "protocol_context": "Current leaderState on commitCh selection",
+      "trigger": "Commit notification selected",
+      "legal_preconditions": [],
+      "implementation_guards": [],
+      "reads": [
+        "Current commitment index",
+        "Inflight entries and latest configuration"
+      ],
+      "writes": [
+        "Raft commit index",
+        "Committed configuration"
+      ],
+      "durable_effects": [],
+      "external_effects": [
+        "processLogs for inflight entries through commit index"
+      ],
+      "important_branches": [
+        "Committed removal of local voting eligibility sets stepDown"
+      ],
+      "async_boundaries": [],
+      "produces_fact_ids": [],
+      "consumes_fact_ids": [
+        "F_commit"
+      ],
+      "cross_activity_effects": {},
+      "existing_protections": [],
+      "source_ids": [
+        "src_commit_consumer"
+      ],
+      "unknowns": [
+        "processLogs and FSM completion not mapped",
+        "Leadership loss cleanup and cross-generation isolation require reading"
+      ]
+    },
+    {
+      "id": "B_setup",
+      "primary_activity": "A2",
+      "execution_owner": "Raft leader main loop",
+      "protocol_context": "Leader state initialization",
+      "trigger": "setupLeaderState",
+      "legal_preconditions": [],
+      "implementation_guards": [],
+      "reads": [],
+      "writes": [
+        "Fresh commitment object with zero match indexes and startIndex=getLastIndex()+1",
+        "Fresh replication-state map and stepDown channel"
+      ],
+      "durable_effects": [],
+      "external_effects": [],
+      "important_branches": [],
+      "async_boundaries": [],
+      "produces_fact_ids": [],
+      "consumes_fact_ids": [],
+      "cross_activity_effects": {
+        "A1": "Resets reported replication support and installs the minimum index needed for commitment in this leadership context"
+      },
+      "existing_protections": [],
+      "source_ids": [
+        "src_leader_setup",
+        "src_commitment"
+      ],
+      "unknowns": [
+        "Election and no-op dispatch prefix not yet mapped"
+      ]
+    },
+    {
+      "id": "B_local_store",
+      "primary_activity": "A6",
+      "execution_owner": "Raft leader main loop",
+      "protocol_context": "Current term and current commitment object",
+      "trigger": "dispatchLogs",
+      "legal_preconditions": [],
+      "implementation_guards": [],
+      "reads": [
+        "Current term and last log index"
+      ],
+      "writes": [
+        "Assigned log term/index",
+        "Inflight queue",
+        "Local log store",
+        "Local match index after StoreLogs succeeds"
+      ],
+      "durable_effects": [
+        "Calls injected LogStore.StoreLogs; durability contract not yet read"
+      ],
+      "external_effects": [],
+      "important_branches": [
+        "Store failure responds with error and sets Follower before returning without match"
+      ],
+      "async_boundaries": [],
+      "produces_fact_ids": [],
+      "consumes_fact_ids": [],
+      "cross_activity_effects": {
+        "A1": "Successful local storage contributes the local voter report to quorum computation"
+      },
+      "existing_protections": [],
+      "source_ids": [
+        "src_local_match"
+      ],
+      "unknowns": [
+        "Injected store fault and durability contracts remain unread"
+      ]
+    },
+    {
+      "id": "B_rpc_match",
+      "primary_activity": "A1",
+      "execution_owner": "Per-follower replication goroutine",
+      "protocol_context": "followerReplication commitment pointer and request term",
+      "trigger": "AppendEntries returns without transport error",
+      "legal_preconditions": [],
+      "implementation_guards": [],
+      "reads": [
+        "Request entries and response Term/Success"
+      ],
+      "writes": [
+        "nextIndex and peer match index after nonempty successful request"
+      ],
+      "durable_effects": [],
+      "external_effects": [],
+      "important_branches": [
+        "Higher response term calls handleStaleTerm and stops",
+        "Negative reply backs off nextIndex without match",
+        "Empty successful append notifies verification but adds no match report"
+      ],
+      "async_boundaries": [
+        "Transport request and reply",
+        "Shared commitment mutex"
+      ],
+      "produces_fact_ids": [],
+      "consumes_fact_ids": [],
+      "cross_activity_effects": {},
+      "existing_protections": [
+        "Rejects higher-term replies before registering match",
+        "Uses request last entry index, not follower LastLog"
+      ],
+      "source_ids": [
+        "src_rpc_match",
+        "src_match_update"
+      ],
+      "unknowns": [
+        "Transport correlation, stale-term handling, and generation cleanup not yet mapped"
+      ]
+    },
+    {
+      "id": "B_pipeline_match",
+      "primary_activity": "A1",
+      "execution_owner": "Pipeline decoder goroutine",
+      "protocol_context": "Pipeline request/response pair and followerReplication commitment pointer",
+      "trigger": "Future arrives from pipeline Consumer",
+      "legal_preconditions": [],
+      "implementation_guards": [],
+      "reads": [
+        "Future Request and Response"
+      ],
+      "writes": [
+        "nextIndex and peer match index for successful nonempty request"
+      ],
+      "durable_effects": [],
+      "external_effects": [],
+      "important_branches": [
+        "Higher term stops via handleStaleTerm",
+        "Unsuccessful response aborts decoder",
+        "Stop channel ends decoder"
+      ],
+      "async_boundaries": [
+        "AppendPipeline.Consumer future delivery"
+      ],
+      "produces_fact_ids": [],
+      "consumes_fact_ids": [
+        "F_pipeline_ready"
+      ],
+      "cross_activity_effects": {},
+      "existing_protections": [
+        "Requires response Success and rejects higher response term",
+        "Built-in producers publish after recording completion, so receipt provides completion ordering even though it does not check error status.",
+        "Real follower append handler error paths do not assign Success true."
+      ],
+      "source_ids": [
+        "src_pipeline_match",
+        "src_match_update",
+        "src_pipeline_interface",
+        "src_inmem_pipeline",
+        "src_net_pipeline",
+        "src_pipeline_launch",
+        "src_pipeline_send"
+      ],
+      "unknowns": [
+        "The decoder reads Response without invoking Error although the interface requires Error to return first. A measured call-order check is selected; invalid commitment is not inferred.",
+        "Success with a nonnil error from a legal real follower and permitted network fault is not established; in-memory timeout leaves a fresh response zero-valued.",
+        "Election prefix, leadership loss, and application consequences remain outside the local interface proposition."
+      ]
+    },
+    {
+      "id": "B_append_success",
+      "primary_activity": "A6",
+      "execution_owner": "Follower Raft main thread",
+      "protocol_context": "AppendEntries request against current term, local log and configuration",
+      "trigger": "appendEntries RPC",
+      "legal_preconditions": [],
+      "implementation_guards": [],
+      "reads": [
+        "Current term",
+        "Previous entry term",
+        "Stored entry terms"
+      ],
+      "writes": [
+        "Conflicting suffix deletion",
+        "New entries through StoreLogs",
+        "Configuration state",
+        "Last log and commit index"
+      ],
+      "durable_effects": [],
+      "external_effects": [
+        "Deferred Respond with Success true only after handler reaches its final success assignment"
+      ],
+      "important_branches": [
+        "Older term, predecessor mismatch and log read/write errors return without success",
+        "Duplicates matched by index and term skip storage",
+        "LeaderCommitIndex advances processing through min(remote commit, local last index)"
+      ],
+      "async_boundaries": [],
+      "produces_fact_ids": [],
+      "consumes_fact_ids": [],
+      "cross_activity_effects": {
+        "A1": "Provides the successful reply used by replication workers as support for request entries"
+      },
+      "existing_protections": [
+        "StoreLogs completes before Success becomes true",
+        "Previous-log term check before new-entry processing"
+      ],
+      "source_ids": [
+        "src_append_producer"
+      ],
+      "unknowns": [
+        "Protocol provenance of well-formed contiguous requests not yet mapped",
+        "Crash durability is conditional on LogStore",
+        "Later suffix invalidation and election protection not mapped"
+      ]
+    },
+    {
+      "id": "B_inmem_ready",
+      "primary_activity": "A6",
+      "execution_owner": "In-memory pipeline decoder",
+      "protocol_context": "One AppendFuture associated with the request pointer and response pointer supplied to AppendEntries",
+      "trigger": "Decoder receives queued in-progress request",
+      "legal_preconditions": [],
+      "implementation_guards": [],
+      "reads": [
+        "Request-associated reply channel or ordered network stream"
+      ],
+      "writes": [
+        "Future response fields and completion error"
+      ],
+      "durable_effects": [],
+      "external_effects": [],
+      "important_branches": [
+        "Reply channel: copy response then record RPC error before publishing future",
+        "Timeout: record timeout without copying a response, then publish future",
+        "Shutdown: return without publishing remaining futures"
+      ],
+      "async_boundaries": [
+        "inprogressCh to decoder",
+        "doneCh to Raft pipelineDecode"
+      ],
+      "produces_fact_ids": [
+        "F_pipeline_ready"
+      ],
+      "consumes_fact_ids": [],
+      "cross_activity_effects": {
+        "A1": "Supplies completion objects whose response fields pipelineDecode uses to decide whether to register voter replication support"
+      },
+      "existing_protections": [
+        "Completion error is recorded before publication",
+        "A fresh response is allocated for each Raft pipeline send"
+      ],
+      "source_ids": [
+        "src_inmem_pipeline",
+        "src_future_completion",
+        "src_pipeline_send"
+      ],
+      "unknowns": [
+        "No network fault experiment has established partially decoded Success under error",
+        "This local completion fact does not establish a legal election or application history"
+      ]
+    },
+    {
+      "id": "B_net_ready",
+      "primary_activity": "A6",
+      "execution_owner": "Network pipeline decoder",
+      "protocol_context": "One AppendFuture associated with the request pointer and response pointer supplied to AppendEntries",
+      "trigger": "Decoder receives queued in-progress request",
+      "legal_preconditions": [],
+      "implementation_guards": [],
+      "reads": [
+        "Request-associated reply channel or ordered network stream"
+      ],
+      "writes": [
+        "Future response fields and completion error"
+      ],
+      "durable_effects": [],
+      "external_effects": [],
+      "important_branches": [
+        "Decode error string and response into caller-owned response, record returned error, then publish future",
+        "Decode failure releases connection but still publishes errored future",
+        "Shutdown may prevent publication"
+      ],
+      "async_boundaries": [
+        "inprogressCh to decoder",
+        "doneCh to Raft pipelineDecode"
+      ],
+      "produces_fact_ids": [
+        "F_pipeline_ready"
+      ],
+      "consumes_fact_ids": [],
+      "cross_activity_effects": {
+        "A1": "Supplies completion objects whose response fields pipelineDecode uses to decide whether to register voter replication support"
+      },
+      "existing_protections": [
+        "Completion error is recorded before publication",
+        "A fresh response is allocated for each Raft pipeline send"
+      ],
+      "source_ids": [
+        "src_net_pipeline",
+        "src_net_decode",
+        "src_future_completion",
+        "src_pipeline_send"
+      ],
+      "unknowns": [
+        "No network fault experiment has established partially decoded Success under error",
+        "This local completion fact does not establish a legal election or application history"
+      ]
+    },
+    {
+      "id": "B_restore_fsm",
+      "primary_activity": "A5",
+      "execution_owner": "Raft runFSM goroutine",
+      "protocol_context": "restoreFuture identifying one locally finalized snapshot by sink ID",
+      "trigger": "restoreFuture arrives on fsmMutateCh",
+      "legal_preconditions": [],
+      "implementation_guards": [],
+      "reads": [
+        "SnapshotStore.Open(req.ID) metadata and bytes"
+      ],
+      "writes": [
+        "FSM state through Restore",
+        "Worker lastIndex and lastTerm after Restore success"
+      ],
+      "durable_effects": [],
+      "external_effects": [
+        "Respond to restoreFuture with error or nil"
+      ],
+      "important_branches": [
+        "Open error responds with error",
+        "FSM Restore error responds with error",
+        "Successful restore sets worker index/term before respond(nil)"
+      ],
+      "async_boundaries": [
+        "fsmMutateCh from main Raft thread",
+        "Future error completion to waiting installSnapshot"
+      ],
+      "produces_fact_ids": [],
+      "consumes_fact_ids": [],
+      "cross_activity_effects": {
+        "A3": "Completes restoration used to establish eligible snapshot state before receiver acknowledgment",
+        "A1": "Nil completion is a required predecessor of the snapshot success reply eventually registered as replication support"
+      },
+      "existing_protections": [],
+      "source_ids": [
+        "src_fsm_restore",
+        "src_fsm_dispatch",
+        "src_fsm_restore_call",
+        "src_fsm_contract"
+      ],
+      "unknowns": [
+        "Injected FSM correctness is conditional on its interface contract; arbitrary implementation corruption is not ruled out."
+      ]
+    },
+    {
+      "id": "B_install_snapshot",
+      "primary_activity": "A3",
+      "execution_owner": "Raft main thread installSnapshot handler",
+      "protocol_context": "InstallSnapshotRequest with term, index/term, configuration and stream size",
+      "trigger": "Incoming InstallSnapshot RPC",
+      "legal_preconditions": [],
+      "implementation_guards": [
+        "Supported snapshot version",
+        "Request term at least current term",
+        "Copy succeeds and byte count equals declared size",
+        "Sink.Close succeeds",
+        "Restore future returns nil"
+      ],
+      "reads": [
+        "Current term",
+        "Request metadata and snapshot stream",
+        "Snapshot sink and restore completion"
+      ],
+      "writes": [
+        "Term/role for higher-term request",
+        "Local snapshot",
+        "lastApplied and lastSnapshot",
+        "Latest and committed configuration"
+      ],
+      "durable_effects": [
+        "SnapshotSink.Close success is required, but physical durability depends on actual store"
+      ],
+      "external_effects": [
+        "Deferred stream drain followed by RPC response; Success set true only after restore and metadata updates"
+      ],
+      "important_branches": [
+        "Version, stale term, copy, size, close and restore errors cannot reach final Success=true",
+        "Shutdown during restore enqueue returns without success",
+        "Log cleanup errors are logged but do not prevent success"
+      ],
+      "async_boundaries": [
+        "Stream reader may block",
+        "Enqueues restoreFuture to runFSM and waits on Error",
+        "Deferred RPC reply after stream draining"
+      ],
+      "produces_fact_ids": [
+        "F_snapshot_installed"
+      ],
+      "consumes_fact_ids": [],
+      "cross_activity_effects": {
+        "A1": "Success provides the snapshot completion fact consumed by sender replication support registration",
+        "A4": "Installs snapshot configuration as latest and committed"
+      },
+      "existing_protections": [
+        "Success is after actual restore completion rather than queue receipt",
+        "Shutdown future error does not masquerade as restore success"
+      ],
+      "source_ids": [
+        "src_install_snapshot",
+        "src_future_completion",
+        "src_snapshot_contract"
+      ],
+      "unknowns": [
+        "Stale but same/higher-term snapshot freshness and regression are not resolved by the completion ordering",
+        "Store crash durability and restart reconstruction are not reviewed",
+        "Ignored log cleanup errors need separate analysis; they do not imply missing FSM restoration"
+      ]
+    },
+    {
+      "id": "B_snapshot_match",
+      "primary_activity": "A1",
+      "execution_owner": "Per-follower leader replication goroutine",
+      "protocol_context": "Current followerReplication commitment pointer and selected snapshot metadata",
+      "trigger": "Missing log fallback calls sendLatestSnapshot",
+      "legal_preconditions": [],
+      "implementation_guards": [],
+      "reads": [
+        "SnapshotStore.List highest-index-first result",
+        "SnapshotStore.Open metadata and stream",
+        "InstallSnapshot transport response"
+      ],
+      "writes": [
+        "nextIndex=meta.Index+1 and commitment.match(peer.ID,meta.Index) after accepted success",
+        "Last contact and failure count"
+      ],
+      "durable_effects": [],
+      "external_effects": [],
+      "important_branches": [
+        "List/open/transport errors return without match",
+        "Higher response term invokes handleStaleTerm and stops",
+        "Success=false adds no match",
+        "Success=true registers selected snapshot index and notifies waiting leader verification futures"
+      ],
+      "async_boundaries": [
+        "Synchronous InstallSnapshot transport call",
+        "commitment mutex and notification"
+      ],
+      "produces_fact_ids": [],
+      "consumes_fact_ids": [
+        "F_snapshot_installed"
+      ],
+      "cross_activity_effects": {},
+      "existing_protections": [
+        "Checks transport error before reading support",
+        "Rejects response term greater than request term",
+        "Uses sent snapshot index rather than any follower log hint"
+      ],
+      "source_ids": [
+        "src_snapshot_open_send",
+        "src_snapshot_match",
+        "src_commitment",
+        "src_snapshot_contract"
+      ],
+      "unknowns": [
+        "Response correlation is conditional on transport API; full transport and leadership generation lifecycle not mapped",
+        "Snapshot creation from committed history and freshness relative to follower applied state remain separate questions"
+      ]
+    },
+    {
+      "id": "B_verify_register",
+      "primary_activity": "A2",
+      "execution_owner": "Leader main loop",
+      "protocol_context": "One verifyFuture with latest configuration voter threshold",
+      "trigger": "Public VerifyLeader arrives with quorumSize zero",
+      "source_ids": [
+        "src_verify_register",
+        "src_voter_quorum",
+        "src_replication_members",
+        "src_verify_api"
+      ],
+      "reads": [
+        "Latest configuration and all replState workers"
+      ],
+      "writes": [
+        "votes=1; quorumSize=voters/2+1",
+        "Register future in each replication worker notify map"
+      ],
+      "external_effects": [
+        "Immediate nil for single-voter quorum; otherwise trigger every worker heartbeat"
+      ],
+      "existing_protections": [
+        "Registration serialized in main loop"
+      ],
+      "unknowns": [
+        "Registration has no suffrage filter even though threshold counts voters; significance requires actual authority history."
+      ]
+    },
+    {
+      "id": "B_peer_notify",
+      "primary_activity": "A2",
+      "execution_owner": "Per-peer heartbeat or replication worker",
+      "protocol_context": "Verification future registered in that worker notify map",
+      "trigger": "Successful transport heartbeat completion or other replication notification",
+      "source_ids": [
+        "src_heartbeat_support",
+        "src_notify_all",
+        "src_match_update",
+        "src_snapshot_match"
+      ],
+      "reads": [
+        "Heartbeat Success or successful replication outcome",
+        "Worker pending notifications"
+      ],
+      "writes": [
+        "Clear worker notify map"
+      ],
+      "external_effects": [
+        "Call vote(leader) for each pending verification"
+      ],
+      "important_branches": [
+        "Heartbeat transport error does not call notifyAll",
+        "Heartbeat response Success=false votes negatively",
+        "Append/snapshot success also notifies verification"
+      ],
+      "unknowns": [
+        "Heartbeat does not test response term in this path; negative responses and lease remain protections."
+      ]
+    },
+    {
+      "id": "B_verify_count",
+      "primary_activity": "A2",
+      "execution_owner": "Replication worker under verifyFuture voteLock",
+      "protocol_context": "Single verifyFuture and snapshotted threshold",
+      "trigger": "vote(leader) from registered worker",
+      "source_ids": [
+        "src_verify_count"
+      ],
+      "reads": [
+        "votes/quorumSize/notifyCh"
+      ],
+      "writes": [
+        "Increment affirmative count without peer identity or suffrage argument",
+        "Clear notifyCh after threshold or negative reply"
+      ],
+      "produces_fact_ids": [
+        "F_verify_threshold"
+      ],
+      "external_effects": [
+        "Send future to leader verifyCh"
+      ],
+      "important_branches": [
+        "Any negative reply notifies early",
+        "Ignore later votes after notifyCh nil"
+      ],
+      "existing_protections": [
+        "One delivery per future after threshold or negative outcome",
+        "Worker notify map is cleared per peer notification"
+      ]
+    },
+    {
+      "id": "B_verify_finish",
+      "primary_activity": "A2",
+      "execution_owner": "Leader main loop",
+      "protocol_context": "Previously registered verifyFuture returns on verifyCh",
+      "trigger": "Verification completion notification",
+      "source_ids": [
+        "src_verify_finish",
+        "src_verify_api"
+      ],
+      "consumes_fact_ids": [
+        "F_verify_threshold"
+      ],
+      "reads": [
+        "votes and quorumSize"
+      ],
+      "writes": [
+        "Remove future from leader and replication notify maps"
+      ],
+      "external_effects": [
+        "Return nil if count reaches threshold; otherwise ErrNotLeader and transition to follower"
+      ],
+      "unknowns": [
+        "No suffrage revalidation at this endpoint.",
+        "A successful count need not establish authority if contributing peer eligibility is insufficient; actual history is selected as next discriminator."
+      ],
+      "cross_activity_effects": {
+        "A7": "Responding nil or ErrNotLeader completes the same verifyFuture returned by public VerifyLeader, making the authority decision observable at that invocation completion."
+      }
+    },
+    {
+      "id": "B_member_activation",
+      "primary_activity": "A4",
+      "execution_owner": "Leader main loop",
+      "protocol_context": "Stable previous configuration and current-term commitment",
+      "trigger": "Configuration request selected from configurationChangeChIfStable",
+      "source_ids": [
+        "src_config_stability",
+        "src_config_activation",
+        "src_config_transition",
+        "src_replication_members",
+        "src_commitment"
+      ],
+      "reads": [
+        "Current configuration and optional prevIndex"
+      ],
+      "writes": [
+        "Configuration log and latest configuration",
+        "Voter-only commitment map",
+        "Replication workers for all latest members"
+      ],
+      "cross_activity_effects": {
+        "A1": "Commitment map excludes nonvoters and preserves indexes only for retained voters",
+        "A2": "Replication map includes nonvoters and is the set used by verification registration"
+      },
+      "existing_protections": [
+        "Wait for previous configuration and current-term entry commitment",
+        "Reject duplicate IDs/addresses and zero-voter result",
+        "Commitment ignores reports from IDs outside current voter map"
+      ],
+      "unknowns": [
+        "Membership persistence-error paths and generation transitions not resolved."
+      ]
+    },
+    {
+      "id": "B_lease_check",
+      "primary_activity": "A2",
+      "execution_owner": "Leader main loop",
+      "protocol_context": "Current latest voter configuration and configured lease interval",
+      "trigger": "Leader lease timer",
+      "source_ids": [
+        "src_voter_lease",
+        "src_voter_quorum"
+      ],
+      "reads": [
+        "Only voter LastContact timestamps"
+      ],
+      "writes": [
+        "Follower state when voter contact count below quorum"
+      ],
+      "existing_protections": [
+        "Explicit suffrage filtering excludes nonvoter contacts"
+      ],
+      "unknowns": [
+        "Finite timer scheduling and configured timeout can allow an interval before stepdown; a candidate witness must retain this worker."
+      ]
+    }
+  ],
+  "facts": [
+    {
+      "id": "F_commit",
+      "meaning": "This commitment object advanced to an index supported by a strict majority of its currently registered voter match values, and that index is at least its configured startIndex. This states reported support, not independently proven durable replication.",
+      "identity": {
+        "object": "commitment instance",
+        "index": "commitIndex",
+        "membership": "voter map at the advancing recalculation"
+      },
+      "validity_context": "Historical calculation at advancement within one commitment object; later membership changes can alter the voter map without decreasing commitIndex.",
+      "representation": [
+        "commitment.commitIndex",
+        "commitCh notification prompts a fresh read"
+      ],
+      "invalidators": [],
+      "reinterpreters": [],
+      "durability": "In-memory derived value; not itself a persisted quorum certificate.",
+      "recovery": "Fresh commitment allocation resets match indexes and commitIndex; full recovery path is unmapped.",
+      "source_ids": [
+        "src_commitment",
+        "src_leader_setup",
+        "src_commit_consumer",
+        "src_install_snapshot",
+        "src_snapshot_open_send",
+        "src_fsm_restore"
+      ],
+      "unknowns": [
+        "Snapshot success producer and restore completion are now mapped; actual store durability, snapshot provenance and leadership-context validity remain unproven.",
+        "Match report truth and legal configuration transitions remain obligations to investigate, not assumed facts"
+      ]
+    },
+    {
+      "id": "F_pipeline_ready",
+      "meaning": "The built-in pipeline decoder has recorded completion status for this request-associated future and published it to Consumer. The status may be an error; readiness alone does not establish a valid successful AppendEntries response.",
+      "identity": {
+        "future": "AppendFuture instance",
+        "request": "Request pointer captured by pipeline AppendEntries",
+        "pipeline": "Transport pipeline instance"
+      },
+      "validity_context": "Completion and publication of one in-progress future, prior to consumer inspection.",
+      "representation": [
+        "AppendFuture from doneCh",
+        "deferError completion channel",
+        "Request and Response pointers"
+      ],
+      "invalidators": [],
+      "reinterpreters": [],
+      "durability": "In-memory completion notification; no independent persistence guarantee.",
+      "recovery": "Pipeline lifecycle is transient; reconstruction across restart is not asserted.",
+      "source_ids": [
+        "src_inmem_pipeline",
+        "src_net_pipeline",
+        "src_net_decode",
+        "src_future_completion",
+        "src_pipeline_interface"
+      ],
+      "unknowns": [
+        "Custom transport producers have not been read; this fact describes the two built-in producers only.",
+        "A completed future can contain unusable response data on error; legal partial-decode histories remain unexplored."
+      ]
+    },
+    {
+      "id": "F_snapshot_installed",
+      "meaning": "For a successful response produced by installSnapshot, the supplied stream passed exact-size copy and sink Close, the FSM restore future returned nil, and receiver lastApplied, lastSnapshot and configurations were assigned from request metadata before reply. This is completion at that handler, not a guarantee of physical durability or request freshness.",
+      "identity": {
+        "request": "InstallSnapshot RPC and its response",
+        "snapshot": "Request LastLogIndex/LastLogTerm and newly created sink ID",
+        "receiver": "Receiving Raft instance"
+      },
+      "validity_context": "At successful receiver reply; subsequent state changes and restart are not covered.",
+      "representation": [
+        "InstallSnapshotResponse.Success",
+        "Request snapshot index/term/configuration",
+        "restoreFuture Error completion"
+      ],
+      "invalidators": [],
+      "reinterpreters": [],
+      "durability": "Conditional on SnapshotStore and FSM contracts; acknowledgment itself is not a durable object.",
+      "recovery": "Restart reconstruction not mapped.",
+      "source_ids": [
+        "src_install_snapshot",
+        "src_fsm_restore",
+        "src_fsm_restore_call",
+        "src_snapshot_open_send",
+        "src_snapshot_contract"
+      ],
+      "unknowns": [
+        "Request provenance and monotone snapshot freshness remain unproven",
+        "Log cleanup failure does not prevent success",
+        "Sender consumption depends on transport preserving request/reply correspondence"
+      ]
+    },
+    {
+      "id": "F_verify_threshold",
+      "meaning": "For this verifyFuture, its affirmative notification count, initialized with one self contribution, reached the voter-derived threshold and the future was enqueued for leader-loop completion. Notifications do not carry peer suffrage into vote(). This is counted support, not established continuing authority.",
+      "identity": {
+        "operation": "verifyFuture instance",
+        "threshold": "quorumSize captured at registration",
+        "context": "leader verification registration and notify maps"
+      },
+      "validity_context": "From affirmative threshold notification until leader-loop consumption; membership and authority validity are separate.",
+      "representation": [
+        "verifyFuture.votes",
+        "verifyFuture.quorumSize",
+        "verifyCh delivery"
+      ],
+      "durability": "Volatile operation-local notification.",
+      "recovery": "No recovery guarantee; futures belong to current process/leader context.",
+      "source_ids": [
+        "src_verify_count",
+        "src_verify_register",
+        "src_voter_quorum",
+        "src_verify_finish"
+      ],
+      "unknowns": [
+        "A legal history where only nonvoter support completes a stale leader verification has not been executed.",
+        "Negative responses, ordinary replication and lease stepdown can prevent the suspected endpoint."
+      ]
+    }
+  ],
+  "surfaces": [
+    {
+      "entry_point": "commitment.setConfiguration",
+      "disposition": "deferred",
+      "behavior_ids": [],
+      "reason": "Membership replacement changes eligible reports while preserving commitIndex; legality and transition serialization require further reading.",
+      "source_ids": [
+        "src_commitment",
+        "src_config_match"
+      ],
+      "high_consequence": true
+    },
+    {
+      "entry_point": "Raft.sendLatestSnapshot",
+      "disposition": "mapped",
+      "behavior_ids": [
+        "B_snapshot_match",
+        "B_install_snapshot",
+        "B_restore_fsm"
+      ],
+      "reason": "Mapped completion-to-match dependency. Sink close and actual FSM restore completion precede receiver success; sender checks error/term/success. Snapshot freshness, generation validity and crash recovery remain unresolved.",
+      "source_ids": [
+        "src_snapshot_open_send",
+        "src_install_snapshot",
+        "src_fsm_restore"
+      ],
+      "high_consequence": true
+    },
+    {
+      "entry_point": "Raft.pipelineDecode / AppendPipeline.Consumer",
+      "disposition": "mapped",
+      "behavior_ids": [
+        "B_inmem_ready",
+        "B_net_ready",
+        "B_pipeline_match"
+      ],
+      "reason": "Built-in completion producers and decoder are mapped. The selected local question concerns required Error-before-Response access; broader erroneous-support reachability remains unknown.",
+      "source_ids": [
+        "src_pipeline_interface",
+        "src_inmem_pipeline",
+        "src_net_pipeline",
+        "src_pipeline_match"
+      ],
+      "high_consequence": true
+    },
+    {
+      "entry_point": "Raft.processLogs",
+      "disposition": "deferred",
+      "behavior_ids": [],
+      "reason": "Application consumption endpoint is visible as a call but its implementation is not mapped.",
+      "source_ids": [
+        "src_commit_consumer",
+        "src_append_producer"
+      ],
+      "high_consequence": true
+    },
+    {
+      "entry_point": "Raft.VerifyLeader",
+      "disposition": "mapped",
+      "behavior_ids": [
+        "B_verify_register",
+        "B_peer_notify",
+        "B_verify_count",
+        "B_verify_finish",
+        "B_lease_check"
+      ],
+      "reason": "Mapped authority verification threshold and independent voter-only lease protection. Need a real election/command prefix to test whether nonvoter support can falsely validate old authority.",
+      "source_ids": [
+        "src_verify_api",
+        "src_verify_register",
+        "src_verify_finish",
+        "src_voter_lease"
+      ],
+      "high_consequence": true
+    }
+  ]
+}

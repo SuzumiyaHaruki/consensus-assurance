@@ -3,7 +3,7 @@ from consensus_assurance.core.types import ReviewIssue
 
 
 from .review_contract import required_aspects, target_contract
-from .sources import citation_status, includes
+from .sources import includes
 
 
 def review_objects(state):
@@ -48,6 +48,26 @@ def lineage(state, artifact):
     return result
 
 
+def repair_changes(old, artifact):
+    """Compare the challenged component, never infer it from the review column."""
+    if hasattr(artifact, 'plan_path'):
+        from .direct_checks import load_plan
+        from .encoding import direct_changes
+        before, after = load_plan(old.plan_path), load_plan(artifact.plan_path)
+        changes=direct_changes(before,after)
+        inputs,predicate,observation=changes['inputs'],changes['oracle'],changes['observation']
+    else:
+        from .artifacts import load_model
+        before, after = load_model(old), load_model(artifact)
+        inputs = (before.behavior, before.constants) != (after.behavior, after.constants)
+        predicate = before.properties != after.properties
+        observation = getattr(before,'observation',None) != getattr(after,'observation',None)
+    semantic = old.graph_versions != artifact.graph_versions
+    return {'configuration':inputs, 'initialization':inputs, 'driver':inputs,
+        'observation':inputs or predicate or observation, 'oracle':predicate,
+        'expectation':semantic, 'scope':semantic or old.scope != artifact.scope}
+
+
 def accept_review(state, submission, operation_id):
     from types import SimpleNamespace
     from consensus_assurance.core.proposals import ReviewReply
@@ -64,7 +84,10 @@ def accept_review(state, submission, operation_id):
     sources = [m.id for m in state.materials]
     task = SimpleNamespace(target_ids=[artifact.id], material_ids=sources, context_receipt_id=None)
     reply = ReviewReply(items=submission.review_items, limitations=[])
-    validate_contract(state, task, reply)
+    from consensus_assurance.core.diagnostics import Diagnostic, DiagnosticError
+    errors = []
+    try:validate_contract(state, task, reply)
+    except DiagnosticError as exc:errors.extend(exc.diagnostics)
     if not required_aspects(artifact) <= {i.aspect for i in reply.items}:
         raise ValueError('Review must address the supplied whole-artifact contract')
     if any(not i.source_ids or not i.rationale.strip() for i in reply.items):
@@ -72,15 +95,23 @@ def accept_review(state, submission, operation_id):
     ancestors = lineage(state, artifact)
     if len({r.issue_id for r in submission.resolutions}) != len(submission.resolutions):
         raise ValueError('Duplicate issue resolution')
-    for resolution in submission.resolutions:
+    def error(index, issue, message, **details):
+        errors.append(Diagnostic(code='issue_resolution', category='format',
+            object_ids=[issue.id] if issue else [], paths=[f'/resolutions/{index}'],
+            message=message, details=details, allowed=['read','representation','semantic_revision']))
+    evidence = {x.id for name in ('checks','direct_checks','models','evidence','findings','semantic_reviews')
+        for x in getattr(state,name)}
+    for index, resolution in enumerate(submission.resolutions):
         issue = next((i for i in state.review_issues if i.id == resolution.issue_id and not i.resolved_by), None)
         if not issue or issue.target_id not in ancestors:
-            raise ValueError('Resolution must address an open issue on this artifact or its lineage')
-        if (resolution.target_version != issue.target_version or resolution.original_question != issue.explanation
-                or not resolution.rationale.strip() or not set(resolution.source_ids) <= set(sources)):
-            raise ValueError('Resolution must retain the exact original issue and cite its actual answer')
-        if not includes(state, issue.source_ids, resolution.source_ids):
-            raise ValueError('Resolution must retain the original issue source basis')
+            error(index, issue, 'Resolution must address an open issue on this artifact or its lineage',
+                issue_id=resolution.issue_id, artifact_id=artifact.id)
+            continue
+        unknown = set(resolution.source_ids)-set(sources)
+        if unknown:error(index, issue, 'source_ids accepts acquired Material IDs', unknown_material_ids=sorted(unknown))
+        unknown_evidence = set(resolution.evidence_ids)-evidence
+        if unknown_evidence:error(index, issue, 'evidence_ids accepts retained execution, artifact, evidence or review IDs', unknown_evidence_ids=sorted(unknown_evidence))
+        if not resolution.rationale.strip():error(index, issue, 'Explain how the answer addresses this issue', original_question=issue.explanation)
         if issue.conditions:
             from .repair_policy import classify_conditions
             dispositions = classify_conditions(state, [c['text'] for c in issue.conditions],
@@ -88,25 +119,26 @@ def accept_review(state, submission, operation_id):
             if any(d.applies_to == 'current_judgment' for d in dispositions):
                 raise ValueError('Current unresolved conditions cannot discharge their issue')
         item = next((i for i in reply.items if i.aspect == issue.aspect and i.status == 'no_issue_found'), None)
-        if not item or item.counterevidence or not set(resolution.source_ids) <= set(item.source_ids):
-            raise ValueError('Resolution needs matching substantive review without current counterevidence')
+        if not item or item.counterevidence or not includes(state,resolution.source_ids,item.source_ids):
+            error(index, issue, 'Resolution needs matching substantive review with its answer sources and no current counterevidence', aspect=issue.aspect, answer_source_ids=resolution.source_ids)
         others = {i.id for i in state.review_issues if not i.resolved_by and i.id != issue.id and i.parent_issue_id != issue.id}
         if not set(resolution.residual_issue_ids) <= others or issue.explanation in resolution.scope_limitations:
             raise ValueError('The original dispute cannot be renamed as a residual scope boundary')
-        if issue.needs_recheck:
+        components = issue.challenged_components
+        if components:
             old = objects[issue.target_id]
             if hasattr(artifact, 'plan_path'):
-                from .direct_checks import load_plan
-                a, b = load_plan(old.plan_path), load_plan(artifact.plan_path)
-                changed = (a.observable_properties, a.monitors) != (b.observable_properties, b.monitors)
                 executed = any(c.action == 'direct_check' and c.exit_code == 0 for c in checks)
             else:
-                from .artifacts import load_model
-                changed = load_model(old).properties != load_model(artifact).properties
                 executed = any(c.action == 'model_check' and c.outcome in {'holds', 'counterexample'}
                     and c.search_fingerprint == artifact.search_fingerprint and not c.reused for c in checks)
-            if artifact.id == old.id or not changed or not executed:
-                raise ValueError('Checker issue requires a changed oracle and actual matching reexecution')
+            changes = repair_changes(old,artifact)
+            unchanged = [c for c in components if not changes[c]]
+            if artifact.id == old.id or unchanged or not executed:
+                error(index, issue, 'Repair needs a new artifact, the challenged component change and matching fresh execution',
+                    challenged_components=components, unchanged_components=unchanged, fresh_execution=executed,
+                    original_artifact=old.id, answering_artifact=artifact.id)
+    if errors:raise DiagnosticError(errors)
     review = SemanticReview(task_id='native:' + operation_id, check_id=operation_id,
         target_versions={artifact.id:artifact.version}, material_ids=sources, items=reply.items,
         origin='mock' if state.mode == 'mock' else 'agent', unit_id=artifact.unit_id or None,
@@ -129,7 +161,7 @@ def accept_review(state, submission, operation_id):
             target_version=artifact.version, aspect=item.aspect, model_id=review.model_id,
             source_ids=item.source_ids, explanation=item.rationale, reason=item.rationale,
             disposition='reading' if item.status == 'needs_reading' else 'investigation',
-            needs_recheck=item.aspect == 'checker_correspondence' and item.status == 'revision_needed'))
+            challenged_components=item.challenged_components if item.status=='revision_needed' else []))
     return review
 
 

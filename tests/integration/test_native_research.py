@@ -2,6 +2,7 @@
 import json
 from pathlib import Path
 import pytest
+from consensus_assurance.workflow.research import view
 from native_support import first, partial_map, products, engine_for, check_step, review_step, stop, feedback
 
 
@@ -91,8 +92,7 @@ def test_cross_activity_producer_connects_to_focus_without_quota(tmp_path):
     e,repo=engine_for(tmp_path,[submit,stop]);e.config.activity_focus=['A1','A2']
     state=e.start(repo)
     assert len(state.units)==1 and not diagnostics(e)
-    from consensus_assurance.workflow.research import view
-    assert view(state)['frontier']['uninvestigated_core']==['A2']
+    assert {r['activity'] for r in view(state)['frontier']['core_regions']}=={'A1','A2'}
 
 
 def test_graph_cannot_create_unowned_unit_but_support_graph_is_allowed(tmp_path):
@@ -108,7 +108,7 @@ def test_graph_cannot_create_unowned_unit_but_support_graph_is_allowed(tmp_path)
     assert len(diagnostics(e))==1 and 'Candidate' in str(diagnostics(e))
 
 
-def test_continuation_accepts_same_text_new_source_but_not_rewording(tmp_path):
+def test_continuation_accepts_sourced_answer_but_not_rewording(tmp_path):
     def reword(state):
         sub,files=question_step(state);sub['candidate_id']=state['question_candidates'][0]['id']
         sub['question']['question']='Could this bounded boundary call exceed capacity?'
@@ -117,6 +117,8 @@ def test_continuation_accepts_same_text_new_source_but_not_rewording(tmp_path):
         sub,files=question_step(state);sub['candidate_id']=state['question_candidates'][0]['id']
         sub['sources'].append(dict(id='consumer',file='consumer.py',start_line=1,end_line=2,kind='code_observation'))
         sub['question']['source_ids'].append('consumer')
+        sub['question']['unknowns']=['The consumer forwards the value unchanged; its external caller remains unexamined']
+        sub['feedback']=dict(feedback(state),ref_ids=['consumer'],answered='The actual consumer source forwards the value without transformation')
         return sub,files
     e,repo=engine_for(tmp_path,[question_step,reword,progress,stop])
     (repo/'consumer.py').write_text('def consume(value):\n    return value\n')
@@ -323,3 +325,166 @@ def test_shared_fact_can_reconnect_paused_and_active_candidates_atomically(tmp_p
     assert not diagnostics(e),diagnostics(e)
     assert state.audit_spec_version==2 and [c.status for c in state.question_candidates]==['paused','active']
     assert all(c.question.audit_spec_version==2 and c.history for c in state.question_candidates)
+
+
+def next_question(state):
+    sub=products()[0]
+    sub.update(action='continue',obligation=None,bindings=[])
+    sub['question'].update(contexts=['Another sourced invocation'],
+        disposition='needs_specific_evidence',unknowns=['Inspect the other invocation boundary'])
+    return sub,{}
+
+
+def local_stop(reason='bounded_completed', scope='candidate'):
+    def step(state):
+        candidate=state['question_candidates'][-1]
+        return dict(action='stop',scope=scope,reason=reason,ref_ids=[candidate['id']],
+            rationale='The scoped discriminator is disposed; compare other sourced directions',
+            frontier_comparison='Other invocation contexts remain available in the mapped region',
+            resume_conditions=[] if reason=='bounded_completed' else ['Acquire the missing producer observation'],
+            feedback=feedback(state)),{}
+    return step
+
+
+@pytest.mark.parametrize('disposition',['bounded','confirmed','explained'])
+def test_local_disposition_continues_with_mapped_unknowns(tmp_path,disposition):
+    def initial(state):
+        sub,files=first(state)
+        if disposition=='explained':
+            sub.update(action='explained',obligation=None,bindings=[])
+            sub['question'].update(disposition='explained_by_existing_mechanism',unknowns=[],
+                counterevidence=['The source branch bounds the return'])
+        return sub,files
+    steps=[initial]+([] if disposition=='explained' else [check_step(),review_step()])
+    steps += [local_stop(),next_question,stop]
+    e,repo=engine_for(tmp_path,steps)
+    if disposition=='confirmed':
+        (repo/'target.py').write_text('def step(value, limit):\n    return value + 1\n')
+        # Actual isolated execution with scripted products, never autonomous discovery.
+        e.agent.mock=False
+        e.config.execution_isolation='bwrap'
+        e.config.directed_question='Controlled small-target confirmation regression'
+    state=e.start(repo)
+    assert len(state.question_candidates)==2 and not diagnostics(e)
+    assert state.question_candidates[0].status=='closed'
+    assert state.native_session_id=='fixture-session' and state.usage['agent_calls']==len(steps)
+    research=view(state)
+    assert research['frontier']['relationships'][0]['unknowns']==['Consumer outside boundary']
+    assert state.audit_spec_version==1 and state.run_stop['scope']=='run'
+    if disposition=='confirmed':
+        result=research['conclusions'][0]
+        assert result['disposition']=='confirmed_in_scope' and result['concern']=='implementation_semantics'
+        assert 'distributed consequences' in result['scope']['excluded']
+
+
+def test_conditional_input_continues_to_actual_producer_in_the_same_history(tmp_path):
+    def initial(state):
+        sub,files=first(state)
+        sub['sources'].append(dict(id='producer-source',file='target.py',start_line=3,end_line=4,kind='code_observation'))
+        sub['question']['source_ids'].append('producer-source')
+        sub['question']['supporting_behavior_ids']={'produce':'The actual input producer supplies the call whose return is checked'}
+        sub['question']['activity_classes'].append('A7')
+        spec=json.loads(files['map.json'])
+        spec['activities'].append(dict(class_id='A7',applicability='applicable',purpose='Admit a public input',
+            realization_summary='The actual producer bounds a requested value',source_ids=['producer-source']))
+        spec['behaviors'].append(dict(id='produce',primary_activity='A7',execution_owner='caller',
+            protocol_context='one request',trigger='produce input',produces_fact_ids=['input'],source_ids=['producer-source']))
+        spec['behaviors'][0]['consumes_fact_ids']=['input']
+        spec['facts'].append(dict(id='input',meaning='The producer returned the bounded input',identity={'operation':'one'},
+            validity_context='one invocation',representation=['return'],durability='volatile',recovery='none',source_ids=['producer-source']))
+        files['map.json']=json.dumps(spec)
+        sub['bindings'].append(dict(id='producer-binding',material_id='producer-source',symbol='produce',start_line=3,end_line=4,
+            associations=[dict(claim_id='bounded',source_ids=['producer-source'],rationale='Actual input of the selected call')],
+            description='The allowed input producer',pending=[]))
+        return sub,files
+    def check(actual=False):
+        def submit(state):
+            sub,files=check_step(revise=actual)(state)
+            plan=json.loads(files['plan.json'])
+            plan['binding_ids'].append('producer-binding')
+            plan['harness']['prerequisites'].append(dict(alias='producer',event='produced'))
+            plan['harness']['prerequisites'][0]['conditions'].append(dict(field='state.value',reference='producer.state.value'))
+            files['plan.json']=json.dumps(plan)
+            files['check.py']='''import json
+from target import step, produce
+def emit(event, **state):
+    print('CA_EVENT '+json.dumps(dict(event=event,operation='one',state=state)))
+'''+('value,limit=produce(9)\nemit("produced",value=value)\n' if actual else 'value,limit=3,3\n')+'''
+emit('admitted',legal=0<=value<=limit,value=value)
+returned=step(value,limit)
+emit('returned',in_range=0<=returned<=limit)
+'''
+            return sub,files
+        return submit
+    def review(state):
+        sub,files=review_step()(state)
+        sub['review_items'][0]['source_ids'].append('producer-source')
+        return sub,files
+    e,repo=engine_for(tmp_path,[initial,check(),check(True),review,stop])
+    with (repo/'target.py').open('a') as stream:stream.write('def produce(request):\n    return min(3, max(0, request)), 3\n')
+    state=e.start(repo)
+    assert not list((e.root/'native-submissions').glob('*/diagnostics.json')),state.native_current
+    assert len(state.direct_checks)==2 and len(state.question_candidates)==1
+    old,new=state.monitor_results
+    assert old['outcome']=='unknown' and new['outcome']=='holds'
+    assert new['properties'][0]['comparison_complete'] and not new['confirmed']
+    assert state.units[0].status=='checked' and state.audit_spec_version==1
+
+
+def test_rejected_local_family_yields_without_erasing_budget_or_issue(tmp_path):
+    invalid=lambda state:({'action':'invalid','rationale':'Unusable draft'}, {})
+    def renamed(state):
+        sub=products()[0];sub.update(action='continue',obligation=None,bindings=[])
+        return sub,{}
+    e,repo=engine_for(tmp_path,[first,invalid,invalid,renamed,next_question,stop])
+    e.config.budget.repair_attempts=2
+    state=e.start(repo)
+    assert len(state.question_candidates)==2,state.native_current
+    assert state.question_candidates[0].status=='paused' and state.question_candidates[0].stagnation==2
+    assert state.units[0].remaining_obligation_ids
+    assert state.usage['agent_calls']==6 and state.usage['audit_units']==1
+    errors=[json.loads(p.read_text()) for p in (e.root/'native-submissions').glob('*/diagnostics.json')]
+    assert len(errors)==3 and any('cannot reset' in str(d) for d in errors)
+
+
+@pytest.mark.parametrize('unavailable',['budget','backend'])
+def test_exhausted_execution_capacity_allows_source_research_but_no_placeholder_unit(tmp_path,unavailable):
+    def source_only(state):
+        sub,files=first(state);sub.update(action='continue',obligation=None,bindings=[])
+        sub['question'].update(disposition='needs_specific_evidence',unknowns=['No authorized execution remains'])
+        return sub,files
+    e,repo=engine_for(tmp_path,[first,source_only,stop])
+    if unavailable=='budget':e.config.budget.experiments=0
+    else:e.config.execution_backend='none';e.implementation=None
+    state=e.start(repo)
+    assert not state.units and not state.claims
+    assert len(state.question_candidates)==1 and not view(state)['capacity']['new_obligation']
+    assert state.usage['agent_calls']==3
+
+
+@pytest.mark.parametrize('scope',['candidate','family','focus'])
+def test_local_tool_gap_preserves_unit_and_continues(scope,tmp_path):
+    e,repo=engine_for(tmp_path,[first,local_stop('tool_gap',scope),next_question,stop])
+    state=e.start(repo)
+    assert len(state.question_candidates)==2 and state.question_candidates[0].status=='paused'
+    assert state.units[0].remaining_obligation_ids and state.usage['agent_calls']==4
+    assert state.run_stop['scope']=='run'
+
+
+def test_local_handoff_recovers_without_reexecuting_checked_work(tmp_path):
+    e,repo=engine_for(tmp_path,[first,check_step(),review_step(),local_stop(),next_question,stop])
+    original=e.checkpoint
+    interrupted=False
+    def checkpoint(event):
+        nonlocal interrupted
+        original(event)
+        if event=='native_execution_completed' and e.state.native_current.get('scope')=='candidate' and not interrupted:
+            interrupted=True
+            raise KeyboardInterrupt('Controlled interruption after durable local handoff')
+    e.checkpoint=checkpoint
+    with pytest.raises(KeyboardInterrupt):e.start(repo)
+    e.checkpoint=original
+    state=e.resume()
+    assert len(state.question_candidates)==2
+    assert state.usage['experiments']==1 and state.usage['agent_calls']==6
+    assert len([s for s in state.selections if s['action']=='stop' and s['scope']=='candidate'])==1

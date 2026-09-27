@@ -17,10 +17,10 @@ FRAMEWORK_REVISION = manifest()['version']
 
 class Engine:
     def __init__(self, config: Config, root: Path, implementation: ExecutionBackend | None,
-                 agent: AgentBackend, verifier: VerifierBackend, knowledge: str, inquiry: str = ""):
+                 agent: AgentBackend, verifier: VerifierBackend, knowledge: str):
         self.config, self.root = config, root.resolve()
         self.implementation, self.agent, self.verifier = implementation, agent, verifier
-        self.knowledge, self.inquiry = knowledge, inquiry
+        self.knowledge = knowledge
         self.store = Store(self.root)
         self.runner = ProcessRunner(self.root)
         self.state = None
@@ -42,12 +42,12 @@ class Engine:
     def start(self, repo, plan_only=False):
         if self.root.is_relative_to(repo.resolve()) or repo.resolve().is_relative_to(self.root):
             raise ValueError("Run and original target directories must be disjoint")
+        if any(path.name != '.run.lock' for path in self.root.iterdir()):
+            raise ValueError("A new run requires an empty directory; use explicit resume for the same run")
         started = time.monotonic()
         snapshot = capture(repo, self.root / "source", analysis_roots=self.config.target.analysis_roots, expected_module=self.config.target.expected_module)
         self.state = Analysis(framework_revision=FRAMEWORK_REVISION, mode="mock" if self.agent.mock else "real", config=self.config.model_dump(mode="json"), snapshot=snapshot)
         self.state.guidance = [{"source":"configured_reference","text":self.knowledge}]
-        if self.inquiry:
-            self.state.guidance.append({"source":"configured_inquiry","text":self.inquiry})
         self.state.analysis_mode = "regression" if self.agent.mock else ("directed" if self.config.directed_question else "autonomous")
         self.state.elapsed_seconds = time.monotonic() - started
         self.budget = BudgetTracker(self.config.budget, self.state)

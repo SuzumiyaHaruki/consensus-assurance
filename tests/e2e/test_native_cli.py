@@ -1,9 +1,11 @@
 """The public CLI uses the same file products as the real native transport."""
 import json
-from pathlib import Path
+import pytest
 from native_support import first, check_step
 from consensus_assurance.cli import main
 from consensus_assurance.core.config import Config, Budget
+from consensus_assurance.registry import assemble
+from consensus_assurance.workflow.engine import Engine
 
 
 def test_cli_native_fixture_execution_and_report(tmp_path,capsys):
@@ -26,6 +28,16 @@ def test_cli_native_fixture_execution_and_report(tmp_path,capsys):
     report=(root/'report.md').read_text()
     assert 'mock' in report and state['units'][0]['id'] in report
     assert main(['report','--run',str(root)])==0
+    saved=(root/'state.json').read_bytes()
+    with pytest.raises(ValueError,match='empty directory'):
+        Engine(config,root,*assemble(config)).start(repo)
+    assert main(['plan','--config',str(path),'--repo',str(repo)])==0
+    fresh=next((tmp_path/'runs').glob('*-mock-plan'))
+    initial=json.loads((fresh/'state.json').read_text())
+    assert initial['id']!=state['id'] and initial['native_session_id'] is None
+    assert all(not initial[key] for key in ('question_candidates','units','materials','evidence','native_turns','usage'))
+    assert (root/'state.json').read_bytes()==saved
+    assert not (fresh/'native-draft').exists()
     old=tmp_path/'historical';old.mkdir()
     (old/'state.json').write_text('{"framework_revision":"old-stage"}')
     (old/'report.md').write_text('历史结果：执行失败，未确认。')
@@ -33,3 +45,8 @@ def test_cli_native_fixture_execution_and_report(tmp_path,capsys):
     assert '历史结果：执行失败' in capsys.readouterr().out
     assert main(['resume','--run',str(old)])==2
     assert json.loads((old/'state.json').read_text())=={'framework_revision':'old-stage'}
+
+
+def test_missing_target_cli_has_no_download(tmp_path, capsys):
+    assert main(["run", "--repo", str(tmp_path / "absent"), "--runs-dir", str(tmp_path / "runs")]) == 2
+    assert "does not exist" in capsys.readouterr().err

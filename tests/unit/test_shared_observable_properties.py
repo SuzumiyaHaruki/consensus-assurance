@@ -36,7 +36,7 @@ def test_v16_checker_correction_uses_one_way_success_requirement():
         assertion=Comparison(field='success',reference='input.expected_success'),
         identity_fields=['operation_id'],description='Successful verification requires eligible voter support')
     monitor=EventMonitor(id='eligibility',checker_id=prop.checker_id,event='verification_result',
-        binding_ids=['b'],grounding=Grounding(),
+        binding_ids=['b'],grounding=Grounding(),admission_alias='input',
         applicability_conditions=[Comparison(field='completed',value=True)])
     requirement=[EventRequirement(alias='input',event='contribution_completed')]
     def observed(success,eligible,completed=True):

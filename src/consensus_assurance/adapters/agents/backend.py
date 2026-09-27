@@ -12,9 +12,23 @@ def classify_failure(text: str) -> ExecutionStatus:
     low = text.lower()
     if any(s in low for s in ["insufficient_quota", "quota exceeded", "usage limit", "rate limit", "quota exhausted", "credits exhausted"]):
         return ExecutionStatus.QUOTA_EXHAUSTED
-    if any(s in low for s in ["login required", "not logged in", "please log in", "authentication required", "unauthorized", "401", "run codex login"]):
+    if (any(s in low for s in ["login required", "not logged in", "please log in", "authentication required", "unauthorized", "run codex login"])
+            or re.search(r"\b(?:http(?:/\d(?:\.\d)?)?|status(?: code)?)\s*[:=]?\s*401\b", low)):
         return ExecutionStatus.LOGIN_REQUIRED
     return ExecutionStatus.ERROR
+
+
+def native_failure_text(check, events):
+    """Use transport errors, never source or command output from native tool items."""
+    errors = [e.get("error") for e in events if e.get("type") == "turn.failed"]
+    errors = errors or [e.get("message") for e in events if e.get("type") == "error"]
+    messages = [" ".join(str(error[k]) for k in ("code", "message") if error.get(k))
+        if isinstance(error, dict) else str(error) for error in errors if error]
+    if any(messages):
+        return "\n".join(messages)
+    if not events:
+        return output(check)
+    return Path(check.stderr).read_text(errors="replace") if check.stderr and Path(check.stderr).is_file() else ""
 
 
 def failure_reason(text: str) -> str:
@@ -27,7 +41,7 @@ def failure_reason(text: str) -> str:
         error = payload.get("error") if isinstance(payload, dict) else None
         if isinstance(error, dict) and error.get("code") == "invalid_json_schema":
             return "Agent output schema rejected (invalid_json_schema): " + redact(str(error.get("message", "")))[:1000]
-    return "Agent execution blocked; inspect raw logs"
+    return "Agent execution failed: " + redact(text.strip())[:1000] if text.strip() else "Agent execution blocked; inspect raw logs"
 
 
 class CodexAgent:
@@ -56,7 +70,9 @@ class CodexAgent:
         if not executable:
             raise FileNotFoundError("Codex executable is unavailable")
         codex_home = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")).resolve()
-        filesystem={":root":"deny",":minimal":"read",":tmpdir":"deny",":slash_tmp":"deny",
+        # Deny the host temp path, not the draft TMPDIR set for sandboxed tools below.
+        filesystem={":root":"deny",":minimal":"read",":slash_tmp":"deny",
+            str(Path(os.environ.get("TMPDIR") or "/tmp").resolve()):"deny",
             str(root/"native-source"):"read",str(directory):"write",
             str(root/"direct-checks"):"read",str(root/"native-submissions"):"read",
             str(root/"state.json"):"read",str(root/"research.json"):"read",
@@ -75,7 +91,8 @@ class CodexAgent:
             "-c","permissions.ca_native.network.enabled=false",
             "-c",'shell_environment_policy.inherit="core"',
             "-c","shell_environment_policy.set={"+",".join(json.dumps(k)+"="+json.dumps(v) for k,v in environment.items())+"}",
-            "-c","project_doc_max_bytes=0", "-c","tools.web_search=false"]
+            "-c","project_doc_max_bytes=0", "-c","tools.web_search=false",
+            "-c","memories.use_memories=false", "-c","memories.generate_memories=false"]
 
     def sandbox_command(self, root):
         """Hide non-path nsfs mount roots from affected Codex Linux sandbox builds."""
@@ -109,7 +126,7 @@ class CodexAgent:
             protected.append(path)
         script = directory / ".permission-probe.py"
         script.write_text(
-            "import errno, pathlib, socket\n"
+            "import errno, os, pathlib, socket, tempfile\n"
             "def denied(label, fn):\n"
             "    try: fn()\n"
             "    except OSError as exc:\n"
@@ -123,6 +140,9 @@ class CodexAgent:
             + "denied('private', lambda: pathlib.Path(" + repr(str(private)) + ").read_bytes())\n"
             "denied('network', lambda: socket.socket(socket.AF_INET, socket.SOCK_STREAM).connect(('127.0.0.1', 9)))\n"
             + "pathlib.Path(" + repr(str(directory / '.write-control')) + ").write_text('allowed')\n"
+            "with tempfile.TemporaryFile(dir=os.environ['TMPDIR']) as stream:\n"
+            "    stream.write(b'temp control'); stream.seek(0)\n"
+            "    assert stream.read() == b'temp control'\n"
             "print('PERMISSIONS_VERIFIED')\n")
         try:
             check = runner.run([*self.sandbox_command(runner.root), "sandbox", "-P", "ca_native", *options,
@@ -164,24 +184,14 @@ class CodexAgent:
         response.parent.mkdir(parents=True, exist_ok=True)
         command = [*self.sandbox_command(runner.root), "exec"]
         if session_id:
-            command += ["resume", "--skip-git-repo-check", "--ignore-user-config", "--json",
-                "--output-schema", str(schema), "--output-last-message", str(response)]
-            command += options
-            if self.reasoning_effort is not None:
-                command += ["-c", "model_reasoning_effort=" + json.dumps(self.reasoning_effort)]
-            if self.model:
-                command += ["-m", self.model]
-            command += [session_id, "-"]
-        else:
-            command += ["--skip-git-repo-check",
-                "--ignore-user-config", "--json", "--output-schema", str(schema),
-                "--output-last-message", str(response)]
-            command += options
-            if self.reasoning_effort is not None:
-                command += ["-c", "model_reasoning_effort=" + json.dumps(self.reasoning_effort)]
-            if self.model:
-                command += ["-m", self.model]
-            command += ["-"]
+            command.append("resume")
+        command += ["--skip-git-repo-check", "--ignore-user-config", "--json",
+            "--output-schema", str(schema), "--output-last-message", str(response), *options]
+        if self.reasoning_effort is not None:
+            command += ["-c", "model_reasoning_effort=" + json.dumps(self.reasoning_effort)]
+        if self.model:
+            command += ["-m", self.model]
+        command += [session_id, "-"] if session_id else ["-"]
         check = runner.run(command, directory, "native_agent", snapshot_id, timeout, stdin=prompt)
         return self.decode(check, response, session_id)
 
@@ -199,16 +209,19 @@ class CodexAgent:
                     events.append(event)
         started = [e.get("thread_id") for e in events if e.get("type") == "thread.started"]
         actual_id = started[-1] if started else None
+        completed = [e for e in events if e.get("type") == "turn.completed"]
         if session_id and actual_id and actual_id != session_id:
             check.status = ExecutionStatus.ERROR
             check.reason = "Native session identity changed unexpectedly"
-        if check.status == ExecutionStatus.COMPLETED and check.exit_code != 0:
-            check.status = classify_failure(output(check))
-            check.reason = failure_reason(output(check))
-            if session_id and any(marker in output(check).lower() for marker in
+        if check.status == ExecutionStatus.COMPLETED and (check.exit_code != 0
+                or any(e.get("type") == "turn.failed" for e in events)
+                or (not completed and any(e.get("type") == "error" for e in events))):
+            diagnostic = native_failure_text(check, events)
+            check.status = classify_failure(diagnostic)
+            check.reason = failure_reason(diagnostic)
+            if session_id and any(marker in diagnostic.lower() for marker in
                     ("session not found","thread not found","no session found")):
                 check.parameters["native_session_unavailable"]=True
-        completed = [e for e in events if e.get("type") == "turn.completed"]
         if completed and not (actual_id or session_id):
             check.status = ExecutionStatus.ERROR
             check.reason = "Native turn completed without a recoverable session identity"

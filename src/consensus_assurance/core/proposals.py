@@ -1,11 +1,12 @@
 from typing import Literal
 from pydantic import Field
-from .types import AssociatedCode, Record, Scope, ConstraintSource, Grounding, CheckerSpec, ReadRequest, SemanticCheck, AuditQuestion, ReachabilityRequirement
+from .types import AssociatedCode, Record, Scope, ConstraintSource, Grounding, CheckerSpec, ReadRequest, SemanticCheck, AuditQuestion, ReachabilityRequirement, Concern
 
 
 class ClaimDraft(Record):
     id: str
     kind: Literal["obligation", "assumption"]
+    concern: Concern = "implementation_semantics"
     description: str
     source_ids: list[str] = Field(min_length=1, description="Located materials; file kinds do not establish normative authority")
     scope: Scope
@@ -101,6 +102,8 @@ class EventMonitor(Record):
     binding_ids: list[str]
     grounding: Grounding
     applicability_conditions: list[Comparison] = []
+    admission_alias: str | None = Field(default=None,
+        description="Prerequisite alias identifying admitted operations whose completion must be observed; may depend on earlier prerequisites, never on the result or array order")
 
 
 class Harness(Record):
@@ -208,7 +211,7 @@ class EncodingRevision(Record):
 
 class JudgmentChange(Record):
     target_id: str
-    field: Literal["description", "scope", "grounding", "source", "target", "kind", "group", "rationale", "pending", "source_ids", "claim_id", "material_id", "symbol", "start_line", "end_line",  "obligation_ids", "binding_ids", "relation_ids", "audit_question", "associations", "anchor"]
+    field: Literal["description", "concern", "scope", "grounding", "source", "target", "kind", "group", "rationale", "pending", "source_ids", "claim_id", "material_id", "symbol", "start_line", "end_line",  "obligation_ids", "binding_ids", "relation_ids", "audit_question", "associations", "anchor"]
     old_value_json: str
     new_value_json: str
 
@@ -240,9 +243,9 @@ class Feedback(Record):
 class IssueResolution(Record):
     condition_dispositions: list[ConditionDisposition] = []
     issue_id: str
-    target_version: int
-    original_question: str = Field(description="The exact stored issue explanation; preserve stable problem identity")
     source_ids: list[str] = Field(min_length=1)
+    evidence_ids: list[str] = Field(default_factory=list,
+        description="Accepted execution, artifact, evidence or review IDs answering this issue; Material IDs belong in source_ids")
     rationale: str = Field(description="Why actual evidence answers this specific issue; describing current behavior alone is insufficient")
     residual_issue_ids: list[str] = Field(description="Other independent open issues that remain; never the resolved issue or its unresolved children")
     scope_limitations: list[str] = Field(description="Independent boundaries retained by the related review item")

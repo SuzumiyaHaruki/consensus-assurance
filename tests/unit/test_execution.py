@@ -14,7 +14,8 @@ from consensus_assurance.adapters.storage.files import redact
 from consensus_assurance.adapters.storage.snapshot import capture
 
 
-@pytest.mark.parametrize("text,status", [("401 Unauthorized", ExecutionStatus.LOGIN_REQUIRED), ("quota exceeded", ExecutionStatus.QUOTA_EXHAUSTED), ("unexpected format", ExecutionStatus.ERROR)])
+@pytest.mark.parametrize("text,status", [("401 Unauthorized", ExecutionStatus.LOGIN_REQUIRED), ("quota exceeded", ExecutionStatus.QUOTA_EXHAUSTED), ("unexpected format", ExecutionStatus.ERROR),
+    ("HTTP 401", ExecutionStatus.LOGIN_REQUIRED), ("401 case request:", ExecutionStatus.ERROR)])
 def test_agent_failure_classification(text, status):
     assert classify_failure(text) == status
 

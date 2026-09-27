@@ -28,7 +28,7 @@ def test_actual_tlc_shared_implication_truth_table_matches_monitor(tmp_path,tlc,
             trigger=dict(field='event',value='returned'),antecedent=dict(field='state.success',value=True),
             assertion=dict(field='state.qualified',value=True),identity_fields=['operation'],description='Success requires qualified support; failure remains permitted')]
         basis=products()[1]['harness']['legality']
-        raw['monitors']=[dict(id='implication',checker_id='Bounded',event='returned',binding_ids=['binding'],grounding=basis)]
+        raw['monitors']=[dict(id='implication',checker_id='Bounded',event='returned',admission_alias='start',binding_ids=['binding'],grounding=basis)]
         raw['observation']['fields']=[dict(model_field='event',raw_field='event',source='event'),
             dict(model_field='success',raw_field='success'),dict(model_field='qualified',raw_field='qualified')]
         raw['observation']['required_events']=['returned']
