@@ -74,13 +74,24 @@ def render_native_report(state, root):
         f'源码 `{state.snapshot.repo}`；提交 `{state.snapshot.commit}`；快照 `{state.snapshot.id}`。',
         f'地图 {link(state.audit_spec_path)}；版本 {state.audit_spec_version}；本次子方向 {research["activity_focus"]}。',
         '保留 Activity → Behavior → Fact → Candidate → Obligation → 执行／复核 → 理解回流。A1/A2 主导选题，五类支撑按依赖展开；局部 checked 不代表整体正确。',
-        '', '## 调查与局部检查', '']
+        '', '## 双主线理解', '',
+        f'初始理解状态：{research["understanding_status"]}；当前研究目标：{research["next_objective"]}。']
+    overview=research['core_overview']
+    if overview:
+        for key,label in [('formation','共识形成与推进'),('context','上下文／权威转换'),('connection','两条主线的连接')]:
+            part=overview[key]
+            lines.append(f'- {label}：{part["explanation"]}；Behavior {part["behavior_ids"]}；Fact {part["fact_ids"]}；来源 {part["source_ids"]}。')
+        lines.append(f'判断依据：{overview["rationale"]}；核心断点：{overview["core_gaps"]}；待展开细节：{overview["open_details"]}。')
+    if research['understanding_status']!='usable' and research['next_objective']['boundary']!='user_directed':
+        lines.append('双主线初始理解尚未完成；已保存片段不等于可以开始默认集中调查。')
+    lines += ['', '## 调查与局部检查', '']
     if research['understanding_status']=='unregistered':lines.append('理解尚未登记；未受理草稿不是证据。')
     for candidate in research['candidates']:
         q = candidate['question']
         lines.append(f'- 候选 `{candidate["id"]}`：{candidate["status"]}；{q["question"]}；意义 {q["importance"]}。')
         lines.append(f'  核心与支撑 {q["activity_classes"]}；直接 Behavior {q["behavior_ids"]}；因果支撑 {q["supporting_behavior_ids"]}；Fact {q["fact_ids"]}/{q["obligation_relation_kind"]}；依据 v{q["audit_spec_version"]}。')
         lines.append(f'  来源 {q["source_ids"]}；路径 {q["event_paths"]}；反证 {q["counterevidence"]}；未知 {q["unknowns"]}；父候选 {candidate["parent_candidate_id"]}；恢复条件 {candidate["resume_conditions"]}。')
+        lines.append(f'  实际执行进度：{candidate["executions"]}。历史假设不替代执行记录。')
     for claim in research['claims']:
         lines.append(f'- 要求 `{claim["id"]}`：{claim["description"]}；适用依据 {claim["grounding"]}；未决 {claim["pending"]}。')
     for unit in research['units']:
@@ -100,6 +111,7 @@ def render_native_report(state, root):
     for handoff in research['handoffs']:
         lines.append(f'- 交接 `{handoff["operation_id"]}`：{handoff["action"]}/{handoff.get("scope","candidate")}；{handoff["rationale"]}；反馈 {handoff.get("feedback",{})}；下一步／恢复 {handoff.get("resume_conditions",[])}。')
     lines += ['', '## 修订与未决', '', f'当前待办：{research["pending_work"]}。',
+        f'未受理草稿及局部状态：{research["drafts"]}。',
         f'研究前沿：{research["frontier"]}。地图条目和已检查 Unit 数不是责任覆盖率。',
         f'最近决定与结果反馈：{research["latest_decision"]}。', '停止原因：'+state.stop_reason,
         f'停止范围与依据：{research["stop"]}。']

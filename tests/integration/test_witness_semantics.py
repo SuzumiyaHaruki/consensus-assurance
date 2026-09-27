@@ -1,25 +1,12 @@
-"""Offline v23 interpretation and generic witness/coverage semantics; no target execution."""
+"""Generic witness and observation coverage semantics; no historical target replay."""
 import copy
-from pathlib import Path
 import pytest
 from consensus_assurance.core.proposals import Comparison, EventRequirement, EventMonitor, ObservableProperty
-from consensus_assurance.core.types import CheckRun, Grounding
+from consensus_assurance.core.types import Grounding
 from consensus_assurance.adapters.runners.experiment import extract_events
-from consensus_assurance.workflow.direct_checks import load_plan, assess, save_plan, execute
+from consensus_assurance.workflow.direct_checks import assess, save_plan, execute
 from consensus_assurance.workflow.observations import monitor_events
 from test_direct_checks import setup, review
-
-
-def test_original_v23_seven_events_have_an_independent_outside_control(tmp_path):
-    fixture=Path(__file__).parents[1]/'fixtures/v23-verification'
-    plan=load_plan(fixture/'plan.json')
-    # Explicit offline interpretation of the public invocation; archive bytes stay unchanged.
-    plan.monitors[0].admission_alias='admission'
-    events=extract_events(CheckRun(action='offline',cwd=str(tmp_path),snapshot_id='v23',stdout=str(fixture/'stdout.log')))
-    assert len(events)==7
-    result=monitor_events(events,plan.monitors[0],plan.observable_properties[0],plan.harness.prerequisites)
-    assert result['witness_indices']==result['valid_witness_indices']==[3]
-    assert result['outside_applicability_indices']==[6] and result['missing_indices']==[]
 
 
 def inputs():
@@ -103,3 +90,15 @@ def test_admission_and_independent_prerequisite_permutation():
     assert monitor_events(reversed_events,monitor,prop,requirements)['outcome']=='unknown'
     result=monitor_events(events[:3]+[events[0]],monitor,prop,requirements)
     assert result['outcome']=='unknown' and result['missing_indices']==[3]
+
+
+@pytest.mark.parametrize('qualified',[False,True])
+def test_result_applicability_does_not_filter_admission(qualified):
+    prop,monitor,requirements,events=inputs()
+    events[0]['enabled']=False
+    events[1]['qualified']=qualified
+    events.append(dict(events[0],operation='unfinished'))
+    result=monitor_events(events,monitor,prop,requirements)
+    assert result['missing_indices']==[2] and not result['comparison_complete']
+    assert result['outcome']==('unknown' if qualified else 'violated')
+    assert result['witness_complete']==(not qualified)

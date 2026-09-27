@@ -114,9 +114,20 @@ def view(state, compact=False):
     artifacts = [a for a in state.direct_checks+state.models if a.id not in superseded and
         (a.unit_id in {u.id for u in current} or getattr(a,'research_ref',None))]
     records = [r for r in state.monitor_results if (r.get('direct_check_id') or r.get('model_id')) in {a.id for a in artifacts}]
+    overview=spec.core_overview if spec else None
+    ready=bool(overview and overview.status=='usable')
+    directed=bool((state.config.get('directed_question') or '').strip())
+    drafts={s['draft_id']:s for s in state.selections if s.get('draft_id')}
     result = {'audit_spec_path':state.audit_spec_path, 'audit_spec_version':state.audit_spec_version,
         'activity_roles':ACTIVITY_ROLES, 'activity_focus':state.config.get('activity_focus',[]),
-        'understanding_status':'accepted_partial_map' if spec else 'unregistered',
+        'understanding_status':overview.status if overview else 'incomplete' if spec else 'unregistered',
+        'core_overview':overview.model_dump(mode='json') if overview else None,
+        'next_objective':{'action':'investigate_and_refocus' if ready or directed else 'recover_core_understanding',
+            'boundary':'user_directed' if directed else 'both_core_paths',
+            'reason':'Use results to update understanding and compare the remaining frontier' if ready or directed else
+                'Save partial maps and leads; explain formation, context transitions and their connection before focused investigation',
+            'core_gaps':overview.core_gaps if overview else ['Initial two-line explanation is not yet recorded']},
+        'drafts':[s for s in drafts.values() if s['draft_status']!='accepted'],
         'candidates':[c.model_dump(mode='json',exclude={'history','check_ids'}) for c in state.question_candidates],
         'units':[u.model_dump(mode='json',exclude={'audit_question'}) for u in current],
         'claims':[c.model_dump(mode='json') for c in state.claims if any(c.id in u.obligation_ids for u in current)],
@@ -126,6 +137,12 @@ def view(state, compact=False):
         'pending_work':pending_work(state), 'current':{k:v for k,v in state.native_current.items() if k!='harness'},
         'latest_decision':state.selections[-1] if state.selections else None,
         'stop':state.run_stop, 'stop_reason':state.stop_reason}
+    for candidate in result['candidates']:
+        units={u.id for u in state.units if u.candidate_id==candidate['id']}
+        owned={a.id for a in state.models+state.direct_checks if a.unit_id in units}
+        candidate['executions']=[{'check_id':c.id,'artifact_id':c.direct_check_id or c.model_id,
+            'action':c.action,'status':c.status.value,'outcome':c.outcome}
+            for c in state.checks if c.direct_check_id in owned or c.model_id in owned]
     if compact:
         for candidate in result['candidates']:
             if candidate['status']!='active' and not any(u.id==state.active_unit_id and u.candidate_id==candidate['id'] for u in current):
@@ -142,20 +159,6 @@ def global_stop(raw):
         raw.get('reason') in {'resource_limit','tool_gap'} and raw.get('scope') not in {'candidate','family','focus'})
 
 
-def family(state, candidate_ids):
-    """Retain family identity through explicit forks and equivalent semantic anchors."""
-    selected=set(candidate_ids)
-    while True:
-        roots=[c for c in state.question_candidates if c.id in selected]
-        anchors={(tuple(sorted(c.question.fact_ids)),c.question.obligation_relation_kind,
-            tuple(sorted(c.question.contexts))) for c in roots}
-        linked={c.id for c in state.question_candidates if c.parent_candidate_id in selected or
-            any(r.parent_candidate_id==c.id for r in roots) or
-            (tuple(sorted(c.question.fact_ids)),c.question.obligation_relation_kind,tuple(sorted(c.question.contexts))) in anchors}
-        if linked<=selected:return selected
-        selected.update(linked)
-
-
 def release(state, ids, reason, resume_conditions, closed=False):
     for c in state.question_candidates:
         if c.id in ids:
@@ -166,21 +169,32 @@ def release(state, ids, reason, resume_conditions, closed=False):
         state.active_unit_id=state.active_direct_check_id=state.active_model_id=None
 
 
-def reject_local(state, operation_id, errors):
-    current=next((u.candidate_id for u in state.units if u.id==state.active_unit_id),None)
-    selected={current} if current else {c.id for c in state.question_candidates if c.status=='active'}
-    ids=family(state,selected)
-    record={'operation_id':operation_id,'action':'rejected','rationale':'; '.join(errors),
-        'candidate_ids':sorted(ids)}
-    if not any(s['operation_id']==operation_id for s in state.selections):
-        state.selections.append(record)
-        for c in state.question_candidates:
-            if c.id in ids:c.stagnation+=1
-    if ids and max(c.stagnation for c in state.question_candidates if c.id in ids)>=max(1,state.config.get('budget',{}).get('repair_attempts',4)):
-        release(state,ids,'Local submission repair limit reached; compare other sourced directions',
-            ['Supply a substantive answer or changed execution evidence before resuming this family'])
-        return True
-    return False
+def reject_local(state, operation_id, errors, raw):
+    """Track one draft through existing operations, including before acceptance."""
+    if any(s['operation_id']==operation_id for s in state.selections):
+        return next(s.get('draft_status')=='paused' for s in state.selections if s['operation_id']==operation_id)
+    target=raw.get('candidate') if isinstance(raw.get('candidate'),dict) else raw
+    repair_of=raw.get('repair_of') or target.get('repair_of')
+    previous=next((s for s in state.selections if s['operation_id']==repair_of and s['action']=='rejected'),None)
+    if previous is None and not raw and state.selections:
+        last=state.selections[-1]
+        if last['action']=='rejected' and last.get('submitted_path')==errors.get('submitted_path'):previous=last
+    ids={c.id for c in state.question_candidates if c.id==target.get('candidate_id')}
+    ids.update(u.candidate_id for u in state.units if raw.get('unit_id') in {u.id,u.candidate_id})
+    diagnostics=sorted(errors['errors'])
+    repeats=previous.get('repeats',1)+1 if previous and previous.get('diagnostics')==diagnostics else 1
+    paused=repeats>=max(1,state.config.get('budget',{}).get('repair_attempts',4))
+    state.selections.append({'operation_id':operation_id,'action':'rejected','rationale':'; '.join(diagnostics),
+        'candidate_ids':sorted(ids),'draft_id':previous['draft_id'] if previous else operation_id,
+        'repair_of':previous['operation_id'] if previous else None,'diagnostics':diagnostics,'repeats':repeats,
+        'draft_status':'paused' if paused else 'active','raw_path':errors['raw_path'],
+        'submitted_path':errors.get('submitted_path')})
+    for c in state.question_candidates:
+        if c.id in ids:c.stagnation=repeats
+    if paused:
+        release(state,ids,'Repeated identical draft diagnostics; compare other sourced directions',
+            ['Repair the archived draft diagnostics with new information before resuming'])
+    return paused
 
 
 def stop_record(engine, raw, operation_id, controller=False):
@@ -216,8 +230,15 @@ def record_decision(engine, submission, operation_id, map_changed=False):
     feedback = submission.feedback
     if feedback:
         if not set(feedback.ref_ids)<=known:raise ValueError('Research feedback references unknown objects: '+', '.join(set(feedback.ref_ids)-known))
+        candidates={c.id:c for c in state.question_candidates}
+        if not set(feedback.question_updates)<=candidates.keys():raise ValueError('Feedback question_updates must name saved Candidates')
+        if feedback.question_updates and not source_refs(state,feedback.ref_ids):raise ValueError('Question updates need sourced answers through retained references')
     record = {'operation_id':operation_id,'action':submission.action,'rationale':submission.rationale,
         'feedback':feedback.model_dump(mode='json') if feedback else {}, 'map_updated':map_changed}
+    if submission.repair_of:
+        prior=next((s for s in state.selections if s['operation_id']==submission.repair_of and s['action']=='rejected'),None)
+        if prior is None:raise ValueError('repair_of must name a retained rejected operation')
+        record.update(repair_of=submission.repair_of,draft_id=prior['draft_id'],draft_status='accepted')
     if isinstance(submission,StopSubmission):
         if not set(submission.ref_ids)<=known or not source_refs(state,submission.ref_ids):
             raise ValueError('Normal stop needs known research references with acquired source ownership')
@@ -225,7 +246,6 @@ def record_decision(engine, submission, operation_id, map_changed=False):
         if submission.scope in {'candidate','family'} and not any(c.id in submission.ref_ids for c in state.question_candidates):
             raise ValueError('Local stop must identify its Candidate or family')
         ids={c.id for c in state.question_candidates if c.id in submission.ref_ids}
-        if submission.scope=='family':ids=family(state,ids)
         if submission.scope=='focus':
             focus=state.config.get('activity_focus',[]) or ['A1','A2']
             ids={c.id for c in state.question_candidates if set(c.question.activity_classes)&set(focus)}
@@ -235,7 +255,7 @@ def record_decision(engine, submission, operation_id, map_changed=False):
         if submission.reason=='bounded_completed':
             if submission.scope=='focus' or any(w['id'] in related or submission.scope=='run' for w in pending_work(state)):
                 raise ValueError('Selected scope still has unfinished work; local checks do not establish focus exhaustion')
-            if submission.scope=='run' and (not spec or any(c.status=='paused' for c in state.question_candidates)
+            if submission.scope=='run' and (not spec or not (state.config.get('directed_question') or '').strip() and (not spec.core_overview or spec.core_overview.status!='usable') or any(c.status=='paused' for c in state.question_candidates)
                     or any(s.disposition in {'deferred','UNCLASSIFIED_PROTOCOL_RESPONSIBILITY'} for s in spec.surfaces)):
                 raise ValueError('Run has paused or unexpanded understanding')
         if submission.scope in {'run','focus'} and not submission.frontier_comparison.strip():

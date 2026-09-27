@@ -19,6 +19,11 @@ class UnderstandingChange(Record):
     source_ids: list[str] = Field(min_length=1)
 
 
+class QuestionUpdate(Record):
+    unknowns: list[str]
+    resume_conditions: list[str]
+
+
 class ResearchFeedback(Record):
     ref_ids: list[str] = Field(min_length=1)
     answered: str = Field(min_length=1)
@@ -26,12 +31,14 @@ class ResearchFeedback(Record):
     understanding: Literal["updated", "unchanged", "deferred"] | None = Field(default=None,
         description="Research understanding across turns, not a declaration that this submission changes the map")
     rationale: str = Field(min_length=1)
+    question_updates: dict[str, QuestionUpdate] = {}
 
 
 class Submission(Record):
     rationale: str = Field(min_length=1)
     sources: list[SourceRange] = []
     feedback: ResearchFeedback | None = None
+    repair_of: str | None = Field(default=None, description="Rejected operation ID whose complete draft this submission repairs")
 
 
 class MappedSubmission(Submission):

@@ -128,6 +128,7 @@ def engine_for(tmp_path, steps):
     (repo/'target.py').write_text('def step(value, limit):\n    return value + 1 if value < limit else 0\n')
     (repo/'README.md').write_text('For 0 <= value <= limit and positive limit, the returned value stays in [0, limit].\n')
     cfg=Config(agent_backend='mock',execution_backend='python',execution_isolation='workspace',
+        directed_question='Check the bounded local return contract of the synthetic target',
         budget=Budget(agent_calls=len(steps),experiments=4,revisions=4,semantic_reviews=4,total_seconds=90))
     e=Engine(cfg,tmp_path/'run',PythonBackend(),ScriptedAgent(steps),None,'')
     return e,repo

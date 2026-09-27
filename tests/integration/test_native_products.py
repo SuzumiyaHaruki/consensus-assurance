@@ -36,7 +36,7 @@ def test_raw_parse_failure_is_retained_and_whole_draft_can_continue(tmp_path):
 
 
 @pytest.mark.parametrize('interrupt',[False,True])
-def test_rejected_receipt_recovery_preserves_the_finite_repair_limit(tmp_path,interrupt):
+def test_rejected_receipt_recovery_pauses_only_the_draft(tmp_path,interrupt):
     malformed=lambda state:('{"action":',{})
     e,repo=engine_for(tmp_path,[malformed,malformed,first])
     e.config.budget.repair_attempts=2
@@ -51,8 +51,11 @@ def test_rejected_receipt_recovery_preserves_the_finite_repair_limit(tmp_path,in
     else:e.start(repo)
     e.checkpoint=original
     state=e.resume()
-    assert state.usage['agent_calls']==2 and not state.units
-    assert state.native_current['failures']==2 and 'bounded whole-draft' in state.stop_reason
+    assert state.usage['agent_calls']==3 and len(state.units)==1
+    rejected=[s for s in state.selections if s['action']=='rejected']
+    assert len(rejected)==2 and rejected[-1]['draft_status']=='paused'
+    assert rejected[0]['draft_id']==rejected[1]['draft_id']
+    assert rejected[-1]['repeats']==2 and state.run_stop['reason']=='resource_limit'
 
 
 def test_draft_symlinks_and_fixed_helper_bytes(tmp_path):

@@ -75,6 +75,31 @@ def validate(state, spec, changes=None):
             if (b.id in f.established_by)!=(f.id in b.produces_fact_ids) or (b.id in f.consumed_by)!=(f.id in b.consumes_fact_ids):issue(f,'Derived fact index contradicts the authoritative behavior edges',[b.id])
     for s in spec.surfaces:
         if not s.reason.strip() or not s.source_ids or not set(s.behavior_ids)<=behaviors.keys() or s.disposition=='mapped' and not s.behavior_ids:issue(s,'Surface requires a sourced disposition and existing mapped behavior',s.behavior_ids)
+    overview=spec.core_overview
+    if overview:
+        def overview_issue(path,message):
+            issues.append(Diagnostic(code='core_overview',category='semantic',paths=['/core_overview/'+path],
+                message=message,allowed=['read','semantic_revision']))
+        if not overview.rationale.strip():overview_issue('rationale','Explain why the initial backbone is usable, incomplete or blocked')
+        if overview.status!='usable' and not overview.core_gaps:
+            overview_issue('core_gaps','Name the missing backbone or unavailable source/boundary')
+        if overview.status=='usable' and overview.core_gaps:
+            overview_issue('status','A declared core break cannot be a usable initial overview; details may remain open')
+        for name in ('formation','context','connection'):
+            path=getattr(overview,name)
+            for field,known_refs in [('behavior_ids',behaviors),('fact_ids',facts),('source_ids',known)]:
+                missing=set(getattr(path,field))-set(known_refs)
+                if missing:overview_issue(name+'/'+field,'Unknown overview references: '+', '.join(sorted(missing)))
+            if overview.status!='usable':continue
+            if not path.explanation.strip() or not path.behavior_ids or not path.fact_ids or not path.source_ids:
+                overview_issue(name,'A usable path needs explanation and Behavior, Fact and source references')
+            selected=[behaviors[b] for b in path.behavior_ids if b in behaviors]
+            roles={b.primary_activity for b in selected}|{k for b in selected for k,v in b.cross_activity_effects.items() if v.strip()}
+            required={'formation':{'A1'},'context':{'A2'},'connection':{'A1','A2'}}[name]
+            if not required<=roles:overview_issue(name+'/behavior_ids','Explain the actual core responsibilities: '+', '.join(sorted(required-roles)))
+            objects=selected+[facts[f] for f in path.fact_ids if f in facts]
+            if any(not set(path.source_ids)&set(o.source_ids) for o in objects):
+                overview_issue(name+'/source_ids','Cite the referenced Behavior and Fact sources; labels alone do not explain a path')
     if issues:raise SpecIssue(issues)
     if changes is not None:
         before,after=audit_object_index(old),audit_object_index(spec)
@@ -100,6 +125,11 @@ def validate(state, spec, changes=None):
     return spec
 
 
+def require_overview(state, spec):
+    if not (state.config.get('directed_question') or '').strip() and (not spec or not spec.core_overview or spec.core_overview.status!='usable'):
+        raise ValueError('Initial core understanding is incomplete: retain partial research and recover both core paths and their connection before focused Candidates or formal checks')
+
+
 def accept(engine,spec):
     """Persist the map validated against the transaction input, before new objects existed."""
     if load(engine.state)==spec:return
@@ -115,25 +145,28 @@ def object_content(obj):
 def validate_question(spec,question,focus=()):
     if not question or not question.activity_classes or not question.behavior_ids or len(question.fact_ids)!=1 or not question.obligation_relation_kind:
         raise ValueError('A bounded question needs one principal fact, lifecycle, behaviors and activity context')
+    errors=[]
     for field,collection in zip(REFS,('behaviors','facts')):
-        if not set(getattr(question,field))<={x.id for x in getattr(spec,collection)}:raise ValueError('Question references absent '+field)
-    if not set(question.activity_classes)<={a.class_id for a in spec.activities}:raise ValueError('Question references absent Activity')
-    fact=next(f for f in spec.facts if f.id==question.fact_ids[0])
-    linked=set(fact.established_by+fact.consumed_by+fact.invalidators+fact.reinterpreters)
-    if not set(question.behavior_ids)<=linked:raise ValueError('Question Behavior must establish, consume, invalidate or reinterpret its principal Fact')
+        if not set(getattr(question,field))<={x.id for x in getattr(spec,collection)}:errors.append('Question references absent '+field+': '+', '.join(sorted(set(getattr(question,field))-{x.id for x in getattr(spec,collection)})))
+    if not set(question.activity_classes)<={a.class_id for a in spec.activities}:errors.append('Question references absent Activity: '+', '.join(sorted(set(question.activity_classes)-{a.class_id for a in spec.activities})))
+    fact=next((f for f in spec.facts if f.id==question.fact_ids[0]),None)
+    linked=set(fact.established_by+fact.consumed_by+fact.invalidators+fact.reinterpreters) if fact else set()
+    if fact and not set(question.behavior_ids)<=linked:errors.append('Question Behavior must establish, consume, invalidate or reinterpret its principal Fact')
     support=question.supporting_behavior_ids
     if set(support)&set(question.behavior_ids) or not set(support)<={b.id for b in spec.behaviors} or any(not v.strip() for v in support.values()):
-        raise ValueError('Causal support needs distinct existing Behavior IDs and their prehistory/context/consequence role')
+        errors.append('Causal support needs distinct existing Behavior IDs and their prehistory/context/consequence role')
     behaviors=[b for b in spec.behaviors if b.id in question.behavior_ids or b.id in support]
     responsibilities={b.primary_activity for b in behaviors}|{k for b in behaviors for k,v in b.cross_activity_effects.items() if v.strip()}
-    if not set(question.activity_classes)<=responsibilities:raise ValueError('Activity labels need actual Behavior responsibility or attributed cross_activity_effects')
+    if not set(question.activity_classes)<=responsibilities:errors.append('Activity labels need actual Behavior responsibility or attributed cross_activity_effects')
     if not any(ACTIVITY_ROLES[a]['role']=='core' for a in question.activity_classes):
-        raise ValueError('Explain an A1 or A2 relationship through the selected sourced Behavior and necessary support; a supporting label alone is not a core question')
-    if focus and not set(focus)&set(question.activity_classes)&responsibilities:raise ValueError('Explain the selected Fact lifecycle connection to the configured Activity focus')
+        errors.append('Explain an A1 or A2 relationship through the selected sourced Behavior and necessary support; a supporting label alone is not a core question')
+    if focus and not set(focus)&set(question.activity_classes)&responsibilities:errors.append('Explain the selected Fact lifecycle connection to the configured Activity focus')
     if not question.contexts or not question.event_paths or not question.importance.strip() or not question.trigger_rationale.strip():
-        raise ValueError('Question needs actual contexts, event paths, consequence and selection reasoning')
-    if not set(question.source_ids)&set(fact.source_ids) or any(not set(question.source_ids)&set(b.source_ids) for b in behaviors):
-        raise ValueError('Question must cite its principal Fact and selected Behavior sources')
+        errors.append('Question needs actual contexts, event paths, consequence and selection reasoning')
+    if (fact and not set(question.source_ids)&set(fact.source_ids)) or any(not set(question.source_ids)&set(b.source_ids) for b in behaviors):
+        errors.append('Question must cite its principal Fact and selected Behavior sources')
+
+    if errors:raise ValueError("; ".join(errors))
 
 
 def require_basis(state,question,spec=None,focus=()):

@@ -125,6 +125,23 @@ class Surface(Record):
     high_consequence: bool = False
 
 
+class CorePath(Record):
+    explanation: str = ""
+    behavior_ids: list[str] = []
+    fact_ids: list[str] = []
+    source_ids: list[str] = []
+
+
+class CoreOverview(Record):
+    formation: CorePath = Field(default_factory=CorePath)
+    context: CorePath = Field(default_factory=CorePath)
+    connection: CorePath = Field(default_factory=CorePath)
+    open_details: list[str] = []
+    core_gaps: list[str] = []
+    status: Literal["incomplete", "usable", "blocked"] = "incomplete"
+    rationale: str
+
+
 class ConsensusAuditSpec(Record):
     version: int = 1
     target_profile: TargetProfile
@@ -132,6 +149,7 @@ class ConsensusAuditSpec(Record):
     behaviors: list[Behavior] = []
     facts: list[Fact] = []
     surfaces: list[Surface] = []
+    core_overview: CoreOverview | None = None
 
     @model_validator(mode="before")
     @classmethod

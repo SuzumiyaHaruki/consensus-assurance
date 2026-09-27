@@ -3,6 +3,7 @@ import json
 import os
 import stat
 from pathlib import Path
+from pydantic import ValidationError
 
 from consensus_assurance.adapters.storage.files import digest, write_json
 from consensus_assurance.adapters.runners.experiment import extract_events, install_harness, run_experiment
@@ -130,7 +131,7 @@ def candidate(engine, submission, operation_id, spec=None):
     for other in state.question_candidates:
         if other.status in {"active","escalated"} and other.id not in selected:
             other.status, other.stop_reason = 'paused', submission.rationale
-            other.resume_conditions = other.question.unknowns or ['Revisit the saved discriminator with its retained sources']
+            other.resume_conditions = ['Reassess the retained question against its current execution results and sourced unknowns']
             released.append(other.id)
     if released:
         state.selections[-1]['released_candidate_ids']=released
@@ -142,7 +143,8 @@ def candidate(engine, submission, operation_id, spec=None):
     if not q.source_ids or not set(q.source_ids) <= known or not any(
             m.id in q.source_ids and m.file in state.snapshot.files for m in state.materials):
         raise ValueError("Question needs actual authorized source citations")
-    from .audit_spec import require_basis, QUESTION_BASIS
+    from .audit_spec import require_basis, require_overview, QUESTION_BASIS
+    require_overview(state,spec)
     require_basis(state,q,spec,engine.config.activity_focus)
     if parent and q == parent.question:
         raise ValueError("A fork needs a distinct sourced question")
@@ -151,20 +153,19 @@ def candidate(engine, submission, operation_id, spec=None):
     if current:
         from .research import source_refs
         answered = submission.feedback and source_refs(state,submission.feedback.ref_ids)
-        changed_answer = any(getattr(q,k)!=getattr(current.question,k) for k in ('unknowns','counterevidence','disposition'))
+        update = submission.feedback.question_updates.get(current.id) if submission.feedback else None
+        changed_answer = any(getattr(q,k)!=getattr(current.question,k) for k in ('unknowns','counterevidence','disposition')) or bool(update and update.unknowns!=current.question.unknowns)
         progress=bool(answered and changed_answer or any(getattr(q,k)!=getattr(current.question,k)
             for k in ('fact_ids','behavior_ids','obligation_relation_kind','contexts','event_paths')))
         if submission.action == "continue" and current.status == "active" and not progress:
             raise ValueError("Candidate continuation made no observable research change; wording alone is not progress")
-        if current.stagnation>=max(1,engine.config.budget.repair_attempts) and submission.action in {'continue','obligation'} and not progress:
-            raise ValueError('This research family is paused after repeated failures; answer its saved discriminator or choose a different sourced relationship')
         if current.obligation_id and any(getattr(q,k)!=getattr(current.question,k) for k in QUESTION_BASIS):
             raise ValueError("An accepted obligation's question needs an attributed semantic revision")
         if ((not set(current.question.counterevidence) <= set(q.counterevidence) or
                 not set(current.question.unknowns) <= set(q.unknowns)) and
                 not answered):
             raise ValueError("Use feedback.answered with retained source ownership to explain changed counterevidence or unknowns")
-        current.history.append(current.question.model_copy(deep=True))
+        if current.question!=q:current.history.append(current.question.model_copy(deep=True))
         current.question = q
         current.resume_conditions = []
         if progress:current.stagnation=0
@@ -176,11 +177,6 @@ def candidate(engine, submission, operation_id, spec=None):
         current = QuestionCandidate(question=q, parent_candidate_id=parent.id if parent else None,
             fork_reason=json.dumps(submission.result_implications) if parent else "")
         state.question_candidates.append(current)
-        from .research import family
-        relatives=family(state,{current.id})
-        current.stagnation=max(c.stagnation for c in state.question_candidates if c.id in relatives)
-        if current.stagnation>=max(1,engine.config.budget.repair_attempts):
-            raise ValueError('A new Candidate ID cannot reset the saved repair limit of the same Fact/lifecycle/context; resume its retained investigation with new evidence')
     current.check_ids.append(operation_id)
     current.status = {"continue":"active", "pause":"paused", "explained":"explained", "obligation":"escalated"}[submission.action]
     current.stop_reason = submission.rationale
@@ -246,7 +242,9 @@ def accept(engine, submission, inputs, operation_id):
     if isinstance(submission,CheckSubmission) and submission.candidate:
         outer,inner=submission.feedback,submission.candidate.feedback
         if outer and inner and outer!=inner:raise ValueError('Combined submission has conflicting research feedback')
-        submission=submission.model_copy(update={'feedback':outer or inner,
+        if submission.repair_of and submission.candidate.repair_of and submission.repair_of!=submission.candidate.repair_of:
+            raise ValueError('Combined submission has conflicting repair_of operations')
+        submission=submission.model_copy(update={'feedback':outer or inner,'repair_of':submission.repair_of or submission.candidate.repair_of,
             'candidate':submission.candidate.model_copy(update={'feedback':outer or inner})})
     state = engine.state
     research_before = state.model_copy(deep=True)
@@ -255,12 +253,18 @@ def accept(engine, submission, inputs, operation_id):
     if mapped is not submission:
         state.materials.extend(source_materials(engine,mapped.sources))
     from . import audit_spec
+    from consensus_assurance.core.diagnostics import Diagnostic, DiagnosticError
     spec=audit_spec.load(state)
     proposed=None
+    issues=[]
+    def collect_validation(check):
+        try:check()
+        except ValueError as exc:
+            issues.extend(getattr(exc,'diagnostics',None) or [Diagnostic(code='submission',category='semantic',message=str(exc))])
     changes=getattr(mapped,'map_changes',{})
     if getattr(mapped,'map_path',None):
         proposed=ConsensusAuditSpec.model_validate(inputs.json(mapped.map_path))
-        audit_spec.validate(state,proposed,changes)
+        collect_validation(lambda:audit_spec.validate(state,proposed,changes))
         if proposed!=spec:
             spec=proposed.model_copy(deep=True)
             spec.version=state.audit_spec_version+1
@@ -290,7 +294,17 @@ def accept(engine, submission, inputs, operation_id):
                 declared=JudgmentChange(target_id=draft.id,field='audit_question',old_value_json=old.audit_question.model_dump_json(),new_value_json='null')
                 declarations.append(declared)
             declared.new_value_json=draft.audit_question.model_dump_json()
-    if isinstance(mapped,CandidateSubmission):question_version(mapped.question)
+    if isinstance(mapped,CandidateSubmission):
+        collect_validation(lambda:question_version(mapped.question))
+        collect_validation(lambda:validate_question(mapped.question))
+        if spec:collect_validation(lambda:audit_spec.validate_question(spec,mapped.question,engine.config.activity_focus))
+        missing=set(mapped.question.source_ids)-{m.id for m in state.materials}
+        if missing:issues.append(Diagnostic(code='question_sources',category='material',message='Question has unacquired sources: '+', '.join(sorted(missing))))
+        if mapped.obligation:
+            from .graph_diagnostics import validate_grounding
+            collect_validation(lambda:validate_grounding(mapped.obligation.grounding,
+                {m.id:m for m in state.materials},{b.id for b in state.bindings}|{b.id for b in mapped.bindings}))
+    if issues:raise DiagnosticError(issues)
     from .research import record_decision
     decision=record_decision(engine,submission,operation_id,map_changed=bool(proposed and proposed!=audit_spec.load(state)))
     decision['map_changes']={k:v.model_dump(mode='json') for k,v in changes.items()}
@@ -318,6 +332,7 @@ def accept(engine, submission, inputs, operation_id):
     if isinstance(submission, CandidateSubmission):
         candidate(engine, submission, operation_id, spec)
     elif isinstance(submission, CheckSubmission):
+        audit_spec.require_overview(state,spec)
         require_capacity(engine,'experiments')
         if submission.previous_check_id:require_capacity(engine,'revisions')
         if submission.candidate:
@@ -347,6 +362,7 @@ def accept(engine, submission, inputs, operation_id):
         current["direct_check_id"] = artifact.id
         state.active_unit_id, state.active_direct_check_id = unit.id, artifact.id
     elif isinstance(submission, ModelSubmission):
+        if submission.unit_id:audit_spec.require_overview(state,spec)
         require_capacity(engine,'model_checks',2)
         if submission.previous_model_id:require_capacity(engine,'revisions')
         from .artifacts import validate_bundle, save_bundle, load_model
@@ -380,6 +396,7 @@ def accept(engine, submission, inputs, operation_id):
             from .research import capacity
             if patch.units and not capacity(state)['new_obligation']:
                 raise ValueError('No remaining capacity for a new checkable Unit; retain sourced map research without a placeholder obligation')
+            if patch.units:audit_spec.require_overview(state,spec)
             patch_versions(patch)
             apply_patch(state, patch, audit_spec=spec)
             for unit in patch.units:
@@ -424,6 +441,15 @@ def accept(engine, submission, inputs, operation_id):
         current.update(scope=submission.scope,reason=submission.reason)
         if global_stop(current):
             state.stop_reason = f"Scoped stop ({submission.scope}/{submission.reason}): " + submission.rationale
+    if submission.feedback:
+        for id,update in submission.feedback.question_updates.items():
+            c=next(c for c in state.question_candidates if c.id==id)
+            if update.resume_conditions and c.status!='paused':raise ValueError('Feedback resume_conditions require a paused Candidate')
+            if c.question.unknowns!=update.unknowns:c.history.append(c.question.model_copy(deep=True))
+            c.question.unknowns=list(update.unknowns)
+            c.resume_conditions=list(update.resume_conditions)
+            for unit in state.units:
+                if unit.candidate_id==id and unit.status!='revised':unit.audit_question.unknowns=list(update.unknowns)
     # Forced/resource exits are always possible, even with incomplete historical understanding.
     if submission.action not in {'stop','explore','review'}:validate_objects()
     if proposed is not None:audit_spec.accept(engine,proposed)
@@ -625,7 +651,6 @@ def receive(engine, payload):
         state.native_turns.append({'check_id':check.id, 'session_id':session,
             'tool_events':check.parameters.get('native_tool_events'), 'usage':check.parameters.get('native_usage')})
     state.native_current = {'phase':'received', 'operation_id':check.id, 'result':result,
-        'failures':state.native_current.get('failures', 0),
         'status':check.status.value, 'reason':check.reason,
         'session_unavailable':check.parameters.get('native_session_unavailable', False)}
     engine.checkpoint('native_receipt_saved')
@@ -642,12 +667,12 @@ def accept_received(engine, draft):
             state.native_session_id = None
             state.gaps.append('Native session unavailable; continue from saved research in a new session')
             current['phase'] = 'rejected'
-            current['failures'] = current.get('failures', 0) + 1
             engine.checkpoint('native_session_unavailable')
             return False
         state.stop_reason = 'Native Agent stopped: ' + current['reason']
         current['phase'] = 'failed'
         return False
+    raw={}
     try:
         if not result.get('submission'):
             raise ValueError('Completed turn supplied no reviewable submission: ' + result.get('summary', ''))
@@ -655,6 +680,7 @@ def accept_received(engine, draft):
         if not raw_path.exists():
             raw_path.write_bytes(draft_bytes(draft, result['submission']))
         raw = json.loads(raw_path.read_bytes())
+        if not isinstance(raw,dict):raise ValueError('A submission must be a JSON object')
         from .research import global_stop
         if global_stop(raw) and raw.get('reason') in {'resource_limit','user_stop','tool_gap'}:
             from .research import stop_record
@@ -671,13 +697,16 @@ def accept_received(engine, draft):
     except (OSError, ValueError, KeyError, TypeError) as exc:
         errors = {'errors':[str(exc)], 'raw_path':str(archive / 'raw.json'),
             'submitted_path':result.get('submission'), 'summary':result.get('summary')}
+        if isinstance(exc,ValidationError):
+            errors['errors']=['/'.join(map(str,error['loc']))+': '+error['msg']
+                for error in exc.errors(include_url=False,include_input=False)]
         if hasattr(exc, 'diagnostics'):
             errors['diagnostics'] = [d.model_dump(mode='json') for d in exc.diagnostics]
         write_json(archive / 'diagnostics.json', errors)
         from .research import reject_local
-        released=reject_local(state,operation_id,errors['errors'])
+        released=reject_local(state,operation_id,errors,raw if isinstance(raw,dict) else {})
         state.native_current = {'phase':'rejected', 'operation_id':operation_id, 'rejected':errors,
-            'failures':0 if released else current.get('failures', 0) + 1, 'local_handoff':released}
+            'local_handoff':released}
         engine.checkpoint('native_submission_rejected')
         return False
 
@@ -741,10 +770,6 @@ def execute(engine):
             raise Blocked('Native Agent capability probe failed; no model payload sent')
         state.stop_reason = 'Not started'
         while engine.budget.remaining() > 0:
-            if state.native_current.get('failures', 0) >= max(1, engine.config.budget.repair_attempts):
-                state.stop_reason = 'Native submission remains unresolved after bounded whole-draft revisions'
-                stop_cause='insufficient_basis'
-                break
             pending = state.pending_action
             recovering = pending and pending.kind == 'native_agent' and pending.status == 'running' and any(
                 c.pending_action_id == pending.id and c.ended_at for c in

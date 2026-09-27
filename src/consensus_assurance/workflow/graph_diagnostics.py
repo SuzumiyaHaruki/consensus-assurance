@@ -7,8 +7,9 @@ from .associations import claim_ids,relevant_use,dependency_reach,graph_contract
 
 def grounding_errors(basis,materials,binding_ids):
     errors=[]
-    if not basis.derivation.strip() or not basis.applicability.strip():
-        errors.append((['derivation','applicability'],'A derivation and implementation applicability are required, not a source file kind'))
+    for field in ('derivation','applicability'):
+        if not getattr(basis,field).strip():
+            errors.append(([field],'grounding.'+field+' is empty; explain '+('the inferred responsibility' if field=='derivation' else 'the conditions under which this expectation applies')))
     if not basis.source_ids and not basis.expectation_ids:
         errors.append((['source_ids','expectation_ids'],'Grounding must reference actually read materials'))
     for field in ('source_ids','expectation_ids'):
@@ -29,14 +30,6 @@ def validate_grounding(basis,materials,binding_ids):
 def diagnose_graph(state,proposal,audit_spec=None):
     issues=[];materials={m.id:m for m in state.materials}
     def emit(code,category,ids,paths,sources,message,allowed):
-        # One citation mistake often repeats across the same draft. Repair that
-        # field family together within the existing 24-replacement interface.
-        if code=='grounding_reference' and issues and issues[-1].code==code and len(issues[-1].paths)+len(paths)<=24:
-            previous=issues[-1]
-            previous.object_ids=list(dict.fromkeys(previous.object_ids+ids))
-            previous.paths+=paths;previous.material_ids=list(dict.fromkeys(previous.material_ids+sources))
-            previous.message+='; '+message
-            return
         issues.append(Diagnostic(code=code,category=category,object_ids=ids,paths=paths,material_ids=list(dict.fromkeys(sources)),message=message,allowed=allowed))
     collections=['claims','bindings','relations','units'];all_ids=[o.id for name in collections for o in getattr(proposal,name)]
     if len(set(all_ids))!=len(all_ids):

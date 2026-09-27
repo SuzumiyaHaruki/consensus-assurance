@@ -79,8 +79,7 @@ def monitor_events(events, monitor, prop, requirements=None):
     if admission and not admission_error:
         for index,event in enumerate(events):
             if event.get('event') != admission.event:continue
-            conditions = admission.conditions+[c for c in monitor.applicability_conditions if not c.reference]
-            if any(compare(event,c) is False for c in conditions):continue
+            if any(compare(event,c) is False for c in admission.conditions if not c.reference):continue
             aliases={}
             if admission_dependencies:
                 linked=match_prerequisites(events,admission_dependencies,index,prop.identity_fields)

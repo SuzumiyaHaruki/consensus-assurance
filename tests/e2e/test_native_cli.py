@@ -18,7 +18,7 @@ def test_cli_native_fixture_execution_and_report(tmp_path,capsys):
     fixture.write_text(json.dumps([{'submission':candidate,'files':map_files}, {'submission':submission,'files':files},
         {'submission':{'action':'stop','scope':'run','reason':'user_stop','rationale':'Explicit fixture boundary; pending review remains visible'}}]))
     config=Config(agent_backend='mock',fixture=str(fixture),execution_backend='python',execution_isolation='workspace',
-        runs_dir=str(tmp_path/'runs'),budget=Budget(agent_calls=3,total_seconds=60))
+        directed_question='Check the synthetic local return contract',runs_dir=str(tmp_path/'runs'),budget=Budget(agent_calls=3,total_seconds=60))
     path=tmp_path/'config.yaml';path.write_text(config.model_dump_json())
     assert main(['run','--config',str(path),'--repo',str(repo)])==0
     root=next((tmp_path/'runs').glob('*-mock-run'))
