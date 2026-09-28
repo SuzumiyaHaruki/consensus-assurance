@@ -71,6 +71,10 @@ class CodexAgent:
             raise FileNotFoundError("Codex executable is unavailable")
         codex_home = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")).resolve()
         # Deny the host temp path, not the draft TMPDIR set for sandboxed tools below.
+        from consensus_assurance.adapters.validation import validation_tool
+        tool_paths = validation_tool(root)['read_only_paths']
+        if any(Path(p) == root or root.is_relative_to(Path(p)) or Path(p).is_relative_to(directory) for p in tool_paths):
+            raise ValueError('Validator installation must be separate from writable drafts and retained runs')
         filesystem={":root":"deny",":minimal":"read",":slash_tmp":"deny",
             str(Path(os.environ.get("TMPDIR") or "/tmp").resolve()):"deny",
             str(root/"agent-source"):"read",str(directory):"write",
@@ -81,6 +85,7 @@ class CodexAgent:
             str(root/"model-method.md"):"read",str(root/"target-support"):"read",
             **{str(root/name):"read" for name in ("logs","models","findings","audit-spec","actions")},
             **{str(path):"read" for path in getattr(self,"read_only_roots",[]) if path.is_dir()},
+            **{path:"read" for path in tool_paths},
             str(codex_home/"tmp"/"arg0"):"read",str(Path(executable).resolve().parent):"read"}
         inline="{"+",".join(json.dumps(key)+"="+json.dumps(value) for key,value in filesystem.items())+"}"
         environment={"GOCACHE":str(directory/"go-cache"),"GOMODCACHE":str(directory/"go-mod-cache"),
@@ -118,7 +123,9 @@ class CodexAgent:
             return False, []
         private = runner.root / "codex-private-canary"
         private.write_text("private permission canary")
-        protected = [source]
+        from consensus_assurance.adapters.validation import validation_tool
+        tool = validation_tool(runner.root)
+        protected = [source, Path(__file__)]
         for folder in ("logs", "models", "direct-checks"):
             path = runner.root / folder / "permission-canary"
             path.parent.mkdir(exist_ok=True)
@@ -126,7 +133,7 @@ class CodexAgent:
             protected.append(path)
         script = directory / ".permission-probe.py"
         script.write_text(
-            "import errno, os, pathlib, socket, tempfile\n"
+            "import errno, os, pathlib, socket, tempfile, subprocess\n"
             "def denied(label, fn):\n"
             "    try: fn()\n"
             "    except OSError as exc:\n"
@@ -143,6 +150,9 @@ class CodexAgent:
             "with tempfile.TemporaryFile(dir=os.environ['TMPDIR']) as stream:\n"
             "    stream.write(b'temp control'); stream.seek(0)\n"
             "    assert stream.read() == b'temp control'\n"
+            + "command = " + repr(tool['command'][:-4] + ['validate', '--help']) + "\n"
+            "result = subprocess.run(command, capture_output=True, text=True)\n"
+            "assert result.returncode == 0 and '--submission' in result.stdout, result.stderr\n"
             "print('PERMISSIONS_VERIFIED')\n")
         try:
             check = runner.run([*self.sandbox_command(runner.root), "sandbox", "-P", "ca_audit", *options,
@@ -152,7 +162,7 @@ class CodexAgent:
             check.parameters['permission_result'] = 'verified' if verified else 'inconclusive_or_unsafe'
             return verified, [check]
         finally:
-            for path in [private, script, directory / '.write-control', *protected[1:]]:
+            for path in [private, script, directory / '.write-control', *protected[2:]]:
                 path.unlink(missing_ok=True)
 
     def prepare(self, runner, directory, snapshot_id):

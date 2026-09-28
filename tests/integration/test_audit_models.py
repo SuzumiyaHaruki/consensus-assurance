@@ -40,8 +40,20 @@ Bounded == value <= 2
 
 def test_optional_history_search_then_separate_direct_evidence(tmp_path,tlc):
     from audit_support import check_step,review_step
-    e,repo=engine_for(tmp_path,[first,model_product,check_step(),review_step(),stop])
+    def preflight_model(state):
+        from consensus_assurance.workflow.audit import validate_submission
+        raw,files=model_product(state)
+        for name,text in files.items():(e.root/'draft'/name).write_text(text)
+        (e.root/'draft'/'model-submission.json').write_text(json.dumps(raw))
+        before={str(p):p.read_bytes() for p in e.root.rglob('*') if p.is_file()}
+        state_before=e.state.model_dump(mode='json')
+        assert validate_submission(e.state,e.root,'model-submission.json',e.implementation)['valid']
+        assert e.state.model_dump(mode='json')==state_before
+        assert before=={str(p):p.read_bytes() for p in e.root.rglob('*') if p.is_file()}
+        return raw,files
+    e,repo=engine_for(tmp_path,[first,preflight_model,check_step(),review_step(),stop])
     e.verifier=tlc[0]
+    e.config.verifier_backend='tlc'
     state=e.start(repo)
     assert len(state.models)==1,(state.stop_reason,state.current_submission)
     assert state.models[0].stage=='model_only'

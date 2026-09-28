@@ -13,8 +13,8 @@ def pending_work(state):
             for c in state.question_candidates if not c.obligation_id and c.status in {'active','blocked'}])
 
 
-def source_refs(state, refs):
-    """Resolve accepted identifiers, not prose, to their retained source ownership."""
+def source_refs(state, refs, include_executions=False):
+    """Resolve retained ownership; execution observations need not have a graph yet."""
     links = {m.id:{m.id} for m in state.materials}
     links.update({c.id:set(c.question.source_ids) for c in state.question_candidates})
     links.update({u.id:set(u.binding_ids+[u.candidate_id]) for u in state.units})
@@ -30,6 +30,9 @@ def source_refs(state, refs):
         for s in state.selections})
     found, seen, todo = set(), set(), list(refs)
     materials = {m.id for m in state.materials}
+    if include_executions:
+        materials.update(c.id for c in state.checks if c.action in
+            {'exploration','direct_check','model_check','reachability','trace_calibration'})
     while todo:
         ref = todo.pop()
         if ref in seen:continue
@@ -93,7 +96,9 @@ def conclusions(state, records):
             'disposition':'confirmed_in_scope' if confirmed else 'bounded_no_violation' if checked and all(r.get('outcome')=='holds' for r in observed) else 'investigation_lead',
             'scope':claim.scope.model_dump(mode='json'),'check_ids':[r['experiment_check_id'] for r in observed],
             'blockers':list(dict.fromkeys(b for r in observed for b in r['blockers'])),
-            'unestablished_consequences':list(dict.fromkeys(b for r in observed for b in r['boundaries']))})
+            'conditions':[{'check_id':r['experiment_check_id'],'scope':r.get('scope',{}),
+                'adaptations':r.get('adaptations',[]),
+                'notes':r.get('conditions',{'supplementary':r.get('boundaries',[])})} for r in observed]})
     return result
 
 
@@ -141,7 +146,7 @@ def view(state, compact=False):
         'claims':[c.model_dump(mode='json') for c in state.claims if any(c.id in u.obligation_ids for u in current)],
         'artifacts':[a.model_dump(mode='json') for a in artifacts], 'assessments':records,
         'frontier':frontier(state,spec,results), 'capacity':capacity(state), 'conclusions':results, 'costs':costs(state),
-        'handoffs':[s for s in state.selections if s.get('released_candidate_ids') or s['action'] in {'pause','explained'} or s['action']=='stop' and s.get('scope')!='run'],
+        'handoffs':[s for s in state.selections if s.get('feedback') or s.get('released_candidate_ids') or s['action'] in {'pause','explained'} or s['action']=='stop' and s.get('scope')!='run'],
         'pending_work':pending_work(state), 'current':{k:v for k,v in state.current_submission.items() if k!='harness'},
         'latest_decision':state.selections[-1] if state.selections else None,
         'stop':state.run_stop, 'stop_reason':state.stop_reason}
@@ -164,7 +169,33 @@ def view(state, compact=False):
                     if key in {'question','source_ids','fact_ids','obligation_relation_kind','unknowns','activity_classes'}}
         result['claims']=[{k:v for k,v in claim.items() if k in {'id','version','concern','description','source_ids'}} for claim in result['claims']]
         result['assessments']=[{k:v for k,v in record.items() if k in {'claim_id','direct_check_id','experiment_check_id','confirmed','outcome','blockers','raw_log','bounded_complete'}} for record in records]
-        result['handoffs']=[{k:v for k,v in s.items() if k in {'operation_id','action','scope','reason','candidate_ids','rationale'}} for s in result['handoffs'][-1:]]
+        substantive=[s for s in result['handoffs'] if s.get('feedback')]
+        result['handoffs']=[{k:v for k,v in s.items() if k in {'operation_id','action','scope','reason','candidate_ids','rationale','feedback'}}
+            for s in (substantive or result['handoffs'])[-1:]]
+    return result
+
+
+def current_view(state, root, implementation=None, compact=False):
+    """Rebuild a snapshot from state and trusted runtime context, never an old projection."""
+    from consensus_assurance.adapters.validation import validation_tool
+    from .review_contract import target_contract
+    result = view(state,compact=compact)
+    targets=[a for a in state.direct_checks+state.models if a.id in {x['id'] for x in result['artifacts']}]
+    targets.extend(c for c in state.question_candidates if any(i.target_id==c.id and not i.resolved_by for i in state.review_issues))
+    contracts=[target_contract(state,a) for a in targets]
+    result.update(run_id=state.id,snapshot_id=state.snapshot.id,elapsed_seconds=state.elapsed_seconds,
+        source_path=str(root/'agent-source'),draft_path=str(root/'draft'),state_path=str(root/'state.json'),
+        product_schemas=str(root/'product-schemas.json'),submission_schema=str(root/'submission.schema.json'),
+        method_path=str(root/'audit-method.md'),
+        optional_model_method=str(root/'model-method.md') if state.config.get('verifier_backend','none')!='none' else None,
+        directed_question=state.config.get('directed_question'),tools=state.tools,
+        implementation={'name':implementation.name,'harness_kind':implementation.harness_kind,
+            'harness_filename':implementation.harness_filename,'instructions':implementation.harness_instructions,
+            'support_path':str(root/'target-support')} if implementation else None,
+        validation=validation_tool(root),
+        rejected_drafts=[str(p) for p in sorted((root/'submissions').glob('*/diagnostics.json'))],
+        review_contracts=[{k:c[k] for k in ('target_id','object_type','version','required_aspects','questions','optional_questions')}
+            for c in contracts])
     return result
 
 
@@ -244,6 +275,8 @@ def record_decision(engine, submission, operation_id, map_changed=False):
     feedback = submission.feedback
     if feedback:
         if not set(feedback.ref_ids)<=known:raise ValueError('Research feedback references unknown objects: '+', '.join(set(feedback.ref_ids)-known))
+        if not source_refs(state,feedback.ref_ids,include_executions=True):
+            raise ValueError('Research feedback needs acquired sources or a retained research execution')
         candidates={c.id:c for c in state.question_candidates}
         if not set(feedback.question_updates)<=candidates.keys():raise ValueError('Feedback question_updates must name saved Candidates')
         if feedback.question_updates and not source_refs(state,feedback.ref_ids):raise ValueError('Question updates need sourced answers through retained references')

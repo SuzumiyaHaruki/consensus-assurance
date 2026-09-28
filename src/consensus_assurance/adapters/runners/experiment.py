@@ -48,7 +48,7 @@ def install_harness(workspace, filename, harness, target_files, *, write=True):
         if (path.is_absolute() or not path.parts or ".." in path.parts or
                 name in target_files or path.name in {"go.mod", "go.sum", "pyproject.toml", "setup.py", "sitecustomize.py"}):
             raise ValueError("Generated file cannot replace target or dependency definitions: " + name)
-        if any(str(parent) in files for parent in path.parents):
+        if any(str(parent) in files or str(parent) in target_files for parent in path.parents):
             raise ValueError("Generated paths contain a file/directory collision")
         destination = workspace / path
         if any(p.is_symlink() for p in [destination, *destination.parents] if p.is_relative_to(workspace)):

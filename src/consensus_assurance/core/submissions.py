@@ -1,6 +1,6 @@
 """File-backed research products; Codex browsing and editing need no submission."""
 from typing import Annotated, Literal, Union
-from pydantic import Field, TypeAdapter, model_validator
+from pydantic import Field, TypeAdapter, field_validator, model_validator
 from .proposals import BindingDraft, ClaimDraft, EncodingRevision, IssueResolution
 from .types import AuditQuestion, Record, SemanticCheck
 
@@ -34,6 +34,13 @@ class ResearchFeedback(Record):
         description="Research understanding across turns, not a declaration that this submission changes the map")
     rationale: str = Field(min_length=1)
     question_updates: dict[str, QuestionUpdate] = {}
+
+    @field_validator('answered', 'rationale')
+    @classmethod
+    def substantive(cls, value):
+        if not value.strip():
+            raise ValueError('Research feedback requires substantive text')
+        return value
 
 
 class Submission(Record):
@@ -127,8 +134,8 @@ class ResearchSubmission(MappedSubmission):
 
     @model_validator(mode="after")
     def shape(self):
-        if self.graph_path and self.scope_path or not any((self.map_path, self.graph_path, self.scope_path)):
-            raise ValueError("Research needs a map, graph addition or scoped update; a map may accompany one graph operation")
+        if self.graph_path and self.scope_path or not any((self.map_path, self.graph_path, self.scope_path, self.feedback)):
+            raise ValueError("Research needs sourced feedback, a map, graph addition or scoped update; a map may accompany one graph operation")
         return self
 
 
@@ -138,11 +145,21 @@ class SemanticSubmission(MappedSubmission):
     feedback_path: str
 
 
+class ArtifactReviewItem(SemanticCheck):
+    target_id: str | None = None
+
+
 class ReviewSubmission(Submission):
     action: Literal["review"]
     artifact_id: str
-    review_items: list[SemanticCheck] = Field(min_length=1)
+    review_items: list[ArtifactReviewItem] = Field(min_length=1)
     resolutions: list[IssueResolution] = []
+
+    @model_validator(mode='after')
+    def inherit_target(self):
+        for item in self.review_items:
+            if item.target_id is None:item.target_id = self.artifact_id
+        return self
 
 
 class ExploreSubmission(Submission):

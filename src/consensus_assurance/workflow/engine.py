@@ -38,6 +38,8 @@ class Engine:
             from .direct_checks import refresh_assessments
             refresh_assessments(self.state,stale,stale_only=True)
         self.store.save(self.state, event)
+        from .research import current_view
+        write_json(self.root/'research.json',current_view(self.state,self.root,self.implementation))
 
     def start(self, repo, plan_only=False):
         if self.root.is_relative_to(repo.resolve()) or repo.resolve().is_relative_to(self.root):

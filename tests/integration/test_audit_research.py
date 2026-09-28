@@ -889,11 +889,29 @@ def test_knowledge_growth_preserves_execution_and_supplies_the_next_check(tmp_pa
     def noop(state):
         spec=json.loads(Path(state['audit_spec_path']).read_text());spec['behaviors'].reverse()
         return dict(action='research',map_path='map.json',rationale='Current understanding suffices'),{'map.json':json.dumps(spec)}
-    steps=[initial,check_step(),review_step(),enrich,record_obligation,review_step(),more]
+    def explore(state):
+        return dict(action='explore',question='Observe a separate record consumer',harness_path='explore.py',
+            rationale='Read actual local feedback without adding a claim'),{
+            'explore.py':"from target import step, count\nstep(3,3)\nprint('record count', count())\n"}
+    def handoff(state):
+        check=next(c for c in reversed(state['checks']) if c['action']=='exploration')
+        return dict(action='research',rationale='Save the small consumer observation before map work',feedback=dict(
+            ref_ids=[check['id'],'code'],answered='The actual isolated call left one record for count.',
+            remaining=['Describe the consumer relation before proposing its obligation.'],
+            rationale='Keep the observation separate from the confirmed return proposition.')),{}
+    def review_inherit(state):
+        raw,files=review_step()(state)
+        raw['review_items'][0].pop('target_id')
+        return raw,files
+    steps=[initial,check_step(),review_inherit]
+    if variant=='shared':steps += [explore,handoff]
+    steps += [enrich,record_obligation,review_inherit,more]
     if variant=='interference':steps += [noop]
     steps += [resume_first,third]
     if variant=='interference':steps += [resolve]
-    steps += [noop,stop]
+    steps += [noop]
+    if variant=='shared':steps += [handoff]
+    steps += [stop]
     e,repo=engine_for(tmp_path,steps)
     e.config.directed_question=None
     (repo/'target.py').write_text('records=[]\ndef step(value, limit):\n    result=value + 1 if value < limit else 0\n    records.append(result)\n    return result\ndef count():\n    return len(records)\ndef clear_records():\n    records.clear()\n')
@@ -901,6 +919,17 @@ def test_knowledge_growth_preserves_execution_and_supplies_the_next_check(tmp_pa
     if variant=='shared':
         e.agent.mock=False;e.config.execution_isolation='bwrap'
         p=repo/'target.py';p.write_text(p.read_text().replace('value < limit','value <= limit'))
+    if variant=='shared':
+        original=e.agent.investigate
+        def preflight(runner,prompt,directory,snapshot_id,timeout,session_id=None):
+            from consensus_assurance.workflow.audit import validate_submission
+            check,session,reply=original(runner,prompt,directory,snapshot_id,timeout,session_id)
+            before=e.state.model_dump(mode='json')
+            result=validate_submission(e.state,e.root,reply['submission'],e.implementation)
+            assert result['valid'],result['diagnostics']
+            assert e.state.model_dump(mode='json')==before
+            return check,session,reply
+        e.agent.investigate=preflight
     def interrupt(key):
         if e.state.audit_spec_version==1 and key.startswith('submission-') and len(e.state.semantic_reviews)==1:
             raise KeyboardInterrupt('Prepared knowledge update before adoption')
@@ -917,7 +946,7 @@ def test_knowledge_growth_preserves_execution_and_supplies_the_next_check(tmp_pa
     assert state.direct_checks[0].model_dump(mode='json')==snapshots['artifact']
     assert next(c for c in state.checks if c.id==snapshots['check']['id']).model_dump(mode='json')==snapshots['check']
     assert state.units[0].version==snapshots['unit']['version']==1 and state.units[0].status=='checked'
-    assert not state.revisions and state.usage.get('revisions',0)==0 and state.usage['experiments']==2
+    assert not state.revisions and state.usage.get('revisions',0)==0 and state.usage['experiments']==(3 if variant=='shared' else 2)
     assert state.usage['semantic_reviews']==(3 if variant=='interference' else 2)
     assert state.units[1].audit_question.audit_spec_version==2 and state.units[1].audit_question.fact_ids==['record']
     current=view(state)
@@ -939,8 +968,16 @@ def test_knowledge_growth_preserves_execution_and_supplies_the_next_check(tmp_pa
     from consensus_assurance.reporting.chinese import render_report
     report=render_report(state,e.root).read_text()
     assert '地图 v3 保存时的实现认识' in report and 'The local check has not executed' in report
-    assert '当前检查和结论见下方实际结果' in report and 'Record consumers remain unread' in report
+    assert '当前检查和结论见上方实际结果' in report and 'Record consumers remain unread' in report
     assert not current['candidates'][0]['resume_conditions'] and current['candidates'][0]['results']
+    if variant=='shared':
+        handoffs=[s for s in state.selections if s['action']=='research' and s.get('feedback') and not s['map_updated']]
+        assert len(handoffs)==2 and all(not s['map_updated'] for s in handoffs)
+        assert compact['handoffs'][-1]['feedback']
+        assert report.count('**已确认违反**')==1 and '未建立后果：' not in report
+        assert 'unestablished_consequences' not in current['conclusions'][0]
+        assert all(item.target_id for r in state.semantic_reviews for item in r.items)
+        assert state.findings[0].description.startswith('Confirmed violation of:')
     # Recovery replays neither a second map event nor an execution.
     counts=(len(state.selections),[c.id for c in state.checks if c.action=='direct_check'],dict(state.usage))
     state=e.resume()

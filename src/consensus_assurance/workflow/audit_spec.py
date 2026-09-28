@@ -38,8 +38,8 @@ def load(state):
     return ConsensusAuditSpec.model_validate_json(Path(state.audit_spec_path).read_text()) if state.audit_spec_path else None
 
 
-def validate(state, spec, changes=None):
-    old=load(state);issues=[];known={m.id for m in state.materials}
+def validate(state, spec, changes=None, unavailable=()):
+    old=load(state);issues=[];known={m.id for m in state.materials}|set(unavailable)
     behaviors={b.id:b for b in spec.behaviors};facts={f.id:f for f in spec.facts}
     objects=[spec.target_profile,*spec.activities,*spec.behaviors,*spec.facts,*spec.surfaces]
     def issue(obj,message,related=()):
@@ -103,7 +103,7 @@ def validate(state, spec, changes=None):
             if any(not set(path.source_ids)&set(o.source_ids) for o in objects):
                 overview_issue(name+'/source_ids','Cite the referenced Behavior and Fact sources; labels alone do not explain a path')
     if issues:raise SpecIssue(issues)
-    if changes is not None:understanding_changes(state,spec,changes)
+    if changes is not None and not unavailable:understanding_changes(state,spec,changes)
     return spec
 
 

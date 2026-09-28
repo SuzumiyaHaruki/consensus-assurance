@@ -49,7 +49,9 @@ def validate_contract(state,task,reply):
     def issue(code,target,message,index=None):
         contract=target_contract(state,objects[target]) if target in objects else {'target_id':target}
         errors.append(Diagnostic(code=code,category='format',object_ids=[target],paths=['/items/'+str(index)] if index is not None else ['/items'],material_ids=contract.get('required_material_ids',[]),
-            message=message,allowed=['representation','read'],details={'review_contract':contract,'item_index':index,'preservation':'Retain previous analysis, negative judgments, limitations and sources; add substantive required items rather than automatic approval'}))
+            message=message,allowed=['representation','read'],details={'review_contract':contract,
+            'allowed_targets':[target_contract(state,objects[id]) for id in task.target_ids if id in objects],
+            'item_index':index,'preservation':'Retain previous analysis, negative judgments, limitations and sources; add substantive required items rather than automatic approval'}))
     seen=set()
     for i,item in enumerate(reply.items):
         if item.target_id not in task.target_ids or item.target_id not in objects:issue('review_unknown_target',item.target_id,'Review references an unknown or unrequested target',i);continue

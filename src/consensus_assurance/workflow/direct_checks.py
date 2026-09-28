@@ -174,6 +174,10 @@ def compute_assessment(state,unit,artifact,plan,check,events):
     return {'direct_check_id':artifact.id,'experiment_check_id':check.id,'scope':artifact.scope.model_dump(mode='json'),
         'raw_log':check.stdout,'parsing_errors':parsing,'prerequisites':prerequisite,'properties':results,
         'adaptations':plan.harness.semantic_changes,
+        'conditions':{'plan_uncertainties':plan.uncertainties,
+            'grounding_unresolved':claim.grounding.unresolved+plan.harness.legality.unresolved+
+                [item for monitor in plan.monitors for item in monitor.grounding.unresolved],
+            'review_limitations':current_review.limitations if current_review else []},
         'blockers':list(dict.fromkeys(blockers+provenance_blockers)),'boundaries':boundaries,
         'reviewed_complete':bounded_complete and not blockers,
         'bounded_complete':bounded_complete,'confirmed':any(r['confirmed'] for r in results),'outcome':outcome,
@@ -192,8 +196,7 @@ def persist_assessment(state,artifact,plan,check,record):
         if not (result['comparison_complete'] or result['witness_complete']):continue
         assessment=Assessment.STALE if 'Direct-check semantic inputs changed; execution requires rechecking' in record['blockers'] else Assessment.CHALLENGED if result['confirmed'] else Assessment.INCONCLUSIVE
         evidence=next((e for e in state.evidence if e.check_id==check.id and e.direct_check_id==artifact.id and e.checker_id==result['checker_id']),None)
-        description=('Finite measured '+result['outcome']+' comparison for direct check '+artifact.id+
-            '; current attribution is stored in its monitor result; broader consequences remain outside this evidence')
+        description='Measured '+result['outcome']+' comparison; current confirmation: '+str(result['confirmed'])
         if evidence is None:
             state.add_evidence(Evidence(check_id=check.id,model_id=None,direct_check_id=artifact.id,snapshot_id=artifact.snapshot_id,
                 claim_id=claim.id,claim_version=claim.version,origin=check.origin,level='framework_test' if state.mode=='mock' else 'implementation_test',
@@ -204,8 +207,10 @@ def persist_assessment(state,artifact,plan,check,record):
         finding=next((f for f in state.findings if f.direct_check_id==artifact.id and f.check_id==check.id and f.checker_id==result['checker_id']),None)
         if finding is None:
             finding=Finding(claim_id=claim.id,claim_version=claim.version,model_id=None,direct_check_id=artifact.id,check_id=check.id,
-                checker_id=result['checker_id'],origin=check.origin,description='Measured direct-check comparison failed; normative attribution is conditional on recorded blockers',trace_path=check.stdout)
+                checker_id=result['checker_id'],origin=check.origin,description='Measured direct-check violation',trace_path=check.stdout)
             state.findings.append(finding)
+        finding.description=('Confirmed violation of: '+claim.description if result['confirmed'] else
+            'Measured violation awaiting attribution: '+'; '.join(record['blockers'] or ['Incomplete observation']))
         finding.stage=Investigation.REPRODUCED if result['confirmed'] else Investigation.INCONCLUSIVE
         finding.level='implementation_obligation' if result['confirmed'] else 'implementation_candidate'
         record.setdefault('finding_ids',{})[result['checker_id']]=finding.id

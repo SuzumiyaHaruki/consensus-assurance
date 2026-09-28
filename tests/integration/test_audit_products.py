@@ -160,7 +160,7 @@ def test_recovery_does_not_repeat_model_or_target_execution(tmp_path,phase):
     assert sum(r['action']=='direct_check' for r in receipts)==1
 
 
-@pytest.mark.parametrize('fault',['malformed_final','missing_submission','session_lost','login','quota','service_refusal'])
+@pytest.mark.parametrize('fault',['malformed_final','missing_submission','session_lost','login','quota','service_refusal','timeout'])
 def test_audit_receipt_failure_routes_preserve_or_stop_the_session(tmp_path,fault):
     from consensus_assurance.adapters.agents.backend import CodexAgent
     from consensus_assurance.core.types import ExecutionStatus
@@ -178,6 +178,9 @@ def test_audit_receipt_failure_routes_preserve_or_stop_the_session(tmp_path,faul
         if len(sessions)==2:
             if fault=='malformed_final':response.write_text('{')
             elif fault=='missing_submission':response.write_text(json.dumps({'submission':'absent.json','summary':'Missing product'}))
+            elif fault=='timeout':
+                check.status=ExecutionStatus.TIMEOUT;check.exit_code=-9;check.reason='Total budget ended before reliable completion'
+                events.write_text(json.dumps({'type':'thread.started','thread_id':session_id}))
             else:
                 check.exit_code=1
                 events.write_text(json.dumps({'type':'turn.failed','error':{'message':{
@@ -187,10 +190,10 @@ def test_audit_receipt_failure_routes_preserve_or_stop_the_session(tmp_path,faul
     e.agent.investigate=investigate
     state=e.start(repo)
     assert len(state.units)==1
-    if fault in {'login','quota','service_refusal'}:
+    if fault in {'login','quota','service_refusal','timeout'}:
         assert len(sessions)==2 and not state.direct_checks
         check=next(c for c in reversed(state.checks) if c.action=='agent_turn')
-        assert check.status==({'login':ExecutionStatus.LOGIN_REQUIRED,'quota':ExecutionStatus.QUOTA_EXHAUSTED,'service_refusal':ExecutionStatus.ERROR}[fault])
+        assert check.status==({'login':ExecutionStatus.LOGIN_REQUIRED,'quota':ExecutionStatus.QUOTA_EXHAUSTED,'service_refusal':ExecutionStatus.ERROR,'timeout':ExecutionStatus.TIMEOUT}[fault])
     else:
         assert len(state.direct_checks)==1,state.current_submission
         assert sessions[2]==(None if fault=='session_lost' else 'fixture-session')
@@ -445,3 +448,139 @@ def test_resolution_reports_independent_reference_errors_together(tmp_path):
     assert any(d.get('unknown_material_ids')==['not-a-material'] for d in details)
     assert any(d.get('unknown_evidence_ids')==['not-an-execution'] for d in details)
     assert not state.review_issues[0].resolved_by
+
+
+def test_feedback_only_retains_exploration_before_a_map_and_recovers_once(tmp_path):
+    from consensus_assurance.workflow.research import view
+    from consensus_assurance.workflow.audit import accept, Inputs, AuditSubmission
+    from consensus_assurance.workflow.transactions import commit_graph
+    def explore(state):
+        return dict(action='explore',question='Observe the local return before selecting a claim',
+            harness_path='explore.py',rationale='Use a real local call'),{
+            'explore.py':"from target import step\nprint('observed', step(3,3))\n"}
+    def retain(state):
+        check=next(c for c in state['checks'] if c['action']=='exploration')
+        return dict(action='research',rationale='Retain the construction observation',feedback=dict(
+            ref_ids=[check['id']],answered='The executed local boundary call returned zero.',remaining=[],
+            understanding='updated',rationale='No normative claim or map change is implied.')),{}
+    def next_turn(state):
+        current=view(e.state,compact=True)
+        assert current['handoffs'][-1]['feedback']['answered'].endswith('zero.')
+        assert not any(state[k] for k in ('question_candidates','units','evidence','findings'))
+        assert state['audit_spec_version']==0
+        from consensus_assurance.workflow.audit import validate_submission
+        raw=retain(state)[0]
+        raw['feedback']['ref_ids']=[current['handoffs'][-1]['operation_id']]
+        (e.root/'draft'/'indirect.json').write_text(json.dumps(raw))
+        assert validate_submission(e.state,e.root,'indirect.json',e.implementation)['valid']
+        return dict(action='stop',scope='run',reason='user_stop',rationale='End the scripted exercise'),{}
+    e,repo=engine_for(tmp_path,[explore,retain,next_turn])
+    e.config.directed_question=None
+    old=e.graph_commit_hook
+    def interrupt(key):
+        if e.state.usage.get('agent_calls')==2:raise KeyboardInterrupt('Retained transaction before adoption')
+    e.graph_commit_hook=interrupt
+    with pytest.raises(KeyboardInterrupt):e.start(repo)
+    e.graph_commit_hook=old
+    state=e.resume()
+    assert state.usage['experiments']==1
+    assert len([s for s in state.selections if s['action']=='research'])==1
+    counts=(dict(state.usage),len(state.selections))
+    e.resume()
+    assert (dict(state.usage),len(state.selections))==counts
+    good=retain(state.model_dump(mode='json'))[0]
+    for index,change in enumerate(({'answered':'   '},{'ref_ids':['unknown']},
+            {'question_updates':{'missing':{'unknowns':[],'resume_conditions':[]}}})):
+        raw=json.loads(json.dumps(good));raw['feedback'].update(change)
+        before=state.model_dump(mode='json')
+        with pytest.raises(ValueError):
+            sub=AuditSubmission.model_validate(raw)
+            commit_graph(e,'bad-feedback-'+str(index),raw,
+                lambda proxy:accept(proxy,sub,Inputs(e.root/'draft',e.root/'submissions'/('bad-'+str(index))),'bad'))
+        assert state.model_dump(mode='json')==before
+    with pytest.raises(ValueError):AuditSubmission.model_validate({'action':'research','rationale':'Empty'})
+
+
+def test_preflight_checks_current_inputs_without_writes_or_execution(tmp_path,monkeypatch):
+    import copy
+    from consensus_assurance.workflow.audit import validate_submission, prepare_agent_source, accept, Inputs, AuditSubmission
+    from consensus_assurance.workflow.transactions import commit_graph
+    e,repo=engine_for(tmp_path,[]);e.start(repo,plan_only=True);prepare_agent_source(e)
+    draft=e.root/'draft';draft.mkdir()
+    candidate,files=first({});_,plan,harness=products()
+    sub=dict(action='check',candidate=candidate,plan_path='plan.json',harness_path='check.py',rationale='A combined product')
+    files.update({'plan.json':json.dumps(plan),'check.py':harness})
+    for name,text in files.items():(draft/name).write_text(text)
+    def validate(raw):
+        (draft/'input.json').write_text(json.dumps(raw))
+        before={str(p): (p.read_bytes(),p.stat().st_mtime_ns) for p in e.root.rglob('*') if p.is_file()}
+        state=e.state.model_dump(mode='json')
+        result=validate_submission(e.state,e.root,'input.json',e.implementation)
+        assert e.state.model_dump(mode='json')==state
+        assert before=={str(p):(p.read_bytes(),p.stat().st_mtime_ns) for p in e.root.rglob('*') if p.is_file()}
+        return result
+    monkeypatch.setattr(e.runner,'run',lambda *a,**kw:pytest.fail('Preflight cannot run a process'))
+    broken=copy.deepcopy(sub)
+    broken['candidate']['sources'][0]['end_line']=999
+    broken['candidate']['question']['behavior_ids']=['missing-behavior']
+    rejected=validate(broken)
+    assert not rejected['valid']
+    assert any(d['category']=='material' and 'code' in d['object_ids'] for d in rejected['diagnostics'])
+    assert any(d['category']=='semantic' for d in rejected['diagnostics'])
+    with pytest.raises(ValueError) as formal:
+        commit_graph(e,'bad-combined',broken,lambda proxy:accept(proxy,AuditSubmission.model_validate(broken),
+            Inputs(draft,e.root/'submissions'/'bad-combined'),'bad-combined'))
+    assert {d['code'] for d in rejected['diagnostics']}=={d.code for d in formal.value.diagnostics}
+    assert validate(sub)['valid']
+    assert not e.state.units and not e.state.direct_checks
+    # Later byte and capacity changes must be checked again by the formal path.
+    (draft/'check.py').write_text('changed harness bytes\n')
+    e.state.usage['experiments']=e.config.budget.experiments
+    assert not validate(sub)['valid']
+    with pytest.raises(ValueError,match='experiments'):
+        commit_graph(e,'capacity-change',sub,lambda proxy:accept(proxy,AuditSubmission.model_validate(sub),
+            Inputs(draft,e.root/'submissions'/'capacity-change'),'capacity-change'))
+    e.state.usage.pop('experiments')
+    assert validate(sub)['valid']
+    commit_graph(e,'fresh-bytes',sub,lambda proxy:accept(proxy,AuditSubmission.model_validate(sub),
+        Inputs(draft,e.root/'submissions'/'fresh-bytes'),'fresh-bytes'))
+    assert Path(e.state.direct_checks[0].harness_path).read_text()=='changed harness bytes\n'
+    assert not e.state.checks and not e.state.evidence
+    # A proposal based on v1 cannot overwrite a later map.
+    update=dict(action='research',map_path='map.json',rationale='Check current map identity')
+    old_map=json.loads((draft/'map.json').read_text());old_map['version']=0
+    (draft/'map.json').write_text(json.dumps(old_map))
+    assert not validate(update)['valid']
+    for bad in ('../state.json',str(e.root/'state.json')):
+        assert not validate_submission(e.state,e.root,bad,e.implementation)['valid']
+    (draft/'escape.json').symlink_to(e.root/'state.json')
+    assert not validate_submission(e.state,e.root,'escape.json',e.implementation)['valid']
+
+
+def test_whole_artifact_review_inherits_only_omitted_identity(tmp_path):
+    from consensus_assurance.workflow.audit import validate_submission
+    from consensus_assurance.core.submissions import AuditSubmission
+    from consensus_assurance.core.types import SemanticCheck
+    def review(state):
+        raw,files=review_step()(state)
+        raw['review_items'][0].pop('target_id')
+        draft=e.root/'draft'/'review.json'
+        draft.write_text(json.dumps(raw))
+        assert validate_submission(e.state,e.root,draft.name,e.implementation)['valid']
+        for fields,expected in (({'target_id':'bounded'},'review_unknown_target'),
+                ({'counterevidence':['This oracle remains disputed']},'review_contradictory_judgment'),
+                ({'status':'revision_needed','counterevidence':['Wrong oracle'],'challenged_components':[]},'review_missing_component'),
+                ({'source_ids':['unacquired']},'review_unknown_source')):
+            broken=json.loads(json.dumps(raw));broken['review_items'][0].update(fields)
+            draft.write_text(json.dumps(broken))
+            diagnostics=validate_submission(e.state,e.root,draft.name,e.implementation)['diagnostics']
+            assert expected in {d['code'] for d in diagnostics}
+            if expected=='review_unknown_target':
+                item=next(d for d in diagnostics if d['code']==expected)
+                assert item['details']['allowed_targets'][0]['target_id']==raw['artifact_id']
+        return raw,files
+    e,repo=engine_for(tmp_path,[first,check_step(),review,stop]);state=e.start(repo)
+    assert state.semantic_reviews[0].items[0].target_id==state.direct_checks[0].id
+    assert 'target_id' not in AuditSubmission.model_json_schema()['$defs']['ArtifactReviewItem']['required']
+    with pytest.raises(ValueError):SemanticCheck.model_validate({'aspect':'applicability','status':'no_issue_found',
+        'source_ids':['code'],'rationale':'A normal persisted semantic item requires its target'})

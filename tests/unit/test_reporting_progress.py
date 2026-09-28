@@ -18,3 +18,27 @@ def test_test_pass_and_model_failure_keep_different_scopes(tmp_path):
     assert '不自动证明目标' in execution_summary(test)[2]
     assert execution_summary(model)[1] == '找到模型反例'
     assert execution_summary(unknown)[2] == '性质检查未完成或无法归属'
+
+
+def test_current_projection_rebuilds_at_deadline_without_old_budget_or_paths(tmp_path):
+    import json
+    from audit_support import engine_for
+    from consensus_assurance.workflow.research import current_view
+    e,repo=engine_for(tmp_path,[]);e.start(repo,plan_only=True)
+    (e.root/'research.json').write_text(json.dumps({'remaining_seconds':98,'remaining_agent_calls':25,
+        'obsolete_pending':'not executed','source_path':'wrong'}))
+    e.budget.previous=e.config.budget.total_seconds
+    e.state.stop_reason='Total runtime budget exhausted'
+    e.checkpoint('controlled_deadline')
+    compact=current_view(e.state,e.root,e.implementation,compact=True)
+    full=current_view(e.state,e.root,e.implementation)
+    report=render_report(e.state,e.root).read_text()
+    saved=json.loads((e.root/'research.json').read_text())
+    for current in (compact,full,saved):
+        assert current['capacity']['remaining_seconds']==0
+        assert not {'remaining_seconds','remaining_agent_calls','obsolete_pending'} & current.keys()
+        assert current['source_path']==str(e.root/'agent-source')
+        assert current['draft_path']==str(e.root/'draft') and current['method_path']
+        assert current['validation']['command'] and current['implementation']['harness_kind']=='python'
+        assert current['conclusions']==full['conclusions'] and current['stop']==full['stop']
+    assert '剩余 0.00 秒' in report

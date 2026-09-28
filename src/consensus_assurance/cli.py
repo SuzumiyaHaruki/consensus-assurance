@@ -75,8 +75,25 @@ def main(argv=None):
             p.add_argument("--repair-attempts",type=int,help="显式调整任务总修复上限；不重置已用次数或单问题失败记录")
             p.add_argument("--action-timeout", type=float, help="调整后续单动作超时（秒）；保留总预算和已用次数")
             p.add_argument("--agent-turn-timeout", type=float, help="调整后续单次Codex 调查最长时长（秒）；不改变正式执行超时或总预算")
+    p = sub.add_parser('validate', help='只读检查当前草稿；不受理、不执行、不获取运行锁')
+    p.add_argument('--run', required=True)
+    p.add_argument('--submission', required=True, help='相对当前 draft 的产品路径')
     args = parser.parse_args(argv)
     try:
+        if args.command == 'validate':
+            from consensus_assurance.core.types import Analysis
+            from consensus_assurance.registry import EXECUTION_BACKENDS
+            from consensus_assurance.workflow.audit import validate_submission, draft_bytes
+            root = Path(args.run).expanduser().resolve()
+            raw = json.loads(draft_bytes(root, 'state.json'))
+            if raw.get('framework_revision') != FRAMEWORK_REVISION:
+                raise ValueError('Historical runs are read-only; validate requires the current framework revision')
+            state = Analysis.model_validate(raw)
+            config = Config.model_validate(state.config)
+            implementation = EXECUTION_BACKENDS[config.execution_backend](config.target, config.budget.action_timeout)
+            result = validate_submission(state, root, args.submission, implementation)
+            print(json.dumps(result, ensure_ascii=False))
+            return 0 if result['valid'] else 2
         if args.command in {"resume", "report"}:
             root = resolve_run(args.run, args.runs_dir)
             raw=json.loads((root/"state.json").read_text())

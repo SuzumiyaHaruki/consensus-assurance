@@ -53,23 +53,27 @@ def draft_bytes(root, name):
 
 
 class Inputs:
-    """Read each submitted file once; resume reads the saved bytes, never mutable drafts."""
-    def __init__(self, draft, archive):
-        self.draft, self.archive = draft, archive
+    """Read fixed bytes once; only formal acceptance retains them on disk."""
+    def __init__(self, draft, archive=None):
+        self.draft, self.archive, self.contents = draft, archive, {}
 
     def read(self, name):
-        relative = Path(name)
-        if relative.is_absolute() or ".." in relative.parts or not relative.parts:
-            raise ValueError("Invalid submitted input path")
-        saved = self.archive / "inputs" / relative
-        if not saved.exists():
-            data = draft_bytes(self.draft, name)
-            saved.parent.mkdir(parents=True, exist_ok=True)
-            saved.write_bytes(data)
-        return draft_file(self.archive / "inputs", name).read_text()
+        if not name or Path(name).is_absolute() or '..' in Path(name).parts:
+            raise ValueError('Invalid submitted input path')
+        if name not in self.contents:
+            saved = self.archive / "inputs" if self.archive else None
+            root = saved if saved and (saved / name).exists() else self.draft
+            self.contents[name] = draft_bytes(root, name)
+        return self.contents[name].decode('utf-8')
 
     def json(self, name):
         return json.loads(self.read(name))
+
+    def retain(self):
+        for name, data in self.contents.items():
+            saved = self.archive / 'inputs' / name
+            saved.parent.mkdir(parents=True, exist_ok=True)
+            saved.write_bytes(data)
 
 
 def harness_files(inputs, submission, raw):
@@ -233,12 +237,21 @@ def validate_model_revision(state, prior, model, submission):
 
 
 def accept(engine, submission, inputs, operation_id):
-    """Runs on a transaction copy; rejected products never mutate accepted research."""
+    """Persist only after the shared preparation has validated the whole product."""
+    try:
+        finish = prepare_submission(engine, submission, inputs, operation_id)
+    finally:
+        inputs.retain()
+    finish()
+
+
+def prepare_submission(engine, submission, inputs, operation_id):
+    """Validate on a transaction's state copy; defer every artifact/map write."""
     from .research import global_stop
     if global_stop(submission.model_dump()) and submission.reason in {'resource_limit','user_stop','tool_gap'}:
         from .research import stop_record
         stop_record(engine, submission.model_dump(mode='json'), operation_id)
-        return
+        return lambda: None
     if isinstance(submission,CheckSubmission) and submission.candidate:
         outer,inner=submission.feedback,submission.candidate.feedback
         if outer and inner and outer!=inner:raise ValueError('Combined submission has conflicting research feedback')
@@ -248,15 +261,17 @@ def accept(engine, submission, inputs, operation_id):
             'candidate':submission.candidate.model_copy(update={'feedback':outer or inner})})
     state = engine.state
     research_before = state.model_copy(deep=True)
-    state.materials.extend(source_materials(engine, submission.sources))
     mapped=submission.candidate if isinstance(submission,CheckSubmission) and submission.candidate else submission
-    if mapped is not submission:
-        state.materials.extend(source_materials(engine,mapped.sources))
     from . import audit_spec
     from consensus_assurance.core.diagnostics import Diagnostic, DiagnosticError
     spec=audit_spec.load(state)
     proposed=None
     issues=[]
+    references = submission.sources + (mapped.sources if mapped is not submission else [])
+    state.materials.extend(source_materials(engine, references, issues,
+        ['/sources/'+str(i) for i in range(len(submission.sources))]+
+        (['/candidate/sources/'+str(i) for i in range(len(mapped.sources))] if mapped is not submission else [])))
+    unavailable = {ref.id for ref in references} - {m.id for m in state.materials}
     def collect_validation(check):
         try:check()
         except ValueError as exc:
@@ -264,7 +279,7 @@ def accept(engine, submission, inputs, operation_id):
     changes=getattr(mapped,'map_changes',{})
     if getattr(mapped,'map_path',None):
         proposed=ConsensusAuditSpec.model_validate(inputs.json(mapped.map_path))
-        collect_validation(lambda:audit_spec.validate(state,proposed,changes))
+        collect_validation(lambda:audit_spec.validate(state,proposed,changes,unavailable))
         if audit_spec.map_delta(spec,proposed):
             spec=proposed.model_copy(deep=True)
             spec.version=state.audit_spec_version+1
@@ -305,9 +320,9 @@ def accept(engine, submission, inputs, operation_id):
         collect_validation(lambda:validate_question(mapped.question))
         if spec and mapped.question.audit_spec_version==spec.version:
             collect_validation(lambda:audit_spec.validate_question(spec,mapped.question,engine.config.activity_focus))
-        missing=set(mapped.question.source_ids)-{m.id for m in state.materials}
+        missing=set(mapped.question.source_ids)-{m.id for m in state.materials}-unavailable
         if missing:issues.append(Diagnostic(code='question_sources',category='material',message='Question has unacquired sources: '+', '.join(sorted(missing))))
-        if mapped.obligation:
+        if mapped.obligation and not unavailable.intersection(mapped.obligation.grounding.source_ids + mapped.obligation.grounding.expectation_ids):
             from .graph_diagnostics import validate_grounding
             collect_validation(lambda:validate_grounding(mapped.obligation.grounding,
                 {m.id:m for m in state.materials},{b.id for b in state.bindings}|{b.id for b in mapped.bindings}))
@@ -339,6 +354,7 @@ def accept(engine, submission, inputs, operation_id):
         if len(state.claims)+len(state.bindings)+len(state.relations)+len(state.units)>engine.config.budget.graph_objects:
             raise ValueError('Accepted graph object budget exceeded')
     current = {"phase":"accepted", "operation_id":operation_id, "action":submission.action}
+    persist_artifact = lambda: None
     if isinstance(submission, CandidateSubmission):
         candidate(engine, submission, operation_id, spec)
     elif isinstance(submission, CheckSubmission):
@@ -353,7 +369,7 @@ def accept(engine, submission, inputs, operation_id):
         plan = plan_from_files(inputs, submission)
         add_support(engine.implementation, plan.harness)
         validate_plan(state, unit, plan, engine.implementation)
-        install_harness(engine.root / "source", engine.implementation.harness_filename, plan.harness,
+        install_harness(getattr(engine, "source_root", engine.root / "source"), engine.implementation.harness_filename, plan.harness,
             state.snapshot.files, write=False)
         prior = next((a for a in state.direct_checks if a.id == submission.previous_check_id), None)
         if submission.previous_check_id:
@@ -362,15 +378,16 @@ def accept(engine, submission, inputs, operation_id):
             validate_check_revision(state, prior, plan, submission)
             engine.budget.take("revisions")
         validate_objects()
-        artifact = save_plan(engine, unit, plan, operation_id, prior)
-        if prior:
-            state.revisions.append(Revision(kind="encoding" if submission.encoding_revision else "F4",
-                rationale=submission.rationale, target_ids=[prior.id],
-                evidence_ids=[c.id for c in state.checks if c.direct_check_id == prior.id],
-                before={"direct_check_id":prior.id}, after={"direct_check_id":artifact.id,
-                "encoding_revision":submission.encoding_revision.model_dump(mode="json") if submission.encoding_revision else None}, return_step="experiment"))
-        current["direct_check_id"] = artifact.id
-        state.active_unit_id, state.active_direct_check_id = unit.id, artifact.id
+        def persist_artifact():
+            artifact = save_plan(engine, unit, plan, operation_id, prior)
+            if prior:
+                state.revisions.append(Revision(kind="encoding" if submission.encoding_revision else "F4",
+                    rationale=submission.rationale, target_ids=[prior.id],
+                    evidence_ids=[c.id for c in state.checks if c.direct_check_id == prior.id],
+                    before={"direct_check_id":prior.id}, after={"direct_check_id":artifact.id,
+                    "encoding_revision":submission.encoding_revision.model_dump(mode="json") if submission.encoding_revision else None}, return_step="experiment"))
+            current["direct_check_id"] = artifact.id
+            state.active_unit_id, state.active_direct_check_id = unit.id, artifact.id
     elif isinstance(submission, ModelSubmission):
         require_capacity(engine,'model_checks',2)
         if submission.previous_model_id:require_capacity(engine,'revisions')
@@ -386,18 +403,19 @@ def accept(engine, submission, inputs, operation_id):
             validate_model_revision(state, previous, model, submission)
             engine.budget.take("revisions")
         validate_objects()
-        artifact = save_bundle(engine.root, state, unit, model, engine.implementation, previous,
-            submission.rationale, transaction_key=operation_id, validated=True)
-        if previous:
-            old = load_model(previous)
-            kind = "encoding" if submission.encoding_revision else "F1"
-            if model.behavior != old.behavior or model.properties != old.properties:
-                state.affect([previous.id], submission.rationale)
-            state.revisions.append(Revision(kind=kind,
-                rationale=submission.rationale, target_ids=[previous.id], evidence_ids=[c.id for c in state.checks if c.model_id == previous.id],
-                before={"model_id":previous.id}, after={"model_id":artifact.id}, return_step="experiment"))
-        state.active_unit_id, state.active_model_id = artifact.unit_id or None, artifact.id
-        current["model_id"] = artifact.id
+        def persist_artifact():
+            artifact = save_bundle(engine.root, state, unit, model, engine.implementation, previous,
+                submission.rationale, transaction_key=operation_id, validated=True)
+            if previous:
+                old = load_model(previous)
+                kind = "encoding" if submission.encoding_revision else "F1"
+                if model.behavior != old.behavior or model.properties != old.properties:
+                    state.affect([previous.id], submission.rationale)
+                state.revisions.append(Revision(kind=kind,
+                    rationale=submission.rationale, target_ids=[previous.id], evidence_ids=[c.id for c in state.checks if c.model_id == previous.id],
+                    before={"model_id":previous.id}, after={"model_id":artifact.id}, return_step="experiment"))
+            state.active_unit_id, state.active_model_id = artifact.unit_id or None, artifact.id
+            current["model_id"] = artifact.id
     elif isinstance(submission, ResearchSubmission):
         if submission.graph_path:
             from .graph import apply_patch
@@ -443,7 +461,7 @@ def accept(engine, submission, inputs, operation_id):
             files={name:inputs.read(path) for name, path in submission.files.items()},
             description=submission.question, semantic_changes=[])
         add_support(engine.implementation, harness)
-        install_harness(engine.root / "source", engine.implementation.harness_filename, harness,
+        install_harness(getattr(engine, "source_root", engine.root / "source"), engine.implementation.harness_filename, harness,
             state.snapshot.files, write=False)
         current["harness"] = harness.model_dump(mode="json")
     else:
@@ -461,20 +479,61 @@ def accept(engine, submission, inputs, operation_id):
                 if unit.candidate_id==id and unit.status!='revised':unit.audit_question.unknowns=list(update.unknowns)
     # Forced/resource exits are always possible, even with incomplete historical understanding.
     if submission.action not in {'stop','explore','review'}:validate_objects()
-    sync_progress(engine)
-    if proposed is not None:audit_spec.accept(engine,proposed)
-    decision=state.selections[-1]
-    decision['candidate_ids']=list(dict.fromkeys(decision.get('candidate_ids',[])+[c.id for c in state.question_candidates if operation_id in c.check_ids]))
-    decision['accepted_versions']={'audit_spec':state.audit_spec_version,
-        'units':{u.id:u.version for u in state.units if u not in research_before.units},
-        'artifacts':{a.id:a.version for a in state.models+state.direct_checks if a not in research_before.models+research_before.direct_checks}}
-    state.current_submission = current
+    def finish():
+        persist_artifact()
+        sync_progress(engine)
+        if proposed is not None:audit_spec.accept(engine,proposed)
+        decision=state.selections[-1]
+        decision['candidate_ids']=list(dict.fromkeys(decision.get('candidate_ids',[])+[c.id for c in state.question_candidates if operation_id in c.check_ids]))
+        decision['accepted_versions']={'audit_spec':state.audit_spec_version,
+            'units':{u.id:u.version for u in state.units if u not in research_before.units},
+            'artifacts':{a.id:a.version for a in state.models+state.direct_checks if a not in research_before.models+research_before.direct_checks}}
+        state.current_submission = current
 
+    return finish
 
 def require_capacity(engine, resource, amount=1):
     available=getattr(engine.config.budget,resource)-engine.state.usage.get(resource,0)
     if available<amount:
         raise ValueError(f'Local capability unavailable: {resource} needs {amount}, remaining {available}; choose source investigation or another authorized action')
+
+
+def submission_diagnostics(exc):
+    from consensus_assurance.core.diagnostics import Diagnostic
+    if hasattr(exc, 'diagnostics'):return exc.diagnostics
+    if isinstance(exc, ValidationError):
+        return [Diagnostic(code='submission',category='format',paths=['/'+'/'.join(map(str,e['loc']))],
+            message=e['msg']) for e in exc.errors(include_url=False,include_input=False)]
+    return [Diagnostic(code='submission',category='semantic' if isinstance(exc,ValueError) else 'tool',message=str(exc))]
+
+
+def validate_submission(state, root, name, implementation):
+    """Read-only preparation; no Engine, lock, runner, receipt or persistent ID."""
+    from types import SimpleNamespace
+    from consensus_assurance.core.config import Config
+    from .budget import BudgetTracker
+    trial = state.model_copy(deep=True)
+    config = Config.model_validate(trial.config)
+    context = SimpleNamespace(state=trial,config=config,root=root,source_root=root/'agent-source',
+        implementation=implementation,verifier=True if config.verifier_backend!='none' else None,
+        budget=BudgetTracker(config.budget,trial))
+    result = {'valid':False,'run_id':state.id,'audit_spec_version':state.audit_spec_version,
+        'elapsed_seconds':state.elapsed_seconds,'diagnostics':[],
+        'meaning':'Validation against the state and bytes read; this is not acceptance, execution or evidence'}
+    try:
+        inputs = Inputs(root/'draft')
+        raw = inputs.json(name)
+        if not isinstance(raw,dict):raise ValueError('A submission must be a JSON object')
+        from .research import global_stop, stop_record
+        if global_stop(raw) and raw.get('reason') in {'resource_limit','user_stop','tool_gap'}:
+            stop_record(context,raw,'preflight')
+        else:
+            product = AuditSubmission.model_validate(raw)
+            prepare_submission(context,product,inputs,'preflight')
+        result['valid'] = True
+    except (OSError,ValueError,KeyError,TypeError,BudgetExhausted) as exc:
+        result['diagnostics'] = [d.model_dump(mode='json') for d in submission_diagnostics(exc)]
+    return result
 
 
 def reconnect_candidate(state,unit):
@@ -495,20 +554,9 @@ def method_text(kind='audit'):
 
 def prompt(engine, draft, method):
     state = engine.state
-    from .research import view
-    context = {**view(state,compact=True), "run_id":state.id, "snapshot_id":state.snapshot.id,
-        "source_path":str(engine.root / "agent-source"), "draft_path":str(draft),
-        "product_schemas":str(engine.root / "product-schemas.json"), "method_path":str(engine.root / "audit-method.md"),
-        "optional_model_method":str(engine.root/'model-method.md') if engine.verifier else None,
-        "state_path":str(engine.root / "state.json"), "audit_spec_path":state.audit_spec_path,
-        "directed_question":engine.config.directed_question,
-        "activity_focus":engine.config.activity_focus, "tools":state.tools,
-        "implementation":{"name":engine.implementation.name, "harness_kind":engine.implementation.harness_kind,
-            "harness_filename":engine.implementation.harness_filename,
-            "instructions":engine.implementation.harness_instructions, "support_path":str(engine.root/"target-support") } if engine.implementation else None,
-        "rejected_drafts":[str(p) for p in sorted((engine.root/'submissions').glob('*/diagnostics.json'))],
-        "remaining_seconds":engine.budget.remaining(),
-        "remaining_agent_calls":engine.config.budget.agent_calls-state.usage.get("agent_calls",0)}
+    from .research import current_view
+    engine.budget.sync()
+    context = current_view(state,engine.root,engine.implementation,compact=True)
     write_json(engine.root / "research.json", context)
     return (method + "\nRead this run's research index at " + str(engine.root / "research.json") +
         ". Submit using " + str(engine.root / "submission.schema.json") +
@@ -595,34 +643,40 @@ def execute_accepted(engine):
     engine.checkpoint("audit_execution_completed")
 
 
-def source_materials(engine, references):
+def source_materials(engine, references, issues=None, paths=None):
+    from consensus_assurance.core.diagnostics import Diagnostic, DiagnosticError
     state = engine.state
+    root = getattr(engine, 'source_root', engine.root / 'source')
+    # Authorize all paths before reading any requested source.
+    for ref in references:
+        if ref.file not in (state.snapshot.readable_files or []):
+            raise ValueError('Source citation is outside the authorized snapshot: ' + ref.file)
+        draft_file(root, ref.file)
+    errors, additions = [], []
     existing = {m.id:m for m in state.materials}
-    if len({r.id for r in references}) != len(references):
-        raise ValueError("Duplicate source range IDs")
-    additions = []
-    for reference in references:
-        rel = Path(reference.file)
-        if rel.is_absolute() or ".." in rel.parts or reference.file not in (state.snapshot.readable_files or []):
-            raise ValueError("Source citation is outside the authorized snapshot: " + reference.file)
-        path = (engine.root / "source" / rel).resolve()
-        if not path.is_relative_to((engine.root / "source").resolve()) or not path.is_file() or path.is_symlink():
-            raise ValueError("Source citation does not resolve to an authorized regular file")
-        data = path.read_bytes()
-        if digest(data) != state.snapshot.files[reference.file]:
-            raise ValueError("Source snapshot version changed: " + reference.file)
-        lines = data.decode("utf-8").splitlines()
-        if reference.end_line < reference.start_line or reference.end_line > len(lines):
-            raise ValueError("Source citation range does not exist: " + reference.id)
-        material = Material(id=reference.id,file=reference.file,start_line=reference.start_line,
-            end_line=reference.end_line,kind=reference.kind,
-            text="\n".join(lines[reference.start_line-1:reference.end_line]),
-            content_digest=state.snapshot.files[reference.file])
-        if reference.id in existing:
-            if existing[reference.id] != material:
-                raise ValueError("Source range ID reused for a different excerpt")
-        else:
-            additions.append(material)
+    seen = set()
+    for index, ref in enumerate(references):
+        message = None
+        data = draft_bytes(root, ref.file)
+        if digest(data) != state.snapshot.files[ref.file]:
+            message = 'Source snapshot version changed: ' + ref.file
+        lines = data.decode('utf-8').splitlines()
+        if message is None and (ref.end_line < ref.start_line or ref.end_line > len(lines)):
+            message = 'Source citation range does not exist: ' + ref.id
+        if ref.id in seen:message = 'Duplicate source range IDs: ' + ref.id
+        seen.add(ref.id)
+        material = Material(id=ref.id,file=ref.file,start_line=ref.start_line,end_line=ref.end_line,
+            kind=ref.kind,text='\n'.join(lines[ref.start_line-1:ref.end_line]),content_digest=state.snapshot.files[ref.file])
+        if message is None and ref.id in existing and existing[ref.id] != material:
+            message = 'Source range ID reused for a different excerpt: ' + ref.id
+        if message:
+            errors.append(Diagnostic(code='source_range',category='material',object_ids=[ref.id],
+                paths=[paths[index] if paths else '/sources/'+str(index)],message=message,
+                details={'blocked_checks':'Checks requiring this excerpt await valid source bytes'},allowed=['read','representation']))
+        elif ref.id not in existing:
+            additions.append(material);existing[ref.id] = material
+    if issues is not None:issues.extend(errors)
+    elif errors:raise DiagnosticError(errors)
     return additions
 
 
@@ -707,11 +761,9 @@ def accept_received(engine, draft):
     except (OSError, ValueError, KeyError, TypeError) as exc:
         errors = {'errors':[str(exc)], 'raw_path':str(archive / 'raw.json'),
             'submitted_path':result.get('submission'), 'summary':result.get('summary')}
-        if isinstance(exc,ValidationError):
-            errors['errors']=['/'.join(map(str,error['loc']))+': '+error['msg']
-                for error in exc.errors(include_url=False,include_input=False)]
-        if hasattr(exc, 'diagnostics'):
-            errors['diagnostics'] = [d.model_dump(mode='json') for d in exc.diagnostics]
+        diagnostics = submission_diagnostics(exc)
+        errors['errors'] = [d.message for d in diagnostics]
+        errors['diagnostics'] = [d.model_dump(mode='json') for d in diagnostics]
         write_json(archive / 'diagnostics.json', errors)
         from .research import reject_local
         released=reject_local(state,operation_id,errors,raw if isinstance(raw,dict) else {})

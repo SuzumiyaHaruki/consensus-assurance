@@ -35,10 +35,13 @@ def test_cli_audit_fixture_execution_and_report(tmp_path,capsys):
     assert 'mock' in report and state['units'][0]['id'] in report
     derived=['audit-spec.json','materials.json','graph.json','audit-progress.json','plan.json']
     assert all(not (root/name).exists() for name in derived)
-    index=json.loads((root/'research.json').read_text());index['retained_context']='current Agent entry'
+    index=json.loads((root/'research.json').read_text());index.update(retained_context='obsolete',remaining_seconds=98,remaining_agent_calls=25)
     (root/'research.json').write_text(json.dumps(index))
     assert main(['report','--run',str(root)])==0
-    assert json.loads((root/'research.json').read_text())['retained_context']=='current Agent entry'
+    current=json.loads((root/'research.json').read_text())
+    assert not {'retained_context','remaining_seconds','remaining_agent_calls'} & current.keys()
+    assert current['implementation']['harness_kind']=='python' and current['validation']['command']
+    assert current['capacity']['remaining']['agent_calls']==0
     assert all(not (root/name).exists() for name in derived)
     assert main(['report','--run',str(root),'--export-views'])==0
     assert all((root/name).exists() for name in derived)

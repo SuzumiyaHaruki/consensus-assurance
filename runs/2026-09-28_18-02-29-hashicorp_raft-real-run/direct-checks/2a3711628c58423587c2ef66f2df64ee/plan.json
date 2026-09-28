@@ -1,0 +1,174 @@
+{
+  "description": "Real-cluster VerifyLeader participant comparison with drained transport boundaries.",
+  "claim_id": "o-verify-voter-eligibility",
+  "binding_ids": [
+    "bind-verify-register",
+    "bind-verify-tally",
+    "bind-verify-result",
+    "bind-verify-producer"
+  ],
+  "harness": {
+    "files": {},
+    "kind": "go_test",
+    "source": "package raft\n\nimport (\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"reflect\"\n\t\"sync\"\n\t\"testing\"\n\t\"time\"\n)\n\n// Gate calls before delivery. Each peer has exactly one ordinary replication\n// worker and one heartbeat worker; pipelines are explicitly unsupported.\ntype assuranceVerifyTransport struct {\n\t*InmemTransport\n\tmu      sync.Mutex\n\tactive  bool\n\tgates   map[ServerID]chan struct{}\n\tblocked map[string]bool\n\treplies map[ServerID]int\n}\n\nfunc (g *assuranceVerifyTransport) AppendEntriesPipeline(ServerID, ServerAddress) (AppendPipeline, error) {\n\treturn nil, ErrPipelineReplicationNotSupported\n}\nfunc (g *assuranceVerifyTransport) AppendEntries(id ServerID, address ServerAddress, req *AppendEntriesRequest, resp *AppendEntriesResponse) error {\n\tkind := \"append\"\n\tif req.PrevLogEntry == 0 && req.PrevLogTerm == 0 && len(req.Entries) == 0 && req.LeaderCommitIndex == 0 {\n\t\tkind = \"heartbeat\"\n\t}\n\tg.mu.Lock()\n\tvar wait chan struct{}\n\tif g.active {\n\t\twait = g.gates[id]\n\t\tg.blocked[string(id)+\"/\"+kind] = true\n\t}\n\tg.mu.Unlock()\n\tif wait != nil {\n\t\t<-wait\n\t}\n\terr := g.InmemTransport.AppendEntries(id, address, req, resp)\n\tg.mu.Lock()\n\tif g.active && err == nil && resp.Success {\n\t\tg.replies[id]++\n\t}\n\tg.mu.Unlock()\n\treturn err\n}\nfunc (g *assuranceVerifyTransport) release(id ServerID) {\n\tg.mu.Lock()\n\tdefer g.mu.Unlock()\n\tif ch := g.gates[id]; ch != nil {\n\t\tclose(ch)\n\t\tg.gates[id] = nil\n\t}\n}\nfunc assuranceVerifyEvent(e map[string]interface{}) {\n\tb, _ := json.Marshal(e)\n\tfmt.Println(\"CA_EVENT \" + string(b))\n}\nfunc assuranceWait(t *testing.T, d time.Duration, f func() bool, what string) {\n\tt.Helper()\n\tuntil := time.Now().Add(d)\n\tfor time.Now().Before(until) {\n\t\tif f() {\n\t\t\treturn\n\t\t}\n\t\ttime.Sleep(time.Millisecond)\n\t}\n\tt.Fatalf(\"setup incomplete: %s\", what)\n}\nfunc TestAssuranceVerifyParticipantEligibility(t *testing.T) {\n\tfor _, selected := range []int{3, 1} {\n\t\tname := \"nonvoter\"\n\t\tif selected == 1 {\n\t\t\tname = \"voter_control\"\n\t\t}\n\t\tt.Run(name, func(t *testing.T) {\n\t\t\tids := []ServerID{\"leader\", \"voter-b\", \"voter-c\", \"nonvoter\"}\n\t\t\tconfig := Configuration{}\n\t\t\ttransports := make([]*InmemTransport, 4)\n\t\t\tfor i, id := range ids {\n\t\t\t\taddr, tr := NewInmemTransportWithTimeout(ServerAddress(string(id)), 200*time.Millisecond)\n\t\t\t\ttransports[i] = tr\n\t\t\t\tsuffrage := Voter\n\t\t\t\tif i == 3 {\n\t\t\t\t\tsuffrage = Nonvoter\n\t\t\t\t}\n\t\t\t\tconfig.Servers = append(config.Servers, Server{ID: id, Address: addr, Suffrage: suffrage})\n\t\t\t}\n\t\t\tfor i := range ids {\n\t\t\t\tfor j := range ids {\n\t\t\t\t\tif i != j {\n\t\t\t\t\t\ttransports[i].Connect(ServerAddress(ids[j]), transports[j])\n\t\t\t\t\t}\n\t\t\t\t}\n\t\t\t}\n\t\t\tgate := &assuranceVerifyTransport{InmemTransport: transports[0], gates: make(map[ServerID]chan struct{}), blocked: make(map[string]bool), replies: make(map[ServerID]int)}\n\t\t\tnodes := make([]*Raft, 0, 4)\n\t\t\tdefer func() {\n\t\t\t\tfor _, id := range ids[1:] {\n\t\t\t\t\tgate.release(id)\n\t\t\t\t}\n\t\t\t\tfutures := make([]Future, 0, len(nodes))\n\t\t\t\tfor _, r := range nodes {\n\t\t\t\t\tfutures = append(futures, r.Shutdown())\n\t\t\t\t}\n\t\t\t\tfor _, f := range futures {\n\t\t\t\t\t_ = f.Error()\n\t\t\t\t}\n\t\t\t\tfor _, tr := range transports {\n\t\t\t\t\t_ = tr.Close()\n\t\t\t\t}\n\t\t\t}()\n\t\t\tfor i, id := range ids {\n\t\t\t\tconf := DefaultConfig()\n\t\t\t\tconf.LocalID = id\n\t\t\t\tconf.HeartbeatTimeout = 5 * time.Second\n\t\t\t\tconf.ElectionTimeout = 5 * time.Second\n\t\t\t\tconf.LeaderLeaseTimeout = 900 * time.Millisecond\n\t\t\t\tconf.CommitTimeout = 20 * time.Millisecond\n\t\t\t\tif i == 0 {\n\t\t\t\t\tconf.HeartbeatTimeout = time.Second\n\t\t\t\t\tconf.ElectionTimeout = time.Second\n\t\t\t\t}\n\t\t\t\tstore := NewInmemStore()\n\t\t\t\tsnapshots := NewInmemSnapshotStore()\n\t\t\t\tvar tr Transport = transports[i]\n\t\t\t\tif i == 0 {\n\t\t\t\t\ttr = gate\n\t\t\t\t}\n\t\t\t\tif err := BootstrapCluster(conf, store, store, snapshots, tr, config); err != nil {\n\t\t\t\t\tt.Fatal(err)\n\t\t\t\t}\n\t\t\t\tr, err := NewRaft(conf, &MockFSM{}, store, store, snapshots, tr)\n\t\t\t\tif err != nil {\n\t\t\t\t\tt.Fatal(err)\n\t\t\t\t}\n\t\t\t\tnodes = append(nodes, r)\n\t\t\t}\n\t\t\tleader := nodes[0]\n\t\t\tassuranceWait(t, 4*time.Second, func() bool { return leader.State() == Leader }, \"real election of local voter\")\n\t\t\tapply := leader.Apply([]byte(\"prefix-\"+name), time.Second)\n\t\t\tapplyDone := make(chan error, 1)\n\t\t\tgo func() { applyDone <- apply.Error() }()\n\t\t\tselect {\n\t\t\tcase err := <-applyDone:\n\t\t\t\tif err != nil {\n\t\t\t\t\tt.Fatal(err)\n\t\t\t\t}\n\t\t\tcase <-time.After(2 * time.Second):\n\t\t\t\tt.Fatal(\"prefix apply incomplete\")\n\t\t\t}\n\t\t\tcf := leader.GetConfiguration()\n\t\t\tif err := cf.Error(); err != nil {\n\t\t\t\tt.Fatal(err)\n\t\t\t}\n\t\t\tvar configEntry Log\n\t\t\tif err := leader.logs.GetLog(1, &configEntry); err != nil {\n\t\t\t\tt.Fatal(err)\n\t\t\t}\n\t\t\tif configEntry.Type != LogConfiguration || !reflect.DeepEqual(DecodeConfiguration(configEntry.Data), config) || !reflect.DeepEqual(cf.Configuration(), config) {\n\t\t\t\tt.Fatal(\"configuration differs from bootstrap\")\n\t\t\t}\n\t\t\tif leader.CommitIndex() < configEntry.Index {\n\t\t\t\tt.Fatal(\"configuration not committed\")\n\t\t\t}\n\t\t\tfor i := 1; i < 4; i++ {\n\t\t\t\tidx := apply.Index()\n\t\t\t\tassuranceWait(t, time.Second, func() bool { return nodes[i].AppliedIndex() >= idx }, \"all peers receive committed prefix\")\n\t\t\t}\n\t\t\tterm := leader.CurrentTerm()\n\t\t\tgate.mu.Lock()\n\t\t\tfor _, id := range ids[1:] {\n\t\t\t\tgate.gates[id] = make(chan struct{})\n\t\t\t}\n\t\t\tgate.active = true\n\t\t\tgate.mu.Unlock()\n\t\t\t// Reaching the next transport call on both loops proves that each loop\n\t\t\t// consumed its preceding reply before we admit the verification operation.\n\t\t\tassuranceWait(t, 500*time.Millisecond, func() bool {\n\t\t\t\tgate.mu.Lock()\n\t\t\t\tdefer gate.mu.Unlock()\n\t\t\t\tfor _, id := range ids[1:] {\n\t\t\t\t\tif !gate.blocked[string(id)+\"/append\"] || !gate.blocked[string(id)+\"/heartbeat\"] {\n\t\t\t\t\t\treturn false\n\t\t\t\t\t}\n\t\t\t\t}\n\t\t\t\treturn true\n\t\t\t}, \"all six sender loops quiescent at transport boundary\")\n\t\t\tif leader.State() != Leader || leader.CurrentTerm() != term {\n\t\t\t\tt.Fatal(\"leader generation changed before admission\")\n\t\t\t}\n\t\t\tgate.mu.Lock()\n\t\t\tgate.replies = make(map[ServerID]int)\n\t\t\tgate.mu.Unlock()\n\t\t\tassuranceVerifyEvent(map[string]interface{}{\"event\": \"prefix\", \"op\": name, \"term\": term, \"configuration_index\": configEntry.Index, \"applied_index\": apply.Index(), \"voters\": 3, \"quiescent_loops\": 6, \"selected_id\": string(ids[selected]), \"selected_voter\": config.Servers[selected].Suffrage == Voter})\n\t\t\tvf := leader.VerifyLeader()\n\t\t\tassuranceVerifyEvent(map[string]interface{}{\"event\": \"admitted\", \"op\": name, \"term\": term})\n\t\t\tgate.release(ids[selected])\n\t\t\tresult := make(chan error, 1)\n\t\t\tgo func() { result <- vf.Error() }()\n\t\t\tselect {\n\t\t\tcase err := <-result:\n\t\t\t\tgate.mu.Lock()\n\t\t\t\tvoterReplies := gate.replies[ids[1]] + gate.replies[ids[2]]\n\t\t\t\tnonvoterReplies := gate.replies[ids[3]]\n\t\t\t\tgate.mu.Unlock()\n\t\t\t\terrText := \"\"\n\t\t\t\tif err != nil {\n\t\t\t\t\terrText = err.Error()\n\t\t\t\t}\n\t\t\t\tassuranceVerifyEvent(map[string]interface{}{\"event\": \"result\", \"op\": name, \"success\": err == nil, \"error\": errText, \"remote_voter_reply\": voterReplies > 0, \"voter_replies\": voterReplies, \"nonvoter_replies\": nonvoterReplies, \"selected_id\": string(ids[selected]), \"term\": leader.CurrentTerm(), \"state\": leader.State().String()})\n\t\t\tcase <-time.After(600 * time.Millisecond):\n\t\t\t\tassuranceVerifyEvent(map[string]interface{}{\"event\": \"incomplete\", \"op\": name, \"reason\": \"no result before finite schedule ends\"})\n\t\t\t}\n\t\t})\n\t}\n}\n",
+    "description": "Two independent four-node histories: nonvoter-only released remote replies and voter-only control. Bootstrap, election, committed Apply and all-peer application prefix precede transport quiescence and public verification. Measure Error result and per-suffrage successful replies.",
+    "semantic_changes": [
+      "Embed InmemTransport and delay AppendEntries calls before real delivery using channels; do not change requests or responses.",
+      "Explicitly disable optional pipelining via ErrPipelineReplicationNotSupported; ordinary retry/fallback and heartbeat remain real.",
+      "Observe transport return fields and public futures; use MockFSM from captured testing support.",
+      "Cut schedule off after 600 ms independently of forbidden success; missing result remains unknown. Release all gates and shut down all nodes."
+    ],
+    "prerequisites": [
+      {
+        "alias": "prefix",
+        "event": "prefix",
+        "conditions": [
+          {
+            "field": "voters",
+            "op": "eq",
+            "value": 3,
+            "reference": null
+          },
+          {
+            "field": "quiescent_loops",
+            "op": "eq",
+            "value": 6,
+            "reference": null
+          }
+        ]
+      },
+      {
+        "alias": "admission",
+        "event": "admitted",
+        "conditions": [
+          {
+            "field": "term",
+            "op": "eq",
+            "value": null,
+            "reference": "prefix.term"
+          }
+        ]
+      }
+    ],
+    "legality": {
+      "source_ids": [
+        "s-startup",
+        "s-bootstrap",
+        "s-config-change",
+        "s-repl-ownership",
+        "s-replication",
+        "s-heartbeat",
+        "s-rpc",
+        "s-transfer",
+        "s-inmem-transport-check",
+        "s-test-fsm-check",
+        "s-config-timing-check",
+        "s-getconfiguration-check"
+      ],
+      "expectation_ids": [
+        "s-transport-contract",
+        "s-verify-documentation",
+        "s-verify-api"
+      ],
+      "binding_ids": [
+        "bind-verify-register",
+        "bind-verify-tally",
+        "bind-verify-result",
+        "bind-verify-producer"
+      ],
+      "derivation": "BootstrapCluster/NewRaft start four real nodes with fixed configuration; node 0 wins an ordinary election and Apply completes. Each peer AppliedIndex reaches that prefix and leader CommitIndex covers the actual persisted bootstrap configuration entry, whose decoded membership matches GetConfiguration and the expected configuration. Only then does a wrapper pause calls before InmemTransport delivery. Pipelines report ErrPipelineReplicationNotSupported, a supported fallback. Both append and heartbeat loops for every peer must enter a paused next call before admission: their previous replies have already been consumed. Reset counters at that boundary. The selected peer is released after public VerifyLeader enqueue; all other replies remain delayed until result or the 600 ms cutoff. No RPC response, role, term, notification tally or stored protocol state is fabricated.",
+      "applicability": "Local test harness in package raft; actual target source unchanged. Controlled non-Byzantine finite delays with active normal workers and lease; peer election timeout exceeds experiment delay. New cluster per independent case, distinct op identity.",
+      "unresolved": [
+        "Scheduling that misses quiescence cutoff yields setup failure, not evidence. Missing verification completion emits only an incomplete diagnostic, not a result."
+      ],
+      "conflicts": [],
+      "alternatives": [
+        "Voter lease can cause failure; it is not disabled or renewed artificially.",
+        "Negative responses from the released real peer are consumed normally. Unreleased responses are finitely delayed and all gates release during cleanup."
+      ]
+    }
+  },
+  "monitors": [
+    {
+      "id": "monitor-verification",
+      "checker_id": "verify-voter-support",
+      "event": "result",
+      "binding_ids": [
+        "bind-verify-register",
+        "bind-verify-tally",
+        "bind-verify-result",
+        "bind-verify-producer"
+      ],
+      "grounding": {
+        "source_ids": [
+          "s-leader-loop",
+          "s-repl-ownership",
+          "s-verify-vote",
+          "s-replication",
+          "s-heartbeat",
+          "s-transfer"
+        ],
+        "expectation_ids": [
+          "s-verify-documentation",
+          "s-verify-api",
+          "s-membership-contract",
+          "s-verify-tests"
+        ],
+        "binding_ids": [
+          "bind-verify-register",
+          "bind-verify-tally",
+          "bind-verify-result",
+          "bind-verify-producer"
+        ],
+        "derivation": "A successful verification requires eligible remote support in a three-voter configuration. The checker uses success implies at least one observed remote voter positive reply after all earlier sender loops have drained. In the forbidden schedule both remote voter loops remain gated, so no remote voter can submit a new notification; only the nonvoter is released. In the control only a voter is released. Reply counts are measured by the transport after real receiver processing, not preset expected outcomes.",
+        "applicability": "Real election and committed application prefix, fixed three-voter/one-nonvoter membership, same operation ID across prefix/admission/result; no state assignments. Pipeline-disabled supported transport variant. Finite request delays, real peer receivers, active lease and all Raft workers.",
+        "unresolved": [
+          "A result proves the local participant-eligibility proposition only. No competing authority or stale application read is observed.",
+          "Successful reply count is an upper bound on consumed support; absence proves no voter consumption after quiescence. The permitted control releases only the voter, excluding nonvoter substitution."
+        ],
+        "conflicts": [],
+        "alternatives": [
+          "Lease may terminate the old leader later, but does not qualify an earlier nonvoter contribution.",
+          "Negative support can reject verification; schedule must preserve or finitely delay this path and report its handling.",
+          "Current authority might in fact persist despite lost communication; the obligation constrains verification support rather than asserting a competing leader."
+        ]
+      },
+      "applicability_conditions": [],
+      "admission_alias": "admission"
+    }
+  ],
+  "observable_properties": [
+    {
+      "checker_id": "verify-voter-support",
+      "kind": "event_implication",
+      "trigger": {
+        "field": "event",
+        "op": "eq",
+        "value": "result",
+        "reference": null
+      },
+      "assertion": {
+        "field": "remote_voter_reply",
+        "op": "eq",
+        "value": true,
+        "reference": null
+      },
+      "antecedent": {
+        "field": "success",
+        "op": "eq",
+        "value": true,
+        "reference": null
+      },
+      "identity_fields": [
+        "op"
+      ],
+      "history_field": null,
+      "description": "Success implies an observed positive remote voter reply since the quiescent boundary. Nonvoter-only completion violates the necessary participant eligibility condition; no success is required of a pending operation."
+    }
+  ],
+  "uncertainties": [
+    "No broader stale-read or later-leader endpoint is measured.",
+    "Counts are transport delivery observations, not instrumentation inside vote(); absence of any eligible reply after complete two-loop quiescence is the relevant discriminator.",
+    "An independently missing case is reported incomplete and cannot supply a holds result."
+  ]
+}
