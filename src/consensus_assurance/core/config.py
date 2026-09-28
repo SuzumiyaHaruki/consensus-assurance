@@ -5,6 +5,7 @@ from .types import ActivityClass, Record
 
 
 class Budget(Record):
+    '''Configuration for budget constraints in the system.'''
     agent_calls: int = Field(default=8, ge=0)
     model_checks: int = Field(default=4, ge=0)
     revisions: int = Field(default=3, ge=0)
@@ -25,6 +26,7 @@ class Budget(Record):
 
 
 class TargetConfig(Record):
+    '''Configuration for the target environment.'''
     expected_module: str | None = None
     variant: str = ""
     analysis_roots: list[str] = []
@@ -40,6 +42,7 @@ class TargetConfig(Record):
 
 
 class Config(Record):
+    '''Main configuration for the system.'''
     protocol: str = "none"
     execution_backend: str = "none"
     target: TargetConfig = TargetConfig()

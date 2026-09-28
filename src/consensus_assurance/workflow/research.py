@@ -122,6 +122,9 @@ def view(state, compact=False):
         'activity_roles':ACTIVITY_ROLES, 'activity_focus':state.config.get('activity_focus',[]),
         'understanding_status':overview.status if overview else 'incomplete' if spec else 'unregistered',
         'core_overview':overview.model_dump(mode='json') if overview else None,
+        'understanding_changes':[{'operation_id':s['operation_id'],'version':s['accepted_versions']['audit_spec'],
+            'delta':s.get('map_delta',{}),'explanations':s.get('map_changes',{}),'effects':s.get('map_effects',{})}
+            for s in state.selections if s.get('map_updated')],
         'next_objective':{'action':'investigate_and_refocus' if ready or directed else 'recover_core_understanding',
             'boundary':'user_directed' if directed else 'both_core_paths',
             'reason':'Use results to update understanding and compare the remaining frontier' if ready or directed else
@@ -138,12 +141,17 @@ def view(state, compact=False):
         'latest_decision':state.selections[-1] if state.selections else None,
         'stop':state.run_stop, 'stop_reason':state.stop_reason}
     for candidate in result['candidates']:
+        candidate['open_issue_ids']=[i.id for i in state.review_issues if i.target_id==candidate['id'] and not i.resolved_by]
+        candidate['current_applicability']='pending_review' if candidate['open_issue_ids'] else 'within_recorded_scope'
         units={u.id for u in state.units if u.candidate_id==candidate['id']}
         owned={a.id for a in state.models+state.direct_checks if a.unit_id in units}
         candidate['executions']=[{'check_id':c.id,'artifact_id':c.direct_check_id or c.model_id,
             'action':c.action,'status':c.status.value,'outcome':c.outcome}
             for c in state.checks if c.direct_check_id in owned or c.model_id in owned]
     if compact:
+        result['understanding_changes']=[{'operation_id':c['operation_id'],'version':c['version'],
+            'changed_object_ids':list(c['delta']),'effects':c['effects']} for c in result['understanding_changes']]
+        if result['latest_decision']:result['latest_decision']={k:v for k,v in result['latest_decision'].items() if k!='map_delta'}
         for candidate in result['candidates']:
             if candidate['status']!='active' and not any(u.id==state.active_unit_id and u.candidate_id==candidate['id'] for u in current):
                 candidate['question']={key:value for key,value in candidate['question'].items()

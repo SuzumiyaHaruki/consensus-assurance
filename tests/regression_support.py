@@ -1,13 +1,4 @@
-"""Explicit budgets for historical local-chain fixtures, not the default product workflow."""
-from consensus_assurance.core.config import Config as ProductConfig
-
-
-def fixture_config(**kwargs):
-    config=ProductConfig(**kwargs)
-    config.budget.semantic_reviews=0
-    return config
-
-
+"""Small product and source constructors for bounded local regressions."""
 def declared_changes(state, feedback):
     """Construct explicit changes in controlled fixtures; production never fills missing declarations."""
     import json
@@ -26,7 +17,7 @@ def toy_responses(repo):
     import json
     from pathlib import Path
     responses=json.loads((Path(__file__).parent/'fixtures/toy_responses.json').read_text())
-    request=next(r for r in responses[0]['requests'] if r['file']=='README.md')
+    request=next(r for r in responses['reads'] if r['file']=='README.md')
     old_id=f"README.md:{request['start_line']}:{request['end_line']}"
     request['end_line']=len((Path(repo)/'README.md').read_text().splitlines())
     new_id=f"README.md:1:{request['end_line']}"
@@ -44,8 +35,8 @@ def add_dependency(state,responses):
         rationale='The checked consumer depends on actual producer input',pending=['Producer guarantee remains unverified'],grounding=state.claims[1].grounding.model_copy(deep=True))
     if not state.relations:state.relations.append(edge)
     from consensus_assurance.core.proposals import RelationDraft
-    responses[1]['relations']=[{k:v for k,v in edge.model_dump(mode='json').items() if k in RelationDraft.model_fields}]
-    state.units[0].relation_ids=['input_dependency'];responses[1]['units'][0]['relation_ids']=['input_dependency']
+    responses['graph']['relations']=[{k:v for k,v in edge.model_dump(mode='json').items() if k in RelationDraft.model_fields}]
+    state.units[0].relation_ids=['input_dependency'];responses['graph']['units'][0]['relation_ids']=['input_dependency']
 
 
 def fixture_reachability(bundle):
@@ -69,18 +60,11 @@ def read_material(repo, snapshot, request):
         content_digest=snapshot.files[request.file])
 
 
-def add_reads(state,repo,reading,budget):
-    additions=[read_material(repo,state.snapshot,r) for r in reading.requests]
+def add_reads(state,repo,requests):
+    additions=[read_material(repo,state.snapshot,r) for r in map(ReadRequest.model_validate,requests)]
     known={m.id for m in state.materials}
     state.materials.extend(m for m in additions if m.id not in known)
     return [m.id for m in additions]
 
 
 from consensus_assurance.core.proposals import ReadRequest
-from consensus_assurance.core.types import Record
-
-class ReadingPlan(Record):
-    requests: list[ReadRequest]
-    rationale: str = ""
-    gap: str = ""
-    related_ids: list[str] = []

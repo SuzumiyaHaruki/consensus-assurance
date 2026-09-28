@@ -3,8 +3,8 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 import pytest
-from consensus_assurance.core.types import ConsensusAuditSpec,Activity,Behavior,Fact,Surface,TargetProfile,AuditQuestion
-from consensus_assurance.workflow.audit_spec import validate,accept,SpecIssue,load
+from consensus_assurance.core.types import ConsensusAuditSpec, Activity, Behavior, Fact, Surface, TargetProfile
+from consensus_assurance.workflow.audit_spec import validate, SpecIssue
 
 
 @pytest.mark.parametrize('applicability',['unknown','externalized','not_applicable','applicable'])
@@ -25,11 +25,10 @@ def test_R1_incomplete_coherent_inventory_and_aggregated_errors(prepared,applica
     assert len(exc.value.diagnostics)>=2 and all(d.material_ids for d in exc.value.diagnostics)
 
 
-@pytest.mark.parametrize('gap',['commit establishment','snapshot selection and transfer'])
-def test_R3_unread_intermediate_establishment_has_no_invented_edge(prepared,gap):
+def test_R3_unread_consumer_has_no_invented_edge(prepared):
     _,state,_,_=prepared;raw=inventory(state.materials[0].id).model_dump(mode='json')
     raw['behaviors'][1]['consumes_fact_ids']=[]
-    raw['facts'][0].pop('consumed_by');raw['facts'][0]['unknowns']=[gap+' is unread']
+    raw['facts'][0].pop('consumed_by');raw['facts'][0]['unknowns']=['The actual consumer is unread']
     spec=ConsensusAuditSpec.model_validate(raw);validate(state,spec)
     assert spec.facts[0].consumed_by==[] and spec.behaviors[1].consumes_fact_ids==[]
 

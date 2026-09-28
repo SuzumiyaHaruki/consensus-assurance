@@ -169,10 +169,10 @@ def test_unrelated_map_update_preserves_check_and_focus_stop_is_bounded(tmp_path
     index=json.loads((e.root/'research.json').read_text())
     assert index['frontier']['surfaces'] and index['stop']['scope']=='run'
     assert 'A2' in report and '不是责任覆盖率' in report
-    assert report.index('候选 `')<report.index('## 实际调用与边界')
+    assert report.index('候选 `')<report.index('## 日志、原稿与恢复记录')
 
 
-def test_used_fact_semantics_require_atomic_f2_reconnection(tmp_path):
+def test_fact_correction_is_saved_before_an_explicit_semantic_revision(tmp_path):
     def revise(state,authorized=False):
         from consensus_assurance.core.types import Analysis
         from consensus_assurance.core.proposals import UnitDraft,GraphPatch
@@ -180,14 +180,15 @@ def test_used_fact_semantics_require_atomic_f2_reconnection(tmp_path):
         saved=Analysis.model_validate(state)
         spec=json.loads(Path(state['audit_spec_path']).read_text())
         spec['facts'][0]['meaning']='The returned value is within the independently stated local capacity'
-        changes={'result':dict(impact='meaning',rationale='Distinguish the contract-bound result from mere delivery',source_ids=['doc','code'])}
+        changes={'result':dict(impact='meaning',rationale='Distinguish the contract-bound result from mere delivery',source_ids=['doc','code'],
+            challenges={state['question_candidates'][0]['id']:'The map confused observed delivery with the independently required bound; inspect the earlier attribution'})}
         sub=dict(action='research',map_path='map.json',map_changes=changes,rationale=changes['result']['rationale'],feedback=feedback(state))
         sub['feedback']['understanding']='updated'
         files={'map.json':json.dumps(spec)}
         if authorized:
             unit=saved.units[0]
             draft=UnitDraft(**{k:v for k,v in unit.model_dump().items() if k in UnitDraft.model_fields})
-            draft.audit_question.audit_spec_version=1
+            draft.audit_question.audit_spec_version=state['audit_spec_version']
             patch=GraphPatch(units=[draft],expected_versions={unit.id:unit.version},rationale=sub['rationale'])
             writes=write_set(saved,patch)
             fb=dict(kind='F2',rationale=sub['rationale'],evidence_ids=['code','doc'],target_ids=[unit.id],relation_ids=[],
@@ -199,11 +200,12 @@ def test_used_fact_semantics_require_atomic_f2_reconnection(tmp_path):
             files['feedback.json']=json.dumps(fb)
         return sub,files
     def accepted(state):
-        assert state['audit_spec_version']==1 and state['units'][0]['version']==1
+        assert state['audit_spec_version']==2 and state['units'][0]['version']==1
+        assert state['review_issues'] and not state['monitor_results'][0]['reviewed_complete']
         return revise(state,True)
     e,repo=engine_for(tmp_path,[first,check_step(),review_step(),revise,accepted,stop])
     state=e.start(repo)
-    assert len(diagnostics(e))==1,diagnostics(e)
+    assert not diagnostics(e),diagnostics(e)
     assert state.audit_spec_version==2 and state.units[0].version==2
     assert state.question_candidates[0].question.audit_spec_version==2
     assert state.units[0].remaining_obligation_ids==['bounded']
@@ -239,14 +241,14 @@ def test_scope_reconnects_added_fact_dependency_and_keeps_old_scope(tmp_path):
         # Reverse indexes are derived from authoritative Behavior edges in the submitted file.
         spec['facts'][0].pop('consumed_by')
         spec['activities'][0].pop('behavior_ids')
-        spec['behaviors'].append(dict(id='consume',primary_activity='A1',execution_owner='consumer',
+        if not any(b['id']=='consume' for b in spec['behaviors']):spec['behaviors'].append(dict(id='consume',primary_activity='A1',execution_owner='consumer',
             protocol_context='one request',trigger='return received',consumes_fact_ids=['result'],source_ids=['consumer']))
         binding=BindingDraft(id='consumer-binding',material_id='consumer',symbol='consume',start_line=1,end_line=2,
             associations=[dict(claim_id='bounded',source_ids=['consumer'],rationale='Uses this exact local return')],
             description='Actual dependent consumer',pending=['No distributed consequence check'])
         draft=UnitDraft(**{k:v for k,v in old.model_dump().items() if k in UnitDraft.model_fields})
         draft.binding_ids.append(binding.id)
-        draft.audit_question.audit_spec_version=1
+        draft.audit_question.audit_spec_version=state['audit_spec_version']
         draft.audit_question.behavior_ids.append('consume');draft.audit_question.source_ids.append('consumer')
         patch=GraphPatch(bindings=[binding],units=[draft],expected_versions={old.id:old.version},rationale='Include actual consumer without changing the principal Fact or normative claim')
         update=from_patch(saved,old,patch)
@@ -254,9 +256,18 @@ def test_scope_reconnects_added_fact_dependency_and_keeps_old_scope(tmp_path):
         update.assessment=dict(decision='refinement',source_ids=update.source_ids,addressed_fields=['audit_question'],
             preserved_question=old.audit_question.question,rationale='Reconnect a known result to its actual consumer; the local bound remains unchanged',remaining_unknowns=['Distributed consequences'])
         sub=dict(action='research',map_path='map.json',scope_path='scope.json',rationale=patch.rationale,
+            map_changes={'consume':dict(impact='dependency',source_ids=['consumer'],rationale='Register the actual read-only consumer',
+                preserves='The prior return bound is unchanged; the accompanying explicit scope update elects to check its consumption')},
             sources=[dict(id='consumer',file='consumer.py',start_line=1,end_line=2,kind='code_observation')])
         return sub,{'map.json':json.dumps(spec),'scope.json':update.model_dump_json()}
-    e,repo=engine_for(tmp_path,[first,expand,check_step(),review_step(),stop])
+    def knowledge_only(state):
+        sub,files=expand(state);sub.pop('scope_path');files.pop('scope.json')
+        return sub,files
+    def elect_scope(state):
+        assert state['audit_spec_version']==2 and not state['revisions']
+        assert state['units'][0]['audit_question']['behavior_ids']==['call']
+        return expand(state)
+    e,repo=engine_for(tmp_path,[first,knowledge_only,elect_scope,check_step(),review_step(),stop])
     (repo/'consumer.py').write_text('def consume(value):\n    return value\n')
     state=e.start(repo)
     assert not diagnostics(e),diagnostics(e)
@@ -326,7 +337,8 @@ def test_shared_fact_can_reconnect_paused_and_active_candidates_atomically(tmp_p
         spec['facts'][0]['validity_context']='The return value remains associated with this one completed call'
         questions={c['id']:{**c['question'],'audit_spec_version':1} for c in state['question_candidates']}
         return dict(action='research',map_path='map.json',reconnect_questions=questions,
-            map_changes={'result':dict(impact='meaning',source_ids=['code'],rationale='Clarify the bounded lifetime before deriving either obligation')},
+            map_changes={'result':dict(impact='meaning',source_ids=['code'],rationale='Correct the bounded lifetime before deriving either obligation',
+                challenges={c['id']:'Reassess the question against the corrected return lifetime' for c in state['question_candidates']})},
             rationale='Reconnect both sourced hypotheses to the revised Fact without changing their status'),{'map.json':json.dumps(spec)}
     e,repo=engine_for(tmp_path,[question_step,pause,other,reconnect,stop])
     state=e.start(repo)
@@ -593,7 +605,7 @@ def test_default_overview_precedes_focus_without_requiring_both_labels_per_quest
     def recover(state):
         assert not state['question_candidates'] and not state['units']
         assert state['native_current']['phase']=='rejected'
-        changes={id:dict(impact='dependency',rationale='Read the context transition and actual consumption',source_ids=['code']) for id in ['A2','call']}
+        changes={id:dict(impact='dependency',rationale='Read the context transition and actual consumption',source_ids=['code']) for id in ['A2','call','core_overview']}
         sub,files=mapping(complete,changes)
         if combined:
             q,_=question(state);sub.update(q);sub['map_changes']=changes;sub['map_path']='map.json'
@@ -693,4 +705,196 @@ def test_execution_feedback_updates_current_unknowns_then_explanation_and_new_di
     assert state.audit_spec_version==2 and state.usage['experiments']==1 and state.units[0].status=='checked'
     from consensus_assurance.reporting.chinese import render_report
     render_report(state,e.root)
-    assert '实际执行进度' in (e.root/'report.md').read_text()
+    assert state.units[0].id in (e.root/'report.md').read_text()
+
+
+def record_map(state, refined=False, challenge=False):
+    spec=json.loads(Path(state['audit_spec_path']).read_text())
+    for item in spec['activities']:item.pop('behavior_ids',None)
+    for item in spec['facts']:
+        item.pop('established_by',None);item.pop('consumed_by',None)
+    if challenge:
+        spec['behaviors'].append(dict(id='clear',primary_activity='A2',execution_owner='caller',protocol_context='same process',
+            trigger='clear records',consumes_fact_ids=['record'],source_ids=['code']))
+        changes={'clear':dict(impact='dependency',source_ids=['code'],rationale='A real shared-state write was absent from the earlier record-count history',
+            challenges={state['question_candidates'][1]['id']:'clear_records can run between append and count, invalidating the assumed uninterrupted observation'})}
+    else:
+        producer='record-write' if refined else 'call'
+        if refined:
+            spec['behaviors'].append(dict(id=producer,primary_activity='A1',execution_owner='caller',protocol_context='one request',
+                trigger='append inside step',produces_fact_ids=['record'],source_ids=['code']))
+        else:spec['behaviors'][0]['produces_fact_ids'].append('record')
+        spec['behaviors'].append(dict(id='record-read',primary_activity='A2',execution_owner='caller',protocol_context='same process',
+            trigger='count records',consumes_fact_ids=['record'],source_ids=['code']))
+        spec['activities'].append(dict(class_id='A2',applicability='applicable',purpose='Access recorded context',
+            realization_summary='count reads the shared records; return checking only depends on the local result',source_ids=['code']))
+        spec['facts'].append(dict(id='record',meaning='The call appended its result to the record list',identity={'operation':'one'},
+            validity_context='Until the records are cleared',representation=['records'],durability='volatile',recovery='none',source_ids=['code']))
+        spec['surfaces'].append(dict(entry_point='count',disposition='mapped',behavior_ids=['record-read'],source_ids=['code'],reason='Actual record consumer'))
+        changes={} if refined else {'call':dict(impact='dependency',source_ids=['code'],rationale='Register another output of the same invocation',
+            preserves='The bounded return uses the local result and capacity, not record count. No requirement, admission, schedule, oracle or observation changes. The explicit local boundary excludes concurrent calls.')}
+    return dict(action='research',map_path='map.json',map_changes=changes,feedback=feedback(state),
+        rationale='Feed actual implementation relationships back into the current map'),{'map.json':json.dumps(spec)}
+
+
+def record_obligation(state):
+    sub,plan,harness=products()
+    sub=json.loads(json.dumps(sub).replace('"bounded"','"recorded"').replace('"binding"','"record-binding"'))
+    plan=json.loads(json.dumps(plan).replace('"bounded"','"recorded"').replace('"binding"','"record-binding"'))
+    producer='record-write' if any(b['id']=='record-write' for b in json.loads(Path(state['audit_spec_path']).read_text())['behaviors']) else 'call'
+    sub.update(sources=[],feedback=feedback(state))
+    sub['question'].update(audit_spec_version=None,question='Does one isolated call leave one countable record?',
+        fact_ids=['record'],behavior_ids=[producer,'record-read'],activity_classes=['A1','A2'],
+        obligation_relation_kind='consumption',importance='The recorded result is visible to the next local reader')
+    sub['obligation']['description']='One isolated call leaves one record before clearing'
+    sub['bindings'][0].update(symbol='count',start_line=6,end_line=7)
+    sub['obligation']['pending']=['Proposed before execution: record observation is pending']
+    plan['description']='Observe count after an actual isolated invocation'
+    harness=harness.replace('from target import step','from target import step, count').replace('0 <= value <= 3','count() == 1')
+    return dict(action='check',candidate=sub,plan_path='plan.json',harness_path='check.py',files={'helper.py':'helper.py'},
+        rationale='Check the new consumer using the newly accepted knowledge'),{
+        'plan.json':json.dumps(plan),'check.py':harness,'helper.py':'def legal(value, limit):\n    return 0 <= value <= limit\n'}
+
+
+@pytest.mark.parametrize('variant',['shared','refined','interference'])
+def test_knowledge_growth_preserves_execution_and_supplies_the_next_check(tmp_path,variant):
+    snapshots={}
+    def initial(state):
+        sub,files=first(state)
+        sub['sources'][0]['end_line']=9
+        sub['bindings'][0].update(start_line=2,end_line=5)
+        spec=json.loads(files['map.json'])
+        spec['behaviors'][0]['existing_protections'].append('The call also appends its local result; record consumers remain unread')
+        files['map.json']=json.dumps(spec)
+        return sub,files
+    def enrich(state):
+        snapshots['unit']=state['units'][0]
+        snapshots['claim']=state['claims'][0]
+        snapshots['artifact']=state['direct_checks'][0]
+        snapshots['check']=next(c for c in state['checks'] if c['action']=='direct_check')
+        assert state['monitor_results'][0]['reviewed_complete']
+        return record_map(state,variant=='refined')
+    def more(state):
+        assert state['units'][0]['audit_question']['audit_spec_version']==1
+        if variant=='interference':return record_map(state,challenge=True)
+        spec=json.loads(Path(state['audit_spec_path']).read_text())
+        spec['surfaces'].append(dict(entry_point='clear_records',disposition='deferred',source_ids=['code'],reason='Uninvestigated record lifetime'))
+        return dict(action='research',map_path='map.json',rationale='Record a remaining boundary'),{'map.json':json.dumps(spec)}
+    def resume_first(state):
+        c=state['question_candidates'][0];q=dict(c['question']);q.pop('audit_spec_version')
+        return dict(action='continue',candidate_id=c['id'],question=q,feedback=feedback(state),
+            rationale='Return to the preserved first discriminator using its actual completed check'),{}
+    def noop(state):
+        spec=json.loads(Path(state['audit_spec_path']).read_text());spec['behaviors'].reverse()
+        return dict(action='research',map_path='map.json',rationale='Current understanding suffices'),{'map.json':json.dumps(spec)}
+    steps=[initial,check_step(),review_step(),enrich,record_obligation,review_step(),more,resume_first,noop,stop]
+    e,repo=engine_for(tmp_path,steps)
+    (repo/'target.py').write_text('records=[]\ndef step(value, limit):\n    result=value + 1 if value < limit else 0\n    records.append(result)\n    return result\ndef count():\n    return len(records)\ndef clear_records():\n    records.clear()\n')
+    (repo/'README.md').write_text('A legal isolated call returns within capacity and appends one record before clearing.\n')
+    def interrupt(key):
+        if e.state.audit_spec_version==1 and key.startswith('native-') and len(e.state.semantic_reviews)==1:
+            raise KeyboardInterrupt('Prepared knowledge update before adoption')
+    if variant=='shared':
+        e.graph_commit_hook=interrupt
+        with pytest.raises(KeyboardInterrupt):e.start(repo)
+        assert e.state.audit_spec_version==1
+        e.graph_commit_hook=lambda key:None
+        state=e.resume()
+    else:state=e.start(repo)
+    assert not diagnostics(e),diagnostics(e)
+    assert state.audit_spec_version==3 and len(state.units)==2
+    assert state.claims[0].model_dump(mode='json')==snapshots['claim']
+    assert state.direct_checks[0].model_dump(mode='json')==snapshots['artifact']
+    assert next(c for c in state.checks if c.id==snapshots['check']['id']).model_dump(mode='json')==snapshots['check']
+    assert state.units[0].version==snapshots['unit']['version']==1 and state.units[0].status=='checked'
+    assert not state.revisions and state.usage.get('revisions',0)==0 and state.usage['experiments']==2
+    assert state.usage['semantic_reviews']==2
+    assert state.units[1].audit_question.audit_spec_version==2 and state.units[1].audit_question.fact_ids==['record']
+    current=view(state)
+    assert current['frontier']['relationships'][1]['consumers']
+    assert current['conclusions'][0]['disposition']=='bounded_no_violation'
+    if variant=='interference':
+        assert len(state.review_issues)==1 and state.review_issues[0].target_id==state.question_candidates[1].id
+        assert current['conclusions'][1]['disposition']=='investigation_lead'
+        assert state.monitor_results[1]['bounded_complete'] and not state.monitor_results[1]['reviewed_complete']
+        assert state.units[1].status!='checked' and current['candidates'][1]['current_applicability']=='pending_review'
+    else:
+        assert state.units[1].status=='checked' and not state.review_issues
+    from consensus_assurance.workflow.audit_spec import validate_units
+    validate_units(state)
+    # Recovery replays neither a second map event nor an execution.
+    counts=(len(state.selections),[c.id for c in state.checks if c.action=='direct_check'],dict(state.usage))
+    state=e.resume()
+    assert (len(state.selections),[c.id for c in state.checks if c.action=='direct_check'],dict(state.usage))==counts
+
+
+@pytest.mark.parametrize('disposition',['explained','closed'])
+def test_new_knowledge_challenges_and_reviews_a_retained_source_explanation(tmp_path,disposition):
+    def explain(state):
+        sub,files=question_step(state)
+        sub.update(action='explained')
+        sub['question'].update(disposition='explained_by_existing_mechanism',counterevidence=['The capacity branch resets the return'])
+        return sub,files
+    def close(state):
+        return dict(action='stop',scope='candidate',reason='bounded_completed',ref_ids=[state['question_candidates'][0]['id']],
+            rationale='Close only the sourced local question'),{}
+    def challenge(state):
+        spec=json.loads(Path(state['audit_spec_path']).read_text())
+        spec['facts'][0]['validity_context']='Only after a legal call with a positive limit'
+        return dict(action='research',map_path='map.json',rationale='Make the previously implicit legal-input boundary explicit',
+            map_changes={'result':dict(impact='meaning',source_ids=['code','doc'],rationale='Recover the documented input qualification',
+                challenges={state['question_candidates'][0]['id']:'Check whether the old explanation assumed arbitrary input despite the documented precondition'})}),{'map.json':json.dumps(spec)}
+    def resolve(state):
+        c=state['question_candidates'][0];issue=state['review_issues'][0]
+        assert c['status']==disposition and not issue['resolved_by']
+        answer='The recorded question is explicitly one legal invocation; the documented positive-limit qualification does not change that source explanation'
+        return dict(action='review',artifact_id=c['id'],review_items=[dict(target_id=c['id'],aspect='applicability',status='no_issue_found',
+            source_ids=['code','doc'],rationale=answer)],resolutions=[dict(issue_id=issue['id'],source_ids=['code','doc'],rationale=answer,residual_issue_ids=[],scope_limitations=[])],rationale='Answer the specific knowledge challenge'),{}
+    def invalid_review(state):
+        sub,files=resolve(state);sub['review_items'][0]['source_ids']=['missing']
+        return sub,files
+    steps=[explain]+([close] if disposition=='closed' else [])+[challenge,invalid_review,resolve,stop]
+    e,repo=engine_for(tmp_path,steps);state=e.start(repo)
+    assert len(diagnostics(e))==1 and 'review_unknown_source' in str(diagnostics(e))
+    assert state.audit_spec_version==2 and state.question_candidates[0].status==disposition
+    assert state.review_issues[0].resolved_by and not state.direct_checks
+    assert view(state)['candidates'][0]['current_applicability']=='within_recorded_scope'
+
+
+@pytest.mark.parametrize('fault',['dangling','unsourced','activity_loss','base_conflict','identity_reuse'])
+def test_rejected_knowledge_update_cannot_leave_a_map_or_challenge(tmp_path,fault):
+    def invalid(state):
+        spec=json.loads(Path(state['audit_spec_path']).read_text())
+        changes={'call':dict(impact='dependency',source_ids=['code'],rationale='A proposed newly read boundary',
+            challenges={state['question_candidates'][0]['id']:'Proposed concurrent access needs investigation'})}
+        if fault=='dangling':spec['behaviors'][0]['produces_fact_ids'].append('absent')
+        elif fault=='unsourced':spec['behaviors'][0]['source_ids']=[]
+        elif fault=='activity_loss':spec['activities'][0]['realization_summary']='Unrelated new topic overwrites the existing summary'
+        elif fault=='base_conflict':spec['version']=2
+        else:
+            spec['behaviors'][0]['id']='result';spec['behaviors'][0]['produces_fact_ids']=['call']
+            spec['facts'][0]['id']='call';spec['facts'][0].pop('established_by')
+            spec['activities'][0].pop('behavior_ids')
+            changes['result']=changes['call']
+        return dict(action='research',map_path='map.json',map_changes=changes,rationale='Submit a complete proposed update'),{'map.json':json.dumps(spec)}
+    e,repo=engine_for(tmp_path,[first,invalid,stop]);state=e.start(repo)
+    assert len(diagnostics(e))==1 and state.audit_spec_version==1 and not state.review_issues
+    assert len(list((e.root/'audit-spec').glob('v*.json')))==1
+    assert len(state.units)==1 and not state.revisions
+
+
+def test_removed_historical_id_is_resolved_in_its_original_map(tmp_path):
+    def replace(state):
+        spec=json.loads(Path(state['audit_spec_path']).read_text())
+        fact=spec['facts'][0];fact['id']='delivered';fact.pop('established_by')
+        spec['behaviors'][0]['produces_fact_ids']=['delivered']
+        explanation=dict(impact='dependency',source_ids=['code'],rationale='Refine the recorded delivery identity while retaining the original version',
+            challenges={state['question_candidates'][0]['id']:'Review the earlier delivery identity against the corrected name and boundary'})
+        return dict(action='research',map_path='map.json',map_changes={'result':explanation,'call':explanation},rationale=explanation['rationale']),{'map.json':json.dumps(spec)}
+    e,repo=engine_for(tmp_path,[first,check_step(),review_step(),replace,stop]);state=e.start(repo)
+    assert not diagnostics(e),diagnostics(e)
+    from consensus_assurance.workflow.audit_spec import validate_units
+    validate_units(state)
+    assert state.units[0].audit_question.fact_ids==['result'] and state.units[0].audit_question.audit_spec_version==1
+    assert state.audit_spec_version==2 and not state.revisions and state.review_issues
+    assert state.monitor_results[0]['bounded_complete'] and not state.monitor_results[0]['reviewed_complete']

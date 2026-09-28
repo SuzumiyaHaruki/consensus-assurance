@@ -144,8 +144,8 @@ def candidate(engine, submission, operation_id, spec=None):
             m.id in q.source_ids and m.file in state.snapshot.files for m in state.materials):
         raise ValueError("Question needs actual authorized source citations")
     from .audit_spec import require_basis, require_overview, QUESTION_BASIS
-    require_overview(state,spec)
-    require_basis(state,q,spec,engine.config.activity_focus)
+    if current is None:require_overview(state,spec)
+    require_basis(state,q,spec,engine.config.activity_focus,current.id if current else None)
     if parent and q == parent.question:
         raise ValueError("A fork needs a distinct sourced question")
     if submission.action == "explained" and (not q.counterevidence or q.disposition != "explained_by_existing_mechanism"):
@@ -265,11 +265,17 @@ def accept(engine, submission, inputs, operation_id):
     if getattr(mapped,'map_path',None):
         proposed=ConsensusAuditSpec.model_validate(inputs.json(mapped.map_path))
         collect_validation(lambda:audit_spec.validate(state,proposed,changes))
-        if proposed!=spec:
+        if audit_spec.map_delta(spec,proposed):
             spec=proposed.model_copy(deep=True)
             spec.version=state.audit_spec_version+1
     elif changes:raise ValueError('Map change declarations require a complete map file')
-    def question_version(q):
+    def question_version(q, candidate_id=None):
+        prior=next((c.question for c in research_before.question_candidates if c.id==candidate_id),None)
+        if prior:
+            if q.audit_spec_version is not None:return
+            if all(getattr(q,k)==getattr(prior,k) for k in audit_spec.QUESTION_BASIS if k!='audit_spec_version'):
+                q.audit_spec_version=prior.audit_spec_version
+                return
         if proposed is not None:
             if q.audit_spec_version not in {None,proposed.version}:
                 raise ValueError(f'Question base version must match submitted map base {proposed.version}; got {q.audit_spec_version}')
@@ -295,9 +301,10 @@ def accept(engine, submission, inputs, operation_id):
                 declarations.append(declared)
             declared.new_value_json=draft.audit_question.model_dump_json()
     if isinstance(mapped,CandidateSubmission):
-        collect_validation(lambda:question_version(mapped.question))
+        collect_validation(lambda:question_version(mapped.question,mapped.candidate_id))
         collect_validation(lambda:validate_question(mapped.question))
-        if spec:collect_validation(lambda:audit_spec.validate_question(spec,mapped.question,engine.config.activity_focus))
+        if spec and mapped.question.audit_spec_version==spec.version:
+            collect_validation(lambda:audit_spec.validate_question(spec,mapped.question,engine.config.activity_focus))
         missing=set(mapped.question.source_ids)-{m.id for m in state.materials}
         if missing:issues.append(Diagnostic(code='question_sources',category='material',message='Question has unacquired sources: '+', '.join(sorted(missing))))
         if mapped.obligation:
@@ -306,25 +313,28 @@ def accept(engine, submission, inputs, operation_id):
                 {m.id:m for m in state.materials},{b.id for b in state.bindings}|{b.id for b in mapped.bindings}))
     if issues:raise DiagnosticError(issues)
     from .research import record_decision
-    decision=record_decision(engine,submission,operation_id,map_changed=bool(proposed and proposed!=audit_spec.load(state)))
+    decision=record_decision(engine,submission,operation_id,map_changed=bool(proposed and audit_spec.map_delta(audit_spec.load(state),proposed)))
     decision['map_changes']={k:v.model_dump(mode='json') for k,v in changes.items()}
     decision['accepted_versions']={'audit_spec':spec.version if spec else 0}
+    if decision['map_updated']:
+        delta,effects=audit_spec.understanding_changes(state,proposed,changes)
+        decision.update(map_delta=delta,map_effects=effects)
+        audit_spec.record_challenges(state,research_before,effects,operation_id)
     def validate_objects():
         for id,q in getattr(mapped,'reconnect_questions',{}).items():
             question_version(q)
             prior=next((c for c in research_before.question_candidates if c.id==id),None)
             c=next((c for c in state.question_candidates if c.id==id),None)
-            if not proposed or proposed==audit_spec.load(research_before) or not prior or not c:
+            if not proposed or not audit_spec.map_delta(audit_spec.load(research_before),proposed) or not prior or not c:
                 raise ValueError('Question reconnection needs a changed map and a saved Candidate')
             validate_question(q)
-            audit_spec.require_basis(state,q,spec,engine.config.activity_focus)
+            audit_spec.require_basis(state,q,spec,engine.config.activity_focus,c.id)
             if not q.source_ids or not set(q.source_ids)<={m.id for m in state.materials}:raise ValueError('Reconnected question needs actual acquired sources')
             from .research import source_refs
             if (not set(prior.question.counterevidence)<=set(q.counterevidence) or not set(prior.question.unknowns)<=set(q.unknowns)) and not (submission.feedback and source_refs(state,submission.feedback.ref_ids)):
                 raise ValueError('Reconnection answers require sourced feedback, preserving earlier questions in history')
             if c.question!=q:
                 c.history.append(c.question.model_copy(deep=True));c.question=q
-        audit_spec.validate_reconnections(research_before,state,spec,changes)
         audit_spec.validate_units(state,spec,engine.config.activity_focus)
         if len(state.claims)+len(state.bindings)+len(state.relations)+len(state.units)>engine.config.budget.graph_objects:
             raise ValueError('Accepted graph object budget exceeded')
@@ -332,7 +342,7 @@ def accept(engine, submission, inputs, operation_id):
     if isinstance(submission, CandidateSubmission):
         candidate(engine, submission, operation_id, spec)
     elif isinstance(submission, CheckSubmission):
-        audit_spec.require_overview(state,spec)
+        if submission.candidate:audit_spec.require_overview(state,spec)
         require_capacity(engine,'experiments')
         if submission.previous_check_id:require_capacity(engine,'revisions')
         if submission.candidate:
@@ -362,7 +372,6 @@ def accept(engine, submission, inputs, operation_id):
         current["direct_check_id"] = artifact.id
         state.active_unit_id, state.active_direct_check_id = unit.id, artifact.id
     elif isinstance(submission, ModelSubmission):
-        if submission.unit_id:audit_spec.require_overview(state,spec)
         require_capacity(engine,'model_checks',2)
         if submission.previous_model_id:require_capacity(engine,'revisions')
         from .artifacts import validate_bundle, save_bundle, load_model
@@ -452,6 +461,7 @@ def accept(engine, submission, inputs, operation_id):
                 if unit.candidate_id==id and unit.status!='revised':unit.audit_question.unknowns=list(update.unknowns)
     # Forced/resource exits are always possible, even with incomplete historical understanding.
     if submission.action not in {'stop','explore','review'}:validate_objects()
+    sync_progress(engine)
     if proposed is not None:audit_spec.accept(engine,proposed)
     decision=state.selections[-1]
     decision['candidate_ids']=list(dict.fromkeys(decision.get('candidate_ids',[])+[c.id for c in state.question_candidates if operation_id in c.check_ids]))

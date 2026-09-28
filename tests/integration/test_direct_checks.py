@@ -159,16 +159,27 @@ def test_direct_encoding_observation_change_must_be_declared(tmp_path,prepared):
     validate_direct_encoding(e.state,old,old_plan,fixed,revision)
 
 
-def test_changed_semantic_input_stales_current_direct_result(tmp_path,prepared):
-    e,u,p=setup(tmp_path,prepared,True);artifact=save_plan(e,u,p,'stale-result');review(e.state,u,artifact)
-    check=execute(e,artifact);assert assess(e.state,u,artifact,p,check,extract_events(check))['confirmed']
+@pytest.mark.parametrize('change',['semantic_input','knowledge_challenge'])
+def test_changed_interpretation_updates_current_direct_result(tmp_path,prepared,change):
+    e,u,p=setup(tmp_path,prepared,True)
     candidate=QuestionCandidate(question=u.audit_question,obligation_id=u.obligation_ids[0],status='escalated')
-    e.state.question_candidates.append(candidate)
-    next(c for c in e.state.claims if c.id==artifact.claim_id).version+=1;e.checkpoint('semantic_input_changed')
+    u.candidate_id=candidate.id;e.state.question_candidates.append(candidate)
+    artifact=save_plan(e,u,p,'stale-result');review(e.state,u,artifact)
+    check=execute(e,artifact);assert assess(e.state,u,artifact,p,check,extract_events(check))['confirmed']
+    original=Path(check.stdout).read_bytes(),Path(artifact.plan_path).read_bytes()
+    if change=='semantic_input':
+        next(c for c in e.state.claims if c.id==artifact.claim_id).version+=1;e.checkpoint('semantic_input_changed')
+    else:
+        e.state.review_issues.append(ReviewIssue(review_id='knowledge-update',target_id=candidate.id,target_version=1,
+            aspect='applicability',source_ids=u.audit_question.source_ids,explanation='Review the recovered input boundary',
+            disposition='investigation',reason='New sourced interpretation'))
+        from consensus_assurance.workflow.native import sync_progress
+        sync_progress(e)
     current=next(r for r in e.state.monitor_results if r.get('direct_check_id')==artifact.id)
     assert current['outcome']=='violated' and not current['confirmed']
-    assert any('semantic inputs changed' in reason for reason in current['blockers'])
-    assert e.state.evidence[0].assessment==Assessment.STALE
+    assert any(('semantic inputs changed' if change=='semantic_input' else 'Open review issue') in reason for reason in current['blockers'])
+    assert e.state.evidence[0].assessment==(Assessment.STALE if change=='semantic_input' else Assessment.INCONCLUSIVE)
+    assert (Path(check.stdout).read_bytes(),Path(artifact.plan_path).read_bytes())==original
     assert len(e.state.monitor_results)==len(e.state.evidence)==len(e.state.findings)==1
 
 

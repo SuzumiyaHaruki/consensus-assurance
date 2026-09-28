@@ -1,11 +1,8 @@
-from consensus_assurance.workflow.reviews import semantic_limitations
 """Repository-type reproductions of the four audited boundary failures."""
 import json
-import shutil
-from pathlib import Path
 import pytest
-from consensus_assurance.core.proposals import ClaimDraft,GraphPatch,Feedback,JudgmentChange,ReviewReply
-from consensus_assurance.core.types import CheckRun,CheckerResult,ExecutionStatus,SemanticReview,SemanticCheck
+from consensus_assurance.core.proposals import ClaimDraft, GraphPatch, Feedback, JudgmentChange
+from consensus_assurance.core.types import CheckRun, CheckerResult, ExecutionStatus
 from consensus_assurance.workflow.artifacts import save_bundle
 from consensus_assurance.workflow.modeling import obligation_progress
 from consensus_assurance.adapters.runners.python import PythonBackend
@@ -35,16 +32,10 @@ def test_same_named_stronger_unexecuted_model_is_not_covered(tmp_path,prepared):
     assert spec.claim_id in missing and spec.claim_id not in checked
 
 
-import json
-import pytest
-from consensus_assurance.core.proposals import GraphPatch,RelationDraft,BindingDraft,UnitDraft,ClaimDraft,JudgmentChange
-from consensus_assurance.core.types import CheckRun,CheckerResult,ExecutionStatus,Origin
-from consensus_assurance.workflow.mutations import write_set
+from consensus_assurance.core.proposals import RelationDraft, BindingDraft, UnitDraft
+from consensus_assurance.core.types import Origin
 from consensus_assurance.workflow.feedback import apply_feedback
 from consensus_assurance.workflow.graph import apply_patch
-from consensus_assurance.workflow.artifacts import save_bundle
-from consensus_assurance.workflow.modeling import obligation_progress
-from consensus_assurance.adapters.runners.python import PythonBackend
 
 
 @pytest.mark.parametrize('extra',['claim','relation','unit','binding'])
@@ -128,7 +119,6 @@ def test_reused_counterexample_keeps_current_attribution_without_reexecuting(tmp
 
 
 """Project-level reproductions of the reviewed interface boundaries."""
-import pytest
 from consensus_assurance.core.config import Config
 from consensus_assurance.core.types import Material
 from consensus_assurance.workflow.engine import Engine
@@ -163,3 +153,19 @@ def complete_search(state,model,root):
     check=CheckRun(action='model_check',status=ExecutionStatus.COMPLETED,outcome='holds',cwd=str(root),snapshot_id=state.snapshot.id,model_id=model.id,search_fingerprint=model.search_fingerprint,origin=Origin.MOCK,checker_results=[CheckerResult(invariant=s.invariant,claim_id=s.claim_id,scope=s.scope,outcome='holds') for s in model.checkers])
     state.checks.append(check)
     return check
+
+
+from consensus_assurance.core.proposals import GraphDraft
+
+
+def test_patch_keeps_object_versions_and_unrelated_claims(prepared):
+    _,state,_,responses=prepared
+    current=state.claims[1]
+    changed=GraphDraft.model_validate(responses['graph']).claims[1]
+    changed.description='Refined responsibility under the same documented configuration'
+    patch=GraphPatch(claims=[changed],expected_versions={changed.id:1},rationale='New interpretation')
+    with pytest.raises(ValueError,match='F2'): apply_patch(state,patch)
+    apply_patch(state,patch,semantic=True)
+    assert state.claims[1].version==2 and state.claims[0].version==1
+    assert state.graph_history[-1]['record']['description']==current.description
+    with pytest.raises(ValueError,match='version'): apply_patch(state,patch,semantic=True)

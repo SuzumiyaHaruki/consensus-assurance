@@ -5,6 +5,7 @@ MISSING = object()
 
 
 def field(event, path):
+    '''Retrieve a nested field from an event dictionary using dot-separated path.'''
     value = event
     for key in path.split('.'):
         if not isinstance(value,dict) or key not in value:
@@ -14,18 +15,20 @@ def field(event, path):
 
 
 def compare(event, condition, aliases=None):
+    '''Compare a field in an event against a condition, optionally using aliases for other events.'''
     left = field(event,condition.field)
     right = condition.value
     if condition.reference:
         alias, sep, path = condition.reference.partition('.')
         if not sep or alias not in (aliases or {}): return None
-        right = field(aliases[alias],path)
+        right = field(aliases[alias],path) # type: ignore
     if left is MISSING or right is MISSING: return None
     equal = type(left) is type(right) and left == right
     return equal if condition.op == 'eq' else not equal
 
 
 def event_requirements(requirements, reference=None):
+    '''Order and validate a list of event requirements, ensuring unique aliases and no causal cycles.'''
     requirements = [EventRequirement.model_validate(r) for r in requirements]
     aliases = {r.alias for r in requirements}
     if len(aliases) != len(requirements) or any(not a or '.' in a for a in aliases):
@@ -43,6 +46,7 @@ def event_requirements(requirements, reference=None):
 
 
 def match_prerequisites(events, requirements, witness_index=None, identity_fields=()):
+    '''Match a sequence of events against a set of ordered prerequisites, optionally using a witness event for identity checks.'''
     if not requirements:
         return {'status':'unknown','reason':'No correlated prerequisite specification','matched_indices':[], 'alias_indices':{}}
     try: ordered = event_requirements(requirements)

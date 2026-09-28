@@ -165,7 +165,7 @@ class ConsensusAuditSpec(Record):
                 if isinstance(obj,dict):obj.update(additions)
                 elif additions:value[collection][i]=obj.model_copy(update=additions)
         derived('activities',{'behavior_ids':lambda a:[get(b,'id') for b in behaviors if get(b,'primary_activity')==get(a,'class_id')]})
-        derived('facts',{key:(lambda f,edge=edge:[get(b,'id') for b in behaviors if get(f,'id') in get(b,edge,[])]) for key,edge in [('established_by','produces_fact_ids'),('consumed_by','consumes_fact_ids')]})
+        derived('facts',{key:(lambda f,edge=edge:[get(b,'id') for b in behaviors if get(f,'id') in get(b,edge,[])]) for key,edge in [('established_by','produces_fact_ids'),('consumed_by','consumes_fact_ids')]}) # type: ignore
         return value
 
     @model_validator(mode="after")

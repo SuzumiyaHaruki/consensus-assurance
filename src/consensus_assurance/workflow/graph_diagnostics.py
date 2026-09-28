@@ -73,7 +73,7 @@ def diagnose_graph(state,proposal,audit_spec=None):
     for i,r in enumerate(proposal.relations):
         if r.source not in set(claims)|set(bindings) or r.target not in set(claims)|set(bindings):
             emit('relation_endpoint','association',[r.id,r.source,r.target],[f'/relations/{i}'],r.grounding.source_ids+r.grounding.expectation_ids,'Relation endpoint does not exist; keep a reading gap instead of inventing an endpoint',['association','read'])
-    from .audit_spec import load,validate_question
+    from .audit_spec import load
     spec=audit_spec or load(state)
     relations={r.id:r for r in proposal.relations}
     for i,u in enumerate(proposal.units):
@@ -100,7 +100,8 @@ def diagnose_graph(state,proposal,audit_spec=None):
         if q and (q.behavior_ids or q.fact_ids):
             try:
                 if not spec:raise ValueError('A generated question requires accepted implementation understanding')
-                validate_question(spec,q)
+                from .audit_spec import require_basis
+                require_basis(state,q,spec,candidate_id=u.candidate_id)
             except ValueError as exc:
                 emit('audit_question','semantic',[u.id],[f'/units/{i}/audit_question'],sources,str(exc),['read','semantic_revision'])
     return issues

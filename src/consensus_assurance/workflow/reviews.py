@@ -7,7 +7,7 @@ from .sources import includes
 
 
 def review_objects(state):
-    return {o.id:o for o in state.claims+state.bindings+state.relations+state.units+state.models+state.direct_checks}
+    return {o.id:o for o in state.claims+state.bindings+state.relations+state.units+state.models+state.direct_checks+state.question_candidates}
 
 
 def issue_challenges(state,issue):
@@ -33,6 +33,7 @@ def material_closure(state, ids):
         wanted.update(source_ids)
     for id in visited:
         obj=objects[id]
+        if hasattr(obj,'question'):wanted.update(obj.question.source_ids)
         if hasattr(obj,'file'):
             wanted.update(m.id for m in state.materials if m.file==obj.file and m.content_digest==obj.content_digest and m.start_line<=obj.end_line and m.end_line>=obj.start_line)
     return wanted,visited
@@ -75,11 +76,12 @@ def accept_review(state, submission, operation_id):
     from .review_contract import validate_contract
     objects = review_objects(state)
     artifact = objects.get(submission.artifact_id)
-    if artifact is None or not (hasattr(artifact, 'plan_path') or hasattr(artifact, 'bundle_path')):
-        raise ValueError('Review requires an accepted check or model artifact ID')
+    candidate=artifact if hasattr(artifact,'question') else None
+    if artifact is None or not (candidate or hasattr(artifact, 'plan_path') or hasattr(artifact, 'bundle_path')):
+        raise ValueError('Review requires an accepted artifact or Candidate ID')
     checks = [c for c in state.checks if (c.direct_check_id == artifact.id or c.model_id == artifact.id)
               and c.status.value == 'completed']
-    if not checks:
+    if not checks and not candidate:
         raise ValueError('Review requires an actual completed execution of the selected artifact')
     sources = [m.id for m in state.materials]
     task = SimpleNamespace(target_ids=[artifact.id], material_ids=sources, context_receipt_id=None)
@@ -93,6 +95,8 @@ def accept_review(state, submission, operation_id):
     if any(not i.source_ids or not i.rationale.strip() for i in reply.items):
         raise ValueError('Review needs actual source citations and substantive reasoning')
     ancestors = lineage(state, artifact)
+    owner=next((u.candidate_id for u in state.units if u.id==getattr(artifact,'unit_id',None)),None)
+    if owner:ancestors.add(owner)
     if len({r.issue_id for r in submission.resolutions}) != len(submission.resolutions):
         raise ValueError('Duplicate issue resolution')
     def error(index, issue, message, **details):
@@ -140,9 +144,9 @@ def accept_review(state, submission, operation_id):
                     original_artifact=old.id, answering_artifact=artifact.id)
     if errors:raise DiagnosticError(errors)
     review = SemanticReview(task_id='native:' + operation_id, check_id=operation_id,
-        target_versions={artifact.id:artifact.version}, material_ids=sources, items=reply.items,
-        origin='mock' if state.mode == 'mock' else 'agent', unit_id=artifact.unit_id or None,
-        unit_version=next((u.version for u in state.units if u.id == artifact.unit_id), None),
+        target_versions={artifact.id:artifact.question.audit_spec_version if candidate else artifact.version}, material_ids=sources, items=reply.items,
+        origin='mock' if state.mode == 'mock' else 'agent', unit_id=getattr(artifact,'unit_id',None) or None,
+        unit_version=next((u.version for u in state.units if u.id == getattr(artifact,'unit_id',None)), None),
         model_id=artifact.id if hasattr(artifact, 'bundle_path') else None,
         resolves_issue_ids=[r.issue_id for r in submission.resolutions])
     state.semantic_reviews.append(review)
@@ -158,7 +162,7 @@ def accept_review(state, submission, operation_id):
                and not i.resolved_by for i in state.review_issues):
             continue
         state.review_issues.append(ReviewIssue(review_id=review.id, target_id=artifact.id,
-            target_version=artifact.version, aspect=item.aspect, model_id=review.model_id,
+            target_version=artifact.question.audit_spec_version if candidate else artifact.version, aspect=item.aspect, model_id=review.model_id,
             source_ids=item.source_ids, explanation=item.rationale, reason=item.rationale,
             disposition='reading' if item.status == 'needs_reading' else 'investigation',
             challenged_components=item.challenged_components if item.status=='revision_needed' else []))
@@ -167,6 +171,7 @@ def accept_review(state, submission, operation_id):
 
 def semantic_limitations(state, model):
     relevant = lineage(state, model) | set(model.graph_versions)
+    relevant.update(u.candidate_id for u in state.units if u.id==model.unit_id)
     blockers = ['Open review issue: ' + i.id + ': ' + i.explanation
         for i in state.review_issues if not i.resolved_by and i.target_id in relevant]
     versions = {o.id:o.version for o in state.claims + state.bindings + state.relations + state.units}

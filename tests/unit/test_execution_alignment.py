@@ -1,11 +1,8 @@
 import json
 """Question-directed execution regressions, independent of target answer keys."""
-from types import SimpleNamespace
-from consensus_assurance.core.types import AuditQuestion, ConstraintSource
+from consensus_assurance.core.types import ConstraintSource
 
 from consensus_assurance.workflow.artifacts import validate_bundle
-from consensus_assurance.core.proposals import GraphDraft
-from test_graph_mutations import controller
 
 
 def test_constraint_cites_material_and_selected_binding(prepared):
@@ -47,3 +44,32 @@ def test_experiment_archives_inputs_separately_from_runtime_outputs(tmp_path):
     reconstructed=restore(source,before,tmp_path/'inputs')
     assert (reconstructed/'harness.py').read_bytes()==(workspace/'harness.py').read_bytes()
     assert not (reconstructed/'produced.txt').exists()
+
+
+import pytest
+from consensus_assurance.core.proposals import Comparison, EventRequirement, ObservationMap, FieldProjection
+from consensus_assurance.workflow.observations import match_prerequisites
+from consensus_assurance.adapters.verifiers.trace import project
+
+
+def prerequisites():
+    return [EventRequirement(alias='start',event='started'),EventRequirement(alias='change',event='context_changed',conditions=[Comparison(field='operation',reference='start.operation'),Comparison(field='participant',reference='start.participant'),Comparison(field='context',op='ne',reference='start.context')]),EventRequirement(alias='end',event='completed',conditions=[Comparison(field='operation',reference='start.operation'),Comparison(field='participant',reference='start.participant'),Comparison(field='context',reference='change.context')])]
+
+
+
+def test_event_identity_and_context_cannot_be_spliced():
+    events=[{'event':e,'operation':'a','participant':'p','context':c} for e,c in [('started',1),('context_changed',2),('completed',2)]]
+    assert match_prerequisites(events,prerequisites())['status']=='matched'
+    events[1]['operation']='other'
+    assert match_prerequisites(events,prerequisites())['status']=='not_reached'
+    events[1]['operation']='a';del events[2]['context']
+    assert match_prerequisites(events,prerequisites())['status']=='unknown'
+
+
+
+def test_projection_of_events_state_and_metadata():
+    mapping=ObservationMap(fields=[FieldProjection(model_field='kind',raw_field='event',source='event'),FieldProjection(model_field='ctx',raw_field='context',source='metadata'),FieldProjection(model_field='value',raw_field='value')],required_events=['initial','step'],description='Explicit event projection')
+    events=[{'event':e,'metadata':{'context':1},'state':{'value':i}} for i,e in enumerate(['initial','step'])]
+    assert project(events,mapping)[1]=={'kind':'step','ctx':1,'value':1}
+    del events[1]['metadata']['context']
+    with pytest.raises(ValueError,match='missing'): project(events,mapping)

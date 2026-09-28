@@ -17,6 +17,8 @@ class UnderstandingChange(Record):
     impact: Literal["clarification", "meaning", "dependency"]
     rationale: str = Field(min_length=1)
     source_ids: list[str] = Field(min_length=1)
+    preserves: str = Field(default='', description='Shared sourced explanation of why the existing propositions, premises and observations still apply')
+    challenges: dict[str, str] = Field(default_factory=dict, description='Saved Candidate IDs and the concrete premise or interpretation challenged by this knowledge')
 
 
 class QuestionUpdate(Record):
@@ -45,7 +47,7 @@ class MappedSubmission(Submission):
     map_path: str | None = None
     map_changes: dict[str, UnderstandingChange] = {}
     reconnect_questions: dict[str, AuditQuestion] = Field(default_factory=dict,
-        description="Explicit complete questions for saved Candidates sharing the changed map basis; Unit semantics still require F2/F3")
+        description="Optional explicit question reconnections; changing an accepted Unit proposition still requires F2/F3")
 
 
 class CandidateSubmission(MappedSubmission):

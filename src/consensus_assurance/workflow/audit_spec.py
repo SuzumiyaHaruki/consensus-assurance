@@ -21,12 +21,12 @@ def audit_object_key(obj):
 
 def audit_object_index(spec):
     value=spec.model_dump(mode='json') if hasattr(spec,'model_dump') else spec or {}
-    return {audit_object_key(o):o for o in [value.get('target_profile')]+[o for k in ('activities','behaviors','facts','surfaces') for o in value.get(k,[])] if o}
+    return {**{audit_object_key(o):o for o in [value.get('target_profile')]+[o for k in ('activities','behaviors','facts','surfaces') for o in value.get(k,[])] if o}, **({'core_overview':value['core_overview']} if value.get('core_overview') else {})}
 
 
 def audit_object_path(spec,key):
     value=spec.model_dump(mode='json') if hasattr(spec,'model_dump') else spec or {}
-    if key=='target_profile':return '/target_profile'
+    if key in {'target_profile','core_overview'}:return '/'+key
     return next(('/'+k+'/'+str(i) for k in ('activities','behaviors','facts','surfaces') for i,o in enumerate(value.get(k,[])) if audit_object_key(o)==key),None)
 
 
@@ -51,7 +51,7 @@ def validate(state, spec, changes=None):
         issues.append(Diagnostic(code='audit_spec_semantics',category='semantic',object_ids=ids,paths=[audit_object_path(spec,ids[0]) or '/'],material_ids=sorted(sources&known),details={'old':audit_object_index(old).get(ids[0]),'proposed':obj.model_dump(mode='json')},message=message,allowed=['read','semantic_revision']))
     if spec.version!=(old.version if old else 1):
         issue(spec.target_profile,f'Map base version conflict: expected {old.version if old else 1}, got {spec.version}; the controller assigns the accepted version')
-    ids=[o.id for o in [*spec.behaviors,*spec.facts]]
+    ids=[audit_object_key(o) for o in objects]+['core_overview']
     if len({s.entry_point for s in spec.surfaces})!=len(spec.surfaces):issue(spec.target_profile,'Duplicate surface entry points')
     if len(ids)!=len(set(ids)):issue(spec.target_profile,'Duplicate implementation object identifiers')
     for obj in objects:
@@ -62,11 +62,13 @@ def validate(state, spec, changes=None):
         if a.applicability!='unknown' and not a.source_ids:issue(a,'Applicability needs actual source evidence')
         if set(a.behavior_ids)!={b.id for b in spec.behaviors if b.primary_activity==a.class_id}:issue(a,'Derived Activity index contradicts Behavior ownership')
     for b in spec.behaviors:
+        if not b.source_ids:issue(b,'Behavior requires actual source evidence')
         if b.primary_activity not in {a.class_id for a in spec.activities}:issue(b,'Behavior needs its actual Activity coordinate')
         if not all(getattr(b,k).strip() for k in ('execution_owner','protocol_context','trigger')):issue(b,'Behavior needs its actual owner, context and trigger')
         missing=set(b.produces_fact_ids+b.consumes_fact_ids)-facts.keys()
         if missing:issue(b,'Behavior references nonexistent facts',sorted(missing))
     for f in spec.facts:
+        if not f.source_ids:issue(f,'Fact requires actual source evidence')
         if not f.meaning.strip() or not f.identity or not f.validity_context.strip():issue(f,'Fact needs an identity-scoped semantic assertion')
         missing=set(f.established_by+f.consumed_by+f.invalidators+f.reinterpreters)-behaviors.keys()
         if missing:issue(f,'Fact references nonexistent behaviors',sorted(missing))
@@ -101,27 +103,7 @@ def validate(state, spec, changes=None):
             if any(not set(path.source_ids)&set(o.source_ids) for o in objects):
                 overview_issue(name+'/source_ids','Cite the referenced Behavior and Fact sources; labels alone do not explain a path')
     if issues:raise SpecIssue(issues)
-    if changes is not None:
-        before,after=audit_object_index(old),audit_object_index(spec)
-        changed={key for key in before if object_content(before[key])!=object_content(after.get(key))}
-        used={id for c in state.question_candidates if c.status!='explained' for id in c.question.fact_ids}
-        added_producers={b.id for b in spec.behaviors if b.id not in before and set(b.produces_fact_ids)&used}
-        required=changed|added_producers
-        missing=required-set(changes)
-        unknown=set(changes)-before.keys()-after.keys()
-        if missing or unknown:
-            raise ValueError('Map change explanations: missing='+str(sorted(missing))+'; unknown='+str(sorted(unknown))+
-                '; derived modified/removed/affected producers='+str(sorted(required))+
-                '; independent additions need no duplicate declaration')
-        # Independent additions and unchanged declarations are mechanical surplus,
-        # not an undeclared semantic modification. Derive the actual changed set.
-        for key in set(changes)-required:changes.pop(key)
-        structural={'identity','validity_context','primary_activity','execution_owner','protocol_context','produces_fact_ids','consumes_fact_ids','invalidators','reinterpreters'}
-        for key,change in changes.items():
-            if not set(change.source_ids)<=known:raise ValueError('Map change needs acquired source evidence: '+key)
-            fields={k for k,v in object_content(before.get(key)).items() if object_content(after.get(key)).get(k)!=v}
-            if change.impact=='clarification' and (key not in after or fields&structural):
-                raise ValueError('Object removal or changed identity/context/edges is not descriptive clarification: '+key)
+    if changes is not None:understanding_changes(state,spec,changes)
     return spec
 
 
@@ -132,7 +114,7 @@ def require_overview(state, spec):
 
 def accept(engine,spec):
     """Persist the map validated against the transaction input, before new objects existed."""
-    if load(engine.state)==spec:return
+    if not map_delta(load(engine.state),spec):return
     spec=spec.model_copy(deep=True);spec.version=engine.state.audit_spec_version+1
     path=engine.root/'audit-spec'/f'v{spec.version}.json';write_json(path,spec)
     engine.state.audit_spec_path=str(path);engine.state.audit_spec_version=spec.version
@@ -169,53 +151,104 @@ def validate_question(spec,question,focus=()):
     if errors:raise ValueError("; ".join(errors))
 
 
-def require_basis(state,question,spec=None,focus=()):
-    """An older basis remains valid when only unrelated or attributed descriptive objects change."""
+def map_delta(before, after):
+    """Derive actual knowledge edits; only reverse indexes are mechanical."""
+    old,new=audit_object_index(before),audit_object_index(after)
+    return {key:{'before':object_content(old.get(key)), 'after':object_content(new.get(key))}
+        for key in sorted(old.keys()|new.keys()) if object_content(old.get(key))!=object_content(new.get(key))}
+
+
+def understanding_changes(state, spec, changes):
+    """One impact contract, shared by acceptance and historical basis validation.
+
+    Citations and graph references are checked mechanically. Preserved and challenged
+    propositions are sourced interpretations, still open to substantive review.
+    """
+    old=load(state)
+    delta=map_delta(old,spec)
+    known={m.id for m in state.materials}
+    candidates={c.id:c for c in state.question_candidates}
+    related={}
+    for id,c in candidates.items():
+        q=c.question
+        used=set(q.behavior_ids+q.fact_ids+list(q.supporting_behavior_ids))
+        related[id]={key for key,d in delta.items() if key in used or
+            any(set(obj.get('produces_fact_ids',[])+obj.get('consumes_fact_ids',[]))&set(q.fact_ids)
+                for obj in d.values())}
+    required={key for key,d in delta.items() if d['before']} | set().union(*related.values(),set())
+    missing=required-changes.keys() if old else set()
+    unknown=changes.keys()-audit_object_index(old).keys()-audit_object_index(spec).keys()
+    if missing or unknown:
+        raise ValueError('Map change explanations: missing='+str(sorted(missing))+'; unknown='+str(sorted(unknown)))
+    for key in list(changes):
+        if key not in delta:changes.pop(key)
+    for key,d in delta.items():
+        if d['before'] and d['after'] and ('meaning' in d['before'])!=('meaning' in d['after']):
+            raise ValueError('Map object identity cannot change between Behavior and Fact: '+key)
+    structural={'identity','validity_context','primary_activity','execution_owner','protocol_context',
+        'produces_fact_ids','consumes_fact_ids','invalidators','reinterpreters'}
+    effects={id:[] for id in candidates}
+    for key,change in changes.items():
+        if not set(change.source_ids)<=known:raise ValueError('Map change needs acquired source evidence: '+key)
+        if not set(change.challenges)<=candidates.keys() or any(not reason.strip() for reason in change.challenges.values()):
+            raise ValueError('Map challenges need saved Candidate IDs and specific reasons: '+key)
+        d=delta[key]
+        fields={k for k in d['before'].keys()|d['after'].keys() if d['before'].get(k)!=d['after'].get(k)}
+        if change.impact=='clarification' and (not d['after'] or fields&structural):
+            raise ValueError('Object removal or changed identity/context/edges is not descriptive clarification: '+key)
+        for id in candidates:
+            challenged=change.challenges.get(id)
+            if key not in related[id] and not challenged:continue
+            preserved=change.preserves or (change.rationale if change.impact=='clarification' else '')
+            if not challenged and not preserved.strip():
+                raise ValueError('Explain preserved propositions once in preserves, or name concrete challenges: '+key+' / '+id)
+            if not challenged and change.impact=='meaning' and key in candidates[id].question.fact_ids:
+                raise ValueError('A corrected principal Fact needs a specific challenge; descriptive wording uses clarification: '+key)
+            effects[id].append({'object_id':key,'status':'challenged' if challenged else 'preserved',
+                'reason':challenged or preserved,'source_ids':change.source_ids})
+    return delta,effects
+
+
+def require_basis(state,question,spec=None,focus=(),candidate_id=None):
+    """Resolve historical IDs in their recorded map, with attributed intervening edits."""
     spec=spec or load(state)
     if spec is None:raise ValueError('Save the referenced Behavior/Fact map first')
     version=question.audit_spec_version if question else None
     if version is None:raise ValueError('Question needs its accepted audit_spec_version')
-    if version!=spec.version:
-        path=Path(state.audit_spec_path).parent/f'v{version}.json' if state.audit_spec_path else None
-        if not path or not path.is_file() or version>state.audit_spec_version:raise ValueError('Question map version does not name an accepted basis')
-        prior=ConsensusAuditSpec.model_validate_json(path.read_text())
-        validate_question(prior,question,focus)
-        old,new=audit_object_index(prior),audit_object_index(spec)
-        dependencies=set(question.behavior_ids+question.fact_ids+list(question.supporting_behavior_ids))
-        for key in dependencies:
-            if object_content(old.get(key))==object_content(new.get(key)):continue
-            declarations=[s['map_changes'][key] for s in state.selections
-                if s.get('accepted_versions',{}).get('audit_spec',0)>version and key in s.get('map_changes',{})]
-            if not declarations or any(d['impact']!='clarification' for d in declarations):
-                raise ValueError('Question cites changed map semantics through an old version: '+key)
-    validate_question(spec,question,focus)
+    if version==spec.version:
+        validate_question(spec,question,focus)
+        return
+    owner=next((c for c in state.question_candidates if c.id==candidate_id),None)
+    if owner is None:raise ValueError('New questions must use the current map; historical bases require their saved Candidate')
+    if not any(all(getattr(question,k)==getattr(saved,k) for k in QUESTION_BASIS) for saved in [owner.question,*owner.history]):
+        raise ValueError('A changed proposition must use the current map, not reinterpret a historical basis')
+    folder=Path(state.audit_spec_path).parent if state.audit_spec_path else None
+    if not folder or version>state.audit_spec_version:raise ValueError('Question map version does not name an accepted basis')
+    prior=ConsensusAuditSpec.model_validate_json((folder/f'v{version}.json').read_text())
+    validate_question(prior,question,focus)
+    for number in range(version+1,spec.version+1):
+        current=spec if number==spec.version else ConsensusAuditSpec.model_validate_json((folder/f'v{number}.json').read_text())
+        record=next((s for s in state.selections if s.get('map_updated') and s.get('accepted_versions',{}).get('audit_spec')==number),None)
+        if not record or record.get('map_delta')!=map_delta(prior,current) or candidate_id not in record.get('map_effects',{}):
+            raise ValueError('Historical map basis has an unattributed change: v'+str(number))
+        for effect in record['map_effects'][candidate_id]:
+            if effect['status']=='challenged' and not any(i.review_id==record['operation_id'] and i.target_id==candidate_id for i in state.review_issues):
+                raise ValueError('Challenged historical basis is missing its retained review issue')
+        prior=current
 
 
-def validate_reconnections(before,state,spec,changes):
-    """Meaning and dependency changes use existing attributed graph revisions, not new gates."""
-    changed={key:change for key,change in changes.items() if change.impact!='clarification'}
-    old_spec=load(before)
-    if old_spec is None:return
-    old_index=audit_object_index(old_spec)
-    for candidate in before.question_candidates:
-        if candidate.status=='explained':continue
-        q=candidate.question
-        used=set(q.behavior_ids+q.fact_ids+list(q.supporting_behavior_ids))
-        affected=used&changed.keys()
-        for key in changed:
-            if set(old_index.get(key,{}).get('produces_fact_ids',[])+old_index.get(key,{}).get('consumes_fact_ids',[]))&set(q.fact_ids):affected.add(key)
-        added=[b for b in spec.behaviors if b.id not in old_index and b.id in changed and set(b.produces_fact_ids)&set(q.fact_ids)]
-        if not affected and not added:continue
-        current=next(c for c in state.question_candidates if c.id==candidate.id)
-        if current.question.audit_spec_version!=spec.version:raise ValueError('Used map objects changed; explicitly reconnect Candidate '+candidate.id)
-        if candidate.obligation_id:
-            kind='F2' if any(changed[k].impact=='meaning' for k in affected) else 'F3'
-            revisions=state.revisions[len(before.revisions):]
-            units=[u for u in state.units if u.candidate_id==candidate.id and u.status!='revised']
-            old_units=[u for u in before.units if u.candidate_id==candidate.id and u.status!='revised']
-            if not any(r.kind==kind and set(r.target_ids)&{u.id for u in old_units} for r in revisions):
-                raise ValueError('Used map change requires attributed '+kind+' and explicit Unit reconnection')
-            if not units or any(u.audit_question.audit_spec_version!=spec.version for u in units):raise ValueError('Reconnect every current Unit to the changed map basis')
+def record_challenges(state, before, effects, operation_id):
+    """Keep new knowledge and its pending interpretation issues in the same transaction."""
+    from consensus_assurance.core.types import ReviewIssue
+    for id,items in effects.items():
+        challenged=[item for item in items if item['status']=='challenged']
+        if not challenged:continue
+        candidate=next(c for c in before.question_candidates if c.id==id)
+        state.review_issues.append(ReviewIssue(review_id=operation_id,target_id=id,
+            target_version=candidate.question.audit_spec_version,aspect='applicability',
+            source_ids=sorted({source for item in challenged for source in item['source_ids']}),
+            explanation='; '.join(item['object_id']+': '+item['reason'] for item in challenged),
+            disposition='investigation',reason='New implementation knowledge challenges the retained proposition; original observations remain unchanged'))
 
 
 def validate_units(state,spec=None,focus=()):
@@ -227,7 +260,7 @@ def validate_units(state,spec=None,focus=()):
         if unit.status=='revised':continue
         c=candidates.get(unit.candidate_id)
         if c is None or c.obligation_id not in unit.obligation_ids:raise ValueError('Executable Unit needs its accepted Candidate and obligation: '+unit.id)
-        require_basis(state,unit.audit_question,spec,focus)
+        require_basis(state,unit.audit_question,spec,focus,unit.candidate_id)
         if any(getattr(unit.audit_question,k)!=getattr(c.question,k) for k in QUESTION_BASIS):
             raise ValueError('Unit and Candidate need an explicit shared question reconnection: '+unit.id)
 

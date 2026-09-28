@@ -1,0 +1,176 @@
+{
+  "description": "Observe public verification after a real higher-term leader has applied a command, with unchanged mixed membership and an isolated nonvoter reachable by the old leader.",
+  "claim_id": "o_verify_superseded_authority",
+  "binding_ids": [
+    "bind_verify_entry",
+    "bind_verify_tally"
+  ],
+  "harness": {
+    "files": {},
+    "kind": "go_test",
+    "source": "package raft\n\nimport (\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"reflect\"\n\t\"sync\"\n\t\"testing\"\n\t\"time\"\n)\n\ntype authorityTransport struct {\n\t*InmemTransport\n\tmu        sync.Mutex\n\tsuccesses map[ServerID]int\n}\n\nfunc (a *authorityTransport) AppendEntriesPipeline(id ServerID, target ServerAddress) (AppendPipeline, error) {\n\treturn nil, ErrPipelineReplicationNotSupported\n}\nfunc (a *authorityTransport) AppendEntries(id ServerID, target ServerAddress, req *AppendEntriesRequest, resp *AppendEntriesResponse) error {\n\terr := a.InmemTransport.AppendEntries(id, target, req, resp)\n\tif err == nil && resp.Success {\n\t\ta.mu.Lock()\n\t\ta.successes[id]++\n\t\ta.mu.Unlock()\n\t}\n\treturn err\n}\nfunc (a *authorityTransport) counts() map[ServerID]int {\n\ta.mu.Lock()\n\tdefer a.mu.Unlock()\n\tout := map[ServerID]int{}\n\tfor k, v := range a.successes {\n\t\tout[k] = v\n\t}\n\treturn out\n}\nfunc authorityEvent(v map[string]interface{}) {\n\tb, _ := json.Marshal(v)\n\tfmt.Println(\"CA_EVENT \" + string(b))\n}\nfunc authorityWait(t *testing.T, f Future) error {\n\tt.Helper()\n\tdone := make(chan error, 1)\n\tgo func() { done <- f.Error() }()\n\tselect {\n\tcase err := <-done:\n\t\treturn err\n\tcase <-time.After(10 * time.Second):\n\t\tt.Fatal(\"future observation deadline\")\n\t\treturn nil\n\t}\n}\nfunc authorityPoll(t *testing.T, what string, p func() bool) {\n\tt.Helper()\n\tdeadline := time.Now().Add(10 * time.Second)\n\tfor time.Now().Before(deadline) {\n\t\tif p() {\n\t\t\treturn\n\t\t}\n\t\ttime.Sleep(5 * time.Millisecond)\n\t}\n\tt.Fatalf(\"precondition not reached: %s\", what)\n}\nfunc TestAssuranceVerifySupersededAuthority(t *testing.T) {\n\tconst op = \"superseded-verify-1\"\n\tvar nodes []*Raft\n\tvar fsms []*MockFSM\n\ttrans := make([]*authorityTransport, 4)\n\tconfig := Configuration{}\n\tfor i := range trans {\n\t\tid := ServerID(fmt.Sprintf(\"authority-%d\", i))\n\t\taddr := ServerAddress(id)\n\t\t_, base := NewInmemTransportWithTimeout(addr, 50*time.Millisecond)\n\t\ttrans[i] = &authorityTransport{InmemTransport: base, successes: map[ServerID]int{}}\n\t\tsuffrage := Voter\n\t\tif i == 3 {\n\t\t\tsuffrage = Nonvoter\n\t\t}\n\t\tconfig.Servers = append(config.Servers, Server{ID: id, Address: addr, Suffrage: suffrage})\n\t}\n\tfor i := range trans {\n\t\tfor j := range trans {\n\t\t\tif i != j {\n\t\t\t\ttrans[i].Connect(trans[j].LocalAddr(), trans[j].InmemTransport)\n\t\t\t}\n\t\t}\n\t}\n\tdefer func() {\n\t\tvar pending []Future\n\t\tfor _, r := range nodes {\n\t\t\tpending = append(pending, r.Shutdown())\n\t\t}\n\t\tfor _, tr := range trans {\n\t\t\ttr.Close()\n\t\t}\n\t\tfor _, f := range pending {\n\t\t\tauthorityWait(t, f)\n\t\t}\n\t}()\n\tfor i := range trans {\n\t\tc := DefaultConfig()\n\t\tc.LocalID = config.Servers[i].ID\n\t\tc.CommitTimeout = 10 * time.Millisecond\n\t\tc.HeartbeatTimeout = 150 * time.Millisecond\n\t\tc.ElectionTimeout = 150 * time.Millisecond\n\t\tc.LeaderLeaseTimeout = 150 * time.Millisecond\n\t\tif i == 0 {\n\t\t\tc.HeartbeatTimeout = 3 * time.Second\n\t\t\tc.ElectionTimeout = 3 * time.Second\n\t\t\tc.LeaderLeaseTimeout = 3 * time.Second\n\t\t}\n\t\tif i == 3 {\n\t\t\tc.HeartbeatTimeout = 3 * time.Second\n\t\t\tc.ElectionTimeout = 3 * time.Second\n\t\t\tc.LeaderLeaseTimeout = 3 * time.Second\n\t\t}\n\t\tstore := NewInmemStore()\n\t\tsnap := NewInmemSnapshotStore()\n\t\tfsm := &MockFSM{}\n\t\tif i == 0 {\n\t\t\tinitial := Configuration{Servers: []Server{config.Servers[0]}}\n\t\t\tif err := BootstrapCluster(c, store, store, snap, trans[i], initial); err != nil {\n\t\t\t\tt.Fatal(err)\n\t\t\t}\n\t\t}\n\t\tr, err := NewRaft(c, fsm, store, store, snap, trans[i])\n\t\tif err != nil {\n\t\t\tt.Fatal(err)\n\t\t}\n\t\tnodes = append(nodes, r)\n\t\tfsms = append(fsms, fsm)\n\t}\n\told := nodes[0]\n\tauthorityPoll(t, \"initial single-voter election\", func() bool { return old.State() == Leader })\n\tfor i := 1; i <= 2; i++ {\n\t\ts := config.Servers[i]\n\t\tif err := authorityWait(t, old.AddVoter(s.ID, s.Address, 0, time.Second)); err != nil {\n\t\t\tt.Fatal(err)\n\t\t}\n\t}\n\ts := config.Servers[3]\n\tif err := authorityWait(t, old.AddNonvoter(s.ID, s.Address, 0, time.Second)); err != nil {\n\t\tt.Fatal(err)\n\t}\n\tprefix := old.Apply([]byte(\"common-prefix\"), time.Second)\n\tif err := authorityWait(t, prefix); err != nil {\n\t\tt.Fatal(err)\n\t}\n\tauthorityPoll(t, \"all nodes have final membership and committed prefix\", func() bool {\n\t\tfor _, r := range nodes {\n\t\t\tif !reflect.DeepEqual(r.getLatestConfiguration(), config) || r.CommitIndex() < prefix.Index() {\n\t\t\t\treturn false\n\t\t\t}\n\t\t}\n\t\treturn true\n\t})\n\tif err := authorityWait(t, old.VerifyLeader()); err != nil {\n\t\tt.Fatal(err)\n\t}\n\tauthorityEvent(map[string]interface{}{\"event\": \"connected_control\", \"operation\": \"connected-control\", \"success\": true, \"term\": old.CurrentTerm()})\n\toldTerm := old.CurrentTerm()\n\tauthorityEvent(map[string]interface{}{\"event\": \"stable_prefix\", \"operation\": op, \"old_term\": oldTerm, \"prefix_index\": prefix.Index(), \"configuration\": config})\n\t// Disconnect every RPC route crossing {old leader, nonvoter} and {two voters}.\n\t// Already admitted requests are allowed to finish. No state is assigned and\n\t// every worker, lease timer and negative-response path remains enabled.\n\tfor _, i := range []int{0, 3} {\n\t\tfor _, j := range []int{1, 2} {\n\t\t\ttrans[i].Disconnect(trans[j].LocalAddr())\n\t\t\ttrans[j].Disconnect(trans[i].LocalAddr())\n\t\t}\n\t}\n\tvar replacement *Raft\n\tri := -1\n\tauthorityPoll(t, \"higher-term elected replacement\", func() bool {\n\t\tfor _, i := range []int{1, 2} {\n\t\t\tif nodes[i].State() == Leader && nodes[i].CurrentTerm() > oldTerm {\n\t\t\t\treplacement = nodes[i]\n\t\t\t\tri = i\n\t\t\t\treturn true\n\t\t\t}\n\t\t}\n\t\treturn false\n\t})\n\tcommand := replacement.Apply([]byte(\"replacement-command\"), time.Second)\n\tif err := authorityWait(t, command); err != nil {\n\t\tt.Fatal(err)\n\t}\n\tfsms[ri].Lock()\n\tseen := false\n\tfor _, data := range fsms[ri].logs {\n\t\tif string(data) == \"replacement-command\" {\n\t\t\tseen = true\n\t\t}\n\t}\n\tfsms[ri].Unlock()\n\treplacementTerm := replacement.CurrentTerm()\n\tif !seen || replacementTerm <= oldTerm || replacement.State() != Leader {\n\t\tt.Fatal(\"replacement authority prerequisite not established\")\n\t}\n\tauthorityEvent(map[string]interface{}{\"event\": \"superseding_command\", \"operation\": op, \"old_term\": oldTerm, \"new_term\": replacementTerm, \"new_leader\": replacement.localID, \"command_index\": command.Index(), \"command_applied\": seen, \"higher_term\": replacementTerm > oldTerm})\n\t// A newer term on the old node would complicate the selected continuity\n\t// premise. Leave that schedule incomplete rather than changing the oracle.\n\tif old.CurrentTerm() != oldTerm {\n\t\tt.Fatal(\"old-node term changed before verification admission\")\n\t}\n\tbefore := trans[0].counts()\n\tauthorityEvent(map[string]interface{}{\"event\": \"verification_admitted\", \"operation\": op, \"new_term\": replacementTerm, \"old_term\": old.CurrentTerm(), \"state\": old.State().String(), \"before\": before})\n\tfuture := old.VerifyLeader()\n\tdone := make(chan error, 1)\n\tgo func() { done <- future.Error() }()\n\tforced := false\n\tvar result error\n\tselect {\n\tcase result = <-done:\n\tcase <-time.After(700 * time.Millisecond):\n\t\t// Stop the controlled operation independently of its forbidden outcome.\n\t\tforced = true\n\t\tshutdown := old.Shutdown()\n\t\tselect {\n\t\tcase result = <-done:\n\t\tcase <-time.After(2 * time.Second):\n\t\t\tt.Fatal(\"verification completion missing after shutdown\")\n\t\t}\n\t\tif err := authorityWait(t, shutdown); err != nil {\n\t\t\tt.Fatal(err)\n\t\t}\n\t}\n\tauthorityEvent(map[string]interface{}{\"event\": \"verification_result\", \"operation\": op, \"success\": result == nil, \"error\": fmt.Sprint(result), \"shutdown_forced\": forced, \"old_term\": old.CurrentTerm(), \"new_term\": replacementTerm, \"state\": old.State().String(), \"after\": trans[0].counts()})\n}\n",
+    "description": "Start node 0 as a real single-voter leader; publicly add two voters and a nonvoter, apply a common prefix, and wait for all four commit indexes and latest memberships. Freeze membership by issuing no further changes. Disconnect both directions across {0,3}/{1,2}. Let actual workers elect a higher-term leader among 1,2 and apply a command. Invoke node 0 VerifyLeader only afterward. Record its exact Future.Error result. If still pending after 700ms, shut down node 0 and await completion. Initial control succeeds while fully connected.",
+    "semantic_changes": [
+      "No target changes or critical state assignments. In-memory transport wrapper disables optional pipelining and records successful append responses by target ID.",
+      "Different valid per-node election/lease durations: old node and nonvoter use 3 seconds, other voters 150ms; all use 10ms commit timeout. These permit replacement election before the old lease expires; no lease worker is paused.",
+      "Network cuts use real InmemTransport.Disconnect, affecting every RPC crossing the partition. Already admitted requests may complete.",
+      "MockFSM records actual callback data; read-only locked inspection confirms the replacement command.",
+      "Read-only atomic latest-configuration and commit-index observations confirm installed membership/prefix; no private role or term writes."
+    ],
+    "prerequisites": [
+      {
+        "alias": "superseded",
+        "event": "superseding_command",
+        "conditions": [
+          {
+            "field": "higher_term",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          },
+          {
+            "field": "command_applied",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          }
+        ]
+      },
+      {
+        "alias": "invocation",
+        "event": "verification_admitted",
+        "conditions": [
+          {
+            "field": "new_term",
+            "op": "eq",
+            "value": null,
+            "reference": "superseded.new_term"
+          },
+          {
+            "field": "old_term",
+            "op": "eq",
+            "value": null,
+            "reference": "superseded.old_term"
+          }
+        ]
+      }
+    ],
+    "legality": {
+      "source_ids": [
+        "s_verify",
+        "s_notify",
+        "s_future",
+        "s_loop",
+        "s_lease",
+        "s_election",
+        "s_campaign",
+        "s_commit",
+        "s_fsm",
+        "s_inmem_transport_probe",
+        "s_transport_disconnect",
+        "s_mockfsm",
+        "s_config_timeouts",
+        "s_membership_api"
+      ],
+      "expectation_ids": [
+        "i_verify",
+        "i_future"
+      ],
+      "binding_ids": [
+        "bind_verify_entry",
+        "bind_verify_tally"
+      ],
+      "derivation": "The public VerifyLeader contract explicitly ensures the peer is still leader and allows use to prevent stale FSM reads after loss of leadership. Future.Error is its observable completion status. Rather than inventing a requirement to collect a particular number of fresh replies, this obligation establishes the antecedent of lost authority independently: another configured voter won a higher-term election and applied a new command before invocation, with no subsequent reacquisition by the old node. A nil verification result then contradicts the promised authority check regardless of the particular tally mechanism. The nonvoter path is the suspected producer of insufficient support, not the normative source of the obligation.",
+      "applicability": "Ordinary online API use in a mixed-membership cluster. Network partition delays or prevents cross-partition RPCs but does not fabricate response contents, terms, votes or commits. A local role still reading Leader is precisely the stale authority condition the API must check; it cannot be assumed to validate itself.",
+      "unresolved": [
+        "The measured comparison is bounded to the submitted partition and timing configuration; successful execution is not overall correctness."
+      ],
+      "conflicts": [],
+      "alternatives": [
+        "Voter-only lease check or negative/newer-term RPC may step down the old node and return error; either prevents the forbidden success.",
+        "A valid alternative authority mechanism would also satisfy the API, but local state and isolated nonvoter success cannot undo an independently observed higher-term election.",
+        "Pending verification is permitted; a finite observation deadline alone is not a violation."
+      ]
+    }
+  },
+  "monitors": [
+    {
+      "id": "monitor_superseded_verify",
+      "checker_id": "verify_no_success_after_supersession",
+      "event": "verification_result",
+      "binding_ids": [
+        "bind_verify_entry",
+        "bind_verify_tally"
+      ],
+      "grounding": {
+        "source_ids": [
+          "s_verify",
+          "s_notify",
+          "s_future",
+          "s_loop",
+          "s_lease",
+          "s_election",
+          "s_campaign",
+          "s_commit",
+          "s_fsm",
+          "s_inmem_transport_probe",
+          "s_transport_disconnect",
+          "s_mockfsm",
+          "s_config_timeouts",
+          "s_membership_api"
+        ],
+        "expectation_ids": [
+          "i_verify",
+          "i_future"
+        ],
+        "binding_ids": [
+          "bind_verify_entry",
+          "bind_verify_tally"
+        ],
+        "derivation": "The public VerifyLeader contract explicitly ensures the peer is still leader and allows use to prevent stale FSM reads after loss of leadership. Future.Error is its observable completion status. Rather than inventing a requirement to collect a particular number of fresh replies, this obligation establishes the antecedent of lost authority independently: another configured voter won a higher-term election and applied a new command before invocation, with no subsequent reacquisition by the old node. A nil verification result then contradicts the promised authority check regardless of the particular tally mechanism. The nonvoter path is the suspected producer of insufficient support, not the normative source of the obligation.",
+        "applicability": "Ordinary online API use in a mixed-membership cluster. Network partition delays or prevents cross-partition RPCs but does not fabricate response contents, terms, votes or commits. A local role still reading Leader is precisely the stale authority condition the API must check; it cannot be assumed to validate itself.",
+        "unresolved": [
+          "The measured comparison is bounded to the submitted partition and timing configuration; successful execution is not overall correctness."
+        ],
+        "conflicts": [],
+        "alternatives": [
+          "Voter-only lease check or negative/newer-term RPC may step down the old node and return error; either prevents the forbidden success.",
+          "A valid alternative authority mechanism would also satisfy the API, but local state and isolated nonvoter success cannot undo an independently observed higher-term election.",
+          "Pending verification is permitted; a finite observation deadline alone is not a violation."
+        ]
+      },
+      "applicability_conditions": [],
+      "admission_alias": "invocation"
+    }
+  ],
+  "observable_properties": [
+    {
+      "checker_id": "verify_no_success_after_supersession",
+      "kind": "event_assertion",
+      "trigger": {
+        "field": "event",
+        "op": "eq",
+        "value": "verification_result",
+        "reference": null
+      },
+      "assertion": {
+        "field": "success",
+        "op": "eq",
+        "value": false,
+        "reference": null
+      },
+      "antecedent": null,
+      "identity_fields": [
+        "operation"
+      ],
+      "history_field": null,
+      "description": "For each admitted verification following actual higher-term authority and applied command, its observed public completion must not be successful. Errors including shutdown are permitted; missing prerequisite/result is incomplete, not a violation."
+    }
+  ],
+  "uncertainties": [
+    "Only public VerifyLeader authority semantics are checked; stale application reads and conflicting logs are excluded.",
+    "The result is not correlated using an expected-to-change term: operation is the independent identity; term relationships are predecessor conditions.",
+    "Response counts are diagnostic only. Delayed pre-partition replies could affect the mechanism but cannot restore authority after the independently established newer election.",
+    "The transport has no heartbeat fast-path and optional pipelining is disabled; other transport modes are not covered."
+  ]
+}

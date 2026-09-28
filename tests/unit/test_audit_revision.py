@@ -1,11 +1,7 @@
-import copy
-import json
-from pathlib import Path
 
 import pytest
 
-from consensus_assurance.core.config import Config
-from consensus_assurance.core.proposals import Feedback, ReadRequest, Comparison
+from consensus_assurance.core.proposals import Feedback
 from consensus_assurance.core.types import CheckRun, CheckerResult, ExecutionStatus
 from consensus_assurance.workflow.artifacts import save_bundle, validate_bundle
 from consensus_assurance.workflow.modeling import validate_technical_repair, obligation_progress
@@ -83,17 +79,32 @@ def test_f2_relation_dependency_requeues_unrelated_completed_unit(tmp_path,depen
 
 
 def test_later_bundle_cannot_hide_an_unfinished_checker_of_same_obligation(tmp_path,prepared):
-    from consensus_assurance.core.types import CheckerSpec
+    from consensus_assurance.core.types import CheckerSpec, SemanticReview, SemanticCheck, ReachabilityResult
     _,state,bundle,_=prepared;unit=state.units[0]
     first=bundle.checker_specs()[0]
+    def completed(model):
+        check=CheckRun(action='model_check',status=ExecutionStatus.COMPLETED,outcome='holds',cwd=str(tmp_path),
+            snapshot_id=state.snapshot.id,model_id=model.id,search_fingerprint=model.search_fingerprint,
+            checker_results=[CheckerResult(invariant=c.invariant,claim_id=c.claim_id,scope=c.scope,outcome='holds') for c in model.checkers])
+        state.checks.append(check)
+        state.semantic_reviews.append(SemanticReview(origin='mock',task_id='local-control',check_id=check.id,target_versions={model.id:model.version},
+            material_ids=state.claims[1].source_ids,items=[SemanticCheck(target_id=model.id,aspect='checker_correspondence',
+                status='no_issue_found',source_ids=state.claims[1].source_ids,rationale='Controlled correspondence record for progress bookkeeping')]))
+        state.reachability_results.extend(ReachabilityResult(model_id=model.id,requirement_id=r.id,check_id=check.id,status='reachable',
+            search_fingerprint=model.search_fingerprint,reason='Controlled reached prerequisite for progress bookkeeping') for r in model.reachability_requirements)
+        return check
+    normal=save_bundle(tmp_path,state,unit,bundle,PythonBackend())
+    completed(normal)
+    assert obligation_progress(state,unit)[1]==[]
     second=CheckerSpec(invariant='Additional',claim_id=first.claim_id,scope=first.scope)
     bundle.checkers=[first,second]
     bundle.properties=bundle.properties.replace('Safe ==','Additional == TRUE\nSafe ==')
     model1=save_bundle(tmp_path,state,unit,bundle,PythonBackend())
+    checked_pair=completed(model1)
     bundle.checkers=[first]
     model2=save_bundle(tmp_path,state,unit,bundle,PythonBackend())
-    for model in [model1,model2]:
-        state.checks.append(CheckRun(action='model_check',status=ExecutionStatus.COMPLETED,cwd=str(tmp_path),snapshot_id=state.snapshot.id,model_id=model.id,
-            checker_results=[CheckerResult(invariant=first.invariant,claim_id=first.claim_id,scope=first.scope,outcome='holds')]))
+    completed(model2)
+    assert obligation_progress(state,unit)[1]==[]
+    checked_pair.checker_results=[r for r in checked_pair.checker_results if r.invariant!=second.invariant]
     checked,missing=obligation_progress(state,unit)
     assert first.claim_id in missing and first.claim_id not in checked

@@ -4,7 +4,6 @@ from consensus_assurance.core.proposals import Feedback,GraphPatch,BindingDraft,
 from consensus_assurance.core.types import ReviewIssue,SemanticCheck
 from consensus_assurance.workflow.graph import apply_patch,expand_unit
 from consensus_assurance.workflow.feedback import apply_feedback
-from regression_support import ReadingPlan
 from regression_support import add_reads
 from consensus_assurance.workflow.errors import Blocked
 from consensus_assurance.adapters.storage.snapshot import capture
@@ -15,7 +14,7 @@ def dependency(dependency_prepared):
     repo,state,_,_=dependency_prepared
     (repo/'new_helper.py').write_text('def boundary(value):\n    return max(1, value)\n')
     state.snapshot=capture(repo)
-    added=add_reads(state,repo,ReadingPlan(requests=[{'file':'new_helper.py','start_line':1,'end_line':2,'reason':'Read a previously absent provider'}],rationale='Actual new dependency'),__import__('consensus_assurance.core.config',fromlist=['Budget']).Budget())
+    added=add_reads(state,repo,[{'file':'new_helper.py','start_line':1,'end_line':2,'reason':'Read a previously absent provider'}])
     u=state.units[0];basis=state.relations[0].grounding.model_copy(deep=True)
     b=BindingDraft(id='fresh_provider',associations=[dict(claim_id=u.obligation_ids[0],source_ids=[added[0]],rationale='Selected fixture operation')],material_id=added[0],symbol='boundary',start_line=1,end_line=2,description='New supporting producer',pending=['Guarantee not checked'])
     edge=RelationDraft(id='fresh_dependency',source=u.obligation_ids[0],target=b.id,kind='boundary',group=None,rationale='The selected computation consumes the actual provider',pending=['Provider guarantee unverified'],grounding=basis)

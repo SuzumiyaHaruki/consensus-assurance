@@ -1,8 +1,6 @@
 """Metamorphic declaration ownership under different physical reading partitions."""
-from pathlib import Path
-import json
 import pytest
-from consensus_assurance.core.types import Material,Analysis
+from consensus_assurance.core.types import Material
 from consensus_assurance.core.proposals import BindingDraft
 from consensus_assurance.workflow.locations import locate
 
@@ -47,3 +45,39 @@ def test_prefix_ending_inside_raw_string_cannot_fabricate_function_end():
     m=Material(id='prefix',file='state.go',start_line=1,end_line=4,kind='code_observation',content_digest='v',text='func Handle() {\n value := `raw\n } fake boundary\n still inside literal')
     definition=next(d for d in declarations(m) if d['symbol']=='Handle' and d['kind']=='declaration')
     assert definition['end'] is None and not definition['closed']
+
+
+from consensus_assurance.core.config import Config
+from consensus_assurance.registry import assemble
+from consensus_assurance.adapters.storage.snapshot import capture
+
+
+def test_build_resources_separate_from_read_material(tmp_path):
+    repo=tmp_path/'repo';repo.mkdir()
+    (repo/'payload.bin').write_bytes(b'\x00\xff\x01')
+    (repo/'engine.cpp').write_text('int main() { return 0; }\n')
+    (repo/'Makefile').write_text('all:\n\ttrue\n')
+    (repo/'credentials.json').write_text('{}')
+    snap=capture(repo,tmp_path/'copy')
+    assert (tmp_path/'copy/payload.bin').read_bytes()==b'\x00\xff\x01'
+    assert 'payload.bin' not in snap.readable_files
+    assert {'Makefile','engine.cpp'}<=set(snap.readable_files)
+    assert 'credentials.json' not in snap.files and snap.exclusion_reasons
+
+
+
+@pytest.mark.parametrize('module',[None,'module another.example/module\n'])
+def test_explicit_module_identity_requires_safe_build_input(tmp_path,module):
+    from consensus_assurance.workflow.engine import Engine
+    repo=tmp_path/'repo';repo.mkdir()
+    if module:(repo/'go.mod').write_text(module)
+    config=Config(execution_backend='none',target={'expected_module':'example.org/module'},agent_backend='mock')
+    with pytest.raises(ValueError,match='explicit target.expected_module'):
+        Engine(config,tmp_path/'run',*assemble(config)).start(repo)
+
+
+
+def test_binary_only_build_inputs_are_not_agent_materials(tmp_path):
+    repo=tmp_path/'repo';repo.mkdir();(repo/'payload.bin').write_bytes(b'data\x00payload')
+    snapshot=capture(repo)
+    assert snapshot.readable_files==[]

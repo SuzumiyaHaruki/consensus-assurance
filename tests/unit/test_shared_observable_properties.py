@@ -1,8 +1,7 @@
 import shutil
-from pathlib import Path
 
 from ack_support import ROOT, setup_ack
-from consensus_assurance.adapters.verifiers.observable import correspondence, properties_source
+from consensus_assurance.adapters.verifiers.observable import correspondence
 from consensus_assurance.core.proposals import Comparison, ObservableProperty, EventMonitor, EventRequirement
 from consensus_assurance.workflow.observations import monitor_events
 
@@ -45,3 +44,22 @@ def test_v16_checker_correction_uses_one_way_success_requirement():
     assert monitor_events(observed(False,True),monitor,prop,requirement)['outcome']=='holds'
     assert monitor_events(observed(True,False),monitor,prop,requirement)['outcome']=='violated'
     assert monitor_events(observed(False,True,False),monitor,prop,requirement)['outcome']=='unknown'
+
+
+import pytest
+from consensus_assurance.core.types import Grounding
+from consensus_assurance.workflow.artifacts import validate_tla
+
+
+@pytest.mark.parametrize('body',[
+    'EXTENDS Naturals\nVARIABLE a\nNext == a\' = [a EXCEPT ![1] = 2]',
+    'EXTENDS Naturals\nText == "Java!Print ASSUME IOUtils"\n\\* INSTANCE Unsafe\nX == 1',
+    'EXTENDS Naturals\n(* nested (* INSTANCE Evil *) Java!Run *)\nX == 1'])
+def test_legal_TLA_updates_strings_and_comments(body):
+    validate_tla('---- MODULE Behavior ----\n'+body+'\n====','Behavior')
+
+
+
+@pytest.mark.parametrize('body',['EXTENDS IOUtils\nX == 1','EXTENDS Naturals\nX == Java!Run(1)','EXTENDS Naturals\nX == INSTANCE Unsafe','EXTENDS Naturals\nASSUME X'])
+def test_unsafe_TLA_features_remain_rejected(body):
+    with pytest.raises(ValueError): validate_tla('---- MODULE Behavior ----\n'+body+'\n====','Behavior')

@@ -24,7 +24,7 @@ def test_declaration_outside_read_material_requires_reading():
 
 
 def test_multiple_obligations_share_one_binding_with_sourced_associations(prepared):
-    _,state,_,responses=prepared;p=GraphDraft.model_validate(responses[1]);b=p.bindings[0]
+    _,state,_,responses=prepared;p=GraphDraft.model_validate(responses['graph']);b=p.bindings[0]
     b.associations.append(BindingAssociation(claim_id=p.claims[-1].id,source_ids=[b.material_id],rationale='The same entry also consumes the producer condition'))
     apply_graph(state,p)
     assert len(state.bindings[0].associations)==2
@@ -55,7 +55,7 @@ def test_member_without_acquired_owner_is_not_resolved_by_suffix():
 
 def test_declaration_diagnostic_supplies_actual_file_length(prepared):
     _,state,_,responses=prepared
-    p=GraphDraft.model_validate(responses[1]);b=p.bindings[0];b.symbol='Unknown'
+    p=GraphDraft.model_validate(responses['graph']);b=p.bindings[0];b.symbol='Unknown'
     m=next(m for m in state.materials if m.id==b.material_id)
     state.file_index[m.file]={'file':m.file,'lines':m.end_line,'content_digest':m.content_digest}
     d=next(d for d in diagnose_graph(state,p) if b.id in d.object_ids)

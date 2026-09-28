@@ -143,7 +143,7 @@ def compute_assessment(state,unit,artifact,plan,check,events):
         for i in r.items if i.target_id==artifact.id and i.aspect=='checker_correspondence']
     current_review=reviews[-1] if reviews else None
     correspondence=bool(current_review and current_review.status=='no_issue_found' and not current_review.counterevidence)
-    issues=[i for i in state.review_issues if i.target_id in related_artifacts and not i.resolved_by]
+    issues=[i for i in state.review_issues if i.target_id in related_artifacts+[unit.candidate_id] and not i.resolved_by]
     if not correspondence and not issues:
         blockers.append('Direct oracle correspondence is unreviewed' if current_review is None else
             'Direct oracle correspondence remains disputed: '+current_review.rationale)

@@ -70,6 +70,7 @@ def main(argv=None):
     for name in ("resume", "report"):
         p = sub.add_parser(name); p.add_argument("--run", required=True)
         p.add_argument("--runs-dir", default="runs")
+        if name == "report":p.add_argument("--export-views",action="store_true",help="按需导出地图、材料、图、进度和计划的根目录派生副本")
         if name == "resume":
             p.add_argument("--repair-attempts",type=int,help="显式调整任务总修复上限；不重置已用次数或单问题失败记录")
             p.add_argument("--action-timeout", type=float, help="调整后续单动作超时（秒）；保留总预算和已用次数")
@@ -85,7 +86,7 @@ def main(argv=None):
                 print("历史运行只读；使用原始报告或离线导入，不能恢复到新语义。");return 2
             state=Store(root).load()
             if args.command == "report":
-                print(render_report(state, root)); return 0
+                print(render_report(state, root,export_derived=args.export_views)); return 0
             config = Config.model_validate(state.config)
         else:
             config = load_config(args.config, {"agent_backend": args.agent_backend, "tlc_jar": args.tlc_jar,

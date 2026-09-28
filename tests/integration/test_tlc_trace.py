@@ -108,7 +108,7 @@ def test_F2_normative_revision_executes_new_checker(tlc, prepared):
     old_check = verifier.check(runner, old_model, 20)
     state.checks.append(old_check)
     assert old_check.outcome == 'counterexample'
-    graph = GraphDraft.model_validate(responses[1])
+    graph = GraphDraft.model_validate(responses['graph'])
     graph.claims[1].description = 'The documented boundary is the supplied capacity, including capacity itself'
     correction = Feedback(kind='F2',rationale='The old checker excluded the documented capacity value',evidence_ids=[next(m.id for m in state.materials if m.file=='README.md')],target_ids=['step_obligation'],relation_ids=[],new_basis='The fixture documents reaching capacity before reset; the old strict boundary was unsupported')
     correction.patch = GraphPatch(claims=[graph.claims[1]],expected_versions={graph.claims[1].id:1},rationale=correction.new_basis)

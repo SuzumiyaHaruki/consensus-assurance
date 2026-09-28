@@ -19,7 +19,7 @@ def test_execution_state_transitions():
 
 def test_strict_structured_result(prepared):
     _, _, _, responses = prepared
-    invalid = dict(responses[1], confirmed=True)
+    invalid = dict(responses['graph'], confirmed=True)
     with pytest.raises(ValidationError): GraphDraft.model_validate(invalid)
     with pytest.raises(ValidationError): Bundle.model_validate({"description": "not a model"})
 

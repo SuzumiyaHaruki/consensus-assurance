@@ -3,8 +3,7 @@ import json
 import shutil
 import pytest
 from consensus_assurance.core.config import Config
-from consensus_assurance.core.types import SemanticCheck, SemanticReview
-from consensus_assurance.core.proposals import ReviewReply, ClaimDraft, GraphPatch, JudgmentChange
+from consensus_assurance.core.proposals import JudgmentChange
 
 from consensus_assurance.workflow.feedback import apply_feedback
 from consensus_assurance.workflow.transactions import commit_graph
@@ -59,3 +58,45 @@ def test_semantic_transaction_failure_and_recovery_are_atomic(tmp_path,prepared,
     commit_graph(engine,'change',{'operation':'one'},change)
     assert engine.state.claims[1].version==2 and engine.state.native_current['operation_id']=='change'
     assert 'change' in Store(engine.root).load().applied_operations
+
+
+from consensus_assurance.core.proposals import ConditionDisposition
+from consensus_assurance.core.diagnostics import DiagnosticError
+from consensus_assurance.workflow.repair_policy import classify_conditions, condition_records
+
+
+@pytest.mark.parametrize('shape,code',[('missing','condition_missing'),('extra','condition_extra'),('duplicate','condition_duplicate')])
+def test_condition_reference_diagnostics_are_specific_and_do_not_erase_judgment(prepared,shape,code):
+    _,state,_,_=prepared;id=state.materials[0].id
+    records=condition_records(['Storage durability has not been inspected'],'issue-version-1',[id],'o',1)
+    item=ConditionDisposition(condition_id=records[0]['id'],applies_to='independent_scope',rationale='This caller-location question does not establish storage behavior',source_ids=[id])
+    dispositions=[] if shape=='missing' else [item,item] if shape=='duplicate' else [item,item.model_copy(update={'condition_id':'wrong'})]
+    before=state.model_dump()
+    with pytest.raises(DiagnosticError) as caught:
+        classify_conditions(state,[r['text'] for r in records],dispositions,[id],records=records,object_ids=['o'])
+    d=caught.value.diagnostics[0]
+    assert d.code==code and d.details[shape] and d.allowed==['representation']
+    assert state.model_dump()==before
+    assert classify_conditions(state,[r['text'] for r in records],[item],[id],records=records)==[item]
+
+
+
+
+
+@pytest.mark.parametrize('applies_to',['old_judgment','current_judgment','independent_scope'])
+def test_F2_attributes_exact_conflict_without_erasing_it(prepared,applies_to):
+    _,s,_,_=prepared;id=s.claims[1].id;f=revision_for(s,[id]);f.grounding.conflicts=['The previous statement also constrained object replacement']
+    f.condition_dispositions=[ConditionDisposition(condition=f.grounding.conflicts[0],applies_to=applies_to,source_ids=f.evidence_ids,rationale='The source distinguishes update within one object from replacement; this is attributed to the stated judgment, not a claim about all histories')]
+    apply_feedback(s,s.units[0],None,f)
+    assert s.revisions[-1].status==('unresolved' if applies_to=='current_judgment' else 'applied')
+    assert s.revisions[-1].after['grounding']['conflicts']==f.grounding.conflicts
+    assert s.claims[1].version==(1 if applies_to=='current_judgment' else 2)
+
+
+
+def test_F2_cannot_rename_unaddressed_condition(prepared):
+    _,s,_,_=prepared;f=revision_for(s,[s.claims[1].id]);f.grounding.unresolved=['Actual input truth unverified']
+    f.condition_dispositions=[ConditionDisposition(condition='Different harmless text',applies_to='old_judgment',source_ids=f.evidence_ids,rationale='Not the actual original question')]
+    before=s.model_dump()
+    with pytest.raises(ValueError):apply_feedback(s,s.units[0],None,f)
+    assert s.model_dump()==before
