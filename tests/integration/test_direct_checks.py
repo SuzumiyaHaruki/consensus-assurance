@@ -173,7 +173,7 @@ def test_changed_interpretation_updates_current_direct_result(tmp_path,prepared,
         e.state.review_issues.append(ReviewIssue(review_id='knowledge-update',target_id=candidate.id,target_version=1,
             aspect='applicability',source_ids=u.audit_question.source_ids,explanation='Review the recovered input boundary',
             disposition='investigation',reason='New sourced interpretation'))
-        from consensus_assurance.workflow.native import sync_progress
+        from consensus_assurance.workflow.audit import sync_progress
         sync_progress(e)
     current=next(r for r in e.state.monitor_results if r.get('direct_check_id')==artifact.id)
     assert current['outcome']=='violated' and not current['confirmed']

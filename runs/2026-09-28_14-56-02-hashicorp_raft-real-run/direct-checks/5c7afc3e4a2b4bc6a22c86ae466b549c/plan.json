@@ -1,0 +1,222 @@
+{
+  "description": "Correlate prefix, drained voter callbacks, new-majority Apply and subsequent former-leader VerifyLeader result in one execution.",
+  "claim_id": "O-verify-after-majority",
+  "binding_ids": [
+    "BIND-verify-registration"
+  ],
+  "harness": {
+    "files": {},
+    "kind": "go_test",
+    "source": "package raft\n\nimport (\n \"encoding/json\"\n \"fmt\"\n \"sync\"\n \"testing\"\n \"time\"\n\n \"github.com/hashicorp/go-hclog\"\n)\n\n// Transport faults affect delivery only. All successful replies come from real Raft handlers.\ntype assuranceTransport struct {\n *InmemTransport\n mu sync.Mutex\n blocked map[ServerID]bool\n failed map[string]int\n epoch uint64\n}\nfunc (x *assuranceTransport) AppendEntriesPipeline(id ServerID, addr ServerAddress) (AppendPipeline, error) {\n return nil, ErrPipelineReplicationNotSupported\n}\nfunc (x *assuranceTransport) AppendEntries(id ServerID, addr ServerAddress, req *AppendEntriesRequest, resp *AppendEntriesResponse) error {\n kind := \"append\"\n if req.PrevLogEntry == 0 && req.PrevLogTerm == 0 && len(req.Entries) == 0 && req.LeaderCommitIndex == 0 { kind = \"heartbeat\" }\n x.mu.Lock()\n epoch := x.epoch\n blocked := x.blocked[id]\n if blocked { x.failed[string(id)+\"/\"+kind]++ }\n x.mu.Unlock()\n if blocked { return fmt.Errorf(\"controlled partition to %s\", id) }\n err := x.InmemTransport.AppendEntries(id, addr, req, resp)\n x.mu.Lock()\n changed := epoch != x.epoch && x.blocked[id]\n x.mu.Unlock()\n if changed { return fmt.Errorf(\"partition crossed response delivery to %s\", id) }\n return err\n}\nfunc assuranceEvent(kind string, fields map[string]interface{}) {\n fields[\"event\"] = kind\n b, _ := json.Marshal(fields)\n fmt.Println(\"CA_EVENT \" + string(b))\n}\nfunc assuranceWait(t *testing.T, what string, limit time.Duration, predicate func() bool) {\n t.Helper()\n deadline := time.Now().Add(limit)\n for time.Now().Before(deadline) {\n  if predicate() { return }\n  time.Sleep(5*time.Millisecond)\n }\n t.Fatalf(\"prefix incomplete: %s\", what)\n}\nfunc assuranceError(t *testing.T, what string, f Future) error {\n t.Helper()\n done := make(chan error, 1)\n go func(){ done <- f.Error() }()\n select {\n case err := <-done: return err\n case <-time.After(8*time.Second): t.Fatalf(\"incomplete future: %s\", what); return fmt.Errorf(\"timeout\")\n }\n}\nfunc TestAssuranceVerifyNonvoterHistory(t *testing.T) {\n const history = \"verify-partition-1\"\n const op = \"verify-after-majority\"\n ids := []ServerID{\"A\", \"B\", \"C\", \"D\"}\n nodes := make([]*Raft, 4)\n stores := make([]*InmemStore, 4)\n fsms := make([]*MockFSM, 4)\n trans := make([]*assuranceTransport, 4)\n for i, id := range ids {\n  _, base := NewInmemTransportWithTimeout(ServerAddress(id), 100*time.Millisecond)\n  trans[i] = &assuranceTransport{InmemTransport:base, blocked:make(map[ServerID]bool), failed:make(map[string]int)}\n }\n for i := range trans { for j := range trans { if i != j { trans[i].Connect(ServerAddress(ids[j]), trans[j].InmemTransport) } } }\n defer func(){\n  for _, n := range nodes { if n != nil { n.Shutdown() } }\n  for _, n := range nodes { if n != nil { _ = n.Shutdown().Error() } }\n  for _, tr := range trans { _ = tr.Close() }\n }()\n for i,id := range ids {\n  conf := DefaultConfig()\n  conf.LocalID = id\n  conf.HeartbeatTimeout = 200*time.Millisecond\n  conf.ElectionTimeout = 200*time.Millisecond\n  conf.LeaderLeaseTimeout = 100*time.Millisecond\n  conf.CommitTimeout = 10*time.Millisecond\n  conf.Logger = hclog.NewNullLogger()\n  if i == 0 {\n   conf.HeartbeatTimeout = 2*time.Second\n   conf.ElectionTimeout = 2*time.Second\n   conf.LeaderLeaseTimeout = 2*time.Second\n  }\n  store := NewInmemStore()\n  stores[i] = store\n  fsms[i] = &MockFSM{}\n  n, err := NewRaft(conf, fsms[i], store, store, NewInmemSnapshotStore(), trans[i])\n  if err != nil { t.Fatal(err) }\n  nodes[i] = n\n }\n if err := assuranceError(t,\"bootstrap\",nodes[0].BootstrapCluster(Configuration{Servers:[]Server{{ID:\"A\",Address:\"A\",Suffrage:Voter}}})); err != nil {t.Fatal(err)}\n assuranceWait(t,\"A elected from single-voter bootstrap\",6*time.Second,func()bool{return nodes[0].State()==Leader})\n if err:=assuranceError(t,\"add D nonvoter\",nodes[0].AddNonvoter(\"D\",\"D\",0,time.Second));err!=nil{t.Fatal(err)}\n for _,id := range []ServerID{\"B\",\"C\"} {\n  if err:=assuranceError(t,\"add voter\",nodes[0].AddVoter(id,ServerAddress(id),0,time.Second));err!=nil{t.Fatal(err)}\n }\n prefix := nodes[0].Apply([]byte(\"prefix\"),time.Second)\n if err:=assuranceError(t,\"prefix apply\",prefix);err!=nil{t.Fatal(err)}\n for i := range nodes {\n  ii:=i\n  assuranceWait(t,\"configuration and prefix propagation\",3*time.Second,func()bool{\n   cf:=nodes[ii].GetConfiguration()\n   if cf.Error()!=nil{return false}\n   return len(cf.Configuration().Servers)==4 && len(fsms[ii].Logs())>=1\n  })\n }\n control:=nodes[0].VerifyLeader()\n if err:=assuranceError(t,\"connected verification\",control);err!=nil{t.Fatal(err)}\n cf := nodes[0].GetConfiguration()\n if err := cf.Error(); err != nil { t.Fatal(err) }\n voters, nonvoters := 0, 0\n for _, server := range cf.Configuration().Servers {\n  if server.Suffrage == Voter { voters++ } else if server.Suffrage == Nonvoter { nonvoters++ }\n  if (server.ID == \"D\") != (server.Suffrage == Nonvoter) { t.Fatal(\"unexpected suffrage\", server) }\n }\n if voters != 3 || nonvoters != 1 { t.Fatal(\"unexpected configuration\") }\n originalTerm := nodes[0].CurrentTerm()\n assuranceEvent(\"prefix\",map[string]interface{}{\"history\":history,\"leader\":\"A\",\"term\":nodes[0].CurrentTerm(),\"prefix_index\":prefix.Index(),\"control_ok\":true,\"voters\":voters,\"nonvoters\":nonvoters,\"operation\":op,\"configuration_index\":cf.Index()})\n // Split {A,D} from {B,C}. Disable existing and future cross-partition routes.\n for i := range trans {\n  for j := range trans {\n   if (i==0||i==3)!=(j==0||j==3) {\n    trans[i].mu.Lock();trans[i].epoch++;trans[i].blocked[ids[j]]=true;trans[i].mu.Unlock()\n    trans[i].Disconnect(ServerAddress(ids[j]))\n   }\n  }\n }\n // Each of A's two sequential workers must begin a failed post-partition RPC.\n // This proves its preceding pre-partition callback has already run.\n assuranceWait(t,\"old voter reply drain\",time.Second,func()bool{\n  trans[0].mu.Lock();defer trans[0].mu.Unlock()\n  return trans[0].failed[\"B/append\"]>0 && trans[0].failed[\"B/heartbeat\"]>0 && trans[0].failed[\"C/append\"]>0 && trans[0].failed[\"C/heartbeat\"]>0\n })\n trans[0].mu.Lock()\n drain := map[string]interface{}{\"history\":history,\"operation\":op,\"B_append\":trans[0].failed[\"B/append\"],\"B_heartbeat\":trans[0].failed[\"B/heartbeat\"],\"C_append\":trans[0].failed[\"C/append\"],\"C_heartbeat\":trans[0].failed[\"C/heartbeat\"],\"drained\":trans[0].failed[\"B/append\"]>0 && trans[0].failed[\"B/heartbeat\"]>0 && trans[0].failed[\"C/append\"]>0 && trans[0].failed[\"C/heartbeat\"]>0}\n trans[0].mu.Unlock()\n assuranceEvent(\"voter_callbacks_drained\",drain)\n next:=-1\n assuranceWait(t,\"majority election\",1500*time.Millisecond,func()bool{\n  for _,i:=range []int{1,2}{if nodes[i].State()==Leader{next=i;return true}}\n  return false\n })\n newWrite:=nodes[next].Apply([]byte(\"majority-after-partition\"),time.Second)\n if err:=assuranceError(t,\"majority apply\",newWrite);err!=nil{t.Fatal(err)}\n var committed Log\n if err := stores[next].GetLog(newWrite.Index(), &committed); err != nil { t.Fatal(err) }\n if string(committed.Data) != \"majority-after-partition\" { t.Fatal(\"wrong command identity\") }\n assuranceEvent(\"new_leader_apply\",map[string]interface{}{\"history\":history,\"leader\":ids[next],\"term\":nodes[next].CurrentTerm(),\"index\":newWrite.Index(),\"operation\":op,\"command\":string(committed.Data),\"entry_term\":committed.Term,\"original_term\":originalTerm,\"higher_term\":committed.Term>originalTerm,\"apply_ok\":true,\"old_state\":nodes[0].State().String(),\"old_fsm_count\":len(fsms[0].Logs()),\"new_fsm_count\":len(fsms[next].Logs())})\n assuranceEvent(\"verify_invoked\",map[string]interface{}{\"history\":history,\"operation\":op,\"node\":\"A\",\"new_leader\":ids[next],\"new_term\":nodes[next].CurrentTerm(),\"new_apply_index\":newWrite.Index(),\"higher_term\":committed.Term>originalTerm,\"old_term\":nodes[0].CurrentTerm(),\"old_state\":nodes[0].State().String()})\n f:=nodes[0].VerifyLeader()\n err:=assuranceError(t,\"target verification\",f)\n errText:=\"\";if err!=nil{errText=err.Error()}\n assuranceEvent(\"verify_result\",map[string]interface{}{\"history\":history,\"operation\":op,\"node\":\"A\",\"success\":err==nil,\"error\":errText,\"old_state\":nodes[0].State().String(),\"old_fsm_count\":len(fsms[0].Logs()),\"new_fsm_count\":len(fsms[next].Logs())})\n}\n",
+    "description": "Actual four-node public-API history using in-memory stores and MockFSM, with transport delivery partition and emitted raw fields.",
+    "semantic_changes": [
+      "Transport wrapper disables optional pipeline support and drops cross-partition AppendEntries; embedded InmemTransport disconnects all cross-partition routes.",
+      "Read-only observations count failed worker calls, inspect the applied log entry and FSM command counts. No target source or critical protocol state is changed.",
+      "Harness timeouts bound construction and completion; missing required events cannot be a passing comparison."
+    ],
+    "prerequisites": [
+      {
+        "alias": "prefix",
+        "event": "prefix",
+        "conditions": [
+          {
+            "field": "control_ok",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          },
+          {
+            "field": "voters",
+            "op": "eq",
+            "value": 3,
+            "reference": null
+          },
+          {
+            "field": "nonvoters",
+            "op": "eq",
+            "value": 1,
+            "reference": null
+          }
+        ]
+      },
+      {
+        "alias": "drain",
+        "event": "voter_callbacks_drained",
+        "conditions": [
+          {
+            "field": "drained",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          },
+          {
+            "field": "history",
+            "op": "eq",
+            "value": null,
+            "reference": "prefix.history"
+          }
+        ]
+      },
+      {
+        "alias": "majority",
+        "event": "new_leader_apply",
+        "conditions": [
+          {
+            "field": "apply_ok",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          },
+          {
+            "field": "higher_term",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          },
+          {
+            "field": "command",
+            "op": "eq",
+            "value": "majority-after-partition",
+            "reference": null
+          },
+          {
+            "field": "history",
+            "op": "eq",
+            "value": null,
+            "reference": "drain.history"
+          }
+        ]
+      },
+      {
+        "alias": "invoked",
+        "event": "verify_invoked",
+        "conditions": [
+          {
+            "field": "new_apply_index",
+            "op": "eq",
+            "value": null,
+            "reference": "majority.index"
+          },
+          {
+            "field": "new_leader",
+            "op": "eq",
+            "value": null,
+            "reference": "majority.leader"
+          },
+          {
+            "field": "node",
+            "op": "eq",
+            "value": "A",
+            "reference": null
+          }
+        ]
+      }
+    ],
+    "legality": {
+      "source_ids": [
+        "S-bootstrap",
+        "S-config-append",
+        "S-membership",
+        "S-inmem-init",
+        "S-inmem-partition",
+        "S-replicate-loop",
+        "S-heartbeat",
+        "S-mock-fsm",
+        "S-startup",
+        "S-lease"
+      ],
+      "expectation_ids": [
+        "S-verify-api",
+        "S-suffrage",
+        "S-api"
+      ],
+      "binding_ids": [
+        "BIND-verify-registration"
+      ],
+      "derivation": "NewRaft, single-node BootstrapCluster, AddNonvoter, AddVoter and Apply create actual term/log/configuration state. All peers run real handlers and background loops. The transport embeds InmemTransport, disables optional pipelining through its supported error, and drops cross-partition RPC delivery/replies; it never forges Success or terms. Failed post-partition calls from A to each voter in each of its two sequential worker paths occur after all earlier calls and callbacks in that path. The driver waits for these failures before verification, excluding prior voter success callbacks. Connected verification before the partition supplies a permitted path.",
+      "applicability": "A has 2s heartbeat/election/lease settings; B,C,D use 200ms heartbeat/election and 100ms lease. The configuration is validated by NewRaft; a majority can elect while A has not yet timed out. No worker is suspended or protocol state assigned.",
+      "unresolved": [
+        "Finite prefix or future timeout is incomplete observation, not a liveness failure.",
+        "No network backend or persistence backend claim."
+      ],
+      "conflicts": [],
+      "alternatives": [
+        "Lease expiry, higher-term replies, negative notifications and shutdown remain real paths; if they return an error, the target comparison may hold."
+      ]
+    }
+  },
+  "monitors": [
+    {
+      "id": "M-verify-result",
+      "checker_id": "C-verify-after-majority",
+      "event": "verify_result",
+      "binding_ids": [
+        "BIND-verify-registration"
+      ],
+      "grounding": {
+        "source_ids": [
+          "S-verify-start",
+          "S-verify-count",
+          "S-verify-consume",
+          "S-notify",
+          "S-heartbeat",
+          "S-peers",
+          "S-lease",
+          "S-election",
+          "S-consume",
+          "S-fsm-rest"
+        ],
+        "expectation_ids": [
+          "S-verify-api",
+          "S-suffrage",
+          "S-api"
+        ],
+        "binding_ids": [
+          "BIND-verify-registration"
+        ],
+        "derivation": "VerifyLeader is documented to ensure the peer is still leader and to prevent stale FSM data after leadership loss. A successful command Apply on a different voter-majority leader in a higher term, completed before the target invocation under an unchanged configuration, independently establishes that A is a former leader for this history. Therefore a subsequent completed VerifyLeader on A must not return nil. This is a necessary public authority-confirmation condition, not an equivalence with communication count or a demand for eventual completion. Suffrage declarations distinguish election/commitment voters from nonvoters; callback registration asymmetry motivates but does not define this obligation.",
+        "applicability": "Four actual Raft instances; stable three-voter/one-nonvoter configuration produced by public APIs; partition {A,D}/{B,C}; no membership changes or manual restore during the measured interval. Target verification occurs strictly after B or C completes a uniquely identified command in a higher term.",
+        "unresolved": [
+          "Does not establish every deployment schedule, consensus log divergence, or a stale application read.",
+          "Specific cause beyond the mapped nonvoter callback route is not isolated by a separate counterfactual run."
+        ],
+        "conflicts": [],
+        "alternatives": [
+          "A lease expiry or negative/higher-term response can cause nonnil verification; these workers remain active.",
+          "Before the majority completes the command, an old local leader state alone does not establish this antecedent."
+        ]
+      },
+      "applicability_conditions": [],
+      "admission_alias": "invoked"
+    }
+  ],
+  "observable_properties": [
+    {
+      "checker_id": "C-verify-after-majority",
+      "kind": "event_assertion",
+      "trigger": {
+        "field": "event",
+        "op": "eq",
+        "value": "verify_result",
+        "reference": null
+      },
+      "assertion": {
+        "field": "success",
+        "op": "eq",
+        "value": false,
+        "reference": null
+      },
+      "antecedent": null,
+      "identity_fields": [
+        "history",
+        "operation"
+      ],
+      "history_field": null,
+      "description": "For the admitted post-majority verification operation, a completed result must not report successful current leadership."
+    }
+  ],
+  "uncertainties": [
+    "The measured endpoint is VerifyLeader error status; FSM counts are supplementary raw observations and not the oracle.",
+    "No claim of global correctness from a passing scenario; no claim of a consensus-safety violation from a failing API comparison."
+  ]
+}

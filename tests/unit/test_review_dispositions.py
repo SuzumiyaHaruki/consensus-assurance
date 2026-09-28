@@ -46,7 +46,7 @@ def test_semantic_transaction_failure_and_recovery_are_atomic(tmp_path,prepared,
     assert state.model_dump(mode='json')==before
     def change(proxy):
         proxy.state.claims[1].version+=1
-        proxy.state.native_current={'phase':'accepted','operation_id':'change'}
+        proxy.state.current_submission={'phase':'accepted','operation_id':'change'}
     if interrupt:
         def crash(key):raise RuntimeError('Interrupted between manifest and state')
         engine.graph_commit_hook=crash
@@ -56,7 +56,7 @@ def test_semantic_transaction_failure_and_recovery_are_atomic(tmp_path,prepared,
         engine.graph_commit_hook=lambda key:None
     commit_graph(engine,'change',{'operation':'one'},change)
     commit_graph(engine,'change',{'operation':'one'},change)
-    assert engine.state.claims[1].version==2 and engine.state.native_current['operation_id']=='change'
+    assert engine.state.claims[1].version==2 and engine.state.current_submission['operation_id']=='change'
     assert 'change' in Store(engine.root).load().applied_operations
 
 

@@ -85,7 +85,7 @@ func TestAssuranceMixedMemberProducer(t *testing.T) {
 	}
 }
 
-// These controlled developer fixtures are not native discovery or a stored bug answer.
+// These controlled developer fixtures are not autonomous discovery or a stored bug answer.
 func assuranceDiscriminator(t *testing.T, phase string) (*AssuranceCluster, int, chan struct{}, <-chan AssuranceMessage, *int32) {
 	release, entered := make(chan struct{}), make(chan AssuranceMessage, 1)
 	armed := new(int32)

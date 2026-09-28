@@ -143,7 +143,7 @@ def accept_review(state, submission, operation_id):
                     challenged_components=components, unchanged_components=unchanged, fresh_execution=executed,
                     original_artifact=old.id, answering_artifact=artifact.id)
     if errors:raise DiagnosticError(errors)
-    review = SemanticReview(task_id='native:' + operation_id, check_id=operation_id,
+    review = SemanticReview(task_id='review:' + operation_id, check_id=operation_id,
         target_versions={artifact.id:artifact.question.audit_spec_version if candidate else artifact.version}, material_ids=sources, items=reply.items,
         origin='mock' if state.mode == 'mock' else 'agent', unit_id=getattr(artifact,'unit_id',None) or None,
         unit_version=next((u.version for u in state.units if u.id == getattr(artifact,'unit_id',None)), None),

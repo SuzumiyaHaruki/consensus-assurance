@@ -18,8 +18,8 @@ def classify_failure(text: str) -> ExecutionStatus:
     return ExecutionStatus.ERROR
 
 
-def native_failure_text(check, events):
-    """Use transport errors, never source or command output from native tool items."""
+def codex_failure_text(check, events):
+    """Use transport errors, never source or command output from Codex tool items."""
     errors = [e.get("error") for e in events if e.get("type") == "turn.failed"]
     errors = errors or [e.get("message") for e in events if e.get("type") == "error"]
     messages = [" ".join(str(error[k]) for k in ("code", "message") if error.get(k))
@@ -62,7 +62,7 @@ class CodexAgent:
             and all(s in text for s in required) and "SESSION_ID" in output(resume_run))
         self.version = output(version).strip()
         self.missing = version.status == ExecutionStatus.TOOL_MISSING
-        return {"available": self.available, "version": self.version, "checks": [version, help_run, resume_run], "reason": "Native CLI session and JSONL capabilities detected" if self.available else "Codex missing or required native session capabilities unavailable"}
+        return {"available": self.available, "version": self.version, "checks": [version, help_run, resume_run], "reason": "Codex CLI session and JSONL capabilities detected" if self.available else "Codex missing or required Codex session capabilities unavailable"}
 
     def permission_options(self, root, directory):
         """Scope model-controlled commands to the captured source, draft, and retained evidence."""
@@ -73,12 +73,12 @@ class CodexAgent:
         # Deny the host temp path, not the draft TMPDIR set for sandboxed tools below.
         filesystem={":root":"deny",":minimal":"read",":slash_tmp":"deny",
             str(Path(os.environ.get("TMPDIR") or "/tmp").resolve()):"deny",
-            str(root/"native-source"):"read",str(directory):"write",
-            str(root/"direct-checks"):"read",str(root/"native-submissions"):"read",
+            str(root/"agent-source"):"read",str(directory):"write",
+            str(root/"direct-checks"):"read",str(root/"submissions"):"read",
             str(root/"state.json"):"read",str(root/"research.json"):"read",
-            str(root/"native-submission.schema.json"):"read",str(root/"product-schemas.json"):"read",
-            str(root/"native-method.md"):"read",
-            str(root/"native-model-method.md"):"read",str(root/"native-support"):"read",
+            str(root/"submission.schema.json"):"read",str(root/"product-schemas.json"):"read",
+            str(root/"audit-method.md"):"read",
+            str(root/"model-method.md"):"read",str(root/"target-support"):"read",
             **{str(root/name):"read" for name in ("logs","models","findings","audit-spec","actions")},
             **{str(path):"read" for path in getattr(self,"read_only_roots",[]) if path.is_dir()},
             str(codex_home/"tmp"/"arg0"):"read",str(Path(executable).resolve().parent):"read"}
@@ -86,9 +86,9 @@ class CodexAgent:
         environment={"GOCACHE":str(directory/"go-cache"),"GOMODCACHE":str(directory/"go-mod-cache"),
             "TMPDIR":str(directory/"tmp"),"GOPROXY":"off","GOSUMDB":"off","GOTOOLCHAIN":"local","GOFLAGS":"-mod=readonly"}
         environment.update(getattr(self,"tool_environment",{}))
-        return ["-c",'default_permissions="ca_native"',
-            "-c","permissions.ca_native.filesystem="+inline,
-            "-c","permissions.ca_native.network.enabled=false",
+        return ["-c",'default_permissions="ca_audit"',
+            "-c","permissions.ca_audit.filesystem="+inline,
+            "-c","permissions.ca_audit.network.enabled=false",
             "-c",'shell_environment_policy.inherit="core"',
             "-c","shell_environment_policy.set={"+",".join(json.dumps(k)+"="+json.dumps(v) for k,v in environment.items())+"}",
             "-c","project_doc_max_bytes=0", "-c","tools.web_search=false",
@@ -113,10 +113,10 @@ class CodexAgent:
 
     def permission_probe(self, runner, directory, snapshot_id, options):
         """Positive controls and explicit denied operations; a crashed probe proves nothing."""
-        source = next((p for p in (runner.root / "native-source").rglob("*") if p.is_file()), None)
+        source = next((p for p in (runner.root / "agent-source").rglob("*") if p.is_file()), None)
         if source is None:
             return False, []
-        private = runner.root / "native-private-canary"
+        private = runner.root / "codex-private-canary"
         private.write_text("private permission canary")
         protected = [source]
         for folder in ("logs", "models", "direct-checks"):
@@ -145,9 +145,9 @@ class CodexAgent:
             "    assert stream.read() == b'temp control'\n"
             "print('PERMISSIONS_VERIFIED')\n")
         try:
-            check = runner.run([*self.sandbox_command(runner.root), "sandbox", "-P", "ca_native", *options,
+            check = runner.run([*self.sandbox_command(runner.root), "sandbox", "-P", "ca_audit", *options,
                 "-C", str(directory), "/usr/bin/python3", str(script)], directory,
-                "native_permission_probe", snapshot_id, 15)
+                "codex_permission_probe", snapshot_id, 15)
             verified = check.status == ExecutionStatus.COMPLETED and check.exit_code == 0 and "PERMISSIONS_VERIFIED" in output(check)
             check.parameters['permission_result'] = 'verified' if verified else 'inconclusive_or_unsafe'
             return verified, [check]
@@ -167,20 +167,20 @@ class CodexAgent:
         return permitted, checks
 
     def investigate(self, runner, prompt, directory, snapshot_id, timeout, session_id=None):
-        """Run one native Codex turn and retain the exact session and tool events."""
+        """Run one Codex turn and retain the exact session and tool events."""
         directory.mkdir(parents=True, exist_ok=True)
-        schema = runner.root / "native-final.schema.json"
+        schema = runner.root / "agent-final.schema.json"
         write_json(schema, {"type":"object","properties":{
             "submission":{"type":"string"},"summary":{"type":"string"}},
             "required":["submission","summary"],"additionalProperties":False})
         if not getattr(self, "available", False):
-            return CheckRun(action="native_agent", cwd=str(directory), snapshot_id=snapshot_id,
+            return CheckRun(action="agent_turn", cwd=str(directory), snapshot_id=snapshot_id,
                 status=ExecutionStatus.TOOL_MISSING if getattr(self, "missing", False) else ExecutionStatus.ERROR,
-                reason="Native Codex capability probe failed"), None, None
+                reason="Codex capability probe failed"), None, None
         options=self.permission_options(runner.root,directory)
         if getattr(self, '_permission_key', None) != (str(runner.root), tuple(options), getattr(self, 'version', 'unknown')):
-            raise RuntimeError("Native permission profile must be prepared before reserving a model call")
-        response = runner.root / "actions" / (runner.active_action_id or "standalone") / "native-response.json"
+            raise RuntimeError("Codex permission profile must be prepared before reserving a model call")
+        response = runner.root / "actions" / (runner.active_action_id or "standalone") / "agent-response.json"
         response.parent.mkdir(parents=True, exist_ok=True)
         command = [*self.sandbox_command(runner.root), "exec"]
         if session_id:
@@ -192,11 +192,11 @@ class CodexAgent:
         if self.model:
             command += ["-m", self.model]
         command += [session_id, "-"] if session_id else ["-"]
-        check = runner.run(command, directory, "native_agent", snapshot_id, timeout, stdin=prompt)
+        check = runner.run(command, directory, "agent_turn", snapshot_id, timeout, stdin=prompt)
         return self.decode(check, response, session_id)
 
     def decode(self, check, response, session_id=None):
-        """Decode a durable native receipt without invoking another model turn."""
+        """Decode a durable Agent receipt without invoking another model turn."""
         check.tool_version = getattr(self, "version", "unknown")
         events = []
         if check.stdout and Path(check.stdout).is_file():
@@ -212,48 +212,48 @@ class CodexAgent:
         completed = [e for e in events if e.get("type") == "turn.completed"]
         if session_id and actual_id and actual_id != session_id:
             check.status = ExecutionStatus.ERROR
-            check.reason = "Native session identity changed unexpectedly"
+            check.reason = "Agent session identity changed unexpectedly"
         if check.status == ExecutionStatus.COMPLETED and (check.exit_code != 0
                 or any(e.get("type") == "turn.failed" for e in events)
                 or (not completed and any(e.get("type") == "error" for e in events))):
-            diagnostic = native_failure_text(check, events)
+            diagnostic = codex_failure_text(check, events)
             check.status = classify_failure(diagnostic)
             check.reason = failure_reason(diagnostic)
             if session_id and any(marker in diagnostic.lower() for marker in
                     ("session not found","thread not found","no session found")):
-                check.parameters["native_session_unavailable"]=True
+                check.parameters["agent_session_unavailable"]=True
         if completed and not (actual_id or session_id):
             check.status = ExecutionStatus.ERROR
-            check.reason = "Native turn completed without a recoverable session identity"
-        check.parameters.update({"native_session_id":actual_id or session_id,
-            "native_response_path":str(response),
-            "native_turn_completed":bool(completed),
-            "native_tool_events":len({e['item']['id'] for e in events if e.get('type') == 'item.completed'
+            check.reason = "Agent turn completed without a recoverable session identity"
+        check.parameters.update({"agent_session_id":actual_id or session_id,
+            "agent_response_path":str(response),
+            "agent_turn_completed":bool(completed),
+            "agent_tool_events":len({e['item']['id'] for e in events if e.get('type') == 'item.completed'
                 and isinstance(e.get('item'),dict) and e['item'].get('id') and e['item'].get('type') in
                 {'command_execution','file_change','mcp_tool_call','web_search'}}),
-            "native_usage":completed[-1].get("usage") if completed else None,
-            "native_sandbox":"ca_native: root deny, captured source/evidence read, draft write, tool network off",
+            "agent_usage":completed[-1].get("usage") if completed else None,
+            "agent_sandbox":"ca_audit: root deny, captured source/evidence read, draft write, tool network off",
             "permission_probe":"verified before model call; cached for this process/profile",
-            "agent_model":self.model or "CLI default; inspect raw native events",
+            "agent_model":self.model or "CLI default; inspect raw Codex events",
             "agent_reasoning_effort":self.reasoning_effort or "CLI default"})
         if check.status != ExecutionStatus.COMPLETED or not completed:
             if check.status == ExecutionStatus.COMPLETED:
                 check.status = ExecutionStatus.ERROR
-                check.reason = "Native turn lacked a completed event"
+                check.reason = "Agent turn lacked a completed event"
             return check, actual_id or session_id, None
         try:
             result = json.loads(response.read_text())
             if (not isinstance(result, dict) or set(result) != {"submission", "summary"}
                     or not all(isinstance(value, str) for value in result.values())):
-                raise ValueError("Native final response has the wrong shape")
+                raise ValueError("Agent final response has the wrong shape")
             return check, actual_id or session_id, result
         except (OSError, ValueError) as exc:
-            check.reason = "Native final response invalid: " + str(exc)
-            check.parameters["native_response_error"] = check.reason
+            check.reason = "Agent final response invalid: " + str(exc)
+            check.parameters["agent_response_error"] = check.reason
             return check, actual_id or session_id, {"submission":"", "summary":check.reason}
 
 class MockAgent:
-    """Explicit file-product playback through the same native product boundary."""
+    """Explicit file-product playback through the same audit product boundary."""
     name = "mock"
     mock = True
 
@@ -264,16 +264,16 @@ class MockAgent:
         self.available = bool(self.responses)
 
     def probe(self, runner):
-        return {"available":self.available, "version":"native-fixture/1", "checks":[],
+        return {"available":self.available, "version":"audit-fixture/1", "checks":[],
             "reason":"Explicit product playback; no autonomous discovery evidence"}
 
     def investigate(self, runner, prompt, directory, snapshot_id, timeout, session_id=None):
         if self.cursor >= len(self.responses):
-            return CheckRun(action="native_agent", status=ExecutionStatus.ERROR,
-                snapshot_id=snapshot_id, origin=Origin.MOCK, reason="Native fixture exhausted"), session_id, None
+            return CheckRun(action="agent_turn", status=ExecutionStatus.ERROR,
+                snapshot_id=snapshot_id, origin=Origin.MOCK, reason="Audit fixture exhausted"), session_id, None
         item = self.responses[self.cursor]
         self.cursor += 1
-        from consensus_assurance.workflow.native import draft_file
+        from consensus_assurance.workflow.audit import draft_file
         for name, content in item.get("files", {}).items():
             relative = Path(name)
             if relative.is_absolute() or ".." in relative.parts:
@@ -283,6 +283,6 @@ class MockAgent:
             path.write_text(content)
             draft_file(directory, name)
         write_json(directory / "submission.json", item["submission"])
-        return CheckRun(action="native_agent", cwd=str(directory), snapshot_id=snapshot_id,
+        return CheckRun(action="agent_turn", cwd=str(directory), snapshot_id=snapshot_id,
             origin=Origin.MOCK, status=ExecutionStatus.COMPLETED, exit_code=0), session_id or "fixture-session", {
             "submission":"submission.json", "summary":"Explicit fixture product"}

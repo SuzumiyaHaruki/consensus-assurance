@@ -6,7 +6,7 @@ class HashicorpRaftBackend(GoModuleBackend):
     name = 'hashicorp_raft'
     version = '2'
     harness_instructions = GoModuleBackend.harness_instructions + (
-        ' Read native-support/assurance_support_test.go. NewAssuranceCluster initializes actual in-memory Raft nodes '
+        ' Read target-support/assurance_support_test.go. NewAssuranceCluster initializes actual in-memory Raft nodes '
         'through BootstrapCluster/NewRaft and caller-supplied configs/FSMs. NewAssuranceClusterWithSuffrage accepts '
         'an explicit role for each initial member, validated by the target bootstrap API; alternatively use real public membership changes. '
         'Inspect GetConfiguration and match actual member IDs and suffrage. Gate actual request_delivery or '

@@ -74,7 +74,7 @@ def main(argv=None):
         if name == "resume":
             p.add_argument("--repair-attempts",type=int,help="显式调整任务总修复上限；不重置已用次数或单问题失败记录")
             p.add_argument("--action-timeout", type=float, help="调整后续单动作超时（秒）；保留总预算和已用次数")
-            p.add_argument("--native-turn-timeout", type=float, help="调整后续单次原生 Codex 调查最长时长（秒）；不改变正式执行超时或总预算")
+            p.add_argument("--agent-turn-timeout", type=float, help="调整后续单次Codex 调查最长时长（秒）；不改变正式执行超时或总预算")
     args = parser.parse_args(argv)
     try:
         if args.command in {"resume", "report"}:
@@ -97,7 +97,7 @@ def main(argv=None):
                 minimum = 1
                 print(json.dumps({"仓库":str(repo),"材料发送":False,"执行目标代码":False,
                     "agent调用上限":b.agent_calls,"粗略计划下限":minimum,
-                    "预算说明":"按 CLI turn、总时长和正式执行计数；源码浏览发生在原生会话内。这不是 token 账单。",
+                    "预算说明":"按 CLI turn、总时长和正式执行计数；源码浏览发生在Codex 会话内。这不是 token 账单。",
                     "计划可能受限":minimum>b.agent_calls,"预算":b.model_dump(mode="json")},ensure_ascii=False,indent=2))
                 return 0
             root = create_run_directory(config, args.command)
@@ -123,7 +123,7 @@ def main(argv=None):
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             if args.command == "resume":
                 state = engine.resume(action_timeout=args.action_timeout,repair_attempts=args.repair_attempts,
-                    native_turn_timeout=args.native_turn_timeout)
+                    agent_turn_timeout=args.agent_turn_timeout)
                 if state.framework_revision!=FRAMEWORK_REVISION:
                     print(state.stop_reason);return 2
             else:

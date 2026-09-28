@@ -53,7 +53,7 @@ def capacity(state):
         'exhausted':[name for name,value in remaining.items() if not value]}
 
 
-def frontier(state, spec):
+def frontier(state, spec, results=()):
     """Project sourced unknowns and actual edges, never synthesize lifecycle products."""
     candidates = state.question_candidates
     relationships = []
@@ -64,9 +64,10 @@ def frontier(state, spec):
         relationships.append({'fact_id':fact.id, 'source_ids':fact.source_ids,
             'unknowns':fact.unknowns, 'producers':fact.established_by, 'consumers':fact.consumed_by,
             'invalidators':fact.invalidators, 'reinterpreters':fact.reinterpreters,
-            'unselected_behavior_ids':sorted(edges-referenced),
+            'unreferenced_behavior_ids':sorted(edges-referenced),
             'investigations':[{'candidate_id':c.id,'status':c.status,'lifecycle':c.question.obligation_relation_kind,
-                'question':c.question.question,'remaining':c.question.unknowns,'resume_conditions':c.resume_conditions}
+                'question':c.question.question,'remaining':c.question.unknowns,'resume_conditions':c.resume_conditions,
+                'results':[{'claim_id':r['claim_id'],'disposition':r['disposition']} for r in results if r['candidate_id']==c.id]}
                 for c in investigations], 'coverage':'Described relationships; selected checks settle only their explicit scope'})
     return {'relationships':relationships,
         'behavior_unknowns':[{'behavior_id':b.id,'activity':b.primary_activity,'unknowns':b.unknowns,
@@ -85,7 +86,10 @@ def conclusions(state, records):
         if not observed:continue
         confirmed=any(r.get('confirmed') and r.get('outcome')=='violated' for r in observed)
         checked=all(r.get('reviewed_complete') for r in observed)
-        result.append({'claim_id':claim.id,'concern':claim.concern,'description':claim.description,
+        unit=next((u for u in state.units if u.status!='revised' and claim.id in u.obligation_ids),None)
+        result.append({'claim_id':claim.id,'candidate_id':unit.candidate_id if unit else None,
+            'question':unit.audit_question.question if unit and unit.audit_question else None,
+            'concern':claim.concern,'description':claim.description,
             'disposition':'confirmed_in_scope' if confirmed else 'bounded_no_violation' if checked and all(r.get('outcome')=='holds' for r in observed) else 'investigation_lead',
             'scope':claim.scope.model_dump(mode='json'),'check_ids':[r['experiment_check_id'] for r in observed],
             'blockers':list(dict.fromkeys(b for r in observed for b in r['blockers'])),
@@ -98,7 +102,7 @@ def costs(state):
     def seconds(check):
         return max(0,(datetime.fromisoformat(check.ended_at)-datetime.fromisoformat(check.started_at)).total_seconds()) if check.ended_at and check.started_at else 0
     rejected={s['operation_id'] for s in state.selections if s['action']=='rejected'}
-    calls=[c for c in state.checks if c.action=='native_agent']
+    calls=[c for c in state.checks if c.action=='agent_turn']
     formal=[c for c in state.checks if c.action in {'direct_check','exploration','model_syntax','model_check','reachability'}]
     return {'agent_calls':state.usage.get('agent_calls',0),'agent_seconds':sum(map(seconds,calls)),
         'rejected_calls':len(rejected),'rejected_call_seconds':sum(seconds(c) for c in calls if c.id in rejected),
@@ -114,6 +118,7 @@ def view(state, compact=False):
     artifacts = [a for a in state.direct_checks+state.models if a.id not in superseded and
         (a.unit_id in {u.id for u in current} or getattr(a,'research_ref',None))]
     records = [r for r in state.monitor_results if (r.get('direct_check_id') or r.get('model_id')) in {a.id for a in artifacts}]
+    results=conclusions(state,records)
     overview=spec.core_overview if spec else None
     ready=bool(overview and overview.status=='usable')
     directed=bool((state.config.get('directed_question') or '').strip())
@@ -135,12 +140,13 @@ def view(state, compact=False):
         'units':[u.model_dump(mode='json',exclude={'audit_question'}) for u in current],
         'claims':[c.model_dump(mode='json') for c in state.claims if any(c.id in u.obligation_ids for u in current)],
         'artifacts':[a.model_dump(mode='json') for a in artifacts], 'assessments':records,
-        'frontier':frontier(state,spec), 'capacity':capacity(state), 'conclusions':conclusions(state,records), 'costs':costs(state),
+        'frontier':frontier(state,spec,results), 'capacity':capacity(state), 'conclusions':results, 'costs':costs(state),
         'handoffs':[s for s in state.selections if s.get('released_candidate_ids') or s['action'] in {'pause','explained'} or s['action']=='stop' and s.get('scope')!='run'],
-        'pending_work':pending_work(state), 'current':{k:v for k,v in state.native_current.items() if k!='harness'},
+        'pending_work':pending_work(state), 'current':{k:v for k,v in state.current_submission.items() if k!='harness'},
         'latest_decision':state.selections[-1] if state.selections else None,
         'stop':state.run_stop, 'stop_reason':state.stop_reason}
     for candidate in result['candidates']:
+        candidate['results']=[{k:r[k] for k in ('claim_id','description','disposition')} for r in results if r['candidate_id']==candidate['id']]
         candidate['open_issue_ids']=[i.id for i in state.review_issues if i.target_id==candidate['id'] and not i.resolved_by]
         candidate['current_applicability']='pending_review' if candidate['open_issue_ids'] else 'within_recorded_scope'
         units={u.id for u in state.units if u.candidate_id==candidate['id']}
@@ -150,7 +156,7 @@ def view(state, compact=False):
             for c in state.checks if c.direct_check_id in owned or c.model_id in owned]
     if compact:
         result['understanding_changes']=[{'operation_id':c['operation_id'],'version':c['version'],
-            'changed_object_ids':list(c['delta']),'effects':c['effects']} for c in result['understanding_changes']]
+            'changed_object_ids':list(c['delta']),'effects':c['effects']} for c in result['understanding_changes'][-1:]]
         if result['latest_decision']:result['latest_decision']={k:v for k,v in result['latest_decision'].items() if k!='map_delta'}
         for candidate in result['candidates']:
             if candidate['status']!='active' and not any(u.id==state.active_unit_id and u.candidate_id==candidate['id'] for u in current):
@@ -158,7 +164,7 @@ def view(state, compact=False):
                     if key in {'question','source_ids','fact_ids','obligation_relation_kind','unknowns','activity_classes'}}
         result['claims']=[{k:v for k,v in claim.items() if k in {'id','version','concern','description','source_ids'}} for claim in result['claims']]
         result['assessments']=[{k:v for k,v in record.items() if k in {'claim_id','direct_check_id','experiment_check_id','confirmed','outcome','blockers','raw_log','bounded_complete'}} for record in records]
-        result['handoffs']=[{k:v for k,v in s.items() if k in {'operation_id','action','scope','reason','candidate_ids','rationale'}} for s in result['handoffs']]
+        result['handoffs']=[{k:v for k,v in s.items() if k in {'operation_id','action','scope','reason','candidate_ids','rationale'}} for s in result['handoffs'][-1:]]
     return result
 
 
@@ -220,7 +226,7 @@ def stop_record(engine, raw, operation_id, controller=False):
             'diagnostics':['Stop metadata is explanatory only; semantic changes were not applied']+
                 (['Unknown or stale references: '+str([r for r in refs if not isinstance(r,str) or r not in known])] if isinstance(refs,list) else ['ref_ids is not a list'])}
         if not any(s['operation_id']==operation_id for s in state.selections):state.selections.append(record)
-        state.native_current = {'phase':'executed','action':'stop','scope':'run','reason':raw['reason'],'operation_id':operation_id}
+        state.current_submission = {'phase':'executed','action':'stop','scope':'run','reason':raw['reason'],'operation_id':operation_id}
         state.stop_reason = 'Scoped stop (run/'+raw['reason']+'): '+record['rationale']
     state.run_stop = record
     return record

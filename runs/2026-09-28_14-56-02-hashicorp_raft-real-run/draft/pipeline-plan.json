@@ -1,0 +1,113 @@
+{
+  "description": "Measure documented method order on the first actual pipeline Response call from live Raft workers.",
+  "claim_id": "O-pipeline-response-order",
+  "binding_ids": [
+    "BIND-pipeline-consume"
+  ],
+  "harness": {
+    "kind": "go_test",
+    "source": "",
+    "files": {},
+    "description": "Two live Raft nodes with forwarding wrappers around actual InmemTransport pipelines and futures.",
+    "semantic_changes": [
+      "Observation-only future wrappers record Error return and Response entry; delegate all protocol data unchanged.",
+      "A forwarding Consumer goroutine preserves per-pipeline order; finite scheduling may change but no producer or reply is fabricated.",
+      "Select one first observed call independent of its result to avoid conflating operation identities."
+    ],
+    "prerequisites": [
+      {
+        "alias": "invoked",
+        "event": "response_invoked",
+        "conditions": []
+      }
+    ],
+    "legality": {
+      "source_ids": [
+        "S-startup",
+        "S-bootstrap",
+        "S-config-append",
+        "S-inmem-init",
+        "S-inmem-pipeline",
+        "S-replicate-loop",
+        "S-pipeline",
+        "S-append-future"
+      ],
+      "expectation_ids": [
+        "S-pipeline-contract"
+      ],
+      "binding_ids": [
+        "BIND-pipeline-consume"
+      ],
+      "derivation": "Public bootstrap and AddVoter establish the elected leader and two-voter cluster, then public Apply completes. Embedded InmemTransport generates actual replies and futures; pipeline wrappers map each underlying future to one wrapper and forward Consumer in order. Error delegates then atomically records return. Response snapshots that per-object observation at entry, delegates the actual getter, then emits the result. A global CAS selects the first Response independently of its observed ordering; no success/error field or protocol state is changed.",
+      "applicability": "No faults or direct protocol assignments; same future identity is maintained on both AppendEntries return and Consumer. The wrapper introduces only finite forwarding/observation scheduling.",
+      "unresolved": [
+        "Only the first observed call is checked; other operations are outside this bounded monitor."
+      ],
+      "conflicts": [],
+      "alternatives": [
+        "Healthy normal Apply must complete independently of the ordering comparison; shutdown is unconditional."
+      ]
+    }
+  },
+  "monitors": [
+    {
+      "id": "M-pipeline-order",
+      "checker_id": "C-pipeline-order",
+      "event": "response_returned",
+      "binding_ids": [
+        "BIND-pipeline-consume"
+      ],
+      "grounding": {
+        "source_ids": [
+          "S-pipeline",
+          "S-net-pipeline",
+          "S-inmem-pipeline",
+          "S-future-complete",
+          "S-append-future"
+        ],
+        "expectation_ids": [
+          "S-pipeline-contract"
+        ],
+        "binding_ids": [
+          "BIND-pipeline-consume"
+        ],
+        "derivation": "AppendFuture.Response explicitly must only be called after Error returns. The selected necessary ordering condition is Error-return precedes Response invocation for the same future, irrespective of whether concrete publication already implies readiness. This checks that literal interface responsibility and does not assert that Error nil is sufficient for consensus support.",
+        "applicability": "Actual pipelineDecode consumes actual in-memory transport futures. Observation wraps and delegates all methods without pre-calling Error, rewriting fields or changing the RPC outcome.",
+        "unresolved": [
+          "No custom transport malfunction or incorrect commit index is inferred."
+        ],
+        "conflicts": [],
+        "alternatives": [
+          "Built-in respond-before-publish ordering avoids a pending-response race but is not the documented Error-method return precondition."
+        ]
+      },
+      "admission_alias": "invoked",
+      "applicability_conditions": []
+    }
+  ],
+  "observable_properties": [
+    {
+      "checker_id": "C-pipeline-order",
+      "kind": "event_assertion",
+      "trigger": {
+        "field": "event",
+        "op": "eq",
+        "value": "response_returned"
+      },
+      "assertion": {
+        "field": "error_returned_before_call",
+        "op": "eq",
+        "value": true
+      },
+      "identity_fields": [
+        "history",
+        "operation"
+      ],
+      "description": "Actual Response access is permitted only after that future Error returned."
+    }
+  ],
+  "uncertainties": [
+    "No malformed result or invalid consensus support is checked.",
+    "The observation is method discipline on this concrete producer/consumer integration, not overall pipeline correctness."
+  ]
+}

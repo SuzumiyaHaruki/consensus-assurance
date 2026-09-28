@@ -7,7 +7,7 @@ def manifest():
     return json.loads(files('consensus_assurance').joinpath('resources/task-skills.json').read_text())
 
 
-def loaded_resources(kind="native"):
+def loaded_resources(kind="audit"):
     routing = manifest()
     if kind not in routing['tasks']:
         raise ValueError('Unknown method resource selection')

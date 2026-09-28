@@ -669,10 +669,10 @@ class Capability(Record):
 
 
 class Analysis(Record):
-    native_session_id: str | None = None
-    native_current: dict[str, Any] = {}
-    native_turns: list[dict[str, Any]] = []
-    native_method_paths: list[str] = []
+    agent_session_id: str | None = None
+    current_submission: dict[str, Any] = {}
+    agent_turns: list[dict[str, Any]] = []
+    method_paths: list[str] = []
     question_candidates: list[QuestionCandidate] = []
     direct_checks: list[DirectCheckArtifact] = []
     active_direct_check_id: str | None = None

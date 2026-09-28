@@ -37,7 +37,7 @@ def test_R3_unread_consumer_has_no_invented_edge(prepared):
 def test_variant_visibility_is_a_subset_of_safe_build_files(tmp_path,variant):
     from consensus_assurance.cli import load_config,main
     from consensus_assurance.adapters.storage.snapshot import capture
-    from consensus_assurance.workflow.native import source_materials, SourceRange
+    from consensus_assurance.workflow.audit import source_materials, SourceRange
     repo=tmp_path/'source';repo.mkdir()
     families=['paxos','n2paxos','swift','epaxos','fastpaxos','curp']
     for family in families+['replica']:

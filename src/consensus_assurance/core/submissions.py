@@ -1,4 +1,4 @@
-"""File-backed research products; native browsing and editing need no submission."""
+"""File-backed research products; Codex browsing and editing need no submission."""
 from typing import Annotated, Literal, Union
 from pydantic import Field, TypeAdapter, model_validator
 from .proposals import BindingDraft, ClaimDraft, EncodingRevision, IssueResolution
@@ -166,6 +166,6 @@ PRODUCTS = TypeAdapter(Annotated[Union[CandidateSubmission, CheckSubmission, Mod
     Field(discriminator="action")])
 
 
-class NativeSubmission:
+class AuditSubmission:
     model_validate = staticmethod(PRODUCTS.validate_python)
     model_json_schema = staticmethod(PRODUCTS.json_schema)

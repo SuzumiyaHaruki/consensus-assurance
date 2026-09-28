@@ -25,7 +25,7 @@ class ProcessRunner:
                         and saved.action == action and saved.snapshot_id == snapshot_id):
                     return saved
         remaining = self.deadline - time.monotonic() if self.deadline is not None else float('inf')
-        limit = 'total_seconds' if remaining <= timeout else 'native_turn_timeout' if action == 'native_agent' else 'action_timeout'
+        limit = 'total_seconds' if remaining <= timeout else 'agent_turn_timeout' if action == 'agent_turn' else 'action_timeout'
         timeout = min(timeout, remaining)
         if timeout <= 0:
             return CheckRun(action=action, command=command, cwd=str(cwd), snapshot_id=snapshot_id,

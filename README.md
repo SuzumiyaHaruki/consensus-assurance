@@ -1,6 +1,6 @@
 # consensus-assurance
 
-使用 Codex 原生 Agent 的 CFT 实现审计方法与证据工具。保留 Activity → Behavior → Fact → Candidate → Obligation → 检查／复核 → 理解回流；A1/A2 主导研究，五类支撑按实际依赖展开。局部问题处置后回到地图继续选题，合法执行见证用于限定结论。
+使用 Codex 的 CFT 实现审计方法与证据工具。保留 Activity → Behavior → Fact → Candidate → Obligation → 检查／复核 → 理解回流；A1/A2 主导研究，五类支撑按实际依赖展开。局部问题处置后回到地图继续选题，合法执行见证用于限定结论。
 
 ## 快速入口
 
@@ -17,9 +17,9 @@ export PATH="$HOME/.local/bin:$PATH"
 
 真实 Codex 路径现在使用持久会话：Agent 在获准的源码快照内自行搜索，并在独立草稿目录写测试或 TLA+ 文件；控制器校验完整提交后，从固定制品和干净副本正式执行。未受理草稿连同全部错误交回同一调查修订。运行前会实际探测文件权限；不能证明源码只读、草稿可写且其他文件不可读时，不发送模型任务。目标仓库与历史运行始终不作为 Agent 可写工作区。
 
-`budget.native_turn_timeout` 限制单次原生调查，`budget.action_timeout` 限制正式工具动作，`budget.total_seconds` 限制整次运行；`agent_calls`、`experiments` 和 `model_checks` 分别计数。旧的材料分片、packet、指针修复和阶段调度已退出生产树；源码阅读和上下文管理交给 Codex。`allow_agent_materials: false` 会在发送源码前停止原生调查；正式目标执行还要求 `allow_experiments: true` 和 `execution_isolation: bwrap`。离线替身使用相同提交入口；它不验证真实 Codex 的自主构造效果。
+`budget.agent_turn_timeout` 限制单次Codex 调查，`budget.action_timeout` 限制正式工具动作，`budget.total_seconds` 限制整次运行；`agent_calls`、`experiments` 和 `model_checks` 分别计数。旧的材料分片、packet、指针修复和阶段调度已退出生产树；源码阅读和上下文管理交给 Codex。`allow_agent_materials: false` 会在发送源码前停止Codex 调查；正式目标执行还要求 `allow_experiments: true` 和 `execution_isolation: bwrap`。离线替身使用相同提交入口；它不验证真实 Codex 的自主构造效果。
 
-Candidate／family／focus 的局部停止保留未决工作并继续原生会话；整次运行停止单独记录。`research.json` 给出已映射关系的未知、问题交接及剩余能力。增加总时长不会自动增加正式执行、Unit、复核或修订额度。
+Candidate／family／focus 的局部停止保留未决工作并继续Codex 会话；整次运行停止单独记录。`research.json` 给出已映射关系的未知、问题交接及剩余能力。增加总时长不会自动增加正式执行、Unit、复核或修订额度。
 
 默认 `verifier_backend: none`，直接检查无需 Java/TLC。要探索关键历史，在新运行中显式选择 `--verifier-backend tlc --tlc-jar /实际路径/tla2tools.jar`；模型方法届时按需加载，轨迹不自动确认实现。
 

@@ -1,0 +1,206 @@
+{
+  "description": "Correlate prefix, drained voter callbacks, new-majority Apply and subsequent former-leader VerifyLeader result in one execution.",
+  "claim_id": "O-verify-after-majority",
+  "binding_ids": [
+    "BIND-verify-registration"
+  ],
+  "harness": {
+    "kind": "go_test",
+    "source": "",
+    "files": {},
+    "description": "Actual four-node public-API history using in-memory stores and MockFSM, with transport delivery partition and emitted raw fields.",
+    "semantic_changes": [
+      "Transport wrapper disables optional pipeline support and drops cross-partition AppendEntries; embedded InmemTransport disconnects all cross-partition routes.",
+      "Read-only observations count failed worker calls, inspect the applied log entry and FSM command counts. No target source or critical protocol state is changed.",
+      "Harness timeouts bound construction and completion; missing required events cannot be a passing comparison."
+    ],
+    "prerequisites": [
+      {
+        "alias": "prefix",
+        "event": "prefix",
+        "conditions": [
+          {
+            "field": "control_ok",
+            "op": "eq",
+            "value": true
+          },
+          {
+            "field": "voters",
+            "op": "eq",
+            "value": 3
+          },
+          {
+            "field": "nonvoters",
+            "op": "eq",
+            "value": 1
+          }
+        ]
+      },
+      {
+        "alias": "drain",
+        "event": "voter_callbacks_drained",
+        "conditions": [
+          {
+            "field": "drained",
+            "op": "eq",
+            "value": true
+          },
+          {
+            "field": "history",
+            "op": "eq",
+            "reference": "prefix.history"
+          }
+        ]
+      },
+      {
+        "alias": "majority",
+        "event": "new_leader_apply",
+        "conditions": [
+          {
+            "field": "apply_ok",
+            "op": "eq",
+            "value": true
+          },
+          {
+            "field": "higher_term",
+            "op": "eq",
+            "value": true
+          },
+          {
+            "field": "command",
+            "op": "eq",
+            "value": "majority-after-partition"
+          },
+          {
+            "field": "history",
+            "op": "eq",
+            "reference": "drain.history"
+          }
+        ]
+      },
+      {
+        "alias": "invoked",
+        "event": "verify_invoked",
+        "conditions": [
+          {
+            "field": "new_apply_index",
+            "op": "eq",
+            "reference": "majority.index"
+          },
+          {
+            "field": "new_leader",
+            "op": "eq",
+            "reference": "majority.leader"
+          },
+          {
+            "field": "node",
+            "op": "eq",
+            "value": "A"
+          }
+        ]
+      }
+    ],
+    "legality": {
+      "source_ids": [
+        "S-bootstrap",
+        "S-config-append",
+        "S-membership",
+        "S-inmem-init",
+        "S-inmem-partition",
+        "S-replicate-loop",
+        "S-heartbeat",
+        "S-mock-fsm",
+        "S-startup",
+        "S-lease"
+      ],
+      "expectation_ids": [
+        "S-verify-api",
+        "S-suffrage",
+        "S-api"
+      ],
+      "binding_ids": [
+        "BIND-verify-registration"
+      ],
+      "derivation": "NewRaft, single-node BootstrapCluster, AddNonvoter, AddVoter and Apply create actual term/log/configuration state. All peers run real handlers and background loops. The transport embeds InmemTransport, disables optional pipelining through its supported error, and drops cross-partition RPC delivery/replies; it never forges Success or terms. Failed post-partition calls from A to each voter in each of its two sequential worker paths occur after all earlier calls and callbacks in that path. The driver waits for these failures before verification, excluding prior voter success callbacks. Connected verification before the partition supplies a permitted path.",
+      "applicability": "A has 2s heartbeat/election/lease settings; B,C,D use 200ms heartbeat/election and 100ms lease. The configuration is validated by NewRaft; a majority can elect while A has not yet timed out. No worker is suspended or protocol state assigned.",
+      "unresolved": [
+        "Finite prefix or future timeout is incomplete observation, not a liveness failure.",
+        "No network backend or persistence backend claim."
+      ],
+      "conflicts": [],
+      "alternatives": [
+        "Lease expiry, higher-term replies, negative notifications and shutdown remain real paths; if they return an error, the target comparison may hold."
+      ]
+    }
+  },
+  "monitors": [
+    {
+      "id": "M-verify-result",
+      "checker_id": "C-verify-after-majority",
+      "event": "verify_result",
+      "binding_ids": [
+        "BIND-verify-registration"
+      ],
+      "grounding": {
+        "source_ids": [
+          "S-verify-start",
+          "S-verify-count",
+          "S-verify-consume",
+          "S-notify",
+          "S-heartbeat",
+          "S-peers",
+          "S-lease",
+          "S-election",
+          "S-consume",
+          "S-fsm-rest"
+        ],
+        "expectation_ids": [
+          "S-verify-api",
+          "S-suffrage",
+          "S-api"
+        ],
+        "binding_ids": [
+          "BIND-verify-registration"
+        ],
+        "derivation": "VerifyLeader is documented to ensure the peer is still leader and to prevent stale FSM data after leadership loss. A successful command Apply on a different voter-majority leader in a higher term, completed before the target invocation under an unchanged configuration, independently establishes that A is a former leader for this history. Therefore a subsequent completed VerifyLeader on A must not return nil. This is a necessary public authority-confirmation condition, not an equivalence with communication count or a demand for eventual completion. Suffrage declarations distinguish election/commitment voters from nonvoters; callback registration asymmetry motivates but does not define this obligation.",
+        "applicability": "Four actual Raft instances; stable three-voter/one-nonvoter configuration produced by public APIs; partition {A,D}/{B,C}; no membership changes or manual restore during the measured interval. Target verification occurs strictly after B or C completes a uniquely identified command in a higher term.",
+        "unresolved": [
+          "Does not establish every deployment schedule, consensus log divergence, or a stale application read.",
+          "Specific cause beyond the mapped nonvoter callback route is not isolated by a separate counterfactual run."
+        ],
+        "conflicts": [],
+        "alternatives": [
+          "A lease expiry or negative/higher-term response can cause nonnil verification; these workers remain active.",
+          "Before the majority completes the command, an old local leader state alone does not establish this antecedent."
+        ]
+      },
+      "admission_alias": "invoked",
+      "applicability_conditions": []
+    }
+  ],
+  "observable_properties": [
+    {
+      "checker_id": "C-verify-after-majority",
+      "kind": "event_assertion",
+      "trigger": {
+        "field": "event",
+        "op": "eq",
+        "value": "verify_result"
+      },
+      "assertion": {
+        "field": "success",
+        "op": "eq",
+        "value": false
+      },
+      "identity_fields": [
+        "history",
+        "operation"
+      ],
+      "description": "For the admitted post-majority verification operation, a completed result must not report successful current leadership."
+    }
+  ],
+  "uncertainties": [
+    "The measured endpoint is VerifyLeader error status; FSM counts are supplementary raw observations and not the oracle.",
+    "No claim of global correctness from a passing scenario; no claim of a consensus-safety violation from a failing API comparison."
+  ]
+}

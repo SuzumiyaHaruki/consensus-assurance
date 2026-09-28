@@ -1,9 +1,9 @@
-"""Scoped knowledge progress and unconditional resource exits through native products."""
+"""Scoped knowledge progress and unconditional resource exits through audit products."""
 import json
 from pathlib import Path
 import pytest
-from native_support import first, products, engine_for, check_step, review_step, stop, feedback
-from test_native_research import question_step, diagnostics
+from audit_support import first, products, engine_for, check_step, review_step, stop, feedback
+from test_audit_research import question_step, diagnostics
 
 
 @pytest.mark.parametrize('owned_ref',['material','result','review','disposition','unknown','unexplained'])
@@ -40,7 +40,7 @@ def test_forced_stop_ignores_malformed_semantics_and_retains_pending(tmp_path,pr
     assert state.run_stop['pending_work']==__import__('consensus_assurance.workflow.research',fromlist=['pending_work']).pending_work(state)
     assert all(not i.resolved_by for i in state.review_issues)
     assert all(u.status!='checked' for u in state.units) if len(prefix)!=0 else not state.units
-    raw=list((e.root/'native-submissions').glob('*/raw.json'))
+    raw=list((e.root/'submissions').glob('*/raw.json'))
     assert any(json.loads(p.read_text()).get('sources')=='not a source list' for p in raw)
 
 
@@ -48,9 +48,15 @@ def test_independent_consumer_enrichment_keeps_old_artifact_current(tmp_path):
     def enrich(state):
         spec=json.loads(Path(state['audit_spec_path']).read_text())
         spec['behaviors'].append(dict(id='consumer',primary_activity='A1',execution_owner='caller',protocol_context='later operation',
-            trigger='use',consumes_fact_ids=['result'],source_ids=['code']))
-        return dict(action='research',map_path='map.json',rationale='Record an independent later consumer'),{'map.json':json.dumps(spec)}
-    e,repo=engine_for(tmp_path,[first,check_step(),review_step(),enrich,stop]);state=e.start(repo)
+            trigger='use',consumes_fact_ids=['result'],source_ids=['consumer-source']))
+        return dict(action='research',map_path='map.json',rationale='Record an independent later consumer',
+            sources=[dict(id='consumer-source',file='consumer.py',start_line=1,end_line=2,kind='code_observation')],
+            map_changes={'consumer':dict(impact='dependency',source_ids=['consumer-source','code'],
+                rationale='The later reader returns its input without mutation',
+                preserves='The earlier obligation ends at step return; this later consumer does not alter that value or its recorded history')}),{'map.json':json.dumps(spec)}
+    e,repo=engine_for(tmp_path,[first,check_step(),review_step(),enrich,stop])
+    (repo/'consumer.py').write_text('def consume(value):\n    return value\n')
+    state=e.start(repo)
     assert not diagnostics(e) and state.audit_spec_version==2 and state.units[0].status=='checked'
     assert state.units[0].audit_question.audit_spec_version==1 and all(e.applicability=='current' for e in state.evidence)
 

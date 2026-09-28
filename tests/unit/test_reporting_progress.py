@@ -2,8 +2,8 @@ from consensus_assurance.core.types import CheckRun, ExecutionStatus
 from consensus_assurance.reporting.chinese import render_report, execution_summary
 
 
-def test_native_receipt_is_not_a_property_verdict(tmp_path):
-    check = CheckRun(action='native_agent', cwd=str(tmp_path), snapshot_id='fixture',
+def test_audit_receipt_is_not_a_property_verdict(tmp_path):
+    check = CheckRun(action='agent_turn', cwd=str(tmp_path), snapshot_id='fixture',
                      status=ExecutionStatus.COMPLETED, exit_code=0)
     assert '产物另经校验' in execution_summary(check)[1]
     assert '不属于性质证据' in execution_summary(check)[2]

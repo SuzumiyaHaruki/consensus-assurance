@@ -59,15 +59,15 @@ class Engine:
             self.state.stop_reason="Snapshot prepared; investigation requires run"
             self.checkpoint("plan_only")
             return self.state
-        from .native import execute
+        from .audit import execute
         return execute(self)
 
-    def resume(self, action_timeout=None, repair_attempts=None, native_turn_timeout=None):
+    def resume(self, action_timeout=None, repair_attempts=None, agent_turn_timeout=None):
         if repair_attempts is not None and (not isinstance(repair_attempts,int) or repair_attempts<0):raise ValueError("Repair attempt limit must be a nonnegative integer")
         if action_timeout is not None and (not math.isfinite(action_timeout) or action_timeout <= 0):
             raise ValueError("Action timeout must be a finite positive number")
-        if native_turn_timeout is not None and (not math.isfinite(native_turn_timeout) or native_turn_timeout <= 0):
-            raise ValueError("Native turn timeout must be a finite positive number")
+        if agent_turn_timeout is not None and (not math.isfinite(agent_turn_timeout) or agent_turn_timeout <= 0):
+            raise ValueError("Agent turn timeout must be a finite positive number")
         self.state = self.store.load()
         self.budget = BudgetTracker(self.config.budget, self.state)
         self.runner.deadline = time.monotonic() + self.budget.remaining()
@@ -91,16 +91,16 @@ class Engine:
             self.state.config = self.config.model_dump(mode="json")
             self.budget.limits = self.config.budget
             self.checkpoint(f"resume_action_timeout_changed:{old_timeout}:{action_timeout}")
-        if native_turn_timeout is not None and native_turn_timeout != self.config.budget.native_turn_timeout:
-            old_timeout=self.config.budget.native_turn_timeout
-            data=self.config.model_dump(mode="json");data["budget"]["native_turn_timeout"]=native_turn_timeout
+        if agent_turn_timeout is not None and agent_turn_timeout != self.config.budget.agent_turn_timeout:
+            old_timeout=self.config.budget.agent_turn_timeout
+            data=self.config.model_dump(mode="json");data["budget"]["agent_turn_timeout"]=agent_turn_timeout
             self.config=Config.model_validate(data);self.state.config=self.config.model_dump(mode="json")
             self.budget.limits=self.config.budget
-            self.checkpoint(f"resume_native_turn_timeout_changed:{old_timeout}:{native_turn_timeout}")
+            self.checkpoint(f"resume_agent_turn_timeout_changed:{old_timeout}:{agent_turn_timeout}")
         if self.agent.mock:
             self.agent.cursor = sum(1 for path in (self.root / "actions").glob("*/result.json")
                 if isinstance(value := json.loads(path.read_text()), list) and value and isinstance(value[0], dict)
-                and value[0].get("action") == "native_agent")
+                and value[0].get("action") == "agent_turn")
         old_tools = dict(self.state.tools)
         if self.budget.remaining() > 0:
             self.probe_tools()
@@ -115,7 +115,7 @@ class Engine:
         # Running actions with a completed raw receipt resume their existing operation.
         # Unknown outcomes receive a new identity only when action() schedules a retry.
         self.checkpoint("resumed")
-        from .native import execute
+        from .audit import execute
         return execute(self)
 
     def record(self, check):

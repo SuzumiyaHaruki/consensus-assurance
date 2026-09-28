@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 from consensus_assurance.core.config import Config
 from consensus_assurance.registry import assemble
-from consensus_assurance.workflow.native import write_schemas, method_text, add_support
+from consensus_assurance.workflow.audit import write_schemas, method_text, add_support
 from consensus_assurance.adapters.runners.process import ProcessRunner
 from consensus_assurance.adapters.runners.experiment import install_harness
 from consensus_assurance.core.proposals import Harness
@@ -52,7 +52,7 @@ def test_selected_support_is_captured_once_and_cannot_replace_target(tmp_path):
 
 
 @pytest.mark.parametrize('limit,action,timeout,remaining',[
-    ('total_seconds','native_agent',1,.02),('native_turn_timeout','native_agent',.02,None),('action_timeout','direct_check',.02,None)])
+    ('total_seconds','agent_turn',1,.02),('agent_turn_timeout','agent_turn',.02,None),('action_timeout','direct_check',.02,None)])
 def test_actual_limiting_timeout_is_recorded(tmp_path,limit,action,timeout,remaining):
     runner=ProcessRunner(tmp_path)
     if remaining is not None:runner.deadline=time.monotonic()+remaining
