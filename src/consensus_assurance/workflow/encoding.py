@@ -4,13 +4,20 @@ from .artifacts import materialize_bundle
 
 
 def direct_changes(before, after):
-    """Component comparison shared by encoding admission and issue resolution."""
+    """One component comparison for ordinary/encoding admission and review repair."""
     inputs=(before.harness.source,before.harness.files)!=(after.harness.source,after.harness.files)
     properties=lambda plan:[p.model_dump(exclude={'description'}) for p in plan.observable_properties]
     predicates=lambda plan:[(m.checker_id,m.applicability_conditions) for m in plan.monitors]
     observations=lambda plan:[(m.checker_id,m.event,m.admission_alias,m.binding_ids) for m in plan.monitors]
     oracle=properties(before)!=properties(after) or predicates(before)!=predicates(after)
-    return {'inputs':inputs,'oracle':oracle,'observation':observations(before)!=observations(after)}
+    def contract(plan):
+        harness=plan.harness.model_dump(exclude={'source','files','description','semantic_changes','legality'})
+        harness['prerequisites']=sorted(harness['prerequisites'],key=lambda r:r['alias'])
+        monitors=[m.model_dump(exclude={'event','admission_alias','applicability_conditions'}) for m in plan.monitors]
+        return plan.claim_id,plan.binding_ids,plan.uncertainties,harness,monitors
+    return {'inputs':inputs,'oracle':oracle,'observation':observations(before)!=observations(after),
+        'contract':contract(before)!=contract(after),
+        'legality':before.harness.legality.model_dump(exclude={'derivation'})!=after.harness.legality.model_dump(exclude={'derivation'})}
 
 
 def validate_encoding(state,previous,current,repaired,revision):
@@ -29,9 +36,9 @@ def validate_encoding(state,previous,current,repaired,revision):
 
 
 def validate_direct_encoding(state,artifact,previous,repaired,revision):
-    from .reviews import lineage
+    from .reviews import lineage, open_issues
     ancestors = lineage(state, artifact) if artifact else set()
-    issue=next((i for i in state.review_issues if i.id==revision.issue_id and not i.resolved_by),None)
+    issue=next((i for i in open_issues(state,artifact) if i.id==revision.issue_id),None)
     if artifact is None or revision.old_model_id or revision.old_direct_check_id!=artifact.id or not issue or issue.target_id not in ancestors or issue.aspect!='checker_correspondence':
         raise ValueError('Direct encoding correction must name the current artifact and its open checker issue')
     components=set(issue.challenged_components)
@@ -42,27 +49,20 @@ def validate_direct_encoding(state,artifact,previous,repaired,revision):
     if not any(c.direct_check_id==artifact.id and c.status.value=='completed' for c in state.checks):raise ValueError('An accepted direct encoding correction requires the original completed execution')
     versions={o.id:o.version for o in state.claims+state.bindings+state.relations+state.units}
     if any(versions.get(id)!=v for id,v in artifact.graph_versions.items()):raise ValueError('Semantic inputs changed; encoding correction cannot repair a changed obligation')
-    if previous.claim_id!=repaired.claim_id or previous.binding_ids!=repaired.binding_ids or previous.uncertainties!=repaired.uncertainties:
-        raise ValueError('Direct encoding correction cannot change claim, source, scenario or execution inputs')
-    before=previous.harness.model_dump();after=repaired.harness.model_dump()
-    for field in ('source','files','semantic_changes','description'):before.pop(field);after.pop(field)
-    before['legality'].pop('derivation');after['legality'].pop('derivation')
-    if before!=after or ((previous.harness.source,previous.harness.files)!=(repaired.harness.source,repaired.harness.files))!=bool(revision.input_changes) or (previous.harness.semantic_changes!=repaired.harness.semantic_changes)!=bool(revision.input_changes):
+    changed=direct_changes(previous,repaired)
+    if changed['contract'] or changed['legality'] or changed['inputs']!=bool(revision.input_changes) or (previous.harness.semantic_changes!=repaired.harness.semantic_changes)!=bool(revision.input_changes):
         raise ValueError('Observation input changes must be declared and preserve harness prerequisites, legality and scope')
     old={p.checker_id:p for p in previous.observable_properties}
     new={p.checker_id:p for p in repaired.observable_properties}
-    if old.keys()!=new.keys() or {m.id:m.checker_id for m in previous.monitors}!={m.id:m.checker_id for m in repaired.monitors}:
+    if old.keys()!=new.keys():
         raise ValueError('Direct encoding correction cannot change checker attribution')
-    for left,right in zip(previous.monitors,repaired.monitors):
-        allowed={'applicability_conditions'}|({'event','admission_alias'} if 'observation' in components else set())
-        if left.model_copy(update={k:getattr(right,k) for k in allowed})!=right:
-            raise ValueError('Direct encoding correction cannot change the observation endpoint or grounding')
+    if 'observation' not in components and changed['observation']:
+        raise ValueError('Oracle correction cannot change the observation endpoint')
     for id in old:
         allowed={'assertion','description','kind','antecedent'}|({'trigger','identity_fields'} if 'observation' in components else set())
         if old[id].model_copy(update={k:getattr(new[id],k) for k in allowed})!=new[id]:
             raise ValueError('Direct encoding correction cannot change trigger or identity')
         if new[id].kind not in {'event_assertion','event_implication'}:
             raise ValueError('Direct encoding correction needs a supported result predicate')
-    changed=direct_changes(previous,repaired)
     if not (changed['oracle'] or changed['observation']):
         raise ValueError('Direct encoding correction needs an actual observation or oracle change')

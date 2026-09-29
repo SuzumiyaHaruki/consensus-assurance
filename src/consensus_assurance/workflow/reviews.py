@@ -49,8 +49,64 @@ def lineage(state, artifact):
     return result
 
 
-def repair_changes(old, artifact):
+def open_issues(state, artifact=None):
+    """A resolution applies to its answering version and descendants, never older inputs."""
+    if artifact is None:
+        superseded={a.previous_id for a in state.direct_checks+state.models}
+        current=[a for a in state.direct_checks+state.models if a.id not in superseded]
+        current+=state.question_candidates
+        ids={i.id for a in current for i in open_issues(state,a)}
+        return [i for i in state.review_issues if i.id in ids]
+    ancestors=lineage(state,artifact)
+    relevant=ancestors | set(getattr(artifact,'graph_versions',{}))
+    relevant.update(u.candidate_id for u in state.units if u.id==getattr(artifact,'unit_id',None))
+    resolved={id for r in state.semantic_reviews if set(r.target_versions)&relevant for id in r.resolves_issue_ids}
+    return [i for i in state.review_issues if i.target_id in relevant and i.id not in resolved]
+
+
+def retain_conflicts(state, artifact, plan):
+    """Retain exact input conflicts in the existing issue/resolution chain."""
+    from .repair_policy import condition_records
+    claim=next(c for c in state.claims if c.id==plan.claim_id)
+    ancestors=lineage(state,artifact)
+    pending={i.id for i in open_issues(state,artifact)}
+    bases=[(claim,'grounding',claim.grounding),(artifact,'harness',plan.harness.legality)]
+    bases.extend((artifact,'monitor/'+m.id,m.grounding) for m in plan.monitors)
+    for owner,field,basis in bases:
+        sources=list(dict.fromkeys(basis.source_ids+basis.expectation_ids))
+        for record in condition_records(basis.conflicts,owner.id+'/'+field,sources,owner.id,owner.version):
+            inherited=any((owner is not artifact or i.id in pending) and i.target_id in (ancestors if owner is artifact else {owner.id}) and
+                (owner is artifact or i.target_version==owner.version) and any(c['text']==record['text'] and
+                c['id'].startswith(i.target_id+'/'+field+'/condition/') for c in i.conditions) for i in state.review_issues)
+            if inherited:continue
+            state.review_issues.append(ReviewIssue(review_id='input:'+artifact.id,target_id=owner.id,
+                target_version=owner.version,aspect='applicability',source_ids=sources,
+                explanation=record['text'],reason='Fixed input counterevidence needs an attributed resolution',
+                conditions=[record],disposition='investigation'))
+
+
+def validate_driver_repair(state, prior, old, plan, issue_ids, changed_inputs):
+    """Authorize an attributed draft answer; only subsequent review can discharge it."""
+    issues={i.id:i for i in open_issues(state,prior) if i.target_id in lineage(state,prior) and
+        (i.aspect=='applicability' or set(i.challenged_components)&{'driver','configuration','initialization'})}
+    basis=plan.harness.legality
+    if not issue_ids or len(set(issue_ids))!=len(issue_ids) or not set(issue_ids)<=issues.keys():
+        raise ValueError('Driver premise repair must name exact open applicability or input issues on its lineage')
+    if not changed_inputs or not basis.derivation.strip() or not basis.source_ids or basis.binding_ids!=old.harness.legality.binding_ids:
+        raise ValueError('Driver premise repair needs changed inputs and sourced legality with preserved bindings')
+    removed=set(old.harness.legality.conflicts)-set(basis.conflicts)
+    answered={c['text'] for id in issue_ids for c in issues[id].conditions
+        if c['id'].startswith(issues[id].target_id+'/harness/condition/')}
+    if not removed<=answered:
+        raise ValueError('Removed counterevidence needs its exact harness condition issue; no anonymous conflict removal')
+
+
+def repair_changes(old, artifact, version=None):
     """Compare the challenged component, never infer it from the review column."""
+    if not (hasattr(old,'plan_path') or hasattr(old,'bundle_path')):
+        changed=artifact.graph_versions.get(old.id)!=version
+        return {c:changed if c in {'expectation','scope'} else False for c in
+            ('configuration','initialization','driver','observation','oracle','expectation','scope')}
     if hasattr(artifact, 'plan_path'):
         from .direct_checks import load_plan
         from .encoding import direct_changes
@@ -94,9 +150,7 @@ def accept_review(state, submission, operation_id):
         raise ValueError('Review must address the supplied whole-artifact contract')
     if any(not i.source_ids or not i.rationale.strip() for i in reply.items):
         raise ValueError('Review needs actual source citations and substantive reasoning')
-    ancestors = lineage(state, artifact)
-    owner=next((u.candidate_id for u in state.units if u.id==getattr(artifact,'unit_id',None)),None)
-    if owner:ancestors.add(owner)
+    pending = {i.id:i for i in open_issues(state,artifact)}
     if len({r.issue_id for r in submission.resolutions}) != len(submission.resolutions):
         raise ValueError('Duplicate issue resolution')
     def error(index, issue, message, **details):
@@ -106,9 +160,9 @@ def accept_review(state, submission, operation_id):
     evidence = {x.id for name in ('checks','direct_checks','models','evidence','findings','semantic_reviews')
         for x in getattr(state,name)}
     for index, resolution in enumerate(submission.resolutions):
-        issue = next((i for i in state.review_issues if i.id == resolution.issue_id and not i.resolved_by), None)
-        if not issue or issue.target_id not in ancestors:
-            error(index, issue, 'Resolution must address an open issue on this artifact or its lineage',
+        issue = pending.get(resolution.issue_id)
+        if not issue:
+            error(index, issue, 'Resolution must address an open issue on this artifact, lineage or semantic dependencies',
                 issue_id=resolution.issue_id, artifact_id=artifact.id)
             continue
         unknown = set(resolution.source_ids)-set(sources)
@@ -125,7 +179,7 @@ def accept_review(state, submission, operation_id):
         item = next((i for i in reply.items if i.aspect == issue.aspect and i.status == 'no_issue_found'), None)
         if not item or item.counterevidence or not includes(state,resolution.source_ids,item.source_ids):
             error(index, issue, 'Resolution needs matching substantive review with its answer sources and no current counterevidence', aspect=issue.aspect, answer_source_ids=resolution.source_ids)
-        others = {i.id for i in state.review_issues if not i.resolved_by and i.id != issue.id and i.parent_issue_id != issue.id}
+        others = {i.id for i in open_issues(state) if i.id != issue.id and i.parent_issue_id != issue.id}
         if not set(resolution.residual_issue_ids) <= others or issue.explanation in resolution.scope_limitations:
             raise ValueError('The original dispute cannot be renamed as a residual scope boundary')
         components = issue.challenged_components
@@ -136,9 +190,11 @@ def accept_review(state, submission, operation_id):
             else:
                 executed = any(c.action == 'model_check' and c.outcome in {'holds', 'counterexample'}
                     and c.search_fingerprint == artifact.search_fingerprint and not c.reused for c in checks)
-            changes = repair_changes(old,artifact)
+            changes = repair_changes(old,artifact,issue.target_version)
             unchanged = [c for c in components if not changes[c]]
-            if artifact.id == old.id or unchanged or not executed:
+            sourced_answer = (artifact.id==old.id and
+                not includes(state,resolution.source_ids,issue.source_ids))
+            if not sourced_answer and (artifact.id == old.id or unchanged or not executed):
                 error(index, issue, 'Repair needs a new artifact, the challenged component change and matching fresh execution',
                     challenged_components=components, unchanged_components=unchanged, fresh_execution=executed,
                     original_artifact=old.id, answering_artifact=artifact.id)
@@ -161,6 +217,13 @@ def accept_review(state, submission, operation_id):
         if any(i.target_id == artifact.id and i.aspect == item.aspect and i.explanation == item.rationale
                and not i.resolved_by for i in state.review_issues):
             continue
+        existing=next((i for i in pending.values() if i.target_id==artifact.id and i.aspect==item.aspect and
+            i.conditions and item.counterevidence==[c['text'] for c in i.conditions]),None)
+        if existing:
+            existing.prior_review_ids.append(existing.review_id)
+            existing.review_id=review.id
+            existing.challenged_components=item.challenged_components if item.status=='revision_needed' else []
+            continue
         state.review_issues.append(ReviewIssue(review_id=review.id, target_id=artifact.id,
             target_version=artifact.question.audit_spec_version if candidate else artifact.version, aspect=item.aspect, model_id=review.model_id,
             source_ids=item.source_ids, explanation=item.rationale, reason=item.rationale,
@@ -170,10 +233,8 @@ def accept_review(state, submission, operation_id):
 
 
 def semantic_limitations(state, model):
-    relevant = lineage(state, model) | set(model.graph_versions)
-    relevant.update(u.candidate_id for u in state.units if u.id==model.unit_id)
     blockers = ['Open review issue: ' + i.id + ': ' + i.explanation
-        for i in state.review_issues if not i.resolved_by and i.target_id in relevant]
+        for i in open_issues(state,model)]
     versions = {o.id:o.version for o in state.claims + state.bindings + state.relations + state.units}
     if any(versions.get(key) != version for key, version in model.graph_versions.items()):
         blockers.append('Model semantic inputs changed; recheck required')

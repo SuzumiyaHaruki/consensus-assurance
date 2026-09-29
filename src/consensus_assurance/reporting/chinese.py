@@ -114,6 +114,9 @@ def render_report(state, root, export_derived=False):
         for record in research['assessments']:
             if record.get('claim_id')!=result['claim_id']:continue
             check=next(c for c in state.checks if c.id==record['experiment_check_id'])
+            artifact=next(a for a in state.direct_checks+state.models if a.id==(record.get('direct_check_id') or record.get('model_id')))
+            review_status=record.get('correspondence') or '待复核'
+            lines.append(f'  Unit `{artifact.unit_id}`／当前制品 v{artifact.version} `{artifact.id}`：执行 {check.status.value}；机械比较 {record["outcome"]}；对应性复核 {review_status}；完整处置 {record.get("reviewed_complete",False)}。')
             events=extract_events(check)
             indices=sorted({i for prop in record['properties'] for i in prop.get('valid_witness_indices',[])})
             for i in indices[:1]:
@@ -126,24 +129,22 @@ def render_report(state, root, export_derived=False):
             q=candidate['question']
             lines += [f'调查问题（Candidate）`{candidate["id"]}`：调查状态 {candidate["status"]}；问题：{q["question"]}',
                 f'来源：{sources(q["source_ids"])}；反证／保护：{terms(q["counterevidence"])}。',
-                f'当前问题未知：{terms(q["unknowns"])}；恢复条件：{terms(candidate["resume_conditions"])}。']
-        for unit in research['units']:
-            if result['claim_id'] in unit['obligation_ids']:lines.append(f'Unit `{unit["id"]}`：{unit["status"]}。')
+                f'问题中保存的语义未知（执行进度以上述记录为准）：{terms(q["unknowns"])}；恢复条件：{terms(candidate["resume_conditions"])}。']
         artifacts=[a for a in research['artifacts'] if a.get('claim_id')==result['claim_id'] or any(
             c.get('claim_id')==result['claim_id'] for c in a.get('checkers',[]))]
         for artifact in artifacts:
             lines.append(f'检查制品（Check）`{artifact["id"]}` v{artifact["version"]}：{link(artifact.get("plan_path") or artifact.get("bundle_path"))}；{link(artifact.get("harness_path"),"测试源码")}。')
+            if artifact.get('previous_id'):lines.append(f'旧版本 `{artifact["previous_id"]}` 的固定输入、观察和争议保留于 {link(root/"state.json","历史记录")}。')
         for review in state.semantic_reviews:
             for item in review.items:
                 if item.target_id not in {a['id'] for a in artifacts}:continue
                 lines.append(f'复核 `{review.id}`／{item.aspect}：{item.status}；{item.rationale}；来源：{sources(item.source_ids)}；补充说明：{terms(item.limitations)}。')
-        lines += [f'条件与补充说明：`{json.dumps(result["conditions"],ensure_ascii=False)}`。',
-            f'范围排除：{terms(result["scope"]["excluded"])}。','', '</details>','']
+        lines += [f'范围排除：{terms(result["scope"]["excluded"])}；具体前史、适配与条件见固定计划和上述复核。','', '</details>','']
     for candidate in research['candidates']:
         if candidate['results']:continue
         q=candidate['question']
         lines += [f'- 调查问题（Candidate）`{candidate["id"]}`：{candidate["status"]}；{q["question"]}',
-            f'  来源：{sources(q["source_ids"])}；反证：{terms(q["counterevidence"])}；当前未知：{terms(q["unknowns"])}；恢复条件：{terms(candidate["resume_conditions"])}。']
+            f'  来源：{sources(q["source_ids"])}；反证：{terms(q["counterevidence"])}；保存的语义未知：{terms(q["unknowns"])}；恢复条件：{terms(candidate["resume_conditions"])}。']
     lines += ['', '## 双主线理解','',
         f'理解状态：{research["understanding_status"]}；当前目标：{research["next_objective"]["action"]}（{research["next_objective"]["boundary"]}）。']
     overview=research['core_overview']
@@ -174,7 +175,10 @@ def render_report(state, root, export_derived=False):
     for draft in research['drafts']:
         lines.append(f'- 未受理稿 `{draft["draft_id"]}`：{draft["draft_status"]}；{draft["rationale"]}；{link(draft.get("raw_path"),"完整原稿")}。')
     lines += ['', '## 当前待办','']
-    for item in research['pending_work']:lines.append(f'- {item["kind"]} `{item["id"]}`：{terms(item["reasons"])}。')
+    shown_issues={id for record in research['assessments'] for id in record.get('open_issue_ids',[])}
+    for item in research['pending_work']:
+        reasons=terms(item['reasons']) if item['kind']=='review_issue' and item['id'] not in shown_issues else ''
+        lines.append(f'- {link(root/"research.json",item["kind"]+": "+item["id"])}：{reasons}。')
     if not research['pending_work']:lines.append('无待完成的正式义务或未解决复核问题。')
     lines += ['', '## 研究交接与可选前沿','',
         '以下是受理时的回答与后续建议；历史“待执行”文字不覆盖上方当前执行结果，也不自动创建任务。']

@@ -1,5 +1,6 @@
 """Current research projection and attributed decisions; history stays in state."""
 from .audit_spec import load, audit_object_index
+from .reviews import open_issues
 from consensus_assurance.core.types import ACTIVITY_ROLES
 
 
@@ -8,7 +9,7 @@ def pending_work(state):
         'remaining':u.remaining_obligation_ids or u.obligation_ids, 'reasons':u.coverage_limitations}
         for u in state.units if u.status not in {'checked','revised'}]
         + [{'id':i.id, 'kind':'review_issue', 'reasons':[i.explanation], 'source_ids':i.source_ids}
-            for i in state.review_issues if not i.resolved_by]
+            for i in open_issues(state)]
         + [{'id':c.id, 'kind':'candidate', 'reasons':c.question.unknowns}
             for c in state.question_candidates if not c.obligation_id and c.status in {'active','blocked'}])
 
@@ -95,10 +96,7 @@ def conclusions(state, records):
             'concern':claim.concern,'description':claim.description,
             'disposition':'confirmed_in_scope' if confirmed else 'bounded_no_violation' if checked and all(r.get('outcome')=='holds' for r in observed) else 'investigation_lead',
             'scope':claim.scope.model_dump(mode='json'),'check_ids':[r['experiment_check_id'] for r in observed],
-            'blockers':list(dict.fromkeys(b for r in observed for b in r['blockers'])),
-            'conditions':[{'check_id':r['experiment_check_id'],'scope':r.get('scope',{}),
-                'adaptations':r.get('adaptations',[]),
-                'notes':r.get('conditions',{'supplementary':r.get('boundaries',[])})} for r in observed]})
+            'blockers':list(dict.fromkeys(b for r in observed for b in r['blockers']))})
     return result
 
 
@@ -152,7 +150,7 @@ def view(state):
         'stop':state.run_stop, 'stop_reason':state.stop_reason}
     for candidate in result['candidates']:
         candidate['results']=[{k:r[k] for k in ('claim_id','description','disposition')} for r in results if r['candidate_id']==candidate['id']]
-        candidate['open_issue_ids']=[i.id for i in state.review_issues if i.target_id==candidate['id'] and not i.resolved_by]
+        candidate['open_issue_ids']=[i.id for i in open_issues(state) if i.target_id==candidate['id']]
         candidate['current_applicability']='pending_review' if candidate['open_issue_ids'] else 'within_recorded_scope'
         units={u.id for u in state.units if u.candidate_id==candidate['id']}
         owned={a.id for a in state.models+state.direct_checks if a.unit_id in units}
@@ -171,7 +169,7 @@ def current_view(state, root, implementation=None):
         return {'path':'state.json', 'collection':collection, 'match':match, **extra}
     def preview(text):
         return text if len(text) <= 240 else text[:240] + '…'
-    issues = [i for i in state.review_issues if not i.resolved_by]
+    issues = open_issues(state)
     disputed = {i.target_id for i in issues}
     focus_units = {u.id for u in state.units if u.status != 'revised' and
         (u.status != 'checked' or u.id == state.active_unit_id)}
@@ -220,11 +218,11 @@ def current_view(state, root, implementation=None):
                     'plan_path','bundle_path','harness_path','graph_versions','record','basis','previous_id','previous_record'}:
                 artifact.pop(key)
     result['assessments'] = [{**{k:r[k] for k in ('claim_id','direct_check_id','experiment_check_id',
-        'confirmed','outcome','blockers','bounded_complete') if k in r},
+        'confirmed','outcome','blockers','bounded_complete','reviewed_complete','correspondence','review_ids','open_issue_ids') if k in r},
         'record':record('monitor_results', {'experiment_check_id':r['experiment_check_id'], 'claim_id':r['claim_id']})}
         for r in result['assessments']]
     for conclusion in result['conclusions']:
-        for key in ('description','question','scope','conditions'):conclusion.pop(key, None)
+        for key in ('description','question','scope'):conclusion.pop(key, None)
     for relationship in result['frontier']['relationships']:
         relationship['candidate_ids'] = [c['candidate_id'] for c in relationship.pop('investigations')]
     result['understanding_changes'] = [{'operation_id':c['operation_id'],'version':c['version'],
@@ -247,7 +245,7 @@ def current_view(state, root, implementation=None):
         result['latest_decision'] = {'operation_id':last['operation_id'],'action':last['action'],
             'record':record('selections', {'operation_id':last['operation_id']})}
     targets=[a for a in state.direct_checks+state.models if a.id in {x['id'] for x in result['artifacts']}]
-    targets.extend(c for c in state.question_candidates if any(i.target_id==c.id and not i.resolved_by for i in state.review_issues))
+    targets.extend(c for c in state.question_candidates if any(i.target_id==c.id for i in issues))
     contracts=[target_contract(state,a) for a in targets]
     result.update(run_id=state.id,snapshot_id=state.snapshot.id,elapsed_seconds=state.elapsed_seconds,
         source_path=str(root/'agent-source'),draft_path=str(root/'draft'),state_path=str(root/'state.json'),
@@ -368,20 +366,33 @@ def record_decision(engine, submission, operation_id, map_changed=False):
         related.update(u.id for u in state.units if u.candidate_id in ids)
         related.update(i.id for i in state.review_issues if any(a.id==i.target_id and
             a.unit_id in related for a in state.direct_checks+state.models))
+        options=submission.frontier_comparison
+        compared={ref for option in options for ref in option.ref_ids}
+        if not compared<=known:raise ValueError('Frontier comparison references unknown research objects: '+', '.join(sorted(compared-known)))
+        if submission.scope in {'run','focus'} and not options:
+            raise ValueError('Normal run/focus stop needs concrete next steps, actionability and reasons against current capacity; local completion is not a run boundary')
+        if submission.scope=='run':
+            required={w['id'] for w in pending_work(state)}|{c.id for c in state.question_candidates if c.status=='paused'}
+            if spec:
+                required.update('surface:'+s.entry_point for s in spec.surfaces if s.disposition in {'deferred','UNCLASSIFIED_PROTOCOL_RESPONSIBILITY'})
+                if not (state.config.get('directed_question') or '').strip() and (not spec.core_overview or spec.core_overview.status!='usable'):
+                    required.add('core_overview' if spec.core_overview else 'target_profile')
+            if required-compared:
+                raise ValueError('Run stop omits current pending or paused work or unexpanded understanding: '+', '.join(sorted(required-compared)))
+            if any(option.actionable for option in options):
+                raise ValueError('Run stop conflicts with an actionable next step; continue or locally pause and reselect in this session, without new user authorization')
         if submission.reason=='bounded_completed':
             if submission.scope=='focus' or any(w['id'] in related or submission.scope=='run' for w in pending_work(state)):
                 raise ValueError('Selected scope still has unfinished work; local checks do not establish focus exhaustion')
             if submission.scope=='run' and (not spec or not (state.config.get('directed_question') or '').strip() and (not spec.core_overview or spec.core_overview.status!='usable') or any(c.status=='paused' for c in state.question_candidates)
                     or any(s.disposition in {'deferred','UNCLASSIFIED_PROTOCOL_RESPONSIBILITY'} for s in spec.surfaces)):
                 raise ValueError('Run has paused or unexpanded understanding')
-        if submission.scope in {'run','focus'} and not submission.frontier_comparison.strip():
-            raise ValueError('Normal run/focus stop needs a comparison of known directions, permissions and remaining capacity; checked Units do not exhaust the map')
         if submission.scope!='run':
             if submission.reason!='bounded_completed' and not submission.resume_conditions:
                 raise ValueError('Local pause needs concrete resume_conditions; pending Units and issues remain visible')
             release(state,ids,submission.rationale,submission.resume_conditions,submission.reason=='bounded_completed')
         record.update(scope=submission.scope,reason=submission.reason,ref_ids=submission.ref_ids,
-            frontier_comparison=submission.frontier_comparison,pending_work=pending_work(state),candidate_ids=sorted(ids),resume_conditions=submission.resume_conditions)
+            frontier_comparison=[option.model_dump(mode='json') for option in options],pending_work=pending_work(state),candidate_ids=sorted(ids),resume_conditions=submission.resume_conditions)
     state.selections.append(record)
     if isinstance(submission,StopSubmission) and global_stop(record):state.run_stop=record
     return record

@@ -134,12 +134,15 @@ def test_direct_failure_never_confirms(tmp_path,prepared,failure):
     assert not any(f.level=='implementation_obligation' for f in e.state.findings)
 
 
-def test_new_direct_artifact_does_not_hide_prior_oracle_dispute(tmp_path,prepared):
+@pytest.mark.parametrize('relationship',['revision','independent','shared_requirement'])
+def test_issue_follows_explicit_lineage_or_requirement_not_checker_name(tmp_path,prepared,relationship):
     e,u,p=setup(tmp_path,prepared,True);old=save_plan(e,u,p,'old');review(e.state,u,old)
     e.state.review_issues.append(ReviewIssue(review_id='old',target_id=old.id,target_version=1,aspect='checker_correspondence',source_ids=u.audit_question.source_ids,explanation='Oracle may use the wrong return boundary',disposition='investigation',reason='Must resolve the specific dispute'))
-    new=save_plan(e,u,p,'new');review(e.state,u,new)
+    if relationship=='shared_requirement':e.state.review_issues[0].target_id=p.claim_id
+    new=save_plan(e,u,p,'new',previous=old if relationship=='revision' else None);review(e.state,u,new)
     c=execute(e,new);result=assess(e.state,u,new,p,c,extract_events(c))
-    assert not result['confirmed'] and any('Open review issue' in x and 'wrong return boundary' in x for x in result['blockers'])
+    assert result['confirmed']==(relationship=='independent')
+    assert any('Open review issue' in x and 'wrong return boundary' in x for x in result['blockers'])==(relationship!='independent')
 
 
 def test_direct_encoding_observation_change_must_be_declared(tmp_path,prepared):

@@ -213,16 +213,13 @@ def validate_check_revision(state, prior, plan, submission):
         from .encoding import validate_direct_encoding
         validate_direct_encoding(state, prior, old, plan, submission.encoding_revision)
     else:
-        left, right = old.model_dump(), plan.model_dump()
-        for value in (left, right):
-            value.pop('description')
-            for field in ("source", "files", "description", "semantic_changes"):
-                value["harness"].pop(field)
-            value['harness']['legality'].pop('derivation')
-            value['harness']['prerequisites']=sorted(value['harness']['prerequisites'],key=lambda r:r['alias'])
-            for prop in value['observable_properties']:prop.pop('description')
-        if left != right:
+        from .encoding import direct_changes
+        from .reviews import validate_driver_repair
+        changed = direct_changes(old, plan)
+        if changed['contract'] or changed['oracle'] or changed['observation']:
             raise ValueError("Ordinary repair preserves the claim, oracle, prerequisites and legality; use attributed encoding/F2/F3")
+        if changed['legality'] or submission.repair_issue_ids:
+            validate_driver_repair(state, prior, old, plan, submission.repair_issue_ids, changed['inputs'])
 
 
 def validate_model_revision(state, prior, model, submission):

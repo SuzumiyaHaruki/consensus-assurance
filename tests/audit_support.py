@@ -119,10 +119,8 @@ def review_step(status='no_issue_found',aspect='checker_correspondence'):
 
 
 def stop(state):
-    return dict(action='stop',scope='run',reason='insufficient_basis',ref_ids=['code','doc'],
-        rationale='End the bounded fixture with remaining work visible; no autonomous claim',
-        frontier_comparison='The scripted exercise ends here; unexecuted directions remain outside this fixture budget',
-        feedback=feedback(state)),{}
+    return dict(action='stop',scope='run',reason='user_stop',
+        rationale='End the explicitly scripted exercise; no autonomous stopping judgment'),{}
 
 
 def engine_for(tmp_path, steps):

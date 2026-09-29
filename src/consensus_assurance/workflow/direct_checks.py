@@ -1,5 +1,4 @@
 """Question routing and bounded implementation checks using existing execution evidence."""
-import json
 from pathlib import Path
 from consensus_assurance.core.proposals import DirectCheckPlan
 from consensus_assurance.core.types import DirectCheckArtifact, CheckRun, CheckerResult, Evidence, Finding, Origin, Assessment, Investigation, ExecutionStatus
@@ -13,13 +12,7 @@ from .observations import monitor_events
 
 
 def load_plan(path):
-    """Convert a legacy saved plan once at its file boundary; new plans have one schema."""
-    raw=json.loads(Path(path).read_text())
-    raw.pop('scope',None)
-    harness=raw.get('harness',{})
-    harness.pop('legal_conditions',None)
-    harness.pop('observation_changes',None)
-    return DirectCheckPlan.model_validate(raw)
+    return DirectCheckPlan.model_validate_json(Path(path).read_text())
 
 
 def validate_question(question):
@@ -97,6 +90,8 @@ def save_plan(engine,unit,plan,operation_id,previous=None):
         origin=Origin.MOCK if state.mode=='mock' else Origin.PRESET if state.analysis_mode=='regression' else Origin.AGENT,
         scope=unit.scope,version=previous.version+1 if previous else 1,operation_id=operation_id,previous_id=previous.id if previous else None)
     state.direct_checks.append(artifact)
+    from .reviews import retain_conflicts
+    retain_conflicts(state,artifact,plan)
     return artifact
 
 
@@ -128,13 +123,6 @@ def compute_assessment(state,unit,artifact,plan,check,events):
     properties={p.checker_id:p for p in plan.observable_properties}
     results=[monitor_events(events,m,properties[m.checker_id],plan.harness.prerequisites) for m in plan.monitors]
     claim=next(c for c in state.claims if c.id==plan.claim_id)
-    checker_ids=set(properties)
-    related_artifacts=[]
-    for candidate in state.direct_checks:
-        if candidate.unit_id!=artifact.unit_id:continue
-        try:related={m.checker_id for m in load_plan(candidate.plan_path).monitors}
-        except (OSError,ValueError):related=set()
-        if checker_ids&related:related_artifacts.append(candidate.id)
     blockers=[]
     versions={o.id:o.version for o in state.claims+state.bindings+state.relations+state.units}
     if any(versions.get(id)!=version for id,version in artifact.graph_versions.items()):
@@ -143,11 +131,11 @@ def compute_assessment(state,unit,artifact,plan,check,events):
         for i in r.items if i.target_id==artifact.id and i.aspect=='checker_correspondence']
     current_review=reviews[-1] if reviews else None
     correspondence=bool(current_review and current_review.status=='no_issue_found' and not current_review.counterevidence)
-    issues=[i for i in state.review_issues if i.target_id in related_artifacts+[unit.candidate_id] and not i.resolved_by]
-    if not correspondence and not issues:
+    from .reviews import open_issues, issue_challenges
+    issues=open_issues(state,artifact)
+    if not correspondence:
         blockers.append('Direct oracle correspondence is unreviewed' if current_review is None else
             'Direct oracle correspondence remains disputed: '+current_review.rationale)
-    from .reviews import issue_challenges
     blockers.extend('Open review issue '+i.id+' ['+','.join(i.source_ids)+']: '+'; '.join(issue_challenges(state,i)) for i in issues)
     if check.status==ExecutionStatus.TIMEOUT:blockers.append('External timeout; target behavior and harness completion are unestablished')
     elif check.status!=ExecutionStatus.COMPLETED:blockers.append('Execution tool or build failed: '+check.reason)
@@ -160,8 +148,6 @@ def compute_assessment(state,unit,artifact,plan,check,events):
     if check.parameters.get('changed_target_files'):blockers.append('Experiment changed target implementation files')
     parsing=[e.get('_ca_observation') for e in events if e.get('event')=='invalid_observation']
     if parsing:blockers.append('Event output contains incomplete or invalid CA_EVENT records')
-    blockers.extend(claim.grounding.conflicts+plan.harness.legality.conflicts+
-        [item for monitor in plan.monitors for item in monitor.grounding.conflicts])
     for result in results:
         result['confirmed']=result['witness_complete'] and not blockers and not provenance_blockers
     execution_complete=check.status==ExecutionStatus.COMPLETED and check.exit_code==0 and associated and prerequisite['status']=='matched' and not parsing and not check.parameters.get('changed_target_files')
@@ -179,6 +165,9 @@ def compute_assessment(state,unit,artifact,plan,check,events):
                 [item for monitor in plan.monitors for item in monitor.grounding.unresolved],
             'review_limitations':current_review.limitations if current_review else []},
         'blockers':list(dict.fromkeys(blockers+provenance_blockers)),'boundaries':boundaries,
+        'review_ids':[r.id for r in state.semantic_reviews if r.target_versions.get(artifact.id)==artifact.version],
+        'open_issue_ids':[i.id for i in issues],
+        'correspondence':current_review.status if current_review else None,
         'reviewed_complete':bounded_complete and not blockers,
         'bounded_complete':bounded_complete,'confirmed':any(r['confirmed'] for r in results),'outcome':outcome,
         'level':'implementation_obligation' if any(r['confirmed'] for r in results) else 'implementation_test',

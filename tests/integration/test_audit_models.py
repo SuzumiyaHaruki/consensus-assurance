@@ -182,5 +182,5 @@ def test_selected_missing_model_tool_retains_draft_without_claiming_execution(tm
     assert len(state.models)==1 and not state.evidence
     assert not any(c.action=='model_check' for c in state.checks)
     assert any('TLC JAR' in gap for gap in state.gaps)
-    assert state.run_stop['reason']=='insufficient_basis'
+    assert state.run_stop['reason']=='user_stop'
     assert state.usage['agent_calls']==3 and Path(state.models[0].bundle_path).exists()

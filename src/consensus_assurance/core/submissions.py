@@ -95,6 +95,8 @@ class CheckSubmission(Submission):
     harness_path: str
     files: dict[str, str] = Field(default_factory=dict, description="Destination path to draft source path for helpers")
     previous_check_id: str | None = None
+    repair_issue_ids: list[str] = Field(default_factory=list,
+        description="Exact issues whose driver premises the new harness legality answers; admission does not resolve them")
     encoding_revision: EncodingRevision | None = None
 
     @model_validator(mode="after")
@@ -109,6 +111,8 @@ class CheckSubmission(Submission):
             raise ValueError("A revision needs its previous artifact")
         if self.encoding_revision and not self.previous_check_id:
             raise ValueError("Encoding correction needs its previous artifact")
+        if self.repair_issue_ids and (not self.previous_check_id or self.encoding_revision):
+            raise ValueError("Driver premise repair needs an ordinary revision of a previous check")
         return self
 
 
@@ -170,12 +174,19 @@ class ExploreSubmission(Submission):
     files: dict[str, str] = {}
 
 
+class FrontierOption(Record):
+    ref_ids: list[str] = Field(min_length=1)
+    next_step: str = Field(pattern=r"\S")
+    actionable: bool = Field(strict=True)
+    rationale: str = Field(pattern=r"\S")
+
+
 class StopSubmission(Submission):
     action: Literal["stop"]
     scope: Literal["candidate", "family", "focus", "run"]
     reason: Literal["bounded_completed", "insufficient_basis", "tool_gap", "resource_limit", "user_stop", "no_actionable_direction"]
     ref_ids: list[str] = []
-    frontier_comparison: str = ""
+    frontier_comparison: list[FrontierOption] = []
     resume_conditions: list[str] = []
 
 

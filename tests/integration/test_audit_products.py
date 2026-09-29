@@ -90,6 +90,12 @@ def test_accepted_check_recovers_without_remaining_model_call(tmp_path):
 
 
 def test_same_version_reading_and_independent_issues(tmp_path):
+    def original(state):
+        sub,files=check_step()(state)
+        plan=json.loads(files['plan.json'])
+        plan['harness']['legality']['conflicts']=['The bound of this admitted invocation needs the documented contract']
+        files['plan.json']=json.dumps(plan)
+        return sub,files
     def issues(state):
         artifact=state['direct_checks'][-1]['id']
         return dict(action='review',artifact_id=artifact,rationale='Two distinct uncertainty sources',
@@ -98,16 +104,23 @@ def test_same_version_reading_and_independent_issues(tmp_path):
     def resolve(state):
         artifact=state['direct_checks'][-1]['id']
         issue=next(i for i in state['review_issues'] if i['aspect']=='checker_correspondence')
-        other=next(i for i in state['review_issues'] if i['aspect']=='applicability')
+        other=next(i for i in state['review_issues'] if i['aspect']=='applicability' and not i['conditions'])
+        condition=next(i for i in state['review_issues'] if i['conditions'])
         item=dict(target_id=artifact,aspect='checker_correspondence',status='no_issue_found',source_ids=['code','doc'],rationale='The actual README bounds the observed return for the explicitly admitted input')
-        return dict(action='review',artifact_id=artifact,review_items=[item],rationale='Answer the named reading issue',
-            resolutions=[dict(issue_id=issue['id'],source_ids=['code','doc'],rationale=item['rationale'],residual_issue_ids=[other['id']],scope_limitations=['Unrelated callers remain outside the observed invocation'])]),{}
-    e,repo=engine_for(tmp_path,[first,check_step(),issues,resolve,stop])
+        answer=dict(issue_id=issue['id'],source_ids=['code','doc'],rationale=item['rationale'],residual_issue_ids=[other['id']],scope_limitations=['Unrelated callers remain outside the observed invocation'])
+        return dict(action='review',artifact_id=artifact,review_items=[item,{**item,'aspect':'applicability'}],rationale='Answer the named reading issue',
+            resolutions=[answer,{**answer,'issue_id':condition['id'],'condition_dispositions':[dict(
+                condition_id=condition['conditions'][0]['id'],applies_to='old_judgment',source_ids=['doc'],
+                rationale='The documented legal bound applies to the actual admitted input; no input change is needed.')]}]),{}
+    e,repo=engine_for(tmp_path,[first,original,issues,resolve,stop])
     state=e.start(repo)
     assert len(state.direct_checks)==1
-    assert len(state.review_issues)==2
+    assert len(state.review_issues)==3
     assert next(i for i in state.review_issues if i.aspect=='checker_correspondence').resolved_by
-    assert not next(i for i in state.review_issues if i.aspect=='applicability').resolved_by
+    assert not next(i for i in state.review_issues if i.aspect=='applicability' and not i.conditions).resolved_by
+    assert next(i for i in state.review_issues if i.conditions).resolved_by
+    assert len([c for c in state.checks if c.direct_check_id])==1
+    assert not any('needs the documented contract' in b for b in state.monitor_results[0]['blockers'])
     assert state.units[0].remaining_obligation_ids==['bounded']
 
 
@@ -376,42 +389,146 @@ def test_unreached_prerequisite_repairs_without_checker_issue(tmp_path):
     assert state.units[0].status=='checked'
 
 
-def test_configuration_repair_closes_its_issue_without_changing_oracle(tmp_path):
+@pytest.mark.parametrize('violated',[False,True])
+def test_driver_repair_executes_reviews_and_continues_without_old_text_blockers(tmp_path,violated):
+    from consensus_assurance.workflow.audit import validate_submission
+    from consensus_assurance.reporting.chinese import render_report
+    from test_audit_research import next_question, local_stop
+    conflict='The private entry requires caller validation absent from this driver.'
+    retained={}
     def original(state):
         sub,files=check_step()(state)
-        files['check.py']='duration = 0\n'+files['check.py']
+        plan=json.loads(files['plan.json'])
+        plan['harness']['legality']['conflicts']=[conflict]
+        files['plan.json']=json.dumps(plan)
         return sub,files
     def challenge(state):
-        sub,_=review_step('revision_needed')(state)
-        sub['sources']=[dict(id='configuration-source',file='target.py',start_line=3,end_line=5,kind='code_observation')]
-        sub['review_items'][0].update(challenged_components=['configuration'],source_ids=['configuration-source','doc'],
-            rationale='The setup uses an invalid duration and bypasses the actual validator',
-            counterevidence=['The real validation function rejects nonpositive duration'])
+        sub,_=review_step('revision_needed','applicability')(state)
+        sub['review_items'][0].update(challenged_components=['driver'],counterevidence=[conflict])
+        item=review_step()(state)[0]['review_items'][0]
+        sub['review_items'].append(item)
         return sub,{}
     def repair(state):
         sub,files=check_step(revise=True)(state)
-        files['check.py']='from target import validate_config\nduration = validate_config(1)\n'+files['check.py']
-        plan=json.loads(files['plan.json']);plan['description']='Same comparison with validated setup'
-        plan['harness']['legality']['derivation']+='; the setup now invokes the actual validation function'
+        issue=state['review_issues'][0]
+        sub['repair_issue_ids']=[issue['id']]
+        sub['sources']=[dict(id='entry',file='target.py',start_line=3,end_line=5,kind='code_observation')]
+        plan=json.loads(files['plan.json'])
+        plan['harness']['legality'].update(source_ids=['entry','code'],conflicts=[],
+            applicability='The validating entry checks this legal input before delegating the same bounded operation.',
+            derivation='checked_step performs the caller validation that was absent from the private-entry driver.')
+        files['check.py']=files['check.py'].replace('from target import step','from target import checked_step as step')
         files['plan.json']=json.dumps(plan)
         return sub,files
+    def pending(state):
+        index=json.loads((e.root/'research.json').read_text())
+        new=next(a for a in index['artifacts'] if a['version']==2)
+        assert new['previous_id']==state['direct_checks'][1]['id']
+        record=next(r for r in index['assessments'] if r['direct_check_id']==new['id'])
+        assert index['assessments'][0]['reviewed_complete']
+        assert record['bounded_complete'] and not record['reviewed_complete'] and record['correspondence'] is None
+        assert record['open_issue_ids'] and any('unreviewed' in b for b in record['blockers'])
+        old=json.loads((e.root/new['previous_record']['path']).read_text())
+        retained['old']=next(a for a in old['direct_checks'] if a['id']==new['previous_id'])
+        retained['bytes']=Path(retained['old']['plan_path']).read_bytes()
+        assert conflict in retained['bytes'].decode()
+        report=render_report(e.state,e.root).read_text()
+        assert '对应性复核 待复核' in report and conflict in report
+        assert json.loads((e.root/'research.json').read_text())['assessments']==index['assessments']
+        # A passing process and a new no-issue review cannot silently resolve old counterevidence.
+        return review_step()(state)
     def resolve(state):
+        assert not state['monitor_results'][-1]['reviewed_complete']
         sub,_=review_step()(state)
-        sub['review_items'][0]['source_ids']=['configuration-source','code','doc']
-        sub['resolutions']=[dict(issue_id=state['review_issues'][0]['id'],source_ids=['configuration-source'],
-            evidence_ids=[state['direct_checks'][-1]['id']],rationale='The new fixed input calls validation before any operation, and the fresh execution reaches the same independent result',
-            residual_issue_ids=[],scope_limitations=['No distributed consequence'])]
+        sub['review_items'].append(dict(target_id=sub['artifact_id'],aspect='applicability',status='no_issue_found',
+            source_ids=['entry','code','doc'],rationale='The fixed input uses the validator before the actual call; the oracle and input remain unchanged.'))
+        issue=state['review_issues'][0]
+        sub['resolutions']=[dict(issue_id=issue['id'],source_ids=['entry'],evidence_ids=[next(c['id'] for c in state['checks'] if c['direct_check_id']==sub['artifact_id'])],
+            rationale='The executed validating entry removes the identified missing caller step only for v2.',
+            condition_dispositions=[dict(condition_id=issue['conditions'][0]['id'],applies_to='old_judgment',
+                source_ids=['entry'],rationale='The missing validation applies to the saved private-entry driver, not the executed validating entry.')],
+            residual_issue_ids=[],scope_limitations=['Other inputs remain unchecked'])]
+        sub['feedback']=feedback(state,question_updates={state['question_candidates'][0]['id']:dict(unknowns=[],resume_conditions=[])})
         return sub,{}
-    e,repo=engine_for(tmp_path,[first,original,challenge,repair,resolve,stop])
-    with (repo/'target.py').open('a') as stream:stream.write('def validate_config(duration):\n    if duration <= 0: raise ValueError("invalid duration")\n    return duration\n')
-    state=e.start(repo)
+    def next_investigation(state):
+        assert state['units'][0]['status']=='checked' and not state['question_candidates'][0]['question']['unknowns']
+        return next_question(state)
+    steps=[first,check_step(),review_step(),original,challenge,repair,pending,resolve,local_stop(),next_investigation,stop]
+    e,repo=engine_for(tmp_path,steps)
+    e.agent.mock=False;e.config.execution_isolation='bwrap'
+    e.config.budget.semantic_reviews=5
+    source=(repo/'target.py').read_text()
+    if violated:source=source.replace('value < limit','value <= limit')
+    (repo/'target.py').write_text(source+'def checked_step(value, limit):\n    if not 0 <= value <= limit or limit <= 0: raise ValueError("invalid input")\n    return step(value, limit)\n')
+    invoke=e.agent.investigate
+    def inspect(runner,prompt,directory,snapshot_id,timeout,session_id=None):
+        check,session,receipt=invoke(runner,prompt,directory,snapshot_id,timeout,session_id)
+        raw=json.loads((directory/'submission.json').read_text())
+        if raw['action']=='revise_check':
+            plan=json.loads((directory/'plan.json').read_text())
+            for fault in ('issue','source','oracle','identity','prerequisite'):
+                bad=json.loads(json.dumps(raw));modified=json.loads(json.dumps(plan))
+                if fault=='issue':bad['repair_issue_ids']=[]
+                if fault=='source':modified['harness']['legality']['source_ids']=[]
+                if fault=='oracle':modified['observable_properties'][0]['assertion']['value']=False
+                if fault=='identity':modified['observable_properties'][0]['identity_fields']=['participant']
+                if fault=='prerequisite':modified['harness']['prerequisites'][0]['conditions'][0]['value']=False
+                (directory/'submission.json').write_text(json.dumps(bad));(directory/'plan.json').write_text(json.dumps(modified))
+                assert not validate_submission(e.state,e.root,'submission.json',e.implementation)['valid'],fault
+            (directory/'submission.json').write_text(json.dumps(raw));(directory/'plan.json').write_text(json.dumps(plan))
+        before=e.state.model_dump()
+        result=validate_submission(e.state,e.root,'submission.json',e.implementation)
+        assert result['valid'],result
+        assert e.state.model_dump()==before
+        return check,session,receipt
+    e.agent.investigate=inspect
+    checkpoint=e.checkpoint
+    def interrupt(event):
+        checkpoint(event)
+        if event=='audit_execution_completed' and len(e.state.direct_checks)==3 and e.agent.cursor==6:
+            raise KeyboardInterrupt('New driver executed, correspondence still pending')
+    e.checkpoint=interrupt
+    with pytest.raises(KeyboardInterrupt):e.start(repo)
+    e.checkpoint=checkpoint
+    state=e.resume()
     assert not list((e.root/'submissions').glob('*/diagnostics.json')),state.current_submission
-    assert state.review_issues[0].resolved_by
-    old,new=[json.loads(Path(a.plan_path).read_text()) for a in state.direct_checks]
-    assert old['observable_properties']==new['observable_properties'] and old['monitors']==new['monitors']
-    assert len([c for c in state.checks if c.direct_check_id])==2 and state.units[0].status=='checked'
-    assert old['harness']['source'].startswith('duration = 0')
-    assert state.review_issues[0].source_ids==['configuration-source','doc']
+    assert len(state.direct_checks)==3 and state.usage['experiments']==3 and len(state.question_candidates)==2
+    independent,old,new=state.monitor_results
+    assert independent['reviewed_complete']
+    assert old['bounded_complete'] and not old['reviewed_complete'] and old['open_issue_ids']
+    assert new['bounded_complete'] and new['reviewed_complete'] and not new['open_issue_ids']
+    assert new['confirmed']==violated and new['outcome']==('violated' if violated else 'holds')
+    assert Path(retained['old']['plan_path']).read_bytes()==retained['bytes']
+    index=json.loads((e.root/'research.json').read_text())
+    assert index['conclusions'][0]['disposition']==('confirmed_in_scope' if violated else 'bounded_no_violation')
+    assert not index['review_issues'] and index['artifacts'][-1]['version']==2
+    assert (repo/'target.py').read_text().startswith(source)
+
+
+def test_additional_source_can_answer_a_driver_dispute_without_reexecution(tmp_path):
+    def challenge(state):
+        sub,_=review_step('revision_needed','applicability')(state)
+        sub['review_items'][0].update(challenged_components=['driver'],counterevidence=['The private entry might require a different caller permission.'])
+        sub['review_items']+=review_step()(state)[0]['review_items']
+        return sub,{}
+    def resolve(state,additional=False):
+        sub,_=review_step()(state)
+        sources=['code','doc']+(['permission'] if additional else [])
+        if additional:sub['sources']=[dict(id='permission',file='README.md',start_line=2,end_line=2,kind='interface_statement')]
+        sub['review_items'].append(dict(aspect='applicability',status='no_issue_found',source_ids=sources,
+            rationale='The permission explicitly covers this already-executed direct call on known legal input.'))
+        sub['resolutions']=[dict(issue_id=state['review_issues'][0]['id'],source_ids=sources,
+            rationale='The missing interface statement answers the caller question; fixed inputs need no change.',
+            residual_issue_ids=[],scope_limitations=[])]
+        if additional:sub['repair_of']=state['selections'][-1]['operation_id']
+        return sub,{}
+    e,repo=engine_for(tmp_path,[first,check_step(),challenge,resolve,lambda state:resolve(state,True),stop])
+    with (repo/'README.md').open('a') as stream:stream.write('A caller with known legal input may invoke step directly without another validation entry.\n')
+    state=e.start(repo)
+    assert len(state.direct_checks)==state.usage['experiments']==1
+    assert len(list((e.root/'submissions').glob('*/diagnostics.json')))==1
+    assert state.units[0].status=='checked' and state.monitor_results[0]['reviewed_complete']
+    assert state.review_issues[0].resolved_by and not state.revisions
 
 
 def test_deadline_preserves_accepted_unexecuted_check_across_resume(tmp_path):

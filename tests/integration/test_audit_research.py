@@ -222,6 +222,8 @@ def test_unrelated_map_update_preserves_check_and_focus_stop_is_bounded(tmp_path
         return sub,{'map.json':json.dumps(spec)}
     def false_complete(state):
         sub,_=stop(state);sub.update(scope='focus',reason='bounded_completed')
+        sub.update(ref_ids=['code'],frontier_comparison=[dict(ref_ids=['surface:A2 authority context'],
+            next_step='Read authority producer',actionable=True,rationale='The source remains available')])
         return sub,{}
     e,repo=engine_for(tmp_path,[first,check_step(),review_step(),update,false_complete,stop]);e.config.activity_focus=['A1','A2']
     state=e.start(repo)
@@ -367,10 +369,8 @@ def test_review_can_supply_feedback_without_an_extra_turn(tmp_path):
         sub['feedback']['ref_ids'].append(state['direct_checks'][-1]['id'])
         return sub,{}
     def finish(state):
-        from consensus_assurance.core.types import Analysis
         assert "feedback_due" not in state
-        sub,_=stop(state);sub.pop('feedback')
-        return sub,{}
+        return stop(state)
     e,repo=engine_for(tmp_path,[first,check_step(),review,finish])
     state=e.start(repo)
     assert not diagnostics(e) and state.units[0].status=='checked'
@@ -424,10 +424,114 @@ def local_stop(reason='bounded_completed', scope='candidate'):
         candidate=state['question_candidates'][-1]
         return dict(action='stop',scope=scope,reason=reason,ref_ids=[candidate['id']],
             rationale='The scoped discriminator is disposed; compare other sourced directions',
-            frontier_comparison='Other invocation contexts remain available in the mapped region',
+            frontier_comparison=[dict(ref_ids=[candidate['id']],next_step='Inspect another invocation context',
+                actionable=True,rationale='Other sourced invocations remain available in the mapped region')],
             resume_conditions=[] if reason=='bounded_completed' else ['Acquire the missing producer observation'],
             feedback=feedback(state)),{}
     return step
+
+
+@pytest.mark.parametrize('reason,fault',[(reason,'actionable') for reason in
+    ['bounded_completed','insufficient_basis','no_actionable_direction']]+
+    [('insufficient_basis',fault) for fault in ['legacy_text','missing_pause','missing_surface','unknown','blank_step','blank_reason']])
+def test_run_stop_rejection_preserves_results_and_continues(tmp_path,reason,fault):
+    from consensus_assurance.workflow.audit import validate_submission
+    preflight_messages=[]
+    def initial(state):
+        sub,files=first(state);spec=json.loads(files['map.json'])
+        spec['surfaces']=[dict(entry_point='consumer',disposition='deferred',source_ids=['code'],
+            reason='Consumer handling of the returned value remains unexamined')]
+        files['map.json']=json.dumps(spec)
+        return sub,files
+    def premature(state):
+        assert not view(e.state)['pending_work'] and not state['run_stop']
+        candidate=state['question_candidates'][-1]['id']
+        option=dict(ref_ids=[candidate,'surface:consumer'],next_step='Inspect consumer handling of the returned value',
+            actionable=True,rationale='Source investigation remains useful with available calls and time')
+        if fault!='actionable':option['actionable']=False
+        if fault=='missing_pause':option['ref_ids'].remove(candidate)
+        if fault=='missing_surface':option['ref_ids'].remove('surface:consumer')
+        if fault=='unknown':option['ref_ids'].append('absent')
+        if fault=='blank_step':option['next_step']='  '
+        if fault=='blank_reason':option['rationale']='\n'
+        sub=dict(action='stop',scope='run',reason=reason,ref_ids=['code','doc'],
+            rationale='Selected checks are complete but broader consequences remain unresolved',
+            frontier_comparison='Further work is possible beyond the selected checks' if fault=='legacy_text' else [option])
+        (e.root/'draft'/'stop.json').write_text(json.dumps(sub))
+        before=e.state.model_dump(mode='json')
+        result=validate_submission(e.state,e.root,'stop.json',e.implementation)
+        assert not result['valid'] and result['diagnostics']
+        preflight_messages.extend(d['message'] for d in result['diagnostics'])
+        assert e.state.model_dump(mode='json')==before
+        return sub,{}
+    def continue_after_rejection(state):
+        assert not state['run_stop'] and state['units'][0]['status']=='checked'
+        assert state['question_candidates'][0]['status']=='closed'
+        assert state['question_candidates'][1]['status']=='paused'
+        assert len(diagnostics(e))==1
+        assert set(preflight_messages)==set(diagnostics(e)[0]['errors'])
+        return next_question(state)
+    steps=[initial,check_step(),review_step(),local_stop(),next_question,
+        local_stop('insufficient_basis'),premature,continue_after_rejection,stop]
+    e,repo=engine_for(tmp_path,steps);state=e.start(repo)
+    assert len(state.question_candidates)==3 and len(state.direct_checks)==1
+    assert state.usage['experiments']==1 and state.agent_session_id=='fixture-session'
+    assert state.run_stop['reason']=='user_stop'
+
+
+@pytest.mark.parametrize('reason',['insufficient_basis','no_actionable_direction','bounded_completed'])
+def test_reasoned_run_stop_can_leave_budget_and_unresolved_scope(tmp_path,reason):
+    def initial(state):
+        sub,files=question_step(state)
+        sub.update(action='explained')
+        sub['question'].update(disposition='explained_by_existing_mechanism',unknowns=[],
+            counterevidence=['The return branch bounds the result'])
+        if reason!='bounded_completed':
+            spec=json.loads(files['map.json'])
+            spec['surfaces']=[dict(entry_point='external consumer',disposition='deferred',source_ids=['code'],
+                reason='Caller code is not part of the supplied target or directed question')]
+            files['map.json']=json.dumps(spec)
+        return sub,files
+    def pause(state):
+        return dict(action='stop',scope='candidate',reason='insufficient_basis',
+            ref_ids=[state['question_candidates'][0]['id']],rationale='External consumer source is unavailable',
+            resume_conditions=['Supply and authorize the external consumer source']),{}
+    def finish(state):
+        refs=[state['question_candidates'][0]['id']]
+        if reason!='bounded_completed':refs.append('surface:external consumer')
+        return dict(action='stop',scope='run',reason=reason,ref_ids=['code','doc'],
+            rationale='The directed local question is explained; the external consumer needs new source and authorization',
+            frontier_comparison=[dict(ref_ids=refs,next_step='Inspect the external consumer implementation',actionable=False,
+                rationale='The supplied snapshot has no caller implementation, and that consumer is outside the configured directed question; remaining calls and experiments cannot provide it')],
+            resume_conditions=['Supply and authorize the external consumer source']),{}
+    steps=[initial]+([pause] if reason!='bounded_completed' else [])+[finish]
+    e,repo=engine_for(tmp_path,steps);e.config.budget.agent_calls=20
+    state=e.start(repo)
+    assert not diagnostics(e) and state.run_stop['reason']==reason
+    assert state.usage['agent_calls']==len(steps) and state.elapsed_seconds<e.config.budget.total_seconds
+    assert state.run_stop['frontier_comparison'][0]['ref_ids'][0]==state.question_candidates[0].id
+    if reason!='bounded_completed':
+        assert view(state)['frontier']['surfaces'][0]['disposition']=='deferred'
+        assert state.question_candidates[0].status=='paused' and state.question_candidates[0].resume_conditions
+
+
+@pytest.mark.parametrize('omitted',['unit','issue'])
+def test_run_stop_accounts_for_unfinished_execution_and_review(tmp_path,omitted):
+    def finish(state,complete=False):
+        unit=state['units'][0]['id'];issue=state['review_issues'][0]['id']
+        refs=[unit,issue]+[c['id'] for c in state['question_candidates']]
+        if not complete:refs.remove(unit if omitted=='unit' else issue)
+        return dict(action='stop',scope='run',reason='insufficient_basis',ref_ids=['code','doc'],
+            rationale='Keep disputed applicability open pending external contract clarification',
+            frontier_comparison=[dict(ref_ids=refs,next_step='Resolve the disputed external caller premise',actionable=False,
+                rationale='No authoritative caller contract is supplied; more executions cannot decide which contract applies')]),{}
+    e,repo=engine_for(tmp_path,[first,check_step(),review_step('disputed'),finish,lambda s:finish(s,True)])
+    e.config.budget.agent_calls=20
+    state=e.start(repo)
+    assert len(diagnostics(e))==1 and 'Run stop omits' in str(diagnostics(e))
+    assert {w['kind'] for w in state.run_stop['pending_work']}=={'unit','review_issue'}
+    assert not state.review_issues[0].resolved_by and state.units[0].status!='checked'
+    assert state.run_stop['reason']=='insufficient_basis' and state.usage['agent_calls']==5
 
 
 @pytest.mark.parametrize('disposition',['bounded','confirmed','explained'])
