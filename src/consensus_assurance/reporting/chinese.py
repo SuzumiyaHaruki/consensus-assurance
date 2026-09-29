@@ -46,7 +46,7 @@ def execution_summary(check):
 def export_views(state, root, derived=False):
     from consensus_assurance.adapters.storage.files import write_json
     from consensus_assurance.workflow.audit_spec import load, audit_progress
-    from consensus_assurance.workflow.research import current_view
+    from consensus_assurance.workflow.research import current_view, view
     from consensus_assurance.core.config import Config
     from consensus_assurance.registry import EXECUTION_BACKENDS
     if derived:
@@ -61,7 +61,7 @@ def export_views(state, root, derived=False):
     implementation=EXECUTION_BACKENDS[config.execution_backend](config.target,config.budget.action_timeout)
     context=current_view(state,root,implementation)
     write_json(root/'research.json',context)
-    return context
+    return view(state)
 
 
 def render_report(state, root, export_derived=False):
@@ -120,11 +120,11 @@ def render_report(state, root, export_derived=False):
                 if i<len(events):lines.append('  实际观测：`'+json.dumps(events[i],ensure_ascii=False)+'`。')
             lines.append(f'  {link(record.get("raw_log"),"原始观察")}；{link(root/"logs"/check.id/"check.json","执行记录")}。')
         lines += ['', '<details><summary>实验条件、固定制品与对应性复核</summary>','',
-            f'逻辑义务 `{result["claim_id"]}`；候选 `{result["candidate_id"]}`。']
+            f'正确性要求（Obligation）`{result["claim_id"]}`；候选 `{result["candidate_id"]}`。']
         for candidate in research['candidates']:
             if candidate['id']!=result['candidate_id']:continue
             q=candidate['question']
-            lines += [f'候选 `{candidate["id"]}`：调查状态 {candidate["status"]}；问题：{q["question"]}',
+            lines += [f'调查问题（Candidate）`{candidate["id"]}`：调查状态 {candidate["status"]}；问题：{q["question"]}',
                 f'来源：{sources(q["source_ids"])}；反证／保护：{terms(q["counterevidence"])}。',
                 f'当前问题未知：{terms(q["unknowns"])}；恢复条件：{terms(candidate["resume_conditions"])}。']
         for unit in research['units']:
@@ -132,7 +132,7 @@ def render_report(state, root, export_derived=False):
         artifacts=[a for a in research['artifacts'] if a.get('claim_id')==result['claim_id'] or any(
             c.get('claim_id')==result['claim_id'] for c in a.get('checkers',[]))]
         for artifact in artifacts:
-            lines.append(f'固定制品 `{artifact["id"]}` v{artifact["version"]}：{link(artifact.get("plan_path") or artifact.get("bundle_path"))}；{link(artifact.get("harness_path"),"测试源码")}。')
+            lines.append(f'检查制品（Check）`{artifact["id"]}` v{artifact["version"]}：{link(artifact.get("plan_path") or artifact.get("bundle_path"))}；{link(artifact.get("harness_path"),"测试源码")}。')
         for review in state.semantic_reviews:
             for item in review.items:
                 if item.target_id not in {a['id'] for a in artifacts}:continue
@@ -142,7 +142,7 @@ def render_report(state, root, export_derived=False):
     for candidate in research['candidates']:
         if candidate['results']:continue
         q=candidate['question']
-        lines += [f'- 候选 `{candidate["id"]}`：{candidate["status"]}；{q["question"]}',
+        lines += [f'- 调查问题（Candidate）`{candidate["id"]}`：{candidate["status"]}；{q["question"]}',
             f'  来源：{sources(q["source_ids"])}；反证：{terms(q["counterevidence"])}；当前未知：{terms(q["unknowns"])}；恢复条件：{terms(candidate["resume_conditions"])}。']
     lines += ['', '## 双主线理解','',
         f'理解状态：{research["understanding_status"]}；当前目标：{research["next_objective"]["action"]}（{research["next_objective"]["boundary"]}）。']

@@ -4,10 +4,11 @@ from .types import AssociatedCode, Record, Scope, ConstraintSource, Grounding, C
 
 
 class ClaimDraft(Record):
+    """A sourced requirement under explicit conditions, not the script for one experiment."""
     id: str
     kind: Literal["obligation", "assumption"]
     concern: Concern = "implementation_semantics"
-    description: str
+    description: str = Field(description="Required relation across applicable objects and contexts; keep test instance IDs and timings in the check unless they determine applicability")
     source_ids: list[str] = Field(min_length=1, description="Located materials; file kinds do not establish normative authority")
     scope: Scope
     pending: list[str]
@@ -257,7 +258,8 @@ class ReviewReply(Record):
 
 
 class DirectCheckPlan(Record):
-    description: str
+    """Concrete investigation of an accepted requirement; execution determines the observed result."""
+    description: str = Field(description="This check’s discriminator, prefix, controls and observations; reference the accepted claim rather than restating it")
     claim_id: str
     binding_ids: list[str] = Field(min_length=1)
     harness: Harness

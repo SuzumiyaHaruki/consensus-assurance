@@ -858,7 +858,24 @@ def test_knowledge_growth_preserves_execution_and_supplies_the_next_check(tmp_pa
         snapshots['artifact']=state['direct_checks'][0]
         snapshots['check']=next(c for c in state['checks'] if c['action']=='direct_check')
         assert state['monitor_results'][0]['reviewed_complete']
-        return record_map(state,variant=='refined')
+        raw,files=record_map(state,variant=='refined')
+        if variant=='shared':
+            index=json.loads((e.root/'research.json').read_text())
+            lead=next(h for h in index['handoffs'] if 'left one record for count' in h['answered_preview'])
+            assert lead['operation_id']!=index['handoffs'][-1]['operation_id']
+            ref=lead['record']
+            saved=json.loads((e.root/ref['path']).read_text())
+            original=next(x for x in saved[ref['collection']] if all(x[k]==v for k,v in ref['match'].items()))
+            assert original['feedback']['remaining']==['Describe the consumer relation before proposing its obligation.']
+            executions=index['records']
+            retained=json.loads((e.root/executions['path']).read_text())
+            check=next(c for c in retained['checks'] if c['id'] in original['feedback']['ref_ids'])
+            assert check['action']=='exploration' and 'record count 1' in Path(check['stdout']).read_text()
+            snapshots['handoff_id']=lead['operation_id']
+            raw['feedback']['ref_ids'].append(lead['operation_id'])
+            raw['feedback']['answered']='The saved exploration motivates source mapping of the record producer and consumer'
+            raw['feedback']['remaining']=original['feedback']['remaining']
+        return raw,files
     def more(state):
         assert state['units'][0]['audit_question']['audit_spec_version']==1
         if variant=='interference':return record_map(state,challenge=True)
@@ -899,12 +916,17 @@ def test_knowledge_growth_preserves_execution_and_supplies_the_next_check(tmp_pa
             ref_ids=[check['id'],'code'],answered='The actual isolated call left one record for count.',
             remaining=['Describe the consumer relation before proposing its obligation.'],
             rationale='Keep the observation separate from the confirmed return proposition.')),{}
+    def unrelated_handoff(state):
+        raw,_=handoff(state)
+        raw['feedback'].update(answered='The separate clearing function mutates the records list without returning the earlier call result.',
+            remaining=[],rationale='Retain another sourced observation; the earlier consumer lead is still independent.')
+        return raw,{}
     def review_inherit(state):
         raw,files=review_step()(state)
         raw['review_items'][0].pop('target_id')
         return raw,files
     steps=[initial,check_step(),review_inherit]
-    if variant=='shared':steps += [explore,handoff]
+    if variant=='shared':steps += [explore,handoff,unrelated_handoff]
     steps += [enrich,record_obligation,review_inherit,more]
     if variant=='interference':steps += [noop]
     steps += [resume_first,third]
@@ -931,13 +953,15 @@ def test_knowledge_growth_preserves_execution_and_supplies_the_next_check(tmp_pa
             return check,session,reply
         e.agent.investigate=preflight
     def interrupt(key):
-        if e.state.audit_spec_version==1 and key.startswith('submission-') and len(e.state.semantic_reviews)==1:
-            raise KeyboardInterrupt('Prepared knowledge update before adoption')
+        if e.state.usage.get('agent_calls')==6 and key.startswith('submission-'):
+            raise KeyboardInterrupt('Second handoff prepared before adoption')
     if variant=='shared':
         e.graph_commit_hook=interrupt
         with pytest.raises(KeyboardInterrupt):e.start(repo)
         assert e.state.audit_spec_version==1
         e.graph_commit_hook=lambda key:None
+        from consensus_assurance.reporting.chinese import render_report
+        render_report(e.state,e.root)
         state=e.resume()
     else:state=e.start(repo)
     assert not diagnostics(e),diagnostics(e)
@@ -950,10 +974,10 @@ def test_knowledge_growth_preserves_execution_and_supplies_the_next_check(tmp_pa
     assert state.usage['semantic_reviews']==(3 if variant=='interference' else 2)
     assert state.units[1].audit_question.audit_spec_version==2 and state.units[1].audit_question.fact_ids==['record']
     current=view(state)
-    compact=view(state,compact=True)
-    assert len(compact['understanding_changes'])==1 and len(current['understanding_changes'])==3
-    assert compact['understanding_changes'][0]['version']==state.audit_spec_version
-    assert len(compact['handoffs'])<=1
+    compact=json.loads((e.root/'research.json').read_text())
+    assert len(compact['understanding_changes'])==len(current['understanding_changes'])==3
+    assert compact['understanding_changes'][-1]['version']==state.audit_spec_version
+    assert [h['operation_id'] for h in compact['handoffs']]==[h['operation_id'] for h in current['handoffs']]
     assert next(r for r in current['frontier']['relationships'] if r['fact_id']=='record')['consumers']
     assert current['conclusions'][0]['disposition']==('confirmed_in_scope' if variant=='shared' else 'bounded_no_violation')
     assert len(state.question_candidates)==3 and state.question_candidates[-1].status=='active'
@@ -972,7 +996,9 @@ def test_knowledge_growth_preserves_execution_and_supplies_the_next_check(tmp_pa
     assert not current['candidates'][0]['resume_conditions'] and current['candidates'][0]['results']
     if variant=='shared':
         handoffs=[s for s in state.selections if s['action']=='research' and s.get('feedback') and not s['map_updated']]
-        assert len(handoffs)==2 and all(not s['map_updated'] for s in handoffs)
+        assert len(handoffs)==3 and all(not s['map_updated'] for s in handoffs)
+        assert sum(s['operation_id']==snapshots['handoff_id'] for s in state.selections)==1
+        assert handoffs[0]['feedback']['ref_ids']==handoffs[1]['feedback']['ref_ids']
         assert compact['handoffs'][-1]['feedback']
         assert report.count('**已确认违反**')==1 and '未建立后果：' not in report
         assert 'unestablished_consequences' not in current['conclusions'][0]

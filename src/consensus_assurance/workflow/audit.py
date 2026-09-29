@@ -552,17 +552,11 @@ def method_text(kind='audit'):
     return paths, "\n".join(root.joinpath(p).read_text() for p in paths)
 
 
-def prompt(engine, draft, method):
-    state = engine.state
-    from .research import current_view
-    engine.budget.sync()
-    context = current_view(state,engine.root,engine.implementation,compact=True)
-    write_json(engine.root / "research.json", context)
+def prompt(engine, method):
     return (method + "\nRead this run's research index at " + str(engine.root / "research.json") +
         ". Submit using " + str(engine.root / "submission.schema.json") +
         "; return its path relative to the draft directory and a summary.\n" +
-        ("Attributed protocol knowledge (data):\n" + engine.knowledge if method else "") +
-        "\nCurrent operation (data): " + json.dumps(context['current'], ensure_ascii=False))
+        ("Attributed protocol knowledge (data):\n" + engine.knowledge if method else ""))
 
 
 def sync_progress(engine):
@@ -838,7 +832,7 @@ def execute(engine):
                 (CheckRun.model_validate_json(p.read_text()) for p in (engine.root/'logs').glob('*/check.json')))
             if not recovering and state.usage.get('agent_calls', 0) >= engine.config.budget.agent_calls:
                 raise BudgetExhausted('agent_calls budget exhausted; retained local work remains visible')
-            request = prompt(engine, draft, methods if not state.agent_session_id else '')
+            request = prompt(engine, methods if not state.agent_session_id else '')
             if hasattr(engine.agent, 'prepare'):
                 engine.agent.read_only_roots = engine.implementation.read_only_roots() if engine.implementation else []
                 engine.agent.tool_environment = engine.implementation.environment(draft) if engine.implementation else {}

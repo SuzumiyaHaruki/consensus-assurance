@@ -176,6 +176,7 @@ class ConsensusAuditSpec(Record):
 
 
 class AuditQuestion(Record):
+    """Sourced investigation, protections and unknowns; neither a requirement nor a finding."""
     audit_spec_version: int | None = Field(default=None, ge=1)
     disposition: Literal["explained_by_existing_mechanism", "concrete_suspicion", "needs_specific_evidence", "ready_for_check"] | None = None
     preferred_check: Literal["source_review", "direct_test", "controlled_schedule", "local_model"] | None = None
@@ -200,7 +201,7 @@ class AuditQuestion(Record):
 
 
 class QuestionCandidate(Record):
-    """Controller continuation; semantic content lives only in AuditQuestion."""
+    """Investigation identity and history; forming an obligation does not confirm a defect."""
     id: str = Field(default_factory=uid)
     question: AuditQuestion
     history: list[AuditQuestion] = []
@@ -340,8 +341,8 @@ class Grounding(Record):
     source_ids: list[str] = Field(default_factory=list, description="Exact IDs of acquired implementation source materials; not Behavior or Binding IDs")
     expectation_ids: list[str] = Field(default_factory=list, description="Exact IDs of acquired materials supporting the expectation; not invented expectation labels. Explain normative applicability in derivation.")
     binding_ids: list[str] = []
-    derivation: str = ""
-    applicability: str = ""
+    derivation: str = Field(default="", description="This component’s sourced reasoning; cite accepted IDs instead of repeating their full argument")
+    applicability: str = Field(default="", description="Conditions for this component, including any added assumptions or omitted protections")
     unresolved: list[str] = []
     conflicts: list[str] = []
     alternatives: list[str] = []
@@ -375,6 +376,7 @@ class PendingAction(Record):
 
 
 class Claim(Record):
+    """Applicable correctness responsibility or assumption; concrete test schedules belong to checks."""
     id: str
     kind: Literal["obligation", "assumption"]
     concern: Concern = "implementation_semantics"
@@ -533,6 +535,7 @@ class CheckRun(Record):
 
 
 class Evidence(Record):
+    """Attributed execution or observation with scope, not agent confidence or question priority."""
     direct_check_id: str | None = None
     id: str = Field(default_factory=uid)
     check_id: str

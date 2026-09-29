@@ -1,0 +1,248 @@
+{
+  "description": "Execute the accepted obsolete-term completion obligation with a legal three-node prefix and actual producer messages. Delay one follower storage append across a real higher-term vote request, then measure the old completion before a current-term HardState-only completion. Later drain all delayed work. No critical protocol state is assigned.",
+  "claim_id": "C_stale_append_completion",
+  "binding_ids": [
+    "BIND_append_issue",
+    "BIND_append_consume",
+    "BIND_unstable_retire"
+  ],
+  "harness": {
+    "files": {},
+    "kind": "go_test",
+    "source": "package raft\n\nimport (\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"testing\"\n\n\tpb \"go.etcd.io/raft/v3/raftpb\"\n)\n\ntype assuranceAppendJob struct {\n\tseq     uint64\n\tmessage pb.Message\n}\ntype assurancePeer struct {\n\trn           *RawNode\n\tstorage      *MemoryStorage\n\tappends      []assuranceAppendJob\n\tapplies      []pb.Message\n\tnextSeq      uint64\n\tcompletedSeq uint64\n}\ntype assuranceCluster struct {\n\tt       *testing.T\n\tpeers   map[uint64]*assurancePeer\n\tnetwork []pb.Message\n}\n\nfunc assuranceEmit(event string, fields map[string]interface{}) {\n\tfields[\"event\"] = event\n\tfields[\"operation\"] = \"delayed-append\"\n\tfields[\"node\"] = uint64(2)\n\tb, err := json.Marshal(fields)\n\tif err != nil {\n\t\tpanic(err)\n\t}\n\tfmt.Println(\"CA_EVENT \" + string(b))\n}\nfunc assuranceRequire(t *testing.T, ok bool, format string, args ...interface{}) {\n\tt.Helper()\n\tif !ok {\n\t\tt.Fatalf(format, args...)\n\t}\n}\nfunc (c *assuranceCluster) step(m pb.Message) {\n\tc.t.Helper()\n\tp := c.peers[m.To]\n\tassuranceRequire(c.t, p != nil, \"unknown recipient %d\", m.To)\n\tif err := p.rn.Step(m); err != nil {\n\t\tc.t.Fatalf(\"Step %s %d->%d: %v\", m.Type, m.From, m.To, err)\n\t}\n}\nfunc (c *assuranceCluster) collect(id uint64) bool {\n\tp := c.peers[id]\n\tif !p.rn.HasReady() {\n\t\treturn false\n\t}\n\trd := p.rn.Ready()\n\tfor _, m := range rd.Messages {\n\t\tswitch m.To {\n\t\tcase LocalAppendThread:\n\t\t\tp.nextSeq++\n\t\t\tp.appends = append(p.appends, assuranceAppendJob{p.nextSeq, m})\n\t\tcase LocalApplyThread:\n\t\t\tp.applies = append(p.applies, m)\n\t\tdefault:\n\t\t\tc.network = append(c.network, m)\n\t\t}\n\t}\n\treturn true\n}\nfunc (c *assuranceCluster) writeAppend(id uint64) assuranceAppendJob {\n\tc.t.Helper()\n\tp := c.peers[id]\n\tassuranceRequire(c.t, len(p.appends) > 0, \"no append job for %d\", id)\n\tj := p.appends[0]\n\tp.appends = p.appends[1:]\n\tassuranceRequire(c.t, j.seq == p.completedSeq+1, \"append order mismatch\")\n\tm := j.message\n\tif m.Snapshot != nil && !IsEmptySnap(*m.Snapshot) {\n\t\tif err := p.storage.ApplySnapshot(*m.Snapshot); err != nil {\n\t\t\tc.t.Fatal(err)\n\t\t}\n\t}\n\tif err := p.storage.Append(m.Entries); err != nil {\n\t\tc.t.Fatal(err)\n\t}\n\ths := pb.HardState{Term: m.Term, Vote: m.Vote, Commit: m.Commit}\n\tif !IsEmptyHardState(hs) {\n\t\tif err := p.storage.SetHardState(hs); err != nil {\n\t\t\tc.t.Fatal(err)\n\t\t}\n\t}\n\tp.completedSeq = j.seq\n\treturn j\n}\nfunc (c *assuranceCluster) release(id uint64, j assuranceAppendJob, observe func(pb.Message)) {\n\tfor _, m := range j.message.Responses {\n\t\tif m.To == id {\n\t\t\tif observe != nil && m.Type == pb.MsgStorageAppendResp {\n\t\t\t\tobserve(m)\n\t\t\t} else {\n\t\t\t\tc.step(m)\n\t\t\t}\n\t\t} else {\n\t\t\tc.network = append(c.network, m)\n\t\t}\n\t}\n}\nfunc (c *assuranceCluster) apply(id uint64) bool {\n\tp := c.peers[id]\n\tif len(p.applies) == 0 {\n\t\treturn false\n\t}\n\tm := p.applies[0]\n\tp.applies = p.applies[1:]\n\tfor _, e := range m.Entries {\n\t\tswitch e.Type {\n\t\tcase pb.EntryConfChange:\n\t\t\tvar cc pb.ConfChange\n\t\t\tif err := cc.Unmarshal(e.Data); err != nil {\n\t\t\t\tc.t.Fatal(err)\n\t\t\t}\n\t\t\tp.rn.ApplyConfChange(cc)\n\t\tcase pb.EntryConfChangeV2:\n\t\t\tvar cc pb.ConfChangeV2\n\t\t\tif err := cc.Unmarshal(e.Data); err != nil {\n\t\t\t\tc.t.Fatal(err)\n\t\t\t}\n\t\t\tp.rn.ApplyConfChange(cc)\n\t\t}\n\t}\n\tfor _, resp := range m.Responses {\n\t\tc.step(resp)\n\t}\n\treturn true\n}\nfunc (c *assuranceCluster) drain() {\n\tc.t.Helper()\n\tfor round := 0; round < 1000; round++ {\n\t\twork := false\n\t\tfor id := uint64(1); id <= 3; id++ {\n\t\t\tif c.collect(id) {\n\t\t\t\twork = true\n\t\t\t}\n\t\t\tif len(c.peers[id].appends) > 0 {\n\t\t\t\tj := c.writeAppend(id)\n\t\t\t\tc.release(id, j, nil)\n\t\t\t\twork = true\n\t\t\t}\n\t\t\tif c.apply(id) {\n\t\t\t\twork = true\n\t\t\t}\n\t\t}\n\t\tif len(c.network) > 0 {\n\t\t\tm := c.network[0]\n\t\t\tc.network = c.network[1:]\n\t\t\tc.step(m)\n\t\t\twork = true\n\t\t}\n\t\tif !work {\n\t\t\treturn\n\t\t}\n\t}\n\tc.t.Fatal(\"scheduler budget exhausted; no property conclusion\")\n}\nfunc assuranceToken(t *testing.T, j assuranceAppendJob) pb.Message {\n\tt.Helper()\n\tvar result pb.Message\n\tcount := 0\n\tfor _, m := range j.message.Responses {\n\t\tif m.Type == pb.MsgStorageAppendResp {\n\t\t\tresult = m\n\t\t\tcount++\n\t\t}\n\t}\n\tassuranceRequire(t, count == 1, \"expected one storage completion, found %d\", count)\n\treturn result\n}\nfunc (c *assuranceCluster) takeNetwork(kind pb.MessageType, from, to uint64) pb.Message {\n\tc.t.Helper()\n\tfor i, m := range c.network {\n\t\tif m.Type == kind && m.From == from && m.To == to {\n\t\t\tc.network = append(c.network[:i], c.network[i+1:]...)\n\t\t\treturn m\n\t\t}\n\t}\n\tc.t.Fatalf(\"missing emitted %s %d->%d\", kind, from, to)\n\treturn pb.Message{}\n}\n\nfunc TestAssuranceOldAppendCompletion(t *testing.T) {\n\tc := &assuranceCluster{t: t, peers: make(map[uint64]*assurancePeer)}\n\tfor id := uint64(1); id <= 3; id++ {\n\t\ts := NewMemoryStorage()\n\t\trn, err := NewRawNode(&Config{ID: id, ElectionTick: 10, HeartbeatTick: 1, Storage: s,\n\t\t\tMaxSizePerMsg: 1 << 20, MaxInflightMsgs: 16, AsyncStorageWrites: true})\n\t\tif err != nil {\n\t\t\tt.Fatal(err)\n\t\t}\n\t\tc.peers[id] = &assurancePeer{rn: rn, storage: s}\n\t\tif err := rn.Bootstrap([]Peer{{ID: 1}, {ID: 2}, {ID: 3}}); err != nil {\n\t\t\tt.Fatal(err)\n\t\t}\n\t}\n\tc.drain()\n\tfor id := uint64(1); id <= 3; id++ {\n\t\tassuranceRequire(t, c.peers[id].rn.raft.raftLog.applied == 3, \"bootstrap not applied on %d\", id)\n\t}\n\tif err := c.peers[1].rn.Campaign(); err != nil {\n\t\tt.Fatal(err)\n\t}\n\tc.drain()\n\tleader := c.peers[1].rn.raft\n\tassuranceRequire(t, leader.state == StateLeader, \"campaign did not elect node 1\")\n\tassuranceRequire(t, leader.raftLog.committed == leader.raftLog.lastIndex(), \"initial leader entry not committed\")\n\tp := c.peers[2]\n\tpriorTerm := p.rn.raft.Term\n\tassuranceEmit(\"prefix_ready\", map[string]interface{}{\"leader\": leader.id, \"term\": leader.Term,\n\t\t\"follower_term\": priorTerm, \"committed\": p.rn.raft.raftLog.committed, \"applied\": p.rn.raft.raftLog.applied})\n\n\tif err := c.peers[1].rn.Propose([]byte(\"completion-context-entry\")); err != nil {\n\t\tt.Fatal(err)\n\t}\n\tc.collect(1)\n\t// Process the leader's storage work. Delay network delivery to node 3.\n\tfor len(c.peers[1].appends) > 0 {\n\t\tj := c.writeAppend(1)\n\t\tc.release(1, j, nil)\n\t}\n\tc.step(c.takeNetwork(pb.MsgApp, 1, 2))\n\tc.collect(2)\n\tassuranceRequire(t, len(p.appends) == 1, \"expected one held follower append\")\n\theld := p.appends[0]\n\told := assuranceToken(t, held)\n\tassuranceRequire(t, len(held.message.Entries) > 0 && old.Index > 0 && old.Snapshot == nil, \"entry-only token not produced\")\n\tassuranceRequire(t, old.Term == priorTerm, \"unexpected issuance term\")\n\tassuranceEmit(\"token_issued\", map[string]interface{}{\"batch\": held.seq, \"issue_term\": old.Term,\n\t\t\"index\": old.Index, \"log_term\": old.LogTerm, \"prefix_term\": priorTerm, \"entry_count\": len(held.message.Entries)})\n\n\t// The lagging peer campaigns from its real, shorter log. Its genuine vote\n\t// request advances node 2's term even though node 2 will reject the vote.\n\tif err := c.peers[3].rn.Campaign(); err != nil {\n\t\tt.Fatal(err)\n\t}\n\tc.collect(3)\n\tfor len(c.peers[3].appends) > 0 {\n\t\tj := c.writeAppend(3)\n\t\tc.release(3, j, nil)\n\t}\n\tvote := c.takeNetwork(pb.MsgVote, 3, 2)\n\tc.step(vote)\n\tnow := p.rn.raft.Term\n\tassuranceRequire(t, now > old.Term, \"vote request did not advance term\")\n\tassuranceEmit(\"context_changed\", map[string]interface{}{\"issue_term\": old.Term, \"current_term\": now,\n\t\t\"request_term\": vote.Term, \"request_index\": vote.Index, \"request_log_term\": vote.LogTerm, \"sender\": vote.From})\n\tc.collect(2)\n\tassuranceRequire(t, len(p.appends) == 2, \"term transition did not emit a second storage request\")\n\tfreshJob := p.appends[1]\n\tfresh := assuranceToken(t, freshJob)\n\tassuranceRequire(t, len(freshJob.message.Entries) == 0, \"reconfirmation request unexpectedly appended entries\")\n\tassuranceRequire(t, fresh.Term == now && fresh.Index == old.Index && fresh.LogTerm == old.LogTerm, \"tail not reconfirmed in current term\")\n\trejected := false\n\tfor _, m := range freshJob.message.Responses {\n\t\tif m.Type == pb.MsgVoteResp && m.To == 3 && m.Reject {\n\t\t\trejected = true\n\t\t}\n\t}\n\tassuranceRequire(t, rejected, \"expected actual stale-log vote rejection\")\n\n\twritten := c.writeAppend(2)\n\tstableTerm, err := p.storage.Term(old.Index)\n\tif err != nil {\n\t\tt.Fatal(err)\n\t}\n\tassuranceEmit(\"batch_written\", map[string]interface{}{\"batch\": written.seq, \"issue_term\": old.Term,\n\t\t\"stable_term\": stableTerm, \"index\": old.Index, \"completed_seq\": p.completedSeq})\n\tobserved := false\n\tc.release(2, written, func(m pb.Message) {\n\t\tobserved = true\n\t\tbefore := p.rn.raft.raftLog.unstable.offset\n\t\tlast := p.rn.raft.raftLog.lastEntryID()\n\t\tassuranceRequire(t, m.Term < now && last.index == m.Index && last.term == m.LogTerm && before <= m.Index,\n\t\t\t\"discriminator preconditions not reached\")\n\t\tassuranceEmit(\"completion_admitted\", map[string]interface{}{\"batch\": written.seq, \"completed_seq\": p.completedSeq,\n\t\t\t\"issue_term\": m.Term, \"current_term\": now, \"offset\": before, \"index\": m.Index, \"log_term\": m.LogTerm,\n\t\t\t\"stale\": m.Term < now, \"identity_matches\": last.index == m.Index && last.term == m.LogTerm, \"has_snapshot\": m.Snapshot != nil})\n\t\tc.step(m)\n\t\tassuranceEmit(\"completion_consumed\", map[string]interface{}{\"batch\": written.seq,\n\t\t\t\"offset\": p.rn.raft.raftLog.unstable.offset, \"current_term\": p.rn.raft.Term,\n\t\t\t\"stale\": m.Term < p.rn.raft.Term, \"identity_matches\": last.index == m.Index && last.term == m.LogTerm,\n\t\t\t\"has_snapshot\": m.Snapshot != nil, \"index\": m.Index, \"log_term\": m.LogTerm})\n\t})\n\tassuranceRequire(t, observed, \"old completion was not delivered\")\n\n\tcurrentWritten := c.writeAppend(2)\n\tc.release(2, currentWritten, func(m pb.Message) {\n\t\tbefore := p.rn.raft.raftLog.unstable.offset\n\t\tc.step(m)\n\t\tassuranceEmit(\"permitted_control\", map[string]interface{}{\"batch\": currentWritten.seq, \"issue_term\": m.Term,\n\t\t\t\"current_term\": p.rn.raft.Term, \"index\": m.Index, \"log_term\": m.LogTerm, \"entries_in_request\": len(currentWritten.message.Entries),\n\t\t\t\"before_offset\": before, \"after_offset\": p.rn.raft.raftLog.unstable.offset})\n\t})\n\t// Finish every delayed worker and network delivery; no tick or eventual\n\t// election is needed to terminate this finite controlled schedule.\n\tc.drain()\n\tassuranceEmit(\"schedule_complete\", map[string]interface{}{\"network_pending\": len(c.network),\n\t\t\"append_pending\": len(p.appends), \"apply_pending\": len(p.applies), \"offset\": p.rn.raft.raftLog.unstable.offset})\n}\n",
+    "description": "TestAssuranceOldAppendCompletion; serialized scheduler for real RawNode instances, actual emitted network/local messages, and actual MemoryStorage writes. Instrumentation reads unstable.offset before/after the delivered old response. All prerequisites and results are runtime JSON.",
+    "semantic_changes": [
+      "Adds a package-local Go test only; no target implementation, dependencies or protocol logic are replaced.",
+      "The caller-owned network and storage workers are deterministic test scheduling adapters. MemoryStorage substitutes for an unspecified durable backend under a no-crash scope.",
+      "Reads unexported state for setup checks and endpoint observation; no direct writes to term, vote, progress, log, commit or unstable state.",
+      "Normal application entries have no external state machine; configuration entries are applied through ApplyConfChange before storage-apply responses. This does not create an application-level result."
+    ],
+    "prerequisites": [
+      {
+        "alias": "prefix",
+        "event": "prefix_ready",
+        "conditions": []
+      },
+      {
+        "alias": "issued",
+        "event": "token_issued",
+        "conditions": [
+          {
+            "field": "prefix_term",
+            "op": "eq",
+            "value": null,
+            "reference": "prefix.follower_term"
+          }
+        ]
+      },
+      {
+        "alias": "changed",
+        "event": "context_changed",
+        "conditions": [
+          {
+            "field": "issue_term",
+            "op": "eq",
+            "value": null,
+            "reference": "issued.issue_term"
+          }
+        ]
+      },
+      {
+        "alias": "written",
+        "event": "batch_written",
+        "conditions": [
+          {
+            "field": "batch",
+            "op": "eq",
+            "value": null,
+            "reference": "issued.batch"
+          },
+          {
+            "field": "index",
+            "op": "eq",
+            "value": null,
+            "reference": "issued.index"
+          },
+          {
+            "field": "stable_term",
+            "op": "eq",
+            "value": null,
+            "reference": "issued.log_term"
+          }
+        ]
+      },
+      {
+        "alias": "admitted",
+        "event": "completion_admitted",
+        "conditions": [
+          {
+            "field": "completed_seq",
+            "op": "eq",
+            "value": null,
+            "reference": "written.completed_seq"
+          },
+          {
+            "field": "batch",
+            "op": "eq",
+            "value": null,
+            "reference": "written.batch"
+          },
+          {
+            "field": "current_term",
+            "op": "eq",
+            "value": null,
+            "reference": "changed.current_term"
+          },
+          {
+            "field": "stale",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          },
+          {
+            "field": "identity_matches",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          },
+          {
+            "field": "has_snapshot",
+            "op": "eq",
+            "value": false,
+            "reference": null
+          }
+        ]
+      }
+    ],
+    "legality": {
+      "source_ids": [
+        "S_api",
+        "S_bootstrap",
+        "S_config",
+        "S_ready",
+        "S_election",
+        "S_transition",
+        "S_roles",
+        "S_proposal",
+        "S_receive",
+        "S_unstable",
+        "S_log_apply",
+        "S_storage",
+        "S_mem_append",
+        "S_mem_hardstate",
+        "S_async_messages",
+        "S_config_validate"
+      ],
+      "expectation_ids": [
+        "S_config",
+        "S_async_messages"
+      ],
+      "binding_ids": [
+        "BIND_append_issue",
+        "BIND_append_consume",
+        "BIND_unstable_retire"
+      ],
+      "derivation": "The harness creates three NewRawNode instances with empty MemoryStorage, bootstraps the same peer list, processes emitted storage append/apply work and applies configuration entries. It then campaigns node 1 through the real API and drains actual emitted election/replication messages before proposing one entry. Node 2 receives the emitted append but its append-worker request is held. Node 3, whose log is shorter, campaigns and emits the actual higher-term vote request delivered to node 2. This advances node 2 term and produces a real vote rejection and current-term storage request. S_ready produces both old and current response tokens; the harness neither fabricates them nor assigns raft term/log/progress state. S_mem_append and S_mem_hardstate implement the selected in-memory storage operations; S_config requires append-worker requests to be processed in order before responses, which sequence counters check.",
+      "applicability": "All calls are serialized. AsyncStorageWrites is enabled; no Advance calls occur. The append worker processes every request in FIFO order. No process/storage crashes, mutations of emitted messages, compaction or snapshots occur. MemoryStorage is the actual library storage backend; synchronous completion is a valid no-crash storage completion for this bounded execution, not evidence of disk durability. Outbound append to node 3 and vote request to node 1 are finitely delayed during the discriminator. Other generated replies, including node 2 vote rejection and node 1/node 3 self responses, are processed. All queued network and local worker actions are drained after observation. Logical ticks are omitted over a finite controlled interval: no deadline or liveness claim is made, and the explicit Campaign invokes the real acquisition path.",
+      "unresolved": [
+        "No competing in-flight suffix overwrite, crash reconstruction, or application/client endpoint is tested."
+      ],
+      "conflicts": [],
+      "alternatives": [
+        "The term transition is caused by a rejected vote request, not by a new leader or log overwrite. This intentionally isolates issuance-term checking when entry identity is unchanged.",
+        "A current-term HardState-only completion is executed as a permitted control; its raw offset transition is recorded but is not a second formal requirement."
+      ]
+    }
+  },
+  "monitors": [
+    {
+      "id": "MON_stale_completion",
+      "checker_id": "CHK_no_old_term_retirement",
+      "event": "completion_consumed",
+      "binding_ids": [
+        "BIND_append_issue",
+        "BIND_append_consume",
+        "BIND_unstable_retire"
+      ],
+      "grounding": {
+        "source_ids": [
+          "S_ready",
+          "S_election",
+          "S_unstable",
+          "S_config"
+        ],
+        "expectation_ids": [
+          "S_completion_contract",
+          "S_stable_contract"
+        ],
+        "binding_ids": [
+          "BIND_append_issue",
+          "BIND_append_consume",
+          "BIND_unstable_retire"
+        ],
+        "derivation": "C_stale_append_completion requires no retirement by this obsolete completion. BIND_append_issue identifies the unmodified emitted response. BIND_append_consume identifies the exact Step call being observed; no other message is processed between admission and its return. BIND_unstable_retire shows that discarding an unstable prefix advances unstable.offset. Compare the post-Step offset with the observed pre-Step admitted.offset, rather than with a precomputed expected result. Prefix, emitted token, actual context transition and completed storage job are independently emitted prerequisites. Explicit references require generation before context/write and both before admission. Operation and node provide stable independent identity; offset and changing term are not identity filters.",
+        "applicability": "One designated old completion per execution stream. Before admission the harness independently checks actual old response term, unchanged tail index/log term, nonempty covered unstable range and absence of snapshot. It emits admission immediately before Step and result immediately after Step. The monitored endpoint is local entry retirement only. The later permitted control and full scheduler drain run regardless of whether the measured offset changed; they are diagnostic output, not prerequisites or filters for this measurement.",
+        "unresolved": [
+          "Offset is a library-internal observation, not an application reply or durable-disk observation."
+        ],
+        "conflicts": [],
+        "alternatives": [
+          "Snapshot completion can legitimately survive a term change, so this check uses an entry-only token.",
+          "An entry-term mismatch could explain no retirement without reaching the chosen discriminator; independent precondition checks exclude that case."
+        ]
+      },
+      "applicability_conditions": [
+        {
+          "field": "stale",
+          "op": "eq",
+          "value": true,
+          "reference": null
+        },
+        {
+          "field": "identity_matches",
+          "op": "eq",
+          "value": true,
+          "reference": null
+        },
+        {
+          "field": "has_snapshot",
+          "op": "eq",
+          "value": false,
+          "reference": null
+        }
+      ],
+      "admission_alias": "admitted"
+    }
+  ],
+  "observable_properties": [
+    {
+      "checker_id": "CHK_no_old_term_retirement",
+      "kind": "event_assertion",
+      "trigger": {
+        "field": "event",
+        "op": "eq",
+        "value": "completion_consumed",
+        "reference": null
+      },
+      "assertion": {
+        "field": "offset",
+        "op": "eq",
+        "value": null,
+        "reference": "admitted.offset"
+      },
+      "antecedent": null,
+      "identity_fields": [
+        "operation",
+        "node"
+      ],
+      "history_field": null,
+      "description": "For the admitted obsolete entry-only completion with matching entry identity, the unstable offset after actual Step equals its observed offset immediately before Step."
+    }
+  ],
+  "uncertainties": [
+    "The measured requirement is conservative term filtering, not whether this particular completion could cause data loss.",
+    "The schedule contains no competing overwrite; it does not reproduce the broader overwrite scenario described in source comments.",
+    "The permitted current-term control is emitted as raw diagnostic observation and is not a separately monitored liveness obligation.",
+    "A local build was used for construction only; formal evidence must come from trusted execution of these fixed artifacts."
+  ]
+}

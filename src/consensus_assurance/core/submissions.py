@@ -27,6 +27,7 @@ class QuestionUpdate(Record):
 
 
 class ResearchFeedback(Record):
+    """New sourced answers and next discriminators; historical remaining is not current pending work."""
     ref_ids: list[str] = Field(min_length=1)
     answered: str = Field(min_length=1)
     remaining: list[str]

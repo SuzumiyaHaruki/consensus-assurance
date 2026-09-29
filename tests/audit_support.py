@@ -51,11 +51,13 @@ def products():
             description='Actual transition',pending=[])])
     plan=dict(description='One legal boundary call',claim_id='bounded',binding_ids=['binding'],
         harness=dict(kind='python',source='',description='Actual target call with independent return observation',
-            semantic_changes=['Emit actual observed fields'],legality=basis,
+            semantic_changes=['Emit actual observed fields'],
+            legality={**basis,'derivation':'Call the bound step function.','applicability':'Legal synchronous input.'},
             prerequisites=[dict(alias='start',event='admitted',conditions=[dict(field='state.legal',value=True)])]),
         observable_properties=[dict(checker_id='Bounded',kind='event_assertion',trigger=dict(field='event',value='returned'),
             assertion=dict(field='state.in_range',value=True),identity_fields=['operation'],description='Return within capacity')],
-        monitors=[dict(id='bound',checker_id='Bounded',event='returned',binding_ids=['binding'],grounding=basis,admission_alias='start')])
+        monitors=[dict(id='bound',checker_id='Bounded',event='returned',binding_ids=['binding'],grounding={**basis,'derivation':'Compare the observed return to input capacity.',
+                'applicability':'Same admitted call.'},admission_alias='start')])
     harness="""import json
 from target import step
 from helper import legal

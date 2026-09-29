@@ -116,7 +116,7 @@ def costs(state):
         'interpretation':'Rejected calls may contain useful investigation; wall time is not token cost or pure waste'}
 
 
-def view(state, compact=False):
+def view(state):
     spec = load(state)
     current = [u for u in state.units if u.status != 'revised']
     superseded = {a.previous_id for a in state.direct_checks+state.models}
@@ -159,27 +159,93 @@ def view(state, compact=False):
         candidate['executions']=[{'check_id':c.id,'artifact_id':c.direct_check_id or c.model_id,
             'action':c.action,'status':c.status.value,'outcome':c.outcome}
             for c in state.checks if c.direct_check_id in owned or c.model_id in owned]
-    if compact:
-        result['understanding_changes']=[{'operation_id':c['operation_id'],'version':c['version'],
-            'changed_object_ids':list(c['delta']),'effects':c['effects']} for c in result['understanding_changes'][-1:]]
-        if result['latest_decision']:result['latest_decision']={k:v for k,v in result['latest_decision'].items() if k!='map_delta'}
-        for candidate in result['candidates']:
-            if candidate['status']!='active' and not any(u.id==state.active_unit_id and u.candidate_id==candidate['id'] for u in current):
-                candidate['question']={key:value for key,value in candidate['question'].items()
-                    if key in {'question','source_ids','fact_ids','obligation_relation_kind','unknowns','activity_classes'}}
-        result['claims']=[{k:v for k,v in claim.items() if k in {'id','version','concern','description','source_ids'}} for claim in result['claims']]
-        result['assessments']=[{k:v for k,v in record.items() if k in {'claim_id','direct_check_id','experiment_check_id','confirmed','outcome','blockers','raw_log','bounded_complete'}} for record in records]
-        substantive=[s for s in result['handoffs'] if s.get('feedback')]
-        result['handoffs']=[{k:v for k,v in s.items() if k in {'operation_id','action','scope','reason','candidate_ids','rationale','feedback'}}
-            for s in (substantive or result['handoffs'])[-1:]]
     return result
 
 
-def current_view(state, root, implementation=None, compact=False):
-    """Rebuild a snapshot from state and trusted runtime context, never an old projection."""
+def current_view(state, root, implementation=None):
+    """Rebuild the work index with exact history locators and trusted runtime context."""
     from consensus_assurance.adapters.validation import validation_tool
     from .review_contract import target_contract
-    result = view(state,compact=compact)
+    result = view(state)
+    def record(collection, match, **extra):
+        return {'path':'state.json', 'collection':collection, 'match':match, **extra}
+    def preview(text):
+        return text if len(text) <= 240 else text[:240] + '…'
+    issues = [i for i in state.review_issues if not i.resolved_by]
+    disputed = {i.target_id for i in issues}
+    focus_units = {u.id for u in state.units if u.status != 'revised' and
+        (u.status != 'checked' or u.id == state.active_unit_id)}
+    focus_units.update(a.unit_id for a in state.direct_checks+state.models if a.id in disputed)
+    focus_candidates = {c.id for c in state.question_candidates if c.status == 'active' or c.id in disputed}
+    focus_candidates.update(u.candidate_id for u in state.units if u.id in focus_units)
+    focus_claims = {id for u in state.units if u.id in focus_units for id in u.obligation_ids}
+    for candidate in result['candidates']:
+        candidate['record'] = record('question_candidates', {'id':candidate['id']})
+        candidate['result_claim_ids'] = [r['claim_id'] for r in candidate.pop('results')]
+        for execution in candidate['executions']:
+            execution['record'] = record('checks', {'id':execution['check_id']})
+        if candidate['id'] not in focus_candidates:
+            question = candidate.pop('question')
+            candidate['question_preview'] = preview(question['question'])
+            candidate['audit_spec_version'] = question['audit_spec_version']
+            for key in ('material_ids','spec_task_ids','stop_reason','resume_conditions'):
+                candidate.pop(key, None)
+    for unit in result['units']:
+        unit['record'] = record('units', {'id':unit['id'], 'version':unit['version']})
+        if unit['id'] not in focus_units:
+            for key in tuple(unit):
+                if key not in {'id','version','candidate_id','obligation_ids','status','record'}:unit.pop(key)
+    for claim in result['claims']:
+        claim['record'] = record('claims', {'id':claim['id'], 'version':claim['version']})
+        if claim['id'] not in focus_claims:
+            claim['description_preview'] = preview(claim['description'])
+            for key in tuple(claim):
+                if key not in {'id','version','concern','description_preview','record'}:claim.pop(key)
+    objects = {(name,obj.id):obj for name in ('claims','bindings','relations','units') for obj in getattr(state,name)}
+    for artifact in result['artifacts']:
+        artifact['record'] = record('direct_checks' if 'plan_path' in artifact else 'models', {'id':artifact['id']})
+        artifact['basis'] = []
+        for id,version in artifact['graph_versions'].items():
+            kind = next((name for name,obj_id in objects if obj_id == id), None)
+            if kind is None:
+                kind = next(h['kind'] for h in state.graph_history if h['id']==id and h['version']==version)
+            obj = objects.get((kind,id))
+            reference = (record(kind, {'id':id,'version':version}) if obj and obj.version==version else
+                record('graph_history', {'kind':kind,'id':id,'version':version}, field='record'))
+            artifact['basis'].append(reference)
+        if artifact.get('previous_id'):
+            artifact['previous_record'] = record(artifact['record']['collection'], {'id':artifact['previous_id']})
+        for key in tuple(artifact):
+            if key not in {'id','version','unit_id','claim_id','research_ref','stage','pending_components',
+                    'plan_path','bundle_path','harness_path','graph_versions','record','basis','previous_id','previous_record'}:
+                artifact.pop(key)
+    result['assessments'] = [{**{k:r[k] for k in ('claim_id','direct_check_id','experiment_check_id',
+        'confirmed','outcome','blockers','bounded_complete') if k in r},
+        'record':record('monitor_results', {'experiment_check_id':r['experiment_check_id'], 'claim_id':r['claim_id']})}
+        for r in result['assessments']]
+    for conclusion in result['conclusions']:
+        for key in ('description','question','scope','conditions'):conclusion.pop(key, None)
+    for relationship in result['frontier']['relationships']:
+        relationship['candidate_ids'] = [c['candidate_id'] for c in relationship.pop('investigations')]
+    result['understanding_changes'] = [{'operation_id':c['operation_id'],'version':c['version'],
+        'record':record('selections', {'operation_id':c['operation_id']})} for c in result['understanding_changes']]
+    handoffs = result['handoffs']
+    recent = next((s['operation_id'] for s in reversed(handoffs) if s.get('feedback')), None)
+    result['handoffs'] = [{**{k:s[k] for k in ('operation_id','action','candidate_ids') if k in s},
+        'answered_preview':preview(s.get('feedback',{}).get('answered',s['rationale'])),
+        'ref_ids':s.get('feedback',{}).get('ref_ids',s.get('ref_ids',[])),
+        'record':record('selections', {'operation_id':s['operation_id']}),
+        **({'feedback':s['feedback']} if s['operation_id']==recent else {})} for s in handoffs]
+    for pending in result['pending_work']:
+        collection = {'unit':'units','candidate':'question_candidates','review_issue':'review_issues'}[pending['kind']]
+        pending['record'] = record(collection, {'id':pending['id']})
+        pending.pop('reasons', None)
+    result['review_issues'] = [i.model_dump(mode='json') for i in issues]
+    result['current'].pop('result', None)
+    if result['latest_decision']:
+        last = result['latest_decision']
+        result['latest_decision'] = {'operation_id':last['operation_id'],'action':last['action'],
+            'record':record('selections', {'operation_id':last['operation_id']})}
     targets=[a for a in state.direct_checks+state.models if a.id in {x['id'] for x in result['artifacts']}]
     targets.extend(c for c in state.question_candidates if any(i.target_id==c.id and not i.resolved_by for i in state.review_issues))
     contracts=[target_contract(state,a) for a in targets]
@@ -194,8 +260,11 @@ def current_view(state, root, implementation=None, compact=False):
             'support_path':str(root/'target-support')} if implementation else None,
         validation=validation_tool(root),
         rejected_drafts=[str(p) for p in sorted((root/'submissions').glob('*/diagnostics.json'))],
-        review_contracts=[{k:c[k] for k in ('target_id','object_type','version','required_aspects','questions','optional_questions')}
-            for c in contracts])
+        records={'path':'state.json','keys':{'materials':'id','checks':'id','semantic_reviews':'id',
+            'selections':'operation_id'},'paths_relative_to':'research.json directory'},
+        review_contracts=[{**{k:c[k] for k in ('target_id','object_type','version','required_aspects')},
+            'optional_aspects':list(c['optional_questions'])} for c in contracts],
+        review_questions={c['object_type']:{**c['questions'],**c['optional_questions']} for c in contracts})
     return result
 
 

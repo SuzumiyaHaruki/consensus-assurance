@@ -451,7 +451,6 @@ def test_resolution_reports_independent_reference_errors_together(tmp_path):
 
 
 def test_feedback_only_retains_exploration_before_a_map_and_recovers_once(tmp_path):
-    from consensus_assurance.workflow.research import view
     from consensus_assurance.workflow.audit import accept, Inputs, AuditSubmission
     from consensus_assurance.workflow.transactions import commit_graph
     def explore(state):
@@ -464,7 +463,7 @@ def test_feedback_only_retains_exploration_before_a_map_and_recovers_once(tmp_pa
             ref_ids=[check['id']],answered='The executed local boundary call returned zero.',remaining=[],
             understanding='updated',rationale='No normative claim or map change is implied.')),{}
     def next_turn(state):
-        current=view(e.state,compact=True)
+        current=json.loads((e.root/'research.json').read_text())
         assert current['handoffs'][-1]['feedback']['answered'].endswith('zero.')
         assert not any(state[k] for k in ('question_candidates','units','evidence','findings'))
         assert state['audit_spec_version']==0
@@ -533,6 +532,12 @@ def test_preflight_checks_current_inputs_without_writes_or_execution(tmp_path,mo
     assert {d['code'] for d in rejected['diagnostics']}=={d.code for d in formal.value.diagnostics}
     assert validate(sub)['valid']
     assert not e.state.units and not e.state.direct_checks
+    for fields in ({'derivation':''},{'applicability':''},{'source_ids':[],'expectation_ids':[]}):
+        missing=copy.deepcopy(plan)
+        missing['harness']['legality'].update(fields)
+        (draft/'plan.json').write_text(json.dumps(missing))
+        assert not validate(sub)['valid']
+    (draft/'plan.json').write_text(json.dumps(plan))
     # Later byte and capacity changes must be checked again by the formal path.
     (draft/'check.py').write_text('changed harness bytes\n')
     e.state.usage['experiments']=e.config.budget.experiments
