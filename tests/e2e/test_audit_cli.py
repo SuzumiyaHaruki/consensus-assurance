@@ -9,7 +9,7 @@ from consensus_assurance.registry import assemble
 from consensus_assurance.workflow.engine import Engine
 
 
-def test_cli_audit_fixture_execution_and_report(tmp_path,capsys):
+def test_cli_audit_fixture_execution_and_report(tmp_path,capsys,monkeypatch):
     repo=tmp_path/'repo';repo.mkdir()
     (repo/'target.py').write_text('def step(value, limit):\n    return value + 1 if value < limit else 0\n')
     (repo/'README.md').write_text('Legal local return remains within capacity.\n')
@@ -17,9 +17,12 @@ def test_cli_audit_fixture_execution_and_report(tmp_path,capsys):
     fixture=tmp_path/'audit.json'
     candidate,map_files=first({})
     fixture.write_text(json.dumps([{'submission':candidate,'files':map_files}, {'submission':submission,'files':files},
-        {'submission':{'action':'stop','scope':'run','reason':'user_stop','rationale':'Explicit fixture boundary; pending review remains visible'}}]))
+        {'submission':dict(action='stop',scope='run',reason='insufficient_basis',ref_ids=['code','doc'],
+            rationale='The configured invocation ends after execution; review remains open',
+            frontier_comparison=[dict(ref_ids=['unit-bounded'],next_step='Review the executed check correspondence',actionable=False,
+                rationale='The caller configured only execution of the supplied check for this invocation; review is outside that directed boundary')])}]))
     config=Config(agent_backend='mock',fixture=str(fixture),execution_backend='python',execution_isolation='workspace',
-        directed_question='Check the synthetic local return contract',runs_dir=str(tmp_path/'runs'),budget=Budget(agent_calls=3,total_seconds=60))
+        directed_question='Execute the supplied local return check only; correspondence review is outside this invocation',runs_dir=str(tmp_path/'runs'),budget=Budget(agent_calls=3,total_seconds=60))
     path=tmp_path/'config.yaml';path.write_text(config.model_dump_json())
     assert main(['run','--config',str(path),'--repo',str(repo)])==0
     root=next((tmp_path/'runs').glob('*-mock-run'))
@@ -65,6 +68,15 @@ def test_cli_audit_fixture_execution_and_report(tmp_path,capsys):
     assert all(not initial[key] for key in ('question_candidates','units','materials','evidence','agent_turns','usage'))
     assert (root/'state.json').read_bytes()==saved
     assert not (fresh/'draft').exists()
+    from consensus_assurance.adapters.agents.backend import MockAgent
+    def cancel(*args,**kwargs):raise KeyboardInterrupt('Actual caller cancellation')
+    monkeypatch.setattr(MockAgent,'investigate',cancel)
+    previous=set((tmp_path/'runs').iterdir())
+    assert main(['run','--config',str(path),'--repo',str(repo)])==130
+    cancelled=next(iter(set((tmp_path/'runs').iterdir())-previous))
+    saved_cancel=json.loads((cancelled/'state.json').read_text())
+    assert saved_cancel['run_stop']['origin']=='controller' and saved_cancel['run_stop']['reason']=='user_stop'
+    assert saved_cancel['usage']['agent_calls']==1 and '实际取消' in (cancelled/'report.md').read_text()
     old=tmp_path/'historical';old.mkdir()
     historical={'framework_revision':'native-products-v27','native_current':{'phase':'executed'},'native_session_id':'old-session'}
     (old/'state.json').write_text(json.dumps(historical))

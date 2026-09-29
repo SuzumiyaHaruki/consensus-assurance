@@ -177,7 +177,7 @@ def test_recovery_does_not_repeat_model_or_target_execution(tmp_path,phase):
 def test_audit_receipt_failure_routes_preserve_or_stop_the_session(tmp_path,fault):
     from consensus_assurance.adapters.agents.backend import CodexAgent
     from consensus_assurance.core.types import ExecutionStatus
-    e,repo=engine_for(tmp_path,[first,stop,check_step(),stop])
+    e,repo=engine_for(tmp_path,[first,lambda s:(dict(action='research',feedback=feedback(s),rationale='Retain sourced progress'),{}),check_step(),stop])
     original=e.agent.investigate
     sessions=[]
     def investigate(runner,prompt,directory,snapshot_id,timeout,session_id=None):
@@ -205,6 +205,7 @@ def test_audit_receipt_failure_routes_preserve_or_stop_the_session(tmp_path,faul
     assert len(state.units)==1
     if fault in {'login','quota','service_refusal','timeout'}:
         assert len(sessions)==2 and not state.direct_checks
+        assert state.run_stop['origin']=='controller' and state.run_stop['reason']=='tool_gap'
         check=next(c for c in reversed(state.checks) if c.action=='agent_turn')
         assert check.status==({'login':ExecutionStatus.LOGIN_REQUIRED,'quota':ExecutionStatus.QUOTA_EXHAUSTED,'service_refusal':ExecutionStatus.ERROR,'timeout':ExecutionStatus.TIMEOUT}[fault])
     else:
@@ -212,6 +213,32 @@ def test_audit_receipt_failure_routes_preserve_or_stop_the_session(tmp_path,faul
         assert sessions[2]==(None if fault=='session_lost' else 'fixture-session')
         if fault=='session_lost':assert any('session unavailable' in gap for gap in state.gaps)
         else:assert list((e.root/'submissions').glob('*/diagnostics.json'))
+
+
+def test_cancel_formal_tool_stops_before_another_agent_call(tmp_path,monkeypatch):
+    import subprocess
+    from consensus_assurance.core.types import ExecutionStatus
+    e,repo=engine_for(tmp_path,[first,check_step(),stop])
+    run=e.runner.run
+    def interrupt(command,cwd,action,*args,**kwargs):
+        if action!='direct_check':return run(command,cwd,action,*args,**kwargs)
+        communicate=subprocess.Popen.communicate
+        interrupted=False
+        def cancel(process,*a,**kw):
+            nonlocal interrupted
+            if not interrupted:
+                interrupted=True
+                raise KeyboardInterrupt('Caller cancelled during formal execution')
+            return communicate(process,*a,**kw)
+        with monkeypatch.context() as patch:
+            patch.setattr(subprocess.Popen,'communicate',cancel)
+            return run(command,cwd,action,*args,**kwargs)
+    e.runner.run=interrupt
+    with pytest.raises(KeyboardInterrupt):e.start(repo)
+    assert e.state.run_stop['reason']=='user_stop' and e.state.usage['agent_calls']==2
+    receipts=[json.loads(p.read_text()) for p in (e.root/'logs').glob('*/check.json')]
+    assert any(c['action']=='direct_check' and c['status']==ExecutionStatus.CANCELLED.value for c in receipts)
+    assert not e.state.evidence
 
 
 def test_candidate_parent_conflict_and_paused_return_keep_one_active_question(tmp_path):
@@ -589,7 +616,7 @@ def test_feedback_only_retains_exploration_before_a_map_and_recovers_once(tmp_pa
         raw['feedback']['ref_ids']=[current['handoffs'][-1]['operation_id']]
         (e.root/'draft'/'indirect.json').write_text(json.dumps(raw))
         assert validate_submission(e.state,e.root,'indirect.json',e.implementation)['valid']
-        return dict(action='stop',scope='run',reason='user_stop',rationale='End the scripted exercise'),{}
+        return stop(state)
     e,repo=engine_for(tmp_path,[explore,retain,next_turn])
     e.config.directed_question=None
     old=e.graph_commit_hook

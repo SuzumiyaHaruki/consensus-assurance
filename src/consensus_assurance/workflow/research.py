@@ -60,6 +60,17 @@ def capacity(state):
 def frontier(state, spec, results=()):
     """Project sourced unknowns and actual edges, never synthesize lifecycle products."""
     candidates = state.question_candidates
+    pending = pending_work(state)
+    disputed = {i.target_id for i in open_issues(state)}
+    completed = {c.id for c in candidates if (units := [u for u in state.units if u.candidate_id==c.id and u.status!='revised'])
+        and all(u.status=='checked' and not u.remaining_obligation_ids for u in units)
+        and not ({c.id}|{a.id for a in state.direct_checks+state.models if a.unit_id in {u.id for u in units}})&disputed}
+    paused = [c.id for c in candidates if c.status=='paused' and (c.id not in completed or c.resume_conditions)]
+    required = {w['id'] for w in pending}|set(paused)
+    if spec:
+        required.update('surface:'+s.entry_point for s in spec.surfaces if s.disposition in {'deferred','UNCLASSIFIED_PROTOCOL_RESPONSIBILITY'})
+        if not (state.config.get('directed_question') or '').strip() and (not spec.core_overview or spec.core_overview.status!='usable'):
+            required.add('core_overview' if spec.core_overview else 'target_profile')
     relationships = []
     for fact in spec.facts if spec else []:
         investigations = [c for c in candidates if fact.id in c.question.fact_ids]
@@ -73,7 +84,7 @@ def frontier(state, spec, results=()):
                 'question':c.question.question,'remaining':c.question.unknowns,'resume_conditions':c.resume_conditions,
                 'results':[{'claim_id':r['claim_id'],'disposition':r['disposition']} for r in results if r['candidate_id']==c.id]}
                 for c in investigations], 'coverage':'Described relationships; selected checks settle only their explicit scope'})
-    return {'relationships':relationships,
+    return {'relationships':relationships, 'paused_candidate_ids':paused, 'comparison_refs':sorted(required),
         'behavior_unknowns':[{'behavior_id':b.id,'activity':b.primary_activity,'unknowns':b.unknowns,
             'source_ids':b.source_ids,'protections':b.existing_protections} for b in spec.behaviors if b.unknowns] if spec else [],
         'surfaces':[s.model_dump(mode='json') for s in spec.surfaces] if spec else [],
@@ -186,8 +197,9 @@ def current_view(state, root, implementation=None):
             question = candidate.pop('question')
             candidate['question_preview'] = preview(question['question'])
             candidate['audit_spec_version'] = question['audit_spec_version']
-            for key in ('material_ids','spec_task_ids','stop_reason','resume_conditions'):
+            for key in ('material_ids','spec_task_ids','stop_reason'):
                 candidate.pop(key, None)
+            if candidate['id'] not in result['frontier']['paused_candidate_ids']:candidate.pop('resume_conditions',None)
     for unit in result['units']:
         unit['record'] = record('units', {'id':unit['id'], 'version':unit['version']})
         if unit['id'] not in focus_units:
@@ -267,8 +279,7 @@ def current_view(state, root, implementation=None):
 
 
 def global_stop(raw):
-    return raw.get('action')=='stop' and (raw.get('scope')=='run' or raw.get('reason')=='user_stop' or
-        raw.get('reason') in {'resource_limit','tool_gap'} and raw.get('scope') not in {'candidate','family','focus'})
+    return raw.get('action')=='stop' and raw.get('scope')=='run'
 
 
 def release(state, ids, reason, resume_conditions, closed=False):
@@ -293,6 +304,7 @@ def reject_local(state, operation_id, errors, raw):
         if last['action']=='rejected' and last.get('submitted_path')==errors.get('submitted_path'):previous=last
     ids={c.id for c in state.question_candidates if c.id==target.get('candidate_id')}
     ids.update(u.candidate_id for u in state.units if raw.get('unit_id') in {u.id,u.candidate_id})
+    if raw.get('action')=='stop':ids.clear()
     diagnostics=sorted(errors['errors'])
     repeats=previous.get('repeats',1)+1 if previous and previous.get('diagnostics')==diagnostics else 1
     paused=repeats>=max(1,state.config.get('budget',{}).get('repair_attempts',4))
@@ -309,32 +321,29 @@ def reject_local(state, operation_id, errors, raw):
     return paused
 
 
-def stop_record(engine, raw, operation_id, controller=False):
-    """Exit without accepting any attached semantic edits or requiring another turn."""
+def stop_record(engine, reason):
+    """Record a controller-observed interruption, never a submitted reason."""
     state = engine.state
-    record = {'operation_id':operation_id, 'action':'stop', 'scope':'run', 'reason':raw['reason'],
-        'rationale':str(raw.get('rationale','Execution interrupted')), 'origin':'controller' if controller else 'agent',
+    state.run_stop = {'operation_id':state.current_submission.get('operation_id',state.id),
+        'action':'stop', 'scope':'run', 'reason':reason, 'origin':'controller', 'rationale':state.stop_reason,
         'pending_work':pending_work(state), 'remaining_seconds':engine.budget.remaining(),
         'remaining_agent_calls':engine.config.budget.agent_calls-state.usage.get('agent_calls',0)}
-    if not controller:
-        ignored = sorted(set(raw)-{'action','scope','reason','rationale','ref_ids'})
-        refs = raw.get('ref_ids',[])
-        known = {x.id for name in ('units','question_candidates','checks','materials','models','direct_checks') for x in getattr(state,name)}
-        record['notes'] = {'ref_ids':refs, 'unapplied_fields':ignored,
-            'diagnostics':['Stop metadata is explanatory only; semantic changes were not applied']+
-                (['Unknown or stale references: '+str([r for r in refs if not isinstance(r,str) or r not in known])] if isinstance(refs,list) else ['ref_ids is not a list'])}
-        if not any(s['operation_id']==operation_id for s in state.selections):state.selections.append(record)
-        state.current_submission = {'phase':'executed','action':'stop','scope':'run','reason':raw['reason'],'operation_id':operation_id}
-        state.stop_reason = 'Scoped stop (run/'+raw['reason']+'): '+record['rationale']
-    state.run_stop = record
-    return record
+
+
+def stop_error(state, message, refs=(), decision=True):
+    from consensus_assurance.core.diagnostics import Diagnostic, DiagnosticError
+    raise DiagnosticError([Diagnostic(code='stop_decision' if decision else 'stop_product',
+        category='semantic' if decision else 'association', object_ids=sorted(refs), message=message,
+        details={'capacity':capacity(state), 'reconsider':'research_decision' if decision else 'submission',
+            'instruction':'Recompare useful steps; changing a label or boolean is not new research basis' if decision else 'Repair the product references or structure'})])
 
 
 def record_decision(engine, submission, operation_id, map_changed=False):
     from consensus_assurance.core.submissions import StopSubmission
     state, spec = engine.state, load(engine.state)
-    if isinstance(submission,StopSubmission) and global_stop(submission.model_dump()) and submission.reason in {'resource_limit','user_stop','tool_gap'}:
-        return stop_record(engine,submission.model_dump(mode='json'),operation_id)
+    if isinstance(submission,StopSubmission) and (submission.reason=='user_stop' or
+            submission.scope=='run' and submission.reason in {'resource_limit','tool_gap'}):
+        stop_error(state,'Submitted reason does not establish a controller interruption; use a local handoff or justify a normal research stop',submission.ref_ids)
     known = {x.id for name in ('question_candidates','units','claims','bindings','checks','semantic_reviews',
         'models','direct_checks','materials','review_issues','evidence','findings') for x in getattr(state,name)}
     known.update(audit_object_index(spec))
@@ -356,7 +365,7 @@ def record_decision(engine, submission, operation_id, map_changed=False):
     if isinstance(submission,StopSubmission):
         if not set(submission.ref_ids)<=known or not source_refs(state,submission.ref_ids):
             raise ValueError('Normal stop needs known research references with acquired source ownership')
-        related = set(submission.ref_ids)|{u.id for u in state.units if u.id in submission.ref_ids or u.candidate_id in submission.ref_ids}
+        related = set(submission.ref_ids)
         if submission.scope in {'candidate','family'} and not any(c.id in submission.ref_ids for c in state.question_candidates):
             raise ValueError('Local stop must identify its Candidate or family')
         ids={c.id for c in state.question_candidates if c.id in submission.ref_ids}
@@ -368,30 +377,26 @@ def record_decision(engine, submission, operation_id, map_changed=False):
             a.unit_id in related for a in state.direct_checks+state.models))
         options=submission.frontier_comparison
         compared={ref for option in options for ref in option.ref_ids}
-        if not compared<=known:raise ValueError('Frontier comparison references unknown research objects: '+', '.join(sorted(compared-known)))
+        if not compared<=known:stop_error(state,'Frontier comparison references unknown research objects',compared-known,decision=False)
         if submission.scope in {'run','focus'} and not options:
-            raise ValueError('Normal run/focus stop needs concrete next steps, actionability and reasons against current capacity; local completion is not a run boundary')
+            stop_error(state,'Normal run/focus stop needs concrete next steps and reasons against current capacity',decision=False)
         if submission.scope=='run':
-            required={w['id'] for w in pending_work(state)}|{c.id for c in state.question_candidates if c.status=='paused'}
-            if spec:
-                required.update('surface:'+s.entry_point for s in spec.surfaces if s.disposition in {'deferred','UNCLASSIFIED_PROTOCOL_RESPONSIBILITY'})
-                if not (state.config.get('directed_question') or '').strip() and (not spec.core_overview or spec.core_overview.status!='usable'):
-                    required.add('core_overview' if spec.core_overview else 'target_profile')
+            required=set(frontier(state,spec)['comparison_refs'])
             if required-compared:
-                raise ValueError('Run stop omits current pending or paused work or unexpanded understanding: '+', '.join(sorted(required-compared)))
+                stop_error(state,'Run stop omits current comparison_refs from the research frontier',required-compared,decision=False)
             if any(option.actionable for option in options):
-                raise ValueError('Run stop conflicts with an actionable next step; continue or locally pause and reselect in this session, without new user authorization')
+                stop_error(state,'Run stop conflicts with an actionable next step; continue or locally pause and reselect within authorization',
+                    {ref for option in options if option.actionable for ref in option.ref_ids})
         if submission.reason=='bounded_completed':
             if submission.scope=='focus' or any(w['id'] in related or submission.scope=='run' for w in pending_work(state)):
-                raise ValueError('Selected scope still has unfinished work; local checks do not establish focus exhaustion')
-            if submission.scope=='run' and (not spec or not (state.config.get('directed_question') or '').strip() and (not spec.core_overview or spec.core_overview.status!='usable') or any(c.status=='paused' for c in state.question_candidates)
-                    or any(s.disposition in {'deferred','UNCLASSIFIED_PROTOCOL_RESPONSIBILITY'} for s in spec.surfaces)):
-                raise ValueError('Run has paused or unexpanded understanding')
+                stop_error(state,'Selected scope still has unfinished work; local checks do not establish focus exhaustion',related)
+            if submission.scope=='run' and (not spec or required):
+                stop_error(state,'Run retains unresolved scope; reconsider completion separately from a reasoned early stop',required)
         if submission.scope!='run':
             if submission.reason!='bounded_completed' and not submission.resume_conditions:
                 raise ValueError('Local pause needs concrete resume_conditions; pending Units and issues remain visible')
             release(state,ids,submission.rationale,submission.resume_conditions,submission.reason=='bounded_completed')
-        record.update(scope=submission.scope,reason=submission.reason,ref_ids=submission.ref_ids,
+        record.update(origin='agent',scope=submission.scope,reason=submission.reason,ref_ids=submission.ref_ids,
             frontier_comparison=[option.model_dump(mode='json') for option in options],pending_work=pending_work(state),candidate_ids=sorted(ids),resume_conditions=submission.resume_conditions)
     state.selections.append(record)
     if isinstance(submission,StopSubmission) and global_stop(record):state.run_stop=record

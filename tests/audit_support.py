@@ -21,8 +21,14 @@ class ScriptedAgent:
 
     def investigate(self, runner, prompt, directory, snapshot_id, timeout, session_id=None):
         state = json.loads((runner.root/'state.json').read_text())
-        value, files = self.steps[self.cursor](state)
+        step = self.steps[self.cursor]
         self.cursor += 1
+        try:
+            value, files = step(state)
+        except KeyboardInterrupt:
+            # The test caller cancels at the transport boundary, as ProcessRunner does.
+            return CheckRun(action='agent_turn',cwd=str(directory),snapshot_id=snapshot_id,
+                status=ExecutionStatus.CANCELLED,reason='Test caller cancelled the investigation'),session_id,None
         for name, content in files.items():
             path = directory/name
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -119,8 +125,7 @@ def review_step(status='no_issue_found',aspect='checker_correspondence'):
 
 
 def stop(state):
-    return dict(action='stop',scope='run',reason='user_stop',
-        rationale='End the explicitly scripted exercise; no autonomous stopping judgment'),{}
+    raise KeyboardInterrupt('Explicit test caller cancellation')
 
 
 def engine_for(tmp_path, steps):

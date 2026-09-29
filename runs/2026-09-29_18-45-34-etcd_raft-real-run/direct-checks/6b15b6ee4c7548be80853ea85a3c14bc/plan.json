@@ -1,0 +1,209 @@
+{
+  "description": "Exercise one leader-produced append delivered twice while follower storage is pending, then once after completion. Measure whether the second response-only Ready retains the persistence dependency. Finish ordered storage and network work independently of the asserted routing.",
+  "claim_id": "claim-async-append-dependency",
+  "binding_ids": [
+    "binding-ready-dependency",
+    "binding-response-production"
+  ],
+  "harness": {
+    "files": {},
+    "kind": "go_test",
+    "source": "package raft\n\nimport (\n \"encoding/json\"\n \"fmt\"\n \"testing\"\n pb \"go.etcd.io/raft/v3/raftpb\"\n)\n\ntype assurancePeer struct { rn *RawNode; storage *MemoryStorage }\ntype assuranceNetwork struct { t *testing.T; peers map[uint64]*assurancePeer; wire []pb.Message }\nfunc assuranceEmit(v map[string]interface{}) { b,err:=json.Marshal(v); if err!=nil { panic(err) }; fmt.Println(\"CA_EVENT \"+string(b)) }\nfunc (n *assuranceNetwork) must(err error) { n.t.Helper(); if err!=nil { n.t.Fatal(err) } }\nfunc (n *assuranceNetwork) appendWork(id uint64,m pb.Message) {\n p:=n.peers[id]\n if m.Snapshot!=nil { n.must(p.storage.ApplySnapshot(*m.Snapshot)) }\n n.must(p.storage.Append(m.Entries))\n hs:=pb.HardState{Term:m.Term,Vote:m.Vote,Commit:m.Commit}\n if !IsEmptyHardState(hs) { n.must(p.storage.SetHardState(hs)) }\n}\nfunc (n *assuranceNetwork) process(id uint64,rd Ready) {\n for _,m:=range rd.Messages {\n  switch m.Type {\n  case pb.MsgStorageAppend:\n   n.appendWork(id,m); n.wire=append(n.wire,m.Responses...)\n  case pb.MsgStorageApply:\n   // This harness has a no-op application; each batch finishes synchronously.\n   n.wire=append(n.wire,m.Responses...)\n  default: n.wire=append(n.wire,m)\n  }\n }\n}\nfunc (n *assuranceNetwork) drain() {\n for turn:=0;turn<500;turn++ {\n  work:=false\n  for _,id:=range []uint64{1,2} { p:=n.peers[id]; if p.rn.HasReady() { work=true; n.process(id,p.rn.Ready()) } }\n  if len(n.wire)>0 {\n   work=true; m:=n.wire[0]; n.wire=n.wire[1:]\n   p:=n.peers[m.To]; if p==nil { n.t.Fatalf(\"unknown destination %d\",m.To) }; n.must(p.rn.Step(m))\n  }\n  if !work { return }\n }\n n.t.Fatal(\"schedule failed to quiesce within 500 transitions\")\n}\nfunc (n *assuranceNetwork) stored(id,index,term uint64,data []byte) bool {\n es,err:=n.peers[id].storage.Entries(index,index+1,^uint64(0))\n return err==nil && len(es)==1 && es[0].Term==term && string(es[0].Data)==string(data)\n}\ntype assuranceObservation struct {\n phase string; rd Ready; pending bool; direct,nested,appendCount,appendEntries int\n delivered int; allBacked bool\n}\nfunc TestAssuranceAsyncDuplicateAppend(t *testing.T) {\n n:=&assuranceNetwork{t:t,peers:map[uint64]*assurancePeer{}}\n for _,id:=range []uint64{1,2} {\n  s:=NewMemoryStorage()\n  // Publicly supported manual bootstrap from a shared compacted prefix.\n  n.must(s.ApplySnapshot(pb.Snapshot{Metadata:pb.SnapshotMetadata{Index:1,Term:1,ConfState:pb.ConfState{Voters:[]uint64{1,2}}}}))\n  n.must(s.SetHardState(pb.HardState{Term:1,Commit:1}))\n  rn,err:=NewRawNode(&Config{ID:id,Storage:s,Applied:1,ElectionTick:10,HeartbeatTick:1,MaxSizePerMsg:4096,MaxInflightMsgs:16,AsyncStorageWrites:true})\n  n.must(err); n.peers[id]=&assurancePeer{rn:rn,storage:s}\n }\n n.must(n.peers[1].rn.Campaign()); n.drain()\n if n.peers[1].rn.BasicStatus().RaftState!=StateLeader { t.Fatal(\"producer did not become leader\") }\n data:=[]byte(\"assurance-duplicate-append\")\n n.must(n.peers[1].rn.Propose(data))\n // Process only the leader until its actual append message is captured.\n if !n.peers[1].rn.HasReady() { t.Fatal(\"proposal produced no Ready\") }\n n.process(1,n.peers[1].rn.Ready())\n var app pb.Message; found:=false\n for i,m:=range n.wire {\n  if m.Type==pb.MsgApp && m.From==1 && m.To==2 && len(m.Entries)>0 && string(m.Entries[len(m.Entries)-1].Data)==string(data) {\n   app=m; n.wire=append(n.wire[:i],n.wire[i+1:]...); found=true; break\n  }\n }\n if !found { t.Fatal(\"no actual leader append for proposal\") }\n target:=app.Entries[len(app.Entries)-1]\n base:=func(event,phase string) map[string]interface{} { return map[string]interface{}{\"event\":event,\"scenario\":\"duplicate_pending\",\"phase\":phase,\"leader\":app.From,\"follower\":app.To,\"entry_index\":target.Index,\"entry_term\":target.Term,\"message_term\":app.Term} }\n matches:=func(m pb.Message) bool { return m.Type==pb.MsgAppResp && !m.Reject && m.From==app.To && m.To==app.From && m.Term==app.Term && m.Index==target.Index }\n capture:=func(phase string) *assuranceObservation {\n  e:=base(\"produced\",phase); e[\"payload\"]=string(target.Data); e[\"previous_index\"]=app.Index; assuranceEmit(e)\n  n.must(n.peers[2].rn.Step(app))\n  o:=&assuranceObservation{phase:phase,pending:!n.stored(2,target.Index,target.Term,target.Data),allBacked:true}\n  e=base(\"admitted\",phase); e[\"pending_storage\"]=o.pending; e[\"producer_term\"]=app.Term; assuranceEmit(e)\n  if !n.peers[2].rn.HasReady() { t.Fatal(\"accepted append has no Ready\") }\n  o.rd=n.peers[2].rn.Ready()\n  for _,m:=range o.rd.Messages {\n   if matches(m) { o.direct++ }\n   if m.Type==pb.MsgStorageAppend {\n    o.appendCount++; o.appendEntries+=len(m.Entries)\n    for _,r:=range m.Responses { if matches(r) { o.nested++ } }\n   }\n  }\n  e=base(\"ready_observed\",phase); e[\"pending_storage\"]=o.pending; e[\"direct_acks\"]=o.direct; e[\"nested_acks\"]=o.nested; e[\"append_work_count\"]=o.appendCount; e[\"append_entries\"]=o.appendEntries; assuranceEmit(e)\n  return o\n }\n // The first Ready accepts entries without executing its local storage work.\n first:=capture(\"original\")\n duplicate:=capture(\"duplicate\")\n publish:=func(o *assuranceObservation,m pb.Message) {\n  if matches(m) {\n   backed:=n.stored(2,target.Index,target.Term,target.Data)\n   o.delivered++; o.allBacked=o.allBacked&&backed\n   e:=base(\"ack_published\",o.phase); e[\"stored\"]=backed; e[\"ack_index\"]=m.Index; e[\"ack_term\"]=m.Term; assuranceEmit(e)\n  }\n  n.wire=append(n.wire,m)\n }\n // Immediate messages are legally publishable before local work. Do this even\n // if the measured routing is wrong, so the schedule does not assume the oracle.\n for _,o:=range []*assuranceObservation{first,duplicate} {\n  for _,m:=range o.rd.Messages { if !IsLocalMsgTarget(m.To) { publish(o,m) } }\n }\n finish:=func(o *assuranceObservation) {\n  for _,m:=range o.rd.Messages {\n   if m.Type==pb.MsgStorageAppend {\n    n.appendWork(2,m)\n    for _,r:=range m.Responses { publish(o,r) }\n   } else if m.Type==pb.MsgStorageApply {\n    for _,r:=range m.Responses { publish(o,r) }\n   }\n  }\n }\n // All same-target work completes in Ready order, including response-only work.\n finish(first); finish(duplicate); n.drain()\n // A permitted control repeats the identical append after storage completion.\n control:=capture(\"stored_retry\")\n for _,m:=range control.rd.Messages { if !IsLocalMsgTarget(m.To) { publish(control,m) } }\n finish(control); n.drain()\n for _,o:=range []*assuranceObservation{first,duplicate,control} {\n  e:=base(\"completed\",o.phase)\n  e[\"pending_storage\"]=o.pending; e[\"direct_acks\"]=o.direct; e[\"nested_acks\"]=o.nested; e[\"append_work_count\"]=o.appendCount; e[\"append_entries\"]=o.appendEntries\n  e[\"published_acks\"]=o.delivered; e[\"all_published_backed\"]=o.allBacked; e[\"stored_at_end\"]=n.stored(2,target.Index,target.Term,target.Data)\n  e[\"leader_commit\"]=n.peers[1].rn.BasicStatus().Commit; e[\"follower_commit\"]=n.peers[2].rn.BasicStatus().Commit\n  if o.delivered==0 || !n.stored(2,target.Index,target.Term,target.Data) { e[\"event\"]=\"completion_gap\" }\n  assuranceEmit(e)\n }\n}\n",
+    "description": "TestAssuranceAsyncDuplicateAppend uses actual RawNode APIs, public storage initialization and an ordered deterministic network/storage driver. It observes original, duplicate-pending and stored-retry deliveries of one produced append.",
+    "semantic_changes": [
+      "No target changes. MemoryStorage is a deterministic substitute for application storage completion, not disk durability.",
+      "Instrumentation reads Ready messages and public MemoryStorage/BasicStatus values. RawNode internals are never assigned.",
+      "Finite serial event loop supplies transport and separate local append/application completion; exact network duplication is the only injected event."
+    ],
+    "prerequisites": [
+      {
+        "alias": "producer",
+        "event": "produced",
+        "conditions": []
+      },
+      {
+        "alias": "admitted",
+        "event": "admitted",
+        "conditions": [
+          {
+            "field": "producer_term",
+            "op": "eq",
+            "value": null,
+            "reference": "producer.message_term"
+          }
+        ]
+      }
+    ],
+    "legality": {
+      "source_ids": [
+        "s-api",
+        "s-ready-storage",
+        "s-follower",
+        "s-send",
+        "s-storage-writes",
+        "s-config-validation",
+        "s-status-observation",
+        "s-init"
+      ],
+      "expectation_ids": [
+        "s-async-config-contract",
+        "s-ready-contract"
+      ],
+      "binding_ids": [
+        "binding-ready-dependency",
+        "binding-response-production"
+      ],
+      "derivation": "For claim-async-append-dependency, this driver uses two public RawNodes and captures an actual MsgApp after election and proposal, rather than inventing follower input or assigning raft internals. Manual bootstrap uses MemoryStorage.ApplySnapshot(index=1,term=1,shared voters) and HardState(term=1,commit=1), as recommended by NewRawNode for a first index above one. Campaign and Ready-response delivery establish term/leader/no-op prefix in this same execution. The target follower receives the exact captured append twice. Its original Ready is accepted, but its append message is retained without processing until the duplicate Ready is also accepted. Config.AsyncStorageWrites allows such pipelining but requires same-worker FIFO completion, which finish(original) then finish(duplicate) preserves. Attached responses are published only after MemoryStorage writes; all top-level network messages are published before deferred work, as the interface permits, including if this reveals the forbidden response.",
+      "applicability": "Two voters, static membership, asynchronous storage, sequential RawNode calls, no crash, no corrupted messages. Exact duplication supplies the network fault. No tick is needed during the finite controlled delay: election was explicitly campaigned and the schedule is not a liveness claim. The initial snapshot represents a common committed compacted prefix, not a claimed execution from process birth. MemoryStorage stands for caller completion and is not measured disk durability. Application is no-op and finishes each supplied batch before returning local response. No protocol logic or dependencies are replaced.",
+      "unresolved": [
+        "The prefix represents an initialized cluster; crash recovery and physical persistence are not observed."
+      ],
+      "conflicts": [],
+      "alternatives": [
+        "Synchronous same-batch message ordering has conflicting documentation and is not exercised."
+      ]
+    }
+  },
+  "monitors": [
+    {
+      "id": "monitor-no-immediate-pending",
+      "checker_id": "no-immediate-pending",
+      "event": "completed",
+      "binding_ids": [
+        "binding-ready-dependency",
+        "binding-response-production"
+      ],
+      "grounding": {
+        "source_ids": [
+          "s-ready-storage",
+          "s-send",
+          "s-follower",
+          "s-storage-writes"
+        ],
+        "expectation_ids": [
+          "s-async-config-contract",
+          "s-ready-contract"
+        ],
+        "binding_ids": [
+          "binding-ready-dependency",
+          "binding-response-production"
+        ],
+        "derivation": "The monitor observes completed operations correlated to produced/admitted events. Independent identity is scenario, phase and the actual producer message endpoints/entry identity; phase distinguishes two deliveries of identical MsgApp. pending_storage is measured with a storage lookup after Step and before Ready. direct_acks counts matching positive MsgAppResp in top-level Ready.Messages. nested_acks and append_entries describe the actual local append messages. A completed event is emitted only after at least one matching response was published and the target entry is observable in storage; otherwise completion_gap leaves the admitted operation unanswered. The primary implication compares direct_acks to zero only when storage was independently pending. A second comparison measures whether each published matching acknowledgment was backed by the exact entry at publication. The stored_retry operation supplies the permitted completion control; no requirement of eventual success under indefinite delay is inferred.",
+        "applicability": "The selected requirement is publication dependency, not a whole-cluster crash-safety result. All matching response publications from the three captured Ready batches are counted, with raw ack_published and ready_observed events retained for review. No result is fabricated from expected protocol behavior. Top-level and attached response fields are actual returned messages.",
+        "unresolved": [
+          "A passing comparison is bounded to these three deliveries and this selected public interface."
+        ],
+        "conflicts": [],
+        "alternatives": [
+          "The library could withhold responses under other inputs; lack of a measured completed response in this driver emits a gap rather than a safety failure."
+        ]
+      },
+      "applicability_conditions": [],
+      "admission_alias": "admitted"
+    },
+    {
+      "id": "monitor-published-support-backed",
+      "checker_id": "published-support-backed",
+      "event": "completed",
+      "binding_ids": [
+        "binding-ready-dependency",
+        "binding-response-production"
+      ],
+      "grounding": {
+        "source_ids": [
+          "s-ready-storage",
+          "s-send",
+          "s-follower",
+          "s-storage-writes"
+        ],
+        "expectation_ids": [
+          "s-async-config-contract",
+          "s-ready-contract"
+        ],
+        "binding_ids": [
+          "binding-ready-dependency",
+          "binding-response-production"
+        ],
+        "derivation": "The monitor observes completed operations correlated to produced/admitted events. Independent identity is scenario, phase and the actual producer message endpoints/entry identity; phase distinguishes two deliveries of identical MsgApp. pending_storage is measured with a storage lookup after Step and before Ready. direct_acks counts matching positive MsgAppResp in top-level Ready.Messages. nested_acks and append_entries describe the actual local append messages. A completed event is emitted only after at least one matching response was published and the target entry is observable in storage; otherwise completion_gap leaves the admitted operation unanswered. The primary implication compares direct_acks to zero only when storage was independently pending. A second comparison measures whether each published matching acknowledgment was backed by the exact entry at publication. The stored_retry operation supplies the permitted completion control; no requirement of eventual success under indefinite delay is inferred.",
+        "applicability": "The selected requirement is publication dependency, not a whole-cluster crash-safety result. All matching response publications from the three captured Ready batches are counted, with raw ack_published and ready_observed events retained for review. No result is fabricated from expected protocol behavior. Top-level and attached response fields are actual returned messages.",
+        "unresolved": [
+          "A passing comparison is bounded to these three deliveries and this selected public interface."
+        ],
+        "conflicts": [],
+        "alternatives": [
+          "The library could withhold responses under other inputs; lack of a measured completed response in this driver emits a gap rather than a safety failure."
+        ]
+      },
+      "applicability_conditions": [],
+      "admission_alias": "admitted"
+    }
+  ],
+  "observable_properties": [
+    {
+      "checker_id": "no-immediate-pending",
+      "kind": "event_implication",
+      "trigger": {
+        "field": "event",
+        "op": "eq",
+        "value": "completed",
+        "reference": null
+      },
+      "assertion": {
+        "field": "direct_acks",
+        "op": "eq",
+        "value": 0,
+        "reference": null
+      },
+      "antecedent": {
+        "field": "pending_storage",
+        "op": "eq",
+        "value": true,
+        "reference": null
+      },
+      "identity_fields": [
+        "scenario",
+        "phase",
+        "leader",
+        "follower",
+        "entry_index",
+        "entry_term",
+        "message_term"
+      ],
+      "history_field": null,
+      "description": "When the accepted append was still absent from local storage at Ready extraction, no matching positive response may be directly deliverable."
+    },
+    {
+      "checker_id": "published-support-backed",
+      "kind": "event_assertion",
+      "trigger": {
+        "field": "event",
+        "op": "eq",
+        "value": "completed",
+        "reference": null
+      },
+      "assertion": {
+        "field": "all_published_backed",
+        "op": "eq",
+        "value": true,
+        "reference": null
+      },
+      "antecedent": null,
+      "identity_fields": [
+        "scenario",
+        "phase",
+        "leader",
+        "follower",
+        "entry_index",
+        "entry_term",
+        "message_term"
+      ],
+      "history_field": null,
+      "description": "Every matching response published by the three captured batches has the exact acknowledged entry present in storage at publication."
+    }
+  ],
+  "uncertainties": [
+    "Global crash safety, disk durability and client application completion are excluded.",
+    "The synchronous documentation conflict is preserved outside this interface.",
+    "The test covers a static two-voter configuration and a single duplicated entry; other schedules and configurations remain open."
+  ]
+}

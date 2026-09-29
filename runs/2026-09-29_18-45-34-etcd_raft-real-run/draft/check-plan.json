@@ -1,0 +1,209 @@
+{
+  "description": "Exercise one leader-produced append delivered twice while follower storage is pending, then once after completion. Measure whether the second response-only Ready retains the persistence dependency. Finish ordered storage and network work independently of the asserted routing.",
+  "claim_id": "claim-async-append-dependency",
+  "binding_ids": [
+    "binding-ready-dependency",
+    "binding-response-production"
+  ],
+  "harness": {
+    "files": {},
+    "kind": "go_test",
+    "source": "",
+    "description": "TestAssuranceAsyncDuplicateAppend uses actual RawNode APIs, public storage initialization and an ordered deterministic network/storage driver. It observes original, duplicate-pending and stored-retry deliveries of one produced append.",
+    "semantic_changes": [
+      "No target changes. MemoryStorage is a deterministic substitute for application storage completion, not disk durability.",
+      "Instrumentation reads Ready messages and public MemoryStorage/BasicStatus values. RawNode internals are never assigned.",
+      "Finite serial event loop supplies transport and separate local append/application completion; exact network duplication is the only injected event.",
+      "Observation correction for issue 8178c42684824a00b28c4cf37110d7d3: bounds-check storage lookup with LastIndex and expose stored_before_ready (positive presence), replacing pending_storage (its inverse). The necessity implication is equivalent: absent storage implies zero direct acknowledgments."
+    ],
+    "prerequisites": [
+      {
+        "alias": "producer",
+        "event": "produced",
+        "conditions": []
+      },
+      {
+        "alias": "admitted",
+        "event": "admitted",
+        "conditions": [
+          {
+            "field": "producer_term",
+            "op": "eq",
+            "value": null,
+            "reference": "producer.message_term"
+          }
+        ]
+      }
+    ],
+    "legality": {
+      "source_ids": [
+        "s-api",
+        "s-ready-storage",
+        "s-follower",
+        "s-send",
+        "s-storage-writes",
+        "s-config-validation",
+        "s-status-observation",
+        "s-init"
+      ],
+      "expectation_ids": [
+        "s-async-config-contract",
+        "s-ready-contract"
+      ],
+      "binding_ids": [
+        "binding-ready-dependency",
+        "binding-response-production"
+      ],
+      "derivation": "For claim-async-append-dependency, this driver uses two public RawNodes and captures an actual MsgApp after election and proposal, rather than inventing follower input or assigning raft internals. Manual bootstrap uses MemoryStorage.ApplySnapshot(index=1,term=1,shared voters) and HardState(term=1,commit=1), as recommended by NewRawNode for a first index above one. Campaign and Ready-response delivery establish term/leader/no-op prefix in this same execution. The target follower receives the exact captured append twice. Its original Ready is accepted, but its append message is retained without processing until the duplicate Ready is also accepted. Config.AsyncStorageWrites allows such pipelining but requires same-worker FIFO completion, which finish(original) then finish(duplicate) preserves. Attached responses are published only after MemoryStorage writes; all top-level network messages are published before deferred work, as the interface permits, including if this reveals the forbidden response.",
+      "applicability": "Two voters, static membership, asynchronous storage, sequential RawNode calls, no crash, no corrupted messages. Exact duplication supplies the network fault. No tick is needed during the finite controlled delay: election was explicitly campaigned and the schedule is not a liveness claim. The initial snapshot represents a common committed compacted prefix, not a claimed execution from process birth. MemoryStorage stands for caller completion and is not measured disk durability. Application is no-op and finishes each supplied batch before returning local response. No protocol logic or dependencies are replaced.",
+      "unresolved": [
+        "The prefix represents an initialized cluster; crash recovery and physical persistence are not observed."
+      ],
+      "conflicts": [],
+      "alternatives": [
+        "Synchronous same-batch message ordering has conflicting documentation and is not exercised."
+      ]
+    }
+  },
+  "monitors": [
+    {
+      "id": "monitor-no-immediate-pending",
+      "checker_id": "no-immediate-pending",
+      "event": "completed",
+      "binding_ids": [
+        "binding-ready-dependency",
+        "binding-response-production"
+      ],
+      "grounding": {
+        "source_ids": [
+          "s-ready-storage",
+          "s-send",
+          "s-follower",
+          "s-storage-writes"
+        ],
+        "expectation_ids": [
+          "s-async-config-contract",
+          "s-ready-contract"
+        ],
+        "binding_ids": [
+          "binding-ready-dependency",
+          "binding-response-production"
+        ],
+        "derivation": "The monitor observes completed operations correlated to produced/admitted events. Independent identity is scenario, phase and the actual producer message endpoints/entry identity; phase distinguishes two deliveries of identical MsgApp. pending_storage is measured with a storage lookup after Step and before Ready. direct_acks counts matching positive MsgAppResp in top-level Ready.Messages. nested_acks and append_entries describe the actual local append messages. A completed event is emitted only after at least one matching response was published and the target entry is observable in storage; otherwise completion_gap leaves the admitted operation unanswered. The primary implication compares direct_acks to zero only when storage was independently pending. A second comparison measures whether each published matching acknowledgment was backed by the exact entry at publication. The stored_retry operation supplies the permitted completion control; no requirement of eventual success under indefinite delay is inferred.",
+        "applicability": "The selected requirement is publication dependency, not a whole-cluster crash-safety result. All matching response publications from the three captured Ready batches are counted, with raw ack_published and ready_observed events retained for review. No result is fabricated from expected protocol behavior. Top-level and attached response fields are actual returned messages.",
+        "unresolved": [
+          "A passing comparison is bounded to these three deliveries and this selected public interface."
+        ],
+        "conflicts": [],
+        "alternatives": [
+          "The library could withhold responses under other inputs; lack of a measured completed response in this driver emits a gap rather than a safety failure."
+        ]
+      },
+      "applicability_conditions": [],
+      "admission_alias": "admitted"
+    },
+    {
+      "id": "monitor-published-support-backed",
+      "checker_id": "published-support-backed",
+      "event": "completed",
+      "binding_ids": [
+        "binding-ready-dependency",
+        "binding-response-production"
+      ],
+      "grounding": {
+        "source_ids": [
+          "s-ready-storage",
+          "s-send",
+          "s-follower",
+          "s-storage-writes"
+        ],
+        "expectation_ids": [
+          "s-async-config-contract",
+          "s-ready-contract"
+        ],
+        "binding_ids": [
+          "binding-ready-dependency",
+          "binding-response-production"
+        ],
+        "derivation": "The monitor observes completed operations correlated to produced/admitted events. Independent identity is scenario, phase and the actual producer message endpoints/entry identity; phase distinguishes two deliveries of identical MsgApp. pending_storage is measured with a storage lookup after Step and before Ready. direct_acks counts matching positive MsgAppResp in top-level Ready.Messages. nested_acks and append_entries describe the actual local append messages. A completed event is emitted only after at least one matching response was published and the target entry is observable in storage; otherwise completion_gap leaves the admitted operation unanswered. The primary implication compares direct_acks to zero only when storage was independently pending. A second comparison measures whether each published matching acknowledgment was backed by the exact entry at publication. The stored_retry operation supplies the permitted completion control; no requirement of eventual success under indefinite delay is inferred.",
+        "applicability": "The selected requirement is publication dependency, not a whole-cluster crash-safety result. All matching response publications from the three captured Ready batches are counted, with raw ack_published and ready_observed events retained for review. No result is fabricated from expected protocol behavior. Top-level and attached response fields are actual returned messages.",
+        "unresolved": [
+          "A passing comparison is bounded to these three deliveries and this selected public interface."
+        ],
+        "conflicts": [],
+        "alternatives": [
+          "The library could withhold responses under other inputs; lack of a measured completed response in this driver emits a gap rather than a safety failure."
+        ]
+      },
+      "applicability_conditions": [],
+      "admission_alias": "admitted"
+    }
+  ],
+  "observable_properties": [
+    {
+      "checker_id": "no-immediate-pending",
+      "kind": "event_implication",
+      "trigger": {
+        "field": "event",
+        "op": "eq",
+        "value": "completed",
+        "reference": null
+      },
+      "assertion": {
+        "field": "direct_acks",
+        "op": "eq",
+        "value": 0,
+        "reference": null
+      },
+      "antecedent": {
+        "field": "stored_before_ready",
+        "op": "eq",
+        "value": false
+      },
+      "identity_fields": [
+        "scenario",
+        "phase",
+        "leader",
+        "follower",
+        "entry_index",
+        "entry_term",
+        "message_term"
+      ],
+      "history_field": null,
+      "description": "When the accepted append was still absent from local storage at Ready extraction, no matching positive response may be directly deliverable."
+    },
+    {
+      "checker_id": "published-support-backed",
+      "kind": "event_assertion",
+      "trigger": {
+        "field": "event",
+        "op": "eq",
+        "value": "completed",
+        "reference": null
+      },
+      "assertion": {
+        "field": "all_published_backed",
+        "op": "eq",
+        "value": true,
+        "reference": null
+      },
+      "antecedent": null,
+      "identity_fields": [
+        "scenario",
+        "phase",
+        "leader",
+        "follower",
+        "entry_index",
+        "entry_term",
+        "message_term"
+      ],
+      "history_field": null,
+      "description": "Every matching response published by the three captured batches has the exact acknowledged entry present in storage at publication."
+    }
+  ],
+  "uncertainties": [
+    "Global crash safety, disk durability and client application completion are excluded.",
+    "The synchronous documentation conflict is preserved outside this interface.",
+    "The test covers a static two-voter configuration and a single duplicated entry; other schedules and configurations remain open."
+  ]
+}

@@ -245,10 +245,6 @@ def accept(engine, submission, inputs, operation_id):
 def prepare_submission(engine, submission, inputs, operation_id):
     """Validate on a transaction's state copy; defer every artifact/map write."""
     from .research import global_stop
-    if global_stop(submission.model_dump()) and submission.reason in {'resource_limit','user_stop','tool_gap'}:
-        from .research import stop_record
-        stop_record(engine, submission.model_dump(mode='json'), operation_id)
-        return lambda: None
     if isinstance(submission,CheckSubmission) and submission.candidate:
         outer,inner=submission.feedback,submission.candidate.feedback
         if outer and inner and outer!=inner:raise ValueError('Combined submission has conflicting research feedback')
@@ -518,15 +514,12 @@ def validate_submission(state, root, name, implementation):
         'elapsed_seconds':state.elapsed_seconds,'diagnostics':[],
         'meaning':'Validation against the state and bytes read; this is not acceptance, execution or evidence'}
     try:
+        context.budget.timeout()
         inputs = Inputs(root/'draft')
         raw = inputs.json(name)
         if not isinstance(raw,dict):raise ValueError('A submission must be a JSON object')
-        from .research import global_stop, stop_record
-        if global_stop(raw) and raw.get('reason') in {'resource_limit','user_stop','tool_gap'}:
-            stop_record(context,raw,'preflight')
-        else:
-            product = AuditSubmission.model_validate(raw)
-            prepare_submission(context,product,inputs,'preflight')
+        product = AuditSubmission.model_validate(raw)
+        prepare_submission(context,product,inputs,'preflight')
         result['valid'] = True
     except (OSError,ValueError,KeyError,TypeError,BudgetExhausted) as exc:
         result['diagnostics'] = [d.model_dump(mode='json') for d in submission_diagnostics(exc)]
@@ -728,6 +721,7 @@ def accept_received(engine, draft):
         current['phase'] = 'failed'
         return False
     raw={}
+    engine.budget.timeout()
     try:
         if not result.get('submission'):
             raise ValueError('Completed turn supplied no reviewable submission: ' + result.get('summary', ''))
@@ -736,13 +730,6 @@ def accept_received(engine, draft):
             raw_path.write_bytes(draft_bytes(draft, result['submission']))
         raw = json.loads(raw_path.read_bytes())
         if not isinstance(raw,dict):raise ValueError('A submission must be a JSON object')
-        from .research import global_stop
-        if global_stop(raw) and raw.get('reason') in {'resource_limit','user_stop','tool_gap'}:
-            from .research import stop_record
-            stop_record(engine, raw, operation_id)
-            write_json(archive / 'accepted.json', {'action':'stop','semantic_changes_applied':False})
-            engine.checkpoint('audit_forced_stop')
-            return True
         submission = AuditSubmission.model_validate(raw)
         inputs = Inputs(draft, archive)
         commit_graph(engine, 'submission-' + operation_id, submission.model_dump(mode='json'),
@@ -863,13 +850,10 @@ def execute(engine):
         if not global_stop(state.current_submission):
             from .research import stop_record
             last = state.checks[-1] if state.checks else None
-            reason = ('resource_limit' if engine.budget.remaining() <= 0 or last and last.status == ExecutionStatus.TIMEOUT
+            reason = ('resource_limit' if engine.budget.remaining() <= 0
                 else 'user_stop' if last and last.status == ExecutionStatus.CANCELLED
                 else 'tool_gap' if state.current_submission.get('phase') == 'failed' else stop_cause)
-            stop_record(engine, {'reason':reason, 'rationale':state.stop_reason},
-                state.current_submission.get('operation_id',state.id), controller=True)
-        elif not state.run_stop:
-            state.run_stop=next(s for s in reversed(state.selections) if s.get('action')=='stop')
+            stop_record(engine, reason)
         engine.checkpoint('audit_stopped')
     return state
 

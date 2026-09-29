@@ -138,17 +138,22 @@ def main(argv=None):
         engine = Engine(config, root, implementation, agent, verifier, knowledge)
         with (root / ".run.lock").open("w") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            if args.command == "resume":
-                state = engine.resume(action_timeout=args.action_timeout,repair_attempts=args.repair_attempts,
-                    agent_turn_timeout=args.agent_turn_timeout)
-                if state.framework_revision!=FRAMEWORK_REVISION:
-                    print(state.stop_reason);return 2
-            else:
-                repo = locate_repo(args.repo, config.repo_path)
-                state = engine.start(repo, plan_only=args.command == "plan")
+            try:
+                if args.command == "resume":
+                    state = engine.resume(action_timeout=args.action_timeout,repair_attempts=args.repair_attempts,
+                        agent_turn_timeout=args.agent_turn_timeout)
+                    if state.framework_revision!=FRAMEWORK_REVISION:
+                        print(state.stop_reason);return 2
+                else:
+                    repo = locate_repo(args.repo, config.repo_path)
+                    state = engine.start(repo, plan_only=args.command == "plan")
+            except KeyboardInterrupt:
+                if engine.state is None:raise
+                state = engine.state
             report = render_report(state, root)
         print(f"运行模式：{state.mode}；报告：{report}")
         print(f"停止原因：{state.stop_reason}")
+        if state.run_stop and state.run_stop['reason']=='user_stop':return 130
         return 0 if state.stop_reason.startswith(("No pending", "Plan generated",
             "No further investigation selected", "Scoped stop (", "Snapshot prepared")) else 2
     except (ValueError, FileNotFoundError, BlockingIOError, OSError) as exc:

@@ -159,11 +159,7 @@ def test_pre_obligation_history_search_has_no_invented_claim(tmp_path,tlc,owner)
         return dict(action='review',artifact_id=model,rationale='Review exploratory history only',review_items=[dict(
             target_id=model,aspect='checker_correspondence',status='no_issue_found',source_ids=['code'],
             rationale='The source-derived bounded history proposes a call sequence; it asserts no implementation correctness')]),{}
-    def finish(state):
-        sub,files=stop(state)
-        sub['ref_ids']=[next(c['id'] for c in state['checks'] if c['action']=='model_check')]
-        return sub,files
-    e,repo=engine_for(tmp_path,[question_step if owner=='candidate' else map_step(spec),explore,review_history,finish]);e.verifier=tlc[0]
+    e,repo=engine_for(tmp_path,[question_step if owner=='candidate' else map_step(spec),explore,review_history,stop]);e.verifier=tlc[0]
     state=e.start(repo)
     assert len(state.models)==1,state.current_submission
     assert not state.units and not state.claims and not state.evidence and not state.findings

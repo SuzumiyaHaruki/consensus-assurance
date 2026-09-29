@@ -27,21 +27,58 @@ def test_same_source_answer_can_reduce_current_unknowns(owned_ref,tmp_path):
         assert not diagnostics(e)
 
 
-@pytest.mark.parametrize('prefix',[[],[question_step],[first],[first,check_step(),review_step('disputed')]])
-def test_forced_stop_ignores_malformed_semantics_and_retains_pending(tmp_path,prefix):
-    def forced(state):
-        refs=[c['id'] for c in state['question_candidates']]+[u['id'] for u in state['units']]
-        return dict(action='stop',reason='resource_limit',scope='invalid-scope',rationale='Total time exhausted',
-            ref_ids=refs+refs+['stale'],sources='not a source list',map_path='absent-map',feedback={'answered':'erase dispute'}),{}
-    e,repo=engine_for(tmp_path,prefix+[forced])
+@pytest.mark.parametrize('reason',['user_stop','resource_limit','tool_gap'])
+def test_model_stop_labels_do_not_establish_controller_events(tmp_path,reason):
+    from consensus_assurance.workflow.audit import validate_submission
+    messages=[]
+    def proposed(state):
+        raw=dict(action='stop',reason=reason,scope='run',rationale='The model asks to terminate',
+            ref_ids=[next(c['id'] for c in state['checks'] if c['action']=='exploration')],feedback=feedback(state))
+        draft=e.root/'draft'/'stop.json';draft.write_text(json.dumps(raw))
+        before=e.state.model_dump(mode='json')
+        result=validate_submission(e.state,e.root,draft.name,e.implementation)
+        assert not result['valid'] and e.state.model_dump(mode='json')==before
+        diagnostic=result['diagnostics'][0];messages.append(diagnostic['message'])
+        assert diagnostic['code']=='stop_decision' and diagnostic['details']['reconsider']=='research_decision'
+        assert diagnostic['details']['capacity']['source_investigation']
+        raw['origin']='controller';draft.write_text(json.dumps(raw))
+        assert not validate_submission(e.state,e.root,draft.name,e.implementation)['valid']
+        raw.pop('origin')
+        return raw,{}
+    def proceed(state):
+        assert not state['run_stop'] and all(not c['stagnation'] for c in state['question_candidates'])
+        assert diagnostics(e)[0]['errors']==messages
+        assert state['units'][0]['status']!='checked' and not state['review_issues'][0]['resolved_by']
+        return dict(action='research',feedback=feedback(state),rationale='The isolated exploration failure leaves source investigation available'),{}
+    def fail_locally(state):
+        return dict(action='explore',question='Observe a controlled local tool failure',harness_path='probe.py',
+            rationale='Test that a failed local check does not end research'),{'probe.py':'raise RuntimeError("controlled local failure")\n'}
+    e,repo=engine_for(tmp_path,[first,check_step(),review_step('disputed'),fail_locally,proposed,proceed,stop])
+    e.config.budget.agent_calls=20
     state=e.start(repo)
-    assert state.run_stop['reason']=='resource_limit' and state.run_stop['notes']['diagnostics']
-    assert not diagnostics(e) and state.usage['agent_calls']==len(prefix)+1
-    assert state.run_stop['pending_work']==__import__('consensus_assurance.workflow.research',fromlist=['pending_work']).pending_work(state)
-    assert all(not i.resolved_by for i in state.review_issues)
-    assert all(u.status!='checked' for u in state.units) if len(prefix)!=0 else not state.units
-    raw=list((e.root/'submissions').glob('*/raw.json'))
-    assert any(json.loads(p.read_text()).get('sources')=='not a source list' for p in raw)
+    assert state.run_stop['origin']=='controller' and state.run_stop['reason']=='user_stop'
+    assert state.usage['agent_calls']==7 and not state.review_issues[0].resolved_by
+
+
+@pytest.mark.parametrize('event',['deadline','cancel'])
+def test_controller_interrupt_does_not_require_a_valid_draft(tmp_path,event):
+    from consensus_assurance.workflow.audit import validate_submission
+    def interrupted(state):
+        raw=dict(action='stop',scope='run',reason='insufficient_basis',ref_ids=['code','doc'],
+            rationale='A source boundary is unresolved',frontier_comparison=[dict(ref_ids=[state['units'][0]['id']],
+                next_step='Acquire an external caller contract',actionable=False,rationale='That contract is outside the supplied snapshot')])
+        draft=e.root/'draft'/'stop.json';draft.write_text(json.dumps(raw))
+        assert validate_submission(e.state,e.root,draft.name,e.implementation)['valid']
+        if event=='cancel':
+            draft.write_text('{')
+            return stop(state)
+        e.budget.previous=e.config.budget.total_seconds
+        return '{',{}
+    e,repo=engine_for(tmp_path,[first,interrupted]);e.config.budget.agent_calls=20
+    state=e.start(repo)
+    assert state.run_stop['origin']=='controller' and state.run_stop['reason']==('user_stop' if event=='cancel' else 'resource_limit')
+    assert state.usage['agent_calls']==2 and state.run_stop['pending_work']
+    assert not diagnostics(e) and not state.evidence and not state.run_stop.get('frontier_comparison')
 
 
 def test_independent_consumer_enrichment_keeps_old_artifact_current(tmp_path):

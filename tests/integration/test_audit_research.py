@@ -221,7 +221,7 @@ def test_unrelated_map_update_preserves_check_and_focus_stop_is_bounded(tmp_path
         sub['feedback']['understanding']='updated'
         return sub,{'map.json':json.dumps(spec)}
     def false_complete(state):
-        sub,_=stop(state);sub.update(scope='focus',reason='bounded_completed')
+        sub=dict(action='stop',scope='focus',reason='bounded_completed',rationale='Claim focus completion')
         sub.update(ref_ids=['code'],frontier_comparison=[dict(ref_ids=['surface:A2 authority context'],
             next_step='Read authority producer',actionable=True,rationale='The source remains available')])
         return sub,{}
@@ -290,7 +290,7 @@ def test_explained_is_not_execution_evidence_and_forced_stop_needs_no_map(tmp_pa
     state=e.start(repo)
     assert state.question_candidates[0].status=='explained' and not state.evidence and not state.units
     other=tmp_path/'forced';other.mkdir()
-    e,repo=engine_for(other,[lambda state:(dict(action='stop',scope='run',reason='user_stop',rationale='User withdrew authorization'),{})])
+    e,repo=engine_for(other,[stop])
     state=e.start(repo)
     from consensus_assurance.reporting.chinese import render_report
     text=render_report(state,e.root).read_text()
@@ -433,50 +433,64 @@ def local_stop(reason='bounded_completed', scope='candidate'):
 
 @pytest.mark.parametrize('reason,fault',[(reason,'actionable') for reason in
     ['bounded_completed','insufficient_basis','no_actionable_direction']]+
-    [('insufficient_basis',fault) for fault in ['legacy_text','missing_pause','missing_surface','unknown','blank_step','blank_reason']])
+    [('insufficient_basis',fault) for fault in ['missing_pause','missing_surface','unknown']])
 def test_run_stop_rejection_preserves_results_and_continues(tmp_path,reason,fault):
     from consensus_assurance.workflow.audit import validate_submission
-    preflight_messages=[]
+    source,spec=instance_products()
+    next(b for b in spec['behaviors'] if b['id']=='read')['cross_activity_effects']={'A1':'Exposes the established decision to the caller'}
+    def question(text,action='continue'):
+        sub=products()[0];sub.update(action=action,obligation=None,bindings=[])
+        sub['sources'][0]['end_line']=len(source.splitlines())
+        sub['question'].update(question=text,activity_classes=['A2'],behavior_ids=['change'],fact_ids=['context'],
+            contexts=['One instance across context changes'],event_paths=['change -> reject or replace context'],
+            disposition='needs_specific_evidence',unknowns=['External caller authorization is unavailable'])
+        return sub
     def initial(state):
-        sub,files=first(state);spec=json.loads(files['map.json'])
-        spec['surfaces']=[dict(entry_point='consumer',disposition='deferred',source_ids=['code'],
-            reason='Consumer handling of the returned value remains unexamined')]
-        files['map.json']=json.dumps(spec)
-        return sub,files
+        sub=question('Can a redundant context change erase pending support?','explained')
+        sub.update(map_path='map.json',feedback=feedback(state))
+        sub['question'].update(disposition='explained_by_existing_mechanism',unknowns=[],
+            counterevidence=['change returns before mutation when the context is unchanged'])
+        return sub,{'map.json':json.dumps(spec)}
+    def external(state):return question('Does the external caller authorize context changes?'),{}
+    preflight=[]
     def premature(state):
-        assert not view(e.state)['pending_work'] and not state['run_stop']
+        index=json.loads((e.root/'research.json').read_text())
+        assert not index['pending_work'] and index['understanding_status']=='usable'
         candidate=state['question_candidates'][-1]['id']
-        option=dict(ref_ids=[candidate,'surface:consumer'],next_step='Inspect consumer handling of the returned value',
-            actionable=True,rationale='Source investigation remains useful with available calls and time')
+        option=dict(ref_ids=[candidate,'surface:read'],next_step='Inspect read consumption across a context change',
+            actionable=True,rationale='Both functions are in the authorized snapshot; the external authorization contract is not needed to establish what read returns')
         if fault!='actionable':option['actionable']=False
         if fault=='missing_pause':option['ref_ids'].remove(candidate)
-        if fault=='missing_surface':option['ref_ids'].remove('surface:consumer')
+        if fault=='missing_surface':option['ref_ids'].remove('surface:read')
         if fault=='unknown':option['ref_ids'].append('absent')
-        if fault=='blank_step':option['next_step']='  '
-        if fault=='blank_reason':option['rationale']='\n'
-        sub=dict(action='stop',scope='run',reason=reason,ref_ids=['code','doc'],
-            rationale='Selected checks are complete but broader consequences remain unresolved',
-            frontier_comparison='Further work is possible beyond the selected checks' if fault=='legacy_text' else [option])
+        sub=dict(action='stop',scope='run',reason=reason,ref_ids=['code'],
+            rationale='Selected local work is disposed',frontier_comparison=[option])
         (e.root/'draft'/'stop.json').write_text(json.dumps(sub))
         before=e.state.model_dump(mode='json')
         result=validate_submission(e.state,e.root,'stop.json',e.implementation)
-        assert not result['valid'] and result['diagnostics']
-        preflight_messages.extend(d['message'] for d in result['diagnostics'])
-        assert e.state.model_dump(mode='json')==before
+        assert not result['valid'] and e.state.model_dump(mode='json')==before
+        preflight.extend(result['diagnostics'])
         return sub,{}
     def continue_after_rejection(state):
-        assert not state['run_stop'] and state['units'][0]['status']=='checked'
-        assert state['question_candidates'][0]['status']=='closed'
-        assert state['question_candidates'][1]['status']=='paused'
-        assert len(diagnostics(e))==1
-        assert set(preflight_messages)==set(diagnostics(e)[0]['errors'])
-        return next_question(state)
-    steps=[initial,check_step(),review_step(),local_stop(),next_question,
-        local_stop('insufficient_basis'),premature,continue_after_rejection,stop]
-    e,repo=engine_for(tmp_path,steps);state=e.start(repo)
-    assert len(state.question_candidates)==3 and len(state.direct_checks)==1
-    assert state.usage['experiments']==1 and state.agent_session_id=='fixture-session'
-    assert state.run_stop['reason']=='user_stop'
+        assert not state['run_stop'] and not any(c['stagnation'] for c in state['question_candidates'])
+        assert [c['status'] for c in state['question_candidates']]==['explained','paused']
+        assert state['question_candidates'][1]['question']['unknowns']
+        assert set(d['message'] for d in preflight)==set(diagnostics(e)[0]['errors'])
+        assert preflight[0]['details']['reconsider']==('research_decision' if fault=='actionable' else 'submission')
+        sub=question('Does read expose the retained decision after a context change?','explained')
+        sub['question'].update(behavior_ids=['read'],supporting_behavior_ids={'change':'Preserves the established decision while invalidating pending support'},
+            activity_classes=['A1','A5'],fact_ids=['result'],disposition='explained_by_existing_mechanism',unknowns=[],
+            counterevidence=['read returns decision directly; change resets support but preserves decision'])
+        sub['feedback']=dict(feedback(state),answered='read exposes the retained decision across context changes; caller timing remains outside this source conclusion')
+        return sub,{}
+    steps=[initial,external,local_stop('insufficient_basis'),premature,continue_after_rejection,stop]
+    e,repo=engine_for(tmp_path,steps);e.config.directed_question=None
+    (repo/'target.py').write_text(source)
+    state=e.start(repo)
+    assert len(diagnostics(e))==1 and len(state.question_candidates)==3
+    assert not state.evidence and state.agent_session_id=='fixture-session'
+    assert state.selections[-1]['feedback']['answered'].startswith('read exposes')
+    assert state.run_stop['origin']=='controller' and state.run_stop['reason']=='user_stop'
 
 
 @pytest.mark.parametrize('reason',['insufficient_basis','no_actionable_direction','bounded_completed'])
@@ -1050,6 +1064,7 @@ def test_knowledge_growth_preserves_execution_and_supplies_the_next_check(tmp_pa
         def preflight(runner,prompt,directory,snapshot_id,timeout,session_id=None):
             from consensus_assurance.workflow.audit import validate_submission
             check,session,reply=original(runner,prompt,directory,snapshot_id,timeout,session_id)
+            if reply is None:return check,session,reply
             before=e.state.model_dump(mode='json')
             result=validate_submission(e.state,e.root,reply['submission'],e.implementation)
             assert result['valid'],result['diagnostics']

@@ -187,6 +187,8 @@ class Engine:
         write_json(directory / "result.json", value)
         pending.status = "completed"
         self.checkpoint("action_result_saved")
+        if isinstance(value,dict) and value.get('status')==ExecutionStatus.CANCELLED.value and self.budget.remaining()>0:
+            raise KeyboardInterrupt('User cancelled the running tool; receipt retained')
         return value
 
     def advance(self, stage):

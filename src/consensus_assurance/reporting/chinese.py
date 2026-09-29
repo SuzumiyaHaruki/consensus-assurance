@@ -101,6 +101,8 @@ def render_report(state, root, export_derived=False):
         f'运行 `{state.id}`；模式 {state.mode}/{state.analysis_mode}；实际方法 `{state.framework_revision}`。',
         f'源码 `{state.snapshot.repo}`；提交 `{state.snapshot.commit}`。',
         f'停止原因：{research["stop_reason"]}',
+        '结束类型：'+('控制器记录的'+{'user_stop':'实际取消','resource_limit':'资源边界','tool_gap':'服务／权限／工具中断'}.get(state.run_stop['reason'],'中断')
+            if state.run_stop and state.run_stop.get('origin')=='controller' else 'Agent 提出的研究停止' if state.run_stop else '尚未结束'),
         f'本轮已确认 {confirmed} 项逻辑义务违反；实际目标执行 {state.usage.get("experiments",0)} 次。',
         f'当前预算快照：耗时 {state.elapsed_seconds:.2f} 秒；剩余 {research["capacity"]["remaining_seconds"]:.2f} 秒、{research["capacity"]["remaining"]["agent_calls"]} 次 Agent 调用。',
         f'当前地图 {link(state.audit_spec_path)}；完整状态 {link(root/"state.json")}；研究索引 {link(root/"research.json")}。',
@@ -179,9 +181,10 @@ def render_report(state, root, export_derived=False):
     for item in research['pending_work']:
         reasons=terms(item['reasons']) if item['kind']=='review_issue' and item['id'] not in shown_issues else ''
         lines.append(f'- {link(root/"research.json",item["kind"]+": "+item["id"])}：{reasons}。')
-    if not research['pending_work']:lines.append('无待完成的正式义务或未解决复核问题。')
+    if not research['pending_work']:lines.append('已选工作暂无未完项；这不表示研究前沿已穷尽。')
     lines += ['', '## 研究交接与可选前沿','',
-        '以下是受理时的回答与后续建议；历史“待执行”文字不覆盖上方当前执行结果，也不自动创建任务。']
+        '以下是受理时的回答与后续建议；历史“待执行”文字不覆盖上方当前执行结果，也不自动创建任务。',
+        '当前需比较的开放对象：'+terms(research['frontier']['comparison_refs'])+'；可合并共同障碍，引用齐全不代表研究覆盖。']
     substantive=[s for s in research['handoffs'] if s.get('feedback')]
     recent=(substantive or research['handoffs'])[-1:]
     for handoff in recent:
