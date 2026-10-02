@@ -1,7 +1,5 @@
-import json
 from pathlib import Path
 import pytest
-from consensus_assurance.core.proposals import Bundle
 from consensus_assurance.core.types import ExecutionStatus, Origin
 from consensus_assurance.workflow.artifacts import save_bundle
 from consensus_assurance.adapters.runners.experiment import run_experiment
@@ -118,7 +116,7 @@ def test_F2_normative_revision_executes_new_checker(tlc, prepared):
     correction.grounding.unresolved = []
     from regression_support import declared_changes
     declared_changes(state,correction)
-    apply_feedback(state,state.units[0],overstrong,correction)
+    apply_feedback(state,state.units[0],correction)
     new_model = save_bundle(runner.root,state,state.units[0],correct,PythonBackend(),old_model,'F2 normative correction')
     new_check = verifier.check(runner,new_model,20)
     assert new_check.outcome == 'holds'

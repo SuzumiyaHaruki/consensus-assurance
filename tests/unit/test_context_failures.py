@@ -1,13 +1,10 @@
 """Reproduce the audited controller branches using actual project records."""
 import pytest
-from consensus_assurance.core.proposals import Feedback,GraphPatch,BindingDraft,RelationDraft,UnitDraft,ReviewReply
-from consensus_assurance.core.types import ReviewIssue,SemanticCheck
+from consensus_assurance.core.proposals import Feedback,GraphPatch,BindingDraft,RelationDraft,UnitDraft
 from consensus_assurance.workflow.graph import apply_patch,expand_unit
 from consensus_assurance.workflow.feedback import apply_feedback
 from regression_support import add_reads
-from consensus_assurance.workflow.errors import Blocked
 from consensus_assurance.adapters.storage.snapshot import capture
-from test_graph_mutations import controller
 
 
 def dependency(dependency_prepared):
@@ -36,7 +33,7 @@ def test_new_dependency_requires_executable_scope_continuation(dependency_prepar
 def test_F3_is_possible_before_first_model(dependency_prepared):
     _,state,_,_=dependency_prepared;u=state.units[0]
     f=Feedback(kind='F3',rationale='Inspect an actual dependency before building',evidence_ids=[state.materials[0].id],target_ids=[u.id],relation_ids=['input_dependency'],new_basis='')
-    result=apply_feedback(state,u,None,f)
+    result=apply_feedback(state,u,f)
     assert result.previous_id==u.id
 
 

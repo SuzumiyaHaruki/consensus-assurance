@@ -1,219 +1,266 @@
+"""Human reading view of retained conclusions; never executes or repairs research state."""
+import json
+from datetime import datetime
 from pathlib import Path
+from urllib.parse import quote
 from consensus_assurance.core.types import ExecutionStatus
+from consensus_assurance.workflow.research import view
+from consensus_assurance.workflow.prompts import manifest
 
-STATUS = {"completed": "正常完成", "error": "执行错误", "timeout": "超时", "tool_missing": "工具缺失",
-    "login_required": "需要登录", "quota_exhausted": "额度不足", "cancelled": "取消", "running": "执行中", "not_scheduled": "未调度"}
-OUTCOME = {"holds": "有限范围搜索完成，无反例", "counterexample": "找到模型反例", "tests_passed": "所执行测试通过",
-    "tests_failed": "所执行测试失败", "deadlock": "模型死锁诊断，性质检查未完成", "unknown": "结果未确定", "not_applicable": "不适用"}
 
-PROBES = {
-    "agent_probe": "Codex 版本检查", "agent_capabilities": "Codex 参数检查",
-    "java_probe": "Java 版本检查", "verifier_probe": "验证工具启动检查",
-    "implementation_tool_probe": "目标工具链版本检查", "implementation_probe": "目标工具链版本检查",
-}
+OUTCOME = {'holds':'有限检查未见违反', 'violated':'观察到违反', 'counterexample':'找到模型反例',
+    'tests_passed':'所执行测试通过', 'tests_failed':'所执行测试失败', 'deadlock':'模型死锁诊断，性质检查未完成',
+    'unknown':'结果未确定', 'not_applicable':'不适用'}
+DISPOSITIONS = {'confirmed_in_scope':'已确认违反', 'bounded_no_violation':'有限检查未见违反', 'investigation_lead':'待调查线索'}
 
 
 def execution_summary(check):
-    """Describe recorded outputs without promoting them to accepted analysis or proof."""
     complete = check.status == ExecutionStatus.COMPLETED and check.exit_code in (0, None)
-    if check.action=='model_syntax':
-        return '模型模块语法解析', ('SANY 解析完成；配置另由 TLC 检查' if check.status==ExecutionStatus.COMPLETED and check.outcome=='not_applicable' else '解析未完成，见原始诊断'), '不适用：未检查性质或实际轨迹'
-    if check.action=='verifier_probe' and 'capability_available' in check.parameters:
-        product='版本帮助已识别，工具可用' if check.parameters['capability_available'] else '工具能力检查未就绪'
-        return PROBES[check.action],product+'；命令退出码 '+str(check.exit_code),'不适用：未检查性质'
-    if check.action in PROBES:
-        product = "命令完成；版本或能力详情见原始输出" if complete else "环境检查未成功完成"
-        return PROBES[check.action], product, "不适用：未检查性质"
-    if check.action == "agent_turn":
-        product = ("Codex 调查已返回；回执待修订：" + check.parameters['agent_response_error']
-            if check.parameters.get('agent_response_error') else
-            "Agent 回执已保存；产物另经校验" if complete else "Agent 调用未完成：" + check.reason)
-        return "Codex 调查", product, "不属于性质证据"
-    if check.action == "reachability":
-        return "审计问题触发可达性", "见触发记录；辅助反例只表示触发可达", "不属于协议违反证据"
-    if check.action == "trace_calibration":
-        return "有限观测轨迹校准", "校准状态见下方模型记录", "轨迹兼容不等于性质成立或违反"
-    if check.action=='direct_check':
-        return '直接实现检查', '实际执行完成；性质判定见监视器记录' if complete else '执行失败或未完成，不能当作性质失败', '限于已观测前提和结果；不自动提升为目标结论'
-    if check.action in {"capability_probe", "experiment", "replay", "direct_check"}:
-        task = "现有测试与实验能力探测" if check.action == "capability_probe" else "实现实验 / 重放"
-        product = OUTCOME[check.outcome] if check.outcome != "unknown" else "执行未产生可判定的测试结果"
-        return task, product, "仅限实际测试覆盖；不自动证明目标或确认违反"
-    product = OUTCOME[check.outcome]
-    return check.action, product, ("性质检查未完成或无法归属" if check.outcome == "unknown" else "限于实际 checker 和模型范围；详见逐项结果")
+    if check.action == 'model_syntax':
+        return '模型模块语法解析', 'SANY 解析完成' if complete else '解析未完成', '未检查性质或实际轨迹；TLC 配置另行检查'
+    if 'probe' in check.action or check.action == 'agent_capabilities':
+        return '环境／能力检查', '工具可用' if check.parameters.get('capability_available',complete) else '工具未就绪', '未检查性质'
+    if check.action == 'agent_turn':
+        return 'Agent 调查', 'Agent 回执已保存；产物另经校验' if complete else 'Agent 调用未完成', '不属于性质证据'
+    if check.action == 'exploration':
+        return '条件探索', '条件观察完成' if complete else '探索执行失败或未完成', '没有正式性质判定'
+    if check.action in {'direct_check','experiment','replay'}:
+        return ('直接实现检查' if check.action == 'direct_check' else '探索／实现执行',
+            '执行完成；比较见 assessment' if complete else '执行失败或未完成', '进程退出码不等于性质判定')
+    if check.action == 'reachability':
+        return '触发可达性检查', OUTCOME[check.outcome], '辅助反例不属于协议违反证据'
+    if check.action == 'trace_calibration':
+        return '轨迹校准', OUTCOME[check.outcome], '轨迹兼容不等于性质成立或违反'
+    if check.action == 'model_check':
+        return check.action, ('执行超时；' if check.status == ExecutionStatus.TIMEOUT else '')+OUTCOME[check.outcome], '性质检查未完成或无法归属' if check.outcome == 'unknown' else '限于实际 checker 和模型范围'
+    return check.action, check.status.value, '未分类执行；不推断性质结果'
 
 
-def export_views(state, root, derived=False):
-    from consensus_assurance.adapters.storage.files import write_json
-    from consensus_assurance.workflow.audit_spec import load, audit_progress
-    from consensus_assurance.workflow.research import current_view, view
-    from consensus_assurance.core.config import Config
-    from consensus_assurance.registry import EXECUTION_BACKENDS
-    if derived:
-        write_json(root/'materials.json',[m.model_dump(mode='json') for m in state.materials])
-        write_json(root/'graph.json',{'version':state.graph_version,
-            **{name:[x.model_dump(mode='json') for x in getattr(state,name)] for name in ('claims','bindings','relations')}})
-        spec=load(state)
-        if spec:write_json(root/'audit-spec.json',spec)
-        write_json(root/'audit-progress.json',audit_progress(state))
-        write_json(root/'plan.json',{'units':[u.model_dump(mode='json') for u in state.units],'selections':state.selections})
-    config=Config.model_validate(state.config)
-    implementation=EXECUTION_BACKENDS[config.execution_backend](config.target,config.budget.action_timeout)
-    context=current_view(state,root,implementation)
-    write_json(root/'research.json',context)
-    return view(state)
+def excerpt(text, limit=230):
+    """An explicitly labelled excerpt is navigation, never a shortened condition."""
+    return text if len(text) <= limit else text[:limit].rsplit(' ',1)[0] + '…'
 
 
-def render_report(state, root, export_derived=False):
-    root=Path(root)
-    research=export_views(state,root,derived=export_derived)
-    from urllib.parse import quote
-    from consensus_assurance.workflow.audit_spec import load, audit_object_index
-    from consensus_assurance.core.types import ConsensusAuditSpec
-    def link(value,label=None):
-        if not value:return '无'
-        path=Path(value);label=label or path.name
-        if not path.exists():return f'`{label}`（路径未保存）'
-        target=path.relative_to(root) if path.is_relative_to(root) else path
-        return f'[{label}]({quote(str(target))})'
-    def terms(values):return '；'.join(str(x) for x in values) or '无'
-    def mapping(version):return root/'audit-spec'/f'v{version}.json'
-    maps={state.audit_spec_version:load(state)}
-    def objects(ids,version):
-        if version not in maps and mapping(version).is_file():
-            maps[version]=ConsensusAuditSpec.model_validate_json(mapping(version).read_text())
-        index=audit_object_index(maps.get(version))
-        return terms(link(mapping(version),id)+': '+str(index.get(id,{}).get('meaning') or index.get(id,{}).get('trigger') or index.get(id,{}).get('purpose') or id) for id in ids)
-    materials={m.id:m for m in state.materials}
-    def sources(ids):
-        entries=[]
-        for id in ids:
-            m=materials.get(id)
-            if not m:entries.append(f'`{id}`');continue
-            path=root/'source'/m.file
-            if state.snapshot.files.get(m.file)!=m.content_digest or not path.is_file():path=root/'state.json'
-            entries.append(link(path,f'{id} · {m.file}:{m.start_line}–{m.end_line}'))
-        return terms(entries)
-    dispositions={'confirmed_in_scope':'已确认违反','bounded_no_violation':'有限检查未见违反','investigation_lead':'待调查线索'}
-    results=research['conclusions']
-    confirmed=sum(r['disposition']=='confirmed_in_scope' for r in results)
-    lines=['# 共识实现持续审计报告','',
-        f'运行 `{state.id}`；模式 {state.mode}/{state.analysis_mode}；实际方法 `{state.framework_revision}`。',
-        f'源码 `{state.snapshot.repo}`；提交 `{state.snapshot.commit}`。',
-        f'停止原因：{research["stop_reason"]}',
-        '结束类型：'+('控制器记录的'+{'user_stop':'实际取消','resource_limit':'资源边界','tool_gap':'服务／权限／工具中断'}.get(state.run_stop['reason'],'中断')
-            if state.run_stop and state.run_stop.get('origin')=='controller' else 'Agent 提出的研究停止' if state.run_stop else '尚未结束'),
-        f'本轮已确认 {confirmed} 项逻辑义务违反；实际目标执行 {state.usage.get("experiments",0)} 次。',
-        f'当前预算快照：耗时 {state.elapsed_seconds:.2f} 秒；剩余 {research["capacity"]["remaining_seconds"]:.2f} 秒、{research["capacity"]["remaining"]["agent_calls"]} 次 Agent 调用。',
-        f'当前地图 {link(state.audit_spec_path)}；完整状态 {link(root/"state.json")}；研究索引 {link(root/"research.json")}。',
-        '', '## 问题与实际结果','']
-    import json
+def cell(value):
+    text = json.dumps(value,ensure_ascii=False) if not isinstance(value,str) else value
+    return text.replace('|','\\|').replace('\n','<br>').replace('`','&#96;')
+
+
+class Archive:
+    """Resolve only saved run-relative records, including after moving the archive."""
+    def __init__(self, state, root):
+        self.root = Path(root).resolve()
+        self.original = [Path(state.audit_spec_path).parent.parent] if state.audit_spec_path else []
+        self.original += [Path(c.stdout).parent.parent.parent for c in state.checks if c.stdout and Path(c.stdout).parent.parent.name == 'logs']
+
+    def path(self, value):
+        if not value:return None
+        path = Path(value)
+        if path.is_absolute():
+            base = next((p for p in [self.root,*self.original] if path.is_relative_to(p)),None)
+            if base is None:return None
+            path = path.relative_to(base)
+        path = self.root / path
+        return path if path.resolve().is_relative_to(self.root) and path.is_file() else None
+
+    def link(self, value, label):
+        path = self.path(value)
+        return f'[{cell(label)}]({quote(path.relative_to(self.root).as_posix())})' if path else f'{cell(label)}（归档字节缺失）'
+
+    def read(self, value):
+        path = self.path(value)
+        return json.loads(path.read_text()) if path else {}
+
+
+def report_view(state, archive):
+    path = archive.path(f'audit-spec/v{state.audit_spec_version}.json')
+    if path and archive.read(path).get('version') != state.audit_spec_version:path = None
+    return view(state.model_copy(update={'audit_spec_path':str(path) if path else None}))
+
+
+def observation_lines(record, artifact, check, archive, event_cache):
+    """Select recorded comparisons and operands; never re-assess or invent an oracle."""
     from consensus_assurance.adapters.runners.experiment import extract_events
-    for result in results:
-        lines += [f'- **{dispositions[result["disposition"]]}**：{result["description"]}',
-            f'  适用范围：{result["scope"]["description"]}；必要条件：{terms(result["scope"]["assumptions"])}。']
-        if result['blockers']:lines.append('  当前争议／阻塞：'+terms(result['blockers']))
-        for record in research['assessments']:
-            if record.get('claim_id')!=result['claim_id']:continue
-            check=next(c for c in state.checks if c.id==record['experiment_check_id'])
-            artifact=next(a for a in state.direct_checks+state.models if a.id==(record.get('direct_check_id') or record.get('model_id')))
-            review_status=record.get('correspondence') or '待复核'
-            lines.append(f'  Unit `{artifact.unit_id}`／当前制品 v{artifact.version} `{artifact.id}`：执行 {check.status.value}；机械比较 {record["outcome"]}；对应性复核 {review_status}；完整处置 {record.get("reviewed_complete",False)}。')
-            events=extract_events(check)
-            indices=sorted({i for prop in record['properties'] for i in prop.get('valid_witness_indices',[])})
-            for i in indices[:1]:
-                if i<len(events):lines.append('  实际观测：`'+json.dumps(events[i],ensure_ascii=False)+'`。')
-            lines.append(f'  {link(record.get("raw_log"),"原始观察")}；{link(root/"logs"/check.id/"check.json","执行记录")}。')
-        lines += ['', '<details><summary>实验条件、固定制品与对应性复核</summary>','',
-            f'正确性要求（Obligation）`{result["claim_id"]}`；候选 `{result["candidate_id"]}`。']
-        for candidate in research['candidates']:
-            if candidate['id']!=result['candidate_id']:continue
-            q=candidate['question']
-            lines += [f'调查问题（Candidate）`{candidate["id"]}`：调查状态 {candidate["status"]}；问题：{q["question"]}',
-                f'来源：{sources(q["source_ids"])}；反证／保护：{terms(q["counterevidence"])}。',
-                f'问题中保存的语义未知（执行进度以上述记录为准）：{terms(q["unknowns"])}；恢复条件：{terms(candidate["resume_conditions"])}。']
-        artifacts=[a for a in research['artifacts'] if a.get('claim_id')==result['claim_id'] or any(
-            c.get('claim_id')==result['claim_id'] for c in a.get('checkers',[]))]
-        for artifact in artifacts:
-            lines.append(f'检查制品（Check）`{artifact["id"]}` v{artifact["version"]}：{link(artifact.get("plan_path") or artifact.get("bundle_path"))}；{link(artifact.get("harness_path"),"测试源码")}。')
-            if artifact.get('previous_id'):lines.append(f'旧版本 `{artifact["previous_id"]}` 的固定输入、观察和争议保留于 {link(root/"state.json","历史记录")}。')
-        for review in state.semantic_reviews:
-            for item in review.items:
-                if item.target_id not in {a['id'] for a in artifacts}:continue
-                lines.append(f'复核 `{review.id}`／{item.aspect}：{item.status}；{item.rationale}；来源：{sources(item.source_ids)}；补充说明：{terms(item.limitations)}。')
-        lines += [f'范围排除：{terms(result["scope"]["excluded"])}；具体前史、适配与条件见固定计划和上述复核。','', '</details>','']
-    for candidate in research['candidates']:
-        if candidate['results']:continue
-        q=candidate['question']
-        lines += [f'- 调查问题（Candidate）`{candidate["id"]}`：{candidate["status"]}；{q["question"]}',
-            f'  来源：{sources(q["source_ids"])}；反证：{terms(q["counterevidence"])}；保存的语义未知：{terms(q["unknowns"])}；恢复条件：{terms(candidate["resume_conditions"])}。']
-    lines += ['', '## 双主线理解','',
-        f'理解状态：{research["understanding_status"]}；当前目标：{research["next_objective"]["action"]}（{research["next_objective"]["boundary"]}）。']
-    overview=research['core_overview']
-    if overview:
-        lines.append(f'地图 v{state.audit_spec_version} 保存时的实现认识；当前检查和结论见上方实际结果。')
+    plan = archive.read(artifact.get('plan_path'))
+    if not plan:return ['模型／缺失制品的观察请按固定 assessment 和原始输出审查。']
+    if check.id not in event_cache:
+        event_cache[check.id] = extract_events(check.model_copy(update={'stdout':str(archive.path(check.stdout) or '')}))
+    events = event_cache[check.id]
+    lines = []
+    for prop in record.get('properties',[]):
+        spec = next((p for p in plan['observable_properties'] if p['checker_id'] == prop['checker_id']),{})
+        indices = prop.get('evaluated_indices',[])
+        witnesses = prop.get('valid_witness_indices',[])
+        lines += [f'固定比较 `{cell(prop["checker_id"])}`：{OUTCOME.get(prop["outcome"],prop["outcome"])}；'
+            f'已比较 {len(indices)} 项，完整见证 {len(witnesses)} 项，缺失 {len(prop.get("missing_indices",[]))} 项。', '']
+        if prop.get('limitations'):lines += ['观察缺口：'+'；'.join(prop['limitations']), '']
+        requested = dict.fromkeys(indices+prop.get('missing_indices',[]))
+        selected = {i:events[i] for i in requested if 0 <= i < len(events)}
+        if len(selected) != len(requested):lines.append('部分归档事件缺失；不补造观察。')
+        if not selected:continue
+        fields = dict.fromkeys(spec.get('identity_fields',[]) + [p['field'] for p in
+            (spec.get('trigger'),spec.get('antecedent'),spec.get('assertion')) if p])
+        # Small scalar records remain readable; complex representations stay in the raw log.
+        rows = {}
+        for i,event in selected.items():
+            values = {}
+            aliases = prop.get('correlations',{}).get(str(i),{}).get('alias_indices',{})
+            for prerequisite in plan['harness'].get('prerequisites',[]):
+                index = aliases.get(prerequisite['alias'])
+                for condition in prerequisite['conditions']:
+                    value = events[index] if isinstance(index,int) and 0 <= index < len(events) else {}
+                    for part in condition['field'].split('.'):
+                        value = value.get(part,'未记录') if isinstance(value,dict) else '未记录'
+                    values[prerequisite['alias']+'.'+condition['field']] = value
+            for key,value in event.items():
+                if key.startswith('_ca_') or key == 'event':continue
+                if isinstance(value,dict):
+                    values.update({key+'.'+k:v for k,v in value.items() if not isinstance(v,(dict,list))})
+                elif not isinstance(value,list):values[key] = value
+            for key in values:fields.setdefault(key,None)
+            rows[i] = values
+        lines += ['| 记录字段 | '+' | '.join(f'观察 {n+1}'+('（违反见证）' if i in witnesses else '（未完成）' if i not in indices else '') for n,i in enumerate(selected))+' |',
+            '| --- | '+' | '.join('---' for _ in selected)+' |']
+        for key in fields:
+            lines.append('| '+cell(key)+' | '+' | '.join(cell(rows[i].get(key,'未记录')) for i in selected)+' |')
+        correlations = prop.get('correlations',{})
+        lines += ['', '前提关联：'+'；'.join(f'观察 {n+1} → '+cell(correlations.get(str(i),{}).get('status','未记录'))
+            for n,i in enumerate(selected))+'。嵌套结构、前提原值及编码数据见原始观察；不猜测解码。', '']
+    return lines
+
+
+def render_report(state, root):
+    archive = Archive(state,root)
+    research = report_view(state,archive)
+    link = archive.link
+    map_link = link(research['audit_spec_path'],f'地图 v{state.audit_spec_version}：概览、Behavior／Fact 与来源')
+    checks = {c.id:c for c in state.checks}
+    artifacts = {a['id']:a for a in research['artifacts']}
+    results = sorted(research['conclusions'],key=lambda r:(list(DISPOSITIONS).index(r['disposition']),
+        ['consensus_safety','bounded_liveness','implementation_semantics'].index(r['concern'])))
+    reviews = {r.id:r for r in state.semantic_reviews}
+    event_cache = {}
+    config, capacity = state.config, research['capacity']
+    formal = [c for c in state.checks if c.action == 'direct_check']
+    explorations = [c for c in state.checks if c.action == 'exploration']
+    failures = [c for c in formal+explorations if c.status != ExecutionStatus.COMPLETED or c.exit_code not in (0,None)]
+    explained = [c for c in research['candidates'] if c['status'] == 'explained' and not c['results']]
+    stop = state.run_stop
+    stop_label = ({'user_stop':'实际取消','resource_limit':'资源边界','tool_gap':'服务／权限／工具中断'}.get(stop.get('reason'),'中断')
+        if stop.get('origin') == 'controller' else {'insufficient_basis':'研究依据不足','bounded_completed':'所声明范围完成',
+        'no_actionable_direction':'未选择可推进方向'}.get(stop.get('reason'),'研究停止')) if stop else '尚未结束'
+    lines = ['# 共识审计研究报告', '', '## 运行概览', '',
+        f'审计目标 **{cell(config.get("target",{}).get("variant") or Path(state.snapshot.repo).name)}**。'
+        f'本轮有 {len(results)} 项已产生观察的正式问题：'+ '、'.join(f'{label} {sum(r["disposition"]==key for r in results)} 项' for key,label in DISPOSITIONS.items())+
+        f'；另有源码解释 {len(explained)} 项、探索执行 {len(explorations)} 次。正式义务共 {len(state.claims)} 项，执行次数不等于问题数。', '',
+        f'实际持续 **{state.elapsed_seconds/60:.2f} 分钟**；结束类型：**'+('控制器记录的' if stop.get('origin') == 'controller' else 'Agent 提出的' if stop else '')+stop_label+'**。',
+        f'剩余 {capacity["remaining_seconds"]:.2f} 秒、{capacity["remaining"]["agent_calls"]} 次 Agent 调用、'
+        f'{capacity["remaining"]["experiments"]} 次控制器目标执行。源码调查能力：'+('仍有预算' if capacity['source_investigation'] else '无剩余预算')+'。', '',
+        '| 资源 | 配置 | 已用 | 剩余 |', '| --- | ---: | ---: | ---: |',
+        f'| 总时间（秒） | {config["budget"]["total_seconds"]} | {state.elapsed_seconds:.2f} | {capacity["remaining_seconds"]:.2f} |']
+    for key,label in [('agent_calls','Agent 调用'),('experiments','控制器目标执行'),('audit_units','新 Unit'),('semantic_reviews','语义复核'),('revisions','修订'),('model_checks','模型工具')]:
+        enabled = config.get('verifier_backend','none') != 'none' if key == 'model_checks' else config.get('allow_experiments',False) and config.get('execution_backend','none') != 'none' if key == 'experiments' else True
+        lines.append(f'| {label} | {config["budget"].get(key,0)} | {state.usage.get(key,0)} | '+(str(capacity['remaining'][key]) if enabled else '未启用')+' |')
+    lines += ['', f'目标执行组成：正式检查 {len(formal)} 次＋探索 {len(explorations)} 次，其中失败／未完成 {len(failures)} 次；失败和重试照常计数。'
+        '会话内本地试跑不属于此控制器计数；总时间不叠加内部工具耗时，缺失 token 用量保持未知。',
+        f'模型检查：{config.get("verifier_backend") if config.get("verifier_backend","none") != "none" else "保留实际模型执行记录" if state.models else "未使用 TLA+／TLC"}。'
+        '新 Unit 入场能力不保证剩余额度足够完成检查与复核。', '',
+        f'元数据：源码 `{state.snapshot.commit or state.snapshot.id}`；实际方法 `{state.framework_revision}`；展示版本 `{manifest()["version"]}`；'
+        f'模式 {state.mode}/{state.analysis_mode}；执行后端 `{config.get("execution_backend","none")}`／包 `{config.get("target",{}).get("execution_package",".")}`；'
+        f'模型 `{config.get("agent_model") or "默认"}`／`{config.get("agent_reasoning_effort") or "默认"}`。重新渲染不代表重新审计。', '',
+        '停止依据（记录摘录）：'+excerpt(stop.get('rationale') or state.stop_reason,190)+'；'+link('state.json','完整停止记录')+'。', '',
+        '## 主要结果', '', '| 问题 | 当前结果 | 实际回答摘录 | 证据 |', '| --- | --- | --- | --- |']
+    entries = []
+    rows = {key:[] for key in DISPOSITIONS}
+    for n,result in enumerate(results,1):
+        records = [r for r in research['assessments'] if r.get('claim_id') == result['claim_id']]
+        items = [item for record in records for rid in record.get('review_ids',[]) if rid in reviews for item in reviews[rid].items
+            if item.target_id == (record.get('direct_check_id') or record.get('model_id')) and
+            reviews[rid].target_versions.get(item.target_id) == artifacts[item.target_id]['version']]
+        title = next((i.report_title for i in reversed(items) if i.report_title),None)
+        title = title or excerpt(result['question'] or result['description'],130)+'（原文摘录）'
+        review_operations = {reviews[rid].check_id for record in records for rid in record.get('review_ids',[]) if rid in reviews}
+        feedback = next((s.get('feedback',{}) for s in reversed(state.selections) if s['operation_id'] in review_operations),{})
+        answer = next((i.report_answer for i in reversed(items) if i.report_answer),None) or feedback.get('answered')
+        entries.append((result,records,answer,title))
+        rows[result['disposition']].append(f'| {n}. {cell(title)} | {DISPOSITIONS[result["disposition"]]} | {cell(excerpt(answer,170)) if answer else "见下方固定观察"} | {link("state.json",result["claim_id"])} |')
+    lines += rows['confirmed_in_scope']+rows['bounded_no_violation']
+    for c in explained:lines.append(f'| {cell(excerpt(c["question"]["question"],130))} | 源码解释，未经性质执行 | {cell(excerpt("；".join(c["question"]["counterevidence"]),170))} | {link("state.json","候选记录")} |')
+    lines += rows['investigation_lead']
+    for n,(result,records,answer,title) in enumerate(entries,1):
+        scope = result['scope']
+        lines += ['', f'### {n}. {title}', '', f'**{DISPOSITIONS[result["disposition"]]}**。要求原文：{result["description"]}', '',
+            '决定性范围：'+scope['description'], '；'.join(scope['assumptions'])+'。' if scope['assumptions'] else '',
+            '范围参数：'+cell(scope['parameters']) if scope['parameters'] else '',
+            '排除：'+'；'.join(scope['excluded'])+'。' if scope['excluded'] else '']
+        if answer:lines += ['', '本次回答（沿用复核文案；无中文摘要时保留原文，判定与数值以下方记录为准）：'+answer]
+        if result['blockers']:lines += ['', '当前争议／阻塞：'+'；'.join(result['blockers'])]
+        for record in records:
+            artifact = artifacts[record.get('direct_check_id') or record.get('model_id')]
+            check = checks[record['experiment_check_id']]
+            lines += ['', f'制品 v{artifact["version"]}；机械比较 **{OUTCOME.get(record["outcome"],record["outcome"])}**；'
+                f'对应性复核 {record.get("correspondence") or "待复核"}；独立场景完整处置：{record.get("reviewed_complete",False)}。',
+                '；'.join([link(artifact.get('harness_path') or artifact.get('path'),'固定测试／模型'),
+                    link(artifact.get('plan_path') or artifact.get('bundle_path'),'条件与检查器'),link(check.stdout,'原始观察'),
+                    link(str(Path(artifact.get('plan_path') or artifact.get('bundle_path')).parent / (check.id+'-assessment.json')),'assessment'),
+                    *[link(f'submissions/{reviews[rid].check_id}/accepted.json','对应性复核') for rid in record.get('review_ids',[]) if rid in reviews]]), '']
+            lines += observation_lines(record,artifact,check,archive,event_cache)
+            from consensus_assurance.workflow.reviews import lineage
+            ancestors=lineage(state,next(a for a in state.direct_checks+state.models if a.id==artifact['id']))
+            old = [c for c in failures if c.direct_check_id in ancestors or c.model_id in ancestors]
+            for failed in old:lines.append('该问题保留的失败执行：'+link(failed.stdout,'原始失败')+'；'+link(failed.stderr,'诊断')+'。旧失败不覆盖当前结果。')
+    for artifact in research['artifacts']:
+        if 'bundle_path' not in artifact:continue
+        searches = [c for c in state.checks if c.model_id == artifact['id'] and c.action in {'model_check','model_syntax'}]
+        lines += ['', '局部模型（与实现证据独立）：'+link(artifact['bundle_path'],'固定模型制品')+'；'+link(artifact['path'],'模型行为')]
+        for c in {c.action:c for c in searches}.values():lines.append('- '+'；'.join(execution_summary(c))+'；'+link(c.stdout,'实际输出')+'；'+link(c.stderr,'诊断'))
+    lines += ['', '## 研究过程与认识增长', '',
+        'A1 共识形成与推进、A2 上下文／权威转换及其连接由双主线概览导航；地图条目和检查数量不是责任覆盖率。',
+        map_link+'。']
+    if research['core_overview']:
         for key,label in [('formation','共识形成与推进'),('context','上下文／权威转换'),('connection','两条主线的连接')]:
-            part=overview[key]
-            lines += [f'- **{label}**：{part["explanation"]}',
-                f'  行为：{objects(part["behavior_ids"],state.audit_spec_version)}。',
-                f'  事实：{objects(part["fact_ids"],state.audit_spec_version)}。来源：{sources(part["source_ids"])}。']
-        lines.append(f'判断依据：{overview["rationale"]}；核心断点：{terms(overview["core_gaps"])}；该版本保留的细节：{terms(overview["open_details"])}。')
-    elif not state.audit_spec_path:lines.append('理解尚未登记；未受理草稿不是证据。')
-    if research['understanding_status']!='usable' and research['next_objective']['boundary']!='user_directed':
-        lines.append('双主线初始理解尚未完成；已保存片段不等于可以开始默认集中调查。')
-    lines += ['', '## 本轮理解变化','']
-    for change in research['understanding_changes']:
-        version=change['version'];operation=change['operation_id']
-        lines.append(f'- {link(mapping(version),"地图 v"+str(version))}：{link(root/"graph-commits"/f"submission-{operation}.json","受理差异与历史状态")}。')
-        for id,delta in change['delta'].items():
-            kind='新增' if not delta['before'] else '移除' if not delta['after'] else '修正／增补'
-            fields=[k for k in delta['before'].keys()|delta['after'].keys() if delta['before'].get(k)!=delta['after'].get(k)]
-            declaration=change['explanations'].get(id,{})
-            lines.append(f'  {kind} `{id}`（{terms(sorted(fields))}）：{declaration.get("rationale","新登记的实现认识")}；{sources(declaration.get("source_ids",[]))}。')
-        for id,effects in change['effects'].items():
-            for effect in effects:
-                label='待核实' if effect['status']=='challenged' else '原范围保留'
-                lines.append(f'  候选 `{id}`／{effect["object_id"]}：{label}；{effect["reason"]}。')
-    for draft in research['drafts']:
-        lines.append(f'- 未受理稿 `{draft["draft_id"]}`：{draft["draft_status"]}；{draft["rationale"]}；{link(draft.get("raw_path"),"完整原稿")}。')
-    lines += ['', '## 当前待办','']
-    shown_issues={id for record in research['assessments'] for id in record.get('open_issue_ids',[])}
-    for item in research['pending_work']:
-        reasons=terms(item['reasons']) if item['kind']=='review_issue' and item['id'] not in shown_issues else ''
-        lines.append(f'- {link(root/"research.json",item["kind"]+": "+item["id"])}：{reasons}。')
-    if not research['pending_work']:lines.append('已选工作暂无未完项；这不表示研究前沿已穷尽。')
-    lines += ['', '## 研究交接与可选前沿','',
-        '以下是受理时的回答与后续建议；历史“待执行”文字不覆盖上方当前执行结果，也不自动创建任务。',
-        '正常停止至少需说明的对象：'+terms(research['frontier']['comparison_refs'])+'；完整关系导航见研究索引，不限于此集合。']
-    substantive=[s for s in research['handoffs'] if s.get('feedback')]
-    recent=(substantive or research['handoffs'])[-1:]
-    for handoff in recent:
-        answer=handoff.get('feedback',{})
-        lines += [f'- 最近交接 `{handoff["operation_id"]}`：{handoff["rationale"]}',
-            f'  已回答：{answer.get("answered","见交接理由")}；可选下一判别：{terms(answer.get("remaining",[]))}。']
-        for ref in answer.get('ref_ids',[]):
-            check=next((c for c in state.checks if c.id==ref),None)
-            lines.append('  依据：'+(link(check.stdout,ref) if check else sources([ref])))
-    if len(research['handoffs'])>1:
-        lines += ['', '<details><summary>历史交接（记录时说明）</summary>','']
-        for handoff in research['handoffs']:
-            if handoff in recent:continue
-            answer=handoff.get('feedback',{})
-            lines.append(f'- `{handoff["operation_id"]}`：{answer.get("answered",handoff["rationale"])}；当时后续：{terms(answer.get("remaining",[]))}。')
-        lines += ['', '</details>','']
-    lines += [f'当前前沿与预算：{link(root/"research.json")}。地图条目和已检查 Unit 数不是责任覆盖率。',
-        '', '## 日志、原稿与恢复记录','',
-        f'CLI 调用 {state.usage.get("agent_calls",0)} 次；目标执行 {state.usage.get("experiments",0)} 次；耗时 {state.elapsed_seconds:.2f} 秒。',
-        f'工具版本、实际 usage、修订和历史判断：{link(root/"state.json")}；正式调用及修复成本：{link(root/"research.json")}。退稿包含有效调查，不能全部视作浪费。']
-    if state.current_submission.get('phase')=='received':
-        receipt=root/'submissions'/state.current_submission['operation_id']
-        lines.append(f'回执未受理：{link(receipt/"raw.json","原稿")}；{link(receipt/"inputs","声明文件")}。保存字节不产生结论或 Evidence。')
-    for check in state.checks:
-        label,result,boundary=execution_summary(check)
-        lines.append(f'- `{check.id}` {label}：{result}；{boundary}；{link(check.stdout,"stdout")}；{link(check.stderr,"stderr")}；期限 {check.parameters.get("timeout_limit","未记录")}／{check.parameters.get("timeout_seconds","未记录")} 秒。')
-    for diagnostic in sorted((root/'submissions').glob('*/diagnostics.json')):
-        lines.append(f'- 原稿诊断：{link(diagnostic.parent/"raw.json","原稿")}；{link(diagnostic,"诊断")}。受理与修正状态见当前记录。')
-    lines += ['- '+gap for gap in dict.fromkeys(state.gaps)]
-    lines.append(f'实际方法路径：{terms(state.method_paths)}。模型轨迹和脚本化产品不构成实现确认或自主发现。')
-    path=root/'report.md';path.write_text('\n'.join(lines))
+            lines.append('- '+label+'（原文导航摘录）：'+excerpt(research['core_overview'][key]['explanation'],220))
+    if research['understanding_status'] != 'usable':lines.append('双主线初始理解尚未完成；定向问题之外不能据片段宣称整体就绪。')
+    milestones = [s for i,s in enumerate(state.selections) if i == 0 or s['action'] in {'review','explained','pause','stop'} or
+        any(c.id in s.get('feedback',{}).get('ref_ids',[]) for c in failures)]
+    milestones = milestones if len(milestones) <= 8 else milestones[:2]+milestones[-6:]
+    for s in milestones:
+        check = checks.get(s['operation_id'])
+        time = datetime.fromisoformat(check.ended_at).strftime('%H:%M:%S %z') if check and check.ended_at else '时间未记录'
+        lines += ['', f'- {time} · {s["action"]}：'+excerpt(s.get('feedback',{}).get('answered') or s['rationale'],330)+
+            '（记录摘录；调查回执时间，不是目标执行耗时）。'+link(f'submissions/{s["operation_id"]}/accepted.json','完整交接')]
+    lines += ['', '## 当前未决事项', '', '已选检查暂无欠账；研究范围仍可开放。' if not research['pending_work'] else '已选检查／争议仍有待办：']
+    for item in research['pending_work']:lines.append('- '+link('research.json',item['id'])+'：'+'；'.join(item['reasons']))
+    covered = set()
+    for surface in research['frontier']['surfaces']:
+        if surface['disposition'] not in {'deferred','UNCLASSIFIED_PROTOCOL_RESPONSIBILITY'}:continue
+        ref = 'surface:'+surface['entry_point']
+        feedback = next((s['feedback'] for s in reversed(state.selections) if ref in s.get('feedback',{}).get('ref_ids',[])),{})
+        covered.update(feedback.get('ref_ids',[]))
+        options = [o for o in stop.get('frontier_comparison',[]) if ref in o['ref_ids']]
+        lines += ['', '**开放责任：'+surface['entry_point']+'**', '', '已知／缺口：'+(feedback.get('answered') or surface['reason']),
+            '尚缺：'+'；'.join(feedback.get('remaining',[])) if feedback else surface['reason'],
+            '可改变判断的下一步：'+'；'.join(o['next_step'] for o in options) if options else '下一步尚未记录；需补适用来源或具体判别。',
+            map_link+'；'+'；'.join(link(checks[i].stdout,'相关探索') for i in feedback.get('ref_ids',[]) if i in checks)]
+    for c in research['candidates']:
+        if c['results'] and not c['resume_conditions'] or c['status'] == 'explained':continue
+        lines += ['', '候选：'+c['question']['question'], '保存的语义未知：'+'；'.join(c['question']['unknowns']),
+            '恢复条件：'+'；'.join(c['resume_conditions']),link('state.json','候选原文与历史')]
+    for c in explorations:
+        if c.id in covered:continue
+        feedback = next((s['feedback'] for s in reversed(state.selections) if c.id in s.get('feedback',{}).get('ref_ids',[])),{})
+        action = next((a for a in state.action_history if a.id == c.pending_action_id),None)
+        operation = action.logical_input.get('operation_id') if action else None
+        product = archive.read(f'submissions/{operation}/accepted.json')
+        lines += ['', '独立探索：'+excerpt(product.get('question','未保存明确问题归属'),200)+'；'+link(c.stdout,'实际输出')+'；'+link(c.stderr,'诊断')+'。'+execution_summary(c)[1]+'，不是正式性质结论。',
+            '历史处置摘录：'+excerpt(feedback.get('answered','未保存明确后续归属；不自动生成当前待办。'),260)]
+    if stop.get('resume_conditions'):lines += ['', '本轮记录的恢复条件：'+'；'.join(stop['resume_conditions'])]
+    lines += ['', '## 证据与运行说明', '',
+        '；'.join(link(name,label) for name,label in [('state.json','完整状态、版本与争议'),('research.json','当前研究索引'),
+            ('config.json','实际配置'),('events.jsonl','事件时序'),('audit-method.md','实际加载方法')]),
+        '环境探测不检查性质；探索成功不代表性质成立；失败驱动不是目标违反。模型结果与实现证据分开，脚本化 Agent 产品不证明自主发现。']
+    for c in failures:lines += ['- 失败／未完成：'+link(c.stdout,c.action)+'；'+link(c.stderr,'stderr')+'；'+link(f'logs/{c.id}/check.json','执行记录')]
+    if state.current_submission.get('phase') == 'received':lines.append('可靠回执尚未受理：'+link(f'submissions/{state.current_submission["operation_id"]}/raw.json','固定原稿')+'；保存字节不产生 Evidence。')
+    path = archive.root / 'report.md'
+    path.write_text('\n'.join(lines)+'\n')
     return path

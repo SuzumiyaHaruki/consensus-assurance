@@ -3,7 +3,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Literal
 from uuid import uuid4
-from pydantic import BaseModel, ConfigDict, Field, model_serializer, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 def uid() -> str:
@@ -16,28 +16,6 @@ def now() -> str:
 
 class Record(BaseModel):
     model_config = ConfigDict(extra="forbid", validate_assignment=True)
-
-
-class ReadRequest(Record):
-    file: str | None = None
-    start_line: int | None = Field(default=None, ge=1)
-    end_line: int | None = Field(default=None, ge=1)
-    symbol: str | None = Field(default=None, min_length=1, max_length=200)
-    literal: str | None = Field(default=None, min_length=1, max_length=200)
-    reason: str
-
-    @model_validator(mode="after")
-    def source_selector(self):
-        if bool(self.symbol)+bool(self.literal)>1:raise ValueError('Select one source lookup kind')
-        if self.symbol or self.literal:
-            if self.start_line is not None or self.end_line is not None:raise ValueError('Lookup cannot prescribe source line numbers')
-        elif not self.file or self.start_line is None or self.end_line is None:
-            raise ValueError('Range read requires a file and both line numbers')
-        return self
-
-    @model_serializer(mode='wrap')
-    def compact(self,handler):
-        return {key:value for key,value in handler(self).items() if value is not None}
 
 
 ActivityClass = Literal["A1", "A2", "A3", "A4", "A5", "A6", "A7"]
@@ -180,7 +158,6 @@ class AuditQuestion(Record):
     audit_spec_version: int | None = Field(default=None, ge=1)
     disposition: Literal["explained_by_existing_mechanism", "concrete_suspicion", "needs_specific_evidence", "ready_for_check"] | None = None
     preferred_check: Literal["source_review", "direct_test", "controlled_schedule", "local_model"] | None = None
-    requests: list[ReadRequest] = []
     question: str
     importance: str
     source_ids: list[str] = []
@@ -209,11 +186,6 @@ class QuestionCandidate(Record):
     status: Literal["active", "explained", "escalated", "blocked", "paused", "closed"] = "active"
     parent_candidate_id: str | None = None
     fork_reason: str = ""
-    stage: Literal["read", "analyze"] = "analyze"
-    read_plan_id: str | None = None
-    material_ids: list[str] = []
-    spec_task_ids: list[str] = []
-    stagnation: int = 0
     stop_reason: str = ""
     resume_conditions: list[str] = []
     obligation_id: str | None = None
@@ -245,6 +217,8 @@ class SemanticCheck(Record):
     status: Literal["no_issue_found", "needs_reading", "disputed", "revision_needed"]
     source_ids: list[str] = Field(min_length=1)
     rationale: str
+    report_title: str | None = Field(default=None, description="Optional short Chinese reading title for this target; presentation only, never a verdict")
+    report_answer: str | None = Field(default=None, description="Optional Chinese observed-answer summary preserving applicability; numbers and status come from retained assessment")
     counterevidence: list[str] = []
     limitations: list[str] = []
     challenged_components: list[RepairComponent] = Field(default_factory=list,
@@ -252,8 +226,6 @@ class SemanticCheck(Record):
 
 
 class SemanticReview(Record):
-    context_receipt_id: str | None = None
-    context_dependencies: dict = {}
     id: str = Field(default_factory=uid)
     task_id: str
     check_id: str
@@ -261,13 +233,10 @@ class SemanticReview(Record):
     target_versions: dict[str, int]
     material_ids: list[str]
     items: list[SemanticCheck]
-    revision_id: str | None = None
     origin: Literal["agent", "mock"]
     unit_id: str | None = None
     unit_version: int | None = None
-    supersedes_task_ids: list[str] = []
     resolves_issue_ids: list[str] = []
-    resolution_rationale: str = ""
 
 
 class ReviewIssue(Record):
@@ -286,9 +255,7 @@ class ReviewIssue(Record):
     explanation: str
     disposition: Literal["reading", "revision", "investigation", "blocked"]
     reason: str
-    task_ids: list[str] = []
     resolved_by: str | None = None
-    resolution_model_id: str | None = None
     resolution_checks: list[str] = []
 
 
@@ -363,7 +330,6 @@ class CheckerResult(Record):
 
 
 class PendingAction(Record):
-    inquiry_id: str | None = None
     logical_input: dict = {}
     id: str = Field(default_factory=uid)
     kind: str
@@ -464,8 +430,6 @@ class ModelArtifact(Record):
     properties: list[str]
     constraints: list[ConstraintSource]
     binding_ids: list[str]
-    extension_schema: dict[str, Any]
-    extension_version: str
     revision_reason: str = "Initial model"
     previous_id: str | None = None
     unit_id: str = ""
@@ -565,12 +529,9 @@ class Finding(Record):
     origin: Origin
     description: str
     trace_path: str
-    investigation_notes: list[str] = []
-    replay_check_id: str | None = None
     level: Literal["model_candidate", "implementation_candidate", "implementation_obligation", "implementation_consequence"] = "model_candidate"
     checker_id: str | None = None
     claim_version: int | None = None
-    confirmation_path: str | None = None
     applicability: Literal["current", "historical_scope", "recheck_required"] = "current"
 
 
@@ -632,7 +593,6 @@ class AuditUnit(Record):
     obligation_checks: dict[str, list[str]] = {}
     remaining_obligation_ids: list[str] = []
     recheck_reasons: list[str] = []
-    semantic_readiness: dict[str, Any] = {}
     audit_question: AuditQuestion | None = None
     coverage_limitations: list[str] = []
 
@@ -664,13 +624,6 @@ class Revision(Record):
     status: Literal["applied", "unresolved"] = "applied"
 
 
-class Capability(Record):
-    name: str
-    status: Literal["observed_in_code", "probe_confirmed", "unavailable"]
-    check_id: str | None
-    description: str
-
-
 class Analysis(Record):
     agent_session_id: str | None = None
     current_submission: dict[str, Any] = {}
@@ -680,11 +633,8 @@ class Analysis(Record):
     direct_checks: list[DirectCheckArtifact] = []
     active_direct_check_id: str | None = None
     scope_updates: dict[str, dict] = {}
-    milestones: dict[str, str] = {}
-    file_index: dict[str, dict] = {}
     trigger_retry_tasks: list[dict] = []
     framework_revision: str | None = None
-    schema_version: str = "2"
     id: str = Field(default_factory=uid)
     mode: Literal["real", "mock"]
     analysis_mode: Literal["autonomous", "directed", "regression"] = "autonomous"
@@ -704,22 +654,15 @@ class Analysis(Record):
     gaps: list[str] = []
     tools: dict[str, str] = {}
     materials: list[Material] = []
-    unexplored: list[str] = []
     units: list[AuditUnit] = []
     calibrations: list[Calibration] = []
     revisions: list[Revision] = []
-    capabilities: list[Capability] = []
     selections: list[dict] = []
     created_at: str = Field(default_factory=now)
-    first_model_seconds: float | None = None
-    parent_run: str | None = None
     graph_version: int = 0
     graph_history: list[dict] = []
-    guidance: list[dict] = []
     active_unit_id: str | None = None
     active_model_id: str | None = None
-    active_finding_id: str | None = None
-    next_action: str = "select"
     pending_action: PendingAction | None = None
     action_history: list[PendingAction] = []
     monitor_results: list[dict] = []
@@ -728,7 +671,6 @@ class Analysis(Record):
     semantic_reviews: list[SemanticReview] = []
     review_issues: list[ReviewIssue] = []
     reachability_results: list[ReachabilityResult] = []
-    consequences: list[dict[str, Any]] = []
     applied_operations: dict[str, dict[str, Any]] = {}
 
 

@@ -56,7 +56,7 @@ def test_actual_write_set_rejects_every_unreviewed_object(dependency_prepared,ex
     from regression_support import declared_changes
     declared_changes(state,f)
     before=state.model_dump()
-    with pytest.raises(ValueError,match='write set'):apply_feedback(state,state.units[0],bundle,f)
+    with pytest.raises(ValueError,match='write set'):apply_feedback(state,state.units[0],f)
     assert state.model_dump()==before
 
 
@@ -67,7 +67,7 @@ def test_cross_type_collision_and_incomplete_changes_are_atomic(prepared):
     before=state.model_dump()
     with pytest.raises(ValueError,match='types'):apply_patch(state,GraphPatch(claims=[candidate],expected_versions={candidate.id:1},rationale='Collision'),semantic=True)
     f=revision_for(state,[state.claims[1].id]);f.changes=[]
-    with pytest.raises(ValueError,match='changes must'):apply_feedback(state,state.units[0],bundle,f)
+    with pytest.raises(ValueError,match='changes must'):apply_feedback(state,state.units[0],f)
     assert state.model_dump()==before
 
 
@@ -91,7 +91,7 @@ def test_reuse_requires_identical_search_inputs_and_explicit_receipt(tmp_path,pr
     if change!='harness':assert reusable is None;return
     assert reusable.id==source.id
     engine=Engine(Config(),tmp_path,PythonBackend(),None,None,'');engine.state=state;engine.budget=BudgetTracker(Config().budget,state)
-    result=engine.search(unit,second,changed,None)
+    result=engine.search(second)
     assert result.reused_from==source.id and result.model_id==second.id and result.id!=source.id
     assert unit.obligation_ids[0] in obligation_progress(state,unit)[0]
     result.checker_results[0].outcome='unknown'
@@ -112,7 +112,7 @@ def test_reused_counterexample_keeps_current_attribution_without_reexecuting(tmp
     receipt=source.model_copy(update={'id':uid(),'model_id':new.id,'reused':True,'reused_from':source.id,'input_versions':new.artifact_digests},deep=True)
     state.checks.append(receipt)
     engine=Engine(Config(),tmp_path,PythonBackend(),None,None,'');engine.state=state;engine.budget=BudgetTracker(Config().budget,state)
-    assert engine.search(unit,new,revised,None).id==receipt.id
+    assert engine.search(new).id==receipt.id
     assert len(state.findings)==1 and state.findings[0].model_id==new.id
     assert state.findings[0].claim_id==old.checkers[0].claim_id
     assert 'model_checks' not in state.usage

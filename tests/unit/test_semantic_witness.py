@@ -21,7 +21,6 @@ def test_encoding_correction_preserves_meaning_and_behavior(tmp_path,prepared,ch
 
 
 def test_feedback_rejects_invalid_bundle_before_commit(prepared):
-    from consensus_assurance.core.proposals import Feedback
     from consensus_assurance.workflow.artifacts import validate_bundle
     _,state,bundle,_=prepared;unit=state.units[0]
     invalid=bundle.model_copy(deep=True)
@@ -34,7 +33,6 @@ def test_feedback_rejects_invalid_bundle_before_commit(prepared):
 @pytest.mark.parametrize('variation',['harness','unrelated','no_check'])
 def test_old_issue_cannot_be_cleared_by_unrelated_or_unexecuted_model(tmp_path,prepared,variation):
     from consensus_assurance.core.types import ReviewIssue,SemanticCheck
-    from consensus_assurance.core.proposals import ReviewReply
     from consensus_assurance.workflow.reviews import accept_review
     from consensus_assurance.core.submissions import ReviewSubmission
     _,state,bundle,_=prepared;u=state.units[0];old=save_bundle(tmp_path,state,u,bundle,PythonBackend())

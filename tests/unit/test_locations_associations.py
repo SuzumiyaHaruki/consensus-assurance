@@ -1,11 +1,8 @@
-import json
 import pytest
 from consensus_assurance.core.types import Material,BindingAssociation
-from consensus_assurance.core.proposals import BindingDraft,GraphDraft,GraphPatch
-from consensus_assurance.workflow.locations import locate,declarations
-from consensus_assurance.workflow.graph import apply_graph,apply_patch
-from consensus_assurance.workflow.graph_diagnostics import diagnose_graph
-from consensus_assurance.workflow.associations import relevant_use
+from consensus_assurance.core.proposals import BindingDraft, GraphDraft
+from consensus_assurance.workflow.locations import locate
+from consensus_assurance.workflow.graph import apply_graph
 
 
 def material(text,start=1,file='sample.go'):
@@ -21,6 +18,8 @@ def test_declaration_outside_read_material_requires_reading():
     assert locate(b,{partial.id:partial})[0] is None
     complete=material('func accept() {\n  value++\n}\n')
     assert locate(b,{partial.id:partial,complete.id:complete})[0]['material_id']==complete.id
+    prefix=material('func accept() {\n  value++\n')
+    assert not locate(binding(prefix),{prefix.id:prefix})[0]['boundary_complete']
 
 
 def test_multiple_obligations_share_one_binding_with_sourced_associations(prepared):
@@ -53,15 +52,6 @@ def test_member_without_acquired_owner_is_not_resolved_by_suffix():
     assert locate(binding(m,'First.Response',2,2),{m.id:m})[0] is None
 
 
-def test_declaration_diagnostic_supplies_actual_file_length(prepared):
-    _,state,_,responses=prepared
-    p=GraphDraft.model_validate(responses['graph']);b=p.bindings[0];b.symbol='Unknown'
-    m=next(m for m in state.materials if m.id==b.material_id)
-    state.file_index[m.file]={'file':m.file,'lines':m.end_line,'content_digest':m.content_digest}
-    d=next(d for d in diagnose_graph(state,p) if b.id in d.object_ids)
-    assert d.details['file_metadata']==state.file_index[m.file]
-
-
 @pytest.mark.parametrize('receiver',['r *First','r First','r *First[T]','*First'])
 def test_receiver_qualified_method_uses_declared_type(receiver):
     from consensus_assurance.workflow.locations import location_context
@@ -79,18 +69,6 @@ def test_local_closure_does_not_inherit_surrounding_receiver():
     m=material('func (r *First) accept() {\n work := func() {\n  value++\n }\n}\n')
     assert locate(binding(m,'First.work',3,3),{m.id:m})[0] is None
     assert locate(binding(m,'work',3,3),{m.id:m})[0] is not None
-
-
-def test_declaration_index_retains_gaps_and_open_boundaries():
-    from consensus_assurance.workflow.locations import declaration_index
-    first=material('func (r *Service) save() {\n value++\n',10)
-    second=material(' value--\n}\n',20)
-    index=declaration_index([first,second])
-    assert len(index)==1
-    d=index[0]['declarations'][0]
-    assert d['symbol']=='Service.save' and d['start_line']==10
-    assert d['end_line'] is None and d['known_end']==11 and not d['boundary_complete']
-    assert index[0]['material_ids']==[first.id]
 
 
 def test_anchor_correction_does_not_fix_cross_declaration_behavior():

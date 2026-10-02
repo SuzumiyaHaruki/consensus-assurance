@@ -1,17 +1,16 @@
-import json
 from pathlib import Path
 from consensus_assurance.core.types import *
 from consensus_assurance.core.proposals import *
 from consensus_assurance.core.config import Config
 from consensus_assurance.adapters.storage.snapshot import capture
-from regression_support import read_material, ReadRequest
+from regression_support import read_material
 
 ROOT=Path(__file__).resolve().parent
 
 
 def setup_ack(repo, mode='durable', partial=False):
     snapshot=capture(repo)
-    materials=[read_material(repo,snapshot,ReadRequest(file=f,start_line=1,end_line=len((repo/f).read_text().splitlines()),reason='Controlled contract evidence')) for f in ['counter.py','README.md']]
+    materials=[read_material(repo,snapshot,file=f, start_line=1, end_line=len((repo/f).read_text().splitlines())) for f in ['counter.py','README.md']]
     code,document=materials
     scope=Scope(description='Synthetic serial acknowledgement, one participant and operation, no faults',excluded=['Production implementations','General crash semantics'])
     basis=Grounding(source_ids=[code.id],expectation_ids=[document.id],binding_ids=['ack-code'],derivation='The selected configuration defines whether return promises memory acceptance or persistence',applicability='The emitted mode and fault metadata identify the exercised configuration')

@@ -2,25 +2,27 @@ from consensus_assurance.core.types import Claim, Binding, Relation, AuditUnit
 from .mutations import adopt, write_set
 from .associations import claim_ids
 from .graph_diagnostics import require_graph
-from .locations import location_evidence
 
 
-def apply_graph(state, proposal, audit_spec=None):
-    require_graph(state,proposal,audit_spec)
+def graph_records(state, proposal, audit_spec=None):
+    locations=require_graph(state,proposal,audit_spec)
     materials={m.id:m for m in state.materials}
     claims=[Claim(**c.model_dump(),source="Candidate derived from attributed implementation responsibilities") for c in proposal.claims]
     bindings=[]
     for b in proposal.bindings:
-        m=materials[b.material_id];evidence,_=location_evidence(b,materials)
+        m=materials[b.material_id];evidence=locations[b.id]
         view=evidence['view'];anchor=evidence['anchor']
         excerpt="\n".join(view.text.splitlines()[b.start_line-view.start_line:b.end_line-view.start_line+1])
         associations=[a.model_copy(update={'source_ids':a.source_ids or [b.material_id]}) for a in b.associations]
         bindings.append(Binding(id=b.id,material_id=b.material_id,associations=associations,anchor=anchor,file=m.file,symbol=b.symbol,
             start_line=b.start_line,end_line=b.end_line,snapshot_id=state.snapshot.id,content_digest=m.content_digest,
             basis='agent_inference',description=b.description,pending=b.pending,excerpt=excerpt))
-    state.claims=claims;state.bindings=bindings
-    state.relations=[Relation(**r.model_dump()) for r in proposal.relations]
-    state.units=[AuditUnit(**u.model_dump()) for u in proposal.units]
+    return dict(claims=claims,bindings=bindings,relations=[Relation(**r.model_dump()) for r in proposal.relations],
+        units=[AuditUnit(**u.model_dump()) for u in proposal.units])
+
+
+def apply_graph(state, proposal, audit_spec=None):
+    for name,values in graph_records(state,proposal,audit_spec).items():setattr(state,name,values)
     state.graph_version+=1
     state.gaps.extend(proposal.conflicts+proposal.unexplored+proposal.gaps)
 
@@ -47,7 +49,7 @@ def expand_unit(state, unit, relation_ids):
 
 
 def _apply_patch(state, patch, semantic=False, audit_spec=None):
-    """Validate an incremental update on a copy, then preserve superseded object versions."""
+    """Prepare graph records before replacing objects on the caller's trial state."""
     from consensus_assurance.core.proposals import GraphDraft, ClaimDraft, BindingDraft, RelationDraft, UnitDraft
     from consensus_assurance.core.diagnostics import Diagnostic,DiagnosticError
     def reject(message,ids):
@@ -100,11 +102,9 @@ def _apply_patch(state, patch, semantic=False, audit_spec=None):
     external = [e for e in state.relations if e not in internal]
     relations = merge(internal,patch.relations,lambda x: RelationDraft(**{k:v for k,v in x.model_dump().items() if k in RelationDraft.model_fields}))
     units = merge(state.units,patch.units,lambda x: UnitDraft(**{k:v for k,v in x.model_dump().items() if k in UnitDraft.model_fields}))
-    trial = state.model_copy(deep=True)
-    apply_graph(trial,GraphDraft(claims=claims,bindings=bindings,relations=relations,units=units,gaps=patch.gaps),audit_spec)
+    records=graph_records(state,GraphDraft(claims=claims,bindings=bindings,relations=relations,units=units,gaps=patch.gaps),audit_spec)
     changed = {id for id,field in writes}|{x.id for x in replacements if x.id not in current}
-    for kind in ("claims","bindings","relations","units"):
-        values = getattr(trial,kind)
+    for kind,values in records.items():
         for index,item in enumerate(values):
             if item.id in current:
                 old = current[item.id]
@@ -120,15 +120,8 @@ def _apply_patch(state, patch, semantic=False, audit_spec=None):
     return changed
 
 
-def validate_patch(state,patch,semantic=False,audit_spec=None):
-    trial=state.model_copy(deep=True)
-    _apply_patch(trial,patch,semantic,audit_spec)
-    return trial
-
-
 def apply_patch(state,patch,semantic=False,audit_spec=None):
-    existing={x.id for name in ('claims','bindings','relations','units') for x in getattr(state,name)}
-    changed={id for id,field in write_set(state,patch)}|{x.id for name in ('claims','bindings','relations','units') for x in getattr(patch,name) if x.id not in existing}
-    trial=validate_patch(state,patch,semantic,audit_spec)
+    trial=state.model_copy(deep=True)
+    changed=_apply_patch(trial,patch,semantic,audit_spec)
     adopt(state,trial)
     return changed

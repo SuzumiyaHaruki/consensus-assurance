@@ -1,5 +1,5 @@
 from pathlib import Path
-from typing import Any, Literal
+from typing import Literal
 from pydantic import Field, model_validator
 from .types import ActivityClass, Record
 
@@ -10,13 +10,11 @@ class Budget(Record):
     model_checks: int = Field(default=4, ge=0)
     revisions: int = Field(default=3, ge=0)
     repair_attempts: int = Field(default=4, ge=0)
-    replays: int = Field(default=1, ge=0)
     action_timeout: float = Field(default=120, gt=0)
     agent_turn_timeout: float = Field(default=900, gt=0)
     total_seconds: float = Field(default=900, gt=0)
 
     experiments: int = Field(default=4, ge=0)
-    calibration_checks: int = Field(default=8, ge=0)
     trigger_retries: int = Field(default=1, ge=0)
     audit_units: int = Field(default=2, ge=0)
 
@@ -51,11 +49,9 @@ class Config(Record):
     agent_reasoning_effort: str | None = None
     agent_model: str | None = None
     verifier_backend: Literal["none", "tlc"] = "none"
-    output_language: Literal["zh-CN"] = "zh-CN"
     runs_dir: str = "runs"
     tlc_jar: str | None = None
     budget: Budget = Budget()
-    parameters: dict[str, Any] = {}
     activity_focus: list[ActivityClass] = []
     directed_question: str | None = None
     fixture: str | None = None

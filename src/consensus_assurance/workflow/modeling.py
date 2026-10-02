@@ -11,7 +11,6 @@ def validate_technical_repair(current, repaired):
 
 
 def obligation_progress(state, unit):
-    import json
     expected={claim:{} for claim in unit.obligation_ids}
     versions={x.id:x.version for x in [*state.claims,*state.bindings,*state.relations,*state.units]}
     superseded={m.previous_id for m in state.models if m.previous_id}
@@ -77,8 +76,6 @@ def coverage_limitations(state,unit):
         if not direct and not any(ref in reachability_refs(r) for m in models for r in m.reachability_requirements):
             limits.append('No executable trigger requirement covers reference '+ref)
     for model in models:
-        import json
-        from pathlib import Path
         data=json.loads(Path(model.bundle_path).read_text()) if Path(model.bundle_path).is_file() else {}
         if not data.get('context_analysis'):limits.append('Context/history correspondence was not supplied; no cross-context coverage claim')
         for req in model.reachability_requirements:

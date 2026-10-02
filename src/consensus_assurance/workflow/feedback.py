@@ -1,10 +1,10 @@
 from consensus_assurance.core.types import Revision
-from .graph import apply_patch, expand_unit
+from .graph import _apply_patch, expand_unit
 from .graph_diagnostics import validate_grounding
 from .mutations import adopt, validate_changes
 
 
-def _apply_feedback(state, unit, current, feedback, audit_spec=None):
+def _apply_feedback(state, unit, feedback, audit_spec=None):
     known = {c.id for c in state.checks} | {c.id for c in state.calibrations} | {m.id for m in state.materials}
     if not set(feedback.evidence_ids) <= known or not feedback.evidence_ids:
         raise ValueError("Semantic feedback requires recorded evidence or material sources")
@@ -41,29 +41,26 @@ def _apply_feedback(state, unit, current, feedback, audit_spec=None):
         originals={obj.id:obj for obj in [*state.claims,*state.bindings,*state.relations,*state.units]}
         replaced={obj.id for name in ('claims','bindings','relations','units') for obj in getattr(feedback.patch,name)}
         before["semantic_objects"]={key:originals[key].model_dump(mode="json") for key in replaced if key in originals}
-        changed = apply_patch(state, feedback.patch, semantic=True, audit_spec=audit_spec)
+        changed = _apply_patch(state, feedback.patch, semantic=True, audit_spec=audit_spec)
         affected = [m.id for m in state.models if changed & (set(m.binding_ids) | {c.claim_id for c in m.checkers} | set(m.graph_versions))]
         before["old_judgment"] = feedback.old_judgment
-        result, step = None, "understand"
     else:
         state.gaps.append("Unresolved attribution: " + feedback.rationale)
         return None
     state.affect(affected, feedback.rationale)
-    after = {"scope": result.scope.model_dump(mode="json") if hasattr(result, "scope") else {},
-             "unit_id": result.id if hasattr(result, "id") else unit.id if unit else None,
+    after = {"scope": {}, "unit_id": unit.id if unit else None,
              "graph_version": state.graph_version, "new_judgment": feedback.new_judgment,
              "grounding": feedback.grounding.model_dump(), "affected_model_ids": affected,
              "condition_dispositions":[d.model_dump(mode="json") for d in feedback.condition_dispositions],
              "property_changes": feedback.new_basis, "changes":[c.model_dump(mode="json") for c in feedback.changes]}
     revision = Revision(kind=feedback.kind, rationale=feedback.rationale, evidence_ids=feedback.evidence_ids,
-        target_ids=feedback.target_ids, relation_ids=feedback.relation_ids, before=before, after=after, return_step=step)
+        target_ids=feedback.target_ids, relation_ids=feedback.relation_ids, before=before, after=after, return_step="understand")
     state.revisions.append(revision)
-    return result
 
 
-def apply_feedback(state, unit, current, feedback, audit_spec=None):
+def apply_feedback(state, unit, feedback, audit_spec=None):
     trial=state.model_copy(deep=True)
     copied=next((u for u in trial.units if unit and u.id==unit.id),None)
-    result=_apply_feedback(trial,copied,current,feedback,audit_spec)
+    result=_apply_feedback(trial,copied,feedback,audit_spec)
     adopt(state,trial)
     return result

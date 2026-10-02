@@ -103,7 +103,20 @@ def main(argv=None):
                 print("历史运行只读；使用原始报告或离线导入，不能恢复到新语义。");return 2
             state=Store(root).load()
             if args.command == "report":
-                print(render_report(state, root,export_derived=args.export_views)); return 0
+                if args.export_views:
+                    from consensus_assurance.reporting.chinese import Archive
+                    from consensus_assurance.workflow.audit_spec import audit_progress
+                    archive=Archive(state,root)
+                    spec_path=archive.path(f'audit-spec/v{state.audit_spec_version}.json')
+                    spec=archive.read(spec_path)
+                    if spec and spec.get('version')!=state.audit_spec_version:raise ValueError('Saved map version differs from state')
+                    write_json(root/'materials.json',[m.model_dump(mode='json') for m in state.materials])
+                    write_json(root/'graph.json',{'version':state.graph_version,
+                        **{name:[x.model_dump(mode='json') for x in getattr(state,name)] for name in ('claims','bindings','relations')}})
+                    if spec:write_json(root/'audit-spec.json',spec)
+                    write_json(root/'audit-progress.json',audit_progress(state.model_copy(update={'audit_spec_path':str(spec_path) if spec_path else None})))
+                    write_json(root/'plan.json',{'units':[u.model_dump(mode='json') for u in state.units],'selections':state.selections})
+                print(render_report(state, root)); return 0
             config = Config.model_validate(state.config)
         else:
             config = load_config(args.config, {"agent_backend": args.agent_backend, "tlc_jar": args.tlc_jar,
@@ -111,11 +124,18 @@ def main(argv=None):
             if args.command == "estimate":
                 repo = locate_repo(args.repo, config.repo_path)
                 b = config.budget
-                minimum = 1
                 print(json.dumps({"仓库":str(repo),"材料发送":False,"执行目标代码":False,
-                    "agent调用上限":b.agent_calls,"粗略计划下限":minimum,
-                    "预算说明":"按 CLI turn、总时长和正式执行计数；源码浏览发生在Codex 会话内。这不是 token 账单。",
-                    "计划可能受限":minimum>b.agent_calls,"预算":b.model_dump(mode="json")},ensure_ascii=False,indent=2))
+                    "后端":{"Agent":config.agent_backend,"目标执行":config.execution_backend,"模型检查":config.verifier_backend},
+                    "授权":{"发送材料":config.allow_agent_materials,"执行目标":config.allow_experiments},
+                    "预算":b.model_dump(mode="json"),
+                    "零额度":[k for k in ('agent_calls','experiments','audit_units','semantic_reviews','revisions','model_checks') if getattr(b,k)==0],
+                    "计数口径":{"agent_calls":"CLI turn；会话内工具不另算调用，总时间不重复叠加内部工具耗时",
+                        "experiments":"控制器探索、失败重试与正式检查共用；不含 Agent 回合内本地试跑，不等于独立问题数",
+                        "audit_units":"新义务入场；new_obligation 不保证能走完整条执行／复核链",
+                        "semantic_reviews":"对应性及语义复核；零额度时新执行不能以 PASS 代替复核",
+                        "revisions":"修订额度独立计数；不按执行次数推算剩余",
+                        "model_checks":"SANY 与模型搜索；verifier_backend=none 时未启用，不要求安装 TLC"},
+                    "限制说明":"上限不自动扩容或兑换；单项额度耗尽不自动终止有预算的源码调查。缺失 token 用量保持未知，不预测发现数。"},ensure_ascii=False,indent=2))
                 return 0
             root = create_run_directory(config, args.command)
         implementation, agent, verifier, knowledge = assemble(config)
@@ -154,8 +174,7 @@ def main(argv=None):
         print(f"运行模式：{state.mode}；报告：{report}")
         print(f"停止原因：{state.stop_reason}")
         if state.run_stop and state.run_stop['reason']=='user_stop':return 130
-        return 0 if state.stop_reason.startswith(("No pending", "Plan generated",
-            "No further investigation selected", "Scoped stop (", "Snapshot prepared")) else 2
+        return 0 if state.stop_reason.startswith(("Scoped stop (", "Snapshot prepared")) else 2
     except (ValueError, FileNotFoundError, BlockingIOError, OSError) as exc:
         print(f"无法继续：{exc}", file=sys.stderr)
         return 2

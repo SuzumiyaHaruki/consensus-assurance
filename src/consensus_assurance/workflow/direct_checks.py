@@ -20,8 +20,8 @@ def validate_question(question):
         raise ValueError('New autonomous units need a typed question disposition')
     if question.disposition=='ready_for_check' and question.preferred_check is None:
         raise ValueError('Ready question needs preferred_check')
-    if question.disposition=='needs_specific_evidence' and not question.requests and not question.unknowns:
-        raise ValueError('Evidence question needs exact requests or a named discriminator in question unknowns')
+    if question.disposition=='needs_specific_evidence' and not question.unknowns:
+        raise ValueError('Evidence question needs a named discriminator in question unknowns')
     if question.preferred_check in {'direct_test','controlled_schedule'} and (not question.event_paths or not question.trigger_rationale.strip()):
         raise ValueError('Executable question needs legal event paths, observations and oracle rationale')
 
@@ -214,14 +214,21 @@ def assess(state,unit,artifact,plan,check,events):
     return persist_assessment(state,artifact,plan,check,compute_assessment(state,unit,artifact,plan,check,events))
 
 
-def refresh_assessments(state,artifact_ids,stale_only=False):
-    from consensus_assurance.adapters.runners.experiment import extract_events
+def refresh_assessments(state,artifact_ids,stale_only=False,before=None):
+    from .reviews import open_issues
     units={u.id:u for u in state.units}
+    objects=lambda s:{o.id:o for o in s.claims+s.bindings+s.relations+s.units}
+    old,current=(objects(before),objects(state)) if before else ({},{})
+    reviews=lambda s,a:[r for r in s.semantic_reviews if r.target_versions.get(a.id)==a.version]
     for artifact in state.direct_checks:
         if artifact.id not in artifact_ids or artifact.unit_id not in units:continue
+        checks=[c for c in state.checks if c.direct_check_id==artifact.id and not (stale_only and any(
+            r.get('experiment_check_id')==c.id and 'Direct-check semantic inputs changed; execution requires rechecking' in r.get('blockers',[])
+            for r in state.monitor_results))]
+        if not checks:continue
+        if before and all(old.get(k)==current.get(k) for k in {*artifact.graph_versions,artifact.unit_id,artifact.claim_id}) and (
+                reviews(before,artifact)==reviews(state,artifact) and open_issues(before,artifact)==open_issues(state,artifact)):
+            continue
         plan=load_plan(artifact.plan_path)
-        for check in state.checks:
-            if check.direct_check_id!=artifact.id:continue
-            if stale_only and any(r.get('experiment_check_id')==check.id and
-                    'Direct-check semantic inputs changed; execution requires rechecking' in r.get('blockers',[]) for r in state.monitor_results):continue
+        for check in checks:
             assess(state,units[artifact.unit_id],artifact,plan,check,extract_events(check))

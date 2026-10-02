@@ -156,7 +156,6 @@ def save_bundle(root, state, unit, bundle, implementation, previous=None, reason
         content_digest=digest(checker.read_bytes()), config_digest=digest(cfg.read_bytes()), scope=bundle.scope,
         initial_state=bundle.initial_state, variables=bundle.variables, actions=bundle.actions,
         properties=invariants, constraints=bundle.constraints, binding_ids=unit.binding_ids,
-        extension_schema={"type": "object", "description": "Tool-specific TLA metadata; constants are saved verbatim"}, extension_version="2",
         unit_id=unit.id if unit.obligation_ids else '', research_ref=None if unit.obligation_ids else unit.id,
         checker_path=str(checker), mapping_path=str(mapping) if complete else "", harness_path=str(harness) if complete else "", bundle_path=str(proposal),
         artifact_digests=artifacts, checkers=specs, graph_versions={x.id:x.version for x in [*state.claims,*state.bindings,*state.relations,*state.units] if x.id in semantic_references}, previous_id=previous.id if previous else None, revision_reason=reason)

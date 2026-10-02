@@ -52,7 +52,7 @@ def test_actual_tlc_shared_implication_truth_table_matches_monitor(tmp_path,tlc,
         files['check.py']='\n'.join('print('+repr('CA_EVENT '+json.dumps(event))+')' for event in observations)+'\n'
         return sub,files
     e,repo=engine_for(tmp_path,[first,bundle,direct,model_review,stop]);e.verifier=tlc[0]
-    e.config.budget.model_checks=4;e.config.budget.calibration_checks=4
+    e.config.budget.model_checks=4
     state=e.start(repo)
     assert len(state.models)==1,state.current_submission
     artifact=state.models[0]
@@ -100,6 +100,10 @@ def test_independent_model_timeout_cannot_be_overwritten_but_revision_can_replac
     state.models.reverse()
     assert obligation_progress(state,state.units[0])[1]==['bounded']
     state.models.reverse()
+    from consensus_assurance.reporting.chinese import render_report
+    text=render_report(state,e.root).read_text()
+    assert '执行超时' in text and '有限检查未见违反' in text
+    assert all(Path(m.path).name in text for m in state.models)
     # Use a separate finite run to exercise actual artifact lineage replacement of the timed-out model.
     path=tmp_path/'revision';path.mkdir();attempts.clear()
     e,repo=engine_for(path,[first,model,lambda s:model(s,True),model_review,stop]);e.verifier=verifier

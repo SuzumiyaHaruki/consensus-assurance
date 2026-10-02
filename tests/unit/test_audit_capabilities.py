@@ -1,3 +1,4 @@
+from consensus_assurance.core.submissions import SourceRange
 """Stable R1-R5/R8 capabilities; R6/R7 retain actual execution and TLC suites."""
 import json
 from pathlib import Path
@@ -37,7 +38,7 @@ def test_R3_unread_consumer_has_no_invented_edge(prepared):
 def test_variant_visibility_is_a_subset_of_safe_build_files(tmp_path,variant):
     from consensus_assurance.cli import load_config,main
     from consensus_assurance.adapters.storage.snapshot import capture
-    from consensus_assurance.workflow.audit import source_materials, SourceRange
+    from consensus_assurance.workflow.audit import source_materials
     repo=tmp_path/'source';repo.mkdir()
     families=['paxos','n2paxos','swift','epaxos','fastpaxos','curp']
     for family in families+['replica']:

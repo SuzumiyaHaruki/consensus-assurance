@@ -15,9 +15,6 @@ class Diagnostic(Record):
     message: str
     allowed: list[Literal['representation','association','read','semantic_revision','stop']] = []
 
-    def problem_key(self):
-        return self.task+':'+self.code+':'+','.join(sorted(self.object_ids))+':'+','.join(sorted(self.paths))
-
 
 class DiagnosticError(ValueError):
     def __init__(self,diagnostics):

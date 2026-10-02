@@ -49,7 +49,6 @@ class Engine:
         started = time.monotonic()
         snapshot = capture(repo, self.root / "source", analysis_roots=self.config.target.analysis_roots, expected_module=self.config.target.expected_module)
         self.state = Analysis(framework_revision=FRAMEWORK_REVISION, mode="mock" if self.agent.mock else "real", config=self.config.model_dump(mode="json"), snapshot=snapshot)
-        self.state.guidance = [{"source":"configured_reference","text":self.knowledge}]
         self.state.analysis_mode = "regression" if self.agent.mock else ("directed" if self.config.directed_question else "autonomous")
         self.state.elapsed_seconds = time.monotonic() - started
         self.budget = BudgetTracker(self.config.budget, self.state)
@@ -195,10 +194,9 @@ class Engine:
         if self.state.pending_action:
             self.state.action_history.append(self.state.pending_action.model_copy(deep=True))
             self.state.pending_action = None
-        self.state.next_action = stage
         self.checkpoint("next_action_" + stage)
 
-    def search(self, unit, model, bundle, calibration):
+    def search(self, model):
         from .inputs import reusable_search
         source=reusable_search(self.state,model)
         prior_reuse=next((c for c in reversed(self.state.checks) if c.model_id==model.id and c.action=="model_check" and c.reused_from and c.search_fingerprint==model.search_fingerprint),None)
@@ -221,8 +219,8 @@ class Engine:
             evidence=Evidence(check_id=check.id,model_id=model.id,snapshot_id=model.snapshot_id,claim_id=result.claim_id,
                 search_fingerprint=check.search_fingerprint,origin=check.origin,level="framework_test" if self.state.mode=="mock" else "model",scope=result.scope,
                 assessment=Assessment.INCONCLUSIVE if self.state.mode=="mock" else Assessment.SUPPORTED if result.outcome=="holds" else Assessment.CHALLENGED,
-                calibration_id=calibration.id if calibration else None,checker_id=result.invariant,claim_version=claim.version,
-                description="Candidate property in its explicit scope; applicability unresolved: "+str(claim.grounding.unresolved+claim.grounding.conflicts)+"; calibration="+(calibration.status if calibration else "not_scheduled"))
+                checker_id=result.invariant,claim_version=claim.version,
+                description="Candidate property in its explicit scope; applicability unresolved: "+str(claim.grounding.unresolved+claim.grounding.conflicts)+"; calibration=not_scheduled")
             self.state.add_evidence(evidence)
             self.state.relations.append(Relation(source=evidence.id,target=claim.id,kind="supports" if result.outcome=="holds" else "challenges",rationale="Direct scoped checker evidence; no graph proof propagation"))
             if result.outcome=="violated":

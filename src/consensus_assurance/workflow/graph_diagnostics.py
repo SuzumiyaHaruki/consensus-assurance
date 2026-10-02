@@ -1,6 +1,6 @@
 """Dependency-ordered, non-mutating candidate diagnostics."""
 from consensus_assurance.core.diagnostics import Diagnostic,DiagnosticError
-from .locations import locate, location_context
+from .locations import location_evidence, location_context
 from .sources import covered
 from .associations import claim_ids,relevant_use,dependency_reach,graph_contract
 
@@ -27,7 +27,7 @@ def validate_grounding(basis,materials,binding_ids):
     if errors:raise ValueError('; '.join(message for _,message in errors))
 
 
-def diagnose_graph(state,proposal,audit_spec=None):
+def diagnose_graph(state,proposal,audit_spec=None,locations=None):
     issues=[];materials={m.id:m for m in state.materials}
     def emit(code,category,ids,paths,sources,message,allowed):
         issues.append(Diagnostic(code=code,category=category,object_ids=ids,paths=paths,material_ids=list(dict.fromkeys(sources)),message=message,allowed=allowed))
@@ -64,10 +64,10 @@ def diagnose_graph(state,proposal,audit_spec=None):
         m=materials[b.material_id]
         if m.file not in state.snapshot.files or not covered(m.model_copy(update={'start_line':b.start_line,'end_line':b.end_line}),materials.values()):
             emit('behavior_range','location',[b.id],[f'/bindings/{i}/{f}' for f in ['symbol','material_id','anchor','start_line','end_line']],[m.id],'Binding range is outside the read code snapshot',['representation','read']);continue
-        anchor,reason=locate(b,materials)
-        if not anchor:
+        located,reason=location_evidence(b,materials)
+        if located and locations is not None:locations[b.id]=located
+        if not located:
             evidence=location_context(b,materials)
-            evidence["file_metadata"]=state.file_index.get(m.file,{})
             emit('declaration_identity','location',[b.id],[f'/bindings/{i}/{f}' for f in ['symbol','material_id','anchor','start_line','end_line']],evidence['material_ids'],f'Binding {b.id}: literal symbol {b.symbol!r} has no verified declaration: '+reason,['representation','read'])
             issues[-1].details=evidence
     for i,r in enumerate(proposal.relations):
@@ -108,5 +108,7 @@ def diagnose_graph(state,proposal,audit_spec=None):
 
 
 def require_graph(state,proposal,audit_spec=None):
-    issues=diagnose_graph(state,proposal,audit_spec)
+    locations={}
+    issues=diagnose_graph(state,proposal,audit_spec,locations)
     if issues:raise DiagnosticError(issues)
+    return locations

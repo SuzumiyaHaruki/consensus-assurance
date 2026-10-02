@@ -212,7 +212,6 @@ def test_question_converges_before_obligation_and_results_do_not_propagate(tmp_p
     assert other.question.unknowns==['Cause has not been isolated'] and not derived.obligation_id
 
 
-
 def test_unrelated_map_update_preserves_check_and_focus_stop_is_bounded(tmp_path):
     def update(state):
         spec=json.loads(Path(state['audit_spec_path']).read_text())
@@ -235,7 +234,7 @@ def test_unrelated_map_update_preserves_check_and_focus_stop_is_bounded(tmp_path
     index=json.loads((e.root/'research.json').read_text())
     assert index['frontier']['surfaces'] and index['stop']['scope']=='run'
     assert 'A2' in report and '不是责任覆盖率' in report
-    assert report.index('候选 `')<report.index('## 日志、原稿与恢复记录')
+    assert 'A2 authority context' in report and '当前未决事项' in report
 
 
 def test_fact_correction_is_saved_before_an_explicit_semantic_revision(tmp_path):
@@ -294,7 +293,7 @@ def test_explained_is_not_execution_evidence_and_forced_stop_needs_no_map(tmp_pa
     state=e.start(repo)
     from consensus_assurance.reporting.chinese import render_report
     text=render_report(state,e.root).read_text()
-    assert '理解尚未登记' in text and not state.audit_spec_path and not diagnostics(e)
+    assert '双主线初始理解尚未完成' in text and not state.audit_spec_path and not diagnostics(e)
 
 
 def test_scope_reconnects_added_fact_dependency_and_keeps_old_scope(tmp_path):
@@ -457,7 +456,7 @@ def test_run_stop_rejection_preserves_results_and_continues(tmp_path,reason,faul
         preflight.extend(result['diagnostics'])
         return sub,{}
     def continue_after_rejection(state):
-        assert not state['run_stop'] and not any(c['stagnation'] for c in state['question_candidates'])
+        assert not state['run_stop']
         assert [c['status'] for c in state['question_candidates']]==['explained','paused']
         assert state['question_candidates'][1]['question']['unknowns']
         assert set(d['message'] for d in preflight)==set(diagnostics(e)[0]['errors'])
@@ -630,7 +629,6 @@ def test_unaccepted_draft_pause_does_not_penalize_shared_fact_or_parent(tmp_path
         return sub,{}
     def independent(state):
         assert len(state['question_candidates'])==1
-        assert state['question_candidates'][0]['stagnation']==0
         assert state['selections'][-1]['draft_status']=='paused'
         sub=products()[0];sub.update(action='continue',obligation=None,bindings=[])
         sub['question']['question']='Does the consumer retain the source boundary after return?'
@@ -644,7 +642,7 @@ def test_unaccepted_draft_pause_does_not_penalize_shared_fact_or_parent(tmp_path
     assert len(state.question_candidates)==2 and len(diagnostics(e))==2
     before,after=state.question_candidates
     assert before.question.fact_ids==after.question.fact_ids and before.question.contexts==after.question.contexts
-    assert before.stagnation==after.stagnation==0 and state.units[0].remaining_obligation_ids
+    assert state.units[0].remaining_obligation_ids
     assert state.active_unit_id is None
     assert before.stop_reason!=after.stop_reason
     assert state.usage['agent_calls']==6 and state.usage['audit_units']==1
@@ -658,13 +656,17 @@ def test_exhausted_execution_capacity_allows_source_research_but_no_placeholder_
         sub,files=first(state);sub.update(action='continue',obligation=None,bindings=[])
         sub['question'].update(disposition='needs_specific_evidence',unknowns=['No authorized execution remains'])
         return sub,files
-    e,repo=engine_for(tmp_path,[first,source_only,stop])
+    def attempt_exploration(state):
+        return dict(action='explore',question='Attempt execution without capacity',harness_path='probe.py',
+            rationale='Capacity must reject before target execution'),{'probe.py':'raise AssertionError("must not run")\n'}
+    e,repo=engine_for(tmp_path,[first,attempt_exploration,source_only,stop])
     if unavailable=='budget':e.config.budget.experiments=0
     else:e.config.execution_backend='none';e.implementation=None
     state=e.start(repo)
     assert not state.units and not state.claims
     assert len(state.question_candidates)==1 and not view(state)['capacity']['new_obligation']
-    assert state.usage['agent_calls']==3
+    assert state.usage['agent_calls']==4 and state.usage.get('experiments',0)==0
+    assert not any(c.action=='exploration' for c in state.checks)
 
 
 @pytest.mark.parametrize('scope',['candidate','family','focus'])
@@ -899,7 +901,7 @@ def test_execution_feedback_updates_current_unknowns_then_explanation_and_new_di
     assert state.audit_spec_version==2 and state.usage['experiments']==1 and state.units[0].status=='checked'
     from consensus_assurance.reporting.chinese import render_report
     render_report(state,e.root)
-    assert state.units[0].id in (e.root/'report.md').read_text()
+    assert Path(state.direct_checks[0].harness_path).relative_to(e.root).as_posix() in (e.root/'report.md').read_text()
 
 
 def record_map(state, refined=False, challenge=False):
@@ -1121,8 +1123,9 @@ def test_knowledge_growth_preserves_execution_and_supplies_the_next_check(tmp_pa
     validate_units(state)
     from consensus_assurance.reporting.chinese import render_report
     report=render_report(state,e.root).read_text()
-    assert '地图 v3 保存时的实现认识' in report and 'External ordering between record consumption and clearing is not supplied' in report
-    assert '当前检查和结论见上方实际结果' in report and 'The local check has not executed' not in json.dumps(current['core_overview'])
+    assert 'audit-spec/v3.json' in report
+    assert 'External ordering between record consumption and clearing is not supplied' in current['core_overview']['open_details']
+    assert 'The local check has not executed' not in report and 'The local check has not executed' not in json.dumps(current['core_overview'])
     assert 'distributed consequences' in state.claims[0].scope.excluded and 'distributed consequences' not in json.dumps(current['frontier'])
     assert not current['candidates'][0]['resume_conditions'] and current['candidates'][0]['results']
     if variant=='shared':

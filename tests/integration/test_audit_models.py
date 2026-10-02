@@ -2,8 +2,7 @@
 import json
 from pathlib import Path
 import pytest
-from consensus_assurance.core.proposals import ModelDraft
-from audit_support import ScriptedAgent, first, stop, engine_for, products
+from audit_support import first, stop, engine_for, products
 
 
 def model_product(state, *, draft=True, previous=False, change='technical', replay=False):
@@ -36,8 +35,6 @@ Bounded == value <= 2
     return submission,files
 
 
-
-
 def test_optional_history_search_then_separate_direct_evidence(tmp_path,tlc):
     from audit_support import check_step,review_step
     def preflight_model(state):
@@ -63,6 +60,10 @@ def test_optional_history_search_then_separate_direct_evidence(tmp_path,tlc):
     assert not state.calibrations and not any(c.action=='replay' for c in state.checks)
     assert len(state.monitor_results)==1 and state.monitor_results[0]['direct_check_id']
     assert not any(f.stage.value=='reproduced' for f in state.findings)
+    from consensus_assurance.reporting.chinese import render_report
+    text=render_report(state,e.root).read_text()
+    assert '找到模型反例' in text and '局部模型（与实现证据独立）' in text
+    assert search.id in text and '**已确认违反**' not in text
 
 
 def test_f1_changes_search_inputs_and_preserves_checker(tmp_path,tlc):
@@ -106,8 +107,6 @@ def test_incomplete_core_and_actual_syntax_error_can_be_repaired(tmp_path,tlc):
     assert len([c for c in state.checks if c.action=='model_check'])==1
     assert Path(state.models[0].path).is_file()
     assert len(list((e.root/'submissions').glob('*/diagnostics.json')))==1
-
-
 
 
 def test_audit_f3_preserves_old_unit_and_checks_new_dependency_scope(tmp_path,tlc):

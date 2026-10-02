@@ -125,7 +125,11 @@ def costs(state):
         'interpretation':'Rejected calls may contain useful investigation; wall time is not token cost or pure waste'}
 
 
-def view(state):
+def preview(text):
+    return text if len(text) <= 240 else text[:240] + '…'
+
+
+def view(state, compact=False):
     spec = load(state)
     current = [u for u in state.units if u.status != 'revised']
     superseded = {a.previous_id for a in state.direct_checks+state.models}
@@ -133,6 +137,14 @@ def view(state):
         (a.unit_id in {u.id for u in current} or getattr(a,'research_ref',None))]
     records = [r for r in state.monitor_results if (r.get('direct_check_id') or r.get('model_id')) in {a.id for a in artifacts}]
     results=conclusions(state,records)
+    issues=open_issues(state)
+    disputed={i.target_id for i in issues}
+    focus_units={u.id for u in current if u.status!='checked' or u.id==state.active_unit_id}
+    focus_units.update(a.unit_id for a in state.direct_checks+state.models if a.id in disputed)
+    focus_candidates={c.id for c in state.question_candidates if c.status=='active' or c.id in disputed}
+    focus_candidates.update(u.candidate_id for u in state.units if u.id in focus_units)
+    focus_claims={id for u in state.units if u.id in focus_units for id in u.obligation_ids}
+    def project(obj,fields):return obj.model_dump(mode='json',include=fields if compact else None)
     overview=spec.core_overview if spec else None
     ready=bool(overview and overview.status=='usable')
     directed=bool((state.config.get('directed_question') or '').strip())
@@ -150,24 +162,37 @@ def view(state):
                 'Save partial maps and leads; explain formation, context transitions and their connection before focused investigation',
             'core_gaps':overview.core_gaps if overview else ['Initial two-line explanation is not yet recorded']},
         'drafts':[s for s in drafts.values() if s['draft_status']!='accepted'],
-        'candidates':[c.model_dump(mode='json',exclude={'history','check_ids'}) for c in state.question_candidates],
-        'units':[u.model_dump(mode='json',exclude={'audit_question'}) for u in current],
-        'claims':[c.model_dump(mode='json') for c in state.claims if any(c.id in u.obligation_ids for u in current)],
-        'artifacts':[a.model_dump(mode='json') for a in artifacts], 'assessments':records,
+        'candidates':[],
+        'units':[project(u,set(type(u).model_fields)-{'audit_question'} if u.id in focus_units else
+            {'id','version','candidate_id','obligation_ids','status'}) if compact else u.model_dump(mode='json',exclude={'audit_question'}) for u in current],
+        'claims':[{**project(c,None if c.id in focus_claims else {'id','version','concern'}),
+            **({'description_preview':preview(c.description)} if compact and c.id not in focus_claims else {})}
+            for c in state.claims if any(c.id in u.obligation_ids for u in current)],
+        'artifacts':[project(a,{'id','version','unit_id','claim_id','research_ref','stage','pending_components',
+            'plan_path','bundle_path','harness_path','graph_versions','previous_id'}) for a in artifacts], 'assessments':records,
         'frontier':frontier(state,spec,results), 'capacity':capacity(state), 'conclusions':results, 'costs':costs(state),
         'handoffs':[s for s in state.selections if s.get('feedback') or s.get('released_candidate_ids') or s['action'] in {'pause','explained'} or s['action']=='stop' and s.get('scope')!='run'],
         'pending_work':pending_work(state), 'current':{k:v for k,v in state.current_submission.items() if k!='harness'},
         'latest_decision':state.selections[-1] if state.selections else None,
         'stop':state.run_stop, 'stop_reason':state.stop_reason}
-    for candidate in result['candidates']:
-        candidate['results']=[{k:r[k] for k in ('claim_id','description','disposition')} for r in results if r['candidate_id']==candidate['id']]
-        candidate['open_issue_ids']=[i.id for i in open_issues(state) if i.target_id==candidate['id']]
+    for c in state.question_candidates:
+        exclude={'history','check_ids'}
+        if compact and c.id not in focus_candidates:
+            exclude.update({'question','stop_reason'})
+            if c.id not in result['frontier']['paused_candidate_ids']:exclude.add('resume_conditions')
+        candidate=c.model_dump(mode='json',exclude=exclude)
+        if 'question' in exclude:
+            candidate.update(question_preview=preview(c.question.question),audit_spec_version=c.question.audit_spec_version)
+        candidate['result_claim_ids' if compact else 'results']=[r['claim_id'] if compact else
+            {k:r[k] for k in ('claim_id','description','disposition')} for r in results if r['candidate_id']==c.id]
+        candidate['open_issue_ids']=[i.id for i in issues if i.target_id==c.id]
         candidate['current_applicability']='pending_review' if candidate['open_issue_ids'] else 'within_recorded_scope'
         units={u.id for u in state.units if u.candidate_id==candidate['id']}
         owned={a.id for a in state.models+state.direct_checks if a.unit_id in units}
         candidate['executions']=[{'check_id':c.id,'artifact_id':c.direct_check_id or c.model_id,
             'action':c.action,'status':c.status.value,'outcome':c.outcome}
             for c in state.checks if c.direct_check_id in owned or c.model_id in owned]
+        result['candidates'].append(candidate)
     return result
 
 
@@ -175,42 +200,16 @@ def current_view(state, root, implementation=None):
     """Rebuild the work index with exact history locators and trusted runtime context."""
     from consensus_assurance.adapters.validation import validation_tool
     from .review_contract import target_contract
-    result = view(state)
+    result = view(state, compact=True)
     def record(collection, match, **extra):
         return {'path':'state.json', 'collection':collection, 'match':match, **extra}
-    def preview(text):
-        return text if len(text) <= 240 else text[:240] + '…'
     issues = open_issues(state)
-    disputed = {i.target_id for i in issues}
-    focus_units = {u.id for u in state.units if u.status != 'revised' and
-        (u.status != 'checked' or u.id == state.active_unit_id)}
-    focus_units.update(a.unit_id for a in state.direct_checks+state.models if a.id in disputed)
-    focus_candidates = {c.id for c in state.question_candidates if c.status == 'active' or c.id in disputed}
-    focus_candidates.update(u.candidate_id for u in state.units if u.id in focus_units)
-    focus_claims = {id for u in state.units if u.id in focus_units for id in u.obligation_ids}
     for candidate in result['candidates']:
         candidate['record'] = record('question_candidates', {'id':candidate['id']})
-        candidate['result_claim_ids'] = [r['claim_id'] for r in candidate.pop('results')]
         for execution in candidate['executions']:
             execution['record'] = record('checks', {'id':execution['check_id']})
-        if candidate['id'] not in focus_candidates:
-            question = candidate.pop('question')
-            candidate['question_preview'] = preview(question['question'])
-            candidate['audit_spec_version'] = question['audit_spec_version']
-            for key in ('material_ids','spec_task_ids','stop_reason'):
-                candidate.pop(key, None)
-            if candidate['id'] not in result['frontier']['paused_candidate_ids']:candidate.pop('resume_conditions',None)
-    for unit in result['units']:
-        unit['record'] = record('units', {'id':unit['id'], 'version':unit['version']})
-        if unit['id'] not in focus_units:
-            for key in tuple(unit):
-                if key not in {'id','version','candidate_id','obligation_ids','status','record'}:unit.pop(key)
-    for claim in result['claims']:
-        claim['record'] = record('claims', {'id':claim['id'], 'version':claim['version']})
-        if claim['id'] not in focus_claims:
-            claim['description_preview'] = preview(claim['description'])
-            for key in tuple(claim):
-                if key not in {'id','version','concern','description_preview','record'}:claim.pop(key)
+    for collection in ('units','claims'):
+        for obj in result[collection]:obj['record']=record(collection,{'id':obj['id'],'version':obj['version']})
     objects = {(name,obj.id):obj for name in ('claims','bindings','relations','units') for obj in getattr(state,name)}
     for artifact in result['artifacts']:
         artifact['record'] = record('direct_checks' if 'plan_path' in artifact else 'models', {'id':artifact['id']})
@@ -225,10 +224,6 @@ def current_view(state, root, implementation=None):
             artifact['basis'].append(reference)
         if artifact.get('previous_id'):
             artifact['previous_record'] = record(artifact['record']['collection'], {'id':artifact['previous_id']})
-        for key in tuple(artifact):
-            if key not in {'id','version','unit_id','claim_id','research_ref','stage','pending_components',
-                    'plan_path','bundle_path','harness_path','graph_versions','record','basis','previous_id','previous_record'}:
-                artifact.pop(key)
     result['assessments'] = [{**{k:r[k] for k in ('claim_id','direct_check_id','experiment_check_id',
         'confirmed','outcome','blockers','bounded_complete','reviewed_complete','correspondence','review_ids','open_issue_ids') if k in r},
         'record':record('monitor_results', {'experiment_check_id':r['experiment_check_id'], 'claim_id':r['claim_id']})}
@@ -313,8 +308,6 @@ def reject_local(state, operation_id, errors, raw):
         'repair_of':previous['operation_id'] if previous else None,'diagnostics':diagnostics,'repeats':repeats,
         'draft_status':'paused' if paused else 'active','raw_path':errors['raw_path'],
         'submitted_path':errors.get('submitted_path')})
-    for c in state.question_candidates:
-        if c.id in ids:c.stagnation=repeats
     if paused:
         release(state,ids,'Repeated identical draft diagnostics; compare other sourced directions',
             ['Repair the archived draft diagnostics with new information before resuming'])

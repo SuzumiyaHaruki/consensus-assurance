@@ -73,7 +73,7 @@ def test_f2_relation_dependency_requeues_unrelated_completed_unit(tmp_path,depen
     from regression_support import declared_changes
     f.target_ids.append(edge.id)
     declared_changes(state,f)
-    apply_feedback(state,unit,bundle,f)
+    apply_feedback(state,unit,f)
     assert next(u for u in state.units if u.id=='other').status=='pending'
     assert next(u for u in state.units if u.id=='other').recheck_reasons
 

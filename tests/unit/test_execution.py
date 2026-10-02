@@ -1,5 +1,4 @@
 import json
-import os
 import subprocess
 import sys
 from pathlib import Path
@@ -135,10 +134,6 @@ def test_go_backend_is_toolchain_scoped(tmp_path,module,package):
     env=backend.environment(workspace)
     assert {k:env[k] for k in ('GOPROXY','GOSUMDB','GOTOOLCHAIN','GOFLAGS')}==dict(GOPROXY='off',GOSUMDB='off',GOTOOLCHAIN='local',GOFLAGS='-mod=readonly')
     assert env['GOCACHE'].startswith(str(workspace))
-    probe=run_experiment(runner,backend.probe_command(),workspace,'s',120,'workspace','capability_probe',adapter=backend)
-    assert probe.outcome=='not_applicable' and probe.parameters['package_build'],probe
-    assert backend.capabilities(probe)[0].status=='probe_confirmed'
-    assert backend.capabilities(probe)[1].status=='unavailable'
     (workspace/harness).write_text('package isolated\nimport "testing"\nfunc TestAssuranceBuild(t *testing.T) {}\n')
     run=run_experiment(runner,backend.experiment_command(),workspace,'s',120,'workspace',adapter=backend)
     assert run.outcome=='tests_passed',run

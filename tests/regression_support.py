@@ -50,21 +50,18 @@ def fixture_reachability(bundle):
     return result
 
 
-def read_material(repo, snapshot, request):
+def read_material(repo, snapshot, file, start_line, end_line):
     from consensus_assurance.core.types import Material
-    path=repo/request.file
-    text="\n".join(path.read_text().splitlines()[request.start_line-1:request.end_line])
-    return Material(id=f"{request.file}:{request.start_line}:{request.end_line}",file=request.file,
-        start_line=request.start_line,end_line=request.end_line,text=text,
+    path=repo/file
+    text="\n".join(path.read_text().splitlines()[start_line-1:end_line])
+    return Material(id=f"{file}:{start_line}:{end_line}",file=file,
+        start_line=start_line,end_line=end_line,text=text,
         kind='document_statement' if path.suffix=='.md' else 'code_observation',
-        content_digest=snapshot.files[request.file])
+        content_digest=snapshot.files[file])
 
 
 def add_reads(state,repo,requests):
-    additions=[read_material(repo,state.snapshot,r) for r in map(ReadRequest.model_validate,requests)]
+    additions=[read_material(repo,state.snapshot,**{k:r[k] for k in ('file','start_line','end_line')}) for r in requests]
     known={m.id for m in state.materials}
     state.materials.extend(m for m in additions if m.id not in known)
     return [m.id for m in additions]
-
-
-from consensus_assurance.core.proposals import ReadRequest

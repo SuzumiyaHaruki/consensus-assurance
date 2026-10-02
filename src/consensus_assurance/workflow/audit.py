@@ -7,7 +7,7 @@ from pydantic import ValidationError
 
 from consensus_assurance.adapters.storage.files import digest, write_json
 from consensus_assurance.adapters.runners.experiment import extract_events, install_harness, run_experiment
-from consensus_assurance.core.submissions import (AuditSubmission, SourceRange, CandidateSubmission,
+from consensus_assurance.core.submissions import (AuditSubmission, CandidateSubmission,
     CheckSubmission, ModelSubmission, ResearchSubmission, SemanticSubmission, ReviewSubmission, ExploreSubmission)
 from consensus_assurance.core.proposals import (DirectCheckPlan, ModelDraft, Feedback,
     Harness, GraphPatch, UnitDraft)
@@ -202,7 +202,6 @@ def candidate(engine, submission, operation_id, spec=None):
         if current.question!=q:current.history.append(current.question.model_copy(deep=True))
         current.question = q
         current.resume_conditions = []
-        if progress:current.stagnation=0
     else:
         if parent and parent.status in {"active", "escalated"}:
             from .research import release
@@ -279,7 +278,8 @@ def prepare_submission(engine, submission, inputs, operation_id):
         submission=submission.model_copy(update={'feedback':outer or inner,'repair_of':submission.repair_of or submission.candidate.repair_of,
             'candidate':submission.candidate.model_copy(update={'feedback':outer or inner})})
     state = engine.state
-    research_before = state.model_copy(deep=True)
+    research_before = state.model_copy(update={name:[o.model_copy(deep=True) for o in getattr(state,name)]
+        for name in ('question_candidates','claims','bindings','relations','units','models','direct_checks','semantic_reviews','review_issues')})
     mapped=submission.candidate if isinstance(submission,CheckSubmission) and submission.candidate else submission
     from . import audit_spec
     from consensus_assurance.core.diagnostics import Diagnostic, DiagnosticError
@@ -456,14 +456,14 @@ def prepare_submission(engine, submission, inputs, operation_id):
             state.scope_updates[update.id] = {"status":"accepted", "proposal":update.model_dump(mode="json"), "new_unit_id":new.id}
             reconnect_candidate(state,new)
     elif isinstance(submission, SemanticSubmission):
-        from .feedback import apply_feedback
+        from .feedback import _apply_feedback
         unit = require_unit(state, submission.unit_id)
         feedback = Feedback.model_validate(inputs.json(submission.feedback_path))
-        if feedback.kind not in {"F2", "F3"} or feedback.requests:
+        if feedback.kind not in {"F2", "F3"}:
             raise ValueError("Semantic submission needs complete attributed F2/F3; use Codex reads first")
         if feedback.patch:patch_versions(feedback.patch, feedback.changes)
         engine.budget.take("revisions")
-        apply_feedback(state, unit, None, feedback, audit_spec=spec)
+        _apply_feedback(state, unit, feedback, audit_spec=spec)
         revised_ids={u.id for u in feedback.patch.units} if feedback.patch else {unit.id}
         for new in state.units:
             if new.status!='revised' and (new.id in revised_ids or new.previous_id==unit.id):reconnect_candidate(state,new)
@@ -500,6 +500,7 @@ def prepare_submission(engine, submission, inputs, operation_id):
     if submission.action not in {'stop','explore','review'}:validate_objects()
     def finish():
         persist_artifact()
+        refresh_assessments(state, {a.id for a in state.direct_checks}, before=research_before)
         sync_progress(engine)
         if proposed is not None:audit_spec.accept(engine,proposed)
         decision=state.selections[-1]
@@ -583,7 +584,6 @@ def prompt(engine, method):
 def sync_progress(engine):
     from .modeling import obligation_progress, coverage_limitations
     state = engine.state
-    refresh_assessments(state, {a.id for a in state.direct_checks})
     for unit in state.units:
         if unit.status == "revised":
             continue
@@ -623,7 +623,7 @@ def execute_model(engine, model):
         if syntax.status != ExecutionStatus.COMPLETED or syntax.exit_code != 0:
             state.gaps.append("Model syntax incomplete; inspect " + str(syntax.stderr))
             return
-    check = latest("model_check") or engine.search(unit, model, bundle, None)
+    check = latest("model_check") or engine.search(model)
     if check.status == ExecutionStatus.COMPLETED and bundle.reachability:
         engine.check_triggers(model, bundle)
 

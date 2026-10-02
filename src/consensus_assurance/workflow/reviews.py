@@ -2,7 +2,7 @@
 from consensus_assurance.core.types import ReviewIssue
 
 
-from .review_contract import required_aspects, target_contract
+from .review_contract import required_aspects
 from .sources import includes
 
 
@@ -126,8 +126,6 @@ def repair_changes(old, artifact, version=None):
 
 
 def accept_review(state, submission, operation_id):
-    from types import SimpleNamespace
-    from consensus_assurance.core.proposals import ReviewReply
     from consensus_assurance.core.types import SemanticReview
     from .review_contract import validate_contract
     objects = review_objects(state)
@@ -140,15 +138,13 @@ def accept_review(state, submission, operation_id):
     if not checks and not candidate:
         raise ValueError('Review requires an actual completed execution of the selected artifact')
     sources = [m.id for m in state.materials]
-    task = SimpleNamespace(target_ids=[artifact.id], material_ids=sources, context_receipt_id=None)
-    reply = ReviewReply(items=submission.review_items, limitations=[])
     from consensus_assurance.core.diagnostics import Diagnostic, DiagnosticError
     errors = []
-    try:validate_contract(state, task, reply)
+    try:validate_contract(state, artifact.id, submission.review_items)
     except DiagnosticError as exc:errors.extend(exc.diagnostics)
-    if not required_aspects(artifact) <= {i.aspect for i in reply.items}:
+    if not required_aspects(artifact) <= {i.aspect for i in submission.review_items}:
         raise ValueError('Review must address the supplied whole-artifact contract')
-    if any(not i.source_ids or not i.rationale.strip() for i in reply.items):
+    if any(not i.source_ids or not i.rationale.strip() for i in submission.review_items):
         raise ValueError('Review needs actual source citations and substantive reasoning')
     pending = {i.id:i for i in open_issues(state,artifact)}
     if len({r.issue_id for r in submission.resolutions}) != len(submission.resolutions):
@@ -176,7 +172,7 @@ def accept_review(state, submission, operation_id):
                 resolution.condition_dispositions, resolution.source_ids, records=issue.conditions)
             if any(d.applies_to == 'current_judgment' for d in dispositions):
                 raise ValueError('Current unresolved conditions cannot discharge their issue')
-        item = next((i for i in reply.items if i.aspect == issue.aspect and i.status == 'no_issue_found'), None)
+        item = next((i for i in submission.review_items if i.aspect == issue.aspect and i.status == 'no_issue_found'), None)
         if not item or item.counterevidence or not includes(state,resolution.source_ids,item.source_ids):
             error(index, issue, 'Resolution needs matching substantive review with its answer sources and no current counterevidence', aspect=issue.aspect, answer_source_ids=resolution.source_ids)
         others = {i.id for i in open_issues(state) if i.id != issue.id and i.parent_issue_id != issue.id}
@@ -200,7 +196,7 @@ def accept_review(state, submission, operation_id):
                     original_artifact=old.id, answering_artifact=artifact.id)
     if errors:raise DiagnosticError(errors)
     review = SemanticReview(task_id='review:' + operation_id, check_id=operation_id,
-        target_versions={artifact.id:artifact.question.audit_spec_version if candidate else artifact.version}, material_ids=sources, items=reply.items,
+        target_versions={artifact.id:artifact.question.audit_spec_version if candidate else artifact.version}, material_ids=sources, items=submission.review_items,
         origin='mock' if state.mode == 'mock' else 'agent', unit_id=getattr(artifact,'unit_id',None) or None,
         unit_version=next((u.version for u in state.units if u.id == getattr(artifact,'unit_id',None)), None),
         model_id=artifact.id if hasattr(artifact, 'bundle_path') else None,
@@ -211,7 +207,7 @@ def accept_review(state, submission, operation_id):
         issue.resolved_by = review.id
         issue.resolution_basis = resolution.model_dump(mode='json')
         issue.resolution_checks = [c.id for c in checks]
-    for item in reply.items:
+    for item in submission.review_items:
         if item.status == 'no_issue_found':
             continue
         if any(i.target_id == artifact.id and i.aspect == item.aspect and i.explanation == item.rationale

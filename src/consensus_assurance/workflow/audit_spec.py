@@ -11,7 +11,7 @@ QUESTION_BASIS = ('audit_spec_version', *IDENTITY, 'supporting_behavior_ids', 'q
 
 class SpecIssue(DiagnosticError):
     """An object-level understanding issue; not a mechanical output patch."""
-    draft_path = None
+    pass
 
 
 def audit_object_key(obj):

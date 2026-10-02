@@ -46,7 +46,7 @@ def test_model_stop_labels_do_not_establish_controller_events(tmp_path,reason):
         raw.pop('origin')
         return raw,{}
     def proceed(state):
-        assert not state['run_stop'] and all(not c['stagnation'] for c in state['question_candidates'])
+        assert not state['run_stop']
         assert diagnostics(e)[0]['errors']==messages
         assert state['units'][0]['status']!='checked' and not state['review_issues'][0]['resolved_by']
         return dict(action='research',feedback=feedback(state),rationale='The isolated exploration failure leaves source investigation available'),{}

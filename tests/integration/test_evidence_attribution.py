@@ -1,14 +1,9 @@
-import copy
-import json
 import shutil
 from pathlib import Path
 import pytest
 from ack_support import ROOT, setup_ack
-from consensus_assurance.core.types import Finding, Investigation, ExecutionStatus, Origin
-from consensus_assurance.core.proposals import Comparison
+from consensus_assurance.core.types import ExecutionStatus
 from consensus_assurance.workflow.artifacts import save_bundle
-from consensus_assurance.workflow.observations import monitor_events
-from consensus_assurance.adapters.runners.experiment import run_experiment, extract_events
 from consensus_assurance.adapters.runners.python import PythonBackend
 
 
@@ -31,11 +26,9 @@ def test_multiple_invariants_are_attributed_individually(tlc,tmp_path,reversed_o
     from consensus_assurance.adapters.agents.backend import MockAgent
     engine=Engine(Config(),runner.root,PythonBackend(),MockAgent(),verifier,'')
     engine.state=state;engine.budget=BudgetTracker(Config().budget,state)
-    engine.search(unit,model,bundle,None)
+    engine.search(model)
     assert [f.claim_id for f in state.findings]==['durable']
     assert [e.claim_id for e in state.evidence]==['durable']
-
-
 
 
 @pytest.mark.real

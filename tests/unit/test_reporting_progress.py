@@ -14,8 +14,11 @@ def test_test_pass_and_model_failure_keep_different_scopes(tmp_path):
     test = CheckRun(action='capability_probe', outcome='tests_passed', exit_code=0, **args)
     model = CheckRun(action='model_check', outcome='counterexample', exit_code=12, **args)
     unknown = CheckRun(action='model_check', **args)
-    assert execution_summary(test)[1] == '所执行测试通过'
-    assert '不自动证明目标' in execution_summary(test)[2]
+    assert '未检查性质' in execution_summary(test)[2]
+    explore=CheckRun(action='exploration',outcome='tests_passed',exit_code=0,**args)
+    assert '没有正式性质判定' in execution_summary(explore)[2]
+    permission=CheckRun(action='codex_permission_probe',exit_code=0,**args)
+    assert '未检查性质' in execution_summary(permission)[2]
     assert execution_summary(model)[1] == '找到模型反例'
     assert execution_summary(unknown)[2] == '性质检查未完成或无法归属'
 
@@ -115,3 +118,77 @@ def test_agent_reads_work_index_after_action_checkpoint_report_and_resume(tmp_pa
     history=json.loads((e.root/ref['path']).read_text())[ref['collection']]
     original=next(h for h in history if all(h[k]==v for k,v in ref['match'].items()))[ref['field']]
     assert original==old_claim and original['description']!=state.claims[0].description
+
+
+def test_mixed_report_reads_fixed_results_and_moves_without_side_effects(tmp_path,monkeypatch):
+    import json,re,shutil
+    from pathlib import Path
+    from urllib.parse import unquote
+    from audit_support import engine_for,first,products,check_step,review_step,stop
+    from consensus_assurance.workflow.research import view
+    from consensus_assurance.adapters.runners.process import ProcessRunner
+    from consensus_assurance.registry import EXECUTION_BACKENDS
+    def initial(state):
+        sub,files=first(state);spec=json.loads(files['map.json'])
+        spec['surfaces']=[dict(entry_point='external repeat policy',disposition='UNCLASSIFIED_PROTOCOL_RESPONSIBILITY',
+            source_ids=['code'],reason='Caller repetition responsibility is unspecified')]
+        files['map.json']=json.dumps(spec)
+        return sub,files
+    def review(state):
+        sub,files=review_step()(state)
+        sub['review_items'][0].update(report_title='边界返回责任',report_answer='本次完整观察返回 4，上限为 3。')
+        return sub,files
+    def second(state):
+        candidate,files=first(state)
+        candidate.pop('map_path');files={}
+        candidate=json.loads(json.dumps(candidate).replace('"bounded"','"interior"').replace('"binding"','"interior-binding"'))
+        candidate['question']['question']='Does an interior input respect the same local capacity?'
+        _,plan,harness=products()
+        plan=json.loads(json.dumps(plan).replace('"bounded"','"interior"').replace('"binding"','"interior-binding"'))
+        return dict(action='check',candidate=candidate,plan_path='plan.json',harness_path='check.py',files={'helper.py':'helper.py'},
+            rationale='Independently check another legal input'),{'plan.json':json.dumps(plan),
+            'check.py':harness.replace('step(3,3)','step(2,3)'), 'helper.py':'def legal(v,n): return 0 <= v <= n\n'}
+    def explained(state):
+        sub,_=first(state);sub.pop('map_path');sub.update(action='explained',obligation=None,bindings=[])
+        sub['question'].update(question='What happens outside the selected local capacity?',
+            disposition='explained_by_existing_mechanism',counterevidence=['The other branch returns zero'])
+        return sub,{}
+    def explore(state):
+        return dict(action='explore',question='Under a caller-selected repeat policy, what values are produced?',
+            harness_path='explore.py',rationale='Observe behavior before attributing the repeat policy'),{'explore.py':"from target import step\nprint('conditional',step(2,3),step(3,3))\n"}
+    def retain(state):
+        check=next(c for c in state['checks'] if c['action']=='exploration')
+        return (dict(action='research',rationale='Retain the conditional output and missing responsibility',feedback=dict(
+            ref_ids=[check['id'],'code','surface:external repeat policy'],answered='Under the chosen repeat policy the actual returns were 3 and 4.',
+            remaining=['Acquire the caller repeat contract'],understanding='updated',rationale='No obligation is inferred from unequal returns')),
+            {})
+    steps=[initial,check_step(broken=True),check_step(revise=True),review,second,review_step(),explained,explore,retain,stop]
+    e,repo=engine_for(tmp_path,steps);e.agent.mock=False;e.config.execution_isolation='bwrap'
+    (repo/'target.py').write_text('def step(value, limit):\n    return value + 1 if value <= limit else 0\n')
+    e.config.budget.experiments=4
+    state=e.start(repo)
+    assert not list((e.root/'submissions').glob('*/diagnostics.json')),state.stop_reason
+    assert [r['disposition'] for r in view(state)['conclusions']]==['confirmed_in_scope','bounded_no_violation']
+    assert state.usage['experiments']==4 and len(state.claims)==2
+    old=state.direct_checks[0];old_check=next(c for c in state.checks if c.direct_check_id==old.id)
+    current=state.direct_checks[1];exploration=next(c for c in state.checks if c.action=='exploration')
+    monkeypatch.setattr(ProcessRunner,'run',lambda *a,**kw:(_ for _ in ()).throw(AssertionError('Report cannot execute')))
+    monkeypatch.setitem(EXECUTION_BACKENDS,'python',lambda *a,**kw:(_ for _ in ()).throw(AssertionError('Report cannot assemble')))
+    moved=tmp_path/'moved';shutil.copytree(e.root,moved)
+    before={p.relative_to(moved):p.read_bytes() for p in moved.rglob('*') if p.is_file()}
+    saved=state.model_dump(mode='json');text=render_report(state,moved).read_text()
+    assert state.model_dump(mode='json')==saved and all((moved/p).read_bytes()==v for p,v in before.items())
+    assert '**已确认违反**' in text and '**有限检查未见违反**' in text and '源码解释' in text
+    assert '边界返回责任' in text and '本次完整观察返回 4' in text
+    assert 'external repeat policy' in text and 'Acquire the caller repeat contract' in text
+    assert old_check.id in text and current.plan_path.split('/direct-checks/')[1] in text
+    assert exploration.id in text and text.count('该问题保留的失败执行')==1
+    assert 'distributed consequences' in text and '没有正式性质判定' in execution_summary(exploration)[2]
+    assert '_ca_stream' not in text and '_ca_observation' not in text and '<details>' not in text
+    assert state.semantic_reviews[0].items[0].rationale not in text
+    links=re.findall(r'\]\(([^)]+)\)',text)
+    assert all(not Path(unquote(p)).is_absolute() and (moved/unquote(p)).is_file() for p in links)
+    # A missing archived version must not silently resolve against the still-existing original run.
+    (moved/Path(current.plan_path).relative_to(e.root)).unlink()
+    text=render_report(state,moved).read_text()
+    assert '条件与检查器（归档字节缺失）' in text and str(e.root) not in text

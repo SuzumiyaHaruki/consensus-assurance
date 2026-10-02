@@ -23,9 +23,8 @@ def setup(tmp_path,prepared,broken=False):
     state.snapshot=capture(repo);state.mode='real';state.analysis_mode='regression';state.framework_revision=FRAMEWORK_REVISION
     for i,m in enumerate(state.materials):
         if m.file=='counter.py':
-            state.materials[i]=read_material(repo,state.snapshot,ReadRequest(file=m.file,start_line=1,end_line=len((repo/m.file).read_text().splitlines()),reason='Actual fixture source'))
+            state.materials[i]=read_material(repo,state.snapshot,file=m.file, start_line=1, end_line=len((repo/m.file).read_text().splitlines()))
             state.materials[i].id=m.id
-    state.file_index={}
     for binding in state.bindings:
         binding.snapshot_id=state.snapshot.id;binding.content_digest=state.snapshot.files[binding.file]
         binding.excerpt='\n'.join((repo/binding.file).read_text().splitlines()[binding.start_line-1:binding.end_line])
@@ -63,7 +62,7 @@ emit('returned', value=returned, in_range=0 <= returned <= limit)
 def review(state,unit,artifact):
     # Explicit controlled semantic input; real execution is tested separately.
     contract=target_contract(state,artifact)
-    state.semantic_reviews.append(SemanticReview(task_id='controlled',check_id='controlled',target_versions={artifact.id:artifact.version},context_dependencies={artifact.id:contract},
+    state.semantic_reviews.append(SemanticReview(task_id='controlled',check_id='controlled',target_versions={artifact.id:artifact.version},
         material_ids=contract['required_material_ids'],items=[SemanticCheck(target_id=artifact.id,aspect='checker_correspondence',status='no_issue_found',source_ids=contract['required_material_ids'],rationale='The fixture contract, actual call, prerequisites and independent oracle agree within the supplied local scope')],origin='mock'))
 
 
@@ -132,6 +131,35 @@ def test_direct_failure_never_confirms(tmp_path,prepared,failure):
     assert not result['confirmed'],result
     assert result['outcome']==('unknown' if failure in {'prerequisite','missing','compile','identity','applicability'} else 'violated'),result
     assert not any(f.level=='implementation_obligation' for f in e.state.findings)
+
+
+@pytest.mark.parametrize('change',['source','review','issue','claim'])
+def test_assessment_refresh_preserves_unaffected_results(tmp_path,prepared,monkeypatch,change):
+    from consensus_assurance.workflow import direct_checks
+    e,u,p=setup(tmp_path,prepared,True)
+    artifacts=[save_plan(e,u,p,key) for key in ('first','second')]
+    for a in artifacts:
+        review(e.state,u,a)
+        c=execute(e,a)
+        assess(e.state,u,a,p,c,extract_events(c))
+    before=e.state.model_copy(deep=True)
+    if change=='source':e.state.materials.append(e.state.materials[0].model_copy(update={'id':'additional-source'}))
+    elif change=='review':e.state.semantic_reviews[0].items[0].status='disputed'
+    elif change=='issue':
+        e.state.review_issues.append(ReviewIssue(review_id='challenge',target_id=artifacts[0].id,target_version=1,
+            aspect='checker_correspondence',source_ids=u.audit_question.source_ids,explanation='Return boundary remains disputed',
+            disposition='investigation',reason='Check actual observation ownership'))
+    else:next(c for c in e.state.claims if c.id==p.claim_id).version+=1
+    parsed=[]
+    def events(check):
+        parsed.append(check.direct_check_id)
+        return extract_events(check)
+    monkeypatch.setattr(direct_checks,'extract_events',events)
+    direct_checks.refresh_assessments(e.state,{a.id for a in artifacts},before=before)
+    assert parsed==([] if change=='source' else [a.id for a in artifacts] if change=='claim' else [artifacts[0].id])
+    records={r['direct_check_id']:r for r in e.state.monitor_results}
+    assert records[artifacts[0].id]['confirmed']==(change=='source')
+    assert records[artifacts[1].id]['confirmed']==(change!='claim')
 
 
 @pytest.mark.parametrize('relationship',['revision','independent','shared_requirement'])

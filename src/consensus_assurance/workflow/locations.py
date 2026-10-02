@@ -158,16 +158,3 @@ def location_context(binding, materials):
             'requested_anchor':binding.anchor.model_dump(mode='json') if binding.anchor else None,
             'behavior_range':[binding.start_line,binding.end_line],
             'next_action':'Correct an anchored offset only with supplied declaration evidence; request any missing contiguous interval. Open prefix does not establish a complete function end.'}
-
-
-def declaration_index(materials):
-    """Index only supplied contiguous source; offsets are navigation, not semantics."""
-    from .sources import source_views
-    result=[]
-    for view,refs in source_views(materials):
-        entries=[{'symbol':(d['owner']+'.' if d.get('owner') else '')+d['symbol'],
-                  'kind':d['kind'],'start_line':d['start'],'signature_end':d['signature_end'],
-                  'end_line':d['end'],'known_end':extent(d),'boundary_complete':d.get('closed',True)}
-                 for d in declarations(view) if d['kind']!='callsite']
-        if entries:result.append({'file':view.file,'material_ids':[m.id for m in refs],'declarations':entries})
-    return result

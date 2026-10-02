@@ -157,7 +157,7 @@ class ArtifactReviewItem(SemanticCheck):
 class ReviewSubmission(Submission):
     action: Literal["review"]
     artifact_id: str
-    review_items: list[ArtifactReviewItem] = Field(min_length=1)
+    review_items: list[ArtifactReviewItem] = Field(min_length=1, max_length=30)
     resolutions: list[IssueResolution] = []
 
     @model_validator(mode='after')

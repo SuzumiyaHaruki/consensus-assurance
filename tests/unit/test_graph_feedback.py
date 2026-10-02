@@ -29,14 +29,12 @@ def test_F3_rejects_unrelated_or_empty_expansion(dependency_prepared):
     with pytest.raises(ValueError): expand_unit(state, state.units[0], ["maps_input"])
 
 
-
-
 def test_F2_requires_normative_basis_and_invalidates(dependency_prepared):
     _, state, bundle, responses = dependency_prepared; add_check(state)
     revised = GraphDraft.model_validate(responses['graph'])
     revised.claims[1].description = "A refined obligation based on the documented caller responsibility"
     f = feedback(state, "F2", graph=revised, new_basis="The document assigns normalization to the caller")
-    with pytest.raises(ValueError): apply_feedback(state, state.units[0], bundle, f)
+    with pytest.raises(ValueError): apply_feedback(state, state.units[0], f)
     f.evidence_ids = [next(m.id for m in state.materials if m.file=='README.md')]
     f.patch = GraphPatch(claims=[revised.claims[1]],expected_versions={revised.claims[1].id:1},rationale=f.new_basis)
     f.target_ids = [revised.claims[1].id]
@@ -47,12 +45,10 @@ def test_F2_requires_normative_basis_and_invalidates(dependency_prepared):
     state.calibrations.append(Calibration(model_id="old", experiment_check_id="observed", mapping_path="mapping", trace_path="trace", status="compatible", reason="Previous match", origin=Origin.MOCK))
     from regression_support import declared_changes
     declared_changes(state,f)
-    apply_feedback(state, state.units[0], bundle, f)
+    apply_feedback(state, state.units[0], f)
     assert state.graph_version == 2
     assert state.calibrations[0].status == "compatible"  # Unrelated historical calibration survives.
     assert state.revisions[-1].return_step == "understand"
-
-
 
 
 def test_fake_binding_and_normative_inference_rejected(dependency_prepared):
@@ -86,7 +82,6 @@ def test_code_derived_responsibilities_are_candidates(prepared):
     with pytest.raises(ValueError,match='located implementation binding'): apply_graph(state,graph)
 
 
-
 def test_conflicting_F2_does_not_turn_error_into_optimization(prepared):
     from consensus_assurance.workflow.feedback import apply_feedback
     _,state,bundle,responses=prepared
@@ -97,6 +92,6 @@ def test_conflicting_F2_does_not_turn_error_into_optimization(prepared):
     before=state.claims[1].model_dump()
     from regression_support import declared_changes
     declared_changes(state,f)
-    assert apply_feedback(state,state.units[0],bundle,f) is None
+    assert apply_feedback(state,state.units[0],f) is None
     assert state.claims[1].model_dump()==before
     assert state.revisions[-1].status=='unresolved'

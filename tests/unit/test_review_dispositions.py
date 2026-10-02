@@ -29,7 +29,7 @@ def test_grounding_only_F2_changes_scope_without_rewriting_claim(prepared):
     draft.grounding.applicability+='; selected serial configuration only'
     feedback.grounding=draft.grounding.model_copy(update={"unresolved":[],"conflicts":[]})
     feedback.changes=[JudgmentChange(target_id=claim.id,field='grounding',old_value_json=json.dumps(old),new_value_json=json.dumps(draft.grounding.model_dump(mode='json')))]
-    apply_feedback(state,state.units[0],None,feedback)
+    apply_feedback(state,state.units[0],feedback)
     current=next(c for c in state.claims if c.id==claim.id)
     assert current.version==2 and current.description==description
     assert 'serial configuration' in current.grounding.applicability
@@ -80,23 +80,19 @@ def test_condition_reference_diagnostics_are_specific_and_do_not_erase_judgment(
     assert classify_conditions(state,[r['text'] for r in records],[item],[id],records=records)==[item]
 
 
-
-
-
 @pytest.mark.parametrize('applies_to',['old_judgment','current_judgment','independent_scope'])
 def test_F2_attributes_exact_conflict_without_erasing_it(prepared,applies_to):
     _,s,_,_=prepared;id=s.claims[1].id;f=revision_for(s,[id]);f.grounding.conflicts=['The previous statement also constrained object replacement']
     f.condition_dispositions=[ConditionDisposition(condition=f.grounding.conflicts[0],applies_to=applies_to,source_ids=f.evidence_ids,rationale='The source distinguishes update within one object from replacement; this is attributed to the stated judgment, not a claim about all histories')]
-    apply_feedback(s,s.units[0],None,f)
+    apply_feedback(s,s.units[0],f)
     assert s.revisions[-1].status==('unresolved' if applies_to=='current_judgment' else 'applied')
     assert s.revisions[-1].after['grounding']['conflicts']==f.grounding.conflicts
     assert s.claims[1].version==(1 if applies_to=='current_judgment' else 2)
-
 
 
 def test_F2_cannot_rename_unaddressed_condition(prepared):
     _,s,_,_=prepared;f=revision_for(s,[s.claims[1].id]);f.grounding.unresolved=['Actual input truth unverified']
     f.condition_dispositions=[ConditionDisposition(condition='Different harmless text',applies_to='old_judgment',source_ids=f.evidence_ids,rationale='Not the actual original question')]
     before=s.model_dump()
-    with pytest.raises(ValueError):apply_feedback(s,s.units[0],None,f)
+    with pytest.raises(ValueError):apply_feedback(s,s.units[0],f)
     assert s.model_dump()==before

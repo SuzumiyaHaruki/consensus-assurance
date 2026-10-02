@@ -35,19 +35,20 @@ def test_cli_audit_fixture_execution_and_report(tmp_path,capsys,monkeypatch):
     assert (root/'draft').is_dir() and (root/'submissions').is_dir() and (root/'agent-source').is_dir()
     assert any(c['action']=='direct_check' and c['exit_code']==0 for c in state['checks'])
     report=(root/'report.md').read_text()
-    assert 'mock' in report and state['units'][0]['id'] in report
+    assert 'mock' in report and '待调查线索' in report and Path(state['direct_checks'][0]['harness_path']).relative_to(root).as_posix() in report
     derived=['audit-spec.json','materials.json','graph.json','audit-progress.json','plan.json']
     assert all(not (root/name).exists() for name in derived)
     index=json.loads((root/'research.json').read_text());index.update(retained_context='obsolete',remaining_seconds=98,remaining_agent_calls=25)
     (root/'research.json').write_text(json.dumps(index))
     assert main(['report','--run',str(root)])==0
     current=json.loads((root/'research.json').read_text())
-    assert not {'retained_context','remaining_seconds','remaining_agent_calls'} & current.keys()
+    assert current==index
     assert current['implementation']['harness_kind']=='python' and current['validation']['command']
     assert current['capacity']['remaining']['agent_calls']==0
     assert all(not (root/name).exists() for name in derived)
     assert main(['report','--run',str(root),'--export-views'])==0
     assert all((root/name).exists() for name in derived)
+    assert json.loads((root/'research.json').read_text())==index
     artifact=state['direct_checks'][0]
     assert json.loads(Path(artifact['plan_path']).read_text())['claim_id']==state['claims'][0]['id']
     import re
@@ -107,3 +108,24 @@ def test_readable_unique_run_directories(tmp_path):
     old = tmp_path / ('a' * 32)
     old.mkdir()
     assert resolve_run(old.name, tmp_path) == old
+
+
+def test_estimate_reports_explicit_long_limits_without_tools(tmp_path,capsys,monkeypatch):
+    import consensus_assurance.cli as cli
+    def forbidden(*args,**kwargs):raise AssertionError('Estimate must not assemble or create a run')
+    monkeypatch.setattr(cli,'assemble',forbidden)
+    monkeypatch.setattr(cli,'create_run_directory',forbidden)
+    example=Path(__file__).parents[2]/'configs/targets/go_long.example.yaml'
+    assert main(['estimate','--config',str(example),'--repo',str(tmp_path)])==0
+    result=json.loads(capsys.readouterr().out)
+    assert result['预算']['total_seconds']==4800 and result['预算']['experiments']==16
+    assert result['预算']['semantic_reviews']==10 and result['预算']['audit_units']==6
+    assert result['后端']['模型检查']=='none' and result['后端']['目标执行']=='go_module'
+    assert result['授权']=={'发送材料':False,'执行目标':False}
+    assert '粗略计划下限' not in result and '计划可能受限' not in result
+    assert '失败重试' in result['计数口径']['experiments']
+    config=cli.load_config(example);config.budget.experiments=0;config.budget.semantic_reviews=0
+    path=tmp_path/'zero.yaml';path.write_text(config.model_dump_json())
+    assert main(['estimate','--config',str(path),'--repo',str(tmp_path)])==0
+    result=json.loads(capsys.readouterr().out)
+    assert result['零额度']==['experiments','semantic_reviews'] and '源码调查' in result['限制说明']

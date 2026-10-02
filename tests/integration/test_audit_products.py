@@ -699,17 +699,17 @@ def test_feedback_only_retains_exploration_before_a_map_and_recovers_once(tmp_pa
     from consensus_assurance.workflow.audit import accept, Inputs, AuditSubmission
     from consensus_assurance.workflow.transactions import commit_graph
     def explore(state):
-        return dict(action='explore',question='Observe the local return before selecting a claim',
+        return dict(action='explore',question='Under an explicit caller policy, compare interior and boundary returns before attributing a requirement',
             harness_path='explore.py',rationale='Use a real local call'),{
-            'explore.py':"from target import step\nprint('observed', step(3,3))\n"}
+            'explore.py':"from target import step\nprint('observed', step(2,3), step(3,3))\n"}
     def retain(state):
         check=next(c for c in state['checks'] if c['action']=='exploration')
         return dict(action='research',rationale='Retain the construction observation',feedback=dict(
-            ref_ids=[check['id']],answered='The executed local boundary call returned zero.',remaining=[],
+            ref_ids=[check['id']],answered='The selected input policy produced distinct returns 3 and 0.',remaining=['The caller policy responsibility is not yet established'],
             understanding='updated',rationale='No normative claim or map change is implied.')),{}
     def next_turn(state):
         current=json.loads((e.root/'research.json').read_text())
-        assert current['handoffs'][-1]['feedback']['answered'].endswith('zero.')
+        assert current['handoffs'][-1]['feedback']['answered'].endswith('3 and 0.')
         assert not any(state[k] for k in ('question_candidates','units','evidence','findings'))
         assert state['audit_spec_version']==0
         from consensus_assurance.workflow.audit import validate_submission
@@ -717,9 +717,9 @@ def test_feedback_only_retains_exploration_before_a_map_and_recovers_once(tmp_pa
         raw['feedback']['ref_ids']=[current['handoffs'][-1]['operation_id']]
         (e.root/'draft'/'indirect.json').write_text(json.dumps(raw))
         assert validate_submission(e.state,e.root,'indirect.json',e.implementation)['valid']
-        return stop(state)
-    e,repo=engine_for(tmp_path,[explore,retain,next_turn])
-    e.config.directed_question=None
+        return first(state)
+    e,repo=engine_for(tmp_path,[explore,retain,next_turn,check_step(),review_step(),stop])
+    e.agent.mock=False;e.config.execution_isolation='bwrap'
     old=e.graph_commit_hook
     def interrupt(key):
         if e.state.usage.get('agent_calls')==2:raise KeyboardInterrupt('Retained transaction before adoption')
@@ -727,7 +727,11 @@ def test_feedback_only_retains_exploration_before_a_map_and_recovers_once(tmp_pa
     with pytest.raises(KeyboardInterrupt):e.start(repo)
     e.graph_commit_hook=old
     state=e.resume()
-    assert state.usage['experiments']==1
+    assert state.usage['experiments']==2
+    exploratory=next(c for c in state.checks if c.action=='exploration')
+    assert 'observed 3 0' in Path(exploratory.stdout).read_text()
+    assert all(e.check_id!=exploratory.id for e in state.evidence)
+    assert state.monitor_results[-1]['outcome']=='holds' and not state.findings
     assert len([s for s in state.selections if s['action']=='research'])==1
     counts=(dict(state.usage),len(state.selections))
     e.resume()
@@ -817,6 +821,7 @@ def test_whole_artifact_review_inherits_only_omitted_identity(tmp_path):
         draft=e.root/'draft'/'review.json'
         draft.write_text(json.dumps(raw))
         assert validate_submission(e.state,e.root,draft.name,e.implementation)['valid']
+        with pytest.raises(ValueError):AuditSubmission.model_validate({**raw,'review_items':raw['review_items']*31})
         for fields,expected in (({'target_id':'bounded'},'review_unknown_target'),
                 ({'counterevidence':['This oracle remains disputed']},'review_contradictory_judgment'),
                 ({'status':'revision_needed','counterevidence':['Wrong oracle'],'challenged_components':[]},'review_missing_component'),
@@ -828,9 +833,24 @@ def test_whole_artifact_review_inherits_only_omitted_identity(tmp_path):
             if expected=='review_unknown_target':
                 item=next(d for d in diagnostics if d['code']==expected)
                 assert item['details']['allowed_targets'][0]['target_id']==raw['artifact_id']
+                assert item['paths']==['/review_items/0']
         return raw,files
     e,repo=engine_for(tmp_path,[first,check_step(),review,stop]);state=e.start(repo)
     assert state.semantic_reviews[0].items[0].target_id==state.direct_checks[0].id
     assert 'target_id' not in AuditSubmission.model_json_schema()['$defs']['ArtifactReviewItem']['required']
     with pytest.raises(ValueError):SemanticCheck.model_validate({'aspect':'applicability','status':'no_issue_found',
         'source_ids':['code'],'rationale':'A normal persisted semantic item requires its target'})
+
+
+def test_zero_review_budget_keeps_measured_violation_unconfirmed(tmp_path):
+    e,repo=engine_for(tmp_path,[first,check_step(),review_step(),stop])
+    e.config.budget.semantic_reviews=0;e.agent.mock=False;e.config.execution_isolation='bwrap'
+    (repo/'target.py').write_text('def step(value, limit):\n    return value + 1\n')
+    state=e.start(repo)
+    assert state.usage['experiments']==1 and state.usage.get('semantic_reviews',0)==0
+    assert state.monitor_results[-1]['outcome']=='violated' and not state.monitor_results[-1]['confirmed']
+    assert not state.semantic_reviews
+    assert state.units[0].remaining_obligation_ids and state.usage['agent_calls']==4
+    from consensus_assurance.reporting.chinese import render_report
+    text=render_report(state,e.root).read_text()
+    assert '**已确认违反**' not in text and '对应性复核 待复核' in text

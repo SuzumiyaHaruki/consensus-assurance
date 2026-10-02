@@ -1,10 +1,11 @@
+from consensus_assurance.core.submissions import SourceRange
 """Codex transport protocol, local permission preflight and source boundaries."""
 import json
 from pathlib import Path
 import pytest
 from consensus_assurance.adapters.agents.backend import CodexAgent, failure_reason
 from consensus_assurance.core.types import CheckRun, ExecutionStatus, Analysis
-from consensus_assurance.workflow.audit import AuditSubmission, prepare_agent_source, source_materials, SourceRange
+from consensus_assurance.workflow.audit import prepare_agent_source, source_materials
 from consensus_assurance.adapters.storage.snapshot import capture
 
 
@@ -120,7 +121,6 @@ def test_source_view_only_exposes_authorized_snapshot_and_rejects_stale_range(tm
 
 
 def test_one_audit_runtime_and_methods_match_product_interface():
-    import ast
     from consensus_assurance.workflow.audit import method_text
     from consensus_assurance.workflow.engine import Engine
     root=Path('src/consensus_assurance/workflow')

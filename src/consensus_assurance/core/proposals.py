@@ -1,6 +1,6 @@
 from typing import Literal
 from pydantic import Field
-from .types import AssociatedCode, Record, Scope, ConstraintSource, Grounding, CheckerSpec, ReadRequest, SemanticCheck, AuditQuestion, ReachabilityRequirement, Concern
+from .types import AssociatedCode, Record, Scope, ConstraintSource, Grounding, CheckerSpec, AuditQuestion, ReachabilityRequirement, Concern
 
 
 class ClaimDraft(Record):
@@ -183,7 +183,6 @@ class Bundle(ModelCore):
 class ComponentWork(Record):
     component: Literal['behavior', 'properties', 'harness', 'observation']
     reason: str = Field(min_length=1, description="The missing evidence or executable component, not an assumed guarantee")
-    requests: list[ReadRequest] = []
 
 
 class ModelDraft(ModelCore):
@@ -238,7 +237,6 @@ class Feedback(Record):
     old_judgment: str = ""
     new_judgment: str = ""
     grounding: Grounding = Grounding()
-    requests: list[ReadRequest] = []
 
 
 class IssueResolution(Record):
@@ -250,11 +248,6 @@ class IssueResolution(Record):
     rationale: str = Field(description="Why actual evidence answers this specific issue; describing current behavior alone is insufficient")
     residual_issue_ids: list[str] = Field(description="Other independent open issues that remain; never the resolved issue or its unresolved children")
     scope_limitations: list[str] = Field(description="Independent boundaries retained by the related review item")
-
-
-class ReviewReply(Record):
-    items: list[SemanticCheck] = Field(min_length=1, max_length=30)
-    limitations: list[str] = []
 
 
 class DirectCheckPlan(Record):

@@ -68,6 +68,10 @@ def test_partial_valid_witness_is_retained_idempotently_without_completing_unit(
     assert first==second and before==(len(e.state.evidence),len(e.state.findings),len(e.state.monitor_results))==(1,1,1)
     assert second['confirmed'] and not second['bounded_complete'] and second['properties'][0]['limitations']
     assert obligation_progress(e.state,unit)[1]==unit.obligation_ids
+    from consensus_assurance.reporting.chinese import render_report
+    text=render_report(e.state,e.root).read_text()
+    assert '**已确认违反**' in text and '独立场景完整处置：False' in text
+    assert '（未完成）' in text and 'other' in text and second['properties'][0]['limitations'][0] in text
     polluted=assess(e.state,unit,artifact,plan,check,events+[dict(event='invalid_observation')])
     assert not polluted['confirmed'] and polluted['parsing_errors']
 

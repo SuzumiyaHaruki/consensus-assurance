@@ -1,24 +1,16 @@
 """Actual TLC witnesses, contract alternatives and bounded consequence dispositions."""
-import json
-import shutil
 import pytest
-from consensus_assurance.core.types import ReachabilityRequirement, AuditQuestion, Claim, Finding, Origin, QuestionCandidate
+from consensus_assurance.core.types import ReachabilityRequirement, AuditQuestion
 from consensus_assurance.workflow.artifacts import save_bundle,validate_bundle
 from consensus_assurance.workflow.modeling import obligation_progress,coverage_limitations
-from consensus_assurance.workflow.engine import Engine
-from consensus_assurance.workflow.budget import BudgetTracker
-from consensus_assurance.core.config import Config
-from consensus_assurance.registry import assemble
 from consensus_assurance.adapters.storage.files import write_json
 from consensus_assurance.adapters.runners.python import PythonBackend
-from ack_support import setup_ack, ROOT
 
 
 @pytest.mark.real
 @pytest.mark.parametrize('predicate,expected', [('value = 1','reachable'),('value = 99','unreachable')])
 def test_original_holds_and_actual_trigger_coverage_remain_separate(tlc,prepared,predicate,expected):
     verifier,runner=tlc;_,state,bundle,_=prepared;unit=state.units[0]
-    unit.audit_question=AuditQuestion(question='Does the increment respect its input when a support step actually occurs?',importance='The consumer uses the produced bound',source_ids=state.claims[1].source_ids,trigger_rationale='A step must occur to exercise the increment responsibility')
     unit.audit_question=AuditQuestion(question="Is the consumer reachable?",importance="Finite scoped consequence",source_ids=state.claims[1].source_ids,trigger_rationale="Execute the actual trigger",behavior_ids=["use"])
     lines=bundle.behavior.splitlines();lines.insert(-1,'Used == '+predicate);bundle.behavior='\n'.join(lines)+'\n'
     req=ReachabilityRequirement(id='use-trigger',operator='Used',claim_ids=[unit.obligation_ids[0]],behavior_ids=['use'],description='Actual supported step is reachable')
@@ -48,8 +40,6 @@ def test_missing_trigger_or_changed_model_never_counts_as_reached(tmp_path,prepa
     req=ReachabilityRequirement(id='changed',operator='Init',claim_ids=unit.obligation_ids,description='Recheck changed input')
     result,check=TLCVerifier(None).reachability(ProcessRunner(tmp_path/'runner'),model,bundle,req,10)
     assert result.status=='unknown' and check.status.value=='not_scheduled'
-
-
 
 
 @pytest.mark.parametrize('status',['tool_missing','timeout'])

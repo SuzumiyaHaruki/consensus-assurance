@@ -1,6 +1,6 @@
 import json
 from pathlib import Path
-from consensus_assurance.core.types import Capability, ExecutionStatus
+from consensus_assurance.core.types import ExecutionStatus
 
 
 class GoModuleBackend:
@@ -26,8 +26,7 @@ class GoModuleBackend:
                 except ValueError:
                     continue
             if not any(e.get("Action") == "pass" and e.get("Test") for e in events):
-                check.parameters["package_build"]=check.action=="capability_probe" and any(e.get("Package") and e.get("Action") in {"pass","skip"} for e in events)
-                check.outcome="not_applicable";check.reason="Compile probe only" if check.parameters["package_build"] else "No tests passed; selected tests were absent or skipped"
+                check.outcome="not_applicable";check.reason="No tests passed; selected tests were absent or skipped"
             else:
                 check.outcome = "tests_passed"
         else:
@@ -46,14 +45,7 @@ class GoModuleBackend:
         self.package=target.execution_package if target else "."
         self.harness_filename=(target.harness_path if target else None) or str(Path(self.package)/"assurance_generated_test.go")
         self.timeout=timeout
-    def probe_command(self):
-        return ["go", "test", "-json", "-run", "^$", "./..."]
     def experiment_command(self):
         return ["go", "test", "-json", "-count=1", f"-timeout={self.timeout}s", "-run", "^TestAssurance", self.package]
     def version_command(self):
         return ["go", "version"]
-    def capabilities(self, check):
-        return [Capability(name="package_build", status="probe_confirmed" if check.status==ExecutionStatus.COMPLETED and check.exit_code==0 and check.parameters.get("package_build") else "unavailable",
-            check_id=check.id, description="Offline package compilation; no protocol correctness or scheduling claim"),
-            Capability(name="precise_schedule_replay", status="unavailable", check_id=None,
-            description="No pre-established deterministic asynchronous or crash schedule control; generated experiments must demonstrate prerequisites")]

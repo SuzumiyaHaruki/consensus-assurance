@@ -19,7 +19,6 @@ class ScopeAssessment(Record):
 
 class ScopeUpdate(Record):
     id: str = Field(default_factory=uid)
-    read_plan_id: str | None = None
     unit_id: str
     unit_version: int
     original_question: str
@@ -28,7 +27,6 @@ class ScopeUpdate(Record):
     changes: list[JudgmentChange]
     source_ids: list[str]
     remaining_unknowns: list[str]
-    continue_at: Literal['build'] = 'build'
     assessment: ScopeAssessment | None = None
 
 
@@ -50,7 +48,7 @@ def reject(update,code,message,writes):
         message=message,allowed=['semantic_revision','stop'],details={'actual_fields':[{'object_id':id,'field':f,'old':a,'new':b} for (id,f),(a,b) in writes.items()],'next_action':'Record a scoped F2 or unresolved investigation; never silently apply a mixed patch'})])
 
 
-def validate_scope_update(state,update,audit_spec=None):
+def _prepare_scope_update(state,update,audit_spec=None):
     unit=next((u for u in state.units if u.id==update.unit_id),None)
     if unit is None or unit.version!=update.unit_version:raise ValueError('Scope source unit/version no longer matches')
     writes=write_set(state,update.patch)
@@ -66,9 +64,10 @@ def validate_scope_update(state,update,audit_spec=None):
     if unit.candidate_id!=draft.candidate_id:reject(update,'scope_question_changed','Scope expansion preserves its Candidate identity',writes)
     if unit.audit_question and (not draft.audit_question or any(getattr(draft.audit_question,k)!=getattr(unit.audit_question,k) for k in ('fact_ids','obligation_relation_kind')) or any(not set(getattr(unit.audit_question,k))<=set(getattr(draft.audit_question,k)) for k in ('behavior_ids','activity_classes'))):reject(update,'scope_question_changed','Replacing the principal Fact/lifecycle or removing responsibility paths requires F2',writes)
     refined={f for id,f in writes if f in {'audit_question'}}
-    from .graph import apply_patch
+    from .graph import _apply_patch
     candidate=new_candidate_patch(state,update)
-    try:apply_patch(state.model_copy(deep=True),candidate,audit_spec=audit_spec)
+    trial=state.model_copy(deep=True)
+    try:_apply_patch(trial,candidate,audit_spec=audit_spec)
     except DiagnosticError as exc:
         # Explicit provenance, not ID-prefix guessing or merged-array coordinates.
         identities={candidate.units[0].id:update.unit_id}
@@ -78,9 +77,13 @@ def validate_scope_update(state,update,audit_spec=None):
         raise
     if refined:
         a=update.assessment
-        if a is None:return sorted(refined)
+        if a is None:return sorted(refined),trial
         if a.decision!='refinement' or a.preserved_question!=update.original_question or not refined<=set(a.addressed_fields) or not a.rationale.strip() or not set(a.source_ids)<=set(update.source_ids):reject(update,'scope_interpretation_unresolved','The changed paths require an attributed refinement judgment; semantic changes remain F2 work',writes)
-    return []
+    return [],trial
+
+
+def validate_scope_update(state,update,audit_spec=None):
+    return _prepare_scope_update(state,update,audit_spec)[0]
 
 
 def declared_to_list(values):return sorted((id,f,a,b) for (id,f),(a,b) in values.items())
@@ -94,25 +97,20 @@ def new_candidate_patch(state,update):
 
 
 def apply_scope_update(state,update,audit_spec=None):
-    needed=validate_scope_update(state,update,audit_spec)
+    needed,trial=_prepare_scope_update(state,update,audit_spec)
     if needed:reject(update,'scope_review_needed','Review the changed event/coverage interpretation before adoption',write_set(state,update.patch))
-    trial=state.model_copy(deep=True);old=next(u for u in trial.units if u.id==update.unit_id)
+    old=next(u for u in trial.units if u.id==update.unit_id)
     new_id=old.id+'.scope.'+update.id
-    existing=next((u for u in trial.units if u.id==new_id),None)
-    if existing:return existing
-    patch=new_candidate_patch(trial,update)
-    from .graph import apply_patch
-    apply_patch(trial,patch,audit_spec=audit_spec)
-    old=next(u for u in trial.units if u.id==update.unit_id);new=next(u for u in trial.units if u.id==new_id)
+    new=next(u for u in trial.units if u.id==new_id)
     new.previous_id=old.id;new.version=old.version+1
-    new.semantic_readiness={};new.remaining_obligation_ids=list(new.obligation_ids)
+    new.remaining_obligation_ids=list(new.obligation_ids)
     new.boundary_changes=['Grounded dependency scope update: '+update.patch.rationale]+update.remaining_unknowns
     if update.assessment:new.boundary_changes+=update.assessment.remaining_unknowns
     new.coverage_limitations=['Newly included support code is not a verified guarantee; current scope needs new model and observation checks']
     trial.graph_history.append({'kind':'units','id':old.id,'version':old.version,'record':old.model_dump(mode='json'),'reason':update.patch.rationale})
     old.status='revised';trial.units.remove(new);trial.units.insert(0,new)
     affected=[m.id for m in trial.models if m.unit_id==old.id];trial.affect(affected,update.patch.rationale,historical=True)
-    trial.revisions.append(Revision(kind='F3',rationale=update.patch.rationale,evidence_ids=update.source_ids,target_ids=[old.id],relation_ids=patch.units[0].relation_ids,
+    trial.revisions.append(Revision(kind='F3',rationale=update.patch.rationale,evidence_ids=update.source_ids,target_ids=[old.id],relation_ids=new.relation_ids,
         before={'unit':old.model_dump(mode='json'),'question':update.original_question},after={'unit_id':new.id,'scope_update':update.model_dump(mode='json'),'affected_model_ids':affected},return_step='build'))
     adopt(state,trial)
     return next(u for u in state.units if u.id==new_id)
