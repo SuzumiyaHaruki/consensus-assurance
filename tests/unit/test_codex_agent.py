@@ -147,19 +147,25 @@ def test_source_view_only_exposes_authorized_snapshot_and_rejects_stale_range(tm
     with pytest.raises(ValueError,match='version changed'):source_materials(e,[ref])
 
 
-def test_one_audit_runtime_and_methods_match_product_interface():
+def test_one_audit_runtime_and_methods_match_product_interface(tmp_path):
     from consensus_assurance.workflow.audit import method_text
     from consensus_assurance.workflow.engine import Engine
+    from consensus_assurance.workflow.prompts import loaded_resources
+    from audit_support import engine_for, stop
     root=Path('src/consensus_assurance/workflow')
     for name in ('discovery','inquiry','agent_tasks','task_packet','output_repair','staged_model','native'):
         assert not (root/(name+'.py')).exists()
     assert not hasattr(Engine,'ask') and not hasattr(Engine,'targeted_read')
     paths,text=method_text()
-    assert 'Use Codex' in text and 'previous_check_id' in text and 'product-schemas.json' in text
-    assert all((Path('src/consensus_assurance/resources')/p).is_file() for p in paths)
-    assert 'key/value_json' not in text and 'previous_reply' not in text
-    for answer in ('hashicorp','swiftpaxos','fixture_value','v16','v20'):
-        assert answer not in text.lower()
+    selection=loaded_resources()
+    e,repo=engine_for(tmp_path,[stop]);state=e.start(repo)
+    assert paths==selection['paths']==state.method_paths
+    assert state.framework_revision==selection['manifest_version']
+    assert (e.root/'audit-method.md').read_text()==text
+    resource_root=Path('src/consensus_assurance/resources')
+    assert text=='\n'.join((resource_root/p).read_text() for p in paths)
+    assert {'system.md','skills/consensus-analysis/guide.md',
+        'skills/consensus-analysis/references/behavior-facts.md','tasks/audit.md'}<=set(paths)
 
 
 def test_submission_symlink_swap_cannot_change_the_read_target(tmp_path,monkeypatch):

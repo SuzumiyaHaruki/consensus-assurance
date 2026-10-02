@@ -279,17 +279,8 @@ def test_fact_correction_is_saved_before_an_explicit_semantic_revision(tmp_path)
     assert state.graph_history and (e.root/'audit-spec'/'v1.json').exists()
 
 
-def test_explained_is_not_execution_evidence_and_forced_stop_needs_no_map(tmp_path):
-    def explained(state):
-        sub,files=question_step(state)
-        sub.update(action='explained')
-        sub['question'].update(disposition='explained_by_existing_mechanism',counterevidence=['The capacity branch resets the returned value to zero'])
-        return sub,files
-    e,repo=engine_for(tmp_path,[explained,stop])
-    state=e.start(repo)
-    assert state.question_candidates[0].status=='explained' and not state.evidence and not state.units
-    other=tmp_path/'forced';other.mkdir()
-    e,repo=engine_for(other,[stop])
+def test_forced_stop_needs_no_map(tmp_path):
+    e,repo=engine_for(tmp_path,[stop])
     state=e.start(repo)
     from consensus_assurance.reporting.chinese import render_report
     text=render_report(state,e.root).read_text()
@@ -1247,7 +1238,8 @@ def test_second_entry_and_consumer_reuse_fact_without_inheriting_a_result(tmp_pa
     retained={}
     def initial(state):
         sub,files=recording_first(state)
-        sub['sources'][0]['end_line']=5
+        sub['sources'][0]['end_line']=7
+        sub['bindings'][0].update(start_line=3,end_line=7)
         spec=json.loads(files['map.json'])
         spec['facts'][0].update(meaning='An invocation appended its returned value to the process records',
             representation=['records entry','return'],identity={'instance':'process','operation':'append occurrence'},
@@ -1260,35 +1252,44 @@ def test_second_entry_and_consumer_reuse_fact_without_inheriting_a_result(tmp_pa
         spec=json.loads(Path(state['audit_spec_path']).read_text())
         producer=spec['behaviors'][0]
         producer.update(execution_owner='step / seed callers',trigger='step or seed invocation',
-            source_ids=['code','alternate'],existing_protections=['step wraps at capacity; seed clamps to capacity; each appends its actual return'])
+            source_ids=['code','alternate'],
+            important_branches=['step appends and publishes a notification', 'seed appends without directly notifying'],
+            external_effects=['Only step adds its return to notifications'],existing_protections=['step wraps at capacity; seed clamps to capacity; each appends its actual return'])
         spec['behaviors'].append(dict(id='consume',primary_activity='A1',execution_owner='consume caller',
             protocol_context='one process',trigger='consume invocation',consumes_fact_ids=['result'],source_ids=['consumer']))
         q=products()[0]['question']
-        q.update(audit_spec_version=None,question='Which caller contract governs consumption after either append entry?',
+        retained['branches']=producer['important_branches']
+        retained['effects']=producer['external_effects']
+        q.update(audit_spec_version=None,question='Does either admitted append entry wake a consumer?',
             behavior_ids=['consume'],fact_ids=['result'],source_ids=['code','alternate','consumer'],
             disposition='needs_specific_evidence',preferred_check='source_review',obligation_relation_kind='consumption',
-            unknowns=['Whether the caller requires its own result or the latest result', 'Allowed ordering across append entries'],
+            unknowns=['Whether notifications are required after either entry', 'Whether another scheduler invokes the consumer'],
             trigger_rationale='Read caller ownership and ordering; no established consumer obligation yet')
         preserve='The existing requirement ends at step return; adding another entry and its later consumer changes neither those fixed inputs nor the return comparison'
         return dict(action='continue',question=q,map_path='map.json',
-            sources=[dict(id='alternate',file='target.py',start_line=6,end_line=9,kind='code_observation'),
-                dict(id='consumer',file='target.py',start_line=10,end_line=11,kind='code_observation')],
+            sources=[dict(id='alternate',file='target.py',start_line=8,end_line=11,kind='code_observation'),
+                dict(id='consumer',file='target.py',start_line=12,end_line=13,kind='code_observation')],
             map_changes={id:dict(impact='dependency',source_ids=['code','alternate','consumer'],rationale=why,preserves=preserve)
                 for id,why in [('call','The existing append-and-return abstraction covers the second actual entry'),
                     ('consume','The actual consumer reads the latest appended record; caller ordering remains unknown')]},
-            feedback=dict(feedback(state),answered='Two actual entry paths append their return; consume reads the last entry',
+            feedback=dict(feedback(state),answered='Both entries append; only step notifies. The consumer reads the last record; its scheduling contract remains unknown',
                 remaining=q['unknowns'],understanding='updated'),rationale='Investigate the distinct consumer contract from shared implementation knowledge'),{'map.json':json.dumps(spec)}
     e,repo=engine_for(tmp_path,[initial,check_step(),review_step(),next_candidate])
     e.config.directed_question=None
-    (repo/'target.py').write_text('records=[]\ndef step(value, limit):\n    result=value + 1 if value < limit else 0\n    records.append(result)\n    return result\ndef seed(value, limit):\n    result=max(0, min(value, limit))\n    records.append(result)\n    return result\ndef consume():\n    return records[-1] if records else None\ndef unread(value):\n    records.append(value)\n')
+    (repo/'target.py').write_text('records=[]\nnotifications=[]\ndef step(value, limit):\n    result=value + 1 if value < limit else 0\n    records.append(result)\n    notifications.append(result)\n    return result\ndef seed(value, limit):\n    result=max(0, min(value, limit))\n    records.append(result)\n    return result\ndef consume():\n    return records[-1] if records else None\ndef unread(value):\n    records.append(value)\n')
     state=e.start(repo)
     assert not diagnostics(e),diagnostics(e)
     assert state.audit_spec_version==2 and len(state.question_candidates)==2
-    spec=json.loads(Path(state.audit_spec_path).read_text())
+    index=json.loads((e.root/'research.json').read_text())
+    spec=json.loads(Path(index['audit_spec_path']).read_text())
+    producer=next(b for b in spec['behaviors'] if b['id']=='call')
+    assert producer['important_branches']==retained['branches']
+    assert producer['external_effects']==retained['effects']
+    assert set(producer['source_ids'])=={'code','alternate'}
     fact=next(f for f in spec['facts'] if f['id']=='result')
     assert fact['established_by']==['call'] and fact['consumed_by']==['consume']
     assert len(spec['facts'])==2 and not any(b['id']=='unread' for b in spec['behaviors'])
-    assert all(m.end_line<=11 for m in state.materials if m.file=='target.py')
+    assert all(m.end_line<=13 for m in state.materials if m.file=='target.py')
     assert state.units[0].model_dump(mode='json')==retained['unit']
     assert state.direct_checks[0].model_dump(mode='json')==retained['artifact']
     assert state.monitor_results[0]==retained['assessment']
@@ -1300,3 +1301,111 @@ def test_second_entry_and_consumer_reuse_fact_without_inheriting_a_result(tmp_pa
     assert current['candidates'][-1]['results']==[] and len(state.claims)==1
     assert state.units[0].audit_question.audit_spec_version==1
     assert state.usage['experiments']==1 and state.usage['semantic_reviews']==1
+
+
+@pytest.mark.parametrize('variant,outcome', [('overlap','violated'),('guarded','holds'),('ordered','unknown')])
+def test_explanation_then_completion_discriminator_with_real_controls(tmp_path, variant, outcome):
+    from audit_support import completion_target
+    target=completion_target(variant)
+    lines=target['target.py'].splitlines()
+    binding_start=lines.index('def allowed(ticket):')+1
+    def question():
+        q=products()[0]['question']
+        q.update(question='Can a caller report authorize consumption before actual work completion?',
+            behavior_ids=['consume'],obligation_relation_kind='consumption',
+            contexts=['One serialized current-generation ticket'],event_paths=['begin -> report -> allowed -> finish'],
+            importance='Consumption must not treat caller notification as completed work',
+            trigger_rationale='Distinguish reported admission from completed work under the documented ordering',
+            unknowns=['Whether the report-before-finish schedule is permitted'])
+        return q
+    def explained(state):
+        sub,_=first(state)
+        sub.update(action='explained',obligation=None,bindings=[],question=question())
+        sub['sources'][0]['end_line']=len(lines)
+        sub['question'].update(question='Can a retired ticket supply current admission after advance?',
+            disposition='explained_by_existing_mechanism',unknowns=[],
+            counterevidence=['advance clears admission and both completion sets; public entries reject retired tickets'])
+        spec=partial_map()
+        spec['target_profile']['system_boundary']='One completion-admission component'
+        spec['activities'][0].update(purpose='Authorize consumption from qualified current work',
+            realization_summary='Current admission, reporting and completion are distinct states')
+        spec['behaviors'][0].update(execution_owner='begin caller',trigger='begin',existing_protections=['Unique live ticket'])
+        spec['behaviors'].append(dict(id='consume',primary_activity='A1',execution_owner='serialized caller',
+            protocol_context='one generation',trigger='report, finish or allowed',consumes_fact_ids=['result'],
+            important_branches=['report records notification; finish also establishes completion',
+                'advance retires all tickets before the next generation'],source_ids=['code']))
+        spec['facts'][0].update(meaning='The current generation admitted this unique ticket',representation=['pending'],
+            identity={'ticket':'generation and request name'},validity_context='Until advance retires the ticket',
+            unknowns=['Completion qualification of downstream consumption'])
+        return sub,{'map.json':json.dumps(spec)}
+    def investigate(state):
+        assert not state['units'] and not state['checks'][-1]['direct_check_id'] and not state['evidence']
+        assert state['question_candidates'][0]['status']=='explained'
+        return dict(action='continue',question=question(),rationale='Investigate the distinct completion premise',
+            feedback=dict(feedback(state),answered='Retired admission is explained; report and completion remain distinct current-ticket events')),{}
+    def check(state):
+        candidate=state['question_candidates'][1]
+        sub,plan,_=products()
+        sub.update(candidate_id=candidate['id'],question=dict(candidate['question']),sources=[])
+        sub['question'].update(disposition='ready_for_check',unknowns=[])
+        sub['feedback']=dict(feedback(state),answered='The captured contract '+
+            ('permits reporting before finish; compare its actual authorization effect' if variant!='ordered' else
+                'forbids early reporting; retain this deliberately inapplicable execution as a negative control, never a defect witness'))
+        sub['obligation'].update(description='For compliant caller order, allowed implies completed work for this ticket',
+            scope={'description':'One current ticket; report before finish where permitted','excluded':['Wider system or client consequences']})
+        sub['obligation']['grounding'].update(derivation='The captured caller contract requires completed work before authorization',
+            applicability='Compliant serialized calls; the ordered control forbids report-before-finish')
+        sub['bindings'][0].update(symbol='allowed',start_line=binding_start,end_line=len(lines))
+        plan['harness']['legality'].update(derivation='Public begin/report/allowed/finish with independent caller-order observation',
+            applicability='Early report is admitted only where the captured contract permits it')
+        plan['description']='Observe reporting before actual completion under explicit caller-order applicability'
+        plan['harness']['description']='Public ticket calls with an independent completion ledger'
+        plan['observable_properties'][0].update(checker_id='Completion',assertion={'field':'state.safe','value':True},
+            description='Authorization requires actual completion')
+        plan['monitors'][0].update(checker_id='Completion')
+        plan['monitors'][0]['grounding'].update(derivation='Compare actual authorization to the independently controlled finish-call history',
+            applicability='Same admitted current ticket')
+        harness='''import json
+from target import begin, report, allowed, finish
+from pathlib import Path
+def emit(event, **state):
+    print('CA_EVENT '+json.dumps(dict(event=event,operation='one',state=state)))
+ticket=begin('request')
+finished=False
+legal='report may precede finish.' in Path('README.md').read_text()
+emit('admitted',legal=legal,ticket=ticket)
+reported=report(ticket)
+permitted=allowed(ticket)
+emit('returned',safe=not permitted or finished,permitted=permitted,finished=finished,reported=reported,ticket=ticket)
+finished=finish(ticket)
+emit('control',finished=finished,permitted=allowed(ticket),ticket=ticket)
+'''
+        return dict(action='check',candidate=sub,plan_path='plan.json',harness_path='check.py',
+            rationale='Retain the report-before-completion discriminator and independently record its applicability'),{
+                'plan.json':json.dumps(plan),'check.py':harness}
+    def review(state):
+        sub,files=review_step()(state)
+        sub['review_items'][0]['rationale']='Actual public-call history distinguishes reporting from completion; the ordered-contract negative control is inapplicable and cannot confirm a defect'
+        return sub,files
+    e,repo=engine_for(tmp_path,[explained,investigate,check,review])
+    e.config.directed_question='Investigate the completion and generation responsibilities of this component'
+    for name,content in target.items():(repo/name).write_text(content)
+    e.agent.mock=False;e.config.execution_isolation='bwrap'
+    state=e.start(repo)
+    assert not diagnostics(e),diagnostics(e)
+    assert all((repo/name).read_text()==content and (e.root/'source'/name).read_text()==content for name,content in target.items())
+    first_q,second_q=state.question_candidates
+    assert first_q.status=='explained' and not first_q.obligation_id and second_q.obligation_id
+    assert first_q.question.fact_ids==second_q.question.fact_ids
+    assert len(state.units)==len(state.direct_checks)==1 and state.usage['experiments']==state.usage['semantic_reviews']==1
+    result=state.monitor_results[0]
+    assert result['outcome']==outcome and result['confirmed']==(variant=='overlap')
+    assert state.units[0].status==('checked' if variant!='ordered' else 'pending')
+    if variant=='ordered':assert state.units[0].remaining_obligation_ids and not state.findings
+    execution=next(c for c in state.checks if c.action=='direct_check')
+    assert execution.snapshot_id==state.snapshot.id and execution.exit_code==0
+    events=[json.loads(line.removeprefix('CA_EVENT ')) for line in Path(execution.stdout).read_text().splitlines() if line.startswith('CA_EVENT ')]
+    assert events[0]['state']['legal']==(variant!='ordered')
+    assert events[1]['state']['permitted']==(variant!='guarded') and not events[1]['state']['finished']
+    assert events[-1]['state']['finished'] and events[-1]['state']['permitted']
+    assert 'Wider system or client consequences' in state.claims[0].scope.excluded

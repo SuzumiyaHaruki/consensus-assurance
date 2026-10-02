@@ -1,6 +1,6 @@
 # consensus-assurance
 
-使用 Codex 的 CFT 实现审计方法与证据工具。保留 Activity → Behavior → Fact → Candidate → Obligation → 检查／复核 → 理解回流；A1/A2 主导研究，五类支撑按实际依赖展开。局部问题处置后回到地图继续选题，合法执行见证用于限定结论。
+使用 Codex 寻找并验证 CFT 实现中有适用依据的正确性缺口。Activity → Behavior → Fact → Candidate → Obligation → 检查／复核 → 理解回流服务缺陷调查；A1/A2 主导，五类支撑按依赖展开。整体理解、保护分析和负结果是手段，测试数量或跑满预算不是目标；没有发现配额，合法执行与独立证据标准保持不变。
 
 ## 快速入口
 

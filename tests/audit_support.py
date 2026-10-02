@@ -137,3 +137,54 @@ def engine_for(tmp_path, steps):
         budget=Budget(agent_calls=len(steps),experiments=4,revisions=4,semantic_reviews=4,total_seconds=90))
     e=Engine(cfg,tmp_path/'run',PythonBackend(),ScriptedAgent(steps),'')
     return e,repo
+
+
+def completion_target(variant):
+    """Offline controls; export only the selected source and its caller contract."""
+    assert variant in {'overlap', 'guarded', 'ordered'}
+    predicate = 'ticket in completed' if variant == 'guarded' else 'ticket in reported'
+    contract = ('report may precede finish.' if variant != 'ordered' else
+        'The caller must finish a ticket before reporting it.')
+    return {'README.md':
+        'Calls are serialized. begin returns a unique live ticket; advance retires all old tickets. '
+        'finish completes work; report records a caller notification. ' + contract +
+        ' For compliant calls, allowed may be true only after work completed for the current ticket.\n',
+        'target.py': '''generation = 0
+pending = set()
+completed = set()
+reported = set()
+
+
+def begin(name):
+    ticket = (generation, name)
+    if ticket in pending:
+        raise ValueError("Duplicate live request")
+    pending.add(ticket)
+    return ticket
+
+
+def advance():
+    global generation
+    generation += 1
+    pending.clear()
+    completed.clear()
+    reported.clear()
+
+
+def finish(ticket):
+    if ticket not in pending:
+        return False
+    completed.add(ticket)
+    reported.add(ticket)
+    return True
+
+
+def report(ticket):
+    if ticket not in pending:
+        return False
+    reported.add(ticket)
+    return True
+
+
+def allowed(ticket):
+    return ticket in pending and ''' + predicate + '\n'}
