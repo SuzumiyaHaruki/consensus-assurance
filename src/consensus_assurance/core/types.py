@@ -154,7 +154,7 @@ class ConsensusAuditSpec(Record):
 
 
 class AuditQuestion(Record):
-    """Sourced investigation, protections and unknowns; neither a requirement nor a finding."""
+    """Sourced investigation of requirements, protections and history; these may remain unknown."""
     audit_spec_version: int | None = Field(default=None, ge=1)
     disposition: Literal["explained_by_existing_mechanism", "concrete_suspicion", "needs_specific_evidence", "ready_for_check"] | None = None
     preferred_check: Literal["source_review", "direct_test", "controlled_schedule"] | None = None

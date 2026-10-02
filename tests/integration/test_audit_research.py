@@ -1241,3 +1241,62 @@ def test_review_pause_and_reselection_continue_to_controller_boundary(tmp_path,m
     assert state.run_stop['origin']=='controller' and state.run_stop['reason']=='resource_limit'
     assert state.usage['experiments']==1 and state.usage['semantic_reviews']==1
     assert (state.elapsed_seconds>=4800)==(boundary=='deadline')
+
+
+def test_second_entry_and_consumer_reuse_fact_without_inheriting_a_result(tmp_path, full_refresh_equivalence):
+    retained={}
+    def initial(state):
+        sub,files=recording_first(state)
+        sub['sources'][0]['end_line']=5
+        spec=json.loads(files['map.json'])
+        spec['facts'][0].update(meaning='An invocation appended its returned value to the process records',
+            representation=['records entry','return'],identity={'instance':'process','operation':'append occurrence'},
+            validity_context='The append and return of that invocation',
+            unknowns=['Ordering of other callers and record consumption is not known'])
+        files['map.json']=json.dumps(spec)
+        return sub,files
+    def next_candidate(state):
+        retained.update(unit=state['units'][0],artifact=state['direct_checks'][0],assessment=state['monitor_results'][0])
+        spec=json.loads(Path(state['audit_spec_path']).read_text())
+        producer=spec['behaviors'][0]
+        producer.update(execution_owner='step / seed callers',trigger='step or seed invocation',
+            source_ids=['code','alternate'],existing_protections=['step wraps at capacity; seed clamps to capacity; each appends its actual return'])
+        spec['behaviors'].append(dict(id='consume',primary_activity='A1',execution_owner='consume caller',
+            protocol_context='one process',trigger='consume invocation',consumes_fact_ids=['result'],source_ids=['consumer']))
+        q=products()[0]['question']
+        q.update(audit_spec_version=None,question='Which caller contract governs consumption after either append entry?',
+            behavior_ids=['consume'],fact_ids=['result'],source_ids=['code','alternate','consumer'],
+            disposition='needs_specific_evidence',preferred_check='source_review',obligation_relation_kind='consumption',
+            unknowns=['Whether the caller requires its own result or the latest result', 'Allowed ordering across append entries'],
+            trigger_rationale='Read caller ownership and ordering; no established consumer obligation yet')
+        preserve='The existing requirement ends at step return; adding another entry and its later consumer changes neither those fixed inputs nor the return comparison'
+        return dict(action='continue',question=q,map_path='map.json',
+            sources=[dict(id='alternate',file='target.py',start_line=6,end_line=9,kind='code_observation'),
+                dict(id='consumer',file='target.py',start_line=10,end_line=11,kind='code_observation')],
+            map_changes={id:dict(impact='dependency',source_ids=['code','alternate','consumer'],rationale=why,preserves=preserve)
+                for id,why in [('call','The existing append-and-return abstraction covers the second actual entry'),
+                    ('consume','The actual consumer reads the latest appended record; caller ordering remains unknown')]},
+            feedback=dict(feedback(state),answered='Two actual entry paths append their return; consume reads the last entry',
+                remaining=q['unknowns'],understanding='updated'),rationale='Investigate the distinct consumer contract from shared implementation knowledge'),{'map.json':json.dumps(spec)}
+    e,repo=engine_for(tmp_path,[initial,check_step(),review_step(),next_candidate])
+    e.config.directed_question=None
+    (repo/'target.py').write_text('records=[]\ndef step(value, limit):\n    result=value + 1 if value < limit else 0\n    records.append(result)\n    return result\ndef seed(value, limit):\n    result=max(0, min(value, limit))\n    records.append(result)\n    return result\ndef consume():\n    return records[-1] if records else None\ndef unread(value):\n    records.append(value)\n')
+    state=e.start(repo)
+    assert not diagnostics(e),diagnostics(e)
+    assert state.audit_spec_version==2 and len(state.question_candidates)==2
+    spec=json.loads(Path(state.audit_spec_path).read_text())
+    fact=next(f for f in spec['facts'] if f['id']=='result')
+    assert fact['established_by']==['call'] and fact['consumed_by']==['consume']
+    assert len(spec['facts'])==2 and not any(b['id']=='unread' for b in spec['behaviors'])
+    assert all(m.end_line<=11 for m in state.materials if m.file=='target.py')
+    assert state.units[0].model_dump(mode='json')==retained['unit']
+    assert state.direct_checks[0].model_dump(mode='json')==retained['artifact']
+    assert state.monitor_results[0]==retained['assessment']
+    assert not state.revisions and not state.review_issues
+    current=view(state)
+    assert len(current['conclusions'])==1 and current['conclusions'][0]['disposition']=='bounded_no_violation'
+    new=state.question_candidates[-1]
+    assert new.question.audit_spec_version==2 and new.question.unknowns and not new.obligation_id
+    assert current['candidates'][-1]['results']==[] and len(state.claims)==1
+    assert state.units[0].audit_question.audit_spec_version==1
+    assert state.usage['experiments']==1 and state.usage['semantic_reviews']==1
