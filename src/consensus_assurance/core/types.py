@@ -157,7 +157,7 @@ class AuditQuestion(Record):
     """Sourced investigation, protections and unknowns; neither a requirement nor a finding."""
     audit_spec_version: int | None = Field(default=None, ge=1)
     disposition: Literal["explained_by_existing_mechanism", "concrete_suspicion", "needs_specific_evidence", "ready_for_check"] | None = None
-    preferred_check: Literal["source_review", "direct_test", "controlled_schedule", "local_model"] | None = None
+    preferred_check: Literal["source_review", "direct_test", "controlled_schedule"] | None = None
     question: str
     importance: str
     source_ids: list[str] = []
@@ -191,26 +191,6 @@ class QuestionCandidate(Record):
     obligation_id: str | None = None
 
 
-class ReachabilityRequirement(Record):
-    sequence: list[str] = []
-    identity_operator: str | None = None
-    id: str
-    operator: str
-    claim_ids: list[str] = Field(default_factory=list, description="Accepted claims when present; exploratory histories create no obligation")
-    behavior_ids: list[str] = []
-    fact_ids: list[str] = []
-    description: str
-
-
-class ReachabilityResult(Record):
-    model_id: str
-    requirement_id: str
-    check_id: str
-    status: Literal["reachable", "unreachable", "unknown"]
-    search_fingerprint: str
-    reason: str
-
-
 class SemanticCheck(Record):
     target_id: str
     aspect: Literal["applicability", "decomposition", "checker_correspondence"]
@@ -229,7 +209,6 @@ class SemanticReview(Record):
     id: str = Field(default_factory=uid)
     task_id: str
     check_id: str
-    model_id: str | None = None
     target_versions: dict[str, int]
     material_ids: list[str]
     items: list[SemanticCheck]
@@ -250,7 +229,6 @@ class ReviewIssue(Record):
     target_id: str
     target_version: int
     aspect: str
-    model_id: str | None = None
     source_ids: list[str]
     explanation: str
     disposition: Literal["reading", "revision", "investigation", "blocked"]
@@ -280,10 +258,7 @@ class Assessment(str, Enum):
 
 
 class Investigation(str, Enum):
-    MODEL_ONLY = "model_only"
-    REACHABILITY_PENDING = "reachability_pending"
     REPRODUCED = "implementation_reproduced"
-    SPURIOUS = "confirmed_abstraction_artifact"
     INCONCLUSIVE = "replay_inconclusive"
 
 
@@ -315,12 +290,6 @@ class Grounding(Record):
     alternatives: list[str] = []
 
 
-class CheckerSpec(Record):
-    invariant: str
-    claim_id: str | None
-    scope: Scope
-
-
 class CheckerResult(Record):
     invariant: str
     claim_id: str | None
@@ -334,7 +303,6 @@ class PendingAction(Record):
     id: str = Field(default_factory=uid)
     kind: str
     unit_id: str | None = None
-    model_id: str | None = None
     finding_id: str | None = None
     status: Literal["planned", "running", "completed", "outcome_unknown"] = "planned"
     input_path: str | None = None
@@ -387,7 +355,7 @@ class Binding(AssociatedCode):
     end_line: int = Field(ge=1)
     snapshot_id: str
     content_digest: str
-    basis: Literal["code_observation", "document_statement", "model_assumption", "agent_inference"]
+    basis: Literal["code_observation", "document_statement", "agent_inference"]
     description: str
     pending: list[str] = []
     excerpt: str
@@ -398,51 +366,6 @@ class Binding(AssociatedCode):
         if self.end_line < self.start_line:
             raise ValueError("Invalid code range")
         return self
-
-
-class ConstraintSource(Record):
-    binding_ids: list[str] = []
-    constraint: str
-    source_kind: Literal["code_observation", "document_statement", "model_assumption", "agent_inference"]
-    source_ids: list[str]
-    justification: str
-
-
-class ModelArtifact(Record):
-    operation_id: str | None = None
-    stage: Literal["model_only", "complete"] = "complete"
-    pending_components: list[str] = []
-    id: str = Field(default_factory=uid)
-    version: int = Field(ge=1)
-    kind: Literal["reference", "implementation_abstraction"]
-    origin: Origin
-    claim_id: str | None
-    research_ref: str | None = None
-    snapshot_id: str
-    path: str
-    config_path: str
-    content_digest: str
-    config_digest: str
-    scope: Scope
-    initial_state: str
-    variables: list[str]
-    actions: list[str]
-    properties: list[str]
-    constraints: list[ConstraintSource]
-    binding_ids: list[str]
-    revision_reason: str = "Initial model"
-    previous_id: str | None = None
-    unit_id: str = ""
-    checker_path: str = ""
-    mapping_path: str = ""
-    harness_path: str = ""
-    bundle_path: str = ""
-    artifact_digests: dict[str, str] = {}
-    checkers: list[CheckerSpec] = []
-    graph_versions: dict[str, int] = {}
-    reachability_requirements: list[ReachabilityRequirement] = []
-    search_inputs: dict[str, Any] = {}
-    search_fingerprint: str = ""
 
 
 class DirectCheckArtifact(Record):
@@ -466,7 +389,7 @@ class CheckRun(Record):
     id: str = Field(default_factory=uid)
     action: str
     status: ExecutionStatus = ExecutionStatus.NOT_SCHEDULED
-    outcome: Literal["holds", "counterexample", "deadlock", "tests_passed", "tests_failed", "unknown", "not_applicable"] = "unknown"
+    outcome: Literal["holds", "tests_passed", "tests_failed", "unknown", "not_applicable"] = "unknown"
     origin: Origin = Origin.EXECUTED
     command: list[str] = []
     cwd: str
@@ -477,18 +400,11 @@ class CheckRun(Record):
     stderr: str = ""
     reason: str = ""
     tool_version: str = "unknown"
-    model_id: str | None = None
     snapshot_id: str
     parameters: dict[str, Any] = {}
     artifacts: list[str] = []
-    input_versions: dict[str, str] = {}
-    reused: bool = False
-    search_statistics: dict[str, str] = {}
-    violated_invariant: str | None = None
     checker_results: list[CheckerResult] = []
     pending_action_id: str | None = None
-    search_fingerprint: str = ""
-    reused_from: str | None = None
 
     def transition(self, status: ExecutionStatus):
         allowed = {ExecutionStatus.NOT_SCHEDULED: {ExecutionStatus.RUNNING, ExecutionStatus.TOOL_MISSING, ExecutionStatus.CANCELLED},
@@ -503,43 +419,32 @@ class Evidence(Record):
     direct_check_id: str | None = None
     id: str = Field(default_factory=uid)
     check_id: str
-    model_id: str | None
     snapshot_id: str
     claim_id: str | None
     origin: Origin
-    level: Literal["model", "implementation_test", "framework_test", "trace_calibration"]
+    level: Literal["implementation_test", "framework_test"]
     scope: Scope
     description: str
     assessment: Assessment
     stale_reason: str | None = None
-    calibration_id: str | None = None
-    search_fingerprint: str = ""
     checker_id: str | None = None
     claim_version: int | None = None
     applicability: Literal["current", "historical_scope", "recheck_required"] = "current"
 
 
 class Finding(Record):
-    direct_check_id: str | None = None
+    direct_check_id: str
     id: str = Field(default_factory=uid)
     claim_id: str
-    model_id: str | None = None
     check_id: str
-    stage: Investigation = Investigation.MODEL_ONLY
+    stage: Investigation = Investigation.INCONCLUSIVE
     origin: Origin
     description: str
     trace_path: str
-    level: Literal["model_candidate", "implementation_candidate", "implementation_obligation", "implementation_consequence"] = "model_candidate"
+    level: Literal["implementation_candidate", "implementation_obligation", "implementation_consequence"] = "implementation_candidate"
     checker_id: str | None = None
     claim_version: int | None = None
     applicability: Literal["current", "historical_scope", "recheck_required"] = "current"
-
-
-    @model_validator(mode="after")
-    def route_provenance(self):
-        if bool(self.model_id) == bool(self.direct_check_id):
-            raise ValueError("Finding needs exactly one model or direct-check provenance")
-        return self
 
 
 class Relation(Record):
@@ -597,23 +502,9 @@ class AuditUnit(Record):
     coverage_limitations: list[str] = []
 
 
-class Calibration(Record):
-    id: str = Field(default_factory=uid)
-    model_id: str
-    experiment_check_id: str
-    check_ids: list[str] = []
-    mapping_path: str
-    trace_path: str
-    status: Literal["not_scheduled", "compatible", "incompatible", "inconclusive", "stale"] = "not_scheduled"
-    reason: str
-    origin: Origin
-    scope: str = "Finite observed traces only; no equivalence proof"
-    applicability: Literal["current", "historical_scope", "recheck_required"] = "current"
-
-
 class Revision(Record):
     id: str = Field(default_factory=uid)
-    kind: Literal["F1", "F2", "F3", "F4", "encoding"]
+    kind: Literal["F2", "F3", "F4", "encoding"]
     rationale: str
     evidence_ids: list[str]
     target_ids: list[str]
@@ -633,7 +524,6 @@ class Analysis(Record):
     direct_checks: list[DirectCheckArtifact] = []
     active_direct_check_id: str | None = None
     scope_updates: dict[str, dict] = {}
-    trigger_retry_tasks: list[dict] = []
     framework_revision: str | None = None
     id: str = Field(default_factory=uid)
     mode: Literal["real", "mock"]
@@ -642,7 +532,6 @@ class Analysis(Record):
     snapshot: Snapshot
     claims: list[Claim] = []
     bindings: list[Binding] = []
-    models: list[ModelArtifact] = []
     checks: list[CheckRun] = []
     evidence: list[Evidence] = []
     findings: list[Finding] = []
@@ -655,14 +544,12 @@ class Analysis(Record):
     tools: dict[str, str] = {}
     materials: list[Material] = []
     units: list[AuditUnit] = []
-    calibrations: list[Calibration] = []
     revisions: list[Revision] = []
     selections: list[dict] = []
     created_at: str = Field(default_factory=now)
     graph_version: int = 0
     graph_history: list[dict] = []
     active_unit_id: str | None = None
-    active_model_id: str | None = None
     pending_action: PendingAction | None = None
     action_history: list[PendingAction] = []
     monitor_results: list[dict] = []
@@ -670,7 +557,6 @@ class Analysis(Record):
     audit_spec_version: int = 0
     semantic_reviews: list[SemanticReview] = []
     review_issues: list[ReviewIssue] = []
-    reachability_results: list[ReachabilityResult] = []
     applied_operations: dict[str, dict[str, Any]] = {}
 
 
@@ -678,7 +564,7 @@ class Analysis(Record):
         check = next((c for c in self.checks if c.id == evidence.check_id), None)
         if check is None or check.status != ExecutionStatus.COMPLETED:
             raise ValueError("Evidence requires a completed execution")
-        if evidence.snapshot_id != check.snapshot_id or evidence.model_id != check.model_id:
+        if evidence.snapshot_id != check.snapshot_id:
             raise ValueError("Evidence input association mismatch")
         if evidence.direct_check_id != check.direct_check_id:
             raise ValueError("Evidence direct-check association mismatch")
@@ -686,17 +572,11 @@ class Analysis(Record):
             raise ValueError("Evidence direct-check artifact is missing")
         if evidence.origin != check.origin:
             raise ValueError("Evidence origin mismatch")
-        if evidence.calibration_id and not any(c.id == evidence.calibration_id and c.model_id == evidence.model_id for c in self.calibrations):
-            raise ValueError("Evidence calibration association mismatch")
-        if evidence.model_id and not any(m.id == evidence.model_id and m.snapshot_id == evidence.snapshot_id for m in self.models):
-            raise ValueError("Evidence model is missing")
         if (evidence.origin == Origin.MOCK or self.mode == "mock") and (evidence.level != "framework_test" or evidence.assessment == Assessment.SUPPORTED):
             raise ValueError("Mock output cannot support correctness")
         self.evidence.append(evidence)
 
     def invalidate(self, reason: str):
-        for calibration in self.calibrations:
-            calibration.status = "stale"
         for e in self.evidence:
             e.assessment = Assessment.STALE
             e.stale_reason = reason
@@ -705,26 +585,4 @@ class Analysis(Record):
                 c.assessment = Assessment.STALE
 
 
-    def affect(self, model_ids, reason, historical=False):
-        model_ids = set(model_ids)
-        for item in [*self.evidence, *self.calibrations, *self.findings]:
-            if item.model_id not in model_ids:
-                continue
-            item.applicability = "historical_scope" if historical else "recheck_required"
-            if not historical:
-                if isinstance(item, Evidence):
-                    item.assessment = Assessment.STALE
-                    item.stale_reason = reason
-                elif isinstance(item, Calibration):
-                    item.status = "stale"
-        if not historical:
-            affected_units = {m.unit_id for m in self.models if m.id in model_ids}
-            for unit in self.units:
-                if unit.id in affected_units:
-                    if reason not in unit.recheck_reasons:
-                        unit.recheck_reasons.append(reason)
-                    unit.obligation_checks = {}
-                    unit.remaining_obligation_ids = list(unit.obligation_ids)
-                    if unit.status in {"checked", "partial", "blocked"}:
-                        unit.status = "pending"
         # Executions and their original outcomes never change.

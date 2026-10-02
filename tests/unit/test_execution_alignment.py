@@ -1,15 +1,6 @@
 import json
 """Question-directed execution regressions, independent of target answer keys."""
-from consensus_assurance.core.types import ConstraintSource
 
-from consensus_assurance.workflow.artifacts import validate_bundle
-
-
-def test_constraint_cites_material_and_selected_binding(prepared):
-    from consensus_assurance.adapters.runners.python import PythonBackend
-    _,state,bundle,_=prepared;unit=state.units[0];binding=state.bindings[0]
-    bundle.constraints=[ConstraintSource(constraint='Actual step',source_kind='code_observation',source_ids=[binding.material_id],binding_ids=[binding.id],justification='Actual transition source')]
-    validate_bundle(state,unit,bundle,PythonBackend())
 
 
 def test_workspace_delta_reconstructs_inputs(tmp_path):
@@ -47,14 +38,12 @@ def test_experiment_archives_inputs_separately_from_runtime_outputs(tmp_path):
 
 
 import pytest
-from consensus_assurance.core.proposals import Comparison, EventRequirement, ObservationMap, FieldProjection
+from consensus_assurance.core.proposals import Comparison, EventRequirement
 from consensus_assurance.workflow.observations import match_prerequisites
-from consensus_assurance.adapters.verifiers.trace import project
 
 
 def prerequisites():
     return [EventRequirement(alias='start',event='started'),EventRequirement(alias='change',event='context_changed',conditions=[Comparison(field='operation',reference='start.operation'),Comparison(field='participant',reference='start.participant'),Comparison(field='context',op='ne',reference='start.context')]),EventRequirement(alias='end',event='completed',conditions=[Comparison(field='operation',reference='start.operation'),Comparison(field='participant',reference='start.participant'),Comparison(field='context',reference='change.context')])]
-
 
 
 def test_event_identity_and_context_cannot_be_spliced():
@@ -66,10 +55,42 @@ def test_event_identity_and_context_cannot_be_spliced():
     assert match_prerequisites(events,prerequisites())['status']=='unknown'
 
 
+def test_F4_actual_async_order_is_checked(tmp_path):
+    import sys
+    from consensus_assurance.adapters.runners.process import ProcessRunner
+    from consensus_assurance.adapters.runners.experiment import extract_events
+    from consensus_assurance.core.events import match_prerequisites
+    from consensus_assurance.core.proposals import EventRequirement, Comparison
+    runner = ProcessRunner(tmp_path)
+    scripts = [
+        "import threading,json; started=threading.Event();changed=threading.Event()\n"
+        "def emit(e): print('CA_EVENT '+json.dumps({'event':e,'operation':'one'}),flush=True)\n"
+        "def worker():\n emit('started'); started.set(); changed.wait(); emit('completed')\n"
+        "thread=threading.Thread(target=worker);thread.start();started.wait();emit('context_changed');changed.set();thread.join()\n",
+        "import threading,json\n"
+        "def emit(e): print('CA_EVENT '+json.dumps({'event':e,'operation':'one'}),flush=True)\n"
+        "def worker(): emit('started');emit('completed')\n"
+        "emit('context_changed');thread=threading.Thread(target=worker);thread.start();thread.join()\n"
+    ]
+    outcomes = []
+    requirements=[EventRequirement(alias='started',event='started'),
+        EventRequirement(alias='context_changed',event='context_changed',conditions=[Comparison(field='operation',reference='started.operation')]),
+        EventRequirement(alias='completed',event='completed',conditions=[Comparison(field='operation',reference='context_changed.operation')])]
+    for script in scripts:
+        check = runner.run([sys.executable,'-c',script],tmp_path,'experiment','fixture',5)
+        assert check.exit_code == 0
+        outcomes.append(match_prerequisites(extract_events(check),requirements)['status']=='matched')
+    assert outcomes == [True, False]
 
-def test_projection_of_events_state_and_metadata():
-    mapping=ObservationMap(fields=[FieldProjection(model_field='kind',raw_field='event',source='event'),FieldProjection(model_field='ctx',raw_field='context',source='metadata'),FieldProjection(model_field='value',raw_field='value')],required_events=['initial','step'],description='Explicit event projection')
-    events=[{'event':e,'metadata':{'context':1},'state':{'value':i}} for i,e in enumerate(['initial','step'])]
-    assert project(events,mapping)[1]=={'kind':'step','ctx':1,'value':1}
-    del events[1]['metadata']['context']
-    with pytest.raises(ValueError,match='missing'): project(events,mapping)
+
+@pytest.mark.parametrize('variation',['same','context','operation','unrelated_event','future'])
+def test_R6_consequence_requires_correlated_participants(variation):
+    from consensus_assurance.core.events import match_prerequisites
+    from consensus_assurance.core.proposals import EventRequirement, Comparison
+    requirement=EventRequirement(alias='producer',event='accepted',conditions=[Comparison(field='participant',value='a')])
+    events=[{'participant':'a','event':'accepted','operation':'x','context':1},{'participant':'b','event':'returned','operation':'x','context':1}];index=1
+    if variation=='context':events[0]['context']=2
+    if variation=='operation':events[0]['operation']='y'
+    if variation=='unrelated_event':events[0]['event']='unrelated'
+    if variation=='future':events.reverse();index=0
+    assert (match_prerequisites(events,[requirement],index,['operation','context'])['status']=='matched') is (variation=='same')

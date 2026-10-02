@@ -1,6 +1,6 @@
 from typing import Literal
 from pydantic import Field
-from .types import AssociatedCode, Record, Scope, ConstraintSource, Grounding, CheckerSpec, AuditQuestion, ReachabilityRequirement, Concern
+from .types import AssociatedCode, Record, Scope, Grounding, AuditQuestion, Concern
 
 
 class ClaimDraft(Record):
@@ -58,20 +58,6 @@ class GraphDraft(Record):
     gaps: list[str] = []
 
 
-class FieldProjection(Record):
-    model_field: str
-    raw_field: str
-    source: Literal["state", "event", "metadata"] = "state"
-
-
-class ObservationMap(Record):
-    fields: list[FieldProjection] = Field(description="Model Obs record field to raw state field mapping; direct scalar projection only")
-    required_events: list[str] = Field(description="Event names that must be present for calibration to be conclusive")
-    max_internal_steps: int = Field(default=3, ge=0, le=20)
-    allow_observed_stutter: bool = True
-    description: str
-
-
 class Comparison(Record):
     field: str
     op: Literal["eq", "ne"] = "eq"
@@ -87,12 +73,11 @@ class EventRequirement(Record):
 
 class ObservableProperty(Record):
     checker_id: str
-    kind: Literal["event_assertion", "event_implication", "stable_support"] = "event_assertion"
+    kind: Literal["event_assertion", "event_implication"] = "event_assertion"
     trigger: Comparison
     assertion: Comparison
     antecedent: Comparison | None = None
     identity_fields: list[str] = Field(default_factory=list,description="Independent operation identity shared by prerequisites and result; never the value being compared or a context expected to change")
-    history_field: str | None = None
     description: str
 
 
@@ -117,79 +102,6 @@ class Harness(Record):
     legality: Grounding = Grounding()
 
 
-class ConsequenceWitnessEvent(Record):
-    participant: str
-    event: str
-
-
-class ConsequenceObservation(Record):
-    identity_fields: list[str] = []
-    witness_events: list[ConsequenceWitnessEvent] = []
-    claim_id: str
-    required_participants: list[str] = Field(min_length=1)
-    required_events: list[str] = Field(min_length=1)
-    binding_ids: list[str] = Field(min_length=1)
-    grounding: Grounding
-
-
-class ContextScenario(Record):
-    description: str = Field(min_length=1,description="Implementation-grounded context dimensions, support lifecycle and interruption boundaries; identify unknowns")
-    mode: Literal['local','cross_context']
-    binding_ids: list[str] = Field(min_length=1)
-    variables: list[str]
-    actions: list[str]
-    checker_ids: list[str]
-    reachability_ids: list[str]
-    excluded: list[str] = Field(description="Dimensions or histories not modeled, with implementation-specific reasons; not a guard")
-
-
-class ModelCore(Record):
-    context_analysis: list[ContextScenario] = []
-    reachability: list[ReachabilityRequirement] = []
-    consequence_observations: list[ConsequenceObservation] = []
-    description: str
-    behavior: str = Field(min_length=1, description="TLA+ MODULE Behavior, with Init, Next, vars, and Obs; implementation behavior only")
-    properties: str = Field(min_length=1, description="TLA+ MODULE Properties EXTENDS Behavior, defining obligation and separately scoped consequence invariants")
-    constants: str = Field(description="TLC constant assignments only; no state/action constraints or invariant overrides")
-    invariants: list[str] = []
-    checked_claim_ids: list[str] = []
-    initial_state: str
-    variables: list[str]
-    actions: list[str]
-    constraints: list[ConstraintSource]
-    scope: Scope
-    uncertainties: list[str]
-    checkers: list[CheckerSpec] = []
-    monitors: list[EventMonitor] = []
-    observable_properties: list[ObservableProperty] = []
-
-    def checker_specs(self):
-        if self.checkers:
-            if len({c.invariant for c in self.checkers}) != len(self.checkers):
-                raise ValueError("Duplicate invariant mapping")
-            return self.checkers
-        if len(self.checked_claim_ids) == 1 and self.invariants:
-            return [CheckerSpec(invariant=i, claim_id=self.checked_claim_ids[0], scope=self.scope) for i in self.invariants]
-        if not self.checked_claim_ids and self.invariants:
-            return [CheckerSpec(invariant=i, claim_id=None, scope=self.scope) for i in self.invariants]
-        raise ValueError("Explicit invariant-to-claim mappings are required; list positions are not a mapping")
-
-
-class Bundle(ModelCore):
-    observation: ObservationMap
-    harness: Harness
-
-
-class ComponentWork(Record):
-    component: Literal['behavior', 'properties', 'harness', 'observation']
-    reason: str = Field(min_length=1, description="The missing evidence or executable component, not an assumed guarantee")
-
-
-class ModelDraft(ModelCore):
-    observation: ObservationMap | None = None
-    pending_work: list[ComponentWork] = Field(default_factory=list, description="Remaining model gaps; behavior/properties gaps prohibit execution. No harness is required for model exploration")
-
-
 class GraphPatch(Record):
     claims: list[ClaimDraft] = Field(default_factory=list,max_length=15)
     bindings: list[BindingDraft] = Field(default_factory=list,max_length=20)
@@ -201,7 +113,6 @@ class GraphPatch(Record):
 
 
 class EncodingRevision(Record):
-    old_model_id: str | None = None
     old_direct_check_id: str | None = None
     issue_id: str | None = None
     input_changes: list[str] = []
@@ -257,5 +168,5 @@ class DirectCheckPlan(Record):
     binding_ids: list[str] = Field(min_length=1)
     harness: Harness
     monitors: list[EventMonitor] = Field(min_length=1)
-    observable_properties: list[ObservableProperty] = Field(min_length=1, description="Direct route supports event_assertion and event_implication. Correlate prerequisite fields by alias; history properties require a local_model fallback.")
+    observable_properties: list[ObservableProperty] = Field(min_length=1, description="Direct route supports event_assertion and event_implication. Correlate prerequisite fields by alias; observe prerequisites and results from the same legal history. Unsupported general temporal properties must remain an explicit limitation.")
     uncertainties: list[str] = []

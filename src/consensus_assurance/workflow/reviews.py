@@ -7,7 +7,7 @@ from .sources import includes
 
 
 def review_objects(state):
-    return {o.id:o for o in state.claims+state.bindings+state.relations+state.units+state.models+state.direct_checks+state.question_candidates}
+    return {o.id:o for o in state.claims+state.bindings+state.relations+state.units+state.direct_checks+state.question_candidates}
 
 
 def issue_challenges(state,issue):
@@ -52,8 +52,8 @@ def lineage(state, artifact):
 def open_issues(state, artifact=None):
     """A resolution applies to its answering version and descendants, never older inputs."""
     if artifact is None:
-        superseded={a.previous_id for a in state.direct_checks+state.models}
-        current=[a for a in state.direct_checks+state.models if a.id not in superseded]
+        superseded={a.previous_id for a in state.direct_checks}
+        current=[a for a in state.direct_checks if a.id not in superseded]
         current+=state.question_candidates
         ids={i.id for a in current for i in open_issues(state,a)}
         return [i for i in state.review_issues if i.id in ids]
@@ -103,22 +103,15 @@ def validate_driver_repair(state, prior, old, plan, issue_ids, changed_inputs):
 
 def repair_changes(old, artifact, version=None):
     """Compare the challenged component, never infer it from the review column."""
-    if not (hasattr(old,'plan_path') or hasattr(old,'bundle_path')):
+    if not hasattr(old,'plan_path'):
         changed=artifact.graph_versions.get(old.id)!=version
         return {c:changed if c in {'expectation','scope'} else False for c in
             ('configuration','initialization','driver','observation','oracle','expectation','scope')}
-    if hasattr(artifact, 'plan_path'):
-        from .direct_checks import load_plan
-        from .encoding import direct_changes
-        before, after = load_plan(old.plan_path), load_plan(artifact.plan_path)
-        changes=direct_changes(before,after)
-        inputs,predicate,observation=changes['inputs'],changes['oracle'],changes['observation']
-    else:
-        from .artifacts import load_model
-        before, after = load_model(old), load_model(artifact)
-        inputs = (before.behavior, before.constants) != (after.behavior, after.constants)
-        predicate = before.properties != after.properties
-        observation = getattr(before,'observation',None) != getattr(after,'observation',None)
+    from .direct_checks import load_plan
+    from .encoding import direct_changes
+    before, after = load_plan(old.plan_path), load_plan(artifact.plan_path)
+    changes=direct_changes(before,after)
+    inputs,predicate,observation=changes['inputs'],changes['oracle'],changes['observation']
     semantic = old.graph_versions != artifact.graph_versions
     return {'configuration':inputs, 'initialization':inputs, 'driver':inputs,
         'observation':inputs or predicate or observation, 'oracle':predicate,
@@ -131,9 +124,9 @@ def accept_review(state, submission, operation_id):
     objects = review_objects(state)
     artifact = objects.get(submission.artifact_id)
     candidate=artifact if hasattr(artifact,'question') else None
-    if artifact is None or not (candidate or hasattr(artifact, 'plan_path') or hasattr(artifact, 'bundle_path')):
+    if artifact is None or not (candidate or hasattr(artifact, 'plan_path')):
         raise ValueError('Review requires an accepted artifact or Candidate ID')
-    checks = [c for c in state.checks if (c.direct_check_id == artifact.id or c.model_id == artifact.id)
+    checks = [c for c in state.checks if (c.direct_check_id == artifact.id)
               and c.status.value == 'completed']
     if not checks and not candidate:
         raise ValueError('Review requires an actual completed execution of the selected artifact')
@@ -153,7 +146,7 @@ def accept_review(state, submission, operation_id):
         errors.append(Diagnostic(code='issue_resolution', category='format',
             object_ids=[issue.id] if issue else [], paths=[f'/resolutions/{index}'],
             message=message, details=details, allowed=['read','representation','semantic_revision']))
-    evidence = {x.id for name in ('checks','direct_checks','models','evidence','findings','semantic_reviews')
+    evidence = {x.id for name in ('checks','direct_checks','evidence','findings','semantic_reviews')
         for x in getattr(state,name)}
     for index, resolution in enumerate(submission.resolutions):
         issue = pending.get(resolution.issue_id)
@@ -181,11 +174,7 @@ def accept_review(state, submission, operation_id):
         components = issue.challenged_components
         if components:
             old = objects[issue.target_id]
-            if hasattr(artifact, 'plan_path'):
-                executed = any(c.action == 'direct_check' and c.exit_code == 0 for c in checks)
-            else:
-                executed = any(c.action == 'model_check' and c.outcome in {'holds', 'counterexample'}
-                    and c.search_fingerprint == artifact.search_fingerprint and not c.reused for c in checks)
+            executed = any(c.action == 'direct_check' and c.exit_code == 0 for c in checks)
             changes = repair_changes(old,artifact,issue.target_version)
             unchanged = [c for c in components if not changes[c]]
             sourced_answer = (artifact.id==old.id and
@@ -199,7 +188,6 @@ def accept_review(state, submission, operation_id):
         target_versions={artifact.id:artifact.question.audit_spec_version if candidate else artifact.version}, material_ids=sources, items=submission.review_items,
         origin='mock' if state.mode == 'mock' else 'agent', unit_id=getattr(artifact,'unit_id',None) or None,
         unit_version=next((u.version for u in state.units if u.id == getattr(artifact,'unit_id',None)), None),
-        model_id=artifact.id if hasattr(artifact, 'bundle_path') else None,
         resolves_issue_ids=[r.issue_id for r in submission.resolutions])
     state.semantic_reviews.append(review)
     for resolution in submission.resolutions:
@@ -221,23 +209,8 @@ def accept_review(state, submission, operation_id):
             existing.challenged_components=item.challenged_components if item.status=='revision_needed' else []
             continue
         state.review_issues.append(ReviewIssue(review_id=review.id, target_id=artifact.id,
-            target_version=artifact.question.audit_spec_version if candidate else artifact.version, aspect=item.aspect, model_id=review.model_id,
+            target_version=artifact.question.audit_spec_version if candidate else artifact.version, aspect=item.aspect,
             source_ids=item.source_ids, explanation=item.rationale, reason=item.rationale,
             disposition='reading' if item.status == 'needs_reading' else 'investigation',
             challenged_components=item.challenged_components if item.status=='revision_needed' else []))
     return review
-
-
-def semantic_limitations(state, model):
-    blockers = ['Open review issue: ' + i.id + ': ' + i.explanation
-        for i in open_issues(state,model)]
-    versions = {o.id:o.version for o in state.claims + state.bindings + state.relations + state.units}
-    if any(versions.get(key) != version for key, version in model.graph_versions.items()):
-        blockers.append('Model semantic inputs changed; recheck required')
-    if model.snapshot_id != state.snapshot.id:
-        blockers.append('Model belongs to a different source snapshot')
-    reviews = [i for r in state.semantic_reviews if r.target_versions.get(model.id) == model.version
-        for i in r.items if i.target_id == model.id and i.aspect == 'checker_correspondence']
-    if not reviews or reviews[-1].status != 'no_issue_found' or reviews[-1].counterevidence:
-        blockers.append('Current model correspondence remains unreviewed or disputed')
-    return blockers

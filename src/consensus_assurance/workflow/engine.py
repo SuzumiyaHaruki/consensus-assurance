@@ -4,9 +4,9 @@ import shutil
 import time
 from pathlib import Path
 from consensus_assurance.core.config import Config
-from consensus_assurance.core.types import (Analysis, Assessment, CheckRun, Evidence,
-    ExecutionStatus, Finding, Origin, Relation, uid, PendingAction, Record)
-from consensus_assurance.ports.interfaces import AgentBackend, ExecutionBackend, VerifierBackend
+from consensus_assurance.core.types import (Analysis, Assessment, CheckRun,
+    ExecutionStatus, uid, PendingAction, Record)
+from consensus_assurance.ports.interfaces import AgentBackend, ExecutionBackend
 from consensus_assurance.adapters.runners.process import ProcessRunner, output
 from consensus_assurance.adapters.storage.files import Store, write_json
 from consensus_assurance.adapters.storage.snapshot import capture
@@ -17,9 +17,9 @@ FRAMEWORK_REVISION = manifest()['version']
 
 class Engine:
     def __init__(self, config: Config, root: Path, implementation: ExecutionBackend | None,
-                 agent: AgentBackend, verifier: VerifierBackend, knowledge: str):
+                 agent: AgentBackend, knowledge: str):
         self.config, self.root = config, root.resolve()
-        self.implementation, self.agent, self.verifier = implementation, agent, verifier
+        self.implementation, self.agent = implementation, agent
         self.knowledge = knowledge
         self.store = Store(self.root)
         self.runner = ProcessRunner(self.root)
@@ -148,11 +148,6 @@ class Engine:
         self.state.tools['agent'] = result['version']
         for check in result['checks']:self.record(check)
         if not result['available']:self.state.gaps.append(result['reason'])
-        if self.verifier and 'verifier' in self.state.tools:
-            result = self.verifier.probe(self.runner)
-            self.state.tools['verifier'] = result['version']
-            for check in result['checks']:self.record(check)
-            if not result['available']:self.state.gaps.append(result['reason'])
         if self.implementation is None:return
         check = self.runner.run(self.implementation.version_command(), self.root, "implementation_tool_probe", self.state.snapshot.id, self.budget.timeout())
         self.record(check)
@@ -180,8 +175,7 @@ class Engine:
                     self.state.gaps.append("Interrupted operation has no completed receipt; retry in a fresh workspace")
                 self.state.action_history.append(pending.model_copy(deep=True))
             self.budget.take(resource)
-            pending = PendingAction(kind=kind, logical_input=logical, unit_id=self.state.active_unit_id,
-                model_id=self.state.active_model_id)
+            pending = PendingAction(kind=kind, logical_input=logical, unit_id=self.state.active_unit_id)
             self.state.pending_action = pending
         directory = self.root / "actions" / pending.id
         pending.input_path = str(directory / "input.json")
@@ -212,43 +206,6 @@ class Engine:
             self.state.pending_action = None
         self.checkpoint("next_action_" + stage)
 
-    def search(self, model):
-        from .inputs import reusable_search
-        source=reusable_search(self.state,model)
-        prior_reuse=next((c for c in reversed(self.state.checks) if c.model_id==model.id and c.action=="model_check" and c.reused_from and c.search_fingerprint==model.search_fingerprint),None)
-        if source:
-            check=source.model_copy(deep=True)
-            check.id=uid();check.model_id=model.id;check.reused=True;check.reused_from=source.id
-            check.input_versions=model.artifact_digests
-            check.reason="Explicit reuse of identical search inputs from " + source.id
-        elif prior_reuse:
-            check=prior_reuse
-        else:
-            check=CheckRun.model_validate(self.action("model_search","model_checks",lambda:self.verifier.check(self.runner,model,self.budget.timeout()),{"model_id":model.id}))
-        check.origin=Origin.MOCK if self.state.mode=="mock" else Origin.EXECUTED
-        self.record(check)
-        for result in check.checker_results:
-            if result.claim_id is None:continue
-            if result.outcome=="unknown" or check.status!=ExecutionStatus.COMPLETED or check.search_fingerprint!=model.search_fingerprint: continue
-            if any(e.check_id==check.id and e.checker_id==result.invariant for e in self.state.evidence): continue
-            claim=next(c for c in self.state.claims if c.id==result.claim_id)
-            evidence=Evidence(check_id=check.id,model_id=model.id,snapshot_id=model.snapshot_id,claim_id=result.claim_id,
-                search_fingerprint=check.search_fingerprint,origin=check.origin,level="framework_test" if self.state.mode=="mock" else "model",scope=result.scope,
-                assessment=Assessment.INCONCLUSIVE if self.state.mode=="mock" else Assessment.SUPPORTED if result.outcome=="holds" else Assessment.CHALLENGED,
-                checker_id=result.invariant,claim_version=claim.version,
-                description="Candidate property in its explicit scope; applicability unresolved: "+str(claim.grounding.unresolved+claim.grounding.conflicts)+"; calibration=not_scheduled")
-            self.state.add_evidence(evidence)
-            self.state.relations.append(Relation(source=evidence.id,target=claim.id,kind="supports" if result.outcome=="holds" else "challenges",rationale="Direct scoped checker evidence; no graph proof propagation"))
-            if result.outcome=="violated":
-                self.state.findings.append(Finding(claim_id=claim.id,model_id=model.id,check_id=check.id,checker_id=result.invariant,
-                    claim_version=claim.version,origin=check.origin,trace_path=check.stdout,
-                    description="Violation of a candidate scoped checker; implementation applicability and execution remain to be established"))
-        self.checkpoint("model_search_recorded")
-        return check
 
     def graph_commit_hook(self,key):
         """Interruption seam after semantic manifest, before state checkpoint."""
-
-    def check_triggers(self,model,bundle):
-        from .modeling import check_triggers
-        return check_triggers(self,model,bundle)

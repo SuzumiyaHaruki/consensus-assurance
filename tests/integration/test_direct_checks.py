@@ -18,7 +18,7 @@ from regression_support import read_material
 
 
 def setup(tmp_path,prepared,broken=False):
-    repo,state,_,_=prepared
+    repo, state, _ = prepared
     if broken:(repo/'counter.py').write_text((repo/'counter.py').read_text().replace('return value + 1 if value < limit else 0','return value + 1'))
     state.snapshot=capture(repo);state.mode='real';state.analysis_mode='regression';state.framework_revision=FRAMEWORK_REVISION
     for i,m in enumerate(state.materials):
@@ -318,3 +318,33 @@ func TestLongEvent(t *testing.T) {
     assert outcome['outcome']=='unknown' and outcome['missing_indices']==[0,1]
     invalid=next(e for e in separated if e['event']=='invalid_observation')
     assert invalid['_ca_observation']['location']['line']=='end-of-stream'
+
+
+def test_independent_scenarios_and_revisions_preserve_direct_progress(tmp_path, prepared):
+    from consensus_assurance.workflow.direct_checks import obligation_progress
+    from consensus_assurance.workflow.audit import sync_progress
+    e, unit, plan = setup(tmp_path, prepared)
+    assert obligation_progress(e.state, unit) == ({}, unit.obligation_ids)
+    first = save_plan(e, unit, plan, 'first')
+    assert obligation_progress(e.state, unit)[1] == unit.obligation_ids
+    check = execute(e, first)
+    assess(e.state, unit, first, plan, check, extract_events(check))
+    assert obligation_progress(e.state, unit)[1] == unit.obligation_ids
+    review(e.state, unit, first)
+    assess(e.state, unit, first, plan, check, extract_events(check))
+    assert obligation_progress(e.state, unit)[1] == []
+    # A distinct scenario cannot inherit a completed checker with the same name.
+    second = save_plan(e, unit, plan, 'second')
+    assert obligation_progress(e.state, unit)[1] == unit.obligation_ids
+    repaired = save_plan(e, unit, plan, 'repaired', previous=second)
+    check2 = execute(e, repaired)
+    review(e.state, unit, repaired)
+    assess(e.state, unit, repaired, plan, check2, extract_events(check2))
+    assert obligation_progress(e.state, unit)[1] == []
+    claim = next(c for c in e.state.claims if c.id == plan.claim_id)
+    claim.version += 1
+    assert obligation_progress(e.state, unit)[1] == unit.obligation_ids
+    empty = unit.model_copy(update={'id':'empty', 'obligation_ids':[]})
+    e.state.units.append(empty)
+    sync_progress(e)
+    assert empty.status == 'pending'

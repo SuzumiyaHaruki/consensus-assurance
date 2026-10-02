@@ -24,8 +24,7 @@ def test_default_direct_schema_and_assembly_do_not_load_target_or_model_method(t
     code='''import sys
 from consensus_assurance.core.config import Config
 from consensus_assurance.registry import assemble
-backend, agent, verifier, knowledge = assemble(Config(execution_backend="python",agent_backend="mock"))
-assert verifier is None
+backend, agent, knowledge = assemble(Config(execution_backend="python",agent_backend="mock"))
 assert not any("plugins.targets" in name for name in sys.modules)
 '''
     subprocess.run([sys.executable,'-c',code],check=True)
@@ -59,3 +58,34 @@ def test_actual_limiting_timeout_is_recorded(tmp_path,limit,action,timeout,remai
     check=runner.run([sys.executable,'-c','import time; time.sleep(2)'],tmp_path,action,'fixture',timeout)
     assert check.status.value=='timeout' and check.parameters['timeout_limit']==limit
     assert Path(check.stdout).exists() and 'killed' in check.reason
+
+
+def test_retired_tools_cannot_be_requested_or_loaded(tmp_path, monkeypatch):
+    from consensus_assurance.core.submissions import AuditSubmission
+    from consensus_assurance.cli import load_config
+    from consensus_assurance.reporting.chinese import render_report
+    from audit_support import engine_for, first, check_step, review_step
+    import importlib.abc
+    class NoModelModules(importlib.abc.MetaPathFinder):
+        def find_spec(self, fullname, path=None, target=None):
+            if 'adapters.verifiers' in fullname or fullname.rsplit('.',1)[-1] in {'modeling','artifacts','inputs'}:
+                raise AssertionError('Retired module imported: ' + fullname)
+    monkeypatch.setattr(sys, 'meta_path', [NoModelModules(), *sys.meta_path])
+    monkeypatch.setenv('PATH', str(tmp_path/'no-external-tools'))
+    monkeypatch.setenv('TLC_JAR', '/missing/unused.jar')
+    assert load_config() == Config()
+    for legacy in ({'verifier_backend':'tlc'}, {'verifier_backend':'none'}, {'tlc_jar':'missing'}, {'budget':{'model_checks':1}}):
+        with pytest.raises(ValueError, match='no longer supported'):Config.model_validate(legacy)
+    with pytest.raises(ValueError):AuditSubmission.model_validate({'action':'model','rationale':'Removed product'})
+    paths, method = method_text()
+    assert 'local_model' not in method and '- model:' not in method
+    e, repo = engine_for(tmp_path, [first, check_step(), review_step()])
+    e.config.budget.agent_calls = 3
+    state = e.start(repo)
+    before = state.model_dump(mode='json')
+    assert state.units[0].status == 'checked'
+    assert not (e.root/'models').exists() and not (e.root/'model-method.md').exists()
+    render_report(state, e.root)
+    resumed = e.resume()
+    assert len(resumed.direct_checks) == len(before['direct_checks']) == 1
+    assert resumed.usage == before['usage']

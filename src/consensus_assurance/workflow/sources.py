@@ -45,10 +45,9 @@ def dependency_closure(objects,seeds):
         if anchor.get('material_id'):wanted.add(anchor['material_id'])
         wanted.update(anchor.get('source_ids',[]))
         basis=obj.get('grounding') or {};wanted.update(basis.get('source_ids',[])+basis.get('expectation_ids',[]));todo.extend(basis.get('binding_ids',[]))
-        for key in ['obligation_ids','binding_ids','relation_ids','behavior_ids','fact_ids','produces_fact_ids','consumes_fact_ids','producer_behavior_ids','consumer_behavior_ids']:todo.extend(obj.get(key,[]))
+        for key in ['obligation_ids','binding_ids','relation_ids','behavior_ids','fact_ids','produces_fact_ids','consumes_fact_ids']:todo.extend(obj.get(key,[]))
         for key in ['source','target','claim_id','fact_id']:
             if obj.get(key) in objects:todo.append(obj[key])
-        for constraint in obj.get('constraints',[]):wanted.update(constraint.get('source_ids',[]));todo.extend(constraint.get('binding_ids',[]))
         for association in obj.get('associations',[]):todo.append(association['claim_id']);wanted.update(association.get('source_ids',[]))
         question=obj.get('audit_question') or {};wanted.update(question.get('source_ids',[]))
     return wanted,visited

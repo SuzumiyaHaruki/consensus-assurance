@@ -8,16 +8,14 @@ from consensus_assurance.workflow.research import view, exploration_results
 from consensus_assurance.workflow.prompts import manifest
 
 
-OUTCOME = {'holds':'有限检查未见违反', 'violated':'观察到违反', 'counterexample':'找到模型反例',
-    'tests_passed':'所执行测试通过', 'tests_failed':'所执行测试失败', 'deadlock':'模型死锁诊断，性质检查未完成',
+OUTCOME = {'holds':'有限检查未见违反', 'violated':'观察到违反',
+    'tests_passed':'所执行测试通过', 'tests_failed':'所执行测试失败',
     'unknown':'结果未确定', 'not_applicable':'不适用'}
 DISPOSITIONS = {'confirmed_in_scope':'已确认违反', 'bounded_no_violation':'有限检查未见违反', 'investigation_lead':'待调查线索'}
 
 
 def execution_summary(check):
     complete = check.status == ExecutionStatus.COMPLETED and check.exit_code in (0, None)
-    if check.action == 'model_syntax':
-        return '模型模块语法解析', 'SANY 解析完成' if complete else '解析未完成', '未检查性质或实际轨迹；TLC 配置另行检查'
     if 'probe' in check.action or check.action == 'agent_capabilities':
         return '环境／能力检查', '工具可用' if check.parameters.get('capability_available',complete) else '工具未就绪', '未检查性质'
     if check.action == 'agent_turn':
@@ -27,12 +25,6 @@ def execution_summary(check):
     if check.action in {'direct_check','experiment','replay'}:
         return ('直接实现检查' if check.action == 'direct_check' else '探索／实现执行',
             '执行完成；比较见 assessment' if complete else '执行失败或未完成', '进程退出码不等于性质判定')
-    if check.action == 'reachability':
-        return '触发可达性检查', OUTCOME[check.outcome], '辅助反例不属于协议违反证据'
-    if check.action == 'trace_calibration':
-        return '轨迹校准', OUTCOME[check.outcome], '轨迹兼容不等于性质成立或违反'
-    if check.action == 'model_check':
-        return check.action, ('执行超时；' if check.status == ExecutionStatus.TIMEOUT else '')+OUTCOME[check.outcome], '性质检查未完成或无法归属' if check.outcome == 'unknown' else '限于实际 checker 和模型范围'
     return check.action, check.status.value, '未分类执行；不推断性质结果'
 
 
@@ -161,7 +153,7 @@ def milestone_lines(state, research, archive, checks):
             archive.link(f'submissions/{s["operation_id"]}/accepted.json','完整交接')))
     current = {a['id'] for a in research['artifacts']}
     for check in checks.values():
-        if check.action == 'exploration' or (check.direct_check_id or check.model_id) in current:
+        if check.action == 'exploration' or (check.direct_check_id) in current:
             selected[check.id] = ('实际执行：'+'；'.join(execution_summary(check)[:2]),archive.link(f'logs/{check.id}/check.json','执行记录'))
     interrupted = [c for c in checks.values() if c.action == 'agent_turn' and c.status != ExecutionStatus.COMPLETED]
     for check in interrupted[-3:]:
@@ -213,12 +205,11 @@ def render_report(state, root):
         f'{capacity["remaining"]["experiments"]} 次控制器目标执行。源码调查能力：'+('仍有预算' if capacity['source_investigation'] else '无剩余预算')+'。', '',
         '| 资源 | 配置 | 已用 | 剩余 |', '| --- | ---: | ---: | ---: |',
         f'| 总时间（秒） | {config["budget"]["total_seconds"]} | {state.elapsed_seconds:.2f} | {capacity["remaining_seconds"]:.2f} |']
-    for key,label in [('agent_calls','Agent 调用'),('experiments','控制器目标执行'),('audit_units','新 Unit'),('semantic_reviews','语义复核'),('revisions','修订'),('model_checks','模型工具')]:
-        enabled = config.get('verifier_backend','none') != 'none' if key == 'model_checks' else config.get('allow_experiments',False) and config.get('execution_backend','none') != 'none' if key == 'experiments' else True
+    for key,label in [('agent_calls','Agent 调用'),('experiments','控制器目标执行'),('audit_units','新 Unit'),('semantic_reviews','语义复核'),('revisions','修订')]:
+        enabled = config.get('allow_experiments',False) and config.get('execution_backend','none') != 'none' if key == 'experiments' else True
         lines.append(f'| {label} | {config["budget"].get(key,0)} | {state.usage.get(key,0)} | '+(str(capacity['remaining'][key]) if enabled else '未启用')+' |')
     lines += ['', f'目标执行组成：正式检查 {len(formal)} 次＋探索 {len(explorations)} 次，其中失败／未完成 {len(failures)} 次；失败和重试照常计数。'
         '会话内本地试跑不属于此控制器计数；总时间不叠加内部工具耗时，缺失 token 用量保持未知。',
-        f'模型检查：{config.get("verifier_backend") if config.get("verifier_backend","none") != "none" else "保留实际模型执行记录" if state.models else "未使用 TLA+／TLC"}。'
         '新 Unit 入场能力不保证剩余额度足够完成检查与复核。', '',
         f'元数据：源码 `{state.snapshot.commit or state.snapshot.id}`；实际方法 `{state.framework_revision}`；展示版本 `{manifest()["version"]}`；'
         f'模式 {state.mode}/{state.analysis_mode}；执行后端 `{config.get("execution_backend","none")}`／包 `{config.get("target",{}).get("execution_package",".")}`；'
@@ -237,7 +228,7 @@ def render_report(state, root):
     for n,result in enumerate(results,1):
         records = [r for r in research['assessments'] if r.get('claim_id') == result['claim_id']]
         items = [item for record in records for rid in record.get('review_ids',[]) if rid in reviews for item in reviews[rid].items
-            if item.target_id == (record.get('direct_check_id') or record.get('model_id')) and
+            if item.target_id == record.get('direct_check_id') and
             reviews[rid].target_versions.get(item.target_id) == artifacts[item.target_id]['version']]
         title = next((i.report_title for i in reversed(items) if i.report_title),None)
         title = title or excerpt(result['question'] or result['description'],130)+'（原文摘录）'
@@ -258,24 +249,19 @@ def render_report(state, root):
         if answer:lines += ['', '本次回答（沿用复核文案；无中文摘要时保留原文，判定与数值以下方记录为准）：'+answer]
         if result['blockers']:lines += ['', '当前争议／阻塞：'+'；'.join(result['blockers'])]
         for record in records:
-            artifact = artifacts[record.get('direct_check_id') or record.get('model_id')]
+            artifact = artifacts[record.get('direct_check_id')]
             check = checks[record['experiment_check_id']]
             lines += ['', f'制品 v{artifact["version"]}；机械比较 **{OUTCOME.get(record["outcome"],record["outcome"])}**；'
                 f'对应性复核 {record.get("correspondence") or "待复核"}；独立场景完整处置：{record.get("reviewed_complete",False)}。',
-                '；'.join([link(artifact.get('harness_path') or artifact.get('path'),'固定测试／模型'),
-                    link(artifact.get('plan_path') or artifact.get('bundle_path'),'条件与检查器'),link(check.stdout,'原始观察'),
-                    link(str(Path(artifact.get('plan_path') or artifact.get('bundle_path')).parent / (check.id+'-assessment.json')),'assessment'),
+                '；'.join([link(artifact['harness_path'],'固定测试'),
+                    link(artifact['plan_path'],'条件与检查器'),link(check.stdout,'原始观察'),
+                    link(str(Path(artifact['plan_path']).parent / (check.id+'-assessment.json')),'assessment'),
                     *[link(f'submissions/{reviews[rid].check_id}/accepted.json','对应性复核') for rid in record.get('review_ids',[]) if rid in reviews]]), '']
             lines += observation_lines(record,artifact,check,archive,event_cache)
             from consensus_assurance.workflow.reviews import lineage
-            ancestors=lineage(state,next(a for a in state.direct_checks+state.models if a.id==artifact['id']))
-            old = [c for c in failures if c.direct_check_id in ancestors or c.model_id in ancestors]
+            ancestors=lineage(state,next(a for a in state.direct_checks if a.id==artifact['id']))
+            old = [c for c in failures if c.direct_check_id in ancestors]
             for failed in old:lines.append('该问题保留的失败执行：'+link(failed.stdout,'原始失败')+'；'+link(failed.stderr,'诊断')+'。旧失败不覆盖当前结果。')
-    for artifact in research['artifacts']:
-        if 'bundle_path' not in artifact:continue
-        searches = [c for c in state.checks if c.model_id == artifact['id'] and c.action in {'model_check','model_syntax'}]
-        lines += ['', '局部模型（与实现证据独立）：'+link(artifact['bundle_path'],'固定模型制品')+'；'+link(artifact['path'],'模型行为')]
-        for c in {c.action:c for c in searches}.values():lines.append('- '+'；'.join(execution_summary(c))+'；'+link(c.stdout,'实际输出')+'；'+link(c.stderr,'诊断'))
     for entry in exploration_records:
         lines += ['', '条件探索：'+excerpt(entry['question'] or '问题原稿字节缺失',200),
             '所选问题／策略（原文摘录）：'+excerpt(entry['rationale'] or '见固定原稿',240),

@@ -1,15 +1,12 @@
-import os
 import shutil
 from pathlib import Path
 import pytest
 from consensus_assurance.core.config import Config
 from consensus_assurance.core.types import Analysis
-from consensus_assurance.core.proposals import Bundle, GraphDraft
+from consensus_assurance.core.proposals import GraphDraft
 from consensus_assurance.adapters.storage.snapshot import capture
 from regression_support import add_reads
 from consensus_assurance.workflow.graph import apply_graph
-from consensus_assurance.adapters.verifiers.tlc import TLCVerifier
-from consensus_assurance.adapters.runners.process import ProcessRunner
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -25,26 +22,13 @@ def prepared(tmp_path):
     state = Analysis(mode="mock", analysis_mode="regression", config=config.model_dump(mode="json"), snapshot=snapshot)
     add_reads(state, repo, responses['reads'])
     apply_graph(state, GraphDraft.model_validate(responses['graph']))
-    return repo, state, Bundle.model_validate(responses['model']), responses
-
-
-@pytest.fixture
-def tlc(tmp_path):
-    jar = os.environ.get("TLC_JAR")
-    if not jar or not Path(jar).is_file() or not shutil.which("java"):
-        pytest.skip("Real TLC requires Java and an explicit TLC_JAR; this is not a passed check")
-    runner = ProcessRunner(tmp_path / "tlc-probe")
-    verifier = TLCVerifier(jar)
-    probe = verifier.probe(runner)
-    if not probe["available"]:
-        pytest.skip("TLC capability probe failed")
-    return verifier, runner
+    return repo, state, responses
 
 
 @pytest.fixture
 def dependency_prepared(prepared):
     from regression_support import add_dependency
-    add_dependency(prepared[1],prepared[3])
+    add_dependency(prepared[1],prepared[2])
     return prepared
 
 

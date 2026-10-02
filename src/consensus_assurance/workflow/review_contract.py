@@ -9,18 +9,16 @@ POLICY={
  'binding': {'decomposition':'Check the source anchor and behavior range, the semantic association to responsibilities, and the selected unit use. Location alone does not establish an obligation.'},
  'relation': {'decomposition':'Check the direction, kind, conditions and actual endpoint responsibilities; explain the implementing handoff and alternatives.'},
  'unit': {'decomposition':'Check that the audit question, selected obligations, direct/support code uses and boundary assumptions form a coherent executable scope.'},
- 'direct_check': {'checker_correspondence':'Explain which part of the current question the obligation and actual observations answer, under which premises. Distinguish the original cause hypothesis and wider consequences from the checked proposition. Review fixed inputs, source bindings, oracle, correlated observations, legality and contrary evidence together; no separate object approvals or model are required. Matching IDs alone are not correspondence.'},
- 'model': {'checker_correspondence':'Compare behavior and checker/oracle encoding with the current question, attributed claim, trigger, observations, scope and contrary evidence. Explain the answered proposition separately from cause hypotheses and wider consequences; model completion alone is not implementation confirmation.'}}
+ 'direct_check': {'checker_correspondence':'Explain which part of the current question the obligation and actual observations answer, under which premises. Distinguish the original cause hypothesis and wider consequences from the checked proposition. Review fixed inputs, source bindings, oracle, correlated observations, legality and contrary evidence together; no separate object approvals are required. Matching IDs alone are not correspondence.'}}
+
 OPTIONAL={'binding':{'applicability':'Evaluate whether the code mapping applies to the current implementation configuration.'},'unit':{'applicability':'Evaluate whether the unit scope is applicable under the supplied execution conditions.'}}
-for kind in ('direct_check', 'model'):
-    OPTIONAL[kind] = {key: value for key, value in POLICY['obligation'].items()}
+OPTIONAL['direct_check'] = dict(POLICY['obligation'])
 
 
 def category(obj):
     if hasattr(obj,'question'):return 'candidate'
     if getattr(obj,'kind',None) in {'obligation','assumption'}:return obj.kind
     if hasattr(obj,'plan_path'):return 'direct_check'
-    if hasattr(obj,'bundle_path'):return 'model'
     if hasattr(obj,'associations'):return 'binding'
     if hasattr(obj,'obligation_ids'):return 'unit'
     if hasattr(obj,'source') and hasattr(obj,'target'):return 'relation'

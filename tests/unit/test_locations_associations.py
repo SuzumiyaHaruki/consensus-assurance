@@ -23,7 +23,7 @@ def test_declaration_outside_read_material_requires_reading():
 
 
 def test_multiple_obligations_share_one_binding_with_sourced_associations(prepared):
-    _,state,_,responses=prepared;p=GraphDraft.model_validate(responses['graph']);b=p.bindings[0]
+    _, state, responses = prepared;p=GraphDraft.model_validate(responses['graph']);b=p.bindings[0]
     b.associations.append(BindingAssociation(claim_id=p.claims[-1].id,source_ids=[b.material_id],rationale='The same entry also consumes the producer condition'))
     apply_graph(state,p)
     assert len(state.bindings[0].associations)==2

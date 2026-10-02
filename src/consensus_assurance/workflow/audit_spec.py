@@ -255,7 +255,7 @@ def validate_units(state,spec=None,focus=()):
     candidates={c.id:c for c in state.question_candidates}
     if sum(c.status=='active' for c in candidates.values())>1:raise ValueError('Only one active Candidate is allowed')
     owners=[u.candidate_id for u in state.units if u.status!='revised']
-    if len(owners)!=len(set(owners)):raise ValueError('A Candidate has one current Unit; use independent check/model scenarios or an explicit scoped successor')
+    if len(owners)!=len(set(owners)):raise ValueError('A Candidate has one current Unit; use independent direct scenarios or an explicit scoped successor')
     for unit in state.units:
         if unit.status=='revised':continue
         c=candidates.get(unit.candidate_id)
@@ -263,10 +263,6 @@ def validate_units(state,spec=None,focus=()):
         require_basis(state,unit.audit_question,spec,focus,unit.candidate_id)
         if any(getattr(unit.audit_question,k)!=getattr(c.question,k) for k in QUESTION_BASIS):
             raise ValueError('Unit and Candidate need an explicit shared question reconnection: '+unit.id)
-
-
-def reachability_refs(question):
-    return set(sum((getattr(question,k) for k in REFS),[])) if question else set()
 
 
 def audit_progress(state):

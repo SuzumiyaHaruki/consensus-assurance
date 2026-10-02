@@ -82,7 +82,6 @@ def save_plan(engine,unit,plan,operation_id,previous=None):
     harness=folder/engine.implementation.harness_filename
     harness.parent.mkdir(parents=True,exist_ok=True)
     harness.write_text(plan.harness.source)
-    from .inputs import semantic_ids
     ids=semantic_ids(state,unit)
     artifact=DirectCheckArtifact(plan_path=str(folder/'plan.json'),harness_path=str(harness),
         snapshot_id=state.snapshot.id,unit_id=unit.id,claim_id=plan.claim_id,binding_ids=plan.binding_ids,
@@ -187,7 +186,7 @@ def persist_assessment(state,artifact,plan,check,record):
         evidence=next((e for e in state.evidence if e.check_id==check.id and e.direct_check_id==artifact.id and e.checker_id==result['checker_id']),None)
         description='Measured '+result['outcome']+' comparison; current confirmation: '+str(result['confirmed'])
         if evidence is None:
-            state.add_evidence(Evidence(check_id=check.id,model_id=None,direct_check_id=artifact.id,snapshot_id=artifact.snapshot_id,
+            state.add_evidence(Evidence(check_id=check.id,direct_check_id=artifact.id,snapshot_id=artifact.snapshot_id,
                 claim_id=claim.id,claim_version=claim.version,origin=check.origin,level='framework_test' if state.mode=='mock' else 'implementation_test',
                 scope=artifact.scope,checker_id=result['checker_id'],description=description,assessment=assessment))
         else:
@@ -195,7 +194,7 @@ def persist_assessment(state,artifact,plan,check,record):
         if result['outcome']!='violated':continue
         finding=next((f for f in state.findings if f.direct_check_id==artifact.id and f.check_id==check.id and f.checker_id==result['checker_id']),None)
         if finding is None:
-            finding=Finding(claim_id=claim.id,claim_version=claim.version,model_id=None,direct_check_id=artifact.id,check_id=check.id,
+            finding=Finding(claim_id=claim.id,claim_version=claim.version,direct_check_id=artifact.id,check_id=check.id,
                 checker_id=result['checker_id'],origin=check.origin,description='Measured direct-check violation',trace_path=check.stdout)
             state.findings.append(finding)
         finding.description=('Confirmed violation of: '+claim.description if result['confirmed'] else
@@ -232,3 +231,48 @@ def refresh_assessments(state,artifact_ids,stale_only=False,before=None):
         plan=load_plan(artifact.plan_path)
         for check in checks:
             assess(state,units[artifact.unit_id],artifact,plan,check,extract_events(check))
+
+
+def semantic_ids(state,unit):
+    ids=set(unit.binding_ids+unit.relation_ids+unit.obligation_ids+[unit.id])
+    ids.update(a.claim_id for b in state.bindings if b.id in unit.binding_ids for a in b.associations)
+    for r in state.relations:
+        if r.id in unit.relation_ids:ids.update([r.source,r.target])
+    return ids
+
+
+def obligation_progress(state, unit):
+    versions={x.id:x.version for x in [*state.claims,*state.bindings,*state.relations,*state.units]}
+    covered={};completed=set()
+    superseded={a.previous_id for a in state.direct_checks if a.previous_id}
+    direct={claim:[] for claim in unit.obligation_ids}
+    for artifact in state.direct_checks:
+        if artifact.unit_id!=unit.id or artifact.claim_id not in direct or artifact.id in superseded:continue
+        if any(versions.get(k)!=v for k,v in artifact.graph_versions.items()):
+            direct[artifact.claim_id].append(False)
+            continue
+        record=next((r for r in reversed(state.monitor_results) if r.get('direct_check_id')==artifact.id),{})
+        check_id=record.get('experiment_check_id')
+        if any(p.get('comparison_complete') or p.get('witness_complete') for p in record.get('properties',[])) and check_id:
+            covered[artifact.claim_id]=list(dict.fromkeys(covered.get(artifact.claim_id,[])+[check_id]))
+        direct[artifact.claim_id].append(bool(record.get('reviewed_complete')))
+    for claim,scenarios in direct.items():
+        if scenarios:
+            if all(scenarios):completed.add(claim)
+            else:completed.discard(claim)
+    return covered,[c for c in unit.obligation_ids if c not in completed]
+
+
+def coverage_limitations(state,unit):
+    limits=[]
+    direct=[a for a in state.direct_checks if a.unit_id==unit.id and a.id not in {x.previous_id for x in state.direct_checks}]
+    if not unit.audit_question:limits.append('Audit question is not structured; effective interaction coverage is unestablished')
+    for artifact in direct:
+        result=next((r for r in reversed(state.monitor_results) if r.get('direct_check_id')==artifact.id),None)
+        if result is None:limits.append('Direct check '+artifact.id+' has no saved machine assessment')
+        elif result.get('bounded_complete') and result.get('blockers'):
+            limits.append('Bounded direct comparison completed; local attribution remains pending: '+'; '.join(result['blockers']))
+        elif not result.get('bounded_complete'):
+            reasons=result.get('blockers',[])+[s for p in result.get('properties',[]) for s in p.get('limitations',[])]
+            limits.append('Direct check '+artifact.id+' is incomplete: '+'; '.join(reasons or ['No completed applicable comparison']))
+    return limits

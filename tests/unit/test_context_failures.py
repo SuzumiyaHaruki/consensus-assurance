@@ -8,7 +8,7 @@ from consensus_assurance.adapters.storage.snapshot import capture
 
 
 def dependency(dependency_prepared):
-    repo,state,_,_=dependency_prepared
+    repo, state, _ = dependency_prepared
     (repo/'new_helper.py').write_text('def boundary(value):\n    return max(1, value)\n')
     state.snapshot=capture(repo)
     added=add_reads(state,repo,[{'file':'new_helper.py','start_line':1,'end_line':2,'reason':'Read a previously absent provider'}])
@@ -30,15 +30,15 @@ def test_new_dependency_requires_executable_scope_continuation(dependency_prepar
     assert 'fresh_provider' in new.binding_ids and new.obligation_ids==state.units[-1].obligation_ids
 
 
-def test_F3_is_possible_before_first_model(dependency_prepared):
-    _,state,_,_=dependency_prepared;u=state.units[0]
+def test_F3_is_possible_before_first_check(dependency_prepared):
+    _, state, _ = dependency_prepared;u=state.units[0]
     f=Feedback(kind='F3',rationale='Inspect an actual dependency before building',evidence_ids=[state.materials[0].id],target_ids=[u.id],relation_ids=['input_dependency'],new_basis='')
     result=apply_feedback(state,u,f)
     assert result.previous_id==u.id
 
 
 def test_dependency_traversal_does_not_depend_on_list_order(dependency_prepared):
-    _,state,_,_=dependency_prepared;first=next(e for e in state.relations if e.id=='input_dependency')
+    _, state, _ = dependency_prepared;first=next(e for e in state.relations if e.id=='input_dependency')
     second=first.model_copy(deep=True);second.id='second_edge';second.source=first.target;second.target='input_binding'
     state.relations.insert(0,second)
     a=state.model_copy(deep=True);b=state.model_copy(deep=True);b.relations.reverse()

@@ -56,17 +56,12 @@ def monitor_events(events, monitor, prop, requirements=None):
         if prop.kind == 'event_implication':
             antecedent = compare(event,prop.antecedent,aliases) if prop.antecedent else None
             value = None if antecedent is None or value is None else not antecedent or value
-        if value is None and prop.kind != 'stable_support':
+        if value is None:
             gap(index, 'Missing required result fields: '+prop.assertion.field+
                 (' or '+prop.antecedent.field if prop.antecedent else ''))
         else:
             results.append((index,value))
     violations = [index for index,value in results if value is False]
-    if prop and prop.kind == 'stable_support':
-        support = monitor_support(events,monitor,prop,{index for index,_ in results})
-        violations = support['witness_indices']
-        for index in support['missing_indices']:
-            gap(index, 'Missing support identity or object')
     # A missing result in the same operation can affect its witness. Unknown
     # identity is not evidence of independence; distinct runner streams are.
     def independent_operation(left, right):
@@ -110,26 +105,3 @@ def monitor_events(events, monitor, prop, requirements=None):
         'evaluated_indices':[index for index,_ in results], 'outside_applicability_indices':outside,
         'correlations':correlations, 'diagnostics':diagnostics, 'limitations':limitations,
         'reason':'Independent applicability, correlated prerequisites and fully observed result comparison'}
-
-
-def monitor_support(events, monitor, p, eligible=None):
-    seen, violations, missing = [], [], []
-    for index, event in enumerate(events):
-        if event.get('event') != monitor.event:
-            continue
-        if eligible is not None and index not in eligible:
-            continue
-        active = compare(event,p.trigger)
-        keys = [field(event,k) for k in p.identity_fields]
-        obj = field(event,p.assertion.field)
-        if active is None or any(v is MISSING for v in keys) or obj is MISSING:
-            missing.append(index); continue
-        if not active: continue
-        for old_keys, old_obj, old_index in seen:
-            if all(type(a) is type(b) and a==b for a,b in zip(keys,old_keys)) and not (type(obj) is type(old_obj) and obj==old_obj):
-                violations.extend([old_index,index])
-        seen.append((keys,obj,index))
-    return {'monitor_id':monitor.id,'checker_id':monitor.checker_id,
-        'outcome':'violated' if violations else 'unknown' if missing or not seen else 'holds',
-        'witness_indices':sorted(set(violations)), 'missing_indices':missing,
-        'reason':'Compare effective support objects for the same observed identity/context across ordered events'}

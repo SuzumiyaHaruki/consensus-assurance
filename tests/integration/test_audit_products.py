@@ -112,7 +112,6 @@ def test_deadline_retains_only_reliably_declared_bytes(tmp_path,fault):
 
 
 @pytest.mark.parametrize('product',[
-    dict(action='model',unit_id='unit',model_path='model.json',behavior_path='Behavior.tla',properties_path='Properties.tla'),
     dict(action='research',map_path='map.json',graph_path='graph.json'),
     dict(action='research',map_path='map.json',scope_path='scope.json'),
     dict(action='semantic_revision',unit_id='unit',map_path='map.json',feedback_path='feedback.json'),

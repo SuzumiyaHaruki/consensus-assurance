@@ -5,10 +5,10 @@ from .mutations import adopt, validate_changes
 
 
 def _apply_feedback(state, unit, feedback, audit_spec=None):
-    known = {c.id for c in state.checks} | {c.id for c in state.calibrations} | {m.id for m in state.materials}
+    known = {c.id for c in state.checks} | {m.id for m in state.materials}
     if not set(feedback.evidence_ids) <= known or not feedback.evidence_ids:
         raise ValueError("Semantic feedback requires recorded evidence or material sources")
-    targets = {c.id for c in state.claims} | {b.id for b in state.bindings} | {m.id for m in state.models} | {u.id for u in state.units} | {r.id for r in state.relations}
+    targets = {c.id for c in state.claims} | {b.id for b in state.bindings} | {u.id for u in state.units} | {r.id for r in state.relations}
     if not feedback.target_ids or not set(feedback.target_ids) <= targets:
         raise ValueError("Feedback target does not exist")
     before = {"unit": unit.model_dump(mode="json") if unit else None}
@@ -41,16 +41,14 @@ def _apply_feedback(state, unit, feedback, audit_spec=None):
         originals={obj.id:obj for obj in [*state.claims,*state.bindings,*state.relations,*state.units]}
         replaced={obj.id for name in ('claims','bindings','relations','units') for obj in getattr(feedback.patch,name)}
         before["semantic_objects"]={key:originals[key].model_dump(mode="json") for key in replaced if key in originals}
-        changed = _apply_patch(state, feedback.patch, semantic=True, audit_spec=audit_spec)
-        affected = [m.id for m in state.models if changed & (set(m.binding_ids) | {c.claim_id for c in m.checkers} | set(m.graph_versions))]
+        _apply_patch(state, feedback.patch, semantic=True, audit_spec=audit_spec)
         before["old_judgment"] = feedback.old_judgment
     else:
         state.gaps.append("Unresolved attribution: " + feedback.rationale)
         return None
-    state.affect(affected, feedback.rationale)
     after = {"scope": {}, "unit_id": unit.id if unit else None,
              "graph_version": state.graph_version, "new_judgment": feedback.new_judgment,
-             "grounding": feedback.grounding.model_dump(), "affected_model_ids": affected,
+             "grounding": feedback.grounding.model_dump(),
              "condition_dispositions":[d.model_dump(mode="json") for d in feedback.condition_dispositions],
              "property_changes": feedback.new_basis, "changes":[c.model_dump(mode="json") for c in feedback.changes]}
     revision = Revision(kind=feedback.kind, rationale=feedback.rationale, evidence_ids=feedback.evidence_ids,

@@ -1,5 +1,5 @@
 import pytest
-from consensus_assurance.core.types import CheckRun, ExecutionStatus, Calibration, Origin
+from consensus_assurance.core.types import CheckRun, ExecutionStatus
 from consensus_assurance.core.proposals import GraphDraft, Feedback, GraphPatch
 from consensus_assurance.workflow.graph import apply_graph, expand_unit
 from consensus_assurance.workflow.feedback import apply_feedback
@@ -15,7 +15,7 @@ def add_check(state):
 
 
 def test_F3_adds_actual_dependency_bindings(dependency_prepared):
-    _, state, _, _ = dependency_prepared
+    _, state, _  = dependency_prepared
     expanded = expand_unit(state, state.units[0], ["input_dependency"])
     assert expanded.binding_ids == ["step_binding", "input_binding"]
     assert expanded.obligation_ids == ["step_obligation"]
@@ -25,12 +25,12 @@ def test_F3_adds_actual_dependency_bindings(dependency_prepared):
 
 
 def test_F3_rejects_unrelated_or_empty_expansion(dependency_prepared):
-    _, state, _, _ = dependency_prepared
+    _, state, _  = dependency_prepared
     with pytest.raises(ValueError): expand_unit(state, state.units[0], ["maps_input"])
 
 
 def test_F2_requires_normative_basis_and_invalidates(dependency_prepared):
-    _, state, bundle, responses = dependency_prepared; add_check(state)
+    _, state, responses  = dependency_prepared; add_check(state)
     revised = GraphDraft.model_validate(responses['graph'])
     revised.claims[1].description = "A refined obligation based on the documented caller responsibility"
     f = feedback(state, "F2", graph=revised, new_basis="The document assigns normalization to the caller")
@@ -42,17 +42,15 @@ def test_F2_requires_normative_basis_and_invalidates(dependency_prepared):
     f.new_judgment = revised.claims[1].description
     f.grounding = revised.claims[1].grounding.model_copy(deep=True)
     f.grounding.unresolved = []
-    state.calibrations.append(Calibration(model_id="old", experiment_check_id="observed", mapping_path="mapping", trace_path="trace", status="compatible", reason="Previous match", origin=Origin.MOCK))
     from regression_support import declared_changes
     declared_changes(state,f)
     apply_feedback(state, state.units[0], f)
     assert state.graph_version == 2
-    assert state.calibrations[0].status == "compatible"  # Unrelated historical calibration survives.
     assert state.revisions[-1].return_step == "understand"
 
 
 def test_fake_binding_and_normative_inference_rejected(dependency_prepared):
-    _, state, _, responses = dependency_prepared
+    _, state, responses  = dependency_prepared
     graph = GraphDraft.model_validate(responses['graph'])
     graph.bindings[0].symbol = "nonexistent_symbol"
     with pytest.raises(ValueError): apply_graph(state, graph)
@@ -65,7 +63,7 @@ from consensus_assurance.core.types import Grounding
 
 
 def test_code_derived_responsibilities_are_candidates(prepared):
-    _,state,_,responses=prepared
+    _, state, responses = prepared
     graph=GraphDraft.model_validate(responses['graph'])
     c=graph.claims[1]
     c.source_ids=['counter.py:1:10','limits.py:1:2']
@@ -84,7 +82,7 @@ def test_code_derived_responsibilities_are_candidates(prepared):
 
 def test_conflicting_F2_does_not_turn_error_into_optimization(prepared):
     from consensus_assurance.workflow.feedback import apply_feedback
-    _,state,bundle,responses=prepared
+    _, state, responses = prepared
     changed=GraphDraft.model_validate(responses['graph']).claims[1]
     changed.description='A weaker proposed obligation'
     basis=changed.grounding.model_copy(deep=True);basis.unresolved=[];basis.conflicts=['The current interface still promises the stronger guarantee']

@@ -1,5 +1,5 @@
 from consensus_assurance.core.submissions import SourceRange
-"""Stable R1-R5/R8 capabilities; R6/R7 retain actual execution and TLC suites."""
+"""Research, revision and direct-evidence capability contracts."""
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -10,7 +10,7 @@ from consensus_assurance.workflow.audit_spec import validate, SpecIssue
 
 @pytest.mark.parametrize('applicability',['unknown','externalized','not_applicable','applicable'])
 def test_R1_incomplete_coherent_inventory_and_aggregated_errors(prepared,applicability):
-    _,state,_,_=prepared;spec=inventory(state.materials[0].id,applicability)
+    _, state, _ = prepared;spec=inventory(state.materials[0].id,applicability)
     spec.activities[2].applicability=applicability
     raw=spec.model_dump(mode='json');second=dict(raw['facts'][0],id='second')
     raw['facts'].append(second)
@@ -27,7 +27,7 @@ def test_R1_incomplete_coherent_inventory_and_aggregated_errors(prepared,applica
 
 
 def test_R3_unread_consumer_has_no_invented_edge(prepared):
-    _,state,_,_=prepared;raw=inventory(state.materials[0].id).model_dump(mode='json')
+    _, state, _ = prepared;raw=inventory(state.materials[0].id).model_dump(mode='json')
     raw['behaviors'][1]['consumes_fact_ids']=[]
     raw['facts'][0].pop('consumed_by');raw['facts'][0]['unknowns']=['The actual consumer is unread']
     spec=ConsensusAuditSpec.model_validate(raw);validate(state,spec)

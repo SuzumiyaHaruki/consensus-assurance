@@ -21,10 +21,9 @@ def source_refs(state, refs, include_executions=False):
     links.update({u.id:set(u.binding_ids+[u.candidate_id]) for u in state.units})
     links.update({b.id:{b.material_id} for b in state.bindings})
     links.update({c.id:set(c.source_ids) for c in state.claims})
-    links.update({a.id:{a.unit_id,getattr(a,'research_ref',None)}-{None,''} for a in state.models+state.direct_checks})
-    links.update({m.id:links[m.id]|{ref for basis in m.constraints for ref in basis.source_ids} for m in state.models})
+    links.update({a.id:{a.unit_id} for a in state.direct_checks})
     links.update({e.id:{e.check_id} for e in state.evidence+state.findings})
-    links.update({c.id:{c.model_id,c.direct_check_id} - {None} for c in state.checks})
+    links.update({c.id:{c.direct_check_id} - {None} for c in state.checks})
     links.update({r.id:{ref for item in r.items for ref in item.source_ids} for r in state.semantic_reviews})
     links.update({key:set(obj.get('source_ids',[])) for key,obj in audit_object_index(load(state)).items()})
     links.update({s['operation_id']:set(s.get('candidate_ids',[])+s.get('feedback',{}).get('ref_ids',[]))
@@ -33,7 +32,7 @@ def source_refs(state, refs, include_executions=False):
     materials = {m.id for m in state.materials}
     if include_executions:
         materials.update(c.id for c in state.checks if c.action in
-            {'exploration','direct_check','model_check','reachability','trace_calibration'})
+            {'exploration','direct_check'})
     while todo:
         ref = todo.pop()
         if ref in seen:continue
@@ -45,14 +44,13 @@ def source_refs(state, refs, include_executions=False):
 
 def capacity(state):
     limits = state.config.get('budget',{})
-    names = ('agent_calls','experiments','model_checks','audit_units','semantic_reviews','revisions','reachability_checks')
+    names = ('agent_calls','experiments','audit_units','semantic_reviews','revisions')
     remaining = {name:max(0,limits.get(name,0)-state.usage.get(name,0)) for name in names}
     seconds=max(0,limits.get('total_seconds',0)-state.elapsed_seconds)
     execution = state.config.get('allow_experiments',False) and state.config.get('execution_backend','none')!='none' and remaining['experiments'] > 0
-    model = state.config.get('verifier_backend','none') != 'none' and remaining['model_checks'] >= 2
     return {'remaining':remaining, 'remaining_seconds':seconds,
-        'new_obligation':bool(seconds and remaining['audit_units'] and (execution or model)),
-        'direct_execution':bool(seconds and execution), 'model_execution':bool(seconds and model),
+        'new_obligation':bool(seconds and remaining['audit_units'] and execution),
+        'direct_execution':bool(seconds and execution),
         'source_investigation':bool(seconds and remaining['agent_calls']),
         'exhausted':[name for name,value in remaining.items() if not value]}
 
@@ -64,7 +62,7 @@ def frontier(state, spec, results=()):
     disputed = {i.target_id for i in open_issues(state)}
     completed = {c.id for c in candidates if (units := [u for u in state.units if u.candidate_id==c.id and u.status!='revised'])
         and all(u.status=='checked' and not u.remaining_obligation_ids for u in units)
-        and not ({c.id}|{a.id for a in state.direct_checks+state.models if a.unit_id in {u.id for u in units}})&disputed}
+        and not ({c.id}|{a.id for a in state.direct_checks if a.unit_id in {u.id for u in units}})&disputed}
     paused = [c.id for c in candidates if c.status=='paused' and (c.id not in completed or c.resume_conditions)]
     required = {w['id'] for w in pending}|set(paused)
     if spec:
@@ -117,7 +115,7 @@ def costs(state):
         return max(0,(datetime.fromisoformat(check.ended_at)-datetime.fromisoformat(check.started_at)).total_seconds()) if check.ended_at and check.started_at else 0
     rejected={s['operation_id'] for s in state.selections if s['action']=='rejected'}
     calls=[c for c in state.checks if c.action=='agent_turn']
-    formal=[c for c in state.checks if c.action in {'direct_check','exploration','model_syntax','model_check','reachability'}]
+    formal=[c for c in state.checks if c.action in {'direct_check','exploration'}]
     return {'agent_calls':state.usage.get('agent_calls',0),'agent_seconds':sum(map(seconds,calls)),
         'rejected_calls':len(rejected),'rejected_call_seconds':sum(seconds(c) for c in calls if c.id in rejected),
         'formal_executions':len(formal),'formal_execution_seconds':sum(map(seconds,formal)),
@@ -158,15 +156,15 @@ def exploration_results(state, read):
 def view(state, compact=False):
     spec = load(state)
     current = [u for u in state.units if u.status != 'revised']
-    superseded = {a.previous_id for a in state.direct_checks+state.models}
-    artifacts = [a for a in state.direct_checks+state.models if a.id not in superseded and
-        (a.unit_id in {u.id for u in current} or getattr(a,'research_ref',None))]
-    records = [r for r in state.monitor_results if (r.get('direct_check_id') or r.get('model_id')) in {a.id for a in artifacts}]
+    superseded = {a.previous_id for a in state.direct_checks}
+    artifacts = [a for a in state.direct_checks if a.id not in superseded and
+        a.unit_id in {u.id for u in current}]
+    records = [r for r in state.monitor_results if r.get('direct_check_id') in {a.id for a in artifacts}]
     results=conclusions(state,records)
     issues=open_issues(state)
     disputed={i.target_id for i in issues}
     focus_units={u.id for u in current if u.status!='checked' or u.id==state.active_unit_id}
-    focus_units.update(a.unit_id for a in state.direct_checks+state.models if a.id in disputed)
+    focus_units.update(a.unit_id for a in state.direct_checks if a.id in disputed)
     focus_candidates={c.id for c in state.question_candidates if c.status=='active' or c.id in disputed}
     focus_candidates.update(u.candidate_id for u in state.units if u.id in focus_units)
     focus_claims={id for u in state.units if u.id in focus_units for id in u.obligation_ids}
@@ -194,8 +192,8 @@ def view(state, compact=False):
         'claims':[{**project(c,None if c.id in focus_claims else {'id','version','concern'}),
             **({'description_preview':preview(c.description)} if compact and c.id not in focus_claims else {})}
             for c in state.claims if any(c.id in u.obligation_ids for u in current)],
-        'artifacts':[project(a,{'id','version','unit_id','claim_id','research_ref','stage','pending_components',
-            'plan_path','bundle_path','harness_path','graph_versions','previous_id'}) for a in artifacts], 'assessments':records,
+        'artifacts':[project(a,{'id','version','unit_id','claim_id',
+            'plan_path','harness_path','graph_versions','previous_id'}) for a in artifacts], 'assessments':records,
         'frontier':frontier(state,spec,results), 'capacity':capacity(state), 'conclusions':results, 'costs':costs(state),
         'handoffs':[s for s in state.selections if s.get('feedback') or s.get('released_candidate_ids') or s['action'] in {'pause','explained'} or s['action']=='stop' and s.get('scope')!='run'],
         'pending_work':pending_work(state), 'current':{k:v for k,v in state.current_submission.items() if k!='harness'},
@@ -214,10 +212,10 @@ def view(state, compact=False):
         candidate['open_issue_ids']=[i.id for i in issues if i.target_id==c.id]
         candidate['current_applicability']='pending_review' if candidate['open_issue_ids'] else 'within_recorded_scope'
         units={u.id for u in state.units if u.candidate_id==candidate['id']}
-        owned={a.id for a in state.models+state.direct_checks if a.unit_id in units}
-        candidate['executions']=[{'check_id':c.id,'artifact_id':c.direct_check_id or c.model_id,
+        owned={a.id for a in state.direct_checks if a.unit_id in units}
+        candidate['executions']=[{'check_id':c.id,'artifact_id':c.direct_check_id,
             'action':c.action,'status':c.status.value,'outcome':c.outcome}
-            for c in state.checks if c.direct_check_id in owned or c.model_id in owned]
+            for c in state.checks if c.direct_check_id in owned]
         result['candidates'].append(candidate)
     return result
 
@@ -246,7 +244,7 @@ def current_view(state, root, implementation=None):
         for obj in result[collection]:obj['record']=record(collection,{'id':obj['id'],'version':obj['version']})
     objects = {(name,obj.id):obj for name in ('claims','bindings','relations','units') for obj in getattr(state,name)}
     for artifact in result['artifacts']:
-        artifact['record'] = record('direct_checks' if 'plan_path' in artifact else 'models', {'id':artifact['id']})
+        artifact['record'] = record('direct_checks', {'id':artifact['id']})
         artifact['basis'] = []
         for id,version in artifact['graph_versions'].items():
             kind = next((name for name,obj_id in objects if obj_id == id), None)
@@ -285,14 +283,13 @@ def current_view(state, root, implementation=None):
         last = result['latest_decision']
         result['latest_decision'] = {'operation_id':last['operation_id'],'action':last['action'],
             'record':record('selections', {'operation_id':last['operation_id']})}
-    targets=[a for a in state.direct_checks+state.models if a.id in {x['id'] for x in result['artifacts']}]
+    targets=[a for a in state.direct_checks if a.id in {x['id'] for x in result['artifacts']}]
     targets.extend(c for c in state.question_candidates if any(i.target_id==c.id for i in issues))
     contracts=[target_contract(state,a) for a in targets]
     result.update(run_id=state.id,snapshot_id=state.snapshot.id,elapsed_seconds=state.elapsed_seconds,
         source_path=str(root/'agent-source'),draft_path=str(root/'draft'),state_path=str(root/'state.json'),
         product_schemas=str(root/'product-schemas.json'),submission_schema=str(root/'submission.schema.json'),
         method_path=str(root/'audit-method.md'),
-        optional_model_method=str(root/'model-method.md') if state.config.get('verifier_backend','none')!='none' else None,
         directed_question=state.config.get('directed_question'),tools=state.tools,
         implementation={'name':implementation.name,'harness_kind':implementation.harness_kind,
             'harness_filename':implementation.harness_filename,'instructions':implementation.harness_instructions,
@@ -318,7 +315,7 @@ def release(state, ids, reason, resume_conditions, closed=False):
             c.stop_reason=reason
             c.resume_conditions=[] if closed else resume_conditions
     if any(u.id==state.active_unit_id and u.candidate_id in ids for u in state.units):
-        state.active_unit_id=state.active_direct_check_id=state.active_model_id=None
+        state.active_unit_id=state.active_direct_check_id=None
 
 
 def reject_local(state, operation_id, errors, raw):
@@ -372,7 +369,7 @@ def record_decision(engine, submission, operation_id, map_changed=False):
             submission.scope=='run' and submission.reason in {'resource_limit','tool_gap'}):
         stop_error(state,'Submitted reason does not establish a controller interruption; use a local handoff or justify a normal research stop',submission.ref_ids)
     known = {x.id for name in ('question_candidates','units','claims','bindings','checks','semantic_reviews',
-        'models','direct_checks','materials','review_issues','evidence','findings') for x in getattr(state,name)}
+        'direct_checks','materials','review_issues','evidence','findings') for x in getattr(state,name)}
     known.update(audit_object_index(spec))
     known.update(s['operation_id'] for s in state.selections)
     feedback = submission.feedback
@@ -401,7 +398,7 @@ def record_decision(engine, submission, operation_id, map_changed=False):
             ids={c.id for c in state.question_candidates if set(c.question.activity_classes)&set(focus)}
         related.update(u.id for u in state.units if u.candidate_id in ids)
         related.update(i.id for i in state.review_issues if any(a.id==i.target_id and
-            a.unit_id in related for a in state.direct_checks+state.models))
+            a.unit_id in related for a in state.direct_checks))
         options=submission.frontier_comparison
         compared={ref for option in options for ref in option.ref_ids}
         if not compared<=known:stop_error(state,'Frontier comparison references unknown research objects',compared-known,decision=False)

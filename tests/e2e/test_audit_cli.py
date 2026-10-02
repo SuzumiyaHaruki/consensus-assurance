@@ -120,7 +120,7 @@ def test_estimate_reports_explicit_long_limits_without_tools(tmp_path,capsys,mon
     result=json.loads(capsys.readouterr().out)
     assert result['预算']['total_seconds']==4800 and result['预算']['experiments']==16
     assert result['预算']['semantic_reviews']==10 and result['预算']['audit_units']==6
-    assert result['后端']['模型检查']=='none' and result['后端']['目标执行']=='go_module'
+    assert '模型检查' not in result['后端'] and result['后端']['目标执行']=='go_module'
     assert result['授权']=={'发送材料':False,'执行目标':False}
     assert '粗略计划下限' not in result and '计划可能受限' not in result
     assert '失败重试' in result['计数口径']['experiments']

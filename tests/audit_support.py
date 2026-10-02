@@ -135,5 +135,5 @@ def engine_for(tmp_path, steps):
     cfg=Config(agent_backend='mock',execution_backend='python',execution_isolation='workspace',
         directed_question='Check the bounded local return contract of the synthetic target',
         budget=Budget(agent_calls=len(steps),experiments=4,revisions=4,semantic_reviews=4,total_seconds=90))
-    e=Engine(cfg,tmp_path/'run',PythonBackend(),ScriptedAgent(steps),None,'')
+    e=Engine(cfg,tmp_path/'run',PythonBackend(),ScriptedAgent(steps),'')
     return e,repo

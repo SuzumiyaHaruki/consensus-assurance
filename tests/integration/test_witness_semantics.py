@@ -57,7 +57,7 @@ def test_identity_renaming_and_independent_operation_order_preserve_witness(rena
 
 
 def test_partial_valid_witness_is_retained_idempotently_without_completing_unit(tmp_path,prepared):
-    from consensus_assurance.workflow.modeling import obligation_progress
+    from consensus_assurance.workflow.direct_checks import obligation_progress
     e,unit,plan=setup(tmp_path,prepared,True)
     plan.harness.source+="\nprint('CA_EVENT '+json.dumps({'event':'admitted','operation':'other','participant':'local','context':'configured','state':{'input_valid':True}}))\n"
     artifact=save_plan(e,unit,plan,'partial');review(e.state,unit,artifact)

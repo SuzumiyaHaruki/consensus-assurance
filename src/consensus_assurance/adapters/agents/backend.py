@@ -105,8 +105,8 @@ class CodexAgent:
             str(root/"state.json"):"read",str(root/"research.json"):"read",
             str(root/"submission.schema.json"):"read",str(root/"product-schemas.json"):"read",
             str(root/"audit-method.md"):"read",
-            str(root/"model-method.md"):"read",str(root/"target-support"):"read",
-            **{str(root/name):"read" for name in ("logs","models","findings","audit-spec","actions")},
+            str(root/"target-support"):"read",
+            **{str(root/name):"read" for name in ("logs","findings","audit-spec","actions")},
             **{str(path):"read" for path in getattr(self,"read_only_roots",[]) if path.is_dir()},
             **{path:"read" for path in tool_paths},
             str(codex_home/"tmp"/"arg0"):"read",str(Path(executable).resolve().parent):"read"}
@@ -149,7 +149,7 @@ class CodexAgent:
         from consensus_assurance.adapters.validation import validation_tool
         tool = validation_tool(runner.root)
         protected = [source, Path(__file__)]
-        for folder in ("logs", "models", "direct-checks"):
+        for folder in ("logs", "direct-checks"):
             path = runner.root / folder / "permission-canary"
             path.parent.mkdir(exist_ok=True)
             path.write_text("retained permission canary")

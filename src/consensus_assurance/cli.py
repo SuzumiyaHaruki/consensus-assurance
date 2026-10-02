@@ -3,7 +3,6 @@ import re
 from datetime import datetime
 import fcntl
 import json
-import os
 import sys
 from pathlib import Path
 import yaml
@@ -19,15 +18,13 @@ def load_config(path=None, overrides=None):
     data = yaml.safe_load(Path(path).read_text()) or {} if path else {}
     if not isinstance(data, dict):
         raise ValueError("Configuration must be an object")
-    for name in ("repo_path", "runs_dir", "tlc_jar", "fixture"):
+    for name in ("repo_path", "runs_dir", "fixture"):
         if data.get(name):
             p = Path(data[name]).expanduser()
             if not p.is_absolute():
                 p = (Path(path).resolve().parent if path else Path.cwd()) / p
             data[name] = str(p.resolve())
     data.update({k: v for k, v in (overrides or {}).items() if v is not None})
-    if not data.get("tlc_jar") and os.environ.get("TLC_JAR"):
-        data["tlc_jar"] = os.environ["TLC_JAR"]
     return Config.model_validate(data)
 
 
@@ -64,8 +61,7 @@ def main(argv=None):
         p = sub.add_parser(name)
         p.add_argument("--config"); p.add_argument("--repo")
         p.add_argument("--agent-backend", choices=["codex", "mock"])
-        p.add_argument("--tlc-jar"); p.add_argument("--runs-dir")
-        p.add_argument("--verifier-backend", choices=["none","tlc"], help="可选历史模型工具；默认不要求 Java/TLC")
+        p.add_argument("--runs-dir")
         p.add_argument("--question", help="可选定向问题；默认不指定目标")
     for name in ("resume", "report"):
         p = sub.add_parser(name); p.add_argument("--run", required=True)
@@ -119,30 +115,28 @@ def main(argv=None):
                 print(render_report(state, root)); return 0
             config = Config.model_validate(state.config)
         else:
-            config = load_config(args.config, {"agent_backend": args.agent_backend, "tlc_jar": args.tlc_jar,
-                "runs_dir": args.runs_dir, "directed_question": args.question, "verifier_backend":args.verifier_backend})
+            config = load_config(args.config, {"agent_backend": args.agent_backend,
+                "runs_dir": args.runs_dir, "directed_question": args.question})
             if args.command == "estimate":
                 repo = locate_repo(args.repo, config.repo_path)
                 b = config.budget
                 print(json.dumps({"仓库":str(repo),"材料发送":False,"执行目标代码":False,
-                    "后端":{"Agent":config.agent_backend,"目标执行":config.execution_backend,"模型检查":config.verifier_backend},
+                    "后端":{"Agent":config.agent_backend,"目标执行":config.execution_backend},
                     "授权":{"发送材料":config.allow_agent_materials,"执行目标":config.allow_experiments},
                     "预算":b.model_dump(mode="json"),
-                    "零额度":[k for k in ('agent_calls','experiments','audit_units','semantic_reviews','revisions','model_checks') if getattr(b,k)==0],
+                    "零额度":[k for k in ('agent_calls','experiments','audit_units','semantic_reviews','revisions') if getattr(b,k)==0],
                     "计数口径":{"agent_calls":"CLI turn；会话内工具不另算调用，总时间不重复叠加内部工具耗时",
                         "experiments":"控制器探索、失败重试与正式检查共用；不含 Agent 回合内本地试跑，不等于独立问题数",
                         "audit_units":"新义务入场；new_obligation 不保证能走完整条执行／复核链",
                         "semantic_reviews":"对应性及语义复核；零额度时新执行不能以 PASS 代替复核",
-                        "revisions":"修订额度独立计数；不按执行次数推算剩余",
-                        "model_checks":"SANY 与模型搜索；verifier_backend=none 时未启用，不要求安装 TLC"},
+                        "revisions":"修订额度独立计数；不按执行次数推算剩余"},
                     "限制说明":"上限不自动扩容或兑换；单项额度耗尽不自动终止有预算的源码调查。缺失 token 用量保持未知，不预测发现数。"},ensure_ascii=False,indent=2))
                 return 0
             root = create_run_directory(config, args.command)
-        implementation, agent, verifier, knowledge = assemble(config)
+        implementation, agent, knowledge = assemble(config)
         if args.command == "doctor":
             runner = ProcessRunner(root)
             results = {"agent": agent.probe(runner)}
-            if verifier:results['verifier']=verifier.probe(runner)
             for result in results.values():
                 result["checks"] = [c.model_dump(mode="json") for c in result["checks"]]
             results["implementation"] = runner.run(implementation.version_command(), root, "implementation_probe", "environment", 10).model_dump(mode="json") if implementation else {"available":False,"reason":"No execution backend configured"}
@@ -155,7 +149,7 @@ def main(argv=None):
             snapshot = capture(repo, analysis_roots=config.target.analysis_roots, expected_module=config.target.expected_module)
             write_json(root / "snapshot.json", snapshot)
             print(f"目标快照已保存：{root / 'snapshot.json'}"); return 0
-        engine = Engine(config, root, implementation, agent, verifier, knowledge)
+        engine = Engine(config, root, implementation, agent, knowledge)
         with (root / ".run.lock").open("w") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             try:

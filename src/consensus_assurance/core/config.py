@@ -7,7 +7,6 @@ from .types import ActivityClass, Record
 class Budget(Record):
     '''Configuration for budget constraints in the system.'''
     agent_calls: int = Field(default=8, ge=0)
-    model_checks: int = Field(default=4, ge=0)
     revisions: int = Field(default=3, ge=0)
     repair_attempts: int = Field(default=4, ge=0)
     action_timeout: float = Field(default=120, gt=0)
@@ -15,10 +14,8 @@ class Budget(Record):
     total_seconds: float = Field(default=900, gt=0)
 
     experiments: int = Field(default=4, ge=0)
-    trigger_retries: int = Field(default=1, ge=0)
     audit_units: int = Field(default=2, ge=0)
 
-    reachability_checks: int = Field(default=3, ge=0)
     semantic_reviews: int = Field(default=4, ge=0)
     graph_objects: int = Field(default=1000, ge=1)
 
@@ -48,9 +45,7 @@ class Config(Record):
     agent_backend: str = "codex"
     agent_reasoning_effort: str | None = None
     agent_model: str | None = None
-    verifier_backend: Literal["none", "tlc"] = "none"
     runs_dir: str = "runs"
-    tlc_jar: str | None = None
     budget: Budget = Budget()
     activity_focus: list[ActivityClass] = []
     directed_question: str | None = None
@@ -58,6 +53,15 @@ class Config(Record):
     execution_isolation: Literal["bwrap", "workspace"] = "bwrap"
     allow_experiments: bool = True
     allow_agent_materials: bool = True
+
+    @model_validator(mode="before")
+    @classmethod
+    def reject_retired_tools(cls, value):
+        budget = value.get('budget') if isinstance(value, dict) else None
+        if isinstance(value, dict) and ({'verifier_backend', 'tlc_jar'} & value.keys() or
+                isinstance(budget, dict) and {'model_checks', 'reachability_checks', 'trigger_retries'} & budget.keys()):
+            raise ValueError("Integrated TLA/TLC is no longer supported; remove retired verifier and model budget settings for a new run")
+        return value
 
 
 def locate_repo(explicit: str | None, configured: str | None) -> Path:

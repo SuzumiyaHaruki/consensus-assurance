@@ -8,8 +8,8 @@ from pydantic import ValidationError
 from consensus_assurance.adapters.storage.files import digest, write_json
 from consensus_assurance.adapters.runners.experiment import extract_events, install_harness, run_experiment
 from consensus_assurance.core.submissions import (AuditSubmission, CandidateSubmission,
-    CheckSubmission, ModelSubmission, ResearchSubmission, SemanticSubmission, ReviewSubmission, ExploreSubmission)
-from consensus_assurance.core.proposals import (DirectCheckPlan, ModelDraft, Feedback,
+    CheckSubmission, ResearchSubmission, SemanticSubmission, ReviewSubmission, ExploreSubmission)
+from consensus_assurance.core.proposals import (DirectCheckPlan, Feedback,
     Harness, GraphPatch, UnitDraft)
 from consensus_assurance.core.types import (Material, QuestionCandidate, Revision, ConsensusAuditSpec,
     CheckRun, ExecutionStatus)
@@ -81,8 +81,6 @@ def submission_files(submission):
     if isinstance(submission,(CheckSubmission,ExploreSubmission)):
         paths += [submission.harness_path,*submission.files.values()]
         if isinstance(submission,CheckSubmission):paths.append(submission.plan_path)
-    elif isinstance(submission,ModelSubmission):
-        paths += [submission.model_path,submission.behavior_path,submission.properties_path]
     elif isinstance(submission,ResearchSubmission):paths += [submission.graph_path,submission.scope_path]
     elif isinstance(submission,SemanticSubmission):paths.append(submission.feedback_path)
     return dict.fromkeys(path for path in paths if path)
@@ -125,33 +123,11 @@ def plan_from_files(inputs, submission):
     return DirectCheckPlan.model_validate(raw)
 
 
-def model_from_files(inputs, submission):
-    raw = inputs.json(submission.model_path)
-    if raw.get("behavior") or raw.get("properties"):
-        raise ValueError("Supply Behavior and Properties through separate source files")
-    raw["behavior"] = inputs.read(submission.behavior_path)
-    raw["properties"] = inputs.read(submission.properties_path)
-    return ModelDraft.model_validate(raw)
-
-
 def require_unit(state, id):
     unit = next((u for u in state.units if u.status != 'revised' and (u.id == id or u.candidate_id == id)), None)
     if unit is None:
         raise ValueError("Select an accepted audit unit")
     return unit
-
-
-def model_owner(state, unit_id, research_ref, scope):
-    if unit_id:return require_unit(state,unit_id)
-    from .audit_spec import load, audit_object_index
-    from consensus_assurance.core.types import AuditUnit
-    candidate = next((c for c in state.question_candidates if c.id==research_ref),None)
-    surface = audit_object_index(load(state)).get(research_ref,{})
-    if candidate is None and not surface.get('entry_point'):
-        raise ValueError('Model exploration requires an accepted Candidate or mapped/deferred Surface')
-    # A transient scope view reuses model validation; it creates no Unit or claim.
-    return AuditUnit(id=research_ref,obligation_ids=[],binding_ids=[],relation_ids=[],scope=scope,
-        rationale='Exploratory history only',audit_question=candidate.question if candidate else None)
 
 
 def candidate(engine, submission, operation_id, spec=None):
@@ -170,7 +146,7 @@ def candidate(engine, submission, operation_id, spec=None):
     if released:
         state.selections[-1]['released_candidate_ids']=released
         if any(u.id==state.active_unit_id and u.candidate_id in released for u in state.units):
-            state.active_unit_id=state.active_direct_check_id=state.active_model_id=None
+            state.active_unit_id=state.active_direct_check_id=None
     q = submission.question
     validate_question(q)
     known = {m.id for m in state.materials}
@@ -215,7 +191,7 @@ def candidate(engine, submission, operation_id, spec=None):
     current.stop_reason = submission.rationale
     current.resume_conditions = submission.resume_conditions
     if submission.action in {'pause','explained'} and any(u.id==state.active_unit_id and u.candidate_id==current.id for u in state.units):
-        state.active_unit_id=state.active_direct_check_id=state.active_model_id=None
+        state.active_unit_id=state.active_direct_check_id=None
     if submission.action == "obligation":
         from .research import capacity
         if not capacity(state)['new_obligation']:
@@ -251,17 +227,6 @@ def validate_check_revision(state, prior, plan, submission):
             validate_driver_repair(state, prior, old, plan, submission.repair_issue_ids, changed['inputs'])
 
 
-def validate_model_revision(state, prior, model, submission):
-    from .artifacts import load_model
-    old = load_model(prior)
-    if submission.encoding_revision:
-        from .encoding import validate_encoding
-        validate_encoding(state, prior, old, model, submission.encoding_revision)
-    else:
-        from .modeling import validate_technical_repair
-        validate_technical_repair(old, model)
-
-
 def accept(engine, submission, inputs, operation_id):
     """Persist only after the shared preparation has validated the whole product."""
     prepare_submission(engine, submission, inputs, operation_id)()
@@ -279,7 +244,7 @@ def prepare_submission(engine, submission, inputs, operation_id):
             'candidate':submission.candidate.model_copy(update={'feedback':outer or inner})})
     state = engine.state
     research_before = state.model_copy(update={name:[o.model_copy(deep=True) for o in getattr(state,name)]
-        for name in ('question_candidates','claims','bindings','relations','units','models','direct_checks','semantic_reviews','review_issues')})
+        for name in ('question_candidates','claims','bindings','relations','units','direct_checks','semantic_reviews','review_issues')})
     mapped=submission.candidate if isinstance(submission,CheckSubmission) and submission.candidate else submission
     from . import audit_spec
     from consensus_assurance.core.diagnostics import Diagnostic, DiagnosticError
@@ -407,34 +372,6 @@ def prepare_submission(engine, submission, inputs, operation_id):
                     "encoding_revision":submission.encoding_revision.model_dump(mode="json") if submission.encoding_revision else None}, return_step="experiment"))
             current["direct_check_id"] = artifact.id
             state.active_unit_id, state.active_direct_check_id = unit.id, artifact.id
-    elif isinstance(submission, ModelSubmission):
-        require_capacity(engine,'model_checks',2)
-        if submission.previous_model_id:require_capacity(engine,'revisions')
-        from .artifacts import validate_bundle, save_bundle, load_model
-        if engine.verifier is None:raise ValueError('Model tool is not configured; select verifier_backend=tlc for a new run')
-        draft = model_from_files(inputs, submission)
-        unit = model_owner(state,submission.unit_id,submission.research_ref,draft.scope)
-        model = validate_bundle(state, unit, draft, engine.implementation)
-        previous = next((m for m in state.models if m.id == submission.previous_model_id), None)
-        if submission.previous_model_id:
-            if previous is None or (previous.unit_id or previous.research_ref) != unit.id:
-                raise ValueError("Previous model must belong to the selected unit")
-            validate_model_revision(state, previous, model, submission)
-            engine.budget.take("revisions")
-        validate_objects()
-        def persist_artifact():
-            artifact = save_bundle(engine.root, state, unit, model, engine.implementation, previous,
-                submission.rationale, transaction_key=operation_id, validated=True)
-            if previous:
-                old = load_model(previous)
-                kind = "encoding" if submission.encoding_revision else "F1"
-                if model.behavior != old.behavior or model.properties != old.properties:
-                    state.affect([previous.id], submission.rationale)
-                state.revisions.append(Revision(kind=kind,
-                    rationale=submission.rationale, target_ids=[previous.id], evidence_ids=[c.id for c in state.checks if c.model_id == previous.id],
-                    before={"model_id":previous.id}, after={"model_id":artifact.id}, return_step="experiment"))
-            state.active_unit_id, state.active_model_id = artifact.unit_id or None, artifact.id
-            current["model_id"] = artifact.id
     elif isinstance(submission, ResearchSubmission):
         if submission.graph_path:
             from .graph import apply_patch
@@ -507,7 +444,7 @@ def prepare_submission(engine, submission, inputs, operation_id):
         decision['candidate_ids']=list(dict.fromkeys(decision.get('candidate_ids',[])+[c.id for c in state.question_candidates if operation_id in c.check_ids]))
         decision['accepted_versions']={'audit_spec':state.audit_spec_version,
             'units':{u.id:u.version for u in state.units if u not in research_before.units},
-            'artifacts':{a.id:a.version for a in state.models+state.direct_checks if a not in research_before.models+research_before.direct_checks}}
+            'artifacts':{a.id:a.version for a in state.direct_checks if a not in research_before.direct_checks}}
         state.current_submission = current
 
     return finish
@@ -540,7 +477,7 @@ def validate_submission(state, root, name, implementation):
     trial = state.model_copy(deep=True)
     config = Config.model_validate(trial.config)
     context = SimpleNamespace(state=trial,config=config,root=root,source_root=root/'agent-source',
-        implementation=implementation,verifier=True if config.verifier_backend!='none' else None,
+        implementation=implementation,
         budget=BudgetTracker(config.budget,trial))
     result = {'valid':False,'run_id':state.id,'audit_spec_version':state.audit_spec_version,
         'elapsed_seconds':state.elapsed_seconds,'diagnostics':[],
@@ -582,14 +519,14 @@ def prompt(engine, method):
 
 
 def sync_progress(engine):
-    from .modeling import obligation_progress, coverage_limitations
+    from .direct_checks import obligation_progress, coverage_limitations
     state = engine.state
     for unit in state.units:
         if unit.status == "revised":
             continue
         unit.obligation_checks, unit.remaining_obligation_ids = obligation_progress(state, unit)
         unit.coverage_limitations = coverage_limitations(state, unit)
-        unit.status = "checked" if not unit.remaining_obligation_ids else "partial" if unit.obligation_checks else "pending"
+        unit.status = "checked" if unit.obligation_ids and not unit.remaining_obligation_ids else "partial" if unit.obligation_checks else "pending"
 
 
 def execute_check(engine, artifact):
@@ -601,40 +538,11 @@ def execute_check(engine, artifact):
     return check
 
 
-def execute_model(engine, model):
-    from .artifacts import load_model
-    state = engine.state
-    bundle = load_model(model)
-    unit = model_owner(state,model.unit_id,model.research_ref,model.scope)
-    if not getattr(engine.verifier, 'available', False):
-        result = engine.verifier.probe(engine.runner)
-        state.tools['verifier'] = result['version']
-        for check in result['checks']:engine.record(check)
-        if not result['available']:raise Blocked(result['reason'])
-    def latest(action):
-        return next((c for c in reversed(state.checks) if c.model_id == model.id and c.action == action), None)
-    if hasattr(engine.verifier, "syntax"):
-        syntax = latest("model_syntax")
-        if syntax is None:
-            syntax = CheckRun.model_validate(engine.action("model_syntax", "model_checks",
-                lambda:engine.verifier.syntax(engine.runner, model, engine.budget.timeout()), {"model_id":model.id}))
-            syntax.model_id = model.id
-            engine.record(syntax)
-        if syntax.status != ExecutionStatus.COMPLETED or syntax.exit_code != 0:
-            state.gaps.append("Model syntax incomplete; inspect " + str(syntax.stderr))
-            return
-    check = latest("model_check") or engine.search(model)
-    if check.status == ExecutionStatus.COMPLETED and bundle.reachability:
-        engine.check_triggers(model, bundle)
-
-
 def execute_accepted(engine):
     current, state = engine.state.current_submission, engine.state
     try:
         if current.get("direct_check_id"):
             execute_check(engine, next(a for a in state.direct_checks if a.id == current["direct_check_id"]))
-        if current.get("model_id"):
-            execute_model(engine, next(m for m in state.models if m.id == current["model_id"]))
         if current.get("harness"):
             def run():
                 workspace = engine.workspace()
@@ -790,13 +698,9 @@ def execute(engine):
         path = engine.root/'target-support'/name
         path.parent.mkdir(parents=True,exist_ok=True)
         path.write_text(content)
-    write_schemas(engine.root, bool(engine.verifier))
+    write_schemas(engine.root)
     (engine.root / 'audit-method.md').write_text(methods)
     state.method_paths = paths
-    if engine.verifier:
-        optional_paths, optional_method = method_text('model')
-        (engine.root/'model-method.md').write_text(optional_method)
-        state.method_paths = list(dict.fromkeys(paths+optional_paths))
     write_json(engine.root / 'submission.schema.json', AuditSubmission.model_json_schema())
     # Remaining calls govern new inference, never recovery of an already durable receipt.
     pending = state.pending_action
@@ -887,9 +791,8 @@ def execute(engine):
     return state
 
 
-def write_schemas(root, model_enabled=False):
+def write_schemas(root):
     from .scope_updates import ScopeUpdate
     products = [DirectCheckPlan, ConsensusAuditSpec, GraphPatch, ScopeUpdate, Feedback]
-    if model_enabled:products.append(ModelDraft)
     schemas = {kind.__name__:kind.model_json_schema() for kind in products}
     write_json(root / "product-schemas.json", schemas)

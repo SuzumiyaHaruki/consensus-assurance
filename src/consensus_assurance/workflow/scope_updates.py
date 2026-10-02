@@ -106,11 +106,10 @@ def apply_scope_update(state,update,audit_spec=None):
     new.remaining_obligation_ids=list(new.obligation_ids)
     new.boundary_changes=['Grounded dependency scope update: '+update.patch.rationale]+update.remaining_unknowns
     if update.assessment:new.boundary_changes+=update.assessment.remaining_unknowns
-    new.coverage_limitations=['Newly included support code is not a verified guarantee; current scope needs new model and observation checks']
+    new.coverage_limitations=['Newly included support code is not a verified guarantee; current scope needs new direct execution and correspondence review']
     trial.graph_history.append({'kind':'units','id':old.id,'version':old.version,'record':old.model_dump(mode='json'),'reason':update.patch.rationale})
     old.status='revised';trial.units.remove(new);trial.units.insert(0,new)
-    affected=[m.id for m in trial.models if m.unit_id==old.id];trial.affect(affected,update.patch.rationale,historical=True)
     trial.revisions.append(Revision(kind='F3',rationale=update.patch.rationale,evidence_ids=update.source_ids,target_ids=[old.id],relation_ids=new.relation_ids,
-        before={'unit':old.model_dump(mode='json'),'question':update.original_question},after={'unit_id':new.id,'scope_update':update.model_dump(mode='json'),'affected_model_ids':affected},return_step='build'))
+        before={'unit':old.model_dump(mode='json'),'question':update.original_question},after={'unit_id':new.id,'scope_update':update.model_dump(mode='json')},return_step='build'))
     adopt(state,trial)
     return next(u for u in state.units if u.id==new_id)

@@ -39,17 +39,6 @@ def add_dependency(state,responses):
     state.units[0].relation_ids=['input_dependency'];responses['graph']['units'][0]['relation_ids']=['input_dependency']
 
 
-def fixture_reachability(bundle):
-    """Explicit toy step trigger for the structured establishment question."""
-    import copy
-    result=copy.deepcopy(bundle)
-    if result.get('reachability'):return result
-    result['behavior']=result['behavior'].replace('vars ==', 'FixtureStep == value = 1\nvars ==',1)
-    result['reachability']=[{'id':'fixture_step_reached','operator':'FixtureStep','claim_ids':['step_obligation'],
-        'behavior_ids':['fixture_step'],'fact_ids':['fixture_value'],'description':'The isolated toy step establishes value one'}]
-    return result
-
-
 def read_material(repo, snapshot, file, start_line, end_line):
     from consensus_assurance.core.types import Material
     path=repo/file

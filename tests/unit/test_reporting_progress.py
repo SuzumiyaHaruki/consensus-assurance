@@ -9,18 +9,17 @@ def test_audit_receipt_is_not_a_property_verdict(tmp_path):
     assert '不属于性质证据' in execution_summary(check)[2]
 
 
-def test_test_pass_and_model_failure_keep_different_scopes(tmp_path):
+def test_probe_and_execution_keep_different_scopes(tmp_path):
     args = dict(cwd=str(tmp_path), snapshot_id='fixture', status=ExecutionStatus.COMPLETED)
     test = CheckRun(action='capability_probe', outcome='tests_passed', exit_code=0, **args)
-    model = CheckRun(action='model_check', outcome='counterexample', exit_code=12, **args)
-    unknown = CheckRun(action='model_check', **args)
+    failed = CheckRun(action='direct_check', exit_code=1, **args)
     assert '未检查性质' in execution_summary(test)[2]
     explore=CheckRun(action='exploration',outcome='tests_passed',exit_code=0,**args)
     assert '没有正式性质判定' in execution_summary(explore)[2]
     permission=CheckRun(action='codex_permission_probe',exit_code=0,**args)
     assert '未检查性质' in execution_summary(permission)[2]
-    assert execution_summary(model)[1] == '找到模型反例'
-    assert execution_summary(unknown)[2] == '性质检查未完成或无法归属'
+    assert execution_summary(failed)[1] == '执行失败或未完成'
+    assert execution_summary(failed)[2] == '进程退出码不等于性质判定'
 
 
 def test_current_projection_rebuilds_at_deadline_without_old_budget_or_paths(tmp_path):

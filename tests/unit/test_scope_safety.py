@@ -41,7 +41,7 @@ def test_new_binding_still_requires_real_symbol_and_association(dependency_prepa
 
 def test_shared_binding_does_not_select_all_associated_obligations(dependency_prepared):
     from consensus_assurance.workflow.graph import expand_unit
-    _,state,_,_=dependency_prepared;b=next(b for b in state.bindings if b.id=='input_binding')
+    _, state, _ = dependency_prepared;b=next(b for b in state.bindings if b.id=='input_binding')
     b.associations.append(b.associations[0].model_copy(update={'claim_id':'step_obligation'}))
     unit=state.units[0];new=expand_unit(state,unit,['input_dependency'])
     assert new.obligation_ids==unit.obligation_ids
