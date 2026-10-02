@@ -95,7 +95,7 @@ def feedback(state, **overrides):
     refs=[s['operation_id'] for s in state.get('selections',[]) if s['action'] in {'pause','explained'}]
     refs += [r['id'] for r in state['semantic_reviews']]
     return dict(ref_ids=list(dict.fromkeys(refs+['code','doc'])),answered='The local return discriminator is bounded by this invocation',
-        remaining=['Unexecuted consumer and distributed consequences'],understanding='unchanged',
+        remaining=['External consumer invocation ordering is not supplied'],understanding='unchanged',
         rationale='The source map already expresses the bounded call; no structural generalization from a test',**overrides)
 
 

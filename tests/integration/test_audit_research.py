@@ -436,22 +436,7 @@ def local_stop(reason='bounded_completed', scope='candidate'):
     [('insufficient_basis',fault) for fault in ['missing_pause','missing_surface','unknown']])
 def test_run_stop_rejection_preserves_results_and_continues(tmp_path,reason,fault):
     from consensus_assurance.workflow.audit import validate_submission
-    source,spec=instance_products()
-    next(b for b in spec['behaviors'] if b['id']=='read')['cross_activity_effects']={'A1':'Exposes the established decision to the caller'}
-    def question(text,action='continue'):
-        sub=products()[0];sub.update(action=action,obligation=None,bindings=[])
-        sub['sources'][0]['end_line']=len(source.splitlines())
-        sub['question'].update(question=text,activity_classes=['A2'],behavior_ids=['change'],fact_ids=['context'],
-            contexts=['One instance across context changes'],event_paths=['change -> reject or replace context'],
-            disposition='needs_specific_evidence',unknowns=['External caller authorization is unavailable'])
-        return sub
-    def initial(state):
-        sub=question('Can a redundant context change erase pending support?','explained')
-        sub.update(map_path='map.json',feedback=feedback(state))
-        sub['question'].update(disposition='explained_by_existing_mechanism',unknowns=[],
-            counterevidence=['change returns before mutation when the context is unchanged'])
-        return sub,{'map.json':json.dumps(spec)}
-    def external(state):return question('Does the external caller authorize context changes?'),{}
+    source,prefix,question=instance_prefix()
     preflight=[]
     def premature(state):
         index=json.loads((e.root/'research.json').read_text())
@@ -483,7 +468,7 @@ def test_run_stop_rejection_preserves_results_and_continues(tmp_path,reason,faul
             counterevidence=['read returns decision directly; change resets support but preserves decision'])
         sub['feedback']=dict(feedback(state),answered='read exposes the retained decision across context changes; caller timing remains outside this source conclusion')
         return sub,{}
-    steps=[initial,external,local_stop('insufficient_basis'),premature,continue_after_rejection,stop]
+    steps=prefix+[premature,continue_after_rejection,stop]
     e,repo=engine_for(tmp_path,steps);e.config.directed_question=None
     (repo/'target.py').write_text(source)
     state=e.start(repo)
@@ -763,6 +748,32 @@ def read(instance):
     return source,spec
 
 
+def instance_prefix():
+    """Human-authored research prefix; no autonomous discovery or execution Evidence."""
+    source,spec=instance_products()
+    next(b for b in spec['behaviors'] if b['id']=='read')['cross_activity_effects']={'A1':'Exposes the established decision to the caller'}
+    def question(text,action='continue'):
+        sub=products()[0];sub.update(action=action,obligation=None,bindings=[])
+        sub['sources'][0]['end_line']=len(source.splitlines())
+        sub['question'].update(question=text,activity_classes=['A2'],behavior_ids=['change'],fact_ids=['context'],
+            contexts=['One instance across context changes'],event_paths=['change -> reject or replace context'],
+            importance='Context changes govern which pending support may contribute',preferred_check='source_review',
+            trigger_rationale='Compare the context guard and its effects with the actual caller contract',
+            disposition='needs_specific_evidence',unknowns=['External caller authorization is unavailable'])
+        return sub
+    def initial(state):
+        sub=question('Can a redundant context change erase pending support?','explained')
+        sub.update(map_path='map.json',feedback=dict(feedback(state),
+            answered='change rejects the current context before mutating pending support or the retained decision',
+            remaining=['The external caller authorization contract is unavailable'],
+            rationale='The source guard answers only redundant changes; other source relationships remain independent'))
+        sub['question'].update(disposition='explained_by_existing_mechanism',unknowns=[],
+            counterevidence=['change returns before mutation when the context is unchanged'])
+        return sub,{'map.json':json.dumps(spec)}
+    def external(state):return question('Does the external caller authorize context changes?'),{}
+    return source,[initial,external,local_stop('insufficient_basis')],question
+
+
 @pytest.mark.parametrize('combined',[False,True])
 def test_default_overview_precedes_focus_without_requiring_both_labels_per_question(tmp_path,combined):
     import copy
@@ -967,7 +978,7 @@ def test_knowledge_growth_preserves_execution_and_supplies_the_next_check(tmp_pa
             formation=path('step computes a local return and appends it; its caller receives that return',['call'],['result']),
             context=path('Module initialization establishes one process instance; shutdown discards its state',['start'],['instance']),
             connection=path('Calls append in their initialized process; a new process starts fresh and cannot inherit earlier results',['start','call'],['instance','result']),
-            core_gaps=[],open_details=['The local check has not executed', 'Record consumers remain unread'])
+            core_gaps=[],open_details=['External ordering between record consumption and clearing is not supplied'])
         files['map.json']=json.dumps(spec)
         return sub,files
     def enrich(state):
@@ -1110,8 +1121,9 @@ def test_knowledge_growth_preserves_execution_and_supplies_the_next_check(tmp_pa
     validate_units(state)
     from consensus_assurance.reporting.chinese import render_report
     report=render_report(state,e.root).read_text()
-    assert '地图 v3 保存时的实现认识' in report and 'The local check has not executed' in report
-    assert '当前检查和结论见上方实际结果' in report and 'Record consumers remain unread' in report
+    assert '地图 v3 保存时的实现认识' in report and 'External ordering between record consumption and clearing is not supplied' in report
+    assert '当前检查和结论见上方实际结果' in report and 'The local check has not executed' not in json.dumps(current['core_overview'])
+    assert 'distributed consequences' in state.claims[0].scope.excluded and 'distributed consequences' not in json.dumps(current['frontier'])
     assert not current['candidates'][0]['resume_conditions'] and current['candidates'][0]['results']
     if variant=='shared':
         handoffs=[s for s in state.selections if s['action']=='research' and s.get('feedback') and not s['map_updated']]

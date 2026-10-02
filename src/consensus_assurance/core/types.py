@@ -97,7 +97,7 @@ class Behavior(Record):
     cross_activity_effects: dict[ActivityClass, str] = Field(default_factory=dict, description="Activity ID to a concrete semantic effect description; not feeds, Behavior IDs or an inferred fact guarantee")
     existing_protections: list[str] = []
     source_ids: list[str] = Field(min_length=1)
-    unknowns: list[str] = []
+    unknowns: list[str] = Field(default_factory=list, description="Unresolved implementation or interface relationships; check exclusions and execution progress belong to Scope/CheckRun")
 
 
 class Fact(Record):
@@ -113,7 +113,7 @@ class Fact(Record):
     durability: str
     recovery: str
     source_ids: list[str] = Field(min_length=1)
-    unknowns: list[str] = []
+    unknowns: list[str] = Field(default_factory=list, description="Unknown establishment, consumption or validity in this implementation; known weak guarantees belong to meaning/context/durability")
 
 
 class Surface(Record):
@@ -195,7 +195,7 @@ class AuditQuestion(Record):
         description="Behavior ID to sourced prehistory, context or consequence support; not a direct principal Fact edge")
     obligation_relation_kind: Lifecycle | None = None
     counterevidence: list[str] = []
-    unknowns: list[str] = []
+    unknowns: list[str] = Field(default_factory=list, description="Specific unresolved premises or discriminators of this question; not generic caution or a checklist of untested cases")
     priority: int = Field(default=0, ge=0, le=3, description="System consequence and audit significance, justified in importance; not proof")
     trigger_rationale: str
 

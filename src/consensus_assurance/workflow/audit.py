@@ -53,27 +53,57 @@ def draft_bytes(root, name):
 
 
 class Inputs:
-    """Read fixed bytes once; only formal acceptance retains them on disk."""
-    def __init__(self, draft, archive=None):
-        self.draft, self.archive, self.contents = draft, archive, {}
+    """Read one source of bytes: live draft for preflight, receipt archive for acceptance."""
+    def __init__(self, root):
+        self.root, self.contents = root, {}
 
     def read(self, name):
         if not name or Path(name).is_absolute() or '..' in Path(name).parts:
             raise ValueError('Invalid submitted input path')
         if name not in self.contents:
-            saved = self.archive / "inputs" if self.archive else None
-            root = saved if saved and (saved / name).exists() else self.draft
-            self.contents[name] = draft_bytes(root, name)
+            self.contents[name] = draft_bytes(self.root, name)
         return self.contents[name].decode('utf-8')
 
     def json(self, name):
         return json.loads(self.read(name))
 
-    def retain(self):
+    def retain(self, archive):
         for name, data in self.contents.items():
-            saved = self.archive / 'inputs' / name
+            saved = archive / 'inputs' / name
             saved.parent.mkdir(parents=True, exist_ok=True)
-            saved.write_bytes(data)
+            with saved.open('xb') as stream:stream.write(data)
+
+
+def submission_files(submission):
+    """Only explicit product fields declare dependencies; file contents declare no more."""
+    mapped = submission.candidate if isinstance(submission,CheckSubmission) and submission.candidate else submission
+    paths = [getattr(mapped,'map_path',None)]
+    if isinstance(submission,(CheckSubmission,ExploreSubmission)):
+        paths += [submission.harness_path,*submission.files.values()]
+        if isinstance(submission,CheckSubmission):paths.append(submission.plan_path)
+    elif isinstance(submission,ModelSubmission):
+        paths += [submission.model_path,submission.behavior_path,submission.properties_path]
+    elif isinstance(submission,ResearchSubmission):paths += [submission.graph_path,submission.scope_path]
+    elif isinstance(submission,SemanticSubmission):paths.append(submission.feedback_path)
+    return dict.fromkeys(path for path in paths if path)
+
+
+def retain_receipt(draft, archive, result):
+    # An existing receipt, even incomplete after interruption, never falls back to mutable draft bytes.
+    if archive.exists():return
+    archive.mkdir(parents=True)
+    inputs, errors = Inputs(draft), []
+    name = result.get('submission')
+    try:
+        submission = AuditSubmission.model_validate(inputs.json(name))
+        for path in submission_files(submission):
+            try:inputs.read(path)
+            except (OSError,ValueError,TypeError) as exc:errors.extend(submission_diagnostics(exc))
+    except (OSError,ValueError,KeyError,TypeError) as exc:errors.extend(submission_diagnostics(exc))
+    finally:
+        if isinstance(name,str) and name in inputs.contents:(archive/'raw.json').write_bytes(inputs.contents[name])
+        inputs.retain(archive)
+    if errors:write_json(archive/'diagnostics.json',submission_errors(errors,archive,result))
 
 
 def harness_files(inputs, submission, raw):
@@ -235,11 +265,7 @@ def validate_model_revision(state, prior, model, submission):
 
 def accept(engine, submission, inputs, operation_id):
     """Persist only after the shared preparation has validated the whole product."""
-    try:
-        finish = prepare_submission(engine, submission, inputs, operation_id)
-    finally:
-        inputs.retain()
-    finish()
+    prepare_submission(engine, submission, inputs, operation_id)()
 
 
 def prepare_submission(engine, submission, inputs, operation_id):
@@ -500,6 +526,11 @@ def submission_diagnostics(exc):
     return [Diagnostic(code='submission',category='semantic' if isinstance(exc,ValueError) else 'tool',message=str(exc))]
 
 
+def submission_errors(diagnostics, archive, result):
+    return {'errors':[d.message for d in diagnostics], 'diagnostics':[d.model_dump(mode='json') for d in diagnostics],
+        'raw_path':str(archive/'raw.json'), 'submitted_path':result.get('submission'), 'summary':result.get('summary')}
+
+
 def validate_submission(state, root, name, implementation):
     """Read-only preparation; no Engine, lock, runner, receipt or persistent ID."""
     from types import SimpleNamespace
@@ -691,6 +722,8 @@ def prepare_agent_source(engine):
 def receive(engine, payload):
     check = CheckRun.model_validate(payload[0])
     session, result = payload[1:]
+    if check.status == ExecutionStatus.COMPLETED and result:
+        retain_receipt(engine.root/'draft',engine.root/'submissions'/check.id,result)
     engine.record(check)
     state = engine.state
     if session:
@@ -704,12 +737,11 @@ def receive(engine, payload):
     engine.checkpoint('agent_receipt_saved')
 
 
-def accept_received(engine, draft):
+def accept_received(engine):
     current, state = engine.state.current_submission, engine.state
     operation_id = current['operation_id']
     result = current.get('result')
     archive = engine.root / 'submissions' / operation_id
-    archive.mkdir(parents=True, exist_ok=True)
     if current['status'] != ExecutionStatus.COMPLETED.value or not result:
         if current.get('session_unavailable'):
             state.agent_session_id = None
@@ -723,25 +755,22 @@ def accept_received(engine, draft):
     raw={}
     engine.budget.timeout()
     try:
-        if not result.get('submission'):
-            raise ValueError('Completed turn supplied no reviewable submission: ' + result.get('summary', ''))
-        raw_path = archive / 'raw.json'
-        if not raw_path.exists():
-            raw_path.write_bytes(draft_bytes(draft, result['submission']))
-        raw = json.loads(raw_path.read_bytes())
+        raw_path = archive/'raw.json'
+        if raw_path.exists():raw = json.loads(raw_path.read_bytes())
+        saved_errors = archive/'diagnostics.json'
+        if saved_errors.exists():
+            from consensus_assurance.core.diagnostics import Diagnostic, DiagnosticError
+            raise DiagnosticError([Diagnostic.model_validate(d) for d in json.loads(saved_errors.read_text())['diagnostics']])
+        if not raw_path.exists():raise ValueError('Reliable receipt has no retained product bytes')
         if not isinstance(raw,dict):raise ValueError('A submission must be a JSON object')
         submission = AuditSubmission.model_validate(raw)
-        inputs = Inputs(draft, archive)
+        inputs = Inputs(archive/'inputs')
         commit_graph(engine, 'submission-' + operation_id, submission.model_dump(mode='json'),
             lambda proxy:accept(proxy, submission, inputs, operation_id))
         write_json(archive / 'accepted.json', submission)
         return True
     except (OSError, ValueError, KeyError, TypeError) as exc:
-        errors = {'errors':[str(exc)], 'raw_path':str(archive / 'raw.json'),
-            'submitted_path':result.get('submission'), 'summary':result.get('summary')}
-        diagnostics = submission_diagnostics(exc)
-        errors['errors'] = [d.message for d in diagnostics]
-        errors['diagnostics'] = [d.model_dump(mode='json') for d in diagnostics]
+        errors = submission_errors(submission_diagnostics(exc),archive,result)
         write_json(archive / 'diagnostics.json', errors)
         from .research import reject_local
         released=reject_local(state,operation_id,errors,raw if isinstance(raw,dict) else {})
@@ -788,7 +817,7 @@ def execute(engine):
     stop_cause='resource_limit'
     try:
         if state.current_submission.get('phase') == 'received':
-            accept_received(engine, draft)
+            accept_received(engine)
         if state.current_submission.get('phase') == 'accepted':
             execute_accepted(engine)
         if global_stop(state.current_submission) or state.current_submission.get('phase') == 'failed':
@@ -830,7 +859,7 @@ def execute(engine):
                 min(engine.budget.remaining(), engine.config.budget.agent_turn_timeout), state.agent_session_id),
                 {'session_id':state.agent_session_id, 'turn':len(state.agent_turns)})
             receive(engine, payload)
-            accepted = accept_received(engine, draft)
+            accepted = accept_received(engine)
             if state.current_submission.get('phase') == 'failed':
                 break
             if accepted:

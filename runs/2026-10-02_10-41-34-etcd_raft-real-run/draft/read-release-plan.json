@@ -1,0 +1,140 @@
+{
+  "description": "Run configuration-first and append-reply-first histories with public synchronous Nodes. Observe the original request identity, leader and old commit term before the trigger. After the configuration API returns, observe current-term commitment and inspect whether that same request remains in the first-commit queue after a Stop ownership barrier.",
+  "claim_id": "C-first-commit-read-release",
+  "binding_ids": [
+    "D-read-release"
+  ],
+  "harness": {
+    "kind": "go_test",
+    "source": "",
+    "files": {},
+    "description": "Actual four-node election and committed membership reduction, documented early Advance, two trigger orders, then stopped-owner queue inspection.",
+    "semantic_changes": [
+      "No target changes or private state assignments.",
+      "Same-package queue read occurs only after public Stop returns; stopping ends the observation independently of the forbidden queue state.",
+      "Normal application is a no-op except required ApplyConfChange; no external client result is modeled.",
+      "MemoryStorage represents successful storage completion.",
+      "current_term_committed is derived from the stored term at observed committed index compared with observed current term; raw operands are emitted."
+    ],
+    "prerequisites": [
+      {
+        "alias": "read",
+        "event": "read_admitted",
+        "conditions": [
+          {
+            "field": "read_call_returned",
+            "value": true
+          },
+          {
+            "field": "leader_state",
+            "value": "StateLeader"
+          },
+          {
+            "field": "current_term_committed_before",
+            "op": "eq",
+            "value": false
+          }
+        ]
+      }
+    ],
+    "legality": {
+      "source_ids": [
+        "node-start-and-restart",
+        "node-step-and-read",
+        "node-control-methods",
+        "node-loop",
+        "node-stop",
+        "doc-early-advance",
+        "node-early-advance",
+        "bootstrap-contract",
+        "storage-memory",
+        "storage-snap-append",
+        "campaign",
+        "candidate-follower",
+        "config-activate",
+        "read-pending",
+        "read-api-contract"
+      ],
+      "expectation_ids": [
+        "doc-early-advance",
+        "node-early-advance",
+        "conf-contract",
+        "read-api-contract"
+      ],
+      "binding_ids": [
+        "D-read-release"
+      ],
+      "derivation": "Four Nodes start with identical Bootstrap peers and consume actual Ready batches. Each Ready writes Entries and HardState before messages or Advance. Node 2 temporarily defers every application batch in order but advances after persistence, as explicitly permitted by synchronous Node/doc.go. A real committed removal entry is later applied in that same FIFO batch order. Campaign and actual vote replies elect Node 2; only its append network messages to peers 1 and 4 are held, preserving an active quorum of the subsequent three-voter configuration through nodes 2 and 3. The original read is submitted locally while commitment is still from the previous term; Status serializes after ReadIndex reception. The experiment case then applies the delayed config; the control first releases actual held append messages so old-config quorum commits through the ordinary response path, then applies all delayed batches. After ApplyConfChange returns and Status observes commit, Stop waits for the Node owner to terminate, and only then the harness reads its private queue without mutation or races. Stop does not clear that queue. There are no tick timeouts in the selected transition. Each observation finishes at the local queue-release endpoint, not a completed client read.",
+      "applicability": "Two independent real histories differing only in which actual event first commits the new-term entry. Post-stop no progress is expected. Timing waits only let Ready channels run; they are not an oracle. MemoryStorage models successful stable writes in a no-crash schedule.",
+      "unresolved": [],
+      "conflicts": [],
+      "alternatives": [
+        "Using private raft methods to assign leadership or commit would not establish this legal public-Node history; none are used.",
+        "The stopped-owner queue observation answers local release, while actual read service remains outside scope."
+      ]
+    }
+  },
+  "monitors": [
+    {
+      "id": "M-first-commit-read-release",
+      "checker_id": "first-commit-read-release",
+      "event": "release_observed",
+      "binding_ids": [
+        "D-read-release"
+      ],
+      "grounding": {
+        "source_ids": [
+          "leader-admit",
+          "leader-match",
+          "read-pending",
+          "config-activate"
+        ],
+        "expectation_ids": [
+          "pending-read-intent"
+        ],
+        "binding_ids": [
+          "D-read-release"
+        ],
+        "derivation": "pending-read-intent describes this particular internal queue as holding reads that cannot be answered before a new leader commits in its term, and says they will be handled as fast as the first log is committed in that term. Interpret this as a local transition responsibility: after the first-current-term commitment transition completes, a request already held solely on that condition must be released from this waiting queue for ordinary read processing. The expectation is attributed to that specific implementation statement, not inferred solely from differing call sites. Public ReadIndex explicitly allows requests to be lost and requires retry; this is not a claim of unconditional read completion, linearizability violation or an elapsed-time deadline.",
+        "applicability": "Synchronous public Node, ReadOnlySafe, surviving leader and unique request context, real pending request before first-current-term commit. Membership activation or an append reply can establish that commit condition. Early Advance is permitted by the Node and doc.go interface statements, with Ready application order retained.",
+        "unresolved": [],
+        "conflicts": [],
+        "alternatives": [
+          "Public read completion can require retries; a missing ReadState alone would not violate this local queue-release proposition.",
+          "The append-reply path explicitly releases this queue; membership activation must be examined separately."
+        ]
+      },
+      "admission_alias": "read",
+      "applicability_conditions": []
+    }
+  ],
+  "observable_properties": [
+    {
+      "checker_id": "first-commit-read-release",
+      "kind": "event_implication",
+      "trigger": {
+        "field": "transition_returned",
+        "value": true
+      },
+      "antecedent": {
+        "field": "current_term_committed",
+        "value": true
+      },
+      "assertion": {
+        "field": "waiting_for_first_commit",
+        "value": false
+      },
+      "identity_fields": [
+        "operation_id",
+        "request",
+        "leader",
+        "leader_term"
+      ],
+      "description": "For the admitted request in the same leader term, a completed local transition with a current-term committed entry implies the request no longer waits in the pre-first-commit pending queue. This does not require ReadState output or public read completion."
+    }
+  ],
+  "uncertainties": [
+    "The local release expectation is attributed to the internal queue comment. Public ReadIndex explicitly allows loss and retries, so this must not be described as an unconditional public completion guarantee.",
+    "The same-history construction exercises one documented synchronous scheduling permission and two trigger orders, not all configurations or application strategies."
+  ]
+}

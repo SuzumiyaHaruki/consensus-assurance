@@ -151,7 +151,7 @@ def render_report(state, root, export_derived=False):
         f'理解状态：{research["understanding_status"]}；当前目标：{research["next_objective"]["action"]}（{research["next_objective"]["boundary"]}）。']
     overview=research['core_overview']
     if overview:
-        lines.append(f'以下是地图 v{state.audit_spec_version} 保存时的实现认识；其中的阶段性执行描述不代表当前待办，当前检查和结论见上方实际结果。')
+        lines.append(f'地图 v{state.audit_spec_version} 保存时的实现认识；当前检查和结论见上方实际结果。')
         for key,label in [('formation','共识形成与推进'),('context','上下文／权威转换'),('connection','两条主线的连接')]:
             part=overview[key]
             lines += [f'- **{label}**：{part["explanation"]}',
@@ -184,7 +184,7 @@ def render_report(state, root, export_derived=False):
     if not research['pending_work']:lines.append('已选工作暂无未完项；这不表示研究前沿已穷尽。')
     lines += ['', '## 研究交接与可选前沿','',
         '以下是受理时的回答与后续建议；历史“待执行”文字不覆盖上方当前执行结果，也不自动创建任务。',
-        '当前需比较的开放对象：'+terms(research['frontier']['comparison_refs'])+'；可合并共同障碍，引用齐全不代表研究覆盖。']
+        '正常停止至少需说明的对象：'+terms(research['frontier']['comparison_refs'])+'；完整关系导航见研究索引，不限于此集合。']
     substantive=[s for s in research['handoffs'] if s.get('feedback')]
     recent=(substantive or research['handoffs'])[-1:]
     for handoff in recent:
@@ -202,14 +202,17 @@ def render_report(state, root, export_derived=False):
             lines.append(f'- `{handoff["operation_id"]}`：{answer.get("answered",handoff["rationale"])}；当时后续：{terms(answer.get("remaining",[]))}。')
         lines += ['', '</details>','']
     lines += [f'当前前沿与预算：{link(root/"research.json")}。地图条目和已检查 Unit 数不是责任覆盖率。',
-        '停止原因：'+state.stop_reason, '', '## 日志、原稿与恢复记录','',
+        '', '## 日志、原稿与恢复记录','',
         f'CLI 调用 {state.usage.get("agent_calls",0)} 次；目标执行 {state.usage.get("experiments",0)} 次；耗时 {state.elapsed_seconds:.2f} 秒。',
         f'工具版本、实际 usage、修订和历史判断：{link(root/"state.json")}；正式调用及修复成本：{link(root/"research.json")}。退稿包含有效调查，不能全部视作浪费。']
+    if state.current_submission.get('phase')=='received':
+        receipt=root/'submissions'/state.current_submission['operation_id']
+        lines.append(f'回执未受理：{link(receipt/"raw.json","原稿")}；{link(receipt/"inputs","声明文件")}。保存字节不产生结论或 Evidence。')
     for check in state.checks:
         label,result,boundary=execution_summary(check)
         lines.append(f'- `{check.id}` {label}：{result}；{boundary}；{link(check.stdout,"stdout")}；{link(check.stderr,"stderr")}；期限 {check.parameters.get("timeout_limit","未记录")}／{check.parameters.get("timeout_seconds","未记录")} 秒。')
     for diagnostic in sorted((root/'submissions').glob('*/diagnostics.json')):
-        lines.append(f'- 历史退稿：{link(diagnostic.parent/"raw.json","原稿")}；{link(diagnostic,"诊断")}。是否仍待修正见上方草稿状态。')
+        lines.append(f'- 原稿诊断：{link(diagnostic.parent/"raw.json","原稿")}；{link(diagnostic,"诊断")}。受理与修正状态见当前记录。')
     lines += ['- '+gap for gap in dict.fromkeys(state.gaps)]
     lines.append(f'实际方法路径：{terms(state.method_paths)}。模型轨迹和脚本化产品不构成实现确认或自主发现。')
     path=root/'report.md';path.write_text('\n'.join(lines))

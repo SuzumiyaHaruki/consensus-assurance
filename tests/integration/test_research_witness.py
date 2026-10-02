@@ -78,7 +78,10 @@ def test_controller_interrupt_does_not_require_a_valid_draft(tmp_path,event):
     state=e.start(repo)
     assert state.run_stop['origin']=='controller' and state.run_stop['reason']==('user_stop' if event=='cancel' else 'resource_limit')
     assert state.usage['agent_calls']==2 and state.run_stop['pending_work']
-    assert not diagnostics(e) and not state.evidence and not state.run_stop.get('frontier_comparison')
+    assert not state.evidence and not state.run_stop.get('frontier_comparison')
+    assert not any(s['action']=='rejected' for s in state.selections)
+    assert bool(diagnostics(e))==(event=='deadline')
+    if event=='deadline':assert Path(diagnostics(e)[0]['raw_path']).read_text()=='{'
 
 
 def test_independent_consumer_enrichment_keeps_old_artifact_current(tmp_path):
@@ -86,16 +89,32 @@ def test_independent_consumer_enrichment_keeps_old_artifact_current(tmp_path):
         spec=json.loads(Path(state['audit_spec_path']).read_text())
         spec['behaviors'].append(dict(id='consumer',primary_activity='A1',execution_owner='caller',protocol_context='later operation',
             trigger='use',consumes_fact_ids=['result'],source_ids=['consumer-source']))
+        spec['facts'][0]['unknowns']=['Which external caller orders production and consumption?']
         return dict(action='research',map_path='map.json',rationale='Record an independent later consumer',
             sources=[dict(id='consumer-source',file='consumer.py',start_line=1,end_line=2,kind='code_observation')],
-            map_changes={'consumer':dict(impact='dependency',source_ids=['consumer-source','code'],
+            map_changes={'result':dict(impact='clarification',source_ids=['consumer-source','code'],
+                rationale='The consumer forwards the value; its external invocation order remains unknown. The original local return scope and observation are unchanged.'),
+                'consumer':dict(impact='dependency',source_ids=['consumer-source','code'],
                 rationale='The later reader returns its input without mutation',
                 preserves='The earlier obligation ends at step return; this later consumer does not alter that value or its recorded history')}),{'map.json':json.dumps(spec)}
-    e,repo=engine_for(tmp_path,[first,check_step(),review_step(),enrich,stop])
+    def investigate(state):
+        sub,_=question_step(state);sub.pop('map_path');sub['sources']=[]
+        sub['question'].update(audit_spec_version=None,question='Does the later consumer transform the delivered value?',
+            behavior_ids=['consumer'],source_ids=['consumer-source','code'],obligation_relation_kind='consumption',
+            counterevidence=['consume directly returns the argument'],unknowns=['External invocation ordering is not supplied'])
+        sub['feedback']=dict(feedback(state),answered='The new source relation supports a separate consumer question; the first local result stays within its recorded scope')
+        return sub,{}
+    e,repo=engine_for(tmp_path,[first,check_step(),review_step(),enrich,investigate,stop])
     (repo/'consumer.py').write_text('def consume(value):\n    return value\n')
     state=e.start(repo)
     assert not diagnostics(e) and state.audit_spec_version==2 and state.units[0].status=='checked'
     assert state.units[0].audit_question.audit_spec_version==1 and all(e.applicability=='current' for e in state.evidence)
+    assert len(state.question_candidates)==2 and state.question_candidates[1].question.fact_ids==['result']
+    old=json.loads((e.root/'audit-spec'/'v1.json').read_text());new=json.loads(Path(state.audit_spec_path).read_text())
+    assert old['facts'][0]['unknowns']==['Consumer outside boundary']
+    assert new['facts'][0]['unknowns']==['Which external caller orders production and consumption?']
+    assert 'distributed consequences' in state.claims[0].scope.excluded and 'distributed consequences' not in json.dumps(new)
+    assert sum(c.action=='direct_check' for c in state.checks)==1 and not state.revisions
 
 
 def test_nonadjacent_history_support_retains_actual_core_relationship(tmp_path):

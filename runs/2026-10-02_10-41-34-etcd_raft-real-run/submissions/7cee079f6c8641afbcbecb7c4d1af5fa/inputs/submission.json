@@ -1,0 +1,180 @@
+{
+  "action": "check",
+  "rationale": "Submit a complete bounded safety check with a necessary-leader-support case and a permitted follower-majority case, both produced through actual public API histories.",
+  "sources": [
+    {
+      "id": "durability-expectation",
+      "file": "raft.go",
+      "start_line": 550,
+      "end_line": 576,
+      "kind": "document_statement"
+    },
+    {
+      "id": "bootstrap-contract",
+      "file": "bootstrap.go",
+      "start_line": 23,
+      "end_line": 80,
+      "kind": "code_observation"
+    }
+  ],
+  "candidate": {
+    "action": "obligation",
+    "rationale": "Test an explicit persistence-before-counting responsibility without assuming local leader persistence is always necessary.",
+    "question": {
+      "question": "Can leader commitment of a current-term proposal advance before the replicas whose storage workers have completed matching appends constitute the active voting majority, when the leader append worker is finitely delayed?",
+      "importance": "Counting an undurable replica toward a required majority can expose committed data to loss after failures. The proposed check observes only the library commitment boundary and storage completion ordering, not crash-induced data loss or client completion.",
+      "source_ids": [
+        "append-receive",
+        "apply-accept",
+        "apply-progress",
+        "async-contract",
+        "bootstrap",
+        "config-activate",
+        "durability-expectation",
+        "joint",
+        "leader-match",
+        "log-apply",
+        "log-commit-apply",
+        "log-eligibility",
+        "majority",
+        "progress-update",
+        "ready-contract",
+        "reset-append",
+        "startup",
+        "step-vote",
+        "storage-tail",
+        "tracker-commit"
+      ],
+      "participants": [
+        "Leader and non-Byzantine voting followers",
+        "Serialized RawNode callers and FIFO local append/apply workers"
+      ],
+      "objects": [
+        "Current-term log entry",
+        "Leader committed prefix",
+        "Per-voter stored log and Match"
+      ],
+      "contexts": [
+        "AsyncStorageWrites with fixed simple voter membership",
+        "Leader append worker held while remote append workers and messages run, then released"
+      ],
+      "event_paths": [
+        "RawNode.Propose -> appendEntry -> deferred self MsgAppResp / remote MsgApp -> follower append -> storage response -> leader Match -> majority -> maybeCommit"
+      ],
+      "activity_classes": [
+        "A1"
+      ],
+      "behavior_ids": [
+        "B-aggregate",
+        "B-apply"
+      ],
+      "fact_ids": [
+        "F-committed"
+      ],
+      "supporting_behavior_ids": {
+        "B-propose": "Produces the current-term target entry and deferred self append response.",
+        "B-follower-append": "Actual remote producer of append acknowledgements.",
+        "B-storage-release": "A6 handoff constrains when remote and local acknowledgement support becomes consumable by A1.",
+        "B-election-result": "Actual election establishes the tested leader, avoiding direct role assignment.",
+        "B-membership": "Bootstrap and application establish the fixed voter identities used by the oracle.",
+        "B-entry": "RawNode is serialized and the driver implements asynchronous caller duties."
+      },
+      "obligation_relation_kind": "establishment",
+      "counterevidence": [
+        "send queues self and remote append responses in msgsAfterAppend.",
+        "Async Ready envelopes defer these responses until local append completion.",
+        "maybeCommit requires a current-term entry and tracker aggregates only active voters.",
+        "A follower majority without the leader is legitimate, so local persistence is not an unconditional prerequisite."
+      ],
+      "unknowns": [
+        "Whether actual self and remote producers, asynchronous Ready collection and commitment consumer preserve the storage-qualified quorum relation in a complete finite execution with held leader writes."
+      ],
+      "priority": 3,
+      "trigger_rationale": "The source separates sending replication from publishing support, and initializes self Match during role transitions. A real elected leader and proposal with delayed local appends tests this distinction at the commit endpoint. Two voters make the leader necessary; three voters supply a permitted follower-majority control.",
+      "disposition": "ready_for_check",
+      "preferred_check": "controlled_schedule"
+    },
+    "obligation": {
+      "id": "C-storage-qualified-commit",
+      "kind": "obligation",
+      "concern": "consensus_safety",
+      "description": "Under a fixed simple voter configuration and compliant asynchronous storage workers, a leader may count replicas toward commitment of a current-term entry only after matching log entries have completed storage writes on those replicas; an advanced committed prefix must therefore be backed by a voting majority of such replicas.",
+      "source_ids": [
+        "durability-expectation",
+        "async-contract",
+        "majority",
+        "log-eligibility"
+      ],
+      "scope": {
+        "description": "Storage-qualified leader commitment of ordinary current-term entries in fixed simple configurations under asynchronous Ready processing.",
+        "assumptions": [
+          "Non-Byzantine messages and honest FIFO storage workers.",
+          "No membership changes during the selected proposal interval.",
+          "MemoryStorage is the storage-completion model; completed writes are not lost during these executions."
+        ],
+        "excluded": [
+          "Physical disk durability and crash recovery",
+          "Joint configurations and dynamic membership",
+          "Byzantine or forged messages",
+          "Global consensus safety or client linearizability conclusions"
+        ],
+        "parameters": {
+          "async_storage_writes": true,
+          "configuration": "fixed simple voters"
+        }
+      },
+      "pending": [],
+      "grounding": {
+        "source_ids": [
+          "reply-queue",
+          "reset-append",
+          "leader-match",
+          "tracker-commit",
+          "majority",
+          "log-eligibility"
+        ],
+        "expectation_ids": [
+          "durability-expectation",
+          "async-contract"
+        ],
+        "binding_ids": [
+          "D-commit-aggregation"
+        ],
+        "derivation": "The implementation explicitly requires entries to be persisted before being counted toward commitment (durability-expectation). The async contract permits outgoing replication before local writes but requires storage-worker responses after ordered durable completion. Under a fixed simple voting configuration, commitment may use any majority of persisted matching replicas; it does not require the leader itself to have persisted when other replicas form a majority. This requirement is independent of the observed committed value and of a blanket expectation that delayed local writes block every commit.",
+        "applicability": "Non-Byzantine peers; stable fixed simple voter membership; async storage mode; current-term ordinary proposal; honest ordered storage workers, no crashes or data corruption. MemoryStorage represents successfully completed storage writes at the library boundary; no physical disk durability is measured.",
+        "unresolved": [],
+        "conflicts": [],
+        "alternatives": [
+          "A three-voter leader may legally commit using both followers while its own append worker is delayed."
+        ]
+      }
+    },
+    "bindings": [
+      {
+        "id": "D-commit-aggregation",
+        "material_id": "reset-append",
+        "symbol": "maybeCommit",
+        "start_line": 778,
+        "end_line": 782,
+        "description": "Leader combines current term with tracker quorum index before raftLog commitment.",
+        "pending": [],
+        "associations": [
+          {
+            "claim_id": "C-storage-qualified-commit",
+            "source_ids": [
+              "durability-expectation",
+              "async-contract",
+              "tracker-commit",
+              "majority",
+              "log-eligibility"
+            ],
+            "rationale": "This consumer is the commitment endpoint for queued storage-qualified append support."
+          }
+        ]
+      }
+    ]
+  },
+  "plan_path": "check-plan.json",
+  "harness_path": "assurance_generated_test.go",
+  "files": {}
+}

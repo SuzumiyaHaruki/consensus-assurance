@@ -5,8 +5,20 @@ import pytest
 from audit_support import products, first, check_step, review_step, stop, engine_for, partial_map, feedback
 
 
-def test_existing_unit_actual_compile_repair_review_progress(tmp_path):
-    e,repo=engine_for(tmp_path,[first,check_step(True),check_step(revise=True),review_step(),stop])
+@pytest.mark.parametrize('fault',['compile','observation','observation_violation'])
+def test_existing_unit_actual_technical_repair_review_progress(tmp_path,fault):
+    def check(state,revise=False):
+        if revise:assert not any(r.get('confirmed') for r in state['monitor_results']) and not state['review_issues']
+        sub,files=check_step(broken=fault=='compile' and not revise,revise=revise)(state)
+        if fault!='compile':
+            files['helper.py']+='def observe(values,index):\n    return '+('values[index] if index < len(values) else None' if revise else 'values[index]')+'\n'
+            files['check.py']=files['check.py'].replace('from helper import legal','from helper import legal, observe\nvalues=[]\nassert observe(values,0) is None, "invalid observation prefix"')
+            files['check.py']=files['check.py'].replace('value=step(3,3)','values.append(step(3,3))\nvalue=observe(values,0)')
+        return sub,files
+    e,repo=engine_for(tmp_path,[first,check,lambda s:check(s,True),review_step(),stop])
+    original=(repo/'target.py').read_text()
+    if fault=='observation_violation':
+        original=original.replace('else 0','else value + 1');(repo/'target.py').write_text(original)
     state=e.start(repo)
     assert len(state.units)==1, state.stop_reason
     assert len(state.direct_checks)==2, state.current_submission
@@ -14,12 +26,18 @@ def test_existing_unit_actual_compile_repair_review_progress(tmp_path):
     assert new.previous_id==old.id and new.version==2
     executions=[c for c in state.checks if c.direct_check_id]
     assert len(executions)==2
-    assert executions[0].exit_code!=0 and 'SyntaxError' in Path(executions[0].stderr).read_text()
+    assert executions[0].exit_code!=0 and ('SyntaxError' if fault=='compile' else 'IndexError') in Path(executions[0].stderr).read_text()
     assert executions[1].exit_code==0
+    assert all(r.kind=='F4' and not r.after['encoding_revision'] for r in state.revisions)
+    assert len(state.claims)==len(state.question_candidates)==1
+    before,after=[json.loads(Path(a.plan_path).read_text()) for a in (old,new)]
+    for key in ('observable_properties','monitors'):assert before[key]==after[key]
+    assert len(after['monitors'])==1
+    assert state.monitor_results[-1]['outcome']==('violated' if fault=='observation_violation' else 'holds')
     assert state.units[0].status=='checked', state.units[0]
     assert not state.units[0].remaining_obligation_ids
     assert not state.review_issues
-    assert (repo/'target.py').read_text().endswith('else 0\n')
+    assert (repo/'target.py').read_text()==original
     assert not (repo/'helper.py').exists()
     index=json.loads((e.root/'research.json').read_text())
     assert index['units'] and index['claims'] and index['artifacts']
@@ -33,6 +51,86 @@ def test_raw_parse_failure_is_retained_and_whole_draft_can_continue(tmp_path):
     rejected=list((e.root/'submissions').glob('*/diagnostics.json'))
     assert len(rejected)==1
     assert (rejected[0].parent/'raw.json').read_bytes()==b'{"action":'
+
+
+@pytest.mark.parametrize('fault',[None,'missing','escape','symlink','unreliable'])
+def test_deadline_retains_only_reliably_declared_bytes(tmp_path,fault):
+    from consensus_assurance.core.types import ExecutionStatus
+    from consensus_assurance.workflow.audit import Inputs
+    saved={}
+    def combined(state):
+        candidate,files=first(state)
+        _,plan,harness=products()
+        sub=dict(action='check',candidate=candidate,plan_path='plan.json',harness_path='check.py',
+            files={'helper.py':'helper.py'},rationale='Submit the complete local check')
+        files.update({'plan.json':json.dumps(plan),'check.py':harness,'helper.py':'def legal(v,n): return 0 <= v <= n\n'})
+        if fault=='missing':files.pop('helper.py')
+        if fault=='escape':sub['files']['helper.py']='../../outside.py'
+        saved.update(files,**{'submission.json':json.dumps(sub)})
+        if fault in {'escape','symlink'}:saved.pop('helper.py')
+        return sub,files
+    e,repo=engine_for(tmp_path,[combined,stop])
+    (tmp_path/'outside.py').write_text('private sentinel')
+    invoke=e.agent.investigate
+    def investigate(*args,**kw):
+        check,session,result=invoke(*args,**kw)
+        if fault=='symlink':
+            helper=e.root/'draft'/'helper.py';helper.unlink();helper.symlink_to(tmp_path/'outside.py')
+        if fault=='unreliable':
+            check.status=ExecutionStatus.TIMEOUT;check.reason='No reliable completed turn';result=None
+        return check,session,result
+    e.agent.investigate=investigate
+    checkpoint=e.checkpoint
+    def deadline(event):
+        if event=='action_result_saved':e.budget.previous=e.config.budget.total_seconds
+        checkpoint(event)
+    e.checkpoint=deadline
+    state=e.start(repo)
+    archive=e.root/'submissions'/state.current_submission['operation_id']
+    assert state.run_stop['reason']=='resource_limit' and state.usage['agent_calls']==1
+    assert not state.claims and not state.evidence and not state.units and not state.applied_operations
+    if fault=='unreliable':
+        assert not (archive/'raw.json').exists() and not (archive/'inputs').exists()
+        return
+    assert state.current_submission['phase']=='received' and not (archive/'accepted.json').exists()
+    assert json.loads((archive/'raw.json').read_text())==json.loads(saved['submission.json'])
+    for name in saved:
+        (e.root/'draft'/name).unlink()
+        assert (archive/'inputs'/name).read_text()==saved[name]
+    (e.root/'draft'/'helper.py').write_text('later replacement')
+    if fault:
+        errors=json.loads((archive/'diagnostics.json').read_text())
+        assert errors['diagnostics'] and not (archive/'inputs'/'helper.py').exists()
+        with pytest.raises(ValueError):Inputs(archive/'inputs').read('helper.py')
+        assert 'private sentinel' not in ''.join(p.read_text() for p in archive.rglob('*') if p.is_file())
+    e.checkpoint=checkpoint
+    before={str(p.relative_to(archive)):p.read_bytes() for p in archive.rglob('*') if p.is_file()}
+    state=e.resume()
+    assert state.usage['agent_calls']==1 and not state.claims and not state.evidence
+    assert before=={str(p.relative_to(archive)):p.read_bytes() for p in archive.rglob('*') if p.is_file()}
+
+
+@pytest.mark.parametrize('product',[
+    dict(action='model',unit_id='unit',model_path='model.json',behavior_path='Behavior.tla',properties_path='Properties.tla'),
+    dict(action='research',map_path='map.json',graph_path='graph.json'),
+    dict(action='research',map_path='map.json',scope_path='scope.json'),
+    dict(action='semantic_revision',unit_id='unit',map_path='map.json',feedback_path='feedback.json'),
+    dict(action='explore',question='Read actual local feedback',harness_path='probe.py',files={'helper.py':'helper.py'})])
+def test_receipt_retains_all_explicit_product_files_without_acceptance(tmp_path,product):
+    from consensus_assurance.workflow.audit import retain_receipt
+    draft=tmp_path/'draft';draft.mkdir();archive=tmp_path/'archive'
+    sub=dict(product,rationale='A completed receipt, not semantic acceptance')
+    names=[v for k,v in product.items() if k.endswith('_path')]+list(product.get('files',{}).values())
+    for name in names:(draft/name).write_text('First declared bytes')
+    (draft/'unsubmitted.json').write_text('{"secret_path":"../outside"}')
+    (draft/'submission.json').write_text(json.dumps(sub))
+    result=dict(submission='submission.json',summary='Complete file product')
+    retain_receipt(draft,archive,result)
+    assert not (archive/'accepted.json').exists() and not (archive/'diagnostics.json').exists()
+    assert {str(p.relative_to(archive/'inputs')) for p in (archive/'inputs').rglob('*')}==set(names+['submission.json'])
+    for name in names:(draft/name).write_text('Changed later')
+    retain_receipt(draft,archive,result)
+    assert all((archive/'inputs'/name).read_text()=='First declared bytes' for name in names)
 
 
 @pytest.mark.parametrize('interrupt',[False,True])
@@ -66,7 +164,7 @@ def test_draft_symlinks_and_fixed_helper_bytes(tmp_path):
     (draft/'link').symlink_to(draft/'real'/'helper.py')
     for name in ('alias/helper.py','link','../outside'):
         with pytest.raises(ValueError):draft_file(draft,name)
-    inputs=Inputs(draft,archive)
+    inputs=Inputs(draft)
     assert inputs.read('real/helper.py')=='fixed'
     (draft/'real'/'helper.py').write_text('modified')
     assert inputs.read('real/helper.py')=='fixed'
@@ -163,6 +261,9 @@ def test_recovery_does_not_repeat_model_or_target_execution(tmp_path,phase):
     e.checkpoint=checkpoint
     with pytest.raises(KeyboardInterrupt):e.start(repo)
     e.checkpoint=original
+    if phase=='agent_receipt_saved':
+        for path in (e.root/'draft').iterdir():
+            if path.is_file():path.write_text('Mutable draft replaced after reliable receipt')
     state=e.resume()
     assert len(state.agent_turns)==2
     assert state.usage['agent_calls']==2
@@ -639,7 +740,7 @@ def test_feedback_only_retains_exploration_before_a_map_and_recovers_once(tmp_pa
         with pytest.raises(ValueError):
             sub=AuditSubmission.model_validate(raw)
             commit_graph(e,'bad-feedback-'+str(index),raw,
-                lambda proxy:accept(proxy,sub,Inputs(e.root/'draft',e.root/'submissions'/('bad-'+str(index))),'bad'))
+                lambda proxy:accept(proxy,sub,Inputs(e.root/'draft'),'bad'))
         assert state.model_dump(mode='json')==before
     with pytest.raises(ValueError):AuditSubmission.model_validate({'action':'research','rationale':'Empty'})
 
@@ -672,7 +773,7 @@ def test_preflight_checks_current_inputs_without_writes_or_execution(tmp_path,mo
     assert any(d['category']=='semantic' for d in rejected['diagnostics'])
     with pytest.raises(ValueError) as formal:
         commit_graph(e,'bad-combined',broken,lambda proxy:accept(proxy,AuditSubmission.model_validate(broken),
-            Inputs(draft,e.root/'submissions'/'bad-combined'),'bad-combined'))
+            Inputs(draft),'bad-combined'))
     assert {d['code'] for d in rejected['diagnostics']}=={d.code for d in formal.value.diagnostics}
     assert validate(sub)['valid']
     assert not e.state.units and not e.state.direct_checks
@@ -688,11 +789,11 @@ def test_preflight_checks_current_inputs_without_writes_or_execution(tmp_path,mo
     assert not validate(sub)['valid']
     with pytest.raises(ValueError,match='experiments'):
         commit_graph(e,'capacity-change',sub,lambda proxy:accept(proxy,AuditSubmission.model_validate(sub),
-            Inputs(draft,e.root/'submissions'/'capacity-change'),'capacity-change'))
+            Inputs(draft),'capacity-change'))
     e.state.usage.pop('experiments')
     assert validate(sub)['valid']
     commit_graph(e,'fresh-bytes',sub,lambda proxy:accept(proxy,AuditSubmission.model_validate(sub),
-        Inputs(draft,e.root/'submissions'/'fresh-bytes'),'fresh-bytes'))
+        Inputs(draft),'fresh-bytes'))
     assert Path(e.state.direct_checks[0].harness_path).read_text()=='changed harness bytes\n'
     assert not e.state.checks and not e.state.evidence
     # A proposal based on v1 cannot overwrite a later map.
