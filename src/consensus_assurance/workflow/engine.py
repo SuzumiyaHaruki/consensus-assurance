@@ -49,7 +49,7 @@ class Engine:
         started = time.monotonic()
         snapshot = capture(repo, self.root / "source", analysis_roots=self.config.target.analysis_roots, expected_module=self.config.target.expected_module)
         self.state = Analysis(framework_revision=FRAMEWORK_REVISION, mode="mock" if self.agent.mock else "real", config=self.config.model_dump(mode="json"), snapshot=snapshot)
-        self.state.analysis_mode = "regression" if self.agent.mock else ("directed" if self.config.directed_question else "autonomous")
+        self.state.analysis_mode = "regression" if self.agent.mock else ("directed" if (self.config.directed_question or "").strip() else "autonomous")
         self.state.elapsed_seconds = time.monotonic() - started
         self.budget = BudgetTracker(self.config.budget, self.state)
         self.runner.deadline = time.monotonic() + self.budget.remaining()

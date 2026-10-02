@@ -158,19 +158,11 @@ class ExploreSubmission(Submission):
     files: dict[str, str] = {}
 
 
-class FrontierOption(Record):
-    ref_ids: list[str] = Field(min_length=1)
-    next_step: str = Field(pattern=r"\S")
-    actionable: bool = Field(strict=True)
-    rationale: str = Field(pattern=r"\S")
-
-
 class StopSubmission(Submission):
     action: Literal["stop"]
     scope: Literal["candidate", "family", "focus", "run"]
     reason: Literal["bounded_completed", "insufficient_basis", "tool_gap", "resource_limit", "user_stop", "no_actionable_direction"]
     ref_ids: list[str] = []
-    frontier_comparison: list[FrontierOption] = []
     resume_conditions: list[str] = []
 
 

@@ -298,7 +298,6 @@ def render_report(state, root):
         if surface['disposition'] not in {'deferred','UNCLASSIFIED_PROTOCOL_RESPONSIBILITY'}:continue
         ref = 'surface:'+surface['entry_point']
         feedback = next((s['feedback'] for s in reversed(state.selections) if ref in s.get('feedback',{}).get('ref_ids',[])),{})
-        options = [o for o in stop.get('frontier_comparison',[]) if ref in o['ref_ids']]
         related = [entry for entry in exploration_records if ref in entry['ref_ids'] or
             {c['check_id'] for c in entry['executions']} & set(feedback.get('ref_ids',[]))]
         lines += ['', '**开放责任：'+surface['entry_point']+'**', '',
@@ -306,7 +305,7 @@ def render_report(state, root):
         if feedback.get('remaining'):lines.append('该交接保留的未知：'+'；'.join(feedback['remaining']))
         for entry in related:
             lines.append('相关探索的实际执行与后续解释见主要结果；'+link(entry['submission'],'已受理问题与计划'))
-        lines += ['可改变判断的下一步：'+'；'.join(o['next_step'] for o in options) if options else
+        lines += ['下一步交接：'+feedback['rationale'] if feedback else
             '已有调查计划见相关探索原稿。' if related else '尚未记录后续步骤。', map_link]
     for c in research['candidates']:
         if c['results'] and not c['resume_conditions'] or c['status'] == 'explained':continue
@@ -316,7 +315,7 @@ def render_report(state, root):
     lines += ['', '## 证据与运行说明', '',
         '；'.join(link(name,label) for name,label in [('state.json','完整状态、版本与争议'),('research.json','当前研究索引'),
             ('config.json','实际配置'),('events.jsonl','事件时序'),('audit-method.md','实际加载方法')]),
-        '环境探测不检查性质；探索成功不代表性质成立；失败驱动不是目标违反。模型结果与实现证据分开，脚本化 Agent 产品不证明自主发现。']
+        '环境探测不检查性质；探索成功不代表性质成立；失败驱动不是目标违反。脚本化 Agent 产品不证明自主发现。']
     for c in failures:lines += ['- 失败／未完成：'+link(c.stdout,c.action)+'；'+link(c.stderr,'stderr')+'；'+link(f'logs/{c.id}/check.json','执行记录')]
     if state.current_submission.get('phase') == 'received':lines.append('可靠回执尚未受理：'+link(f'submissions/{state.current_submission["operation_id"]}/raw.json','固定原稿')+'；保存字节不产生 Evidence。')
     path = archive.root / 'report.md'

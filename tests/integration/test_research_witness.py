@@ -64,11 +64,9 @@ def test_model_stop_labels_do_not_establish_controller_events(tmp_path,reason):
 def test_controller_interrupt_does_not_require_a_valid_draft(tmp_path,event):
     from consensus_assurance.workflow.audit import validate_submission
     def interrupted(state):
-        raw=dict(action='stop',scope='run',reason='insufficient_basis',ref_ids=['code','doc'],
-            rationale='A source boundary is unresolved',frontier_comparison=[dict(ref_ids=[state['units'][0]['id']],
-                next_step='Acquire an external caller contract',actionable=False,rationale='That contract is outside the supplied snapshot')])
+        raw=dict(action='stop',scope='run',reason='insufficient_basis',ref_ids=['code','doc'],rationale='A source boundary is unresolved')
         draft=e.root/'draft'/'stop.json';draft.write_text(json.dumps(raw))
-        assert validate_submission(e.state,e.root,draft.name,e.implementation)['valid']
+        assert not validate_submission(e.state,e.root,draft.name,e.implementation)['valid']
         if event=='cancel':
             draft.write_text('{')
             return stop(state)

@@ -221,8 +221,7 @@ def test_unrelated_map_update_preserves_check_and_focus_stop_is_bounded(tmp_path
         return sub,{'map.json':json.dumps(spec)}
     def false_complete(state):
         sub=dict(action='stop',scope='focus',reason='bounded_completed',rationale='Claim focus completion')
-        sub.update(ref_ids=['code'],frontier_comparison=[dict(ref_ids=['surface:A2 authority context'],
-            next_step='Read authority producer',actionable=True,rationale='The source remains available')])
+        sub.update(ref_ids=['code'])
         return sub,{}
     e,repo=engine_for(tmp_path,[first,check_step(),review_step(),update,false_complete,stop]);e.config.activity_focus=['A1','A2']
     state=e.start(repo)
@@ -413,7 +412,7 @@ def test_shared_fact_can_reconnect_paused_and_active_candidates_atomically(tmp_p
 
 def next_question(state):
     sub=products()[0]
-    sub.update(action='continue',obligation=None,bindings=[])
+    sub.update(action='continue',obligation=None,bindings=[],sources=[])
     sub['question'].update(contexts=['Another sourced invocation'],
         disposition='needs_specific_evidence',unknowns=['Inspect the other invocation boundary'])
     return sub,{}
@@ -424,113 +423,74 @@ def local_stop(reason='bounded_completed', scope='candidate'):
         candidate=state['question_candidates'][-1]
         return dict(action='stop',scope=scope,reason=reason,ref_ids=[candidate['id']],
             rationale='The scoped discriminator is disposed; compare other sourced directions',
-            frontier_comparison=[dict(ref_ids=[candidate['id']],next_step='Inspect another invocation context',
-                actionable=True,rationale='Other sourced invocations remain available in the mapped region')],
             resume_conditions=[] if reason=='bounded_completed' else ['Acquire the missing producer observation'],
             feedback=feedback(state)),{}
     return step
 
 
-@pytest.mark.parametrize('reason,fault',[(reason,'actionable') for reason in
-    ['bounded_completed','insufficient_basis','no_actionable_direction']]+
-    [('insufficient_basis',fault) for fault in ['missing_pause','missing_surface','unknown']])
-def test_run_stop_rejection_preserves_results_and_continues(tmp_path,reason,fault):
+@pytest.mark.parametrize('reason',['bounded_completed','insufficient_basis','no_actionable_direction'])
+def test_open_run_rejects_semantic_stops_in_preflight_and_acceptance(tmp_path,reason):
     from consensus_assurance.workflow.audit import validate_submission
     source,prefix,question=instance_prefix()
-    preflight=[]
+    messages=[]
     def premature(state):
-        index=json.loads((e.root/'research.json').read_text())
-        assert not index['pending_work'] and index['understanding_status']=='usable'
-        candidate=state['question_candidates'][-1]['id']
-        option=dict(ref_ids=[candidate,'surface:read'],next_step='Inspect read consumption across a context change',
-            actionable=True,rationale='Both functions are in the authorized snapshot; the external authorization contract is not needed to establish what read returns')
-        if fault!='actionable':option['actionable']=False
-        if fault=='missing_pause':option['ref_ids'].remove(candidate)
-        if fault=='missing_surface':option['ref_ids'].remove('surface:read')
-        if fault=='unknown':option['ref_ids'].append('absent')
-        sub=dict(action='stop',scope='run',reason=reason,ref_ids=['code'],
-            rationale='Selected local work is disposed',frontier_comparison=[option])
-        (e.root/'draft'/'stop.json').write_text(json.dumps(sub))
+        raw=dict(action='stop',scope='run',reason=reason,ref_ids=['code'],rationale='No complete next check selected')
+        path=e.root/'draft'/'stop.json';path.write_text(json.dumps(raw))
         before=e.state.model_dump(mode='json')
-        result=validate_submission(e.state,e.root,'stop.json',e.implementation)
+        result=validate_submission(e.state,e.root,path.name,e.implementation)
         assert not result['valid'] and e.state.model_dump(mode='json')==before
-        preflight.extend(result['diagnostics'])
-        return sub,{}
-    def continue_after_rejection(state):
-        assert not state['run_stop']
+        messages.extend(d['message'] for d in result['diagnostics'])
+        assert result['diagnostics'][0]['details']['reconsider']=='research_decision'
+        # The retired all-false frontier form cannot authorize a stop either.
+        raw['frontier_comparison']=[dict(ref_ids=['code'],next_step='None selected',actionable=False,rationale='No complete check')]
+        path.write_text(json.dumps(raw))
+        assert not validate_submission(e.state,e.root,path.name,e.implementation)['valid']
+        raw.pop('frontier_comparison')
+        return raw,{}
+    def continue_research(state):
+        assert not state['run_stop'] and diagnostics(e)[0]['errors']==messages
         assert [c['status'] for c in state['question_candidates']]==['explained','paused']
-        assert state['question_candidates'][1]['question']['unknowns']
-        assert set(d['message'] for d in preflight)==set(diagnostics(e)[0]['errors'])
-        assert preflight[0]['details']['reconsider']==('research_decision' if fault=='actionable' else 'submission')
-        sub=question('Does read expose the retained decision after a context change?','explained')
-        sub['question'].update(behavior_ids=['read'],supporting_behavior_ids={'change':'Preserves the established decision while invalidating pending support'},
-            activity_classes=['A1','A5'],fact_ids=['result'],disposition='explained_by_existing_mechanism',unknowns=[],
-            counterevidence=['read returns decision directly; change resets support but preserves decision'])
-        sub['feedback']=dict(feedback(state),answered='read exposes the retained decision across context changes; caller timing remains outside this source conclusion')
+        sub=question('What does the read consumer actually expose?', 'explained')
+        sub['question'].update(behavior_ids=['read'],activity_classes=['A1','A2','A5'],fact_ids=['result'],
+            supporting_behavior_ids={'change':'Preserves the established decision across context changes for read consumption'},
+            disposition='explained_by_existing_mechanism',unknowns=[],counterevidence=['read returns the preserved decision'])
+        sub['feedback']=dict(feedback(state),answered='The actual read path returns the established decision; caller timing is still unknown')
         return sub,{}
-    steps=prefix+[premature,continue_after_rejection,stop]
-    e,repo=engine_for(tmp_path,steps);e.config.directed_question=None
+    steps=prefix+[premature,continue_research]
+    e,repo=engine_for(tmp_path,steps);e.config.directed_question=None;e.config.activity_focus=['A2']
     (repo/'target.py').write_text(source)
     state=e.start(repo)
     assert len(diagnostics(e))==1 and len(state.question_candidates)==3
-    assert not state.evidence and state.agent_session_id=='fixture-session'
-    assert state.selections[-1]['feedback']['answered'].startswith('read exposes')
-    assert state.run_stop['origin']=='controller' and state.run_stop['reason']=='user_stop'
+    assert state.agent_session_id=='fixture-session' and not state.evidence
+    assert state.run_stop['origin']=='controller' and state.run_stop['reason']=='resource_limit'
+    assert state.usage['agent_calls']==len(steps) and state.question_candidates[1].resume_conditions
 
 
-@pytest.mark.parametrize('reason',['insufficient_basis','no_actionable_direction','bounded_completed'])
-def test_reasoned_run_stop_can_leave_budget_and_unresolved_scope(tmp_path,reason):
-    def initial(state):
-        sub,files=question_step(state)
-        sub.update(action='explained')
-        sub['question'].update(disposition='explained_by_existing_mechanism',unknowns=[],
-            counterevidence=['The return branch bounds the result'])
-        if reason!='bounded_completed':
-            spec=json.loads(files['map.json'])
-            spec['surfaces']=[dict(entry_point='external consumer',disposition='deferred',source_ids=['code'],
-                reason='Caller code is not part of the supplied target or directed question')]
-            files['map.json']=json.dumps(spec)
+def test_only_configured_directed_disposition_can_complete_a_run(tmp_path):
+    def explain(state):
+        sub,files=question_step(state);sub['action']='explained'
+        sub['question'].update(disposition='explained_by_existing_mechanism',unknowns=[],counterevidence=['The capacity branch handles the call'])
         return sub,files
-    def pause(state):
-        return dict(action='stop',scope='candidate',reason='insufficient_basis',
-            ref_ids=[state['question_candidates'][0]['id']],rationale='External consumer source is unavailable',
-            resume_conditions=['Supply and authorize the external consumer source']),{}
     def finish(state):
-        refs=[state['question_candidates'][0]['id']]
-        if reason!='bounded_completed':refs.append('surface:external consumer')
-        return dict(action='stop',scope='run',reason=reason,ref_ids=['code','doc'],
-            rationale='The directed local question is explained; the external consumer needs new source and authorization',
-            frontier_comparison=[dict(ref_ids=refs,next_step='Inspect the external consumer implementation',actionable=False,
-                rationale='The supplied snapshot has no caller implementation, and that consumer is outside the configured directed question; remaining calls and experiments cannot provide it')],
-            resume_conditions=['Supply and authorize the external consumer source']),{}
-    steps=[initial]+([pause] if reason!='bounded_completed' else [])+[finish]
-    e,repo=engine_for(tmp_path,steps);e.config.budget.agent_calls=20
+        return dict(action='stop',scope='run',reason='bounded_completed',
+            ref_ids=[state['question_candidates'][0]['id']],rationale='The configured finite source question is explained'),{}
+    e,repo=engine_for(tmp_path,[explain,finish]);e.config.budget.agent_calls=20
     state=e.start(repo)
-    assert not diagnostics(e) and state.run_stop['reason']==reason
-    assert state.usage['agent_calls']==len(steps) and state.elapsed_seconds<e.config.budget.total_seconds
-    assert state.run_stop['frontier_comparison'][0]['ref_ids'][0]==state.question_candidates[0].id
-    if reason!='bounded_completed':
-        assert view(state)['frontier']['surfaces'][0]['disposition']=='deferred'
-        assert state.question_candidates[0].status=='paused' and state.question_candidates[0].resume_conditions
+    assert not diagnostics(e) and state.run_stop['origin']=='agent'
+    assert state.run_stop['reason']=='bounded_completed' and state.usage['agent_calls']==2
+    assert state.elapsed_seconds<e.config.budget.total_seconds
 
 
-@pytest.mark.parametrize('omitted',['unit','issue'])
-def test_run_stop_accounts_for_unfinished_execution_and_review(tmp_path,omitted):
-    def finish(state,complete=False):
-        unit=state['units'][0]['id'];issue=state['review_issues'][0]['id']
-        refs=[unit,issue]+[c['id'] for c in state['question_candidates']]
-        if not complete:refs.remove(unit if omitted=='unit' else issue)
-        return dict(action='stop',scope='run',reason='insufficient_basis',ref_ids=['code','doc'],
-            rationale='Keep disputed applicability open pending external contract clarification',
-            frontier_comparison=[dict(ref_ids=refs,next_step='Resolve the disputed external caller premise',actionable=False,
-                rationale='No authoritative caller contract is supplied; more executions cannot decide which contract applies')]),{}
-    e,repo=engine_for(tmp_path,[first,check_step(),review_step('disputed'),finish,lambda s:finish(s,True)])
-    e.config.budget.agent_calls=20
+def test_directed_completion_does_not_erase_execution_or_review_debt(tmp_path):
+    def finish(state):
+        return dict(action='stop',scope='run',reason='bounded_completed',
+            ref_ids=[state['question_candidates'][0]['id']],rationale='Claim completion despite pending correspondence'),{}
+    e,repo=engine_for(tmp_path,[first,check_step(),review_step('disputed'),finish])
     state=e.start(repo)
-    assert len(diagnostics(e))==1 and 'Run stop omits' in str(diagnostics(e))
+    assert len(diagnostics(e))==1 and 'finite task is disposed' in str(diagnostics(e))
     assert {w['kind'] for w in state.run_stop['pending_work']}=={'unit','review_issue'}
     assert not state.review_issues[0].resolved_by and state.units[0].status!='checked'
-    assert state.run_stop['reason']=='insufficient_basis' and state.usage['agent_calls']==5
+    assert state.run_stop['origin']=='controller' and state.usage['agent_calls']==4
 
 
 @pytest.mark.parametrize('disposition',['bounded','confirmed','explained'])
@@ -960,31 +920,33 @@ def record_obligation(state):
         'plan.json':json.dumps(plan),'check.py':harness,'helper.py':'def legal(value, limit):\n    return 0 <= value <= limit\n'}
 
 
+def recording_first(state):
+    sub,files=first(state)
+    sub['sources'][0]['end_line']=9
+    sub['bindings'][0].update(start_line=2,end_line=5)
+    spec=json.loads(files['map.json'])
+    spec['behaviors'][0]['existing_protections'].append('The call also appends its local result; record consumers remain unread')
+    spec['behaviors'][0]['consumes_fact_ids']=['instance']
+    spec['activities'].append(dict(class_id='A2',applicability='applicable',purpose='Establish local instance context',
+        realization_summary='Process initialization creates the instance; observations use this instance until shutdown',source_ids=['code']))
+    spec['behaviors'].append(dict(id='start',primary_activity='A2',execution_owner='module loader',protocol_context='one process',
+        trigger='initialize module',produces_fact_ids=['instance'],source_ids=['code']))
+    spec['facts'].append(dict(id='instance',meaning='The fresh process owns an initialized records list',identity={'instance':'process'},
+        validity_context='Until process shutdown',representation=['records'],durability='volatile',recovery='fresh process',source_ids=['code']))
+    def path(text,bs,fs):return dict(explanation=text,behavior_ids=bs,fact_ids=fs,source_ids=['code'])
+    spec['core_overview']=dict(status='usable',rationale='Explain the finite local result path and the fresh instance boundary',
+        formation=path('step computes a local return and appends it; its caller receives that return',['call'],['result']),
+        context=path('Module initialization establishes one process instance; shutdown discards its state',['start'],['instance']),
+        connection=path('Calls append in their initialized process; a new process starts fresh and cannot inherit earlier results',['start','call'],['instance','result']),
+        core_gaps=[],open_details=['External ordering between record consumption and clearing is not supplied'])
+    files['map.json']=json.dumps(spec)
+    return sub,files
+
 @pytest.mark.parametrize('variant',['shared','refined','interference'])
 @pytest.mark.usefixtures('full_refresh_equivalence')
 def test_knowledge_growth_preserves_execution_and_supplies_the_next_check(tmp_path,variant):
     snapshots={}
-    def initial(state):
-        sub,files=first(state)
-        sub['sources'][0]['end_line']=9
-        sub['bindings'][0].update(start_line=2,end_line=5)
-        spec=json.loads(files['map.json'])
-        spec['behaviors'][0]['existing_protections'].append('The call also appends its local result; record consumers remain unread')
-        spec['behaviors'][0]['consumes_fact_ids']=['instance']
-        spec['activities'].append(dict(class_id='A2',applicability='applicable',purpose='Establish local instance context',
-            realization_summary='Process initialization creates the instance; observations use this instance until shutdown',source_ids=['code']))
-        spec['behaviors'].append(dict(id='start',primary_activity='A2',execution_owner='module loader',protocol_context='one process',
-            trigger='initialize module',produces_fact_ids=['instance'],source_ids=['code']))
-        spec['facts'].append(dict(id='instance',meaning='The fresh process owns an initialized records list',identity={'instance':'process'},
-            validity_context='Until process shutdown',representation=['records'],durability='volatile',recovery='fresh process',source_ids=['code']))
-        def path(text,bs,fs):return dict(explanation=text,behavior_ids=bs,fact_ids=fs,source_ids=['code'])
-        spec['core_overview']=dict(status='usable',rationale='Explain the finite local result path and the fresh instance boundary',
-            formation=path('step computes a local return and appends it; its caller receives that return',['call'],['result']),
-            context=path('Module initialization establishes one process instance; shutdown discards its state',['start'],['instance']),
-            connection=path('Calls append in their initialized process; a new process starts fresh and cannot inherit earlier results',['start','call'],['instance','result']),
-            core_gaps=[],open_details=['External ordering between record consumption and clearing is not supplied'])
-        files['map.json']=json.dumps(spec)
-        return sub,files
+    initial=recording_first
     def enrich(state):
         snapshots['unit']=state['units'][0]
         snapshots['claim']=state['claims'][0]
@@ -1222,3 +1184,60 @@ def test_removed_historical_id_is_resolved_in_its_original_map(tmp_path):
     assert state.units[0].audit_question.fact_ids==['result'] and state.units[0].audit_question.audit_spec_version==1
     assert state.audit_spec_version==2 and not state.revisions and state.review_issues
     assert state.monitor_results[0]['bounded_complete'] and not state.monitor_results[0]['reviewed_complete']
+
+
+@pytest.mark.parametrize('violated,boundary',[(False,'calls'),(True,'deadline')])
+def test_review_pause_and_reselection_continue_to_controller_boundary(tmp_path,monkeypatch,violated,boundary):
+    from types import SimpleNamespace
+    from consensus_assurance.workflow import budget
+    from consensus_assurance.workflow.audit import validate_submission
+    clock=[0.0]
+    monkeypatch.setattr(budget,'time',SimpleNamespace(monotonic=lambda:clock[0]))
+    retained={}
+    def early_stop(state):
+        retained['artifact']=state['direct_checks'][0]
+        retained['check']=next(c for c in state['checks'] if c['action']=='direct_check')
+        retained['assessment']=state['monitor_results'][0]
+        raw=dict(action='stop',scope='run',reason='insufficient_basis',ref_ids=['code'],
+            rationale='The next complete check lacks a caller contract')
+        (e.root/'draft'/'stop.json').write_text(json.dumps(raw))
+        result=validate_submission(e.state,e.root,'stop.json',e.implementation)
+        assert not result['valid'] and result['diagnostics'][0]['code']=='stop_decision'
+        return raw,{}
+    def learning(state):
+        assert len(diagnostics(e))==1 and not state['run_stop']
+        spec=json.loads(Path(state['audit_spec_path']).read_text())
+        spec['surfaces'].append(dict(entry_point='count',disposition='deferred',source_ids=['code'],
+            reason='count reads the recorded list; the callers ordering append, count and clear remain unexamined'))
+        return dict(action='research',map_path='map.json',feedback=dict(feedback(state),
+            answered='count reads the process-local list length; clear_records empties the same list',
+            remaining=['Read the callers ordering record creation and consumption'],understanding='updated'),
+            rationale='Save the actual consumer and reset paths for another discriminator'),{'map.json':json.dumps(spec)}
+    steps=[recording_first,check_step(),review_step(),next_question,local_stop('insufficient_basis'),early_stop,learning]
+    e,repo=engine_for(tmp_path,steps)
+    e.config.directed_question=None
+    e.config.budget.total_seconds=4800
+    if boundary=='deadline':e.config.budget.agent_calls=20
+    source='records=[]\ndef step(value, limit):\n    result=value + 1 if value < limit else 0\n    records.append(result)\n    return result\ndef count():\n    return len(records)\ndef clear_records():\n    records.clear()\n'
+    (repo/'target.py').write_text(source.replace('value + 1 if value < limit else 0','value + 1') if violated else source)
+    if violated:
+        e.agent.mock=False
+        e.config.execution_isolation='bwrap'
+    checkpoint=e.checkpoint
+    def advance_clock(event):
+        if boundary=='deadline' and event=='audit_execution_completed' and e.state.current_submission['action']=='research':
+            clock[0]=e.config.budget.total_seconds
+        checkpoint(event)
+    e.checkpoint=advance_clock
+    state=e.start(repo)
+    assert state.agent_session_id=='fixture-session' and state.usage['agent_calls']==len(steps)
+    assert state.direct_checks[0].model_dump(mode='json')==retained['artifact']
+    assert next(c for c in state.checks if c.action=='direct_check').model_dump(mode='json')==retained['check']
+    assert state.monitor_results[0]==retained['assessment']
+    assert state.monitor_results[0]['outcome']==('violated' if violated else 'holds')
+    assert state.monitor_results[0]['confirmed']==violated
+    assert state.units[0].status=='checked' and state.question_candidates[1].status=='paused'
+    assert state.question_candidates[1].resume_conditions and state.audit_spec_version==2
+    assert state.run_stop['origin']=='controller' and state.run_stop['reason']=='resource_limit'
+    assert state.usage['experiments']==1 and state.usage['semantic_reviews']==1
+    assert (state.elapsed_seconds>=4800)==(boundary=='deadline')

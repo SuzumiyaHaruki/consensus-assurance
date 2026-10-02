@@ -19,7 +19,7 @@ export PATH="$HOME/.local/bin:$PATH"
 
 `budget.agent_turn_timeout` 限制单次Codex 调查，`budget.action_timeout` 限制正式工具动作，`budget.total_seconds` 限制整次运行；`agent_calls` 与 `experiments` 分别计数。旧的材料分片、packet、指针修复和阶段调度已退出生产树；源码阅读和上下文管理交给 Codex。`allow_agent_materials: false` 会在发送源码前停止Codex 调查；正式目标执行还要求 `allow_experiments: true` 和 `execution_isolation: bwrap`。离线替身使用相同提交入口；它不验证真实 Codex 的自主构造效果。
 
-Candidate／family／focus 的局部停止保留未决工作并继续Codex 会话；整次运行停止单独记录。`research.json` 给出已映射关系的未知、问题交接及剩余能力。增加总时长不会自动增加正式执行、Unit、复核或修订额度。
+Candidate／family／focus 的局部停止保留未决工作并继续Codex 会话；开放运行持续推进到控制器时间／调用边界或真实中断；没有下一项完整检查不能结束整轮。用户预先指定的有限定向任务处置完毕后可结束。`research.json` 给出已映射关系的未知、问题交接及剩余能力。增加总时长不会自动增加正式执行、Unit、复核或修订额度。
 
 新运行支持源码调查、条件探索和真实实现的直接检查／受控调度；内置 TLA/TLC 产品、搜索及校准链已退出，不再要求 Java 或 JAR。直接测试不等价于模型空间穷举。旧运行及原始报告保持只读，旧模型配置会明确拒绝。
 

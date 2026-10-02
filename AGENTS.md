@@ -8,7 +8,7 @@ Preserve these design principles; changes to them require explicit user directio
 - D2: Initial understanding covers both core lines and their connection; the other five Activities are substantive support.
 - D3: Establish a broad semantic backbone with progressive detail, without exhaustive repository reading.
 - D4: After that overview, an individual Candidate may concern only one core line.
-- D5: Continue investigation and reselection within the same run; no discovery quota or forced budget exhaustion.
+- D5: Open runs continue useful investigation and reselection until controller time/call or actual interruption boundaries. Only a preconfigured finite directed task may complete early; no discovery quota or empty budget-filling work.
 - D6: Actively investigate tractable producer, prefix, schedule and endpoint gaps.
 - D7: Sourced local interface conclusions remain valid within scope, without automatic consensus-defect promotion.
 - D8: Codex owns reading, search and editing; the controller owns research structure, execution and evidence boundaries.

@@ -86,7 +86,6 @@ def test_agent_reads_work_index_after_action_checkpoint_report_and_resume(tmp_pa
         assert record['question']['trigger_rationale']==old.question.trigger_rationale
         selected=next(c for c in index['candidates'] if c['id']==current.id)
         assert selected['question']['counterevidence']==current.question.counterevidence
-        assert old.id not in index['frontier']['comparison_refs']
         assert paused.id in index['frontier']['paused_candidate_ids']
         assert next(c for c in index['candidates'] if c['id']==paused.id)['resume_conditions']==paused.resume_conditions
         assert any(i['id']=='current-dispute' for i in index['review_issues'])

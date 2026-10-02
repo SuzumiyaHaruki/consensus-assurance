@@ -16,20 +16,16 @@ def test_cli_audit_fixture_execution_and_report(tmp_path,capsys,monkeypatch):
     submission,files=check_step()({'units':[{'id':'unit-bounded'}]})
     fixture=tmp_path/'audit.json'
     candidate,map_files=first({})
-    fixture.write_text(json.dumps([{'submission':candidate,'files':map_files}, {'submission':submission,'files':files},
-        {'submission':dict(action='stop',scope='run',reason='insufficient_basis',ref_ids=['code','doc'],
-            rationale='The configured invocation ends after execution; review remains open',
-            frontier_comparison=[dict(ref_ids=['unit-bounded'],next_step='Review the executed check correspondence',actionable=False,
-                rationale='The caller configured only execution of the supplied check for this invocation; review is outside that directed boundary')])}]))
+    fixture.write_text(json.dumps([{'submission':candidate,'files':map_files}, {'submission':submission,'files':files}]))
     config=Config(agent_backend='mock',fixture=str(fixture),execution_backend='python',execution_isolation='workspace',
-        directed_question='Execute the supplied local return check only; correspondence review is outside this invocation',runs_dir=str(tmp_path/'runs'),budget=Budget(agent_calls=3,total_seconds=60))
+        directed_question='Execute the supplied local return check',runs_dir=str(tmp_path/'runs'),budget=Budget(agent_calls=2,total_seconds=60))
     path=tmp_path/'config.yaml';path.write_text(config.model_dump_json())
-    assert main(['run','--config',str(path),'--repo',str(repo)])==0
+    assert main(['run','--config',str(path),'--repo',str(repo)])==2
     root=next((tmp_path/'runs').glob('*-mock-run'))
     state=json.loads((root/'state.json').read_text())
-    assert len(state['direct_checks'])==1 and state['usage']['agent_calls']==3
-    assert state['agent_session_id']=='fixture-session' and len(state['agent_turns'])==3
-    assert state['method_paths'] and state['current_submission']['action']=='stop'
+    assert len(state['direct_checks'])==1 and state['usage']['agent_calls']==2
+    assert state['agent_session_id']=='fixture-session' and len(state['agent_turns'])==2
+    assert state['method_paths'] and state['run_stop']['origin']=='controller'
     assert not any(key.startswith('native_') for key in state)
     assert not any(p.name.startswith('native-') for p in root.iterdir())
     assert (root/'draft').is_dir() and (root/'submissions').is_dir() and (root/'agent-source').is_dir()
@@ -54,7 +50,7 @@ def test_cli_audit_fixture_execution_and_report(tmp_path,capsys,monkeypatch):
     import re
     from urllib.parse import unquote
     assert all((root/unquote(target)).is_file() for target in re.findall(r'\]\(([^)]+)\)',report))
-    assert main(['resume','--run',str(root),'--agent-turn-timeout','120'])==0
+    assert main(['resume','--run',str(root),'--agent-turn-timeout','120'])==2
     resumed=json.loads((root/'state.json').read_text())
     assert resumed['config']['budget']['agent_turn_timeout']==120
     assert resumed['agent_session_id']==state['agent_session_id'] and resumed['agent_turns']==state['agent_turns']
