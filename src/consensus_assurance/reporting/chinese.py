@@ -4,7 +4,7 @@ from datetime import datetime
 from pathlib import Path
 from urllib.parse import quote
 from consensus_assurance.core.types import ExecutionStatus
-from consensus_assurance.workflow.research import view
+from consensus_assurance.workflow.research import view, exploration_results
 from consensus_assurance.workflow.prompts import manifest
 
 
@@ -84,7 +84,8 @@ def observation_lines(record, artifact, check, archive, event_cache):
     plan = archive.read(artifact.get('plan_path'))
     if not plan:return ['模型／缺失制品的观察请按固定 assessment 和原始输出审查。']
     if check.id not in event_cache:
-        event_cache[check.id] = extract_events(check.model_copy(update={'stdout':str(archive.path(check.stdout) or '')}))
+        event_cache[check.id] = extract_events(check.model_copy(update={'stdout':str(archive.path(check.stdout) or ''),
+            'stderr':str(archive.path(check.stderr) or '')}))
     events = event_cache[check.id]
     lines = []
     for prop in record.get('properties',[]):
@@ -113,7 +114,7 @@ def observation_lines(record, artifact, check, archive, event_cache):
                         value = value.get(part,'未记录') if isinstance(value,dict) else '未记录'
                     values[prerequisite['alias']+'.'+condition['field']] = value
             for key,value in event.items():
-                if key.startswith('_ca_') or key == 'event':continue
+                if key.startswith('_ca_'):continue
                 if isinstance(value,dict):
                     values.update({key+'.'+k:v for k,v in value.items() if not isinstance(v,(dict,list))})
                 elif not isinstance(value,list):values[key] = value
@@ -127,6 +128,59 @@ def observation_lines(record, artifact, check, archive, event_cache):
         lines += ['', '前提关联：'+'；'.join(f'观察 {n+1} → '+cell(correlations.get(str(i),{}).get('status','未记录'))
             for n,i in enumerate(selected))+'。嵌套结构、前提原值及编码数据见原始观察；不猜测解码。', '']
     return lines
+
+
+def interruption_lines(check, archive):
+    from consensus_assurance.adapters.agents.backend import codex_events, codex_diagnostic
+    saved = check.model_copy(update={'stdout':str(archive.path(check.stdout) or '')})
+    diagnostic = codex_diagnostic(codex_events(saved)) if check.action == 'agent_turn' else {}
+    limit = check.parameters.get('timeout_limit','未记录')
+    seconds = check.parameters.get('timeout_seconds','未记录')
+    lines = [f'中断调用 `{check.action}`：status=`{check.status.value}`；timeout_limit=`{limit}`；timeout_seconds=`{seconds}`。',
+        '；'.join([archive.link(f'logs/{check.id}/check.json','调用记录'),archive.link(check.stdout,'stdout'),archive.link(check.stderr,'stderr')])]
+    if check.action == 'agent_turn':
+        lines.append('可靠完成回执：'+('已记录完成事件；产物另行校验。' if check.parameters.get('agent_turn_completed') else '未记录；未完成草稿不受理。'))
+        lines.append(('可信传输诊断（不能定位故障责任方）：' if diagnostic.get('transport_failure') else '调用诊断（不据此授权重试）：')+
+            excerpt(diagnostic['message']) if diagnostic.get('message') else '单轮超时，具体原因未知。' if check.status == ExecutionStatus.TIMEOUT else '具体原因见原始调用记录。')
+    return lines
+
+
+def milestone_lines(state, research, archive, checks):
+    """Keep readiness and actual executions regardless of product action labels."""
+    selected = {}
+    changes = [s for s in state.selections if s.get('map_updated')]
+    for s in changes:
+        version = s['accepted_versions']['audit_spec']
+        if (archive.read(f'audit-spec/v{version}.json').get('core_overview') or {}).get('status') == 'usable':
+            selected[s['operation_id']] = ('双主线概览已就绪', archive.link(f'audit-spec/v{version}.json','当时地图'))
+            break
+    growth = [s for s in state.selections if s.get('map_delta') or s.get('feedback',{}).get('understanding') == 'updated'
+        or s.get('accepted_versions',{}).get('artifacts') or s.get('released_candidate_ids')]
+    for s in growth[-3:]:
+        selected.setdefault(s['operation_id'], ('认识／制品更新：'+excerpt(s.get('feedback',{}).get('answered') or s['rationale'],200),
+            archive.link(f'submissions/{s["operation_id"]}/accepted.json','完整交接')))
+    current = {a['id'] for a in research['artifacts']}
+    for check in checks.values():
+        if check.action == 'exploration' or (check.direct_check_id or check.model_id) in current:
+            selected[check.id] = ('实际执行：'+'；'.join(execution_summary(check)[:2]),archive.link(f'logs/{check.id}/check.json','执行记录'))
+    interrupted = [c for c in checks.values() if c.action == 'agent_turn' and c.status != ExecutionStatus.COMPLETED]
+    for check in interrupted[-3:]:
+        selected[check.id] = ('Agent 调查中断；后续记录不抹掉此失败',archive.link(f'logs/{check.id}/check.json','中断记录'))
+    lines = []
+    for id in sorted(selected, key=lambda id:list(checks).index(id) if id in checks else -1):
+        title, link = selected[id]
+        check = checks.get(id)
+        timing = '时间未记录'
+        if check and check.ended_at:
+            ended = datetime.fromisoformat(check.ended_at)
+            timing = ended.strftime('%H:%M:%S %z') + f'（距创建墙钟 {(ended-datetime.fromisoformat(state.created_at)).total_seconds():.1f} 秒，含暂停间隔）'
+            if check.started_at:
+                duration = (ended-datetime.fromisoformat(check.started_at)).total_seconds()
+                timing += f'；{"Agent 回合墙钟" if check.action == "agent_turn" else "目标工具耗时"} {duration:.2f} 秒'
+        lines += ['', '- '+timing+' · '+title+'。'+link]
+        if check in interrupted and id != state.run_stop.get('operation_id'):
+            lines += interruption_lines(check,archive)
+    return lines + ['', archive.link('events.jsonl','完整运行时序')+'；'+archive.link('state.json','完整研究交接与执行历史')]
 
 
 def render_report(state, root):
@@ -143,6 +197,7 @@ def render_report(state, root):
     config, capacity = state.config, research['capacity']
     formal = [c for c in state.checks if c.action == 'direct_check']
     explorations = [c for c in state.checks if c.action == 'exploration']
+    exploration_records = exploration_results(state, archive.read)
     failures = [c for c in formal+explorations if c.status != ExecutionStatus.COMPLETED or c.exit_code not in (0,None)]
     explained = [c for c in research['candidates'] if c['status'] == 'explained' and not c['results']]
     stop = state.run_stop
@@ -168,8 +223,15 @@ def render_report(state, root):
         f'元数据：源码 `{state.snapshot.commit or state.snapshot.id}`；实际方法 `{state.framework_revision}`；展示版本 `{manifest()["version"]}`；'
         f'模式 {state.mode}/{state.analysis_mode}；执行后端 `{config.get("execution_backend","none")}`／包 `{config.get("target",{}).get("execution_package",".")}`；'
         f'模型 `{config.get("agent_model") or "默认"}`／`{config.get("agent_reasoning_effort") or "默认"}`。重新渲染不代表重新审计。', '',
-        '停止依据（记录摘录）：'+excerpt(stop.get('rationale') or state.stop_reason,190)+'；'+link('state.json','完整停止记录')+'。', '',
-        '## 主要结果', '', '| 问题 | 当前结果 | 实际回答摘录 | 证据 |', '| --- | --- | --- | --- |']
+        '停止依据（记录摘录）：'+excerpt(stop.get('rationale') or state.stop_reason,190)+'；'+link('state.json','完整停止记录')+'。', '']
+    stopped_check = checks.get(stop.get('operation_id'))
+    if stopped_check and (stopped_check.status != ExecutionStatus.COMPLETED or stopped_check.exit_code not in (0,None)):
+        lines += interruption_lines(stopped_check,archive)
+    lines += ['', '## 主要结果', '']
+    if results or explained:
+        lines += ['| 问题 | 当前结果 | 实际回答摘录 | 证据 |', '| --- | --- | --- | --- |']
+    else:
+        lines += ['尚无正式性质判定；已保存的整体理解与条件探索见下文，不能据此断言目标没有问题。']
     entries = []
     rows = {key:[] for key in DISPOSITIONS}
     for n,result in enumerate(results,1):
@@ -214,6 +276,28 @@ def render_report(state, root):
         searches = [c for c in state.checks if c.model_id == artifact['id'] and c.action in {'model_check','model_syntax'}]
         lines += ['', '局部模型（与实现证据独立）：'+link(artifact['bundle_path'],'固定模型制品')+'；'+link(artifact['path'],'模型行为')]
         for c in {c.action:c for c in searches}.values():lines.append('- '+'；'.join(execution_summary(c))+'；'+link(c.stdout,'实际输出')+'；'+link(c.stderr,'诊断'))
+    for entry in exploration_records:
+        lines += ['', '条件探索：'+excerpt(entry['question'] or '问题原稿字节缺失',200),
+            '所选问题／策略（原文摘录）：'+excerpt(entry['rationale'] or '见固定原稿',240),
+            link(entry['submission'],'受理问题、条件与来源')+'；'+'；'.join(link(path,'固定输入') for path in entry['inputs'])]
+        for execution in entry['executions']:
+            check = checks[execution['check_id']]
+            lines += ['；'.join(execution_summary(check)[1:])+'。'+link(execution['record'],'执行记录')+'；'+
+                link(execution['stdout'],'实际输出')+'；'+link(execution['stderr'],'诊断'),
+                '；'.join(link(path,'执行文件清单') for path in execution['artifacts'])]
+            from consensus_assurance.adapters.runners.experiment import extract_events
+            events = extract_events(check.model_copy(update={'stdout':str(archive.path(check.stdout) or ''),
+                'stderr':str(archive.path(check.stderr) or '')}))
+            for event in events[:2]:
+                lines.append('结构化观察原值（非性质判定；全部事件见日志）：'+cell(excerpt(json.dumps(
+                    {k:v for k,v in event.items() if not k.startswith('_ca_')},ensure_ascii=False),300)))
+        if not entry['executions']:lines.append('已受理问题，尚无保存的执行记录。')
+        if entry['feedback']:
+            saved = entry['feedback'][-1]['submission']
+            feedback = archive.read(saved).get('feedback') or {}
+            lines += ['执行后交接摘录：'+excerpt(feedback.get('answered','归档字节缺失'),260)+'；'+link(saved,'完整解释与剩余问题')]
+            if feedback.get('remaining'):lines.append('该交接保留的未知：'+'；'.join(feedback['remaining']))
+        else:lines.append('尚无受理的执行后解释；原观察可继续研究，不自动生成正式义务或审批待办。')
     lines += ['', '## 研究过程与认识增长', '',
         'A1 共识形成与推进、A2 上下文／权威转换及其连接由双主线概览导航；地图条目和检查数量不是责任覆盖率。',
         map_link+'。']
@@ -221,39 +305,27 @@ def render_report(state, root):
         for key,label in [('formation','共识形成与推进'),('context','上下文／权威转换'),('connection','两条主线的连接')]:
             lines.append('- '+label+'（原文导航摘录）：'+excerpt(research['core_overview'][key]['explanation'],220))
     if research['understanding_status'] != 'usable':lines.append('双主线初始理解尚未完成；定向问题之外不能据片段宣称整体就绪。')
-    milestones = [s for i,s in enumerate(state.selections) if i == 0 or s['action'] in {'review','explained','pause','stop'} or
-        any(c.id in s.get('feedback',{}).get('ref_ids',[]) for c in failures)]
-    milestones = milestones if len(milestones) <= 8 else milestones[:2]+milestones[-6:]
-    for s in milestones:
-        check = checks.get(s['operation_id'])
-        time = datetime.fromisoformat(check.ended_at).strftime('%H:%M:%S %z') if check and check.ended_at else '时间未记录'
-        lines += ['', f'- {time} · {s["action"]}：'+excerpt(s.get('feedback',{}).get('answered') or s['rationale'],330)+
-            '（记录摘录；调查回执时间，不是目标执行耗时）。'+link(f'submissions/{s["operation_id"]}/accepted.json','完整交接')]
+    lines += milestone_lines(state,research,archive,checks)
     lines += ['', '## 当前未决事项', '', '已选检查暂无欠账；研究范围仍可开放。' if not research['pending_work'] else '已选检查／争议仍有待办：']
     for item in research['pending_work']:lines.append('- '+link('research.json',item['id'])+'：'+'；'.join(item['reasons']))
-    covered = set()
     for surface in research['frontier']['surfaces']:
         if surface['disposition'] not in {'deferred','UNCLASSIFIED_PROTOCOL_RESPONSIBILITY'}:continue
         ref = 'surface:'+surface['entry_point']
         feedback = next((s['feedback'] for s in reversed(state.selections) if ref in s.get('feedback',{}).get('ref_ids',[])),{})
-        covered.update(feedback.get('ref_ids',[]))
         options = [o for o in stop.get('frontier_comparison',[]) if ref in o['ref_ids']]
-        lines += ['', '**开放责任：'+surface['entry_point']+'**', '', '已知／缺口：'+(feedback.get('answered') or surface['reason']),
-            '尚缺：'+'；'.join(feedback.get('remaining',[])) if feedback else surface['reason'],
-            '可改变判断的下一步：'+'；'.join(o['next_step'] for o in options) if options else '下一步尚未记录；需补适用来源或具体判别。',
-            map_link+'；'+'；'.join(link(checks[i].stdout,'相关探索') for i in feedback.get('ref_ids',[]) if i in checks)]
+        related = [entry for entry in exploration_records if ref in entry['ref_ids'] or
+            {c['check_id'] for c in entry['executions']} & set(feedback.get('ref_ids',[]))]
+        lines += ['', '**开放责任：'+surface['entry_point']+'**', '',
+            '保存的交接摘录：'+feedback['answered'] if feedback else '地图保留的缺口：'+surface['reason']]
+        if feedback.get('remaining'):lines.append('该交接保留的未知：'+'；'.join(feedback['remaining']))
+        for entry in related:
+            lines.append('相关探索的实际执行与后续解释见主要结果；'+link(entry['submission'],'已受理问题与计划'))
+        lines += ['可改变判断的下一步：'+'；'.join(o['next_step'] for o in options) if options else
+            '已有调查计划见相关探索原稿。' if related else '尚未记录后续步骤。', map_link]
     for c in research['candidates']:
         if c['results'] and not c['resume_conditions'] or c['status'] == 'explained':continue
         lines += ['', '候选：'+c['question']['question'], '保存的语义未知：'+'；'.join(c['question']['unknowns']),
             '恢复条件：'+'；'.join(c['resume_conditions']),link('state.json','候选原文与历史')]
-    for c in explorations:
-        if c.id in covered:continue
-        feedback = next((s['feedback'] for s in reversed(state.selections) if c.id in s.get('feedback',{}).get('ref_ids',[])),{})
-        action = next((a for a in state.action_history if a.id == c.pending_action_id),None)
-        operation = action.logical_input.get('operation_id') if action else None
-        product = archive.read(f'submissions/{operation}/accepted.json')
-        lines += ['', '独立探索：'+excerpt(product.get('question','未保存明确问题归属'),200)+'；'+link(c.stdout,'实际输出')+'；'+link(c.stderr,'诊断')+'。'+execution_summary(c)[1]+'，不是正式性质结论。',
-            '历史处置摘录：'+excerpt(feedback.get('answered','未保存明确后续归属；不自动生成当前待办。'),260)]
     if stop.get('resume_conditions'):lines += ['', '本轮记录的恢复条件：'+'；'.join(stop['resume_conditions'])]
     lines += ['', '## 证据与运行说明', '',
         '；'.join(link(name,label) for name,label in [('state.json','完整状态、版本与争议'),('research.json','当前研究索引'),

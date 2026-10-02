@@ -6,6 +6,7 @@ from audit_support import products, first, check_step, review_step, stop, engine
 
 
 @pytest.mark.parametrize('fault',['compile','observation','observation_violation'])
+@pytest.mark.usefixtures('full_refresh_equivalence')
 def test_existing_unit_actual_technical_repair_review_progress(tmp_path,fault):
     def check(state,revise=False):
         if revise:assert not any(r.get('confirmed') for r in state['monitor_results']) and not state['review_issues']
@@ -187,6 +188,7 @@ def test_accepted_check_recovers_without_remaining_model_call(tmp_path):
     assert state.current_submission['phase']=='executed'
 
 
+@pytest.mark.usefixtures('full_refresh_equivalence')
 def test_same_version_reading_and_independent_issues(tmp_path):
     def original(state):
         sub,files=check_step()(state)
@@ -220,6 +222,9 @@ def test_same_version_reading_and_independent_issues(tmp_path):
     assert len([c for c in state.checks if c.direct_check_id])==1
     assert not any('needs the documented contract' in b for b in state.monitor_results[0]['blockers'])
     assert state.units[0].remaining_obligation_ids==['bounded']
+    result = state.monitor_results[0]
+    assert result['bounded_complete'] and not result['reviewed_complete'] and not result['confirmed']
+    assert len(result['open_issue_ids']) == 1 and len(state.evidence) == 1 and not state.findings
 
 
 @pytest.mark.parametrize('phase',['action_result_saved','agent_receipt_saved','runner_complete','agent_runner_complete'])
@@ -293,7 +298,7 @@ def test_audit_receipt_failure_routes_preserve_or_stop_the_session(tmp_path,faul
             if fault=='malformed_final':response.write_text('{')
             elif fault=='missing_submission':response.write_text(json.dumps({'submission':'absent.json','summary':'Missing product'}))
             elif fault=='timeout':
-                check.status=ExecutionStatus.TIMEOUT;check.exit_code=-9;check.reason='Total budget ended before reliable completion'
+                check.status=ExecutionStatus.TIMEOUT;check.exit_code=-9;check.reason='Single turn ended without a completion receipt'
                 events.write_text(json.dumps({'type':'thread.started','thread_id':session_id}))
             else:
                 check.exit_code=1
@@ -309,11 +314,140 @@ def test_audit_receipt_failure_routes_preserve_or_stop_the_session(tmp_path,faul
         assert state.run_stop['origin']=='controller' and state.run_stop['reason']=='tool_gap'
         check=next(c for c in reversed(state.checks) if c.action=='agent_turn')
         assert check.status==({'login':ExecutionStatus.LOGIN_REQUIRED,'quota':ExecutionStatus.QUOTA_EXHAUSTED,'service_refusal':ExecutionStatus.ERROR,'timeout':ExecutionStatus.TIMEOUT}[fault])
+        calls = state.usage['agent_calls']
+        assert e.resume().usage['agent_calls'] == calls and len(sessions) == 2
     else:
         assert len(state.direct_checks)==1,state.current_submission
         assert sessions[2]==(None if fault=='session_lost' else 'fixture-session')
         if fault=='session_lost':assert any('session unavailable' in gap for gap in state.gaps)
         else:assert list((e.root/'submissions').glob('*/diagnostics.json'))
+
+
+def test_explicit_resume_reads_executed_exploration_after_transport_timeout(tmp_path):
+    import sys
+    from test_audit_research import instance_products
+    from consensus_assurance.adapters.agents.backend import CodexAgent
+    from consensus_assurance.adapters.runners.experiment import extract_events
+    from consensus_assurance.reporting.chinese import render_report
+    from consensus_assurance.core.types import ExecutionStatus
+    source, spec = instance_products()
+    def initial(state):
+        sources = products()[0]['sources']
+        sources[0]['end_line'] = len(source.splitlines())
+        return dict(action='research', map_path='map.json', sources=sources,
+            rationale='Retain the two connected instance paths'), {'map.json':json.dumps(spec)}
+    def explore(state):
+        return dict(action='explore', question='Does a decision survive a caller-selected context change?',
+            harness_path='explore.py',
+            rationale='Observe the retained decision under an explicit caller policy'), {
+            'explore.py':
+                "import json\nfrom target import create, change, support, read\n"
+                "s=create(['a']); change(s,1); support(s,1,'a',7); change(s,2)\n"
+                "print('CA_EVENT '+json.dumps({'event':'observed','value':read(s)}))\n"}
+    def interpret(state):
+        # Read the actual handoff written before invocation, never a closure-supplied result.
+        assert e.state.pending_action.id != failed_action and state['usage']['agent_calls'] == 4
+        index = json.loads((e.root/'research.json').read_text())
+        entry, = index['explorations']
+        product = json.loads((e.root/entry['submission']).read_text())
+        assert product['question'].startswith('Does a decision survive')
+        execution, = entry['executions']
+        check = next(c for c in e.state.checks if c.id == execution['check_id'])
+        assert extract_events(check)[0]['value'] == 7
+        assert not entry['feedback'] and not index['pending_work']
+        return dict(action='research', rationale='Interpret the retained execution without repeating it',
+            feedback=dict(ref_ids=[check.id, 'code'], answered='Under the selected policy the observed decision remained 7',
+                remaining=['External caller authorization remains outside scope'], understanding='unchanged',
+                rationale='The existing map already retains this distinction')), {}
+    e, repo = engine_for(tmp_path, [initial, explore, stop, interpret, stop])
+    (repo/'target.py').write_text(source)
+    original = e.agent.investigate
+    sessions = []
+    def investigate(runner, prompt, directory, snapshot_id, timeout, session_id=None):
+        sessions.append(session_id)
+        if len(sessions) != 3:
+            return original(runner, prompt, directory, snapshot_id, timeout, session_id)
+        e.agent.cursor += 1
+        # A complete-looking draft is still unauthorized without a completed turn.
+        (directory/'submission.json').write_text(json.dumps({'action':'research','rationale':'Unfinished draft'}))
+        events = [{'type':'thread.started','thread_id':session_id},
+            {'type':'error','message':'Reconnecting: stream disconnected: request timed out'}]
+        command = [sys.executable, '-c', 'import time; print('+repr('\n'.join(map(json.dumps, events)))+', flush=True); time.sleep(10)']
+        check = runner.run(command, directory, 'agent_turn', snapshot_id, .15)
+        return CodexAgent().decode(check, runner.root/'actions'/runner.active_action_id/'agent-response.json', session_id)
+    e.agent.investigate = investigate
+    checkpoint = e.checkpoint
+    def inspect_execution(event):
+        checkpoint(event)
+        if event == 'audit_execution_completed' and e.state.current_submission.get('action') == 'explore':
+            index = json.loads((e.root/'research.json').read_text())
+            assert e.state.pending_action.kind == 'exploration' and not index['pending_work']
+            entry, = index['explorations']
+            assert len(entry['executions']) == 1 and not entry['feedback']
+            assert all((e.root/path).is_file() for path in entry['inputs'])
+    e.checkpoint = inspect_execution
+    state = e.start(repo)
+    failed = next(c for c in state.checks if c.status == ExecutionStatus.TIMEOUT)
+    assert state.current_submission['phase'] == 'failed' and len(sessions) == 3
+    assert failed.parameters['timeout_limit'] == 'agent_turn_timeout'
+    assert state.elapsed_seconds < e.config.budget.total_seconds and state.usage['agent_calls'] == 3
+    assert not (e.root/'submissions'/failed.id).exists()
+    assert state.usage['experiments'] == 1 and not state.claims and not state.evidence
+    stopped_report = render_report(state, e.root).read_text()
+    failed_action = state.pending_action.id
+    elapsed = state.elapsed_seconds
+    state = e.resume()
+    assert state.usage['agent_calls'] == 5, 'Explicit resume must retire the failed attempt and request a fresh turn'
+    assert sessions == [None] + ['fixture-session'] * 4
+    assert state.elapsed_seconds >= elapsed and state.usage['experiments'] == 1
+    assert any(a.id == failed_action for a in state.action_history) and state.pending_action.id != failed_action
+    assert any(c.id == failed.id and c.status == ExecutionStatus.TIMEOUT for c in state.checks)
+    assert not state.evidence and not state.claims and not (e.root/'submissions'/failed.id).exists()
+    index = json.loads((e.root/'research.json').read_text())
+    entry, = index['explorations']
+    assert len(entry['executions']) == len(entry['feedback']) == 1
+    assert '没有正式性质判定' in stopped_report and '| 问题 | 当前结果 |' not in stopped_report
+    assert '尚无受理的执行后解释' in stopped_report and failed.id in stopped_report
+    assert 'agent_turn_timeout' in stopped_report and '0.15' in stopped_report
+    assert '双主线概览已就绪' in stopped_report
+    continued = render_report(state, e.root).read_text()
+    assert failed.id in continued and 'observed decision remained 7' in continued
+
+
+@pytest.mark.parametrize('boundary',['total','calls','config','snapshot','permissions','tools','repeat'])
+def test_explicit_transport_resume_keeps_authority_and_global_limits(tmp_path,boundary):
+    import sys
+    from consensus_assurance.adapters.agents.backend import CodexAgent
+    e,repo=engine_for(tmp_path,[stop,stop,stop])
+    sessions=[]
+    def disconnected(runner,prompt,directory,snapshot_id,timeout,session_id=None):
+        sessions.append(session_id)
+        events=[{'type':'thread.started','thread_id':'fixture-session'},
+            {'type':'turn.failed','error':{'message':'stream disconnected: connection reset'}}]
+        check=runner.run([sys.executable,'-c','print('+repr('\n'.join(map(json.dumps,events)))+'); raise SystemExit(1)'],
+            directory,'agent_turn',snapshot_id,timeout)
+        return CodexAgent().decode(check,runner.root/'actions'/runner.active_action_id/'agent-response.json',session_id)
+    e.agent.investigate=disconnected
+    state=e.start(repo)
+    old=state.current_submission['operation_id']
+    assert state.current_submission['phase']=='failed' and state.usage['agent_calls']==1
+    if boundary=='total':e.budget.previous=e.config.budget.total_seconds;e.checkpoint('controlled_total_deadline')
+    elif boundary=='calls':state.usage['agent_calls']=e.config.budget.agent_calls;e.checkpoint('controlled_call_limit')
+    elif boundary=='config':e.config.allow_agent_materials=False
+    elif boundary=='snapshot':(e.root/'agent-source'/'target.py').write_text('Changed captured bytes')
+    elif boundary=='permissions':e.agent.prepare=lambda *args:(False,[])
+    elif boundary=='tools':e.agent.probe=lambda runner:dict(available=True,version='changed-tool',checks=[],reason='Changed fixture')
+    calls=state.usage['agent_calls']
+    if boundary=='snapshot':
+        with pytest.raises(ValueError,match='source view content changed'):e.resume()
+    else:state=e.resume(agent_turn_timeout=120 if boundary=='total' else None)
+    assert len(sessions)==(2 if boundary=='repeat' else 1)
+    assert state.usage['agent_calls']==calls+(boundary=='repeat')
+    assert any(c.id==old for c in state.checks) and not state.evidence
+    if boundary=='repeat':
+        assert state.current_submission['phase']=='failed' and state.current_submission['operation_id']!=old
+        assert sessions==[None,'fixture-session']
+    if boundary=='total':assert state.run_stop['reason']=='resource_limit' and e.budget.remaining()==0
 
 
 def test_cancel_formal_tool_stops_before_another_agent_call(tmp_path,monkeypatch):
@@ -442,6 +576,7 @@ def test_partial_map_then_references_and_persistent_resume(tmp_path):
     assert len(list((e.root/'submissions').glob('*/diagnostics.json')))==1
 
 
+@pytest.mark.usefixtures('full_refresh_equivalence')
 def test_checker_correction_across_intermediate_harness_version(tmp_path):
     def flawed(state):
         sub,files=check_step()(state)

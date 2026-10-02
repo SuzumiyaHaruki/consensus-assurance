@@ -18,17 +18,40 @@ def classify_failure(text: str) -> ExecutionStatus:
     return ExecutionStatus.ERROR
 
 
-def codex_failure_text(check, events):
-    """Use transport errors, never source or command output from Codex tool items."""
-    errors = [e.get("error") for e in events if e.get("type") == "turn.failed"]
-    errors = errors or [e.get("message") for e in events if e.get("type") == "error"]
-    messages = [" ".join(str(error[k]) for k in ("code", "message") if error.get(k))
-        if isinstance(error, dict) else str(error) for error in errors if error]
-    if any(messages):
-        return "\n".join(messages)
-    if not events:
-        return output(check)
-    return Path(check.stderr).read_text(errors="replace") if check.stderr and Path(check.stderr).is_file() else ""
+def codex_events(check):
+    events = []
+    if check.stdout and Path(check.stdout).is_file():
+        for line in Path(check.stdout).read_text(errors="replace").splitlines():
+            try:
+                event = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(event, dict):events.append(event)
+    return events
+
+
+def codex_diagnostic(events):
+    """Only top-level failures authorize transport recovery; mixed/unknown errors do not."""
+    errors = [e.get('error') if e.get('type') == 'turn.failed' else e.get('message')
+        for e in events if e.get('type') in {'turn.failed','error'}]
+    messages = [' '.join(str(error[k]) for k in ('code','message') if error.get(k))
+        if isinstance(error,dict) else str(error or '') for error in errors]
+    def restricted(low):
+        restrictive = ('cybersecurity','safety','policy','flagged','refus','permission','denied','cancel',
+            'forbidden','authentication','quota','rate_limit','billing','credential','account')
+        return (classify_failure(low) != ExecutionStatus.ERROR or any(s in low for s in restrictive)
+            or re.search(r'\b(?:http(?:/\d(?:\.\d)?)?|status(?: code)?)\s*[:=]?\s*(?:403|429)\b',low))
+    def missing(low):
+        return any(s in low for s in ('session not found','thread not found','no session found'))
+    def transport(low):
+        return (not restricted(low) and not missing(low)
+            and any(s in low for s in ('request timed out','stream disconnected','connection reset',
+                'connection closed','tls handshake','unexpected eof','error sending request')))
+    normalized = [m.lower() for m in messages]
+    return {'message':redact('\n'.join(messages)),
+        'transport_failure':bool(messages) and all(map(transport,normalized)),
+        'session_unavailable':any(map(missing,normalized)) and
+            all(not restricted(m) and (missing(m) or transport(m)) for m in normalized)}
 
 
 def failure_reason(text: str) -> str:
@@ -208,34 +231,30 @@ class CodexAgent:
     def decode(self, check, response, session_id=None):
         """Decode a durable Agent receipt without invoking another model turn."""
         check.tool_version = getattr(self, "version", "unknown")
-        events = []
-        if check.stdout and Path(check.stdout).is_file():
-            for line in Path(check.stdout).read_text(errors="replace").splitlines():
-                try:
-                    event = json.loads(line)
-                except ValueError:
-                    continue
-                if isinstance(event, dict):
-                    events.append(event)
+        events = codex_events(check)
         started = [e.get("thread_id") for e in events if e.get("type") == "thread.started"]
         actual_id = started[-1] if started else None
         completed = [e for e in events if e.get("type") == "turn.completed"]
+        diagnostic = codex_diagnostic(events)
         if session_id and actual_id and actual_id != session_id:
             check.status = ExecutionStatus.ERROR
             check.reason = "Agent session identity changed unexpectedly"
+            diagnostic['transport_failure'] = False
         if check.status == ExecutionStatus.COMPLETED and (check.exit_code != 0
                 or any(e.get("type") == "turn.failed" for e in events)
                 or (not completed and any(e.get("type") == "error" for e in events))):
-            diagnostic = codex_failure_text(check, events)
-            check.status = classify_failure(diagnostic)
-            check.reason = failure_reason(diagnostic)
-            if session_id and any(marker in diagnostic.lower() for marker in
-                    ("session not found","thread not found","no session found")):
+            # Startup stderr remains useful diagnosis, but never transport retry authority.
+            failure = diagnostic['message'] or (output(check) if not events else
+                Path(check.stderr).read_text(errors='replace') if check.stderr and Path(check.stderr).is_file() else '')
+            check.status = classify_failure(failure)
+            check.reason = failure_reason(failure)
+            if session_id and diagnostic['session_unavailable']:
                 check.parameters["agent_session_unavailable"]=True
         if completed and not (actual_id or session_id):
             check.status = ExecutionStatus.ERROR
             check.reason = "Agent turn completed without a recoverable session identity"
         check.parameters.update({"agent_session_id":actual_id or session_id,
+            "agent_diagnostic":{**diagnostic, 'message':diagnostic['message'][:2000]},
             "agent_response_path":str(response),
             "agent_turn_completed":bool(completed),
             "agent_tool_events":len({e['item']['id'] for e in events if e.get('type') == 'item.completed'

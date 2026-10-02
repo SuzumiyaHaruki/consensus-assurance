@@ -162,27 +162,47 @@ def test_mixed_report_reads_fixed_results_and_moves_without_side_effects(tmp_pat
             ref_ids=[check['id'],'code','surface:external repeat policy'],answered='Under the chosen repeat policy the actual returns were 3 and 4.',
             remaining=['Acquire the caller repeat contract'],understanding='updated',rationale='No obligation is inferred from unequal returns')),
             {})
-    steps=[initial,check_step(broken=True),check_step(revise=True),review,second,review_step(),explained,explore,retain,stop]
+    def independent_issue(state):
+        candidate=state['question_candidates'][-1]['id']
+        return dict(action='review',artifact_id=candidate,rationale='Retain an independent source applicability dispute',
+            review_items=[dict(target_id=candidate,aspect='applicability',status='disputed',source_ids=['code'],
+                rationale='The external caller may have another boundary',counterevidence=['External caller responsibility remains unacquired'])]),{}
+    def fact_feedback(state):
+        return dict(action='research',rationale='Retain a separate Fact explanation',feedback=dict(ref_ids=['result'],
+            answered='The result Fact describes local delivery only',remaining=[],understanding='unchanged',
+            rationale='A shared Fact does not associate this feedback with an execution')),{}
+    steps=[initial,check_step(broken=True),check_step(revise=True),review,second,review_step(),explained,
+        independent_issue,explore,retain,explore,fact_feedback,stop]
     e,repo=engine_for(tmp_path,steps);e.agent.mock=False;e.config.execution_isolation='bwrap'
     (repo/'target.py').write_text('def step(value, limit):\n    return value + 1 if value <= limit else 0\n')
-    e.config.budget.experiments=4
+    e.config.budget.experiments=5
     state=e.start(repo)
     assert not list((e.root/'submissions').glob('*/diagnostics.json')),state.stop_reason
     assert [r['disposition'] for r in view(state)['conclusions']]==['confirmed_in_scope','bounded_no_violation']
-    assert state.usage['experiments']==4 and len(state.claims)==2
+    assert state.usage['experiments']==5 and len(state.claims)==2
+    index=json.loads((e.root/'research.json').read_text())
+    assert [len(entry['feedback']) for entry in index['explorations']]==[1,0]
+    assert index['explorations'][0]['operation_id']!=index['explorations'][1]['operation_id']
     old=state.direct_checks[0];old_check=next(c for c in state.checks if c.direct_check_id==old.id)
     current=state.direct_checks[1];exploration=next(c for c in state.checks if c.action=='exploration')
     monkeypatch.setattr(ProcessRunner,'run',lambda *a,**kw:(_ for _ in ()).throw(AssertionError('Report cannot execute')))
     monkeypatch.setitem(EXECUTION_BACKENDS,'python',lambda *a,**kw:(_ for _ in ()).throw(AssertionError('Report cannot assemble')))
     moved=tmp_path/'moved';shutil.copytree(e.root,moved)
+    read_text=Path.read_text
+    def archive_only(path,*args,**kwargs):
+        assert not path.is_relative_to(e.root), 'Moved reports must not read the original host paths'
+        return read_text(path,*args,**kwargs)
+    monkeypatch.setattr(Path,'read_text',archive_only)
     before={p.relative_to(moved):p.read_bytes() for p in moved.rglob('*') if p.is_file()}
     saved=state.model_dump(mode='json');text=render_report(state,moved).read_text()
     assert state.model_dump(mode='json')==saved and all((moved/p).read_bytes()==v for p,v in before.items())
     assert '**已确认违反**' in text and '**有限检查未见违反**' in text and '源码解释' in text
     assert '边界返回责任' in text and '本次完整观察返回 4' in text
+    assert '| event | returned |' in text
     assert 'external repeat policy' in text and 'Acquire the caller repeat contract' in text
     assert old_check.id in text and current.plan_path.split('/direct-checks/')[1] in text
     assert exploration.id in text and text.count('该问题保留的失败执行')==1
+    assert text.count('尚无受理的执行后解释')==1 and 'external caller may have another boundary' in text
     assert 'distributed consequences' in text and '没有正式性质判定' in execution_summary(exploration)[2]
     assert '_ca_stream' not in text and '_ca_observation' not in text and '<details>' not in text
     assert state.semantic_reviews[0].items[0].rationale not in text
@@ -190,5 +210,7 @@ def test_mixed_report_reads_fixed_results_and_moves_without_side_effects(tmp_pat
     assert all(not Path(unquote(p)).is_absolute() and (moved/unquote(p)).is_file() for p in links)
     # A missing archived version must not silently resolve against the still-existing original run.
     (moved/Path(current.plan_path).relative_to(e.root)).unlink()
+    (moved/index['explorations'][1]['submission']).unlink()
     text=render_report(state,moved).read_text()
     assert '条件与检查器（归档字节缺失）' in text and str(e.root) not in text
+    assert '问题原稿字节缺失' in text

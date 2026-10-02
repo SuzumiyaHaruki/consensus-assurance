@@ -237,6 +237,7 @@ def test_unrelated_map_update_preserves_check_and_focus_stop_is_bounded(tmp_path
     assert 'A2 authority context' in report and '当前未决事项' in report
 
 
+@pytest.mark.usefixtures('full_refresh_equivalence')
 def test_fact_correction_is_saved_before_an_explicit_semantic_revision(tmp_path):
     def revise(state,authorized=False):
         from consensus_assurance.core.types import Analysis
@@ -960,6 +961,7 @@ def record_obligation(state):
 
 
 @pytest.mark.parametrize('variant',['shared','refined','interference'])
+@pytest.mark.usefixtures('full_refresh_equivalence')
 def test_knowledge_growth_preserves_execution_and_supplies_the_next_check(tmp_path,variant):
     snapshots={}
     def initial(state):

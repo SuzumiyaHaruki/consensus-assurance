@@ -15,11 +15,13 @@ from consensus_assurance.adapters.storage.snapshot import capture
     ({'type':'error','message':'HTTP 401 Unauthorized'},1,ExecutionStatus.LOGIN_REQUIRED,False),
     ({'type':'turn.failed','error':{'code':'insufficient_quota','message':'Account exhausted'}},1,ExecutionStatus.QUOTA_EXHAUSTED,False),
     ({'type':'error','message':'thread not found'},1,ExecutionStatus.ERROR,True),
+    ({'type':'turn.failed','error':{'message':'thread not found; request timed out; permission denied'}},1,ExecutionStatus.ERROR,False),
+    ({'type':'turn.failed','error':{'message':'thread not found; insufficient_quota'}},1,ExecutionStatus.QUOTA_EXHAUSTED,False),
     (None,1,ExecutionStatus.ERROR,False)])
 def test_audit_failure_uses_transport_diagnostics_not_tool_output(tmp_path,terminal,exit_code,status,lost):
     events=[{'type':'thread.started','thread_id':'saved'},
         {'type':'item.completed','item':{'id':'tool','type':'command_execution',
-            'aggregated_output':'401 case request: login required; quota exceeded; thread not found'}}]
+            'aggregated_output':'401 case request: login required; quota exceeded; request timed out; thread not found'}}]
     if terminal: events.append(terminal)
     log=tmp_path/'events.jsonl';log.write_text('\n'.join(json.dumps(e) for e in events))
     check=CheckRun(action='agent_turn',cwd=str(tmp_path),snapshot_id='fixture',
@@ -27,12 +29,37 @@ def test_audit_failure_uses_transport_diagnostics_not_tool_output(tmp_path,termi
     check,session,result=CodexAgent().decode(check,tmp_path/'absent.json','saved')
     assert check.status==status and session=='saved' and result is None
     assert bool(check.parameters.get('agent_session_unavailable'))==lost
+    assert not check.parameters['agent_diagnostic']['transport_failure']
     if terminal:
         error=terminal.get('error') or terminal
         assert error['message'] in check.reason
     else:
         assert check.reason=='Agent execution blocked; inspect raw logs'
     assert 'case request' not in check.reason
+
+
+@pytest.mark.parametrize('extra,completed,retry',[
+    (None,False,True), ('This content was flagged for possible cybersecurity risk.',False,False),
+    ('Permission denied; request timed out',False,False), ('HTTP 403: error sending request',False,False),
+    ('HTTP/1.1 403: error sending request',False,False), ('rate_limit_exceeded: stream disconnected',False,False),
+    ('thread not found; This content was flagged for possible cybersecurity risk.',False,False),
+    ('insufficient_quota; request timed out',False,False), ('Unclassified failure',False,False),
+    (None,True,True)])
+def test_transport_diagnostic_keeps_mixed_restrictions_and_completed_reconnects(tmp_path,extra,completed,retry):
+    events=[{'type':'thread.started','thread_id':'saved'}, {'type':'error','message':'stream disconnected: request timed out'}]
+    if extra:events.append({'type':'turn.failed','error':{'message':extra}})
+    if completed:events.append({'type':'turn.completed','usage':{'input_tokens':12,'output_tokens':3}})
+    log=tmp_path/'events.jsonl';log.write_text('\n'.join(map(json.dumps,events)))
+    response=tmp_path/'response.json';response.write_text(json.dumps({'submission':'input.json','summary':'Complete'}))
+    check=CheckRun(action='agent_turn',cwd=str(tmp_path),snapshot_id='fixture',stdout=str(log),
+        status=ExecutionStatus.COMPLETED if completed else ExecutionStatus.TIMEOUT,exit_code=0 if completed else -9)
+    check,session,result=CodexAgent().decode(check,response,'saved')
+    assert check.parameters['agent_diagnostic']['transport_failure']==retry
+    assert session=='saved' and not check.parameters.get('agent_session_unavailable')
+    if completed:
+        assert result['submission']=='input.json' and check.status==ExecutionStatus.COMPLETED
+        assert check.parameters['agent_usage']['input_tokens']==12
+    else:assert result is None and check.status==ExecutionStatus.TIMEOUT
 
 
 def test_audit_failure_reason_preserves_schema_diagnostic_and_redacts_secrets():

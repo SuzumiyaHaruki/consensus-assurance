@@ -113,6 +113,22 @@ class Engine:
         pending = self.state.pending_action
         if pending and (self.root / "actions" / pending.id / "result.json").exists():
             pending.status = "completed"
+        current = self.state.current_submission
+        failed = next((c for c in self.state.checks if c.id == current.get('operation_id')), None)
+        if (current.get('phase') == 'failed' and failed and failed.action == 'agent_turn'
+                and failed.status in {ExecutionStatus.ERROR, ExecutionStatus.TIMEOUT}
+                and failed.parameters.get('agent_diagnostic',{}).get('transport_failure')
+                and not failed.parameters.get('agent_turn_completed')
+                and not failed.parameters.get('agent_session_unavailable')
+                and self.state.agent_session_id == failed.parameters.get('agent_session_id')
+                and self.state.agent_session_id and self.budget.remaining() > 0
+                and self.state.usage.get('agent_calls',0) < self.config.budget.agent_calls):
+            # Retire the failed result cache before scheduling a separately charged attempt.
+            # execute still verifies source, capabilities and permissions before any payload.
+            self.state.current_submission = {}
+            self.state.run_stop = {}
+            self.state.stop_reason = 'Not started'
+            self.advance('explicit_transport_resume:' + failed.id)
         # Running actions with a completed raw receipt resume their existing operation.
         # Unknown outcomes receive a new identity only when action() schedules a retry.
         self.checkpoint("resumed")

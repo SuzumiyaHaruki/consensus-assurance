@@ -46,3 +46,30 @@ def dependency_prepared(prepared):
     from regression_support import add_dependency
     add_dependency(prepared[1],prepared[3])
     return prepared
+
+
+@pytest.fixture
+def full_refresh_equivalence(monkeypatch):
+    """Compare accepted transactions with the existing evaluator, without a second runtime."""
+    from types import SimpleNamespace
+    from consensus_assurance.workflow import audit, direct_checks
+    from consensus_assurance.workflow.research import view
+    compared = []
+    def refresh(state, artifact_ids, **kwargs):
+        direct_checks.refresh_assessments(state, artifact_ids, **kwargs)
+        if not state.monitor_results:return
+        expected = state.model_copy(deep=True)
+        direct_checks.refresh_assessments(expected, artifact_ids)
+        for key in ('monitor_results','checks','evidence','findings'):
+            assert getattr(state,key) == getattr(expected,key), key
+        actual = state.model_copy(deep=True)
+        for copy in (actual,expected):audit.sync_progress(SimpleNamespace(state=copy))
+        assert actual.units == expected.units
+        assert view(actual)['conclusions'] == view(expected)['conclusions']
+        stable = expected.model_dump(mode='json')
+        direct_checks.refresh_assessments(expected, artifact_ids)
+        assert expected.model_dump(mode='json') == stable
+        compared.append(artifact_ids)
+    monkeypatch.setattr(audit, 'refresh_assessments', refresh)
+    yield
+    assert compared, 'The regression must reach an actual measured result'

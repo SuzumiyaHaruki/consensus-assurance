@@ -133,7 +133,7 @@ def test_direct_failure_never_confirms(tmp_path,prepared,failure):
     assert not any(f.level=='implementation_obligation' for f in e.state.findings)
 
 
-@pytest.mark.parametrize('change',['source','review','issue','claim'])
+@pytest.mark.parametrize('change',['source','review','issue','claim','binding','unit'])
 def test_assessment_refresh_preserves_unaffected_results(tmp_path,prepared,monkeypatch,change):
     from consensus_assurance.workflow import direct_checks
     e,u,p=setup(tmp_path,prepared,True)
@@ -149,17 +149,28 @@ def test_assessment_refresh_preserves_unaffected_results(tmp_path,prepared,monke
         e.state.review_issues.append(ReviewIssue(review_id='challenge',target_id=artifacts[0].id,target_version=1,
             aspect='checker_correspondence',source_ids=u.audit_question.source_ids,explanation='Return boundary remains disputed',
             disposition='investigation',reason='Check actual observation ownership'))
-    else:next(c for c in e.state.claims if c.id==p.claim_id).version+=1
+    else:
+        objects = {'claim':e.state.claims,'binding':e.state.bindings,'unit':e.state.units}[change]
+        selected = {'claim':p.claim_id,'binding':u.binding_ids[0],'unit':u.id}[change]
+        next(o for o in objects if o.id==selected).version+=1
     parsed=[]
     def events(check):
         parsed.append(check.direct_check_id)
         return extract_events(check)
     monkeypatch.setattr(direct_checks,'extract_events',events)
     direct_checks.refresh_assessments(e.state,{a.id for a in artifacts},before=before)
-    assert parsed==([] if change=='source' else [a.id for a in artifacts] if change=='claim' else [artifacts[0].id])
+    semantic = change in {'claim','binding','unit'}
+    assert parsed==([] if change=='source' else [a.id for a in artifacts] if semantic else [artifacts[0].id])
     records={r['direct_check_id']:r for r in e.state.monitor_results}
     assert records[artifacts[0].id]['confirmed']==(change=='source')
-    assert records[artifacts[1].id]['confirmed']==(change!='claim')
+    assert records[artifacts[1].id]['confirmed']==(not semantic)
+    expected=e.state.model_copy(deep=True)
+    direct_checks.refresh_assessments(expected,{a.id for a in artifacts})
+    assert expected.monitor_results==e.state.monitor_results
+    assert expected.evidence==e.state.evidence and expected.findings==e.state.findings
+    if semantic:
+        assert all(e.assessment==Assessment.STALE for e in e.state.evidence)
+        assert all(f.stage==Investigation.INCONCLUSIVE for f in e.state.findings)
 
 
 @pytest.mark.parametrize('relationship',['revision','independent','shared_requirement'])
@@ -193,19 +204,21 @@ def test_direct_encoding_observation_change_must_be_declared(tmp_path,prepared):
 @pytest.mark.parametrize('change',['semantic_input','knowledge_challenge'])
 def test_changed_interpretation_updates_current_direct_result(tmp_path,prepared,change):
     e,u,p=setup(tmp_path,prepared,True)
-    candidate=QuestionCandidate(question=u.audit_question,obligation_id=u.obligation_ids[0],status='escalated')
-    u.candidate_id=candidate.id;e.state.question_candidates.append(candidate)
     artifact=save_plan(e,u,p,'stale-result');review(e.state,u,artifact)
     check=execute(e,artifact);assert assess(e.state,u,artifact,p,check,extract_events(check))['confirmed']
     original=Path(check.stdout).read_bytes(),Path(artifact.plan_path).read_bytes()
     if change=='semantic_input':
         next(c for c in e.state.claims if c.id==artifact.claim_id).version+=1;e.checkpoint('semantic_input_changed')
     else:
-        e.state.review_issues.append(ReviewIssue(review_id='knowledge-update',target_id=candidate.id,target_version=1,
-            aspect='applicability',source_ids=u.audit_question.source_ids,explanation='Review the recovered input boundary',
-            disposition='investigation',reason='New sourced interpretation'))
-        from consensus_assurance.workflow.audit import sync_progress
-        sync_progress(e)
+        from consensus_assurance.workflow.audit import accept, Inputs
+        from consensus_assurance.workflow.transactions import commit_graph
+        from consensus_assurance.core.submissions import ReviewSubmission
+        submission=ReviewSubmission(action='review',artifact_id=artifact.id,rationale='New sourced interpretation',
+            review_items=[dict(target_id=artifact.id,aspect='checker_correspondence',status='disputed',
+                source_ids=u.audit_question.source_ids,rationale='Review the recovered input boundary',
+                counterevidence=['The caller boundary remains outside the observed local operation'])])
+        commit_graph(e,'knowledge-update',submission.model_dump(mode='json'),
+            lambda proxy:accept(proxy,submission,Inputs(e.root/'draft'),'knowledge-update'))
     current=next(r for r in e.state.monitor_results if r.get('direct_check_id')==artifact.id)
     assert current['outcome']=='violated' and not current['confirmed']
     assert any(('semantic inputs changed' if change=='semantic_input' else 'Open review issue') in reason for reason in current['blockers'])

@@ -129,6 +129,32 @@ def preview(text):
     return text if len(text) <= 240 else text[:240] + '…'
 
 
+def exploration_results(state, read):
+    """Join accepted products, action identities, executions and explicit later feedback."""
+    actions = {a.id:a for a in [*state.action_history, *([state.pending_action] if state.pending_action else [])]}
+    result = []
+    for index, selection in enumerate(state.selections):
+        if selection['action'] != 'explore' or 'accepted_versions' not in selection:continue
+        operation = selection['operation_id']
+        submission = f'submissions/{operation}/accepted.json'
+        product = read(submission)
+        owned = {a.id for a in actions.values() if a.kind == 'exploration' and a.logical_input.get('operation_id') == operation}
+        checks = {c.id:c for c in state.checks if c.action == 'exploration' and c.pending_action_id in owned}
+        result.append({'operation_id':operation, 'submission':submission,
+            'question':product.get('question'), 'rationale':product.get('rationale'),
+            'ref_ids':product.get('feedback',{}).get('ref_ids',[]) if product.get('feedback') else [],
+            'source_ids':[s['id'] for s in product.get('sources',[])],
+            'inputs':[f'submissions/{operation}/inputs/{name}' for name in
+                dict.fromkeys([product.get('harness_path'),*product.get('files',{}).values()]) if name],
+            'executions':[{'check_id':c.id,'status':c.status.value,'exit_code':c.exit_code,
+                'started_at':c.started_at,'ended_at':c.ended_at,'record':f'logs/{c.id}/check.json',
+                'stdout':c.stdout,'stderr':c.stderr,'artifacts':c.artifacts} for c in checks.values()],
+            'feedback':[{'operation_id':s['operation_id'],'submission':f'submissions/{s["operation_id"]}/accepted.json'}
+                for s in state.selections[index+1:] if 'accepted_versions' in s
+                and checks.keys() & set(s.get('feedback',{}).get('ref_ids',[]))]})
+    return result
+
+
 def view(state, compact=False):
     spec = load(state)
     current = [u for u in state.units if u.status != 'revised']
@@ -199,8 +225,16 @@ def view(state, compact=False):
 def current_view(state, root, implementation=None):
     """Rebuild the work index with exact history locators and trusted runtime context."""
     from consensus_assurance.adapters.validation import validation_tool
+    from .audit import Inputs
     from .review_contract import target_contract
     result = view(state, compact=True)
+    def read(path):
+        try:return Inputs(root).json(path)
+        except (OSError, ValueError):return {}
+    result['explorations'] = exploration_results(state, read)
+    for exploration in result['explorations']:
+        for field in ('question','rationale'):
+            if exploration[field]:exploration[field]=preview(exploration[field])
     def record(collection, match, **extra):
         return {'path':'state.json', 'collection':collection, 'match':match, **extra}
     issues = open_issues(state)
