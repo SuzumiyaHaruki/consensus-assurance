@@ -1,0 +1,132 @@
+{
+  "description": "Retain the third genuine pre-vote reply while self and peer 2 start the real campaign; deliver it at the same numeric term, then release genuine real votes under four fixed phases.",
+  "claim_id": "C_real_vote_type",
+  "binding_ids": [
+    "BIND_real_vote_consumer"
+  ],
+  "harness": {
+    "files": {},
+    "kind": "go_test",
+    "source": "package raft\n\nimport (\n    \"encoding/json\"\n    \"fmt\"\n    \"testing\"\n\n    pb \"go.etcd.io/raft/v3/raftpb\"\n)\n\n// This adapter models completed stable writes with MemoryStorage. It does not\n// model power loss or claim that an in-memory write is physically durable.\ntype assuranceStorageCluster struct {\n    t *testing.T\n    nodes [3]*RawNode\n    stores [3]*MemoryStorage\n    appendQ [3][]pb.Message\n    applyQ [3][]pb.Message\n    network []pb.Message\n    applied [3]uint64\n    request string\n    phase string\n    heldVotes []pb.Message\n    currentTerm uint64\n    delivered map[uint64]bool\n}\n\nfunc assuranceEmit(v map[string]interface{}) {\n    b, err := json.Marshal(v)\n    if err != nil { panic(err) }\n    fmt.Println(\"CA_EVENT \" + string(b))\n}\n\nfunc (c *assuranceStorageCluster) takeReady(i int) bool {\n    n := c.nodes[i]\n    if !n.HasReady() { return false }\n    rd := n.Ready()\n    for _, msg := range rd.Messages {\n        switch msg.To {\n        case LocalAppendThread:\n            if msg.Type != pb.MsgStorageAppend { c.t.Fatal(\"wrong append target message\") }\n            c.appendQ[i] = append(c.appendQ[i], msg)\n        case LocalApplyThread:\n            if msg.Type != pb.MsgStorageApply { c.t.Fatal(\"wrong apply target message\") }\n            c.applyQ[i] = append(c.applyQ[i], msg)\n        default:\n            c.network = append(c.network, msg)\n        }\n    }\n    return true\n}\n\nfunc (c *assuranceStorageCluster) appendOne(i int) bool {\n    if len(c.appendQ[i]) == 0 { return false }\n    msg := c.appendQ[i][0]\n    c.appendQ[i] = c.appendQ[i][1:]\n    // Bootstrap does not use snapshots. An unexpected snapshot is a construction\n    // gap, not a result of the quorum comparison.\n    if msg.Snapshot != nil { c.t.Fatal(\"unexpected snapshot in fixed configuration history\") }\n    if err := c.stores[i].Append(msg.Entries); err != nil { c.t.Fatal(err) }\n    hs := pb.HardState{Term: msg.Term, Vote: msg.Vote, Commit: msg.Commit}\n    if !IsEmptyHardState(hs) {\n        if err := c.stores[i].SetHardState(hs); err != nil { c.t.Fatal(err) }\n    }\n    last, err := c.stores[i].LastIndex()\n    if err != nil { c.t.Fatal(err) }\n    assuranceEmit(map[string]interface{}{\"event\":\"append_completed\", \"request\":c.request, \"phase\":c.phase, \"node\":i+1, \"last\":last, \"responses\":len(msg.Responses)})\n    c.network = append(c.network, msg.Responses...)\n    return true\n}\n\nfunc (c *assuranceStorageCluster) applyOne(i int) bool {\n    if len(c.applyQ[i]) == 0 { return false }\n    msg := c.applyQ[i][0]\n    c.applyQ[i] = c.applyQ[i][1:]\n    for _, ent := range msg.Entries {\n        if ent.Index != c.applied[i]+1 { c.t.Fatalf(\"noncontiguous application node=%d index=%d prior=%d\",i+1,ent.Index,c.applied[i]) }\n        switch ent.Type {\n        case pb.EntryConfChange:\n            var cc pb.ConfChange\n            if err := cc.Unmarshal(ent.Data); err != nil { c.t.Fatal(err) }\n            c.nodes[i].ApplyConfChange(cc)\n        case pb.EntryConfChangeV2:\n            var cc pb.ConfChangeV2\n            if err := cc.Unmarshal(ent.Data); err != nil { c.t.Fatal(err) }\n            c.nodes[i].ApplyConfChange(cc)\n        }\n        c.applied[i] = ent.Index\n    }\n    c.network = append(c.network, msg.Responses...)\n    return true\n}\n\n// Drain the permitted work, retaining blocked append queues. Termination is\n// independent of commitment and of the predicate being checked.\nfunc (c *assuranceStorageCluster) drain(allow [3]bool) {\n    for steps:=0; steps<10000; steps++ {\n        work := false\n        for i:=0; i<3; i++ { if c.takeReady(i) { work=true } }\n        for i:=0; i<3; i++ {\n            if allow[i] && c.appendOne(i) { work=true }\n            if c.applyOne(i) { work=true }\n        }\n        if len(c.network)>0 {\n            msg := c.network[0]\n            c.network = c.network[1:]\n            if msg.To<1 || msg.To>3 { c.t.Fatalf(\"unexpected recipient %d\",msg.To) }\n            assuranceEmit(map[string]interface{}{\"event\":\"message_dequeued\", \"request\":c.request, \"phase\":c.phase, \"from\":msg.From,\"to\":msg.To,\"type\":msg.Type.String(),\"index\":msg.Index,\"term\":msg.Term})\n            if (msg.Type==pb.MsgVoteResp || msg.Type==pb.MsgPreVoteResp) && msg.To==1 {\n                hs,_,err:=c.stores[msg.From-1].InitialState();if err!=nil {c.t.Fatal(err)}\n                if msg.Reject || (msg.Type==pb.MsgVoteResp && (hs.Term!=msg.Term || hs.Vote!=1)) {c.t.Fatal(\"grant lacks matching completed vote at capture\")}\n                c.heldVotes=append(c.heldVotes,msg)\n                assuranceEmit(map[string]interface{}{\"event\":\"grant_captured\",\"type\":msg.Type.String(),\"request\":c.request,\"from\":msg.From,\"term\":msg.Term,\"stored_term\":hs.Term,\"stored_vote\":hs.Vote})\n            } else {c.deliver(msg)}\n            work=true\n        }\n        if !work { return }\n    }\n    c.t.Fatal(\"schedule work bound exhausted\")\n}\n\n\nfunc (c *assuranceStorageCluster) deliver(msg pb.Message) {\n    if msg.Type==pb.MsgVoteResp && msg.To==1 && !msg.Reject && msg.Term==c.currentTerm {c.delivered[msg.From]=true}\n    assuranceEmit(map[string]interface{}{\"event\":\"actual_delivery\",\"request\":c.request,\"phase\":c.phase,\"from\":msg.From,\"to\":msg.To,\"type\":msg.Type.String(),\"term\":msg.Term})\n    if err:=c.nodes[msg.To-1].Step(msg);err!=nil {c.t.Fatal(err)}\n}\nfunc (c *assuranceStorageCluster) release(typ pb.MessageType,term,from uint64) {\n    for i,m:=range c.heldVotes {\n        if m.Type==typ && m.Term==term && m.From==from {\n            c.heldVotes=append(c.heldVotes[:i],c.heldVotes[i+1:]...)\n            c.deliver(m)\n            return\n        }\n    }\n    c.t.Fatalf(\"missing actual grant term=%d from=%d\",term,from)\n}\nfunc TestAssuranceDelayedPreVoteGrant(t *testing.T) {\n    c:=&assuranceStorageCluster{t:t,request:\"prevote-real-campaign-1\",phase:\"bootstrap\",delivered:map[uint64]bool{}}\n    all:=[3]bool{true,true,true}\n    peers:=[]Peer{{ID:1},{ID:2},{ID:3}}\n    for i:=0;i<3;i++ {\n        c.stores[i]=NewMemoryStorage()\n        n,err:=NewRawNode(&Config{ID:uint64(i+1),Storage:c.stores[i],ElectionTick:10,HeartbeatTick:1,MaxSizePerMsg:1<<20,MaxInflightMsgs:8,AsyncStorageWrites:true,PreVote:true,Logger:discardLogger})\n        if err!=nil {t.Fatal(err)}\n        c.nodes[i]=n\n        if err=n.Bootstrap(peers);err!=nil {t.Fatal(err)}\n    }\n    c.drain(all)\n    c.phase=\"pre_campaign\"\n    before:=c.nodes[0].BasicStatus().Term\n    if err:=c.nodes[0].Campaign();err!=nil {t.Fatal(err)}\n    c.drain(all)\n    if len(c.heldVotes)!=3 || c.nodes[0].BasicStatus().RaftState!=StatePreCandidate || c.nodes[0].BasicStatus().Term!=before {t.Fatal(\"pre-campaign prefix missing\")}\n    c.currentTerm=before+1\n    c.phase=\"pre_majority\"\n    c.release(pb.MsgPreVoteResp,c.currentTerm,1)\n    c.drain(all)\n    c.release(pb.MsgPreVoteResp,c.currentTerm,2)\n    c.drain(all)\n    if len(c.heldVotes)!=4 || c.nodes[0].BasicStatus().Term!=c.currentTerm || c.nodes[0].BasicStatus().RaftState!=StateCandidate {t.Fatal(\"real campaign prefix missing\")}\n    phases:=[]struct{name string;typ pb.MessageType;term,from uint64}{\n        {\"delayed_pre_vote\",pb.MsgPreVoteResp,c.currentTerm,3},\n        {\"real_self\",pb.MsgVoteResp,c.currentTerm,1},\n        {\"real_peer_2\",pb.MsgVoteResp,c.currentTerm,2},\n        {\"real_peer_3\",pb.MsgVoteResp,c.currentTerm,3},\n    }\n    for _,p:=range phases {\n        c.phase=p.name\n        assuranceEmit(map[string]interface{}{\"event\":\"vote_phase_admitted\",\"request\":c.request,\"phase\":p.name,\"node\":1,\"campaign_term\":c.currentTerm,\"prefix_ready\":true,\"released_type\":p.typ.String(),\"released_term\":p.term,\"released_sender\":p.from})\n        c.release(p.typ,p.term,p.from)\n        c.drain(all)\n        st:=c.nodes[0].BasicStatus()\n        assuranceEmit(map[string]interface{}{\"event\":\"election_observed\",\"request\":c.request,\"phase\":p.name,\"node\":1,\"campaign_term\":c.currentTerm,\"actual_term\":st.Term,\"role\":st.RaftState.String(),\"leader\":st.RaftState==StateLeader,\"current_grants\":len(c.delivered),\"current_majority\":len(c.delivered)>=2,\"senders\":c.delivered,\"held_grants\":len(c.heldVotes),\"schedule_complete\":true})\n    }\n    assuranceEmit(map[string]interface{}{\"event\":\"history_finished\",\"request\":c.request,\"campaign_term\":c.currentTerm,\"held_grants\":len(c.heldVotes)})\n}\n",
+    "description": "TestAssuranceDelayedPreVoteGrant; actual bootstrap, pre-campaign, pre-vote majority, real campaign and four response releases.",
+    "semantic_changes": [
+      "MemoryStorage models crash-free storage completion.",
+      "Deterministic transport holds actual pre-vote and real-vote grants after FIFO local storage completion.",
+      "The independent ledger counts only delivered MsgVoteResp from distinct fixed voters at the real campaign term; public BasicStatus supplies leadership."
+    ],
+    "prerequisites": [
+      {
+        "alias": "release_input",
+        "event": "vote_phase_admitted",
+        "conditions": [
+          {
+            "field": "prefix_ready",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          }
+        ]
+      }
+    ],
+    "legality": {
+      "source_ids": [
+        "S_bootstrap_api",
+        "S_raw_entry",
+        "S_campaign",
+        "S_roles",
+        "S_send",
+        "S_append_messages",
+        "S_ready_advance",
+        "S_memory_read_write",
+        "S_memory_append",
+        "S_step"
+      ],
+      "expectation_ids": [
+        "S_async_contract",
+        "S_storage_contract"
+      ],
+      "binding_ids": [
+        "BIND_real_vote_consumer"
+      ],
+      "derivation": "Bootstrap and apply configuration on three empty RawNodes with PreVote enabled. One Campaign produces three actual MsgPreVoteResp messages at next term; hold them after local workers finish. No persistence of a real vote is assumed for pre-votes. Release self and peer-2 pre-vote replies; the implementation resets vote support and starts the actual real campaign. Capture its three real grants, checking each producer stored term and Vote=1. The retained peer-3 pre-vote and new real grants have equal terms. Release that pre-vote, real self, real peer 2 and real peer 3, draining fixed permitted work after each. No second Campaign call or synthetic vote is used. Responses and their types/terms are unmodified.",
+      "applicability": "Single goroutine, reliable FIFO local workers, no external timer or term input. All grant holds occur in transport after attached responses were released by completed local storage work.",
+      "unresolved": [],
+      "conflicts": [],
+      "alternatives": [
+        "Pre-vote grant capture reads stored HardState diagnostically but does not require a recorded vote, since pre-vote does not persist one.",
+        "A real grant still requires its actual producer vote in storage at capture."
+      ]
+    }
+  },
+  "monitors": [
+    {
+      "id": "M_real_vote_type",
+      "checker_id": "real_vote_type",
+      "event": "election_observed",
+      "binding_ids": [
+        "BIND_real_vote_consumer"
+      ],
+      "grounding": {
+        "source_ids": [
+          "S_candidate_follower",
+          "S_step",
+          "S_roles",
+          "S_tracker_votes",
+          "S_raw_entry"
+        ],
+        "expectation_ids": [
+          "S_majority",
+          "S_send"
+        ],
+        "binding_ids": [
+          "BIND_real_vote_consumer"
+        ],
+        "derivation": "Independent ledger admits only original delivered MsgVoteResp with the real campaign term. Original MsgPreVoteResp is delivered but never added even with matching term. Compare observed leadership from BasicStatus against two distinct real-grant senders. The implementation vote map is never read. Prerequisite and result identities remain request/phase/node/campaign_term; every fixed phase completes regardless of the predicate.",
+        "applicability": "Four release operations after actual pre-vote majority and real-candidate admission; no outcome-dependent filtering.",
+        "unresolved": [],
+        "conflicts": [],
+        "alternatives": [
+          "A pending candidate after delayed pre-vote or one real grant is permitted.",
+          "Real self plus peer 2 provides a permitted current-real-majority control."
+        ]
+      },
+      "applicability_conditions": [],
+      "admission_alias": "release_input"
+    }
+  ],
+  "observable_properties": [
+    {
+      "checker_id": "real_vote_type",
+      "kind": "event_implication",
+      "trigger": {
+        "field": "event",
+        "op": "eq",
+        "value": "election_observed",
+        "reference": null
+      },
+      "assertion": {
+        "field": "current_majority",
+        "op": "eq",
+        "value": true,
+        "reference": null
+      },
+      "antecedent": {
+        "field": "leader",
+        "op": "eq",
+        "value": true,
+        "reference": null
+      },
+      "identity_fields": [
+        "request",
+        "phase",
+        "node",
+        "campaign_term"
+      ],
+      "description": "Leadership at each fixed checkpoint requires at least two genuine delivered real vote grants; matching-term pre-vote grants do not contribute."
+    }
+  ],
+  "uncertainties": [
+    "One fixed pre-vote-to-real transition and four checkpoints, not general pre-vote safety or liveness.",
+    "No crash, competing leader or client consequence is observed."
+  ]
+}

@@ -1,0 +1,135 @@
+{
+  "description": "Check local campaign admission across an actual pending snapshot and completion of an older normal apply batch, preserving three fixed phase observations and a post-completion control.",
+  "claim_id": "C_snapshot_campaign_barrier",
+  "binding_ids": [
+    "BIND_campaign_admission"
+  ],
+  "harness": {
+    "files": {},
+    "kind": "go_test",
+    "source": "package raft\n\nimport (\n    \"encoding/json\"\n    \"fmt\"\n    \"testing\"\n\n    pb \"go.etcd.io/raft/v3/raftpb\"\n)\n\n// This adapter models completed stable writes with MemoryStorage. It does not\n// model power loss or claim that an in-memory write is physically durable.\ntype assuranceStorageCluster struct {\n    t *testing.T\n    nodes [3]*RawNode\n    stores [3]*MemoryStorage\n    appendQ [3][]pb.Message\n    applyQ [3][]pb.Message\n    network []pb.Message\n    applied [3]uint64\n    request string\n    phase string\n    holdApply bool\n    partition bool\n    appData [3][]string\n    conf [3]pb.ConfState\n    snapshotIndex uint64\n    snapshotDelivered bool\n    snapshotInstalled bool\n    snapshotCompleted bool\n}\n\nfunc assuranceEmit(v map[string]interface{}) {\n    b, err := json.Marshal(v)\n    if err != nil { panic(err) }\n    fmt.Println(\"CA_EVENT \" + string(b))\n}\n\nfunc (c *assuranceStorageCluster) takeReady(i int) bool {\n    n := c.nodes[i]\n    if !n.HasReady() { return false }\n    rd := n.Ready()\n    for _, msg := range rd.Messages {\n        switch msg.To {\n        case LocalAppendThread:\n            if msg.Type != pb.MsgStorageAppend { c.t.Fatal(\"wrong append target message\") }\n            c.appendQ[i] = append(c.appendQ[i], msg)\n        case LocalApplyThread:\n            if msg.Type != pb.MsgStorageApply { c.t.Fatal(\"wrong apply target message\") }\n            c.applyQ[i] = append(c.applyQ[i], msg)\n        default:\n            c.network = append(c.network, msg)\n        }\n    }\n    return true\n}\n\nfunc (c *assuranceStorageCluster) appendOne(i int) bool {\n    if len(c.appendQ[i]) == 0 { return false }\n    msg := c.appendQ[i][0]\n    c.appendQ[i] = c.appendQ[i][1:]\n    if msg.Snapshot != nil {\n        if i!=2 || len(c.applyQ[i])!=0 { c.t.Fatal(\"snapshot installation requires older apply work drained\") }\n        if err:=c.stores[i].ApplySnapshot(*msg.Snapshot);err!=nil {c.t.Fatal(err)}\n        if err:=json.Unmarshal(msg.Snapshot.Data,&c.appData[i]);err!=nil {c.t.Fatal(err)}\n        c.applied[i]=msg.Snapshot.Metadata.Index\n        c.conf[i]=msg.Snapshot.Metadata.ConfState\n        c.snapshotInstalled=true\n        assuranceEmit(map[string]interface{}{\"event\":\"snapshot_installed\",\"request\":c.request,\"snapshot_index\":c.applied[i],\"payload\":c.appData[i]})\n    }\n    if err := c.stores[i].Append(msg.Entries); err != nil { c.t.Fatal(err) }\n    hs := pb.HardState{Term: msg.Term, Vote: msg.Vote, Commit: msg.Commit}\n    if !IsEmptyHardState(hs) {\n        if err := c.stores[i].SetHardState(hs); err != nil { c.t.Fatal(err) }\n    }\n    last, err := c.stores[i].LastIndex()\n    if err != nil { c.t.Fatal(err) }\n    assuranceEmit(map[string]interface{}{\"event\":\"append_completed\", \"request\":c.request, \"phase\":c.phase, \"node\":i+1, \"last\":last, \"responses\":len(msg.Responses)})\n    c.network = append(c.network, msg.Responses...)\n    return true\n}\n\nfunc (c *assuranceStorageCluster) applyOne(i int) bool {\n    if len(c.applyQ[i]) == 0 { return false }\n    msg := c.applyQ[i][0]\n    c.applyQ[i] = c.applyQ[i][1:]\n    for _, ent := range msg.Entries {\n        if ent.Index != c.applied[i]+1 { c.t.Fatalf(\"noncontiguous application node=%d index=%d prior=%d\",i+1,ent.Index,c.applied[i]) }\n        switch ent.Type {\n        case pb.EntryConfChange:\n            var cc pb.ConfChange\n            if err := cc.Unmarshal(ent.Data); err != nil { c.t.Fatal(err) }\n            c.conf[i]=*c.nodes[i].ApplyConfChange(cc)\n        case pb.EntryConfChangeV2:\n            var cc pb.ConfChangeV2\n            if err := cc.Unmarshal(ent.Data); err != nil { c.t.Fatal(err) }\n            c.conf[i]=*c.nodes[i].ApplyConfChange(cc)\n        }\n        if ent.Type==pb.EntryNormal { c.appData[i]=append(c.appData[i],string(ent.Data)) }\n        c.applied[i] = ent.Index\n    }\n    c.network = append(c.network, msg.Responses...)\n    return true\n}\n\n// Drain the permitted work, retaining blocked append queues. Termination is\n// independent of commitment and of the predicate being checked.\nfunc (c *assuranceStorageCluster) drain(allow [3]bool) {\n    for steps:=0; steps<10000; steps++ {\n        work := false\n        for i:=0; i<3; i++ { if c.takeReady(i) { work=true } }\n        for i:=0; i<3; i++ {\n            // While snapshot work is held, earlier FIFO append work must still\n            // complete so genuine rejection replies can trigger snapshot fallback.\n            appendAllowed:=allow[i] || (i==2 && len(c.appendQ[i])>0 && c.appendQ[i][0].Snapshot==nil)\n            if appendAllowed && c.appendOne(i) { work=true }\n            if !(i==2 && c.holdApply) && c.applyOne(i) { work=true }\n        }\n        if len(c.network)>0 {\n            msg := c.network[0]\n            c.network = c.network[1:]\n            if msg.To<1 || msg.To>3 { c.t.Fatalf(\"unexpected recipient %d\",msg.To) }\n            if c.partition && msg.From<=3 && (msg.From==3 || msg.To==3) { continue }\n            assuranceEmit(map[string]interface{}{\"event\":\"message_delivered\", \"request\":c.request, \"phase\":c.phase, \"from\":msg.From,\"to\":msg.To,\"type\":msg.Type.String(),\"index\":msg.Index,\"term\":msg.Term})\n            if err := c.nodes[msg.To-1].Step(msg); err != nil { c.t.Fatal(err) }\n            if msg.Type==pb.MsgStorageAppendResp && msg.To==3 && msg.Snapshot!=nil && msg.Snapshot.Metadata.Index==c.snapshotIndex {\n                if !c.snapshotInstalled {c.t.Fatal(\"snapshot response delivered before installation\")}\n                c.snapshotCompleted=true\n            }\n            if msg.Type==pb.MsgSnap {\n                if msg.To!=3 || msg.Snapshot==nil || msg.Snapshot.Metadata.Index!=c.snapshotIndex { c.t.Fatal(\"unexpected snapshot delivery\") }\n                c.snapshotDelivered=true\n                c.nodes[msg.From-1].ReportSnapshot(msg.To,SnapshotFinish)\n            }\n            work=true\n        }\n        if !work { return }\n    }\n    c.t.Fatal(\"schedule work bound exhausted\")\n}\n\n\nfunc TestAssuranceSnapshotCampaignBarrier(t *testing.T) {\n    c := &assuranceStorageCluster{t:t,request:\"snapshot-campaign-1\",phase:\"prefix\"}\n    all:=[3]bool{true,true,true}\n    held:=[3]bool{true,true,false}\n    peers:=[]Peer{{ID:1},{ID:2},{ID:3}}\n    for i:=0;i<3;i++ {\n        c.stores[i]=NewMemoryStorage()\n        n,err:=NewRawNode(&Config{ID:uint64(i+1),Storage:c.stores[i],ElectionTick:10,HeartbeatTick:1,MaxSizePerMsg:1<<20,MaxInflightMsgs:8,AsyncStorageWrites:true,Logger:discardLogger})\n        if err!=nil {t.Fatal(err)}\n        c.nodes[i]=n\n        if err=n.Bootstrap(peers);err!=nil {t.Fatal(err)}\n    }\n    c.drain(all)\n    if err:=c.nodes[0].Campaign();err!=nil {t.Fatal(err)}\n    c.drain(all)\n    prefix:=c.applied[0]\n    for i:=0;i<3;i++ {if c.applied[i]!=prefix || len(c.applyQ[i])!=0 || c.nodes[i].BasicStatus().Commit!=prefix {t.Fatal(\"incomplete election prefix\")}}\n    c.holdApply=true\n    c.phase=\"older_normal_apply\"\n    if err:=c.nodes[0].Propose([]byte(\"old-normal\"));err!=nil {t.Fatal(err)}\n    c.drain(all)\n    oldIndex:=c.nodes[2].BasicStatus().Commit\n    if len(c.applyQ[2])!=1 || oldIndex!=prefix+1 {t.Fatal(\"older apply batch missing\")}\n    for _,ent:=range c.applyQ[2][0].Entries {if ent.Type!=pb.EntryNormal {t.Fatal(\"older batch includes configuration\")}}\n    c.partition=true\n    c.phase=\"snapshot_prefix\"\n    for _,payload:=range []string{\"new-normal-a\",\"new-normal-b\"} {\n        if err:=c.nodes[0].Propose([]byte(payload));err!=nil {t.Fatal(err)}\n        c.drain(all)\n    }\n    c.snapshotIndex=c.applied[0]\n    data,err:=json.Marshal(c.appData[0]);if err!=nil {t.Fatal(err)}\n    snap,err:=c.stores[0].CreateSnapshot(c.snapshotIndex,&c.conf[0],data);if err!=nil {t.Fatal(err)}\n    if err=c.stores[0].Compact(c.snapshotIndex);err!=nil {t.Fatal(err)}\n    followerLast,err:=c.stores[2].LastIndex();if err!=nil {t.Fatal(err)}\n    if c.snapshotIndex<=followerLast || snap.Metadata.Index!=c.nodes[0].BasicStatus().Commit {t.Fatal(\"snapshot prefix does not require full restore\")}\n    c.partition=false\n    c.phase=\"snapshot_pending\"\n    c.nodes[0].Tick()\n    c.drain(held)\n    if !c.snapshotDelivered {t.Fatal(\"automatic snapshot path not reached\")}\n    found:=false\n    for _,m:=range c.appendQ[2] {if m.Snapshot!=nil && m.Snapshot.Metadata.Index==c.snapshotIndex {found=true}}\n    if !found {t.Fatal(\"snapshot work missing\")}\n    assuranceEmit(map[string]interface{}{\"event\":\"producer_prefix\",\"request\":c.request,\"old_index\":oldIndex,\"snapshot_index\":c.snapshotIndex,\"snapshot_term\":snap.Metadata.Term,\"follower_stored_last\":followerLast,\"older_apply_batches\":len(c.applyQ[2]),\"payload\":c.appData[0]})\n    phases:=[]string{\"snapshot_and_apply_held\",\"older_apply_completed\",\"snapshot_completed\"}\n    for _,phase:=range phases {\n        c.phase=phase\n        if phase==\"older_apply_completed\" {c.holdApply=false;c.drain(held)}\n        if phase==\"snapshot_completed\" {c.drain(all)}\n        before:=c.nodes[2].BasicStatus()\n        assuranceEmit(map[string]interface{}{\"event\":\"campaign_admitted\",\"snapshot_delivered\":c.snapshotDelivered,\"request\":c.request,\"phase\":phase,\"node\":3,\"snapshot_index\":c.snapshotIndex,\"snapshot_completed\":c.snapshotCompleted,\"old_apply_completed\":len(c.applyQ[2])==0,\"before_term\":before.Term,\"before_role\":before.RaftState.String()})\n        if err:=c.nodes[2].Campaign();err!=nil {t.Fatal(err)}\n        after:=c.nodes[2].BasicStatus()\n        started:=after.Term>before.Term || after.RaftState==StateCandidate || after.RaftState==StatePreCandidate || after.RaftState==StateLeader\n        assuranceEmit(map[string]interface{}{\"event\":\"campaign_observed\",\"request\":c.request,\"phase\":phase,\"node\":3,\"snapshot_index\":c.snapshotIndex,\"snapshot_completed\":c.snapshotCompleted,\"campaign_started\":started,\"before_term\":before.Term,\"after_term\":after.Term,\"after_role\":after.RaftState.String(),\"applied\":after.Applied,\"app_applied\":c.applied[2],\"call_completed\":true})\n        if phase==\"snapshot_completed\" {c.drain(all)} else {c.drain(held)}\n    }\n    assuranceEmit(map[string]interface{}{\"event\":\"history_finished\",\"request\":c.request,\"snapshot_index\":c.snapshotIndex,\"final_term\":c.nodes[2].BasicStatus().Term,\"final_role\":c.nodes[2].BasicStatus().RaftState.String()})\n}\n",
+    "description": "TestAssuranceSnapshotCampaignBarrier; actual Bootstrap/Campaign/Propose, application data snapshot, compaction, automatic replication fallback and FIFO storage responses.",
+    "semantic_changes": [
+      "MemoryStorage models a no-crash stable-storage boundary.",
+      "Deterministic transport, a temporary follower partition and held local work replace production scheduling.",
+      "Public BasicStatus supplies the checked role and term; internal pending queues belong to the driver, not modified protocol internals."
+    ],
+    "prerequisites": [
+      {
+        "alias": "campaign_input",
+        "event": "campaign_admitted",
+        "conditions": [
+          {
+            "field": "snapshot_delivered",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          }
+        ]
+      }
+    ],
+    "legality": {
+      "source_ids": [
+        "S_bootstrap_api",
+        "S_raw_entry",
+        "S_raw_snapshot_report",
+        "S_memory_snapshot",
+        "S_replication_send",
+        "S_leader_ack",
+        "S_append_messages",
+        "S_step",
+        "S_ready_advance",
+        "S_restore_config",
+        "S_campaign"
+      ],
+      "expectation_ids": [
+        "S_async_usage",
+        "S_async_contract",
+        "S_storage_contract"
+      ],
+      "binding_ids": [
+        "BIND_campaign_admission"
+      ],
+      "derivation": "Bootstrap three empty MemoryStorage-backed RawNodes and elect node 1 through actual messages. Drain all bootstrap configuration and the leader no-op. Hold node 3 apply work only while a normal proposal reaches index 5. Partition node 3, commit/apply two more proposals on nodes 1/2, create a snapshot from the actual leader application data and last returned ConfState at index 7, then compact. Reconnect with one leader heartbeat; process actual probe rejections and non-snapshot FIFO append work until automatic MsgSnap reaches node 3. Snapshot index exceeds its stored last index 5, preventing matching-prefix fast-forward. Hold the snapshot queue head. First Campaign runs with old apply still held; second follows completion of that actual normal apply batch; third follows snapshot storage/application and delivery of its actual attached response. Snapshot transport completion is reported through RawNode.ReportSnapshot. The scheduler never skips a blocked snapshot head. It drains a fixed permitted-work schedule with a 10000-step construction limit, independent of the comparison. No raft state or network message is assigned.",
+      "applicability": "Single goroutine serializes RawNode calls. MemoryStorage substitutes for durable media only in a no-crash setting. Snapshot Data contains the actual accumulated normal-entry state and is installed by decoding that payload. The snapshot installation deliberately follows earlier normal application, avoiding the unresolved configuration ordering branch.",
+      "unresolved": [],
+      "conflicts": [],
+      "alternatives": [
+        "Holding all append work before snapshot delivery blocks the real rejection path; failed exploration 9a5cebc41e534ebab825feb8e52e1d62 demonstrated this construction mistake.",
+        "Permitting non-snapshot FIFO work before holding the snapshot reached the intended history in exploration b24b00617a78411f8e23ab629496c70d; that exploration is not formal property Evidence."
+      ]
+    }
+  },
+  "monitors": [
+    {
+      "id": "M_snapshot_campaign",
+      "checker_id": "snapshot_campaign_barrier",
+      "event": "campaign_observed",
+      "binding_ids": [
+        "BIND_campaign_admission"
+      ],
+      "grounding": {
+        "source_ids": [
+          "S_raw_entry",
+          "S_roles",
+          "S_campaign",
+          "S_step",
+          "S_append_messages"
+        ],
+        "expectation_ids": [
+          "S_campaign_precondition",
+          "S_async_usage"
+        ],
+        "binding_ids": [
+          "BIND_campaign_admission"
+        ],
+        "derivation": "For each request/phase/node/snapshot identity, campaign_admitted records the already delivered snapshot and invocation context. campaign_observed is emitted immediately after the synchronous Campaign call. campaign_started derives from public BasicStatus term increase or candidate/pre-candidate/leader role, retaining raw before/after term and role. snapshot_completed is an independent driver ledger set only after actual snapshot installation and subsequent Step delivery of its matching attached MsgStorageAppendResp, not from promotable or unstable.snapshot. The one-way comparison is campaign_started implies snapshot_completed. The post-completion checkpoint is a permitted control, not an eventual-election oracle.",
+        "applicability": "Three separately correlated synchronous calls in one actual history. No unrelated message dispatch occurs between before/after status reads. No result is filtered by the expected property value.",
+        "unresolved": [],
+        "conflicts": [],
+        "alternatives": [
+          "A blocked campaign is allowed while work is pending.",
+          "A blocked post-completion campaign would not itself violate this necessity condition."
+        ]
+      },
+      "applicability_conditions": [],
+      "admission_alias": "campaign_input"
+    }
+  ],
+  "observable_properties": [
+    {
+      "checker_id": "snapshot_campaign_barrier",
+      "kind": "event_implication",
+      "trigger": {
+        "field": "event",
+        "op": "eq",
+        "value": "campaign_observed",
+        "reference": null
+      },
+      "assertion": {
+        "field": "snapshot_completed",
+        "op": "eq",
+        "value": true,
+        "reference": null
+      },
+      "antecedent": {
+        "field": "campaign_started",
+        "op": "eq",
+        "value": true,
+        "reference": null
+      },
+      "identity_fields": [
+        "request",
+        "phase",
+        "node",
+        "snapshot_index"
+      ],
+      "description": "An explicit Campaign starts an election only after the matching full snapshot completion has been consumed. Earlier application completion cannot substitute for snapshot completion."
+    }
+  ],
+  "uncertainties": [
+    "This checks a source-defined local admission responsibility, not overall election safety or client linearizability.",
+    "Only a single full snapshot, fixed membership and normal-entry older batch are covered.",
+    "MemoryStorage completion is not physical crash durability evidence."
+  ]
+}

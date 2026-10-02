@@ -1,0 +1,128 @@
+{
+  "description": "Delay the elected leader append worker for one fresh proposal; compare no completed follower, one completed follower, both completed followers, then leader completion. Measure commitment and storage copies independently after each completed permitted-work phase. Remote-only majority and final all-worker phase are retained controls without equating quorum sufficiency with a general liveness guarantee.",
+  "claim_id": "C_append_completed_quorum",
+  "binding_ids": [
+    "BIND_self_support"
+  ],
+  "harness": {
+    "kind": "go_test",
+    "source": "",
+    "files": {},
+    "description": "Single TestAssuranceDelayedLeaderStorageQuorum. Three sequential RawNodes, actual bootstrap/election prefix, actual proposal and message/Ready/storage producers; independent storage and commit observations.",
+    "semantic_changes": [
+      "MemoryStorage substitutes for a crash-durable backend in a no-crash schedule; it represents the completion boundary only.",
+      "Deterministic FIFO transport and separate per-node append/apply queues replace a production scheduler.",
+      "Read-only internal fields expose entry identity, leader role, Match and committed index; no protocol state or dependency is modified."
+    ],
+    "prerequisites": [
+      {
+        "alias": "admitted",
+        "event": "phase_admitted",
+        "conditions": [
+          {
+            "field": "prefix_complete",
+            "value": true
+          },
+          {
+            "field": "proposal_accepted",
+            "value": true
+          }
+        ]
+      }
+    ],
+    "legality": {
+      "source_ids": [
+        "S_bootstrap_api",
+        "S_raw_entry",
+        "S_config_validation",
+        "S_campaign",
+        "S_ready_advance",
+        "S_append_messages",
+        "S_memory_append",
+        "S_memory_read_write",
+        "S_node_loop",
+        "S_test_ready",
+        "S_test_append",
+        "S_test_apply"
+      ],
+      "expectation_ids": [
+        "S_async_contract",
+        "S_ready_contract",
+        "S_storage_contract"
+      ],
+      "binding_ids": [
+        "BIND_self_support"
+      ],
+      "derivation": "Construct three empty MemoryStorage-backed RawNodes, Bootstrap identical peers and drain all local/network work. Campaign node 1 and drain actual vote/append responses until the elected leader no-op is stored, committed and applied on all nodes. No raft/tracker fields are assigned. Propose one payload through RawNode.Propose; read its generated index and term. In the suffix process four fixed FIFO schedules: no append worker, follower 2 only, followers 2 and 3, then all workers. Each worker appends actual Entries and saves nonempty HardState before releasing actual attached Responses; all messages target actual node IDs. Apply workers process only actual MsgStorageApply entries and call ApplyConfChange for bootstrap configuration entries. No Advance is called in async mode. Access to raft fields is read-only observation. Each phase drains available permitted work, retaining blocked queues, and terminates independently of the measured commitment.",
+      "applicability": "RawNode is used sequentially on one test goroutine. Reliable FIFO local append/application work, no Tick or term-changing input during the measured suffix. Adapter uses MemoryStorage as modeled stable storage and performs no crash. Maximum 10000 scheduler iterations per phase is a construction bound, not a liveness deadline.",
+      "unresolved": [],
+      "alternatives": [
+        "Synchronous Ready/Advance has a different caller boundary and is outside this check.",
+        "The Node channel API is not invoked; its public completion permission is not substituted for RawNode."
+      ]
+    }
+  },
+  "monitors": [
+    {
+      "id": "M_quorum_completion",
+      "checker_id": "quorum_completion",
+      "event": "quorum_observed",
+      "binding_ids": [
+        "BIND_self_support"
+      ],
+      "grounding": {
+        "source_ids": [
+          "S_leader_ack",
+          "S_tracker_commit",
+          "S_log_decision",
+          "S_memory_read_write",
+          "S_memory_append",
+          "S_reset_append"
+        ],
+        "expectation_ids": [
+          "S_append_duty",
+          "S_async_contract",
+          "S_joint"
+        ],
+        "binding_ids": [
+          "BIND_self_support"
+        ],
+        "derivation": "quorum_observed reads raftLog.committed after each phase and compares it to the actual target index. Independently, each MemoryStorage is queried for target index/term/payload. stored_copies and append_completed_majority derive solely from those storage reads, never from tracker Match. Match, pending queues and leader application are diagnostic fields. The safety oracle is the one-way implication committed => append_completed_majority. The fixed phase schedule continues regardless of the comparison.",
+        "applicability": "A phase_admitted event records a reached elected/persisted/applied prefix and accepted proposal before its phase runs. request and phase distinguish observations; target index/term are diagnostic identity confirmations. schedule_complete selects completion of the fixed phase, not success of the property.",
+        "alternatives": [
+          "A committed remote quorum with local leader storage still pending is allowed.",
+          "False committed antecedent is a pending outcome, not a violation or an eventual-success claim."
+        ]
+      },
+      "admission_alias": "admitted",
+      "applicability_conditions": []
+    }
+  ],
+  "observable_properties": [
+    {
+      "checker_id": "quorum_completion",
+      "kind": "event_implication",
+      "trigger": {
+        "field": "event",
+        "value": "quorum_observed"
+      },
+      "antecedent": {
+        "field": "committed",
+        "value": true
+      },
+      "assertion": {
+        "field": "append_completed_majority",
+        "value": true
+      },
+      "identity_fields": [
+        "request",
+        "phase"
+      ],
+      "description": "At each completed scheduled checkpoint, commitment of the proposed entry implies actual modeled stable append completion at two or more of the three voters. A pending minority is permitted; remote-majority and final phases retain raw control measurements."
+    }
+  ],
+  "uncertainties": [
+    "This observation concerns storage-completion-aware quorum bookkeeping under a modeled stable-storage interface, not physical durability or client-visible loss.",
+    "Only the four fixed phase boundaries of one no-crash, single-term suffix are measured."
+  ]
+}

@@ -1,0 +1,140 @@
+{
+  "description": "Run one five-node history in which an existing read context receives no remote replies until an explicit joint voter reduction is applied. Observe self-only, one outgoing reply, outgoing-majority-only, both-majorities, and remaining-reply phases through public Ready.ReadStates and an independent delivery ledger.",
+  "claim_id": "C_read_joint_eligibility",
+  "binding_ids": [
+    "BIND_read_joint_consumer"
+  ],
+  "harness": {
+    "files": {},
+    "kind": "go_test",
+    "source": "package raft\n\nimport (\n    \"encoding/json\"\n    \"fmt\"\n    \"testing\"\n\n    pb \"go.etcd.io/raft/v3/raftpb\"\n)\n\n// This adapter models completed stable writes with MemoryStorage. It does not\n// model power loss or claim that an in-memory write is physically durable.\ntype assuranceStorageCluster struct {\n    t *testing.T\n    nodes [5]*RawNode\n    stores [5]*MemoryStorage\n    appendQ [5][]pb.Message\n    applyQ [5][]pb.Message\n    network []pb.Message\n    applied [5]uint64\n    request string\n    phase string\n    held map[uint64][]pb.Message\n    delivered map[uint64]bool\n    outputs []ReadState\n}\n\nfunc assuranceEmit(v map[string]interface{}) {\n    b, err := json.Marshal(v)\n    if err != nil { panic(err) }\n    fmt.Println(\"CA_EVENT \" + string(b))\n}\n\nfunc (c *assuranceStorageCluster) takeReady(i int) bool {\n    n := c.nodes[i]\n    if !n.HasReady() { return false }\n    rd := n.Ready()\n    for _, rs := range rd.ReadStates {\n        if i == 0 && string(rs.RequestCtx) == c.request {\n            c.outputs = append(c.outputs, rs)\n            assuranceEmit(map[string]interface{}{\"event\":\"read_output\", \"request\":c.request,\"phase\":c.phase,\"index\":rs.Index,\"context\":string(rs.RequestCtx),\"incoming_count\":c.count([]uint64{1,4,5}),\"outgoing_count\":c.count([]uint64{1,2,3,4,5})})\n        }\n    }\n    for _, msg := range rd.Messages {\n        switch msg.To {\n        case LocalAppendThread:\n            if msg.Type != pb.MsgStorageAppend { c.t.Fatal(\"wrong append target message\") }\n            c.appendQ[i] = append(c.appendQ[i], msg)\n        case LocalApplyThread:\n            if msg.Type != pb.MsgStorageApply { c.t.Fatal(\"wrong apply target message\") }\n            c.applyQ[i] = append(c.applyQ[i], msg)\n        default:\n            c.network = append(c.network, msg)\n        }\n    }\n    return true\n}\n\nfunc (c *assuranceStorageCluster) appendOne(i int) bool {\n    if len(c.appendQ[i]) == 0 { return false }\n    msg := c.appendQ[i][0]\n    c.appendQ[i] = c.appendQ[i][1:]\n    // Bootstrap does not use snapshots. An unexpected snapshot is a construction\n    // gap, not a result of the quorum comparison.\n    if msg.Snapshot != nil { c.t.Fatal(\"unexpected snapshot in fixed configuration history\") }\n    if err := c.stores[i].Append(msg.Entries); err != nil { c.t.Fatal(err) }\n    hs := pb.HardState{Term: msg.Term, Vote: msg.Vote, Commit: msg.Commit}\n    if !IsEmptyHardState(hs) {\n        if err := c.stores[i].SetHardState(hs); err != nil { c.t.Fatal(err) }\n    }\n    last, err := c.stores[i].LastIndex()\n    if err != nil { c.t.Fatal(err) }\n    assuranceEmit(map[string]interface{}{\"event\":\"append_completed\", \"request\":c.request, \"phase\":c.phase, \"node\":i+1, \"last\":last, \"responses\":len(msg.Responses)})\n    c.network = append(c.network, msg.Responses...)\n    return true\n}\n\nfunc (c *assuranceStorageCluster) applyOne(i int) bool {\n    if len(c.applyQ[i]) == 0 { return false }\n    msg := c.applyQ[i][0]\n    c.applyQ[i] = c.applyQ[i][1:]\n    for _, ent := range msg.Entries {\n        if ent.Index != c.applied[i]+1 { c.t.Fatalf(\"noncontiguous application node=%d index=%d prior=%d\",i+1,ent.Index,c.applied[i]) }\n        switch ent.Type {\n        case pb.EntryConfChange:\n            var cc pb.ConfChange\n            if err := cc.Unmarshal(ent.Data); err != nil { c.t.Fatal(err) }\n            c.nodes[i].ApplyConfChange(cc)\n        case pb.EntryConfChangeV2:\n            var cc pb.ConfChangeV2\n            if err := cc.Unmarshal(ent.Data); err != nil { c.t.Fatal(err) }\n            c.nodes[i].ApplyConfChange(cc)\n        }\n        c.applied[i] = ent.Index\n    }\n    c.network = append(c.network, msg.Responses...)\n    return true\n}\n\n// Drain the permitted work, retaining blocked append queues. Termination is\n// independent of commitment and of the predicate being checked.\nfunc (c *assuranceStorageCluster) drain(allow [5]bool) {\n    for steps:=0; steps<10000; steps++ {\n        work := false\n        for i:=0; i<5; i++ { if c.takeReady(i) { work=true } }\n        for i:=0; i<5; i++ {\n            if allow[i] && c.appendOne(i) { work=true }\n            if c.applyOne(i) { work=true }\n        }\n        if len(c.network)>0 {\n            msg := c.network[0]\n            c.network = c.network[1:]\n            if msg.Type == pb.MsgHeartbeatResp && msg.To == 1 && string(msg.Context) == c.request {\n                c.held[msg.From] = append(c.held[msg.From], msg)\n                assuranceEmit(map[string]interface{}{\"event\":\"reply_held\",\"request\":c.request,\"phase\":c.phase,\"from\":msg.From,\"term\":msg.Term,\"context\":string(msg.Context)})\n                work=true\n                continue\n            }\n            if msg.To<1 || msg.To>5 { c.t.Fatalf(\"unexpected recipient %d\",msg.To) }\n            assuranceEmit(map[string]interface{}{\"event\":\"message_delivered\", \"request\":c.request, \"phase\":c.phase, \"from\":msg.From,\"to\":msg.To,\"type\":msg.Type.String(),\"index\":msg.Index,\"term\":msg.Term})\n            if err := c.nodes[msg.To-1].Step(msg); err != nil { c.t.Fatal(err) }\n            work=true\n        }\n        if !work { return }\n    }\n    c.t.Fatal(\"schedule work bound exhausted\")\n}\n\n\nfunc (c *assuranceStorageCluster) count(ids []uint64) int {\n    n:=0\n    for _,id:=range ids { if c.delivered[id] {n++} }\n    return n\n}\n\nfunc (c *assuranceStorageCluster) release(id uint64) {\n    msgs:=c.held[id]\n    if len(msgs)==0 {c.t.Fatalf(\"missing produced reply from %d\",id)}\n    delete(c.held,id)\n    for _,msg:=range msgs {\n        c.delivered[id]=true\n        assuranceEmit(map[string]interface{}{\"event\":\"reply_released\",\"request\":c.request,\"phase\":c.phase,\"from\":id,\"term\":msg.Term,\"context\":string(msg.Context)})\n        if err:=c.nodes[0].Step(msg);err!=nil {c.t.Fatal(err)}\n    }\n}\n\nfunc TestAssuranceReadSupportAcrossJointChange(t *testing.T) {\n    c:=&assuranceStorageCluster{t:t,request:\"unique-read-joint-1\",phase:\"prefix\",held:map[uint64][]pb.Message{},delivered:map[uint64]bool{}}\n    peers:=[]Peer{{ID:1},{ID:2},{ID:3},{ID:4},{ID:5}}\n    all:=[5]bool{true,true,true,true,true}\n    for i:=0;i<5;i++ {\n        c.stores[i]=NewMemoryStorage()\n        n,err:=NewRawNode(&Config{ID:uint64(i+1),Storage:c.stores[i],ElectionTick:10,HeartbeatTick:1,MaxSizePerMsg:1<<20,MaxInflightMsgs:8,AsyncStorageWrites:true,ReadOnlyOption:ReadOnlySafe,Logger:discardLogger})\n        if err!=nil {t.Fatal(err)}\n        c.nodes[i]=n\n        if err=n.Bootstrap(peers);err!=nil {t.Fatal(err)}\n    }\n    c.drain(all)\n    if err:=c.nodes[0].Campaign();err!=nil {t.Fatal(err)}\n    c.drain(all)\n    r:=c.nodes[0].raft\n    prefix:=r.raftLog.lastIndex()\n    if r.state!=StateLeader || !r.committedEntryInCurrentTerm() {t.Fatal(\"election/current-term prefix missing\")}\n    for i:=0;i<5;i++ {\n        last,err:=c.stores[i].LastIndex();if err!=nil {t.Fatal(err)}\n        if last!=prefix || c.nodes[i].raft.raftLog.committed!=prefix || c.applied[i]!=prefix {t.Fatalf(\"prefix incomplete at node %d\",i+1)}\n    }\n    originalTerm:=r.Term\n    c.phase=\"read_requested\"\n    // Local dispatch supplies self participation. Remote participation is recorded\n    // only at actual delivery below, independently from readOnly.acks.\n    c.nodes[0].ReadIndex([]byte(c.request))\n    c.delivered[1]=true\n    c.drain(all)\n    for id:=uint64(2);id<=5;id++ {if len(c.held[id])!=1 {t.Fatalf(\"expected one produced response from %d\",id)}}\n    c.phase=\"configuration_applied\"\n    cc:=pb.ConfChangeV2{Transition:pb.ConfChangeTransitionJointExplicit,Changes:[]pb.ConfChangeSingle{{Type:pb.ConfChangeRemoveNode,NodeID:2},{Type:pb.ConfChangeRemoveNode,NodeID:3}}}\n    if err:=c.nodes[0].ProposeConfChange(cc);err!=nil {t.Fatal(err)}\n    changeIndex:=r.raftLog.lastIndex()\n    c.drain(all)\n    cs:=r.trk.ConfState()\n    has:=func(ids []uint64,id uint64)bool{for _,x:=range ids {if x==id{return true}};return false}\n    if len(cs.Voters)!=3 || !has(cs.Voters,1) || !has(cs.Voters,4) || !has(cs.Voters,5) || len(cs.VotersOutgoing)!=5 || cs.AutoLeave {t.Fatalf(\"joint configuration prerequisite not reached: %+v\",cs)}\n    for id:=uint64(1);id<=5;id++ {if !has(cs.VotersOutgoing,id) {t.Fatal(\"outgoing voter missing\")}}\n    if r.Term!=originalTerm || r.state!=StateLeader || c.applied[0]!=changeIndex {t.Fatal(\"authority/configuration prefix not reached\")}\n    assuranceEmit(map[string]interface{}{\"event\":\"joint_prefix\",\"request\":c.request,\"term\":r.Term,\"change_index\":changeIndex,\"voters\":cs.Voters,\"outgoing\":cs.VotersOutgoing,\"pre_joint_outputs\":len(c.outputs),\"applied\":c.applied[0]})\n    phases:=[]struct{name string;release uint64}{\n        {\"self_only\",0},\n        {\"one_outgoing_reply\",2},\n        {\"outgoing_majority_only\",3},\n        {\"both_majorities\",4},\n        {\"remaining_reply\",5},\n    }\n    for _,p:=range phases {\n        c.phase=p.name\n        assuranceEmit(map[string]interface{}{\"event\":\"read_phase_admitted\",\"request\":c.request,\"phase\":p.name,\"joint_applied\":true,\"term\":r.Term,\"change_index\":changeIndex})\n        if p.release!=0 {c.release(p.release)}\n        c.drain(all)\n        in,out:=c.count([]uint64{1,4,5}),c.count([]uint64{1,2,3,4,5})\n        var index uint64\n        if len(c.outputs)>0 {index=c.outputs[0].Index}\n        assuranceEmit(map[string]interface{}{\"event\":\"read_support_observed\",\"request\":c.request,\"phase\":p.name,\"read_emitted\":len(c.outputs)>0,\"read_count\":len(c.outputs),\"read_index\":index,\"incoming_count\":in,\"outgoing_count\":out,\"both_majorities\":in>=2 && out>=3,\"leader_term\":r.Term,\"leader_role\":r.state.String(),\"leader_commit\":r.raftLog.committed,\"leader_applied\":c.applied[0],\"schedule_complete\":true})\n    }\n    assuranceEmit(map[string]interface{}{\"event\":\"read_history_finished\",\"request\":c.request,\"read_count\":len(c.outputs),\"held_replies\":len(c.held)})\n}\n",
+    "description": "TestAssuranceReadSupportAcrossJointChange: actual Bootstrap/Campaign/ReadIndex/ProposeConfChange and committed ApplyConfChange calls; delayed original heartbeat responses and public Ready output.",
+    "semantic_changes": [
+      "MemoryStorage and deterministic single-threaded FIFO local storage/transport replace production storage and scheduling; no crash or physical durability claim.",
+      "Heartbeat response delay is the sole network perturbation; messages and response contexts are not rewritten.",
+      "Read-only internal observations establish elected prefix, active configuration, applied index and unchanged term; no protocol state is assigned."
+    ],
+    "prerequisites": [
+      {
+        "alias": "joint_admission",
+        "event": "read_phase_admitted",
+        "conditions": [
+          {
+            "field": "joint_applied",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          }
+        ]
+      }
+    ],
+    "legality": {
+      "source_ids": [
+        "S_bootstrap_api",
+        "S_raw_entry",
+        "S_raw_read_api",
+        "S_read_api",
+        "S_config_validation",
+        "S_joint_selection",
+        "S_change",
+        "S_restore_config",
+        "S_campaign",
+        "S_ready_advance",
+        "S_append_messages",
+        "S_memory_append",
+        "S_memory_read_write",
+        "S_heartbeat_broadcast",
+        "S_follower_log"
+      ],
+      "expectation_ids": [
+        "S_async_contract",
+        "S_ready_contract",
+        "S_storage_contract"
+      ],
+      "binding_ids": [
+        "BIND_read_joint_consumer"
+      ],
+      "derivation": "Reuse the previously executed adapter structure but instantiate five actual RawNodes and a new independent history. Bootstrap peers 1..5, elect 1, and drain actual append/application/network work to a committed/applied current-term prefix. Invoke RawNode.ReadIndex once, collect actual nonempty-context heartbeat responses and retain them unchanged. Propose an explicit-joint ConfChangeV2 removing 2 and 3 through ProposeConfChange. Apply only delivered committed configuration entries via ApplyConfChange. Require observed ConfState incoming {1,4,5}, outgoing {1,2,3,4,5}, AutoLeave false, unchanged leader/term and applied change index. No critical raft or tracker fields are assigned. Five fixed phases retain all replies, release 2, release 3, release 4, then release 5, draining permitted work after each. RawNode.Ready output captures ReadStates. Local storage/apply target queues remain FIFO, and attached responses are released only after modeled completion. No Advance, ticks, snapshots or extra ReadIndex calls are used.",
+      "applicability": "Network delay permits retained genuine replies across configuration application. Self participation follows local ReadIndex dispatch; remote participation is counted at delivery, independently of readOnly.acks. MemoryStorage is a completion model without crash injection. A 10000-iteration bound prevents an unbounded harness, not a protocol deadline.",
+      "unresolved": [],
+      "conflicts": [],
+      "alternatives": [
+        "Pending support is allowed to survive configuration application; the check does not demand that it be reset.",
+        "The old commit index in a returned ReadState is not an oracle failure."
+      ]
+    }
+  },
+  "monitors": [
+    {
+      "id": "M_read_joint",
+      "checker_id": "read_joint_eligibility",
+      "event": "read_support_observed",
+      "binding_ids": [
+        "BIND_read_joint_consumer"
+      ],
+      "grounding": {
+        "source_ids": [
+          "S_leader_other",
+          "S_read_tracking",
+          "S_joint",
+          "S_majority",
+          "S_restore_config",
+          "S_raw_read_api",
+          "S_ready_advance"
+        ],
+        "expectation_ids": [
+          "S_options",
+          "S_joint",
+          "S_read_api"
+        ],
+        "binding_ids": [
+          "BIND_read_joint_consumer"
+        ],
+        "derivation": "read_support_observed records whether public Ready.ReadStates has emitted the sole context and independently computes both_majorities from an external sender-delivery ledger. The driver counts local dispatch as self participation and adds remote IDs only when it delivers actual held replies to leader Step; it never reads the implementation acknowledgment map for the oracle. For fixed incoming {1,4,5} and outgoing {1,2,3,4,5}, required counts are 2 and 3. The implication read_emitted => both_majorities is evaluated at each phase boundary. Cumulative delivered support is monotone because this measured suffix has no further reconfiguration/term change; individual read_output events record the counts at actual emission as additional diagnostics.",
+        "applicability": "The phase admission follows reached committed/application joint configuration, not the observed release value. request and phase uniquely correlate phase admissions/results. Pre-joint output count, context, term, original read index and emission-time ledger counts are retained for correspondence review rather than filtered to fit the oracle.",
+        "unresolved": [],
+        "conflicts": [],
+        "alternatives": [
+          "Outgoing-only support may remain pending.",
+          "The both-majorities phase is a permitted positive control, not an equality or liveness oracle."
+        ]
+      },
+      "applicability_conditions": [],
+      "admission_alias": "joint_admission"
+    }
+  ],
+  "observable_properties": [
+    {
+      "checker_id": "read_joint_eligibility",
+      "kind": "event_implication",
+      "trigger": {
+        "field": "event",
+        "op": "eq",
+        "value": "read_support_observed",
+        "reference": null
+      },
+      "assertion": {
+        "field": "both_majorities",
+        "op": "eq",
+        "value": true,
+        "reference": null
+      },
+      "antecedent": {
+        "field": "read_emitted",
+        "op": "eq",
+        "value": true,
+        "reference": null
+      },
+      "identity_fields": [
+        "request",
+        "phase"
+      ],
+      "description": "ReadState release for the sole request implies an incoming and outgoing acknowledgment majority at each fixed checkpoint. Missing either majority permits pending output."
+    }
+  ],
+  "uncertainties": [
+    "A qualified ReadState release is not an observed client read and does not establish full linearizability.",
+    "One single-term explicit-joint voter-reduction history and five checkpoints; other reconfigurations, batching and retries remain outside this check.",
+    "Pre-joint output and emission-time diagnostics must be inspected to ensure actual release corresponds to the declared joint phase."
+  ]
+}
