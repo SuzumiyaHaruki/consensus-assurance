@@ -1094,6 +1094,10 @@ func emit(event string, value bool) {{ fmt.Printf("CA_EVENT {{\\"event\\":\\"%s\
     moved=plan.model_copy(deep=True);moved.monitors[0].event='different_endpoint'
     with pytest.raises(ValueError,match='Ordinary repair'):validate_check_revision(state,new,moved,revision)
     assert capture(repo).files==before
+    from consensus_assurance.reporting.chinese import render_report
+    report=render_report(state,e.root).read_text()
+    assert 'run 默认包 `.`' in report
+    assert all(f'固定执行包 `{package}`' in report for package in ('.','./internal/core','./internal/store'))
     # An exact operation receipt survives mutable defaults/drafts and does not become another package's result.
     e.config.target.execution_package='./internal/store';e.implementation=GoModuleBackend(e.config.target.model_copy(update={'harness_path':None}),120)
     (e.root/'draft/primary.go').write_text('not Go')
@@ -1167,6 +1171,12 @@ def test_small_exploration_answer_is_independent_of_unfinished_large_product(tmp
         assert not entry['feedback'] and entry['without_followup']==[entry['executions'][0]['check_id']]
         assert state.current_submission['phase']=='failed'
     assert not any((p/'accepted.json').exists() and 'unfinished.json' in (p/'accepted.json').read_text() for p in (e.root/'submissions').iterdir())
+    from consensus_assurance.reporting.chinese import render_report
+    report=render_report(state,e.root).read_text()
+    unresolved=report.split('## 当前未决事项')[1]
+    assert '已选检查暂无欠账' in unresolved
+    assert ('尚无精确对应的后续受理解释' in unresolved)==(delivery!='accepted')
+    if delivery=='accepted':assert '精确引用不表示已解决或已正式化' in report
     # This checks the actual loaded resource, not an unattached instruction file or LLM behavior.
     method=(e.root/'audit-method.md').read_text()
     assert 'tasks/audit.md' in state.method_paths

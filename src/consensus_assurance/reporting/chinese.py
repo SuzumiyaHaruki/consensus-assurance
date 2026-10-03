@@ -20,15 +20,20 @@ INLINE_LIMIT = 200
 
 def execution_summary(check):
     complete = check.status == ExecutionStatus.COMPLETED and check.exit_code in (0, None)
+    phase = {'build_or_setup':'未进入测试：包发现／构建准备失败',
+        'test_failure':'已进入测试，执行失败；性质归因另核',
+        'panic_unattributed':'已进入测试，panic 尚未归因',
+        'execution_unclassified':'未进入所选测试，失败阶段未确定'}.get(check.parameters.get('failure_class'))
+    if check.outcome == 'not_applicable':phase = '所声明检查未完成：没有匹配测试或全部跳过'
     if 'probe' in check.action or check.action == 'agent_capabilities':
         return '环境／能力检查', '工具可用' if check.parameters.get('capability_available',complete) else '工具未就绪', '未检查性质'
     if check.action == 'agent_turn':
         return 'Agent 调查', 'Agent 回执已保存；产物另经校验' if complete else 'Agent 调用未完成', '不属于性质证据'
     if check.action == 'exploration':
-        return '条件探索', '条件观察完成' if complete else '探索执行失败或未完成', '没有正式性质判定'
+        return '条件探索', phase or ('条件观察完成' if complete else '探索执行失败或未完成'), '没有正式性质判定'
     if check.action in {'direct_check','experiment','replay'}:
         return ('直接实现检查' if check.action == 'direct_check' else '探索／实现执行',
-            '执行完成；比较见 assessment' if complete else '执行失败或未完成', '进程退出码不等于性质判定')
+            phase or ('执行完成；比较见 assessment' if complete else '执行失败或未完成'), '进程退出码不等于性质判定')
     return check.action, check.status.value, '未分类执行；不推断性质结果'
 
 
@@ -48,6 +53,28 @@ def cell(value, locator=''):
 def assessment_progress(record):
     opinion = record.get('correspondence') or ('尚未记录' if 'correspondence' in record else '信息不足')
     return '机械比较：'+OUTCOME.get(record.get('outcome'),'信息不足')+'；对应性意见：'+opinion
+
+
+def execution_location(check, archive):
+    package = check.parameters.get('execution_package')
+    filename = check.parameters.get('harness_filename')
+    location = f'固定执行包 `{cell(package)}`；主文件 `{cell(filename)}`' if package is not None else (
+        f'固定主文件 `{cell(filename)}`' if filename else '旧记录未固定单次位置；按历史控制器命令和输入解释，嵌套启动器不等于直接切包')
+    return location+'；'+archive.link(f'logs/{check.id}/check.json','实际命令、工具版本与输入记录')
+
+
+def failure_detail(check, archive):
+    """Legacy output can explain a technical turn without rewriting its saved CheckRun."""
+    if ('failure_class' in check.parameters and 'test_started' in check.parameters
+            or check.status not in {ExecutionStatus.COMPLETED,ExecutionStatus.ERROR}
+            or check.parameters.get('execution_backend',{}).get('name') not in {'go_module','hashicorp_raft'}):
+        return execution_summary(check)[1]
+    from consensus_assurance.adapters.runners.go_module import go_test_diagnostics
+    paths = [archive.path(p) for p in (check.stdout,check.stderr)]
+    text = '\n'.join(p.read_text() for p in paths if p)
+    facts = go_test_diagnostics(text)
+    interpreted = check.model_copy(update={'parameters':{**check.parameters,**facts}})
+    return '历史输出诊断：'+execution_summary(interpreted)[1]+'（原记录未改写）'
 
 
 class Archive:
@@ -172,10 +199,15 @@ def milestone_lines(state, research, archive, checks, titles):
         title = next((i.report_title for r in state.semantic_reviews if r.check_id==s['operation_id'] for i in r.items if i.report_title),None)
         selected.setdefault(s['operation_id'], (f'受理 {s["action"]}：'+excerpt(title or s['rationale'],140),
             archive.link(f'submissions/{s["operation_id"]}/accepted.json','完整交接')))
+    from consensus_assurance.workflow.reviews import lineage
     current = {a['id'] for a in research['artifacts']}
+    ancestors = set().union(*(lineage(state,a) for a in state.direct_checks if a.id in current))
+    versions = {a.id:a.version for a in state.direct_checks}
     for check in checks.values():
         if check.action == 'exploration' or (check.direct_check_id) in current:
             selected[check.id] = ('实际执行：'+excerpt(titles.get(check.id,execution_summary(check)[0]),140)+'；'+execution_summary(check)[1],archive.link(f'logs/{check.id}/check.json','执行记录'))
+        elif check.direct_check_id in ancestors and (check.status != ExecutionStatus.COMPLETED or check.exit_code not in (0,None)):
+            selected[check.id] = (f'修订前 v{versions[check.direct_check_id]}：'+failure_detail(check,archive)+'；后续版本独立执行与复核',archive.link(f'logs/{check.id}/check.json','原失败记录'))
     interrupted = [c for c in checks.values() if c.action == 'agent_turn' and c.status != ExecutionStatus.COMPLETED]
     for check in interrupted[-3:]:
         selected[check.id] = ('Agent 调查中断；后续记录不抹掉此失败',archive.link(f'logs/{check.id}/check.json','中断记录'))
@@ -243,7 +275,7 @@ def render_report(state, root):
         '会话内本地试跑不属于此控制器计数；总时间不叠加内部工具耗时，缺失 token 用量保持未知。',
         '新 Unit 入场能力不保证剩余额度足够完成检查与复核。', '',
         f'元数据：源码 `{state.snapshot.commit or state.snapshot.id}`；实际方法 `{state.framework_revision}`；展示版本 `{manifest()["version"]}`；'
-        f'模式 {state.mode}/{state.analysis_mode}；执行后端 `{config.get("execution_backend","none")}`／包 `{config.get("target",{}).get("execution_package",".")}`；'
+        f'模式 {state.mode}/{state.analysis_mode}；执行后端 `{config.get("execution_backend","none")}`／run 默认包 `{config.get("target",{}).get("execution_package",".")}`；'
         f'模型 `{config.get("agent_model") or "默认"}`／`{config.get("agent_reasoning_effort") or "默认"}`。重新渲染不代表重新审计。', '',
         '停止依据（记录摘录）：'+excerpt(stop.get('rationale') or state.stop_reason,190)+'；'+link('state.json','完整停止记录')+'。', '']
     stopped_check = checks.get(stop.get('operation_id'))
@@ -294,12 +326,13 @@ def render_report(state, root):
                     *[link(f'submissions/{reviews[rid].check_id}/accepted.json','对应性复核') for rid in record.get('review_ids',[]) if rid in reviews]]), '']
             if record.get('blockers'):lines += ['当前争议／阻塞：'+'；'.join(record['blockers']), '']
             harness = archive.read(artifact['plan_path']).get('harness',{})
+            lines += [execution_location(check,archive)]
             lines += ['执行边界：'+harness.get('description','固定计划字节缺失')+'；'+'；'.join(harness.get('semantic_changes',[]))]
             lines += observation_lines(record,artifact,check,archive,event_cache)
             from consensus_assurance.workflow.reviews import lineage
             ancestors=lineage(state,next(a for a in state.direct_checks if a.id==artifact['id']))
             old = [c for c in failures if c.direct_check_id in ancestors]
-            for failed in old:lines.append('该问题保留的失败执行：'+link(failed.stdout,'原始失败')+'；'+link(failed.stderr,'诊断')+'。旧失败不覆盖当前结果。')
+            for failed in old:lines.append('该问题保留的失败执行：'+link(failed.stdout,'原始失败')+'；'+link(failed.stderr,'诊断')+'。修订转折见时间线，旧失败不覆盖当前结果。')
     interpretations = {}
     for entry in exploration_records:
         lines += ['', '条件探索：'+excerpt(entry['question'] or '问题原稿字节缺失',200),
@@ -309,17 +342,17 @@ def render_report(state, root):
             check = checks[execution['check_id']]
             lines += ['；'.join(execution_summary(check)[1:])+'。'+link(execution['record'],'执行记录')+'；'+
                 link(execution['stdout'],'实际输出')+'；'+link(execution['stderr'],'诊断'),
-                '；'.join(link(path,'执行文件清单') for path in execution['artifacts'])]
+                execution_location(check,archive), '；'.join(link(path,'执行文件清单') for path in execution['artifacts'])]
         if not entry['executions']:lines.append('已受理问题，尚无保存的执行记录。')
         for handoff in entry['feedback']:
             saved = handoff['submission']
             if handoff==entry['feedback'][-1]:interpretations.setdefault(saved,set()).update(handoff['ref_ids'])
             lines.append('执行后精确引用交接：'+link(saved,'受理解释；不是本次独立观察'))
-        if entry['executions'] and not entry['feedback']:lines.append('实际观察已保存，尚待解释；输出不自动生成正式义务或审批待办。')
+        if entry['without_followup']:lines.append('探索执行记录已保存，尚待解释；输出不自动生成正式义务或审批待办。')
     for saved, refs in interpretations.items():
         feedback = archive.read(saved).get('feedback') or {}
         lines += ['', '后续受理解释（关联 '+str(len(refs))+' 次执行）：'+excerpt(feedback.get('answered','归档字节缺失'),260),
-            link(saved,'完整交接；当前正式处置见上方固定制品与复核')]
+            link(saved,'完整交接；精确引用不表示已解决或已正式化')]
     lines += ['', '## 研究过程与认识增长', '',
         'A1 共识形成与推进、A2 上下文／权威转换及其连接由双主线概览导航；地图条目和检查数量不是责任覆盖率。',
         map_link+'。']
@@ -331,6 +364,9 @@ def render_report(state, root):
     titles.update({x['check_id']:e['rationale'] or e['question'] or '探索原稿缺失' for e in exploration_records for x in e['executions']})
     lines += ['累计分钟从本轮创建起计，含暂停间隔；详细墙钟与耗时见执行记录。']+milestone_lines(state,research,archive,checks,titles)
     lines += ['', '## 当前未决事项', '', '已选检查暂无欠账；研究范围仍可开放。' if not research['pending_work'] else '已选检查／争议仍有待办：']
+    unexplained = [id for entry in exploration_records for id in entry['without_followup']]
+    if unexplained:lines += [f'另有 {len(unexplained)} 次探索保存了执行记录，尚无精确对应的后续受理解释；这不是新增正式欠账。'+
+        '；'.join(link(f'logs/{id}/check.json','待解释探索') for id in unexplained)]
     for item in research['pending_work']:
         unit = next((u for u in research['units'] if u['id']==item['id']),None)
         detail = '；'.join(item['reasons'])

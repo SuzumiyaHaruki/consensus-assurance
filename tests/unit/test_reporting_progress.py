@@ -275,9 +275,12 @@ def test_mixed_report_reads_fixed_results_and_moves_without_side_effects(tmp_pat
     visible_timeline=re.sub(r'\]\([^)]*\)',']',timeline)
     assert re.search(r'\d+\.\d+ 分钟',timeline) and not re.search(r'\b[0-9a-f]{32}\b',visible_timeline)
     assert 'Under the chosen repeat policy the actual returns were 3 and 4.' not in timeline
-    assert text.count('实际观察已保存，尚待解释')==1 and 'external caller may have another boundary' in text
+    assert text.count('探索执行记录已保存，尚待解释')==1 and 'external caller may have another boundary' in text
+    assert timeline.count('修订前 v1')==1
     assert text.count('后续受理解释（关联 2 次执行）')==1 and '该交接当时的剩余问题' not in text
     unresolved=text.split('## 当前未决事项')[1]
+    assert '另有 1 次探索保存了执行记录，尚无精确对应的后续受理解释' in unresolved
+    assert '精确引用不表示已解决或已正式化' in text
     assert 'Acquire the caller repeat contract' not in unresolved and '地图 v1' in unresolved
     assert 'x'*200 not in text and 'z'*200 not in text and '首尾预览' in text
     assert '| state.encoded |' in text and '| start.state.encoded |' in text and '| operation | dict，' in text
