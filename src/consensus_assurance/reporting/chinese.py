@@ -106,12 +106,12 @@ def observation_lines(record, artifact, check, archive, event_cache):
             locations = {key:(i,key) for key in fields}
             aliases = prop.get('correlations',{}).get(str(i),{}).get('alias_indices',{})
             locations.update({key:(aliases.get(key.partition('.')[0]),key.partition('.')[2]) for key in references})
-            # Requested operands may be complex; only small scalars add incidental context.
+            # Keep harness-reported scalar inputs too; their full values stay in the log.
             for key,value in event.items():
                 if key.startswith('_ca_'):continue
                 extras = {key+'.'+k:v for k,v in value.items()} if isinstance(value,dict) else {key:value}
                 for name,extra in extras.items():
-                    if not isinstance(extra,(dict,list)) and len(str(extra)) <= INLINE_LIMIT:
+                    if not isinstance(extra,(dict,list)):
                         locations.setdefault(name,(i,name))
             values = {}
             for key,(index,name) in locations.items():

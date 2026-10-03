@@ -147,7 +147,7 @@ def test_mixed_report_reads_fixed_results_and_moves_without_side_effects(tmp_pat
             files['check.py']=files['check.py'].replace("'legal':legal(3,3)",
                 "'legal':legal(3,3),'encoded':json.dumps({'padding':'x'*4000,'bounded':True})")
             files['check.py']=files['check.py'].replace("'in_range':0 <= value <= 3",
-                "'in_range':0 <= value <= 3,'encoded':json.dumps({'padding':'x'*4000,'bounded':0 <= value <= 3})")
+                "'in_range':0 <= value <= 3,'encoded':json.dumps({'padding':'x'*4000,'bounded':0 <= value <= 3}),'driver_input':'y'*4000+str(value)")
             return sub,files
         return step
     def second(state):
@@ -219,6 +219,7 @@ def test_mixed_report_reads_fixed_results_and_moves_without_side_effects(tmp_pat
     assert 'Acquire the caller repeat contract' not in unresolved and '地图 v1' in unresolved
     assert 'x'*200 not in text and 'z'*200 not in text and '首尾预览' in text
     assert '| state.encoded |' in text and '| start.state.encoded |' in text and '| operation | dict，' in text
+    assert '| state.driver_input | str，' in text and 'y'*200 not in text
     visible=re.sub(r'\]\([^)]*\)',']',text)
     assert max(len(v.strip()) for line in visible.splitlines() if line.startswith('|') for v in line.split('|')) < 300
     assert '"bounded": true}' in text and '"bounded": false}' in text
