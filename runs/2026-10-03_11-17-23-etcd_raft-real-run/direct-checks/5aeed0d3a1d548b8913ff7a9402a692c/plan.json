@@ -1,0 +1,139 @@
+{
+  "description": "Actual three-node RawNode election from identical genesis snapshots; replicate and apply an implicit joint removal. Immediately after leader ApplyConfChange, optionally invoke TransferLeader(2) before Advance. Drop TimeoutNow only, complete all Ready batches and deliver all other messages, then tick every node 40 times with a full drain after each tick. Observe outgoing set; independently record transfer expiration, stable leadership, heartbeat acknowledgments and generated exit entries. Compare no-transfer control and run one ordinary proposal only after final result as rescue.",
+  "claim_id": "c_auto_exit_retry",
+  "binding_ids": [
+    "bind_auto_exit",
+    "bind_transfer_expiry"
+  ],
+  "harness": {
+    "files": {},
+    "kind": "go_test",
+    "source": "package raft\n\nimport (\n \"encoding/json\"\n \"fmt\"\n \"testing\"\n pb \"go.etcd.io/raft/v3/raftpb\"\n)\n\nfunc TestAssuranceAutoLeaveTransfer(t *testing.T) {\n for _, transfer := range []bool{false,true} {\n  name := \"control\"\n  if transfer { name = \"transfer_timeout\" }\n  t.Run(name,func(t *testing.T) {\n   nodes:=map[uint64]*RawNode{}\n   stores:=map[uint64]*MemoryStorage{}\n   jointIndex:=uint64(0)\n   tickNumber:=0\n   startTerm:=uint64(0)\n   stableAuthority:=true\n   heartbeatAcks:=map[uint64]int{}\n   exitEntries:=0\n   emit:=func(stage string) {\n    r:=nodes[1].raft\n    out:=map[string]interface{}{\"event\":stage,\"case\":name,\"joint_index\":jointIndex,\"tick\":tickNumber,\"stable_authority\":stableAuthority,\"acks2\":heartbeatAcks[2],\"acks3\":heartbeatAcks[3],\"exit_entries\":exitEntries,\"stage\":stage,\"term\":r.Term,\"role\":r.state.String(),\"commit\":r.raftLog.committed,\"applied\":r.raftLog.applied,\"last\":r.raftLog.lastIndex(),\"transferee\":r.leadTransferee,\"auto_leave\":r.trk.AutoLeave,\"outgoing\":len(r.trk.Voters[1])}\n    b,_:=json.Marshal(out);fmt.Println(\"CA_EVENT \"+string(b))\n   }\n   for id:=uint64(1);id<=3;id++ {\n    st:=NewMemoryStorage()\n    // Identical genesis snapshots establish the initial cluster. No crashes occur.\n    if err:=st.ApplySnapshot(pb.Snapshot{Metadata:pb.SnapshotMetadata{Index:1,Term:1,ConfState:pb.ConfState{Voters:[]uint64{1,2,3}}}});err!=nil {t.Fatal(err)}\n    if err:=st.SetHardState(pb.HardState{Term:1,Commit:1});err!=nil {t.Fatal(err)}\n    rn,err:=NewRawNode(&Config{ID:id,ElectionTick:10,HeartbeatTick:1,Storage:st,Applied:1,MaxSizePerMsg:4096,MaxInflightMsgs:256,CheckQuorum:true})\n    if err!=nil {t.Fatal(err)}\n    nodes[id]=rn;stores[id]=st\n   }\n   hooked:=false\n   dropped:=0\n   queue:=[]pb.Message{}\n   pump:=func() {\n    for round:=0;round<1000;round++ {\n     work:=false\n     for id:=uint64(1);id<=3;id++ {\n      rn:=nodes[id]\n      if !rn.HasReady(){continue};work=true\n      rd:=rn.Ready()\n      st:=stores[id]\n      if !IsEmptySnap(rd.Snapshot) {if err:=st.ApplySnapshot(rd.Snapshot);err!=nil {t.Fatal(err)}}\n      if !IsEmptyHardState(rd.HardState) {if err:=st.SetHardState(rd.HardState);err!=nil {t.Fatal(err)}}\n      if err:=st.Append(rd.Entries);err!=nil {t.Fatal(err)}\n      if id==1 {for _,e:=range rd.Entries {if e.Type==pb.EntryConfChangeV2 {var cc pb.ConfChangeV2;if err:=cc.Unmarshal(e.Data);err!=nil {t.Fatal(err)};if cc.LeaveJoint(){exitEntries++}}}}\n      for _,e:=range rd.CommittedEntries {\n       if e.Type==pb.EntryConfChangeV2 {\n        var cc pb.ConfChangeV2\n        if err:=cc.Unmarshal(e.Data);err!=nil {t.Fatal(err)}\n        rn.ApplyConfChange(cc)\n        if id==1 && !hooked && cc.Transition==pb.ConfChangeTransitionJointImplicit {\n         hooked=true\n         jointIndex=e.Index\n         emit(\"joint_installed_before_advance\")\n         if transfer {rn.TransferLeader(2);emit(\"transfer_started_before_advance\")}\n         emit(\"admitted\")\n        }\n       } else if e.Type==pb.EntryConfChange {\n        var cc pb.ConfChange;if err:=cc.Unmarshal(e.Data);err!=nil {t.Fatal(err)};rn.ApplyConfChange(cc)\n       }\n      }\n      // Persistence and application finish before all message delivery and Advance.\n      queue=append(queue,rd.Messages...)\n      rn.Advance(rd)\n     }\n     if len(queue)>0 {\n      work=true;batch:=queue;queue=nil\n      for _,m:=range batch {\n       // Only transfer-triggering packets are lost. All quorum traffic is delivered.\n       if transfer && m.Type==pb.MsgTimeoutNow {dropped++;continue}\n       if rn:=nodes[m.To];rn!=nil {\n        if err:=rn.Step(m);err!=nil && err!=ErrStepPeerNotFound {t.Fatal(err)}\n        if m.To==1 && m.Type==pb.MsgHeartbeatResp && m.Term==nodes[1].raft.Term {heartbeatAcks[m.From]++}\n       }\n      }\n     }\n     if startTerm!=0 && (nodes[1].raft.Term!=startTerm || nodes[1].raft.state!=StateLeader) {stableAuthority=false}\n     if !work{return}\n    }\n    t.Fatal(\"exploration failed to quiesce within pump bound\")\n   }\n   if err:=nodes[1].Campaign();err!=nil {t.Fatal(err)};pump()\n   if nodes[1].raft.state!=StateLeader {t.Fatal(\"leader not established\")}\n   startTerm=nodes[1].raft.Term\n   emit(\"elected\")\n   cc:=pb.ConfChangeV2{Transition:pb.ConfChangeTransitionJointImplicit,Changes:[]pb.ConfChangeSingle{{Type:pb.ConfChangeRemoveNode,NodeID:3}}}\n   if err:=nodes[1].ProposeConfChange(cc);err!=nil {t.Fatal(err)};pump()\n   if !hooked {t.Fatal(\"joint application not reached\")}\n   emit(\"after_joint_completion\")\n   for tick:=1;tick<=40;tick++ {\n    tickNumber=tick\n    for id:=uint64(1);id<=3;id++ {nodes[id].Tick()}\n    pump()\n    if tick==10 || tick==20 {emit(fmt.Sprintf(\"after_tick_%d\",tick))}\n   }\n   emit(\"result\")\n   fmt.Printf(\"CA_EVENT {\\\"event\\\":\\\"diagnostics\\\",\\\"case\\\":%q,\\\"joint_index\\\":%d,\\\"dropped_timeout_now\\\":%d,\\\"queue_remaining\\\":%d}\\n\",name,jointIndex,dropped,len(queue))\n   // Independent rescue observation tests whether new application work supplies the trigger.\n   if err:=nodes[1].Propose([]byte(\"wake-application\"));err!=nil {t.Fatal(err)};pump();emit(\"after_rescue_proposal\")\n  })\n }\n}\n",
+    "description": "Two independent histories identified by case and the applied joint-entry index. No source patches, fabricated protocol messages, progress rewrites or manual appliedTo calls. MemoryStorage models stable storage with no crashes. Driver uses actual emitted protocol messages.",
+    "semantic_changes": [
+      "In-package reads expose state and counters only; target logic is unchanged.",
+      "Transport drops only emitted TimeoutNow; storage and application are supplied synchronously by the harness.",
+      "Genesis snapshot at index/term 1 represents a preconfigured cluster, consistent with RawNode bootstrap guidance."
+    ],
+    "prerequisites": [
+      {
+        "alias": "admission",
+        "event": "admitted",
+        "conditions": [
+          {
+            "field": "auto_leave",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          },
+          {
+            "field": "outgoing",
+            "op": "eq",
+            "value": 3,
+            "reference": null
+          },
+          {
+            "field": "role",
+            "op": "eq",
+            "value": "StateLeader",
+            "reference": null
+          }
+        ]
+      }
+    ],
+    "legality": {
+      "source_ids": [
+        "s_ready",
+        "s_advance",
+        "s_node_loop",
+        "s_apply_contract",
+        "s_bootstrap",
+        "s_init",
+        "s_autoleave"
+      ],
+      "expectation_ids": [
+        "s_apply_contract",
+        "s_conf_contract2"
+      ],
+      "binding_ids": [
+        "bind_auto_exit",
+        "bind_transfer_expiry"
+      ],
+      "derivation": "RawNode calls are sequential, and the corresponding Node loop accepts messages while a Ready is outstanding. The configuration is applied only from actual CommittedEntries. Persistence and application complete before Advance and any queued network delivery. Transfer is invoked between configuration installation and completion acknowledgment, preserving the investigated overlap. One actual transfer request is lost in the explored schedule; no support messages are fabricated or selectively withheld. Remaining membership receives normal ticks and heartbeats.",
+      "applicability": "Three initial voters, incoming {1,2}, outgoing {1,2,3}, CheckQuorum enabled, election/heartbeat ticks 10/1, no asynchronous storage writes or crashes.",
+      "unresolved": [
+        "No application state machine beyond ordered configuration application is modeled; only configuration completion is claimed."
+      ],
+      "conflicts": [],
+      "alternatives": []
+    }
+  },
+  "monitors": [
+    {
+      "id": "m_auto_exit",
+      "checker_id": "auto_exit_finished",
+      "event": "result",
+      "binding_ids": [
+        "bind_auto_exit",
+        "bind_transfer_expiry"
+      ],
+      "grounding": {
+        "source_ids": [
+          "s_autoleave",
+          "s_timers",
+          "s_advance",
+          "s_apply_resp",
+          "s_node_loop"
+        ],
+        "expectation_ids": [
+          "s_conf_contract",
+          "s_conf_contract2"
+        ],
+        "binding_ids": [
+          "bind_auto_exit",
+          "bind_transfer_expiry"
+        ],
+        "derivation": "c_auto_exit_retry assigns implicit exit to Raft. The checker observes the actual outgoing voter set after a completed finite interval, separately from the same-operation admission event. Its equality oracle checks completed exit, not transfer success. The no-transfer path and post-result rescue test driver capability; their outcomes never filter the primary result.",
+        "applicability": "Legal sequential RawNode history with prompt persistence/application, full delivery except actual TimeoutNow packets, stable original leader and responsive joint quorum. Result is emitted after exactly 40 ticks and a drained pump regardless of whether exit occurred.",
+        "unresolved": [
+          "Forty ticks is a fixed observation horizon, not a protocol-specified deadline. Attribution to lost autonomous work needs source correspondence: ordinary heartbeat and timeout paths cannot supply appliedTo once committed work is drained."
+        ],
+        "conflicts": [],
+        "alternatives": [
+          "New client work or a successful new election can trigger later exit; these are outside the primary observation and the former is measured only after result."
+        ]
+      },
+      "applicability_conditions": [],
+      "admission_alias": "admission"
+    }
+  ],
+  "observable_properties": [
+    {
+      "checker_id": "auto_exit_finished",
+      "kind": "event_assertion",
+      "trigger": {
+        "field": "event",
+        "op": "eq",
+        "value": "result",
+        "reference": null
+      },
+      "assertion": {
+        "field": "outgoing",
+        "op": "eq",
+        "value": 0,
+        "reference": null
+      },
+      "antecedent": null,
+      "identity_fields": [
+        "case",
+        "joint_index"
+      ],
+      "description": "The same applied implicit-joint operation has no outgoing voter set at the end of the fixed serviced interval. Retained joint state is a bounded non-completion observation; source review assesses autonomous retry responsibility."
+    }
+  ],
+  "uncertainties": [
+    "No numeric automatic-exit deadline appears in the API; the finite comparison is not by itself an unbounded liveness violation.",
+    "Term and leader continuity, transfer expiration, heartbeat counts and draining diagnostics must be inspected in checker correspondence rather than silently used to discard observations.",
+    "The check covers synchronous Ready/Advance and a failed transfer, not asynchronous storage or successful transfer."
+  ]
+}

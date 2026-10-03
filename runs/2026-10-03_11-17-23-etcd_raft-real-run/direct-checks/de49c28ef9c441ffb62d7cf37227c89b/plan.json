@@ -1,0 +1,152 @@
+{
+  "description": "Fresh fixed three-node election and joint removal of nodes 1 and 3. Apply automatic exit on all nodes, campaign singleton 2, replicate/apply a set-one write, then invoke a unique ReadIndex on removed node 1. Observe every returned ReadState and application state after draining. Repeat with StepDownOnRemoval=true; permit no result.",
+  "claim_id": "c_removed_read_fence",
+  "binding_ids": [
+    "bind_singleton_read",
+    "bind_removal_read"
+  ],
+  "harness": {
+    "files": {},
+    "kind": "go_test",
+    "source": "package raft\n\nimport (\n \"bytes\"\n \"encoding/json\"\n \"fmt\"\n \"testing\"\n pb \"go.etcd.io/raft/v3/raftpb\"\n)\n\nfunc TestAssuranceRemovedReadFence(t *testing.T) {\n for _,stepDown:=range []bool{false,true} {\n  name:=\"retained_role\";if stepDown{name=\"stepdown_control\"}\n  t.Run(name,func(t *testing.T){\n   nodes:=map[uint64]*RawNode{};stores:=map[uint64]*MemoryStorage{}\n   values:=map[uint64]int{};applied:=map[uint64]uint64{}\n   reads:=map[uint64][]ReadState{}\n   writeIndex:=uint64(0)\n   readID:=\"read-after-write-\"+name\n   emit:=func(stage string){\n    r:=nodes[1].raft\n    x:=map[string]interface{}{\"event\":stage,\"case\":name,\"read_id\":readID,\"read_returned\":len(reads[1])>0,\"write_completed\":writeIndex>0 && applied[2]>=writeIndex && values[2]==1,\"covers_completed_write\":false,\"old_role\":r.state.String(),\"old_term\":r.Term,\"old_commit\":r.raftLog.committed,\"old_applied\":applied[1],\"old_value\":values[1],\"old_member\":r.trk.Progress[1]!=nil,\"old_voters\":r.trk.VoterNodes(),\"new_term\":nodes[2].raft.Term,\"new_role\":nodes[2].raft.state.String(),\"new_applied\":applied[2],\"new_value\":values[2],\"write_index\":writeIndex,\"read_count\":len(reads[1])}\n    if len(reads[1])>0{x[\"read_index\"]=reads[1][len(reads[1])-1].Index;x[\"read_context\"]=string(reads[1][len(reads[1])-1].RequestCtx);x[\"covers_completed_write\"]=reads[1][len(reads[1])-1].Index>=writeIndex;x[\"applied_through_fence\"]=applied[1]>=reads[1][len(reads[1])-1].Index}\n    b,_:=json.Marshal(x);fmt.Println(\"CA_EVENT \"+string(b))\n   }\n   for id:=uint64(1);id<=3;id++{\n    st:=NewMemoryStorage()\n    if err:=st.ApplySnapshot(pb.Snapshot{Metadata:pb.SnapshotMetadata{Index:1,Term:1,ConfState:pb.ConfState{Voters:[]uint64{1,2,3}}}});err!=nil{t.Fatal(err)}\n    if err:=st.SetHardState(pb.HardState{Term:1,Commit:1});err!=nil{t.Fatal(err)}\n    rn,err:=NewRawNode(&Config{ID:id,ElectionTick:10,HeartbeatTick:1,Storage:st,Applied:1,MaxSizePerMsg:4096,MaxInflightMsgs:256,CheckQuorum:true,StepDownOnRemoval:stepDown,ReadOnlyOption:ReadOnlySafe});if err!=nil{t.Fatal(err)}\n    nodes[id]=rn;stores[id]=st;applied[id]=1\n   }\n   pump:=func(){\n    for rounds:=0;rounds<1000;rounds++{\n     work:=false;var queue []pb.Message\n     for id:=uint64(1);id<=3;id++{\n      rn:=nodes[id];if !rn.HasReady(){continue};work=true;rd:=rn.Ready();st:=stores[id]\n      if !IsEmptySnap(rd.Snapshot){if err:=st.ApplySnapshot(rd.Snapshot);err!=nil{t.Fatal(err)}}\n      if !IsEmptyHardState(rd.HardState){if err:=st.SetHardState(rd.HardState);err!=nil{t.Fatal(err)}}\n      if err:=st.Append(rd.Entries);err!=nil{t.Fatal(err)}\n      for _,e:=range rd.CommittedEntries{\n       switch e.Type{\n       case pb.EntryConfChangeV2:var cc pb.ConfChangeV2;if err:=cc.Unmarshal(e.Data);err!=nil{t.Fatal(err)};rn.ApplyConfChange(cc)\n       case pb.EntryConfChange:var cc pb.ConfChange;if err:=cc.Unmarshal(e.Data);err!=nil{t.Fatal(err)};rn.ApplyConfChange(cc)\n       case pb.EntryNormal:if bytes.Equal(e.Data,[]byte(\"set-one\")){values[id]=1;if id==2{writeIndex=e.Index}}\n       }\n       applied[id]=e.Index\n      }\n      reads[id]=append(reads[id],rd.ReadStates...)\n      queue=append(queue,rd.Messages...);rn.Advance(rd)\n     }\n     for _,m:=range queue{if rn:=nodes[m.To];rn!=nil{if err:=rn.Step(m);err!=nil && err!=ErrStepPeerNotFound{t.Fatal(err)}}}\n     if !work{return}\n    }\n    t.Fatal(\"pump did not drain\")\n   }\n   if err:=nodes[1].Campaign();err!=nil{t.Fatal(err)};pump()\n   if nodes[1].raft.state!=StateLeader{t.Fatal(\"initial election failed\")}\n   cc:=pb.ConfChangeV2{Transition:pb.ConfChangeTransitionJointImplicit,Changes:[]pb.ConfChangeSingle{{Type:pb.ConfChangeRemoveNode,NodeID:1},{Type:pb.ConfChangeRemoveNode,NodeID:3}}}\n   if err:=nodes[1].ProposeConfChange(cc);err!=nil{t.Fatal(err)};pump();emit(\"removed\")\n   if nodes[2].raft.trk.IsSingleton()!=true || nodes[2].raft.trk.Progress[1]!=nil{t.Fatal(\"final singleton configuration not reached\")}\n   if err:=nodes[2].Campaign();err!=nil{t.Fatal(err)};pump()\n   if nodes[2].raft.state!=StateLeader{t.Fatal(\"successor not elected\")}\n   if err:=nodes[2].Propose([]byte(\"set-one\"));err!=nil{t.Fatal(err)};pump()\n   if writeIndex==0 || values[2]!=1{t.Fatal(\"write not applied\")}\n   emit(\"write_completed\")\n   emit(\"read_admitted\")\n   nodes[1].ReadIndex([]byte(readID));pump();emit(\"read_result\")\n  })\n }\n}\n",
+    "description": "Actual RawNode instances and emitted messages with no packet loss, no ticks needed between successor write completion and read, no target-state mutation. MemoryStorage models persisted state in a no-crash run; integer application state changes only when actual committed set-one entries are applied.",
+    "semantic_changes": [
+      "In-package observation reads local role/configuration and ReadStates; no protocol logic changes.",
+      "Driver supplies synchronous storage, ordered application and reliable transport.",
+      "Identical genesis snapshots configure the original three voters."
+    ],
+    "prerequisites": [
+      {
+        "alias": "write",
+        "event": "write_completed",
+        "conditions": [
+          {
+            "field": "new_value",
+            "op": "eq",
+            "value": 1,
+            "reference": null
+          },
+          {
+            "field": "write_completed",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          }
+        ]
+      },
+      {
+        "alias": "admission",
+        "event": "read_admitted",
+        "conditions": [
+          {
+            "field": "write_index",
+            "op": "eq",
+            "value": null,
+            "reference": "write.write_index"
+          }
+        ]
+      }
+    ],
+    "legality": {
+      "source_ids": [
+        "s_ready",
+        "s_advance",
+        "s_bootstrap",
+        "s_init",
+        "s_apply_contract",
+        "s_config_commit",
+        "s_node_read_route",
+        "s_node_read_entry",
+        "s_removal_option"
+      ],
+      "expectation_ids": [
+        "s_read_contract",
+        "s_raw_read",
+        "s_apply_contract"
+      ],
+      "binding_ids": [
+        "bind_singleton_read",
+        "bind_removal_read"
+      ],
+      "derivation": "All methods run sequentially. Ready persistence/application precede Advance and delivery. Membership transitions come solely from committed entries. The single surviving voter uses Campaign and its persistence-delayed self-vote rather than a fabricated election. Its set-one application establishes write completion before read admission. Removal does not stop the live RawNode; optional stepdown, proposal blocking and independent read dispatch are explicit source mechanisms. Timers need not intervene between two finite consecutive API operations, and no network message to the old node is withheld.",
+      "applicability": "ReadOnlySafe; CheckQuorum=true; StepDownOnRemoval toggled as the only control difference. No stale read contexts, failed storage or early Advance.",
+      "unresolved": [],
+      "conflicts": [],
+      "alternatives": [
+        "An embedding service may terminate removed nodes; such policy is outside this live-node library check."
+      ]
+    }
+  },
+  "monitors": [
+    {
+      "id": "m_removed_read",
+      "checker_id": "safe_returned_fence",
+      "event": "read_result",
+      "binding_ids": [
+        "bind_singleton_read",
+        "bind_removal_read"
+      ],
+      "grounding": {
+        "source_ids": [
+          "s_leader_admit",
+          "s_tracker",
+          "s_config_commit",
+          "s_load_read",
+          "s_raw_read"
+        ],
+        "expectation_ids": [
+          "s_read_safety",
+          "s_read_contract",
+          "s_raw_read"
+        ],
+        "binding_ids": [
+          "bind_singleton_read",
+          "bind_removal_read"
+        ],
+        "derivation": "For c_removed_read_fence, a returned certificate must cover the already completed write. covers_completed_write is computed from the actual returned index and actual write-entry index; neither value is chosen from an expected outcome. The result record is unconditional after processing Ready, and read_returned selects the necessary safety antecedent. A missing certificate is permitted and must not fail this implication. Observed old application value and applied-through-fence diagnostic independently expose whether the lower fence permits stale local state.",
+        "applicability": "Correlated write completion and read invocation in one actual log history. Unique read_id is present at both prerequisites and result; its identity is independent of read index, term or the value compared.",
+        "unresolved": [],
+        "conflicts": [],
+        "alternatives": [
+          "No returned certificate under the stepdown control is a bounded absence of unsafe certification, not successful read completion."
+        ]
+      },
+      "applicability_conditions": [],
+      "admission_alias": "admission"
+    }
+  ],
+  "observable_properties": [
+    {
+      "checker_id": "safe_returned_fence",
+      "kind": "event_implication",
+      "trigger": {
+        "field": "event",
+        "op": "eq",
+        "value": "read_result",
+        "reference": null
+      },
+      "assertion": {
+        "field": "covers_completed_write",
+        "op": "eq",
+        "value": true,
+        "reference": null
+      },
+      "antecedent": {
+        "field": "read_returned",
+        "op": "eq",
+        "value": true,
+        "reference": null
+      },
+      "identity_fields": [
+        "case",
+        "read_id"
+      ],
+      "description": "If this uniquely identified post-write read receives a certificate, its fence must cover the actual completed write. Absence of a certificate is permitted pending behavior."
+    }
+  ],
+  "uncertainties": [
+    "The check observes a library read certificate and a minimal integer state machine, not an external service endpoint.",
+    "Embedding applications that immediately stop removed nodes do not expose this path.",
+    "The stepdown control has no completed read; only bounded absence of unsafe output is established."
+  ]
+}
