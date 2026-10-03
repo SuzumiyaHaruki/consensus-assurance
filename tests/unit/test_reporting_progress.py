@@ -86,17 +86,25 @@ def test_agent_reads_work_index_after_action_checkpoint_report_and_resume(tmp_pa
         assert record['question']['trigger_rationale']==old.question.trigger_rationale
         selected=next(c for c in index['candidates'] if c['id']==current.id)
         assert selected['question']['counterevidence']==current.question.counterevidence
+        assert all('current_applicability' not in c for c in index['candidates'])
+        pending_unit=next(u for u in index['units'] if u['id']==unit.id)
+        assert pending_unit['progress'][0]['record_status']=='no_fixed_check'
         assert paused.id in index['frontier']['paused_candidate_ids']
-        assert next(c for c in index['candidates'] if c['id']==paused.id)['resume_conditions']==paused.resume_conditions
-        assert any(i['id']=='current-dispute' for i in index['review_issues'])
+        pending=next(c for c in index['candidates'] if c['id']==paused.id)
+        assert pending['resume_conditions']==paused.resume_conditions and not pending['open_issue_ids']
+        dispute=next(i for i in index['review_issues'] if i['id']=='current-dispute')
+        assert (dispute['target_id'],dispute['target_version'],dispute['aspect'])==(current.id,1,'applicability')
         assert index['capacity']['remaining']['agent_calls']==e.config.budget.agent_calls-e.state.usage['agent_calls']
         assert index['claims'][0]['scope'] and index['claims'][0]['grounding']
         return {'inspected':True}
     e.agent.investigate=inspect
     e.action('agent_turn','agent_calls',lambda:e.agent.investigate(e.runner,request,e.root/'draft',state.snapshot.id,10),{'sample':1})
+    before=e.state.model_dump(mode='json')
     rendered=render_report(e.state,e.root).read_text()
+    assert e.state.model_dump(mode='json')==before
     assert 'Historical construction detail.' in (e.root/'state.json').read_text()
     assert 'Current identity is disputed' in rendered
+    assert '义务已受理，尚无固定检查记录' in rendered
     exported=json.loads((e.root/'research.json').read_text())
     for key in ('candidates','handoffs','review_issues','conclusions'):assert exported[key]==seen[-1][key]
     e.advance('audit')
@@ -116,6 +124,19 @@ def test_agent_reads_work_index_after_action_checkpoint_report_and_resume(tmp_pa
     history=json.loads((e.root/ref['path']).read_text())[ref['collection']]
     original=next(h for h in history if all(h[k]==v for k,v in ref['match'].items()))[ref['field']]
     assert original==old_claim and original['description']!=state.claims[0].description
+    # A new fixed version cannot borrow the old execution or its completed review.
+    from consensus_assurance.workflow.research import view
+    revised=state.model_copy(deep=True)
+    artifact=revised.direct_checks[0].model_copy(update={'id':'new-artifact','version':2,'previous_id':revised.direct_checks[0].id})
+    revised.direct_checks.append(artifact)
+    progress=lambda:next(u for u in view(revised)['units'] if u['id']==artifact.unit_id)['progress'][0]['record_status']
+    assert progress()=='no_execution'
+    execution=next(c for c in revised.checks if c.direct_check_id==artifact.previous_id).model_copy(
+        update={'id':'new-execution','direct_check_id':artifact.id})
+    revised.checks.append(execution)
+    assert progress()=='no_assessment'
+    execution.status=ExecutionStatus.ERROR
+    assert progress()=='execution_incomplete'
 
 
 def test_mixed_report_reads_fixed_results_and_moves_without_side_effects(tmp_path,monkeypatch):
@@ -182,15 +203,31 @@ def test_mixed_report_reads_fixed_results_and_moves_without_side_effects(tmp_pat
         return dict(action='research',rationale='Retain a separate Fact explanation',feedback=dict(ref_ids=['result'],
             answered='The result Fact describes local delivery only',remaining=[],understanding='unchanged',
             rationale='A shared Fact does not associate this feedback with an execution')),{}
+    def contract_question(state):
+        sub,_=first(state);sub.pop('map_path')
+        sub.update(action='continue',obligation=None,bindings=[])
+        sub['question'].update(question='Does the caller permit finite callback delay?',unknowns=['The timing contract is unacquired'])
+        return sub,{}
+    def paused_contract(state):
+        sub,_=contract_question(state)
+        sub.update(action='pause',candidate_id=state['question_candidates'][-1]['id'],
+            resume_conditions=['Obtain the external timing contract'])
+        return sub,{}
+    def unconstructed(state):
+        sub,_=first(state);sub.pop('map_path')
+        sub=json.loads(json.dumps(sub).replace('"bounded"','"pending-bound"').replace('"binding"','"pending-binding"'))
+        sub['question']['question']='Does the second public entry preserve the local bound?'
+        return sub,{}
     steps=[initial,encoded_check(broken=True),encoded_check(revise=True),review,second,review_step(),explained,
-        independent_issue,explore,explore,retain,explore,fact_feedback,stop]
+        independent_issue,explore,explore,retain,explore,fact_feedback,contract_question,paused_contract,unconstructed,stop]
     e,repo=engine_for(tmp_path,steps);e.agent.mock=False;e.config.execution_isolation='bwrap'
     (repo/'target.py').write_text('def step(value, limit):\n    return value + 1 if value <= limit else 0\n')
-    e.config.budget.experiments=6
+    e.config.budget.experiments=7
+    e.config.budget.audit_units=3
     state=e.start(repo)
     assert not list((e.root/'submissions').glob('*/diagnostics.json')),state.stop_reason
     assert [r['disposition'] for r in view(state)['conclusions']]==['confirmed_in_scope','bounded_no_violation']
-    assert state.usage['experiments']==6 and len(state.claims)==2
+    assert state.usage['experiments']==6 and len(state.claims)==3
     index=json.loads((e.root/'research.json').read_text())
     assert [len(entry['feedback']) for entry in index['explorations']]==[1,1,0]
     assert index['explorations'][0]['operation_id']!=index['explorations'][1]['operation_id']
@@ -209,6 +246,11 @@ def test_mixed_report_reads_fixed_results_and_moves_without_side_effects(tmp_pat
     assert state.model_dump(mode='json')==saved and all((moved/p).read_bytes()==v for p,v in before.items())
     assert '**已确认违反**' in text and '**有限检查未见违反**' in text and '源码解释' in text
     assert '边界返回责任' in text and '本次完整观察返回 4' in text
+    assert 'Candidate 5 项；当前 Unit 3 项、义务 3 项、固定检查制品 2 项' in text
+    assert text.count('保存的语义未知：The timing contract is unacquired')==1
+    assert 'Obtain the external timing contract' in text and '义务已受理，尚无固定检查记录' in text
+    assert '实际取消' in text and '配置值不表示触发了超时' in text
+    assert not re.search(r'^- \[.*：\s*$',text,re.M) and not re.search(r'恢复条件：\s*$',text,re.M)
     assert '| event | returned |' in text
     assert 'external repeat policy' in text and 'Acquire the caller repeat contract' in text
     assert old_check.id in text and current.plan_path.split('/direct-checks/')[1] in text
@@ -229,7 +271,10 @@ def test_mixed_report_reads_fixed_results_and_moves_without_side_effects(tmp_pat
     assert '_ca_stream' not in text and '_ca_observation' not in text and '<details>' not in text
     assert state.semantic_reviews[0].items[0].rationale not in text
     links=re.findall(r'\]\(([^)]+)\)',text)
-    assert all(not Path(unquote(p.split('#')[0])).is_absolute() and (moved/unquote(p.split('#')[0])).is_file() for p in links)
+    assert '#event=' not in text and '并非物理行号或自动跳转' in text
+    for p in links:
+        if p.startswith('#'):assert f'id="{p[1:]}"' in text
+        else:assert not Path(unquote(p)).is_absolute() and (moved/unquote(p)).is_file()
     (moved/Path(check.stdout).relative_to(e.root)).unlink()
     missing=render_report(state,moved).read_text()
     assert '部分归档事件缺失' in missing and '**已确认违反**' in missing
@@ -258,3 +303,12 @@ def test_timeout_report_uses_recorded_limit_and_preserves_transport_diagnostic(t
         assert label in text and 'stream disconnected before completion' in text
         assert '单轮超时，具体原因未知' not in text
         assert check.model_dump(mode='json')==saved and stdout.read_bytes()==raw
+    message='This content was flagged for possible cybersecurity risk.'
+    stdout.write_text('\n'.join(json.dumps(event) for event in [dict(type='error',message=message),
+        {'type':'turn.failed','error':{'message':message}}])+'\n')
+    check.status=ExecutionStatus.ERROR;check.parameters={'timeout_limit':'agent_turn_timeout','timeout_seconds':900}
+    raw=stdout.read_bytes();saved=check.model_dump(mode='json')
+    text='\n'.join(interruption_lines(check,archive))
+    assert text.count(message)==1 and 'status=`error`' in text and 'timeout_seconds=`900`' in text
+    assert '达到单轮上限' not in text and '未记录；未完成草稿不受理' in text and '不据此授权重试' in text
+    assert stdout.read_bytes()==raw and check.model_dump(mode='json')==saved

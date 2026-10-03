@@ -14,6 +14,23 @@ def pending_work(state):
             for c in state.question_candidates if not c.obligation_id and c.status in {'active','blocked'}])
 
 
+def unit_progress(state, unit, artifacts, assessments):
+    """Describe current record presence; neither applicability nor scheduling authority."""
+    rows = []
+    for claim in unit.obligation_ids:
+        fixed = [a for a in artifacts if a.unit_id==unit.id and a.claim_id==claim]
+        if not fixed:rows.append({'claim_id':claim, 'record_status':'no_fixed_check'})
+        for artifact in fixed:
+            checks = [c for c in state.checks if c.direct_check_id==artifact.id and c.action=='direct_check']
+            if not checks:rows.append({'claim_id':claim, 'artifact_id':artifact.id, 'record_status':'no_execution'})
+            for check in checks:
+                records = [r for r in assessments if r.get('experiment_check_id')==check.id and r.get('claim_id')==claim]
+                status = ('execution_incomplete' if check.status.value!='completed' or check.exit_code not in (0,None) else
+                    'no_assessment' if not records else 'assessed' if all(r.get('reviewed_complete') for r in records) else 'assessment_incomplete')
+                rows.append({'claim_id':claim, 'artifact_id':artifact.id, 'check_id':check.id, 'record_status':status})
+    return rows
+
+
 def source_refs(state, refs, include_executions=False):
     """Resolve retained ownership; execution observations need not have a graph yet."""
     links = {m.id:{m.id} for m in state.materials}
@@ -193,8 +210,9 @@ def view(state, compact=False):
             'core_gaps':overview.core_gaps if overview else ['Initial two-line explanation is not yet recorded']},
         'drafts':[s for s in drafts.values() if s['draft_status']!='accepted'],
         'candidates':[],
-        'units':[project(u,set(type(u).model_fields)-{'audit_question'} if u.id in focus_units else
-            {'id','version','candidate_id','obligation_ids','status'}) if compact else u.model_dump(mode='json',exclude={'audit_question'}) for u in current],
+        'units':[{**(project(u,set(type(u).model_fields)-{'audit_question'} if u.id in focus_units else
+            {'id','version','candidate_id','obligation_ids','status'}) if compact else u.model_dump(mode='json',exclude={'audit_question'})),
+            'progress':unit_progress(state,u,artifacts,records)} for u in current],
         'claims':[{**project(c,None if c.id in focus_claims else {'id','version','concern'}),
             **({'description_preview':preview(c.description)} if compact and c.id not in focus_claims else {})}
             for c in state.claims if any(c.id in u.obligation_ids for u in current)],
@@ -217,7 +235,6 @@ def view(state, compact=False):
         candidate['result_claim_ids' if compact else 'results']=[r['claim_id'] if compact else
             {k:r[k] for k in ('claim_id','description','disposition')} for r in results if r['candidate_id']==c.id]
         candidate['open_issue_ids']=[i.id for i in issues if i.target_id==c.id]
-        candidate['current_applicability']='pending_review' if candidate['open_issue_ids'] else 'within_recorded_scope'
         units={u.id for u in state.units if u.candidate_id==candidate['id']}
         owned={a.id for a in state.direct_checks if a.unit_id in units}
         candidate['executions']=[{'check_id':c.id,'artifact_id':c.direct_check_id,

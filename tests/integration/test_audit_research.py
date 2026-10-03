@@ -1165,7 +1165,8 @@ def test_new_knowledge_challenges_and_reviews_a_retained_source_explanation(tmp_
     assert len(diagnostics(e))==1 and 'review_unknown_source' in str(diagnostics(e))
     assert state.audit_spec_version==3 and state.question_candidates[0].status==disposition
     assert state.review_issues[0].resolved_by and not state.direct_checks
-    assert view(state)['candidates'][0]['current_applicability']=='within_recorded_scope'
+    assert not view(state)['candidates'][0]['open_issue_ids']
+    assert 'current_applicability' not in view(state)['candidates'][0]
 
 
 @pytest.mark.parametrize('fault',['dangling','unsourced','activity_loss','base_conflict','identity_reuse'])
