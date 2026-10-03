@@ -131,6 +131,15 @@ def test_direct_failure_never_confirms(tmp_path,prepared,failure):
     assert not result['confirmed'],result
     assert result['outcome']==('unknown' if failure in {'prerequisite','missing','compile','identity','applicability'} else 'violated'),result
     assert not any(f.level=='implementation_obligation' for f in e.state.findings)
+    from consensus_assurance.reporting.chinese import render_report
+    from consensus_assurance.workflow.research import current_view
+    saved=e.state.model_dump(mode='json')
+    index=current_view(e.state,e.root,e.implementation)
+    text=render_report(e.state,e.root).read_text()
+    assert index['assessments'][0]['correspondence']==result['correspondence']
+    assert '对应性意见：'+(result['correspondence'] or '尚未记录') in text
+    assert '尚未完成复核' not in text and all(b in text for b in result['blockers'])
+    assert e.state.model_dump(mode='json')==saved
 
 
 @pytest.mark.parametrize('change',['source','review','issue','claim','binding','unit'])
@@ -171,6 +180,11 @@ def test_assessment_refresh_preserves_unaffected_results(tmp_path,prepared,monke
     if semantic:
         assert all(e.assessment==Assessment.STALE for e in e.state.evidence)
         assert all(f.stage==Investigation.INCONCLUSIVE for f in e.state.findings)
+        from consensus_assurance.reporting.chinese import render_report
+        saved=e.state.model_dump(mode='json')
+        text=render_report(e.state,e.root).read_text()
+        assert '对应性意见：no_issue_found' in text and 'Direct-check semantic inputs changed' in text
+        assert '尚未完成复核' not in text and e.state.model_dump(mode='json')==saved
 
 
 @pytest.mark.parametrize('relationship',['revision','independent','shared_requirement'])

@@ -15,7 +15,7 @@ def pending_work(state):
 
 
 def unit_progress(state, unit, artifacts, assessments):
-    """Describe current record presence; neither applicability nor scheduling authority."""
+    """Locate current records; incomplete disposition does not imply missing review."""
     rows = []
     for claim in unit.obligation_ids:
         fixed = [a for a in artifacts if a.unit_id==unit.id and a.claim_id==claim]

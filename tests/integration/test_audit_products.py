@@ -696,7 +696,7 @@ def test_driver_repair_executes_reviews_and_continues_without_old_text_blockers(
         retained['bytes']=Path(retained['old']['plan_path']).read_bytes()
         assert conflict in retained['bytes'].decode()
         report=render_report(e.state,e.root).read_text()
-        assert '对应性复核 待复核' in report and conflict in report
+        assert '对应性意见：尚未记录' in report and '对应性意见：no_issue_found' in report and conflict in report
         assert json.loads((e.root/'research.json').read_text())['assessments']==index['assessments']
         # A passing process and a new no-issue review cannot silently resolve old counterevidence.
         return review_step()(state)
@@ -988,4 +988,4 @@ def test_zero_review_budget_keeps_measured_violation_unconfirmed(tmp_path):
     assert state.units[0].remaining_obligation_ids and state.usage['agent_calls']==4
     from consensus_assurance.reporting.chinese import render_report
     text=render_report(state,e.root).read_text()
-    assert '**已确认违反**' not in text and '对应性复核 待复核' in text
+    assert '**已确认违反**' not in text and '机械比较：观察到违反' in text and '对应性意见：尚未记录' in text

@@ -941,7 +941,8 @@ def test_knowledge_growth_preserves_execution_and_supplies_the_next_check(tmp_pa
         sub,files=recording_first(state)
         if variant=='shared':
             spec=json.loads(files['map.json'])
-            spec['behaviors'][0]['unknowns']=['Does the local boundary overflow?', 'Clearing schedules remain independent']
+            spec['behaviors'][0]['unknowns']=['Does the local boundary overflow?', 'The boundary checker correspondence is pending', 'Clearing schedules remain independent']
+            spec['core_overview']['open_details'].insert(0,'The boundary checker correspondence is pending')
             spec['surfaces']=[dict(entry_point='local-return',disposition='deferred',source_ids=['code'],reason='Does the local boundary overflow?')]
             files['map.json']=json.dumps(spec)
         return sub,files
@@ -950,6 +951,7 @@ def test_knowledge_growth_preserves_execution_and_supplies_the_next_check(tmp_pa
         snapshots['claim']=state['claims'][0]
         snapshots['artifact']=state['direct_checks'][0]
         snapshots['check']=next(c for c in state['checks'] if c['action']=='direct_check')
+        snapshots['review']=state['semantic_reviews'][0]
         assert state['monitor_results'][0]['reviewed_complete']
         raw,files=record_map(state,variant=='refined')
         if variant=='shared':
@@ -973,6 +975,11 @@ def test_knowledge_growth_preserves_execution_and_supplies_the_next_check(tmp_pa
             raw['feedback']['remaining']=original['feedback']['remaining']
             spec=json.loads(files['map.json'])
             spec['behaviors'][0]['unknowns']=['Clearing schedules remain independent']
+            spec['behaviors'][0]['important_branches']=['Returning the local result and retaining it in records are separate effects; clearing records does not retract an already returned value.']
+            spec['core_overview']['open_details'].remove('The boundary checker correspondence is pending')
+            raw['map_changes']['core_overview']=dict(impact='clarification',source_ids=['code'],
+                rationale='Remove completed checker work from semantic unknowns at the consumer-map handoff',
+                preserves='Execution and review remain in their exact records; no requirement, history or dependency changes')
             spec['surfaces'][0].update(disposition='mapped',behavior_ids=['call'],
                 reason='The admitted boundary call takes the increment branch; its local overflow was checked. Other callers and clearing schedules remain independent.')
             raw['map_changes']['surface:local-return']=dict(impact='clarification',source_ids=['code'],
@@ -985,6 +992,9 @@ def test_knowledge_growth_preserves_execution_and_supplies_the_next_check(tmp_pa
         spec=json.loads(Path(state['audit_spec_path']).read_text())
         spec['surfaces'].append(dict(entry_point='clear_records',disposition='deferred',source_ids=['code'],reason='Uninvestigated record lifetime'))
         return dict(action='research',map_path='map.json',rationale='Record a remaining boundary'),{'map.json':json.dumps(spec)}
+    def next_check(state):
+        assert len(state['monitor_results'])==1 and state['monitor_results'][0]['claim_id']=='bounded'
+        return record_obligation(state)
     def resume_first(state):
         c=state['question_candidates'][0];q=dict(c['question']);q.pop('audit_spec_version')
         return dict(action='continue',candidate_id=c['id'],question=q,feedback=feedback(state),
@@ -1038,7 +1048,7 @@ def test_knowledge_growth_preserves_execution_and_supplies_the_next_check(tmp_pa
         return raw,files
     steps=[initial,check_step(),review_inherit]
     if variant=='shared':steps += [explore,handoff,unrelated_handoff]
-    steps += [enrich,record_obligation,review_inherit,more]
+    steps += [enrich,next_check,review_inherit,more]
     if variant=='interference':steps += [noop]
     steps += [resume_first,third]
     if variant=='interference':steps += [resolve]
@@ -1073,13 +1083,18 @@ def test_knowledge_growth_preserves_execution_and_supplies_the_next_check(tmp_pa
         assert e.state.audit_spec_version==1
         e.graph_commit_hook=lambda key:None
         from consensus_assurance.reporting.chinese import render_report
-        render_report(e.state,e.root)
+        before=e.state.model_dump(mode='json')
+        text=render_report(e.state,e.root).read_text()
+        assert 'The boundary checker correspondence is pending' in text and '地图 v1' in text
+        assert '对应性意见：no_issue_found' in text and '**已确认违反**' in text
+        assert e.state.model_dump(mode='json')==before
         state=e.resume()
     else:state=e.start(repo)
     assert not diagnostics(e),diagnostics(e)
     assert state.audit_spec_version==3 and len(state.units)==2
     assert state.claims[0].model_dump(mode='json')==snapshots['claim']
     assert state.direct_checks[0].model_dump(mode='json')==snapshots['artifact']
+    assert state.semantic_reviews[0].model_dump(mode='json')==snapshots['review']
     assert next(c for c in state.checks if c.id==snapshots['check']['id']).model_dump(mode='json')==snapshots['check']
     assert state.units[0].version==snapshots['unit']['version']==1 and state.units[0].status=='checked'
     assert not state.revisions and state.usage.get('revisions',0)==0 and state.usage['experiments']==(3 if variant=='shared' else 2)
@@ -1117,6 +1132,8 @@ def test_knowledge_growth_preserves_execution_and_supplies_the_next_check(tmp_pa
         assert (e.root/'audit-spec/v1.json').read_bytes()==snapshots['map1']
         spec=json.loads(Path(state.audit_spec_path).read_text())
         assert spec['behaviors'][0]['unknowns']==['Clearing schedules remain independent']
+        assert 'already returned value' in spec['behaviors'][0]['important_branches'][0]
+        assert 'The boundary checker correspondence is pending' not in json.dumps(spec)
         assert 'Does the local boundary overflow?' not in json.dumps(spec)
         assert compact['handoffs'][-1]['feedback']
         assert report.count('**已确认违反**')==1 and '未建立后果：' not in report

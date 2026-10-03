@@ -218,7 +218,7 @@ def test_mixed_report_reads_fixed_results_and_moves_without_side_effects(tmp_pat
         sub=json.loads(json.dumps(sub).replace('"bounded"','"pending-bound"').replace('"binding"','"pending-binding"'))
         sub['question']['question']='Does the second public entry preserve the local bound?'
         return sub,{}
-    steps=[initial,encoded_check(broken=True),encoded_check(revise=True),review,second,review_step(),explained,
+    steps=[initial,encoded_check(broken=True),encoded_check(revise=True),review,second,explained,
         independent_issue,explore,explore,retain,explore,fact_feedback,contract_question,paused_contract,unconstructed,stop]
     e,repo=engine_for(tmp_path,steps);e.agent.mock=False;e.config.execution_isolation='bwrap'
     (repo/'target.py').write_text('def step(value, limit):\n    return value + 1 if value <= limit else 0\n')
@@ -226,7 +226,7 @@ def test_mixed_report_reads_fixed_results_and_moves_without_side_effects(tmp_pat
     e.config.budget.audit_units=3
     state=e.start(repo)
     assert not list((e.root/'submissions').glob('*/diagnostics.json')),state.stop_reason
-    assert [r['disposition'] for r in view(state)['conclusions']]==['confirmed_in_scope','bounded_no_violation']
+    assert [r['disposition'] for r in view(state)['conclusions']]==['confirmed_in_scope','investigation_lead']
     assert state.usage['experiments']==6 and len(state.claims)==3
     index=json.loads((e.root/'research.json').read_text())
     assert [len(entry['feedback']) for entry in index['explorations']]==[1,1,0]
@@ -234,6 +234,7 @@ def test_mixed_report_reads_fixed_results_and_moves_without_side_effects(tmp_pat
     old=state.direct_checks[0];old_check=next(c for c in state.checks if c.direct_check_id==old.id)
     current=state.direct_checks[1];exploration=next(c for c in state.checks if c.action=='exploration')
     monkeypatch.setattr(ProcessRunner,'run',lambda *a,**kw:(_ for _ in ()).throw(AssertionError('Report cannot execute')))
+    monkeypatch.setattr('consensus_assurance.workflow.direct_checks.compute_assessment',lambda *a,**kw:(_ for _ in ()).throw(AssertionError('Report cannot assess')))
     monkeypatch.setitem(EXECUTION_BACKENDS,'python',lambda *a,**kw:(_ for _ in ()).throw(AssertionError('Report cannot assemble')))
     moved=tmp_path/'moved';shutil.copytree(e.root,moved)
     read_text=Path.read_text
@@ -244,7 +245,13 @@ def test_mixed_report_reads_fixed_results_and_moves_without_side_effects(tmp_pat
     before={p.relative_to(moved):p.read_bytes() for p in moved.rglob('*') if p.is_file()}
     saved=state.model_dump(mode='json');text=render_report(state,moved).read_text()
     assert state.model_dump(mode='json')==saved and all((moved/p).read_bytes()==v for p,v in before.items())
-    assert '**已确认违反**' in text and '**有限检查未见违反**' in text and '源码解释' in text
+    assert '**已确认违反**' in text and '**待调查线索**' in text and '源码解释' in text
+    table=text.split('## 主要结果')[1].split('### 1.')[0]
+    rows=[line for line in table.splitlines() if line.startswith('|')]
+    for claim in ('bounded','interior','pending-bound'):
+        assert sum(f'[{claim}](' in line for line in rows)==1
+    pending=next(line for line in rows if '[interior](' in line)
+    assert '待调查线索' in pending and '有限检查未见违反' in pending and '对应性意见：尚未记录' in pending
     assert '边界返回责任' in text and '本次完整观察返回 4' in text
     assert 'Candidate 5 项；当前 Unit 3 项、义务 3 项、固定检查制品 2 项' in text
     assert text.count('保存的语义未知：The timing contract is unacquired')==1
@@ -255,6 +262,9 @@ def test_mixed_report_reads_fixed_results_and_moves_without_side_effects(tmp_pat
     assert 'external repeat policy' in text and 'Acquire the caller repeat contract' in text
     assert old_check.id in text and current.plan_path.split('/direct-checks/')[1] in text
     assert exploration.id in text and text.count('该问题保留的失败执行')==1
+    timeline=text.split('## 研究过程与认识增长')[1].split('## 当前未决事项')[0]
+    assert '受理 review：边界返回责任' in timeline and 'Retain the conditional output and missing responsibility' in timeline
+    assert 'Under the chosen repeat policy the actual returns were 3 and 4.' not in timeline
     assert text.count('实际观察已保存，尚待解释')==1 and 'external caller may have another boundary' in text
     assert text.count('后续受理解释（执行 ')==1 and '该交接当时的剩余问题（非当前欠账）' in text
     unresolved=text.split('## 当前未决事项')[1]
@@ -275,6 +285,21 @@ def test_mixed_report_reads_fixed_results_and_moves_without_side_effects(tmp_pat
     for p in links:
         if p.startswith('#'):assert f'id="{p[1:]}"' in text
         else:assert not Path(unquote(p)).is_absolute() and (moved/unquote(p)).is_file()
+    # Distinct obligations keep their identities even under one recorded owner.
+    grouped=state.model_copy(deep=True)
+    previous=grouped.units[1].candidate_id
+    grouped.units[1].candidate_id=grouped.units[0].candidate_id
+    grouped.question_candidates=[c for c in grouped.question_candidates if c.id!=previous]
+    grouped.question_candidates[0].resume_conditions=['Obtain the independent caller lifetime contract']
+    combined=render_report(grouped,moved).read_text()
+    table=combined.split('## 主要结果')[1].split('### 1.')[0]
+    assert table.count('[bounded](')==1 and table.count('[interior](')==1
+    assert 'Obtain the independent caller lifetime contract' in combined
+    assert grouped.monitor_results==state.monitor_results
+    legacy=state.model_copy(deep=True)
+    for key in ('correspondence','bounded_complete','reviewed_complete'):legacy.monitor_results[1].pop(key)
+    legacy_text=render_report(legacy,moved).read_text()
+    assert '对应性意见：信息不足' in legacy_text and '独立场景完整处置：未记录' in legacy_text
     (moved/Path(check.stdout).relative_to(e.root)).unlink()
     missing=render_report(state,moved).read_text()
     assert '部分归档事件缺失' in missing and '**已确认违反**' in missing
