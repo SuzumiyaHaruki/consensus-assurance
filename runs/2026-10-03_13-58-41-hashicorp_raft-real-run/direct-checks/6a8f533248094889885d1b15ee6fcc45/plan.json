@@ -1,0 +1,172 @@
+{
+  "description": "Execute a same-history sequence: A obtains term-2 vote at V; B obtains a term-3 majority from A+self without V, appends its no-op and replicates to V; B later attempts term-4 vote at V with candidate-key success or injected unchanged-key failure; A electSelf produces a term-4 stale request. Observe whether V grants A, and all intermediate stored vote keys.",
+  "claim_id": "claim-vote-freshness-after-write-error",
+  "binding_ids": [
+    "bind-vote-pair-write",
+    "bind-vote-pair-consume"
+  ],
+  "harness": {
+    "files": {},
+    "kind": "go_test",
+    "source": "package raft\n\nimport (\n \"bytes\"\n \"encoding/json\"\n \"fmt\"\n \"io\"\n \"sync\"\n \"testing\"\n \"time\"\n)\n\ntype assuranceFailCandidate struct { *InmemStore; armed bool; failures int }\nfunc (s *assuranceFailCandidate) Set(k, v []byte) error {\n if s.armed && bytes.Equal(k, keyLastVoteCand) { s.armed=false; s.failures++; return fmt.Errorf(\"injected candidate write failure\") }\n return s.InmemStore.Set(k,v)\n}\ntype assuranceVoteRecord struct { candidate ServerID; term uint64; granted bool }\ntype assuranceVoteNetwork struct {\n sync.Mutex\n nodes map[ServerID]*Raft\n blocked map[string]bool\n history []assuranceVoteRecord\n final bool\n operation string\n}\ntype assuranceVoteTransport struct { *InmemTransport; id ServerID; net *assuranceVoteNetwork }\nfunc assuranceVoteEmit(e map[string]interface{}) { b,err:=json.Marshal(e);if err!=nil {panic(err)};fmt.Println(\"CA_EVENT \"+string(b)) }\nfunc (x *assuranceVoteTransport) RequestVote(id ServerID, addr ServerAddress, req *RequestVoteRequest, resp *RequestVoteResponse) error {\n x.net.Lock()\n blocked:=x.net.blocked[string(x.id)+\":\"+string(id)]\n node:=x.net.nodes[id]\n final:=x.net.final && x.id==\"a\" && id==\"v\"\n prior:=false\n for _,h:=range x.net.history { if h.term==req.Term && h.candidate==x.id && h.granted {prior=true} }\n x.net.Unlock()\n if blocked { return fmt.Errorf(\"scheduled message omission\") }\n if final {\n  idx,term:=node.getLastEntry()\n  stale:=req.LastLogTerm<term || (req.LastLogTerm==term && req.LastLogIndex<idx)\n  assuranceVoteEmit(map[string]interface{}{\"event\":\"vote_admitted\",\"operation\":x.net.operation,\"request_term\":req.Term,\"candidate\":string(x.id),\"candidate_index\":req.LastLogIndex,\"candidate_log_term\":req.LastLogTerm,\"receiver_index\":idx,\"receiver_log_term\":term,\"candidate_stale\":stale,\"prior_same_term_grant\":prior})\n }\n ch:=make(chan RPCResponse,1)\n node.processRPC(RPC{Command:req,RespChan:ch})\n result:=<-ch\n if result.Error!=nil {return result.Error}\n *resp=*(result.Response.(*RequestVoteResponse))\n if id==\"v\" { x.net.Lock(); x.net.history=append(x.net.history,assuranceVoteRecord{x.id,req.Term,resp.Granted}); x.net.Unlock() }\n if final {\n  vt,_:=node.stable.GetUint64(keyLastVoteTerm);vc,_:=node.stable.Get(keyLastVoteCand)\n  assuranceVoteEmit(map[string]interface{}{\"event\":\"vote_result\",\"operation\":x.net.operation,\"granted\":resp.Granted,\"response_term\":resp.Term,\"stored_vote_term\":vt,\"stored_candidate\":string(vc),\"rpc_completed\":true})\n }\n return nil\n}\nfunc (x *assuranceVoteTransport) AppendEntries(id ServerID, addr ServerAddress, req *AppendEntriesRequest, resp *AppendEntriesResponse) error {\n ch:=make(chan RPCResponse,1);x.net.nodes[id].processRPC(RPC{Command:req,RespChan:ch});v:=<-ch\n if v.Error!=nil{return v.Error};*resp=*(v.Response.(*AppendEntriesResponse));return nil\n}\nfunc assuranceCampaign(t *testing.T,r *Raft) int {\n t.Helper();r.setState(Candidate);ch:=r.electSelf();grants:=0\n for i:=0;i<3;i++ { select {case v:=<-ch:if v.Granted {grants++};case <-time.After(time.Second):t.Fatal(\"campaign response missing\")} }\n return grants\n}\nfunc TestAssurancePartialVotePair(t *testing.T) {\n for _,fault:=range []bool{false,true} {\n  name:=\"successful_write_control\";if fault{name=\"failed_candidate_write\"}\n  t.Run(name,func(t *testing.T){\n   cfgs:=Configuration{Servers:[]Server{{ID:\"a\",Address:\"a\",Suffrage:Voter},{ID:\"b\",Address:\"b\",Suffrage:Voter},{ID:\"v\",Address:\"v\",Suffrage:Voter}}}\n   net:=&assuranceVoteNetwork{nodes:map[ServerID]*Raft{},blocked:map[string]bool{},operation:name}\n   var receiverStore *assuranceFailCandidate\n   for _,server:=range cfgs.Servers {\n    cfg:=DefaultConfig();cfg.LocalID=server.ID;cfg.ProtocolVersion=3;cfg.PreVoteDisabled=true;cfg.skipStartup=true;cfg.LogOutput=io.Discard\n    _,base:=NewInmemTransport(server.Address);tr:=&assuranceVoteTransport{base,server.ID,net}\n    store:=NewInmemStore();stable:=&assuranceFailCandidate{InmemStore:store};if server.ID==\"v\"{receiverStore=stable}\n    snaps:=NewInmemSnapshotStore();if err:=BootstrapCluster(cfg,store,stable,snaps,tr,cfgs);err!=nil{t.Fatal(err)}\n    r,err:=NewRaft(cfg,&MockFSM{},store,stable,snaps,tr);if err!=nil{t.Fatal(err)};net.nodes[server.ID]=r\n   }\n   defer func(){for _,r:=range net.nodes{r.Shutdown().Error()}}()\n   a,b,v:=net.nodes[\"a\"],net.nodes[\"b\"],net.nodes[\"v\"]\n   // A's term-2 campaign executes real grants. Delay its main-loop tally;\n   // B's later term-3 campaign can arrive while A is still a candidate.\n   if assuranceCampaign(t,a)!=3 {t.Fatal(\"initial campaign grants missing\")}\n   net.blocked[\"b:v\"]=true\n   if assuranceCampaign(t,b)!=2 {t.Fatal(\"B did not get A+self majority\")}\n   b.setState(Leader);b.setLeader(b.localAddr,b.localID);b.setupLeaderState()\n   // Prepare the same initial replication state as a new leader, before noop.\n   repl:=&followerReplication{lastContact:time.Now(),peer:cfgs.Servers[2],commitment:b.leaderState.commitment,currentTerm:b.getCurrentTerm(),nextIndex:b.getLastIndex()+1,stopCh:make(chan uint64,1),triggerCh:make(chan struct{},1),notify:map[*verifyFuture]struct{}{},stepDown:b.leaderState.stepDown}\n   b.leaderState.replState[\"v\"]=repl\n   b.leaderState.replState[\"a\"]=&followerReplication{peer:cfgs.Servers[0],lastContact:time.Now(),triggerCh:make(chan struct{},1)}\n   noop:=&logFuture{log:Log{Type:LogNoop}};noop.init();b.dispatchLogs([]*logFuture{noop})\n   if b.replicateTo(repl,b.getLastIndex()){t.Fatal(\"replication stopped\")}\n   // V learns term-3 history through AppendEntries, without voting for B.\n   vi,vt:=v.getLastEntry();ai,at:=a.getLastEntry()\n   oldTerm,_:=receiverStore.GetUint64(keyLastVoteTerm);oldCand,_:=receiverStore.Get(keyLastVoteCand)\n   if oldTerm!=2 || string(oldCand)!=\"a\" || !(vt>at || (vt==at && vi>ai)) {t.Fatal(\"prefix did not establish old vote and newer receiver log\")}\n   // Let contacts expire, execute the real lease check, then the real follower\n   // timeout path. No peers respond during this scheduled interval.\n   time.Sleep(b.config().LeaderLeaseTimeout+10*time.Millisecond)\n   b.checkLeaderLease()\n   if b.getState()!=Follower {t.Fatal(\"lease did not remove leader authority\")}\n   b.setLastContact() // runLeader exit performs this update before follower loop.\n   b.runFollower()\n   if b.getState()!=Candidate {t.Fatal(\"follower timeout did not start campaign\")}\n   net.blocked[\"b:v\"]=false;net.blocked[\"b:a\"]=true\n   receiverStore.armed=fault\n   grants:=assuranceCampaign(t,b)\n   bGranted:=grants==2\n   pairTerm,_:=receiverStore.GetUint64(keyLastVoteTerm);pairCand,_:=receiverStore.Get(keyLastVoteCand)\n   assuranceVoteEmit(map[string]interface{}{\"event\":\"vote_prefix\",\"operation\":name,\"old_vote_term\":oldTerm,\"old_candidate\":string(oldCand),\"receiver_index\":vi,\"receiver_log_term\":vt,\"stale_index\":ai,\"stale_log_term\":at,\"intervening_granted\":bGranted,\"write_failures\":receiverStore.failures,\"pair_term\":pairTerm,\"pair_candidate\":string(pairCand)})\n   // A learned term 3 when it granted B's prior election, but missed B's\n   // new log. Its own electSelf therefore produces a real stale term-4 RPC.\n   net.blocked[\"a:b\"]=true;net.final=true\n   assuranceCampaign(t,a)\n  })\n }\n}\n",
+    "description": "Three bootstrapped real Raft states; actual electSelf, requestVote, dispatchLogs, replicateTo and appendEntries. Synchronous transport substitutes RPC scheduling while preserving actual requests/responses.",
+    "semantic_changes": [
+      "No target source edits. skipStartup suppresses background loops; driver schedules campaigns and state transitions serially.",
+      "A term-2 election result is collected by the driver but its main-loop majority transition is delayed; B term-3 request reaches A while A is still Candidate, causing the real higher-term handler transition.",
+      "B majority transition is performed by the driver after observed A+self grants. Driver initializes one replication state matching startStopReplication and uses actual dispatchLogs/replicateTo for the term-3 no-op.",
+      "After the no-op replication, the driver lets the configured lease interval expire, invokes actual checkLeaderLease, performs the sourced runLeader-exit last-contact update and runs actual runFollower to its candidate transition. The enclosing runLeader cleanup is not executed; no prior replication worker remains running.",
+      "Transport replaces delivery with synchronous processRPC calls and explicit omissions; each candidate request comes from electSelf. No reply is forged.",
+      "StableStore wrapper returns one candidate-key Set error without changing the key; all other writes delegate to InmemStore. Successful-write control uses the same history without that error."
+    ],
+    "prerequisites": [
+      {
+        "alias": "prefix",
+        "event": "vote_prefix",
+        "conditions": [
+          {
+            "field": "old_vote_term",
+            "op": "eq",
+            "value": 2,
+            "reference": null
+          },
+          {
+            "field": "old_candidate",
+            "op": "eq",
+            "value": "a",
+            "reference": null
+          },
+          {
+            "field": "pair_term",
+            "op": "eq",
+            "value": 4,
+            "reference": null
+          }
+        ]
+      },
+      {
+        "alias": "admitted",
+        "event": "vote_admitted",
+        "conditions": [
+          {
+            "field": "request_term",
+            "op": "eq",
+            "value": null,
+            "reference": "prefix.pair_term"
+          },
+          {
+            "field": "candidate_stale",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          },
+          {
+            "field": "prior_same_term_grant",
+            "op": "eq",
+            "value": false,
+            "reference": null
+          }
+        ]
+      }
+    ],
+    "legality": {
+      "source_ids": [
+        "src-stable-interface",
+        "src-durable-term-vote",
+        "src-vote-handler",
+        "src-vote-producer",
+        "src-startup",
+        "src-bootstrap",
+        "src-campaign",
+        "src-dispatch-config",
+        "src-replicate",
+        "src-follower-append",
+        "src-repl-lifecycle",
+        "src-inmem-store-driver",
+        "src-transfer-lease",
+        "src-leader-context"
+      ],
+      "expectation_ids": [],
+      "binding_ids": [
+        "bind-vote-pair-write",
+        "bind-vote-pair-consume"
+      ],
+      "derivation": "Bootstrap creates a fixed three-voter configuration. Actual A term-2 campaign saves A at V. B term-3 wins A+self while V delivery is omitted; therefore V need not have voted for B to legally receive B history. Actual dispatchLogs creates the higher-term no-op and replicateTo/appendEntries stores it at V while A remains behind. A learned term 3 by granting B and later electSelf advances it to 4 using its actual old last-log tuple. B term-4 request has the fresh tuple; the failed candidate-key write leaves old A with successfully stored term 4. The driver invokes checkLeaderLease after configured contact expiry, then actual runFollower reaches Candidate on its heartbeat timeout. It substitutes enclosing leader-loop cleanup, performing its last-contact update; this does not alter V vote memory or supply the tested grant. Individual successful stable writes remain intact, and the failed Set returns an ordinary error without corruption. The driver does not fake a prior same-term grant: history of actual V responses is inspected at final admission.",
+      "applicability": "Local RequestVote freshness after a partial vote persistence error, plus same-sequence successful-write control. Fixed IDs/addresses, no concurrent node mutation during each phase.",
+      "unresolved": [],
+      "conflicts": [],
+      "alternatives": [
+        "Actual lease checking and follower timeout execute, but the driver replaces enclosing runLeader setup/cleanup and final majority handling; no stale leader election endpoint is claimed.",
+        "Storage backends that stop the process instead of returning the injected error do not exercise this conditional continuation."
+      ]
+    }
+  },
+  "monitors": [
+    {
+      "id": "monitor-vote-freshness",
+      "checker_id": "vote-freshness",
+      "event": "vote_result",
+      "binding_ids": [
+        "bind-vote-pair-write",
+        "bind-vote-pair-consume"
+      ],
+      "grounding": {
+        "source_ids": [
+          "src-stable-interface",
+          "src-durable-term-vote",
+          "src-vote-handler",
+          "src-vote-producer",
+          "src-startup",
+          "src-bootstrap",
+          "src-campaign",
+          "src-dispatch-config",
+          "src-replicate",
+          "src-follower-append",
+          "src-repl-lifecycle",
+          "src-inmem-store-driver",
+          "src-transfer-lease",
+          "src-leader-context"
+        ],
+        "expectation_ids": [],
+        "binding_ids": [
+          "bind-vote-pair-write",
+          "bind-vote-pair-consume"
+        ],
+        "derivation": "Admission independently computes log staleness from actual request and receiver log tuples and checks actual prior V response history for same candidate/term grant. Compare the subsequent actual Granted response with false. Distinct operation names correlate each control/discriminator prefix, admission and completed reply. The result is emitted even when granted, not filtered by expected outcome.",
+        "applicability": "A log-stale request without previous same-term grant; fault branch has the documented partial pair and successful control has the other candidate saved.",
+        "unresolved": [],
+        "conflicts": [],
+        "alternatives": []
+      },
+      "applicability_conditions": [],
+      "admission_alias": "admitted"
+    }
+  ],
+  "observable_properties": [
+    {
+      "checker_id": "vote-freshness",
+      "kind": "event_assertion",
+      "trigger": {
+        "field": "event",
+        "op": "eq",
+        "value": "vote_result",
+        "reference": null
+      },
+      "assertion": {
+        "field": "granted",
+        "op": "eq",
+        "value": false,
+        "reference": null
+      },
+      "antecedent": null,
+      "identity_fields": [
+        "operation"
+      ],
+      "description": "The stale candidate without a previous same-term grant must be denied; a new term paired with an old candidate after Set failure cannot serve as an eligibility exception."
+    }
+  ],
+  "uncertainties": [
+    "No particular production storage backend is exercised; the error-return model is explicit.",
+    "Actual election RPC producers, log replication, lease checking and follower timeout execute; enclosing loop setup/cleanup and majority transitions remain driver-controlled.",
+    "No final stale-leader election or loss of a committed command is observed."
+  ]
+}

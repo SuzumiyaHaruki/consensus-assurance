@@ -1,0 +1,103 @@
+{
+  "description": "Elect a one-voter node from declared snapshot, commit a joint change adding a learner, then compare returned configuration policy to immediate Status. Run implicit true and explicit false modes. Finish all Ready work regardless of observed comparison.",
+  "claim_id": "o-status-autoleave-copy",
+  "binding_ids": [
+    "bind-config-clone"
+  ],
+  "harness": {
+    "files": {},
+    "kind": "go_test",
+    "source": "package raft\nimport (\n \"encoding/json\"\n \"fmt\"\n \"testing\"\n pb \"go.etcd.io/raft/v3/raftpb\"\n)\nfunc TestAssuranceStatusAutoLeaveCopy(t *testing.T) {\n for _,implicit:=range []bool{true,false} {\n  name:=\"explicit\"; transition:=pb.ConfChangeTransitionJointExplicit\n  if implicit {name=\"implicit\";transition=pb.ConfChangeTransitionJointImplicit}\n  t.Run(name,func(t *testing.T) {\n   emit:=func(v map[string]interface{}) {v[\"case\"]=name;v[\"node\"]=uint64(1);b,err:=json.Marshal(v);if err!=nil {t.Fatal(err)};fmt.Println(\"CA_EVENT \"+string(b))}\n   st:=NewMemoryStorage()\n   if err:=st.ApplySnapshot(pb.Snapshot{Metadata:pb.SnapshotMetadata{Index:1,Term:1,ConfState:pb.ConfState{Voters:[]uint64{1}}}});err!=nil {t.Fatal(err)}\n   if err:=st.SetHardState(pb.HardState{Term:1,Commit:1});err!=nil {t.Fatal(err)}\n   rn,err:=NewRawNode(&Config{ID:1,Storage:st,Applied:1,ElectionTick:10,HeartbeatTick:1,MaxSizePerMsg:4096,MaxInflightMsgs:256})\n   if err!=nil {t.Fatal(err)}\n   applied:=uint64(1);observed:=false\n   pump:=func() {\n    for step:=0;step<100 && rn.HasReady();step++ {\n     rd:=rn.Ready()\n     if !IsEmptySnap(rd.Snapshot) {t.Fatal(\"unexpected snapshot\")}\n     if err:=st.Append(rd.Entries);err!=nil {t.Fatal(err)}\n     if !IsEmptyHardState(rd.HardState) {if err:=st.SetHardState(rd.HardState);err!=nil {t.Fatal(err)}}\n     for _,e:=range rd.CommittedEntries {\n      if e.Index!=applied+1 {t.Fatal(\"apply order\")}\n      if e.Type==pb.EntryConfChangeV2 {\n       var cc pb.ConfChangeV2;if err:=cc.Unmarshal(e.Data);err!=nil {t.Fatal(err)}\n       cs:=rn.ApplyConfChange(cc)\n       // Observe only the entering operation, by its nonempty Changes identity;\n       // this selects both true and false modes independently of the result.\n       if len(cc.Changes)>0 {\n        if observed {t.Fatal(\"duplicate entering change\")};observed=true\n        emit(map[string]interface{}{\"event\":\"configuration_installed\",\"index\":e.Index,\"auto_leave\":cs.AutoLeave,\"outgoing_count\":len(cs.VotersOutgoing)})\n        status:=rn.Status()\n        emit(map[string]interface{}{\"event\":\"status_copy\",\"index\":e.Index,\"auto_leave\":status.Config.AutoLeave,\"outgoing_count\":len(status.Config.Voters[1]),\"observed\":true})\n       }\n      } else if e.Type!=pb.EntryNormal {t.Fatal(\"unexpected entry\")}\n      applied=e.Index\n     }\n     // Outgoing messages can target the newly added learner 2. They are\n     // dropped by the isolated transport; all voters are node 1 in both sets.\n     rn.Advance(rd)\n    }\n    if rn.HasReady() {t.Fatal(\"work bound exceeded\")}\n   }\n   if err:=rn.Campaign();err!=nil {t.Fatal(err)};pump()\n   if rn.Status().RaftState!=StateLeader {t.Fatal(\"election failed\")}\n   cc:=pb.ConfChangeV2{Transition:transition,Changes:[]pb.ConfChangeSingle{{Type:pb.ConfChangeAddLearnerNode,NodeID:2}}}\n   if err:=rn.ProposeConfChange(cc);err!=nil {t.Fatal(err)};pump()\n   if !observed {t.Fatal(\"configuration was not applied\")}\n   emit(map[string]interface{}{\"event\":\"run_completed\",\"applied\":applied})\n  })\n }\n}\n",
+    "description": "Public RawNode APIs and MemoryStorage; actual self-vote persistence and commit drive the configuration. Transport drops learner-bound messages, which do not contribute to either voter quorum.",
+    "semantic_changes": [
+      "Only host instrumentation and declared initial snapshot; no target mutation."
+    ],
+    "prerequisites": [
+      {
+        "alias": "installed",
+        "event": "configuration_installed",
+        "conditions": []
+      }
+    ],
+    "legality": {
+      "source_ids": [
+        "s-raw-api",
+        "s-ready-contract",
+        "s-config-changer",
+        "s-node-contract",
+        "s-restart"
+      ],
+      "expectation_ids": [
+        "s-raw-api",
+        "s-ready-contract",
+        "s-node-contract"
+      ],
+      "binding_ids": [],
+      "derivation": "RawNode used serially; entries and HardState saved before Advance, configurations applied consecutively. Status is an allowed synchronous observation between ApplyConfChange and Advance. Both voter halves are node 1, so no learner acknowledgment is needed.",
+      "applicability": "No crashes; initial snapshot substitutes bootstrap only.",
+      "unresolved": [],
+      "conflicts": [],
+      "alternatives": []
+    }
+  },
+  "monitors": [
+    {
+      "id": "monitor-copy",
+      "checker_id": "status-policy-copy",
+      "event": "status_copy",
+      "binding_ids": [
+        "bind-config-clone"
+      ],
+      "grounding": {
+        "source_ids": [
+          "s-config-clone",
+          "s-status-config-copy",
+          "s-config-changer",
+          "s-auto-field-contract"
+        ],
+        "expectation_ids": [
+          "s-config-clone",
+          "s-auto-field-contract"
+        ],
+        "binding_ids": [
+          "bind-config-clone"
+        ],
+        "derivation": "Compare Status.Config.AutoLeave to the actual immediately preceding ApplyConfChange return, using index/case/node as identity. The expected value is observed from configuration installation, not precomputed from the desired failure.",
+        "applicability": "Same-thread observation before Advance or further protocol calls can mutate configuration.",
+        "unresolved": [],
+        "conflicts": [],
+        "alternatives": []
+      },
+      "applicability_conditions": [],
+      "admission_alias": "installed"
+    }
+  ],
+  "observable_properties": [
+    {
+      "checker_id": "status-policy-copy",
+      "kind": "event_assertion",
+      "trigger": {
+        "field": "observed",
+        "op": "eq",
+        "value": true,
+        "reference": null
+      },
+      "assertion": {
+        "field": "auto_leave",
+        "op": "eq",
+        "value": null,
+        "reference": "installed.auto_leave"
+      },
+      "antecedent": null,
+      "identity_fields": [
+        "case",
+        "node",
+        "index"
+      ],
+      "description": "Immediate Status must preserve the actual installed AutoLeave value for this configuration operation."
+    }
+  ],
+  "uncertainties": [
+    "This measures status reporting only; no live configuration mutation or external consumer effect is attributed."
+  ]
+}
