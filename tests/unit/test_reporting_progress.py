@@ -1,5 +1,6 @@
 from consensus_assurance.core.types import CheckRun, ExecutionStatus
 from consensus_assurance.reporting.chinese import render_report, execution_summary
+import pytest
 
 
 def test_audit_receipt_is_not_a_property_verdict(tmp_path):
@@ -139,7 +140,8 @@ def test_agent_reads_work_index_after_action_checkpoint_report_and_resume(tmp_pa
     assert progress()=='execution_incomplete'
 
 
-def test_mixed_report_reads_fixed_results_and_moves_without_side_effects(tmp_path,monkeypatch):
+@pytest.mark.parametrize('reviewed',[False,True])
+def test_mixed_report_reads_fixed_results_and_moves_without_side_effects(tmp_path,monkeypatch,reviewed):
     import json,re,shutil
     from pathlib import Path
     from urllib.parse import unquote
@@ -161,6 +163,7 @@ def test_mixed_report_reads_fixed_results_and_moves_without_side_effects(tmp_pat
         def step(state):
             sub,files=check_step(**options)(state)
             plan=json.loads(files['plan.json'])
+            plan['harness']['semantic_changes'].append('A synchronous driver replaces external caller scheduling')
             plan['observable_properties'][0]['assertion']=dict(field='state.encoded',reference='start.state.encoded')
             files['plan.json']=json.dumps(plan)
             # A lossless string encoding of the existing boolean oracle, with a shared long prefix.
@@ -218,7 +221,7 @@ def test_mixed_report_reads_fixed_results_and_moves_without_side_effects(tmp_pat
         sub=json.loads(json.dumps(sub).replace('"bounded"','"pending-bound"').replace('"binding"','"pending-binding"'))
         sub['question']['question']='Does the second public entry preserve the local bound?'
         return sub,{}
-    steps=[initial,encoded_check(broken=True),encoded_check(revise=True),review,second,explained,
+    steps=[initial,encoded_check(broken=True),encoded_check(revise=True),review,second]+([review_step()] if reviewed else [])+[explained,
         independent_issue,explore,explore,retain,explore,fact_feedback,contract_question,paused_contract,unconstructed,stop]
     e,repo=engine_for(tmp_path,steps);e.agent.mock=False;e.config.execution_isolation='bwrap'
     (repo/'target.py').write_text('def step(value, limit):\n    return value + 1 if value <= limit else 0\n')
@@ -226,7 +229,7 @@ def test_mixed_report_reads_fixed_results_and_moves_without_side_effects(tmp_pat
     e.config.budget.audit_units=3
     state=e.start(repo)
     assert not list((e.root/'submissions').glob('*/diagnostics.json')),state.stop_reason
-    assert [r['disposition'] for r in view(state)['conclusions']]==['confirmed_in_scope','investigation_lead']
+    assert [r['disposition'] for r in view(state)['conclusions']]==['confirmed_in_scope','bounded_no_violation' if reviewed else 'investigation_lead']
     assert state.usage['experiments']==6 and len(state.claims)==3
     index=json.loads((e.root/'research.json').read_text())
     assert [len(entry['feedback']) for entry in index['explorations']]==[1,1,0]
@@ -245,13 +248,16 @@ def test_mixed_report_reads_fixed_results_and_moves_without_side_effects(tmp_pat
     before={p.relative_to(moved):p.read_bytes() for p in moved.rglob('*') if p.is_file()}
     saved=state.model_dump(mode='json');text=render_report(state,moved).read_text()
     assert state.model_dump(mode='json')==saved and all((moved/p).read_bytes()==v for p,v in before.items())
-    assert '**已确认违反**' in text and '**待调查线索**' in text and '源码解释' in text
+    assert '**已确认违反**' in text and ('**有限检查未见违反**' if reviewed else '**待调查线索**') in text and '源码解释' in text
     table=text.split('## 主要结果')[1].split('### 1.')[0]
     rows=[line for line in table.splitlines() if line.startswith('|')]
     for claim in ('bounded','interior','pending-bound'):
         assert sum(f'[{claim}](' in line for line in rows)==1
     pending=next(line for line in rows if '[interior](' in line)
-    assert '待调查线索' in pending and '有限检查未见违反' in pending and '对应性意见：尚未记录' in pending
+    assert '有限检查未见违反' in pending if reviewed else '待调查线索' in pending and '对应性意见：尚未记录' in pending
+    complete=next(line for line in rows if '[bounded](' in line)
+    assert '已确认违反' in complete and not any(label in complete for label in ('no_issue_found','机械比较','完整处置'))
+    assert text.count('本次完整观察返回 4，上限为 3。')==1 and 'A synchronous driver replaces external caller scheduling' in text
     assert '边界返回责任' in text and '本次完整观察返回 4' in text
     assert 'Candidate 5 项；当前 Unit 3 项、义务 3 项、固定检查制品 2 项' in text
     assert text.count('保存的语义未知：The timing contract is unacquired')==1
@@ -259,14 +265,18 @@ def test_mixed_report_reads_fixed_results_and_moves_without_side_effects(tmp_pat
     assert '实际取消' in text and '配置值不表示触发了超时' in text
     assert not re.search(r'^- \[.*：\s*$',text,re.M) and not re.search(r'恢复条件：\s*$',text,re.M)
     assert '| event | returned |' in text
-    assert 'external repeat policy' in text and 'Acquire the caller repeat contract' in text
+    assert 'external repeat policy' in text and 'Acquire the caller repeat contract' not in text
+    handoff=next(s for s in state.selections if s.get('feedback',{}).get('answered')=='Under the chosen repeat policy the actual returns were 3 and 4.')
+    assert 'Acquire the caller repeat contract' in (moved/f'submissions/{handoff["operation_id"]}/accepted.json').read_text()
     assert old_check.id in text and current.plan_path.split('/direct-checks/')[1] in text
     assert exploration.id in text and text.count('该问题保留的失败执行')==1
     timeline=text.split('## 研究过程与认识增长')[1].split('## 当前未决事项')[0]
     assert '受理 review：边界返回责任' in timeline and 'Retain the conditional output and missing responsibility' in timeline
+    visible_timeline=re.sub(r'\]\([^)]*\)',']',timeline)
+    assert re.search(r'\d+\.\d+ 分钟',timeline) and not re.search(r'\b[0-9a-f]{32}\b',visible_timeline)
     assert 'Under the chosen repeat policy the actual returns were 3 and 4.' not in timeline
     assert text.count('实际观察已保存，尚待解释')==1 and 'external caller may have another boundary' in text
-    assert text.count('后续受理解释（执行 ')==1 and '该交接当时的剩余问题（非当前欠账）' in text
+    assert text.count('后续受理解释（关联 2 次执行）')==1 and '该交接当时的剩余问题' not in text
     unresolved=text.split('## 当前未决事项')[1]
     assert 'Acquire the caller repeat contract' not in unresolved and '地图 v1' in unresolved
     assert 'x'*200 not in text and 'z'*200 not in text and '首尾预览' in text
@@ -277,7 +287,8 @@ def test_mixed_report_reads_fixed_results_and_moves_without_side_effects(tmp_pat
     assert '"bounded": true}' in text and '"bounded": false}' in text
     check=next(c for c in state.checks if c.direct_check_id==current.id)
     assert f'{check.id} / event[0] / state.encoded' in text and f'{check.id} / event[1] / state.encoded' in text
-    assert 'distributed consequences' in text and '没有正式性质判定' in execution_summary(exploration)[2]
+    assert '完整要求、假设与排除范围' in text and 'distributed consequences' in (moved/'state.json').read_text()
+    assert '没有正式性质判定' in execution_summary(exploration)[2]
     assert '_ca_stream' not in text and '_ca_observation' not in text and '<details>' not in text
     assert state.semantic_reviews[0].items[0].rationale not in text
     links=re.findall(r'\]\(([^)]+)\)',text)

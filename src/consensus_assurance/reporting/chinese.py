@@ -157,7 +157,7 @@ def interruption_lines(check, archive):
     return lines
 
 
-def milestone_lines(state, research, archive, checks):
+def milestone_lines(state, research, archive, checks, titles):
     """Keep readiness and actual executions regardless of product action labels."""
     selected = {}
     changes = [s for s in state.selections if s.get('map_updated')]
@@ -168,15 +168,14 @@ def milestone_lines(state, research, archive, checks):
             break
     growth = [s for s in state.selections if s.get('map_delta') or s.get('feedback',{}).get('understanding') == 'updated'
         or s.get('accepted_versions',{}).get('artifacts') or s.get('released_candidate_ids')]
-    for s in growth[-3:]+[s for s in state.selections if s['action']=='review' and 'accepted_versions' in s]:
-        targets = list(s.get('accepted_versions',{}).get('units',{}))+s.get('candidate_ids',[])
+    for s in growth[-3:]+[s for s in state.selections if s['action'] in {'review','pause','explained','continue','obligation'} and 'accepted_versions' in s]:
         title = next((i.report_title for r in state.semantic_reviews if r.check_id==s['operation_id'] for i in r.items if i.report_title),None)
-        selected.setdefault(s['operation_id'], (f'受理 {s["action"]}：'+excerpt(title or s['rationale'],140)+('；对象 '+', '.join(targets) if targets else ''),
+        selected.setdefault(s['operation_id'], (f'受理 {s["action"]}：'+excerpt(title or s['rationale'],140),
             archive.link(f'submissions/{s["operation_id"]}/accepted.json','完整交接')))
     current = {a['id'] for a in research['artifacts']}
     for check in checks.values():
         if check.action == 'exploration' or (check.direct_check_id) in current:
-            selected[check.id] = ('实际执行：'+'；'.join(execution_summary(check)[:2])+f'；对象 {check.direct_check_id or check.id}',archive.link(f'logs/{check.id}/check.json','执行记录'))
+            selected[check.id] = ('实际执行：'+excerpt(titles.get(check.id,execution_summary(check)[0]),140)+'；'+execution_summary(check)[1],archive.link(f'logs/{check.id}/check.json','执行记录'))
     interrupted = [c for c in checks.values() if c.action == 'agent_turn' and c.status != ExecutionStatus.COMPLETED]
     for check in interrupted[-3:]:
         selected[check.id] = ('Agent 调查中断；后续记录不抹掉此失败',archive.link(f'logs/{check.id}/check.json','中断记录'))
@@ -186,11 +185,8 @@ def milestone_lines(state, research, archive, checks):
         check = checks.get(id)
         timing = '时间未记录'
         if check and check.ended_at:
-            ended = datetime.fromisoformat(check.ended_at)
-            timing = ended.strftime('%H:%M:%S %z') + f'（距创建墙钟 {(ended-datetime.fromisoformat(state.created_at)).total_seconds():.1f} 秒，含暂停间隔）'
-            if check.started_at:
-                duration = (ended-datetime.fromisoformat(check.started_at)).total_seconds()
-                timing += f'；{"Agent 回合墙钟" if check.action == "agent_turn" else "目标工具耗时"} {duration:.2f} 秒'
+            minutes = (datetime.fromisoformat(check.ended_at)-datetime.fromisoformat(state.created_at)).total_seconds()/60
+            timing = f'{minutes:.2f} 分钟'
         lines += ['', '- '+timing+' · '+title+'。'+link]
         if check in interrupted and id != state.run_stop.get('operation_id'):
             lines += interruption_lines(check,archive)
@@ -220,11 +216,12 @@ def render_report(state, root):
     candidate_links = {c['id']:f'[候选 {n}](#candidate-{c["id"]})' for n,c in enumerate(ongoing,1)}
     claim_links = {c['id']:f'[{c["id"]}](#claim-{c["id"]})' for c in research['claims']}
     def progress_text(claim_id):
-        current = [p for u in research['units'] for p in u['progress'] if p['claim_id']==claim_id]
-        records = [assessment_progress(r) for r in research['assessments'] if r['claim_id']==claim_id]
+        current = [p for u in research['units'] for p in u['progress'] if p['claim_id']==claim_id and p['record_status']!='assessed']
+        records = [assessment_progress(r)+'；'+'；'.join(r.get('blockers',[])) for r in research['assessments']
+            if any(p.get('artifact_id')==r['direct_check_id'] and p.get('check_id')==r['experiment_check_id'] for p in current)]
         refs = [link(artifacts[p['artifact_id']]['plan_path'],'固定计划') for p in current if p['record_status'] in {'no_execution','no_assessment'}]
         refs += [link(f'logs/{p["check_id"]}/check.json','执行记录') for p in current if p['record_status']=='no_assessment']
-        return '；'.join([cell('；'.join(dict.fromkeys(records+[PROGRESS[p['record_status']] for p in current])),claim_links[claim_id]),*refs])
+        return '；'.join(filter(None,[cell('；'.join(dict.fromkeys(records+[PROGRESS[p['record_status']] for p in current])),claim_links[claim_id]),*refs]))
     stop = state.run_stop
     stop_label = ({'user_stop':'实际取消','resource_limit':'资源边界','tool_gap':'服务／权限／工具中断'}.get(stop.get('reason'),'中断')
         if stop.get('origin') == 'controller' else {'insufficient_basis':'研究依据不足','bounded_completed':'所声明范围完成',
@@ -254,7 +251,7 @@ def render_report(state, root):
         lines += interruption_lines(stopped_check,archive)
     lines += ['', '## 主要结果', '']
     if research['claims'] or explained or ongoing:
-        lines += ['| 问题 | 当前结果 | 回答摘录 | 检查进度 | 定位 |', '| --- | --- | --- | --- | --- |']
+        lines += ['| 问题 | 当前判断 | 观察／未完成原因（原文摘录） | 证据入口 |', '| --- | --- | --- | --- |']
     else:
         lines += ['尚无正式性质判定；已保存的研究记录见下文，不能据此断言目标没有问题。']
     entries = []
@@ -269,42 +266,40 @@ def render_report(state, root):
         feedback = next((s.get('feedback',{}) for s in reversed(state.selections) if s['operation_id'] in review_operations),{})
         answer = next((i.report_answer for i in reversed(items) if i.report_answer),None) or feedback.get('answered')
         entries.append((result,records,answer,title))
-        lines.append(f'| {n}. {cell(title)} | {DISPOSITIONS[result["disposition"]]} | {cell(excerpt(answer,170)) if answer else "见下方固定观察"} | {progress_text(result["claim_id"])} | {claim_links[result["claim_id"]]} |')
-    for c in explained:lines.append(f'| {cell(excerpt(c["question"]["question"],130))} | 源码解释，未经性质执行 | {cell(excerpt("；".join(c["question"]["counterevidence"]),170))} | — | {link("state.json","候选记录")} |')
+        progress = progress_text(result['claim_id'])
+        disposition = DISPOSITIONS[result['disposition']]+('；另有场景尚未完成' if progress and result['disposition']=='confirmed_in_scope' else '')
+        lines.append(f'| {n}. {cell(title)} | {disposition} | {progress or (cell(excerpt(answer,170)) if answer else "见下方固定观察")} | {claim_links[result["claim_id"]]} |')
+    for c in explained:lines.append(f'| {cell(excerpt(c["question"]["question"],130))} | 源码解释，未经性质执行 | {cell(excerpt("；".join(c["question"]["counterevidence"]),170))} | {link("state.json","候选原文与来源")} |')
     for claim in research['claims']:
         if any(r['claim_id']==claim['id'] for r in results):continue
         owner = next(u['candidate_id'] for u in research['units'] if claim['id'] in u['obligation_ids'])
-        lines.append(f'| <a id="claim-{claim["id"]}"></a>{cell(excerpt(claim["description"],130))} | 尚无正式判定 | {candidate_links.get(owner,link("state.json",owner))} | {progress_text(claim["id"])} | {link("state.json",claim["id"])} |')
+        lines.append(f'| <a id="claim-{claim["id"]}"></a>{cell(excerpt(claim["description"],130))} | 尚无正式判定 | {progress_text(claim["id"])} | {link("state.json",claim["id"])}；{candidate_links.get(owner,"")} |')
     for c in ongoing:
         if not any(u['candidate_id']==c['id'] for u in research['units']):
-            lines.append(f'| {cell(excerpt(c["question"]["question"],130))} | 记录状态 `{c["status"]}` | 尚无正式义务 | — | {candidate_links[c["id"]]} |')
+            lines.append(f'| {cell(excerpt(c["question"]["question"],130))} | {"暂停调查" if c["status"]=="paused" else "研究中"}，尚无正式义务 | {cell(excerpt("；".join(c["resume_conditions"] or c["question"]["unknowns"]),170))} | {candidate_links[c["id"]]} |')
     for n,(result,records,answer,title) in enumerate(entries,1):
         scope = result['scope']
         lines += ['', f'<a id="claim-{result["claim_id"]}"></a>', '', f'### {n}. {title}', '', f'**{DISPOSITIONS[result["disposition"]]}**。要求原文：{result["description"]}', '',
             '决定性范围：'+scope['description'], '；'.join(scope['assumptions'])+'。' if scope['assumptions'] else '',
             '范围参数：'+cell(scope['parameters']) if scope['parameters'] else '',
-            '排除：'+'；'.join(scope['excluded'])+'。' if scope['excluded'] else '']
-        if answer:lines += ['', '本次回答（沿用复核文案；无中文摘要时保留原文，判定与数值以下方记录为准）：'+answer]
+            link('state.json','完整要求、假设与排除范围')]
         for record in records:
             artifact = artifacts[record.get('direct_check_id')]
             check = checks[record['experiment_check_id']]
-            lines += ['', f'制品 v{artifact["version"]}；'+assessment_progress(record)+'；'
-                f'场景比较完整：{record.get("bounded_complete","未记录")}；独立场景完整处置：{record.get("reviewed_complete","未记录")}。',
+            lines += ['', f'制品 v{artifact["version"]}；'+('对应性意见：'+str(record.get('correspondence','信息不足')) if record.get('reviewed_complete') else
+                assessment_progress(record)+f'；场景比较完整：{record.get("bounded_complete","未记录")}；独立场景完整处置：{record.get("reviewed_complete","未记录")}')+'。',
                 '；'.join([link(artifact['harness_path'],'固定测试'),
                     link(artifact['plan_path'],'条件与检查器'),link(check.stdout,'原始观察'),
                     link(str(Path(artifact['plan_path']).parent / (check.id+'-assessment.json')),'assessment'),
                     *[link(f'submissions/{reviews[rid].check_id}/accepted.json','对应性复核') for rid in record.get('review_ids',[]) if rid in reviews]]), '']
             if record.get('blockers'):lines += ['当前争议／阻塞：'+'；'.join(record['blockers']), '']
+            harness = archive.read(artifact['plan_path']).get('harness',{})
+            lines += ['执行边界：'+harness.get('description','固定计划字节缺失')+'；'+'；'.join(harness.get('semantic_changes',[]))]
             lines += observation_lines(record,artifact,check,archive,event_cache)
             from consensus_assurance.workflow.reviews import lineage
             ancestors=lineage(state,next(a for a in state.direct_checks if a.id==artifact['id']))
             old = [c for c in failures if c.direct_check_id in ancestors]
             for failed in old:lines.append('该问题保留的失败执行：'+link(failed.stdout,'原始失败')+'；'+link(failed.stderr,'诊断')+'。旧失败不覆盖当前结果。')
-    for c in ongoing:
-        lines += ['', f'<a id="candidate-{c["id"]}"></a>', '', '研究中问题：'+c['question']['question'],
-            '当前记录状态：`'+c['status']+'`；'+link('state.json',c['id']+'：候选原文与历史')]
-        if c['question']['unknowns']:lines.append('保存的语义未知：'+'；'.join(c['question']['unknowns']))
-        if c['resume_conditions']:lines.append('恢复条件：'+'；'.join(c['resume_conditions']))
     interpretations = {}
     for entry in exploration_records:
         lines += ['', '条件探索：'+excerpt(entry['question'] or '问题原稿字节缺失',200),
@@ -318,14 +313,13 @@ def render_report(state, root):
         if not entry['executions']:lines.append('已受理问题，尚无保存的执行记录。')
         for handoff in entry['feedback']:
             saved = handoff['submission']
-            interpretations.setdefault(saved,set()).update(handoff['ref_ids'])
-            lines.append('执行后精确引用交接：'+link(saved,'见下方集中解释；不是本次独立观察'))
+            if handoff==entry['feedback'][-1]:interpretations.setdefault(saved,set()).update(handoff['ref_ids'])
+            lines.append('执行后精确引用交接：'+link(saved,'受理解释；不是本次独立观察'))
         if entry['executions'] and not entry['feedback']:lines.append('实际观察已保存，尚待解释；输出不自动生成正式义务或审批待办。')
     for saved, refs in interpretations.items():
         feedback = archive.read(saved).get('feedback') or {}
-        lines += ['', '后续受理解释（执行 '+', '.join(sorted(refs))+'）：'+excerpt(feedback.get('answered','归档字节缺失'),260),
+        lines += ['', '后续受理解释（关联 '+str(len(refs))+' 次执行）：'+excerpt(feedback.get('answered','归档字节缺失'),260),
             link(saved,'完整交接；当前正式处置见上方固定制品与复核')]
-        if feedback.get('remaining'):lines.append('该交接当时的剩余问题（非当前欠账）：'+'；'.join(feedback['remaining']))
     lines += ['', '## 研究过程与认识增长', '',
         'A1 共识形成与推进、A2 上下文／权威转换及其连接由双主线概览导航；地图条目和检查数量不是责任覆盖率。',
         map_link+'。']
@@ -333,7 +327,9 @@ def render_report(state, root):
         for key,label in [('formation','共识形成与推进'),('context','上下文／权威转换'),('connection','两条主线的连接')]:
             lines.append('- '+label+'（原文导航摘录）：'+excerpt(research['core_overview'][key]['explanation'],220))
     if research['understanding_status'] != 'usable':lines.append('双主线初始理解尚未完成；定向问题之外不能据片段宣称整体就绪。')
-    lines += milestone_lines(state,research,archive,checks)
+    titles = {r['experiment_check_id']:title for _,records,_,title in entries for r in records}
+    titles.update({x['check_id']:e['rationale'] or e['question'] or '探索原稿缺失' for e in exploration_records for x in e['executions']})
+    lines += ['累计分钟从本轮创建起计，含暂停间隔；详细墙钟与耗时见执行记录。']+milestone_lines(state,research,archive,checks,titles)
     lines += ['', '## 当前未决事项', '', '已选检查暂无欠账；研究范围仍可开放。' if not research['pending_work'] else '已选检查／争议仍有待办：']
     for item in research['pending_work']:
         unit = next((u for u in research['units'] if u['id']==item['id']),None)
@@ -343,7 +339,10 @@ def render_report(state, root):
         else:detail = candidate_links.get(item['id'],detail)
         lines.append('- '+link('research.json',item['id'])+('：'+detail if detail else '（状态与原因见记录）'))
     for c in ongoing:
-        if c['status']=='paused':lines.append('- 暂停调查：'+candidate_links[c['id']]+'；恢复条件见该候选。')
+        lines += ['', f'<a id="candidate-{c["id"]}"></a>', '', ('暂停调查：' if c['status']=='paused' else '研究中问题：')+c['question']['question'],
+            link('state.json','候选原文与历史')]
+        if c['question']['unknowns']:lines.append('保存的语义未知：'+'；'.join(c['question']['unknowns']))
+        if c['resume_conditions']:lines.append('恢复条件：'+'；'.join(c['resume_conditions']))
     if stop.get('resume_conditions'):lines += ['', '本轮记录的恢复条件：'+'；'.join(stop['resume_conditions'])]
     registry = [('core_overview',research['core_overview']['open_details'])] if research['core_overview'] else []
     registry += [(b['behavior_id'],b['unknowns']) for b in research['frontier']['behavior_unknowns']]
@@ -351,22 +350,12 @@ def render_report(state, root):
     registry += [('surface:'+s['entry_point'],[s['reason']]) for s in research['frontier']['surfaces'] if s['disposition']!='mapped']
     if registry:lines += ['', '### 地图登记与研究交接', '',
         f'以下是地图 v{state.audit_spec_version} 的登记原文摘录，不等于当前检查欠账。精确引用仅表示相关；是否已回答及回填须核对条件和版本。'+map_link]
-    handoff_numbers = {h['operation_id']:n for n,h in enumerate(research['map_handoffs'],1)}
     for ref, questions in registry:
         if not questions:continue
         handoffs = [h for h in research['map_handoffs'] if ref in h['ref_ids']]
         lines += ['', '- '+cell(ref)+'：'+excerpt('；'.join(questions),200),
-            '  相关交接：'+'；'.join(f'[交接 {handoff_numbers[h["operation_id"]]}](#handoff-{h["operation_id"]})' for h in handoffs)
+            '  相关交接：'+'；'.join(link(h['submission'],'交接 '+str(n)) for n,h in enumerate(handoffs,1))
             if handoffs else '  尚无精确对应交接。']
-    for h in research['map_handoffs']:
-        lines += ['', f'<a id="handoff-{h["operation_id"]}"></a>', '',
-            f'交接 {handoff_numbers[h["operation_id"]]}：'+link(h['submission'],'完整原文')+'；精确引用 '+', '.join(h['ref_ids'])+'。']
-        if h['submission'] in interpretations:
-            lines.append('解释已在上方条件探索中集中展示。')
-        else:
-            feedback = archive.read(h['submission']).get('feedback') or {}
-            lines.append('回答摘录：'+excerpt(feedback.get('answered','归档字节缺失'),260))
-            if feedback.get('remaining'):lines.append('该交接当时的剩余问题（非当前欠账）：'+'；'.join(feedback['remaining']))
     lines += ['', '## 证据与运行说明', '',
         '；'.join(link(name,label) for name,label in [('state.json','完整状态、版本与争议'),('research.json','当前研究索引'),
             ('config.json','实际配置'),('events.jsonl','事件时序'),('audit-method.md','实际加载方法')]),

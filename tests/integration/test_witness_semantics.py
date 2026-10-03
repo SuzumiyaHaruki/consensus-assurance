@@ -73,6 +73,7 @@ def test_partial_valid_witness_is_retained_idempotently_without_completing_unit(
     text=render_report(e.state,e.root).read_text()
     assert '**已确认违反**' in text and '独立场景完整处置：False' in text
     assert '当前检查尚未完整处置' in text and '对应性意见：no_issue_found' in text
+    assert '已确认违反；另有场景尚未完成' in text
     assert '尚未完成复核' not in text and e.state.model_dump(mode='json')==saved
     assert '（未完成）' in text and 'other' in text and second['properties'][0]['limitations'][0] in text
     polluted=assess(e.state,unit,artifact,plan,check,events+[dict(event='invalid_observation')])
