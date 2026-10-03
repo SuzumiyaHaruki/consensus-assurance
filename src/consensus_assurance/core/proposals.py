@@ -93,6 +93,7 @@ class EventMonitor(Record):
 
 
 class Harness(Record):
+    execution_package: str | None = Field(default=None, description="Optional single Go package directory; the controller fixes the effective package at acceptance")
     files: dict[str, str] = Field(default_factory=dict, description="Additional generated files with relative destinations and fixed source text")
     kind: str = Field(description="Harness kind advertised by the configured execution backend")
     source: str = Field(min_length=1, description="Executable experiment source, calling actual target code; no fabricated expected observations")

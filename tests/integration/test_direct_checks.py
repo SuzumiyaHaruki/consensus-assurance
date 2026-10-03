@@ -115,7 +115,7 @@ def test_necessary_support_oracle_does_not_require_sufficient_completion(eligibl
         assert monitor_events([events[0],{k:v for k,v in events[1].items() if k!='operation'}],monitor,prop,requirements)['outcome']=='unknown'
 
 
-@pytest.mark.parametrize('failure',['prerequisite','missing','compile','test_failure','disputed','unreviewed','identity','applicability'])
+@pytest.mark.parametrize('failure',['prerequisite','missing','compile','test_failure','no_tests','disputed','unreviewed','identity','applicability'])
 def test_direct_failure_never_confirms(tmp_path,prepared,failure):
     e,u,p=setup(tmp_path,prepared,True)
     if failure=='prerequisite':p.harness.prerequisites[0].event='not_observed'
@@ -127,7 +127,9 @@ def test_direct_failure_never_confirms(tmp_path,prepared,failure):
     a=save_plan(e,u,p,'negative')
     if failure!='unreviewed':review(e.state,u,a)
     if failure=='disputed':e.state.semantic_reviews[0].items[0].status='disputed'
-    c=execute(e,a);result=assess(e.state,u,a,p,c,extract_events(c))
+    c=execute(e,a)
+    if failure=='no_tests':c.outcome='not_applicable'  # Controlled backend result; observations cannot override skipped checks.
+    result=assess(e.state,u,a,p,c,extract_events(c))
     assert not result['confirmed'],result
     assert result['outcome']==('unknown' if failure in {'prerequisite','missing','compile','identity','applicability'} else 'violated'),result
     assert not any(f.level=='implementation_obligation' for f in e.state.findings)

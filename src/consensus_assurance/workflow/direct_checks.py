@@ -73,13 +73,14 @@ def validate_plan(state,unit,plan,implementation):
     if errors:raise ValueError('; '.join(dict.fromkeys(errors)))
 
 
-def save_plan(engine,unit,plan,operation_id,previous=None):
+def save_plan(engine,unit,plan,operation_id,previous=None,*,filename=None):
     state=engine.state
     existing=next((a for a in state.direct_checks if a.operation_id==operation_id),None)
     if existing:return existing
+    if filename is None:filename=engine.implementation.resolve_harness(plan.harness,engine.root/'source',state.snapshot.files)
     folder=engine.root/'direct-checks'/operation_id
     write_json(folder/'plan.json',plan)
-    harness=folder/engine.implementation.harness_filename
+    harness=folder/filename
     harness.parent.mkdir(parents=True,exist_ok=True)
     harness.write_text(plan.harness.source)
     ids=semantic_ids(state,unit)
@@ -94,24 +95,35 @@ def save_plan(engine,unit,plan,operation_id,previous=None):
     return artifact
 
 
+def execute_harness(engine,harness,filename,action):
+    """Execute fixed placement and bytes through the same formal/exploratory boundary."""
+    workspace=engine.workspace()
+    paths=install_harness(workspace,filename,harness,engine.state.snapshot.files)
+    check=run_experiment(engine.runner,engine.implementation.experiment_command(harness.execution_package,filename),
+        workspace,engine.state.snapshot.id,engine.budget.timeout(),engine.config.execution_isolation,
+        action,adapter=engine.implementation)
+    check.parameters.update(execution_package=harness.execution_package,harness_filename=filename)
+    check.tool_version=engine.state.tools.get('implementation','unknown')
+    check.artifacts.extend(paths)
+    return check
+
+
 def execute(engine,artifact):
     if not engine.config.allow_experiments or engine.implementation is None:raise Blocked('Target execution disabled or no execution backend configured')
     plan=load_plan(artifact.plan_path)
     def perform():
-        workspace=engine.workspace()
         before=engine.state.snapshot.files
-        paths=install_harness(workspace,engine.implementation.harness_filename,plan.harness,before)
-        check=run_experiment(engine.runner,engine.implementation.experiment_command(),workspace,engine.state.snapshot.id,
-            engine.budget.timeout(),engine.config.execution_isolation,'direct_check',adapter=engine.implementation)
+        filename=str(Path(artifact.harness_path).relative_to(Path(artifact.plan_path).parent))
+        check=execute_harness(engine,plan.harness,filename,'direct_check')
+        workspace=Path(check.cwd)
         after=capture(workspace,excluded_dirs={".execution"}).files
         changed=[p for p,value in before.items() if after.get(p)!=value]
         check.direct_check_id=artifact.id
         check.origin=Origin.MOCK if engine.state.mode=='mock' else Origin.EXECUTED
         check.parameters['changed_target_files']=changed
-        check.tool_version=engine.state.tools.get('implementation','unknown')
-        check.artifacts.extend(paths)
         return check
-    check=CheckRun.model_validate(engine.action('direct_execute','experiments',perform,{'direct_check_id':artifact.id}))
+    check=CheckRun.model_validate(engine.action('direct_execute','experiments',perform,{'direct_check_id':artifact.id,
+        'execution_package':plan.harness.execution_package}))
     engine.record(check)
     return check
 
@@ -139,6 +151,7 @@ def compute_assessment(state,unit,artifact,plan,check,events):
     if check.status==ExecutionStatus.TIMEOUT:blockers.append('External timeout; target behavior and harness completion are unestablished')
     elif check.status!=ExecutionStatus.COMPLETED:blockers.append('Execution tool or build failed: '+check.reason)
     elif check.exit_code!=0:blockers.append('Nonzero direct test exit ('+check.parameters.get('failure_class','unclassified')+'); inspect raw stack and target path before attribution')
+    elif check.outcome=='not_applicable':blockers.append('No selected target test completed; absent or skipped tests cannot establish the check')
     associated=check.snapshot_id==artifact.snapshot_id and check.direct_check_id==artifact.id
     if not associated:blockers.append('Direct input association mismatch')
     original=state.mode!='mock' and artifact.origin not in {Origin.MOCK,Origin.SYNTHETIC,Origin.MUTATION,Origin.IMPORTED} and check.origin==Origin.EXECUTED
@@ -149,7 +162,7 @@ def compute_assessment(state,unit,artifact,plan,check,events):
     if parsing:blockers.append('Event output contains incomplete or invalid CA_EVENT records')
     for result in results:
         result['confirmed']=result['witness_complete'] and not blockers and not provenance_blockers
-    execution_complete=check.status==ExecutionStatus.COMPLETED and check.exit_code==0 and associated and prerequisite['status']=='matched' and not parsing and not check.parameters.get('changed_target_files')
+    execution_complete=check.status==ExecutionStatus.COMPLETED and check.exit_code==0 and check.outcome!='not_applicable' and associated and prerequisite['status']=='matched' and not parsing and not check.parameters.get('changed_target_files')
     bounded_complete=execution_complete and bool(results) and all(r['comparison_complete'] for r in results)
     semantic_boundaries=(current_review.limitations if current_review else claim.grounding.unresolved+plan.harness.legality.unresolved+
         [item for monitor in plan.monitors for item in monitor.grounding.unresolved])

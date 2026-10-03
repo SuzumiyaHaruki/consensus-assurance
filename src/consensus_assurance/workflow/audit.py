@@ -6,7 +6,7 @@ from pathlib import Path
 from pydantic import ValidationError
 
 from consensus_assurance.adapters.storage.files import digest, write_json
-from consensus_assurance.adapters.runners.experiment import extract_events, install_harness, run_experiment
+from consensus_assurance.adapters.runners.experiment import extract_events, install_harness
 from consensus_assurance.core.submissions import (AuditSubmission, CandidateSubmission,
     CheckSubmission, ResearchSubmission, SemanticSubmission, ReviewSubmission, ExploreSubmission)
 from consensus_assurance.core.proposals import (DirectCheckPlan, Feedback,
@@ -14,7 +14,7 @@ from consensus_assurance.core.proposals import (DirectCheckPlan, Feedback,
 from consensus_assurance.core.types import (Material, QuestionCandidate, Revision, ConsensusAuditSpec,
     CheckRun, ExecutionStatus)
 from .budget import BudgetExhausted
-from .direct_checks import (assess, execute as execute_direct_check, load_plan, save_plan,
+from .direct_checks import (assess, execute as execute_direct_check, execute_harness, load_plan, save_plan,
     validate_plan, validate_question, refresh_assessments)
 from .transactions import commit_graph
 from .errors import Blocked
@@ -115,6 +115,14 @@ def add_support(implementation, harness):
     support = getattr(implementation, 'support_files', lambda:{})()
     if set(support) & set(harness.files):raise ValueError('Submitted files cannot replace selected backend support')
     harness.files.update(support)
+
+
+def prepare_harness(engine, harness):
+    source = getattr(engine, 'source_root', engine.root / 'source')
+    add_support(engine.implementation, harness)
+    filename = engine.implementation.resolve_harness(harness, source, engine.state.snapshot.files)
+    install_harness(source, filename, harness, engine.state.snapshot.files, write=False)
+    return filename
 
 
 def plan_from_files(inputs, submission):
@@ -351,10 +359,8 @@ def prepare_submission(engine, submission, inputs, operation_id):
         if not engine.config.allow_experiments:
             raise ValueError("Formal execution is not authorized")
         plan = plan_from_files(inputs, submission)
-        add_support(engine.implementation, plan.harness)
         validate_plan(state, unit, plan, engine.implementation)
-        install_harness(getattr(engine, "source_root", engine.root / "source"), engine.implementation.harness_filename, plan.harness,
-            state.snapshot.files, write=False)
+        filename = prepare_harness(engine, plan.harness)
         prior = next((a for a in state.direct_checks if a.id == submission.previous_check_id), None)
         if submission.previous_check_id:
             if prior is None or prior.unit_id != unit.id:
@@ -363,7 +369,7 @@ def prepare_submission(engine, submission, inputs, operation_id):
             engine.budget.take("revisions")
         validate_objects()
         def persist_artifact():
-            artifact = save_plan(engine, unit, plan, operation_id, prior)
+            artifact = save_plan(engine, unit, plan, operation_id, prior, filename=filename)
             if prior:
                 state.revisions.append(Revision(kind="encoding" if submission.encoding_revision else "F4",
                     rationale=submission.rationale, target_ids=[prior.id],
@@ -414,11 +420,10 @@ def prepare_submission(engine, submission, inputs, operation_id):
         if not engine.config.allow_experiments or engine.implementation is None:
             raise ValueError("Exploratory execution is not authorized or configured")
         harness = Harness(kind=engine.implementation.harness_kind, source=inputs.read(submission.harness_path),
+            execution_package=submission.execution_package,
             files={name:inputs.read(path) for name, path in submission.files.items()},
             description=submission.question, semantic_changes=[])
-        add_support(engine.implementation, harness)
-        install_harness(getattr(engine, "source_root", engine.root / "source"), engine.implementation.harness_filename, harness,
-            state.snapshot.files, write=False)
+        current['harness_filename'] = prepare_harness(engine, harness)
         current["harness"] = harness.model_dump(mode="json")
     else:
         current.update(scope=submission.scope,reason=submission.reason)
@@ -545,14 +550,11 @@ def execute_accepted(engine):
             execute_check(engine, next(a for a in state.direct_checks if a.id == current["direct_check_id"]))
         if current.get("harness"):
             def run():
-                workspace = engine.workspace()
-                harness = Harness.model_validate(current["harness"])
-                install_harness(workspace, engine.implementation.harness_filename, harness, state.snapshot.files)
-                return run_experiment(engine.runner, engine.implementation.experiment_command(), workspace,
-                    state.snapshot.id, engine.budget.timeout(), engine.config.execution_isolation,
-                    "exploration", adapter=engine.implementation)
+                return execute_harness(engine, Harness.model_validate(current['harness']),
+                    current['harness_filename'], 'exploration')
             check = CheckRun.model_validate(engine.action("exploration", "experiments", run,
-                {"operation_id":current["operation_id"]}))
+                {"operation_id":current["operation_id"], 'execution_package':current['harness']['execution_package'],
+                 'harness_filename':current['harness_filename']}))
             engine.record(check)
     except (OSError, ValueError, Blocked, BudgetExhausted) as exc:
         current["execution_gap"] = str(exc)

@@ -57,3 +57,16 @@ def full_refresh_equivalence(monkeypatch):
     monkeypatch.setattr(audit, 'refresh_assessments', refresh)
     yield
     assert compared, 'The regression must reach an actual measured result'
+
+
+@pytest.fixture
+def go_module(tmp_path):
+    """A dependency-free module with distinct directory and package names."""
+    root=tmp_path/'go-module'
+    root.mkdir()
+    (root/'go.mod').write_text('module example.org/local\n\ngo 1.20\n')
+    (root/'README.md').write_text('For 0 <= value <= limit, Step must return within [0, limit].\n')
+    for directory,package in [('.', 'service'),('internal/core','engine'),('internal/store','storage')]:
+        folder=root/directory;folder.mkdir(parents=True,exist_ok=True)
+        (folder/'value.go').write_text(f'package {package}\nfunc Step(value, limit int) int {{\n return value + 1\n}}\n')
+    return root

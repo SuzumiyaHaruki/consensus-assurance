@@ -89,3 +89,55 @@ def test_retired_tools_cannot_be_requested_or_loaded(tmp_path, monkeypatch):
     resumed = e.resume()
     assert len(resumed.direct_checks) == len(before['direct_checks']) == 1
     assert resumed.usage == before['usage']
+
+
+@pytest.mark.parametrize('selection',[
+    {'execution_package':'/tmp'}, {'execution_package':'../outside'}, {'execution_package':'-args'},
+    {'execution_package':'./...'}, {'execution_package':'. ./internal/core'}, {'execution_package':'.;true'},
+    {'execution_package':'example.org/other'}, {'execution_package':'internal/escape'},
+    {'execution_package':'internal/child'}, {'execution_package':'internal/core/value.go'},
+    {'files':{'value.go':'helper.go'}}, {'files':{'go.work':'helper.go'}},
+    {'files':{'internal/core/go.mod':'helper.go'}},
+    {'execution_package':'internal/core','files':{'internal/core/assurance_generated_test.go':'helper.go'}},
+    {'files':{'internal/child/helper.go':'helper.go'}}, {'files':{'vendor/modules.txt':'helper.go'}},
+])
+def test_package_boundaries_match_preflight_and_admission_without_execution(tmp_path,go_module,selection,monkeypatch):
+    import shutil
+    from consensus_assurance.adapters.runners.go_module import GoModuleBackend
+    from consensus_assurance.workflow.audit import validate_submission, Inputs, prepare_submission
+    from consensus_assurance.core.submissions import AuditSubmission
+    from audit_support import engine_for
+    from consensus_assurance.core.types import Analysis
+    from consensus_assurance.adapters.storage.snapshot import capture
+    from consensus_assurance.workflow.budget import BudgetTracker
+    engine,repo=engine_for(tmp_path,[])
+    shutil.copytree(go_module,repo,dirs_exist_ok=True)
+    nested=repo/'internal/child';nested.mkdir();(nested/'go.mod').write_text('module example.org/child\n')
+    (nested/'value.go').write_text('package child\n')
+    engine.implementation=GoModuleBackend();engine.config.execution_backend='go_module'
+    engine.state=Analysis(mode='mock',config=engine.config.model_dump(mode='json'),snapshot=capture(repo,engine.root/'source'))
+    engine.budget=BudgetTracker(engine.config.budget,engine.state)
+    shutil.copytree(engine.root/'source',engine.root/'agent-source')
+    # Captured snapshots normally exclude links; both validation paths must still reject a damaged source view.
+    for folder in ('source','agent-source'):(engine.root/folder/'internal/escape').symlink_to(tmp_path,target_is_directory=True)
+    draft=engine.root/'draft';draft.mkdir()
+    sub=dict(action='explore',question='Check local placement only',harness_path='check.go',rationale='Boundary control',**selection)
+    (draft/'submission.json').write_text(json.dumps(sub));(draft/'check.go').write_text('package service\n')
+    (draft/'helper.go').write_text('package service\n')
+    monkeypatch.setattr(ProcessRunner,'run',lambda *a,**kw:pytest.fail('Validation cannot execute'))
+    saved=engine.state.model_dump(mode='json')
+    result=validate_submission(engine.state,engine.root,'submission.json',engine.implementation)
+    assert not result['valid'] and result['diagnostics']
+    assert engine.state.model_dump(mode='json')==saved
+    with pytest.raises(ValueError):prepare_submission(engine,AuditSubmission.model_validate(sub),Inputs(draft),'invalid')
+    assert not (engine.root/'experiments').exists() and not engine.state.checks and not engine.state.direct_checks
+
+
+def test_python_rejects_go_override_and_go_default_path_conflict(tmp_path):
+    from consensus_assurance.adapters.runners.python import PythonBackend
+    from consensus_assurance.adapters.runners.go_module import GoModuleBackend
+    from consensus_assurance.core.config import TargetConfig
+    harness=Harness(kind='python',source='print(1)',description='Local check',semantic_changes=[],execution_package='.')
+    with pytest.raises(ValueError,match='does not support'):PythonBackend().resolve_harness(harness,tmp_path,{})
+    with pytest.raises(ValueError,match='target.harness_path'):
+        GoModuleBackend(TargetConfig(execution_package='internal/core',harness_path='assurance_generated_test.go'))

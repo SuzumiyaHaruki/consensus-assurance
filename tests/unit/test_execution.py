@@ -143,3 +143,41 @@ def test_go_backend_is_toolchain_scoped(tmp_path,module,package):
 def test_target_paths_cannot_escape_relative_namespace(paths):
     from consensus_assurance.core.config import TargetConfig
     with pytest.raises(ValueError,match='relative repository'):TargetConfig(**paths)
+
+
+@pytest.mark.parametrize('version',['1.23.5','1.26.7'])
+def test_go_actual_failure_phases_in_isolated_copy(tmp_path,go_module,monkeypatch,version):
+    import os, shutil
+    from consensus_assurance.adapters.runners.go_module import GoModuleBackend
+    from consensus_assurance.adapters.runners.experiment import run_experiment
+    executable=Path.home()/f'go/pkg/mod/golang.org/toolchain@v0.0.1-go{version}.linux-amd64/bin'
+    if not (executable/'go').is_file() or not shutil.which('bwrap'):pytest.skip('Installed toolchain or bubblewrap unavailable; no download')
+    monkeypatch.setenv('PATH',str(executable)+os.pathsep+os.environ['PATH'])
+    workspace=tmp_path/'workspace';shutil.copytree(go_module,workspace)
+    backend=GoModuleBackend(timeout=10);runner=ProcessRunner(tmp_path)
+    header='package service\nimport "testing"\n'
+    cases=[
+        ('package_conflict','package wrong\n','build_or_setup','unknown',False),
+        ('compile',header+'func TestAssurance(t *testing.T) { undefined() }\n','build_or_setup','unknown',False),
+        ('assertion',header+'func TestAssurance(t *testing.T) { t.Log("CA_EVENT {\\"event\\":\\"observed\\"}"); t.Fatal("actual assertion") }\n','test_failure','tests_failed',True),
+        ('panic',header+'func TestAssurance(t *testing.T) { panic("actual panic") }\n','panic_unattributed','tests_failed',True),
+        ('absent',header+'func TestOther(t *testing.T) {}\n',None,'not_applicable',False),
+        ('skip',header+'func TestAssurance(t *testing.T) { t.Skip("explicitly skipped") }\n',None,'not_applicable',True),
+        ('literal',header+'func TestAssurance(t *testing.T) { t.Log("panic: build failed") }\n',None,'tests_passed',True),
+        ('startup',header+'import "os"\nfunc TestMain(m *testing.M) { os.Exit(3) }\n', 'execution_unclassified','unknown',False),
+    ]
+    for label,source,failure,outcome,started in cases:
+        (workspace/'assurance_generated_test.go').write_text(source)
+        check=run_experiment(runner,backend.experiment_command(),workspace,'local-fixture',120,'bwrap',adapter=backend)
+        assert check.parameters.get('failure_class')==failure,(version,label,check,Path(check.stderr).read_text())
+        assert check.parameters['test_started']==started and check.outcome==outcome,(label,check)
+        if failure=='build_or_setup':assert check.status==ExecutionStatus.ERROR
+        if label=='package_conflict':assert 'found packages' in Path(check.stderr).read_text()+Path(check.stdout).read_text()
+        if label=='assertion':
+            from consensus_assurance.adapters.runners.experiment import extract_events
+            assert extract_events(check)[0]['event']=='observed'
+    # A runner timeout keeps its own boundary; the parser cannot turn it into a test failure.
+    (workspace/'assurance_generated_test.go').write_text(header+'import "time"\nfunc TestAssurance(t *testing.T) { time.Sleep(time.Minute) }\n')
+    check=run_experiment(runner,backend.experiment_command(),workspace,'local-fixture',.1,'bwrap',adapter=backend)
+    assert check.status==ExecutionStatus.TIMEOUT and 'failure_class' not in check.parameters
+    assert not (go_module/'assurance_generated_test.go').exists()

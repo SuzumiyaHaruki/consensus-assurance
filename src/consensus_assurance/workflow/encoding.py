@@ -3,13 +3,13 @@
 
 def direct_changes(before, after):
     """One component comparison for ordinary/encoding admission and review repair."""
-    inputs=(before.harness.source,before.harness.files)!=(after.harness.source,after.harness.files)
+    inputs=any(getattr(before.harness,k)!=getattr(after.harness,k) for k in ('source','files','execution_package'))
     properties=lambda plan:[p.model_dump(exclude={'description'}) for p in plan.observable_properties]
     predicates=lambda plan:[(m.checker_id,m.applicability_conditions) for m in plan.monitors]
     observations=lambda plan:[(m.checker_id,m.event,m.admission_alias,m.binding_ids) for m in plan.monitors]
     oracle=properties(before)!=properties(after) or predicates(before)!=predicates(after)
     def contract(plan):
-        harness=plan.harness.model_dump(exclude={'source','files','description','semantic_changes','legality'})
+        harness=plan.harness.model_dump(exclude={'source','files','execution_package','description','semantic_changes','legality'})
         harness['prerequisites']=sorted(harness['prerequisites'],key=lambda r:r['alias'])
         monitors=[m.model_dump(exclude={'event','admission_alias','applicability_conditions'}) for m in plan.monitors]
         return plan.claim_id,plan.binding_ids,plan.uncertainties,harness,monitors

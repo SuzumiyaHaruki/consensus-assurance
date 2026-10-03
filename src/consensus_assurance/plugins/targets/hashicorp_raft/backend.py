@@ -4,7 +4,7 @@ from consensus_assurance.adapters.runners.go_module import GoModuleBackend
 
 class HashicorpRaftBackend(GoModuleBackend):
     name = 'hashicorp_raft'
-    version = '2'
+    version = '3'
     harness_instructions = GoModuleBackend.harness_instructions + (
         ' Read target-support/assurance_support_test.go. NewAssuranceCluster initializes actual in-memory Raft nodes '
         'through BootstrapCluster/NewRaft and caller-supplied configs/FSMs. NewAssuranceClusterWithSuffrage accepts '

@@ -989,3 +989,120 @@ def test_zero_review_budget_keeps_measured_violation_unconfirmed(tmp_path):
     from consensus_assurance.reporting.chinese import render_report
     text=render_report(state,e.root).read_text()
     assert '**已确认违反**' not in text and '机械比较：观察到违反' in text and '对应性意见：尚未记录' in text
+
+
+def test_one_investigation_fixes_packages_for_checks_exploration_and_revision(tmp_path,go_module):
+    import shutil
+    from consensus_assurance.adapters.runners.go_module import GoModuleBackend
+    from consensus_assurance.adapters.storage.snapshot import capture
+    from consensus_assurance.core.config import TargetConfig
+    from consensus_assurance.workflow.direct_checks import load_plan, execute
+    from consensus_assurance.workflow.encoding import direct_changes
+    if not shutil.which('go') or not shutil.which('bwrap'):pytest.skip('Local Go and bubblewrap required')
+    def initial(state):
+        sub,files=first(state)
+        sub['sources'][0]['file']='internal/core/value.go'
+        sub['sources'][0]['end_line']=4
+        sub['bindings'][0].update(symbol='Step',start_line=2,end_line=4)
+        return sub,files
+    def source(package,value=3):
+        return f'''package {package}
+import "testing"
+func TestAssuranceBound(t *testing.T) {{
+ emit("admitted", true)
+ value := Step({value},3)
+ emit("returned", value >= 0 && value <= 3)
+}}
+'''
+    def helpers(directory,package):
+        return {f'{directory}/observe_test.go'.removeprefix('./'):f'''package {package}
+import "fmt"
+func emit(event string, value bool) {{ fmt.Printf("CA_EVENT {{\\"event\\":\\"%s\\",\\"operation\\":\\"one\\",\\"state\\":{{\\"legal\\":true,\\"in_range\\":%t}}}}\\n",event,value) }}
+'''}
+    def check(package,revise=False,value=3):
+        def step(state):
+            sub,files=check_step(revise=revise)(state)
+            plan=json.loads(files['plan.json'])
+            plan['harness']['kind']='go_test'
+            if package is not None:plan['harness']['execution_package']=package
+            name=('engine_test' if revise else 'engine') if package else 'service'
+            # Both root and core use the same actual bound implementation.
+            body=source(name,value)
+            if package is None or revise:
+                body=body.replace('import "testing"','import ("testing"; core "example.org/local/internal/core")').replace('value := Step','value := core.Step')
+            if revise:body+='// Keep the actual call and oracle unchanged.\n'
+            helper,content=next(iter(helpers(package or '.',name).items()))
+            sub.update(harness_path='primary.go',files={helper:'helper.go'})
+            return sub,{'plan.json':json.dumps(plan),'primary.go':body,'helper.go':content}
+        return step
+    def explore(state):
+        return dict(action='explore',question='Observe the storage package under one legal input',
+            execution_package='internal/store',harness_path='storage.go',rationale='Independent conditional observation'),{
+            'storage.go':'package storage\nimport("testing";"fmt")\nfunc TestAssuranceStore(t *testing.T) { fmt.Println(Step(1,3)) }\n'}
+    steps=[initial,check(None,value=2),review_step(),check('internal/core'),review_step(),explore,check('./internal/core',revise=True),review_step()]
+    e,repo=engine_for(tmp_path,steps)
+    shutil.copytree(go_module,repo,dirs_exist_ok=True)
+    e.config.execution_backend='go_module';e.config.execution_isolation='bwrap'
+    e.config.target=TargetConfig(harness_path='custom_generated_test.go')
+    e.config.budget.total_seconds=360;e.config.budget.action_timeout=120
+    e.implementation=GoModuleBackend(e.config.target,120)
+    before=capture(repo).files
+    # Every product preflight reads fixed source; it must not run a build or consume a budget.
+    invoke=e.agent.investigate
+    def investigate(*args,**kwargs):
+        result=invoke(*args,**kwargs)
+        from consensus_assurance.workflow.audit import validate_submission
+        saved=e.state.model_dump(mode='json')
+        validation=validate_submission(e.state,e.root,'submission.json',e.implementation)
+        assert validation['valid'],validation
+        assert e.state.model_dump(mode='json')==saved
+        return result
+    e.agent.investigate=investigate
+    state=e.start(repo)
+    assert not list((e.root/'submissions').glob('*/diagnostics.json')),state.stop_reason
+    assert state.usage['experiments']==4 and len(state.direct_checks)==3
+    root,old,new=state.direct_checks
+    assert new.previous_id==old.id and new.version==2
+    assert e.implementation.package=='.' and e.config.target.execution_package=='.'
+    for artifact,package in [(root,'.'),(old,'./internal/core'),(new,'./internal/core')]:
+        plan=load_plan(artifact.plan_path)
+        assert plan.harness.execution_package==package
+        check=next(c for c in state.checks if c.direct_check_id==artifact.id)
+        assert check.exit_code==0 and check.parameters['test_started']
+        assert check.command[-1]==package==check.parameters['execution_package']
+        filename=str(Path(package)/'custom_generated_test.go')
+        assert check.parameters['harness_filename']==filename
+        assert Path(artifact.harness_path).relative_to(Path(artifact.plan_path).parent).as_posix()==filename
+        assert (Path(check.cwd)/filename).read_text()==plan.harness.source
+        assert all((Path(check.cwd)/name).read_text()==text for name,text in plan.harness.files.items())
+        assert 'os/exec' not in plan.harness.source
+    assert [r['outcome'] for r in state.monitor_results]==['holds','violated','violated']
+    assert all(r['reviewed_complete'] for r in state.monitor_results)
+    conditional=next(c for c in state.checks if c.action=='exploration')
+    assert conditional.command[-1]=='./internal/store' and conditional.parameters['harness_filename']=='internal/store/custom_generated_test.go'
+    assert conditional.tool_version==state.tools['implementation'] and conditional.direct_check_id is None
+    plan=load_plan(new.plan_path)
+    moved=plan.model_copy(deep=True);moved.harness.execution_package='.'
+    assert direct_changes(plan,moved)==dict(inputs=True,oracle=False,observation=False,contract=False,legality=False)
+    moved.harness.prerequisites[0].event='different_prefix'
+    assert direct_changes(plan,moved)['contract']
+    from consensus_assurance.core.submissions import CheckSubmission
+    from consensus_assurance.workflow.audit import validate_check_revision
+    revision=CheckSubmission(action='revise_check',unit_id=new.unit_id,previous_check_id=new.id,
+        plan_path='plan.json',harness_path='primary.go',rationale='Placement-only repair')
+    with pytest.raises(ValueError,match='Ordinary repair'):validate_check_revision(state,new,moved,revision)
+    moved=plan.model_copy(deep=True);moved.monitors[0].event='different_endpoint'
+    with pytest.raises(ValueError,match='Ordinary repair'):validate_check_revision(state,new,moved,revision)
+    assert capture(repo).files==before
+    # An exact operation receipt survives mutable defaults/drafts and does not become another package's result.
+    e.config.target.execution_package='./internal/store';e.implementation=GoModuleBackend(e.config.target.model_copy(update={'harness_path':None}),120)
+    (e.root/'draft/primary.go').write_text('not Go')
+    previous=next(c for c in state.checks if c.direct_check_id==new.id)
+    state.pending_action=next(a for a in state.action_history if a.kind=='direct_execute' and a.logical_input.get('direct_check_id')==new.id)
+    repeated=execute(e,new)
+    assert repeated.id==previous.id and repeated.command[-1]=='./internal/core'
+    # Recover an interrupted action with a durable tool receipt but no packed action result.
+    (e.root/'actions'/state.pending_action.id/'result.json').unlink()
+    recovered=execute(e,new)
+    assert recovered.id==previous.id and recovered.command==previous.command
+    assert recovered.parameters['harness_filename']=='internal/core/custom_generated_test.go'
