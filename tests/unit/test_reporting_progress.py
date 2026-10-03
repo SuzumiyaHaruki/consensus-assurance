@@ -136,6 +136,20 @@ def test_mixed_report_reads_fixed_results_and_moves_without_side_effects(tmp_pat
         sub,files=review_step()(state)
         sub['review_items'][0].update(report_title='边界返回责任',report_answer='本次完整观察返回 4，上限为 3。')
         return sub,files
+    def encoded_check(**options):
+        def step(state):
+            sub,files=check_step(**options)(state)
+            plan=json.loads(files['plan.json'])
+            plan['observable_properties'][0]['assertion']=dict(field='state.encoded',reference='start.state.encoded')
+            files['plan.json']=json.dumps(plan)
+            # A lossless string encoding of the existing boolean oracle, with a shared long prefix.
+            files['check.py']=files['check.py'].replace("'operation':'one'","'operation':{'id':'identity-'+'z'*500,'parts':list(range(300))}")
+            files['check.py']=files['check.py'].replace("'legal':legal(3,3)",
+                "'legal':legal(3,3),'encoded':json.dumps({'padding':'x'*4000,'bounded':True})")
+            files['check.py']=files['check.py'].replace("'in_range':0 <= value <= 3",
+                "'in_range':0 <= value <= 3,'encoded':json.dumps({'padding':'x'*4000,'bounded':0 <= value <= 3})")
+            return sub,files
+        return step
     def second(state):
         candidate,files=first(state)
         candidate.pop('map_path');files={}
@@ -155,9 +169,8 @@ def test_mixed_report_reads_fixed_results_and_moves_without_side_effects(tmp_pat
         return dict(action='explore',question='Under a caller-selected repeat policy, what values are produced?',
             harness_path='explore.py',rationale='Observe behavior before attributing the repeat policy'),{'explore.py':"from target import step\nprint('conditional',step(2,3),step(3,3))\n"}
     def retain(state):
-        check=next(c for c in state['checks'] if c['action']=='exploration')
         return (dict(action='research',rationale='Retain the conditional output and missing responsibility',feedback=dict(
-            ref_ids=[check['id'],'code','surface:external repeat policy'],answered='Under the chosen repeat policy the actual returns were 3 and 4.',
+            ref_ids=[c['id'] for c in state['checks'] if c['action']=='exploration']+['code','surface:external repeat policy'],answered='Under the chosen repeat policy the actual returns were 3 and 4.',
             remaining=['Acquire the caller repeat contract'],understanding='updated',rationale='No obligation is inferred from unequal returns')),
             {})
     def independent_issue(state):
@@ -169,17 +182,17 @@ def test_mixed_report_reads_fixed_results_and_moves_without_side_effects(tmp_pat
         return dict(action='research',rationale='Retain a separate Fact explanation',feedback=dict(ref_ids=['result'],
             answered='The result Fact describes local delivery only',remaining=[],understanding='unchanged',
             rationale='A shared Fact does not associate this feedback with an execution')),{}
-    steps=[initial,check_step(broken=True),check_step(revise=True),review,second,review_step(),explained,
-        independent_issue,explore,retain,explore,fact_feedback,stop]
+    steps=[initial,encoded_check(broken=True),encoded_check(revise=True),review,second,review_step(),explained,
+        independent_issue,explore,explore,retain,explore,fact_feedback,stop]
     e,repo=engine_for(tmp_path,steps);e.agent.mock=False;e.config.execution_isolation='bwrap'
     (repo/'target.py').write_text('def step(value, limit):\n    return value + 1 if value <= limit else 0\n')
-    e.config.budget.experiments=5
+    e.config.budget.experiments=6
     state=e.start(repo)
     assert not list((e.root/'submissions').glob('*/diagnostics.json')),state.stop_reason
     assert [r['disposition'] for r in view(state)['conclusions']]==['confirmed_in_scope','bounded_no_violation']
-    assert state.usage['experiments']==5 and len(state.claims)==2
+    assert state.usage['experiments']==6 and len(state.claims)==2
     index=json.loads((e.root/'research.json').read_text())
-    assert [len(entry['feedback']) for entry in index['explorations']]==[1,0]
+    assert [len(entry['feedback']) for entry in index['explorations']]==[1,1,0]
     assert index['explorations'][0]['operation_id']!=index['explorations'][1]['operation_id']
     old=state.direct_checks[0];old_check=next(c for c in state.checks if c.direct_check_id==old.id)
     current=state.direct_checks[1];exploration=next(c for c in state.checks if c.action=='exploration')
@@ -200,15 +213,47 @@ def test_mixed_report_reads_fixed_results_and_moves_without_side_effects(tmp_pat
     assert 'external repeat policy' in text and 'Acquire the caller repeat contract' in text
     assert old_check.id in text and current.plan_path.split('/direct-checks/')[1] in text
     assert exploration.id in text and text.count('该问题保留的失败执行')==1
-    assert text.count('尚无受理的执行后解释')==1 and 'external caller may have another boundary' in text
+    assert text.count('实际观察已保存，尚待解释')==1 and 'external caller may have another boundary' in text
+    assert text.count('后续受理解释（执行 ')==1 and '该交接当时的剩余问题（非当前欠账）' in text
+    unresolved=text.split('## 当前未决事项')[1]
+    assert 'Acquire the caller repeat contract' not in unresolved and '地图 v1' in unresolved
+    assert 'x'*200 not in text and 'z'*200 not in text and '首尾预览' in text
+    assert '| state.encoded |' in text and '| start.state.encoded |' in text and '| operation | dict，' in text
+    visible=re.sub(r'\]\([^)]*\)',']',text)
+    assert max(len(v.strip()) for line in visible.splitlines() if line.startswith('|') for v in line.split('|')) < 300
+    assert '"bounded": true}' in text and '"bounded": false}' in text
+    check=next(c for c in state.checks if c.direct_check_id==current.id)
+    assert f'{check.id} / event[0] / state.encoded' in text and f'{check.id} / event[1] / state.encoded' in text
     assert 'distributed consequences' in text and '没有正式性质判定' in execution_summary(exploration)[2]
     assert '_ca_stream' not in text and '_ca_observation' not in text and '<details>' not in text
     assert state.semantic_reviews[0].items[0].rationale not in text
     links=re.findall(r'\]\(([^)]+)\)',text)
-    assert all(not Path(unquote(p)).is_absolute() and (moved/unquote(p)).is_file() for p in links)
+    assert all(not Path(unquote(p.split('#')[0])).is_absolute() and (moved/unquote(p.split('#')[0])).is_file() for p in links)
+    (moved/Path(check.stdout).relative_to(e.root)).unlink()
+    missing=render_report(state,moved).read_text()
+    assert '部分归档事件缺失' in missing and '**已确认违反**' in missing
+    assert '| state.encoded |' not in missing
     # A missing archived version must not silently resolve against the still-existing original run.
     (moved/Path(current.plan_path).relative_to(e.root)).unlink()
     (moved/index['explorations'][1]['submission']).unlink()
     text=render_report(state,moved).read_text()
     assert '条件与检查器（归档字节缺失）' in text and str(e.root) not in text
     assert '问题原稿字节缺失' in text
+
+
+def test_timeout_report_uses_recorded_limit_and_preserves_transport_diagnostic(tmp_path):
+    import json
+    from types import SimpleNamespace
+    from consensus_assurance.reporting.chinese import Archive, interruption_lines
+    stdout=tmp_path/'stdout.log'
+    stdout.write_text(json.dumps({'type':'error','message':'stream disconnected before completion'})+'\n')
+    check=CheckRun(action='agent_turn',cwd=str(tmp_path),snapshot_id='fixture',stdout=str(stdout),status=ExecutionStatus.TIMEOUT)
+    archive=Archive(SimpleNamespace(audit_spec_path=None,checks=[check]),tmp_path)
+    for limit,label in [('total_seconds','总运行预算到达'),('agent_turn_timeout','单轮上限'),
+        ('action_timeout','目标动作达到执行上限'),(None,'超时上限依据不足')]:
+        check.parameters={'timeout_limit':limit} if limit else {}
+        saved=check.model_dump(mode='json');raw=stdout.read_bytes()
+        text='\n'.join(interruption_lines(check,archive))
+        assert label in text and 'stream disconnected before completion' in text
+        assert '单轮超时，具体原因未知' not in text
+        assert check.model_dump(mode='json')==saved and stdout.read_bytes()==raw

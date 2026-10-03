@@ -937,7 +937,14 @@ def recording_first(state):
 @pytest.mark.usefixtures('full_refresh_equivalence')
 def test_knowledge_growth_preserves_execution_and_supplies_the_next_check(tmp_path,variant):
     snapshots={}
-    initial=recording_first
+    def initial(state):
+        sub,files=recording_first(state)
+        if variant=='shared':
+            spec=json.loads(files['map.json'])
+            spec['behaviors'][0]['unknowns']=['Does the local boundary overflow?', 'Clearing schedules remain independent']
+            spec['surfaces']=[dict(entry_point='local-return',disposition='deferred',source_ids=['code'],reason='Does the local boundary overflow?')]
+            files['map.json']=json.dumps(spec)
+        return sub,files
     def enrich(state):
         snapshots['unit']=state['units'][0]
         snapshots['claim']=state['claims'][0]
@@ -946,6 +953,7 @@ def test_knowledge_growth_preserves_execution_and_supplies_the_next_check(tmp_pa
         assert state['monitor_results'][0]['reviewed_complete']
         raw,files=record_map(state,variant=='refined')
         if variant=='shared':
+            snapshots['map1']=(e.root/'audit-spec/v1.json').read_bytes()
             index=json.loads((e.root/'research.json').read_text())
             lead=next(h for h in index['handoffs'] if 'left one record for count' in h['answered_preview'])
             assert lead['operation_id']!=index['handoffs'][-1]['operation_id']
@@ -958,9 +966,18 @@ def test_knowledge_growth_preserves_execution_and_supplies_the_next_check(tmp_pa
             check=next(c for c in retained['checks'] if c['id'] in original['feedback']['ref_ids'])
             assert check['action']=='exploration' and 'record count 1' in Path(check['stdout']).read_text()
             snapshots['handoff_id']=lead['operation_id']
+            assert any(h['operation_id']==lead['operation_id'] and 'surface:local-return' in h['ref_ids'] for h in index['map_handoffs'])
+            assert not original['map_updated'] and original['feedback']['understanding']=='updated'
             raw['feedback']['ref_ids'].append(lead['operation_id'])
             raw['feedback']['answered']='The saved exploration motivates source mapping of the record producer and consumer'
             raw['feedback']['remaining']=original['feedback']['remaining']
+            spec=json.loads(files['map.json'])
+            spec['behaviors'][0]['unknowns']=['Clearing schedules remain independent']
+            spec['surfaces'][0].update(disposition='mapped',behavior_ids=['call'],
+                reason='The admitted boundary call takes the increment branch; its local overflow was checked. Other callers and clearing schedules remain independent.')
+            raw['map_changes']['surface:local-return']=dict(impact='clarification',source_ids=['code'],
+                rationale='Associate the sourced boundary entry with its actual Behavior; mapping does not close wider caller questions')
+            files['map.json']=json.dumps(spec)
         return raw,files
     def more(state):
         assert state['units'][0]['audit_question']['audit_spec_version']==1
@@ -999,17 +1016,25 @@ def test_knowledge_growth_preserves_execution_and_supplies_the_next_check(tmp_pa
     def handoff(state):
         check=next(c for c in reversed(state['checks']) if c['action']=='exploration')
         return dict(action='research',rationale='Save the small consumer observation before map work',feedback=dict(
-            ref_ids=[check['id'],'code'],answered='The actual isolated call left one record for count.',
+            ref_ids=[check['id'],'code','call','surface:local-return'],answered='The actual isolated call left one record for count. This supplements the checked local return; clearing schedules remain independent.',
             remaining=['Describe the consumer relation before proposing its obligation.'],
+            understanding='updated',
             rationale='Keep the observation separate from the confirmed return proposition.')),{}
     def unrelated_handoff(state):
         raw,_=handoff(state)
-        raw['feedback'].update(answered='The separate clearing function mutates the records list without returning the earlier call result.',
+        raw['feedback'].update(ref_ids=['result'],answered='The separate clearing function mutates the records list without returning the earlier call result.',
             remaining=[],rationale='Retain another sourced observation; the earlier consumer lead is still independent.')
         return raw,{}
     def review_inherit(state):
         raw,files=review_step()(state)
         raw['review_items'][0].pop('target_id')
+        if variant=='shared' and len(state['units'])==1:
+            candidate=state['question_candidates'][0]['id']
+            check=next(c['id'] for c in state['checks'] if c['action']=='direct_check')
+            raw['feedback']=dict(ref_ids=[candidate,'call','surface:local-return',check,'code'],
+                answered='The admitted boundary reaches the increment branch and returns 4 above 3. This answers the local boundary question only.',
+                remaining=['Clearing schedules remain independent'],understanding='updated',
+                rationale='Retain the actual scoped result for source backfill without closing the wider consumer question')
         return raw,files
     steps=[initial,check_step(),review_inherit]
     if variant=='shared':steps += [explore,handoff,unrelated_handoff]
@@ -1087,7 +1112,12 @@ def test_knowledge_growth_preserves_execution_and_supplies_the_next_check(tmp_pa
         handoffs=[s for s in state.selections if s['action']=='research' and s.get('feedback') and not s['map_updated']]
         assert len(handoffs)==3 and all(not s['map_updated'] for s in handoffs)
         assert sum(s['operation_id']==snapshots['handoff_id'] for s in state.selections)==1
-        assert handoffs[0]['feedback']['ref_ids']==handoffs[1]['feedback']['ref_ids']
+        assert handoffs[1]['feedback']['ref_ids']==['result']
+        assert not any(h['operation_id']==handoffs[1]['operation_id'] and 'surface:local-return' in h['ref_ids'] for h in compact['map_handoffs'])
+        assert (e.root/'audit-spec/v1.json').read_bytes()==snapshots['map1']
+        spec=json.loads(Path(state.audit_spec_path).read_text())
+        assert spec['behaviors'][0]['unknowns']==['Clearing schedules remain independent']
+        assert 'Does the local boundary overflow?' not in json.dumps(spec)
         assert compact['handoffs'][-1]['feedback']
         assert report.count('**已确认违反**')==1 and '未建立后果：' not in report
         assert 'unestablished_consequences' not in current['conclusions'][0]

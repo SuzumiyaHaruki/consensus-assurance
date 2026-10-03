@@ -12,6 +12,7 @@ OUTCOME = {'holds':'有限检查未见违反', 'violated':'观察到违反',
     'tests_passed':'所执行测试通过', 'tests_failed':'所执行测试失败',
     'unknown':'结果未确定', 'not_applicable':'不适用'}
 DISPOSITIONS = {'confirmed_in_scope':'已确认违反', 'bounded_no_violation':'有限检查未见违反', 'investigation_lead':'待调查线索'}
+INLINE_LIMIT = 200
 
 
 def execution_summary(check):
@@ -33,9 +34,12 @@ def excerpt(text, limit=230):
     return text if len(text) <= limit else text[:limit].rsplit(' ',1)[0] + '…'
 
 
-def cell(value):
+def cell(value, locator=''):
     text = json.dumps(value,ensure_ascii=False) if not isinstance(value,str) else value
-    return text.replace('|','\\|').replace('\n','<br>').replace('`','&#96;')
+    if len(text) > INLINE_LIMIT:
+        text = f'{type(value).__name__}，{len(text)} 字符；首尾预览：{text[:INLINE_LIMIT//4]}…{text[-INLINE_LIMIT//4:]}'
+    else:locator = ''
+    return text.replace('|','\\|').replace('\n','<br>').replace('`','&#96;') + ('；'+locator if locator else '')
 
 
 class Archive:
@@ -55,9 +59,9 @@ class Archive:
         path = self.root / path
         return path if path.resolve().is_relative_to(self.root) and path.is_file() else None
 
-    def link(self, value, label):
+    def link(self, value, label, fragment=''):
         path = self.path(value)
-        return f'[{cell(label)}]({quote(path.relative_to(self.root).as_posix())})' if path else f'{cell(label)}（归档字节缺失）'
+        return f'[{cell(label)}]({quote(path.relative_to(self.root).as_posix())}{fragment})' if path else f'{cell(label)}（归档字节缺失）'
 
     def read(self, value):
         path = self.path(value)
@@ -73,8 +77,9 @@ def report_view(state, archive):
 def observation_lines(record, artifact, check, archive, event_cache):
     """Select recorded comparisons and operands; never re-assess or invent an oracle."""
     from consensus_assurance.adapters.runners.experiment import extract_events
+    from consensus_assurance.core.events import field, MISSING
     plan = archive.read(artifact.get('plan_path'))
-    if not plan:return ['模型／缺失制品的观察请按固定 assessment 和原始输出审查。']
+    if not plan:return ['固定计划字节缺失；观察范围请按保存的 assessment 和原始输出审查。']
     if check.id not in event_cache:
         event_cache[check.id] = extract_events(check.model_copy(update={'stdout':str(archive.path(check.stdout) or ''),
             'stderr':str(archive.path(check.stderr) or '')}))
@@ -91,34 +96,38 @@ def observation_lines(record, artifact, check, archive, event_cache):
         selected = {i:events[i] for i in requested if 0 <= i < len(events)}
         if len(selected) != len(requested):lines.append('部分归档事件缺失；不补造观察。')
         if not selected:continue
-        fields = dict.fromkeys(spec.get('identity_fields',[]) + [p['field'] for p in
-            (spec.get('trigger'),spec.get('antecedent'),spec.get('assertion')) if p])
-        # Small scalar records remain readable; complex representations stay in the raw log.
+        predicates = [p for p in (spec.get('trigger'),spec.get('antecedent'),spec.get('assertion')) if p]
+        fields = dict.fromkeys(spec.get('identity_fields',[]) + [p['field'] for p in predicates])
+        prerequisites = plan['harness'].get('prerequisites',[])
+        references = dict.fromkeys(p['reference'] for p in predicates + [c for req in prerequisites for c in req['conditions']] if p.get('reference'))
+        references.update({req['alias']+'.'+c['field']:None for req in prerequisites for c in req['conditions']})
         rows = {}
         for i,event in selected.items():
-            values = {}
+            locations = {key:(i,key) for key in fields}
             aliases = prop.get('correlations',{}).get(str(i),{}).get('alias_indices',{})
-            for prerequisite in plan['harness'].get('prerequisites',[]):
-                index = aliases.get(prerequisite['alias'])
-                for condition in prerequisite['conditions']:
-                    value = events[index] if isinstance(index,int) and 0 <= index < len(events) else {}
-                    for part in condition['field'].split('.'):
-                        value = value.get(part,'未记录') if isinstance(value,dict) else '未记录'
-                    values[prerequisite['alias']+'.'+condition['field']] = value
+            locations.update({key:(aliases.get(key.partition('.')[0]),key.partition('.')[2]) for key in references})
+            # Requested operands may be complex; only small scalars add incidental context.
             for key,value in event.items():
                 if key.startswith('_ca_'):continue
-                if isinstance(value,dict):
-                    values.update({key+'.'+k:v for k,v in value.items() if not isinstance(v,(dict,list))})
-                elif not isinstance(value,list):values[key] = value
-            for key in values:fields.setdefault(key,None)
+                extras = {key+'.'+k:v for k,v in value.items()} if isinstance(value,dict) else {key:value}
+                for name,extra in extras.items():
+                    if not isinstance(extra,(dict,list)) and len(str(extra)) <= INLINE_LIMIT:
+                        locations.setdefault(name,(i,name))
+            values = {}
+            for key,(index,name) in locations.items():
+                value = field(events[index],name) if isinstance(index,int) and 0 <= index < len(events) else MISSING
+                locator = archive.link(check.stdout,f'{check.id} / event[{index}] / {name}',
+                    f'#event={index}&field={quote(name,safe="")}')
+                values[key] = '未记录' if value is MISSING else cell(value,locator)
+                fields.setdefault(key,None)
             rows[i] = values
         lines += ['| 记录字段 | '+' | '.join(f'观察 {n+1}'+('（违反见证）' if i in witnesses else '（未完成）' if i not in indices else '') for n,i in enumerate(selected))+' |',
             '| --- | '+' | '.join('---' for _ in selected)+' |']
         for key in fields:
-            lines.append('| '+cell(key)+' | '+' | '.join(cell(rows[i].get(key,'未记录')) for i in selected)+' |')
+            lines.append('| '+cell(key)+' | '+' | '.join(rows[i].get(key,'未记录') for i in selected)+' |')
         correlations = prop.get('correlations',{})
         lines += ['', '前提关联：'+'；'.join(f'观察 {n+1} → '+cell(correlations.get(str(i),{}).get('status','未记录'))
-            for n,i in enumerate(selected))+'。嵌套结构、前提原值及编码数据见原始观察；不猜测解码。', '']
+            for n,i in enumerate(selected))+'。首尾预览不参与比较，也不证明相等；原值链接的 event 从 0 计，field 为字段路径，不解码字符串。', '']
     return lines
 
 
@@ -130,10 +139,14 @@ def interruption_lines(check, archive):
     seconds = check.parameters.get('timeout_seconds','未记录')
     lines = [f'中断调用 `{check.action}`：status=`{check.status.value}`；timeout_limit=`{limit}`；timeout_seconds=`{seconds}`。',
         '；'.join([archive.link(f'logs/{check.id}/check.json','调用记录'),archive.link(check.stdout,'stdout'),archive.link(check.stderr,'stderr')])]
+    if check.status == ExecutionStatus.TIMEOUT:
+        lines.append({'total_seconds':'总运行预算到达，控制器停止最后一次调用；已受理结果保留。',
+            'agent_turn_timeout':'本轮 Agent 调用达到单轮上限；恢复资格仍按原合同处理。',
+            'action_timeout':'目标动作达到执行上限，未完成；不据此生成 holds 或活性违反。'}.get(limit,
+            '超时上限依据不足，具体原因见原始调用记录。'))
     if check.action == 'agent_turn':
         lines.append('可靠完成回执：'+('已记录完成事件；产物另行校验。' if check.parameters.get('agent_turn_completed') else '未记录；未完成草稿不受理。'))
-        lines.append(('可信传输诊断（不能定位故障责任方）：' if diagnostic.get('transport_failure') else '调用诊断（不据此授权重试）：')+
-            excerpt(diagnostic['message']) if diagnostic.get('message') else '单轮超时，具体原因未知。' if check.status == ExecutionStatus.TIMEOUT else '具体原因见原始调用记录。')
+        if diagnostic.get('message'):lines.append(('可信传输诊断（不能定位故障责任方）：' if diagnostic.get('transport_failure') else '调用诊断（不据此授权重试）：')+excerpt(diagnostic['message']))
     return lines
 
 
@@ -199,7 +212,7 @@ def render_report(state, root):
     lines = ['# 共识审计研究报告', '', '## 运行概览', '',
         f'审计目标 **{cell(config.get("target",{}).get("variant") or Path(state.snapshot.repo).name)}**。'
         f'本轮有 {len(results)} 项已产生观察的正式问题：'+ '、'.join(f'{label} {sum(r["disposition"]==key for r in results)} 项' for key,label in DISPOSITIONS.items())+
-        f'；另有源码解释 {len(explained)} 项、探索执行 {len(explorations)} 次。正式义务共 {len(state.claims)} 项，执行次数不等于问题数。', '',
+        f'；另有已获源码解释的 Candidate {len(explained)} 项、探索执行 {len(explorations)} 次。正式义务共 {len(state.claims)} 项，执行次数不等于问题数。', '',
         f'实际持续 **{state.elapsed_seconds/60:.2f} 分钟**；结束类型：**'+('控制器记录的' if stop.get('origin') == 'controller' else 'Agent 提出的' if stop else '')+stop_label+'**。',
         f'剩余 {capacity["remaining_seconds"]:.2f} 秒、{capacity["remaining"]["agent_calls"]} 次 Agent 调用、'
         f'{capacity["remaining"]["experiments"]} 次控制器目标执行。源码调查能力：'+('仍有预算' if capacity['source_investigation'] else '无剩余预算')+'。', '',
@@ -262,6 +275,7 @@ def render_report(state, root):
             ancestors=lineage(state,next(a for a in state.direct_checks if a.id==artifact['id']))
             old = [c for c in failures if c.direct_check_id in ancestors]
             for failed in old:lines.append('该问题保留的失败执行：'+link(failed.stdout,'原始失败')+'；'+link(failed.stderr,'诊断')+'。旧失败不覆盖当前结果。')
+    interpretations = {}
     for entry in exploration_records:
         lines += ['', '条件探索：'+excerpt(entry['question'] or '问题原稿字节缺失',200),
             '所选问题／策略（原文摘录）：'+excerpt(entry['rationale'] or '见固定原稿',240),
@@ -271,19 +285,17 @@ def render_report(state, root):
             lines += ['；'.join(execution_summary(check)[1:])+'。'+link(execution['record'],'执行记录')+'；'+
                 link(execution['stdout'],'实际输出')+'；'+link(execution['stderr'],'诊断'),
                 '；'.join(link(path,'执行文件清单') for path in execution['artifacts'])]
-            from consensus_assurance.adapters.runners.experiment import extract_events
-            events = extract_events(check.model_copy(update={'stdout':str(archive.path(check.stdout) or ''),
-                'stderr':str(archive.path(check.stderr) or '')}))
-            for event in events[:2]:
-                lines.append('结构化观察原值（非性质判定；全部事件见日志）：'+cell(excerpt(json.dumps(
-                    {k:v for k,v in event.items() if not k.startswith('_ca_')},ensure_ascii=False),300)))
         if not entry['executions']:lines.append('已受理问题，尚无保存的执行记录。')
-        if entry['feedback']:
-            saved = entry['feedback'][-1]['submission']
-            feedback = archive.read(saved).get('feedback') or {}
-            lines += ['执行后交接摘录：'+excerpt(feedback.get('answered','归档字节缺失'),260)+'；'+link(saved,'完整解释与剩余问题')]
-            if feedback.get('remaining'):lines.append('该交接保留的未知：'+'；'.join(feedback['remaining']))
-        else:lines.append('尚无受理的执行后解释；原观察可继续研究，不自动生成正式义务或审批待办。')
+        for handoff in entry['feedback']:
+            saved = handoff['submission']
+            interpretations.setdefault(saved,set()).update(handoff['ref_ids'])
+            lines.append('执行后精确引用交接：'+link(saved,'见下方集中解释；不是本次独立观察'))
+        if entry['executions'] and not entry['feedback']:lines.append('实际观察已保存，尚待解释；输出不自动生成正式义务或审批待办。')
+    for saved, refs in interpretations.items():
+        feedback = archive.read(saved).get('feedback') or {}
+        lines += ['', '后续受理解释（执行 '+', '.join(sorted(refs))+'）：'+excerpt(feedback.get('answered','归档字节缺失'),260),
+            link(saved,'完整交接；当前正式处置见上方固定制品与复核')]
+        if feedback.get('remaining'):lines.append('该交接当时的剩余问题（非当前欠账）：'+'；'.join(feedback['remaining']))
     lines += ['', '## 研究过程与认识增长', '',
         'A1 共识形成与推进、A2 上下文／权威转换及其连接由双主线概览导航；地图条目和检查数量不是责任覆盖率。',
         map_link+'。']
@@ -294,24 +306,23 @@ def render_report(state, root):
     lines += milestone_lines(state,research,archive,checks)
     lines += ['', '## 当前未决事项', '', '已选检查暂无欠账；研究范围仍可开放。' if not research['pending_work'] else '已选检查／争议仍有待办：']
     for item in research['pending_work']:lines.append('- '+link('research.json',item['id'])+'：'+'；'.join(item['reasons']))
-    for surface in research['frontier']['surfaces']:
-        if surface['disposition'] not in {'deferred','UNCLASSIFIED_PROTOCOL_RESPONSIBILITY'}:continue
-        ref = 'surface:'+surface['entry_point']
-        feedback = next((s['feedback'] for s in reversed(state.selections) if ref in s.get('feedback',{}).get('ref_ids',[])),{})
-        related = [entry for entry in exploration_records if ref in entry['ref_ids'] or
-            {c['check_id'] for c in entry['executions']} & set(feedback.get('ref_ids',[]))]
-        lines += ['', '**开放责任：'+surface['entry_point']+'**', '',
-            '保存的交接摘录：'+feedback['answered'] if feedback else '地图保留的缺口：'+surface['reason']]
-        if feedback.get('remaining'):lines.append('该交接保留的未知：'+'；'.join(feedback['remaining']))
-        for entry in related:
-            lines.append('相关探索的实际执行与后续解释见主要结果；'+link(entry['submission'],'已受理问题与计划'))
-        lines += ['下一步交接：'+feedback['rationale'] if feedback else
-            '已有调查计划见相关探索原稿。' if related else '尚未记录后续步骤。', map_link]
     for c in research['candidates']:
-        if c['results'] and not c['resume_conditions'] or c['status'] == 'explained':continue
+        if c['status'] in {'explained','closed'} or c['results'] and not c['resume_conditions'] and c['id'] not in research['frontier']['paused_candidate_ids']:continue
         lines += ['', '候选：'+c['question']['question'], '保存的语义未知：'+'；'.join(c['question']['unknowns']),
             '恢复条件：'+'；'.join(c['resume_conditions']),link('state.json','候选原文与历史')]
     if stop.get('resume_conditions'):lines += ['', '本轮记录的恢复条件：'+'；'.join(stop['resume_conditions'])]
+    registry = [('core_overview',research['core_overview']['open_details'])] if research['core_overview'] else []
+    registry += [(b['behavior_id'],b['unknowns']) for b in research['frontier']['behavior_unknowns']]
+    registry += [(f['fact_id'],f['unknowns']) for f in research['frontier']['relationships'] if f['unknowns']]
+    registry += [('surface:'+s['entry_point'],[s['reason']]) for s in research['frontier']['surfaces'] if s['disposition']!='mapped']
+    if registry:lines += ['', '### 地图登记与研究交接', '',
+        f'以下是地图 v{state.audit_spec_version} 的登记原文摘录，不等于当前检查欠账。精确引用仅表示相关；是否已回答及回填须核对条件和版本。'+map_link]
+    for ref, questions in registry:
+        if not questions:continue
+        handoffs = [h for h in research['map_handoffs'] if ref in h['ref_ids']]
+        lines += ['', '- '+cell(ref)+'：'+excerpt('；'.join(questions),200),
+            '  已有精确引用的研究交接，登记项未自动消除：'+'；'.join(link(h['submission'],h['operation_id']) for h in handoffs)
+            if handoffs else '  尚无精确对应交接；保留地图原问，不推断解决或新增欠账。']
     lines += ['', '## 证据与运行说明', '',
         '；'.join(link(name,label) for name,label in [('state.json','完整状态、版本与争议'),('research.json','当前研究索引'),
             ('config.json','实际配置'),('events.jsonl','事件时序'),('audit-method.md','实际加载方法')]),

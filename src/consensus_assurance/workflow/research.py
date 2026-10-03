@@ -121,11 +121,25 @@ def preview(text):
     return text if len(text) <= 240 else text[:240] + '…'
 
 
+def feedback_links(state, ref_ids, after=None):
+    """Locate accepted, explicit references; related does not mean answered or resolved."""
+    links, following = [], after is None
+    for selection in state.selections:
+        if following and 'accepted_versions' in selection:
+            refs = sorted(set(ref_ids) & set(selection.get('feedback',{}).get('ref_ids',[])))
+            if refs:
+                operation = selection['operation_id']
+                links.append({'operation_id':operation, 'ref_ids':refs,
+                    'submission':f'submissions/{operation}/accepted.json'})
+        if selection['operation_id'] == after:following = True
+    return links
+
+
 def exploration_results(state, read):
     """Join accepted products, action identities, executions and explicit later feedback."""
     actions = {a.id:a for a in [*state.action_history, *([state.pending_action] if state.pending_action else [])]}
     result = []
-    for index, selection in enumerate(state.selections):
+    for selection in state.selections:
         if selection['action'] != 'explore' or 'accepted_versions' not in selection:continue
         operation = selection['operation_id']
         submission = f'submissions/{operation}/accepted.json'
@@ -141,9 +155,7 @@ def exploration_results(state, read):
             'executions':[{'check_id':c.id,'status':c.status.value,'exit_code':c.exit_code,
                 'started_at':c.started_at,'ended_at':c.ended_at,'record':f'logs/{c.id}/check.json',
                 'stdout':c.stdout,'stderr':c.stderr,'artifacts':c.artifacts} for c in checks.values()],
-            'feedback':[{'operation_id':s['operation_id'],'submission':f'submissions/{s["operation_id"]}/accepted.json'}
-                for s in state.selections[index+1:] if 'accepted_versions' in s
-                and checks.keys() & set(s.get('feedback',{}).get('ref_ids',[]))]})
+            'feedback':feedback_links(state,checks,after=operation)})
     return result
 
 
@@ -189,6 +201,7 @@ def view(state, compact=False):
         'artifacts':[project(a,{'id','version','unit_id','claim_id',
             'plan_path','harness_path','graph_versions','previous_id'}) for a in artifacts], 'assessments':records,
         'frontier':frontier(state,spec,results), 'capacity':capacity(state), 'conclusions':results, 'costs':costs(state),
+        'map_handoffs':feedback_links(state,audit_object_index(spec)),
         'handoffs':[s for s in state.selections if s.get('feedback') or s.get('released_candidate_ids') or s['action'] in {'pause','explained'} or s['action']=='stop' and s.get('scope')!='run'],
         'pending_work':pending_work(state), 'current':{k:v for k,v in state.current_submission.items() if k!='harness'},
         'latest_decision':state.selections[-1] if state.selections else None,

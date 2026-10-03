@@ -2,7 +2,7 @@
 
 Read research.json for selected work and shared relationship navigation. A record locator names an existing JSON path, collection and exact match fields; paths are relative to the index directory unless absolute. Select matching records, then read field when present. Historical previews are navigation, not current pending work. Use artifact basis locators and graph_versions for old requirements, not the latest same-ID claim. Materials and execution IDs resolve through records in state.json. Full reviews, drafts and fixed inputs remain at their indexed paths.
 
-Existing review items may carry optional short Chinese report_title/report_answer for their target. This presentation-only exception does not replace English rationale, conditions, measured fields or the controller verdict. Omission never blocks work; do not add a translation or closing turn.
+When capacity permits, supply an optional short Chinese report_title and one to three report_answer sentences with decisive conditions in review items. Keep English semantic reasoning; actual verdicts and measurements prevail. Omission never blocks work or warrants a translation turn.
 
 Write a complete submission.json using submission.schema.json and product-schemas.json. Cite authorized captured ranges. Follow next_objective and the analysis guide for core_overview readiness; a usable map and first Candidate may share a submission.
 
@@ -21,7 +21,7 @@ The controller derives actual map differences and reverse indexes. map_changes e
 
 Coherent knowledge and its issues are accepted together; unaffected checks retain their basis. reconnect_questions updates explicitly selected questions. ScopeUpdate/F3 expands dependencies under its existing write rules; changed normative or fault/configuration applicability uses F2. No-op maps create no version.
 
-feedback records ref_ids, answered, remaining, optional understanding and next-discriminator rationale. question_updates maps Candidate IDs to semantic unknowns and resume_conditions; it cannot change requirements or erase counterevidence. CheckRun and assessments own current execution/review progress; remaining in historical handoffs is not a live task list.
+feedback.ref_ids names the particular Candidate, Behavior, Fact or surface:<entry_point> answered and its supporting acquired sources or executions. Explain each relationship, scoped answer and independent remaining gap; shared names or Facts do not transfer answers. map_handoffs locates exact references, not resolution. understanding=updated alone needs no map/version. question_updates revises Candidate unknowns/resume_conditions with sources, preserving requirements and counterevidence. Historical remaining is then-remaining; current execution/review progress belongs to CheckRun/assessment.
 
 Claim/Scope owns requirement and applicability; Harness legality records this history and caller duties. Use the evidence-review guide and experiments reference for independent monitoring, identity, prerequisites, completion and attribution. claim.concern classifies responsibility, not confidence.
 

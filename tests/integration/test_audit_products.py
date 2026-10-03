@@ -406,11 +406,12 @@ def test_explicit_resume_reads_executed_exploration_after_transport_timeout(tmp_
     entry, = index['explorations']
     assert len(entry['executions']) == len(entry['feedback']) == 1
     assert '没有正式性质判定' in stopped_report and '| 问题 | 当前结果 |' not in stopped_report
-    assert '尚无受理的执行后解释' in stopped_report and failed.id in stopped_report
+    assert entry['executions'][0]['check_id'] in stopped_report and failed.id in stopped_report
+    assert '后续受理解释（执行' not in stopped_report
     assert 'agent_turn_timeout' in stopped_report and '0.15' in stopped_report
     assert '双主线概览已就绪' in stopped_report
     continued = render_report(state, e.root).read_text()
-    assert failed.id in continued and 'observed decision remained 7' in continued
+    assert failed.id in continued and entry['feedback'][0]['submission'] in continued and 'observed decision remained 7' in continued
 
 
 @pytest.mark.parametrize('boundary',['total','calls','config','snapshot','permissions','tools','repeat'])
