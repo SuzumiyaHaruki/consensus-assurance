@@ -163,6 +163,7 @@ def exploration_results(state, read):
         product = read(submission)
         owned = {a.id for a in actions.values() if a.kind == 'exploration' and a.logical_input.get('operation_id') == operation}
         checks = {c.id:c for c in state.checks if c.action == 'exploration' and c.pending_action_id in owned}
+        handoffs = feedback_links(state,checks,after=operation)
         result.append({'operation_id':operation, 'submission':submission,
             'question':product.get('question'), 'rationale':product.get('rationale'),
             'ref_ids':product.get('feedback',{}).get('ref_ids',[]) if product.get('feedback') else [],
@@ -171,8 +172,9 @@ def exploration_results(state, read):
                 dict.fromkeys([product.get('harness_path'),*product.get('files',{}).values()]) if name],
             'executions':[{'check_id':c.id,'status':c.status.value,'exit_code':c.exit_code,
                 'started_at':c.started_at,'ended_at':c.ended_at,'record':f'logs/{c.id}/check.json',
+                'execution_package':c.parameters.get('execution_package'),'harness_filename':c.parameters.get('harness_filename'),
                 'stdout':c.stdout,'stderr':c.stderr,'artifacts':c.artifacts} for c in checks.values()],
-            'feedback':feedback_links(state,checks,after=operation)})
+            'feedback':handoffs, 'without_followup':[id for id in checks if not any(id in h['ref_ids'] for h in handoffs)]})
     return result
 
 
@@ -316,6 +318,7 @@ def current_view(state, root, implementation=None):
         method_path=str(root/'audit-method.md'),
         directed_question=state.config.get('directed_question'),tools=state.tools,
         implementation={'name':implementation.name,'harness_kind':implementation.harness_kind,
+            'default_execution_package':getattr(implementation,'package',None),
             'harness_filename':implementation.harness_filename,'instructions':implementation.harness_instructions,
             'support_path':str(root/'target-support')} if implementation else None,
         validation=validation_tool(root),

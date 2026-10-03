@@ -1106,3 +1106,68 @@ func emit(event string, value bool) {{ fmt.Printf("CA_EVENT {{\\"event\\":\\"%s\
     recovered=execute(e,new)
     assert recovered.id==previous.id and recovered.command==previous.command
     assert recovered.parameters['harness_filename']=='internal/core/custom_generated_test.go'
+
+
+@pytest.mark.parametrize('delivery',['accepted','deadline','blocked'])
+def test_small_exploration_answer_is_independent_of_unfinished_large_product(tmp_path,delivery):
+    from consensus_assurance.core.types import ExecutionStatus
+    from consensus_assurance.workflow.audit import validate_submission
+    from consensus_assurance.workflow.research import exploration_results
+    def explore(state):
+        return dict(action='explore',question='What does the second legal call return?',harness_path='probe.py',
+            rationale='Keep an observation separate from a formal claim'),{'probe.py':'from target import step\nprint(step(2,3))\n'}
+    def small(state):
+        large,files=first(state)
+        large['sources'][0]['end_line']=999
+        files['unfinished.json']=json.dumps(large)
+        check=next(c for c in state['checks'] if c['action']=='exploration')
+        return dict(action='research',rationale='Retain only the understood conditional observation',
+            feedback=dict(ref_ids=[check['id'],'code'],answered='The legal interior call returned 3; this observation creates no new obligation.',
+                remaining=['Acquire the independent caller contract before formalizing another question'],
+                understanding='unchanged',rationale='The larger draft still has an invalid citation')),files
+    e,repo=engine_for(tmp_path,[first,check_step(),review_step(),explore,small,stop])
+    e.agent.mock=False;e.config.execution_isolation='bwrap'
+    (repo/'target.py').write_text('def step(value, limit):\n    return value + 1\n')
+    old={};invoke=e.agent.investigate
+    def investigate(*args,**kwargs):
+        result=invoke(*args,**kwargs)
+        if e.agent.cursor!=5:return result
+        old.update({k:json.loads(json.dumps(e.state.model_dump(mode='json')[k])) for k in
+            ('units','evidence','monitor_results','audit_spec_version','graph_version','question_candidates')})
+        diagnostics=validate_submission(e.state,e.root,'unfinished.json',e.implementation)
+        assert not diagnostics['valid'] and diagnostics['diagnostics']
+        (e.root/'draft/unfinished-diagnostics.json').write_text(json.dumps(diagnostics))
+        if delivery!='accepted':
+            check,session,_=result
+            check.status=ExecutionStatus.TIMEOUT if delivery=='deadline' else ExecutionStatus.ERROR
+            check.reason='No reliable receipt before the deadline' if delivery=='deadline' else 'Service security refusal'
+            if delivery=='deadline':e.budget.previous=e.config.budget.total_seconds
+            return check,session,None
+        return result
+    e.agent.investigate=investigate
+    checkpoint=e.checkpoint
+    def expire(event):
+        checkpoint(event)
+        if event=='audit_execution_completed' and e.state.current_submission.get('action')=='research':
+            e.budget.previous=e.config.budget.total_seconds
+    e.checkpoint=expire
+    state=e.start(repo)
+    assert state.monitor_results[0]['confirmed'] and len(state.units)==1
+    for key,value in old.items():assert state.model_dump(mode='json')[key]==value,key
+    assert (e.root/'draft/unfinished.json').exists() and (e.root/'draft/unfinished-diagnostics.json').exists()
+    entries=exploration_results(state,lambda name:json.loads((e.root/name).read_text()))
+    entry,=entries
+    assert len(entry['executions'])==1
+    if delivery=='accepted':
+        assert len(entry['feedback'])==1 and not entry['without_followup']
+        accepted=json.loads((e.root/entry['feedback'][0]['submission']).read_text())
+        assert accepted['action']=='research' and accepted['feedback']['remaining']
+        assert entry['executions'][0]['check_id'] in accepted['feedback']['ref_ids']
+    else:
+        assert not entry['feedback'] and entry['without_followup']==[entry['executions'][0]['check_id']]
+        assert state.current_submission['phase']=='failed'
+    assert not any((p/'accepted.json').exists() and 'unfinished.json' in (p/'accepted.json').read_text() for p in (e.root/'submissions').iterdir())
+    # This checks the actual loaded resource, not an unattached instruction file or LLM behavior.
+    method=(e.root/'audit-method.md').read_text()
+    assert 'tasks/audit.md' in state.method_paths
+    assert all(concept in method for concept in ('feedback-only','CheckRun','execution_package'))
