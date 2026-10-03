@@ -335,21 +335,62 @@ def test_scope_reconnects_added_fact_dependency_and_keeps_old_scope(tmp_path):
 
 
 def test_descriptive_noop_and_removal_are_explicit_without_reexecution(tmp_path):
+    from consensus_assurance.workflow.audit import validate_submission
+    saved={}
+    def initial(state):
+        sub,files=first(state);spec=json.loads(files['map.json'])
+        spec['behaviors'][0]['unknowns']=['Can the checked entry pass a negative input?', 'Who invokes the later consumer?']
+        files['map.json']=json.dumps(spec)
+        return sub,files
+    def explain(state):
+        sub,_=question_step(state);sub.pop('map_path')
+        sub.update(action='explained',sources=[dict(id='entry',file='entry.py',start_line=1,end_line=4,kind='code_observation')])
+        sub['question'].update(question='Can the checked entry pass a negative input?',source_ids=['code','entry'],
+            disposition='explained_by_existing_mechanism',unknowns=[],counterevidence=['checked rejects negative input before calling step'])
+        return sub,{}
     def clarify(state,remove=False):
         spec=json.loads(Path(state['audit_spec_path']).read_text())
-        spec['facts'][0]['meaning']='The invocation has delivered its local return value'
-        changes={'result':dict(impact='clarification',source_ids=['code'],rationale='Same delivery semantics and identity, more precise local wording')}
+        if not saved:
+            saved.update(map=Path(state['audit_spec_path']).read_bytes(),fact=spec['facts'][0],
+                records={k:state[k] for k in ('units','direct_checks','checks','monitor_results','semantic_reviews')})
+        spec['behaviors'][0].update(important_branches=['checked rejects negative input before step; direct callers retain their own input duties'],
+            unknowns=['Who invokes the later consumer?'],source_ids=['code','entry'])
+        changes={'call':dict(impact='clarification',source_ids=['entry'],rationale='Store the explained caller guard in its Behavior',
+            preserves='The return Fact, original legal-call check and explained entry question retain their exact scope')}
+        sub,_=next_question(state)
+        sub['question'].update(question='Who consumes the result after the checked entry?',source_ids=['code','entry'],
+            counterevidence=spec['behaviors'][0]['important_branches'],unknowns=spec['behaviors'][0]['unknowns'])
         if remove:
-            spec['facts'][0]['unknowns']=[]
+            spec['behaviors'][0]['unknowns']=[]
             changes={}
-        return dict(action='research',map_path='map.json',map_changes=changes,rationale='Refine sourced wording'),{'map.json':json.dumps(spec)}
+            sub=dict(action='research',rationale='Remove an unknown without its required explanation')
+        return dict(sub,map_path='map.json',map_changes=changes),{'map.json':json.dumps(spec)}
     def noop(state):
         return dict(action='research',map_path='map.json',rationale='Confirm current map already suffices'),{'map.json':Path(state['audit_spec_path']).read_text()}
-    e,repo=engine_for(tmp_path,[first,clarify,noop,lambda s:clarify(s,True),stop])
+    e,repo=engine_for(tmp_path,[initial,check_step(),review_step(),explain,clarify,noop,lambda s:clarify(s,True),stop])
+    e.agent.mock=False;e.config.execution_isolation='bwrap'
+    (repo/'entry.py').write_text('from target import step\ndef checked(value, limit):\n    if value < 0: raise ValueError("negative input")\n    return step(value, limit)\n')
+    invoke=e.agent.investigate
+    def preflight(*args,**kwargs):
+        reply=invoke(*args,**kwargs)
+        if e.agent.cursor==5:
+            before=e.state.model_dump(mode='json')
+            result=validate_submission(e.state,e.root,'submission.json',e.implementation)
+            assert result['valid'],result
+            assert e.state.model_dump(mode='json')==before
+        return reply
+    e.agent.investigate=preflight
     state=e.start(repo)
     assert state.audit_spec_version==2 and len(diagnostics(e))==1
     assert len(list((e.root/'audit-spec').glob('v*.json')))==2
     assert state.units[0].audit_question.audit_spec_version==1
+    assert (e.root/'audit-spec/v1.json').read_bytes()==saved['map']
+    assert json.loads(Path(state.audit_spec_path).read_text())['facts'][0]==saved['fact']
+    assert all(state.model_dump(mode='json')[k]==v for k,v in saved['records'].items() if k!='checks')
+    assert [c.model_dump(mode='json') for c in state.checks if c.action=='direct_check']==[c for c in saved['records']['checks'] if c['action']=='direct_check']
+    assert not state.review_issues and state.usage['experiments']==state.usage['semantic_reviews']==1
+    assert [c.status for c in state.question_candidates]==['paused','explained','active']
+    assert state.question_candidates[-1].question.unknowns==['Who invokes the later consumer?']
 
 
 def test_review_can_supply_feedback_without_an_extra_turn(tmp_path):
@@ -1162,6 +1203,9 @@ def test_new_knowledge_challenges_and_reviews_a_retained_source_explanation(tmp_
         return dict(action='research',map_path='map.json',rationale='Make the previously implicit legal-input boundary explicit',
             map_changes={'result':dict(impact='meaning',source_ids=['code','doc'],rationale='Recover the documented input qualification',
                 challenges={state['question_candidates'][0]['id']:'Check whether the old explanation assumed arbitrary input despite the documented precondition'})}),{'map.json':json.dumps(spec)}
+    def disguised(state):
+        sub,files=challenge(state);sub['map_changes']['result']['impact']='clarification'
+        return sub,files
     def resolve(state):
         c=state['question_candidates'][0];issue=state['review_issues'][0]
         assert c['status']==disposition and not issue['resolved_by']
@@ -1177,9 +1221,14 @@ def test_new_knowledge_challenges_and_reviews_a_retained_source_explanation(tmp_
         return dict(action='research',map_path='map.json',rationale='Separate an independent consumer boundary from the pending qualification review',
             map_changes={'result':dict(impact='clarification',source_ids=['code','doc'],
                 rationale='The additional unknown is about a later consumer',preserves='The consumer is outside the saved local question; its qualification challenge still requires review')}),{'map.json':json.dumps(spec)}
-    steps=[explain]+([close] if disposition=='closed' else [])+[challenge,preserve_without_resolving,invalid_review,resolve,stop]
+    steps=[explain]+([close] if disposition=='closed' else [])+[disguised,challenge,preserve_without_resolving,invalid_review,resolve,stop]
     e,repo=engine_for(tmp_path,steps);state=e.start(repo)
-    assert len(diagnostics(e))==1 and 'review_unknown_source' in str(diagnostics(e))
+    assert len(diagnostics(e))==2 and 'review_unknown_source' in str(diagnostics(e))
+    assert 'not descriptive clarification' in str(diagnostics(e))
+    change=next(s for s in state.selections if s.get('map_updated') and s['accepted_versions']['audit_spec']==2)
+    delta=change['map_delta']['result']
+    assert delta['before']['validity_context']!=delta['after']['validity_context']
+    assert state.review_issues[0].review_id==change['operation_id']
     assert state.audit_spec_version==3 and state.question_candidates[0].status==disposition
     assert state.review_issues[0].resolved_by and not state.direct_checks
     assert not view(state)['candidates'][0]['open_issue_ids']
