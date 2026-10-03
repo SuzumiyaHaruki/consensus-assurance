@@ -1,0 +1,782 @@
+{
+  "version": 1,
+  "target_profile": {
+    "system_boundary": "Captured Go Raft library, its in-repository transport/store implementations and injected Transport, LogStore, StableStore, SnapshotStore and FSM interfaces. External implementations are not inferred to have been read.",
+    "protocol_contexts": [
+      "Term and leader tenure",
+      "Per-peer replication progress",
+      "Latest/committed configuration",
+      "Log/snapshot prefix",
+      "Client future"
+    ],
+    "ownership": [
+      "Main loop serializes ordinary protocol state",
+      "Per-peer replication and heartbeat workers",
+      "FSM and snapshot workers",
+      "Caller provides deterministic FSM and storage/transport implementations"
+    ],
+    "source_ids": [
+      "startup",
+      "transport-contract",
+      "fsm-contract",
+      "logstore-interface"
+    ],
+    "unknowns": [
+      "Full transport and concrete store failure contracts remain unmapped."
+    ]
+  },
+  "activities": [
+    {
+      "class_id": "A1",
+      "applicability": "applicable",
+      "purpose": "Qualified support for decision formation and legal advancement",
+      "realization_summary": "Log dispatch, periodic commit propagation, explicit trigger, retry or successful pipeline response; match increase or voter-set change; commitCh notification; AppendEntries request",
+      "entry_points": [
+        "replicate-support",
+        "aggregate-commit",
+        "follower-append"
+      ],
+      "source_ids": [
+        "dispatch-apply",
+        "replication-context",
+        "replication-response",
+        "replication-producer",
+        "replication-match",
+        "replication-triggers",
+        "snapshot-send",
+        "commitment",
+        "leader-results",
+        "leader-consumption",
+        "follower-append",
+        "rpc-dispatch",
+        "heartbeat-verify"
+      ]
+    },
+    {
+      "class_id": "A2",
+      "applicability": "applicable",
+      "purpose": "Context validity and acquisition, transfer or loss of authority",
+      "realization_summary": "Follower contact expiry or TimeoutNow; candidate election retries; Entering or leaving runLeader; Public VerifyLeader admitted on verifyCh; response-triggered vote notification",
+      "entry_points": [
+        "campaign",
+        "leader-tenure-state",
+        "verification"
+      ],
+      "source_ids": [
+        "follower-authority",
+        "leader-tenure",
+        "election-producer",
+        "vote-handlers",
+        "term-persistence",
+        "transfer-receiver",
+        "replication-context",
+        "verify-lease",
+        "api-completion",
+        "verify-notify",
+        "verify-tally",
+        "heartbeat-verify",
+        "leader-results",
+        "replication-match",
+        "snapshot-send"
+      ]
+    },
+    {
+      "class_id": "A3",
+      "applicability": "applicable",
+      "purpose": "Recovery and resynchronization of eligible participation",
+      "realization_summary": "Missing append history or InstallSnapshot RPC",
+      "entry_points": [
+        "snapshot-recovery"
+      ],
+      "source_ids": [
+        "snapshot-send",
+        "snapshot-install",
+        "fsm-execution"
+      ]
+    },
+    {
+      "class_id": "A4",
+      "applicability": "applicable",
+      "purpose": "Configuration and participant eligibility",
+      "realization_summary": "Admitted configuration request or received configuration entry",
+      "entry_points": [
+        "membership"
+      ],
+      "source_ids": [
+        "configuration-update",
+        "configuration-rules",
+        "suffrage-contract",
+        "follower-append",
+        "leader-consumption"
+      ]
+    },
+    {
+      "class_id": "A5",
+      "applicability": "applicable",
+      "purpose": "Decision application and consumption",
+      "realization_summary": "processLogs batch or restoreFuture",
+      "entry_points": [
+        "fsm-consumption"
+      ],
+      "source_ids": [
+        "dispatch-apply",
+        "fsm-contract",
+        "fsm-execution"
+      ]
+    },
+    {
+      "class_id": "A6",
+      "applicability": "applicable",
+      "purpose": "History, persistence and reconstruction of support",
+      "realization_summary": "Startup or snapshot request",
+      "entry_points": [
+        "history-reconstruction"
+      ],
+      "source_ids": [
+        "startup",
+        "snapshot-create",
+        "term-persistence"
+      ]
+    },
+    {
+      "class_id": "A7",
+      "applicability": "applicable",
+      "purpose": "Client contracts, invocation intervals and observed completion",
+      "realization_summary": "Public invocation",
+      "entry_points": [
+        "client-entry"
+      ],
+      "source_ids": [
+        "api-completion",
+        "restore-contract",
+        "restore-user",
+        "leader-results"
+      ]
+    }
+  ],
+  "behaviors": [
+    {
+      "id": "campaign",
+      "primary_activity": "A2",
+      "execution_owner": "Raft main loop, campaign RPC workers",
+      "protocol_context": "Current term and latest configuration; campaign-local reply channel",
+      "trigger": "Follower contact expiry or TimeoutNow; candidate election retries",
+      "source_ids": [
+        "follower-authority",
+        "leader-tenure",
+        "election-producer",
+        "vote-handlers",
+        "term-persistence",
+        "transfer-receiver"
+      ],
+      "implementation_guards": [
+        "Only latest-configuration voters are solicited. Normal follower timeout requires local voting eligibility. Pre-vote precedes term increment unless disabled or leadership transfer.",
+        "Vote handlers check known leader, candidate configuration membership, terms, prior persisted vote, and lexicographic last-log term/index freshness. A newer-term request may cause step-down before rejection as nonvoter."
+      ],
+      "writes": [
+        "Term, role, known leader, last-contact, campaign tally"
+      ],
+      "durable_effects": [
+        "Current term stored before publishing; vote term then candidate bytes stored before granting"
+      ],
+      "external_effects": [
+        "A campaign majority changes role to Leader; higher-term vote reply changes to Follower"
+      ],
+      "async_boundaries": [
+        "One buffered reply channel per campaign; old replies do not enter a later campaign tally"
+      ],
+      "cross_activity_effects": {
+        "A1": "Elects owner of a fresh commitment context using persisted log freshness",
+        "A6": "Reads durable vote and last log/snapshot history"
+      },
+      "unknowns": [
+        "Failure semantics between the two vote persistence writes remain unexamined."
+      ]
+    },
+    {
+      "id": "leader-tenure-state",
+      "primary_activity": "A2",
+      "execution_owner": "Raft main loop",
+      "protocol_context": "One leader tenure with captured term and commitment object",
+      "trigger": "Entering or leaving runLeader",
+      "source_ids": [
+        "leader-tenure",
+        "replication-context",
+        "verify-lease"
+      ],
+      "writes": [
+        "Fresh commitment startIndex, inflight list, replication map, verification map, stepDown channel"
+      ],
+      "external_effects": [
+        "Starts replicators and dispatches a current-term no-op; leaving closes replication stop channels and fails pending inflight and verification futures"
+      ],
+      "async_boundaries": [
+        "Each replicator retains this tenure commitment pointer and stepDown channel; old workers can finish against detached state"
+      ],
+      "produces_fact_ids": [
+        "tenure-support"
+      ],
+      "cross_activity_effects": {
+        "A1": "New commitment requires a current-term entry before advancing old prefix",
+        "A7": "Leadership loss does not certify that a previously submitted write was never committed"
+      }
+    },
+    {
+      "id": "replicate-support",
+      "primary_activity": "A1",
+      "execution_owner": "Leader dispatch on main loop and per-peer replication workers",
+      "protocol_context": "Captured leader term, peer identity and commitment pointer",
+      "trigger": "Log dispatch, periodic commit propagation, explicit trigger, retry or successful pipeline response",
+      "source_ids": [
+        "dispatch-apply",
+        "replication-context",
+        "replication-response",
+        "replication-producer",
+        "replication-match",
+        "replication-triggers",
+        "snapshot-send"
+      ],
+      "implementation_guards": [
+        "Leader local StoreLogs must succeed before self match. Follower success and absence of newer response term precede match. commitment.match accepts current voters only."
+      ],
+      "writes": [
+        "Peer nextIndex, lastContact, matchIndexes"
+      ],
+      "external_effects": [
+        "Bounded contiguous append batches; rejection backs up nextIndex; missing log invokes snapshot transfer; successful responses may notify pending verification"
+      ],
+      "async_boundaries": [
+        "Pipeline decoding and heartbeat run separately; replication fallback and commit timeout provide later attempts"
+      ],
+      "produces_fact_ids": [
+        "tenure-support"
+      ],
+      "consumes_fact_ids": [
+        "tenure-support"
+      ],
+      "cross_activity_effects": {
+        "A2": "A newer response term signals this tenure to step down",
+        "A3": "Snapshot restores participation when log replay cannot reach peer"
+      },
+      "unknowns": [
+        "Legal history in which bounded AppendEntries ends before a divergent follower suffix remains to be traced."
+      ]
+    },
+    {
+      "id": "aggregate-commit",
+      "primary_activity": "A1",
+      "execution_owner": "Mutex-protected commitment object and main leader loop",
+      "protocol_context": "One tenure, latest voter set, first index of tenure",
+      "trigger": "match increase or voter-set change; commitCh notification",
+      "source_ids": [
+        "commitment",
+        "leader-results",
+        "leader-consumption"
+      ],
+      "implementation_guards": [
+        "Match increases only for IDs in current voter map. Majority order statistic must reach startIndex and exceed prior commitIndex."
+      ],
+      "writes": [
+        "Commitment commitIndex then Raft commitIndex on notification"
+      ],
+      "external_effects": [
+        "Updates committed configuration when crossed, queues committed inflight prefix for application, and steps down if removed"
+      ],
+      "consumes_fact_ids": [
+        "tenure-support"
+      ],
+      "produces_fact_ids": [
+        "commit-bound"
+      ],
+      "cross_activity_effects": {
+        "A4": "New configuration is marked committed on crossing its index",
+        "A5": "processLogs queues committed entries, separate from completed FSM execution"
+      }
+    },
+    {
+      "id": "follower-append",
+      "primary_activity": "A1",
+      "execution_owner": "Raft RPC consumer; transport fast-path for empty heartbeat",
+      "protocol_context": "Incoming leader term and local log/snapshot predecessor",
+      "trigger": "AppendEntries request",
+      "source_ids": [
+        "follower-append",
+        "rpc-dispatch",
+        "replication-producer",
+        "heartbeat-verify"
+      ],
+      "implementation_guards": [
+        "Reject older term or mismatching predecessor; skip same-term duplicate entries; delete conflicting suffix then store new entries"
+      ],
+      "writes": [
+        "Role/term/known leader, log suffix, latest/committed configuration, commitIndex and queued lastApplied"
+      ],
+      "durable_effects": [
+        "Replacement logs persist before successful response"
+      ],
+      "external_effects": [
+        "With positive newer LeaderCommitIndex, queues up to min(LeaderCommitIndex, local last index); successful response refreshes contact. Empty heartbeat producer carries zero commit index."
+      ],
+      "produces_fact_ids": [
+        "commit-bound"
+      ],
+      "cross_activity_effects": {
+        "A2": "New term changes authority, with same-term candidate transfer exception",
+        "A4": "Truncation can revert latest configuration",
+        "A5": "processLogs consumes the computed boundary"
+      },
+      "unknowns": [
+        "Does bounded replication establish matching history through every index used by the follower commit bound?",
+        "After successful truncation and failed StoreLogs, cached last-log metadata is not refreshed; applicable failure contract and later consumers remain unresolved."
+      ]
+    },
+    {
+      "id": "membership",
+      "primary_activity": "A4",
+      "execution_owner": "Raft main loop",
+      "protocol_context": "Latest and committed configuration indexes",
+      "trigger": "Admitted configuration request or received configuration entry",
+      "source_ids": [
+        "configuration-update",
+        "configuration-rules",
+        "suffrage-contract",
+        "follower-append",
+        "leader-consumption"
+      ],
+      "implementation_guards": [
+        "Leader admits changes only after prior latest configuration and current-term no-op are committed. nextConfiguration checks prevIndex, unique nonempty IDs/addresses and at least one voter."
+      ],
+      "writes": [
+        "Latest configuration, commitment voter map, replication map"
+      ],
+      "external_effects": [
+        "AddVoter grants Voter directly; replication includes Nonvoters too. A following configuration entry implies preceding configuration committed on follower."
+      ],
+      "consumes_fact_ids": [
+        "commit-bound"
+      ],
+      "cross_activity_effects": {
+        "A1": "Rebuilds eligible match map while preserving retained voter match indexes",
+        "A2": "Latest configuration controls campaign and lease quorum eligibility"
+      },
+      "unknowns": [
+        "Detailed address-change and remove/re-add overlap semantics remain unread."
+      ]
+    },
+    {
+      "id": "verification",
+      "primary_activity": "A2",
+      "execution_owner": "Main-loop verifyLeader and asynchronous followerReplication notifications",
+      "protocol_context": "One verifyFuture attached to current tenure replicators",
+      "trigger": "Public VerifyLeader admitted on verifyCh; response-triggered vote notification",
+      "source_ids": [
+        "api-completion",
+        "verify-lease",
+        "verify-notify",
+        "verify-tally",
+        "heartbeat-verify",
+        "leader-results",
+        "replication-context",
+        "replication-match",
+        "snapshot-send"
+      ],
+      "implementation_guards": [
+        "Threshold is latest voter count / 2 + 1; initial self vote is one. vote lock permits only one terminal notification per future."
+      ],
+      "writes": [
+        "Future votes and quorumSize; each replicator notify set"
+      ],
+      "external_effects": [
+        "verifyLeader registers the future with every replicator and requests immediate heartbeats. notifyAll forwards success booleans without identity/suffrage; leader loop returns nil once votes reach threshold or steps down on early negative notification."
+      ],
+      "produces_fact_ids": [
+        "verify-tally-fact"
+      ],
+      "consumes_fact_ids": [
+        "verify-tally-fact"
+      ],
+      "cross_activity_effects": {
+        "A1": "Aggregates support for authority verification using voter-derived threshold",
+        "A7": "Successful public verification is intended to prevent stale reads after leadership loss"
+      },
+      "existing_protections": [
+        "Leader lease separately counts only Voter contact and eventually steps down on insufficient contact. Main-loop tenure exit fails tracked verification futures."
+      ],
+      "unknowns": [
+        "Can a reachable Nonvoter success complete VerifyLeader while the old leader has lost voter-majority contact and another leader exists, before lease step-down?",
+        "Configuration changes concurrent with a pending verification may reinterpret threshold/support; this is a separate unresolved context."
+      ]
+    },
+    {
+      "id": "fsm-consumption",
+      "primary_activity": "A5",
+      "execution_owner": "Raft main loop queues; dedicated FSM goroutine consumes",
+      "protocol_context": "Ordered committed log prefix or explicit snapshot restore",
+      "trigger": "processLogs batch or restoreFuture",
+      "source_ids": [
+        "dispatch-apply",
+        "fsm-contract",
+        "fsm-execution"
+      ],
+      "implementation_guards": [
+        "Skip already queued lastApplied indexes; missing required log panics; batching validates response count"
+      ],
+      "writes": [
+        "Raft queued lastApplied separately from FSM worker lastIndex/lastTerm and user FSM state"
+      ],
+      "external_effects": [
+        "Commands invoke user Apply/ApplyBatch; futures complete after FSM callback. No-ops are not applied. Barrier completion is sequenced through FSM queue. Restore replaces state and worker indexes."
+      ],
+      "consumes_fact_ids": [
+        "commit-bound"
+      ],
+      "cross_activity_effects": {
+        "A7": "Apply response represents callback completion rather than merely replication",
+        "A6": "FSM snapshot captures worker completed index"
+      },
+      "unknowns": [
+        "Batching interface no-gap wording versus filtered internal log types has not been investigated."
+      ]
+    },
+    {
+      "id": "snapshot-recovery",
+      "primary_activity": "A3",
+      "execution_owner": "Replication sender, main RPC loop and FSM worker",
+      "protocol_context": "Leader term and snapshot log/configuration boundary",
+      "trigger": "Missing append history or InstallSnapshot RPC",
+      "source_ids": [
+        "snapshot-send",
+        "snapshot-install",
+        "fsm-execution"
+      ],
+      "implementation_guards": [
+        "Reject older term/version mismatch, incomplete transfer, snapshot finalization or FSM restore failure"
+      ],
+      "writes": [
+        "After successful FSM restore, lastApplied, snapshot boundary and latest/committed configuration; sender advances nextIndex and reports match on successful response"
+      ],
+      "external_effects": [
+        "Compacts logs or removes old logs for monotonic stores; then acknowledges snapshot"
+      ],
+      "produces_fact_ids": [
+        "tenure-support"
+      ],
+      "cross_activity_effects": {
+        "A1": "Successful snapshot acknowledgement contributes match index to sender tenure",
+        "A4": "Receiver installs snapshot configuration",
+        "A5": "Snapshot restoration replaces FSM state"
+      },
+      "unknowns": [
+        "Handling of delayed snapshots relative to newer applied entries needs separate source/history investigation."
+      ]
+    },
+    {
+      "id": "history-reconstruction",
+      "primary_activity": "A6",
+      "execution_owner": "NewRaft startup and snapshot goroutine",
+      "protocol_context": "Persisted current term, logs, snapshot and configuration",
+      "trigger": "Startup or snapshot request",
+      "source_ids": [
+        "startup",
+        "snapshot-create",
+        "term-persistence"
+      ],
+      "implementation_guards": [
+        "Startup validates configuration, loads last log, tries snapshots newest first and scans later configuration entries. Snapshot creation rejects FSM boundary before committed configuration."
+      ],
+      "writes": [
+        "Startup role Follower, term/log/snapshot caches, lastApplied and configuration; snapshot capture persists index/term/configuration"
+      ],
+      "external_effects": [
+        "Registers heartbeat callback and starts main/FSM/snapshot workers unless test skipStartup set"
+      ],
+      "cross_activity_effects": {
+        "A1": "Persisted history feeds matching and prefix application",
+        "A2": "Persisted term and log freshness constrain subsequent campaigns",
+        "A3": "Snapshots support recovery and truncation"
+      },
+      "unknowns": [
+        "Concrete persistence backend error atomicity and restart fault contracts are not yet mapped."
+      ]
+    },
+    {
+      "id": "client-entry",
+      "primary_activity": "A7",
+      "execution_owner": "Application API and main loop",
+      "protocol_context": "Leader-only Apply/Barrier/VerifyLeader; caller-owned FSM implementation",
+      "trigger": "Public invocation",
+      "source_ids": [
+        "api-completion",
+        "restore-contract",
+        "restore-user",
+        "leader-results"
+      ],
+      "implementation_guards": [
+        "Apply and Barrier timeout bounds enqueue, not completion. Nonleader rejects operations. Leadership transfer blocks writes/configuration changes."
+      ],
+      "external_effects": [
+        "Apply returns future; ErrLeadershipLost leaves write survival ambiguous. Disaster-recovery Restore cancels inflight writes, creates a hole above local/snapshot index with current configuration, restores FSM, then public API submits and waits for no-op."
+      ],
+      "cross_activity_effects": {
+        "A5": "Caller observes FSM completion via future",
+        "A3": "Manual restore is documented for disaster recovery into fresh cluster, not normal operations"
+      },
+      "unknowns": [
+        "Application-specific deterministic FSM correctness remains caller responsibility."
+      ]
+    }
+  ],
+  "facts": [
+    {
+      "id": "tenure-support",
+      "meaning": "Per-server greatest acknowledged matching log index retained by a particular leader commitment object for IDs currently admitted as voters.",
+      "identity": {
+        "owner": "leader commitment object",
+        "peer": "ServerID"
+      },
+      "validity_context": "One leader tenure; setConfiguration changes the eligible ID map and retains indexes for retained voters.",
+      "representation": [
+        "commitment.matchIndexes",
+        "followerReplication.commitment"
+      ],
+      "durability": "Volatile tracker; underlying log/snapshot persistence is reported by successful producer paths.",
+      "recovery": "Recreated with zero matches and a new startIndex for each tenure.",
+      "source_ids": [
+        "commitment",
+        "leader-tenure",
+        "replication-context",
+        "replication-match",
+        "snapshot-send"
+      ],
+      "invalidators": [
+        "leader-tenure-state"
+      ],
+      "reinterpreters": [
+        "membership"
+      ]
+    },
+    {
+      "id": "commit-bound",
+      "meaning": "Local index recorded as committed by either leader majority aggregation or follower consumption of a leader commit bound; this is distinct from completed FSM execution.",
+      "identity": {
+        "node": "Raft instance",
+        "index": "log index"
+      },
+      "validity_context": "Leader tenure aggregation or follower append history; correctness of each producer bound is not assumed.",
+      "representation": [
+        "raftState.commitIndex",
+        "commitment.commitIndex"
+      ],
+      "durability": "Volatile index; durable logs/snapshots carry recoverable history.",
+      "recovery": "Snapshot recovers applied boundary; subsequent leader/follower commit processing reconstructs later advancement.",
+      "source_ids": [
+        "commitment",
+        "leader-results",
+        "follower-append",
+        "startup"
+      ],
+      "unknowns": [
+        "Follower local-last-index bound may exceed entries matched by one bounded request."
+      ]
+    },
+    {
+      "id": "verify-tally-fact",
+      "meaning": "A verifyFuture records one initial self vote plus successful notifications until its voter-derived numerical quorum threshold or an early negative terminal notification is reached; the tally itself carries no peer identity or suffrage.",
+      "identity": {
+        "request": "verifyFuture instance"
+      },
+      "validity_context": "One verification request registered in a leader tenure; threshold sampled from latest voter count at registration.",
+      "representation": [
+        "verifyFuture.votes",
+        "verifyFuture.quorumSize",
+        "verifyFuture.notifyCh",
+        "followerReplication.notify"
+      ],
+      "durability": "Volatile; not a durable election or log commitment.",
+      "recovery": "No replay; tenure exit responds ErrLeadershipLost to pending tracked requests.",
+      "source_ids": [
+        "verify-lease",
+        "verify-notify",
+        "verify-tally",
+        "leader-results",
+        "leader-tenure"
+      ],
+      "invalidators": [
+        "leader-tenure-state"
+      ],
+      "unknowns": [
+        "Whether nonvoter support can make public verification falsely succeed after authority loss under a legal partition."
+      ]
+    }
+  ],
+  "surfaces": [
+    {
+      "entry_point": "Raft.appendEntries bounded commit advancement",
+      "disposition": "mapped",
+      "behavior_ids": [
+        "follower-append",
+        "replicate-support"
+      ],
+      "reason": "Can a legal bounded AppendEntries consume an unmatched local suffix before later batches replace it?",
+      "source_ids": [
+        "follower-append",
+        "replication-producer"
+      ],
+      "high_consequence": true
+    },
+    {
+      "entry_point": "Raft.appendEntries StoreLogs failure after truncation",
+      "disposition": "mapped",
+      "behavior_ids": [
+        "follower-append"
+      ],
+      "reason": "Which later actions consume stale last-log cache after truncation succeeds but replacement write fails, under which applicable storage fault contract?",
+      "source_ids": [
+        "follower-append",
+        "logstore-interface"
+      ],
+      "high_consequence": true
+    },
+    {
+      "entry_point": "Raft.VerifyLeader nonvoter notification",
+      "disposition": "mapped",
+      "behavior_ids": [
+        "verification"
+      ],
+      "reason": "Does nonvoter notification satisfy a voter quorum threshold after voter-majority authority is lost?",
+      "source_ids": [
+        "verify-lease",
+        "verify-notify",
+        "verify-tally",
+        "suffrage-contract"
+      ],
+      "high_consequence": true
+    }
+  ],
+  "core_overview": {
+    "status": "usable",
+    "rationale": "Representative formation and context transitions are traced through producers, aggregators, consumers, persistence, recovery and completion. Local anomalies and detailed concurrency/fault variants remain open, without asserting exhaustive coverage.",
+    "formation": {
+      "explanation": "Leader dispatch assigns term/index and persists locally, then self-matches and wakes per-peer replication. Replicators backtrack on mismatch, send bounded log batches or snapshots, and report successful progress into the tenure commitment object. Only eligible voter matches count; the majority boundary must reach the first index of this term. Main loop receives commit notification, updates configuration commitment, and queues entries. Followers accept matching predecessors, reconcile suffixes and use leader commit metadata to queue local history. FSM callbacks and futures complete asynchronously after queuing.",
+      "behavior_ids": [
+        "replicate-support",
+        "aggregate-commit",
+        "follower-append",
+        "fsm-consumption"
+      ],
+      "fact_ids": [
+        "tenure-support",
+        "commit-bound"
+      ],
+      "source_ids": [
+        "dispatch-apply",
+        "commitment",
+        "replication-response",
+        "follower-append",
+        "leader-results",
+        "fsm-execution",
+        "replication-context",
+        "replication-producer",
+        "replication-match",
+        "replication-triggers",
+        "snapshot-send",
+        "leader-consumption",
+        "rpc-dispatch",
+        "heartbeat-verify",
+        "fsm-contract",
+        "leader-tenure",
+        "startup"
+      ]
+    },
+    "context": {
+      "explanation": "Follower contact timeout starts campaigns only with local voter eligibility; optional pre-vote precedes persisted term/vote advancement. Vote handling checks membership, known leader, term, prior vote and last-log freshness. Campaign-local replies form the authority majority. New leadership allocates fresh support state and a no-op. Higher terms, insufficient voter lease contact or removal cause loss; transfer catches a target up and sends TimeoutNow, temporarily suppressing new writes. Tenure exit detaches old support state and fails pending client/verification work.",
+      "behavior_ids": [
+        "campaign",
+        "leader-tenure-state",
+        "membership",
+        "verification"
+      ],
+      "fact_ids": [
+        "tenure-support",
+        "verify-tally-fact"
+      ],
+      "source_ids": [
+        "follower-authority",
+        "vote-handlers",
+        "election-producer",
+        "leader-tenure",
+        "verify-lease",
+        "leader-results",
+        "term-persistence",
+        "transfer-receiver",
+        "replication-context",
+        "configuration-update",
+        "configuration-rules",
+        "suffrage-contract",
+        "follower-append",
+        "leader-consumption",
+        "api-completion",
+        "verify-notify",
+        "verify-tally",
+        "heartbeat-verify",
+        "replication-match",
+        "snapshot-send",
+        "commitment"
+      ]
+    },
+    "connection": {
+      "explanation": "Log freshness and durable votes constrain authority acquisition. New tenure match accounting starts afresh, but retained log history may advance only when a current-term entry gains majority support. Latest configuration governs voter eligibility; stable-configuration admission waits for prior commitment and the tenure no-op, while truncation and snapshots reconstruct configuration context. Old replication replies retain the old commitment pointer, not the new tenure tracker. Already queued committed FSM work is separate from inflight work failed at step-down; leadership loss is an ambiguous client outcome. Startup reconstructs term, log/snapshot and membership before beginning follower work. Verification separately aggregates replication notifications; its numerical tally does not itself establish voting eligibility, which is the selected unresolved premise.",
+      "behavior_ids": [
+        "leader-tenure-state",
+        "campaign",
+        "aggregate-commit",
+        "membership",
+        "history-reconstruction",
+        "snapshot-recovery",
+        "client-entry",
+        "verification"
+      ],
+      "fact_ids": [
+        "tenure-support",
+        "commit-bound",
+        "verify-tally-fact"
+      ],
+      "source_ids": [
+        "leader-tenure",
+        "replication-context",
+        "commitment",
+        "startup",
+        "configuration-update",
+        "snapshot-install",
+        "api-completion",
+        "verify-notify",
+        "verify-tally",
+        "verify-lease",
+        "follower-authority",
+        "election-producer",
+        "vote-handlers",
+        "term-persistence",
+        "transfer-receiver",
+        "leader-results",
+        "leader-consumption",
+        "configuration-rules",
+        "suffrage-contract",
+        "follower-append",
+        "snapshot-create",
+        "snapshot-send",
+        "fsm-execution",
+        "restore-contract",
+        "restore-user",
+        "heartbeat-verify",
+        "replication-match"
+      ]
+    },
+    "open_details": [
+      "Bounded follower append commit boundary and divergent history",
+      "Post-truncation storage-error cache validity and backend fault assumptions",
+      "Nonvoter support and concurrent configuration changes in verification",
+      "Delayed snapshot histories, legacy protocol variants and detailed transport scheduling"
+    ],
+    "core_gaps": []
+  }
+}

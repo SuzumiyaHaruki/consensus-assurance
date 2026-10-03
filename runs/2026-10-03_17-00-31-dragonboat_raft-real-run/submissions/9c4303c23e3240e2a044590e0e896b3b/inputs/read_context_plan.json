@@ -1,0 +1,119 @@
+{
+  "description": "Compare sequential and overlapping reads in fresh three-Peer networks. Real bootstrap, Tick election and committed no-op precede both scenarios. In overlap, nodes 2 and 3 each submit a distinct ReadIndex; node 3 probes confirm first, releasing the queued prefix. Deliver every generated response and then every held earlier probe. Compare each receiving ReadyToRead context with that originating operation input, using scenario/origin rather than ctx as identity. Wire messages and drained queue counts are diagnostics. This fixes inputs before execution and does not treat finite waiting as a liveness oracle.",
+  "claim_id": "C-forwarded-context",
+  "binding_ids": [
+    "BD-forwarded-context"
+  ],
+  "harness": {
+    "kind": "go_test",
+    "source": "",
+    "files": {},
+    "description": "TestAssuranceForwardedReadContexts in package raft, exercising actual Peer producer/consumer paths with existing TestLogDB as a crash-free persistence adapter.",
+    "semantic_changes": [
+      "No target implementation changes.",
+      "Deterministic in-process transport delivers messages, deferring earlier probes only in overlap.",
+      "Application adapter consumes only bootstrap membership entries and the election no-op; no user state-machine result is simulated.",
+      "Read-only private fields establish setup/admission and diagnostics; decisive observations use Peer.GetUpdate ReadyToReads."
+    ],
+    "prerequisites": [
+      {
+        "alias": "admitted",
+        "event": "read_admitted",
+        "conditions": []
+      }
+    ],
+    "legality": {
+      "source_ids": [
+        "M-peer-launch",
+        "M-peer-bootstrap",
+        "M-test-logdb",
+        "M-peer",
+        "M-engine-order",
+        "M-free-order",
+        "M-core-dispatch",
+        "M-core-commit",
+        "M-timers",
+        "M-heartbeat-producer",
+        "M-read-queue",
+        "M-follower-read",
+        "M-read-reply",
+        "M-node-read-entry",
+        "M-read-prefix-test",
+        "M-read-receiver-test"
+      ],
+      "expectation_ids": [
+        "M-read-prefix-test",
+        "M-read-receiver-test"
+      ],
+      "binding_ids": [
+        "BD-forwarded-context"
+      ],
+      "derivation": "Harness uses actual Launch with identical bootstrap membership on three Peers, the existing in-memory TestLogDB adapter, and actual Tick-triggered election on node 1. Every returned Update is appended/saved before any message is deliverable, then committed; committed bootstrap config entries are passed to ApplyConfigChange and the no-op is consumed in order, with NotifyRaftLastApplied reporting that work. This is a crash-free adapter, not a disk durability test. During the fixed-membership read phase, only actual Peer.ReadIndex, produced messages via Peer.Handle, and GetUpdate/Commit are used. ReadIndex calls from nodes 2 and 3 produce distinct contexts and are forwarded by actual followers; later heartbeat probes are delivered and fully drained before earlier held probes. Delaying an older probe across a newer one is a normal asynchronous network schedule and no helper serializes the two reads. All messages are eventually delivered unchanged. The setup explicitly verifies elected role, shared term/leader, current-term committed no-op and synchronized applied prefix. There is no private-state mutation, mocked handler, or fabricated response. Private pending state is read solely to record admission and final queue state.",
+      "applicability": "Fixed membership, no crashes or compaction, only bootstrap configuration and empty application entry, one operation per originating follower per scenario.",
+      "unresolved": [],
+      "conflicts": [],
+      "alternatives": [
+        "Serial fresh-network control drains each read before admitting the next; overlap differs only in probe delivery order."
+      ]
+    }
+  },
+  "monitors": [
+    {
+      "id": "MON-forwarded-context",
+      "checker_id": "CHK-forwarded-context",
+      "event": "read_result",
+      "binding_ids": [
+        "BD-forwarded-context"
+      ],
+      "grounding": {
+        "source_ids": [
+          "M-read-queue",
+          "M-read-reply",
+          "M-follower-read",
+          "M-read-client",
+          "M-node-read-entry",
+          "M-peer"
+        ],
+        "expectation_ids": [
+          "M-read-prefix-test",
+          "M-read-receiver-test",
+          "M-read-api"
+        ],
+        "binding_ids": [
+          "BD-forwarded-context"
+        ],
+        "derivation": "M-read-prefix-test explicitly expects a prefix release to retain the individual ctx/from of each earlier status even when its index is advanced. M-read-receiver-test expects received Hint/HintHigh to become the readiness SystemCtx. M-read-api makes readiness completion belong to the returned operation, while M-read-client and M-node-read-entry implement that association with an exact SystemCtx batch key. Together these ground preservation of the original admitted context when routing a released status to its origin. They do not require immediate success for every admitted read or preservation of its old index. The suspect sender implementation is the subject of comparison, not the source of the expected output. Results read ReadyToReads directly from each receiving Peer Update before Commit clears the buffer. scenario plus receiving origin identify the operation independently of ctx. read_admitted.ctx records the originating Peer input after actual leader admission; read_result.ctx is the exported observed context. Wire response events preserve the intermediate route but are diagnostics, not substitutes for the receiver observation.",
+        "applicability": "Every exported result at the two originating followers is retained; no result is filtered by expected context or index. Missing or ambiguous results remain incomplete.",
+        "unresolved": [],
+        "conflicts": []
+      },
+      "admission_alias": "admitted",
+      "applicability_conditions": []
+    }
+  ],
+  "observable_properties": [
+    {
+      "checker_id": "CHK-forwarded-context",
+      "kind": "event_assertion",
+      "trigger": {
+        "field": "event",
+        "op": "eq",
+        "value": "read_result"
+      },
+      "assertion": {
+        "field": "ctx",
+        "op": "eq",
+        "reference": "admitted.ctx"
+      },
+      "identity_fields": [
+        "scenario",
+        "origin"
+      ],
+      "description": "Exported readiness preserves the exact original SystemCtx for the independently identified originating operation."
+    }
+  ],
+  "uncertainties": [
+    "No client RequestState deadline or application Lookup endpoint is executed; consequences beyond local response/readiness correlation remain unmeasured.",
+    "TestLogDB saves model crash-free persistence only; no statement about actual disk crash recovery."
+  ]
+}
