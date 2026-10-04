@@ -132,18 +132,32 @@ def conclusions(state, records):
     return result
 
 
-def costs(state):
+def execution_cost(check):
+    """Process time and enclosing action cost are different, independently optional records."""
     from datetime import datetime
-    def seconds(check):
-        return max(0,(datetime.fromisoformat(check.ended_at)-datetime.fromisoformat(check.started_at)).total_seconds()) if check.ended_at and check.started_at else 0
+    from math import isfinite
+    def valid(value):return value if type(value) in (int,float) and isfinite(value) and value>=0 else None
+    try:process=valid((datetime.fromisoformat(check.ended_at)-datetime.fromisoformat(check.started_at)).total_seconds())
+    except (TypeError,ValueError,OverflowError):process=None
+    return {'process_seconds':process,'action_seconds':valid(check.parameters.get('action_seconds'))}
+
+
+def costs(state):
     rejected={s['operation_id'] for s in state.selections if s['action']=='rejected'}
-    calls=[c for c in state.checks if c.action=='agent_turn']
-    formal=[c for c in state.checks if c.action in {'direct_check','exploration'}]
-    return {'agent_calls':state.usage.get('agent_calls',0),'agent_seconds':sum(map(seconds,calls)),
-        'rejected_calls':len(rejected),'rejected_call_seconds':sum(seconds(c) for c in calls if c.id in rejected),
-        'formal_executions':len(formal),'formal_execution_seconds':sum(map(seconds,formal)),
+    checks=list({c.id:c for c in state.checks}.values())
+    calls=[c for c in checks if c.action=='agent_turn']
+    formal={c.id:execution_cost(c) for c in checks if c.action in {'direct_check','exploration'}}
+    def total(key):
+        known=[c[key] for c in formal.values() if c[key] is not None]
+        return sum(known) if known or not formal else None
+    return {'agent_calls':state.usage.get('agent_calls',0),'agent_seconds':sum(execution_cost(c)['process_seconds'] or 0 for c in calls),
+        'rejected_calls':len(rejected),'rejected_call_seconds':sum(execution_cost(c)['process_seconds'] or 0 for c in calls if c.id in rejected),
+        'formal_executions':len(formal),'formal_execution_seconds':total('process_seconds'),
+        'target_action_cost':{'known_seconds':total('action_seconds'),
+            'unrecorded_check_ids':[id for id,c in formal.items() if c['action_seconds'] is None],
+            'process_unrecorded_check_ids':[id for id,c in formal.items() if c['process_seconds'] is None]},
         'elapsed_seconds':state.elapsed_seconds,
-        'interpretation':'Rejected calls may contain useful investigation; wall time is not token cost or pure waste'}
+        'interpretation':'formal_execution_seconds is controlled target process time (checks and explorations); target_action_cost includes preparation only where recorded. Parent actions and child steps are not added together. Rejected calls may contain useful investigation; wall time is not token cost'}
 
 
 def preview(text):

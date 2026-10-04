@@ -135,12 +135,17 @@ def test_direct_failure_never_confirms(tmp_path,prepared,failure):
     assert not any(f.level=='implementation_obligation' for f in e.state.findings)
     from consensus_assurance.reporting.chinese import render_report
     from consensus_assurance.workflow.research import current_view
+    assessment=Path(a.plan_path).parent/(c.id+'-assessment.json')
+    assessment.write_text(json.dumps(result))
     saved=e.state.model_dump(mode='json')
     index=current_view(e.state,e.root,e.implementation)
     text=render_report(e.state,e.root).read_text()
     assert index['assessments'][0]['correspondence']==result['correspondence']
     assert '对应性意见：'+(result['correspondence'] or '尚未记录') in text
-    assert '尚未完成复核' not in text and all(b in text for b in result['blockers'])
+    assert '尚未完成复核' not in text
+    assert not result['blockers'] or '当前争议／阻塞：' in text
+    assert str(assessment.relative_to(e.root)) in text
+    assert json.loads(assessment.read_text())['blockers']==result['blockers']==index['assessments'][0]['blockers']
     assert e.state.model_dump(mode='json')==saved
 
 

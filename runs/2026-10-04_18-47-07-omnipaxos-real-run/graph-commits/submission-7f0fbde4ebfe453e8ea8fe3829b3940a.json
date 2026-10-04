@@ -1,0 +1,762 @@
+{
+  "input": {
+    "rationale": "Retain the initial two-core-path explanation and sourced recovery/eligibility questions before focused selection.",
+    "sources": [
+      {
+        "id": "src-leader",
+        "file": "omnipaxos/src/sequence_paxos/leader.rs",
+        "start_line": 14,
+        "end_line": 415,
+        "kind": "code_observation"
+      },
+      {
+        "id": "src-follower",
+        "file": "omnipaxos/src/sequence_paxos/follower.rs",
+        "start_line": 13,
+        "end_line": 290,
+        "kind": "code_observation"
+      },
+      {
+        "id": "src-sequence",
+        "file": "omnipaxos/src/sequence_paxos/mod.rs",
+        "start_line": 53,
+        "end_line": 463,
+        "kind": "code_observation"
+      },
+      {
+        "id": "src-support",
+        "file": "omnipaxos/src/util.rs",
+        "start_line": 96,
+        "end_line": 259,
+        "kind": "code_observation"
+      },
+      {
+        "id": "src-sync",
+        "file": "omnipaxos/src/storage/internal_storage.rs",
+        "start_line": 313,
+        "end_line": 359,
+        "kind": "code_observation"
+      },
+      {
+        "id": "src-order",
+        "file": "omnipaxos/src/util.rs",
+        "start_line": 370,
+        "end_line": 390,
+        "kind": "code_observation"
+      },
+      {
+        "id": "src-api",
+        "file": "omnipaxos/src/omni_paxos.rs",
+        "start_line": 345,
+        "end_line": 441,
+        "kind": "code_observation"
+      },
+      {
+        "id": "src-ble",
+        "file": "omnipaxos/src/ballot_leader_election.rs",
+        "start_line": 175,
+        "end_line": 293,
+        "kind": "code_observation"
+      },
+      {
+        "id": "src-config",
+        "file": "omnipaxos/src/omni_paxos.rs",
+        "start_line": 102,
+        "end_line": 131,
+        "kind": "code_observation"
+      },
+      {
+        "id": "src-read",
+        "file": "omnipaxos/src/storage/internal_storage.rs",
+        "start_line": 77,
+        "end_line": 157,
+        "kind": "code_observation"
+      },
+      {
+        "id": "doc-log",
+        "file": "docs/omnipaxos/log.md",
+        "start_line": 1,
+        "end_line": 32,
+        "kind": "document_statement"
+      },
+      {
+        "id": "doc-transport",
+        "file": "docs/omnipaxos/communication.md",
+        "start_line": 1,
+        "end_line": 25,
+        "kind": "document_statement"
+      },
+      {
+        "id": "doc-reconfiguration",
+        "file": "docs/omnipaxos/reconfiguration.md",
+        "start_line": 1,
+        "end_line": 47,
+        "kind": "document_statement"
+      }
+    ],
+    "feedback": {
+      "ref_ids": [
+        "src-follower",
+        "src-leader",
+        "src-sync",
+        "src-ble"
+      ],
+      "answered": "Ballot promises and per-peer support govern formation; incremental replication additionally checks sequence order. AcceptSync instead checks ballot and Prepare phase and directly installs supplied decision/history state. BLE filters heartbeat replies by round/configuration but appends them without visible deduplication in the inspected handler.",
+      "remaining": [
+        "Finish storage, initialization and runtime caller contracts for usable core overview.",
+        "Determine whether delayed same-ballot synchronization can legally overlap a later recovery and affect established decisions.",
+        "Determine heartbeat delivery uniqueness assumptions before treating reply counting as an eligibility defect."
+      ],
+      "understanding": "updated",
+      "rationale": "These are source observations and specific questions, not proven failures. Existing ballot, phase and incremental sequence guards are retained as counterevidence.",
+      "question_updates": {}
+    },
+    "repair_of": null,
+    "map_path": "initial-map.json",
+    "map_changes": {},
+    "reconnect_questions": {},
+    "action": "research",
+    "graph_path": null,
+    "scope_path": null
+  },
+  "before": {
+    "current_submission": {
+      "phase": "received",
+      "operation_id": "7f0fbde4ebfe453e8ea8fe3829b3940a",
+      "result": {
+        "submission": "submission.json",
+        "summary": "Prepared a partial core map and sourced questions about same-ballot recovery and heartbeat participant accounting. Preflight validation passed; no defect or execution evidence is claimed."
+      },
+      "status": "completed",
+      "reason": "",
+      "session_unavailable": false
+    },
+    "materials": [],
+    "selections": [],
+    "audit_spec_path": null,
+    "audit_spec_version": 0,
+    "applied_operations": {}
+  },
+  "after": {
+    "current_submission": {
+      "phase": "accepted",
+      "operation_id": "7f0fbde4ebfe453e8ea8fe3829b3940a",
+      "action": "research"
+    },
+    "materials": [
+      {
+        "id": "src-leader",
+        "file": "omnipaxos/src/sequence_paxos/leader.rs",
+        "start_line": 14,
+        "end_line": 415,
+        "kind": "code_observation",
+        "text": "    /// Handle a new leader. Should be called when the leader election has elected a new leader with the ballot `n`\n    /*** Leader ***/\n    pub(crate) fn handle_leader(&mut self, n: Ballot) {\n        if n <= self.leader_state.n_leader || n <= self.internal_storage.get_promise() {\n            return;\n        }\n        #[cfg(feature = \"logging\")]\n        debug!(self.logger, \"Newly elected leader: {:?}\", n);\n        if self.pid == n.pid {\n            self.leader_state =\n                LeaderState::with(n, self.leader_state.max_pid, self.leader_state.quorum);\n            // Flush any pending writes\n            // Don't have to handle flushed entries here because we will sync with followers\n            let _ = self.internal_storage.flush_batch().expect(WRITE_ERROR_MSG);\n            self.internal_storage.set_promise(n).expect(WRITE_ERROR_MSG);\n            /* insert my promise */\n            let na = self.internal_storage.get_accepted_round();\n            let decided_idx = self.get_decided_idx();\n            let accepted_idx = self.internal_storage.get_accepted_idx();\n            let my_promise = Promise {\n                n,\n                n_accepted: na,\n                decided_idx,\n                accepted_idx,\n                log_sync: None,\n            };\n            self.leader_state.set_promise(my_promise, self.pid, true);\n            /* initialise longest chosen sequence and update state */\n            self.state = (Role::Leader, Phase::Prepare);\n            let prep = Prepare {\n                n,\n                decided_idx,\n                n_accepted: na,\n                accepted_idx,\n            };\n            /* send prepare */\n            for pid in &self.peers {\n                self.outgoing.push(Message::SequencePaxos(PaxosMessage {\n                    from: self.pid,\n                    to: *pid,\n                    msg: PaxosMsg::Prepare(prep),\n                }));\n            }\n        } else {\n            self.become_follower();\n        }\n    }\n\n    pub(crate) fn become_follower(&mut self) {\n        self.state.0 = Role::Follower;\n    }\n\n    pub(crate) fn handle_preparereq(&mut self, prepreq: PrepareReq, from: NodeId) {\n        #[cfg(feature = \"logging\")]\n        debug!(self.logger, \"Incoming message PrepareReq from {}\", from);\n        if self.state.0 == Role::Leader && prepreq.n <= self.leader_state.n_leader {\n            self.leader_state.reset_promise(from);\n            self.leader_state.set_latest_accept_meta(from, None);\n            self.send_prepare(from);\n        }\n    }\n\n    pub(crate) fn handle_forwarded_proposal(&mut self, mut entries: Vec<T>) {\n        if !self.accepted_reconfiguration() {\n            match self.state {\n                (Role::Leader, Phase::Prepare) => self.buffered_proposals.append(&mut entries),\n                (Role::Leader, Phase::Accept) => self.accept_entries_leader(entries),\n                _ => self.forward_proposals(entries),\n            }\n        }\n    }\n\n    pub(crate) fn handle_forwarded_stopsign(&mut self, ss: StopSign) {\n        if self.accepted_reconfiguration() {\n            return;\n        }\n        match self.state {\n            (Role::Leader, Phase::Prepare) => self.buffered_stopsign = Some(ss),\n            (Role::Leader, Phase::Accept) => self.accept_stopsign_leader(ss),\n            _ => self.forward_stopsign(ss),\n        }\n    }\n\n    pub(crate) fn send_prepare(&mut self, to: NodeId) {\n        let prep = Prepare {\n            n: self.leader_state.n_leader,\n            decided_idx: self.internal_storage.get_decided_idx(),\n            n_accepted: self.internal_storage.get_accepted_round(),\n            accepted_idx: self.internal_storage.get_accepted_idx(),\n        };\n        self.outgoing.push(Message::SequencePaxos(PaxosMessage {\n            from: self.pid,\n            to,\n            msg: PaxosMsg::Prepare(prep),\n        }));\n    }\n\n    pub(crate) fn accept_entry_leader(&mut self, entry: T) {\n        let accepted_metadata = self\n            .internal_storage\n            .append_entry_with_batching(entry)\n            .expect(WRITE_ERROR_MSG);\n        if let Some(metadata) = accepted_metadata {\n            self.leader_state\n                .set_accepted_idx(self.pid, metadata.accepted_idx);\n            self.send_acceptdecide(metadata);\n        }\n    }\n\n    pub(crate) fn accept_entries_leader(&mut self, entries: Vec<T>) {\n        let accepted_metadata = self\n            .internal_storage\n            .append_entries_with_batching(entries)\n            .expect(WRITE_ERROR_MSG);\n        if let Some(metadata) = accepted_metadata {\n            self.leader_state\n                .set_accepted_idx(self.pid, metadata.accepted_idx);\n            self.send_acceptdecide(metadata);\n        }\n    }\n\n    pub(crate) fn accept_stopsign_leader(&mut self, ss: StopSign) {\n        let accepted_metadata = self\n            .internal_storage\n            .append_stopsign(ss.clone())\n            .expect(WRITE_ERROR_MSG);\n        if let Some(metadata) = accepted_metadata {\n            self.send_acceptdecide(metadata);\n        }\n        let accepted_idx = self.internal_storage.get_accepted_idx();\n        self.leader_state.set_accepted_idx(self.pid, accepted_idx);\n        for pid in self.leader_state.get_promised_followers() {\n            self.send_accept_stopsign(pid, ss.clone(), false);\n        }\n    }\n\n    fn send_accsync(&mut self, to: NodeId) {\n        let current_n = self.leader_state.n_leader;\n        let PromiseMetaData {\n            n_accepted: prev_round_max_promise_n,\n            accepted_idx: prev_round_max_accepted_idx,\n            ..\n        } = &self.leader_state.get_max_promise_meta();\n        let PromiseMetaData {\n            n_accepted: followers_promise_n,\n            accepted_idx: followers_accepted_idx,\n            pid,\n            ..\n        } = self.leader_state.get_promise_meta(to);\n        let followers_decided_idx = self\n            .leader_state\n            .get_decided_idx(*pid)\n            .expect(\"Received PromiseMetaData but not found in ld\");\n        // Follower can have valid accepted entries depending on which leader they were previously following\n        let followers_valid_entries_idx = if *followers_promise_n == current_n {\n            *followers_accepted_idx\n        } else if *followers_promise_n == *prev_round_max_promise_n {\n            *prev_round_max_accepted_idx.min(followers_accepted_idx)\n        } else {\n            followers_decided_idx\n        };\n        let log_sync = self.create_log_sync(followers_valid_entries_idx, followers_decided_idx);\n        self.leader_state.increment_seq_num_session(to);\n        let acc_sync = AcceptSync {\n            n: current_n,\n            seq_num: self.leader_state.next_seq_num(to),\n            decided_idx: self.get_decided_idx(),\n            log_sync,\n            #[cfg(feature = \"unicache\")]\n            unicache: self.internal_storage.get_unicache(),\n        };\n        let msg = Message::SequencePaxos(PaxosMessage {\n            from: self.pid,\n            to,\n            msg: PaxosMsg::AcceptSync(acc_sync),\n        });\n        self.outgoing.push(msg);\n    }\n\n    fn send_acceptdecide(&mut self, accepted: AcceptedMetaData<T>) {\n        let decided_idx = self.internal_storage.get_decided_idx();\n        for pid in self.leader_state.get_promised_followers() {\n            let latest_accdec = self.get_latest_accdec_message(pid);\n            match latest_accdec {\n                // Modify existing AcceptDecide message to follower\n                Some(accdec) => {\n                    accdec.entries.extend(accepted.entries.iter().cloned());\n                    accdec.decided_idx = decided_idx;\n                }\n                // Add new AcceptDecide message to follower\n                None => {\n                    self.leader_state\n                        .set_latest_accept_meta(pid, Some(self.outgoing.len()));\n                    let acc = AcceptDecide {\n                        n: self.leader_state.n_leader,\n                        seq_num: self.leader_state.next_seq_num(pid),\n                        decided_idx,\n                        entries: accepted.entries.clone(),\n                    };\n                    self.outgoing.push(Message::SequencePaxos(PaxosMessage {\n                        from: self.pid,\n                        to: pid,\n                        msg: PaxosMsg::AcceptDecide(acc),\n                    }));\n                }\n            }\n        }\n    }\n\n    fn send_accept_stopsign(&mut self, to: NodeId, ss: StopSign, resend: bool) {\n        let seq_num = match resend {\n            true => self.leader_state.get_seq_num(to),\n            false => self.leader_state.next_seq_num(to),\n        };\n        let acc_ss = PaxosMsg::AcceptStopSign(AcceptStopSign {\n            seq_num,\n            n: self.leader_state.n_leader,\n            ss,\n        });\n        self.outgoing.push(Message::SequencePaxos(PaxosMessage {\n            from: self.pid,\n            to,\n            msg: acc_ss,\n        }));\n    }\n\n    pub(crate) fn send_decide(&mut self, to: NodeId, decided_idx: usize, resend: bool) {\n        let seq_num = match resend {\n            true => self.leader_state.get_seq_num(to),\n            false => self.leader_state.next_seq_num(to),\n        };\n        let d = Decide {\n            n: self.leader_state.n_leader,\n            seq_num,\n            decided_idx,\n        };\n        self.outgoing.push(Message::SequencePaxos(PaxosMessage {\n            from: self.pid,\n            to,\n            msg: PaxosMsg::Decide(d),\n        }));\n    }\n\n    fn handle_majority_promises(&mut self) {\n        let max_promise_sync = self.leader_state.take_max_promise_sync();\n        let decided_idx = self.leader_state.get_max_decided_idx();\n        let mut new_accepted_idx = self\n            .internal_storage\n            .sync_log(self.leader_state.n_leader, decided_idx, max_promise_sync)\n            .expect(WRITE_ERROR_MSG);\n        if !self.accepted_reconfiguration() {\n            if !self.buffered_proposals.is_empty() {\n                let entries = std::mem::take(&mut self.buffered_proposals);\n                new_accepted_idx = self\n                    .internal_storage\n                    .append_entries_without_batching(entries)\n                    .expect(WRITE_ERROR_MSG);\n            }\n            if let Some(ss) = self.buffered_stopsign.take() {\n                self.internal_storage\n                    .append_stopsign(ss)\n                    .expect(WRITE_ERROR_MSG);\n                new_accepted_idx = self.internal_storage.get_accepted_idx();\n            }\n        }\n        self.state = (Role::Leader, Phase::Accept);\n        self.leader_state\n            .set_accepted_idx(self.pid, new_accepted_idx);\n        for pid in self.leader_state.get_promised_followers() {\n            self.send_accsync(pid);\n        }\n    }\n\n    pub(crate) fn handle_promise_prepare(&mut self, prom: Promise<T>, from: NodeId) {\n        #[cfg(feature = \"logging\")]\n        debug!(\n            self.logger,\n            \"Handling promise from {} in Prepare phase\", from\n        );\n        if prom.n == self.leader_state.n_leader {\n            let received_majority = self.leader_state.set_promise(prom, from, true);\n            if received_majority {\n                self.handle_majority_promises();\n            }\n        }\n    }\n\n    pub(crate) fn handle_promise_accept(&mut self, prom: Promise<T>, from: NodeId) {\n        #[cfg(feature = \"logging\")]\n        {\n            let (r, p) = &self.state;\n            debug!(\n                self.logger,\n                \"Self role {:?}, phase {:?}. Incoming message Promise Accept from {}\", r, p, from\n            );\n        }\n        if prom.n == self.leader_state.n_leader {\n            self.leader_state.set_promise(prom, from, false);\n            self.send_accsync(from);\n        }\n    }\n\n    pub(crate) fn handle_accepted(&mut self, accepted: Accepted, from: NodeId) {\n        #[cfg(feature = \"logging\")]\n        trace!(\n            self.logger,\n            \"Got Accepted from {}, idx: {}, chosen_idx: {}, accepted: {:?}\",\n            from,\n            accepted.accepted_idx,\n            self.internal_storage.get_decided_idx(),\n            self.leader_state.accepted_indexes\n        );\n        if accepted.n == self.leader_state.n_leader && self.state == (Role::Leader, Phase::Accept) {\n            self.leader_state\n                .set_accepted_idx(from, accepted.accepted_idx);\n            if accepted.accepted_idx > self.internal_storage.get_decided_idx()\n                && self.leader_state.is_chosen(accepted.accepted_idx)\n            {\n                let decided_idx = accepted.accepted_idx;\n                self.internal_storage\n                    .set_decided_idx(decided_idx)\n                    .expect(WRITE_ERROR_MSG);\n                for pid in self.leader_state.get_promised_followers() {\n                    let latest_accdec = self.get_latest_accdec_message(pid);\n                    match latest_accdec {\n                        Some(accdec) => accdec.decided_idx = decided_idx,\n                        None => self.send_decide(pid, decided_idx, false),\n                    }\n                }\n            }\n        }\n    }\n\n    fn get_latest_accdec_message(&mut self, to: NodeId) -> Option<&mut AcceptDecide<T>> {\n        if let Some((bal, outgoing_idx)) = self.leader_state.get_latest_accept_meta(to) {\n            if bal == self.leader_state.n_leader {\n                if let Message::SequencePaxos(PaxosMessage {\n                    msg: PaxosMsg::AcceptDecide(accdec),\n                    ..\n                }) = self.outgoing.get_mut(outgoing_idx).unwrap()\n                {\n                    return Some(accdec);\n                } else {\n                    #[cfg(feature = \"logging\")]\n                    debug!(self.logger, \"Cached idx is not an AcceptedDecide!\");\n                }\n            }\n        }\n        None\n    }\n\n    pub(crate) fn handle_notaccepted(&mut self, not_acc: NotAccepted, from: NodeId) {\n        if self.state.0 == Role::Leader && self.leader_state.n_leader < not_acc.n {\n            self.leader_state.lost_promise(from);\n        }\n    }\n\n    pub(crate) fn resend_messages_leader(&mut self) {\n        match self.state.1 {\n            Phase::Prepare => {\n                // Resend Prepare\n                let preparable_peers = self.leader_state.get_preparable_peers(&self.peers);\n                for peer in preparable_peers {\n                    self.send_prepare(peer);\n                }\n            }\n            Phase::Accept => {\n                // Resend AcceptStopSign or StopSign's decide\n                if let Some(ss) = self.internal_storage.get_stopsign() {\n                    let decided_idx = self.internal_storage.get_decided_idx();\n                    for follower in self.leader_state.get_promised_followers() {\n                        if self.internal_storage.stopsign_is_decided() {\n                            self.send_decide(follower, decided_idx, true);\n                        } else if self.leader_state.get_accepted_idx(follower)\n                            != self.internal_storage.get_accepted_idx()\n                        {\n                            self.send_accept_stopsign(follower, ss.clone(), true);\n                        }\n                    }\n                }\n                // Resend Prepare\n                let preparable_peers = self.leader_state.get_preparable_peers(&self.peers);\n                for peer in preparable_peers {\n                    self.send_prepare(peer);\n                }\n            }\n            Phase::Recover => (),\n            Phase::None => (),\n        }\n    }\n\n    pub(crate) fn flush_batch_leader(&mut self) {\n        let accepted_metadata = self\n            .internal_storage\n            .flush_batch_and_get_entries()\n            .expect(WRITE_ERROR_MSG);\n        if let Some(metadata) = accepted_metadata {\n            self.leader_state\n                .set_accepted_idx(self.pid, metadata.accepted_idx);\n            self.send_acceptdecide(metadata);\n        }\n    }",
+        "content_digest": "88814be77547ffe3e3dd2aff771df9852b09da9718e5980515748d2ab580162b"
+      },
+      {
+        "id": "src-follower",
+        "file": "omnipaxos/src/sequence_paxos/follower.rs",
+        "start_line": 13,
+        "end_line": 290,
+        "kind": "code_observation",
+        "text": "    pub(crate) fn handle_prepare(&mut self, prep: Prepare, from: NodeId) {\n        let old_promise = self.internal_storage.get_promise();\n        if old_promise < prep.n || (old_promise == prep.n && self.state.1 == Phase::Recover) {\n            // Flush any pending writes\n            // Don't have to handle flushed entries here because we will sync with followers\n            let _ = self.internal_storage.flush_batch().expect(WRITE_ERROR_MSG);\n            self.internal_storage\n                .set_promise(prep.n)\n                .expect(WRITE_ERROR_MSG);\n            self.state = (Role::Follower, Phase::Prepare);\n            self.current_seq_num = SequenceNumber::default();\n            let na = self.internal_storage.get_accepted_round();\n            let accepted_idx = self.internal_storage.get_accepted_idx();\n            let log_sync = if na > prep.n_accepted {\n                // I'm more up to date: send leader what he is missing after his decided index.\n                Some(self.create_log_sync(prep.decided_idx, prep.decided_idx))\n            } else if na == prep.n_accepted && accepted_idx > prep.accepted_idx {\n                // I'm more up to date and in same round: send leader what he is missing after his\n                // accepted index.\n                Some(self.create_log_sync(prep.accepted_idx, prep.decided_idx))\n            } else {\n                // I'm equally or less up to date\n                None\n            };\n            let promise = Promise {\n                n: prep.n,\n                n_accepted: na,\n                decided_idx: self.internal_storage.get_decided_idx(),\n                accepted_idx,\n                log_sync,\n            };\n            self.cached_promise_message = Some(promise.clone());\n            self.outgoing.push(Message::SequencePaxos(PaxosMessage {\n                from: self.pid,\n                to: from,\n                msg: PaxosMsg::Promise(promise),\n            }));\n        }\n    }\n\n    pub(crate) fn handle_acceptsync(&mut self, accsync: AcceptSync<T>, from: NodeId) {\n        if self.check_valid_ballot(accsync.n) && self.state == (Role::Follower, Phase::Prepare) {\n            self.cached_promise_message = None;\n            let new_accepted_idx = self\n                .internal_storage\n                .sync_log(accsync.n, accsync.decided_idx, Some(accsync.log_sync))\n                .expect(WRITE_ERROR_MSG);\n            if self.internal_storage.get_stopsign().is_none() {\n                self.forward_buffered_proposals();\n            }\n            let accepted = Accepted {\n                n: accsync.n,\n                accepted_idx: new_accepted_idx,\n            };\n            self.state = (Role::Follower, Phase::Accept);\n            self.current_seq_num = accsync.seq_num;\n            let cached_idx = self.outgoing.len();\n            self.latest_accepted_meta = Some((accsync.n, cached_idx));\n            self.outgoing.push(Message::SequencePaxos(PaxosMessage {\n                from: self.pid,\n                to: from,\n                msg: PaxosMsg::Accepted(accepted),\n            }));\n            #[cfg(feature = \"unicache\")]\n            self.internal_storage.set_unicache(accsync.unicache);\n        }\n    }\n\n    fn forward_buffered_proposals(&mut self) {\n        let proposals = std::mem::take(&mut self.buffered_proposals);\n        if !proposals.is_empty() {\n            self.forward_proposals(proposals);\n        }\n    }\n\n    pub(crate) fn handle_acceptdecide(&mut self, acc_dec: AcceptDecide<T>) {\n        if self.check_valid_ballot(acc_dec.n)\n            && self.state == (Role::Follower, Phase::Accept)\n            && self.handle_sequence_num(acc_dec.seq_num, acc_dec.n.pid) == MessageStatus::Expected\n        {\n            #[cfg(not(feature = \"unicache\"))]\n            let entries = acc_dec.entries;\n            #[cfg(feature = \"unicache\")]\n            let entries = self.internal_storage.decode_entries(acc_dec.entries);\n            let mut new_accepted_idx = self\n                .internal_storage\n                .append_entries_and_get_accepted_idx(entries)\n                .expect(WRITE_ERROR_MSG);\n            let flushed_after_decide =\n                self.update_decided_idx_and_get_accepted_idx(acc_dec.decided_idx);\n            if flushed_after_decide.is_some() {\n                new_accepted_idx = flushed_after_decide;\n            }\n            if let Some(idx) = new_accepted_idx {\n                self.reply_accepted(acc_dec.n, idx);\n            }\n        }\n    }\n\n    pub(crate) fn handle_accept_stopsign(&mut self, acc_ss: AcceptStopSign) {\n        if self.check_valid_ballot(acc_ss.n)\n            && self.state == (Role::Follower, Phase::Accept)\n            && self.handle_sequence_num(acc_ss.seq_num, acc_ss.n.pid) == MessageStatus::Expected\n        {\n            // Flush entries before appending stopsign. The accepted index is ignored here as\n            // it will be updated when appending stopsign.\n            let _ = self.internal_storage.flush_batch().expect(WRITE_ERROR_MSG);\n            let new_accepted_idx = self\n                .internal_storage\n                .set_stopsign(Some(acc_ss.ss))\n                .expect(WRITE_ERROR_MSG);\n            self.reply_accepted(acc_ss.n, new_accepted_idx);\n        }\n    }\n\n    pub(crate) fn handle_decide(&mut self, dec: Decide) {\n        if self.check_valid_ballot(dec.n)\n            && self.state.1 == Phase::Accept\n            && self.handle_sequence_num(dec.seq_num, dec.n.pid) == MessageStatus::Expected\n        {\n            let new_accepted_idx = self.update_decided_idx_and_get_accepted_idx(dec.decided_idx);\n            if let Some(idx) = new_accepted_idx {\n                self.reply_accepted(dec.n, idx);\n            }\n        }\n    }\n\n    /// To maintain decided index <= accepted index, batched entries may be flushed.\n    /// Returns `Some(new_accepted_idx)` if entries are flushed, otherwise `None`.\n    fn update_decided_idx_and_get_accepted_idx(&mut self, new_decided_idx: usize) -> Option<usize> {\n        if new_decided_idx <= self.internal_storage.get_decided_idx() {\n            return None;\n        }\n        if new_decided_idx > self.internal_storage.get_accepted_idx() {\n            let new_accepted_idx = self.internal_storage.flush_batch().expect(WRITE_ERROR_MSG);\n            self.internal_storage\n                .set_decided_idx(new_decided_idx.min(new_accepted_idx))\n                .expect(WRITE_ERROR_MSG);\n            Some(new_accepted_idx)\n        } else {\n            self.internal_storage\n                .set_decided_idx(new_decided_idx)\n                .expect(WRITE_ERROR_MSG);\n            None\n        }\n    }\n\n    fn reply_accepted(&mut self, n: Ballot, accepted_idx: usize) {\n        let latest_accepted = self.get_latest_accepted_message(n);\n        match latest_accepted {\n            Some(acc) => acc.accepted_idx = accepted_idx,\n            None => {\n                let accepted = Accepted { n, accepted_idx };\n                let cached_idx = self.outgoing.len();\n                self.latest_accepted_meta = Some((n, cached_idx));\n                self.outgoing.push(Message::SequencePaxos(PaxosMessage {\n                    from: self.pid,\n                    to: n.pid,\n                    msg: PaxosMsg::Accepted(accepted),\n                }));\n            }\n        }\n    }\n\n    fn get_latest_accepted_message(&mut self, n: Ballot) -> Option<&mut Accepted> {\n        if let Some((ballot, outgoing_idx)) = &self.latest_accepted_meta {\n            if *ballot == n {\n                if let Message::SequencePaxos(PaxosMessage {\n                    msg: PaxosMsg::Accepted(a),\n                    ..\n                }) = self.outgoing.get_mut(*outgoing_idx).unwrap()\n                {\n                    return Some(a);\n                } else {\n                    #[cfg(feature = \"logging\")]\n                    debug!(self.logger, \"Cached idx is not an Accepted message!\");\n                }\n            }\n        }\n        None\n    }\n\n    /// Also returns whether the message's ballot was promised\n    fn check_valid_ballot(&mut self, message_ballot: Ballot) -> bool {\n        let my_promise = self.internal_storage.get_promise();\n        match my_promise.cmp(&message_ballot) {\n            std::cmp::Ordering::Equal => true,\n            std::cmp::Ordering::Greater => {\n                let not_acc = NotAccepted { n: my_promise };\n                #[cfg(feature = \"logging\")]\n                trace!(\n                    self.logger,\n                    \"NotAccepted. My promise: {:?}, theirs: {:?}\",\n                    my_promise,\n                    message_ballot\n                );\n                self.outgoing.push(Message::SequencePaxos(PaxosMessage {\n                    from: self.pid,\n                    to: message_ballot.pid,\n                    msg: PaxosMsg::NotAccepted(not_acc),\n                }));\n                false\n            }\n            std::cmp::Ordering::Less => {\n                // Should never happen, but to be safe send PrepareReq\n                #[cfg(feature = \"logging\")]\n                warn!(\n                    self.logger,\n                    \"Received non-prepare message from a leader I've never promised. My: {:?}, theirs: {:?}\", my_promise, message_ballot\n                );\n                self.reconnected(message_ballot.pid);\n                false\n            }\n        }\n    }\n\n    /// Also returns the MessageStatus of the sequence based on the incoming sequence number.\n    fn handle_sequence_num(&mut self, seq_num: SequenceNumber, from: NodeId) -> MessageStatus {\n        let msg_status = self.current_seq_num.check_msg_status(seq_num);\n        match msg_status {\n            MessageStatus::Expected => self.current_seq_num = seq_num,\n            MessageStatus::DroppedPreceding => self.reconnected(from),\n            MessageStatus::Outdated => (),\n        };\n        msg_status\n    }\n\n    pub(crate) fn resend_messages_follower(&mut self) {\n        match self.state.1 {\n            Phase::Prepare => {\n                // Resend Promise\n                match &self.cached_promise_message {\n                    Some(promise) => {\n                        self.outgoing.push(Message::SequencePaxos(PaxosMessage {\n                            from: self.pid,\n                            to: promise.n.pid,\n                            msg: PaxosMsg::Promise(promise.clone()),\n                        }));\n                    }\n                    None => {\n                        // Shouldn't be possible to be in prepare phase without having\n                        // cached the promise sent as a response to the prepare\n                        #[cfg(feature = \"logging\")]\n                        warn!(self.logger, \"In Prepare phase without a cached promise!\");\n                        self.state = (Role::Follower, Phase::Recover);\n                        self.send_preparereq_to_all_peers();\n                    }\n                }\n            }\n            Phase::Recover => {\n                // Resend PrepareReq\n                self.send_preparereq_to_all_peers();\n            }\n            Phase::Accept => (),\n            Phase::None => (),\n        }\n    }\n\n    fn send_preparereq_to_all_peers(&mut self) {\n        let prepreq = PrepareReq {\n            n: self.get_promise(),\n        };\n        for peer in &self.peers {\n            self.outgoing.push(Message::SequencePaxos(PaxosMessage {\n                from: self.pid,\n                to: *peer,\n                msg: PaxosMsg::PrepareReq(prepreq),\n            }));\n        }\n    }\n\n    pub(crate) fn flush_batch_follower(&mut self) {\n        let accepted_idx = self.internal_storage.get_accepted_idx();\n        let new_accepted_idx = self.internal_storage.flush_batch().expect(WRITE_ERROR_MSG);\n        if new_accepted_idx > accepted_idx {\n            self.reply_accepted(self.get_promise(), new_accepted_idx);\n        }\n    }",
+        "content_digest": "cbe87da8f37d9528e9d188bdee7c228be7336bfabbd24b65840f4c40b74ff30e"
+      },
+      {
+        "id": "src-sequence",
+        "file": "omnipaxos/src/sequence_paxos/mod.rs",
+        "start_line": 53,
+        "end_line": 463,
+        "kind": "code_observation",
+        "text": "    pub(crate) fn with(config: SequencePaxosConfig, storage: B) -> Self {\n        let pid = config.pid;\n        let peers = config.peers;\n        let num_nodes = &peers.len() + 1;\n        let quorum = Quorum::with(config.flexible_quorum, num_nodes);\n        let max_peer_pid = peers.iter().max().unwrap();\n        let max_pid = *std::cmp::max(max_peer_pid, &pid) as usize;\n        let mut outgoing = Vec::with_capacity(config.buffer_size);\n        let (state, leader) = match storage\n            .get_promise()\n            .expect(\"storage error while trying to read promise\")\n        {\n            // if we recover a promise from storage then we must do failure recovery\n            Some(b) => {\n                let state = (Role::Follower, Phase::Recover);\n                for peer_pid in &peers {\n                    let prepreq = PrepareReq { n: b };\n                    outgoing.push(Message::SequencePaxos(PaxosMessage {\n                        from: pid,\n                        to: *peer_pid,\n                        msg: PaxosMsg::PrepareReq(prepreq),\n                    }));\n                }\n                (state, b)\n            }\n            None => ((Role::Follower, Phase::None), Ballot::default()),\n        };\n        let internal_storage_config = InternalStorageConfig {\n            batch_size: config.batch_size,\n        };\n        let mut paxos = SequencePaxos {\n            internal_storage: InternalStorage::with(\n                storage,\n                internal_storage_config,\n                #[cfg(feature = \"unicache\")]\n                pid,\n            ),\n            pid,\n            peers,\n            state,\n            buffered_proposals: vec![],\n            buffered_stopsign: None,\n            outgoing,\n            leader_state: LeaderState::<T>::with(leader, max_pid, quorum),\n            latest_accepted_meta: None,\n            current_seq_num: SequenceNumber::default(),\n            cached_promise_message: None,\n            #[cfg(feature = \"logging\")]\n            logger: {\n                if let Some(logger) = config.custom_logger {\n                    logger\n                } else {\n                    let s = config\n                        .logger_file_path\n                        .unwrap_or_else(|| format!(\"logs/paxos_{}.log\", pid));\n                    create_logger(s.as_str())\n                }\n            },\n        };\n        paxos\n            .internal_storage\n            .set_promise(leader)\n            .expect(WRITE_ERROR_MSG);\n        #[cfg(feature = \"logging\")]\n        {\n            info!(paxos.logger, \"Paxos component pid: {} created!\", pid);\n            if let Quorum::Flexible(flex_quorum) = quorum {\n                if flex_quorum.read_quorum_size > num_nodes - flex_quorum.write_quorum_size + 1 {\n                    warn!(\n                        paxos.logger,\n                        \"Unnecessary overlaps in read and write quorums. Read and Write quorums only need to be overlapping by one node i.e., read_quorum_size + write_quorum_size = num_nodes + 1\");\n                }\n            }\n        }\n        paxos\n    }\n\n    pub(crate) fn get_state(&self) -> &(Role, Phase) {\n        &self.state\n    }\n\n    pub(crate) fn get_promise(&self) -> Ballot {\n        self.internal_storage.get_promise()\n    }\n\n    /// Initiates the trim process.\n    /// # Arguments\n    /// * `trim_idx` - Deletes all entries up to [`trim_idx`], if the [`trim_idx`] is `None` then the minimum index accepted by **ALL** servers will be used as the [`trim_idx`].\n    pub(crate) fn trim(&mut self, trim_idx: Option<usize>) -> Result<(), CompactionErr> {\n        match self.state {\n            (Role::Leader, _) => {\n                let min_all_accepted_idx = self.leader_state.get_min_all_accepted_idx();\n                let trimmed_idx = match trim_idx {\n                    Some(idx) if idx <= *min_all_accepted_idx => idx,\n                    None => {\n                        #[cfg(feature = \"logging\")]\n                        trace!(\n                            self.logger,\n                            \"No trim index provided, using min_las_idx: {:?}\",\n                            min_all_accepted_idx\n                        );\n                        *min_all_accepted_idx\n                    }\n                    _ => {\n                        return Err(CompactionErr::NotAllDecided(*min_all_accepted_idx));\n                    }\n                };\n                let result = self.internal_storage.try_trim(trimmed_idx);\n                if result.is_ok() {\n                    for pid in &self.peers {\n                        let msg = PaxosMsg::Compaction(Compaction::Trim(trimmed_idx));\n                        self.outgoing.push(Message::SequencePaxos(PaxosMessage {\n                            from: self.pid,\n                            to: *pid,\n                            msg,\n                        }));\n                    }\n                }\n                result.map_err(|e| {\n                    *e.downcast()\n                        .expect(\"storage error while trying to trim log\")\n                })\n            }\n            _ => Err(CompactionErr::NotCurrentLeader(self.get_current_leader())),\n        }\n    }\n\n    /// Trim the log and create a snapshot. ** Note: only up to the `decided_idx` can be snapshotted **\n    /// # Arguments\n    /// `idx` - Snapshots all entries with index < [`idx`], if the [`idx`] is None then the decided index will be used.\n    /// `local_only` - If `true`, only this server snapshots the log. If `false` all servers performs the snapshot.\n    pub(crate) fn snapshot(\n        &mut self,\n        idx: Option<usize>,\n        local_only: bool,\n    ) -> Result<(), CompactionErr> {\n        let result = self.internal_storage.try_snapshot(idx);\n        if !local_only && result.is_ok() {\n            // since it is decided, it is ok even for a follower to send this\n            for pid in &self.peers {\n                let msg = PaxosMsg::Compaction(Compaction::Snapshot(idx));\n                self.outgoing.push(Message::SequencePaxos(PaxosMessage {\n                    from: self.pid,\n                    to: *pid,\n                    msg,\n                }));\n            }\n        }\n        result.map_err(|e| {\n            *e.downcast()\n                .expect(\"storage error while trying to snapshot log\")\n        })\n    }\n\n    /// Return the decided index.\n    pub(crate) fn get_decided_idx(&self) -> usize {\n        self.internal_storage.get_decided_idx()\n    }\n\n    /// Return trim index from storage.\n    pub(crate) fn get_compacted_idx(&self) -> usize {\n        self.internal_storage.get_compacted_idx()\n    }\n\n    fn handle_compaction(&mut self, c: Compaction) {\n        // try trimming and snapshotting forwarded compaction. Errors are ignored as that the data will still be kept.\n        match c {\n            Compaction::Trim(idx) => {\n                let _ = self.internal_storage.try_trim(idx);\n            }\n            Compaction::Snapshot(idx) => {\n                let _ = self.snapshot(idx, true);\n            }\n        }\n    }\n\n    /// Detects if a Prepare, Promise, AcceptStopSign, Decide of a Stopsign, or PrepareReq message\n    /// has been sent but not been received. If so resends them. Note: We can't detect if a\n    /// StopSign's Decide message has been received so we always resend to be safe.\n    pub(crate) fn resend_message_timeout(&mut self) {\n        match self.state.0 {\n            Role::Leader => self.resend_messages_leader(),\n            Role::Follower => self.resend_messages_follower(),\n        }\n    }\n\n    /// Flushes any batched log entries and sends their corresponding Accept or Accepted messages.\n    pub(crate) fn flush_batch_timeout(&mut self) {\n        match self.state {\n            (Role::Leader, Phase::Accept) => self.flush_batch_leader(),\n            (Role::Follower, Phase::Accept) => self.flush_batch_follower(),\n            _ => (),\n        }\n    }\n\n    /// Moves the outgoing messages from this replica into the buffer. The messages should then be sent via the network implementation.\n    /// If `buffer` is empty, it gets swapped with the internal message buffer. Otherwise, messages are appended to the buffer. This prevents messages from getting discarded.\n    /// the buffer.\n    pub(crate) fn take_outgoing_msgs(&mut self, buffer: &mut Vec<Message<T>>) {\n        if buffer.is_empty() {\n            std::mem::swap(buffer, &mut self.outgoing);\n        } else {\n            // User has unsent messages in their buffer, must extend their buffer.\n            buffer.append(&mut self.outgoing);\n        }\n        self.leader_state.reset_latest_accept_meta();\n        self.latest_accepted_meta = None;\n    }\n\n    /// Handle an incoming message.\n    pub(crate) fn handle(&mut self, m: PaxosMessage<T>) {\n        match m.msg {\n            PaxosMsg::PrepareReq(prepreq) => self.handle_preparereq(prepreq, m.from),\n            PaxosMsg::Prepare(prep) => self.handle_prepare(prep, m.from),\n            PaxosMsg::Promise(prom) => match &self.state {\n                (Role::Leader, Phase::Prepare) => self.handle_promise_prepare(prom, m.from),\n                (Role::Leader, Phase::Accept) => self.handle_promise_accept(prom, m.from),\n                _ => {}\n            },\n            PaxosMsg::AcceptSync(acc_sync) => self.handle_acceptsync(acc_sync, m.from),\n            PaxosMsg::AcceptDecide(acc) => self.handle_acceptdecide(acc),\n            PaxosMsg::NotAccepted(not_acc) => self.handle_notaccepted(not_acc, m.from),\n            PaxosMsg::Accepted(accepted) => self.handle_accepted(accepted, m.from),\n            PaxosMsg::Decide(d) => self.handle_decide(d),\n            PaxosMsg::ProposalForward(proposals) => self.handle_forwarded_proposal(proposals),\n            PaxosMsg::Compaction(c) => self.handle_compaction(c),\n            PaxosMsg::AcceptStopSign(acc_ss) => self.handle_accept_stopsign(acc_ss),\n            PaxosMsg::ForwardStopSign(f_ss) => self.handle_forwarded_stopsign(f_ss),\n        }\n    }\n\n    /// Returns whether this Sequence Paxos has been reconfigured\n    pub(crate) fn is_reconfigured(&self) -> Option<StopSign> {\n        match self.internal_storage.get_stopsign() {\n            Some(ss) if self.internal_storage.stopsign_is_decided() => Some(ss),\n            _ => None,\n        }\n    }\n\n    /// Returns whether this Sequence Paxos instance is stopped, i.e. if it has been reconfigured.\n    fn accepted_reconfiguration(&self) -> bool {\n        self.internal_storage.get_stopsign().is_some()\n    }\n\n    /// Append an entry to the replicated log.\n    pub(crate) fn append(&mut self, entry: T) -> Result<(), ProposeErr<T>> {\n        if self.accepted_reconfiguration() {\n            Err(ProposeErr::PendingReconfigEntry(entry))\n        } else {\n            self.propose_entry(entry);\n            Ok(())\n        }\n    }\n\n    /// Propose a reconfiguration. Returns an error if already stopped or `new_config` is invalid.\n    /// `new_config` defines the cluster-wide configuration settings for the next cluster.\n    /// `metadata` is optional data to commit alongside the reconfiguration.\n    pub(crate) fn reconfigure(\n        &mut self,\n        new_config: ClusterConfig,\n        metadata: Option<Vec<u8>>,\n    ) -> Result<(), ProposeErr<T>> {\n        if self.accepted_reconfiguration() {\n            return Err(ProposeErr::PendingReconfigConfig(new_config, metadata));\n        }\n        #[cfg(feature = \"logging\")]\n        info!(\n            self.logger,\n            \"Accepting reconfiguration {:?}\", new_config.nodes\n        );\n        let ss = StopSign::with(new_config, metadata);\n        match self.state {\n            (Role::Leader, Phase::Prepare) => self.buffered_stopsign = Some(ss),\n            (Role::Leader, Phase::Accept) => self.accept_stopsign_leader(ss),\n            _ => self.forward_stopsign(ss),\n        }\n        Ok(())\n    }\n\n    fn get_current_leader(&self) -> NodeId {\n        self.get_promise().pid\n    }\n\n    /// Returns this node's own pid.\n    pub(crate) fn get_pid(&self) -> NodeId {\n        self.pid\n    }\n\n    /// Handles re-establishing a connection to a previously disconnected peer.\n    /// This should only be called if the underlying network implementation indicates that a connection has been re-established.\n    pub(crate) fn reconnected(&mut self, pid: NodeId) {\n        if pid == self.pid {\n            return;\n        } else if pid == self.get_current_leader() {\n            self.state = (Role::Follower, Phase::Recover);\n        }\n        let prepreq = PrepareReq {\n            n: self.get_promise(),\n        };\n        self.outgoing.push(Message::SequencePaxos(PaxosMessage {\n            from: self.pid,\n            to: pid,\n            msg: PaxosMsg::PrepareReq(prepreq),\n        }));\n    }\n\n    fn propose_entry(&mut self, entry: T) {\n        match self.state {\n            (Role::Leader, Phase::Prepare) => self.buffered_proposals.push(entry),\n            (Role::Leader, Phase::Accept) => self.accept_entry_leader(entry),\n            _ => self.forward_proposals(vec![entry]),\n        }\n    }\n\n    pub(crate) fn get_leader_state(&self) -> &LeaderState<T> {\n        &self.leader_state\n    }\n\n    pub(crate) fn forward_proposals(&mut self, mut entries: Vec<T>) {\n        let leader = self.get_current_leader();\n        if leader > 0 && self.pid != leader {\n            let pf = PaxosMsg::ProposalForward(entries);\n            let msg = Message::SequencePaxos(PaxosMessage {\n                from: self.pid,\n                to: leader,\n                msg: pf,\n            });\n            self.outgoing.push(msg);\n        } else {\n            self.buffered_proposals.append(&mut entries);\n        }\n    }\n\n    pub(crate) fn forward_stopsign(&mut self, ss: StopSign) {\n        let leader = self.get_current_leader();\n        if leader > 0 && self.pid != leader {\n            #[cfg(feature = \"logging\")]\n            trace!(self.logger, \"Forwarding StopSign to Leader {:?}\", leader);\n            let fs = PaxosMsg::ForwardStopSign(ss);\n            let msg = Message::SequencePaxos(PaxosMessage {\n                from: self.pid,\n                to: leader,\n                msg: fs,\n            });\n            self.outgoing.push(msg);\n        } else if self.buffered_stopsign.as_mut().is_none() {\n            self.buffered_stopsign = Some(ss);\n        }\n    }\n    /// Returns `LogSync`, a struct to help other servers synchronize their log to correspond to the\n    /// current state of our own log. The `common_prefix_idx` marks where in the log the other server\n    /// needs to be sync from.\n    fn create_log_sync(\n        &self,\n        common_prefix_idx: usize,\n        other_logs_decided_idx: usize,\n    ) -> LogSync<T> {\n        let decided_idx = self.internal_storage.get_decided_idx();\n        let (decided_snapshot, suffix, sync_idx) =\n            if T::Snapshot::use_snapshots() && decided_idx > common_prefix_idx {\n                // Note: We snapshot from the other log's decided index and not the common prefix because\n                // snapshots currently only work on decided entries.\n                let (delta_snapshot, compacted_idx) = self\n                    .internal_storage\n                    .create_diff_snapshot(other_logs_decided_idx)\n                    .expect(READ_ERROR_MSG);\n                let suffix = self\n                    .internal_storage\n                    .get_suffix(decided_idx)\n                    .expect(READ_ERROR_MSG);\n                (delta_snapshot, suffix, compacted_idx)\n            } else {\n                let suffix = self\n                    .internal_storage\n                    .get_suffix(common_prefix_idx)\n                    .expect(READ_ERROR_MSG);\n                (None, suffix, common_prefix_idx)\n            };\n        LogSync {\n            decided_snapshot,\n            suffix,\n            sync_idx,\n            stopsign: self.internal_storage.get_stopsign(),\n        }\n    }\n}\n\n#[derive(PartialEq, Debug)]\npub(crate) enum Phase {\n    Prepare,\n    Accept,\n    Recover,\n    None,\n}\n\n#[derive(PartialEq, Debug)]\npub(crate) enum Role {\n    Follower,\n    Leader,\n}\n\n/// Configuration for `SequencePaxos`.\n/// # Fields\n/// * `pid`: The unique identifier of this node. Must not be 0.\n/// * `peers`: The peers of this node i.e. the `pid`s of the other servers in the configuration.\n/// * `flexible_quorum` : Defines read and write quorum sizes. Can be used for different latency vs fault tolerance tradeoffs.\n/// * `buffer_size`: The buffer size for outgoing messages.\n/// * `batch_size`: The size of the buffer for log batching. The default is 1, which means no batching.\n/// * `logger_file_path`: The path where the default logger logs events.\n#[derive(Clone, Debug)]\npub(crate) struct SequencePaxosConfig {",
+        "content_digest": "8b3053463fc9c77f162a7b97133f90d86fc0621283a420d1638d2c4decff454a"
+      },
+      {
+        "id": "src-support",
+        "file": "omnipaxos/src/util.rs",
+        "start_line": 96,
+        "end_line": 259,
+        "kind": "code_observation",
+        "text": "    pub fn with(n_leader: Ballot, max_pid: usize, quorum: Quorum) -> Self {\n        Self {\n            n_leader,\n            promises_meta: vec![PromiseState::NotPromised; max_pid],\n            follower_seq_nums: vec![SequenceNumber::default(); max_pid],\n            accepted_indexes: vec![0; max_pid],\n            max_promise_meta: PromiseMetaData::default(),\n            max_promise_sync: None,\n            latest_accept_meta: vec![None; max_pid],\n            max_pid,\n            quorum,\n        }\n    }\n\n    fn pid_to_idx(pid: NodeId) -> usize {\n        (pid - 1) as usize\n    }\n\n    // Resets `pid`'s accept sequence to indicate they are in the next session of accepts\n    pub fn increment_seq_num_session(&mut self, pid: NodeId) {\n        let idx = Self::pid_to_idx(pid);\n        self.follower_seq_nums[idx].session += 1;\n        self.follower_seq_nums[idx].counter = 0;\n    }\n\n    pub fn next_seq_num(&mut self, pid: NodeId) -> SequenceNumber {\n        let idx = Self::pid_to_idx(pid);\n        self.follower_seq_nums[idx].counter += 1;\n        self.follower_seq_nums[idx]\n    }\n\n    pub fn get_seq_num(&mut self, pid: NodeId) -> SequenceNumber {\n        self.follower_seq_nums[Self::pid_to_idx(pid)]\n    }\n\n    pub fn set_promise(&mut self, prom: Promise<T>, from: NodeId, check_max_prom: bool) -> bool {\n        let promise_meta = PromiseMetaData {\n            n_accepted: prom.n_accepted,\n            accepted_idx: prom.accepted_idx,\n            decided_idx: prom.decided_idx,\n            pid: from,\n        };\n        if check_max_prom && promise_meta > self.max_promise_meta {\n            self.max_promise_meta = promise_meta.clone();\n            self.max_promise_sync = prom.log_sync;\n        }\n        self.promises_meta[Self::pid_to_idx(from)] = PromiseState::Promised(promise_meta);\n        let num_promised = self\n            .promises_meta\n            .iter()\n            .filter(|p| matches!(p, PromiseState::Promised(_)))\n            .count();\n        self.quorum.is_prepare_quorum(num_promised)\n    }\n\n    pub fn reset_promise(&mut self, pid: NodeId) {\n        self.promises_meta[Self::pid_to_idx(pid)] = PromiseState::NotPromised;\n    }\n\n    /// Node `pid` seen with ballot greater than my ballot\n    pub fn lost_promise(&mut self, pid: NodeId) {\n        self.promises_meta[Self::pid_to_idx(pid)] = PromiseState::PromisedHigher;\n    }\n\n    pub fn take_max_promise_sync(&mut self) -> Option<LogSync<T>> {\n        std::mem::take(&mut self.max_promise_sync)\n    }\n\n    pub fn get_max_promise_meta(&self) -> &PromiseMetaData {\n        &self.max_promise_meta\n    }\n\n    pub fn get_max_decided_idx(&self) -> usize {\n        self.promises_meta\n            .iter()\n            .filter_map(|p| match p {\n                PromiseState::Promised(m) => Some(m.decided_idx),\n                _ => None,\n            })\n            .max()\n            .unwrap_or_default()\n    }\n\n    pub fn get_promise_meta(&self, pid: NodeId) -> &PromiseMetaData {\n        match &self.promises_meta[Self::pid_to_idx(pid)] {\n            PromiseState::Promised(metadata) => metadata,\n            _ => panic!(\"No Metadata found for promised follower\"),\n        }\n    }\n\n    pub fn get_min_all_accepted_idx(&self) -> &usize {\n        self.accepted_indexes\n            .iter()\n            .min()\n            .expect(\"Should be all initialised to 0!\")\n    }\n\n    pub fn reset_latest_accept_meta(&mut self) {\n        self.latest_accept_meta = vec![None; self.max_pid];\n    }\n\n    pub fn get_promised_followers(&self) -> Vec<NodeId> {\n        self.promises_meta\n            .iter()\n            .enumerate()\n            .filter_map(|(idx, x)| match x {\n                PromiseState::Promised(_) if idx != Self::pid_to_idx(self.n_leader.pid) => {\n                    Some((idx + 1) as NodeId)\n                }\n                _ => None,\n            })\n            .collect()\n    }\n\n    /// The pids of peers which have not promised a higher ballot than mine.\n    pub(crate) fn get_preparable_peers(&self, peers: &[NodeId]) -> Vec<NodeId> {\n        peers\n            .iter()\n            .filter_map(|pid| {\n                let idx = Self::pid_to_idx(*pid);\n                match self.promises_meta.get(idx).unwrap() {\n                    PromiseState::NotPromised => Some(*pid),\n                    _ => None,\n                }\n            })\n            .collect()\n    }\n\n    pub fn set_latest_accept_meta(&mut self, pid: NodeId, idx: Option<usize>) {\n        let meta = idx.map(|x| (self.n_leader, x));\n        self.latest_accept_meta[Self::pid_to_idx(pid)] = meta;\n    }\n\n    pub fn set_accepted_idx(&mut self, pid: NodeId, idx: usize) {\n        self.accepted_indexes[Self::pid_to_idx(pid)] = idx;\n    }\n\n    pub fn get_latest_accept_meta(&self, pid: NodeId) -> Option<(Ballot, usize)> {\n        self.latest_accept_meta\n            .get(Self::pid_to_idx(pid))\n            .unwrap()\n            .as_ref()\n            .copied()\n    }\n\n    pub fn get_decided_idx(&self, pid: NodeId) -> Option<usize> {\n        match self.promises_meta.get(Self::pid_to_idx(pid)).unwrap() {\n            PromiseState::Promised(metadata) => Some(metadata.decided_idx),\n            _ => None,\n        }\n    }\n\n    pub fn get_accepted_idx(&self, pid: NodeId) -> usize {\n        *self.accepted_indexes.get(Self::pid_to_idx(pid)).unwrap()\n    }\n\n    pub fn is_chosen(&self, idx: usize) -> bool {\n        let num_accepted = self\n            .accepted_indexes\n            .iter()\n            .filter(|la| **la >= idx)\n            .count();\n        self.quorum.is_accept_quorum(num_accepted)\n    }",
+        "content_digest": "fefe70bb2c17e5a6027556a83495d3d75d2b624c9b2371fd4cf91d0e0a2709ba"
+      },
+      {
+        "id": "src-sync",
+        "file": "omnipaxos/src/storage/internal_storage.rs",
+        "start_line": 313,
+        "end_line": 359,
+        "kind": "code_observation",
+        "text": "    pub(crate) fn sync_log(\n        &mut self,\n        accepted_round: Ballot,\n        decided_idx: usize,\n        log_sync: Option<LogSync<T>>,\n    ) -> StorageResult<usize> {\n        self.state_cache.accepted_round = accepted_round;\n        self.state_cache.decided_idx = decided_idx;\n        let mut sync_txn: Vec<StorageOp<T>> = vec![\n            StorageOp::SetAcceptedRound(accepted_round),\n            StorageOp::SetDecidedIndex(decided_idx),\n        ];\n        if let Some(sync) = log_sync {\n            match sync.decided_snapshot {\n                Some(SnapshotType::Complete(c)) => {\n                    self.state_cache.compacted_idx = sync.sync_idx;\n                    sync_txn.push(StorageOp::Trim(sync.sync_idx));\n                    sync_txn.push(StorageOp::SetCompactedIdx(sync.sync_idx));\n                    sync_txn.push(StorageOp::SetSnapshot(Some(c)));\n                }\n                Some(SnapshotType::Delta(d)) => {\n                    let mut snapshot = self.create_decided_snapshot()?;\n                    snapshot.merge(d);\n                    self.state_cache.compacted_idx = sync.sync_idx;\n                    sync_txn.push(StorageOp::Trim(sync.sync_idx));\n                    sync_txn.push(StorageOp::SetCompactedIdx(sync.sync_idx));\n                    sync_txn.push(StorageOp::SetSnapshot(Some(snapshot)));\n                }\n                None => (),\n            }\n            self.state_cache.accepted_idx = sync.sync_idx + sync.suffix.len();\n            sync_txn.push(StorageOp::AppendOnPrefix(sync.sync_idx, sync.suffix));\n            match sync.stopsign {\n                Some(ss) => {\n                    self.state_cache.stopsign = Some(ss.clone());\n                    self.state_cache.accepted_idx += 1;\n                    sync_txn.push(StorageOp::SetStopsign(Some(ss)));\n                }\n                None if self.state_cache.stopsign.is_some() => {\n                    self.state_cache.stopsign = None;\n                    sync_txn.push(StorageOp::SetStopsign(None));\n                }\n                None => (),\n            }\n        }\n        self.storage.write_atomically(sync_txn)?;\n        Ok(self.state_cache.accepted_idx)",
+        "content_digest": "4ad8f4d686efe518f90480ba3a9e2ccb0273714994fe241b033e4fe4e066aefa"
+      },
+      {
+        "id": "src-order",
+        "file": "omnipaxos/src/util.rs",
+        "start_line": 370,
+        "end_line": 390,
+        "kind": "code_observation",
+        "text": "/// Keeps track of the ordering of messages in the accept phase\n#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]\n#[cfg_attr(feature = \"serde\", derive(Serialize, Deserialize))]\npub struct SequenceNumber {\n    /// Meant to refer to a TCP session\n    pub session: u64,\n    /// The sequence number with respect to a session\n    pub counter: u64,\n}\n\nimpl SequenceNumber {\n    /// Compares this sequence number with the sequence number of an incoming message.\n    pub(crate) fn check_msg_status(&self, msg_seq_num: SequenceNumber) -> MessageStatus {\n        if msg_seq_num.session == self.session && msg_seq_num.counter == self.counter + 1 {\n            MessageStatus::Expected\n        } else if msg_seq_num <= *self {\n            MessageStatus::Outdated\n        } else {\n            MessageStatus::DroppedPreceding\n        }\n    }",
+        "content_digest": "fefe70bb2c17e5a6027556a83495d3d75d2b624c9b2371fd4cf91d0e0a2709ba"
+      },
+      {
+        "id": "src-api",
+        "file": "omnipaxos/src/omni_paxos.rs",
+        "start_line": 345,
+        "end_line": 441,
+        "kind": "code_observation",
+        "text": "    pub fn read_decided_suffix(&self, from_idx: usize) -> Option<Vec<LogEntry<T>>> {\n        self.seq_paxos\n            .internal_storage\n            .read_decided_suffix(from_idx)\n            .expect(\"storage error while trying to read decided log suffix\")\n    }\n\n    /// Handle an incoming message\n    pub fn handle_incoming(&mut self, m: Message<T>) {\n        match m {\n            Message::SequencePaxos(p) => self.seq_paxos.handle(p),\n            Message::BLE(b) => self.ble.handle(b),\n            #[cfg(feature = \"async_runtime\")]\n            Message::AsyncRuntime(_) => {\n                // Runtime-layer messages are consumed by the actor before reaching here.\n                // If one leaks through (e.g. user hand-delivered), silently ignore.\n            }\n        }\n    }\n\n    /// Returns whether this Sequence Paxos has been reconfigured\n    pub fn is_reconfigured(&self) -> Option<StopSign> {\n        self.seq_paxos.is_reconfigured()\n    }\n\n    /// Append an entry to the replicated log.\n    pub fn append(&mut self, entry: T) -> Result<(), ProposeErr<T>> {\n        self.seq_paxos.append(entry)\n    }\n\n    /// Propose a cluster reconfiguration. Returns an error if the current configuration has already been stopped\n    /// by a previous reconfiguration request or if the `new_configuration` is invalid.\n    /// `new_configuration` defines the cluster-wide configuration settings for the **next** cluster.\n    /// `metadata` is optional data to commit alongside the reconfiguration.\n    pub fn reconfigure(\n        &mut self,\n        new_configuration: ClusterConfig,\n        metadata: Option<Vec<u8>>,\n    ) -> Result<(), ProposeErr<T>> {\n        if let Err(config_error) = new_configuration.validate() {\n            return Err(ProposeErr::ConfigError(\n                config_error,\n                new_configuration,\n                metadata,\n            ));\n        }\n        self.seq_paxos.reconfigure(new_configuration, metadata)\n    }\n\n    /// Handles re-establishing a connection to a previously disconnected peer.\n    /// This should only be called if the underlying network implementation indicates that a connection has been re-established.\n    pub fn reconnected(&mut self, pid: NodeId) {\n        self.seq_paxos.reconnected(pid)\n    }\n\n    /// Increments the internal logical clock. This drives the processes for leader changes, resending dropped messages, and flushing batched log entries.\n    /// Each of these is triggered every `election_tick_timeout`, `resend_message_tick_timeout`, and `flush_batch_tick_timeout` number of calls to this function\n    /// (See how to configure these timeouts in `ServerConfig`).\n    pub fn tick(&mut self) {\n        if self.election_clock.tick_and_check_timeout() {\n            self.election_timeout();\n        }\n        if self.resend_message_clock.tick_and_check_timeout() {\n            self.seq_paxos.resend_message_timeout();\n        }\n        if self.flush_batch_clock.tick_and_check_timeout() {\n            self.seq_paxos.flush_batch_timeout();\n        }\n    }\n\n    /// Manually attempt to become the leader by incrementing this instance's Ballot. Calling this\n    /// function may not result in gainig leadership if other instances are competing for\n    /// leadership with higher Ballots.\n    pub fn try_become_leader(&mut self) {\n        let mut my_ballot = self.ble.get_current_ballot();\n        let promise = self.seq_paxos.get_promise();\n        my_ballot.n = promise.n + 1;\n        self.seq_paxos.handle_leader(my_ballot);\n    }\n\n    /*** BLE calls ***/\n    /// Update the custom priority used in the Ballot for this server. Note that changing the\n    /// priority triggers a leader re-election.\n    pub fn set_priority(&mut self, p: u32) {\n        self.ble.set_priority(p)\n    }\n\n    /// If the heartbeat of a leader is not received when election_timeout() is called, the server might attempt to become the leader.\n    /// It is also used for the election process, where the server checks if it can become the leader.\n    /// For instance if `election_timeout()` is called every 100ms, then if the leader fails, the servers will detect it after 100ms and elect a new server after another 100ms if possible.\n    fn election_timeout(&mut self) {\n        if let Some(new_leader) = self\n            .ble\n            .hb_timeout(self.seq_paxos.get_state(), self.seq_paxos.get_promise())\n        {\n            self.seq_paxos.handle_leader(new_leader);\n        }",
+        "content_digest": "03a67ebddc884606cd0843413a7937b4d1cb863d5a5762f82c03f9af9ebf022b"
+      },
+      {
+        "id": "src-ble",
+        "file": "omnipaxos/src/ballot_leader_election.rs",
+        "start_line": 175,
+        "end_line": 293,
+        "kind": "code_observation",
+        "text": "    pub(crate) fn new_hb_round(&mut self) {\n        self.prev_replies = std::mem::take(&mut self.heartbeat_replies);\n        self.hb_round += 1;\n        #[cfg(feature = \"logging\")]\n        trace!(\n            self.logger,\n            \"Initiate new heartbeat round: {}\",\n            self.hb_round\n        );\n        for peer in &self.peers {\n            let hb_request = HeartbeatRequest {\n                round: self.hb_round,\n            };\n            self.outgoing.push(BLEMessage {\n                from: self.pid,\n                to: *peer,\n                msg: HeartbeatMsg::Request(hb_request),\n            });\n        }\n    }\n\n    /// End of a heartbeat round. Returns current leader and election status.\n    pub(crate) fn hb_timeout(\n        &mut self,\n        seq_paxos_state: &(Role, Phase),\n        seq_paxos_promise: Ballot,\n    ) -> Option<Ballot> {\n        self.update_leader();\n        self.update_happiness(seq_paxos_state);\n        self.check_takeover();\n        self.new_hb_round();\n        if seq_paxos_promise > self.leader {\n            // Sync leader with Paxos promise in case ballot didn't make it to BLE followers\n            // or become_leader() was called.\n            self.leader = seq_paxos_promise;\n            if seq_paxos_promise.pid == self.pid {\n                self.current_ballot = seq_paxos_promise;\n            }\n            self.happy = true;\n        }\n        if self.leader == self.current_ballot {\n            Some(self.current_ballot)\n        } else {\n            None\n        }\n    }\n\n    fn update_leader(&mut self) {\n        let max_reply_ballot = self.heartbeat_replies.iter().map(|r| r.ballot).max();\n        if let Some(max) = max_reply_ballot {\n            if max > self.leader {\n                self.leader = max;\n            }\n        }\n    }\n\n    fn update_happiness(&mut self, seq_paxos_state: &(Role, Phase)) {\n        self.happy = if self.leader == self.current_ballot {\n            let potential_followers = self\n                .heartbeat_replies\n                .iter()\n                .filter(|hb_reply| hb_reply.leader <= self.current_ballot)\n                .count();\n            let can_form_quorum = match seq_paxos_state {\n                (Role::Leader, Phase::Accept) => {\n                    self.quorum.is_accept_quorum(potential_followers + 1)\n                }\n                _ => self.quorum.is_prepare_quorum(potential_followers + 1),\n            };\n            if can_form_quorum {\n                true\n            } else {\n                let see_larger_happy_leader = self\n                    .heartbeat_replies\n                    .iter()\n                    .any(|r| r.leader > self.current_ballot && r.happy);\n                see_larger_happy_leader\n            }\n        } else {\n            self.heartbeat_replies\n                .iter()\n                .any(|r| r.ballot == self.leader && r.happy)\n        };\n    }\n\n    fn check_takeover(&mut self) {\n        if !self.happy {\n            let all_neighbors_unhappy = self.heartbeat_replies.iter().all(|r| !r.happy);\n            let im_quorum_connected = self\n                .quorum\n                .is_prepare_quorum(self.heartbeat_replies.len() + 1);\n            if all_neighbors_unhappy && im_quorum_connected {\n                // We increment past our leader instead of max of unhappy ballots because we\n                // assume we have already checked leader for this round so they should be equal\n                self.current_ballot.n = self.leader.n + 1;\n                self.leader = self.current_ballot;\n                self.happy = true;\n            }\n        }\n    }\n\n    fn handle_request(&mut self, from: NodeId, req: HeartbeatRequest) {\n        let hb_reply = HeartbeatReply {\n            round: req.round,\n            ballot: self.current_ballot,\n            leader: self.leader,\n            happy: self.happy,\n        };\n        self.outgoing.push(BLEMessage {\n            from: self.pid,\n            to: from,\n            msg: HeartbeatMsg::Reply(hb_reply),\n        });\n    }\n\n    fn handle_reply(&mut self, rep: HeartbeatReply) {\n        if rep.round == self.hb_round && rep.ballot.config_id == self.configuration_id {\n            self.heartbeat_replies.push(rep);\n        }",
+        "content_digest": "387e245b665c0d407af62dff48efe37071d0191987c22ef008ab743773b2f575"
+      },
+      {
+        "id": "src-config",
+        "file": "omnipaxos/src/omni_paxos.rs",
+        "start_line": 102,
+        "end_line": 131,
+        "kind": "code_observation",
+        "text": "impl ClusterConfig {\n    /// Checks that all the fields of the cluster config are valid.\n    pub fn validate(&self) -> Result<(), ConfigError> {\n        let num_nodes = self.nodes.len();\n        valid_config!(num_nodes > 1, \"Need more than 1 node\");\n        valid_config!(self.configuration_id != 0, \"Configuration ID cannot be 0\");\n        if let Some(FlexibleQuorum {\n            read_quorum_size,\n            write_quorum_size,\n        }) = self.flexible_quorum\n        {\n            valid_config!(\n                read_quorum_size + write_quorum_size > num_nodes,\n                \"The quorums must overlap i.e., the sum of their sizes must exceed the # of nodes\"\n            );\n            valid_config!(\n                read_quorum_size >= 2 && read_quorum_size <= num_nodes,\n                \"Read quorum must be in range 2 to # of nodes in the cluster\"\n            );\n            valid_config!(\n                write_quorum_size >= 2 && write_quorum_size <= num_nodes,\n                \"Write quorum must be in range 2 to # of nodes in the cluster\"\n            );\n            valid_config!(\n                read_quorum_size >= write_quorum_size,\n                \"Read quorum size must be >= the write quorum size.\"\n            );\n        }\n        Ok(())\n    }",
+        "content_digest": "03a67ebddc884606cd0843413a7937b4d1cb863d5a5762f82c03f9af9ebf022b"
+      },
+      {
+        "id": "src-read",
+        "file": "omnipaxos/src/storage/internal_storage.rs",
+        "start_line": 77,
+        "end_line": 157,
+        "kind": "code_observation",
+        "text": "    pub(crate) fn read_decided_suffix(\n        &self,\n        from_idx: usize,\n    ) -> StorageResult<Option<Vec<LogEntry<T>>>> {\n        let decided_idx = self.get_decided_idx();\n        if from_idx < decided_idx {\n            self.read(from_idx..decided_idx)\n        } else {\n            Ok(None)\n        }\n    }\n\n    /// Read entries in the range `r` in the log. Returns `None` if `r` is out of bounds.\n    pub(crate) fn read<R>(&self, r: R) -> StorageResult<Option<Vec<LogEntry<T>>>>\n    where\n        R: RangeBounds<usize>,\n    {\n        let from_idx = match r.start_bound() {\n            Bound::Included(i) => *i,\n            Bound::Excluded(e) => *e + 1,\n            Bound::Unbounded => 0,\n        };\n        let to_idx = match r.end_bound() {\n            Bound::Included(i) => *i + 1,\n            Bound::Excluded(e) => *e,\n            Bound::Unbounded => self.get_accepted_idx(),\n        };\n        if to_idx == 0 {\n            return Ok(None);\n        }\n        let compacted_idx = self.get_compacted_idx();\n        let accepted_idx = self.get_accepted_idx();\n        // use to_idx-1 when getting the entry type as to_idx is exclusive\n        let to_type = match self.get_entry_type(to_idx - 1, compacted_idx, accepted_idx)? {\n            Some(IndexEntry::Compacted) => {\n                return Ok(Some(vec![self.create_compacted_entry(compacted_idx)?]))\n            }\n            Some(from_type) => from_type,\n            _ => return Ok(None),\n        };\n        let from_type = match self.get_entry_type(from_idx, compacted_idx, accepted_idx)? {\n            Some(from_type) => from_type,\n            _ => return Ok(None),\n        };\n        match (from_type, to_type) {\n            (IndexEntry::Entry, IndexEntry::Entry) => {\n                Ok(Some(self.create_read_log_entries(from_idx, to_idx)?))\n            }\n            (IndexEntry::Entry, IndexEntry::StopSign(ss)) => {\n                let mut entries = self.create_read_log_entries(from_idx, to_idx - 1)?;\n                entries.push(LogEntry::StopSign(ss, self.stopsign_is_decided()));\n                Ok(Some(entries))\n            }\n            (IndexEntry::Compacted, IndexEntry::Entry) => {\n                let mut entries = Vec::with_capacity(to_idx - compacted_idx + 1);\n                let compacted = self.create_compacted_entry(compacted_idx)?;\n                entries.push(compacted);\n                let mut e = self.create_read_log_entries(compacted_idx, to_idx)?;\n                entries.append(&mut e);\n                Ok(Some(entries))\n            }\n            (IndexEntry::Compacted, IndexEntry::StopSign(ss)) => {\n                let mut entries = Vec::with_capacity(to_idx - compacted_idx + 1);\n                let compacted = self.create_compacted_entry(compacted_idx)?;\n                entries.push(compacted);\n                let mut e = self.create_read_log_entries(compacted_idx, to_idx - 1)?;\n                entries.append(&mut e);\n                entries.push(LogEntry::StopSign(ss, self.stopsign_is_decided()));\n                Ok(Some(entries))\n            }\n            (IndexEntry::StopSign(ss), IndexEntry::StopSign(_)) => {\n                Ok(Some(vec![LogEntry::StopSign(\n                    ss,\n                    self.stopsign_is_decided(),\n                )]))\n            }\n            e => {\n                unimplemented!(\"{}\", format!(\"Unexpected read combination: {:?}\", e))\n            }\n        }\n    }",
+        "content_digest": "4ad8f4d686efe518f90480ba3a9e2ccb0273714994fe241b033e4fe4e066aefa"
+      },
+      {
+        "id": "doc-log",
+        "file": "docs/omnipaxos/log.md",
+        "start_line": 1,
+        "end_line": 32,
+        "kind": "document_statement",
+        "text": "We now show how to read and write the replicated log. The replicated log is *append-only*. To append an entry we call the following:\n\n```rust\nlet write_entry = KeyValue { key: String::from(\"a\"), value: 123 };\nomni_paxos.append(write_entry).expect(\"Failed to append\");\n```\n\nThis will cause our `write_entry` to be proposed to get decided in the replicated log. Appends can be pipelined without waiting for preceding entries to be decided. Furthermore, `append()` can be called on any node. If the calling node is not the leader, the entry will be forwarded. \n\n## Reading the Log\nReads are also handled by calling various functions on `OmniPaxos`. To read the entry at a specific index `idx` of the log we call `omni_paxos.read_entry(idx)`. We can also read a specific range of log entries with `omni_paxos.read_entries()`. \n\n```rust\n/*** Read a single entry ***/\nlet idx = 5;\nlet read_entry = omni_paxos.read(idx);\n\n/*** Read a range ***/\nlet read_entries = omni_paxos.read_entries(2..5);\n``` \n\nThe read functions return `Option<LogEntry>` and `Option<Vec<LogEntry>>` respectively, where `None` is returned if the index or range is out of bounds. `LogEntry` is an enum with the following variants:\n- `Decided(T)`: The entry is decided and guaranteed to not be reverted. It is thus safe to apply a decided entry to the application state. For instance, in our case, it is safe to update our key-value store when we read a `Decided(KeyValue)` entry.\n- `Undecided(T)`: The entry is NOT decided and might be removed from the log at a later time. However, it could be useful in applications that allow speculative execution for example.\n- `Trimmed(TrimmedIndex)`: We tried to read an index where the entry has already been trimmed. \n- `Snapshotted(SnapshottedEntry<T>)`: The index we read has already been compacted into a snapshot. We can access the snapshot from the field `snapshot` in `SnapshottedEntry`. In our case our this will correspond to `KVSnapshot` that we defined [here](../compaction).\n- `StopSign(StopSign)`: This Sequence Paxos instance has been stopped for reconfiguration. This implies that this log will not be appended anymore and one should use the new Sequence Paxos instead for writing.\n\nIt is also possible to only read decided entries or snapshot from a specific index using `read_decided_suffix(idx)`.\n\n\n",
+        "content_digest": "49924ce2b143cecce202698b97376eb9eaa5e0612f9e083f5fe980abc27a418d"
+      },
+      {
+        "id": "doc-transport",
+        "file": "docs/omnipaxos/communication.md",
+        "start_line": 1,
+        "end_line": 25,
+        "kind": "document_statement",
+        "text": "As previously mentioned, the user has to send/receive messages between servers themselves. In this section, we show how the user should interact with `OmniPaxos` and its incoming and outgoing messages.\n\n## Incoming and Outgoing\nWhen a message is received from the network layer intended for our node, we need to handle it in `OmniPaxos`.\n\n```rust\nuse omnipaxos::messages::Message;\n\n// handle incoming message from network layer\nlet msg: Message<KeyValue> = in_msg;    // in_msg is a received message for this node e.g. `in_msg.get_receiver() == 2`\nomni_paxos.handle_incoming(msg);\n```\n\nBy handling incoming messages and local calls such as `append()`, our local `omni_paxos` will produce outgoing messages for its peers. Thus, we must periodically send the outgoing messages on the network layer.\n\n```rust\n// send outgoing messages. This should be called periodically, e.g. every ms\nlet mut msg_buffer = Vec::with_capacity(1000);\nomni_paxos.take_outgoing_messages(&mut msg_buffer);\nfor out_msg in msg_buffer.drain(..) {\n    let receiver = out_msg.get_receiver();\n    // send out_msg to receiver on network layer\n}\n```\n",
+        "content_digest": "3e830a781fb092703200a8a3515be9a009f93d255b062d5b018d8be25a3e5978"
+      },
+      {
+        "id": "doc-reconfiguration",
+        "file": "docs/omnipaxos/reconfiguration.md",
+        "start_line": 1,
+        "end_line": 47,
+        "kind": "document_statement",
+        "text": "To change the servers in the cluster, we must first stop the current OmniPaxos cluster. This is done via the `reconfigure()` function, which takes a `ClusterConfig` that contains the settings for the next OmniPaxos cluster and some optional metadata.\n\n```rust\n// Node 3 seems to have crashed... let's replace it with a new node 4.\nlet new_configuration = ClusterConfig {\n    configuration_id: 2,\n    nodes: vec![1, 2, 4],\n    ..Default::default()\n};\nlet metadata = None;\nomni_paxos.reconfigure(new_configuration, metadata).expect(\"Failed to propose reconfiguration\");\n```\n\nCalling ``reconfigure()`` will propose a `StopSign` entry to be appended. If it gets decided, the log is sealed and prevented from being further appended. From the `StopSign` entry, all nodes will be able to see the new configuration. When you, the user, read from a node and find a `LogEntry::StopSign` in the log, you should start a new `OmniPaxos` instance at this node if it is part of the new configuration.\n\n```rust\n    // the ServerConfig config for current node\n    let current_config = ServerConfig {\n        pid: 2,\n        ..Default::default()\n    };\n    let my_pid = current_config.pid;\n    \n    let idx: usize = 2;  // some index we last read from\n    let decided_entries: Option<Vec<LogEntry<KeyValue>>> = omni_paxos.read_decided_suffix(idx);\n\n    if let Some(de) = decided_entries {\n        for d in de {\n            match d {\n                LogEntry::StopSign(stopsign, true) => {\n                    let new_configuration = stopsign.next_config;\n                    if new_configuration.nodes.contains(&my_pid) {\n                        // current configuration has been safely stopped. Start new instance\n                        let new_storage = MemoryStorage::default();\n                        let mut new_omnipaxos = new_configuration.build_for_server(current_config.clone(), MemoryStorage::default()).unwrap();\n\n                        // use new_omnipaxos\n                        // ...\n                    }\n                }\n                _ => {}\n            }\n        }\n    }\n```\n\n> **Note:** New nodes will not see the `StopSign` since they were not part of the old configuration. The user themselves must notify and start these new nodes. Furthermore,the user must ensure these new nodes have the application state or log up to the stopsign before starting their `OmniPaxos` instance.",
+        "content_digest": "bdb4f36c178d117b93c0d7327c1f96a09893fb06726ae409d55432873035c572"
+      }
+    ],
+    "selections": [
+      {
+        "operation_id": "7f0fbde4ebfe453e8ea8fe3829b3940a",
+        "action": "research",
+        "rationale": "Retain the initial two-core-path explanation and sourced recovery/eligibility questions before focused selection.",
+        "feedback": {
+          "ref_ids": [
+            "src-follower",
+            "src-leader",
+            "src-sync",
+            "src-ble"
+          ],
+          "answered": "Ballot promises and per-peer support govern formation; incremental replication additionally checks sequence order. AcceptSync instead checks ballot and Prepare phase and directly installs supplied decision/history state. BLE filters heartbeat replies by round/configuration but appends them without visible deduplication in the inspected handler.",
+          "remaining": [
+            "Finish storage, initialization and runtime caller contracts for usable core overview.",
+            "Determine whether delayed same-ballot synchronization can legally overlap a later recovery and affect established decisions.",
+            "Determine heartbeat delivery uniqueness assumptions before treating reply counting as an eligibility defect."
+          ],
+          "understanding": "updated",
+          "rationale": "These are source observations and specific questions, not proven failures. Existing ballot, phase and incremental sequence guards are retained as counterevidence.",
+          "question_updates": {}
+        },
+        "map_updated": true,
+        "map_changes": {},
+        "accepted_versions": {
+          "audit_spec": 1,
+          "units": {},
+          "artifacts": {}
+        },
+        "map_delta": {
+          "A1": {
+            "before": {},
+            "after": {
+              "class_id": "A1",
+              "applicability": "applicable",
+              "purpose": "Qualified support for decision formation and legal advancement",
+              "realization_summary": "Prepare quorum selects accepted history; acceptance quorum advances decided prefix.",
+              "entry_points": [],
+              "variants": [],
+              "unknowns": [],
+              "source_ids": [
+                "src-leader",
+                "src-follower",
+                "src-support"
+              ]
+            }
+          },
+          "A2": {
+            "before": {},
+            "after": {
+              "class_id": "A2",
+              "applicability": "applicable",
+              "purpose": "Context validity and acquisition, transfer or loss of authority",
+              "realization_summary": "BLE proposes ballots; promise and role/phase checks qualify replication.",
+              "entry_points": [],
+              "variants": [],
+              "unknowns": [],
+              "source_ids": [
+                "src-api",
+                "src-ble",
+                "src-leader",
+                "src-follower"
+              ]
+            }
+          },
+          "A3": {
+            "before": {},
+            "after": {
+              "class_id": "A3",
+              "applicability": "applicable",
+              "purpose": "Recovery and resynchronization of eligible participation",
+              "realization_summary": "Stored promises, reconnects and sequence gaps enter recovery; Prepare/Promise/AcceptSync restore participation.",
+              "entry_points": [],
+              "variants": [],
+              "unknowns": [],
+              "source_ids": [
+                "src-sequence",
+                "src-follower",
+                "src-leader"
+              ]
+            }
+          },
+          "A4": {
+            "before": {},
+            "after": {
+              "class_id": "A4",
+              "applicability": "applicable",
+              "purpose": "Configuration and participant eligibility",
+              "realization_summary": "Cluster validates quorum overlap and bounds; StopSign proposes a new cluster.",
+              "entry_points": [],
+              "variants": [],
+              "unknowns": [],
+              "source_ids": [
+                "src-config",
+                "doc-reconfiguration"
+              ]
+            }
+          },
+          "A5": {
+            "before": {},
+            "after": {
+              "class_id": "A5",
+              "applicability": "applicable",
+              "purpose": "Decision application and consumption",
+              "realization_summary": "Read API exposes decided entries and StopSign; application consumes them.",
+              "entry_points": [],
+              "variants": [],
+              "unknowns": [],
+              "source_ids": [
+                "doc-log",
+                "src-read"
+              ]
+            }
+          },
+          "A6": {
+            "before": {},
+            "after": {
+              "class_id": "A6",
+              "applicability": "applicable",
+              "purpose": "History, persistence and reconstruction of support",
+              "realization_summary": "InternalStorage synchronizes accepted history and decision metadata with a storage transaction.",
+              "entry_points": [],
+              "variants": [],
+              "unknowns": [],
+              "source_ids": [
+                "src-sync"
+              ]
+            }
+          },
+          "A7": {
+            "before": {},
+            "after": {
+              "class_id": "A7",
+              "applicability": "applicable",
+              "purpose": "Client contracts, invocation intervals and observed completion",
+              "realization_summary": "Append proposes work; callers deliver messages, tick clocks and read results. In-repository async runtime remains unread.",
+              "entry_points": [],
+              "variants": [],
+              "unknowns": [],
+              "source_ids": [
+                "src-api",
+                "doc-transport",
+                "doc-log"
+              ]
+            }
+          },
+          "b-election": {
+            "before": {},
+            "after": {
+              "id": "b-election",
+              "primary_activity": "A2",
+              "execution_owner": "BallotLeaderElection and OmniPaxos",
+              "protocol_context": "Heartbeat round and configuration ballot",
+              "trigger": "tick -> election_timeout -> hb_timeout",
+              "legal_preconditions": [],
+              "implementation_guards": [
+                "Heartbeat reply round and ballot configuration match; takeover requires unhappy neighbors and prepare quorum connectivity."
+              ],
+              "reads": [],
+              "writes": [],
+              "durable_effects": [],
+              "external_effects": [
+                "Queue heartbeat requests and replies; invoke handle_leader when local ballot is selected."
+              ],
+              "important_branches": [],
+              "async_boundaries": [],
+              "produces_fact_ids": [],
+              "consumes_fact_ids": [],
+              "cross_activity_effects": {},
+              "existing_protections": [],
+              "source_ids": [
+                "src-api",
+                "src-ble"
+              ],
+              "unknowns": [
+                "Heartbeat reply accumulation counts vector entries; participant uniqueness and duplicate-delivery assumptions need source investigation."
+              ]
+            }
+          },
+          "b-follow": {
+            "before": {},
+            "after": {
+              "id": "b-follow",
+              "primary_activity": "A1",
+              "execution_owner": "SequencePaxos follower",
+              "protocol_context": "Promised ballot and replication sequence",
+              "trigger": "handle_acceptsync, handle_acceptdecide, handle_decide and handle_accept_stopsign",
+              "legal_preconditions": [],
+              "implementation_guards": [
+                "AcceptSync requires promised ballot and Follower/Prepare; incremental AcceptDecide requires Follower/Accept and expected sequence. Decide requires Accept phase and expected sequence."
+              ],
+              "reads": [],
+              "writes": [
+                "AcceptSync installs supplied history, decided index and sequence; incremental messages append entries and advance decided index with batching bounds."
+              ],
+              "durable_effects": [],
+              "external_effects": [
+                "Queue or coalesce Accepted responses after accepted storage changes."
+              ],
+              "important_branches": [],
+              "async_boundaries": [],
+              "produces_fact_ids": [],
+              "consumes_fact_ids": [
+                "f-promise"
+              ],
+              "cross_activity_effects": {},
+              "existing_protections": [],
+              "source_ids": [
+                "src-follower",
+                "src-order",
+                "src-sync"
+              ],
+              "unknowns": [
+                "AcceptSync does not check its sequence against a retained prior session; determine whether older same-ballot synchronization can reach a later Prepare phase under the actual transport contract."
+              ]
+            }
+          },
+          "b-formation": {
+            "before": {},
+            "after": {
+              "id": "b-formation",
+              "primary_activity": "A1",
+              "execution_owner": "SequencePaxos leader",
+              "protocol_context": "Current leader ballot; Prepare then Accept",
+              "trigger": "handle_promise_prepare, handle_majority_promises and handle_accepted",
+              "legal_preconditions": [],
+              "implementation_guards": [
+                "Promise ballot equals leader ballot; distinct promise slots counted toward prepare quorum. Accepted requires current ballot and Leader/Accept."
+              ],
+              "reads": [],
+              "writes": [
+                "Choose maximal accepted round/index history; synchronize log; append buffered proposals unless stopped; record accepted indexes and update decided index when acceptance quorum supports it."
+              ],
+              "durable_effects": [],
+              "external_effects": [
+                "Queue AcceptSync, AcceptDecide and Decide messages for promised followers."
+              ],
+              "important_branches": [],
+              "async_boundaries": [],
+              "produces_fact_ids": [],
+              "consumes_fact_ids": [
+                "f-promise"
+              ],
+              "cross_activity_effects": {},
+              "existing_protections": [],
+              "source_ids": [
+                "src-leader",
+                "src-support"
+              ],
+              "unknowns": [
+                "Same-ballot recovery may replace peer support metadata; accepted indexes are assigned rather than max-merged. Consequence depends on permitted message history."
+              ]
+            }
+          },
+          "b-prepare": {
+            "before": {},
+            "after": {
+              "id": "b-prepare",
+              "primary_activity": "A2",
+              "execution_owner": "SequencePaxos leader and follower",
+              "protocol_context": "Configuration-local ballot and prepare phase",
+              "trigger": "handle_leader and handle_prepare",
+              "legal_preconditions": [],
+              "implementation_guards": [
+                "New leader ballot exceeds remembered leader and promise; follower accepts higher promise or equal promise in Recover."
+              ],
+              "reads": [],
+              "writes": [
+                "Flush pending batches; persist promise; reset leader support on local leadership; reset follower sequence on prepare."
+              ],
+              "durable_effects": [],
+              "external_effects": [
+                "Queue Prepare or Promise containing accepted round, accepted index and decided index; selected history may include log sync."
+              ],
+              "important_branches": [],
+              "async_boundaries": [],
+              "produces_fact_ids": [
+                "f-promise"
+              ],
+              "consumes_fact_ids": [],
+              "cross_activity_effects": {},
+              "existing_protections": [],
+              "source_ids": [
+                "src-leader",
+                "src-follower",
+                "src-support"
+              ],
+              "unknowns": [
+                "Full initialization and durable recovery contract still require tracing."
+              ]
+            }
+          },
+          "b-recovery": {
+            "before": {},
+            "after": {
+              "id": "b-recovery",
+              "primary_activity": "A3",
+              "execution_owner": "SequencePaxos peer",
+              "protocol_context": "Reconnect, sequence gap or stored promise",
+              "trigger": "reconnected, resend_messages_follower and handle_preparereq",
+              "legal_preconditions": [],
+              "implementation_guards": [],
+              "reads": [],
+              "writes": [
+                "Reconnect to current leader sets Follower/Recover. PrepareReq clears leader promise slot and pending accept metadata before sending Prepare."
+              ],
+              "durable_effects": [],
+              "external_effects": [
+                "Periodic resend sends cached Promise in Prepare or PrepareReq in Recover; leader retries prepares for unpromised peers."
+              ],
+              "important_branches": [],
+              "async_boundaries": [],
+              "produces_fact_ids": [],
+              "consumes_fact_ids": [],
+              "cross_activity_effects": {
+                "A2": "Permits equal-ballot Prepare after entering Recover.",
+                "A1": "Resynchronization replaces follower history before ordinary acceptance resumes."
+              },
+              "existing_protections": [],
+              "source_ids": [
+                "src-sequence",
+                "src-leader",
+                "src-follower"
+              ],
+              "unknowns": [
+                "Caller delivery ordering and whether old-connection messages may remain deliverable after reconnection."
+              ]
+            }
+          },
+          "core_overview": {
+            "before": {},
+            "after": {
+              "formation": {
+                "explanation": "Append is buffered during prepare, sent locally during Leader/Accept, or forwarded. Current-ballot promises populate participant slots; a prepare quorum selects maximal accepted-round/index history, synchronizes it, then sends AcceptSync. Followers synchronize and acknowledge, and incremental appends use sequence validation. Current-ballot Accepted messages update leader indexes; a write quorum causes decided-index advancement and decision propagation. Read APIs expose the decided prefix for application use.",
+                "behavior_ids": [
+                  "b-formation",
+                  "b-follow"
+                ],
+                "fact_ids": [],
+                "source_ids": [
+                  "src-sequence",
+                  "src-leader",
+                  "src-follower",
+                  "src-support",
+                  "src-read",
+                  "doc-log"
+                ]
+              },
+              "context": {
+                "explanation": "Tick drives BLE; matching heartbeat rounds/configurations influence leader selection. SequencePaxos requires a higher ballot before initiating preparation. Followers persist a higher promise, reject lower-ballot replication and accept same-ballot prepare only during recovery. Reconnect and sequence gaps can initiate equal-ballot recovery. StopSign seals the old log and delegates startup/state transfer of a new configuration to the caller.",
+                "behavior_ids": [
+                  "b-prepare",
+                  "b-election",
+                  "b-recovery"
+                ],
+                "fact_ids": [],
+                "source_ids": [
+                  "src-api",
+                  "src-ble",
+                  "src-sequence",
+                  "src-leader",
+                  "src-follower",
+                  "doc-reconfiguration"
+                ]
+              },
+              "connection": {
+                "explanation": "Authority alone does not enable acceptance: the new leader first gathers promise support and adopts accepted history, including prior decisions, before appending buffered work. A stopped selected history blocks appends. Followers require the promised ballot and appropriate phase; incremental old-session work is rejected or triggers recovery. Equal-ballot recovery resets phase and sequence before synchronization, leaving a specific delayed-AcceptSync history question.",
+                "behavior_ids": [
+                  "b-prepare",
+                  "b-formation",
+                  "b-follow",
+                  "b-recovery"
+                ],
+                "fact_ids": [
+                  "f-promise"
+                ],
+                "source_ids": [
+                  "src-leader",
+                  "src-follower",
+                  "src-support",
+                  "src-sync",
+                  "src-order"
+                ]
+              },
+              "open_details": [
+                "Legal transport history for delayed same-ballot AcceptSync.",
+                "Heartbeat duplicate accounting contract.",
+                "Compaction and reconfiguration edge paths."
+              ],
+              "core_gaps": [
+                "Complete initialization, storage reconstruction and read classification path; inspect runtime caller/delivery responsibilities before declaring the combined backbone usable."
+              ],
+              "status": "incomplete",
+              "rationale": "Initial sourced backbone with explicit incomplete support boundaries; no violation or execution result is claimed."
+            }
+          },
+          "f-promise": {
+            "before": {},
+            "after": {
+              "id": "f-promise",
+              "meaning": "Replica has recorded the ballot to which its acceptance handling is currently promised.",
+              "identity": {
+                "replica": "NodeId",
+                "configuration": "Replica instance configuration"
+              },
+              "validity_context": "Stored promise ballot; equal-ballot recovery can change phase and session without increasing it.",
+              "representation": [
+                "InternalStorage promise"
+              ],
+              "invalidators": [],
+              "reinterpreters": [],
+              "durability": "Written through storage; actual storage failure and recovery semantics not yet fully traced.",
+              "recovery": "Constructor seeing a stored promise starts Recover and queues PrepareReq; precise backend reconstruction remains open.",
+              "source_ids": [
+                "src-sequence",
+                "src-leader",
+                "src-follower"
+              ],
+              "unknowns": [
+                "Storage backend persistence and atomicity contracts."
+              ]
+            }
+          },
+          "surface:BallotLeaderElection::handle_reply": {
+            "before": {},
+            "after": {
+              "entry_point": "BallotLeaderElection::handle_reply",
+              "disposition": "mapped",
+              "behavior_ids": [
+                "b-election"
+              ],
+              "reason": "What ensures heartbeat support counts distinct eligible participants when replies are appended to a vector?",
+              "source_ids": [
+                "src-ble"
+              ],
+              "high_consequence": false
+            }
+          },
+          "surface:SequencePaxos::handle_acceptsync": {
+            "before": {},
+            "after": {
+              "entry_point": "SequencePaxos::handle_acceptsync",
+              "disposition": "mapped",
+              "behavior_ids": [
+                "b-follow"
+              ],
+              "reason": "Does same-ballot recovery admit stale synchronization history after a later decision? Ballot/phase checks protect ordinary delivery; legal overlapping sessions and transport duties remain unresolved.",
+              "source_ids": [
+                "src-follower",
+                "src-leader",
+                "src-sync",
+                "src-order"
+              ],
+              "high_consequence": true
+            }
+          },
+          "target_profile": {
+            "before": {},
+            "after": {
+              "system_boundary": "Captured OmniPaxos core, storage and runtime; caller owns network delivery and application consumption. In-repository runtime and storage backends are not yet mapped.",
+              "protocol_contexts": [
+                "Configuration ID",
+                "Ballot",
+                "Follower replication session and counter"
+              ],
+              "external_interfaces": [
+                "OmniPaxos::append",
+                "OmniPaxos::handle_incoming",
+                "OmniPaxos::tick",
+                "OmniPaxos::reconnected",
+                "OmniPaxos::read_decided_suffix"
+              ],
+              "ownership": [],
+              "selection_injection": [],
+              "variants": [],
+              "source_ids": [
+                "src-api",
+                "doc-transport",
+                "doc-log",
+                "doc-reconfiguration"
+              ],
+              "unknowns": []
+            }
+          }
+        },
+        "map_effects": {},
+        "candidate_ids": []
+      }
+    ],
+    "audit_spec_path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-04_18-47-07-omnipaxos-real-run/audit-spec/v1.json",
+    "audit_spec_version": 1,
+    "applied_operations": {
+      "submission-7f0fbde4ebfe453e8ea8fe3829b3940a": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-04_18-47-07-omnipaxos-real-run/graph-commits/submission-7f0fbde4ebfe453e8ea8fe3829b3940a.json"
+      }
+    }
+  }
+}

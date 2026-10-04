@@ -142,6 +142,78 @@ println!("CA_EVENT {{\\"event\\":\\"value\\",\\"value\\":{}}}", sample::step(VAL
         assert json.loads((e.root/variant.parameters['build_inputs']).read_text())['snapshot_id']!=basis['snapshot_id']
 
 
+@pytest.mark.parametrize('cut',['copy','partial_copy','process','adapter','unknown_process'])
+def test_rust_same_action_recovers_materialization_and_execution(tmp_path,rust_workspace,monkeypatch,cut):
+    import shutil
+    from consensus_assurance.adapters.runners.cargo import CargoBackend
+    from consensus_assurance.adapters.runners.experiment import extract_events
+    from consensus_assurance.core.config import TargetConfig
+    from consensus_assurance.core.proposals import Harness
+    from consensus_assurance.core.types import CheckRun
+    from consensus_assurance.workflow.direct_checks import execute_harness
+    if not shutil.which('cargo') or not shutil.which('bwrap'):pytest.skip('Local Rust and bubblewrap are required')
+    e,repo=engine_for(tmp_path,[]);shutil.copytree(rust_workspace,repo,dirs_exist_ok=True)
+    e.config.target=TargetConfig(execution_package='sample');e.config.execution_backend='cargo'
+    e.config.execution_isolation='bwrap';e.implementation=CargoBackend(e.config.target);e.start(repo,plan_only=True)
+    harness=Harness(kind='rust_test',source='''#[test] fn actual() {
+assert!(!std::path::Path::new("executed-once").exists());
+std::fs::write("executed-once", "actual execution").unwrap();
+println!("CA_EVENT {{\\"event\\":\\"value\\",\\"value\\":{}}}",sample::step(4,9));
+}''',description='Actual public call across a controlled crash',semantic_changes=[])
+    filename=e.implementation.resolve_harness(harness,e.root/'source',e.state.snapshot.files)
+    class Crash(BaseException):pass
+    original=e.runner.run;interrupted=[];target_runs=[]
+    def run(command,cwd,action,*args,**kwargs):
+        check=original(command,cwd,action,*args,**kwargs)
+        if action=='exploration':target_runs.append(check.id)
+        if not interrupted and action==('cargo_seed_copy' if cut in {'copy','partial_copy'} else 'exploration') and cut!='adapter':
+            interrupted.append(check);e.checkpoint('controlled_crash_after_raw_receipt')
+            raise Crash()
+        return check
+    monkeypatch.setattr(e.runner,'run',run)
+    def perform():
+        check=execute_harness(e,harness,filename,'exploration')
+        if cut=='adapter' and not interrupted:
+            interrupted.append(check);e.checkpoint('controlled_crash_after_adapter_return');raise Crash()
+        return check
+    def action():return e.action('exploration','experiments',perform,{'generation':1})
+    with pytest.raises(Crash):action()
+    operation=e.state.pending_action.id;workspace=e.workspace()
+    assert not (e.root/'actions'/operation/'result.json').exists()
+    if cut=='partial_copy':
+        copied=Path(interrupted[0].command[-1])
+        next(copied.rglob('libincrement*.rlib')).unlink()
+    if cut=='process':(workspace/'Cargo.lock').write_text('unverified replacement after the process receipt')
+    if cut=='unknown_process':
+        path=e.root/'logs'/interrupted[0].id/'check.json';raw=json.loads(path.read_text())
+        raw.update(ended_at=None,status='running');path.write_text(json.dumps(raw))
+    frozen={p:p.read_bytes() for p in (e.root/'logs'/interrupted[0].id).glob('*.log')}
+    monkeypatch.setattr('consensus_assurance.workflow.audit.execute',lambda engine:action())
+    if cut=='unknown_process':
+        with pytest.raises(ValueError,match='outcome unknown'):e.resume()
+        assert len(target_runs)==1 and e.state.usage['experiments']==1
+        return
+    recovered=CheckRun.model_validate(e.resume())
+    assert e.state.pending_action.id==operation and e.state.usage['experiments']==1
+    assert extract_events(recovered)[0]['value']==5 and len(target_runs)==1
+    artifacts=json.loads(Path(recovered.parameters['cargo_artifacts']).read_text())
+    assert all(a['fresh'] for a in artifacts if a['target']['name']=='increment')
+    assert all(p.read_bytes()==value for p,value in frozen.items())
+    if cut=='adapter':assert recovered.parameters['action_seconds']==interrupted[0].parameters['action_seconds']
+    else:assert recovered.parameters['action_seconds'] is None
+    if cut=='process':
+        assert recovered.status.value=='error' and 'integrity postprocessing' in recovered.reason
+        assert recovered.parameters['changed_target_files'] is None and 'lock_unchanged' not in recovered.parameters
+        assert (workspace/'Cargo.lock').read_text()=='unverified replacement after the process receipt'
+    else:assert recovered.status.value=='completed' and recovered.parameters['lock_unchanged']
+    copies=[json.loads(p.read_text()) for p in (e.root/'logs').glob('*/check.json') if json.loads(p.read_text())['action']=='cargo_seed_copy']
+    assert len(copies)==(2 if cut in {'copy','partial_copy'} else 1)
+    assert len({c['id'] for c in copies})==len(copies)
+    cached=action()
+    assert cached['id']==recovered.id and e.state.usage['experiments']==1
+    assert len(target_runs)==1 and not (repo/'Cargo.lock').exists()
+
+
 @pytest.mark.parametrize('fault',['compile','observation','observation_violation'])
 @pytest.mark.usefixtures('full_refresh_equivalence')
 def test_existing_unit_actual_technical_repair_review_progress(tmp_path,fault):

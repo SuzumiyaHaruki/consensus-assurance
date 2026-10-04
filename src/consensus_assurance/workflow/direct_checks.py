@@ -116,11 +116,11 @@ def execute(engine,artifact):
         filename=str(Path(artifact.harness_path).relative_to(Path(artifact.plan_path).parent))
         check=execute_harness(engine,plan.harness,filename,'direct_check')
         workspace=Path(check.cwd)
-        after=capture(workspace,excluded_dirs={".execution"}).files
-        changed=[p for p,value in before.items() if after.get(p)!=value]
+        if 'changed_target_files' not in check.parameters:
+            after=capture(workspace,excluded_dirs={".execution"}).files
+            check.parameters['changed_target_files']=[p for p,value in before.items() if after.get(p)!=value]
         check.direct_check_id=artifact.id
         check.origin=Origin.MOCK if engine.state.mode=='mock' else Origin.EXECUTED
-        check.parameters['changed_target_files']=changed
         return check
     check=CheckRun.model_validate(engine.action('direct_execute','experiments',perform,{'direct_check_id':artifact.id,
         'execution_package':plan.harness.execution_package}))

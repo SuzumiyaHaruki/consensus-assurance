@@ -100,6 +100,23 @@ def test_admission_and_independent_prerequisite_permutation():
     assert result['outcome']=='unknown' and result['missing_indices']==[3]
 
 
+def test_phase_readiness_does_not_discharge_selected_delivery_contract():
+    for fifo,special in [(True,True),(True,False),(False,True)]:
+        pending=['earlier'];ready=True
+        assert ready and pending
+        pending.append('later')
+        delivered=[pending.pop(-1 if special else 0),pending.pop(0)]
+        prop,monitor,requirements,events=inputs()
+        requirements.append(EventRequirement(alias='delivery',event='delivery',
+            conditions=[Comparison(field='contract_met',value=True)]))
+        observed=dict(events[0],event='delivery',ready=ready,fifo_required=fifo,
+            delivered=delivered,contract_met=not fifo or delivered==['earlier','later'])
+        events.insert(1,observed)
+        result=monitor_events(events,monitor,prop,requirements)
+        assert result['outcome']==('unknown' if fifo and special else 'violated')
+        assert result['witness_complete']==(not fifo or not special)
+
+
 @pytest.mark.parametrize('qualified',[False,True])
 def test_result_applicability_does_not_filter_admission(qualified):
     prop,monitor,requirements,events=inputs()

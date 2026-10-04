@@ -1,0 +1,110 @@
+{
+  "description": "Observe same-instance log extent immediately after write_atomically returns a serializer error following a successfully staged entry. Preserve immediate database metadata and later unrelated-commit/reopen observations as diagnostics, without expanding the formal length oracle.",
+  "claim_id": "claim-storage-rollback",
+  "binding_ids": [
+    "bind-storage-rollback"
+  ],
+  "harness": {
+    "execution_package": "omnipaxos",
+    "kind": "rust_test",
+    "source": "",
+    "files": {},
+    "description": "Open a fresh real PersistentStorage in a disposable workspace directory. Append one valid entry, then invoke write_atomically with a promise change and two entries, the second of which deterministically returns a serde error. Compare live get_log_len before/after the returned result. Drop storage before reopen and cleanup to respect RocksDB ownership.",
+    "semantic_changes": [
+      "No target or database replacement. Use real persistent backend and native serialization calls.",
+      "Test Entry implements Serialize with a deterministic normal error for value 99; valid values serialize as u64. This supplies a fault through the declared fallible interface.",
+      "An atomic counter reports whether the failing serializer actually ran."
+    ],
+    "prerequisites": [
+      {
+        "alias": "admission",
+        "event": "atomic_admitted",
+        "conditions": [
+          {
+            "field": "healthy_prefix",
+            "value": true
+          },
+          {
+            "field": "fault_value",
+            "value": 99
+          }
+        ]
+      }
+    ],
+    "legality": {
+      "source_ids": [
+        "src-persistent-config",
+        "src-persistent-recovery",
+        "src-persistent-atomic-declaration",
+        "src-persistent-batching",
+        "src-persistent-extent",
+        "src-storage-contract",
+        "src-core-dev-storage"
+      ],
+      "expectation_ids": [
+        "src-storage-contract"
+      ],
+      "derivation": "The selected core crate already enables the persistent_storage dependency through its original dev-dependencies; no feature flags or manifests are changed. PersistentStorage accepts generic Entry + Serialize + Deserialize types and propagates bincode errors. A deterministic serializer Err, rather than panic or injected storage mutation, exercises the actual fallible helper path. Initial append and read establish a healthy existing extent. Ordered StorageOps are public API inputs; no core protocol history is needed to invoke this independently grounded storage rollback responsibility.",
+      "applicability": "Single writer and same live storage object, no crash or concurrent access, healthy local RocksDB and error returned during later-entry serialization. The directory is newly created under the disposable workspace, opened via the configured path, and closed before cleanup.",
+      "unresolved": [
+        "Active persistent_storage compilation is determined by the trusted selected-target build. Native dependency build failure would leave observations unknown.",
+        "Core panic behavior and cluster consequences are outside this local interface check."
+      ]
+    }
+  },
+  "monitors": [
+    {
+      "id": "monitor-atomic-extent",
+      "checker_id": "atomic-extent",
+      "event": "atomic_result",
+      "admission_alias": "admission",
+      "binding_ids": [
+        "bind-storage-rollback"
+      ],
+      "grounding": {
+        "source_ids": [
+          "src-persistent-atomic-declaration",
+          "src-persistent-batching",
+          "src-persistent-extent"
+        ],
+        "expectation_ids": [
+          "src-storage-contract"
+        ],
+        "binding_ids": [
+          "bind-storage-rollback"
+        ],
+        "derivation": "The actual write_atomically Result supplies the antecedent. get_log_len before and immediately after the same call supplies the rollback comparison; transaction identity is a separate label. This getter reads cached next_log_key minus persisted compaction state, so the result establishes an observable API-state discrepancy, not immediate durable log mutation. Later commit/reopen output is diagnostic and is not a second formal property.",
+        "applicability": "Compare only returned Err outcomes after independent valid-state admission. There is no requirement that every call fail or that failed calls later succeed.",
+        "unresolved": [
+          "No whole-cluster safety attribution follows solely from this getter comparison."
+        ]
+      }
+    }
+  ],
+  "observable_properties": [
+    {
+      "checker_id": "atomic-extent",
+      "kind": "event_implication",
+      "trigger": {
+        "field": "event",
+        "value": "atomic_result"
+      },
+      "antecedent": {
+        "field": "returned_error",
+        "value": true
+      },
+      "assertion": {
+        "field": "after_len",
+        "reference": "admission.before_len"
+      },
+      "identity_fields": [
+        "transaction"
+      ],
+      "description": "A returned error from an atomic transaction must leave same-instance observable log extent unchanged."
+    }
+  ],
+  "uncertainties": [
+    "This formal oracle checks immediate observable extent; persistence and future-commit diagnostics do not broaden the obligation result.",
+    "A compilation or database initialization failure is not a property violation."
+  ]
+}

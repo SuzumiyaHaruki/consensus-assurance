@@ -1,0 +1,143 @@
+{
+  "description": "Launch three actual Peer instances with bootstrap membership and existing TestLogDB, persist and apply updates before message delivery, elect node 1 via ticks and drain a current-term no-op. Admit one remote read at node 2 and defer its actual heartbeat replies; admit a second at node 3 and deliver its actual replies, then release all earlier replies. Observe live prefix removal with original status identities and each origin's exported ReadyToRead context.",
+  "claim_id": "C-read-context",
+  "binding_ids": [
+    "BD-read-response"
+  ],
+  "harness": {
+    "execution_package": "./internal/raft",
+    "files": {},
+    "kind": "go_test",
+    "source": "package raft\n\nimport (\n    \"encoding/json\"\n    \"fmt\"\n    \"testing\"\n\n    \"github.com/lni/dragonboat/v3/config\"\n    pb \"github.com/lni/dragonboat/v3/raftpb\"\n)\n\nfunc assuranceContext(c pb.SystemCtx) string { return fmt.Sprintf(\"%d:%d\", c.High, c.Low) }\nfunc assuranceEvent(v map[string]interface{}) {\n    b, err := json.Marshal(v)\n    if err != nil { panic(err) }\n    fmt.Println(\"CA_EVENT \" + string(b))\n}\n\ntype assuranceReadNode struct {\n    peer *Peer\n    db ILogDB\n    applied uint64\n}\n\ntype assuranceReadNetwork struct {\n    t *testing.T\n    nodes map[uint64]*assuranceReadNode\n    queue []pb.Message\n    held []pb.Message\n    deferEarly bool\n    early pb.SystemCtx\n    phase string\n    admissions map[uint64]*readStatus\n}\n\n// Each update is persisted in the existing memory-backed test LogDB before\n// messages are exposed to this crash-free transport. Application is synchronous\n// and only bootstrap configuration entries and the elected leader's no-op occur.\nfunc (n *assuranceReadNetwork) harvest(id uint64) {\n    x := n.nodes[id]\n    for i := 0; x.peer.HasUpdate(true); i++ {\n        if i > 100 { n.t.Fatal(\"update processing did not drain\") }\n        u := x.peer.GetUpdate(true, x.applied)\n        if !pb.IsEmptySnapshot(u.Snapshot) { n.t.Fatal(\"unexpected snapshot\") }\n        if err := x.db.Append(u.EntriesToSave); err != nil { n.t.Fatal(err) }\n        if !pb.IsEmptyState(u.State) { x.db.SetState(u.State) }\n        messages := append([]pb.Message(nil), u.Messages...)\n        ready := append([]pb.ReadyToRead(nil), u.ReadyToReads...)\n        for _, e := range u.CommittedEntries {\n            if e.Index != x.applied+1 { n.t.Fatal(\"noncontiguous application\") }\n            if e.Type == pb.ConfigChangeEntry {\n                var cc pb.ConfigChange\n                if err := cc.Unmarshal(e.Cmd); err != nil { n.t.Fatal(err) }\n                if !cc.Initialize || cc.Type != pb.AddNode { n.t.Fatal(\"unexpected membership mutation\") }\n                x.peer.ApplyConfigChange(cc)\n            } else if e.Type != pb.ApplicationEntry || len(e.Cmd) != 0 {\n                n.t.Fatal(\"unexpected non-noop application\")\n            }\n            x.applied = e.Index\n        }\n        x.peer.Commit(u)\n        x.peer.NotifyRaftLastApplied(x.applied)\n        n.queue = append(n.queue, messages...)\n        for _, rr := range ready {\n            assuranceEvent(map[string]interface{}{\n                \"event\":\"read_ready\", \"scenario\":\"remote_prefix\", \"origin\":id,\n                \"context\":assuranceContext(rr.SystemCtx), \"index\":rr.Index,\n                \"applied\":x.applied, \"term\":x.peer.raft.term, \"phase\":n.phase,\n            })\n        }\n    }\n}\n\n// All phases use this one delivery path. Only genuine early-context heartbeat\n// responses are delayed; no message fields are rewritten or forged.\nfunc (n *assuranceReadNetwork) drain() {\n    for count := 0; len(n.queue)>0; count++ {\n        if count > 10000 { n.t.Fatal(\"message processing did not drain\") }\n        m := n.queue[0]\n        n.queue = n.queue[1:]\n        if n.deferEarly && m.Type == pb.HeartbeatResp && m.Hint == n.early.Low && m.HintHigh == n.early.High {\n            n.held = append(n.held,m)\n            continue\n        }\n        x := n.nodes[m.To]\n        if x == nil { n.t.Fatal(\"message addressed outside fixed membership\") }\n        // Keep references to the actual registered statuses across the handler;\n        // confirm mutates their indexes and removes them from the live map.\n        var before []*readStatus\n        if m.Type == pb.HeartbeatResp && m.To == 1 {\n            for _, ctx := range x.peer.raft.readIndex.queue {\n                before = append(before, x.peer.raft.readIndex.pending[ctx])\n            }\n        }\n        x.peer.Handle(m)\n        if n.phase == \"reads\" && m.Type == pb.ReadIndex && m.To == 1 {\n            ctx := pb.SystemCtx{Low:m.Hint, High:m.HintHigh}\n            s, ok := x.peer.raft.readIndex.pending[ctx]\n            if !ok || s.from != m.From { n.t.Fatal(\"read was not registered\") }\n            if _, exists := n.admissions[s.from]; exists { n.t.Fatal(\"ambiguous origin identity\") }\n            n.admissions[s.from] = s\n            assuranceEvent(map[string]interface{}{\n                \"event\":\"read_admitted\", \"scenario\":\"remote_prefix\", \"origin\":s.from,\n                \"context\":assuranceContext(s.ctx), \"index\":s.index, \"term\":x.peer.raft.term,\n            })\n        }\n        for _, s := range before {\n            if _, ok := x.peer.raft.readIndex.pending[s.ctx]; !ok {\n                assuranceEvent(map[string]interface{}{\n                    \"event\":\"read_confirmed\", \"scenario\":\"remote_prefix\", \"origin\":s.from,\n                    \"context\":assuranceContext(s.ctx), \"index\":s.index,\n                    \"term\":x.peer.raft.term, \"ack_from\":m.From,\n                    \"ack_context\":assuranceContext(pb.SystemCtx{Low:m.Hint,High:m.HintHigh}),\n                })\n            }\n        }\n        if n.phase == \"reads\" && m.Type == pb.ReadIndexResp {\n            assuranceEvent(map[string]interface{}{\n                \"event\":\"response_delivered\", \"scenario\":\"remote_prefix\", \"origin\":m.To,\n                \"context\":assuranceContext(pb.SystemCtx{Low:m.Hint,High:m.HintHigh}),\n                \"index\":m.LogIndex, \"term\":m.Term,\n            })\n        }\n        n.harvest(m.To)\n    }\n}\n\nfunc TestAssuranceRemoteReadContext(t *testing.T) {\n    n := &assuranceReadNetwork{t:t, nodes:make(map[uint64]*assuranceReadNode),\n        phase:\"setup\", admissions:make(map[uint64]*readStatus)}\n    addresses := []PeerAddress{{NodeID:1,Address:\"n1\"},{NodeID:2,Address:\"n2\"},{NodeID:3,Address:\"n3\"}}\n    for id:=uint64(1); id<=3; id++ {\n        db := NewTestLogDB()\n        c := config.Config{ClusterID:41,NodeID:id,ElectionRTT:10,HeartbeatRTT:1,CheckQuorum:true}\n        p := Launch(c,db,nil,append([]PeerAddress(nil),addresses...),true,true)\n        n.nodes[id]=&assuranceReadNode{peer:p,db:db}\n        n.harvest(id)\n    }\n    n.drain()\n    // Only node 1's clock is advanced during election. No node has crashed;\n    // all produced messages are processed through the same delivery path.\n    for i:=0; i<30 && !n.nodes[1].peer.raft.isLeader(); i++ {\n        n.nodes[1].peer.Tick()\n        n.harvest(1)\n        n.drain()\n    }\n    leader := n.nodes[1].peer.raft\n    if !leader.isLeader() || !leader.hasCommittedEntryAtCurrentTerm() { t.Fatal(\"current-term committed leader not reached\") }\n    for id:=uint64(1); id<=3; id++ {\n        x:=n.nodes[id]\n        if x.peer.raft.leaderID!=1 || x.peer.raft.term!=leader.term || x.applied!=leader.log.committed {\n            t.Fatal(\"stable applied prefix not reached\")\n        }\n    }\n    assuranceEvent(map[string]interface{}{\"event\":\"setup\", \"leader\":uint64(1),\"term\":leader.term,\"commit\":leader.log.committed})\n    n.phase=\"reads\"\n    n.early=pb.SystemCtx{Low:101,High:301}\n    late:=pb.SystemCtx{Low:202,High:302}\n    n.deferEarly=true\n    n.nodes[2].peer.ReadIndex(n.early)\n    n.harvest(2)\n    n.drain()\n    if len(n.held)!=2 || len(leader.readIndex.pending)!=1 { t.Fatal(\"early read overlap prerequisite not reached\") }\n    n.nodes[3].peer.ReadIndex(late)\n    n.harvest(3)\n    n.drain()\n    // Release all earlier replies regardless of observed contexts/results.\n    n.deferEarly=false\n    n.queue=append(n.queue,n.held...)\n    n.held=nil\n    n.drain()\n    assuranceEvent(map[string]interface{}{\"event\":\"end\", \"pending\":len(leader.readIndex.pending),\"queued\":len(n.queue),\"held\":len(n.held),\"admitted\":len(n.admissions)})\n    // Peer and TestLogDB own no goroutines or open resources. No target state\n    // was assigned by the harness; all protocol inputs used Peer methods.\n}\n",
+    "description": "Crash-free Peer-level network using real Handle/ReadIndex/Tick/GetUpdate/Commit and existing in-memory TestLogDB. Only two fixed read contexts and delivery policy are injected.",
+    "semantic_changes": [
+      "No target code or protocol state mutation. Package-local reads observe live registration, term, commit, queue removal and status index.",
+      "Memory-backed TestLogDB substitutes durable storage under a no-crash scope; production transport and RSM scheduling replaced by synchronous update processing.",
+      "Bootstrap configuration entries are accepted through Peer.ApplyConfigChange; the harness verifies all are Initialize/AddNode. No later configuration change or application command occurs.",
+      "Only node 1 clock advances for election; no ticks during finite read-message schedule. All messages are genuine outputs and delivered unchanged, with earlier-context replies delayed then released.",
+      "Request contexts are fixed legal distinct nonzero values instead of node random generation; the contract treats them as opaque operation identifiers."
+    ],
+    "prerequisites": [
+      {
+        "alias": "admitted",
+        "event": "read_admitted",
+        "conditions": []
+      },
+      {
+        "alias": "confirmed",
+        "event": "read_confirmed",
+        "conditions": [
+          {
+            "field": "context",
+            "op": "eq",
+            "value": null,
+            "reference": "admitted.context"
+          },
+          {
+            "field": "term",
+            "op": "eq",
+            "value": null,
+            "reference": "admitted.term"
+          }
+        ]
+      }
+    ],
+    "legality": {
+      "source_ids": [
+        "S-peer-launch",
+        "S-bootstrap",
+        "S-peer-update",
+        "S-peer-export",
+        "S-peer-members",
+        "S-memory-db",
+        "S-logdb-interface",
+        "S-engine-order",
+        "S-node-effects",
+        "S-node-config",
+        "S-peer-admission",
+        "S-message-term",
+        "S-read-send",
+        "S-replication-recv",
+        "S-read-queue",
+        "S-read-response",
+        "S-ticks",
+        "S-client-batches"
+      ],
+      "expectation_ids": [
+        "S-context-contract",
+        "S-read-context-test",
+        "S-prefix-context-test"
+      ],
+      "binding_ids": [
+        "BD-read-response"
+      ],
+      "derivation": "Launch/bootstrap sources establish fixed initial membership and committed initial configuration. Driver persists each update into TestLogDB before exposing messages, applies committed bootstrap/no-op entries, calls Commit and NotifyRaftLastApplied. This is stricter than the permitted early Replicate send, without excluding overlapping read requests. Peer.Handle supplies sender admission/term protection. All heartbeat replies are produced by actual followers; policy delays early-context replies only. Setup requires elected leader, current-term committed entry, common term/leader and applied prefix. No target goroutines/resources are owned by Peer/TestLogDB; the finite network drains all captured messages before return.",
+      "applicability": "Only crash-free volatile read identity is measured. TestLogDB durability across failure, RSM client completion and real transport behavior are outside this check.",
+      "unresolved": [],
+      "conflicts": [],
+      "alternatives": []
+    }
+  },
+  "monitors": [
+    {
+      "id": "M-read-context",
+      "checker_id": "CK-read-context",
+      "event": "read_ready",
+      "binding_ids": [
+        "BD-read-response"
+      ],
+      "grounding": {
+        "source_ids": [
+          "S-read-queue",
+          "S-read-response",
+          "S-follower-read",
+          "S-client-batches",
+          "S-peer-read"
+        ],
+        "expectation_ids": [
+          "S-context-contract",
+          "S-read-context-test",
+          "S-prefix-context-test"
+        ],
+        "binding_ids": [
+          "BD-read-response"
+        ],
+        "derivation": "Compare an exported ReadyToRead context to the same origin's independently recorded request context after confirmed prefix removal. There is exactly one request per origin, so scenario+origin identifies it without using the compared context.",
+        "applicability": "Both operations use the same preselected policy and are compared; no selection by observed context or outcome.",
+        "unresolved": [],
+        "conflicts": [],
+        "alternatives": []
+      },
+      "applicability_conditions": [],
+      "admission_alias": "confirmed"
+    }
+  ],
+  "observable_properties": [
+    {
+      "checker_id": "CK-read-context",
+      "kind": "event_assertion",
+      "trigger": {
+        "field": "event",
+        "op": "eq",
+        "value": "read_ready",
+        "reference": null
+      },
+      "assertion": {
+        "field": "context",
+        "op": "eq",
+        "value": null,
+        "reference": "admitted.context"
+      },
+      "antecedent": null,
+      "identity_fields": [
+        "scenario",
+        "origin"
+      ],
+      "description": "Each successfully confirmed remote operation retains its admitted SystemCtx in the originating Peer readiness result."
+    }
+  ],
+  "uncertainties": [
+    "This observes the Peer interface, not a NodeHost client timeout or application read.",
+    "Memory test storage excludes crash/durable ordering defects; captured response and readiness values are actual implementation outputs."
+  ]
+}

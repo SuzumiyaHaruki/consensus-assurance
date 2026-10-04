@@ -8,7 +8,7 @@ from .experiment import clean_environment, sandbox_command, run_experiment
 from .process import output
 from ..storage.files import digest, write_json
 from ..storage.snapshot import capture
-from ...core.types import ExecutionStatus, uid, now
+from ...core.types import CheckRun, ExecutionStatus, uid, now
 
 VIEW = Path('/tmp/consensus-cargo')
 
@@ -181,9 +181,32 @@ def seed(adapter,runner,snapshot_id,command,record,basis,deadline):
 def execute(adapter,runner,command,workspace,snapshot_id,timeout,mode,action):
     if mode!='bwrap':raise ValueError('Prepared Cargo execution requires bubblewrap; no workspace fallback')
     started=now();clock=time.monotonic();deadline=min(clock+timeout,runner.deadline or float('inf'))
+    prior=[CheckRun.model_validate_json(p.read_text()) for p in (runner.root/'logs').glob('*/check.json')]
+    prior=[c for c in prior if runner.active_action_id and c.pending_action_id==runner.active_action_id]
+    executed=[c for c in prior if c.action==action and c.cwd==str(workspace.resolve()) and c.snapshot_id==snapshot_id]
+    if len(executed)>1:raise ValueError('Multiple target receipts in one Cargo action; execution ownership is unresolved')
+    if executed:
+        expected=runner.root/'build-inputs/targets'/Path(command[command.index('--manifest-path')+1]).parent/command[command.index('--test')+1]/'basis.json'
+        if not expected.is_file():raise ValueError('Saved Cargo execution lost its fixed build inputs; cannot reconstruct them for result reuse')
     record=None;basis=None
     try:
         record,basis=inputs(adapter,runner,snapshot_id,command,deadline)
+        if executed:
+            check=executed[0]
+            if check.parameters.get('preparation_failure'):return check
+            if check.command!=sandbox_command(command,workspace,mode,adapter.read_only_roots(),VIEW):
+                raise ValueError('Saved Cargo execution command differs from the fixed input')
+            if not check.ended_at:raise ValueError('Target outcome unknown; same-action replay is prohibited; use an explicit new attempt')
+            if 'lock_unchanged' in check.parameters and 'changed_target_files' in check.parameters:
+                return check
+            # A raw process receipt cannot establish post-execution integrity. Do not
+            # repair its workspace and then treat the repaired files as old evidence.
+            retain_diagnostics(check,output(check))
+            check.parameters.update(execution_backend={'name':adapter.name,'version':adapter.version},
+                action_seconds=None,action_started_at=None,changed_target_files=None,build_inputs=str(record.relative_to(runner.root)))
+            if check.status==ExecutionStatus.COMPLETED:check.status=ExecutionStatus.ERROR
+            check.outcome='unknown';check.reason='Target receipt recovered without integrity postprocessing; no target replay; action total unrecorded'
+            return check
         cached,receipt=seed(adapter,runner,snapshot_id,command,record,basis,deadline)
         if receipt['basis_digest']!=digest(record.read_bytes()):raise ValueError('Cargo seed belongs to different build inputs')
         lock=workspace/basis['lock']['path']
@@ -191,10 +214,13 @@ def execute(adapter,runner,command,workspace,snapshot_id,timeout,mode,action):
             raise ValueError('Execution lock differs from the saved build inputs')
         lock.write_bytes((runner.root/basis['lock']['record']).read_bytes())
         target=workspace/'.execution/cargo-target'
-        if target.exists():shutil.rmtree(target)
-        target.mkdir(parents=True)
-        copied=runner.run(['cp','-a','--reflink=auto',str(cached)+'/.',str(target)],workspace,'cargo_seed_copy',snapshot_id,max(0,deadline-time.monotonic()))
+        # An old copy receipt does not prove that its side effect still exists.
+        # Materialize into a new private staging directory, then publish the complete copy.
+        staging=target.with_name('cargo-copy-'+uid());staging.mkdir(parents=True)
+        copied=runner.run(['cp','-a','--reflink=auto',str(cached)+'/.',str(staging)],workspace,'cargo_seed_copy',snapshot_id,max(0,deadline-time.monotonic()))
         if copied.status!=ExecutionStatus.COMPLETED or copied.exit_code!=0:raise PreparationFailed(copied)
+        if target.exists():shutil.rmtree(target)
+        staging.rename(target)
         check=run_experiment(runner,command,workspace,snapshot_id,max(0,deadline-time.monotonic()),mode,action,
             adapter,prepared=True,view_path=VIEW)
         check.parameters.update(build_inputs=str(record.relative_to(runner.root)),seed_build=receipt['check_id'],
@@ -203,6 +229,8 @@ def execute(adapter,runner,command,workspace,snapshot_id,timeout,mode,action):
             lock_unchanged=lock.is_file() and digest(lock.read_bytes())==basis['lock']['digest'])
         if not check.parameters['lock_unchanged']:
             check.status=ExecutionStatus.ERROR;check.outcome='unknown';check.reason='Test changed fixed Cargo.lock'
+        actual=capture(workspace,excluded_dirs={'.execution'}).files
+        check.parameters['changed_target_files']=[p for p,d in basis['source_files'].items() if actual.get(p)!=d]
         check.artifacts += [str(record),str(runner.root/basis['lock']['record']),str(runner.root/receipt['record'])]
     except PreparationFailed as failure:
         original=failure.check
@@ -212,5 +240,7 @@ def execute(adapter,runner,command,workspace,snapshot_id,timeout,mode,action):
         if check.status==ExecutionStatus.COMPLETED:check.status=ExecutionStatus.ERROR
         check.outcome='unknown';check.reason=original.action+' did not complete; inspect preparation logs'
         if record:check.parameters['build_inputs']=str(record.relative_to(runner.root))
-    check.parameters.update(action_seconds=time.monotonic()-clock,action_started_at=started)
+    check.parameters.update(action_seconds=None if prior else time.monotonic()-clock,action_started_at=None if prior else started)
+    if prior:check.reason='; '.join(filter(None,[check.reason,'Interrupted action total unrecorded; original subprocess timings retained']))
+    write_json(runner.root/'logs'/check.id/'check.json',check)
     return check

@@ -1,0 +1,186 @@
+{
+  "description": "Exercise unit-claim-notify-correspondence using an unchosen original entry on isolated old leader 1, replacement decision by peers 2/3 under a higher ballot, and synchronization of actor 1 before its next periodic notifier drain. Compare the actual completed future against a public decided-content read at returned end-index minus one.",
+  "claim_id": "claim-notify-correspondence",
+  "binding_ids": [
+    "bind-notify"
+  ],
+  "harness": {
+    "execution_package": "./omnipaxos_runtime",
+    "files": {},
+    "kind": "rust_test",
+    "source": "use std::{collections::VecDeque, future::Future, time::Duration};\nuse omnipaxos::{messages::{Message, sequence_paxos::PaxosMsg}, storage::{Entry, Snapshot}, util::LogEntry, ClusterConfig, OmniPaxos, OmniPaxosConfig, ServerConfig};\nuse omnipaxos_runtime::{spawn_actor, AsyncRuntime, AppendError, RuntimeConfig};\nuse omnipaxos_storage::memory_storage::MemoryStorage;\n\n#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]\nstruct Value(u64);\n#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]\nstruct NoSnapshot;\nimpl Snapshot<Value> for NoSnapshot {\n    fn create(_: &[Value]) -> Self { Self }\n    fn merge(&mut self, _: Self) {}\n    fn use_snapshots() -> bool { false }\n}\nimpl Entry for Value { type Snapshot = NoSnapshot; }\ntype Node = OmniPaxos<Value, MemoryStorage<Value>>;\n\n// The public executor adapter uses real Tokio timers, without changing actor logic.\nstruct TestRuntime;\nimpl AsyncRuntime for TestRuntime {\n    type JoinHandle = tokio::task::JoinHandle<()>;\n    fn spawn<F: Future<Output = ()> + Send + 'static>(future: F) -> Self::JoinHandle { tokio::spawn(future) }\n    fn sleep(duration: Duration) -> impl Future<Output = ()> + Send + 'static { tokio::time::sleep(duration) }\n}\nfn build(pid: u64) -> Node {\n    OmniPaxosConfig {\n        cluster_config: ClusterConfig { configuration_id: 1, nodes: vec![1,2,3], flexible_quorum: None },\n        server_config: ServerConfig { pid, batch_size: 1, election_tick_timeout: 1000,\n            resend_message_tick_timeout: 1000, flush_batch_tick_timeout: 1000, ..Default::default() },\n    }.build(MemoryStorage::default()).unwrap()\n}\nfn take(node: &mut Node) -> Vec<Message<Value>> {\n    let mut messages = Vec::new(); node.take_outgoing_messages(&mut messages); messages\n}\nfn trace(message: &Message<Value>, action: &str) {\n    let (kind, round) = match message {\n        Message::SequencePaxos(p) => match &p.msg {\n            PaxosMsg::Prepare(x) => (\"prepare\", x.n.n),\n            PaxosMsg::Promise(x) => (\"promise\", x.n.n),\n            PaxosMsg::AcceptSync(x) => (\"sync\", x.n.n),\n            PaxosMsg::AcceptDecide(x) => (\"accept\", x.n.n),\n            PaxosMsg::Accepted(x) => (\"accepted\", x.n.n),\n            PaxosMsg::Decide(x) => (\"decide\", x.n.n),\n            _ => (\"other_paxos\", 0),\n        },\n        _ => (\"other\", 0),\n    };\n    println!(\"CA_EVENT {{\\\"event\\\":\\\"transport\\\",\\\"operation\\\":\\\"notify-original\\\",\\\"action\\\":\\\"{}\\\",\\\"from\\\":{},\\\"to\\\":{},\\\"kind\\\":\\\"{}\\\",\\\"round\\\":{}}}\", action, message.get_sender(), message.get_receiver(), kind, round);\n}\n// Each producer's outgoing order is preserved; traffic to the isolated actor is\n// deferred without modifying bytes. Core peers 2 and 3 continue normally.\nfn pump_pair(n2: &mut Node, n3: &mut Node, deferred: &mut Vec<Message<Value>>) {\n    let mut queue = VecDeque::new();\n    queue.extend(take(n2)); queue.extend(take(n3));\n    let mut steps = 0;\n    while let Some(message) = queue.pop_front() {\n        steps += 1; assert!(steps < 1000, \"peer pump failed to quiesce\");\n        if message.get_receiver() == 1 {\n            trace(&message, \"defer\"); deferred.push(message); continue;\n        }\n        trace(&message, \"deliver\");\n        let target = if message.get_receiver() == 2 { &mut *n2 } else { &mut *n3 };\n        target.handle_incoming(message); queue.extend(take(target));\n    }\n}\nfn decided_value(node: &Node) -> Option<u64> {\n    match node.read(0) { Some(LogEntry::Decided(Value(x))) => Some(x), _ => None }\n}\n\n#[tokio::test(flavor = \"current_thread\")]\nasync fn notify_after_replacement() {\n    tokio::time::timeout(Duration::from_secs(20), scenario()).await.expect(\"scenario timeout\");\n}\nasync fn scenario() {\n    // Prepare a real empty cluster. No storage state or protocol message is invented.\n    let mut nodes = vec![build(1), build(2), build(3)];\n    nodes[0].try_become_leader();\n    let mut queue = VecDeque::new();\n    for node in &mut nodes { queue.extend(take(node)); }\n    let mut steps = 0;\n    while let Some(message) = queue.pop_front() {\n        steps += 1; assert!(steps < 1000);\n        trace(&message, \"deliver\");\n        let receiver = message.get_receiver() as usize - 1;\n        nodes[receiver].handle_incoming(message);\n        queue.extend(take(&mut nodes[receiver]));\n    }\n    assert_eq!(nodes[0].get_current_leader(), Some((1,true)));\n    assert!(nodes.iter().all(|n| n.get_accepted_idx() == 0 && n.get_decided_idx() == 0));\n    let old_ballot = nodes[0].get_promise();\n    let mut n3 = nodes.pop().unwrap(); let mut n2 = nodes.pop().unwrap(); let n1 = nodes.pop().unwrap();\n    let actor = spawn_actor::<_,_,TestRuntime>(n1, RuntimeConfig {\n        tick_period: Duration::from_secs(5), egress_period: Duration::from_millis(1),\n        append_notify_timeout: Duration::from_secs(15), ..Default::default()\n    });\n    let outgoing = actor.outgoing_messages();\n    let events = actor.subscribe_events();\n    let event_drain = tokio::spawn(async move { while events.recv().await.is_ok() {} });\n    let call_handle = actor.clone();\n    let call = tokio::spawn(async move { call_handle.append_notify(Value(101)).await });\n\n    // While isolated, drain and discard the old leader's proposals. Wait for both\n    // actual AcceptDecide messages containing the original value as admission evidence.\n    let mut sent_to = Vec::new();\n    while sent_to.len() < 2 {\n        let message = outgoing.recv().await.unwrap();\n        if let Message::SequencePaxos(p) = &message {\n            if let PaxosMsg::AcceptDecide(a) = &p.msg {\n                assert_eq!(a.n, old_ballot);\n                assert_eq!(a.entries, vec![Value(101)]);\n                assert!(!sent_to.contains(&p.to)); sent_to.push(p.to);\n            }\n        }\n        trace(&message, \"drop_isolated\");\n    }\n    assert_eq!(actor.decided_idx().await, 0);\n    assert_eq!(n2.get_accepted_idx(),0); assert_eq!(n3.get_accepted_idx(),0);\n    println!(\"CA_EVENT {{\\\"event\\\":\\\"admitted\\\",\\\"operation\\\":\\\"notify-original\\\",\\\"payload\\\":101,\\\"old_round\\\":{},\\\"old_pid\\\":{},\\\"peers_empty\\\":true,\\\"origin_decided\\\":0,\\\"producer_observed\\\":true}}\",old_ballot.n,old_ballot.pid);\n\n    // A disjoint-from-origin majority elects a new leader and decides a replacement.\n    let mut deferred = Vec::new();\n    n2.try_become_leader(); pump_pair(&mut n2,&mut n3,&mut deferred);\n    assert_eq!(n2.get_current_leader(),Some((2,true)));\n    assert!(n2.get_promise() > old_ballot);\n    assert_eq!(n2.get_accepted_idx(),0);\n    n2.append(Value(202)).unwrap(); pump_pair(&mut n2,&mut n3,&mut deferred);\n    assert_eq!(decided_value(&n2),Some(202)); assert_eq!(decided_value(&n3),Some(202));\n    println!(\"CA_EVENT {{\\\"event\\\":\\\"replacement_chosen\\\",\\\"operation\\\":\\\"notify-original\\\",\\\"value\\\":202,\\\"round\\\":{},\\\"leader\\\":2,\\\"decided\\\":{}}}\", n2.get_promise().n,n2.get_decided_idx());\n\n    // Heal delivery to the actor. These are original queued messages. It processes\n    // the new Prepare, emits Promise, then receives the leader's actual AcceptSync.\n    for message in deferred.drain(..) { trace(&message,\"deliver\"); actor.handle_incoming(message).await; }\n    let mut delivered_sync = false;\n    while !delivered_sync {\n        let message = outgoing.recv().await.unwrap();\n        trace(&message,\"deliver\");\n        match message.get_receiver() { 2 => n2.handle_incoming(message), 3 => n3.handle_incoming(message), _ => panic!(\"unexpected receiver\") }\n        pump_pair(&mut n2,&mut n3,&mut deferred);\n        for message in deferred.drain(..) {\n            if let Message::SequencePaxos(p) = &message {\n                if let PaxosMsg::AcceptSync(s) = &p.msg {\n                    assert_eq!(s.n,n2.get_promise()); assert_eq!(s.decided_idx,1);\n                    assert_eq!(s.log_sync.suffix,vec![Value(202)]);\n                    delivered_sync = true;\n                }\n            }\n            trace(&message,\"deliver\"); actor.handle_incoming(message).await;\n        }\n    }\n    // Read commands are serviced after the incoming queue is drained by the actor.\n    let replacement = actor.read_decided_suffix(0).await.unwrap();\n    assert!(matches!(replacement.as_slice(),[LogEntry::Decided(Value(202))]));\n    println!(\"CA_EVENT {{\\\"event\\\":\\\"origin_replaced\\\",\\\"operation\\\":\\\"notify-original\\\",\\\"value\\\":202,\\\"decided\\\":{},\\\"pending_at_observation\\\":{}}}\",actor.decided_idx().await,!call.is_finished());\n\n    // Keep consuming all available outgoing messages and events while waiting for\n    // the real periodic timer. No additional append or artificial tick is used.\n    let route_actor = actor.clone();\n    let route = tokio::spawn(async move {\n        while let Ok(message) = outgoing.recv().await {\n            trace(&message,\"deliver\");\n            match message.get_receiver() { 2 => n2.handle_incoming(message), 3 => n3.handle_incoming(message), _ => panic!(\"unexpected receiver\") }\n            pump_pair(&mut n2,&mut n3,&mut deferred);\n            for message in deferred.drain(..) { trace(&message,\"deliver\"); route_actor.handle_incoming(message).await; }\n        }\n    });\n    let completion = call.await.unwrap();\n    let (success,index,error_kind) = match completion {\n        Ok(k) => (true,k,\"none\"),\n        Err(AppendError::Superseded { log_entry_idx }) => (false,log_entry_idx,\"superseded\"),\n        Err(AppendError::Timeout) => (false,0,\"timeout\"),\n        Err(_) => (false,0,\"other\"),\n    };\n    let observed = actor.read_decided_suffix(index.saturating_sub(1)).await;\n    let value = match observed.as_ref().and_then(|v| v.first()) {\n        Some(LogEntry::Decided(Value(v))) => *v as i64, _ => -1,\n    };\n    println!(\"CA_EVENT {{\\\"event\\\":\\\"completion\\\",\\\"operation\\\":\\\"notify-original\\\",\\\"success\\\":{},\\\"returned_index\\\":{},\\\"decided_value\\\":{},\\\"error_kind\\\":\\\"{}\\\"}}\",success,index,value,error_kind);\n    route.abort(); let _ = route.await;\n    drop(actor);\n    event_drain.abort(); let _ = event_drain.await;\n}\n",
+    "description": "Single current-thread Tokio test with a public AsyncRuntime implementation equivalent to the repository Tokio adapter. Actual core peers produce all messages. Prefix assertions check stable old leadership, empty peers, emitted original proposals, higher-ballot replacement quorum, and origin replacement. The result event comes from the awaited original append_notify and an independent read of the live actor log.",
+    "semantic_changes": [
+      "No target changes. A test Entry and no-snapshot type instantiate the generic API.",
+      "TestRuntime supplies public executor hooks using ordinary tokio::spawn and tokio::time::sleep; no virtual time or actor interception.",
+      "Caller transport temporarily drops old-leader traffic and defers traffic to the isolated node. Retained messages preserve per-link order."
+    ],
+    "prerequisites": [
+      {
+        "alias": "admission",
+        "event": "admitted",
+        "conditions": [
+          {
+            "field": "producer_observed",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          },
+          {
+            "field": "peers_empty",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          },
+          {
+            "field": "origin_decided",
+            "op": "eq",
+            "value": 0,
+            "reference": null
+          }
+        ]
+      },
+      {
+        "alias": "chosen",
+        "event": "replacement_chosen",
+        "conditions": [
+          {
+            "field": "leader",
+            "op": "eq",
+            "value": 2,
+            "reference": null
+          },
+          {
+            "field": "decided",
+            "op": "eq",
+            "value": 1,
+            "reference": null
+          },
+          {
+            "field": "value",
+            "op": "eq",
+            "value": 202,
+            "reference": null
+          }
+        ]
+      },
+      {
+        "alias": "replacement",
+        "event": "origin_replaced",
+        "conditions": [
+          {
+            "field": "value",
+            "op": "eq",
+            "value": 202,
+            "reference": null
+          },
+          {
+            "field": "decided",
+            "op": "eq",
+            "value": 1,
+            "reference": null
+          }
+        ]
+      }
+    ],
+    "legality": {
+      "source_ids": [
+        "src-build",
+        "src-memory",
+        "src-runtime-spawn",
+        "src-runtime-loop",
+        "src-runtime-trait",
+        "src-runtime-transport-contract",
+        "src-runtime-tokio-adapter",
+        "src-public-manual-leader",
+        "src-leader",
+        "src-follower",
+        "src-runtime-assignment"
+      ],
+      "expectation_ids": [
+        "src-notify-contract",
+        "src-superseded-contract",
+        "doc-transport"
+      ],
+      "binding_ids": [],
+      "derivation": "Create three fresh core instances with valid unique members and MemoryStorage. Public try_become_leader establishes the old leader through generated Prepare/Promise/AcceptSync messages. Move its live core into the actor, invoke append_notify once, observe its two actual proposal messages and drop these during isolation. The other two peers select new leadership and decide a different entry without receiving the original. Deliver their deferred generated Prepare and subsequent generated synchronization to the actor in per-link order. Observe replacement through read_decided_suffix before awaiting the original future. One fixed operation identity associates call and result independently of entry values. No protocol message, ballot, storage value or result is fabricated.",
+      "applicability": "Configured actor ticks every five real seconds; egress every millisecond. Core peers are directly driven through public APIs, with a finite message schedule between their ticks. Public manual leadership avoids requiring an automatic failure-detection deadline. All events and outgoing traffic are drained during completion wait; no channel backpressure is used to force the result. Actor and router tasks are cleaned up after the final observation.",
+      "unresolved": [
+        "Host scheduling could let notification resolve Superseded before replacement; such an error is allowed by the success-only oracle. A timeout or failed prefix assertion gives no completed comparison."
+      ],
+      "conflicts": [],
+      "alternatives": [
+        "Quorum adoption would preserve the original if the new leader selected history containing it. The driver independently confirms both new quorum members are empty before replacement.",
+        "The existing Superseded guard may reject the operation if it runs earlier; no requirement forces success."
+      ]
+    }
+  },
+  "monitors": [
+    {
+      "id": "monitor-notify-content",
+      "checker_id": "notify-content",
+      "event": "completion",
+      "binding_ids": [
+        "bind-notify"
+      ],
+      "grounding": {
+        "source_ids": [
+          "src-runtime-completion",
+          "src-runtime-assignment",
+          "src-read-classify",
+          "src-runtime-spawn",
+          "src-runtime-loop"
+        ],
+        "expectation_ids": [
+          "src-notify-contract",
+          "src-superseded-contract"
+        ],
+        "binding_ids": [
+          "bind-notify"
+        ],
+        "derivation": "The returned future is the original operation oneshot. Its returned index is an exclusive log end index as assigned from get_accepted_idx; inspect read_decided_suffix(k-1) to read that entry. The assertion applies only when success is true; error responses cannot create a violation. Unique operation label is independent of both submitted and decided values.",
+        "applicability": "One non-compacted operation and a fixed successful setup; content is observed from the live actor through its public read command after completion.",
+        "unresolved": [
+          "A failed setup or missing result remains incomplete, not evidence of the property."
+        ],
+        "conflicts": [],
+        "alternatives": []
+      },
+      "applicability_conditions": [],
+      "admission_alias": "admission"
+    }
+  ],
+  "observable_properties": [
+    {
+      "checker_id": "notify-content",
+      "kind": "event_implication",
+      "trigger": {
+        "field": "event",
+        "op": "eq",
+        "value": "completion",
+        "reference": null
+      },
+      "assertion": {
+        "field": "decided_value",
+        "op": "eq",
+        "value": null,
+        "reference": "admission.payload"
+      },
+      "antecedent": {
+        "field": "success",
+        "op": "eq",
+        "value": true,
+        "reference": null
+      },
+      "identity_fields": [
+        "operation"
+      ],
+      "description": "A successful completion must return an index containing the submitted value. Superseded, Timeout and other errors do not violate this success-only obligation."
+    }
+  ],
+  "uncertainties": [
+    "This check targets client notification correctness, not disagreement between chosen logs.",
+    "No crash, compaction, batching or reconfiguration behavior is tested.",
+    "Only a real completed comparison after observed prefix prerequisites is attributable."
+  ]
+}

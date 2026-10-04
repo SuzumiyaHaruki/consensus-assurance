@@ -10,6 +10,30 @@ def test_audit_receipt_is_not_a_property_verdict(tmp_path):
     assert '不属于性质证据' in execution_summary(check)[2]
 
 
+def test_target_action_costs_keep_process_time_missing_data_and_identity(tmp_path):
+    from types import SimpleNamespace
+    from consensus_assurance.workflow.research import costs,execution_cost
+    from consensus_assurance.reporting.chinese import execution_location,Archive
+    cargo=CheckRun(id='cargo',action='direct_check',cwd=str(tmp_path),snapshot_id='fixture',
+        started_at='2026-10-04T00:00:20+00:00',ended_at='2026-10-04T00:00:24.300000+00:00',parameters={'action_seconds':28.71})
+    old=cargo.model_copy(update={'id':'old-go','action':'exploration','parameters':{}})
+    child=cargo.model_copy(update={'id':'copy','action':'cargo_seed_copy','parameters':{},'started_at':'2026-10-04T00:00:00+00:00'})
+    state=SimpleNamespace(checks=[cargo,old,child,cargo.model_copy(deep=True)],selections=[],usage={},elapsed_seconds=80,audit_spec_path=None)
+    saved=[c.model_dump(mode='json') for c in state.checks]
+    cost=costs(state)
+    assert cost['formal_executions']==2 and cost['formal_execution_seconds']==8.6
+    assert cost['target_action_cost']=={'known_seconds':28.71,'unrecorded_check_ids':['old-go'],'process_unrecorded_check_ids':[]}
+    assert cost['elapsed_seconds']==80 and [c.model_dump(mode='json') for c in state.checks]==saved
+    archive=Archive(state,tmp_path)
+    assert '目标动作总耗时 28.71 秒；执行进程耗时 4.30 秒' in execution_location(cargo,archive)
+    assert '目标动作总耗时未完整记录；执行进程耗时 4.30 秒' in execution_location(old,archive)
+    for invalid in (None,-1,float('inf'),float('nan'),True,'28.71'):
+        record=cargo.model_copy(update={'parameters':{'action_seconds':invalid},'started_at':'invalid'})
+        assert execution_cost(record)=={'process_seconds':None,'action_seconds':None}
+        state.checks=[record]
+        assert costs(state)['formal_execution_seconds'] is None and costs(state)['target_action_cost']['known_seconds'] is None
+
+
 def test_probe_and_execution_keep_different_scopes(tmp_path):
     args = dict(cwd=str(tmp_path), snapshot_id='fixture', status=ExecutionStatus.COMPLETED)
     test = CheckRun(action='capability_probe', outcome='tests_passed', exit_code=0, **args)
@@ -368,6 +392,36 @@ def test_mixed_report_reads_fixed_results_and_moves_without_side_effects(tmp_pat
     unexecuted.checks=[c for c in unexecuted.checks if c.id!=explorations[-1].id]
     assert '已受理问题，尚无保存的执行记录' in render_report(unexecuted,moved).read_text()
     assert state.model_dump(mode='json')==saved
+
+
+def test_current_answer_preserves_versions_and_separate_issue_navigation(tmp_path):
+    from audit_support import engine_for,first,check_step,review_step,stop
+    def old_review(state):
+        sub,files=review_step()(state);sub['review_items'][0]['report_answer']='旧版本已完成的回答。'
+        return sub,files
+    def revised(state):
+        sub,files=check_step(revise=True)(state);files['check.py']+='\nprint("new fixed input version")\n'
+        return sub,files
+    def current_review(state):
+        sub,files=review_step('revision_needed')(state)
+        item=sub['review_items'][0];item.update(report_title='当前局部返回',report_answer='本次调用返回 0；驱动前提仍需复核。',
+            rationale='Driver ordering needs examination. '+'Retain the complete recorded rationale. '*20)
+        sub['review_items'].append(dict(item,aspect='applicability',status='disputed',report_title=None,report_answer=None,
+            challenged_components=[],rationale='Independent caller responsibility remains open. '+'Retain the other issue independently. '*20))
+        return sub,files
+    e,repo=engine_for(tmp_path,[first,check_step(),old_review,revised,current_review,stop]);state=e.start(repo)
+    assert not list((e.root/'submissions').glob('*/diagnostics.json'))
+    saved=state.model_dump(mode='json');text=render_report(state,e.root).read_text()
+    table=text.split('## 主要结果')[1].split('### 1.')[0]
+    assert '本次调用返回 0；驱动前提仍需复核。' in table and 'revision_needed' in table and '待调查线索' in table
+    assert '旧版本已完成的回答。' not in table
+    assert len(state.review_issues)==2
+    unresolved=text.split('## 当前未决事项')[1]
+    for issue in state.review_issues:
+        assert text.count(f'<a id="issue-{issue.id}"></a>')==1
+        assert f'](#issue-{issue.id})' in table and f'](#issue-{issue.id})' in unresolved
+        assert issue.explanation not in text
+    assert state.model_dump(mode='json')==saved and len(state.direct_checks)==2
 
 
 def test_timeout_report_uses_recorded_limit_and_preserves_transport_diagnostic(tmp_path):

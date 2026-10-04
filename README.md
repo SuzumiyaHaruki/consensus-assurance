@@ -25,7 +25,7 @@ Candidate／family／focus 的局部停止保留未决工作并继续Codex 会�
 
 ## 目标配置
 
-configs/targets 中包含 HashiCorp Raft、Dragonboat 与 SwiftPaxos 的 Paxos、N²Paxos、Swift 配置；目标差异由 TargetConfig 声明，使用共同工具链后端。默认自主选题，--question 可指定定向问题。examples/toy_protocol 是隔离回归源代码，不是默认选题答案。
+configs/targets 中包含 HashiCorp Raft、Dragonboat、OmniPaxos 与 SwiftPaxos 的 Paxos、N²Paxos、Swift、EPaxos 配置；目标差异由 TargetConfig 声明，使用共同工具链后端。默认自主选题，--question 可指定定向问题。examples/toy_protocol 是隔离回归源代码，不是默认选题答案。
 
 ## 文档与记录
 

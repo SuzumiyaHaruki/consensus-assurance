@@ -1,0 +1,635 @@
+{
+  "version": 1,
+  "target_profile": {
+    "system_boundary": "Captured OmniPaxos core, storage and optional async runtime. Caller owns message transport and application consumption; actor owns ticking, command serialization and append-notification completion.",
+    "protocol_contexts": [
+      "Configuration ID",
+      "Ballot",
+      "Follower replication session and counter"
+    ],
+    "external_interfaces": [
+      "OmniPaxos::append",
+      "OmniPaxos::handle_incoming",
+      "OmniPaxos::tick",
+      "OmniPaxos::reconnected",
+      "OmniPaxos::read_decided_suffix"
+    ],
+    "ownership": [],
+    "selection_injection": [],
+    "variants": [],
+    "source_ids": [
+      "src-api",
+      "doc-transport",
+      "doc-log",
+      "doc-reconfiguration",
+      "src-notify-contract",
+      "src-runtime-spawn",
+      "src-runtime-loop",
+      "src-storage-contract"
+    ],
+    "unknowns": []
+  },
+  "activities": [
+    {
+      "class_id": "A1",
+      "applicability": "applicable",
+      "purpose": "Qualified support for decision formation and legal advancement",
+      "realization_summary": "Prepare quorum selects accepted history; acceptance quorum advances decided prefix.",
+      "entry_points": [],
+      "variants": [],
+      "unknowns": [],
+      "source_ids": [
+        "src-leader",
+        "src-follower",
+        "src-support"
+      ]
+    },
+    {
+      "class_id": "A2",
+      "applicability": "applicable",
+      "purpose": "Context validity and acquisition, transfer or loss of authority",
+      "realization_summary": "BLE proposes ballots; promise and role/phase checks qualify replication.",
+      "entry_points": [],
+      "variants": [],
+      "unknowns": [],
+      "source_ids": [
+        "src-api",
+        "src-ble",
+        "src-leader",
+        "src-follower"
+      ]
+    },
+    {
+      "class_id": "A3",
+      "applicability": "applicable",
+      "purpose": "Recovery and resynchronization of eligible participation",
+      "realization_summary": "Stored promises, reconnects and sequence gaps enter recovery; Prepare/Promise/AcceptSync restore participation.",
+      "entry_points": [],
+      "variants": [],
+      "unknowns": [],
+      "source_ids": [
+        "src-sequence",
+        "src-follower",
+        "src-leader"
+      ]
+    },
+    {
+      "class_id": "A4",
+      "applicability": "applicable",
+      "purpose": "Configuration and participant eligibility",
+      "realization_summary": "Cluster validates quorum overlap and bounds; StopSign proposes a new cluster.",
+      "entry_points": [],
+      "variants": [],
+      "unknowns": [],
+      "source_ids": [
+        "src-config",
+        "doc-reconfiguration"
+      ]
+    },
+    {
+      "class_id": "A5",
+      "applicability": "applicable",
+      "purpose": "Decision application and consumption",
+      "realization_summary": "Read API exposes decided entries and StopSign; application consumes them.",
+      "entry_points": [],
+      "variants": [],
+      "unknowns": [],
+      "source_ids": [
+        "doc-log",
+        "src-read"
+      ]
+    },
+    {
+      "class_id": "A6",
+      "applicability": "applicable",
+      "purpose": "History, persistence and reconstruction of support",
+      "realization_summary": "Construction loads protocol metadata and reconstructs accepted extent; synchronization uses ordered storage transactions. MemoryStorage is volatile; PersistentStorage uses RocksDB batches.",
+      "entry_points": [],
+      "variants": [],
+      "unknowns": [],
+      "source_ids": [
+        "src-sync",
+        "src-load",
+        "src-storage-contract",
+        "src-memory",
+        "src-persistent-recovery",
+        "src-persistent-txn"
+      ]
+    },
+    {
+      "class_id": "A7",
+      "applicability": "applicable",
+      "purpose": "Client contracts, invocation intervals and observed completion",
+      "realization_summary": "Core callers deliver messages and tick; optional in-repository actor serializes commands, drives timers, tracks assignments and resolves append_notify using decided index and ballot.",
+      "entry_points": [],
+      "variants": [],
+      "unknowns": [],
+      "source_ids": [
+        "src-api",
+        "doc-transport",
+        "doc-log",
+        "src-notify-contract",
+        "src-runtime-loop",
+        "src-runtime-completion"
+      ]
+    }
+  ],
+  "behaviors": [
+    {
+      "id": "b-prepare",
+      "primary_activity": "A2",
+      "execution_owner": "SequencePaxos leader and follower",
+      "protocol_context": "Configuration-local ballot and prepare phase",
+      "trigger": "handle_leader and handle_prepare",
+      "legal_preconditions": [],
+      "implementation_guards": [
+        "New leader ballot exceeds remembered leader and promise; follower accepts higher promise or equal promise in Recover."
+      ],
+      "reads": [],
+      "writes": [
+        "Flush pending batches; persist promise; reset leader support on local leadership; reset follower sequence on prepare."
+      ],
+      "durable_effects": [],
+      "external_effects": [
+        "Queue Prepare or Promise containing accepted round, accepted index and decided index; selected history may include log sync."
+      ],
+      "important_branches": [
+        "Construction with stored promise enters Recover and requests preparation. BLE initializes recovered leadership context separately and lowers own initial round to prevent same-ballot recovery leadership."
+      ],
+      "async_boundaries": [],
+      "produces_fact_ids": [
+        "f-promise"
+      ],
+      "consumes_fact_ids": [],
+      "cross_activity_effects": {},
+      "existing_protections": [],
+      "source_ids": [
+        "src-leader",
+        "src-follower",
+        "src-support",
+        "src-build",
+        "src-load",
+        "src-ble-init"
+      ],
+      "unknowns": []
+    },
+    {
+      "id": "b-formation",
+      "primary_activity": "A1",
+      "execution_owner": "SequencePaxos leader",
+      "protocol_context": "Current leader ballot; Prepare then Accept",
+      "trigger": "handle_promise_prepare, handle_majority_promises and handle_accepted",
+      "legal_preconditions": [],
+      "implementation_guards": [
+        "Promise ballot equals leader ballot; distinct promise slots counted toward prepare quorum. Accepted requires current ballot and Leader/Accept."
+      ],
+      "reads": [],
+      "writes": [
+        "Choose maximal accepted round/index history; synchronize log; append buffered proposals unless stopped; record accepted indexes and update decided index when acceptance quorum supports it."
+      ],
+      "durable_effects": [],
+      "external_effects": [
+        "Queue AcceptSync, AcceptDecide and Decide messages for promised followers."
+      ],
+      "important_branches": [],
+      "async_boundaries": [],
+      "produces_fact_ids": [],
+      "consumes_fact_ids": [
+        "f-promise"
+      ],
+      "cross_activity_effects": {},
+      "existing_protections": [],
+      "source_ids": [
+        "src-leader",
+        "src-support"
+      ],
+      "unknowns": [
+        "Same-ballot recovery may replace peer support metadata; accepted indexes are assigned rather than max-merged. Consequence depends on permitted message history."
+      ]
+    },
+    {
+      "id": "b-follow",
+      "primary_activity": "A1",
+      "execution_owner": "SequencePaxos follower",
+      "protocol_context": "Promised ballot and replication sequence",
+      "trigger": "handle_acceptsync, handle_acceptdecide, handle_decide and handle_accept_stopsign",
+      "legal_preconditions": [],
+      "implementation_guards": [
+        "AcceptSync requires promised ballot and Follower/Prepare; incremental AcceptDecide requires Follower/Accept and expected sequence. Decide requires Accept phase and expected sequence."
+      ],
+      "reads": [],
+      "writes": [
+        "AcceptSync installs supplied history, decided index and sequence; incremental messages append entries and advance decided index with batching bounds."
+      ],
+      "durable_effects": [],
+      "external_effects": [
+        "Queue or coalesce Accepted responses after accepted storage changes."
+      ],
+      "important_branches": [],
+      "async_boundaries": [],
+      "produces_fact_ids": [],
+      "consumes_fact_ids": [
+        "f-promise"
+      ],
+      "cross_activity_effects": {},
+      "existing_protections": [],
+      "source_ids": [
+        "src-follower",
+        "src-order",
+        "src-sync"
+      ],
+      "unknowns": [
+        "AcceptSync does not check its sequence against a retained prior session; determine whether older same-ballot synchronization can reach a later Prepare phase under the actual transport contract."
+      ]
+    },
+    {
+      "id": "b-recovery",
+      "primary_activity": "A3",
+      "execution_owner": "SequencePaxos peer",
+      "protocol_context": "Reconnect, sequence gap or stored promise",
+      "trigger": "reconnected, resend_messages_follower and handle_preparereq",
+      "legal_preconditions": [],
+      "implementation_guards": [],
+      "reads": [],
+      "writes": [
+        "Reconnect to current leader sets Follower/Recover. PrepareReq clears leader promise slot and pending accept metadata before sending Prepare."
+      ],
+      "durable_effects": [],
+      "external_effects": [
+        "Periodic resend sends cached Promise in Prepare or PrepareReq in Recover; leader retries prepares for unpromised peers."
+      ],
+      "important_branches": [],
+      "async_boundaries": [],
+      "produces_fact_ids": [],
+      "consumes_fact_ids": [],
+      "cross_activity_effects": {
+        "A2": "Permits equal-ballot Prepare after entering Recover.",
+        "A1": "Resynchronization replaces follower history before ordinary acceptance resumes."
+      },
+      "existing_protections": [],
+      "source_ids": [
+        "src-sequence",
+        "src-leader",
+        "src-follower"
+      ],
+      "unknowns": [
+        "Caller delivery ordering and whether old-connection messages may remain deliverable after reconnection."
+      ]
+    },
+    {
+      "id": "b-election",
+      "primary_activity": "A2",
+      "execution_owner": "BallotLeaderElection and OmniPaxos",
+      "protocol_context": "Heartbeat round and configuration ballot",
+      "trigger": "tick -> election_timeout -> hb_timeout",
+      "legal_preconditions": [],
+      "implementation_guards": [
+        "Heartbeat reply round and ballot configuration match; takeover requires unhappy neighbors and prepare quorum connectivity."
+      ],
+      "reads": [],
+      "writes": [],
+      "durable_effects": [],
+      "external_effects": [
+        "Queue heartbeat requests and replies; invoke handle_leader when local ballot is selected."
+      ],
+      "important_branches": [],
+      "async_boundaries": [],
+      "produces_fact_ids": [],
+      "consumes_fact_ids": [],
+      "cross_activity_effects": {},
+      "existing_protections": [],
+      "source_ids": [
+        "src-api",
+        "src-ble"
+      ],
+      "unknowns": [
+        "Heartbeat reply accumulation counts vector entries; participant uniqueness and duplicate-delivery assumptions need source investigation."
+      ]
+    },
+    {
+      "id": "b-storage",
+      "primary_activity": "A6",
+      "execution_owner": "InternalStorage and Storage backend",
+      "protocol_context": "Replica construction and synchronized log history",
+      "trigger": "OmniPaxosConfig::build, InternalStorage::load_cache and sync_log",
+      "source_ids": [
+        "src-build",
+        "src-load",
+        "src-storage-contract",
+        "src-memory",
+        "src-persistent-recovery",
+        "src-persistent-txn",
+        "src-sync"
+      ],
+      "writes": [
+        "Load promise, accepted round, decided index, compacted index and StopSign from supplied backend; reconstruct accepted index from log length plus compacted prefix and StopSign.",
+        "sync_log updates cache and submits ordered atomic operations; caller panics on storage error."
+      ],
+      "produces_fact_ids": [
+        "f-promise"
+      ],
+      "cross_activity_effects": {
+        "A2": "Recovered promise determines Recover phase and BLE recovered leader; a recovered BLE node does not retain same-ballot leadership.",
+        "A1": "Synchronized accepted round, suffix and decided prefix determine subsequent acknowledgments."
+      },
+      "unknowns": [
+        "Persistent backend crash durability and in-memory cache state after storage errors are not established by the read transaction API."
+      ]
+    },
+    {
+      "id": "b-read",
+      "primary_activity": "A5",
+      "execution_owner": "InternalStorage",
+      "protocol_context": "Current accepted log and decided-index boundary",
+      "trigger": "read and read_decided_suffix",
+      "source_ids": [
+        "src-read-classify",
+        "src-read",
+        "doc-log"
+      ],
+      "reads": [
+        "Storage entries and current cached decided index."
+      ],
+      "external_effects": [
+        "Entries below decided index become LogEntry::Decided; later accepted entries become Undecided; compaction has separate output variants."
+      ],
+      "cross_activity_effects": {
+        "A7": "Provides an independent public log-content observation for client completion checks."
+      }
+    },
+    {
+      "id": "b-runtime-assign",
+      "primary_activity": "A7",
+      "execution_owner": "ActorState",
+      "protocol_context": "Pending EntryId and ballot-scoped assigned end index",
+      "trigger": "AppendNotify command dispatch, append_tracked, reconcile_unconfirmed and Assigned receipt",
+      "source_ids": [
+        "src-runtime-assignment",
+        "src-runtime-routing",
+        "src-runtime-loop"
+      ],
+      "implementation_guards": [
+        "accept_as_leader requires local stable Leader/Accept.",
+        "Deferred batch tracking ignores entries whose stored ballot differs from current promise."
+      ],
+      "writes": [
+        "Pending record gets a generated EntryId and deadline. record_assignment matches EntryId and stores (idx, ballot). Immediate local append records new accepted end index; deferred records are reconciled on ticks; remote Assigned messages also record assignments."
+      ],
+      "produces_fact_ids": [
+        "f-runtime-assignment"
+      ],
+      "external_effects": [
+        "Remote assignments are sent back to origin; pending append future remains outstanding."
+      ],
+      "unknowns": [
+        "Full interleavings between assignment, higher-ballot synchronization and next completion drain."
+      ]
+    },
+    {
+      "id": "b-runtime-notify",
+      "primary_activity": "A7",
+      "execution_owner": "ActorState::drain_notifiers",
+      "protocol_context": "Pending assigned operations and current local decided prefix",
+      "trigger": "Actor tick after core tick, event emission, dispatch and reconciliation",
+      "source_ids": [
+        "src-runtime-completion",
+        "src-runtime-loop",
+        "src-notify-contract",
+        "src-superseded-contract"
+      ],
+      "reads": [
+        "Pending assigned (idx,ballot), current promise, current decided index and deadline."
+      ],
+      "consumes_fact_ids": [
+        "f-runtime-assignment"
+      ],
+      "writes": [
+        "Removes pending and resolves Ok(idx) when idx <= decided, before considering ballot supersession; otherwise returns Superseded for older ballot or Timeout after deadline."
+      ],
+      "external_effects": [
+        "Resolve original append_notify oneshot to the caller."
+      ],
+      "existing_protections": [
+        "A newer promise produces Superseded when assigned index remains beyond the decided prefix.",
+        "Quorum adoption may preserve an old entry across a ballot change; a changed ballot alone is not proof of a false success."
+      ],
+      "cross_activity_effects": {
+        "A1": "Consumes core decided-prefix advancement as success evidence.",
+        "A2": "Uses current promise to reject some superseded assignments, after the success arm."
+      },
+      "unknowns": [
+        "Can an undecided assigned entry be replaced and its index decided before completion drain, yielding success for the wrong entry?"
+      ]
+    },
+    {
+      "id": "b-runtime-loop",
+      "primary_activity": "A7",
+      "execution_owner": "Runtime actor",
+      "protocol_context": "Single actor serializes commands, incoming messages and timers",
+      "trigger": "spawn_actor and run",
+      "source_ids": [
+        "src-runtime-spawn",
+        "src-runtime-loop",
+        "src-runtime-egress",
+        "src-runtime-config"
+      ],
+      "external_effects": [
+        "Timer branches tick core and drain completion; egress periodically retrieves core messages. Incoming branch mutates core but does not drain notifiers immediately.",
+        "Bounded outgoing buffering preserves retained message order and can discard oldest traffic at capacity."
+      ],
+      "async_boundaries": [
+        "Event emission is awaited during tick; network transport remains caller-owned.",
+        "Dropping all handles closes command/incoming senders; run exits on a closed input."
+      ],
+      "cross_activity_effects": {
+        "A2": "Incoming higher-ballot preparation can precede a later timer-driven completion drain.",
+        "A1": "Core may process multiple protocol messages and advance decisions between notifier drains."
+      },
+      "unknowns": [
+        "Backpressure-specific progress and subscriber compaction semantics remain separate unread details."
+      ]
+    }
+  ],
+  "facts": [
+    {
+      "id": "f-promise",
+      "meaning": "Replica has recorded the ballot to which its acceptance handling is currently promised.",
+      "identity": {
+        "replica": "NodeId",
+        "configuration": "Replica instance configuration"
+      },
+      "validity_context": "Stored promise ballot; equal-ballot recovery can change phase and session without increasing it.",
+      "representation": [
+        "InternalStorage promise"
+      ],
+      "invalidators": [],
+      "reinterpreters": [],
+      "durability": "Promise is stored through Storage and loaded at construction. MemoryStorage is volatile; PersistentStorage stores it in RocksDB. Crash durability of backend settings remains a separate unknown.",
+      "recovery": "InternalStorage::load_cache reads the backend promise; SequencePaxos constructor enters Recover when get_promise returns Some and sends PrepareReq. BLE initializes from recovered promise with its own recovery round.",
+      "source_ids": [
+        "src-sequence",
+        "src-leader",
+        "src-follower",
+        "src-load",
+        "src-storage-contract",
+        "src-memory",
+        "src-ble-init"
+      ],
+      "unknowns": [
+        "Persistent backend crash durability under configured options."
+      ]
+    },
+    {
+      "id": "f-runtime-assignment",
+      "meaning": "Pending client operation has a recorded assigned log end index and assignment ballot, associated by its EntryId.",
+      "identity": {
+        "operation": "Pending EntryId",
+        "owner": "Origin actor instance"
+      },
+      "validity_context": "Recorded assignment under its supplied ballot; this record alone does not establish that the same entry remains at the index after later synchronization.",
+      "representation": [
+        "Pending.assigned: Option<(usize, Ballot)>"
+      ],
+      "durability": "Volatile actor state; removed on completion/error and lost at actor shutdown.",
+      "recovery": "No reconstruction of Pending records on actor restart is implemented in ActorState::new.",
+      "source_ids": [
+        "src-runtime-assignment",
+        "src-runtime-routing",
+        "src-runtime-loop",
+        "src-runtime-completion"
+      ],
+      "unknowns": [
+        "Preservation of operation-to-entry association across a higher-ballot synchronization before completion."
+      ]
+    }
+  ],
+  "surfaces": [
+    {
+      "entry_point": "SequencePaxos::handle_acceptsync",
+      "disposition": "mapped",
+      "behavior_ids": [
+        "b-follow"
+      ],
+      "reason": "Does same-ballot recovery admit stale synchronization history after a later decision? Ballot/phase checks protect ordinary delivery; legal overlapping sessions and transport duties remain unresolved.",
+      "source_ids": [
+        "src-follower",
+        "src-leader",
+        "src-sync",
+        "src-order"
+      ],
+      "high_consequence": true
+    },
+    {
+      "entry_point": "BallotLeaderElection::handle_reply",
+      "disposition": "mapped",
+      "behavior_ids": [
+        "b-election"
+      ],
+      "reason": "What ensures heartbeat support counts distinct eligible participants when replies are appended to a vector?",
+      "source_ids": [
+        "src-ble"
+      ],
+      "high_consequence": false
+    },
+    {
+      "entry_point": "ActorState::drain_notifiers",
+      "disposition": "mapped",
+      "behavior_ids": [
+        "b-runtime-notify"
+      ],
+      "reason": "Does numeric decided-index success precede recognition that a different entry replaced this pending operation under a new ballot?",
+      "source_ids": [
+        "src-runtime-completion",
+        "src-notify-contract",
+        "src-superseded-contract",
+        "src-sync"
+      ],
+      "high_consequence": true
+    }
+  ],
+  "core_overview": {
+    "formation": {
+      "explanation": "Append is buffered during prepare, sent locally during Leader/Accept, or forwarded. Current-ballot promises populate participant slots; a prepare quorum selects maximal accepted-round/index history, synchronizes it, then sends AcceptSync. Followers synchronize and acknowledge, and incremental appends use sequence validation. Current-ballot Accepted messages update leader indexes; a write quorum causes decided-index advancement and decision propagation. Read APIs expose the decided prefix for application use. Storage load reconstructs accepted extent and reads classify entries against the decided boundary. The optional actor tracks a client EntryId to an assigned end index and ballot; on ticks it resolves success using decided index before testing ballot supersession.",
+      "behavior_ids": [
+        "b-formation",
+        "b-follow",
+        "b-storage",
+        "b-read",
+        "b-runtime-assign",
+        "b-runtime-notify"
+      ],
+      "fact_ids": [
+        "f-promise",
+        "f-runtime-assignment"
+      ],
+      "source_ids": [
+        "src-sequence",
+        "src-leader",
+        "src-follower",
+        "src-support",
+        "src-read",
+        "doc-log",
+        "src-load",
+        "src-read-classify",
+        "src-runtime-completion",
+        "src-runtime-assignment"
+      ]
+    },
+    "context": {
+      "explanation": "Tick drives BLE; matching heartbeat rounds/configurations influence leader selection. SequencePaxos requires a higher ballot before initiating preparation. Followers persist a higher promise, reject lower-ballot replication and accept same-ballot prepare only during recovery. Reconnect and sequence gaps can initiate equal-ballot recovery. StopSign seals the old log and delegates startup/state transfer of a new configuration to the caller. Construction reads the stored promise into protocol and BLE recovery context, while cached accepted metadata comes from the backend. The actor serializes incoming messages and commands but runs completion processing only on tick branches.",
+      "behavior_ids": [
+        "b-prepare",
+        "b-election",
+        "b-recovery"
+      ],
+      "fact_ids": [
+        "f-promise"
+      ],
+      "source_ids": [
+        "src-api",
+        "src-ble",
+        "src-sequence",
+        "src-leader",
+        "src-follower",
+        "doc-reconfiguration",
+        "src-load",
+        "src-build",
+        "src-ble-init",
+        "src-runtime-loop"
+      ]
+    },
+    "connection": {
+      "explanation": "Authority alone does not enable acceptance: the new leader first gathers promise support and adopts accepted history, including prior decisions, before appending buffered work. A stopped selected history blocks appends. Followers require the promised ballot and appropriate phase; incremental old-session work is rejected or triggers recovery. Equal-ballot recovery resets phase and sequence before synchronization, leaving a specific delayed-AcceptSync history question. Client assignment records survive incoming higher-ballot synchronization until a later notifier drain. Whether the assigned entry survives depends on adopted history, rather than on numeric decided-index advancement alone.",
+      "behavior_ids": [
+        "b-prepare",
+        "b-formation",
+        "b-follow",
+        "b-recovery"
+      ],
+      "fact_ids": [
+        "f-promise"
+      ],
+      "source_ids": [
+        "src-leader",
+        "src-follower",
+        "src-support",
+        "src-sync",
+        "src-order",
+        "src-runtime-completion",
+        "src-runtime-assignment",
+        "src-runtime-loop"
+      ]
+    },
+    "open_details": [
+      "Legal transport history for delayed same-ballot AcceptSync.",
+      "Heartbeat duplicate accounting contract.",
+      "Compaction and reconfiguration edge paths.",
+      "Persistent backend failure/crash durability.",
+      "Actor assignment consumption after unchosen history is superseded.",
+      "Actor event backpressure and compacted subscription cursor handling."
+    ],
+    "core_gaps": [],
+    "status": "usable",
+    "rationale": "Both core paths now connect initialization, storage reconstruction, quorum adoption, authority transitions, stale-message guards, retries, decided reads and actor completion. Local transport/session and backend-failure details remain open without blocking this backbone."
+  }
+}

@@ -1,16 +1,17 @@
 # 保留运行
 
-当前 Git 仅追踪以下四次实验及本索引。OmniPaxos 已替换为 10 月 4 日 15:42 的最新实验；原 12:40 实验保留在本地和 Git 历史中，其他本地运行也不删除。
+当前 Git 仅追踪以下最近五次正式实验及本索引，分别对应 etcd/raft、HashiCorp Raft、Dragonboat、OmniPaxos 和 SwiftPaxos 中的修订版 EPaxos。之前的运行保留在本地，已提交版本仍可从 Git 历史查看。
 
-etcd/raft、HashiCorp Raft 和 Dragonboat 使用 `audit-products-v47`，最新 OmniPaxos 使用 `audit-products-v48`；各配置 2400 秒、`gpt-6-astra` / `low`。下表直接摘录保存的状态与报告；具体适用条件、检查过程、证据和未完成工作见各自原始报告。确认违反均限于各自固定义务范围，不代表完整共识缺陷已经确证。
+五次实验均使用 `audit-products-v49`，各配置 2400 秒、`gpt-6-astra` / `low`。下表直接摘录保存的状态与报告；具体适用条件、检查过程、证据和未完成工作见各自原始报告。按各自固定义务和执行范围报告确认结果；其他性质、不同模式和更广后果分别研究。
 
 | 实验 | 实际时间 | 报告中的正式结论 | 停止依据 |
 | --- | ---: | --- | --- |
-| [10:35 etcd/raft](2026-10-04_10-35-25-etcd_raft-real-run/report.md) | 2201.00 秒 | 2 项确认违反、1 项待调查线索 | 服务端安全拒绝 |
-| [11:12 HashiCorp Raft](2026-10-04_11-12-06-hashicorp_raft-real-run/report.md) | 2400.17 秒 | 1 项确认违反、1 项待调查线索 | 总时间边界，Agent 进程终止 |
-| [11:52 Dragonboat](2026-10-04_11-52-07-dragonboat_raft-real-run/report.md) | 1181.19 秒 | 1 项确认违反 | 服务端安全拒绝 |
-| [15:42 OmniPaxos](2026-10-04_15-42-42-omnipaxos-real-run/report.md) | 962.45 秒 | 1 项实际比较观察到违反；对应性复核要求修正驱动顺序，尚未确认 | 服务端安全拒绝 |
+| [17:36 etcd/raft](2026-10-04_17-36-49-etcd_raft-real-run/report.md) | 1437.09 秒 | 1 项确认违反 | 服务端安全拒绝 |
+| [18:00 HashiCorp Raft](2026-10-04_18-00-47-hashicorp_raft-real-run/report.md) | 619.69 秒 | 已受理 1 项 Candidate，尚无正式执行或确认结果 | 服务端安全拒绝 |
+| [18:11 Dragonboat](2026-10-04_18-11-07-dragonboat_raft-real-run/report.md) | 2159.35 秒 | 1 项确认违反、1 项待调查线索 | 服务端安全拒绝 |
+| [18:47 OmniPaxos](2026-10-04_18-47-07-omnipaxos-real-run/report.md) | 2400.34 秒 | 2 项确认违反；另 1 项检查构建超时，未执行到比较 | 总时间边界 |
+| [19:27 EPaxos](2026-10-04_19-27-07-swiftpaxos_epaxos-real-run/report.md) | 561.25 秒 | 已受理 1 项 Candidate，尚无正式执行或确认结果 | 服务端安全拒绝 |
 
-本次归档同时提交 Rust 构建依据固定、隔离构建种子复用、超时阶段诊断，以及 Go 诊断对照适用性指导和报告计数修正。原始报告、研究状态、固定制品、来源、评估和日志保持原样；未完成回合不受理，历史归档不作为新自主实验的发现输入。
+原始报告、研究状态、固定制品、来源、评估和日志保持原样；未完成回合不受理，历史归档不作为新自主实验的发现输入。
 
 归档保留源码快照、固定构建依据与锁文件、研究地图、草稿、受理输入、执行差异、版本、评估及原始日志；排除凭据、虚拟环境、临时锁、`.execution`、草稿临时目录、编译缓存、可重建的 `experiments/**/workspace` 和本地权限覆盖配置。
