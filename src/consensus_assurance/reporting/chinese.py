@@ -4,7 +4,7 @@ from datetime import datetime
 from pathlib import Path
 from urllib.parse import quote
 from consensus_assurance.core.types import ExecutionStatus
-from consensus_assurance.workflow.research import view, exploration_results
+from consensus_assurance.workflow.research import view, exploration_results, comparison_observed
 from consensus_assurance.workflow.prompts import manifest
 
 
@@ -55,7 +55,14 @@ def cell(value, locator=''):
 
 def assessment_progress(record):
     opinion = record.get('correspondence') or ('尚未记录' if 'correspondence' in record else '信息不足')
-    return '机械比较：'+OUTCOME.get(record.get('outcome'),'信息不足')+'；对应性意见：'+opinion
+    observed=comparison_observed(record)
+    return ('检查未执行到比较' if observed is False else '实际比较依据不足' if observed is None else
+        '机械比较：'+OUTCOME.get(record.get('outcome'),'信息不足'))+'；对应性意见：'+opinion
+
+
+def conclusion_label(result):
+    if result['disposition']!='investigation_lead' or result['comparison_observed'] is True:return DISPOSITIONS[result['disposition']]
+    return '检查未执行到比较' if result['comparison_observed'] is False else '实际比较依据不足'
 
 
 def execution_location(check, archive):
@@ -63,11 +70,30 @@ def execution_location(check, archive):
     filename = check.parameters.get('harness_filename')
     location = f'固定执行包 `{cell(package)}`；主文件 `{cell(filename)}`' if package is not None else (
         f'固定主文件 `{cell(filename)}`' if filename else '旧记录未固定单次位置；按历史控制器命令和输入解释，嵌套启动器不等于直接切包')
+    if check.started_at and check.ended_at:
+        duration=check.parameters.get('action_seconds',(datetime.fromisoformat(check.ended_at)-datetime.fromisoformat(check.started_at)).total_seconds())
+        location+=f'；动作总耗时 {duration:.2f} 秒'
+    if check.parameters.get('build_inputs'):
+        location+='；'+archive.link(check.parameters['build_inputs'],'构建依据')
+    if check.parameters.get('execution_backend',{}).get('name')=='cargo':location+='；'+failure_detail(check,archive)
     return location+'；'+archive.link(f'logs/{check.id}/check.json','实际命令、工具版本与输入记录')
 
 
 def failure_detail(check, archive):
     """Legacy output can explain a technical turn without rewriting its saved CheckRun."""
+    if check.parameters.get('execution_backend',{}).get('name')=='cargo':
+        from consensus_assurance.adapters.runners.cargo_build import diagnostics
+        facts=check.parameters
+        if 'build_finished' not in facts:
+            paths=[archive.path(p) for p in (check.stdout,check.stderr)]
+            facts=diagnostics('\n'.join(p.read_text() for p in paths if p))
+        if facts.get('test_started'):
+            return '已观察到测试启动；'+('正常退出，性质比较另核' if check.status==ExecutionStatus.COMPLETED and check.exit_code==0 else '执行失败或未完成')
+        if facts.get('build_finished') is True:return '构建完成，未观察到测试启动'
+        if facts.get('build_finished') is False:return '构建失败，未观察到测试启动'
+        if facts.get('build_activity'):
+            return ('构建期间超时' if check.status==ExecutionStatus.TIMEOUT else '已记录构建活动，构建未完成')+'；未观察到测试启动'
+        return '构建／测试阶段依据不足；'+check.status.value
     if ('failure_class' in check.parameters and 'test_started' in check.parameters
             or check.status not in {ExecutionStatus.COMPLETED,ExecutionStatus.ERROR}
             or check.parameters.get('execution_backend',{}).get('name') not in {'go_module','hashicorp_raft'}):
@@ -252,11 +278,18 @@ def render_report(state, root):
     claim_links = {c['id']:f'[{c["id"]}](#claim-{c["id"]})' for c in research['claims']}
     def progress_text(claim_id):
         current = [p for u in research['units'] for p in u['progress'] if p['claim_id']==claim_id and p['record_status']!='assessed']
-        records = [assessment_progress(r)+'；'+'；'.join(r.get('blockers',[])) for r in research['assessments']
-            if any(p.get('artifact_id')==r['direct_check_id'] and p.get('check_id')==r['experiment_check_id'] for p in current)]
-        refs = [link(artifacts[p['artifact_id']]['plan_path'],'固定计划') for p in current if p['record_status'] in {'no_execution','no_assessment'}]
+        records=[];refs=[]
+        for r in research['assessments']:
+            if not any(p.get('artifact_id')==r['direct_check_id'] and p.get('check_id')==r['experiment_check_id'] for p in current):continue
+            check=checks[r['experiment_check_id']]
+            records.append(failure_detail(check,archive) if check.status!=ExecutionStatus.COMPLETED or check.exit_code not in (0,None) else assessment_progress(r))
+            if r.get('confirmed') and not r.get('bounded_complete'):records.append('完整反例已确认；另有独立场景覆盖缺口')
+            elif r.get('blockers'):records.append('原因摘录：'+excerpt(r['blockers'][0],140))
+            refs.append(link(str(Path(artifacts[r['direct_check_id']]['plan_path']).parent/(check.id+'-assessment.json')),'完整评估与原因'))
+        refs += [link(artifacts[p['artifact_id']]['plan_path'],'固定计划') for p in current if p['record_status'] in {'no_execution','no_assessment'}]
         refs += [link(f'logs/{p["check_id"]}/check.json','执行记录') for p in current if p['record_status']=='no_assessment']
-        return '；'.join(filter(None,[cell('；'.join(dict.fromkeys(records+[PROGRESS[p['record_status']] for p in current])),claim_links[claim_id]),*refs]))
+        reasons=records or [PROGRESS[p['record_status']] for p in current]
+        return '；'.join([cell(excerpt(reason,180)) for reason in list(dict.fromkeys(reasons))[:2]]+list(dict.fromkeys(refs)))
     stop = state.run_stop
     stop_label = ({'user_stop':'实际取消','resource_limit':'资源边界','tool_gap':'服务／权限／工具中断'}.get(stop.get('reason'),'中断')
         if stop.get('origin') == 'controller' else {'insufficient_basis':'研究依据不足','bounded_completed':'所声明范围完成',
@@ -264,7 +297,8 @@ def render_report(state, root):
     lines = ['# 共识审计研究报告', '', '## 运行概览', '',
         f'审计目标 **{cell(config.get("target",{}).get("variant") or Path(state.snapshot.repo).name)}**。'
         f'已受理 Candidate {len(research["candidates"])} 项；当前 Unit {len(research["units"])} 项、义务 {len(research["claims"])} 项、固定检查制品 {len(artifacts)} 项。'
-        f'已产生观察的正式结论 {len(results)} 项：'+ '、'.join(f'{label} {sum(r["disposition"]==key for r in results)} 项' for key,label in DISPOSITIONS.items())+
+        f'正式执行尝试 {len(formal)} 次；已保存评估的义务 {len(results)} 项，其中有实际比较 {sum(r["comparison_observed"] is True for r in results)} 项。'+
+        '、'.join(f'{label} {sum(r["disposition"]==key and (key!="investigation_lead" or r["comparison_observed"] is True) for r in results)} 项' for key,label in DISPOSITIONS.items())+
         f'；另有已获源码解释的 Candidate {len(explained)} 项。受理、执行与结论分别计数。', '',
         f'实际持续 **{state.elapsed_seconds/60:.2f} 分钟**；结束类型：**'+('控制器记录的' if stop.get('origin') == 'controller' else 'Agent 提出的' if stop else '')+stop_label+'**。',
         f'剩余 {capacity["remaining_seconds"]:.2f} 秒、{capacity["remaining"]["agent_calls"]} 次 Agent 调用、'
@@ -302,7 +336,7 @@ def render_report(state, root):
         answer = next((i.report_answer for i in reversed(items) if i.report_answer),None) or feedback.get('answered')
         entries.append((result,records,answer,title))
         progress = progress_text(result['claim_id'])
-        disposition = DISPOSITIONS[result['disposition']]+('；另有场景尚未完成' if progress and result['disposition']=='confirmed_in_scope' else '')
+        disposition = conclusion_label(result)+('；另有场景尚未完成' if progress and result['disposition']=='confirmed_in_scope' else '')
         lines.append(f'| {n}. {cell(title)} | {disposition} | {progress or (cell(excerpt(answer,170)) if answer else "见下方固定观察")} | {claim_links[result["claim_id"]]} |')
     for c in explained:lines.append(f'| {cell(excerpt(c["question"]["question"],130))} | 源码解释，未经性质执行 | {cell(excerpt("；".join(c["question"]["counterevidence"]),170))} | {link("state.json","候选原文与来源")} |')
     for claim in research['claims']:
@@ -314,7 +348,7 @@ def render_report(state, root):
             lines.append(f'| {cell(excerpt(c["question"]["question"],130))} | {"暂停调查" if c["status"]=="paused" else "研究中"}，尚无正式义务 | {cell(excerpt("；".join(c["resume_conditions"] or c["question"]["unknowns"]),170))} | {candidate_links[c["id"]]} |')
     for n,(result,records,answer,title) in enumerate(entries,1):
         scope = result['scope']
-        lines += ['', f'<a id="claim-{result["claim_id"]}"></a>', '', f'### {n}. {title}', '', f'**{DISPOSITIONS[result["disposition"]]}**。要求原文：{result["description"]}', '',
+        lines += ['', f'<a id="claim-{result["claim_id"]}"></a>', '', f'### {n}. {title}', '', f'**{conclusion_label(result)}**。要求原文：{result["description"]}', '',
             '决定性范围：'+scope['description'], '；'.join(scope['assumptions'])+'。' if scope['assumptions'] else '',
             '范围参数：'+cell(scope['parameters']) if scope['parameters'] else '',
             link('state.json','完整要求、假设与排除范围')]

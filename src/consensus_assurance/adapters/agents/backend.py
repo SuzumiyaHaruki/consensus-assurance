@@ -106,6 +106,7 @@ class CodexAgent:
             str(root/"submission.schema.json"):"read",str(root/"product-schemas.json"):"read",
             str(root/"audit-method.md"):"read",
             str(root/"target-support"):"read",
+            str(root/"build-inputs"):"read",
             **{str(root/name):"read" for name in ("logs","findings","audit-spec","actions")},
             **{str(path):"read" for path in getattr(self,"read_only_roots",[]) if path.is_dir()},
             **{path:"read" for path in tool_paths},
@@ -154,6 +155,8 @@ class CodexAgent:
             path.parent.mkdir(exist_ok=True)
             path.write_text("retained permission canary")
             protected.append(path)
+        build_input=next((runner.root/'build-inputs').glob('targets/**/basis.json'),None)
+        if build_input:protected.append(build_input)
         script = directory / ".permission-probe.py"
         script.write_text(
             "import errno, os, pathlib, socket, tempfile, subprocess\n"
@@ -185,7 +188,8 @@ class CodexAgent:
             check.parameters['permission_result'] = 'verified' if verified else 'inconclusive_or_unsafe'
             return verified, [check]
         finally:
-            for path in [private, script, directory / '.write-control', *protected[2:]]:
+            for path in [private, script, directory / '.write-control',
+                    *(runner.root/folder/'permission-canary' for folder in ('logs','direct-checks'))]:
                 path.unlink(missing_ok=True)
 
     def prepare(self, runner, directory, snapshot_id):

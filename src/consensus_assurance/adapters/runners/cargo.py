@@ -1,5 +1,4 @@
 """Cargo integration tests through the existing fixed-input and isolated runner path."""
-import json
 import os
 import re
 import shutil
@@ -15,9 +14,9 @@ from consensus_assurance.adapters.runners.experiment import local_package
 
 class CargoBackend:
     name = "cargo"
-    version = "1"
+    version = "2"
     harness_kind = "rust_test"
-    harness_instructions = "Write Rust #[test] integration tests in the selected crate's tests directory, using the captured crate's public API and existing dependencies. The controller runs only the generated test target, serially, with --nocapture and offline Cargo. Emit complete CA_EVENT JSON lines with println!. Helpers are workspace-relative; do not submit manifests, build scripts or Cargo configuration. Default crate features apply; private internals and disabled features are not automatically exposed."
+    harness_instructions = "Write Rust #[test] integration tests using the captured crate's public API and existing dependencies. The controller fixes the workspace lock and tools, builds a neutral integration target once, and copies its compiler outputs into each private action. Only the generated test target runs, serially with --nocapture and --locked --offline. Emit complete CA_EVENT JSON lines. Helpers are workspace-relative; never replace manifests, locks, build scripts or Cargo configuration. No extra feature flags are added; original dev-dependencies can enable additional features. Consult build_inputs metadata and actual compiler-artifact records; declaration syntax does not establish active cfg branches or private-state reachability."
 
     def __init__(self, target=None, timeout=90):
         self.package = local_package(target.execution_package if target else ".")
@@ -76,30 +75,40 @@ class CargoBackend:
         if harness_filename is not None and execution_package is None:raise ValueError("Accepted Rust input lacks a fixed execution_package")
         package=local_package(execution_package if execution_package is not None else self.package)
         filename=self.destination(package,harness_filename or self.harness_filename)
-        return [str(self.cargo),'test','--offline','--manifest-path',str(Path(package)/'Cargo.toml'),
+        return [str(self.cargo),'test','--locked','--offline','--manifest-path',str(Path(package)/'Cargo.toml'),
             '--test',filename.stem,'--message-format=json','--','--nocapture','--test-threads=1']
 
     def version_command(self):
         return [str(self.cargo.parent/'rustc'),'--version','--verbose']
 
+    def prepare_run(self,runner,snapshot_id,timeout,mode):
+        import time
+        from .cargo_build import inputs, PreparationFailed
+        if mode!='bwrap':raise ValueError('Prepared Cargo execution requires bubblewrap')
+        try:
+            return inputs(self,runner,snapshot_id,self.experiment_command(),
+                min(time.monotonic()+timeout,runner.deadline or float('inf')))[0]
+        except PreparationFailed as exc:
+            raise ValueError('Cargo build-input preparation failed; inspect '+str(exc.check.stderr)) from exc
+
+    def validate_builds(self,root,snapshot_id,deadline=None):
+        from .cargo_build import verify
+        verify(self,root,snapshot_id,deadline)
+
+    def execute(self,*args):
+        from .cargo_build import execute
+        return execute(self,*args)
+
     def parse_test_result(self,check,text):
+        from .cargo_build import retain_diagnostics
+        facts=retain_diagnostics(check,text)
         if check.status != ExecutionStatus.COMPLETED:return
-        events=[]
-        for line in text.splitlines():
-            try:
-                event=json.loads(line)
-                if isinstance(event,dict):events.append(event)
-            except ValueError:pass
-        result=re.search(r'(?m)^test result: (?:ok|FAILED)\. (\d+) passed; (\d+) failed;',text)
-        started=bool(re.search(r'(?m)^running [1-9][0-9]* tests?$',text))
-        check.parameters['test_started']=started
         if check.exit_code==0:
-            check.outcome='tests_passed' if result and int(result[1])>0 else 'not_applicable'
+            check.outcome='tests_passed' if facts['test_passed'] else 'not_applicable'
             if check.outcome=='not_applicable':check.reason='No selected Rust tests passed; tests were absent or ignored'
         else:
-            build_failed=any(e.get('reason')=='build-finished' and e.get('success') is False for e in events)
-            failure='test_failure' if started else 'build_or_setup' if build_failed else 'execution_unclassified'
+            failure='test_failure' if facts['test_started'] else 'build_or_setup' if facts['build_finished'] is False else 'execution_unclassified'
             check.parameters['failure_class']=failure
             if failure=='build_or_setup':check.status=ExecutionStatus.ERROR
-            if started:check.outcome='tests_failed'
+            if facts['test_started']:check.outcome='tests_failed'
             check.reason='Rust execution failed; inspect retained Cargo diagnostics and actual test observations'

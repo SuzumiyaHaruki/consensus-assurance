@@ -26,7 +26,7 @@ def clean_environment(workspace, adapter=None):
     return result
 
 
-def sandbox_command(command, workspace, mode, read_only_roots=()):
+def sandbox_command(command, workspace, mode, read_only_roots=(), view_path=None):
     if mode == "workspace":
         return command
     executable = shutil.which("bwrap")
@@ -35,7 +35,8 @@ def sandbox_command(command, workspace, mode, read_only_roots=()):
     args = [executable, "--die-with-parent", "--new-session", "--unshare-net", "--ro-bind", "/", "/",
             "--tmpfs", "/home", "--tmpfs", "/root", "--tmpfs", "/tmp", "--dev", "/dev", "--proc", "/proc"]
     # Only the experiment workspace is writable; raw run logs and source repositories are hidden.
-    args += ["--bind", str(workspace), str(workspace)]
+    visible = str(view_path or workspace)
+    args += ["--bind", str(workspace), visible]
     for cache in read_only_roots:
         if cache.is_dir():
             args += ["--ro-bind", str(cache), str(cache)]
@@ -43,7 +44,7 @@ def sandbox_command(command, workspace, mode, read_only_roots=()):
     if str(exe).startswith(str(Path.home())):
         tool_root = exe.parent.parent
         args += ["--ro-bind", str(tool_root), str(tool_root)]
-    args += ["--chdir", str(workspace), "--", str(exe), *command[1:]]
+    args += ["--chdir", visible, "--", str(exe), *command[1:]]
     return args
 
 
@@ -56,7 +57,7 @@ def install_harness(workspace, filename, harness, target_files, *, write=True):
     for name, content in files.items():
         path = Path(name)
         if (path.is_absolute() or not path.parts or ".." in path.parts or
-                name in target_files or '.cargo' in path.parts or path.name in {"go.mod", "go.sum", "go.work", "go.work.sum",
+                name in target_files or {'.cargo','.execution'} & set(path.parts) or path.name in {"go.mod", "go.sum", "go.work", "go.work.sum",
                     "Cargo.toml", "Cargo.lock", "build.rs", "rust-toolchain", "rust-toolchain.toml", "pyproject.toml", "setup.py", "sitecustomize.py"}):
             raise ValueError("Generated file cannot replace target or dependency definitions: " + name)
         if any(str(parent) in files or str(parent) in target_files for parent in path.parents):
@@ -77,30 +78,35 @@ def install_harness(workspace, filename, harness, target_files, *, write=True):
     return [str(workspace / name) for name in files]
 
 
-def run_experiment(runner, command, workspace, snapshot_id, timeout, mode, action="experiment", adapter=None):
+def run_experiment(runner, command, workspace, snapshot_id, timeout, mode, action="experiment", adapter=None, *, prepared=False, view_path=None):
+    if not prepared and hasattr(adapter,'execute'):
+        return adapter.execute(runner,command,workspace,snapshot_id,timeout,mode,action)
     source=workspace.parent.parent.parent/'source'
     input_manifest=None
     if source.is_dir() and workspace.name=='workspace':
         from consensus_assurance.adapters.storage.workspace_delta import save_delta
         input_manifest=save_delta(source,workspace,snapshot_id)
     try:
-        argv = sandbox_command(command, workspace, mode, adapter.read_only_roots() if adapter else ())
+        argv = sandbox_command(command, workspace, mode, adapter.read_only_roots() if adapter else (),view_path)
     except FileNotFoundError as exc:
         return CheckRun(action=action, cwd=str(workspace), snapshot_id=snapshot_id,
             status=ExecutionStatus.TOOL_MISSING, reason=str(exc),artifacts=[str(input_manifest)] if input_manifest else [])
-    check = runner.run(argv, workspace, action, snapshot_id, timeout, env=clean_environment(workspace, adapter))
+    env=clean_environment(workspace, adapter)
+    if view_path:
+        env={k:v.replace(str(workspace),str(view_path)) for k,v in env.items()}
+    check = runner.run(argv, workspace, action, snapshot_id, timeout, env=env)
     if adapter:check.parameters['execution_backend'] = {'name':adapter.name,'version':adapter.version,
         'support_files':list(getattr(adapter,'support_files',lambda:{})())}
     if check.status == ExecutionStatus.COMPLETED:
         text = output(check)
         if "bwrap:" in text:
             check.status = ExecutionStatus.ERROR; check.reason = "Execution isolation, build or dependency error"
-        elif adapter:
-            adapter.parse_test_result(check, text)
-        elif check.exit_code == 0:
+        elif not adapter and check.exit_code == 0:
             check.outcome = "tests_passed"
-        else:
+        elif not adapter:
             check.outcome = "tests_failed"
+    if adapter and (check.status==ExecutionStatus.COMPLETED or hasattr(adapter,'execute')):
+        adapter.parse_test_result(check,output(check))
     if input_manifest:
         check.artifacts.extend([str(input_manifest),str(save_delta(source,workspace,snapshot_id,phase='outcome'))])
     return check

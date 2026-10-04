@@ -74,9 +74,13 @@ def go_module(tmp_path):
 
 @pytest.fixture
 def rust_workspace(tmp_path):
-    """A dependency-free Cargo workspace with one ordinary public library."""
+    """A local Cargo dependency, build script and dev-feature unification."""
     root=tmp_path/'rust-workspace';(root/'sample/src').mkdir(parents=True)
-    (root/'Cargo.toml').write_text('[workspace]\nmembers=["sample"]\nresolver="2"\n')
-    (root/'sample/Cargo.toml').write_text('[package]\nname="sample"\nversion="0.1.0"\nedition="2021"\n')
-    (root/'sample/src/lib.rs').write_text('pub fn step(value: i64, _limit: i64) -> i64 {\n    value + 1\n}\n')
+    (root/'Cargo.toml').write_text('[workspace]\nmembers=["sample","increment"]\nresolver="2"\n')
+    (root/'sample/Cargo.toml').write_text('[package]\nname="sample"\nversion="0.1.0"\nedition="2021"\n[dependencies]\nincrement={path="../increment"}\n[dev-dependencies]\nincrement={path="../increment",features=["instrumented"]}\n')
+    (root/'sample/src/lib.rs').write_text('pub fn step(value: i64, _limit: i64) -> i64 {\n    value + increment::value()\n}\n')
+    (root/'increment/src').mkdir(parents=True)
+    (root/'increment/Cargo.toml').write_text('[package]\nname="increment"\nversion="0.1.0"\nedition="2021"\n[features]\ninstrumented=[]\nalternate=[]\n')
+    (root/'increment/src/lib.rs').write_text('pub fn value() -> i64 { if cfg!(feature="alternate") { 2 } else { 1 } }\n')
+    (root/'increment/build.rs').write_text('fn main() { println!("cargo:rerun-if-changed=build.rs"); }\n')
     return root

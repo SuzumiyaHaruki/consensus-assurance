@@ -535,6 +535,8 @@ def sync_progress(engine):
 
 
 def execute_check(engine, artifact):
+    if hasattr(engine.implementation,'validate_builds'):
+        engine.implementation.validate_builds(engine.root,engine.state.snapshot.id,engine.runner.deadline)
     existing = next((c for c in engine.state.checks if c.direct_check_id == artifact.id), None)
     check = existing or execute_direct_check(engine, artifact)
     unit = require_unit(engine.state, artifact.unit_id)
@@ -743,6 +745,10 @@ def execute(engine):
             engine.probe_tools()
         if not getattr(engine.agent, 'available', False):
             raise Blocked('Agent capability probe failed; no model payload sent')
+        if hasattr(engine.implementation,'prepare_run'):
+            try:
+                engine.implementation.prepare_run(engine.runner,state.snapshot.id,engine.budget.timeout(),engine.config.execution_isolation)
+            except ValueError as exc:raise Blocked(str(exc)) from exc
         state.stop_reason = 'Not started'
         while engine.budget.remaining() > 0:
             pending = state.pending_action

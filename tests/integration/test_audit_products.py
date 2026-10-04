@@ -5,7 +5,8 @@ import pytest
 from audit_support import products, first, check_step, review_step, stop, engine_for, partial_map, feedback
 
 
-def test_rust_formal_check_and_exploration_share_existing_audit_path(tmp_path,rust_workspace):
+@pytest.mark.parametrize('outcome',['violated','holds','missing_admission','missing_result','compile_timeout'])
+def test_rust_formal_check_and_exploration_share_existing_audit_path(tmp_path,rust_workspace,outcome):
     import shutil
     from consensus_assurance.adapters.runners.cargo import CargoBackend
     from consensus_assurance.core.config import TargetConfig
@@ -21,6 +22,9 @@ fn actual_boundary() {
     println!("CA_EVENT {{\\"event\\":\\"returned\\",\\"operation\\":\\"one\\",\\"state\\":{{\\"in_range\\":{}}}}}", (0..=3).contains(&value));
 }
 '''
+    if outcome=='holds':source=source.replace('step(3,3)','step(2,3)')
+    if outcome.startswith('missing_'):
+        source='\n'.join(line for line in source.splitlines() if ('admitted' if outcome=='missing_admission' else 'returned') not in line)
     def check(state):
         sub,files=check_step()(state);plan=json.loads(files['plan.json']);plan['harness']['kind']='rust_test'
         sub.update(harness_path='check.rs',files={})
@@ -32,9 +36,23 @@ fn actual_boundary() {
     shutil.copytree(rust_workspace,repo,dirs_exist_ok=True)
     e.config.target=TargetConfig(execution_package='sample');e.config.execution_backend='cargo'
     e.implementation=CargoBackend(e.config.target);e.agent.mock=False;e.config.execution_isolation='bwrap'
+    if outcome=='compile_timeout':
+        (repo/'increment/build.rs').write_text('fn main() { std::thread::sleep(std::time::Duration::from_secs(10)); }')
+        e.config.budget.action_timeout=2;e.agent.steps=[initial,check,stop]
     state=e.start(repo)
     assert not list((e.root/'submissions').glob('*/diagnostics.json')),state.stop_reason
-    assert state.monitor_results[0]['confirmed'] and state.monitor_results[0]['outcome']=='violated'
+    result=state.monitor_results[0]
+    if outcome=='compile_timeout':
+        from consensus_assurance.workflow.research import comparison_observed
+        from consensus_assurance.reporting.chinese import render_report
+        check=next(c for c in state.checks if c.action=='direct_check')
+        assert check.status.value=='timeout' and check.parameters['build_activity'] and not check.parameters['test_started']
+        assert not result['confirmed'] and result['outcome']=='unknown' and comparison_observed(result) is False
+        assert not state.semantic_reviews and '构建期间超时' in render_report(state,e.root).read_text()
+        return
+    assert result['confirmed']==(outcome=='violated')
+    assert result['outcome']==('unknown' if outcome.startswith('missing_') else outcome)
+    assert result['reviewed_complete']==(outcome in {'violated','holds'})
     checks=[c for c in state.checks if c.action in {'direct_check','exploration'}]
     assert [c.action for c in checks]==['direct_check','exploration']
     assert all(c.parameters['execution_package']=='./sample' and c.outcome=='tests_passed' for c in checks)
@@ -43,6 +61,85 @@ fn actual_boundary() {
         manifest=next(p for p in c.artifacts if p.endswith('workspace-outcome/manifest.json'))
         restored=tmp_path/f'restored-{i}';restore(e.root/'source',manifest,restored)
         assert (restored/'Cargo.lock').is_file() and (restored/'sample/tests/assurance_generated.rs').is_file()
+
+
+@pytest.mark.parametrize('upstream_lock',[False,True])
+def test_rust_cross_action_seed_isolation_inputs_and_recovery(tmp_path,rust_workspace,monkeypatch,upstream_lock):
+    import shutil
+    from consensus_assurance.adapters.runners import cargo_build
+    from consensus_assurance.adapters.runners.cargo import CargoBackend
+    from consensus_assurance.adapters.runners.experiment import extract_events
+    from consensus_assurance.core.config import TargetConfig
+    from consensus_assurance.core.proposals import Harness
+    from consensus_assurance.workflow.direct_checks import execute_harness
+    from consensus_assurance.core.types import CheckRun
+    if not shutil.which('cargo') or not shutil.which('bwrap'):pytest.skip('Local Rust and bubblewrap are required')
+    e,repo=engine_for(tmp_path,[]);shutil.copytree(rust_workspace,repo,dirs_exist_ok=True)
+    if upstream_lock:
+        (repo/'Cargo.lock').write_text('version = 4\n\n[[package]]\nname = "increment"\nversion = "0.1.0"\n\n[[package]]\nname = "sample"\nversion = "0.1.0"\ndependencies = ["increment"]\n')
+    original_lock=(repo/'Cargo.lock').read_bytes() if upstream_lock else None
+    e.config.target=TargetConfig(execution_package='sample');e.config.execution_backend='cargo'
+    e.config.execution_isolation='bwrap';e.config.budget.experiments=6;e.config.budget.action_timeout=60
+    e.implementation=CargoBackend(e.config.target);e.start(repo,plan_only=True)
+    checks=[]
+    def run(value):
+        text='invalid Rust' if value is None else '''#[test] fn actual() {
+assert!(!std::path::Path::new("runtime-db").exists());
+assert!(!std::path::Path::new("../.execution/cargo-target/poison").exists());
+std::fs::write("runtime-db", "private").unwrap();
+std::fs::write("../.execution/cargo-target/poison", "private").unwrap();
+println!("CA_EVENT {{\\"event\\":\\"value\\",\\"value\\":{}}}", sample::step(VALUE,9));
+}'''.replace('VALUE',str(value))
+        h=Harness(kind='rust_test',source=text,description='Actual changed input',semantic_changes=[])
+        filename=e.implementation.resolve_harness(h,e.root/'source',e.state.snapshot.files)
+        c=CheckRun.model_validate(e.action('exploration','experiments',lambda:execute_harness(e,h,filename,'exploration'),{'version':len(checks)}))
+        e.record(c);checks.append(c);return c
+    first_check=run(1);e.advance('next');second=run(4);e.advance('next');bad=run(None)
+    assert [extract_events(c)[0]['value'] for c in (first_check,second)]==[2,5]
+    assert bad.status.value=='error' and not extract_events(bad) and not bad.parameters['test_started']
+    assert len({c.id for c in checks})==len({c.cwd for c in checks})==3
+    assert len({c.parameters['build_inputs'] for c in checks})==1
+    basis=json.loads((e.root/first_check.parameters['build_inputs']).read_text())
+    lock=e.root/basis['lock']['record'];locked=lock.read_bytes()
+    assert basis['lock']['origin']==('source' if upstream_lock else 'prepared')
+    assert (repo/'Cargo.lock').read_bytes()==original_lock==locked if upstream_lock else not (repo/'Cargo.lock').exists()
+    for c in checks:
+        assert c.started_at>=c.parameters['action_started_at']
+        artifacts=json.loads(Path(c.parameters['cargo_artifacts']).read_text())
+        deps=[a for a in artifacts if a['target']['name']=='increment']
+        assert deps and all(a['fresh'] and 'instrumented' in a['features'] for a in deps)
+        assert (Path(c.cwd)/'Cargo.lock').read_bytes()==locked
+    seed=e.root/'.execution/cargo-seeds'
+    assert not list(seed.rglob('poison')) and not list(seed.rglob('runtime-db'))
+    original=cargo_build.tool_inputs
+    with monkeypatch.context() as patch:
+        patch.setattr(cargo_build,'tool_inputs',lambda a,deadline=None:original(a,deadline)+[{'version':'changed'}])
+        with pytest.raises(ValueError,match='changed'):e.action('exploration','experiments',lambda:pytest.fail('reused result'),{'version':2})
+    lock.write_bytes(locked+b'\n# unauthorized change\n')
+    with pytest.raises(ValueError,match='changed'):e.implementation.validate_builds(e.root,e.state.snapshot.id)
+    lock.write_bytes(locked)
+    manifest=e.root/'source/sample/Cargo.toml';saved=manifest.read_bytes();manifest.write_bytes(saved+b'\n# changed feature basis\n')
+    with pytest.raises(ValueError,match='changed'):e.implementation.validate_builds(e.root,e.state.snapshot.id)
+    manifest.write_bytes(saved)
+    saved_receipt=(e.root/first_check.parameters['seed_record']).read_bytes()
+    shutil.rmtree(seed);e.advance('cold');cold=run(7)
+    assert extract_events(cold)[0]['value']==8 and cold.parameters['seed_build']!=first_check.parameters['seed_build']
+    rebuilt=json.loads((e.root/'logs'/cold.parameters['seed_build']/'cargo-artifacts.json').read_text())
+    assert any(a['target']['name']=='increment' and a['fresh'] is False for a in rebuilt)
+    assert (e.root/cold.parameters['build_inputs']).read_bytes()==(e.root/first_check.parameters['build_inputs']).read_bytes()
+    assert (repo/'sample/src/lib.rs').read_bytes()==(rust_workspace/'sample/src/lib.rs').read_bytes()
+    assert (e.root/first_check.parameters['seed_record']).read_bytes()==saved_receipt
+    if not upstream_lock:
+        (tmp_path/'variant').mkdir()
+        e,repo=engine_for(tmp_path/'variant',[]);shutil.copytree(rust_workspace,repo,dirs_exist_ok=True)
+        manifest=repo/'sample/Cargo.toml';manifest.write_text(manifest.read_text().replace('["instrumented"]','["instrumented","alternate"]'))
+        e.config.target=TargetConfig(execution_package='sample');e.config.execution_backend='cargo'
+        e.config.execution_isolation='bwrap';e.implementation=CargoBackend(e.config.target);e.start(repo,plan_only=True)
+        variant=run(1)
+        assert extract_events(variant)[0]['value']==3
+        artifacts=json.loads((e.root/'logs'/variant.parameters['seed_build']/'cargo-artifacts.json').read_text())
+        assert any(a['target']['name']=='increment' and a['fresh'] is False and 'alternate' in a['features'] for a in artifacts)
+        assert json.loads((e.root/variant.parameters['build_inputs']).read_text())['snapshot_id']!=basis['snapshot_id']
 
 
 @pytest.mark.parametrize('fault',['compile','observation','observation_violation'])
@@ -1029,6 +1126,46 @@ def test_zero_review_budget_keeps_measured_violation_unconfirmed(tmp_path):
     from consensus_assurance.reporting.chinese import render_report
     text=render_report(state,e.root).read_text()
     assert '**已确认违反**' not in text and '机械比较：观察到违反' in text and '对应性意见：尚未记录' in text
+
+
+@pytest.mark.parametrize('selection',['diagnostic_control','formal_control','outside_only'])
+def test_go_control_applicability_preserves_independent_witness(tmp_path,go_module,selection):
+    import shutil
+    from consensus_assurance.adapters.runners.go_module import GoModuleBackend
+    from consensus_assurance.core.config import TargetConfig
+    from consensus_assurance.core.proposals import Comparison
+    from consensus_assurance.workflow.direct_checks import load_plan,validate_plan
+    if not shutil.which('go') or not shutil.which('bwrap'):pytest.skip('Local Go and bubblewrap required')
+    def initial(state):
+        sub,files=first(state);sub['sources'][0].update(file='value.go',end_line=4)
+        sub['bindings'][0].update(symbol='Step',start_line=2,end_line=4)
+        return sub,files
+    def check(state):
+        sub,files=check_step()(state);plan=json.loads(files['plan.json']);plan['harness']['kind']='go_test'
+        if selection!='formal_control':plan['monitors'][0]['applicability_conditions']=[{'field':'scenario','value':'principal'}]
+        principal='' if selection=='outside_only' else 'emit("admitted","principal",true); emit("returned","principal",Step(3,3)<=3);'
+        text='''package service
+import ("testing";"fmt")
+func emit(event,scenario string,ok bool) {fmt.Printf("CA_EVENT {\\"event\\":\\"%s\\",\\"scenario\\":\\"%s\\",\\"operation\\":\\"%s\\",\\"state\\":{\\"legal\\":true,\\"in_range\\":%t}}\\n",event,scenario,scenario,ok)}
+func TestAssurancePolicies(t *testing.T) { PRINCIPAL emit("returned","control",Step(2,3)<=3) }
+'''.replace('PRINCIPAL',principal)
+        sub.update(harness_path='check.go',files={})
+        return sub,{'plan.json':json.dumps(plan),'check.go':text}
+    e,repo=engine_for(tmp_path,[initial,check,review_step(),stop]);shutil.copytree(go_module,repo,dirs_exist_ok=True)
+    e.config.execution_backend='go_module';e.config.execution_isolation='bwrap';e.config.target=TargetConfig()
+    e.implementation=GoModuleBackend(e.config.target);e.agent.mock=False
+    state=e.start(repo)
+    assert not list((e.root/'submissions').glob('*/diagnostics.json')),state.stop_reason
+    result=state.monitor_results[0];prop=result['properties'][0]
+    assert result['confirmed']==(selection!='outside_only')
+    assert result['outcome']==('unknown' if selection=='outside_only' else 'violated')
+    assert result['bounded_complete']==(selection=='diagnostic_control')
+    assert bool(prop['missing_indices'])==(selection=='formal_control')
+    assert bool(prop['outside_applicability_indices'])==(selection!='formal_control')
+    if selection=='outside_only':assert not prop['evaluated_indices']
+    artifact=state.direct_checks[0];plan=load_plan(artifact.plan_path)
+    plan.monitors[0].applicability_conditions=[Comparison(field='state.in_range',value=False)]
+    with pytest.raises(ValueError,match='cannot filter on the result field'):validate_plan(state,state.units[0],plan,e.implementation)
 
 
 def test_one_investigation_fixes_packages_for_checks_exploration_and_revision(tmp_path,go_module):

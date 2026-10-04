@@ -23,6 +23,7 @@ def test_cargo_selected_target_phases_and_read_only_source(tmp_path,rust_workspa
     from consensus_assurance.adapters.storage.snapshot import capture
     if not shutil.which('cargo') or not shutil.which('bwrap'):pytest.skip('Local Rust and bubblewrap are required')
     backend=CargoBackend(TargetConfig(execution_package='sample'))
+    shutil.copytree(rust_workspace,tmp_path/'source')
     files=capture(rust_workspace).files;workspace=tmp_path/'workspace';shutil.copytree(rust_workspace,workspace)
     harness=Harness(kind='rust_test',source='#[test] fn measured() { println!("CA_EVENT {{\\"event\\":\\"returned\\",\\"value\\":{}}}",sample::step(2,3)); }',
         description='Observe an actual public library call',semantic_changes=[])
@@ -48,7 +49,7 @@ def test_cargo_selected_target_phases_and_read_only_source(tmp_path,rust_workspa
         check=run_experiment(runner,command,workspace,'rust-fixture',60,'bwrap',adapter=backend)
         assert (check.outcome,check.parameters.get('failure_class'))==(outcome,failure),Path(check.stderr).read_text()
     (workspace/filename).write_text('#[test] fn slow() { std::thread::sleep(std::time::Duration::from_secs(30)); }')
-    check=run_experiment(runner,command,workspace,'rust-fixture',.1,'bwrap',adapter=backend)
+    check=run_experiment(runner,command,workspace,'rust-fixture',1,'bwrap',adapter=backend)
     assert check.status==ExecutionStatus.TIMEOUT and check.outcome=='unknown'
     for package in ('../escape','/tmp','--workspace','sample/...'):
         with pytest.raises(ValueError):backend.resolve_harness(harness.model_copy(update={'execution_package':package}),rust_workspace,files)

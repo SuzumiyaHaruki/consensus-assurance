@@ -122,7 +122,7 @@ def test_effective_profile_exposes_results_and_retains_root_network_boundary(tmp
     monkeypatch.setenv('TMPDIR',str(tmp_path/'host-tmp'))
     options='\n'.join(CodexAgent().permission_options(tmp_path,tmp_path/'draft'))
     for path in ('agent-source','submissions','logs','direct-checks','actions','state.json','research.json',
-            'submission.schema.json','product-schemas.json','audit-method.md','target-support'):
+            'submission.schema.json','product-schemas.json','audit-method.md','target-support','build-inputs'):
         assert json.dumps(str(tmp_path/path))+'="read"' in options
     assert 'default_permissions="ca_audit"' in options and 'permissions.ca_audit.filesystem=' in options
     assert json.dumps(str(tmp_path/'source')) not in options

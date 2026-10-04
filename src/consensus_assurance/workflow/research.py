@@ -27,7 +27,9 @@ def unit_progress(state, unit, artifacts, assessments):
                 records = [r for r in assessments if r.get('experiment_check_id')==check.id and r.get('claim_id')==claim]
                 status = ('execution_incomplete' if check.status.value!='completed' or check.exit_code not in (0,None) else
                     'no_assessment' if not records else 'assessed' if all(r.get('reviewed_complete') for r in records) else 'assessment_incomplete')
-                rows.append({'claim_id':claim, 'artifact_id':artifact.id, 'check_id':check.id, 'record_status':status})
+                rows.append({'claim_id':claim, 'artifact_id':artifact.id, 'check_id':check.id, 'record_status':status,
+                    'comparison_observed':True if any(comparison_observed(r) for r in records) else
+                        False if records and all(comparison_observed(r) is False for r in records) else None})
     return rows
 
 
@@ -102,6 +104,14 @@ def frontier(state, spec, results=()):
             for a,role in ACTIVITY_ROLES.items() if role['role']=='core']}
 
 
+def comparison_observed(record):
+    """An assessment alone is not an evaluated comparison; missing legacy fields stay unknown."""
+    properties=record.get('properties')
+    if properties is None:return None
+    if any(p.get('evaluated_indices') or p.get('witness_complete') for p in properties):return True
+    return False if all('evaluated_indices' in p for p in properties) else None
+
+
 def conclusions(state, records):
     """One result per logical obligation, with artifact versions retained as evidence."""
     result=[]
@@ -116,6 +126,8 @@ def conclusions(state, records):
             'concern':claim.concern,'description':claim.description,
             'disposition':'confirmed_in_scope' if confirmed else 'bounded_no_violation' if checked and all(r.get('outcome')=='holds' for r in observed) else 'investigation_lead',
             'scope':claim.scope.model_dump(mode='json'),'check_ids':[r['experiment_check_id'] for r in observed],
+            'comparison_observed':True if any(comparison_observed(r) for r in observed) else
+                False if all(comparison_observed(r) is False for r in observed) else None,
             'blockers':list(dict.fromkeys(b for r in observed for b in r['blockers']))})
     return result
 
@@ -284,6 +296,7 @@ def current_view(state, root, implementation=None):
             artifact['previous_record'] = record(artifact['record']['collection'], {'id':artifact['previous_id']})
     result['assessments'] = [{**{k:r[k] for k in ('claim_id','direct_check_id','experiment_check_id',
         'confirmed','outcome','blockers','bounded_complete','reviewed_complete','correspondence','review_ids','open_issue_ids') if k in r},
+        'comparison_observed':comparison_observed(r),
         'record':record('monitor_results', {'experiment_check_id':r['experiment_check_id'], 'claim_id':r['claim_id']})}
         for r in result['assessments']]
     for conclusion in result['conclusions']:
@@ -312,10 +325,18 @@ def current_view(state, root, implementation=None):
     targets=[a for a in state.direct_checks if a.id in {x['id'] for x in result['artifacts']}]
     targets.extend(c for c in state.question_candidates if any(i.target_id==c.id for i in issues))
     contracts=[target_contract(state,a) for a in targets]
+    build_inputs=[]
+    for path in sorted((root/'build-inputs/targets').glob('**/basis.json')):
+        basis=read(str(path.relative_to(root)))
+        compilations=[read(str(p.relative_to(root))) for p in sorted(path.parent.glob('*-seed.json'))]
+        build_inputs.append({'record':str(path.relative_to(root)),
+            **{k:basis.get(k) for k in ('manifest','test_target','resolved_features','feature_evidence')},
+            'compilations':[{'record':c['record'],'compiled_features':c['selected_features']} for c in compilations]})
     result.update(run_id=state.id,snapshot_id=state.snapshot.id,elapsed_seconds=state.elapsed_seconds,
         source_path=str(root/'agent-source'),draft_path=str(root/'draft'),state_path=str(root/'state.json'),
         product_schemas=str(root/'product-schemas.json'),submission_schema=str(root/'submission.schema.json'),
         method_path=str(root/'audit-method.md'),
+        build_inputs=build_inputs,
         directed_question=state.config.get('directed_question'),tools=state.tools,
         implementation={'name':implementation.name,'harness_kind':implementation.harness_kind,
             'default_execution_package':getattr(implementation,'package',None),

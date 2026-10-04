@@ -110,6 +110,12 @@ class Engine:
             self.state.stop_reason = "Tool inputs changed; start a new run for revalidation"
             self.checkpoint("resume_tools_changed")
             return self.state
+        try:
+            if hasattr(self.implementation,'validate_builds'):
+                self.implementation.validate_builds(self.root,self.state.snapshot.id,self.runner.deadline)
+        except ValueError as exc:
+            self.state.invalidate(str(exc));self.state.stop_reason=str(exc)
+            self.checkpoint('resume_build_inputs_changed');return self.state
         pending = self.state.pending_action
         if pending and (self.root / "actions" / pending.id / "result.json").exists():
             pending.status = "completed"
@@ -161,6 +167,8 @@ class Engine:
 
     def action(self, kind, resource, callback, inputs=None):
         from .action_identity import stable_input
+        if kind in {'direct_execute','exploration'} and hasattr(self.implementation,'validate_builds'):
+            self.implementation.validate_builds(self.root,self.state.snapshot.id,self.runner.deadline)
         logical = stable_input(inputs or {})
         pending = self.state.pending_action
         same = pending and pending.kind == kind and pending.logical_input == logical
