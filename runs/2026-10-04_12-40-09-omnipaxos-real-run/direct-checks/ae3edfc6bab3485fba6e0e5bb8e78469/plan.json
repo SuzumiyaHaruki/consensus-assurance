@@ -1,0 +1,170 @@
+{
+  "description": "Re-execute the missing-local-range Delta history under C_snapshot_preservation, alongside a Complete control. A unique case name correlates initial prefix, selected source history, generated sync delivery and final export. Compare receiver history to the actual source history observed before reconnect, independently of receiver output.",
+  "claim_id": "C_snapshot_preservation",
+  "binding_ids": [
+    "bind_sync"
+  ],
+  "harness": {
+    "execution_package": "./omnipaxos",
+    "files": {},
+    "kind": "rust_test",
+    "source": "use omnipaxos::{OmniPaxos, OmniPaxosConfig, ClusterConfig, ServerConfig};\nuse omnipaxos::storage::{Entry, Snapshot, SnapshotType};\nuse omnipaxos::messages::{Message, sequence_paxos::PaxosMsg};\nuse omnipaxos::util::LogEntry;\nuse omnipaxos_storage::memory_storage::MemoryStorage;\nuse serde_json::json;\nuse std::collections::VecDeque;\n\n#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]\nstruct Item(u64);\nimpl Entry for Item { type Snapshot = History; }\n#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]\nstruct History(Vec<u64>);\nimpl Snapshot<Item> for History {\n    fn create(entries: &[Item]) -> Self { Self(entries.iter().map(|e| e.0).collect()) }\n    fn merge(&mut self, delta: Self) { self.0.extend(delta.0); }\n    fn use_snapshots() -> bool { true }\n}\ntype Node = OmniPaxos<Item, MemoryStorage<Item>>;\nfn emit(mut v: serde_json::Value) {\n    // Encode ordered vectors as JSON strings for the scalar event comparison interface.\n    for key in [\"values\", \"source_values\", \"receiver_values\", \"snapshot\"] {\n        if let Some(value) = v.get(key).cloned() {\n            v[key] = serde_json::Value::String(serde_json::to_string(&value).unwrap());\n        }\n    }\n    println!(\"CA_EVENT {}\", v);\n}\nfn drain(nodes: &mut [Node], isolated: bool, case: &str) {\n    let mut queue = VecDeque::new();\n    for node in nodes.iter_mut() { let mut out=vec![]; node.take_outgoing_messages(&mut out); queue.extend(out); }\n    let mut deliveries=0;\n    while let Some(msg)=queue.pop_front() {\n        let from=msg.get_sender(); let to=msg.get_receiver();\n        if isolated && (from==3 || to==3) {\n            emit(json!({\"event\":\"partition_drop\",\"case\":case,\"from\":from,\"to\":to,\"message\":format!(\"{:?}\",msg)}));\n            continue;\n        }\n        if let Message::SequencePaxos(p)=&msg {\n            match &p.msg {\n                PaxosMsg::Promise(p) => emit(json!({\"event\":\"promise\",\"case\":case,\"from\":from,\"to\":to,\"decided\":p.decided_idx,\"accepted\":p.accepted_idx})),\n                PaxosMsg::AcceptSync(a) => {\n                    let (kind,values)=match &a.log_sync.decided_snapshot {\n                        Some(SnapshotType::Delta(s)) => (\"delta\",s.0.clone()),\n                        Some(SnapshotType::Complete(s)) => (\"complete\",s.0.clone()),\n                        None => (\"none\",vec![]),\n                    };\n                    emit(json!({\"event\":\"sync_delivery\",\"case\":case,\"from\":from,\"to\":to,\"kind\":kind,\"snapshot\":values,\"sync_idx\":a.log_sync.sync_idx,\"incoming_decided\":a.decided_idx,\"receiver_decided\":nodes[(to-1) as usize].get_decided_idx(),\"receiver_accepted\":nodes[(to-1) as usize].get_accepted_idx()}));\n                }\n                _ => (),\n            }\n        }\n        nodes[(to-1) as usize].handle_incoming(msg);\n        let mut out=vec![]; nodes[(to-1) as usize].take_outgoing_messages(&mut out); queue.extend(out);\n        deliveries+=1; assert!(deliveries<1000,\"drain did not terminate\");\n    }\n    emit(json!({\"event\":\"queue_drained\",\"case\":case,\"deliveries\":deliveries,\"isolated\":isolated}));\n}\nfn contents(node: &Node)->Vec<u64> {\n    let mut values=vec![];\n    for entry in node.read_decided_suffix(0).unwrap_or_default() {\n        match entry { LogEntry::Decided(e)=>values.push(e.0),LogEntry::Snapshotted(s)=>values.extend(s.snapshot.0),x=>panic!(\"unexpected decided export: {:?}\",x) }\n    }\n    values\n}\n#[test]\nfn explore_delta_base() {\n    for prefix in [0usize,1] {\n        let case=if prefix==0 {\"complete_control\"} else {\"delta_missing_range\"};\n        let mut nodes:Vec<Node>=(1..=3).map(|pid| OmniPaxosConfig {\n            cluster_config:ClusterConfig{configuration_id:1,nodes:vec![1,2,3],..Default::default()},\n            server_config:ServerConfig{pid,..Default::default()},\n        }.build(MemoryStorage::default()).unwrap()).collect();\n        nodes[0].try_become_leader(); drain(&mut nodes,false,case);\n        if prefix==1 { nodes[0].append(Item(11)).unwrap(); drain(&mut nodes,false,case); }\n        for n in &nodes { assert_eq!(n.get_decided_idx(),prefix); assert_eq!(n.get_accepted_idx(),prefix); }\n        emit(json!({\"event\":\"initial_prefix\",\"case\":case,\"decided\":prefix,\"values\":contents(&nodes[2])}));\n        // Disconnect node 3, deliver the new proposal only through the remaining quorum.\n        nodes[0].append(Item(22)).unwrap(); drain(&mut nodes,true,case);\n        assert_eq!(nodes[0].get_decided_idx(),prefix+1);\n        assert_eq!(nodes[1].get_decided_idx(),prefix+1);\n        assert_eq!(nodes[2].get_decided_idx(),prefix);\n        emit(json!({\"event\":\"before_reconnect\",\"case\":case,\"source_values\":contents(&nodes[0]),\"receiver_values\":contents(&nodes[2]),\"source_decided\":nodes[0].get_decided_idx(),\"receiver_decided\":nodes[2].get_decided_idx()}));\n        // The transport reports that the previously disconnected link is now restored.\n        nodes[2].reconnected(1); drain(&mut nodes,false,case);\n        emit(json!({\"event\":\"result\",\"case\":case,\"source_values\":contents(&nodes[0]),\"receiver_values\":contents(&nodes[2]),\"source_decided\":nodes[0].get_decided_idx(),\"receiver_decided\":nodes[2].get_decided_idx(),\"receiver_accepted\":nodes[2].get_accepted_idx(),\"receiver_compacted\":nodes[2].get_compacted_idx()}));\n    }\n}\n",
+    "description": "Public API integration test; no private state injection. Records preconditions and actual message contents; drains controlled network work and exports decisions through read_decided_suffix.",
+    "semantic_changes": [
+      "Test-defined Entry and concatenating Snapshot; JSON event instrumentation and explicit network partition scheduling only.",
+      "Ordered vector observations are encoded as JSON strings for scalar comparison."
+    ],
+    "prerequisites": [
+      {
+        "alias": "prefix",
+        "event": "initial_prefix",
+        "conditions": []
+      },
+      {
+        "alias": "before",
+        "event": "before_reconnect",
+        "conditions": [
+          {
+            "field": "receiver_decided",
+            "op": "eq",
+            "value": null,
+            "reference": "prefix.decided"
+          },
+          {
+            "field": "receiver_values",
+            "op": "eq",
+            "value": null,
+            "reference": "prefix.values"
+          }
+        ]
+      },
+      {
+        "alias": "sync",
+        "event": "sync_delivery",
+        "conditions": [
+          {
+            "field": "to",
+            "op": "eq",
+            "value": 3,
+            "reference": null
+          },
+          {
+            "field": "from",
+            "op": "eq",
+            "value": 1,
+            "reference": null
+          },
+          {
+            "field": "receiver_decided",
+            "op": "eq",
+            "value": null,
+            "reference": "before.receiver_decided"
+          },
+          {
+            "field": "incoming_decided",
+            "op": "eq",
+            "value": null,
+            "reference": "before.source_decided"
+          },
+          {
+            "field": "sync_idx",
+            "op": "eq",
+            "value": null,
+            "reference": "before.source_decided"
+          }
+        ]
+      }
+    ],
+    "legality": {
+      "source_ids": [
+        "src_sync",
+        "src_read",
+        "src_memory",
+        "src_entry",
+        "src_dispatch",
+        "src_follower",
+        "src_leader"
+      ],
+      "expectation_ids": [
+        "src_snapshot_doc",
+        "src_storage_contract",
+        "src_test_snapshot"
+      ],
+      "binding_ids": [
+        "bind_sync"
+      ],
+      "derivation": "Build three validated public OmniPaxos instances with fresh MemoryStorage; manually attempt leader 1, drain all generated messages; optionally decide value 11 on every replica. Temporarily disconnect node 3 and discard its link traffic while quorum 1/2 decides 22. After healing call reconnected(1) at node 3, a documented caller notification of a re-established connection, then deliver all generated messages. No target code or message fields are changed. All work runs synchronously and the test drops its in-memory nodes after exporting results. No timer deadline is claimed; finite operations finish between periodic ticks.",
+      "applicability": "Three noncrashed nodes in configuration 1 with default batch size, successful MemoryStorage operations, and a temporary node-3 link partition followed by reconnected(1).",
+      "unresolved": [],
+      "conflicts": [],
+      "alternatives": [
+        "Complete-snapshot control has initial prefix length zero."
+      ]
+    }
+  },
+  "monitors": [
+    {
+      "id": "M_snapshot",
+      "checker_id": "snapshot_prefix",
+      "event": "result",
+      "binding_ids": [
+        "bind_sync"
+      ],
+      "grounding": {
+        "source_ids": [
+          "src_sync",
+          "src_read",
+          "src_memory",
+          "src_entry",
+          "src_dispatch",
+          "src_follower",
+          "src_leader"
+        ],
+        "expectation_ids": [
+          "src_snapshot_doc",
+          "src_storage_contract",
+          "src_test_snapshot"
+        ],
+        "binding_ids": [
+          "bind_sync"
+        ],
+        "derivation": "Apply C_snapshot_preservation to the observed source decided prefix and receiver export after delivery of a real synchronization. Concatenating History matches the repository ValueSnapshot semantics. Exact vector encoding preserves ordering and multiplicity.",
+        "applicability": "Three noncrashed nodes in configuration 1 with default batch size, successful MemoryStorage operations, and a temporary node-3 link partition followed by reconnected(1).",
+        "unresolved": [],
+        "conflicts": [],
+        "alternatives": [
+          "Complete-snapshot control has initial prefix length zero."
+        ]
+      },
+      "applicability_conditions": [],
+      "admission_alias": "sync"
+    }
+  ],
+  "observable_properties": [
+    {
+      "checker_id": "snapshot_prefix",
+      "kind": "event_assertion",
+      "trigger": {
+        "field": "event",
+        "op": "eq",
+        "value": "result",
+        "reference": null
+      },
+      "assertion": {
+        "field": "receiver_values",
+        "op": "eq",
+        "value": null,
+        "reference": "before.source_values"
+      },
+      "antecedent": null,
+      "identity_fields": [
+        "case"
+      ],
+      "description": "After admitted synchronization completes, the receiver decided-prefix representation equals the previously observed selected source decided prefix."
+    }
+  ],
+  "uncertainties": [
+    "Only the captured same-ballot reconnect schedule and MemoryStorage are measured.",
+    "Other snapshot implementations, persistent recovery and later application processing are not checked."
+  ]
+}

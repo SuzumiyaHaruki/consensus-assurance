@@ -2,15 +2,7 @@ import json
 import re
 from pathlib import Path
 from consensus_assurance.core.types import ExecutionStatus
-
-
-def local_package(value):
-    """A single module-local directory, never a Go import path or pattern."""
-    name = value.removeprefix("./")
-    if name != "." and (not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]*(/[A-Za-z0-9_][A-Za-z0-9_.-]*)*", name)
-            or any(part in {".", ".."} or "..." in part for part in name.split("/"))):
-        raise ValueError("execution_package must name one local package directory, not flags, imports or patterns")
-    return "." if name == "." else "./" + name
+from consensus_assurance.adapters.runners.experiment import local_package
 
 
 def go_test_diagnostics(text):

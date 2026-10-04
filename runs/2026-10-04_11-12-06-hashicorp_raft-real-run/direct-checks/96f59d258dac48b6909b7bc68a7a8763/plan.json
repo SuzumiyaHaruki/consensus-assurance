@@ -1,0 +1,198 @@
+{
+  "description": "Check the accepted participant-eligibility obligation with three voters and one nonvoter. Bootstrap one voter, run actual follower timeout and candidate election against actual peer RPC handlers, then initialize leader replication and commit a no-op through real stored-log acknowledgments. Hold all subsequent responses. Register a verification and release exactly one nonvoter heartbeat acknowledgment. Read the live tally only after the next heartbeat call proves completion of the preceding native notifyAll. Repeat with one voter as a diagnostic control. The assertion compares the nonvoter post-count to the same request pre-count.",
+  "claim_id": "claim-verify-voter-eligibility",
+  "binding_ids": [
+    "bind-verify-registration",
+    "bind-verify-notification",
+    "bind-verify-tally"
+  ],
+  "harness": {
+    "execution_package": ".",
+    "files": {},
+    "kind": "go_test",
+    "source": "package raft\n\nimport (\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"sync\"\n\t\"testing\"\n\t\"time\"\n)\n\ntype assurancePending struct {\n\tid   ServerID\n\taddr ServerAddress\n\treq  *AppendEntriesRequest\n\tresp *AppendEntriesResponse\n\tdone chan error\n}\n\nfunc (p *assurancePending) heartbeat() bool {\n\treturn p.req.PrevLogEntry == 0 && len(p.req.Entries) == 0 && p.req.LeaderCommitIndex == 0\n}\n\ntype assuranceTransport struct {\n\t*InmemTransport\n\tpending chan *assurancePending\n\tcancel  <-chan struct{}\n}\n\nfunc (a *assuranceTransport) AppendEntries(id ServerID, addr ServerAddress, req *AppendEntriesRequest, resp *AppendEntriesResponse) error {\n\tp := &assurancePending{id: id, addr: addr, req: req, resp: resp, done: make(chan error, 1)}\n\tselect {\n\tcase a.pending <- p:\n\tcase <-a.cancel:\n\t\treturn fmt.Errorf(\"driver closed\")\n\t}\n\tselect {\n\tcase err := <-p.done:\n\t\treturn err\n\tcase <-a.cancel:\n\t\treturn fmt.Errorf(\"driver closed\")\n\t}\n}\nfunc (a *assuranceTransport) AppendEntriesPipeline(ServerID, ServerAddress) (AppendPipeline, error) {\n\treturn nil, ErrPipelineReplicationNotSupported\n}\nfunc assuranceEmit(t *testing.T, event string, fields map[string]interface{}) {\n\tfields[\"event\"] = event\n\tdata, err := json.Marshal(fields)\n\tif err != nil {\n\t\tt.Fatal(err)\n\t}\n\tfmt.Println(\"CA_EVENT \" + string(data))\n}\n\nfunc TestAssuranceVerifyNonvoterEligibility(t *testing.T) {\n\t// Only scheduling is substituted: real elections, storage, replication,\n\t// heartbeat response production and verification accounting run unchanged.\n\tcancel := make(chan struct{})\n\tvar nodes []*Raft\n\tvar transports []*InmemTransport\n\tvar pump sync.WaitGroup\n\tvar leader *Raft\n\tdefer func() {\n\t\tclose(cancel)\n\t\tif leader != nil {\n\t\t\tfor _, s := range leader.leaderState.replState {\n\t\t\t\tclose(s.stopCh)\n\t\t\t}\n\t\t}\n\t\tvar stops []Future\n\t\tfor _, r := range nodes {\n\t\t\tstops = append(stops, r.Shutdown())\n\t\t}\n\t\tfor _, stop := range stops {\n\t\t\tif err := stop.Error(); err != nil {\n\t\t\t\tt.Log(err)\n\t\t\t}\n\t\t}\n\t\tpump.Wait()\n\t\tfor _, tr := range transports {\n\t\t\ttr.Close()\n\t\t}\n\t}()\n\tconfiguration := Configuration{Servers: []Server{\n\t\t{Suffrage: Voter, ID: \"a\", Address: \"a\"}, {Suffrage: Voter, ID: \"b\", Address: \"b\"},\n\t\t{Suffrage: Voter, ID: \"c\", Address: \"c\"}, {Suffrage: Nonvoter, ID: \"n\", Address: \"n\"},\n\t}}\n\tvar controlled *assuranceTransport\n\tfor i, server := range configuration.Servers {\n\t\t_, base := NewInmemTransportWithTimeout(server.Address, time.Second)\n\t\ttransports = append(transports, base)\n\t\tvar tr Transport = base\n\t\tif i == 0 {\n\t\t\tcontrolled = &assuranceTransport{InmemTransport: base, pending: make(chan *assurancePending, 64), cancel: cancel}\n\t\t\ttr = controlled\n\t\t}\n\t\tconf := DefaultConfig()\n\t\tconf.LocalID = server.ID\n\t\tconf.skipStartup = true\n\t\tconf.PreVoteDisabled = true\n\t\tconf.HeartbeatTimeout = 20 * time.Millisecond\n\t\tconf.ElectionTimeout = 20 * time.Millisecond\n\t\tconf.LeaderLeaseTimeout = 20 * time.Millisecond\n\t\tconf.CommitTimeout = 5 * time.Millisecond\n\t\tstore := NewInmemStore()\n\t\tsnaps := NewInmemSnapshotStore()\n\t\tif i == 0 {\n\t\t\tif err := BootstrapCluster(conf, store, store, snaps, tr, configuration); err != nil {\n\t\t\t\tt.Fatal(err)\n\t\t\t}\n\t\t}\n\t\tr, err := NewRaft(conf, &MockFSM{}, store, store, snaps, tr)\n\t\tif err != nil {\n\t\t\tt.Fatal(err)\n\t\t}\n\t\tnodes = append(nodes, r)\n\t}\n\tfor _, a := range transports {\n\t\tfor _, b := range transports {\n\t\t\tif a != b {\n\t\t\t\ta.Connect(b.LocalAddr(), b)\n\t\t\t}\n\t\t}\n\t}\n\t// Followers process the actual network RPCs, but their autonomous election\n\t// timers are not scheduled during this finite local-accounting experiment.\n\tfor _, r := range nodes[1:] {\n\t\tpump.Add(1)\n\t\tgo func(r *Raft) {\n\t\t\tdefer pump.Done()\n\t\t\tfor {\n\t\t\t\tselect {\n\t\t\t\tcase rpc := <-r.rpcCh:\n\t\t\t\t\tr.processRPC(rpc)\n\t\t\t\tcase <-cancel:\n\t\t\t\t\treturn\n\t\t\t\t}\n\t\t\t}\n\t\t}(r)\n\t}\n\tleader = nodes[0]\n\tleader.runFollower()\n\tif leader.getState() != Candidate {\n\t\tt.Fatal(\"candidate transition not reached\")\n\t}\n\tleader.runCandidate()\n\tif leader.getState() != Leader {\n\t\tt.Fatal(\"real campaign did not elect leader\")\n\t}\n\tleader.setupLeaderState()\n\tleader.startStopReplication()\n\tnoop := &logFuture{log: Log{Type: LogNoop}}\n\tnoop.init()\n\tleader.dispatchLogs([]*logFuture{noop})\n\tvar held []*assurancePending\n\tawait := func(id ServerID, hb bool) *assurancePending {\n\t\tt.Helper()\n\t\ttimer := time.NewTimer(3 * time.Second)\n\t\tdefer timer.Stop()\n\t\tfor {\n\t\t\tfor i, p := range held {\n\t\t\t\tif p.id == id && p.heartbeat() == hb {\n\t\t\t\t\theld = append(held[:i], held[i+1:]...)\n\t\t\t\t\treturn p\n\t\t\t\t}\n\t\t\t}\n\t\t\tselect {\n\t\t\tcase p := <-controlled.pending:\n\t\t\t\theld = append(held, p)\n\t\t\tcase <-timer.C:\n\t\t\t\tt.Fatalf(\"missing scheduled request peer=%s heartbeat=%v\", id, hb)\n\t\t\t\treturn nil\n\t\t\t}\n\t\t}\n\t}\n\trelease := func(p *assurancePending) bool {\n\t\tt.Helper()\n\t\terr := controlled.InmemTransport.AppendEntries(p.id, p.addr, p.req, p.resp)\n\t\tsuccess := err == nil && p.resp.Success\n\t\tp.done <- err\n\t\tif err != nil {\n\t\t\tt.Fatalf(\"actual RPC failed: %v\", err)\n\t\t}\n\t\treturn success\n\t}\n\t// Synchronize every peer through configuration and the elected-term no-op.\n\t// Waiting for the next request on the same serial replication path ensures\n\t// its previous updateLastAppended/notifyAll has finished before admission.\n\tfor _, id := range []ServerID{\"b\", \"c\", \"n\"} {\n\t\tfor {\n\t\t\tp := await(id, false)\n\t\t\tif release(p) {\n\t\t\t\tbreak\n\t\t\t}\n\t\t}\n\t\tp := await(id, false)\n\t\theld = append(held, p)\n\t}\n\tci := leader.leaderState.commitment.getCommitIndex()\n\tif ci != noop.log.Index {\n\t\tt.Fatalf(\"no-op commitment missing: %d\", ci)\n\t}\n\t// These calls are the corresponding leaderLoop commit-notification branch;\n\t// do not run unrelated main-loop timer cases in this controlled schedule.\n\tleader.setCommitIndex(ci)\n\tleader.setCommittedConfiguration(leader.configurations.latest, leader.configurations.latestIndex)\n\tleader.processLogs(ci, map[uint64]*logFuture{noop.log.Index: noop})\n\tfor _, id := range []ServerID{\"b\", \"c\", \"n\"} {\n\t\tfor {\n\t\t\tp := await(id, false)\n\t\t\tadvertised := p.req.LeaderCommitIndex\n\t\t\trelease(p)\n\t\t\tif advertised == ci {\n\t\t\t\tbreak\n\t\t\t}\n\t\t}\n\t\tp := await(id, false)\n\t\theld = append(held, p)\n\t}\n\tif leader.configurations.latestIndex != leader.configurations.committedIndex {\n\t\tt.Fatal(\"configuration not stable\")\n\t}\n\tfor _, r := range nodes[1:] {\n\t\tif r.configurations.latestIndex != r.configurations.committedIndex {\n\t\t\tt.Fatal(\"peer configuration not stable\")\n\t\t}\n\t}\n\t// No response remains in post-return notification work: normal replication\n\t// requests are all parked at their next send; heartbeats have never replied.\n\tfor _, responder := range []ServerID{\"n\", \"b\"} {\n\t\tcaseID := \"verify-\" + string(responder)\n\t\tv := &verifyFuture{}\n\t\tv.init()\n\t\tleader.verifyLeader(v)\n\t\tv.voteLock.Lock()\n\t\tbefore, quorum := v.votes, v.quorumSize\n\t\tv.voteLock.Unlock()\n\t\ts := leader.leaderState.replState[responder]\n\t\tpeer := s.peer\n\t\ts.notifyLock.Lock()\n\t\t_, registered := s.notify[v]\n\t\ts.notifyLock.Unlock()\n\t\tassuranceEmit(t, \"verify_admitted\", map[string]interface{}{\"case_id\": caseID, \"peer_id\": string(peer.ID), \"suffrage\": peer.Suffrage.String(), \"before\": before, \"quorum\": quorum, \"registered\": registered, \"leader\": leader.getState() == Leader, \"stable\": leader.configurations.latestIndex == leader.configurations.committedIndex, \"term\": leader.getCurrentTerm()})\n\t\tp := await(responder, true)\n\t\tsuccess := release(p)\n\t\tassuranceEmit(t, \"verify_acknowledged\", map[string]interface{}{\"case_id\": caseID, \"peer_id\": string(peer.ID), \"response_success\": success})\n\t\t// The next heartbeat invocation occurs after native heartbeat() has called\n\t\t// notifyAll for the released response. It is held without a second reply.\n\t\tnext := await(responder, true)\n\t\theld = append(held, next)\n\t\tv.voteLock.Lock()\n\t\tafter := v.votes\n\t\tv.voteLock.Unlock()\n\t\tsignaled := false\n\t\tcorrectIdentity := true\n\t\tselect {\n\t\tcase got := <-leader.verifyCh:\n\t\t\tsignaled = true\n\t\t\tcorrectIdentity = got == v\n\t\tdefault:\n\t\t}\n\t\tassuranceEmit(t, \"verify_observed\", map[string]interface{}{\"case_id\": caseID, \"peer_id\": string(peer.ID), \"suffrage\": peer.Suffrage.String(), \"after\": after, \"delta\": after - before, \"response_success\": success, \"callback_finished\": true, \"completion_signaled\": signaled, \"completion_identity\": correctIdentity, \"term\": leader.getCurrentTerm()})\n\t\t// Clean the completed test invocation using the production cleanup methods;\n\t\t// no success/failure response or external read is synthesized.\n\t\tdelete(leader.leaderState.notify, v)\n\t\tfor _, rep := range leader.leaderState.replState {\n\t\t\trep.cleanNotify(v)\n\t\t}\n\t}\n}\n",
+    "description": "Controlled scheduling around actual election, AppendEntries, replication acknowledgment, verifyLeader and heartbeat notification methods; in-memory stores and transport. Test terminates after the selected callback and one independent voter control, regardless of whether count changed.",
+    "semantic_changes": [
+      "NewRaft skipStartup prevents autonomous main/FSM/snapshot loops. Driver calls actual runFollower and runCandidate for the selected leader; follower RPC pumps dispatch actual processRPC calls without running their election timers.",
+      "Driver invokes setupLeaderState/startStopReplication/dispatchLogs and the sourced leaderLoop commit effects (setCommitIndex, setCommittedConfiguration, processLogs) after observing actual majority commitment. It directly invokes verifyLeader as the source main-loop branch does.",
+      "A Transport wrapper delays AppendEntries at the send/return boundary. Responses are generated by actual follower handlers through InmemTransport; no reply value is invented. Pipeline support is declined using the supported ErrPipelineReplicationNotSupported path.",
+      "Main-loop lease/timer scheduling and FSM consumption are not exercised during the measured step. No external VerifyLeader future success, stale read, competing leader, or full public-API history is inferred.",
+      "Private fields are read under their existing locks where concurrent mutation exists. The driver closes replication stop channels, releases blocked transport calls with cancellation, and waits on Shutdown futures."
+    ],
+    "prerequisites": [
+      {
+        "alias": "admitted",
+        "event": "verify_admitted",
+        "conditions": [
+          {
+            "field": "leader",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          },
+          {
+            "field": "stable",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          },
+          {
+            "field": "before",
+            "op": "eq",
+            "value": 1,
+            "reference": null
+          },
+          {
+            "field": "quorum",
+            "op": "eq",
+            "value": 2,
+            "reference": null
+          }
+        ]
+      },
+      {
+        "alias": "ack",
+        "event": "verify_acknowledged",
+        "conditions": [
+          {
+            "field": "case_id",
+            "op": "eq",
+            "value": null,
+            "reference": "admitted.case_id"
+          },
+          {
+            "field": "response_success",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          }
+        ]
+      }
+    ],
+    "legality": {
+      "source_ids": [
+        "src-startup",
+        "src-bootstrap-entry",
+        "src-election-producer",
+        "src-campaign",
+        "src-follower-loop",
+        "src-leader-lifetime",
+        "src-replication-lifetime",
+        "src-replication-loop",
+        "src-replication-heartbeat",
+        "src-leader-commit",
+        "src-verify-start",
+        "src-verify-notify",
+        "src-verify-vote",
+        "src-append-consumer",
+        "src-inmem-transport",
+        "src-shutdown"
+      ],
+      "expectation_ids": [
+        "src-verify-doc",
+        "src-verify-contract",
+        "src-config-types"
+      ],
+      "binding_ids": [
+        "bind-verify-registration",
+        "bind-verify-notification",
+        "bind-verify-tally"
+      ],
+      "derivation": "BootstrapCluster runs once on clean selected-voter storage with one mixed configuration. Actual election responses establish the selected leader; actual replication and commitment establish the no-op and configuration prefix. Subsequent normal replication requests are held at their next invocation, proving previous callbacks have finished, and no heartbeat reply is released before verification registration. Only the selected peer response is then released; its identity is the independently configured peer ID, not inferred from response success. A next heartbeat from that same serial heartbeat routine occurs after its prior notifyAll completed. Manual main-loop scheduling preserves the local claim conditions and explicitly omits lease timing and endpoint inference. The voter control does not add a sufficient-success obligation.",
+      "applicability": "Stable three-voter/one-nonvoter configuration; finite local accounting step without concurrent configuration or term change.",
+      "unresolved": [],
+      "conflicts": [],
+      "alternatives": []
+    }
+  },
+  "monitors": [
+    {
+      "id": "monitor-nonvoter-support",
+      "checker_id": "nonvoter-count-unchanged",
+      "event": "verify_observed",
+      "binding_ids": [
+        "bind-verify-registration",
+        "bind-verify-notification",
+        "bind-verify-tally"
+      ],
+      "grounding": {
+        "source_ids": [
+          "src-startup",
+          "src-bootstrap-entry",
+          "src-election-producer",
+          "src-campaign",
+          "src-follower-loop",
+          "src-leader-lifetime",
+          "src-replication-lifetime",
+          "src-replication-loop",
+          "src-replication-heartbeat",
+          "src-leader-commit",
+          "src-verify-start",
+          "src-verify-notify",
+          "src-verify-vote",
+          "src-append-consumer",
+          "src-inmem-transport",
+          "src-shutdown"
+        ],
+        "expectation_ids": [
+          "src-verify-doc",
+          "src-verify-contract",
+          "src-config-types"
+        ],
+        "binding_ids": [
+          "bind-verify-registration",
+          "bind-verify-notification",
+          "bind-verify-tally"
+        ],
+        "derivation": "The result reads the live verifyFuture count after actual heartbeat response notification has finished. The oracle is the accepted exclusion of nonvoters from the voter quorum; comparison against admitted.before checks no increment. registered and completion_signaled are diagnostics, not prerequisites or filters. The observed voter control is outside this property.",
+        "applicability": "Correlated case_id and peer_id join the admitted operation, actual acknowledgment and resulting count; suffrage is read from the configured replication peer.",
+        "unresolved": [],
+        "conflicts": [],
+        "alternatives": []
+      },
+      "applicability_conditions": [
+        {
+          "field": "suffrage",
+          "op": "eq",
+          "value": "Nonvoter",
+          "reference": null
+        },
+        {
+          "field": "callback_finished",
+          "op": "eq",
+          "value": true,
+          "reference": null
+        }
+      ],
+      "admission_alias": "admitted"
+    }
+  ],
+  "observable_properties": [
+    {
+      "checker_id": "nonvoter-count-unchanged",
+      "kind": "event_assertion",
+      "trigger": {
+        "field": "event",
+        "op": "eq",
+        "value": "verify_observed",
+        "reference": null
+      },
+      "assertion": {
+        "field": "after",
+        "op": "eq",
+        "value": null,
+        "reference": "admitted.before"
+      },
+      "antecedent": null,
+      "identity_fields": [
+        "case_id",
+        "peer_id"
+      ],
+      "description": "An actual nonvoter acknowledgment does not increase the verification support tally over the same request initial count."
+    }
+  ],
+  "uncertainties": [
+    "This check isolates a local eligibility duty. It does not execute the public VerifyLeader return branch, main-loop lease checks, a competing leader election, FSM read, or asynchronous timer consequence.",
+    "The heartbeat request may have been sent before registration; response delivery and notification occur after registration, as permitted by the actual notify-map mechanism. The obligation does not assert new-request freshness."
+  ]
+}

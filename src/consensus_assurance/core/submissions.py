@@ -155,7 +155,7 @@ class ExploreSubmission(Submission):
     action: Literal["explore"]
     question: str = Field(min_length=1)
     harness_path: str
-    execution_package: str | None = Field(default=None, description="Optional single Go package directory, with the same meaning as Harness.execution_package")
+    execution_package: str | None = Field(default=None, description="Optional single local Go package or Rust crate directory, with the same meaning as Harness.execution_package")
     files: dict[str, str] = {}
 
 

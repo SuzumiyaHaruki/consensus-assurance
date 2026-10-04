@@ -1,0 +1,249 @@
+{
+  "action": "obligation",
+  "candidate_id": "df58639a581544c288c0192bc5c095e4",
+  "rationale": "Fix the sourced per-operation correlation responsibility before executing a history. The oracle will use independent requester identity and original SystemCtx; it will not infer a global liveness obligation.",
+  "question": {
+    "audit_spec_version": 1,
+    "disposition": "ready_for_check",
+    "preferred_check": "controlled_schedule",
+    "question": "When a later heartbeat confirms a prefix containing multiple forwarded ReadIndex requests, does the leader preserve each released request context in its response to that requester?",
+    "importance": "A mismatched response context may strand an otherwise confirmed read batch until timeout. No stale-read safety violation or global progress failure is asserted.",
+    "source_ids": [
+      "S-read-response",
+      "S-read-aggregation",
+      "S-read-batch",
+      "S-read-consumer",
+      "S-read-contract",
+      "S-forward-read",
+      "S-read-entry",
+      "S-heartbeat-producer",
+      "S-read-response-test",
+      "S-core-commit",
+      "S-read-timeout",
+      "S-node-events",
+      "S-node-consume",
+      "S-term-election",
+      "S-peer-admission",
+      "S-vote-response",
+      "S-ticks",
+      "S-replication",
+      "S-log-guards",
+      "S-read-identity-contract",
+      "S-message-dispatch",
+      "S-update-contract"
+    ],
+    "participants": [
+      "Leader",
+      "Forwarding follower or observer",
+      "Voting heartbeat responder"
+    ],
+    "objects": [
+      "Pending readStatus prefix",
+      "ReadIndexResp",
+      "ReadyToRead"
+    ],
+    "contexts": [
+      "Stable term and voting membership after a current-term entry is committed",
+      "Distinct nonzero contexts admitted before confirmation"
+    ],
+    "event_paths": [
+      "Node read batches -> Peer.ReadIndex -> follower forwarding -> leader pending queue -> later contextual heartbeat confirmation -> prefix response emission -> follower ReadyToRead"
+    ],
+    "activity_classes": [
+      "A1"
+    ],
+    "behavior_ids": [
+      "B-read-confirm",
+      "B-read-receive"
+    ],
+    "fact_ids": [
+      "F-read-release"
+    ],
+    "supporting_behavior_ids": {
+      "B-read-client": "Establishes independently pending context batches and exact-context completion consumer.",
+      "B-authority": "Explains term qualification and reset of pending support.",
+      "B-replicate": "Establishes current-term committed entry prerequisite."
+    },
+    "obligation_relation_kind": "consumption",
+    "counterevidence": [
+      "Single outstanding forwarded request has the same stored and triggering context.",
+      "Local prefix completion uses each stored context.",
+      "Earlier heartbeat response can complete the earlier request first; schedule must preserve the overlapping prefix.",
+      "Timeout notification is supported, so non-completion alone supplies no general deadline violation."
+    ],
+    "unknowns": [],
+    "priority": 2,
+    "trigger_rationale": "confirm returns records with distinct stored contexts and destinations, but the remote branch encodes the same triggering heartbeat context for every record; the local branch uses each record context. Normal node steps admit fresh batches without awaiting prior completion. Source review of the producer rules out arbitrary observer acknowledgements; a bounded overlapping history can now discriminate encoding behavior more directly than a whole-cluster timing test. Node.handleReceivedMessages passes ordinary messages directly to Peer.Handle, and the SystemCtx interface explicitly identifies a ReadIndex operation. The proposed oracle compares response identity against the released request, not against a deadline or assumed eventual success."
+  },
+  "sources": [
+    {
+      "id": "S-read-identity-contract",
+      "file": "raftpb/raft.go",
+      "start_line": 42,
+      "end_line": 54,
+      "kind": "interface_statement"
+    },
+    {
+      "id": "S-update-contract",
+      "file": "raftpb/raft.go",
+      "start_line": 69,
+      "end_line": 101,
+      "kind": "interface_statement"
+    },
+    {
+      "id": "S-message-dispatch",
+      "file": "node.go",
+      "start_line": 1274,
+      "end_line": 1317,
+      "kind": "code_observation"
+    },
+    {
+      "id": "S-peer-bootstrap",
+      "file": "internal/raft/peer.go",
+      "start_line": 360,
+      "end_line": 426,
+      "kind": "code_observation"
+    },
+    {
+      "id": "S-peer-cycle",
+      "file": "internal/raft/peer.go",
+      "start_line": 284,
+      "end_line": 317,
+      "kind": "code_observation"
+    },
+    {
+      "id": "S-test-storage",
+      "file": "internal/raft/logdb_test.go",
+      "start_line": 23,
+      "end_line": 60,
+      "kind": "code_observation"
+    }
+  ],
+  "obligation": {
+    "id": "C-read-context",
+    "kind": "obligation",
+    "concern": "implementation_semantics",
+    "description": "When the leader releases an admitted forwarded ReadIndex request after quorum confirmation, the ReadIndexResp sent to its requester must carry that released request's SystemCtx unchanged, so the requester can associate ReadyToRead with the same operation. Coalesced confirmation may raise the read index but must not replace an earlier request's context with another request's context.",
+    "source_ids": [
+      "S-read-identity-contract",
+      "S-read-contract",
+      "S-read-aggregation",
+      "S-read-response",
+      "S-forward-read",
+      "S-read-consumer"
+    ],
+    "scope": {
+      "description": "Per-operation response correlation for released forwarded requests within a stable leader term and membership after a current-term entry is committed.",
+      "assumptions": [
+        "Distinct nonzero SystemCtx values identify independently admitted requests.",
+        "Requests and quorum acknowledgements originate from the actual Peer handlers in one controlled history.",
+        "Non-Byzantine members; a delayed earlier response may overlap later traffic; no crash or membership change during the selected history."
+      ],
+      "excluded": [
+        "No requirement that unconfirmed or dropped requests succeed.",
+        "No deadline or infinite-stall claim; no end-to-end NodeHost completion or stale-read consequence.",
+        "No backend crash atomicity or snapshot-recovery property."
+      ]
+    },
+    "pending": [],
+    "grounding": {
+      "source_ids": [
+        "S-read-aggregation",
+        "S-read-response",
+        "S-forward-read",
+        "S-read-consumer"
+      ],
+      "expectation_ids": [
+        "S-read-identity-contract",
+        "S-read-contract"
+      ],
+      "binding_ids": [
+        "BD-read-emit",
+        "BD-read-receive"
+      ],
+      "derivation": "SystemCtx is explicitly the identity of a ReadIndex operation, and ReadyToRead identifies a prior batch. The async ReadIndex API returns a per-operation RequestState. Leader confirm retains each pending record and releases a prefix; follower receipt copies the response context into ReadyToRead, whose consumer performs an exact-key batch lookup. Therefore a response for a released record must preserve its stored identity. This is an identity-preservation duty at release, not a promise of success for all calls. The suspected implementation difference is not treated as a conflicting normative source.",
+      "applicability": "Forwarded requests that are actually released by a quorum confirmation in the same authority epoch.",
+      "unresolved": [],
+      "conflicts": [],
+      "alternatives": [
+        "No obligation to immediately complete a still-pending request.",
+        "One request or local-only prefix processing can preserve identity and does not exercise the remote-prefix discrepancy."
+      ]
+    }
+  },
+  "bindings": [
+    {
+      "id": "BD-read-emit",
+      "material_id": "S-read-response",
+      "symbol": "handleReadIndexLeaderConfirmation",
+      "start_line": 1771,
+      "end_line": 1790,
+      "description": "Consumes released readStatus objects and encodes each remote response destination, index and context.",
+      "pending": [],
+      "associations": [
+        {
+          "claim_id": "C-read-context",
+          "source_ids": [
+            "S-read-identity-contract",
+            "S-read-response"
+          ],
+          "rationale": "Consumes released readStatus objects and encodes each remote response destination, index and context."
+        }
+      ]
+    },
+    {
+      "id": "BD-read-receive",
+      "material_id": "S-forward-read",
+      "symbol": "handleFollowerReadIndexResp",
+      "start_line": 1955,
+      "end_line": 1963,
+      "description": "Copies received response identity into ReadyToRead for exact-context client consumption.",
+      "pending": [],
+      "associations": [
+        {
+          "claim_id": "C-read-context",
+          "source_ids": [
+            "S-read-identity-contract",
+            "S-forward-read"
+          ],
+          "rationale": "Copies received response identity into ReadyToRead for exact-context client consumption."
+        }
+      ]
+    }
+  ],
+  "map_path": "map-read-contract.json",
+  "map_changes": {
+    "B-read-client": {
+      "impact": "clarification",
+      "source_ids": [
+        "S-message-dispatch",
+        "S-read-identity-contract"
+      ],
+      "rationale": "Resolve the previously unread ordinary-message dispatch premise and make the operation identity interface explicit.",
+      "preserves": "The principal Fact, its producer/consumer edges and the candidate's remote response-correlation question are unchanged; dispatch adds no completion barrier and does not change admissible overlap."
+    },
+    "core_overview": {
+      "impact": "clarification",
+      "source_ids": [
+        "S-message-dispatch",
+        "S-read-identity-contract"
+      ],
+      "rationale": "Add newly acquired sources of the referenced client behavior; overview explanation is unchanged.",
+      "preserves": "No authority, formation, identity, dependency or observation scope changes."
+    }
+  },
+  "feedback": {
+    "ref_ids": [
+      "df58639a581544c288c0192bc5c095e4",
+      "B-read-client",
+      "S-message-dispatch",
+      "S-read-identity-contract"
+    ],
+    "answered": "Ordinary read request/response dispatch does not serialize completion across contexts. The captured identity interface and exact-context consumer establish an operation-correlation duty when pending records are released. Persistence ordering for the future driver is explicit in Update: store state/entries before sending non-replication messages.",
+    "remaining": [
+      "A controlled Peer history must observe actual admission, quorum release, emitted replies and destination ReadyToRead without injecting private pending records or fabricated acknowledgements."
+    ],
+    "understanding": "updated",
+    "rationale": "The obligation concerns correspondence at a completed protocol action; it neither assumes all reads succeed nor claims finite waiting proves stalling."
+  }
+}

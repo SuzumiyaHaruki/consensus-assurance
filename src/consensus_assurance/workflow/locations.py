@@ -1,4 +1,4 @@
-"""Limited source-backed Python/Go declaration index, never protocol-driven correction."""
+"""Limited source-backed declaration index, never protocol-driven correction."""
 import ast
 import re
 
@@ -87,17 +87,39 @@ def declarations(material, include_calls=True):
                 if any(d['start']==line(match.start()) and d['symbol']==match[1] for d in result):continue
                 end=closing(masked,match.end()-1,'(',')')
                 if end is not None:result.append({'symbol':match[1],'start':line(match.start()),'signature_end':line(match.start()),'end':line(end),'closed':True,'kind':'callsite'})
+    elif material.file.endswith('.rs'):
+        from tree_sitter import Language, Parser
+        import tree_sitter_rust
+        nodes=[Parser(Language(tree_sitter_rust.language())).parse(text.encode()).root_node]
+        while nodes:
+            node=nodes.pop()
+            if node.type in {'macro_definition','macro_invocation','token_tree'}:continue
+            nodes.extend(reversed(node.named_children))
+            if node.type not in {'function_item','function_signature_item','struct_item','enum_item','trait_item','type_item','const_item','static_item'}:continue
+            name=node.child_by_field_name('name');body=node.child_by_field_name('body')
+            if name is None or name.is_missing or any(c.has_error for c in node.named_children if c!=body):continue
+            owner=None
+            parent=node.parent.parent if node.parent and node.parent.type=='declaration_list' else None
+            if parent and parent.type in {'impl_item','trait_item'}:
+                target=parent.child_by_field_name('type' if parent.type=='impl_item' else 'name')
+                if target and target.type=='generic_type':target=target.child_by_field_name('type')
+                if target and not target.has_error:owner=target.text.decode()
+            result.append({'owner':owner,'separator':'::','symbol':name.text.decode(),'start':offset+node.start_point.row+1,
+                'signature_end':offset+(body.start_point.row if body else node.start_point.row)+1,
+                'end':offset+node.end_point.row+1 if not node.has_error else None,
+                'known_end':material.end_line,'closed':not node.has_error,
+                'kind':'interface_member' if node.type=='function_signature_item' else 'declaration'})
     return result
 
 
 def matches_symbol(declaration, symbol):
     return symbol == declaration["symbol"] or (declaration.get("owner") is not None
-        and symbol == declaration["owner"] + "." + declaration["symbol"])
+        and symbol == declaration["owner"] + declaration.get('separator','.') + declaration["symbol"])
 
 
 def contains(binding,material,declaration):
     start=declaration.get('owner_start',declaration['start']);end=extent(declaration)
-    lines=code_mask(material.text).splitlines()
+    lines=(material.text if material.file.endswith('.rs') else code_mask(material.text)).splitlines()
     def empty(a,b):return not ''.join(lines[max(0,a-material.start_line):max(0,b-material.start_line+1)]).strip()
     if binding.start_line<start and not empty(binding.start_line,start-1):return False
     if binding.end_line>end and not empty(end+1,binding.end_line):return False

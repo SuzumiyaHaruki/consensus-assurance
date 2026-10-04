@@ -21,6 +21,16 @@ def test_probe_and_execution_keep_different_scopes(tmp_path):
     assert '未检查性质' in execution_summary(permission)[2]
     assert execution_summary(failed)[1] == '执行失败或未完成'
     assert execution_summary(failed)[2] == '进程退出码不等于性质判定'
+    for changes,expected in [({},'探索执行正常结束'),({'exit_code':None},'退出信息缺失'),
+        ({'exit_code':1},'非零退出'),({'outcome':'not_applicable'},'没有匹配测试或全部跳过'),
+        ({'status':ExecutionStatus.ERROR,'parameters':{'failure_class':'build_or_setup','test_started':False}},'未进入测试'),
+        ({'exit_code':1,'parameters':{'failure_class':'test_failure','test_started':True}},'已进入测试，执行失败'),
+        ({'exit_code':2,'parameters':{'failure_class':'panic_unattributed','test_started':True}},'panic 尚未归因'),
+        ({'status':ExecutionStatus.TIMEOUT},'status=timeout'),({'status':ExecutionStatus.ERROR},'status=error')]:
+        record=explore.model_copy(update=changes);saved=record.model_dump(mode='json')
+        summary=execution_summary(record)
+        assert expected in summary[1] and '条件观察完成' not in summary[1]
+        assert '前提是否达到' in summary[2] and record.model_dump(mode='json')==saved
 
 
 def test_current_projection_rebuilds_at_deadline_without_old_budget_or_paths(tmp_path):
@@ -190,13 +200,20 @@ def test_mixed_report_reads_fixed_results_and_moves_without_side_effects(tmp_pat
             disposition='explained_by_existing_mechanism',counterevidence=['The other branch returns zero'])
         return sub,{}
     def explore(state):
+        setup="ready.append('initialized')\n" if any(c['action']=='exploration' for c in state['checks']) else ''
         return dict(action='explore',question='Under a caller-selected repeat policy, what values are produced?',
-            harness_path='explore.py',rationale='Observe behavior before attributing the repeat policy'),{'explore.py':"from target import step\nprint('conditional',step(2,3),step(3,3))\n"}
-    def retain(state):
-        return (dict(action='research',rationale='Retain the conditional output and missing responsibility',feedback=dict(
-            ref_ids=[c['id'] for c in state['checks'] if c['action']=='exploration']+['code','surface:external repeat policy'],answered='Under the chosen repeat policy the actual returns were 3 and 4.',
-            remaining=['Acquire the caller repeat contract'],understanding='updated',rationale='No obligation is inferred from unequal returns')),
-            {})
+            harness_path='explore.py',rationale='Observe behavior before attributing the repeat policy'),{
+                'explore.py':"from target import step\nready=[]\n"+setup+"print('conditional',bool(ready),step(2,3),step(3,3))\n"}
+    def retain(answer,positions):
+        def step(state):
+            executions=[c['id'] for c in state['checks'] if c['action']=='exploration']
+            return dict(action='research',rationale='Retain the conditional output and missing responsibility',feedback=dict(
+                ref_ids=[executions[i] for i in positions]+['code','surface:external repeat policy'],answered=answer,
+                remaining=['Acquire the caller repeat contract'],understanding='updated',rationale='No obligation is inferred from unequal returns')),{}
+        return step
+    first_answer='The first execution exited normally, but initialization did not occur; no prerequisite was reached.'
+    repaired_answer='Only the second execution initialized the input and reached the comparison; this remains an exploration.'
+    joint_answer='The first execution missed initialization; the second reached it and returned 3 and 4. The external caller contract remains open.'
     def independent_issue(state):
         candidate=state['question_candidates'][-1]['id']
         return dict(action='review',artifact_id=candidate,rationale='Retain an independent source applicability dispute',
@@ -222,7 +239,8 @@ def test_mixed_report_reads_fixed_results_and_moves_without_side_effects(tmp_pat
         sub['question']['question']='Does the second public entry preserve the local bound?'
         return sub,{}
     steps=[initial,encoded_check(broken=True),encoded_check(revise=True),review,second]+([review_step()] if reviewed else [])+[explained,
-        independent_issue,explore,explore,retain,explore,fact_feedback,contract_question,paused_contract,unconstructed,stop]
+        independent_issue,explore,retain(first_answer,[0]),explore,retain(repaired_answer,[1]),retain(joint_answer,[0,1]),
+        explore,fact_feedback,contract_question,paused_contract,unconstructed,stop]
     e,repo=engine_for(tmp_path,steps);e.agent.mock=False;e.config.execution_isolation='bwrap'
     (repo/'target.py').write_text('def step(value, limit):\n    return value + 1 if value <= limit else 0\n')
     e.config.budget.experiments=7
@@ -232,7 +250,7 @@ def test_mixed_report_reads_fixed_results_and_moves_without_side_effects(tmp_pat
     assert [r['disposition'] for r in view(state)['conclusions']]==['confirmed_in_scope','bounded_no_violation' if reviewed else 'investigation_lead']
     assert state.usage['experiments']==6 and len(state.claims)==3
     index=json.loads((e.root/'research.json').read_text())
-    assert [len(entry['feedback']) for entry in index['explorations']]==[1,1,0]
+    assert [len(entry['feedback']) for entry in index['explorations']]==[2,2,0]
     assert index['explorations'][0]['operation_id']!=index['explorations'][1]['operation_id']
     old=state.direct_checks[0];old_check=next(c for c in state.checks if c.direct_check_id==old.id)
     current=state.direct_checks[1];exploration=next(c for c in state.checks if c.action=='exploration')
@@ -266,18 +284,33 @@ def test_mixed_report_reads_fixed_results_and_moves_without_side_effects(tmp_pat
     assert not re.search(r'^- \[.*：\s*$',text,re.M) and not re.search(r'恢复条件：\s*$',text,re.M)
     assert '| event | returned |' in text
     assert 'external repeat policy' in text and 'Acquire the caller repeat contract' not in text
-    handoff=next(s for s in state.selections if s.get('feedback',{}).get('answered')=='Under the chosen repeat policy the actual returns were 3 and 4.')
+    handoff=next(s for s in state.selections if s.get('feedback',{}).get('answered')==joint_answer)
     assert 'Acquire the caller repeat contract' in (moved/f'submissions/{handoff["operation_id"]}/accepted.json').read_text()
+    explorations=[c for c in state.checks if c.action=='exploration']
+    assert 'conditional False 3 4' in (moved/Path(explorations[0].stdout).relative_to(e.root)).read_text()
+    assert 'conditional True 3 4' in (moved/Path(explorations[1].stdout).relative_to(e.root)).read_text()
+    assert '条件观察完成' not in text and '执行工具失败／未完成 1 次（不统计研究前提未达）' in text
+    for n,(answer,positions) in enumerate([(first_answer,[0]),(joint_answer,[0,1]),(repaired_answer,[1])],1):
+        related=next(s for s in state.selections if s.get('feedback',{}).get('answered')==answer)
+        anchor=f'exploration-feedback-{related["operation_id"]}'
+        paragraph=text.split(f'<a id="{anchor}"></a>')[1].split('\n\n')[0]
+        assert text.count(answer)==1 and answer in paragraph
+        for i,c in enumerate(explorations):
+            assert (f'](#exploration-{c.id})' in paragraph)==(i in positions)
+        assert ('共同后续说明' in paragraph)==(len(positions)>1)
+        for i,entry in enumerate(index['explorations']):
+            section=text.split(f'<a id="exploration-{explorations[i].id}"></a>')[1].split('\n\n')[0]
+            assert (f'](#{anchor})' in section)==(i in positions)
     assert old_check.id in text and current.plan_path.split('/direct-checks/')[1] in text
     assert exploration.id in text and text.count('该问题保留的失败执行')==1
     timeline=text.split('## 研究过程与认识增长')[1].split('## 当前未决事项')[0]
     assert '受理 review：边界返回责任' in timeline and 'Retain the conditional output and missing responsibility' in timeline
     visible_timeline=re.sub(r'\]\([^)]*\)',']',timeline)
     assert re.search(r'\d+\.\d+ 分钟',timeline) and not re.search(r'\b[0-9a-f]{32}\b',visible_timeline)
-    assert 'Under the chosen repeat policy the actual returns were 3 and 4.' not in timeline
+    assert all(answer not in timeline for answer in (first_answer,repaired_answer,joint_answer))
     assert text.count('探索执行记录已保存，尚待解释')==1 and 'external caller may have another boundary' in text
     assert timeline.count('修订前 v1')==1
-    assert text.count('后续受理解释（关联 2 次执行）')==1 and '该交接当时的剩余问题' not in text
+    assert text.count('共同后续说明')==1 and '该交接当时的剩余问题' not in text
     unresolved=text.split('## 当前未决事项')[1]
     assert '另有 1 次探索保存了执行记录，尚无精确对应的后续受理解释' in unresolved
     assert '精确引用不表示已解决或已正式化' in text
@@ -324,6 +357,17 @@ def test_mixed_report_reads_fixed_results_and_moves_without_side_effects(tmp_pat
     text=render_report(state,moved).read_text()
     assert '条件与检查器（归档字节缺失）' in text and str(e.root) not in text
     assert '问题原稿字节缺失' in text
+    # Exact links survive absent accepted bytes; neither state text nor an unaccepted draft fills the gap.
+    missing_handoff=next(s for s in state.selections if s.get('feedback',{}).get('answered')==repaired_answer)
+    (moved/f'submissions/{missing_handoff["operation_id"]}/accepted.json').unlink()
+    (moved/'draft/unaccepted.json').write_text(json.dumps({'feedback':missing_handoff['feedback']}))
+    missing=render_report(state,moved).read_text()
+    assert repaired_answer not in missing and first_answer in missing and joint_answer in missing
+    assert '完整交接；精确引用不表示已解决或已正式化（归档字节缺失）' in missing
+    unexecuted=state.model_copy(deep=True)
+    unexecuted.checks=[c for c in unexecuted.checks if c.id!=explorations[-1].id]
+    assert '已受理问题，尚无保存的执行记录' in render_report(unexecuted,moved).read_text()
+    assert state.model_dump(mode='json')==saved
 
 
 def test_timeout_report_uses_recorded_limit_and_preserves_transport_diagnostic(tmp_path):

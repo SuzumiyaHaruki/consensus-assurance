@@ -81,3 +81,28 @@ def test_anchor_correction_does_not_fix_cross_declaration_behavior():
     b.anchor={'material_id':m.id,'symbol':'save','start_line':1,'end_line':1}
     evidence,error=location_evidence(b,{m.id:m})
     assert evidence is None and error
+
+
+def test_rust_declarations_use_syntax_and_acquired_impl_owner():
+    from consensus_assurance.workflow.locations import declarations
+    m=material('''const TEXT: &str = r#"fn invented() {}"#;
+/* fn commented() { /* nested */ } */
+impl<T> First<T> {
+    pub fn take<'a>(&self, value: &'a str) -> &'a str {
+        value
+    }
+}
+impl Second {
+    pub fn take(&self) {}
+}
+''',file='sample.rs')
+    assert not {'invented','commented'} & {d['symbol'] for d in declarations(m)}
+    anchor,error=locate(binding(m,'First::take',5,5),{m.id:m})
+    assert not error and anchor['start_line']==4 and anchor['boundary_complete']
+    assert locate(binding(m,'Second::take',5,5),{m.id:m})[0] is None
+    assert locate(binding(m,'First::take',5,9),{m.id:m})[0] is None
+    fragment=material('pub fn take(&self) {}\n',9,file='sample.rs')
+    assert locate(binding(fragment,'Second::take',9,9),{fragment.id:fragment})[0] is None
+    assert locate(binding(fragment,'take',9,9),{fragment.id:fragment})[0]
+    incomplete=material('pub fn take(value:i64) {\n value+1\n',file='sample.rs')
+    assert locate(binding(incomplete,'take',2,2),{incomplete.id:incomplete})[0] is None

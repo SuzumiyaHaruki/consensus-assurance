@@ -5,6 +5,46 @@ import pytest
 from audit_support import products, first, check_step, review_step, stop, engine_for, partial_map, feedback
 
 
+def test_rust_formal_check_and_exploration_share_existing_audit_path(tmp_path,rust_workspace):
+    import shutil
+    from consensus_assurance.adapters.runners.cargo import CargoBackend
+    from consensus_assurance.core.config import TargetConfig
+    from consensus_assurance.adapters.storage.workspace_delta import restore
+    if not shutil.which('cargo') or not shutil.which('bwrap'):pytest.skip('Local Rust and bubblewrap are required')
+    def initial(state):
+        sub,files=first(state);sub['sources'][0].update(file='sample/src/lib.rs',end_line=3)
+        return sub,files
+    source='''#[test]
+fn actual_boundary() {
+    println!("CA_EVENT {{\\"event\\":\\"admitted\\",\\"operation\\":\\"one\\",\\"state\\":{{\\"legal\\":true}}}}");
+    let value=sample::step(3,3);
+    println!("CA_EVENT {{\\"event\\":\\"returned\\",\\"operation\\":\\"one\\",\\"state\\":{{\\"in_range\\":{}}}}}", (0..=3).contains(&value));
+}
+'''
+    def check(state):
+        sub,files=check_step()(state);plan=json.loads(files['plan.json']);plan['harness']['kind']='rust_test'
+        sub.update(harness_path='check.rs',files={})
+        return sub,{'plan.json':json.dumps(plan),'check.rs':source}
+    def explore(state):
+        return dict(action='explore',question='What does a legal interior invocation return?',harness_path='check.rs',
+            execution_package='sample',rationale='Observe without creating another property'),{'check.rs':source.replace('step(3,3)','step(2,3)')}
+    e,repo=engine_for(tmp_path,[initial,check,review_step(),explore,stop])
+    shutil.copytree(rust_workspace,repo,dirs_exist_ok=True)
+    e.config.target=TargetConfig(execution_package='sample');e.config.execution_backend='cargo'
+    e.implementation=CargoBackend(e.config.target);e.agent.mock=False;e.config.execution_isolation='bwrap'
+    state=e.start(repo)
+    assert not list((e.root/'submissions').glob('*/diagnostics.json')),state.stop_reason
+    assert state.monitor_results[0]['confirmed'] and state.monitor_results[0]['outcome']=='violated'
+    checks=[c for c in state.checks if c.action in {'direct_check','exploration'}]
+    assert [c.action for c in checks]==['direct_check','exploration']
+    assert all(c.parameters['execution_package']=='./sample' and c.outcome=='tests_passed' for c in checks)
+    assert not (repo/'Cargo.lock').exists() and not list(repo.glob('**/assurance_generated.rs'))
+    for i,c in enumerate(checks):
+        manifest=next(p for p in c.artifacts if p.endswith('workspace-outcome/manifest.json'))
+        restored=tmp_path/f'restored-{i}';restore(e.root/'source',manifest,restored)
+        assert (restored/'Cargo.lock').is_file() and (restored/'sample/tests/assurance_generated.rs').is_file()
+
+
 @pytest.mark.parametrize('fault',['compile','observation','observation_violation'])
 @pytest.mark.usefixtures('full_refresh_equivalence')
 def test_existing_unit_actual_technical_repair_review_progress(tmp_path,fault):

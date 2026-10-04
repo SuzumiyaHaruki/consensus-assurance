@@ -1,0 +1,178 @@
+{
+  "description": "Three actual Raft instances: bootstrap v; elect v in term 2 and replicate its configuration/no-op; restart v and b; elect a in term 3 then restart a before its leader no-op; elect b in term 4 with a and self while dropping b-to-v vote RPC; replicate/commit b no-op to v but not a; restart b; in term 5 drop b-to-a vote RPC and optionally fail v candidate-key Set; finally actual a electSelf emits its term-5 stale-log request. Observe the v response for fault branch and no-failure control. Only the local freshness response is asserted.",
+  "claim_id": "claim-vote-freshness-after-write-error",
+  "binding_ids": [
+    "bind-vote-freshness",
+    "bind-vote-persistence"
+  ],
+  "harness": {
+    "execution_package": ".",
+    "files": {},
+    "kind": "go_test",
+    "source": "package raft\n\nimport (\n\t\"bytes\"\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"testing\"\n\t\"time\"\n)\n\ntype assuranceVoteStore struct {\n\t*InmemStore\n\tfailCandidate bool\n\tfailures      int\n}\n\nfunc (s *assuranceVoteStore) Set(key, value []byte) error {\n\tif s.failCandidate && bytes.Equal(key, keyLastVoteCand) {\n\t\ts.failCandidate = false\n\t\ts.failures++\n\t\treturn fmt.Errorf(\"injected candidate-key write failure; previous value retained\")\n\t}\n\treturn s.InmemStore.Set(key, value)\n}\nfunc assuranceVoteEvent(t *testing.T, event string, m map[string]interface{}) {\n\tm[\"event\"] = event\n\tb, err := json.Marshal(m)\n\tif err != nil {\n\t\tt.Fatal(err)\n\t}\n\tfmt.Println(\"CA_EVENT \" + string(b))\n}\n\n// This transport executes real handlers synchronously at scheduled deliveries.\n// Selected vote RPCs are dropped; no successful response is synthesized.\ntype assuranceVoteNetwork struct {\n\tnodes map[ServerID]*Raft\n}\ntype assuranceVoteTransport struct {\n\t*InmemTransport\n\tfrom          ServerID\n\tnetwork       *assuranceVoteNetwork\n\ttargetReplies chan map[string]interface{}\n}\n\nfunc (tr *assuranceVoteTransport) RequestVote(id ServerID, addr ServerAddress, req *RequestVoteRequest, resp *RequestVoteResponse) error {\n\tif tr.from == \"b\" && ((req.Term == 4 && id == \"v\") || (req.Term == 5 && id == \"a\")) {\n\t\treturn fmt.Errorf(\"scheduled vote RPC loss\")\n\t}\n\ttarget := tr.network.nodes[id]\n\tindex, term := target.getLastEntry()\n\tch := make(chan RPCResponse, 1)\n\ttarget.processRPC(RPC{Command: req, RespChan: ch})\n\tgot := <-ch\n\tif got.Error != nil {\n\t\treturn got.Error\n\t}\n\t*resp = *got.Response.(*RequestVoteResponse)\n\tif tr.from == \"a\" && id == \"v\" && req.Term == 5 {\n\t\ttr.targetReplies <- map[string]interface{}{\"candidate\": string(req.ID), \"request_term\": req.Term, \"candidate_last_index\": req.LastLogIndex, \"candidate_last_term\": req.LastLogTerm, \"local_index\": index, \"local_log_term\": term, \"granted\": resp.Granted, \"candidate_log_older\": req.LastLogTerm < term, \"response_term\": resp.Term}\n\t}\n\treturn nil\n}\nfunc (tr *assuranceVoteTransport) AppendEntries(id ServerID, addr ServerAddress, req *AppendEntriesRequest, resp *AppendEntriesResponse) error {\n\tch := make(chan RPCResponse, 1)\n\ttr.network.nodes[id].processRPC(RPC{Command: req, RespChan: ch})\n\tgot := <-ch\n\tif got.Error != nil {\n\t\treturn got.Error\n\t}\n\t*resp = *got.Response.(*AppendEntriesResponse)\n\treturn nil\n}\nfunc TestAssuranceVoteFreshnessAfterStoreError(t *testing.T) {\n\tfor _, inject := range []bool{false, true} {\n\t\tt.Run(fmt.Sprint(inject), func(t *testing.T) {\n\t\t\tnetwork := &assuranceVoteNetwork{nodes: make(map[ServerID]*Raft)}\n\t\t\tconfigs := make(map[ServerID]*Config)\n\t\t\tstores := make(map[ServerID]*assuranceVoteStore)\n\t\t\tsnapshots := make(map[ServerID]*InmemSnapshotStore)\n\t\t\ttransports := make(map[ServerID]*assuranceVoteTransport)\n\t\t\tconfiguration := Configuration{Servers: []Server{{Suffrage: Voter, ID: \"v\", Address: \"v\"}, {Suffrage: Voter, ID: \"a\", Address: \"a\"}, {Suffrage: Voter, ID: \"b\", Address: \"b\"}}}\n\t\t\tfor _, server := range configuration.Servers {\n\t\t\t\tc := DefaultConfig()\n\t\t\t\tc.LocalID = server.ID\n\t\t\t\tc.skipStartup = true\n\t\t\t\tc.PreVoteDisabled = true\n\t\t\t\tc.HeartbeatTimeout = 5 * time.Millisecond\n\t\t\t\tc.ElectionTimeout = 5 * time.Millisecond\n\t\t\t\tc.LeaderLeaseTimeout = 5 * time.Millisecond\n\t\t\t\tconfigs[server.ID] = c\n\t\t\t\tstores[server.ID] = &assuranceVoteStore{InmemStore: NewInmemStore()}\n\t\t\t\tsnapshots[server.ID] = NewInmemSnapshotStore()\n\t\t\t\t_, base := NewInmemTransport(server.Address)\n\t\t\t\ttransports[server.ID] = &assuranceVoteTransport{InmemTransport: base, from: server.ID, network: network, targetReplies: make(chan map[string]interface{}, 1)}\n\t\t\t}\n\t\t\tif err := BootstrapCluster(configs[\"v\"], stores[\"v\"], stores[\"v\"], snapshots[\"v\"], transports[\"v\"], configuration); err != nil {\n\t\t\t\tt.Fatal(err)\n\t\t\t}\n\t\t\trestart := func(id ServerID) {\n\t\t\t\tt.Helper()\n\t\t\t\tif old := network.nodes[id]; old != nil {\n\t\t\t\t\tif err := old.Shutdown().Error(); err != nil {\n\t\t\t\t\t\tt.Fatal(err)\n\t\t\t\t\t}\n\t\t\t\t}\n\t\t\t\tr, err := NewRaft(configs[id], &MockFSM{}, stores[id], stores[id], snapshots[id], transports[id])\n\t\t\t\tif err != nil {\n\t\t\t\t\tt.Fatal(err)\n\t\t\t\t}\n\t\t\t\tnetwork.nodes[id] = r\n\t\t\t}\n\t\t\tfor _, id := range []ServerID{\"v\", \"a\", \"b\"} {\n\t\t\t\trestart(id)\n\t\t\t}\n\t\t\tdefer func() {\n\t\t\t\tfor _, r := range network.nodes {\n\t\t\t\t\tr.Shutdown().Error()\n\t\t\t\t}\n\t\t\t\tfor _, tr := range transports {\n\t\t\t\t\ttr.Close()\n\t\t\t\t}\n\t\t\t}()\n\t\t\t// Drain all actual campaign results before changing the scheduled network.\n\t\t\t// Only the majority state transition from runCandidate is performed here.\n\t\t\tcampaign := func(id ServerID) int {\n\t\t\t\tt.Helper()\n\t\t\t\tr := network.nodes[id]\n\t\t\t\tr.runFollower()\n\t\t\t\tif r.getState() != Candidate {\n\t\t\t\t\tt.Fatal(\"candidate not reached\")\n\t\t\t\t}\n\t\t\t\tresults := r.electSelf()\n\t\t\t\tif results == nil {\n\t\t\t\t\tt.Fatal(\"self vote failed\")\n\t\t\t\t}\n\t\t\t\tgrants := 0\n\t\t\t\tfor i := 0; i < len(configuration.Servers); i++ {\n\t\t\t\t\tselect {\n\t\t\t\t\tcase vote := <-results:\n\t\t\t\t\t\tif vote.Granted {\n\t\t\t\t\t\t\tgrants++\n\t\t\t\t\t\t}\n\t\t\t\t\tcase <-time.After(time.Second):\n\t\t\t\t\t\tt.Fatal(\"campaign result missing\")\n\t\t\t\t\t}\n\t\t\t\t}\n\t\t\t\tif grants >= r.quorumSize() {\n\t\t\t\t\tr.setState(Leader)\n\t\t\t\t\tr.setLeader(r.localAddr, r.localID)\n\t\t\t\t}\n\t\t\t\tidx, term := r.getLastEntry()\n\t\t\t\tassuranceVoteEvent(t, \"produced_campaign\", map[string]interface{}{\"case_id\": fmt.Sprint(inject), \"node\": string(id), \"term\": r.getCurrentTerm(), \"grants\": grants, \"last_index\": idx, \"last_log_term\": term})\n\t\t\t\treturn grants\n\t\t\t}\n\t\t\tprepareLeader := func(id ServerID) *logFuture {\n\t\t\t\tr := network.nodes[id]\n\t\t\t\tr.setupLeaderState()\n\t\t\t\tf := &logFuture{log: Log{Type: LogNoop}}\n\t\t\t\tf.init()\n\t\t\t\tr.dispatchLogs([]*logFuture{f})\n\t\t\t\treturn f\n\t\t\t}\n\t\t\treplicate := func(from, to ServerID) {\n\t\t\t\tt.Helper()\n\t\t\t\tr := network.nodes[from]\n\t\t\t\tpeer := Server{Suffrage: Voter, ID: to, Address: ServerAddress(to)}\n\t\t\t\ts := &followerReplication{peer: peer, currentTerm: r.getCurrentTerm(), nextIndex: 1, commitment: r.leaderState.commitment, stopCh: make(chan uint64), notify: make(map[*verifyFuture]struct{}), stepDown: make(chan struct{}, 1)}\n\t\t\t\tif r.replicateTo(s, r.getLastIndex()) {\n\t\t\t\t\tt.Fatal(\"replication stopped\")\n\t\t\t\t}\n\t\t\t}\n\t\t\tcommit := func(id ServerID, f *logFuture) {\n\t\t\t\tt.Helper()\n\t\t\t\tr := network.nodes[id]\n\t\t\t\tidx := r.leaderState.commitment.getCommitIndex()\n\t\t\t\tif idx != f.log.Index {\n\t\t\t\t\tt.Fatal(\"quorum commitment missing\")\n\t\t\t\t}\n\t\t\t\tr.setCommitIndex(idx)\n\t\t\t\tr.setCommittedConfiguration(r.configurations.latest, r.configurations.latestIndex)\n\t\t\t\tr.processLogs(idx, map[uint64]*logFuture{f.log.Index: f})\n\t\t\t}\n\t\t\tif campaign(\"v\") < 2 {\n\t\t\t\tt.Fatal(\"initial election failed\")\n\t\t\t}\n\t\t\tf := prepareLeader(\"v\")\n\t\t\treplicate(\"v\", \"a\")\n\t\t\treplicate(\"v\", \"b\")\n\t\t\tcommit(\"v\", f)\n\t\t\treplicate(\"v\", \"a\")\n\t\t\treplicate(\"v\", \"b\")\n\t\t\t// The first leader crashes; its successor a obtains an actual term-3 vote\n\t\t\t// from v, then crashes before dispatching its first leader no-op.\n\t\t\trestart(\"v\")\n\t\t\trestart(\"b\")\n\t\t\tif campaign(\"a\") < 2 {\n\t\t\t\tt.Fatal(\"a election failed\")\n\t\t\t}\n\t\t\trestart(\"a\")\n\t\t\t// b wins term 4 using a plus self, while its request to v is lost. It\n\t\t\t// creates a term-4 no-op and replicates it to v, but not to a.\n\t\t\tif campaign(\"b\") < 2 {\n\t\t\t\tt.Fatal(\"b election failed\")\n\t\t\t}\n\t\t\tf = prepareLeader(\"b\")\n\t\t\treplicate(\"b\", \"v\")\n\t\t\tcommit(\"b\", f)\n\t\t\treplicate(\"b\", \"v\")\n\t\t\toldVoteTerm, _ := stores[\"v\"].GetUint64(keyLastVoteTerm)\n\t\t\toldCandidate, _ := stores[\"v\"].Get(keyLastVoteCand)\n\t\t\tif oldVoteTerm != 3 || string(oldCandidate) != \"a\" {\n\t\t\t\tt.Fatalf(\"unexpected previous vote: %d %q\", oldVoteTerm, oldCandidate)\n\t\t\t}\n\t\t\trestart(\"b\")\n\t\t\tstores[\"v\"].failCandidate = inject\n\t\t\tbGrants := campaign(\"b\") // Request to a is lost, keeping a in term 4.\n\t\t\tstoredTerm, _ := stores[\"v\"].GetUint64(keyLastVoteTerm)\n\t\t\tstoredCandidate, _ := stores[\"v\"].Get(keyLastVoteCand)\n\t\t\tindex, term := network.nodes[\"v\"].getLastEntry()\n\t\t\tassuranceVoteEvent(t, \"produced_failure_prefix\", map[string]interface{}{\"case_id\": fmt.Sprint(inject), \"prior_vote_term\": oldVoteTerm, \"prior_candidate\": string(oldCandidate), \"stored_vote_term\": storedTerm, \"stored_candidate\": string(storedCandidate), \"injected_failures\": stores[\"v\"].failures, \"local_index\": index, \"local_log_term\": term, \"b_term5_grants\": bGrants})\n\t\t\taGrants := campaign(\"a\")\n\t\t\tobserved := <-transports[\"a\"].targetReplies\n\t\t\tobserved[\"case_id\"] = fmt.Sprint(inject)\n\t\t\tobserved[\"a_term5_grants\"] = aGrants\n\t\t\tobserved[\"injected_failures\"] = stores[\"v\"].failures\n\t\t\tassuranceVoteEvent(t, \"produced_stale_vote\", observed)\n\t\t})\n\t}\n}\n",
+    "description": "Actual runFollower, electSelf, requestVote, dispatchLogs, replicateTo and appendEntries with synchronous scheduled Transport and stable-store fault wrapper. Native vote requests read actual candidate logs. Stores survive selected node restarts.",
+    "semantic_changes": [
+      "skipStartup suppresses autonomous background loops. The driver runs actual follower timeout and electSelf, drains all produced votes, and performs the same majority state transition as runCandidate; it does not implement a substitute vote handler.",
+      "Leader setup/no-op dispatch and actual replicateTo drive log prefix; driver executes source leaderLoop commit setters after actual commitment reaches the no-op. FSM consumption and independent timer races are not exercised.",
+      "Transport directly dispatches source processRPC. Exactly b-to-v term-4 and b-to-a term-5 RequestVote calls return scheduled loss; AppendEntries deliveries execute the real handler.",
+      "StableStore wrapper returns one candidate-key error before mutation; successful writes and restart state use the original InmemStore. The fault is injected only in one branch.",
+      "No later log overwrite or client endpoint is constructed or claimed; observing election counts is diagnostic, not a separate property."
+    ],
+    "prerequisites": [
+      {
+        "alias": "prefix",
+        "event": "produced_failure_prefix",
+        "conditions": [
+          {
+            "field": "prior_candidate",
+            "op": "eq",
+            "value": "a",
+            "reference": null
+          },
+          {
+            "field": "prior_vote_term",
+            "op": "eq",
+            "value": 3,
+            "reference": null
+          },
+          {
+            "field": "stored_vote_term",
+            "op": "eq",
+            "value": 5,
+            "reference": null
+          },
+          {
+            "field": "stored_candidate",
+            "op": "eq",
+            "value": "a",
+            "reference": null
+          },
+          {
+            "field": "injected_failures",
+            "op": "eq",
+            "value": 1,
+            "reference": null
+          }
+        ]
+      }
+    ],
+    "legality": {
+      "source_ids": [
+        "src-vote-handler",
+        "src-persist-context",
+        "src-stable-interface",
+        "src-vote-rpc-fields",
+        "src-election-producer",
+        "src-campaign",
+        "src-startup",
+        "src-append-consumer",
+        "src-replication-retry",
+        "src-request-producer",
+        "src-commitment",
+        "src-leader-commit",
+        "src-bootstrap-entry",
+        "src-follower-loop",
+        "src-shutdown"
+      ],
+      "expectation_ids": [
+        "src-vote-rpc-fields",
+        "src-vote-handler",
+        "src-stable-interface"
+      ],
+      "binding_ids": [
+        "bind-vote-freshness",
+        "bind-vote-persistence"
+      ],
+      "derivation": "All candidate RequestVote messages come from electSelf reading actual local logs, and all grants come from requestVote. v term-2 leader initializes shared history. a receives v term-3 vote and restarts before leader work; b wins term 4 with a and self while its request to v is dropped. b then supplies a newer actual no-op to v, preserving v old vote for a. After b restart, its term-5 request to v has the same address as the known leader, so it passes that guard and advances v term; the one setter failure retains a from term 3. a never receives b term-5 request and therefore next electSelf legitimately requests term 5 with its older log. All campaign RPC results are drained before any restart or phase change. The no-failure control uses the same source prefix and deliveries. The precise fault is part of scope; no backend production failure frequency is inferred.",
+      "applicability": "One successful vote-term write and one no-write error from the candidate-key setter; later eligible candidate request with strictly older last-log term and no prior grant to that candidate in this term.",
+      "unresolved": [],
+      "conflicts": [],
+      "alternatives": []
+    }
+  },
+  "monitors": [
+    {
+      "id": "monitor-stale-vote-after-error",
+      "checker_id": "stale-candidate-not-granted",
+      "event": "produced_stale_vote",
+      "binding_ids": [
+        "bind-vote-freshness",
+        "bind-vote-persistence"
+      ],
+      "grounding": {
+        "source_ids": [
+          "src-vote-handler",
+          "src-persist-context",
+          "src-stable-interface",
+          "src-vote-rpc-fields",
+          "src-election-producer",
+          "src-campaign",
+          "src-startup",
+          "src-append-consumer",
+          "src-replication-retry",
+          "src-request-producer",
+          "src-commitment",
+          "src-leader-commit",
+          "src-bootstrap-entry",
+          "src-follower-loop",
+          "src-shutdown"
+        ],
+        "expectation_ids": [
+          "src-vote-rpc-fields",
+          "src-vote-handler",
+          "src-stable-interface"
+        ],
+        "binding_ids": [
+          "bind-vote-freshness",
+          "bind-vote-persistence"
+        ],
+        "derivation": "Correlate fixed case_id across the prefix and native response. The transport records the receiver live last entry before dispatch and candidate last-entry fields from the actual request, and calculates candidate_log_older from their terms. This observed antecedent independently establishes the unsafe eligibility condition; compare native response Granted with false. No result is suppressed based on Granted or the election tally. The control has no injected error and remains diagnostic.",
+        "applicability": "One successful vote-term write and one no-write error from the candidate-key setter; later eligible candidate request with strictly older last-log term and no prior grant to that candidate in this term.",
+        "unresolved": [],
+        "conflicts": [],
+        "alternatives": []
+      },
+      "applicability_conditions": [
+        {
+          "field": "injected_failures",
+          "op": "eq",
+          "value": 1,
+          "reference": null
+        }
+      ],
+      "admission_alias": "prefix"
+    }
+  ],
+  "observable_properties": [
+    {
+      "checker_id": "stale-candidate-not-granted",
+      "kind": "event_implication",
+      "trigger": {
+        "field": "event",
+        "op": "eq",
+        "value": "produced_stale_vote",
+        "reference": null
+      },
+      "assertion": {
+        "field": "granted",
+        "op": "eq",
+        "value": false,
+        "reference": null
+      },
+      "antecedent": {
+        "field": "candidate_log_older",
+        "op": "eq",
+        "value": true,
+        "reference": null
+      },
+      "identity_fields": [
+        "case_id"
+      ],
+      "description": "Under the scoped failed-write prefix, a candidate whose actual last-log term is older must not receive a new vote grant from this receiver."
+    }
+  ],
+  "uncertainties": [
+    "The error-returning candidate write is a controlled StableStore substitute; no concrete production backend failure is exercised.",
+    "Main-loop election-result and commit-notification scheduling is explicit; autonomous timer races and FSM endpoints are outside the local handler claim."
+  ]
+}

@@ -30,7 +30,10 @@ def execution_summary(check):
     if check.action == 'agent_turn':
         return 'Agent 调查', 'Agent 回执已保存；产物另经校验' if complete else 'Agent 调用未完成', '不属于性质证据'
     if check.action == 'exploration':
-        return '条件探索', phase or ('条件观察完成' if complete else '探索执行失败或未完成'), '没有正式性质判定'
+        progress = ({0:'探索执行正常结束',None:'记录标记结束，退出信息缺失'}.get(check.exit_code,'探索执行非零退出')
+            if check.status == ExecutionStatus.COMPLETED else f'探索执行未完成（status={check.status.value}）')
+        return ('条件探索', (phase if check.status in {ExecutionStatus.COMPLETED,ExecutionStatus.ERROR} else None) or progress,
+            '前提是否达到及观察含义见原始输出与后续受理解释；没有正式性质判定')
     if check.action in {'direct_check','experiment','replay'}:
         return ('直接实现检查' if check.action == 'direct_check' else '探索／实现执行',
             phase or ('执行完成；比较见 assessment' if complete else '执行失败或未完成'), '进程退出码不等于性质判定')
@@ -271,7 +274,7 @@ def render_report(state, root):
     for key,label in [('agent_calls','Agent 调用'),('experiments','控制器目标执行'),('audit_units','新 Unit'),('semantic_reviews','语义复核'),('revisions','修订')]:
         enabled = config.get('allow_experiments',False) and config.get('execution_backend','none') != 'none' if key == 'experiments' else True
         lines.append(f'| {label} | {config["budget"].get(key,0)} | {state.usage.get(key,0)} | '+(str(capacity['remaining'][key]) if enabled else '未启用')+' |')
-    lines += ['', f'目标执行组成：正式检查 {len(formal)} 次＋探索 {len(explorations)} 次，其中失败／未完成 {len(failures)} 次；失败和重试照常计数。'
+    lines += ['', f'目标执行组成：正式检查 {len(formal)} 次＋探索 {len(explorations)} 次，其中执行工具失败／未完成 {len(failures)} 次（不统计研究前提未达）；失败和重试照常计数。'
         '会话内本地试跑不属于此控制器计数；总时间不叠加内部工具耗时，缺失 token 用量保持未知。',
         '新 Unit 入场能力不保证剩余额度足够完成检查与复核。', '',
         f'元数据：源码 `{state.snapshot.commit or state.snapshot.id}`；实际方法 `{state.framework_revision}`；展示版本 `{manifest()["version"]}`；'
@@ -335,23 +338,29 @@ def render_report(state, root):
             for failed in old:lines.append('该问题保留的失败执行：'+link(failed.stdout,'原始失败')+'；'+link(failed.stderr,'诊断')+'。修订转折见时间线，旧失败不覆盖当前结果。')
     interpretations = {}
     for entry in exploration_records:
+        for handoff in entry['feedback']:
+            interpretations.setdefault(handoff['operation_id'],set()).update(handoff['ref_ids'])
+    handoff_links = {id:f'[交接 {n}](#exploration-feedback-{id})' for n,id in enumerate(interpretations,1)}
+    execution_links = {c.id:f'[探索执行 {n}](#exploration-{c.id})' for n,c in enumerate(explorations,1)}
+    for entry in exploration_records:
         lines += ['', '条件探索：'+excerpt(entry['question'] or '问题原稿字节缺失',200),
             '所选问题／策略（原文摘录）：'+excerpt(entry['rationale'] or '见固定原稿',240),
             link(entry['submission'],'受理问题、条件与来源')+'；'+'；'.join(link(path,'固定输入') for path in entry['inputs'])]
         for execution in entry['executions']:
             check = checks[execution['check_id']]
-            lines += ['；'.join(execution_summary(check)[1:])+'。'+link(execution['record'],'执行记录')+'；'+
+            lines += [f'<a id="exploration-{check.id}"></a>', execution_links[check.id]+'：'+'；'.join(execution_summary(check)[1:])+'。'+link(execution['record'],'执行记录')+'；'+
                 link(execution['stdout'],'实际输出')+'；'+link(execution['stderr'],'诊断'),
                 execution_location(check,archive), '；'.join(link(path,'执行文件清单') for path in execution['artifacts'])]
         if not entry['executions']:lines.append('已受理问题，尚无保存的执行记录。')
         for handoff in entry['feedback']:
-            saved = handoff['submission']
-            if handoff==entry['feedback'][-1]:interpretations.setdefault(saved,set()).update(handoff['ref_ids'])
-            lines.append('执行后精确引用交接：'+link(saved,'受理解释；不是本次独立观察'))
+            lines.append('后续受理交接原文导航：'+handoff_links[handoff['operation_id']])
         if entry['without_followup']:lines.append('探索执行记录已保存，尚待解释；输出不自动生成正式义务或审批待办。')
-    for saved, refs in interpretations.items():
+    for operation, refs in interpretations.items():
+        saved = f'submissions/{operation}/accepted.json'
         feedback = archive.read(saved).get('feedback') or {}
-        lines += ['', '后续受理解释（关联 '+str(len(refs))+' 次执行）：'+excerpt(feedback.get('answered','归档字节缺失'),260),
+        lines += ['', f'<a id="exploration-feedback-{operation}"></a>',
+            handoff_links[operation]+' · '+('共同后续说明' if len(refs)>1 else '后续说明')+'；关联：'+'、'.join(execution_links[id] for id in execution_links if id in refs),
+            '后续受理交接原文（摘录，不是各次执行的独立观察）：'+excerpt(feedback.get('answered','归档字节缺失'),260),
             link(saved,'完整交接；精确引用不表示已解决或已正式化')]
     lines += ['', '## 研究过程与认识增长', '',
         'A1 共识形成与推进、A2 上下文／权威转换及其连接由双主线概览导航；地图条目和检查数量不是责任覆盖率。',

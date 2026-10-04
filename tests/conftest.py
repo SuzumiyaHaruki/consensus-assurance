@@ -70,3 +70,13 @@ def go_module(tmp_path):
         folder=root/directory;folder.mkdir(parents=True,exist_ok=True)
         (folder/'value.go').write_text(f'package {package}\nfunc Step(value, limit int) int {{\n return value + 1\n}}\n')
     return root
+
+
+@pytest.fixture
+def rust_workspace(tmp_path):
+    """A dependency-free Cargo workspace with one ordinary public library."""
+    root=tmp_path/'rust-workspace';(root/'sample/src').mkdir(parents=True)
+    (root/'Cargo.toml').write_text('[workspace]\nmembers=["sample"]\nresolver="2"\n')
+    (root/'sample/Cargo.toml').write_text('[package]\nname="sample"\nversion="0.1.0"\nedition="2021"\n')
+    (root/'sample/src/lib.rs').write_text('pub fn step(value: i64, _limit: i64) -> i64 {\n    value + 1\n}\n')
+    return root

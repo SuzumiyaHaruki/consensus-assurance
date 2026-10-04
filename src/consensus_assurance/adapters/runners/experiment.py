@@ -1,9 +1,19 @@
 import json
 import os
+import re
 import shutil
 from pathlib import Path
 from consensus_assurance.core.types import ExecutionStatus, CheckRun
 from consensus_assurance.adapters.runners.process import output
+
+
+def local_package(value):
+    """One repository-local directory, never flags, import specifiers or patterns."""
+    name = value.removeprefix("./")
+    if name != "." and (not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]*(/[A-Za-z0-9_][A-Za-z0-9_.-]*)*", name)
+            or any(part in {".", ".."} or "..." in part for part in name.split("/"))):
+        raise ValueError("execution_package must name one local package directory, not flags, imports or patterns")
+    return "." if name == "." else "./" + name
 
 
 def clean_environment(workspace, adapter=None):
@@ -46,7 +56,8 @@ def install_harness(workspace, filename, harness, target_files, *, write=True):
     for name, content in files.items():
         path = Path(name)
         if (path.is_absolute() or not path.parts or ".." in path.parts or
-                name in target_files or path.name in {"go.mod", "go.sum", "go.work", "go.work.sum", "pyproject.toml", "setup.py", "sitecustomize.py"}):
+                name in target_files or '.cargo' in path.parts or path.name in {"go.mod", "go.sum", "go.work", "go.work.sum",
+                    "Cargo.toml", "Cargo.lock", "build.rs", "rust-toolchain", "rust-toolchain.toml", "pyproject.toml", "setup.py", "sitecustomize.py"}):
             raise ValueError("Generated file cannot replace target or dependency definitions: " + name)
         if any(str(parent) in files or str(parent) in target_files for parent in path.parents):
             raise ValueError("Generated paths contain a file/directory collision")
