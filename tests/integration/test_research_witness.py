@@ -3,7 +3,7 @@ import json
 from pathlib import Path
 import pytest
 from audit_support import first, products, engine_for, check_step, review_step, stop, feedback
-from test_audit_research import question_step, diagnostics
+from audit_support import question_step, diagnostics
 
 
 @pytest.mark.parametrize('owned_ref',['material','result','review','disposition','unknown','unexplained'])

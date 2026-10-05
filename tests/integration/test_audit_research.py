@@ -4,23 +4,12 @@ from pathlib import Path
 import pytest
 from consensus_assurance.workflow.research import view
 from consensus_assurance.reporting.chinese import render_report
-from audit_support import first, partial_map, products, engine_for, check_step, review_step, stop, feedback
-
-
-def diagnostics(engine):
-    return [json.loads(p.read_text()) for p in (engine.root/'submissions').glob('*/diagnostics.json')]
+from audit_support import first, partial_map, products, engine_for, check_step, review_step, stop, feedback, instance_products, local_stop, next_question, question_step, diagnostics
 
 
 def map_step(spec):
     return lambda state:(dict(action='research',map_path='map.json',sources=products()[0]['sources'],
         rationale='Register sourced partial understanding'),{'map.json':json.dumps(spec)})
-
-
-def question_step(state):
-    sub,files=first(state)
-    sub.update(action='continue',obligation=None,bindings=[])
-    sub['question'].update(disposition='needs_specific_evidence',unknowns=['Consumer unexamined'])
-    return sub,files
 
 
 def open_first(state):
@@ -148,36 +137,6 @@ def test_continuation_accepts_sourced_answer_but_not_rewording(tmp_path,separate
     assert 'consumer forwards' in state.question_candidates[0].question.unknowns[0]
 
 
-def test_pending_feedback_does_not_block_an_independent_candidate(tmp_path):
-    def pause(state):
-        return dict(action='pause',candidate_id=state['question_candidates'][0]['id'],question=state['question_candidates'][0]['question'],
-            rationale='Need unexamined consumer code',resume_conditions=['Read actual consumer']),{}
-    answer=dict(action='research',rationale='Keep the sourced return answer',feedback=dict(
-        ref_ids=['code','doc'],answered='The capacity branch bounds this return',remaining=['External consumer'],
-        understanding='updated',rationale='Source observation only'))
-    def repeated(state):
-        return json.dumps(answer,indent=4),{}
-    def new_source(state):
-        index=json.loads((e.root/'research.json').read_text())
-        a,b=state['selections'][-2:]
-        assert b['duplicate_of']==a['operation_id'] and index['latest_decision']['duplicate_of']==a['operation_id']
-        assert [h['operation_id'] for h in index['handoffs'] if h.get('feedback')]==[a['operation_id']]
-        assert len(index['map_handoffs'])==0
-        assert all((e.root/'submissions'/s['operation_id']/'accepted.json').exists() for s in (a,b))
-        return dict(answer,sources=[dict(id='consumer',file='consumer.py',start_line=1,end_line=2,kind='code_observation')],
-            feedback=dict(answer['feedback'],ref_ids=['consumer'],answered='The consumer forwards the returned value')),{}
-    steps=[question_step,pause,repeated,repeated,new_source,first,check_step(),review_step(),repeated,stop]
-    e,repo=engine_for(tmp_path,steps)
-    (repo/'consumer.py').write_text('def consume(value):\n    return value\n')
-    state=e.start(repo)
-    assert state.question_candidates[0].status=='paused'
-    assert state.units[0].status=='checked' and not diagnostics(e)
-    assert len([s for s in state.selections if s.get('duplicate_of')])==1
-    assert 'duplicate_of' not in state.selections[-1]
-    assert state.usage['agent_calls']==len(steps) and len(state.agent_turns)==len(steps)
-    assert '纯反馈重复受理 1 次，无新增认识' in render_report(state,e.root).read_text()
-
-
 def test_question_converges_before_obligation_and_results_do_not_propagate(tmp_path):
     lead='Does caller interference explain the returned value?'
     def initial(state):
@@ -240,30 +199,6 @@ def test_question_converges_before_obligation_and_results_do_not_propagate(tmp_p
     assert first_q.status=='paused' and not first_q.resume_conditions
     assert len(projected['conclusions'])==1 and projected['conclusions'][0]['candidate_id']==first_q.id
     assert other.question.unknowns==['Cause has not been isolated'] and not derived.obligation_id
-
-
-def test_unrelated_map_update_preserves_check_and_focus_stop_is_bounded(tmp_path):
-    def update(state):
-        spec=json.loads(Path(state['audit_spec_path']).read_text())
-        spec['surfaces'].append(dict(entry_point='A2 authority context',disposition='deferred',source_ids=['code'],reason='Actual authority producer unexamined',high_consequence=True))
-        sub=dict(action='research',map_path='map.json',rationale='Register an independent unexplored responsibility',feedback=feedback(state))
-        sub['feedback']['understanding']='updated'
-        return sub,{'map.json':json.dumps(spec)}
-    def false_complete(state):
-        sub=dict(action='stop',scope='focus',reason='bounded_completed',rationale='Claim focus completion')
-        sub.update(ref_ids=['code'])
-        return sub,{}
-    e,repo=engine_for(tmp_path,[first,check_step(),review_step(),update,false_complete,stop]);e.config.activity_focus=['A1','A2']
-    state=e.start(repo)
-    assert state.audit_spec_version==2 and state.units[0].audit_question.audit_spec_version==1
-    assert state.units[0].status=='checked' and len(state.direct_checks)==1
-    assert len(diagnostics(e))==1
-    from consensus_assurance.reporting.chinese import render_report
-    report=render_report(state,e.root).read_text()
-    index=json.loads((e.root/'research.json').read_text())
-    assert index['frontier']['surfaces'] and index['stop']['scope']=='run'
-    assert 'A2' in report and '不是责任覆盖率' in report
-    assert 'A2 authority context' in report and '当前未决事项' in report
 
 
 @pytest.mark.usefixtures('full_refresh_equivalence')
@@ -472,24 +407,6 @@ def test_shared_fact_can_reconnect_paused_and_active_candidates_atomically(tmp_p
     assert all(c.question.audit_spec_version==2 and c.history for c in state.question_candidates)
 
 
-def next_question(state):
-    sub=products()[0]
-    sub.update(action='continue',obligation=None,bindings=[],sources=[])
-    sub['question'].update(contexts=['Another sourced invocation'],
-        disposition='needs_specific_evidence',unknowns=['Inspect the other invocation boundary'])
-    return sub,{}
-
-
-def local_stop(reason='bounded_completed', scope='candidate'):
-    def step(state):
-        candidate=state['question_candidates'][-1]
-        return dict(action='stop',scope=scope,reason=reason,ref_ids=[candidate['id']],
-            rationale='The scoped discriminator is disposed; compare other sourced directions',
-            resume_conditions=[] if reason=='bounded_completed' else ['Acquire the missing producer observation'],
-            feedback=feedback(state)),{}
-    return step
-
-
 @pytest.mark.parametrize('reason',['bounded_completed','insufficient_basis','no_actionable_direction'])
 def test_open_run_rejects_semantic_stops_in_preflight_and_acceptance(tmp_path,reason):
     from consensus_assurance.workflow.audit import validate_submission
@@ -597,6 +514,7 @@ def test_local_disposition_continues_with_mapped_unknowns(tmp_path,disposition):
                 assert any(w['id']==copy.units[0].id for w in pending_work(copy)),change
         return next_question(state)
     steps=[initial]+([explain] if disposition=='explained_after_obligation' else [] if disposition=='explained' else [check_step(),review_step()])
+    if disposition=='bounded':steps += [local_stop(scope='focus')]
     steps += [local_stop(),continued,stop]
     e,repo=engine_for(tmp_path,steps)
     if disposition=='explained_after_obligation':e.config.directed_question=None
@@ -607,7 +525,8 @@ def test_local_disposition_continues_with_mapped_unknowns(tmp_path,disposition):
         e.config.execution_isolation='bwrap'
         e.config.directed_question='Controlled small-target confirmation regression'
     state=e.start(repo)
-    assert len(state.question_candidates)==2 and not diagnostics(e)
+    assert len(state.question_candidates)==2 and len(diagnostics(e))==int(disposition=='bounded')
+    if disposition=='bounded':assert 'focus exhaustion' in str(diagnostics(e))
     assert state.question_candidates[0].status=='closed'
     assert state.agent_session_id=='fixture-session' and state.usage['agent_calls']==len(steps)
     research=view(state)
@@ -755,59 +674,6 @@ def test_local_handoff_recovers_without_reexecuting_checked_work(tmp_path):
     assert len([s for s in state.selections if s['action']=='stop' and s['scope']=='candidate'])==1
 
 
-def instance_products():
-    source = '''def create(eligible):
-    return dict(eligible=set(eligible), context=None, support={}, decision=None)
-
-def change(instance, context):
-    if context is None or context == instance['context']:
-        return False
-    instance['context'], instance['support'] = context, {}
-    return True
-
-def support(instance, context, member, value):
-    if context != instance['context'] or member not in instance['eligible']:
-        return False
-    instance['support'][member] = value
-    if set(instance['support']) != instance['eligible'] or set(instance['support'].values()) != {value}:
-        return False
-    if instance['decision'] is None:
-        instance['decision'] = value
-    return instance['decision'] == value
-
-def read(instance):
-    return instance['decision']
-'''
-    spec=partial_map()
-    spec['target_profile']=dict(system_boundary='Synthetic per-instance support; callers and crashes outside',
-        protocol_contexts=['Independent instance context'],source_ids=['code'])
-    spec['activities']=[dict(class_id=a,applicability='applicable',purpose=p,realization_summary=r,source_ids=['code'])
-        for a,p,r in [('A1','Form an instance decision','Collect matching support from configured identities'),
-            ('A2','Change per-instance context','Discard pending support; preserve the decision'),
-            ('A4','Configure eligible identities','The caller supplies a set at instance creation'),
-            ('A5','Consume the decision','read exposes the stored decision')]]
-    spec['behaviors']=[dict(id=id,primary_activity=a,execution_owner='Instance caller',protocol_context='One instance',
-        trigger=trigger,produces_fact_ids=produces,consumes_fact_ids=consumes,source_ids=['code'])
-        for id,a,trigger,produces,consumes in [('call','A1','support call',['result'],['context']),
-            ('change','A2','change call',['context'],[]),('init','A4','create call',[],[]),
-            ('read','A5','read call',[],['result'])]]
-    spec['facts']=[dict(id=id,meaning=meaning,identity={'instance':'Selected object'},validity_context=context,
-        representation=[representation],durability='Volatile',recovery='Not implemented in this source',
-        source_ids=['code'],unknowns=unknowns)
-        for id,meaning,context,representation,unknowns in [
-            ('result','First decision established by all configured matching support','Preserved across change','decision',[]),
-            ('context','Active per-instance context after change','Until next change','context',['Caller authorization is outside the source'])]]
-    spec['surfaces']=[dict(entry_point='read',disposition='deferred',source_ids=['code'],
-        reason='Caller timing and completion contract need investigation; preserve this early lead')]
-    def path(text,bs,fs):return dict(explanation=text,behavior_ids=bs,fact_ids=fs,source_ids=['code'])
-    spec['core_overview']=dict(status='usable',rationale='The finite in-memory paths and their connection are explained; caller policy remains open',
-        formation=path('support rejects stale or ineligible input, records one value per member, requires all eligible members to agree, preserves the first decision; read exposes it',['call','init','read'],['result','context']),
-        context=path('create leaves context unset; change accepts a distinct non-null context, resets support, preserves decision and rejects redundant change',['init','change'],['context']),
-        connection=path('support requires the current context; change invalidates pending support while the established decision survives and constrains later return',['call','change'],['result','context']),
-        core_gaps=[],open_details=['Retry policy of unavailable external callers'])
-    return source,spec
-
-
 def instance_prefix():
     """Human-authored research prefix; no autonomous discovery or execution Evidence."""
     source,spec=instance_products()
@@ -923,43 +789,23 @@ def test_independent_construction_diagnostics_are_batched_and_repairs_make_progr
     assert len(state.units)==len(state.question_candidates)==1 and state.usage['agent_calls']==5
 
 
-def test_execution_feedback_updates_current_unknowns_then_explanation_and_new_direction(tmp_path):
-    def initial(state):
-        sub,files=first(state);sub['question']['unknowns']=['The direct check has not executed']
-        return sub,files
-    def explained(state):
-        first_candidate,selected=state['question_candidates']
-        assert first_candidate['question']['unknowns']==['The direct check has not executed']
-        assert first_candidate['resume_conditions']!=first_candidate['question']['unknowns']
-        q=selected['question'];q.update(disposition='explained_by_existing_mechanism',unknowns=[],
-            counterevidence=['The capacity branch handles the selected input'])
-        spec=json.loads(Path(state['audit_spec_path']).read_text())
-        spec['facts'][0]['unknowns']=['External consumer behavior remains outside the inspected return function']
-        check=next(c for c in state['checks'] if c['action']=='direct_check')
-        fb=dict(ref_ids=[check['id'],'code'],answered='The isolated invocation executed and review completed; the source bounds the return',
-            remaining=['External consumer behavior'],understanding='updated',rationale='Return to the independent consumer boundary',
-            question_updates={first_candidate['id']:dict(unknowns=['Distributed consequences are untested'],
-                resume_conditions=['Acquire an actual consumer and its applicable contract'])})
-        return dict(action='explained',candidate_id=selected['id'],question=q,feedback=fb,map_path='map.json',
-            map_changes={'result':dict(impact='clarification',rationale='Separate the observed local return from an unread external consumer',source_ids=['code'])},
-            rationale='Source explains the local branch; compare a third consumer question'),{'map.json':json.dumps(spec)}
-    def third(state):
-        sub,_=next_question(state)
-        sub['question'].update(question='Which caller enforces the input precondition?',audit_spec_version=None)
-        return sub,{}
-    e,repo=engine_for(tmp_path,[initial,check_step(),review_step(),next_question,explained,third,stop])
+def test_sourced_feedback_updates_unknowns_and_preserves_history(tmp_path):
+    def answer(state):
+        c=state['question_candidates'][0]
+        fb=dict(feedback(state),answered='The source branch bounds this local return; the external consumer remains unread',
+            question_updates={c['id']:dict(unknowns=['External consumer responsibility'],resume_conditions=['Acquire the consumer contract'])})
+        return dict(action='research',feedback=fb,rationale='Update only this saved question'),{}
+    e,repo=engine_for(tmp_path,[question_step,local_stop('insufficient_basis'),answer,next_question,stop])
     state=e.start(repo)
-    assert not diagnostics(e),diagnostics(e)
-    assert len(state.question_candidates)==3 and state.question_candidates[1].status=='explained'
-    current=state.question_candidates[0]
-    assert current.question.unknowns==['Distributed consequences are untested']
-    assert any(q.unknowns==['The direct check has not executed'] for q in current.history)
-    projected=view(state)
-    assert projected['candidates'][0]['executions'][0]['status']=='completed'
-    assert state.audit_spec_version==2 and state.usage['experiments']==1 and state.units[0].status=='checked'
-    from consensus_assurance.reporting.chinese import render_report
-    render_report(state,e.root)
-    assert Path(state.direct_checks[0].harness_path).relative_to(e.root).as_posix() in (e.root/'report.md').read_text()
+    c=state.question_candidates[0]
+    assert not diagnostics(e) and c.status=='paused' and len(state.question_candidates)==2
+    assert c.question.unknowns==['External consumer responsibility'] and c.resume_conditions==['Acquire the consumer contract']
+    assert c.history[-1].unknowns==['Consumer unexamined']
+    assert not state.units and not state.evidence and state.audit_spec_version==1
+    index=json.loads((e.root/'research.json').read_text())
+    assert index['candidates'][0]['resume_conditions']==c.resume_conditions
+    assert index['candidates'][0]['record']['match']=={'id':c.id}
+    assert 'Acquire the consumer contract' in render_report(state,e.root).read_text()
 
 
 def record_map(state, refined=False, challenge=False):
@@ -1096,7 +942,7 @@ def test_knowledge_growth_preserves_execution_and_supplies_the_next_check(tmp_pa
         assert state['units'][0]['audit_question']['audit_spec_version']==1
         if variant=='interference':return record_map(state,challenge=True)
         spec=json.loads(Path(state['audit_spec_path']).read_text())
-        spec['surfaces'].append(dict(entry_point='clear_records',disposition='deferred',source_ids=['code'],reason='Uninvestigated record lifetime'))
+        spec['surfaces'].append(dict(entry_point='clear_records',disposition='deferred',source_ids=['code'],reason='Uninvestigated record lifetime',high_consequence=True))
         return dict(action='research',map_path='map.json',rationale='Record a remaining boundary'),{'map.json':json.dumps(spec)}
     def next_check(state):
         assert len(state['monitor_results'])==1 and state['monitor_results'][0]['claim_id']=='bounded'
@@ -1225,6 +1071,9 @@ def test_knowledge_growth_preserves_execution_and_supplies_the_next_check(tmp_pa
     from consensus_assurance.reporting.chinese import render_report
     report=render_report(state,e.root).read_text()
     assert 'audit-spec/v3.json' in report
+    if variant!='interference':
+        assert next(s for s in current['frontier']['surfaces'] if s['entry_point']=='clear_records')['high_consequence']
+        assert 'clear_records' in report and '不是责任覆盖率' in report
     assert 'External ordering between record consumption and clearing is not supplied' in current['core_overview']['open_details']
     assert 'The local check has not executed' not in report and 'The local check has not executed' not in json.dumps(current['core_overview'])
     assert 'distributed consequences' in state.claims[0].scope.excluded and 'distributed consequences' not in json.dumps(current['frontier'])

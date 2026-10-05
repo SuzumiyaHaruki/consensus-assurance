@@ -1,19 +1,7 @@
 """Repository-type reproductions of the four audited boundary failures."""
-import json
 import pytest
-from consensus_assurance.core.proposals import ClaimDraft, GraphPatch, Feedback, JudgmentChange
-
-
-def revision_for(state, ids):
-    drafts=[];changes=[]
-    for id in ids:
-        old=next(c for c in state.claims if c.id==id)
-        new=ClaimDraft(**{k:v for k,v in old.model_dump().items() if k in ClaimDraft.model_fields})
-        new.description=old.description+' with a weaker requirement'
-        drafts.append(new)
-        changes.append(JudgmentChange(target_id=id,field='description',old_value_json=json.dumps(old.description),new_value_json=json.dumps(new.description)))
-    basis=drafts[0].grounding.model_copy(deep=True);basis.unresolved=[];basis.conflicts=[]
-    return Feedback(kind='F2',rationale='Candidate correction',evidence_ids=basis.expectation_ids or basis.source_ids,target_ids=[ids[0]],relation_ids=[],new_basis='Actual materials support the requested correction',patch=GraphPatch(claims=drafts,expected_versions={i:1 for i in ids},rationale='Correction'),changes=changes,old_judgment=state.claims[1].description,new_judgment=drafts[0].description,grounding=basis)
+from regression_support import revision_for
+from consensus_assurance.core.proposals import ClaimDraft, GraphPatch
 
 
 from consensus_assurance.core.proposals import RelationDraft, BindingDraft, UnitDraft

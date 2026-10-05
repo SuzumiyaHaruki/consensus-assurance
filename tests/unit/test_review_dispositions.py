@@ -11,7 +11,7 @@ from consensus_assurance.workflow.engine import Engine
 from consensus_assurance.workflow.budget import BudgetTracker
 from consensus_assurance.registry import assemble
 from consensus_assurance.adapters.storage.files import Store
-from test_graph_mutations import revision_for
+from regression_support import revision_for
 
 
 def engine_for(tmp_path,state):

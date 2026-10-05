@@ -1,7 +1,5 @@
 """Public audit loop with scripted transport and actual isolated Python execution."""
 import json
-from pathlib import Path
-import pytest
 from consensus_assurance.core.config import Config, Budget
 from consensus_assurance.core.types import CheckRun, ExecutionStatus
 from consensus_assurance.workflow.engine import Engine
@@ -188,3 +186,85 @@ def report(ticket):
 
 def allowed(ticket):
     return ticket in pending and ''' + predicate + '\n'}
+
+
+def diagnostics(engine):
+    return [json.loads(p.read_text()) for p in (engine.root/'submissions').glob('*/diagnostics.json')]
+
+
+def question_step(state):
+    sub,files=first(state)
+    sub.update(action='continue',obligation=None,bindings=[])
+    sub['question'].update(disposition='needs_specific_evidence',unknowns=['Consumer unexamined'])
+    return sub,files
+
+
+def next_question(state):
+    sub=products()[0]
+    sub.update(action='continue',obligation=None,bindings=[],sources=[])
+    sub['question'].update(contexts=['Another sourced invocation'],
+        disposition='needs_specific_evidence',unknowns=['Inspect the other invocation boundary'])
+    return sub,{}
+
+
+def local_stop(reason='bounded_completed', scope='candidate'):
+    def step(state):
+        candidate=state['question_candidates'][-1]
+        return dict(action='stop',scope=scope,reason=reason,ref_ids=[candidate['id']],
+            rationale='The scoped discriminator is disposed; compare other sourced directions',
+            resume_conditions=[] if reason=='bounded_completed' else ['Acquire the missing producer observation'],
+            feedback=feedback(state)),{}
+    return step
+
+
+def instance_products():
+    source = '''def create(eligible):
+    return dict(eligible=set(eligible), context=None, support={}, decision=None)
+
+def change(instance, context):
+    if context is None or context == instance['context']:
+        return False
+    instance['context'], instance['support'] = context, {}
+    return True
+
+def support(instance, context, member, value):
+    if context != instance['context'] or member not in instance['eligible']:
+        return False
+    instance['support'][member] = value
+    if set(instance['support']) != instance['eligible'] or set(instance['support'].values()) != {value}:
+        return False
+    if instance['decision'] is None:
+        instance['decision'] = value
+    return instance['decision'] == value
+
+def read(instance):
+    return instance['decision']
+'''
+    spec=partial_map()
+    spec['target_profile']=dict(system_boundary='Synthetic per-instance support; callers and crashes outside',
+        protocol_contexts=['Independent instance context'],source_ids=['code'])
+    spec['activities']=[dict(class_id=a,applicability='applicable',purpose=p,realization_summary=r,source_ids=['code'])
+        for a,p,r in [('A1','Form an instance decision','Collect matching support from configured identities'),
+            ('A2','Change per-instance context','Discard pending support; preserve the decision'),
+            ('A4','Configure eligible identities','The caller supplies a set at instance creation'),
+            ('A5','Consume the decision','read exposes the stored decision')]]
+    spec['behaviors']=[dict(id=id,primary_activity=a,execution_owner='Instance caller',protocol_context='One instance',
+        trigger=trigger,produces_fact_ids=produces,consumes_fact_ids=consumes,source_ids=['code'])
+        for id,a,trigger,produces,consumes in [('call','A1','support call',['result'],['context']),
+            ('change','A2','change call',['context'],[]),('init','A4','create call',[],[]),
+            ('read','A5','read call',[],['result'])]]
+    spec['facts']=[dict(id=id,meaning=meaning,identity={'instance':'Selected object'},validity_context=context,
+        representation=[representation],durability='Volatile',recovery='Not implemented in this source',
+        source_ids=['code'],unknowns=unknowns)
+        for id,meaning,context,representation,unknowns in [
+            ('result','First decision established by all configured matching support','Preserved across change','decision',[]),
+            ('context','Active per-instance context after change','Until next change','context',['Caller authorization is outside the source'])]]
+    spec['surfaces']=[dict(entry_point='read',disposition='deferred',source_ids=['code'],
+        reason='Caller timing and completion contract need investigation; preserve this early lead')]
+    def path(text,bs,fs):return dict(explanation=text,behavior_ids=bs,fact_ids=fs,source_ids=['code'])
+    spec['core_overview']=dict(status='usable',rationale='The finite in-memory paths and their connection are explained; caller policy remains open',
+        formation=path('support rejects stale or ineligible input, records one value per member, requires all eligible members to agree, preserves the first decision; read exposes it',['call','init','read'],['result','context']),
+        context=path('create leaves context unset; change accepts a distinct non-null context, resets support, preserves decision and rejects redundant change',['init','change'],['context']),
+        connection=path('support requires the current context; change invalidates pending support while the established decision survives and constrains later return',['call','change'],['result','context']),
+        core_gaps=[],open_details=['Retry policy of unavailable external callers'])
+    return source,spec

@@ -1,10 +1,8 @@
 """Scope refinement preserves semantics, full graph checks and historical applicability."""
-import copy
 import pytest
-from test_context_failures import dependency
+from regression_support import dependency
 from consensus_assurance.workflow.scope_updates import from_patch,apply_scope_update,validate_scope_update,ScopeAssessment
 from consensus_assurance.core.types import AuditQuestion
-from consensus_assurance.workflow.graph import apply_patch
 
 
 @pytest.mark.parametrize('field',['assumptions','excluded','obligation','other_unit'])

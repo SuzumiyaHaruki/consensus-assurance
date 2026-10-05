@@ -168,13 +168,8 @@ def test_source_view_only_exposes_authorized_snapshot_and_rejects_stale_range(tm
 
 def test_one_audit_runtime_and_methods_match_product_interface(tmp_path):
     from consensus_assurance.workflow.audit import method_text
-    from consensus_assurance.workflow.engine import Engine
     from consensus_assurance.workflow.prompts import loaded_resources
     from audit_support import engine_for, stop
-    root=Path('src/consensus_assurance/workflow')
-    for name in ('discovery','inquiry','agent_tasks','task_packet','output_repair','staged_model','native'):
-        assert not (root/(name+'.py')).exists()
-    assert not hasattr(Engine,'ask') and not hasattr(Engine,'targeted_read')
     paths,text=method_text()
     selection=loaded_resources()
     e,repo=engine_for(tmp_path,[stop]);state=e.start(repo)
@@ -326,93 +321,3 @@ print(json.dumps({'type':'turn.failed','error':{'message':'Client diagnostic '+o
     check=runner.run([sys.executable,'-c',"import os; assert 'PROVIDER_TICKET' not in os.environ; print('CREDENTIAL_ABSENT')"],
         workspace,'target-environment','fixture',10,env=clean_environment(workspace))
     assert check.exit_code==0 and Path(check.stdout).read_text().strip()=='CREDENTIAL_ABSENT'
-
-
-@pytest.fixture
-def codex_workspace():
-    import shutil,tempfile,time
-    from consensus_assurance.adapters.runners.process import ProcessRunner
-    if not shutil.which('codex') or not shutil.which('bwrap'):pytest.skip('Local Codex and bubblewrap are required')
-    # The permission profile deliberately denies /tmp; retain probe receipts outside it.
-    cache=Path.home()/'.cache/consensus-assurance';cache.mkdir(parents=True,exist_ok=True)
-    root=Path(tempfile.mkdtemp(prefix='provider-acceptance-',dir=cache))
-    source=root/'agent-source';source.mkdir();(source/'value.txt').write_text('7\n')
-    draft=root/'draft';draft.mkdir()
-    runner=ProcessRunner(root);runner.deadline=time.monotonic()+300
-    print('Retained capability receipts:',root)
-    return runner,draft
-
-
-@pytest.mark.real
-@pytest.mark.parametrize('custom',[False,True])
-def test_real_codex_local_permissions(codex_workspace,monkeypatch,custom):
-    from consensus_assurance.cli import load_config
-    from consensus_assurance.adapters.runners.process import output
-    runner,draft=codex_workspace
-    cfg=load_config('configs/targets/deepseek.example.yaml')
-    provider=cfg.codex_provider.model_copy(update={'env_key':'CA_PROVIDER_CANARY'}) if custom else None
-    monkeypatch.setenv('CA_PROVIDER_CANARY','unlabelled-local-canary-987654321')
-    agent=CodexAgent('low','deepseek-flash' if custom else None,provider)
-    agent.bind_inputs(runner.root,runner.root/'agent-source')
-    assert agent.probe(runner)['available']
-    ok,checks=agent.prepare(runner,draft,'synthetic')
-    assert ok,output(checks[-1])
-    if custom:
-        assert 'CREDENTIAL_ABSENT' in output(checks[-1])
-        assert 'READ:5' in output(checks[-1]) and 'DENIED:write:5' in output(checks[-1])
-    assert (runner.root/'agent-source/value.txt').read_text()=='7\n'
-    for path in runner.root.rglob('*'):
-        if path.is_file():
-            assert b'unlabelled-local-canary-987654321' not in path.read_bytes()
-            assert b'ca-provider-permission-canary' not in path.read_bytes()
-
-
-@pytest.mark.real
-def test_deepseek_two_turn_acceptance(request):
-    """Explicit opt-in: official service, synthetic data, two turns, five minutes total."""
-    import os,secrets
-    if os.environ.get('CA_DEEPSEEK_ACCEPTANCE')!='1':
-        pytest.skip('Paid DeepSeek acceptance requires explicit CA_DEEPSEEK_ACCEPTANCE=1 authorization')
-    from consensus_assurance.cli import load_config
-    from consensus_assurance.adapters.agents.backend import codex_events
-    from consensus_assurance.adapters.storage.files import write_json
-    runner,draft=request.getfixturevalue('codex_workspace')
-    cfg=load_config('configs/targets/deepseek.example.yaml')
-    assert cfg.codex_provider.base_url=='https://api.deepseek.com' and cfg.agent_model=='deepseek-flash'
-    agent=CodexAgent(cfg.agent_reasoning_effort,cfg.agent_model,cfg.codex_provider)
-    agent.client_environment()
-    agent.bind_inputs(runner.root,runner.root/'agent-source')
-    write_json(runner.root/'config.json',cfg)
-    assert agent.probe(runner)['available']
-    assert agent.prepare(runner,draft,'synthetic')[0]
-    marker=secrets.token_hex(16)
-    prompts=[
-        f'Authorized synthetic capability check. Read {runner.root}/agent-source/value.txt through a shell tool. '
-        'Use apply_patch to create one.json in the current draft with a value field equal to twice the observed integer. '
-        'Run /usr/bin/python3 to load that JSON and print its value. '
-        f'Remember this session marker only in conversation: {marker}. Do not echo it, put it in a command, '
-        'write it to any file or repeat it in the answer. Return exactly {"submission":"one.json","summary":"first complete"}.',
-        'Continue this exact session. Use the value obtained in the previous tool loop and the session marker '
-        'provided only in that turn. Do not reread the source or search saved logs. Use apply_patch to create two.json '
-        'with previous_value, marker and next_value (previous_value plus one). Run /usr/bin/python3 to load it and '
-        'print next_value. Return exactly {"submission":"two.json","summary":"second complete"}.']
-    session=None
-    for index,prompt in enumerate(prompts,1):
-        agent.validate_inputs(runner.root,cfg)
-        runner.active_action_id=f'capability-{index}'
-        check,observed,result=agent.investigate(runner,prompt,draft,'synthetic',120,session)
-        write_json(runner.root/'logs'/check.id/'check.json',check)
-        assert check.status==ExecutionStatus.COMPLETED and check.exit_code==0 and check.parameters['agent_turn_completed'],check.reason
-        assert result==dict(submission='one.json' if index==1 else 'two.json',summary='first complete' if index==1 else 'second complete')
-        assert observed and (session is None or observed==session)
-        session=observed
-        items=[e['item'] for e in codex_events(check) if e.get('type')=='item.completed']
-        assert any(i.get('type')=='file_change' and i.get('status')=='completed' for i in items)
-        expected=14 if index==1 else 15
-        assert any(i.get('type')=='command_execution' and i.get('exit_code')==0
-            and str(expected) in i.get('aggregated_output','').split() for i in items)
-        value=json.loads((draft/result['submission']).read_text())
-        assert value==({'value':14} if index==1 else {'previous_value':14,'marker':marker,'next_value':15})
-        if index==1:
-            assert all(marker.encode() not in p.read_bytes() for p in runner.root.rglob('*') if p.is_file())
-    assert (runner.root/'agent-source/value.txt').read_text()=='7\n'

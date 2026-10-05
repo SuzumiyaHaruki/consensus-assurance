@@ -5,11 +5,6 @@ from consensus_assurance.workflow.graph import apply_graph, expand_unit
 from consensus_assurance.workflow.feedback import apply_feedback
 
 
-def feedback(state, kind, bundle=None, graph=None, evidence=None, **kwargs):
-    return Feedback(kind=kind, rationale="Observed evidence requires a scoped revision", evidence_ids=evidence or ["observed"],
-        target_ids=[state.units[0].id], relation_ids=kwargs.get("relation_ids", []), new_basis=kwargs.get("new_basis", ""))
-
-
 def add_check(state):
     state.checks.append(CheckRun(id="observed", action="experiment", cwd="/tmp", snapshot_id=state.snapshot.id, status=ExecutionStatus.COMPLETED))
 
@@ -33,7 +28,8 @@ def test_F2_requires_normative_basis_and_invalidates(dependency_prepared):
     _, state, responses  = dependency_prepared; add_check(state)
     revised = GraphDraft.model_validate(responses['graph'])
     revised.claims[1].description = "A refined obligation based on the documented caller responsibility"
-    f = feedback(state, "F2", graph=revised, new_basis="The document assigns normalization to the caller")
+    f = Feedback(kind="F2", rationale="Observed evidence requires a scoped revision", evidence_ids=["observed"],
+        target_ids=[state.units[0].id], relation_ids=[], new_basis="The document assigns normalization to the caller")
     with pytest.raises(ValueError): apply_feedback(state, state.units[0], f)
     f.evidence_ids = [next(m.id for m in state.materials if m.file=='README.md')]
     f.patch = GraphPatch(claims=[revised.claims[1]],expected_versions={revised.claims[1].id:1},rationale=f.new_basis)

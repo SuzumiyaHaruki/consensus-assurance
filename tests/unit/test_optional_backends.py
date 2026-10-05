@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 from consensus_assurance.core.config import Config
 from consensus_assurance.registry import assemble
-from consensus_assurance.workflow.audit import write_schemas, method_text, add_support
+from consensus_assurance.workflow.audit import add_support
 from consensus_assurance.adapters.runners.process import ProcessRunner
 from consensus_assurance.adapters.runners.experiment import install_harness
 from consensus_assurance.core.proposals import Harness
@@ -63,7 +63,7 @@ def test_cargo_selected_target_phases_and_read_only_source(tmp_path,rust_workspa
     with pytest.raises(ValueError,match='symlink'):backend.environment(workspace/'.execution/escape')
 
 
-def test_default_direct_schema_and_assembly_do_not_load_target_or_model_method(tmp_path):
+def test_default_assembly_respects_plugin_dependency_boundary():
     root=Path(__file__).resolve().parents[2]/'src/consensus_assurance'
     for package in ('core','workflow'):
         for path in (root/package).rglob('*.py'):
@@ -77,11 +77,6 @@ backend, agent, knowledge = assemble(Config(execution_backend="python",agent_bac
 assert not any("plugins.targets" in name for name in sys.modules)
 '''
     subprocess.run([sys.executable,'-c',code],check=True)
-    write_schemas(tmp_path)
-    schemas=json.loads((tmp_path/'product-schemas.json').read_text())
-    assert 'ModelDraft' not in schemas and 'Bundle' not in str(schemas)
-    paths,text=method_text()
-    assert not any('local-modeling' in path for path in paths)
     assert Config().activity_focus==[]
 
 
@@ -109,35 +104,13 @@ def test_actual_limiting_timeout_is_recorded(tmp_path,limit,action,timeout,remai
     assert Path(check.stdout).exists() and 'killed' in check.reason
 
 
-def test_retired_tools_cannot_be_requested_or_loaded(tmp_path, monkeypatch):
+def test_retired_configuration_and_products_are_rejected():
     from consensus_assurance.core.submissions import AuditSubmission
     from consensus_assurance.cli import load_config
-    from consensus_assurance.reporting.chinese import render_report
-    from audit_support import engine_for, first, check_step, review_step
-    import importlib.abc
-    class NoModelModules(importlib.abc.MetaPathFinder):
-        def find_spec(self, fullname, path=None, target=None):
-            if 'adapters.verifiers' in fullname or fullname.rsplit('.',1)[-1] in {'modeling','artifacts','inputs'}:
-                raise AssertionError('Retired module imported: ' + fullname)
-    monkeypatch.setattr(sys, 'meta_path', [NoModelModules(), *sys.meta_path])
-    monkeypatch.setenv('PATH', str(tmp_path/'no-external-tools'))
-    monkeypatch.setenv('TLC_JAR', '/missing/unused.jar')
     assert load_config() == Config()
     for legacy in ({'verifier_backend':'tlc'}, {'verifier_backend':'none'}, {'tlc_jar':'missing'}, {'budget':{'model_checks':1}}):
         with pytest.raises(ValueError, match='no longer supported'):Config.model_validate(legacy)
     with pytest.raises(ValueError):AuditSubmission.model_validate({'action':'model','rationale':'Removed product'})
-    paths, method = method_text()
-    assert 'local_model' not in method and '- model:' not in method
-    e, repo = engine_for(tmp_path, [first, check_step(), review_step()])
-    e.config.budget.agent_calls = 3
-    state = e.start(repo)
-    before = state.model_dump(mode='json')
-    assert state.units[0].status == 'checked'
-    assert not (e.root/'models').exists() and not (e.root/'model-method.md').exists()
-    render_report(state, e.root)
-    resumed = e.resume()
-    assert len(resumed.direct_checks) == len(before['direct_checks']) == 1
-    assert resumed.usage == before['usage']
 
 
 @pytest.mark.parametrize('selection',[

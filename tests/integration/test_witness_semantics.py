@@ -6,7 +6,7 @@ from consensus_assurance.core.types import Grounding
 from consensus_assurance.adapters.runners.experiment import extract_events
 from consensus_assurance.workflow.direct_checks import assess, save_plan, execute
 from consensus_assurance.workflow.observations import monitor_events
-from test_direct_checks import setup, review
+from regression_support import setup, review
 
 
 def inputs():

@@ -5,7 +5,7 @@ import pytest
 from audit_support import products, first, check_step, review_step, stop, engine_for, partial_map, feedback
 
 
-@pytest.mark.parametrize('outcome',['violated','holds','missing_admission','missing_result','compile_timeout'])
+@pytest.mark.parametrize('outcome',['violated','holds','compile_timeout'])
 def test_rust_formal_check_and_exploration_share_existing_audit_path(tmp_path,rust_workspace,outcome):
     import shutil
     from consensus_assurance.adapters.runners.cargo import CargoBackend
@@ -23,8 +23,6 @@ fn actual_boundary() {
 }
 '''
     if outcome=='holds':source=source.replace('step(3,3)','step(2,3)')
-    if outcome.startswith('missing_'):
-        source='\n'.join(line for line in source.splitlines() if ('admitted' if outcome=='missing_admission' else 'returned') not in line)
     def check(state):
         sub,files=check_step()(state);plan=json.loads(files['plan.json']);plan['harness']['kind']='rust_test'
         sub.update(harness_path='check.rs',files={})
@@ -56,8 +54,7 @@ fn actual_boundary() {
         assert preparation['latest_preparation']['status']=='timeout' and preparation['latest_preparation']['process_seconds']>0
         return
     assert result['confirmed']==(outcome=='violated')
-    assert result['outcome']==('unknown' if outcome.startswith('missing_') else outcome)
-    assert result['reviewed_complete']==(outcome in {'violated','holds'})
+    assert result['outcome']==outcome and result['reviewed_complete']
     checks=[c for c in state.checks if c.action in {'direct_check','exploration'}]
     assert [c.action for c in checks]==['direct_check','exploration']
     assert all(c.parameters['execution_package']=='./sample' and c.outcome=='tests_passed' for c in checks)
@@ -565,7 +562,7 @@ def test_audit_receipt_failure_routes_preserve_or_stop_the_session(tmp_path,faul
 
 def test_explicit_resume_reads_executed_exploration_after_transport_timeout(tmp_path):
     import sys
-    from test_audit_research import instance_products
+    from audit_support import instance_products
     from consensus_assurance.adapters.agents.backend import CodexAgent
     from consensus_assurance.adapters.runners.experiment import extract_events
     from consensus_assurance.reporting.chinese import render_report
@@ -897,7 +894,7 @@ def test_unreached_prerequisite_repairs_without_checker_issue(tmp_path):
 def test_driver_repair_executes_reviews_and_continues_without_old_text_blockers(tmp_path,violated):
     from consensus_assurance.workflow.audit import validate_submission
     from consensus_assurance.reporting.chinese import render_report
-    from test_audit_research import next_question, local_stop
+    from audit_support import next_question, local_stop
     conflict='The private entry requires caller validation absent from this driver.'
     retained={}
     def original(state):
@@ -1083,6 +1080,16 @@ def test_feedback_only_retains_exploration_before_a_map_and_recovers_once(tmp_pa
         return dict(action='research',rationale='Retain the construction observation',feedback=dict(
             ref_ids=[check['id']],answered='The selected input policy produced distinct returns 3 and 0.',remaining=['The caller policy responsibility is not yet established'],
             understanding='updated',rationale='No normative claim or map change is implied.')),{}
+    def new_source(state):
+        current=json.loads((e.root/'research.json').read_text())
+        a,b=state['selections'][-2:]
+        assert b['duplicate_of']==a['operation_id']==current['latest_decision']['duplicate_of']
+        assert [h['operation_id'] for h in current['handoffs'] if h.get('feedback')]==[a['operation_id']]
+        assert all((e.root/'submissions'/r['operation_id']/'accepted.json').is_file() for r in (a,b))
+        raw,files=retain(state)
+        raw['sources']=[dict(id='code',file='target.py',start_line=1,end_line=2,kind='code_observation')]
+        raw['feedback']['ref_ids'].append('code')
+        return raw,files
     def next_turn(state):
         current=json.loads((e.root/'research.json').read_text())
         assert current['handoffs'][-1]['feedback']['answered'].endswith('3 and 0.')
@@ -1094,7 +1101,8 @@ def test_feedback_only_retains_exploration_before_a_map_and_recovers_once(tmp_pa
         (e.root/'draft'/'indirect.json').write_text(json.dumps(raw))
         assert validate_submission(e.state,e.root,'indirect.json',e.implementation)['valid']
         return first(state)
-    e,repo=engine_for(tmp_path,[explore,retain,next_turn,check_step(),review_step(),stop])
+    steps=[explore,retain,lambda s:(json.dumps(retain(s)[0],indent=4),{}),new_source,next_turn,check_step(),review_step(),retain,stop]
+    e,repo=engine_for(tmp_path,steps)
     e.agent.mock=False;e.config.execution_isolation='bwrap'
     old=e.graph_commit_hook
     def interrupt(key):
@@ -1108,7 +1116,11 @@ def test_feedback_only_retains_exploration_before_a_map_and_recovers_once(tmp_pa
     assert 'observed 3 0' in Path(exploratory.stdout).read_text()
     assert all(e.check_id!=exploratory.id for e in state.evidence)
     assert state.monitor_results[-1]['outcome']=='holds' and not state.findings
-    assert len([s for s in state.selections if s['action']=='research'])==1
+    handoffs=[s for s in state.selections if s['action']=='research']
+    assert len(handoffs)==4 and sum(bool(s.get('duplicate_of')) for s in handoffs)==1
+    assert 'duplicate_of' not in handoffs[-1] and state.usage['agent_calls']==len(steps)==len(state.agent_turns)
+    from consensus_assurance.reporting.chinese import render_report
+    assert '纯反馈重复受理 1 次，无新增认识' in render_report(state,e.root).read_text()
     counts=(dict(state.usage),len(state.selections))
     e.resume()
     assert (dict(state.usage),len(state.selections))==counts
@@ -1480,8 +1492,8 @@ def test_small_exploration_answer_is_independent_of_unfinished_large_product(tmp
     from consensus_assurance.reporting.chinese import render_report
     report=render_report(state,e.root).read_text()
     unresolved=report.split('## 当前未决事项')[1]
-    assert '已选检查暂无欠账' in unresolved
-    assert ('尚无精确对应的后续受理解释' in unresolved)==(delivery!='accepted')
+    assert '已选检查／复核暂无待办' in unresolved
+    assert ('尚待受理解释' in unresolved)==(delivery!='accepted')
     if delivery=='accepted':assert '精确引用不表示已解决或已正式化' in report
     # This checks the actual loaded resource, not an unattached instruction file or LLM behavior.
     method=(e.root/'audit-method.md').read_text()

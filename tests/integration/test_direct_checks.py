@@ -4,66 +4,12 @@ import shutil
 import subprocess
 from pathlib import Path
 import pytest
+from regression_support import review
+from regression_support import setup
 from consensus_assurance.core.types import *
 from consensus_assurance.core.proposals import *
-from consensus_assurance.core.config import Config
-from consensus_assurance.registry import assemble
-from consensus_assurance.workflow.engine import Engine,FRAMEWORK_REVISION
-from consensus_assurance.workflow.budget import BudgetTracker
 from consensus_assurance.workflow.direct_checks import save_plan,execute,assess,validate_plan
-from consensus_assurance.workflow.review_contract import target_contract
 from consensus_assurance.adapters.runners.experiment import extract_events
-from consensus_assurance.adapters.storage.snapshot import capture
-from regression_support import read_material
-
-
-def setup(tmp_path,prepared,broken=False):
-    repo, state, _ = prepared
-    if broken:(repo/'counter.py').write_text((repo/'counter.py').read_text().replace('return value + 1 if value < limit else 0','return value + 1'))
-    state.snapshot=capture(repo);state.mode='real';state.analysis_mode='regression';state.framework_revision=FRAMEWORK_REVISION
-    for i,m in enumerate(state.materials):
-        if m.file=='counter.py':
-            state.materials[i]=read_material(repo,state.snapshot,file=m.file, start_line=1, end_line=len((repo/m.file).read_text().splitlines()))
-            state.materials[i].id=m.id
-    for binding in state.bindings:
-        binding.snapshot_id=state.snapshot.id;binding.content_digest=state.snapshot.files[binding.file]
-        binding.excerpt='\n'.join((repo/binding.file).read_text().splitlines()[binding.start_line-1:binding.end_line])
-    unit=state.units[0];unit.binding_ids=['step_binding']
-    unit.scope.excluded.append('Cluster-wide consequences outside this finite call')
-    basis=Grounding(source_ids=['counter.py:1:10'],expectation_ids=[next(m.id for m in state.materials if m.file=='README.md')],binding_ids=unit.binding_ids,derivation='Finite legal counter inputs must return within capacity',applicability='One local operation, legal initial value and positive capacity')
-    for claim in state.claims:
-        claim.pending=[];claim.grounding=basis.model_copy(deep=True)
-    unit.audit_question=AuditQuestion(question='Does one legal boundary call preserve the range?',importance='Bounded service result',source_ids=basis.source_ids+basis.expectation_ids,
-        disposition='ready_for_check',preferred_check='direct_test',event_paths=['legal input -> actual call -> correlated observed return'],trigger_rationale='Observe actual return and independent range predicate')
-    cfg=Config(execution_backend='python',allow_experiments=True,allow_agent_materials=True,execution_isolation='workspace')
-    state.config=cfg.model_dump(mode='json')
-    e=Engine(cfg,tmp_path/'direct',*assemble(cfg));e.state=state;e.budget=BudgetTracker(cfg.budget,state)
-    shutil.copytree(repo,e.root/'source');state.active_unit_id=unit.id
-    source='''import json
-from counter import step
-value, limit = 3, 3
-def emit(event, **values):
-    print('CA_EVENT ' + json.dumps({'event': event, 'operation': 'one', 'participant': 'local', 'context': 'configured', 'state': values}))
-emit('admitted', value=value, limit=limit, input_valid=0 <= value <= limit and limit > 0)
-returned = step(value, limit)
-emit('returned', value=returned, in_range=0 <= returned <= limit)
-'''
-    identities=['operation','participant','context']
-    prop=ObservableProperty(checker_id='Range',trigger=Comparison(field='event',value='returned'),assertion=Comparison(field='state.in_range',value=True),identity_fields=identities,description='Observed result remains in the documented capacity range')
-    monitor=EventMonitor(id='range',checker_id='Range',event='returned',
-        binding_ids=unit.binding_ids,grounding=basis,admission_alias='start')
-    plan=DirectCheckPlan(description='One actual boundary call',claim_id=unit.obligation_ids[0],binding_ids=unit.binding_ids,
-        harness=Harness(kind='python',source=source,description='Actual fixture call and independent bound observation',semantic_changes=['Emit actual event values after the target call'],legality=basis,
-            prerequisites=[EventRequirement(alias='start',event='admitted',conditions=[Comparison(field='state.input_valid',value=True)])]),
-        monitors=[monitor],observable_properties=[prop])
-    return e,unit,plan
-
-
-def review(state,unit,artifact):
-    # Explicit controlled semantic input; real execution is tested separately.
-    contract=target_contract(state,artifact)
-    state.semantic_reviews.append(SemanticReview(task_id='controlled',check_id='controlled',target_versions={artifact.id:artifact.version},
-        material_ids=contract['required_material_ids'],items=[SemanticCheck(target_id=artifact.id,aspect='checker_correspondence',status='no_issue_found',source_ids=contract['required_material_ids'],rationale='The fixture contract, actual call, prerequisites and independent oracle agree within the supplied local scope')],origin='mock'))
 
 
 def test_completion_is_independent_of_forbidden_response_access(tmp_path):
