@@ -34,11 +34,11 @@ def test_R3_unread_consumer_has_no_invented_edge(prepared):
     assert spec.facts[0].consumed_by==[] and spec.behaviors[1].consumes_fact_ids==[]
 
 
-@pytest.mark.parametrize('variant',['paxos','n2paxos','swift'])
-def test_variant_visibility_is_a_subset_of_safe_build_files(tmp_path,variant):
+def test_variant_visibility_is_a_subset_of_safe_build_files(tmp_path):
     from consensus_assurance.cli import load_config,main
     from consensus_assurance.adapters.storage.snapshot import capture
     from consensus_assurance.workflow.audit import source_materials
+    variant='epaxos'
     repo=tmp_path/'source';repo.mkdir()
     families=['paxos','n2paxos','swift','epaxos','fastpaxos','curp']
     for family in families+['replica']:

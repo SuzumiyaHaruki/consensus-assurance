@@ -2,7 +2,7 @@
 
 Read research.json for selected work and shared relationship navigation. A record locator names an existing JSON path, collection and exact match fields; paths are relative to the index directory unless absolute. Select matching records, then read field when present. Historical previews are navigation, not current pending work. Use artifact basis locators and graph_versions for old requirements, not the latest same-ID claim. Materials and execution IDs resolve through records in state.json. Full reviews, drafts and fixed inputs remain at their indexed paths.
 
-When capacity permits, supply an optional short Chinese report_title and one to three report_answer sentences with decisive conditions in review items. Keep English semantic reasoning; actual verdicts and measurements prevail. Omission never blocks work or warrants a translation turn.
+When capacity permits, supply an optional short Chinese report_title and one to three report_answer sentences in review items, leading with the measured discrepancy and actual observation. State decisive applicability once and keep open disputes visible; leave repeated execution detail and wider exclusions in the scoped records. Keep English semantic reasoning; actual verdicts and measurements prevail. Omission never blocks work or warrants a translation turn.
 
 Write a complete submission.json using submission.schema.json and product-schemas.json. Cite authorized captured ranges. Follow next_objective and the analysis guide for core_overview readiness; a usable map and first Candidate may share a submission.
 

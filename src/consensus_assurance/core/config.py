@@ -1,5 +1,7 @@
 from pathlib import Path
+import re
 from typing import Literal
+from urllib.parse import urlsplit
 from pydantic import Field, model_validator
 from .types import ActivityClass, Record
 
@@ -36,6 +38,29 @@ class TargetConfig(Record):
         return self
 
 
+class CodexProvider(Record):
+    id: str
+    base_url: str
+    env_key: str
+    model_catalog_path: str | None = None
+
+    @model_validator(mode="after")
+    def connection(self):
+        if not re.fullmatch(r'[a-z][a-z0-9_-]{0,63}',self.id) or self.id in {'openai','ollama','lmstudio','amazon-bedrock'}:
+            raise ValueError('Custom provider id must be a nonreserved simple identifier')
+        url=urlsplit(self.base_url)
+        if (url.scheme!='https' or not url.hostname or url.username is not None or url.password is not None
+                or '?' in self.base_url or '#' in self.base_url or any(c.isspace() or c=='\\' for c in self.base_url)):
+            raise ValueError('Provider base_url must be HTTPS without credentials, query, fragment or whitespace')
+        _ = url.port
+        if not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*',self.env_key) or self.env_key.upper() in {
+                'PATH','HOME','CODEX_HOME','TMPDIR','LANG','LC_ALL','JAVA_HOME','RUSTC','RUSTDOC','CARGO_HOME',
+                'GOCACHE','GOMODCACHE','GOPROXY','GOSUMDB','GOTOOLCHAIN','GOFLAGS','SSL_CERT_FILE','SSL_CERT_DIR',
+                'HTTP_PROXY','HTTPS_PROXY','ALL_PROXY','NO_PROXY'}:
+            raise ValueError('Provider env_key must name a dedicated credential variable, not a runtime setting')
+        return self
+
+
 class Config(Record):
     '''Main configuration for the system.'''
     protocol: str = "none"
@@ -45,6 +70,7 @@ class Config(Record):
     agent_backend: str = "codex"
     agent_reasoning_effort: str | None = None
     agent_model: str | None = None
+    codex_provider: CodexProvider | None = None
     runs_dir: str = "runs"
     budget: Budget = Budget()
     activity_focus: list[ActivityClass] = []
@@ -53,6 +79,14 @@ class Config(Record):
     execution_isolation: Literal["bwrap", "workspace"] = "bwrap"
     allow_experiments: bool = True
     allow_agent_materials: bool = True
+
+    @model_validator(mode="after")
+    def provider_selection(self):
+        if self.codex_provider and (self.agent_backend!='codex' or not (self.agent_model or '').strip()):
+            raise ValueError('A custom provider requires agent_backend=codex and an explicit agent_model')
+        if self.codex_provider and (self.agent_model.startswith('-') or any(c.isspace() for c in self.agent_model)):
+            raise ValueError('Custom provider agent_model must be a single model identifier')
+        return self
 
     @model_validator(mode="before")
     @classmethod

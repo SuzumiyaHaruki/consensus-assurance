@@ -24,6 +24,10 @@ def load_config(path=None, overrides=None):
             if not p.is_absolute():
                 p = (Path(path).resolve().parent if path else Path.cwd()) / p
             data[name] = str(p.resolve())
+    provider=data.get('codex_provider')
+    if isinstance(provider,dict) and provider.get('model_catalog_path'):
+        p=Path(provider['model_catalog_path']).expanduser()
+        provider['model_catalog_path']=str((p if p.is_absolute() else (Path(path).resolve().parent if path else Path.cwd())/p).resolve())
     data.update({k: v for k, v in (overrides or {}).items() if v is not None})
     return Config.model_validate(data)
 

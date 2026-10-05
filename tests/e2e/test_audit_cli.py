@@ -111,7 +111,9 @@ def test_estimate_reports_explicit_long_limits_without_tools(tmp_path,capsys,mon
     def forbidden(*args,**kwargs):raise AssertionError('Estimate must not assemble or create a run')
     monkeypatch.setattr(cli,'assemble',forbidden)
     monkeypatch.setattr(cli,'create_run_directory',forbidden)
-    example=Path(__file__).parents[2]/'configs/targets/go_long.example.yaml'
+    config=cli.load_config(Path(__file__).parents[2]/'configs/targets/etcd_raft.yaml')
+    config.budget.total_seconds=4800
+    example=tmp_path/'long.yaml';example.write_text(config.model_dump_json())
     assert main(['estimate','--config',str(example),'--repo',str(tmp_path)])==0
     result=json.loads(capsys.readouterr().out)
     assert result['预算']['total_seconds']==4800 and result['预算']['experiments']==16

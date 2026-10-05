@@ -10,6 +10,22 @@ def test_audit_receipt_is_not_a_property_verdict(tmp_path):
     assert '不属于性质证据' in execution_summary(check)[2]
 
 
+def test_report_distinguishes_configured_provider_from_unrecorded_history(tmp_path):
+    from audit_support import engine_for
+    from consensus_assurance.cli import load_config
+    e,repo=engine_for(tmp_path,[]);e.start(repo,plan_only=True)
+    e.state.config['agent_backend']='codex';e.state.config['agent_model']='deepseek-flash'
+    provider=load_config('configs/targets/deepseek.example.yaml').codex_provider.model_dump(mode='json')
+    for value,label in [(provider,'deepseek'),(None,'Codex 默认'),('absent','未记录')]:
+        if value=='absent':e.state.config.pop('codex_provider')
+        else:e.state.config['codex_provider']=value
+        before=e.state.model_dump(mode='json')
+        text=render_report(e.state,e.root).read_text()
+        assert f'配置 provider `{label}`' in text and '请求模型 `deepseek-flash`' in text
+        assert '服务端模型／版本：未记录' in text
+        assert e.state.model_dump(mode='json')==before
+
+
 def test_target_action_costs_keep_process_time_missing_data_and_identity(tmp_path):
     from types import SimpleNamespace
     from consensus_assurance.workflow.research import costs,execution_cost

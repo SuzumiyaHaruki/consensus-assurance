@@ -16,7 +16,7 @@ class ProcessRunner:
         self.active_action_id = None
 
     def run(self, command: list[str], cwd: Path, action: str, snapshot_id: str,
-            timeout: float = 60, stdin: str | None = None, env: dict | None = None) -> CheckRun:
+            timeout: float = 60, stdin: str | None = None, env: dict | None = None, sensitive_env=()) -> CheckRun:
         if self.active_action_id:
             for path in (self.root / "logs").glob("*/check.json"):
                 saved = CheckRun.model_validate_json(path.read_text())
@@ -81,6 +81,9 @@ class ProcessRunner:
                     pass
         run.ended_at = now()
         run.stdout, run.stderr = str(logs / "stdout.log"), str(logs / "stderr.log")
+        secrets=[(os.environ if env is None else env).get(k) for k in sensitive_env]
+        for value in secrets:
+            if value:out=out.replace(value,'[REDACTED]');err=err.replace(value,'[REDACTED]')
         Path(run.stdout).write_text(redact(out))
         Path(run.stderr).write_text(redact(err))
         write_json(logs / "check.json", run)

@@ -297,6 +297,9 @@ def render_report(state, root):
         'investigation':'继续核对','blocked':'保留阻塞依据'}[issue['disposition']]+'）' for id,issue in issues.items()}
     event_cache = {}
     config, capacity = state.config, research['capacity']
+    provider=config.get('codex_provider')
+    provider_label=provider['id'] if provider else ('Codex 默认' if 'codex_provider' in config else '未记录')
+    last_turn=next((c for c in reversed(state.checks) if c.action=='agent_turn'),None)
     formal = [c for c in state.checks if c.action == 'direct_check']
     explorations = [c for c in state.checks if c.action == 'exploration']
     exploration_records = exploration_results(state, archive.read)
@@ -348,7 +351,11 @@ def render_report(state, root):
         '新 Unit 入场能力不保证剩余额度足够完成检查与复核。', '',
         f'元数据：源码 `{state.snapshot.commit or state.snapshot.id}`；实际方法 `{state.framework_revision}`；展示版本 `{manifest()["version"]}`；'
         f'模式 {state.mode}/{state.analysis_mode}；执行后端 `{config.get("execution_backend","none")}`／run 默认包 `{config.get("target",{}).get("execution_package",".")}`；'
-        f'模型 `{config.get("agent_model") or "默认"}`／`{config.get("agent_reasoning_effort") or "默认"}`。重新渲染不代表重新审计。', '',
+        f'Agent `{config.get("agent_backend","未记录")}`／配置 provider `{cell(provider_label)}`／'
+        f'请求模型 `{cell(config.get("agent_model") or "默认")}`／推理档位 `{cell(config.get("agent_reasoning_effort") or "默认")}`。重新渲染不代表重新审计。',
+        '服务端模型／版本：未记录；'+link('config.json','非敏感连接输入（含 endpoint）')+
+        ('；'+link('agent-inputs/catalog.json','固定目录来源与摘要') if provider and provider.get('model_catalog_path') else '')+
+        ('；'+link(f'logs/{last_turn.id}/check.json','最近调用的 CLI、session 与 usage（缺失项仍未知）') if last_turn else '；尚无 Agent 调用记录')+'。', '',
         '停止依据（记录摘录）：'+excerpt(stop.get('rationale') or state.stop_reason,190)+'；'+link('state.json','完整停止记录')+'。', '']
     stopped_check = checks.get(stop.get('operation_id'))
     if stopped_check and (stopped_check.status != ExecutionStatus.COMPLETED or stopped_check.exit_code not in (0,None)):
@@ -389,6 +396,7 @@ def render_report(state, root):
             lines.append(f'| {cell(excerpt(c["question"]["question"],130))} | {"暂停调查" if c["status"]=="paused" else "研究中"}，尚无正式义务 | {cell(excerpt("；".join(c["resume_conditions"] or c["question"]["unknowns"]),170))} | {candidate_links[c["id"]]} |')
     for n,(result,records,answer,title) in enumerate(entries,1):
         scope = result['scope']
+        shown_boundaries=set()
         lines += ['', f'<a id="claim-{result["claim_id"]}"></a>', '', f'### {n}. {title}', '', f'**{conclusion_label(result)}**。要求原文：{result["description"]}', '',
             '决定性范围：'+scope['description'], '；'.join(scope['assumptions'])+'。' if scope['assumptions'] else '',
             '范围参数：'+cell(scope['parameters']) if scope['parameters'] else '',
@@ -408,7 +416,9 @@ def render_report(state, root):
                     link(str(Path(artifact['plan_path']).parent/(check.id+'-assessment.json')),'完整评估与阻塞'), '']
             harness = archive.read(artifact['plan_path']).get('harness',{})
             lines += [execution_location(check,archive)]
-            lines += ['执行边界：'+harness.get('description','固定计划字节缺失')+'；'+'；'.join(harness.get('semantic_changes',[]))]
+            boundary=harness.get('description','固定计划字节缺失')+'；'+'；'.join(harness.get('semantic_changes',[]))
+            if boundary not in shown_boundaries:
+                lines += ['执行边界：'+boundary];shown_boundaries.add(boundary)
             lines += observation_lines(record,artifact,check,archive,event_cache)
             from consensus_assurance.workflow.reviews import lineage
             ancestors=lineage(state,next(a for a in state.direct_checks if a.id==artifact['id']))

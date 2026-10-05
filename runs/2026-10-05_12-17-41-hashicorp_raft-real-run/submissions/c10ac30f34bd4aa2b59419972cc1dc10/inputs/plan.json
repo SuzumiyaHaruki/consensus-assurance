@@ -1,0 +1,64 @@
+{
+  "description": "Direct check on claim-truncate-store-failure-watermark. One follower is built from the real InmemStore with only StoreLogs made failable, is seeded with log entries [1@1, 2@1, 3@2], and is then driven with a well-formed AppendEntries (PrevLogEntry=2, PrevLogTerm=1) whose single entry at index 3 carries term 5. The follower therefore deletes the conflicting suffix [3,3] and then fails to store the replacement entry, reaching exactly the raft.go 1524-1544 error path. The observation compares the follower's own log watermark with the store's last index after the handler returns.",
+  "claim_id": "claim-truncate-store-failure-watermark",
+  "binding_ids": ["bind-append-entries-store-failure"],
+  "harness": {
+    "kind": "go_test",
+    "execution_package": null,
+    "description": "Package-internal Go test that seeds a real InmemStore, wraps it so StoreLogs fails on demand, builds a Raft instance with skipStartup so no background loop races the handler, invokes appendEntries directly on the main-thread path, and emits the follower watermark and store last index as CA_EVENT records.",
+    "semantic_changes": [
+      "StoreLogs of the injected LogStore is wrapped to return an error when armed; DeleteRange, GetLog, FirstIndex, LastIndex and the StableStore methods remain the unmodified InmemStore implementation, so the truncation still succeeds and only the replacement write fails.",
+      "The Raft instance is created with the internal skipStartup flag so the main loop and FSM goroutines do not run; appendEntries is invoked directly as the main-thread handler and LeaderCommitIndex is 0 so no FSM application is attempted."
+    ],
+    "prerequisites": [
+      {"alias": "admit", "event": "append_request"},
+      {"alias": "store", "event": "store_after_failure", "conditions": [{"field": "write_failed", "op": "eq", "value": true}]}
+    ],
+    "legality": {
+      "source_ids": ["S-append-entries", "S-process-logs"],
+      "expectation_ids": [],
+      "binding_ids": ["bind-append-entries-store-failure"],
+      "derivation": "The handler under test is reached only after the previous-log coordinate matches, which the seed and the request guarantee: the follower holds index 2 at term 1 and the request declares PrevLogEntry=2, PrevLogTerm=1. The request is a legal AppendEntries shape (ascending single entry, LeaderCommitIndex below any uncommitted range), so the only substituted edge is the injected StoreLogs error, which is a legal LogStore return value.",
+      "applicability": "Applies to the appendEntries conflict branch when DeleteRange succeeds and the following StoreLogs fails. The harness is in the captured package raft so it uses the real handler, stores and configuration state.",
+      "unresolved": [
+        "Whether a later request could advance the commit index past the truncation point is not exercised here."
+      ],
+      "conflicts": [],
+      "alternatives": []
+    }
+  },
+  "monitors": [
+    {
+      "id": "mon-store-failure-watermark",
+      "checker_id": "chk-store-failure-watermark",
+      "event": "watermark_observed",
+      "binding_ids": ["bind-append-entries-store-failure"],
+      "admission_alias": "admit",
+      "applicability_conditions": [],
+      "grounding": {
+        "source_ids": ["S-append-entries", "S-process-logs"],
+        "expectation_ids": [],
+        "binding_ids": ["bind-append-entries-store-failure"],
+        "derivation": "The result event reports the follower's in-memory watermark from getLastLog/getLastIndex and the durable store's LastIndex at the same observation point, so a single event carries both sides of the consistency relation the claim requires after the failed write.",
+        "applicability": "Only observations whose store_after_failure prerequisite reports write_failed=true are applicable; the trigger selects those results.",
+        "unresolved": [],
+        "conflicts": [],
+        "alternatives": []
+      }
+    }
+  ],
+  "observable_properties": [
+    {
+      "checker_id": "chk-store-failure-watermark",
+      "kind": "event_assertion",
+      "trigger": {"field": "write_failed", "op": "eq", "value": true},
+      "assertion": {"field": "raft_last_log_index", "op": "eq", "reference": "store.store_last_index"},
+      "identity_fields": ["node"],
+      "description": "After the replacement StoreLogs fails, the follower's own log watermark (getLastLog index) must equal the last index its durable log store still holds; a greater watermark means the follower reports entries it no longer has."
+    }
+  ],
+  "uncertainties": [
+    "A correct post-failure state could also be a watermark lower than the store's last index, which the equality oracle would not distinguish; in this fixture the durable log ends exactly at the retained prefix so equality is the consistent value.",
+    "The check observes one follower and one failure point; it does not enumerate every store error ordering."
+  ]
+}

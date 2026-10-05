@@ -1,0 +1,82 @@
+{
+  "rationale": "Source reading resolves the suspicion raised by the truncation branch: the reset latest := committed cannot name a configuration that is not backed by the follower's retained prefix, because the reset only runs when entry.Index <= latestIndex and, for any legal leader, the first conflicting index is strictly greater than the follower's committed configuration index. The mechanism is recorded as counterevidence and the two answered unknowns are removed through sourced feedback; the illegal-sender sub-case is kept as the independent remaining boundary. No execution is needed to dispose this premise, so no check is manufactured and no obligation is re-stated.",
+  "sources": [],
+  "feedback": {
+    "ref_ids": [
+      "S-append-entries",
+      "S-set-config",
+      "S-commitment",
+      "S-newraft"
+    ],
+    "answered": "The follower-side configuration rollback in appendEntries is consistent with the retained log for any legal history: the reset latest := committed at committedIndex only runs when entry.Index <= latestIndex, while a legal leader's first conflicting index is always greater than the follower's committedIndex, so the reset target is inside the retained prefix and every uncommitted configuration it could contradict was removed by the same truncation. The published and consumed latest value is updated in one write, so GetConfiguration and the membership/voter checks agree.",
+    "remaining": [
+      "The illegal-sender boundary stays open: a malformed AppendEntries with a conflict at or below committedIndex would reach a state the guard does not cover; nothing in the library is claimed to defend against that.",
+      "This resolution is about F-config's consistency after truncation only; it does not evaluate the other F-config consumers or the leader-side configuration append path."
+    ],
+    "understanding": "updated",
+    "rationale": "The explanation cites the specific assignment sites of configurations.committed and the atomic latest copy rather than the guard in isolation, so it is a sourced relationship, not a restatement of the protection. The two unknowns that this reading answers (non-main-thread reads of the atomic latest copy; the latestIndex == committedIndex sub-case) are removed; the illegal-sender boundary is retained as the independent gap.",
+    "question_updates": {}
+  },
+  "repair_of": null,
+  "map_path": null,
+  "map_changes": {},
+  "reconnect_questions": {},
+  "action": "explained",
+  "candidate_id": "cb0fdbde5b154523bf9120eee935842f",
+  "parent_candidate_id": null,
+  "question": {
+    "audit_spec_version": 1,
+    "disposition": "explained_by_existing_mechanism",
+    "preferred_check": "source_review",
+    "question": "After appendEntries truncates a conflicting log suffix and resets the latest configuration to the committed one, is the resulting follower configuration state consistent with the log prefix it retains? Specifically, can configurations.latest/latestIndex (and the atomically published r.latestConfiguration that backs Raft.GetConfiguration) end up naming a configuration index that is no longer present in the follower's log, or a configuration that is not the one the retained committed prefix establishes?",
+    "importance": "If a follower resumes with a latest configuration inconsistent with its retained log, then Raft.GetConfiguration reports a configuration the follower cannot justify, and every later membership decision that reads configurations.latest - the inConfiguration/hasVote rejections in requestVote and requestPreVote, the voter count in quorumSize, and the voters counted by checkLeaderLease - is taken on that configuration. A voter-count or membership error can shift which server sets form a quorum, affecting election and commitment safety.",
+    "source_ids": [
+      "S-append-entries",
+      "S-set-config",
+      "S-config-append",
+      "S-request-vote",
+      "S-follower-loop"
+    ],
+    "participants": [],
+    "objects": [],
+    "contexts": [
+      "a follower whose log suffix conflicts with a new leader's entries at an index at or below the follower's latest configuration index, with an uncommitted configuration entry inside the truncated range",
+      "a follower whose committed configuration index lies inside the truncated range"
+    ],
+    "event_paths": [
+      "processRPC -> appendEntries: prevLogTerm matches, a later entry.Index has a different term -> logs.DeleteRange(entry.Index, lastLogIdx) -> setLatestConfiguration(configurations.committed, configurations.committedIndex)",
+      "appendEntries -> StoreLogs(newEntries) -> processConfigurationLogEntry for each new entry -> setLastLog(last.Index, last.Term)"
+    ],
+    "activity_classes": [
+      "A2",
+      "A4"
+    ],
+    "behavior_ids": [
+      "b-append-entries",
+      "b-config-change-append"
+    ],
+    "fact_ids": [
+      "F-config"
+    ],
+    "supporting_behavior_ids": {
+      "b-request-vote": "The vote handler's candidate-in-configuration and voter checks consume the latest configuration that the truncation path mutates, so they carry the consequence of an inconsistent rollback.",
+      "b-follower-heartbeat-timeout": "The election-abort guard compares latestIndex with committedIndex and tests voter membership against the latest configuration, so an inconsistent latest value changes whether this follower even starts an election."
+    },
+    "obligation_relation_kind": "recovery",
+    "counterevidence": [
+      "The reset runs only under the guard entry.Index <= configurations.latestIndex (raft.go 1529-1531), and on a follower configurations.committedIndex is never greater than configurations.latestIndex: setCommittedConfiguration is called either with configurations.latest/ configurations.latestIndex (raft.go 1571, 1588, 1592; api.go 663) or with the snapshot configuration and its own index (raft.go 1938), so committedIndex <= latestIndex holds on every assignment.",
+      "For a legal leader the first conflicting index entry.Index is strictly greater than the follower's committedIndex: the entries at indices <= committedIndex are committed cluster-wide, and a legal leader's log matches every committed entry (log matching / Leader Completeness), so it cannot carry a different term there. Therefore entry.Index > committedIndex whenever the truncation branch is reached under a legal leader.",
+      "Because DeleteRange removes exactly [entry.Index, lastLogIdx] (raft.go 1524-1528) and committedIndex < entry.Index, the reset target committedIndex lies inside the retained prefix, so the reset configuration and its index are backed by a retained entry. Any uncommitted configuration entry at latestIndex is inside the truncated range, since the guard gives entry.Index <= latestIndex; no uncommitted configuration survives that the reset could contradict.",
+      "The reset is published consistently: setLatestConfiguration writes configurations.latest/ latestIndex and the atomic r.latestConfiguration copy in one call (raft.go 2216-2222), there is no separate committed atomic (api.go 160), and the only off-main-thread reader getLatestConfiguration is called solely by Raft.GetConfiguration (api.go 900), which therefore reports the same reset value that the main-thread consumers (requestVote, requestPreVote, quorumSize, checkLeaderLease) use."
+    ],
+    "unknowns": [
+      "Whether a conflicting suffix at or below the follower's committed configuration index is reachable at all remains open; the counterevidence excludes it only for legal senders, so a deliberately malformed or byzantine AppendEntries is the boundary at which the guard would need re-examination."
+    ],
+    "priority": 2,
+    "trigger_rationale": "The suspicion came from a single read of the truncation branch whose guard compares entry.Index only with latestIndex. Reading the remaining assignment sites of configurations.committed and the follower's commit-advancement path shows the guard is not used alone: it is combined with the log-matching invariant that keeps a legal leader from conflicting at or below the follower's committed configuration index. That closes the premise without needing a target run."
+  },
+  "resume_conditions": [],
+  "result_implications": {},
+  "obligation": null,
+  "bindings": []
+}

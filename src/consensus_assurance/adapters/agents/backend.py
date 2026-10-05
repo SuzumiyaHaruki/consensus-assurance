@@ -5,7 +5,7 @@ import shutil
 from pathlib import Path
 from consensus_assurance.core.types import CheckRun, ExecutionStatus, Origin
 from consensus_assurance.adapters.runners.process import output
-from consensus_assurance.adapters.storage.files import write_json, redact
+from consensus_assurance.adapters.storage.files import write_json, redact, digest
 
 
 def classify_failure(text: str) -> ExecutionStatus:
@@ -71,9 +71,71 @@ class CodexAgent:
     name = "codex"
     mock = False
 
-    def __init__(self, reasoning_effort: str | None = None, model: str | None = None):
+    def __init__(self, reasoning_effort: str | None = None, model: str | None = None, provider=None):
         self.reasoning_effort = reasoning_effort
         self.model = model
+        self.provider = provider
+
+    def bind_inputs(self, root, repo):
+        """Capture an explicitly selected catalog, including any behavioral template."""
+        if not self.provider or not self.provider.model_catalog_path:return
+        path=Path(self.provider.model_catalog_path).expanduser().resolve()
+        if path.is_relative_to(repo.resolve()) or path.is_relative_to(root):
+            raise ValueError('Model catalog must be a trusted input outside the target and run')
+        raw=path.read_bytes();catalog=json.loads(raw)
+        models=catalog.get('models',[]) if isinstance(catalog,dict) else []
+        if not isinstance(models,list) or len(models)!=1 or not isinstance(models[0],dict) or models[0].get('slug')!=self.model:
+            raise ValueError('Model catalog must contain exactly the configured model')
+        efforts={item['effort'] for item in models[0].get('supported_reasoning_levels',[])}
+        if self.reasoning_effort is not None and self.reasoning_effort not in efforts:
+            raise ValueError('Requested reasoning effort is not supported by the selected catalog')
+        folder=root/'agent-inputs';folder.mkdir(exist_ok=True)
+        (folder/'models.json').write_bytes(raw)
+        (folder/'models.json').chmod(0o444)
+        write_json(folder/'catalog.json',{'source':str(path),'digest':digest(raw),'record':'agent-inputs/models.json'})
+
+    def validate_inputs(self, root, config):
+        expected=(config.agent_model,config.agent_reasoning_effort,config.codex_provider)
+        if (self.model,self.reasoning_effort,self.provider)!=expected:
+            raise ValueError('Codex connection changed; start a new run')
+        def connection(argv):
+            return sorted((arg,argv[i+1]) for i,arg in enumerate(argv[:-1]) if arg=='-m' or
+                arg=='-c' and (argv[i+1].split('=',1)[0] in {'model_reasoning_effort','model_provider','model_catalog_json','web_search'}
+                    or argv[i+1].startswith('model_providers.')))
+        options=connection(self.connection_options(root))
+        for path in (root/'logs').glob('*/check.json'):
+            record=json.loads(path.read_text())
+            if record['action']=='agent_turn' and connection(record['command'])!=options:
+                raise ValueError('Codex connection options changed; start a new run')
+        if not self.provider or not self.provider.model_catalog_path:return
+        record=json.loads((root/'agent-inputs/catalog.json').read_text())
+        source=Path(self.provider.model_catalog_path).expanduser().resolve()
+        if (record['source']!=str(source) or digest((root/'agent-inputs/models.json').read_bytes())!=record['digest']
+                or source.is_file() and digest(source.read_bytes())!=record['digest']):
+            raise ValueError('Codex model catalog changed; start a new run')
+
+    def connection_options(self, root, *, sandbox=False):
+        options=[]
+        if self.model:options += ['-c','model='+json.dumps(self.model)] if sandbox else ['-m',self.model]
+        if self.reasoning_effort is not None:options += ['-c','model_reasoning_effort='+json.dumps(self.reasoning_effort)]
+        if self.provider:
+            provider=self.provider
+            options += ['-c','model_provider='+json.dumps(provider.id)]
+            for key,value in dict(name=provider.id,base_url=provider.base_url,env_key=provider.env_key,
+                    wire_api='responses',requires_openai_auth=False,supports_websockets=False).items():
+                options += ['-c',f'model_providers.{provider.id}.{key}='+json.dumps(value)]
+            options += ['-c','web_search="disabled"']
+            if provider.model_catalog_path:
+                options += ['-c','model_catalog_json='+json.dumps(str(root/'agent-inputs/models.json'))]
+        return options
+
+    def client_environment(self):
+        if not self.provider:return None
+        key=self.provider.env_key
+        if not os.environ.get(key):raise ValueError('Missing provider credential environment variable: '+key+'; no model payload sent')
+        allowed=('PATH','HOME','CODEX_HOME','TMPDIR','LANG','LC_ALL','SSL_CERT_FILE','SSL_CERT_DIR',
+            'HTTP_PROXY','HTTPS_PROXY','ALL_PROXY','NO_PROXY','http_proxy','https_proxy','all_proxy','no_proxy')
+        return {k:os.environ[k] for k in (*allowed,key) if k in os.environ}
 
     def probe(self, runner):
         version = runner.run(["codex", "--version"], runner.root, "agent_probe", "environment", 10)
@@ -107,6 +169,7 @@ class CodexAgent:
             str(root/"audit-method.md"):"read",
             str(root/"target-support"):"read",
             str(root/"build-inputs"):"read",
+            str(root/"agent-inputs"):"read",
             **{str(root/name):"read" for name in ("logs","findings","audit-spec","actions")},
             **{str(path):"read" for path in getattr(self,"read_only_roots",[]) if path.is_dir()},
             **{path:"read" for path in tool_paths},
@@ -115,10 +178,13 @@ class CodexAgent:
         environment={"GOCACHE":str(directory/"go-cache"),"GOMODCACHE":str(directory/"go-mod-cache"),
             "TMPDIR":str(directory/"tmp"),"GOPROXY":"off","GOSUMDB":"off","GOTOOLCHAIN":"local","GOFLAGS":"-mod=readonly"}
         environment.update(getattr(self,"tool_environment",{}))
+        if self.provider and self.provider.env_key.upper() in {k.upper() for k in environment}:
+            raise ValueError('Provider credential cannot be a tool environment setting')
         return ["-c",'default_permissions="ca_audit"',
             "-c","permissions.ca_audit.filesystem="+inline,
             "-c","permissions.ca_audit.network.enabled=false",
             "-c",'shell_environment_policy.inherit="core"',
+            *(['-c','shell_environment_policy.filters={'+json.dumps(self.provider.env_key)+'="exclude"}'] if self.provider else []),
             "-c","shell_environment_policy.set={"+",".join(json.dumps(k)+"="+json.dumps(v) for k,v in environment.items())+"}",
             "-c","project_doc_max_bytes=0", "-c","tools.web_search=false",
             "-c","memories.use_memories=false", "-c","memories.generate_memories=false"]
@@ -157,6 +223,7 @@ class CodexAgent:
             protected.append(path)
         build_input=next((runner.root/'build-inputs').glob('targets/**/basis.json'),None)
         if build_input:protected.append(build_input)
+        protected.extend(p for p in (runner.root/'agent-inputs').glob('*.json'))
         script = directory / ".permission-probe.py"
         script.write_text(
             "import errno, os, pathlib, socket, tempfile, subprocess\n"
@@ -166,6 +233,7 @@ class CodexAgent:
             "        if exc.errno not in (errno.EACCES, errno.EPERM, errno.EROFS, errno.ENOENT): raise\n"
             "        print('DENIED:' + label)\n"
             "    else: raise RuntimeError('UNSAFE:' + label)\n"
+            + ("assert "+repr(self.provider.env_key)+" not in os.environ\nprint('CREDENTIAL_ABSENT')\n" if self.provider else '')
             + "protected = " + repr([str(p) for p in protected]) + "\n"
             "for i, name in enumerate(protected):\n"
             "    path = pathlib.Path(name); path.read_bytes(); print('READ:' + str(i))\n"
@@ -181,9 +249,12 @@ class CodexAgent:
             "assert result.returncode == 0 and '--submission' in result.stdout, result.stderr\n"
             "print('PERMISSIONS_VERIFIED')\n")
         try:
-            check = runner.run([*self.sandbox_command(runner.root), "sandbox", "-P", "ca_audit", *options,
+            environment=self.client_environment() if self.provider else None
+            if environment is not None:environment[self.provider.env_key]='ca-provider-permission-canary'
+            check = runner.run([*self.sandbox_command(runner.root), "sandbox", "-P", "ca_audit", *options,*self.connection_options(runner.root,sandbox=True),
                 "-C", str(directory), "/usr/bin/python3", str(script)], directory,
-                "codex_permission_probe", snapshot_id, 15)
+                "codex_permission_probe", snapshot_id, 15,
+                **({'env':environment,'sensitive_env':(self.provider.env_key,)} if self.provider else {}))
             verified = check.status == ExecutionStatus.COMPLETED and check.exit_code == 0 and "PERMISSIONS_VERIFIED" in output(check)
             check.parameters['permission_result'] = 'verified' if verified else 'inconclusive_or_unsafe'
             return verified, [check]
@@ -193,9 +264,10 @@ class CodexAgent:
                 path.unlink(missing_ok=True)
 
     def prepare(self, runner, directory, snapshot_id):
+        self.client_environment()
         (directory / "tmp").mkdir(parents=True, exist_ok=True)
         options = self.permission_options(runner.root, directory)
-        key = (str(runner.root), tuple(options), getattr(self, 'version', 'unknown'))
+        key = (str(runner.root), tuple(options), tuple(self.connection_options(runner.root)), getattr(self, 'version', 'unknown'))
         if getattr(self, '_permission_key', None) == key:
             return True, []
         permitted, checks = self.permission_probe(runner, directory, snapshot_id, options)
@@ -215,7 +287,7 @@ class CodexAgent:
                 status=ExecutionStatus.TOOL_MISSING if getattr(self, "missing", False) else ExecutionStatus.ERROR,
                 reason="Codex capability probe failed"), None, None
         options=self.permission_options(runner.root,directory)
-        if getattr(self, '_permission_key', None) != (str(runner.root), tuple(options), getattr(self, 'version', 'unknown')):
+        if getattr(self, '_permission_key', None) != (str(runner.root), tuple(options), tuple(self.connection_options(runner.root)), getattr(self, 'version', 'unknown')):
             raise RuntimeError("Codex permission profile must be prepared before reserving a model call")
         response = runner.root / "actions" / (runner.active_action_id or "standalone") / "agent-response.json"
         response.parent.mkdir(parents=True, exist_ok=True)
@@ -223,13 +295,10 @@ class CodexAgent:
         if session_id:
             command.append("resume")
         command += ["--skip-git-repo-check", "--ignore-user-config", "--json",
-            "--output-schema", str(schema), "--output-last-message", str(response), *options]
-        if self.reasoning_effort is not None:
-            command += ["-c", "model_reasoning_effort=" + json.dumps(self.reasoning_effort)]
-        if self.model:
-            command += ["-m", self.model]
+            "--output-schema", str(schema), "--output-last-message", str(response), *options,*self.connection_options(runner.root)]
         command += [session_id, "-"] if session_id else ["-"]
-        check = runner.run(command, directory, "agent_turn", snapshot_id, timeout, stdin=prompt)
+        check = runner.run(command, directory, "agent_turn", snapshot_id, timeout, stdin=prompt,
+            **({'env':self.client_environment(),'sensitive_env':(self.provider.env_key,)} if self.provider else {}))
         return self.decode(check, response, session_id)
 
     def decode(self, check, response, session_id=None):
@@ -268,6 +337,7 @@ class CodexAgent:
             "agent_sandbox":"ca_audit: root deny, captured source/evidence read, draft write, tool network off",
             "permission_probe":"verified before model call; cached for this process/profile",
             "agent_model":self.model or "CLI default; inspect raw Codex events",
+            "codex_provider":self.provider.model_dump(mode='json') if self.provider else None,
             "agent_reasoning_effort":self.reasoning_effort or "CLI default"})
         if check.status != ExecutionStatus.COMPLETED or not completed:
             if check.status == ExecutionStatus.COMPLETED:

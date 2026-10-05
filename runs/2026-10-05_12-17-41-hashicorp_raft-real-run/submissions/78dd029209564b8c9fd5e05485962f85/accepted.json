@@ -1,0 +1,131 @@
+{
+  "rationale": "Third Candidate, on the accepted v1 map, opened after the store-failure lead was confirmed. Reading installSnapshot end to end shows that the handler updates lastApplied, the snapshot index/term and the configuration, and then clears or compacts the log store, but never updates the in-memory log watermark through setLastLog (raft.go 1814-1955; the tail calls setLastApplied/setLastSnapshot and then removeOldLogs or compactLogs). getLastIndex/getLastEntry take the maximum of that watermark and the snapshot index (state.go 145-162), so a follower whose previous watermark index exceeds the installed snapshot index keeps reporting the old, larger index - and on a monotonic store the log it referred to has just been removed. The claim states the required post-install consistency; the binding locates the install handler.",
+  "sources": [],
+  "feedback": null,
+  "repair_of": null,
+  "map_path": null,
+  "map_changes": {},
+  "reconnect_questions": {},
+  "action": "obligation",
+  "candidate_id": null,
+  "parent_candidate_id": null,
+  "question": {
+    "audit_spec_version": 1,
+    "disposition": "ready_for_check",
+    "preferred_check": "direct_test",
+    "question": "After installSnapshot accepts a snapshot at index S and then clears (MonotonicLogStore) or compacts (otherwise) the log store, does the follower leave its in-memory log watermark (lastLogIndex/lastLogTerm as read by getLastLog/getLastIndex/getLastEntry) consistent with the durable state it now holds, or can it keep the pre-install watermark when that index is greater than S? If it keeps the old watermark, what do the consumers of that value - the follower's own previous-log check in appendEntries, the AppendEntriesResponse.LastLog the leader uses to set nextIndex, and the leader's post-snapshot nextIndex = meta.Index+1 - then describe?",
+    "importance": "The watermark is the follower's claim about which log entries it holds. If installSnapshot leaves a pre-install watermark above the installed snapshot, the follower reports a LastLog it no longer has: on a monotonic store the log was removed, so the previous-log check and the follower's own reads address indices that are gone; on the leader side, sendLatestSnapshot sets nextIndex to S+1 after the install, but the very next AppendEntriesResponse.LastLog again reports the stale larger index, driving nextIndex back up while the leader's own compacted log cannot serve entries below S+1. The observable consequence is a follower that keeps re-receiving snapshots or rejects at the same point rather than resuming replication, and stale lastLogTerm can also satisfy a previous-log comparison against an index whose entry was removed.",
+    "source_ids": [
+      "S-install-snapshot",
+      "S-append-entries",
+      "S-replicate-append",
+      "S-snapshot-loop"
+    ],
+    "participants": [],
+    "objects": [],
+    "contexts": [
+      "a follower that accepts an InstallSnapshot whose LastLogIndex is smaller than the follower's current in-memory log watermark index",
+      "a MonotonicLogStore follower whose log is cleared by removeOldLogs during the install"
+    ],
+    "event_paths": [
+      "installSnapshot: snapshot restored -> setLastApplied(S) -> setLastSnapshot(S,term) -> configurations replaced -> removeOldLogs()/compactLogs(S) -> resp.Success=true (no setLastLog)",
+      "appendEntries after the install: a.PrevLogEntry compared against getLastEntry()/GetLog, and resp.LastLog = getLastIndex() = max(lastLogIndex, S)"
+    ],
+    "activity_classes": [
+      "A1",
+      "A3"
+    ],
+    "behavior_ids": [
+      "b-install-snapshot"
+    ],
+    "fact_ids": [
+      "F-snapshot"
+    ],
+    "supporting_behavior_ids": {
+      "b-append-entries": "appendEntries is the consumer that reads the watermark for the previous-log check and for the AppendEntriesResponse.LastLog it returns, so it carries the consequence of a stale post-install watermark.",
+      "b-replicate-follower": "The leader's sendLatestSnapshot sets nextIndex to meta.Index+1 and replicateTo's rejection path lowers it from response.LastLog, so the leader-side recovery effect of the stale watermark is carried here."
+    },
+    "obligation_relation_kind": "establishment",
+    "counterevidence": [],
+    "unknowns": [
+      "Whether a follower whose watermark exceeds the leader's snapshot index is reachable in a legal history, and how often, was not established: it needs a follower with a longer uncommitted tail than the leader's compacted snapshot, which depends on the sending leader's log and compaction timing.",
+      "Whether the leader's next AppendEntries after a successful install actually re-raises nextIndex from the stale response value, or whether the follower's log is already consistent enough to accept, was not traced.",
+      "Whether compactLogs(S) with the default TrailingLogs can leave the follower's old entries above S in place, so that the stale watermark still names an entry the store happens to hold, was not traced for the non-monotonic default."
+    ],
+    "priority": 2,
+    "trigger_rationale": "The gap is local and readable: installSnapshot is the only handler that replaces the durable log prefix wholesale and the only one that never calls setLastLog, while both the follower's own readers and the leader's recovery consume that value. A controlled single-process check can seed a follower whose watermark is above the snapshot index, drive InstallSnapshot, and read getLastLog/getLastIndex against the snapshot index and the store, which distinguishes a reset watermark from a stale one."
+  },
+  "resume_conditions": [],
+  "result_implications": {},
+  "obligation": {
+    "id": "claim-snapshot-install-stale-watermark",
+    "kind": "obligation",
+    "concern": "implementation_semantics",
+    "description": "After installSnapshot has restored a snapshot at index S and has cleared or compacted the log store accordingly, the follower must not continue to report a log watermark (lastLogIndex/lastLogTerm as read by getLastLog/getLastIndex/getLastEntry) that describes entries the install has removed. Either the watermark must be reset to a value consistent with the installed snapshot and the retained log, or the follower must otherwise ensure that no reader - its own previous-log comparison, the AppendEntriesResponse.LastLog it returns, or any configuration reconstruction - treats a removed index as present.",
+    "source_ids": [
+      "S-install-snapshot",
+      "S-append-entries",
+      "S-replicate-append"
+    ],
+    "scope": {
+      "description": "The installSnapshot success path (raft.go 1814-1955) after the snapshot is restored, in particular the absence of any setLastLog before the log store is cleared or compacted, and the readers of the resulting watermark.",
+      "assumptions": [
+        "The SnapshotStore and LogStore are the injected implementations; the snapshot restore and the log clear/compaction are the unmodified library calls.",
+        "The follower's in-memory watermark index can be greater than the installed snapshot's LastLogIndex when the install begins."
+      ],
+      "excluded": [
+        "Required durability of the injected stores.",
+        "Any change to the RPC framing or snapshot streaming path.",
+        "The correctness of the leader's snapshot contents."
+      ],
+      "parameters": {}
+    },
+    "pending": [
+      "A direct check must construct a follower whose watermark exceeds the snapshot index, drive a successful InstallSnapshot, and compare getLastLog/getLastIndex with the snapshot index and the store afterwards.",
+      "Reachability of a legal history with watermark above the leader's snapshot index is an open premise."
+    ],
+    "grounding": {
+      "source_ids": [
+        "S-install-snapshot",
+        "S-append-entries",
+        "S-replicate-append"
+      ],
+      "expectation_ids": [],
+      "binding_ids": [
+        "bind-install-snapshot-watermark"
+      ],
+      "derivation": "installSnapshot sets lastApplied (raft.go 1930-1931), lastSnapshot (1933-1934) and the latest/committed configuration, then calls removeOldLogs for a MonotonicLogStore or compactLogs(req.LastLogIndex) otherwise (1939-1947); no setLastLog call appears anywhere in the handler. getLastIndex returns max(lastLogIndex,lastSnapshotIndex) and getLastEntry returns lastLog if lastLogIndex >= lastSnapshotIndex (state.go 145-162), so a pre-install watermark above S survives. appendEntries builds AppendEntriesResponse.LastLog from getLastIndex and uses getLastEntry/GetLog for the previous-log check, and the leader's sendLatestSnapshot sets nextIndex to meta.Index+1 while replicateTo lowers it from resp.LastLog (replication.go 366-372, 258-263).",
+      "applicability": "Applies whenever the follower's in-memory watermark index at install time is greater than the installed snapshot's LastLogIndex; it does not apply when the follower is strictly behind the snapshot, which is the common path.",
+      "unresolved": [
+        "Whether such a follower and snapshot pairing is reachable from legal leader behavior.",
+        "Whether the non-monotonic compaction branch can leave the stale watermark naming an entry the store still holds, which would change the consequence but not the reported mismatch."
+      ],
+      "conflicts": [],
+      "alternatives": [
+        "A follower that is strictly behind the snapshot has its watermark below S, so getLastIndex already returns S and the missing setLastLog has no effect; the gap is specific to the stale-high case and is not claimed for the ordinary catch-up path."
+      ]
+    }
+  },
+  "bindings": [
+    {
+      "associations": [
+        {
+          "claim_id": "claim-snapshot-install-stale-watermark",
+          "source_ids": [
+            "S-install-snapshot",
+            "S-snapshot-loop"
+          ],
+          "rationale": "The success tail of this declaration is where the snapshot index is set and the log store is cleared or compacted, and where the missing setLastLog would belong."
+        }
+      ],
+      "anchor": null,
+      "id": "bind-install-snapshot-watermark",
+      "material_id": "S-install-snapshot",
+      "symbol": "Raft.installSnapshot",
+      "start_line": 1814,
+      "end_line": 1955,
+      "description": "installSnapshot handler: term and version checks, snapshot creation and streaming, FSM restore, then lastApplied/lastSnapshot/configuration updates and log clearing or compaction without a log-watermark reset.",
+      "pending": []
+    }
+  ]
+}

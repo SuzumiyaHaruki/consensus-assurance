@@ -55,6 +55,7 @@ class Engine:
         self.runner.deadline = time.monotonic() + self.budget.remaining()
         write_json(self.root / "config.json", self.config)
         write_json(self.root / "snapshot.json", snapshot)
+        if hasattr(self.agent,'bind_inputs'):self.agent.bind_inputs(self.root,repo)
         self.checkpoint("created")
         if plan_only:
             self.state.stop_reason="Snapshot prepared; investigation requires run"
@@ -75,6 +76,7 @@ class Engine:
         if self.state.framework_revision!=FRAMEWORK_REVISION:
             self.state.stop_reason="Framework revision differs or was not recorded; preserve this historical run and use an explicit offline migration/subrun"
             return self.state
+        self.validate_agent_inputs()
         if self.config.model_dump(mode="json") != self.state.config:
             self.state.stop_reason="Configuration changed; start a new run"
             self.checkpoint("resume_configuration_changed")
@@ -151,6 +153,8 @@ class Engine:
     def probe_tools(self):
         self.budget.timeout()
         result = self.agent.probe(self.runner)
+        if hasattr(self.agent,'validate_inputs') and self.state.tools.get('agent',result['version'])!=result['version']:
+            raise ValueError('Codex CLI version changed; preserve this run and start a new one')
         self.state.tools['agent'] = result['version']
         for check in result['checks']:self.record(check)
         if not result['available']:self.state.gaps.append(result['reason'])
@@ -165,8 +169,21 @@ class Engine:
             shutil.copytree(self.root / "source", directory)
         return directory
 
+    def validate_agent_inputs(self):
+        if not hasattr(self.agent,'validate_inputs'):return
+        saved=Config.model_validate(self.state.config)
+        original=Config.model_validate_json((self.root/'config.json').read_text())
+        for key in ('agent_backend','agent_model','agent_reasoning_effort','codex_provider'):
+            if getattr(saved,key)!=getattr(self.config,key) or getattr(original,key)!=getattr(saved,key):
+                raise ValueError('Codex connection changed; start a new run')
+        self.agent.validate_inputs(self.root,saved)
+        version=getattr(self.agent,'version',None)
+        if version and self.state.tools.get('agent',version)!=version:
+            raise ValueError('Codex CLI version changed; start a new run')
+
     def action(self, kind, resource, callback, inputs=None):
         from .action_identity import stable_input
+        if kind=='agent_turn':self.validate_agent_inputs()
         if kind in {'direct_execute','exploration'} and hasattr(self.implementation,'validate_builds'):
             self.implementation.validate_builds(self.root,self.state.snapshot.id,self.runner.deadline)
         logical = stable_input(inputs or {})

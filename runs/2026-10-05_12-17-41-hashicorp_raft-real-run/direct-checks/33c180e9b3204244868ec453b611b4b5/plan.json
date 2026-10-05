@@ -1,0 +1,103 @@
+{
+  "description": "Direct check on claim-snapshot-trigger-underflow. A node is given a genuine snapshot at index 4 in the SnapshotStore and an empty InmemStore log, so NewRaft performs a real restore and leaves the last snapshot index (4) above the log store's last index (0). The real periodic trigger r.shouldSnapshot() is then called directly and its boolean result is reported next to the measured log last index and snapshot index. No threshold value is faked: the configuration keeps the default SnapshotThreshold.",
+  "claim_id": "claim-snapshot-trigger-underflow",
+  "binding_ids": [
+    "bind-should-snapshot-delta"
+  ],
+  "harness": {
+    "execution_package": ".",
+    "files": {},
+    "kind": "go_test",
+    "source": "package raft\n\nimport (\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"testing\"\n)\n\nfunc assuranceTriggerEmit(t *testing.T, fields map[string]interface{}) {\n\tblob, err := json.Marshal(fields)\n\tif err != nil {\n\t\tt.Fatalf(\"marshal CA_EVENT: %v\", err)\n\t}\n\tfmt.Println(\"CA_EVENT \" + string(blob))\n}\n\n// TestAssuranceSnapshotTriggerAfterClearedLog restores a node from a snapshot\n// while its log store holds nothing, so the last snapshot index is above the\n// log store's last index, and then asks the real periodic trigger whether a new\n// snapshot is due.\nfunc TestAssuranceSnapshotTriggerAfterClearedLog(t *testing.T) {\n\tconst node = ServerID(\"assurance-node\")\n\tconst snapIndex = 4\n\tconst snapTerm = 1\n\n\tconfiguration := Configuration{Servers: []Server{{Suffrage: Voter, ID: node, Address: ServerAddress(node)}}}\n\n\tstore := NewInmemStore() // empty log store\n\t_, trans := NewInmemTransport(ServerAddress(node))\n\n\t// Place a snapshot in the store so NewRaft performs a real restore and sets\n\t// the last snapshot coordinate above the empty log.\n\tsnaps := NewInmemSnapshotStore()\n\tsink, err := snaps.Create(1, snapIndex, snapTerm, configuration, 1, trans)\n\tif err != nil {\n\t\tt.Fatalf(\"create snapshot: %v\", err)\n\t}\n\tpayload, err := encodeMsgPack([][]byte{[]byte(\"snapshot-state\")})\n\tif err != nil {\n\t\tt.Fatalf(\"encode payload: %v\", err)\n\t}\n\tif _, err := sink.Write(payload.Bytes()); err != nil {\n\t\tt.Fatalf(\"write snapshot: %v\", err)\n\t}\n\tif err := sink.Close(); err != nil {\n\t\tt.Fatalf(\"close snapshot: %v\", err)\n\t}\n\n\tconf := inmemConfig(t)\n\tconf.skipStartup = true\n\tconf.LocalID = node\n\n\tr, err := NewRaft(conf, &MockFSM{}, store, store, snaps, trans)\n\tif err != nil {\n\t\tt.Fatalf(\"NewRaft: %v\", err)\n\t}\n\n\tlogLast, err := store.LastIndex()\n\tif err != nil {\n\t\tt.Fatalf(\"store LastIndex: %v\", err)\n\t}\n\tsnapIdx, snapTrm := r.getLastSnapshot()\n\tif snapIdx != snapIndex || snapTrm != snapTerm {\n\t\tt.Fatalf(\"precondition: restored snapshot is (%d,%d), want (%d,%d)\", snapIdx, snapTrm, snapIndex, snapTerm)\n\t}\n\tif logLast != 0 {\n\t\tt.Fatalf(\"precondition: log store last index is %d, want 0\", logLast)\n\t}\n\n\tassuranceTriggerEmit(t, map[string]interface{}{\n\t\t\"event\":                \"snapshot_state\",\n\t\t\"node\":                 string(node),\n\t\t\"restored\":             true,\n\t\t\"log_store_last_index\": logLast,\n\t\t\"snapshot_index\":       snapIdx,\n\t\t\"threshold\":            r.config().SnapshotThreshold,\n\t})\n\tassuranceTriggerEmit(t, map[string]interface{}{\n\t\t\"event\":                \"trigger_observed\",\n\t\t\"node\":                 string(node),\n\t\t\"restored\":             true,\n\t\t\"snapshot_due\":         r.shouldSnapshot(),\n\t\t\"log_store_last_index\": logLast,\n\t\t\"snapshot_index\":       snapIdx,\n\t})\n}\n",
+    "description": "Package-internal Go test that pre-creates a real snapshot, builds Raft with skipStartup so the restore happens but no goroutine runs, asserts the restored snapshot coordinate and the empty log as preconditions, then calls the real shouldSnapshot handler and emits its result plus the measured indices as CA_EVENT records.",
+    "semantic_changes": [
+      "The node is built with the internal skipStartup flag so no background loop races the direct call to the periodic trigger; the trigger function, the stores, the snapshot store and the restore path are the unmodified implementation.",
+      "The snapshot payload is a genuine msgpack FSM snapshot produced with the package's own encoder so MockFSM.Restore succeeds, and the default SnapshotThreshold is used unchanged."
+    ],
+    "prerequisites": [
+      {
+        "alias": "admit",
+        "event": "snapshot_state",
+        "conditions": [
+          {
+            "field": "restored",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          }
+        ]
+      }
+    ],
+    "legality": {
+      "source_ids": [
+        "S-should-snapshot",
+        "S-snapshot-loop"
+      ],
+      "expectation_ids": [],
+      "binding_ids": [
+        "bind-should-snapshot-delta"
+      ],
+      "derivation": "The trigger under test is reached through its only caller's condition: runSnapshots calls shouldSnapshot after its interval elapses and takes a snapshot when it returns true. The fixture supplies the state that condition is meant to judge - a restored snapshot coordinate above the log store's last index - and the harness asserts that state before calling the handler, so a failed precondition fails the test instead of emitting a misleading event.",
+      "applicability": "Applies to a node whose log store's last index is below its last snapshot index, which occurs after a monotonic-store installSnapshot clears the log and after a restart that restored a snapshot without retaining logs.",
+      "unresolved": [
+        "Whether the repeated snapshot the trigger causes on such a node has any effect other than redundant work is not exercised; the check only evaluates the trigger's decision."
+      ],
+      "conflicts": [],
+      "alternatives": []
+    }
+  },
+  "monitors": [
+    {
+      "id": "mon-snapshot-trigger",
+      "checker_id": "chk-snapshot-trigger",
+      "event": "trigger_observed",
+      "binding_ids": [
+        "bind-should-snapshot-delta"
+      ],
+      "grounding": {
+        "source_ids": [
+          "S-should-snapshot",
+          "S-snapshot-loop"
+        ],
+        "expectation_ids": [],
+        "binding_ids": [
+          "bind-should-snapshot-delta"
+        ],
+        "derivation": "The result event carries the boolean returned by the real trigger together with the log store last index and the snapshot index it compared, so one correlated event shows both the decision and the measured state the decision was made on.",
+        "applicability": "Only observations whose snapshot_state prerequisite reports restored=true are applicable; the trigger selects those results.",
+        "unresolved": [],
+        "conflicts": [],
+        "alternatives": []
+      },
+      "applicability_conditions": [],
+      "admission_alias": "admit"
+    }
+  ],
+  "observable_properties": [
+    {
+      "checker_id": "chk-snapshot-trigger",
+      "kind": "event_assertion",
+      "trigger": {
+        "field": "restored",
+        "op": "eq",
+        "value": true,
+        "reference": null
+      },
+      "assertion": {
+        "field": "snapshot_due",
+        "op": "eq",
+        "value": false,
+        "reference": null
+      },
+      "antecedent": null,
+      "identity_fields": [
+        "node"
+      ],
+      "description": "With no log entries beyond the last snapshot, the periodic trigger must report that no new snapshot is due; a true value means the delta between the log store's last index and the snapshot index was not evaluated as zero."
+    }
+  ],
+  "uncertainties": [
+    "The check evaluates the trigger's decision only; it does not run the snapshotter to observe the follow-on snapshot, so the consequence is characterized as redundant repeated snapshots rather than measured.",
+    "The fixture uses a restart-restore with an empty log store; the installSnapshot route to the same state is covered by the separate confirmed check and is not re-exercised here."
+  ]
+}

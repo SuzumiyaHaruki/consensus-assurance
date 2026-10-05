@@ -694,6 +694,7 @@ def accept_received(engine):
 
 def execute(engine):
     from .research import global_stop
+    engine.validate_agent_inputs()
     state = engine.state
     draft = engine.root / 'draft'
     draft.mkdir(exist_ok=True)
@@ -761,7 +762,8 @@ def execute(engine):
             if hasattr(engine.agent, 'prepare'):
                 engine.agent.read_only_roots = engine.implementation.read_only_roots() if engine.implementation else []
                 engine.agent.tool_environment = engine.implementation.environment(draft) if engine.implementation else {}
-                permitted, checks = engine.agent.prepare(engine.runner, draft, state.snapshot.id)
+                try:permitted, checks = engine.agent.prepare(engine.runner, draft, state.snapshot.id)
+                except ValueError as exc:raise Blocked(str(exc)) from exc
                 for check in checks:
                     engine.record(check)
                 if not permitted:

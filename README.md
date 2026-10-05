@@ -8,9 +8,9 @@
 python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements-dev.txt
 export PATH="$HOME/.local/bin:$PATH"
-.venv/bin/consensus-assurance doctor --config configs/targets/swiftpaxos_paxos.yaml
+.venv/bin/consensus-assurance doctor --config configs/targets/etcd_raft.yaml
 .venv/bin/consensus-assurance inspect \
-  --config configs/targets/swiftpaxos_paxos.yaml --repo /实际路径/swiftpaxos
+  --config configs/targets/etcd_raft.yaml --repo /实际路径/etcd-raft
 ```
 
 真实运行需要现有认证、材料发送及隔离执行授权；具体运行命令、工具路径和开发测试见环境文档。工具不会自动下载目标或提高预算。
@@ -25,7 +25,7 @@ Candidate／family／focus 的局部停止保留未决工作并继续Codex 会�
 
 ## 目标配置
 
-configs/targets 中包含 HashiCorp Raft、Dragonboat、OmniPaxos 与 SwiftPaxos 的 Paxos、N²Paxos、Swift、EPaxos 配置；目标差异由 TargetConfig 声明，使用共同工具链后端。默认自主选题，--question 可指定定向问题。examples/toy_protocol 是隔离回归源代码，不是默认选题答案。
+configs/targets 保留 etcd Raft、HashiCorp Raft、Dragonboat、OmniPaxos、SwiftPaxos 中 EPaxos 的五份目标模板，以及一份 DeepSeek 接入示例。目标模板默认关闭材料发送和执行授权；本地 `*.run.yaml` 用于 GPT，`*.deepseek.run.yaml` 用于 DeepSeek，均不提交。目标差异由 TargetConfig 声明，使用共同工具链后端。默认自主选题，--question 可指定定向问题。examples/toy_protocol 是隔离回归源代码，不是默认选题答案。
 
 ## 文档与记录
 

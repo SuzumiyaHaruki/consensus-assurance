@@ -70,13 +70,18 @@ def test_audit_failure_reason_preserves_schema_diagnostic_and_redacts_secrets():
 
 
 @pytest.mark.parametrize('session_id',[None,'exact-session'])
-def test_new_session_or_exact_resume_counts_unique_completed_tool_items(tmp_path,monkeypatch,session_id):
+@pytest.mark.parametrize('custom',[False,True])
+def test_new_session_or_exact_resume_counts_unique_completed_tool_items(tmp_path,monkeypatch,session_id,custom):
+    from consensus_assurance.core.config import CodexProvider
     monkeypatch.setattr('shutil.which',lambda name:'/usr/bin/'+name)
+    monkeypatch.setenv('PROVIDER_TICKET','canary-client-only')
     class Runner:
         root=tmp_path
         active_action_id='operation'
-        def run(self,command,cwd,action,snapshot_id,timeout,stdin=None):
+        def run(self,command,cwd,action,snapshot_id,timeout,stdin=None,env=None,sensitive_env=()):
             self.command=command
+            assert (env is not None)==custom
+            if custom:assert env['PROVIDER_TICKET']=='canary-client-only' and sensitive_env==('PROVIDER_TICKET',)
             log=tmp_path/'events.jsonl'
             events=[{'type':'thread.started','thread_id':'exact-session'},
                 {'type':'item.started','item':{'id':'tool-1','type':'command_execution'}},
@@ -88,7 +93,8 @@ def test_new_session_or_exact_resume_counts_unique_completed_tool_items(tmp_path
             log.write_text('\n'.join(json.dumps(e) for e in events))
             response=Path(command[command.index('--output-last-message')+1]);response.write_text(json.dumps({'submission':'submission.json','summary':'Done'}))
             return CheckRun(action=action,cwd=str(cwd),snapshot_id=snapshot_id,status=ExecutionStatus.COMPLETED,exit_code=0,stdout=str(log))
-    runner=Runner();agent=CodexAgent('low','gpt-6-astra');agent.available=True;agent.version='fixture-cli'
+    provider=CodexProvider(id='deepseek',base_url='https://api.deepseek.com',env_key='PROVIDER_TICKET') if custom else None
+    runner=Runner();agent=CodexAgent('low','deepseek-flash' if custom else 'gpt-6-astra',provider);agent.available=True;agent.version='fixture-cli'
     agent.sandbox_command=lambda root:['codex']
     agent.permission_probe=lambda *a:(True,[])
     agent.prepare(runner,tmp_path/'draft','snapshot')
@@ -100,6 +106,19 @@ def test_new_session_or_exact_resume_counts_unique_completed_tool_items(tmp_path
     assert {'memories.use_memories=false','memories.generate_memories=false'} <= set(runner.command)
     assert check.parameters['agent_tool_events']==1 and check.parameters['agent_usage']['input_tokens']==10
     assert ('exact-session' in runner.command)==bool(session_id) and 'model_reasoning_effort="low"' in runner.command
+    assert runner.command[runner.command.index('-m')+1]==agent.model
+    assert check.parameters['codex_provider']==(provider.model_dump(mode='json') if custom else None)
+    if custom:
+        try:import tomllib
+        except ModuleNotFoundError:import tomli as tomllib
+        overrides=tomllib.loads('\n'.join(runner.command[i+1] for i,arg in enumerate(runner.command) if arg=='-c'))
+        assert overrides['model_provider']=='deepseek'
+        assert overrides['model_providers']['deepseek']==dict(name='deepseek',base_url='https://api.deepseek.com',
+            env_key='PROVIDER_TICKET',wire_api='responses',requires_openai_auth=False,supports_websockets=False)
+        assert overrides['shell_environment_policy']['filters']=={'PROVIDER_TICKET':'exclude'}
+        assert 'PROVIDER_TICKET' not in overrides['shell_environment_policy']['set']
+    else:assert not any('model_provider=' in arg or 'model_providers.' in arg for arg in runner.command)
+    assert 'canary-client-only' not in json.dumps(check.model_dump(mode='json'))
 
 
 def test_probe_bootstrap_crash_does_not_prove_denial(tmp_path,monkeypatch):
@@ -122,7 +141,7 @@ def test_effective_profile_exposes_results_and_retains_root_network_boundary(tmp
     monkeypatch.setenv('TMPDIR',str(tmp_path/'host-tmp'))
     options='\n'.join(CodexAgent().permission_options(tmp_path,tmp_path/'draft'))
     for path in ('agent-source','submissions','logs','direct-checks','actions','state.json','research.json',
-            'submission.schema.json','product-schemas.json','audit-method.md','target-support','build-inputs'):
+            'submission.schema.json','product-schemas.json','audit-method.md','target-support','build-inputs','agent-inputs'):
         assert json.dumps(str(tmp_path/path))+'="read"' in options
     assert 'default_permissions="ca_audit"' in options and 'permissions.ca_audit.filesystem=' in options
     assert json.dumps(str(tmp_path/'source')) not in options
@@ -214,3 +233,186 @@ def test_failed_permission_preflight_spends_no_agent_call(tmp_path):
     state=engine.start(repo)
     assert state.usage.get('agent_calls',0)==0 and not state.agent_turns
     assert 'no model payload sent' in state.stop_reason
+
+
+def test_provider_configuration_and_catalog_inputs_precede_cached_results(tmp_path,monkeypatch):
+    from audit_support import engine_for
+    from consensus_assurance.cli import load_config
+    from consensus_assurance.core.config import Config,CodexProvider
+    cfg=load_config('configs/targets/deepseek.example.yaml')
+    assert not cfg.allow_agent_materials and not cfg.allow_experiments
+    assert Path(cfg.codex_provider.model_catalog_path).is_absolute()
+    raw=cfg.codex_provider.model_dump(mode='json')
+    for fields in ({'id':'openai'},{'id':'other.headers'},{'id':'bad\nname'},
+            {'base_url':'http://api.deepseek.com'},{'base_url':'https://user:password@api.deepseek.com'},
+            {'base_url':'https://api.deepseek.com?key=not-a-key'},{'base_url':'https://api.deepseek.com/#fragment'},
+            {'base_url':'https://api.deepseek.com?'},{'base_url':'https://api.deepseek.com:invalid'},
+            {'env_key':'TOKEN=not-a-key'},{'env_key':'PATH'},{'env_key':'https_proxy'},
+            {'experimental_bearer_token':'not-a-key'}):
+        with pytest.raises(ValueError):CodexProvider.model_validate({**raw,**fields})
+    for fields in ({'agent_model':None},{'agent_model':'--malicious'},{'agent_model':'bad\nname'},{'agent_backend':'mock'}):
+        with pytest.raises(ValueError):Config.model_validate({**cfg.model_dump(mode='json'),**fields})
+    catalog=tmp_path/'trusted-models.json';catalog.write_bytes(Path(cfg.codex_provider.model_catalog_path).read_bytes())
+    e,repo=engine_for(tmp_path,[])
+    e.config.agent_backend='codex';e.config.agent_model=cfg.agent_model;e.config.agent_reasoning_effort='low'
+    e.config.codex_provider=cfg.codex_provider.model_copy(update={'model_catalog_path':str(catalog)})
+    e.agent=CodexAgent('low',cfg.agent_model,e.config.codex_provider)
+    e.config.budget.agent_calls=1
+    monkeypatch.delenv('DEEPSEEK_API_KEY',raising=False)
+    e.start(repo,plan_only=True)
+    frozen=e.root/'agent-inputs/models.json'
+    assert frozen.read_bytes()==catalog.read_bytes() and not frozen.stat().st_mode & 0o222
+    assert 'model_catalog_json='+json.dumps(str(frozen)) in e.agent.connection_options(e.root)
+    with pytest.raises(ValueError,match='Missing provider credential'):
+        e.agent.prepare(e.runner,e.root/'draft','fixture')
+    assert e.state.usage.get('agent_calls',0)==0
+    e.agent.version='fixture-cli-v1';e.state.tools['agent']=e.agent.version
+    from consensus_assurance.adapters.storage.files import write_json
+    write_json(e.root/'logs/fixture/check.json',CheckRun(action='agent_turn',cwd=str(e.root/'draft'),snapshot_id='fixture',
+        command=['codex','exec','--ignore-user-config',*e.agent.connection_options(e.root)]))
+    result=e.action('agent_turn','agent_calls',lambda:{'retained':True},{'turn':1})
+    saved={p:p.read_bytes() for p in e.root.rglob('*') if p.is_file()}
+    def reused():return e.action('agent_turn','agent_calls',lambda:pytest.fail('Cached action executed'),{'turn':1})
+    assert reused()==result
+    with monkeypatch.context() as patched:
+        options=e.agent.connection_options(e.root)
+        patched.setattr(e.agent,'connection_options',lambda root:[v.replace('supports_websockets=false','supports_websockets=true') for v in options])
+        with pytest.raises(ValueError,match='connection options changed'):reused()
+    for name,value in [('agent_model','another-model'),('agent_reasoning_effort','high'),
+            ('codex_provider',e.config.codex_provider.model_copy(update={'base_url':'https://other.example'}))]:
+        original=getattr(e.config,name);setattr(e.config,name,value)
+        with pytest.raises(ValueError,match='connection changed'):reused()
+        setattr(e.config,name,original)
+    original=catalog.read_bytes();catalog.write_bytes(original+b'\n')
+    with pytest.raises(ValueError,match='catalog changed'):reused()
+    with pytest.raises(ValueError,match='catalog changed'):e.resume()
+    from consensus_assurance.workflow.audit import execute
+    with pytest.raises(ValueError,match='catalog changed'):execute(e)
+    catalog.write_bytes(original)
+    frozen.chmod(0o644);frozen.write_bytes(original+b'\n')
+    with pytest.raises(ValueError,match='catalog changed'):reused()
+    frozen.write_bytes(original);frozen.chmod(0o444)
+    e.agent.version='fixture-cli-v2'
+    with pytest.raises(ValueError,match='CLI version changed'):reused()
+    e.agent.version='fixture-cli-v1'
+    monkeypatch.setattr(e.agent,'probe',lambda runner:{'version':'fixture-cli-v2','available':True,'checks':[]})
+    with pytest.raises(ValueError,match='CLI version changed'):e.resume()
+    assert reused()==result and all(p.read_bytes()==v for p,v in saved.items())
+    assert e.state.usage['agent_calls']==1
+
+
+def test_provider_client_environment_and_error_redaction_do_not_reach_target(tmp_path,monkeypatch):
+    import os,sys
+    from consensus_assurance.core.config import CodexProvider
+    from consensus_assurance.adapters.runners.process import ProcessRunner
+    from consensus_assurance.adapters.runners.experiment import clean_environment
+    secret='unlabelled-client-canary-7890123456'
+    monkeypatch.setenv('PROVIDER_TICKET',secret)
+    root=tmp_path/'run';runner=ProcessRunner(root);draft=root/'draft'
+    client=tmp_path/'client.py';client.write_text('''import json,os
+assert 'PROVIDER_TICKET' in os.environ
+print(json.dumps({'type':'thread.started','thread_id':'canary-session'}))
+print(json.dumps({'type':'turn.failed','error':{'message':'Client diagnostic '+os.environ['PROVIDER_TICKET']}}))
+''')
+    agent=CodexAgent('low','deepseek-flash',CodexProvider(id='deepseek',base_url='https://api.deepseek.com',env_key='PROVIDER_TICKET'))
+    agent.available=True;agent.version='fixture-client';agent.sandbox_command=lambda root:[sys.executable,str(client)]
+    agent.permission_probe=lambda *args:(True,[])
+    monkeypatch.setattr('shutil.which',lambda name:'/usr/bin/'+name)
+    agent.prepare(runner,draft,'fixture')
+    check,_,result=agent.investigate(runner,'Neutral fixture',draft,'fixture',10)
+    assert result is None and check.status==ExecutionStatus.ERROR and '[REDACTED]' in check.reason
+    assert all(secret.encode() not in p.read_bytes() for p in root.rglob('*') if p.is_file())
+    workspace=root/'workspace';workspace.mkdir()
+    check=runner.run([sys.executable,'-c',"import os; assert 'PROVIDER_TICKET' not in os.environ; print('CREDENTIAL_ABSENT')"],
+        workspace,'target-environment','fixture',10,env=clean_environment(workspace))
+    assert check.exit_code==0 and Path(check.stdout).read_text().strip()=='CREDENTIAL_ABSENT'
+
+
+@pytest.fixture
+def codex_workspace():
+    import shutil,tempfile,time
+    from consensus_assurance.adapters.runners.process import ProcessRunner
+    if not shutil.which('codex') or not shutil.which('bwrap'):pytest.skip('Local Codex and bubblewrap are required')
+    # The permission profile deliberately denies /tmp; retain probe receipts outside it.
+    cache=Path.home()/'.cache/consensus-assurance';cache.mkdir(parents=True,exist_ok=True)
+    root=Path(tempfile.mkdtemp(prefix='provider-acceptance-',dir=cache))
+    source=root/'agent-source';source.mkdir();(source/'value.txt').write_text('7\n')
+    draft=root/'draft';draft.mkdir()
+    runner=ProcessRunner(root);runner.deadline=time.monotonic()+300
+    print('Retained capability receipts:',root)
+    return runner,draft
+
+
+@pytest.mark.real
+@pytest.mark.parametrize('custom',[False,True])
+def test_real_codex_local_permissions(codex_workspace,monkeypatch,custom):
+    from consensus_assurance.cli import load_config
+    from consensus_assurance.adapters.runners.process import output
+    runner,draft=codex_workspace
+    cfg=load_config('configs/targets/deepseek.example.yaml')
+    provider=cfg.codex_provider.model_copy(update={'env_key':'CA_PROVIDER_CANARY'}) if custom else None
+    monkeypatch.setenv('CA_PROVIDER_CANARY','unlabelled-local-canary-987654321')
+    agent=CodexAgent('low','deepseek-flash' if custom else None,provider)
+    agent.bind_inputs(runner.root,runner.root/'agent-source')
+    assert agent.probe(runner)['available']
+    ok,checks=agent.prepare(runner,draft,'synthetic')
+    assert ok,output(checks[-1])
+    if custom:
+        assert 'CREDENTIAL_ABSENT' in output(checks[-1])
+        assert 'READ:5' in output(checks[-1]) and 'DENIED:write:5' in output(checks[-1])
+    assert (runner.root/'agent-source/value.txt').read_text()=='7\n'
+    for path in runner.root.rglob('*'):
+        if path.is_file():
+            assert b'unlabelled-local-canary-987654321' not in path.read_bytes()
+            assert b'ca-provider-permission-canary' not in path.read_bytes()
+
+
+@pytest.mark.real
+def test_deepseek_two_turn_acceptance(request):
+    """Explicit opt-in: official service, synthetic data, two turns, five minutes total."""
+    import os,secrets
+    if os.environ.get('CA_DEEPSEEK_ACCEPTANCE')!='1':
+        pytest.skip('Paid DeepSeek acceptance requires explicit CA_DEEPSEEK_ACCEPTANCE=1 authorization')
+    from consensus_assurance.cli import load_config
+    from consensus_assurance.adapters.agents.backend import codex_events
+    from consensus_assurance.adapters.storage.files import write_json
+    runner,draft=request.getfixturevalue('codex_workspace')
+    cfg=load_config('configs/targets/deepseek.example.yaml')
+    assert cfg.codex_provider.base_url=='https://api.deepseek.com' and cfg.agent_model=='deepseek-flash'
+    agent=CodexAgent(cfg.agent_reasoning_effort,cfg.agent_model,cfg.codex_provider)
+    agent.client_environment()
+    agent.bind_inputs(runner.root,runner.root/'agent-source')
+    write_json(runner.root/'config.json',cfg)
+    assert agent.probe(runner)['available']
+    assert agent.prepare(runner,draft,'synthetic')[0]
+    marker=secrets.token_hex(16)
+    prompts=[
+        f'Authorized synthetic capability check. Read {runner.root}/agent-source/value.txt through a shell tool. '
+        'Use apply_patch to create one.json in the current draft with a value field equal to twice the observed integer. '
+        'Run /usr/bin/python3 to load that JSON and print its value. '
+        f'Remember this session marker only in conversation: {marker}. Do not echo it, put it in a command, '
+        'write it to any file or repeat it in the answer. Return exactly {"submission":"one.json","summary":"first complete"}.',
+        'Continue this exact session. Use the value obtained in the previous tool loop and the session marker '
+        'provided only in that turn. Do not reread the source or search saved logs. Use apply_patch to create two.json '
+        'with previous_value, marker and next_value (previous_value plus one). Run /usr/bin/python3 to load it and '
+        'print next_value. Return exactly {"submission":"two.json","summary":"second complete"}.']
+    session=None
+    for index,prompt in enumerate(prompts,1):
+        agent.validate_inputs(runner.root,cfg)
+        runner.active_action_id=f'capability-{index}'
+        check,observed,result=agent.investigate(runner,prompt,draft,'synthetic',120,session)
+        write_json(runner.root/'logs'/check.id/'check.json',check)
+        assert check.status==ExecutionStatus.COMPLETED and check.exit_code==0 and check.parameters['agent_turn_completed'],check.reason
+        assert result==dict(submission='one.json' if index==1 else 'two.json',summary='first complete' if index==1 else 'second complete')
+        assert observed and (session is None or observed==session)
+        session=observed
+        items=[e['item'] for e in codex_events(check) if e.get('type')=='item.completed']
+        assert any(i.get('type')=='file_change' and i.get('status')=='completed' for i in items)
+        expected=14 if index==1 else 15
+        assert any(i.get('type')=='command_execution' and i.get('exit_code')==0
+            and str(expected) in i.get('aggregated_output','').split() for i in items)
+        value=json.loads((draft/result['submission']).read_text())
+        assert value==({'value':14} if index==1 else {'previous_value':14,'marker':marker,'next_value':15})
+        if index==1:
+            assert all(marker.encode() not in p.read_bytes() for p in runner.root.rglob('*') if p.is_file())
+    assert (runner.root/'agent-source/value.txt').read_text()=='7\n'

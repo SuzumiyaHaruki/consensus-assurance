@@ -7,7 +7,7 @@ from consensus_assurance.plugins.protocols.toy.pack import knowledge as toy_know
 
 EXECUTION_BACKENDS = {"go_module": GoModuleBackend, "cargo": CargoBackend, "python": PythonBackend, "none": lambda target, timeout: None}
 KNOWLEDGE = {"raft": raft_knowledge, "toy": toy_knowledge, "none": lambda: ""}
-AGENTS = {"codex": lambda cfg: CodexAgent(cfg.agent_reasoning_effort, cfg.agent_model), "mock": lambda cfg: MockAgent(cfg.fixture)}
+AGENTS = {"codex": lambda cfg: CodexAgent(cfg.agent_reasoning_effort, cfg.agent_model, cfg.codex_provider), "mock": lambda cfg: MockAgent(cfg.fixture)}
 
 
 def hashicorp_backend(target, timeout):

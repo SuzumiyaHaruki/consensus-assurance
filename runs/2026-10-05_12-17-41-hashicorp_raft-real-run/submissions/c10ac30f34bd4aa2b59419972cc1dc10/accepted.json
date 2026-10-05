@@ -1,0 +1,144 @@
+{
+  "rationale": "Combined submission: create the second Candidate (claim-truncate-store-failure-watermark) and immediately fix and run the direct check for it. The claim is the fault-handling gap the code itself admits at raft.go 1541-1542. The harness reaches the real handler by seeding a real InmemStore, arming a single StoreLogs failure, and driving one well-formed conflicting AppendEntries; it then reads the follower's own watermark and the store's last index at the same point. The oracle compares the reported watermark with the durable last index and expects them equal after a failed replacement write.",
+  "sources": [],
+  "feedback": null,
+  "repair_of": null,
+  "action": "check",
+  "unit_id": null,
+  "candidate": {
+    "rationale": "Second Candidate, on the accepted v1 map. This is a fault-handling gap the code itself admits: appendEntries deletes the conflicting suffix (raft.go 1524-1533) and then, if StoreLogs of the replacement entries fails, returns leaving r.lastLog/lastLogIdx still describing the deleted indices (raft.go 1537-1544, with the author's own TODO). getLastIndex then reports the deleted index to the leader, whose nextIndex recovery consumes exactly that value.",
+    "sources": [],
+    "feedback": null,
+    "repair_of": null,
+    "map_path": null,
+    "map_changes": {},
+    "reconnect_questions": {},
+    "action": "obligation",
+    "candidate_id": null,
+    "parent_candidate_id": null,
+    "question": {
+      "audit_spec_version": 1,
+      "disposition": "ready_for_check",
+      "preferred_check": "direct_test",
+      "question": "After appendEntries has already truncated a conflicting log suffix and the following StoreLogs of the leader's replacement entries fails, does the follower leave its in-memory log watermark (lastLog/lastLogIdx, read back by getLastLog/getLastIndex) consistent with the log it now durably holds, or does it keep a stale watermark that still counts the truncated indices? If the watermark is stale, does the leader's own recovery (nextIndex derived from the follower's reported LastLog) still bring the follower back into sync, or does it produce a persistent divergence that only a restart repairs?",
+      "importance": "getLastIndex feeds both the AppendEntriesResponse.LastLog the leader uses to lower nextIndex and the follower's own previous-log check. If the watermark still includes a deleted index, the leader clamps nextIndex to a value whose previous entry the follower no longer has, so every subsequent AppendEntries is rejected at the same point without ever surfacing the leader-side ErrLogNotFound that would trigger a snapshot; the follower stays a divergent voter while reporting log state it does not hold. A stronger sub-case, that a later commit advancement applies indices the follower no longer holds, is left as an explicit unknown rather than assumed.",
+      "source_ids": [
+        "S-append-entries",
+        "S-process-logs",
+        "S-replicate-append"
+      ],
+      "participants": [],
+      "objects": [],
+      "contexts": [
+        "a follower whose LogStore accepts DeleteRange of the conflicting suffix but rejects the following StoreLogs of the leader's replacement entries",
+        "the leader whose per-follower nextIndex is derived from that follower's reported AppendEntriesResponse.LastLog"
+      ],
+      "event_paths": [
+        "appendEntries: entry.Term != storeEntry.Term -> logs.DeleteRange(entry.Index, lastLogIdx) succeeds -> logs.StoreLogs(newEntries) fails -> return with r.lastLog unchanged and resp.Success=false",
+        "replicateTo: AppendEntries rejected -> nextIndex = max(min(nextIndex-1, resp.LastLog+1), 1), where resp.LastLog is the follower's stale getLastIndex()"
+      ],
+      "activity_classes": [
+        "A1",
+        "A6"
+      ],
+      "behavior_ids": [
+        "b-append-entries"
+      ],
+      "fact_ids": [
+        "F-log-entry"
+      ],
+      "supporting_behavior_ids": {
+        "b-replicate-follower": "The leader's replicateTo lowers nextIndex using resp.LastLog and only falls back to a snapshot on its own ErrLogNotFound, so it carries the recovery consequence of the follower's reported watermark.",
+        "b-fsm-apply": "processLogs later reads the log by index from the store; if a subsequent request ever advances the commit/apply index past the truncation point, this reader is the consumer that would touch the missing range."
+      },
+      "obligation_relation_kind": "recovery",
+      "counterevidence": [],
+      "unknowns": [
+        "Whether a later AppendEntries can advance the follower's commit index past the truncation point while the watermark is stale, which would make processLogs read an index the store no longer holds, was not established; the reachable consequence may be limited to the persistent rejection loop.",
+        "Whether any store implementation in the snapshot is expected to make StoreLogs succeed after a successful DeleteRange (e.g. an atomic batch) is not established; the failure is treated as a legal error return of the injected LogStore.",
+        "Whether a restart or a snapshot install is the only repair, and whether any in-library path recomputes lastLog from the store without a restart, was not traced."
+      ],
+      "priority": 2,
+      "trigger_rationale": "The failure scenario is concrete and local: one injected LogStore error after the library has already mutated the durable log. The follower's own comment names the resulting wrong state, and the leader's nextIndex formula consumes the very value that is left stale, so the effect is not confined to the follower. A controlled single-process check injects the store error, drives a conflicting AppendEntries, and reads both r.getLastLog() and the store's LastIndex() to see whether the two still agree."
+    },
+    "resume_conditions": [],
+    "result_implications": {},
+    "obligation": {
+      "id": "claim-truncate-store-failure-watermark",
+      "kind": "obligation",
+      "concern": "bounded_liveness",
+      "description": "When appendEntries has deleted a conflicting log suffix and the subsequent StoreLogs of the leader's replacement entries returns an error, the follower must not continue with an in-memory log watermark (lastLog/lastLogIdx as returned by getLastLog/getLastIndex) that exceeds the log it durably holds. Either the watermark must be restored to a value consistent with the store after the failure, or the follower must stop presenting the deleted indices as present, so that a later legal AppendEntries is not accepted against a stale previous-log coordinate and the leader is not left repeatedly retrying against a follower that permanently rejects at the same index without an ErrLogNotFound that would trigger snapshot recovery.",
+      "source_ids": [
+        "S-append-entries",
+        "S-process-logs",
+        "S-replicate-append"
+      ],
+      "scope": {
+        "description": "The appendEntries error path after a successful truncation and a failing StoreLogs (raft.go 1524-1544), and the recovery it leaves for the leader's per-follower replication loop.",
+        "assumptions": [
+          "The LogStore is the injected implementation; a DeleteRange may succeed while a following StoreLogs of other entries returns an error, and the error is a legal return of the LogStore interface.",
+          "The conflicting AppendEntries is well formed (prevLogTerm matches at PrevLogEntry) so the truncation branch is reached before the store write fails."
+        ],
+        "excluded": [
+          "Required durability of a store that fails mid-batch; the check does not assert what a store must do, only how Raft continues.",
+          "Leader-side configuration and snapshot machinery beyond the ErrLogNotFound trigger in setupAppendEntries.",
+          "Any claim that the process panics."
+        ],
+        "parameters": {}
+      },
+      "pending": [
+        "A direct check must inject the StoreLogs failure at the truncation site and compare r.getLastLog() with the store's LastIndex() after the handler returns.",
+        "The stronger sub-case (a later request advancing the commit index past the truncation point) is blocked on whether such a request is reachable while the watermark is stale."
+      ],
+      "grounding": {
+        "source_ids": [
+          "S-append-entries",
+          "S-process-logs",
+          "S-replicate-append"
+        ],
+        "expectation_ids": [],
+        "binding_ids": [
+          "bind-append-entries-store-failure"
+        ],
+        "derivation": "appendEntries removes [entry.Index,lastLogIdx] from the store (raft.go 1524-1528) and only updates r.lastLog through setLastLog after StoreLogs succeeds (raft.go 1537-1552). On the error return at 1544 the durable suffix is already gone while r.lastLog still names the deleted index; the code's own TODO on the preceding lines records exactly this. getLastIndex/getLastLog are the source of AppendEntriesResponse.LastLog (raft.go 1445) and of the follower's own previous-log comparison. On the leader, replicateTo lowers nextIndex to min(nextIndex-1, resp.LastLog+1) (replication.go 258-263) using that value, and only setupAppendEntries returning ErrLogNotFound from the leader's own reads triggers SEND_SNAP.",
+        "applicability": "Applies whenever a LogStore returns an error from StoreLogs after DeleteRange has already succeeded inside the same appendEntries call; the observable effect requires a subsequent AppendEntries to reach this follower.",
+        "unresolved": [
+          "Whether the follower is permanently unsynchronizable short of restart, or whether some other path repairs the watermark.",
+          "Whether the processLogs reader can be driven into the missing range."
+        ],
+        "conflicts": [],
+        "alternatives": [
+          "A store that either fails the DeleteRange too (leaving the log untouched) or never fails StoreLogs never reaches this state; the gap is specific to a partial failure between the two writes and is not claimed to affect stores with atomic batch semantics."
+        ]
+      }
+    },
+    "bindings": [
+      {
+        "associations": [
+          {
+            "claim_id": "claim-truncate-store-failure-watermark",
+            "source_ids": [
+              "S-append-entries",
+              "S-process-logs"
+            ],
+            "rationale": "DeleteRange at raft.go 1524-1528 mutates the durable log, the StoreLogs error return at 1537-1544 leaves r.lastLog untouched, and processLogs is the reader that would trip on the missing range."
+          }
+        ],
+        "anchor": null,
+        "id": "bind-append-entries-store-failure",
+        "material_id": "S-append-entries",
+        "symbol": "Raft.appendEntries",
+        "start_line": 1524,
+        "end_line": 1543,
+        "description": "appendEntries conflicting-suffix truncation and the following StoreLogs error return, including the author's TODO about leaving getLastLog() in the wrong state.",
+        "pending": []
+      }
+    ]
+  },
+  "plan_path": "plan.json",
+  "harness_path": "assurance_generated_test.go",
+  "files": {},
+  "previous_check_id": null,
+  "repair_issue_ids": [],
+  "encoding_revision": null
+}
