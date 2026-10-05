@@ -334,7 +334,7 @@ def render_report(state, root):
         f'已受理 Candidate {len(research["candidates"])} 项；当前 Unit {len(research["units"])} 项、义务 {len(research["claims"])} 项、固定检查制品 {len(artifacts)} 项。'
         f'正式执行尝试 {len(formal)} 次；已保存评估的义务 {len(results)} 项，其中有实际比较 {sum(r["comparison_observed"] is True for r in results)} 项。'+
         '、'.join(f'{label} {sum(r["disposition"]==key and (key!="investigation_lead" or r["comparison_observed"] is True) for r in results)} 项' for key,label in DISPOSITIONS.items())+
-        f'；另有已获源码解释的 Candidate {len(explained)+sum(bool(u["source_explanation"]) for u in research["units"])} 项。受理、执行与结论分别计数。', '',
+        f'；另有已获源码解释的 Candidate {len(explained)+sum(bool(u["source_explanation"]) for u in research["units"])} 项。受理、执行与结论分别计数；确认项数按义务命题计，不等于独立根因数。', '',
         f'实际持续 **{state.elapsed_seconds/60:.2f} 分钟**；结束类型：**'+('控制器记录的' if stop.get('origin') == 'controller' else 'Agent 提出的' if stop else '')+stop_label+'**。',
         f'剩余 {capacity["remaining_seconds"]:.2f} 秒、{capacity["remaining"]["agent_calls"]} 次 Agent 调用、'
         f'{capacity["remaining"]["experiments"]} 次控制器目标执行。资源余量不表示获准恢复或重试。', '',
@@ -452,7 +452,9 @@ def render_report(state, root):
             check = checks[execution['check_id']]
             lines += [f'<a id="exploration-{check.id}"></a>', execution_links[check.id]+'：'+'；'.join(execution_summary(check)[1:])+'。'+link(execution['record'],'执行记录')+'；'+
                 link(execution['stdout'],'实际输出')+'；'+link(execution['stderr'],'诊断'),
-                execution_location(check,archive), '；'.join(link(path,'执行文件清单') for path in execution['artifacts'])]
+                execution_location(check,archive)]
+            for directory,label in [('workspace-delta','执行输入文件清单'),('workspace-outcome','执行后文件清单')]:
+                lines.extend(link(path,label) for path in execution['artifacts'] if Path(path).parts[-2:]==(directory,'manifest.json'))
         if not entry['executions']:lines.append('已受理问题，尚无保存的执行记录。')
         for handoff in entry['feedback']:
             lines.append('后续受理交接原文导航：'+handoff_links[handoff['operation_id']])

@@ -241,7 +241,8 @@ def test_mixed_report_reads_fixed_results_and_moves_without_side_effects(tmp_pat
         setup="ready.append('initialized')\n" if any(c['action']=='exploration' for c in state['checks']) else ''
         return dict(action='explore',question=f'For candidate {state["question_candidates"][-1]["id"]}, under a caller-selected repeat policy, what values are produced?',
             harness_path='explore.py',rationale='Observe behavior before attributing the repeat policy'),{
-                'explore.py':"from target import step\nready=[]\n"+setup+"print('conditional',bool(ready),step(2,3),step(3,3))\n"}
+                'explore.py':"from target import step\nfrom pathlib import Path\nready=[]\n"+setup+
+                "print('conditional',bool(ready),step(2,3),step(3,3))\nPath(__file__).write_text('# Rewritten during execution\\n')\n"}
     def retain(answer,positions):
         def step(state):
             executions=[c['id'] for c in state['checks'] if c['action']=='exploration']
@@ -258,9 +259,9 @@ def test_mixed_report_reads_fixed_results_and_moves_without_side_effects(tmp_pat
             review_items=[dict(target_id=candidate,aspect='applicability',status='disputed',source_ids=['code'],
                 rationale='The external caller may have another boundary',counterevidence=['External caller responsibility remains unacquired'])]),{}
     def fact_feedback(state):
-        return dict(action='research',rationale='Retain a separate Fact explanation',feedback=dict(ref_ids=['result'],
+        return dict(action='research',rationale='Retain a separate Fact explanation',feedback=dict(ref_ids=['result','call'],
             answered='The result Fact describes local delivery only',remaining=[],understanding='unchanged',
-            rationale='A shared Fact does not associate this feedback with an execution')),{}
+            rationale='Shared Fact and Behavior references do not associate this feedback with an execution')),{}
     def contract_question(state):
         sub,_=first(state);sub.pop('map_path')
         sub.update(action='continue',obligation=None,bindings=[])
@@ -295,14 +296,43 @@ def test_mixed_report_reads_fixed_results_and_moves_without_side_effects(tmp_pat
     monkeypatch.setattr(ProcessRunner,'run',lambda *a,**kw:(_ for _ in ()).throw(AssertionError('Report cannot execute')))
     monkeypatch.setattr('consensus_assurance.workflow.direct_checks.compute_assessment',lambda *a,**kw:(_ for _ in ()).throw(AssertionError('Report cannot assess')))
     monkeypatch.setitem(EXECUTION_BACKENDS,'python',lambda *a,**kw:(_ for _ in ()).throw(AssertionError('Report cannot assemble')))
+    def valid_links(text):
+        files=set()
+        for ref in re.findall(r'\]\(([^)]+)\)',text):
+            if ref.startswith('#'):assert f'id="{ref[1:]}"' in text
+            else:
+                path=Path(unquote(ref));assert not path.is_absolute() and (moved/path).is_file(),ref
+                files.add(path.as_posix())
+        return files
+    saved=state.model_dump(mode='json')
+    live=render_report(state,e.root).read_text()
+    assert list(e.root.glob('experiments/*/workspace'))
     moved=tmp_path/'moved';shutil.copytree(e.root,moved)
-    read_text=Path.read_text
+    for directory in [moved/'.execution',*moved.glob('experiments/*/workspace'),*moved.rglob('__pycache__')]:
+        if directory.exists():shutil.rmtree(directory)
+    # Publication must preserve links in the already-generated report without rerendering it.
+    assert (moved/'report.md').read_text()==live
+    files=valid_links(live)
+    assert not any('/workspace/' in path or '/.execution/' in path for path in files)
+    manifests={Path(p).parent.name:Path(p).relative_to(e.root) for p in exploration.artifacts if Path(p).name=='manifest.json'}
+    input_manifest=manifests['workspace-delta'];outcome_manifest=manifests['workspace-outcome']
+    assert f'[执行输入文件清单]({input_manifest})' in live and f'[执行后文件清单]({outcome_manifest})' in live
+    filename=exploration.parameters['harness_filename']
+    submitted=moved/index['explorations'][0]['inputs'][0]
+    assert (moved/input_manifest.parent/'files'/filename).read_bytes()==submitted.read_bytes()
+    assert (moved/outcome_manifest.parent/'files'/filename).read_text()=='# Rewritten during execution\n'
+    assert submitted.read_bytes()!=(moved/outcome_manifest.parent/'files'/filename).read_bytes()
+    for manifest,phase in [(input_manifest,'input'),(outcome_manifest,'outcome')]:
+        data=json.loads((moved/manifest).read_text())
+        assert data['phase']==phase and filename in data['changed_files']
+    open_path=Path.open
     def archive_only(path,*args,**kwargs):
         assert not path.is_relative_to(e.root), 'Moved reports must not read the original host paths'
-        return read_text(path,*args,**kwargs)
-    monkeypatch.setattr(Path,'read_text',archive_only)
+        return open_path(path,*args,**kwargs)
+    monkeypatch.setattr(Path,'open',archive_only)
     before={p.relative_to(moved):p.read_bytes() for p in moved.rglob('*') if p.is_file()}
-    saved=state.model_dump(mode='json');text=render_report(state,moved).read_text()
+    text=render_report(state,moved).read_text()
+    assert text==live and valid_links(text)==files
     assert state.model_dump(mode='json')==saved and all((moved/p).read_bytes()==v for p,v in before.items())
     assert '**已确认违反**' in text and '**有限检查未见违反**' in text and '源码解释' in text
     table=text.split('## 主要结果')[1].split('### 1.')[0]
@@ -356,10 +386,7 @@ def test_mixed_report_reads_fixed_results_and_moves_without_side_effects(tmp_pat
     check=next(c for c in state.checks if c.direct_check_id==current.id)
     assert f'{check.id} / event[0] / state.encoded' in text and f'{check.id} / event[1] / state.encoded' in text
     assert '完整要求、假设与排除范围' in text and 'distributed consequences' in (moved/'state.json').read_text()
-    links=re.findall(r'\]\(([^)]+)\)',text)
-    for p in links:
-        if p.startswith('#'):assert f'id="{p[1:]}"' in text
-        else:assert not Path(unquote(p)).is_absolute() and (moved/unquote(p)).is_file()
+    assert '确认项数按义务命题计，不等于独立根因数' in text
     for name,snapshot in snapshots.items():
         preserved=snapshot.model_dump(mode='json')
         preview=render_report(snapshot,moved).read_text()
@@ -405,9 +432,12 @@ def test_mixed_report_reads_fixed_results_and_moves_without_side_effects(tmp_pat
     # A missing archived version must not silently resolve against the still-existing original run.
     (moved/Path(current.plan_path).relative_to(e.root)).unlink()
     (moved/index['explorations'][1]['submission']).unlink()
+    (moved/input_manifest).unlink()
     text=render_report(state,moved).read_text()
     assert '条件与检查器（归档字节缺失）' in text and str(e.root) not in text
     assert '问题原稿字节缺失' in text
+    assert '执行输入文件清单（归档字节缺失）' in text and input_manifest.as_posix() not in valid_links(text)
+    assert outcome_manifest.as_posix() in valid_links(text)
     # Exact links survive absent accepted bytes; neither state text nor an unaccepted draft fills the gap.
     missing_handoff=next(s for s in state.selections if s.get('feedback',{}).get('answered')==repaired_answer)
     (moved/f'submissions/{missing_handoff["operation_id"]}/accepted.json').unlink()
@@ -415,6 +445,7 @@ def test_mixed_report_reads_fixed_results_and_moves_without_side_effects(tmp_pat
     missing=render_report(state,moved).read_text()
     assert repaired_answer not in missing and first_answer in missing and joint_answer in missing
     assert '完整交接；精确引用不表示已解决或已正式化（归档字节缺失）' in missing
+    valid_links(missing)
     unexecuted=state.model_copy(deep=True)
     unexecuted.checks=[c for c in unexecuted.checks if c.id!=explorations[-1].id]
     assert '已受理问题，尚无保存的执行记录' in render_report(unexecuted,moved).read_text()
