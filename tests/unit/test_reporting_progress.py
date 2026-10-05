@@ -343,7 +343,7 @@ def test_mixed_report_reads_fixed_results_and_moves_without_side_effects(tmp_pat
     assert re.search(r'\d+\.\d+ 分钟',timeline) and not re.search(r'\b[0-9a-f]{32}\b',visible_timeline)
     assert all(answer not in timeline for answer in (first_answer,repaired_answer,joint_answer))
     unresolved=text.split('## 当前未决事项')[1]
-    assert '1 次探索已有原始执行记录，尚待受理解释' in unresolved and 'external caller may have another boundary' in text
+    assert '1 次探索尚无精确引用该执行的后续受理交接' in unresolved and 'external caller may have another boundary' in text
     assert '已选检查／复核待办：' in unresolved and '正在调查的问题：' not in unresolved
     assert '显式关联探索（不计为另一个发现）' in unresolved
     assert 'Acquire the caller repeat contract' not in unresolved and '地图 v1' in unresolved
@@ -391,7 +391,7 @@ def test_mixed_report_reads_fixed_results_and_moves_without_side_effects(tmp_pat
     question_text=render_report(candidate_only,moved).read_text()
     assert 'Candidate 1 项；当前 Unit 0 项、义务 0 项、固定检查制品 0 项' in question_text
     assert '已选检查／复核待办：' not in question_text and '已选检查／争议仍有待办' not in question_text
-    assert '正在调查的问题：' in question_text and '1 次探索已有原始执行记录，尚待受理解释' in question_text
+    assert '正在调查的问题：' in question_text and '1 次探索尚无精确引用该执行的后续受理交接' in question_text
     assert f'](#candidate-{candidate.id})' in question_text and f'](#exploration-{explorations[0].id})' in question_text
     assert candidate_only.model_dump(mode='json')==preserved
     legacy=state.model_copy(deep=True)

@@ -1493,7 +1493,7 @@ def test_small_exploration_answer_is_independent_of_unfinished_large_product(tmp
     report=render_report(state,e.root).read_text()
     unresolved=report.split('## 当前未决事项')[1]
     assert '已选检查／复核暂无待办' in unresolved
-    assert ('尚待受理解释' in unresolved)==(delivery!='accepted')
+    assert ('尚无精确引用该执行的后续受理交接' in unresolved)==(delivery!='accepted')
     if delivery=='accepted':assert '精确引用不表示已解决或已正式化' in report
     # This checks the actual loaded resource, not an unattached instruction file or LLM behavior.
     method=(e.root/'audit-method.md').read_text()

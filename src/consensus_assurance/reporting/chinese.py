@@ -456,7 +456,7 @@ def render_report(state, root):
         if not entry['executions']:lines.append('已受理问题，尚无保存的执行记录。')
         for handoff in entry['feedback']:
             lines.append('后续受理交接原文导航：'+handoff_links[handoff['operation_id']])
-        if entry['without_followup']:lines.append('探索执行记录已保存，尚待解释；输出不自动生成正式义务或审批待办。')
+        if entry['without_followup']:lines.append('探索执行记录已保存，尚无精确引用该执行的后续受理交接；输出不自动生成正式义务或审批待办。')
     for operation, refs in interpretations.items():
         saved = f'submissions/{operation}/accepted.json'
         feedback = archive.read(saved).get('feedback') or {}
@@ -489,7 +489,7 @@ def render_report(state, root):
             detail=('；'.join(claim_links[id] for id in item['remaining'])+'；具体进度与缺口见对应义务' if item['kind']=='unit' else
                 issue_links.get(item['id']) or candidate_links.get(item['id']) or '；'.join(item['reasons']))
             lines.append('- '+link('research.json',item['id'])+('：'+detail if detail else '（状态与原因见记录）'))
-    if unexplained:lines += ['',f'{len(unexplained)} 次探索已有原始执行记录，尚待受理解释；前提与观察是否达到仍需核对：'+
+    if unexplained:lines += ['',f'{len(unexplained)} 次探索尚无精确引用该执行的后续受理交接；前提与观察是否达到仍需核对：'+
         '；'.join(execution_links[id] for id in unexplained)]
     for c in ongoing:
         lines += ['', f'<a id="candidate-{c["id"]}"></a>', '', ('暂停调查：' if c['status']=='paused' else '研究中问题：')+c['question']['question'],

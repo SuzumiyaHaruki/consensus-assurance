@@ -922,7 +922,7 @@ def test_knowledge_growth_preserves_execution_and_supplies_the_next_check(tmp_pa
             snapshots['handoff_id']=lead['operation_id']
             assert any(h['operation_id']==lead['operation_id'] and 'surface:local-return' in h['ref_ids'] for h in index['map_handoffs'])
             assert not original['map_updated'] and original['feedback']['understanding']=='updated'
-            raw['feedback']['ref_ids'].append(lead['operation_id'])
+            raw['feedback']['ref_ids'].append(check['id'])
             raw['feedback']['answered']='The saved exploration motivates source mapping of the record producer and consumer'
             raw['feedback']['remaining']=original['feedback']['remaining']
             spec=json.loads(files['map.json'])
@@ -1085,6 +1085,10 @@ def test_knowledge_growth_preserves_execution_and_supplies_the_next_check(tmp_pa
         assert handoffs[1]['feedback']['ref_ids']==['result']
         assert not any(h['operation_id']==handoffs[1]['operation_id'] and 'surface:local-return' in h['ref_ids'] for h in compact['map_handoffs'])
         assert (e.root/'audit-spec/v1.json').read_bytes()==snapshots['map1']
+        exploration=compact['explorations'][0]
+        mapped=next(s for s in state.selections if s['map_updated'] and exploration['executions'][0]['check_id'] in s.get('feedback',{}).get('ref_ids',[]))
+        assert any(h['operation_id']==mapped['operation_id'] for h in exploration['feedback'])
+        assert f'#exploration-feedback-{mapped["operation_id"]}' in report
         spec=json.loads(Path(state.audit_spec_path).read_text())
         assert spec['behaviors'][0]['unknowns']==['Clearing schedules remain independent']
         assert 'already returned value' in spec['behaviors'][0]['important_branches'][0]

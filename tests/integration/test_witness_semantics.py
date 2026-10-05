@@ -21,9 +21,14 @@ def inputs():
     return prop,monitor,req,events
 
 
-@pytest.mark.parametrize('change',['outside','independent_missing','same_missing','identity','prerequisite','result','ambiguous','alias_missing','cross_context'])
-def test_existential_witness_is_not_scope_completeness(change):
+@pytest.mark.parametrize('change,success,expected',[
+    ('outside',True,'violated'),('independent_missing',True,'violated'),('same_missing',True,'unknown'),
+    ('identity',True,'unknown'),('prerequisite',True,'unknown'),('result',True,'unknown'),
+    ('ambiguous',True,'unknown'),('alias_missing',True,'unknown'),('cross_context',True,'unknown'),
+    ('complete',False,'holds'),('result',False,'unknown'),('identity',False,'unknown'),('prerequisite',False,'unknown')])
+def test_existential_witness_is_not_scope_completeness(change,success,expected):
     p,m,req,events=inputs()
+    events[1]['success']=success
     if change=='outside':events.append(dict(event='result',enabled=False))
     if change=='independent_missing':events.append(dict(events[0],operation='two'))
     if change=='same_missing':events.append({k:v for k,v in events[1].items() if k!='qualified'})
@@ -34,10 +39,9 @@ def test_existential_witness_is_not_scope_completeness(change):
     if change=='alias_missing':events[0].pop('context')
     if change=='cross_context':events[0]['generation']=2
     result=monitor_events(events,m,p,req)
-    valid=change in {'outside','independent_missing'}
-    assert result['witness_complete']==valid
-    assert result['comparison_complete']==(change=='outside')
-    assert result['outcome']==('violated' if valid else 'unknown')
+    assert result['witness_complete']==(expected=='violated')
+    assert result['comparison_complete']==(change in {'outside','complete'})
+    assert result['outcome']==expected
     if not result['comparison_complete']:assert result['diagnostics'] and result['limitations']
 
 
