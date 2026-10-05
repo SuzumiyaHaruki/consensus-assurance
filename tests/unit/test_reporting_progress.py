@@ -225,7 +225,7 @@ def test_mixed_report_reads_fixed_results_and_moves_without_side_effects(tmp_pat
         return sub,{}
     def explore(state):
         setup="ready.append('initialized')\n" if any(c['action']=='exploration' for c in state['checks']) else ''
-        return dict(action='explore',question='Under a caller-selected repeat policy, what values are produced?',
+        return dict(action='explore',question=f'For candidate {state["question_candidates"][-1]["id"]}, under a caller-selected repeat policy, what values are produced?',
             harness_path='explore.py',rationale='Observe behavior before attributing the repeat policy'),{
                 'explore.py':"from target import step\nready=[]\n"+setup+"print('conditional',bool(ready),step(2,3),step(3,3))\n"}
     def retain(answer,positions):
@@ -263,8 +263,8 @@ def test_mixed_report_reads_fixed_results_and_moves_without_side_effects(tmp_pat
         sub['question']['question']='Does the second public entry preserve the local bound?'
         return sub,{}
     steps=[initial,encoded_check(broken=True),encoded_check(revise=True),review,second]+([review_step()] if reviewed else [])+[explained,
-        independent_issue,explore,retain(first_answer,[0]),explore,retain(repaired_answer,[1]),retain(joint_answer,[0,1]),
-        explore,fact_feedback,contract_question,paused_contract,unconstructed,stop]
+        independent_issue,contract_question,explore,retain(first_answer,[0]),explore,retain(repaired_answer,[1]),retain(joint_answer,[0,1]),
+        explore,fact_feedback,paused_contract,unconstructed,stop]
     e,repo=engine_for(tmp_path,steps);e.agent.mock=False;e.config.execution_isolation='bwrap'
     (repo/'target.py').write_text('def step(value, limit):\n    return value + 1 if value <= limit else 0\n')
     e.config.budget.experiments=7
@@ -336,7 +336,9 @@ def test_mixed_report_reads_fixed_results_and_moves_without_side_effects(tmp_pat
     assert timeline.count('修订前 v1')==1
     assert text.count('共同后续说明')==1 and '该交接当时的剩余问题' not in text
     unresolved=text.split('## 当前未决事项')[1]
-    assert '另有 1 次探索保存了执行记录，尚无精确对应的后续受理解释' in unresolved
+    assert '1 次探索已有原始执行记录，尚待受理解释' in unresolved
+    assert '已选检查／复核待办：' in unresolved and '正在调查的问题：' not in unresolved
+    assert '显式关联探索（不计为另一个发现）' in unresolved
     assert '精确引用不表示已解决或已正式化' in text
     assert 'Acquire the caller repeat contract' not in unresolved and '地图 v1' in unresolved
     assert 'x'*200 not in text and 'z'*200 not in text and '首尾预览' in text
@@ -367,6 +369,22 @@ def test_mixed_report_reads_fixed_results_and_moves_without_side_effects(tmp_pat
     assert table.count('[bounded](')==1 and table.count('[interior](')==1
     assert 'Obtain the independent caller lifetime contract' in combined
     assert grouped.monitor_results==state.monitor_results
+    # A question plus an exploration does not imply a selected formal check or review debt.
+    candidate_only=state.model_copy(deep=True)
+    candidate_only.units=[];candidate_only.claims=[];candidate_only.direct_checks=[];candidate_only.monitor_results=[]
+    candidate_only.semantic_reviews=[];candidate_only.review_issues=[];candidate_only.evidence=[];candidate_only.findings=[]
+    candidate=next(c for c in candidate_only.question_candidates if c.resume_conditions)
+    candidate.status='active';candidate.resume_conditions=[];candidate.obligation_id=None
+    candidate_only.question_candidates=[candidate];candidate_only.checks=[explorations[0]]
+    operation=index['explorations'][0]['operation_id']
+    candidate_only.selections=[s for s in candidate_only.selections if s['operation_id']==operation]
+    preserved=candidate_only.model_dump(mode='json')
+    question_text=render_report(candidate_only,moved).read_text()
+    assert 'Candidate 1 项；当前 Unit 0 项、义务 0 项、固定检查制品 0 项' in question_text
+    assert '已选检查／复核待办：' not in question_text and '已选检查／争议仍有待办' not in question_text
+    assert '正在调查的问题：' in question_text and '1 次探索已有原始执行记录，尚待受理解释' in question_text
+    assert f'](#candidate-{candidate.id})' in question_text and f'](#exploration-{explorations[0].id})' in question_text
+    assert candidate_only.model_dump(mode='json')==preserved
     legacy=state.model_copy(deep=True)
     for key in ('correspondence','bounded_complete','reviewed_complete'):legacy.monitor_results[1].pop(key)
     legacy_text=render_report(legacy,moved).read_text()
@@ -422,6 +440,41 @@ def test_current_answer_preserves_versions_and_separate_issue_navigation(tmp_pat
         assert f'](#issue-{issue.id})' in table and f'](#issue-{issue.id})' in unresolved
         assert issue.explanation not in text
     assert state.model_dump(mode='json')==saved and len(state.direct_checks)==2
+    raw={p:p.read_bytes() for folder in ('logs','direct-checks') for p in (e.root/folder).rglob('*') if p.is_file()}
+    # Display-only variants retain the original review, assessment and log bytes.
+    for variant in ('unreviewed','preparation','observation','confirmed_partial','unknown'):
+        sample=state.model_copy(deep=True);sample.semantic_reviews=[];sample.review_issues=[]
+        record=next(r for r in sample.monitor_results if r['direct_check_id']==sample.direct_checks[-1].id)
+        record.update(review_ids=[],open_issue_ids=[],correspondence=None,reviewed_complete=False,
+            blockers=['Direct oracle correspondence is unreviewed'])
+        check=next(c for c in sample.checks if c.id==record['experiment_check_id'])
+        if variant in {'unreviewed','confirmed_partial'}:
+            confirmed=variant=='confirmed_partial'
+            record.update(outcome='violated',confirmed=confirmed,bounded_complete=not confirmed,
+                correspondence='no_issue_found' if confirmed else None)
+            record['properties'][0].update(outcome='violated',witness_complete=True,confirmed=confirmed)
+        else:
+            record.update(confirmed=False,bounded_complete=False,properties=[],outcome='unknown')
+            if variant=='preparation':
+                check.status=ExecutionStatus.TIMEOUT
+                check.parameters.update(execution_backend={'name':'cargo'},preparation_stage='cargo_seed_build',
+                    test_started=False,build_finished=None,build_activity=True)
+                record['prerequisites']={'status':'not_reached','reason':'No admission event reached'}
+            elif variant=='observation':
+                check.parameters['test_started']=True
+                record['prerequisites']={'status':'not_reached','reason':'Operation identity does not match'}
+            else:record.pop('prerequisites')
+        preserved=sample.model_dump(mode='json');preview=render_report(sample,e.root).read_text()
+        row=next(line for line in preview.splitlines() if line.startswith('| 1.'))
+        expected={'unreviewed':'机械比较：观察到违反','preparation':'准备阶段 cargo_seed_build：超时；测试未启动，尚无目标比较',
+            'observation':'Operation identity does not match','confirmed_partial':'完整反例已确认；另有独立场景覆盖缺口',
+            'unknown':'当前检查尚未完整处置'}[variant]
+        assert expected in row and 'Direct oracle correspondence is unreviewed' not in preview
+        if variant=='unreviewed':assert '待当前版本复核' in row and '已确认违反' not in row
+        if variant=='observation':assert 'status=completed' in row and '测试未启动' not in row
+        if variant=='confirmed_partial':assert '已确认违反' in row
+        assert sample.model_dump(mode='json')==preserved and all(p.read_bytes()==v for p,v in raw.items())
+    assert state.model_dump(mode='json')==saved
 
 
 def test_timeout_report_uses_recorded_limit_and_preserves_transport_diagnostic(tmp_path):

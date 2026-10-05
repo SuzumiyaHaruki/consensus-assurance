@@ -1,5 +1,6 @@
 """Human reading view of retained conclusions; never executes or repairs research state."""
 import json
+import re
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import quote
@@ -104,6 +105,32 @@ def failure_detail(check, archive):
     facts = go_test_diagnostics(text)
     interpreted = check.model_copy(update={'parameters':{**check.parameters,**facts}})
     return '历史输出诊断：'+execution_summary(interpreted)[1]+'（原记录未改写）'
+
+
+def assessment_obstacle(record, check, archive):
+    """Explain the nearest recorded gap without ranking or rewriting raw blockers."""
+    facts=check.parameters
+    failed=check.status!=ExecutionStatus.COMPLETED or check.exit_code not in (0,None)
+    stage=facts.get('preparation_stage')
+    if failed and facts.get('test_started') is False and (stage or facts.get('failure_class')=='build_or_setup'
+            or facts.get('build_finished') is False or facts.get('build_activity')):
+        return (f'准备阶段 {stage}：'+('超时' if check.status==ExecutionStatus.TIMEOUT else '失败／未完成') if stage else failure_detail(check,archive))+'；测试未启动，尚无目标比较'
+    if record.get('confirmed') and record.get('bounded_complete') is False:
+        return '完整反例已确认；另有独立场景覆盖缺口'
+    missing=[]
+    prerequisite=record.get('prerequisites',{})
+    if prerequisite.get('status') not in (None,'matched'):missing.append(prerequisite.get('reason') or '前提未完整关联')
+    for prop in record.get('properties',[]):
+        if prop.get('comparison_complete') is False:
+            missing.append(str(prop.get('checker_id','性质'))+'：'+'；'.join(prop.get('limitations') or ['观察／关联不完整']))
+    if record.get('parsing_errors'):missing.append('事件记录不完整或无法解析')
+    if missing:return f'观察／关联尚不完整；执行 status={check.status.value}，exit={check.exit_code}：'+excerpt('；'.join(missing),110)
+    progress=assessment_progress(record)
+    if record.get('open_issue_ids') or record.get('correspondence') in {'revision_needed','disputed','insufficient_basis'}:
+        return '已有复核争议，处理要求见对应争议；'+progress
+    if comparison_observed(record) is True and 'correspondence' in record and record['correspondence'] is None:
+        return progress+'；待当前版本复核'
+    return '当前检查尚未完整处置；'+(failure_detail(check,archive) if failed else progress)
 
 
 class Archive:
@@ -266,7 +293,8 @@ def render_report(state, root):
     reviews = {r.id:r for r in state.semantic_reviews}
     pending_issues={p['id'] for p in research['pending_work'] if p['kind']=='review_issue'}
     issues = {i.id:i.model_dump(mode='json') for i in state.review_issues if i.id in pending_issues}
-    issue_links = {id:f'[争议 {id}](#issue-{id})' for id in issues}
+    issue_links = {id:f'[争议 {id}](#issue-{id})（'+{'reading':'补充来源调查','revision':'修订并复核',
+        'investigation':'继续核对','blocked':'保留阻塞依据'}[issue['disposition']]+'）' for id,issue in issues.items()}
     event_cache = {}
     config, capacity = state.config, research['capacity']
     formal = [c for c in state.checks if c.action == 'direct_check']
@@ -279,15 +307,13 @@ def render_report(state, root):
             any(p['record_status']!='assessed' for p in u['progress']) for u in research['units']))]
     candidate_links = {c['id']:f'[候选 {n}](#candidate-{c["id"]})' for n,c in enumerate(ongoing,1)}
     claim_links = {c['id']:f'[{c["id"]}](#claim-{c["id"]})' for c in research['claims']}
-    def progress_text(claim_id,short=False):
+    def progress_text(claim_id):
         current = [p for u in research['units'] for p in u['progress'] if p['claim_id']==claim_id and p['record_status']!='assessed']
         records=[];refs=[]
         for r in research['assessments']:
             if not any(p.get('artifact_id')==r['direct_check_id'] and p.get('check_id')==r['experiment_check_id'] for p in current):continue
             check=checks[r['experiment_check_id']]
-            records.append(failure_detail(check,archive) if check.status!=ExecutionStatus.COMPLETED or check.exit_code not in (0,None) else assessment_progress(r))
-            if r.get('confirmed') and not r.get('bounded_complete'):records.append('完整反例已确认；另有独立场景覆盖缺口')
-            elif r.get('blockers') and not short:records.append('原因摘录：'+excerpt(r['blockers'][0],140))
+            records.append(assessment_obstacle(r,check,archive))
             refs.extend(issue_links[id] for id in r.get('open_issue_ids',[]) if id in issue_links)
             refs.append(link(str(Path(artifacts[r['direct_check_id']]['plan_path']).parent/(check.id+'-assessment.json')),'完整评估与原因'))
         refs += [link(artifacts[p['artifact_id']]['plan_path'],'固定计划') for p in current if p['record_status'] in {'no_execution','no_assessment'}]
@@ -349,7 +375,7 @@ def render_report(state, root):
             relevant & set(s.get('feedback',{}).get('ref_ids',[]))),{})
         answer = next((i.report_answer for i in reversed(items) if i.report_answer),None) or feedback.get('answered')
         entries.append((result,records,answer,title))
-        progress = progress_text(result['claim_id'],short=bool(answer))
+        progress = progress_text(result['claim_id'])
         disposition = conclusion_label(result)+('；另有场景尚未完成' if progress and result['disposition']=='confirmed_in_scope' else '')
         summary='；'.join(filter(None,[cell(excerpt(answer,170)) if answer else '',progress])) or '见下方固定观察'
         lines.append(f'| {n}. {cell(title)} | {disposition} | {summary} | {claim_links[result["claim_id"]]} |')
@@ -378,7 +404,7 @@ def render_report(state, root):
                     *[link(f'submissions/{reviews[rid].check_id}/accepted.json','对应性复核') for rid in record.get('review_ids',[]) if rid in reviews]]), '']
             if record.get('blockers'):
                 refs=[issue_links[id] for id in record.get('open_issue_ids',[]) if id in issue_links]
-                lines += ['当前争议／阻塞：'+'；'.join(refs or [excerpt(record['blockers'][0],220)])+'；'+
+                lines += ['当前争议／阻塞：'+'；'.join([assessment_obstacle(record,check,archive),*refs])+'；'+
                     link(str(Path(artifact['plan_path']).parent/(check.id+'-assessment.json')),'完整评估与阻塞'), '']
             harness = archive.read(artifact['plan_path']).get('harness',{})
             lines += [execution_location(check,archive)]
@@ -398,10 +424,15 @@ def render_report(state, root):
             interpretations.setdefault(handoff['operation_id'],set()).update(handoff['ref_ids'])
     handoff_links = {id:f'[交接 {n}](#exploration-feedback-{id})' for n,id in enumerate(interpretations,1)}
     execution_links = {c.id:f'[探索执行 {n}](#exploration-{c.id})' for n,c in enumerate(explorations,1)}
+    candidate_explorations = {id:[] for id in candidate_links}
     for entry in exploration_records:
         lines += ['', '条件探索：'+excerpt(entry['question'] or '问题原稿字节缺失',200),
             '所选问题／策略（原文摘录）：'+excerpt(entry['rationale'] or '见固定原稿',240),
             link(entry['submission'],'受理问题、条件与来源')+'；'+'；'.join(link(path,'固定输入') for path in entry['inputs'])]
+        referenced=set(entry['ref_ids']) | set(re.findall(r'[\w-]+',entry['question'] or ''))
+        related=[id for id in candidate_links if id in referenced]
+        if related:lines.append('显式引用的问题（不表示已解决）：'+'；'.join(candidate_links[id] for id in related))
+        for id in related:candidate_explorations[id].extend(execution_links[x['check_id']] for x in entry['executions'])
         for execution in entry['executions']:
             check = checks[execution['check_id']]
             lines += [f'<a id="exploration-{check.id}"></a>', execution_links[check.id]+'：'+'；'.join(execution_summary(check)[1:])+'。'+link(execution['record'],'执行记录')+'；'+
@@ -428,24 +459,24 @@ def render_report(state, root):
     titles = {r['experiment_check_id']:title for _,records,_,title in entries for r in records}
     titles.update({x['check_id']:e['rationale'] or e['question'] or '探索原稿缺失' for e in exploration_records for x in e['executions']})
     lines += ['累计分钟从本轮创建起计，含暂停间隔；详细墙钟与耗时见执行记录。']+milestone_lines(state,research,archive,checks,titles)
-    lines += ['', '## 当前未决事项', '', '已选检查暂无欠账；研究范围仍可开放。' if not research['pending_work'] else '已选检查／争议仍有待办：']
+    lines += ['', '## 当前未决事项', '']
     unexplained = [id for entry in exploration_records for id in entry['without_followup']]
-    if unexplained:lines += [f'另有 {len(unexplained)} 次探索保存了执行记录，尚无精确对应的后续受理解释；这不是新增正式欠账。'+
-        '；'.join(link(f'logs/{id}/check.json','待解释探索') for id in unexplained)]
-    for item in research['pending_work']:
-        unit = next((u for u in research['units'] if u['id']==item['id']),None)
-        detail = '；'.join(item['reasons'])
-        if unit:
-            detail = '；'.join(claim_links[id] for id in item['remaining'])+'；具体进度与缺口见对应义务'
-        elif item['id'] in issue_links:detail=issue_links[item['id']]+'；'+{
-            'reading':'补充来源调查','revision':'修订并复核','investigation':'继续核对','blocked':'保留阻塞依据'}[issues[item['id']]['disposition']]
-        else:detail = candidate_links.get(item['id'],detail)
-        lines.append('- '+link('research.json',item['id'])+('：'+detail if detail else '（状态与原因见记录）'))
+    for kinds,label in [({'unit','review_issue'},'已选检查／复核待办'),({'candidate'},'正在调查的问题')]:
+        pending=[p for p in research['pending_work'] if p['kind'] in kinds]
+        if pending:lines += ['',label+'：']
+        elif 'unit' in kinds:lines.append('已选检查／复核暂无待办；研究范围仍可开放。')
+        for item in pending:
+            detail=('；'.join(claim_links[id] for id in item['remaining'])+'；具体进度与缺口见对应义务' if item['kind']=='unit' else
+                issue_links.get(item['id']) or candidate_links.get(item['id']) or '；'.join(item['reasons']))
+            lines.append('- '+link('research.json',item['id'])+('：'+detail if detail else '（状态与原因见记录）'))
+    if unexplained:lines += ['',f'{len(unexplained)} 次探索已有原始执行记录，尚待受理解释；前提与观察是否达到仍需核对：'+
+        '；'.join(execution_links[id] for id in unexplained)]
     for c in ongoing:
         lines += ['', f'<a id="candidate-{c["id"]}"></a>', '', ('暂停调查：' if c['status']=='paused' else '研究中问题：')+c['question']['question'],
             link('state.json','候选原文与历史')]
         if c['question']['unknowns']:lines.append('保存的语义未知：'+'；'.join(c['question']['unknowns']))
         if c['resume_conditions']:lines.append('恢复条件：'+'；'.join(c['resume_conditions']))
+        if candidate_explorations[c['id']]:lines.append('显式关联探索（不计为另一个发现）：'+'；'.join(candidate_explorations[c['id']]))
     if stop.get('resume_conditions'):lines += ['', '本轮记录的恢复条件：'+'；'.join(stop['resume_conditions'])]
     registry = [('core_overview',research['core_overview']['open_details'])] if research['core_overview'] else []
     registry += [(b['behavior_id'],b['unknowns']) for b in research['frontier']['behavior_unknowns']]

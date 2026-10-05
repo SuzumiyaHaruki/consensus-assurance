@@ -1,0 +1,22 @@
+import json
+sources=[]
+def src(id,file,start,end):
+ sources.append(dict(id=id,file=file,start_line=start,end_line=end,kind='code_observation'))
+src('src_vote_admission','internal/raft/peer.go',184,197)
+src('src_response_types','internal/raft/entryutils.go',103,111)
+src('src_candidate_votes','internal/raft/raft.go',2029,2046)
+src('src_node_dispatch','node.go',1273,1316)
+src('src_formation','internal/raft/raft.go',891,927)
+src('src_transition','internal/raft/raft.go',971,1132)
+src('src_message_terms','internal/raft/raft.go',1393,1488)
+src('src_election_guard','internal/raft/raft.go',1490,1564)
+src('src_replication','internal/raft/raft.go',1316,1390)
+src('src_responses','internal/raft/raft.go',1697,1740)
+src('src_membership','internal/raft/raft.go',1137,1213)
+src('src_restore','internal/raft/raft.go',447,528)
+src('src_history','internal/raft/logentry.go',290,332)
+src('src_commit_term','internal/raft/logentry.go',356,400)
+src('src_engine_order','engine.go',1288,1337)
+src('src_update_admission','internal/raft/peer.go',199,244)
+x=dict(action='research',rationale='Preserve initial source understanding of both core relationships and a composed protection that resolves an apparent vote eligibility gap; do not construct a test that bypasses Peer.Handle.',sources=sources,feedback=dict(ref_ids=[s['id'] for s in sources],understanding='updated',answered='A1 initial trace: leader proposals append entries with the current term and consecutive indices, update self match, and replication responses advance per-peer match. tryCommit selects a voting-member quorum index and entryLog.tryCommit requires that index to belong to the current term. Followers require the preceding log term to match, reject conflicting committed entries, and limit propagated commit to the replicated prefix. A2 initial trace: campaigning increments term and votes for self; vote grants require an eligible vote slot and an up-to-date log. Message handling rejects older terms and normally steps down for higher terms, with an explicit recent-leader exception for vote requests under checkQuorum. Reset clears transient votes, read-index requests, transfer state and remote progress, while leaving log history and its committed prefix in place. Their connection is concrete: new authority rebuilds replication support and appends a current-term no-op; pending committed application blocks campaigning to avoid using stale membership. The apparent unknown-sender vote-response discrepancy is explained on the inspected production path: node.handleReceivedMessages calls Peer.Handle, which admits response messages only from current remotes, observers or witnesses; isResponseMessageType explicitly includes RequestVoteResp; the candidate handler then excludes observers and handleVoteResp counts each sender once. Directly invoking the inner raft handler with an arbitrary sender would bypass this protection. This is source reasoning, not an execution result or a proof over all membership histories. Engine processing also separates replication sends from persistence: replication messages can precede SaveRaftState, while subsequent update processing follows it; FastApply is disabled when a snapshot exists or the applied suffix overlaps entries to save.',remaining=['Complete the core map by tracing processRaftUpdate, committed-entry application, membership acceptance and ApplyConfigChange back into the raft peer; determine exactly when applied membership and campaign eligibility change.', 'Trace snapshot installation through persistence, state-machine recovery completion and RestoreRemotes to explain the interval between restoring log history and restoring membership.', 'Trace read-index and proposal completion to the caller, including dropped requests, timeouts and authority changes; distinguish internal readiness from externally completed operations.', 'Inspect initialization, tick/checkQuorum and leader-transfer callers and lifecycle before claiming a usable overview or constructing a legal execution history.'],rationale='The composition of entry admission and the inner candidate handler answers the concrete unknown-sender suspicion without execution. The broader initial reading establishes useful formation/authority relationships but does not yet explain the complete consumption and recovery backbone. No Candidate, obligation or defect is asserted.'))
+json.dump(x,open('submission.json','w'),indent=2)

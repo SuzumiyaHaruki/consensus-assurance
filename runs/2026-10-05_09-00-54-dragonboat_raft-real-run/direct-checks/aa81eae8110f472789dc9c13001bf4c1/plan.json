@@ -1,0 +1,198 @@
+{
+  "description": "Establish a three-voter leader through normal Peer initialization and traffic, lose only the first remote read heartbeat round, then allow a second remote read to confirm the queued prefix. Observe actual response encoding and ReadyToRead at each origin, plus release and setup diagnostics, for C_remote_read_context.",
+  "claim_id": "C_remote_read_context",
+  "binding_ids": [
+    "bind_read_emission",
+    "bind_read_receive"
+  ],
+  "harness": {
+    "execution_package": "./internal/raft",
+    "files": {},
+    "kind": "go_test",
+    "source": "package raft\n\nimport (\n \"encoding/json\"\n \"fmt\"\n \"testing\"\n\n \"github.com/lni/dragonboat/v3/config\"\n pb \"github.com/lni/dragonboat/v3/raftpb\"\n)\n\nfunc assuranceContext(c pb.SystemCtx) string { return fmt.Sprintf(\"%d:%d\", c.Low, c.High) }\nfunc assuranceEvent(t *testing.T, e map[string]interface{}) {\n t.Helper()\n b, err := json.Marshal(e)\n if err != nil { t.Fatal(err) }\n fmt.Println(\"CA_EVENT \" + string(b))\n}\n\n// This driver replaces storage, application scheduling and transport only.\n// All elections, forwarding, confirmation and response handling use Peer APIs.\nfunc TestAssuranceRemoteReadContext(t *testing.T) {\n const scenario = \"prefix_release\"\n peers := map[uint64]*Peer{}\n dbs := map[uint64]*TestLogDB{}\n applied := map[uint64]uint64{}\n expected := map[uint64]pb.SystemCtx{2: {Low: 1101, High: 30}, 3: {Low: 2202, High: 30}}\n addresses := []PeerAddress{{NodeID: 1, Address: \"n1:1234\"}, {NodeID: 2, Address: \"n2:1234\"}, {NodeID: 3, Address: \"n3:1234\"}}\n queue := []pb.Message{}\n dropFirst := false\n observed := false\n dropped := 0\n wireCount := map[uint64]int{}\n readyCount := map[uint64]int{}\n releaseCount := map[uint64]int{}\n var term uint64\n\n for id := uint64(1); id <= 3; id++ {\n  dbs[id] = NewTestLogDB().(*TestLogDB)\n  peers[id] = Launch(config.Config{NodeID: id, ClusterID: 1, ElectionRTT: 10, HeartbeatRTT: 1, CheckQuorum: true}, dbs[id], nil, append([]PeerAddress(nil), addresses...), true, true)\n }\n // Peer and TestLogDB allocate no background workers or external resources.\n // No production state is mutated by the driver outside documented APIs.\n flush := func(id uint64) {\n  p := peers[id]\n  ud := p.GetUpdate(true, applied[id])\n  if !pb.IsEmptySnapshot(ud.Snapshot) { t.Fatal(\"unexpected snapshot\") }\n  if err := dbs[id].Append(ud.EntriesToSave); err != nil { t.Fatal(err) }\n  if !pb.IsEmptyState(ud.State) { dbs[id].SetState(ud.State) }\n  for _, e := range ud.CommittedEntries {\n   if e.Index != applied[id]+1 { t.Fatalf(\"application gap at node %d\", id) }\n   if e.Type == pb.ConfigChangeEntry {\n    var cc pb.ConfigChange\n    if err := cc.Unmarshal(e.Cmd); err != nil { t.Fatal(err) }\n    if !cc.Initialize || cc.Type != pb.AddNode { t.Fatal(\"unexpected configuration change\") }\n    p.ApplyConfigChange(cc)\n   } else if len(e.Cmd) != 0 { t.Fatal(\"unexpected application payload\") }\n   applied[id] = e.Index\n  }\n  for _, rr := range ud.ReadyToReads {\n   if observed {\n    readyCount[id]++\n    assuranceEvent(t, map[string]interface{}{\"event\":\"ready\", \"scenario\":scenario, \"origin\":id, \"context\":assuranceContext(rr.SystemCtx), \"index\":rr.Index, \"applied\":applied[id], \"term\":p.raft.term})\n   } else { t.Fatal(\"readiness before requests\") }\n  }\n  for _, m := range ud.Messages {\n   if observed && m.Type == pb.ReadIndexResp {\n    wireCount[m.To]++\n    assuranceEvent(t, map[string]interface{}{\"event\":\"wire\", \"scenario\":scenario, \"origin\":m.To, \"from\":m.From, \"context\":assuranceContext(pb.SystemCtx{Low:m.Hint, High:m.HintHigh}), \"term\":m.Term, \"index\":m.LogIndex})\n   }\n   if dropFirst && m.Type == pb.Heartbeat && m.Hint == expected[2].Low && m.HintHigh == expected[2].High {\n    dropped++\n    assuranceEvent(t, map[string]interface{}{\"event\":\"loss\", \"scenario\":scenario, \"from\":m.From, \"to\":m.To, \"context\":assuranceContext(expected[2])})\n    continue\n   }\n   // Copy message entry storage before acknowledging its update.\n   m.Entries = append([]pb.Entry(nil), m.Entries...)\n   queue = append(queue, m)\n  }\n  p.Commit(ud)\n  p.NotifyRaftLastApplied(applied[id])\n }\n deliver := func() {\n  if len(queue)==0 { t.Fatal(\"empty delivery queue\") }\n  m := queue[0]\n  queue = queue[1:]\n  p := peers[m.To]\n  before := map[uint64]bool{}\n  if observed && m.To==1 && m.Type==pb.HeartbeatResp {\n   for origin, ctx := range expected { _, before[origin] = p.raft.readIndex.pending[ctx] }\n  }\n  p.Handle(m)\n  for origin, existed := range before {\n   _, remains := p.raft.readIndex.pending[expected[origin]]\n   if existed && !remains {\n    if !p.raft.isLeader() || p.raft.term!=term { t.Fatal(\"authority changed during confirmation\") }\n    releaseCount[origin]++\n    assuranceEvent(t, map[string]interface{}{\"event\":\"released\", \"scenario\":scenario, \"origin\":origin, \"removed\":true, \"term\":p.raft.term, \"response_from\":m.From, \"confirming_context\":assuranceContext(pb.SystemCtx{Low:m.Hint, High:m.HintHigh})})\n   }\n  }\n  flush(m.To)\n }\n drain := func() {\n  for steps:=0; len(queue)>0; steps++ {\n   if steps>=500 { t.Fatal(\"message drain bound reached\") }\n   deliver()\n  }\n }\n for id:=uint64(1); id<=3; id++ { flush(id) }\n drain()\n for ticks:=0; !peers[1].raft.isLeader() && ticks<50; ticks++ {\n  peers[1].Tick()\n  flush(1)\n  drain()\n }\n if !peers[1].raft.isLeader() || !peers[1].raft.hasCommittedEntryAtCurrentTerm() { t.Fatal(\"current-term committed leader not reached\") }\n term=peers[1].raft.term\n for id:=uint64(1); id<=3; id++ {\n  p:=peers[id]\n  if p.raft.term!=term || p.raft.leaderID!=1 || applied[id]!=p.raft.log.committed || p.raft.numVotingMembers()!=3 { t.Fatalf(\"prefix incomplete at node %d\",id) }\n }\n observed=true\n dropFirst=true\n peers[2].ReadIndex(expected[2])\n flush(2)\n drain()\n dropFirst=false\n if dropped!=2 || len(peers[1].raft.readIndex.pending)!=1 { t.Fatal(\"first pending request / first round loss not established\") }\n peers[3].ReadIndex(expected[3])\n flush(3)\n if len(queue)!=1 || queue[0].Type!=pb.ReadIndex || queue[0].From!=3 || queue[0].To!=1 { t.Fatal(\"second forwarded request not reached\") }\n deliver()\n if len(peers[1].raft.readIndex.pending)!=2 || len(peers[1].raft.readIndex.queue)!=2 { t.Fatal(\"coexisting requests not reached\") }\n for _, origin:=range []uint64{2,3} {\n  ctx:=expected[origin]\n  status,ok:=peers[1].raft.readIndex.pending[ctx]\n  if !ok || status.from!=origin || status.ctx!=ctx { t.Fatal(\"leader admission differs from caller request\") }\n  assuranceEvent(t,map[string]interface{}{\"event\":\"admitted\", \"scenario\":scenario, \"origin\":origin, \"expected_context\":assuranceContext(ctx), \"term\":term, \"leader\":uint64(1), \"pending_count\":len(peers[1].raft.readIndex.pending), \"current_term_committed\":peers[1].raft.hasCommittedEntryAtCurrentTerm(), \"first_round_drops\":dropped})\n }\n drain()\n // End after finite queue exhaustion, independently of whether contexts match.\n for _, origin:=range []uint64{2,3} {\n  assuranceEvent(t,map[string]interface{}{\"event\":\"diagnostic\", \"scenario\":scenario, \"origin\":origin, \"wire_count\":wireCount[origin], \"ready_count\":readyCount[origin], \"release_count\":releaseCount[origin], \"leader_pending\":len(peers[1].raft.readIndex.pending), \"remaining_messages\":len(queue)})\n }\n}\n",
+    "description": "Single TestAssuranceRemoteReadContext using captured raft Peer, TestLogDB and real generated messages.",
+    "semantic_changes": [
+      "Storage is the captured in-memory TestLogDB; no crash or durability conclusion.",
+      "Sequential update/application driver handles bootstrap configuration entries and empty no-op entries through Peer APIs; no application state-machine payloads or NodeHost client objects are used.",
+      "Transport is a FIFO generated-message queue with explicit first-context outbound heartbeat loss; no protocol handler, response content or source file is replaced.",
+      "Read-only inspection of live peer state supplies prerequisites and release identity. Fixed unique contexts replace random caller context generation."
+    ],
+    "prerequisites": [
+      {
+        "alias": "admitted",
+        "event": "admitted",
+        "conditions": [
+          {
+            "field": "current_term_committed",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          },
+          {
+            "field": "pending_count",
+            "op": "eq",
+            "value": 2,
+            "reference": null
+          },
+          {
+            "field": "first_round_drops",
+            "op": "eq",
+            "value": 2,
+            "reference": null
+          }
+        ]
+      },
+      {
+        "alias": "released",
+        "event": "released",
+        "conditions": [
+          {
+            "field": "removed",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          },
+          {
+            "field": "term",
+            "op": "eq",
+            "value": null,
+            "reference": "admitted.term"
+          }
+        ]
+      }
+    ],
+    "legality": {
+      "source_ids": [
+        "src_launch",
+        "src_launch_bootstrap",
+        "src_memory_storage",
+        "src_peer_updates",
+        "src_engine_order",
+        "src_node_completion",
+        "src_context_admission",
+        "src_vote_admission",
+        "src_transport_loss",
+        "src_transport_order",
+        "src_context_generation"
+      ],
+      "expectation_ids": [
+        "src_forwarded_read_expectation"
+      ],
+      "binding_ids": [],
+      "derivation": "Launch all peers with a common initial configuration and empty TestLogDB, persist each extracted update into its in-memory LogDB before messages, apply only bootstrap configuration and empty no-op entries, acknowledge updates and notify applied index. Tick only node 1 until a real election and current-term commit complete. Use Peer.ReadIndex on followers and Peer.Handle for every delivered message; no test-only campaign guard replacement. Drop the two generated first-context heartbeats at the outbound boundary as an allowed send loss, then deliver all remaining generated traffic in queue order. This does not synthesize votes or heartbeat replies. Contexts are fixed distinct nonzero legal Peer inputs; caller random generation is substituted, not its uniqueness constraint. Peers/TestLogDB have no background workers or external resources to shut down.",
+      "applicability": "Accepted C_remote_read_context scope; fixed unchanged three-voter configuration, term and one request per remote origin.",
+      "unresolved": [],
+      "conflicts": [],
+      "alternatives": []
+    }
+  },
+  "monitors": [
+    {
+      "id": "monitor_wire",
+      "checker_id": "check_wire_context",
+      "event": "wire",
+      "binding_ids": [
+        "bind_read_emission"
+      ],
+      "grounding": {
+        "source_ids": [
+          "src_confirmation_emission",
+          "src_read_receive",
+          "src_read_complete"
+        ],
+        "expectation_ids": [
+          "src_confirm_expectation",
+          "src_forwarded_read_expectation",
+          "src_receive_expectation"
+        ],
+        "binding_ids": [],
+        "derivation": "Compare observed wire and ReadyToRead contexts with the context supplied by the driver at admitted. Correlate by scenario and origin only, which are unique since each follower originates one request. Removal from leader pending during the actual HeartbeatResp handler in unchanged authority records release before result delivery. Do not filter by context equality or outcome.",
+        "applicability": "Accepted C_remote_read_context scope; fixed unchanged three-voter configuration, term and one request per remote origin.",
+        "unresolved": [],
+        "conflicts": [],
+        "alternatives": []
+      },
+      "applicability_conditions": [],
+      "admission_alias": "released"
+    },
+    {
+      "id": "monitor_ready",
+      "checker_id": "check_ready_context",
+      "event": "ready",
+      "binding_ids": [
+        "bind_read_receive"
+      ],
+      "grounding": {
+        "source_ids": [
+          "src_confirmation_emission",
+          "src_read_receive",
+          "src_read_complete"
+        ],
+        "expectation_ids": [
+          "src_confirm_expectation",
+          "src_forwarded_read_expectation",
+          "src_receive_expectation"
+        ],
+        "binding_ids": [],
+        "derivation": "Compare observed wire and ReadyToRead contexts with the context supplied by the driver at admitted. Correlate by scenario and origin only, which are unique since each follower originates one request. Removal from leader pending during the actual HeartbeatResp handler in unchanged authority records release before result delivery. Do not filter by context equality or outcome.",
+        "applicability": "Accepted C_remote_read_context scope; fixed unchanged three-voter configuration, term and one request per remote origin.",
+        "unresolved": [],
+        "conflicts": [],
+        "alternatives": []
+      },
+      "applicability_conditions": [],
+      "admission_alias": "released"
+    }
+  ],
+  "observable_properties": [
+    {
+      "checker_id": "check_wire_context",
+      "kind": "event_assertion",
+      "trigger": {
+        "field": "event",
+        "op": "eq",
+        "value": "wire",
+        "reference": null
+      },
+      "assertion": {
+        "field": "context",
+        "op": "eq",
+        "value": null,
+        "reference": "admitted.expected_context"
+      },
+      "antecedent": null,
+      "identity_fields": [
+        "scenario",
+        "origin"
+      ],
+      "description": "The wire observation for each released remote request preserves its supplied context; higher read index is allowed."
+    },
+    {
+      "checker_id": "check_ready_context",
+      "kind": "event_assertion",
+      "trigger": {
+        "field": "event",
+        "op": "eq",
+        "value": "ready",
+        "reference": null
+      },
+      "assertion": {
+        "field": "context",
+        "op": "eq",
+        "value": null,
+        "reference": "admitted.expected_context"
+      },
+      "antecedent": null,
+      "identity_fields": [
+        "scenario",
+        "origin"
+      ],
+      "description": "The ready observation for each released remote request preserves its supplied context; higher read index is allowed."
+    }
+  ],
+  "uncertainties": [
+    "The check observes internal Peer ReadyToRead, not pendingReadIndex request notification or application lookup.",
+    "No assertion of timeout, eventual success or infinite stalling is made; only completed context comparisons are formal properties.",
+    "In-memory storage and a deterministic schedule do not cover crashes, dynamic membership or role transitions."
+  ]
+}

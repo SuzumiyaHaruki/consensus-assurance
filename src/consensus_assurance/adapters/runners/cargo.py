@@ -16,7 +16,7 @@ class CargoBackend:
     name = "cargo"
     version = "2"
     harness_kind = "rust_test"
-    harness_instructions = "Write Rust #[test] integration tests using the captured crate's public API and existing dependencies. The controller fixes the workspace lock and tools, builds a neutral integration target once, and copies its compiler outputs into each private action. Only the generated test target runs, serially with --nocapture and --locked --offline. Emit complete CA_EVENT JSON lines. Helpers are workspace-relative; never replace manifests, locks, build scripts or Cargo configuration. No extra feature flags are added; original dev-dependencies can enable additional features. Consult build_inputs metadata and actual compiler-artifact records; declaration syntax does not establish active cfg branches or private-state reachability."
+    harness_instructions = "Write Rust #[test] integration tests using the captured crate's public API and existing dependencies. The controller fixes the workspace lock and tools; build reuse is specific to a manifest, integration test target and saved build basis. Switching crates may require a first heavy dependency build. Consult research.json build_inputs for preparation evidence and current seed availability; unlisted targets are not known to be prepared, and available seeds still require execution-time validation. Only the generated test target runs, serially with --nocapture and --locked --offline. Emit complete CA_EVENT JSON lines. Helpers are workspace-relative; never replace manifests, locks, build scripts or Cargo configuration. No extra feature flags are added; original dev-dependencies can enable additional features. Actual compiler-artifact records describe reuse; declaration syntax does not establish active cfg branches or private-state reachability."
 
     def __init__(self, target=None, timeout=90):
         self.package = local_package(target.execution_package if target else ".")
@@ -94,6 +94,10 @@ class CargoBackend:
     def validate_builds(self,root,snapshot_id,deadline=None):
         from .cargo_build import verify
         verify(self,root,snapshot_id,deadline)
+
+    def build_inputs(self,root,state,read):
+        from .cargo_build import build_inputs
+        return build_inputs(self,root,state,read)
 
     def execute(self,*args):
         from .cargo_build import execute

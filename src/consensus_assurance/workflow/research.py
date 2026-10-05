@@ -1,7 +1,7 @@
 """Current research projection and attributed decisions; history stays in state."""
 from .audit_spec import load, audit_object_index
 from .reviews import open_issues
-from consensus_assurance.core.types import ACTIVITY_ROLES
+from consensus_assurance.core.types import ACTIVITY_ROLES, CheckRun
 
 
 def pending_work(state):
@@ -339,13 +339,11 @@ def current_view(state, root, implementation=None):
     targets=[a for a in state.direct_checks if a.id in {x['id'] for x in result['artifacts']}]
     targets.extend(c for c in state.question_candidates if any(i.target_id==c.id for i in issues))
     contracts=[target_contract(state,a) for a in targets]
-    build_inputs=[]
-    for path in sorted((root/'build-inputs/targets').glob('**/basis.json')):
-        basis=read(str(path.relative_to(root)))
-        compilations=[read(str(p.relative_to(root))) for p in sorted(path.parent.glob('*-seed.json'))]
-        build_inputs.append({'record':str(path.relative_to(root)),
-            **{k:basis.get(k) for k in ('manifest','test_target','resolved_features','feature_evidence')},
-            'compilations':[{'record':c['record'],'compiled_features':c['selected_features']} for c in compilations]})
+    build_inputs=implementation.build_inputs(root,state,read) if hasattr(implementation,'build_inputs') else []
+    for item in build_inputs:
+        latest=item['latest_preparation']
+        if latest:
+            latest.update(execution_cost(CheckRun.model_validate(read(latest['record']))))
     result.update(run_id=state.id,snapshot_id=state.snapshot.id,elapsed_seconds=state.elapsed_seconds,
         source_path=str(root/'agent-source'),draft_path=str(root/'draft'),state_path=str(root/'state.json'),
         product_schemas=str(root/'product-schemas.json'),submission_schema=str(root/'submission.schema.json'),

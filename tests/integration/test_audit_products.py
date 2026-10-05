@@ -49,6 +49,11 @@ fn actual_boundary() {
         assert check.status.value=='timeout' and check.parameters['build_activity'] and not check.parameters['test_started']
         assert not result['confirmed'] and result['outcome']=='unknown' and comparison_observed(result) is False
         assert not state.semantic_reviews and '构建期间超时' in render_report(state,e.root).read_text()
+        from consensus_assurance.workflow.research import current_view
+        preparation=current_view(state,e.root,e.implementation)['build_inputs'][0]
+        assert preparation['status']=='preparation_failed'
+        assert preparation['latest_preparation']['stage']=='cargo_seed_build'
+        assert preparation['latest_preparation']['status']=='timeout' and preparation['latest_preparation']['process_seconds']>0
         return
     assert result['confirmed']==(outcome=='violated')
     assert result['outcome']==('unknown' if outcome.startswith('missing_') else outcome)
@@ -82,7 +87,20 @@ def test_rust_cross_action_seed_isolation_inputs_and_recovery(tmp_path,rust_work
     e.config.execution_isolation='bwrap';e.config.budget.experiments=6;e.config.budget.action_timeout=60
     e.implementation=CargoBackend(e.config.target);e.start(repo,plan_only=True)
     checks=[]
-    def run(value):
+    from consensus_assurance.workflow.research import current_view
+    def preparation():
+        saved=e.state.model_dump(mode='json')
+        files={p:p.read_bytes() for directory in ('build-inputs','logs') for p in (e.root/directory).rglob('*.json')}
+        with monkeypatch.context() as patch:
+            patch.setattr(e.runner,'run',lambda *a,**kw:pytest.fail('Status query executed a tool'))
+            patch.setattr(cargo_build,'tool_inputs',lambda *a,**kw:pytest.fail('Status query verified tools'))
+            index=current_view(e.state,e.root,e.implementation)['build_inputs']
+        assert e.state.model_dump(mode='json')==saved and all(p.read_bytes()==b for p,b in files.items())
+        return {p['manifest']:p for p in index}
+    assert preparation()['sample/Cargo.toml']['status']=='unprepared'
+    e.implementation.prepare_run(e.runner,e.state.snapshot.id,60,'bwrap')
+    assert preparation()['sample/Cargo.toml']['status']=='inputs_fixed'
+    def run(value,package='sample'):
         text='invalid Rust' if value is None else '''#[test] fn actual() {
 assert!(!std::path::Path::new("runtime-db").exists());
 assert!(!std::path::Path::new("../.execution/cargo-target/poison").exists());
@@ -90,15 +108,25 @@ std::fs::write("runtime-db", "private").unwrap();
 std::fs::write("../.execution/cargo-target/poison", "private").unwrap();
 println!("CA_EVENT {{\\"event\\":\\"value\\",\\"value\\":{}}}", sample::step(VALUE,9));
 }'''.replace('VALUE',str(value))
-        h=Harness(kind='rust_test',source=text,description='Actual changed input',semantic_changes=[])
+        if package=='increment':text=text.replace('sample::step(VALUE,9)'.replace('VALUE',str(value)),'increment::value()')
+        h=Harness(kind='rust_test',execution_package=package,source=text,description='Actual changed input',semantic_changes=[])
         filename=e.implementation.resolve_harness(h,e.root/'source',e.state.snapshot.files)
+        e.state.current_submission={'harness':h.model_dump(mode='json'),'harness_filename':filename}
+        if package=='increment':assert preparation()['increment/Cargo.toml']['status']=='unprepared'
         c=CheckRun.model_validate(e.action('exploration','experiments',lambda:execute_harness(e,h,filename,'exploration'),{'version':len(checks)}))
         e.record(c);checks.append(c);return c
-    first_check=run(1);e.advance('next');second=run(4);e.advance('next');bad=run(None)
+    first_check=run(1);e.advance('next');second=run(4)
+    assert first_check.parameters['seed_build']==second.parameters['seed_build']
+    assert preparation()['sample/Cargo.toml']['status']=='seed_available'
+    e.advance('other_crate');other=run(0,'increment')
+    assert extract_events(other)[0]['value']==1 and other.parameters['seed_build']!=first_check.parameters['seed_build']
+    prepared=preparation()['increment/Cargo.toml']
+    assert prepared['status']=='seed_available' and prepared['compilations'][0]['record']==other.parameters['seed_record']
+    e.advance('next');bad=run(None)
     assert [extract_events(c)[0]['value'] for c in (first_check,second)]==[2,5]
     assert bad.status.value=='error' and not extract_events(bad) and not bad.parameters['test_started']
-    assert len({c.id for c in checks})==len({c.cwd for c in checks})==3
-    assert len({c.parameters['build_inputs'] for c in checks})==1
+    assert len({c.id for c in checks})==len({c.cwd for c in checks})==4
+    assert len({c.parameters['build_inputs'] for c in checks})==2
     basis=json.loads((e.root/first_check.parameters['build_inputs']).read_text())
     lock=e.root/basis['lock']['record'];locked=lock.read_bytes()
     assert basis['lock']['origin']==('source' if upstream_lock else 'prepared')
@@ -107,7 +135,7 @@ println!("CA_EVENT {{\\"event\\":\\"value\\",\\"value\\":{}}}", sample::step(VAL
         assert c.started_at>=c.parameters['action_started_at']
         artifacts=json.loads(Path(c.parameters['cargo_artifacts']).read_text())
         deps=[a for a in artifacts if a['target']['name']=='increment']
-        assert deps and all(a['fresh'] and 'instrumented' in a['features'] for a in deps)
+        if c!=other:assert deps and all(a['fresh'] and 'instrumented' in a['features'] for a in deps)
         assert (Path(c.cwd)/'Cargo.lock').read_bytes()==locked
     seed=e.root/'.execution/cargo-seeds'
     assert not list(seed.rglob('poison')) and not list(seed.rglob('runtime-db'))
@@ -122,7 +150,11 @@ println!("CA_EVENT {{\\"event\\":\\"value\\",\\"value\\":{}}}", sample::step(VAL
     with pytest.raises(ValueError,match='changed'):e.implementation.validate_builds(e.root,e.state.snapshot.id)
     manifest.write_bytes(saved)
     saved_receipt=(e.root/first_check.parameters['seed_record']).read_bytes()
-    shutil.rmtree(seed);e.advance('cold');cold=run(7)
+    old=[c.model_dump(mode='json') for c in checks]
+    shutil.rmtree(seed)
+    assert all(p['status']=='seed_unavailable' and p['compilations'] for p in preparation().values())
+    assert [c.model_dump(mode='json') for c in checks]==old
+    e.advance('cold');cold=run(7)
     assert extract_events(cold)[0]['value']==8 and cold.parameters['seed_build']!=first_check.parameters['seed_build']
     rebuilt=json.loads((e.root/'logs'/cold.parameters['seed_build']/'cargo-artifacts.json').read_text())
     assert any(a['target']['name']=='increment' and a['fresh'] is False for a in rebuilt)
@@ -1287,7 +1319,7 @@ func emit(event string, value bool) {{ fmt.Printf("CA_EVENT {{\\"event\\":\\"%s\
     def explore(state):
         return dict(action='explore',question='Observe the storage package under one legal input',
             execution_package='internal/store',harness_path='storage.go',rationale='Independent conditional observation'),{
-            'storage.go':'package storage\nimport("testing";"fmt")\nfunc TestAssuranceStore(t *testing.T) { fmt.Println(Step(1,3)) }\n'}
+            'storage.go':'package storage\nimport("testing";"fmt")\nfunc TestAssuranceStore(t *testing.T) { fmt.Println(Step(1,3)); t.Error("fixture failure after observation") }\n'}
     steps=[initial,check(None,value=2),review_step(),check('internal/core'),review_step(),explore,check('./internal/core',revise=True),review_step()]
     e,repo=engine_for(tmp_path,steps)
     shutil.copytree(go_module,repo,dirs_exist_ok=True)
@@ -1328,8 +1360,15 @@ func emit(event string, value bool) {{ fmt.Printf("CA_EVENT {{\\"event\\":\\"%s\
     assert [r['outcome'] for r in state.monitor_results]==['holds','violated','violated']
     assert all(r['reviewed_complete'] for r in state.monitor_results)
     conditional=next(c for c in state.checks if c.action=='exploration')
+    assert conditional.exit_code!=0 and conditional.parameters['test_started'] and '2' in Path(conditional.stdout).read_text()
     assert conditional.command[-1]=='./internal/store' and conditional.parameters['harness_filename']=='internal/store/custom_generated_test.go'
     assert conditional.tool_version==state.tools['implementation'] and conditional.direct_check_id is None
+    from consensus_assurance.workflow.research import costs,execution_cost
+    for check in [c for c in state.checks if c.action in {'direct_check','exploration'}]:
+        timing=execution_cost(check)
+        assert timing['action_seconds']>=timing['process_seconds']>=0
+        assert check.parameters['action_started_at']<=check.started_at<check.ended_at
+        assert json.loads((e.root/'logs'/check.id/'check.json').read_text())['parameters']['action_seconds']==timing['action_seconds']
     plan=load_plan(new.plan_path)
     moved=plan.model_copy(deep=True);moved.harness.execution_package='.'
     assert direct_changes(plan,moved)==dict(inputs=True,oracle=False,observation=False,contract=False,legality=False)
@@ -1351,6 +1390,8 @@ func emit(event string, value bool) {{ fmt.Printf("CA_EVENT {{\\"event\\":\\"%s\
     e.config.target.execution_package='./internal/store';e.implementation=GoModuleBackend(e.config.target.model_copy(update={'harness_path':None}),120)
     (e.root/'draft/primary.go').write_text('not Go')
     previous=next(c for c in state.checks if c.direct_check_id==new.id)
+    original_cost=execution_cost(previous);original_times=(previous.started_at,previous.ended_at)
+    original_output=Path(previous.stdout).read_bytes();original_totals=costs(state)
     state.pending_action=next(a for a in state.action_history if a.kind=='direct_execute' and a.logical_input.get('direct_check_id')==new.id)
     repeated=execute(e,new)
     assert repeated.id==previous.id and repeated.command[-1]=='./internal/core'
@@ -1359,6 +1400,22 @@ func emit(event string, value bool) {{ fmt.Printf("CA_EVENT {{\\"event\\":\\"%s\
     recovered=execute(e,new)
     assert recovered.id==previous.id and recovered.command==previous.command
     assert recovered.parameters['harness_filename']=='internal/core/custom_generated_test.go'
+    assert execution_cost(recovered)==original_cost and (recovered.started_at,recovered.ended_at)==original_times
+    assert Path(previous.stdout).read_bytes()==original_output and state.usage['experiments']==4
+    assert costs(state)['target_action_cost']==original_totals['target_action_cost']
+    assert costs(state)['formal_execution_seconds']==original_totals['formal_execution_seconds']
+    legacy=previous.model_copy(deep=True);legacy.id='legacy-go'
+    for key in ('action_seconds','action_started_at'):legacy.parameters.pop(key)
+    mixed=state.model_copy(update={'checks':[*state.checks,recovered,legacy]})
+    assert costs(mixed)['target_action_cost']=={**original_totals['target_action_cost'],'unrecorded_check_ids':['legacy-go']}
+    receipt=e.root/'logs'/previous.id/'check.json';raw=json.loads(receipt.read_text())
+    for key in ('action_seconds','action_started_at'):raw['parameters'].pop(key)
+    receipt.write_text(json.dumps(raw))
+    (e.root/'actions'/state.pending_action.id/'result.json').unlink()
+    raw_recovery=execute(e,new)
+    assert raw_recovery.id==previous.id and execution_cost(raw_recovery)['action_seconds'] is None
+    assert (raw_recovery.started_at,raw_recovery.ended_at)==original_times and Path(raw_recovery.stdout).read_bytes()==original_output
+    assert state.usage['experiments']==4
 
 
 @pytest.mark.parametrize('delivery',['accepted','deadline','blocked'])

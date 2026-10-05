@@ -1,7 +1,8 @@
 """Question routing and bounded implementation checks using existing execution evidence."""
 from pathlib import Path
+import time
 from consensus_assurance.core.proposals import DirectCheckPlan
-from consensus_assurance.core.types import DirectCheckArtifact, CheckRun, CheckerResult, Evidence, Finding, Origin, Assessment, Investigation, ExecutionStatus
+from consensus_assurance.core.types import DirectCheckArtifact, CheckRun, CheckerResult, Evidence, Finding, Origin, Assessment, Investigation, ExecutionStatus, now
 from consensus_assurance.core.events import match_prerequisites, event_requirements
 from consensus_assurance.adapters.storage.files import write_json
 from consensus_assurance.adapters.storage.snapshot import capture
@@ -97,6 +98,8 @@ def save_plan(engine,unit,plan,operation_id,previous=None,*,filename=None):
 
 def execute_harness(engine,harness,filename,action):
     """Execute fixed placement and bytes through the same formal/exploratory boundary."""
+    started=now();clock=time.monotonic()
+    prior={p.parent.name for p in (engine.root/'logs').glob('*/check.json')} if harness.kind=='go_test' else set()
     workspace=engine.workspace()
     paths=install_harness(workspace,filename,harness,engine.state.snapshot.files)
     check=run_experiment(engine.runner,engine.implementation.experiment_command(harness.execution_package,filename),
@@ -105,6 +108,9 @@ def execute_harness(engine,harness,filename,action):
     check.parameters.update(execution_package=harness.execution_package,harness_filename=filename)
     check.tool_version=engine.state.tools.get('implementation','unknown')
     check.artifacts.extend(paths)
+    if harness.kind=='go_test' and check.id not in prior:
+        check.parameters.update(action_started_at=started,action_seconds=time.monotonic()-clock)
+        write_json(engine.root/'logs'/check.id/'check.json',check)
     return check
 
 

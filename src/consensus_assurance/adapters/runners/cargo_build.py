@@ -75,6 +75,53 @@ class PreparationFailed(Exception):
     def __init__(self,check):self.check=check
 
 
+def build_inputs(adapter,root,state,read):
+    """Read bounded preparation metadata, never validate tools or materialize a seed."""
+    selected=[(adapter.package,adapter.harness_filename)]
+    for artifact in state.direct_checks:
+        harness=read(f'direct-checks/{artifact.operation_id}/plan.json').get('harness',{})
+        if harness.get('kind')=='rust_test':
+            package=harness.get('execution_package') or adapter.package
+            selected.append((package,str(Path(package)/'tests'/Path(artifact.harness_path).name)))
+    current=state.current_submission
+    if current.get('harness',{}).get('kind')=='rust_test':
+        selected.append((current['harness']['execution_package'],current['harness_filename']))
+    paths={p.relative_to(root) for p in (root/'build-inputs/targets').glob('**/basis.json')}
+    for package,filename in selected:
+        command=adapter.experiment_command(package,filename)
+        paths.add(Path('build-inputs/targets')/Path(command[command.index('--manifest-path')+1]).parent/Path(filename).stem/'basis.json')
+    result=[]
+    for path in sorted(paths):
+        basis=read(str(path));manifest=str(path.parent.parent.relative_to('build-inputs/targets')/'Cargo.toml')
+        target=path.parent.name;compilations=[];preparations=[]
+        basis_digest=digest((root/path).read_bytes()) if basis else None
+        for saved in sorted((root/path).parent.glob('*-seed.json')):
+            name=str(saved.relative_to(root));receipt=read(name)
+            if not basis or receipt.get('basis')!=str(path) or receipt.get('basis_digest')!=basis_digest:continue
+            compilations.append({'record':name,'compiled_features':receipt['selected_features']})
+            check=read(f'logs/{receipt["check_id"]}/check.json')
+            if check:preparations.append((check['started_at'] or '',{'record':f'logs/{check["id"]}/check.json',
+                'stage':check['action'],'status':check['status']}))
+        cache=root/'.execution/cargo-seeds'/path.parent.relative_to('build-inputs/targets')
+        ready=read(str((cache/'ready.json').relative_to(root)))
+        available=bool(ready and any(ready==read(c['record']) for c in compilations))
+        status='seed_available' if available else 'seed_unavailable' if compilations else 'inputs_fixed' if basis else 'unprepared'
+        for check in state.checks:
+            params=check.parameters
+            same=params.get('build_inputs')==str(path) or (
+                params.get('execution_package') is not None and params.get('harness_filename') is not None and
+                str(Path(params['execution_package'])/'Cargo.toml')==manifest and Path(params['harness_filename']).stem==target)
+            if same and params.get('preparation_failure'):
+                preparations.append((check.started_at or '',{'record':f'logs/{check.id}/check.json',
+                    'stage':params['preparation_stage'],'status':check.status.value,'failure_record':f'logs/{params["preparation_failure"]}/check.json'}))
+        latest=max(preparations,key=lambda p:p[0])[1] if preparations else None
+        if latest and 'failure_record' in latest:status='preparation_failed'
+        result.append({'record':str(path) if basis else None,'manifest':manifest,'test_target':target,
+            'resolved_features':basis.get('resolved_features'),'feature_evidence':basis.get('feature_evidence'),
+            'compilations':compilations,'status':status,'latest_preparation':latest})
+    return result
+
+
 def retain_diagnostics(check,text):
     facts=diagnostics(text);artifacts=facts.pop('compiler_artifacts')
     if check.stdout and artifacts:
