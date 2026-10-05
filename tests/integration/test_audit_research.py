@@ -3,6 +3,7 @@ import json
 from pathlib import Path
 import pytest
 from consensus_assurance.workflow.research import view
+from consensus_assurance.reporting.chinese import render_report
 from audit_support import first, partial_map, products, engine_for, check_step, review_step, stop, feedback
 
 
@@ -19,6 +20,17 @@ def question_step(state):
     sub,files=first(state)
     sub.update(action='continue',obligation=None,bindings=[])
     sub['question'].update(disposition='needs_specific_evidence',unknowns=['Consumer unexamined'])
+    return sub,files
+
+
+def open_first(state):
+    sub,files=first(state);spec=json.loads(files['map.json'])
+    spec['behaviors'][0]['cross_activity_effects']={'A2':'Each invocation supplies fresh bounds; no prior call state is retained'}
+    path=dict(explanation='One synchronous invocation establishes the return under its own input bounds; prior calls retain no state',
+        behavior_ids=['call'],fact_ids=['result'],source_ids=['code'])
+    spec['core_overview']=dict(status='usable',rationale='The synthetic stateless boundary is fully sourced',
+        formation=path,context=path,connection=path)
+    files['map.json']=json.dumps(spec)
     return sub,files
 
 
@@ -140,12 +152,30 @@ def test_pending_feedback_does_not_block_an_independent_candidate(tmp_path):
     def pause(state):
         return dict(action='pause',candidate_id=state['question_candidates'][0]['id'],question=state['question_candidates'][0]['question'],
             rationale='Need unexamined consumer code',resume_conditions=['Read actual consumer']),{}
-    e,repo=engine_for(tmp_path,[question_step,pause,first,check_step(),review_step(),stop])
+    answer=dict(action='research',rationale='Keep the sourced return answer',feedback=dict(
+        ref_ids=['code','doc'],answered='The capacity branch bounds this return',remaining=['External consumer'],
+        understanding='updated',rationale='Source observation only'))
+    def repeated(state):
+        return json.dumps(answer,indent=4),{}
+    def new_source(state):
+        index=json.loads((e.root/'research.json').read_text())
+        a,b=state['selections'][-2:]
+        assert b['duplicate_of']==a['operation_id'] and index['latest_decision']['duplicate_of']==a['operation_id']
+        assert [h['operation_id'] for h in index['handoffs'] if h.get('feedback')]==[a['operation_id']]
+        assert len(index['map_handoffs'])==0
+        assert all((e.root/'submissions'/s['operation_id']/'accepted.json').exists() for s in (a,b))
+        return dict(answer,sources=[dict(id='consumer',file='consumer.py',start_line=1,end_line=2,kind='code_observation')],
+            feedback=dict(answer['feedback'],ref_ids=['consumer'],answered='The consumer forwards the returned value')),{}
+    steps=[question_step,pause,repeated,repeated,new_source,first,check_step(),review_step(),repeated,stop]
+    e,repo=engine_for(tmp_path,steps)
+    (repo/'consumer.py').write_text('def consume(value):\n    return value\n')
     state=e.start(repo)
     assert state.question_candidates[0].status=='paused'
     assert state.units[0].status=='checked' and not diagnostics(e)
-    from consensus_assurance.workflow.research import view
-    assert 'feedback_due' not in view(state)
+    assert len([s for s in state.selections if s.get('duplicate_of')])==1
+    assert 'duplicate_of' not in state.selections[-1]
+    assert state.usage['agent_calls']==len(steps) and len(state.agent_turns)==len(steps)
+    assert '纯反馈重复受理 1 次，无新增认识' in render_report(state,e.root).read_text()
 
 
 def test_question_converges_before_obligation_and_results_do_not_propagate(tmp_path):
@@ -514,29 +544,62 @@ def test_only_configured_directed_disposition_can_complete_a_run(tmp_path):
 
 
 def test_directed_completion_does_not_erase_execution_or_review_debt(tmp_path):
+    def explain(state):
+        c=state['question_candidates'][0]
+        return dict(action='explained',candidate_id=c['id'],question=dict(c['question'],
+            disposition='explained_by_existing_mechanism',counterevidence=['Source branch bounds return']),
+            rationale='The source explanation cannot erase the executed dispute'),{}
     def finish(state):
         return dict(action='stop',scope='run',reason='bounded_completed',
             ref_ids=[state['question_candidates'][0]['id']],rationale='Claim completion despite pending correspondence'),{}
-    e,repo=engine_for(tmp_path,[first,check_step(),review_step('disputed'),finish])
+    e,repo=engine_for(tmp_path,[first,check_step(),review_step('disputed'),explain,finish])
     state=e.start(repo)
     assert len(diagnostics(e))==1 and 'finite task is disposed' in str(diagnostics(e))
     assert {w['kind'] for w in state.run_stop['pending_work']}=={'unit','review_issue'}
     assert not state.review_issues[0].resolved_by and state.units[0].status!='checked'
-    assert state.run_stop['origin']=='controller' and state.usage['agent_calls']==4
+    assert state.run_stop['origin']=='controller' and state.usage['agent_calls']==5
+    assert view(state)['units'][0]['source_explanation'] is None
+    assert state.monitor_results and state.checks and '已选检查／复核待办' in render_report(state,e.root).read_text()
 
 
-@pytest.mark.parametrize('disposition',['bounded','confirmed','explained'])
+@pytest.mark.parametrize('disposition',['bounded','confirmed','explained','explained_after_obligation'])
 def test_local_disposition_continues_with_mapped_unknowns(tmp_path,disposition):
     def initial(state):
-        sub,files=first(state)
+        sub,files=(open_first if disposition=='explained_after_obligation' else first)(state)
         if disposition=='explained':
             sub.update(action='explained',obligation=None,bindings=[])
             sub['question'].update(disposition='explained_by_existing_mechanism',unknowns=[],
                 counterevidence=['The source branch bounds the return'])
         return sub,files
-    steps=[initial]+([] if disposition=='explained' else [check_step(),review_step()])
-    steps += [local_stop(),next_question,stop]
+    def explain(state):
+        c=state['question_candidates'][0]
+        q=dict(c['question'],disposition='explained_by_existing_mechanism',unknowns=[],counterevidence=['The source branch bounds the return'])
+        return dict(action='explained',candidate_id=c['id'],question=q,rationale='Source answers this exact suspicion',feedback=feedback(state)),{}
+    def continued(state):
+        if disposition=='explained_after_obligation':
+            index=json.loads((e.root/'research.json').read_text())
+            assert not index['pending_work'] and index['units'][0]['status']=='pending'
+            assert index['units'][0]['progress']==[dict(claim_id='bounded',record_status='no_fixed_check')]
+            assert index['units'][0]['source_explanation']
+            assert '源码解释结束当前怀疑；未进行性质执行' in render_report(e.state,e.root).read_text()
+            assert not state['evidence'] and not state['monitor_results'] and not state['direct_checks']
+            assert state['usage']['audit_units']==1 and not state['active_unit_id']
+            from consensus_assurance.core.types import PendingAction
+            from consensus_assurance.workflow.research import pending_work
+            for change in ('claim_version','multiple_obligations','directed','in_flight','legacy'):
+                copy=e.state.model_copy(deep=True)
+                if change=='claim_version':copy.claims[0].version+=1
+                if change=='multiple_obligations':copy.units[0].obligation_ids.append('unanswered')
+                if change=='directed':copy.config['directed_question']='Execute the selected check'
+                if change=='in_flight':copy.pending_action=PendingAction(kind='direct_check',unit_id=copy.units[0].id,status='running')
+                if change=='legacy':
+                    next(s for s in copy.selections if s['action']=='explained')['accepted_versions'].pop('units')
+                assert any(w['id']==copy.units[0].id for w in pending_work(copy)),change
+        return next_question(state)
+    steps=[initial]+([explain] if disposition=='explained_after_obligation' else [] if disposition=='explained' else [check_step(),review_step()])
+    steps += [local_stop(),continued,stop]
     e,repo=engine_for(tmp_path,steps)
+    if disposition=='explained_after_obligation':e.config.directed_question=None
     if disposition=='confirmed':
         (repo/'target.py').write_text('def step(value, limit):\n    return value + 1\n')
         # Actual isolated execution with scripted products, never autonomous discovery.
@@ -643,23 +706,25 @@ def test_unaccepted_draft_pause_does_not_penalize_shared_fact_or_parent(tmp_path
     assert draft['draft_status']=='paused' and not draft['candidate_ids']
 
 
-@pytest.mark.parametrize('unavailable',['budget','backend'])
+@pytest.mark.parametrize('unavailable',['budget','backend','units'])
 def test_exhausted_execution_capacity_allows_source_research_but_no_placeholder_unit(tmp_path,unavailable):
     def source_only(state):
         sub,files=first(state);sub.update(action='continue',obligation=None,bindings=[])
         sub['question'].update(disposition='needs_specific_evidence',unknowns=['No authorized execution remains'])
         return sub,files
     def attempt_exploration(state):
-        return dict(action='explore',question='Attempt execution without capacity',harness_path='probe.py',
-            rationale='Capacity must reject before target execution'),{'probe.py':'raise AssertionError("must not run")\n'}
+        return dict(action='explore',question='Observe without a new obligation',harness_path='probe.py',
+            rationale='Execution capacity is independent of Unit admission'),{'probe.py':'from target import step\nprint(step(3,3))\n'}
     e,repo=engine_for(tmp_path,[first,attempt_exploration,source_only,stop])
     if unavailable=='budget':e.config.budget.experiments=0
+    elif unavailable=='units':e.config.budget.audit_units=0
     else:e.config.execution_backend='none';e.implementation=None
     state=e.start(repo)
     assert not state.units and not state.claims
     assert len(state.question_candidates)==1 and not view(state)['capacity']['new_obligation']
-    assert state.usage['agent_calls']==4 and state.usage.get('experiments',0)==0
-    assert not any(c.action=='exploration' for c in state.checks)
+    assert state.usage['agent_calls']==4 and state.usage.get('experiments',0)==int(unavailable=='units')
+    assert any(c.action=='exploration' for c in state.checks)==(unavailable=='units')
+    assert len(diagnostics(e))==(1 if unavailable=='units' else 2)
 
 
 @pytest.mark.parametrize('scope',['candidate','family','focus'])
@@ -1191,13 +1256,15 @@ def test_knowledge_growth_preserves_execution_and_supplies_the_next_check(tmp_pa
 def test_new_knowledge_challenges_and_reviews_a_retained_source_explanation(tmp_path,disposition):
     def explain(state):
         sub,files=question_step(state)
-        sub.update(action='explained')
+        sub.update(action='explained',candidate_id=state['question_candidates'][0]['id'])
+        sub.pop('map_path');files={}
         sub['question'].update(disposition='explained_by_existing_mechanism',counterevidence=['The capacity branch resets the return'])
         return sub,files
     def close(state):
         return dict(action='stop',scope='candidate',reason='bounded_completed',ref_ids=[state['question_candidates'][0]['id']],
             rationale='Close only the sourced local question'),{}
     def challenge(state):
+        assert view(e.state)['units'][0]['source_explanation']
         spec=json.loads(Path(state['audit_spec_path']).read_text())
         spec['facts'][0]['validity_context']='Only after a legal call with a positive limit'
         return dict(action='research',map_path='map.json',rationale='Make the previously implicit legal-input boundary explicit',
@@ -1209,6 +1276,8 @@ def test_new_knowledge_challenges_and_reviews_a_retained_source_explanation(tmp_
     def resolve(state):
         c=state['question_candidates'][0];issue=state['review_issues'][0]
         assert c['status']==disposition and not issue['resolved_by']
+        assert not view(e.state)['units'][0]['source_explanation']
+        assert {w['kind'] for w in view(e.state)['pending_work']}=={'unit','review_issue'}
         answer='The recorded question is explicitly one legal invocation; the documented positive-limit qualification does not change that source explanation'
         return dict(action='review',artifact_id=c['id'],review_items=[dict(target_id=c['id'],aspect='applicability',status='no_issue_found',
             source_ids=['code','doc'],rationale=answer)],resolutions=[dict(issue_id=issue['id'],source_ids=['code','doc'],rationale=answer,residual_issue_ids=[],scope_limitations=[])],rationale='Answer the specific knowledge challenge'),{}
@@ -1221,8 +1290,9 @@ def test_new_knowledge_challenges_and_reviews_a_retained_source_explanation(tmp_
         return dict(action='research',map_path='map.json',rationale='Separate an independent consumer boundary from the pending qualification review',
             map_changes={'result':dict(impact='clarification',source_ids=['code','doc'],
                 rationale='The additional unknown is about a later consumer',preserves='The consumer is outside the saved local question; its qualification challenge still requires review')}),{'map.json':json.dumps(spec)}
-    steps=[explain]+([close] if disposition=='closed' else [])+[disguised,challenge,preserve_without_resolving,invalid_review,resolve,stop]
-    e,repo=engine_for(tmp_path,steps);state=e.start(repo)
+    steps=[open_first,explain]+([close] if disposition=='closed' else [])+[disguised,challenge,preserve_without_resolving,invalid_review,resolve,stop]
+    e,repo=engine_for(tmp_path,steps);e.config.directed_question=None
+    state=e.start(repo)
     assert len(diagnostics(e))==2 and 'review_unknown_source' in str(diagnostics(e))
     assert 'not descriptive clarification' in str(diagnostics(e))
     change=next(s for s in state.selections if s.get('map_updated') and s['accepted_versions']['audit_spec']==2)
@@ -1232,6 +1302,7 @@ def test_new_knowledge_challenges_and_reviews_a_retained_source_explanation(tmp_
     assert state.audit_spec_version==3 and state.question_candidates[0].status==disposition
     assert state.review_issues[0].resolved_by and not state.direct_checks
     assert not view(state)['candidates'][0]['open_issue_ids']
+    assert view(state)['units'][0]['source_explanation'] and not view(state)['pending_work']
     assert 'current_applicability' not in view(state)['candidates'][0]
 
 

@@ -447,9 +447,14 @@ def prepare_submission(engine, submission, inputs, operation_id):
         if proposed is not None:audit_spec.accept(engine,proposed)
         decision=state.selections[-1]
         decision['candidate_ids']=list(dict.fromkeys(decision.get('candidate_ids',[])+[c.id for c in state.question_candidates if operation_id in c.check_ids]))
-        decision['accepted_versions']={'audit_spec':state.audit_spec_version,
+        decision['accepted_versions']={'audit_spec':state.audit_spec_version,'graph':state.graph_version,
             'units':{u.id:u.version for u in state.units if u not in research_before.units},
             'artifacts':{a.id:a.version for a in state.direct_checks if a not in research_before.direct_checks}}
+        if submission.action=='explained':
+            units=[u for u in state.units if u.candidate_id in decision['candidate_ids'] and u.status!='revised']
+            for kind,ids in {'units':[u.id for u in units], 'claims':[id for u in units for id in u.obligation_ids],
+                    'bindings':[id for u in units for id in u.binding_ids], 'relations':[id for u in units for id in u.relation_ids]}.items():
+                decision['accepted_versions'][kind]={obj.id:obj.version for obj in getattr(state,kind) if obj.id in ids}
         state.current_submission = current
 
     return finish

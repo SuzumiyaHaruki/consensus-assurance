@@ -130,7 +130,8 @@ def assessment_obstacle(record, check, archive):
         return '已有复核争议，处理要求见对应争议；'+progress
     if comparison_observed(record) is True and 'correspondence' in record and record['correspondence'] is None:
         return progress+'；待当前版本复核'
-    return '当前检查尚未完整处置；'+(failure_detail(check,archive) if failed else progress)
+    return '当前检查尚未完整处置；'+(failure_detail(check,archive) if failed else
+        progress+('；'+excerpt('；'.join(record['blockers']),160) if record.get('blockers') and record.get('correspondence')=='no_issue_found' else ''))
 
 
 class Archive:
@@ -249,8 +250,8 @@ def milestone_lines(state, research, archive, checks, titles):
         if (archive.read(f'audit-spec/v{version}.json').get('core_overview') or {}).get('status') == 'usable':
             selected[s['operation_id']] = ('双主线概览已就绪', archive.link(f'audit-spec/v{version}.json','当时地图'))
             break
-    growth = [s for s in state.selections if s.get('map_delta') or s.get('feedback',{}).get('understanding') == 'updated'
-        or s.get('accepted_versions',{}).get('artifacts') or s.get('released_candidate_ids')]
+    growth = [s for s in state.selections if not s.get('duplicate_of') and (s.get('map_delta') or s.get('feedback',{}).get('understanding') == 'updated'
+        or s.get('accepted_versions',{}).get('artifacts') or s.get('released_candidate_ids'))]
     for s in growth[-3:]+[s for s in state.selections if s['action'] in {'review','pause','explained','continue','obligation'} and 'accepted_versions' in s]:
         title = next((i.report_title for r in state.semantic_reviews if r.check_id==s['operation_id'] for i in r.items if i.report_title),None)
         selected.setdefault(s['operation_id'], (f'受理 {s["action"]}：'+excerpt(title or s['rationale'],140),
@@ -304,7 +305,8 @@ def render_report(state, root):
     explorations = [c for c in state.checks if c.action == 'exploration']
     exploration_records = exploration_results(state, archive.read)
     failures = [c for c in formal+explorations if c.status != ExecutionStatus.COMPLETED or c.exit_code not in (0,None)]
-    explained = [c for c in research['candidates'] if c['status'] == 'explained' and not c['results']]
+    explained = [c for c in research['candidates'] if c['status'] == 'explained' and not c['results'] and
+        not any(u['candidate_id']==c['id'] for u in research['units'])]
     ongoing = [c for c in research['candidates'] if c['status'] not in {'explained','closed'} and
         (not c['results'] or c['resume_conditions'] or any(u['candidate_id']==c['id'] and
             any(p['record_status']!='assessed' for p in u['progress']) for u in research['units']))]
@@ -332,7 +334,7 @@ def render_report(state, root):
         f'已受理 Candidate {len(research["candidates"])} 项；当前 Unit {len(research["units"])} 项、义务 {len(research["claims"])} 项、固定检查制品 {len(artifacts)} 项。'
         f'正式执行尝试 {len(formal)} 次；已保存评估的义务 {len(results)} 项，其中有实际比较 {sum(r["comparison_observed"] is True for r in results)} 项。'+
         '、'.join(f'{label} {sum(r["disposition"]==key and (key!="investigation_lead" or r["comparison_observed"] is True) for r in results)} 项' for key,label in DISPOSITIONS.items())+
-        f'；另有已获源码解释的 Candidate {len(explained)} 项。受理、执行与结论分别计数。', '',
+        f'；另有已获源码解释的 Candidate {len(explained)+sum(bool(u["source_explanation"]) for u in research["units"])} 项。受理、执行与结论分别计数。', '',
         f'实际持续 **{state.elapsed_seconds/60:.2f} 分钟**；结束类型：**'+('控制器记录的' if stop.get('origin') == 'controller' else 'Agent 提出的' if stop else '')+stop_label+'**。',
         f'剩余 {capacity["remaining_seconds"]:.2f} 秒、{capacity["remaining"]["agent_calls"]} 次 Agent 调用、'
         f'{capacity["remaining"]["experiments"]} 次控制器目标执行。资源余量不表示获准恢复或重试。', '',
@@ -389,8 +391,11 @@ def render_report(state, root):
     for c in explained:lines.append(f'| {cell(excerpt(c["question"]["question"],130))} | 源码解释，未经性质执行 | {cell(excerpt("；".join(c["question"]["counterevidence"]),170))} | {link("state.json","候选原文与来源")} |')
     for claim in research['claims']:
         if any(r['claim_id']==claim['id'] for r in results):continue
-        owner = next(u['candidate_id'] for u in research['units'] if claim['id'] in u['obligation_ids'])
-        lines.append(f'| <a id="claim-{claim["id"]}"></a>{cell(excerpt(claim["description"],130))} | 尚无正式判定 | {progress_text(claim["id"])} | {link("state.json",claim["id"])}；{candidate_links.get(owner,"")} |')
+        unit = next(u for u in research['units'] if claim['id'] in u['obligation_ids'])
+        explanation=unit['source_explanation']
+        disposition='源码解释结束当前怀疑；未进行性质执行' if explanation else '尚无正式判定'
+        detail=link(f'submissions/{explanation}/accepted.json','来源化解释与当时问题') if explanation else progress_text(claim['id'])
+        lines.append(f'| <a id="claim-{claim["id"]}"></a>{cell(excerpt(claim["description"],130))} | {disposition} | {detail} | {link("state.json",claim["id"])}；{candidate_links.get(unit["candidate_id"],"")} |')
     for c in ongoing:
         if not any(u['candidate_id']==c['id'] for u in research['units']):
             lines.append(f'| {cell(excerpt(c["question"]["question"],130))} | {"暂停调查" if c["status"]=="paused" else "研究中"}，尚无正式义务 | {cell(excerpt("；".join(c["resume_conditions"] or c["question"]["unknowns"]),170))} | {candidate_links[c["id"]]} |')
@@ -470,6 +475,11 @@ def render_report(state, root):
     titles.update({x['check_id']:e['rationale'] or e['question'] or '探索原稿缺失' for e in exploration_records for x in e['executions']})
     lines += ['累计分钟从本轮创建起计，含暂停间隔；详细墙钟与耗时见执行记录。']+milestone_lines(state,research,archive,checks,titles)
     lines += ['', '## 当前未决事项', '']
+    duplicates=[s for s in state.selections if s.get('duplicate_of')]
+    if duplicates:
+        lines += ['纯反馈重复受理 '+str(len(duplicates))+' 次，无新增认识，调用照常计数：'+
+            '；'.join(link(f'submissions/{s["operation_id"]}/accepted.json','重复原稿')+' → '+
+                link(f'submissions/{s["duplicate_of"]}/accepted.json','原交接') for s in duplicates)]
     unexplained = [id for entry in exploration_records for id in entry['without_followup']]
     for kinds,label in [({'unit','review_issue'},'已选检查／复核待办'),({'candidate'},'正在调查的问题')]:
         pending=[p for p in research['pending_work'] if p['kind'] in kinds]

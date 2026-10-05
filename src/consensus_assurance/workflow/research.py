@@ -4,10 +4,30 @@ from .reviews import open_issues
 from consensus_assurance.core.types import ACTIVITY_ROLES, CheckRun
 
 
+def source_explanation(state, unit):
+    """Return the accepted answer selecting no execution, without changing execution progress."""
+    from .audit_spec import QUESTION_BASIS
+    candidate = next((c for c in state.question_candidates if c.id==unit.candidate_id), None)
+    if (not candidate or candidate.status not in {'explained','closed'} or not candidate.check_ids or
+            unit.obligation_ids != [candidate.obligation_id] or not unit.audit_question or
+            state.config.get('directed_question') or any(a.unit_id==unit.id for a in state.direct_checks)):
+        return None
+    if state.pending_action and state.pending_action.unit_id==unit.id:return None
+    if any(getattr(candidate.question,k)!=getattr(unit.audit_question,k) for k in QUESTION_BASIS):return None
+    record=next((s for s in reversed(state.selections) if s['operation_id']==candidate.check_ids[-1]), {})
+    versions=record.get('accepted_versions',{})
+    owned={'units':[unit.id], 'claims':unit.obligation_ids, 'bindings':unit.binding_ids, 'relations':unit.relation_ids}
+    if record.get('action')!='explained' or any(versions.get(kind,{}).get(obj.id)!=obj.version
+            for kind,ids in owned.items() for obj in getattr(state,kind) if obj.id in ids):return None
+    targets={candidate.id, *(id for ids in owned.values() for id in ids)}
+    if any(i.target_id in targets for i in open_issues(state)):return None
+    return record['operation_id']
+
+
 def pending_work(state):
     return ([{'id':u.id, 'candidate_id':u.candidate_id, 'kind':'unit',
         'remaining':u.remaining_obligation_ids or u.obligation_ids, 'reasons':u.coverage_limitations}
-        for u in state.units if u.status not in {'checked','revised'}]
+        for u in state.units if u.status not in {'checked','revised'} and not source_explanation(state,u)]
         + [{'id':i.id, 'kind':'review_issue', 'reasons':[i.explanation], 'source_ids':i.source_ids}
             for i in open_issues(state)]
         + [{'id':c.id, 'kind':'candidate', 'reasons':c.question.unknowns}
@@ -93,6 +113,7 @@ def frontier(state, spec, results=()):
             'unreferenced_behavior_ids':sorted(edges-referenced),
             'investigations':[{'candidate_id':c.id,'status':c.status,'lifecycle':c.question.obligation_relation_kind,
                 'question':c.question.question,'remaining':c.question.unknowns,'resume_conditions':c.resume_conditions,
+                'source_explanation':next((source_explanation(state,u) for u in state.units if u.candidate_id==c.id and u.status!='revised'),None),
                 'results':[{'claim_id':r['claim_id'],'disposition':r['disposition']} for r in results if r['candidate_id']==c.id]}
                 for c in investigations], 'coverage':'Described relationships; selected checks settle only their explicit scope'})
     return {'relationships':relationships, 'paused_candidate_ids':paused,
@@ -168,7 +189,7 @@ def feedback_links(state, ref_ids, after=None):
     """Locate accepted, explicit references; related does not mean answered or resolved."""
     links, following = [], after is None
     for selection in state.selections:
-        if following and 'accepted_versions' in selection:
+        if following and 'accepted_versions' in selection and not selection.get('duplicate_of'):
             refs = sorted(set(ref_ids) & set(selection.get('feedback',{}).get('ref_ids',[])))
             if refs:
                 operation = selection['operation_id']
@@ -214,7 +235,7 @@ def view(state, compact=False):
     results=conclusions(state,records)
     issues=open_issues(state)
     disputed={i.target_id for i in issues}
-    focus_units={u.id for u in current if u.status!='checked' or u.id==state.active_unit_id}
+    focus_units={u.id for u in current if (u.status!='checked' and not source_explanation(state,u)) or u.id==state.active_unit_id}
     focus_units.update(a.unit_id for a in state.direct_checks if a.id in disputed)
     focus_candidates={c.id for c in state.question_candidates if c.status=='active' or c.id in disputed}
     focus_candidates.update(u.candidate_id for u in state.units if u.id in focus_units)
@@ -240,7 +261,7 @@ def view(state, compact=False):
         'candidates':[],
         'units':[{**(project(u,set(type(u).model_fields)-{'audit_question'} if u.id in focus_units else
             {'id','version','candidate_id','obligation_ids','status'}) if compact else u.model_dump(mode='json',exclude={'audit_question'})),
-            'progress':unit_progress(state,u,artifacts,records)} for u in current],
+            'progress':unit_progress(state,u,artifacts,records), 'source_explanation':source_explanation(state,u)} for u in current],
         'claims':[{**project(c,None if c.id in focus_claims else {'id','version','concern'}),
             **({'description_preview':preview(c.description)} if compact and c.id not in focus_claims else {})}
             for c in state.claims if any(c.id in u.obligation_ids for u in current)],
@@ -320,8 +341,8 @@ def current_view(state, root, implementation=None):
     result['understanding_changes'] = [{'operation_id':c['operation_id'],'version':c['version'],
         'record':record('selections', {'operation_id':c['operation_id']})} for c in result['understanding_changes']]
     handoffs = result['handoffs']
-    recent = next((s['operation_id'] for s in reversed(handoffs) if s.get('feedback')), None)
-    result['handoffs'] = [{**{k:s[k] for k in ('operation_id','action','candidate_ids') if k in s},
+    recent = next((s['operation_id'] for s in reversed(handoffs) if s.get('feedback') and not s.get('duplicate_of')), None)
+    result['handoffs'] = [{**{k:s[k] for k in ('operation_id','action','candidate_ids','duplicate_of') if k in s},
         'answered_preview':preview(s.get('feedback',{}).get('answered',s['rationale'])),
         'ref_ids':s.get('feedback',{}).get('ref_ids',s.get('ref_ids',[])),
         'record':record('selections', {'operation_id':s['operation_id']}),
@@ -335,6 +356,7 @@ def current_view(state, root, implementation=None):
     if result['latest_decision']:
         last = result['latest_decision']
         result['latest_decision'] = {'operation_id':last['operation_id'],'action':last['action'],
+            **({'duplicate_of':last['duplicate_of'],'next_step':'Accepted without new knowledge; investigate another sourced discriminator within remaining capacity'} if last.get('duplicate_of') else {}),
             'record':record('selections', {'operation_id':last['operation_id']})}
     targets=[a for a in state.direct_checks if a.id in {x['id'] for x in result['artifacts']}]
     targets.extend(c for c in state.question_candidates if any(i.target_id==c.id for i in issues))
@@ -443,6 +465,21 @@ def record_decision(engine, submission, operation_id, map_changed=False):
         if feedback.question_updates and not source_refs(state,feedback.ref_ids):raise ValueError('Question updates need sourced answers through retained references')
     record = {'operation_id':operation_id,'action':submission.action,'rationale':submission.rationale,
         'feedback':feedback.model_dump(mode='json') if feedback else {}, 'map_updated':map_changed}
+    from consensus_assurance.core.submissions import ResearchSubmission, AuditSubmission
+    if (isinstance(submission,ResearchSubmission) and feedback and not any((submission.map_path, submission.graph_path,
+            submission.scope_path, submission.map_changes, submission.reconnect_questions, submission.sources,
+            feedback.question_updates, submission.repair_of)) and state.selections):
+        previous=state.selections[-1]
+        versions=previous.get('accepted_versions',{})
+        prior_turn=next((n for n,c in enumerate(state.checks) if c.id==previous['operation_id']),None)
+        if (previous['action']=='research' and versions.get('audit_spec')==state.audit_spec_version and
+                versions.get('graph')==state.graph_version and prior_turn is not None and
+                all(c.action in {'agent_turn','agent_probe','implementation_tool_probe','codex_permission_probe'}
+                    for c in state.checks[prior_turn+1:])):
+            from .audit import Inputs
+            try:prior=AuditSubmission.model_validate(Inputs(engine.root).json(f'submissions/{previous["operation_id"]}/accepted.json'))
+            except (OSError,ValueError):prior=None
+            if submission==prior:record['duplicate_of']=previous.get('duplicate_of',previous['operation_id'])
     if submission.repair_of:
         prior=next((s for s in state.selections if s['operation_id']==submission.repair_of and s['action']=='rejected'),None)
         if prior is None:raise ValueError('repair_of must name a retained rejected operation')
