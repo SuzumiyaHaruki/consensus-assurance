@@ -1,0 +1,108 @@
+{
+  "action": "check",
+  "rationale": "Fix one attributed responsibility on the configuration path and run a first direct check for it. Reading Raft.appendConfigurationEntry shows that the leader publishes a new configuration through setLatestConfiguration(configuration, future.Index()), recomputes the commitment voter set and restarts replication after dispatchLogs, without inspecting the dispatch outcome; dispatchLogs assigns the index and pushes the future before StoreLogs and, on a StoreLogs error, answers the future and steps down to Follower. The obligation is therefore that a server must not treat a configuration as its latest unless the entry was durably stored, and the check drives exactly that path with one injected durable-write failure.",
+  "plan_path": "plan_config_durability.json",
+  "harness_path": "harness_config_durability.go",
+  "sources": [
+    {"id": "SR-APPEND-CONFIG", "file": "raft.go", "start_line": 1203, "end_line": 1240, "kind": "code_observation"},
+    {"id": "SR-DISPATCH", "file": "raft.go", "start_line": 1244, "end_line": 1291, "kind": "code_observation"},
+    {"id": "SR-CONFIG-CORE", "file": "configuration.go", "start_line": 174, "end_line": 195, "kind": "code_observation"},
+    {"id": "SR-NEXT-CONFIG", "file": "configuration.go", "start_line": 228, "end_line": 310, "kind": "code_observation"},
+    {"id": "SR-COMMITMENT", "file": "commitment.go", "start_line": 1, "end_line": 104, "kind": "code_observation"}
+  ],
+  "candidate": {
+    "action": "obligation",
+    "rationale": "The configuration-append path publishes configuration state without checking whether the supporting log entry was durably stored, so the voter set used for quorum and eligibility can diverge from the agreed log. This is a sourced responsibility on the A4 configuration path with a stated A1 consequence, and it is executable with an injectable LogStore.",
+    "question": {
+      "question": "When a leader attempts a configuration change and the configuration entry's durable log write fails, must the server keep its latest configuration equal to the configuration that is actually present in its log, rather than adopting the new voter set?",
+      "importance": "The latest configuration defines the voter set used for election eligibility, the commitment quorum and the leader-lease check, so a server that adopts an unpersisted configuration can compute quorums over a membership that was never agreed in the log; on a node that later regains leadership this can commit a configuration that no log entry supports.",
+      "trigger_rationale": "appendConfigurationEntry publishes the new configuration through setLatestConfiguration and commitment.setConfiguration immediately after dispatchLogs, while dispatchLogs can fail the durable write and step the node down; the publish happens regardless of that outcome, so the attempt event and the post-failure configuration observation are the decisive pair.",
+      "contexts": [
+        "stable single-voter leader whose next durable log write fails",
+        "configuration change admitted once latest==committed and the leader has committed an entry of its term"
+      ],
+      "event_paths": [
+        "Raft.AddVoter -> requestConfigChange -> configurationChangeCh -> leaderLoop -> Raft.appendConfigurationEntry",
+        "Raft.appendConfigurationEntry -> Raft.dispatchLogs fails StoreLogs, answers the future and sets state Follower, then returns to appendConfigurationEntry",
+        "Raft.appendConfigurationEntry -> setLatestConfiguration(configuration, future.Index()) / commitment.setConfiguration / startStopReplication"
+      ],
+      "activity_classes": ["A1", "A4"],
+      "behavior_ids": ["b-config-change"],
+      "fact_ids": ["f-config-membership"],
+      "supporting_behavior_ids": {
+        "b-commit-quorum": "consumes the latest voter set as the commitment quorum, the A1 consequence of adopting an unpersisted configuration"
+      },
+      "obligation_relation_kind": "establishment",
+      "source_ids": [
+        "SR-APPEND-CONFIG",
+        "SR-DISPATCH",
+        "SR-CONFIG-CORE",
+        "SR-NEXT-CONFIG",
+        "SR-COMMITMENT"
+      ],
+      "counterevidence": [
+        "configurationChangeChIfStable admits only one uncommitted configuration at a time, which keeps ordinary membership changes well ordered",
+        "a subsequent successful AppendEntries from a working leader replaces the log and the latest configuration, so an isolated duplication usually self-heals"
+      ],
+      "unknowns": [
+        "Whether the phantom latest configuration can actually be committed by this node if it regains leadership before the log is repaired"
+      ],
+      "disposition": "ready_for_check",
+      "preferred_check": "direct_test",
+      "priority": 3
+    },
+    "obligation": {
+      "id": "oblig-config-from-durable-entry",
+      "kind": "obligation",
+      "concern": "consensus_safety",
+      "description": "A server must not publish or commit a configuration change as its latest configuration unless the corresponding configuration log entry was durably stored, so that the voter set used for quorum, election eligibility and the leader lease always corresponds to an entry present in the log or snapshot.",
+      "source_ids": ["SR-APPEND-CONFIG", "SR-DISPATCH", "SR-CONFIG-CORE", "SR-NEXT-CONFIG"],
+      "scope": {
+        "description": "One configuration change attempted by a stable leader whose durable log write for that configuration entry fails.",
+        "assumptions": [
+          "configurationChangeChIfStable has admitted the request (latest==committed and the leader has committed an entry of its term)",
+          "the only faulted component is the LogStore's StoreLogs call"
+        ],
+        "excluded": [
+          "consequences that require the node to regain leadership and commit the phantom configuration",
+          "failures of StableStore, the transport or the snapshot store"
+        ]
+      },
+      "pending": [
+        "The whole-cluster consequence of a phantom latest configuration is retained as an open question, not established by this unit."
+      ],
+      "grounding": {
+        "source_ids": ["SR-APPEND-CONFIG", "SR-DISPATCH", "SR-CONFIG-CORE", "SR-NEXT-CONFIG"],
+        "expectation_ids": [],
+        "binding_ids": ["bind-append-configuration-entry"],
+        "derivation": "configurations.latest is documented as the latest configuration in the log or snapshot and latestIndex as the index where it was written; processConfigurationLogEntry is the intended writer from an actual entry, and setLatestConfiguration is meant to mirror the configuration that a log entry established. appendConfigurationEntry reaches setLatestConfiguration unconditionally after dispatchLogs, while dispatchLogs can answer the future with a durable-write error and step the node down, so the responsibility is that the publish must be qualified by that durable write.",
+        "applicability": "Applies to a leader attempting a single configuration change when the entry's durable log write fails; the ordinary path with a successful write is unaffected, and the unit does not claim a cluster-wide outcome.",
+        "unresolved": [
+          "Whether the divergence can be turned into a committed configuration by a later leadership change"
+        ],
+        "conflicts": [],
+        "alternatives": [
+          "returning before setLatestConfiguration when dispatchLogs reports an error is one design alternative; the obligation fixes the responsibility, not that repair"
+        ]
+      }
+    },
+    "bindings": [
+      {
+        "id": "bind-append-configuration-entry",
+        "material_id": "SR-APPEND-CONFIG",
+        "symbol": "appendConfigurationEntry",
+        "start_line": 1203,
+        "end_line": 1240,
+        "associations": [
+          {
+            "claim_id": "oblig-config-from-durable-entry",
+            "source_ids": ["SR-APPEND-CONFIG"],
+            "rationale": "This declaration builds the next configuration, dispatches it as a log entry, and then unconditionally publishes it as the latest configuration and recomputes the commitment voter set."
+          }
+        ],
+        "description": "Raft.appendConfigurationEntry: the leader-side membership change path that publishes latest configuration state after dispatchLogs.",
+        "pending": []
+      }
+    ]
+  }
+}

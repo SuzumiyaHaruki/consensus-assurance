@@ -1,0 +1,177 @@
+{
+  "rationale": "Add the caller-visible configuration readout as a mapped behavior and run a direct check on a second, different responsibility. Raft.GetConfiguration builds a configurationsFuture from the atomic latest-configuration copy and responds immediately, while configurationsFuture.Index() returns configurations.latestIndex, documented as the index of the latest configuration in use, and Raft.Stats reports that same value as latest_configuration_index. The obligation is therefore that the public readout must identify the index at which the latest configuration was written, and the check compares the readout with the live latest-configuration index on a committed single-voter cluster.",
+  "sources": [
+    {
+      "id": "SR-GETCONFIG",
+      "file": "api.go",
+      "start_line": 895,
+      "end_line": 903,
+      "kind": "code_observation"
+    },
+    {
+      "id": "SR-CONFIG-FUTURE",
+      "file": "future.go",
+      "start_line": 255,
+      "end_line": 270,
+      "kind": "code_observation"
+    },
+    {
+      "id": "SR-STATS",
+      "file": "api.go",
+      "start_line": 1183,
+      "end_line": 1189,
+      "kind": "code_observation"
+    }
+  ],
+  "feedback": null,
+  "repair_of": null,
+  "action": "check",
+  "unit_id": null,
+  "candidate": {
+    "rationale": "The configuration readout is the caller's handle for the membership context, yet GetConfiguration never populates the index its own future type exposes, so the fence a caller is told to use (and the diagnostics the library publishes) report the zero value. This is a sourced A7 client-contract responsibility whose consequence lands on the A2/A4 configuration fence, and it is executable without any fault injection.",
+    "sources": [],
+    "feedback": null,
+    "repair_of": null,
+    "map_path": "map.json",
+    "map_changes": {
+      "b-config-readout": {
+        "impact": "dependency",
+        "rationale": "New behavior describing the caller-visible configuration readout: Raft.GetConfiguration serves the atomic latest-configuration copy through configurationsFuture, whose documented Index method returns latestIndex, and Raft.Stats publishes the same value as latest_configuration_index. The behavior is added as a consumer of f-config-membership and as the A2 consequence that the configuration index is the caller's fence for the membership context.",
+        "source_ids": [
+          "SR-GETCONFIG",
+          "SR-CONFIG-FUTURE",
+          "SR-STATS"
+        ],
+        "preserves": "The added behavior shares the existing f-config-membership assertion (the latest configuration and its index as published by the main loop) and does not change any existing behavior, fact, edge or observation scope; the confirmed configuration-durability finding and its unit remain based on the same configuration path.",
+        "challenges": {}
+      }
+    },
+    "reconnect_questions": {},
+    "action": "obligation",
+    "candidate_id": null,
+    "parent_candidate_id": null,
+    "question": {
+      "audit_spec_version": 3,
+      "disposition": "ready_for_check",
+      "preferred_check": "direct_test",
+      "question": "Does Raft.GetConfiguration report the index at which the node's latest configuration was written, so that a caller can order or fence a later configuration change on it?",
+      "importance": "The configuration index is the caller-visible handle for the membership context: a caller uses it to notice that the configuration moved on since it read it, and nextConfiguration refuses a change whose prevIndex no longer matches the current configuration index. A readout that always reports zero silently disables that fence and also misreports membership freshness in the library's own stats.",
+      "source_ids": [
+        "SR-GETCONFIG",
+        "SR-CONFIG-FUTURE",
+        "SR-STATS",
+        "SR-NEXT-CONFIG"
+      ],
+      "participants": [],
+      "objects": [],
+      "contexts": [
+        "committed single-voter cluster in the leader state",
+        "caller reading the latest configuration in order to fence a later membership change"
+      ],
+      "event_paths": [
+        "Raft.GetConfiguration constructs configurationsFuture from the atomic latest-configuration copy and responds immediately",
+        "caller reads ConfigurationFuture.Index() on the returned future",
+        "Raft.Stats separately reports latest_configuration_index from the same future"
+      ],
+      "activity_classes": [
+        "A2",
+        "A7"
+      ],
+      "behavior_ids": [
+        "b-config-readout"
+      ],
+      "fact_ids": [
+        "f-config-membership"
+      ],
+      "supporting_behavior_ids": {
+        "b-config-change": "the membership-change path that consumes the configuration index as its prevIndex fence"
+      },
+      "obligation_relation_kind": "consumption",
+      "counterevidence": [
+        "the Configuration() value itself is served from the same atomic copy the main loop published, so the configuration contents are not stale"
+      ],
+      "unknowns": [
+        "Whether any caller outside this repository depends on the reported configuration index"
+      ],
+      "priority": 2,
+      "trigger_rationale": "The synchronous read path constructs configurationsFuture with only the configuration value, while the same future type documents and returns the configuration index and feeds Raft.Stats; the probe and readout pair is the decisive comparison between the index the node is actually using and the value the public API returns."
+    },
+    "resume_conditions": [],
+    "result_implications": {},
+    "obligation": {
+      "id": "oblig-config-readout-index",
+      "kind": "obligation",
+      "concern": "implementation_semantics",
+      "description": "Raft.GetConfiguration must report, through the returned future's Index, the log index at which the node's latest configuration was written, so that a caller can order or fence later configuration changes on it; the reported index must not be a value the constructor never assigns.",
+      "source_ids": [
+        "SR-GETCONFIG",
+        "SR-CONFIG-FUTURE",
+        "SR-STATS",
+        "SR-NEXT-CONFIG"
+      ],
+      "scope": {
+        "description": "One synchronous Raft.GetConfiguration call on a node whose latest configuration is committed, compared with the index at which that configuration was written.",
+        "assumptions": [
+          "the caller may call GetConfiguration from any goroutine, as the API documents",
+          "the latest configuration index is observable on the same node"
+        ],
+        "excluded": [
+          "the Configuration() contents, which are served from the atomic copy",
+          "the configurationsCh path used by snapshot creation, which fills both fields"
+        ],
+        "parameters": {}
+      },
+      "pending": [
+        "Whether the zero index actually changes an external caller's behaviour is outside this snapshot."
+      ],
+      "grounding": {
+        "source_ids": [
+          "SR-GETCONFIG",
+          "SR-CONFIG-FUTURE",
+          "SR-STATS",
+          "SR-NEXT-CONFIG"
+        ],
+        "expectation_ids": [],
+        "binding_ids": [
+          "bind-get-configuration"
+        ],
+        "derivation": "ConfigurationFuture embeds IndexFuture, and configurationsFuture.Index() is documented as the index of the latest configuration in use and returns configurations.latestIndex. GetConfiguration populates only the configuration value of the future it constructs, so the index it reports is the zero value rather than the index of the configuration it returns; the same value is published as latest_configuration_index by Raft.Stats. nextConfiguration treats a nonzero prevIndex as the only configuration upon which a change may be applied, which is the caller duty the index is meant to serve.",
+        "applicability": "Applies to the synchronous GetConfiguration read on a node with a committed latest configuration; the readout of the configuration value itself is not in question, and no fault or timing assumption is added.",
+        "unresolved": [
+          "External consumers of the reported index cannot be checked from this snapshot"
+        ],
+        "conflicts": [],
+        "alternatives": [
+          "serving the index from the main-loop configurationsCh clone instead of the atomic copy is one design alternative; the obligation fixes the responsibility, not that repair"
+        ]
+      }
+    },
+    "bindings": [
+      {
+        "associations": [
+          {
+            "claim_id": "oblig-config-readout-index",
+            "source_ids": [
+              "SR-GETCONFIG"
+            ],
+            "rationale": "This declaration constructs the configurationsFuture that the caller receives and fills only its configuration value, leaving the index that the same future type exposes unassigned."
+          }
+        ],
+        "anchor": null,
+        "id": "bind-get-configuration",
+        "material_id": "SR-GETCONFIG",
+        "symbol": "GetConfiguration",
+        "start_line": 897,
+        "end_line": 903,
+        "description": "Raft.GetConfiguration: the synchronous caller-visible readout of the latest configuration and its index.",
+        "pending": []
+      }
+    ]
+  },
+  "plan_path": "plan_config_readout.json",
+  "harness_path": "harness_config_readout.go",
+  "files": {},
+  "previous_check_id": null,
+  "repair_issue_ids": [],
+  "encoding_revision": null
+}

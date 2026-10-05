@@ -1,0 +1,100 @@
+{
+  "action": "check",
+  "rationale": "Spend the last unit on the remaining executable question of the configuration line: whether the adopted-and-then-committed configuration remains a configuration the node acts on after a restart. NewRaft derives configuration state only by scanning entries through processConfigurationLogEntry and does not restore the commit index, so restarting the node over the same stores is the decisive observation. The check repeats the failed configuration write, lets the node commit the adopted configuration with a fresh peer, restarts it, and observes which configuration it reports and what its log holds at that index.",
+  "plan_path": "plan_restart_consistency.json",
+  "harness_path": "harness_restart_consistency.go",
+  "candidate": {
+    "action": "obligation",
+    "rationale": "The restart is a genuinely different route to the same state question: after a restart the node can no longer rely on the in-memory latest configuration it adopted, so what it re-derives determines whether the anomaly persists as behaviour or is confined to the running instance.",
+    "obligation": {
+      "id": "oblig-restart-config-log-backed",
+      "kind": "obligation",
+      "concern": "consensus_safety",
+      "description": "A restarted server must report as its latest configuration only a configuration that is encoded by the configuration entry at the index it reports, so that the voter set it acts on after recovery is always backed by its own log.",
+      "source_ids": ["SR-CONFIG-ENTRY", "SR-CONFIG-CORE", "SR-NEWRAFT"],
+      "scope": {
+        "description": "One node restarted over identical stores after it had committed a configuration whose entry was never written.",
+        "assumptions": [
+          "the same LogStore, StableStore, SnapshotStore and transport are reused with a fresh FSM",
+          "no fault is injected into the restart itself"
+        ],
+        "excluded": [
+          "an FSM that already applied entries under the lost configuration",
+          "behaviour of peers that never learned the adopted configuration"
+        ]
+      },
+      "pending": [
+        "Whether an application FSM that applied entries under the in-memory configuration is affected after the restart is retained as an open question."
+      ],
+      "grounding": {
+        "source_ids": ["SR-CONFIG-ENTRY", "SR-CONFIG-CORE", "SR-NEWRAFT"],
+        "expectation_ids": [],
+        "binding_ids": ["bind-process-configuration-log-entry"],
+        "derivation": "NewRaft restores the term and the last log entry and then scans the entries above the snapshot index through processConfigurationLogEntry, which sets the latest configuration from the entry it reads; the commit index is not persisted or restored. The configuration a restarted node reports is therefore derived from its log, and the responsibility fixes that it must be the configuration the entry at that index encodes.",
+        "applicability": "Applies to the selected restart of a node whose committed configuration had no supporting entry; an ordinary restart with a stored configuration entry is unaffected.",
+        "unresolved": [
+          "Interaction with an FSM state that was applied before the restart"
+        ],
+        "conflicts": [],
+        "alternatives": [
+          "persisting the commit index or the configuration would be an alternative design; the obligation fixes the responsibility, not that repair"
+        ]
+      }
+    },
+    "bindings": [
+      {
+        "id": "bind-process-configuration-log-entry",
+        "material_id": "SR-CONFIG-ENTRY",
+        "symbol": "processConfigurationLogEntry",
+        "start_line": 1585,
+        "end_line": 1600,
+        "associations": [
+          {
+            "claim_id": "oblig-restart-config-log-backed",
+            "source_ids": ["SR-CONFIG-ENTRY"],
+            "rationale": "This declaration is the only path that derives configuration state from a log entry, and NewRaft runs it over every entry above the snapshot index when the node starts."
+          }
+        ],
+        "description": "Raft.processConfigurationLogEntry: derives the latest configuration from a configuration entry.",
+        "pending": []
+      }
+    ],
+    "question": {
+      "question": "Does a node that committed a configuration whose entry was never stored still report that configuration as its latest configuration after a restart over the same stores, or does it re-derive only the configuration its log encodes?",
+      "importance": "The configuration a node reports after recovery defines the voter set it will use for quorum, election eligibility and the leader lease for the rest of its life; if the in-memory anomaly persisted across a restart the divergence would become durable behaviour, while if only the log-backed configuration survives then the anomaly is confined to the running instance and the log remains the source of truth.",
+      "trigger_rationale": "NewRaft restores the term and last log entry and then scans entries through processConfigurationLogEntry without restoring the commit index, so the restart is the point where an in-memory configuration with no supporting entry can either persist or disappear; comparing the restarted node's reported configuration with the entry at its reported index decides which happened.",
+      "contexts": [
+        "a node that committed an unpersisted configuration and is then restarted over identical stores",
+        "a running peer that stays up across the restart"
+      ],
+      "event_paths": [
+        "AddVoter fails its StoreLogs and the node adopts the configuration",
+        "the node returns to the leader state under the adopted voter set and commits it",
+        "the node is shut down and a new Raft instance is created over the same stores",
+        "NewRaft scans the stored entries through processConfigurationLogEntry and the node reports the configuration it derived"
+      ],
+      "activity_classes": ["A2", "A6"],
+      "behavior_ids": ["b-snapshot-resync"],
+      "fact_ids": ["f-config-membership"],
+      "supporting_behavior_ids": {
+        "b-config-change": "produced the configuration state whose durability is in question",
+        "b-candidate-election": "the restarted node's campaign that follows from the configuration it re-derived"
+      },
+      "obligation_relation_kind": "recovery",
+      "source_ids": ["SR-CONFIG-ENTRY", "SR-NEWRAFT", "SR-CONFIG-CORE", "SR-APPEND-CONFIG", "SR-ELECT"],
+      "counterevidence": [
+        "the commit index is never persisted, so a restarted node always starts without a commit index and re-derives configurations from its log",
+        "the node shuts down cleanly through Raft.Shutdown, so no in-flight write is being replayed during the restart"
+      ],
+      "unknowns": [
+        "Whether the restarted node's FSM state, which may have applied entries under the lost configuration, is consistent with the re-derived configuration"
+      ],
+      "disposition": "ready_for_check",
+      "preferred_check": "direct_test",
+      "priority": 2
+    }
+  },
+  "sources": [
+    {"id": "SR-CONFIG-ENTRY", "file": "raft.go", "start_line": 1585, "end_line": 1600, "kind": "code_observation"}
+  ]
+}

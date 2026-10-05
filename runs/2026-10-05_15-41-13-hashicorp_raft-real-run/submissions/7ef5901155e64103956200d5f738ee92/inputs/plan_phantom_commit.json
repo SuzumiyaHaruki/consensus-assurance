@@ -1,0 +1,69 @@
+{
+  "description": "Carry the confirmed configuration-durability defect to the state it excluded: after a node fails to store a configuration entry it adopts the new voter set, campaigns under it, and returns to the leader state with the vote of a fresh peer that has no configuration of its own. The admitted operation is the adoption of the unpersisted configuration; the result event reports the node's committed configuration, its index, and the type of the log entry stored at that index, together with the peer's configuration. The check discriminates whether the committed configuration is backed by a configuration entry at the index the node reports.",
+  "claim_id": "oblig-config-committed-backed-by-entry",
+  "binding_ids": ["bind-leader-commit-configuration"],
+  "harness": {
+    "kind": "go_test",
+    "description": "Two-node in-memory cluster: node A bootstraps as a single voter, one injected StoreLogs failure during AddVoter leaves it holding an unpersisted configuration, and node B joins with an empty configuration. The harness admits the adoption event and then reports the committed configuration, its index, the log entry type at that index and the peer's voter count.",
+    "semantic_changes": [
+      "one LogStore wrapper fails exactly one StoreLogs call; no target source is replaced",
+      "the joining peer starts unbootstrapped with an empty configuration and log, standing in for a fresh node",
+      "election and heartbeat timeouts are shortened and the log level is raised to ERROR so the sequence completes quickly"
+    ],
+    "prerequisites": [
+      {
+        "alias": "adopted",
+        "event": "phantom_config_adopted",
+        "conditions": []
+      }
+    ],
+    "legality": {
+      "source_ids": ["SR-APPEND-CONFIG", "SR-LEADER-LOOP", "SR-COMMITMENT", "SR-RUN-CANDIDATE"],
+      "expectation_ids": [],
+      "binding_ids": ["bind-leader-commit-configuration"],
+      "derivation": "appendConfigurationEntry publishes the new configuration through setLatestConfiguration after a failed StoreLogs, so the node's latestIndex points at an index whose entry was never written. The follower heartbeat path admits a campaign when latestIndex differs from committedIndex and the local server is a voter of the latest configuration, and election eligibility for a peer with an empty configuration has no membership veto, so the node can win a majority of the adopted voter set. The leader's commit path then marks configurations.latest committed whenever latestIndex lies within the new commit index, without consulting the entry stored at that index, so the committed configuration may have no supporting configuration entry.",
+      "applicability": "Two in-memory nodes on connected transports; node A's configuration entry write is failed once, node B is unbootstrapped. Only the LogStore write is faulted, and both nodes are ordinary Raft instances started through BootstrapCluster and NewRaft.",
+      "unresolved": [
+        "Whether a configuration committed this way can survive a restart of the node and be re-derived from the log is not exercised by this unit."
+      ],
+      "conflicts": [],
+      "alternatives": [
+        "the same sequence with a successful configuration write is the ordinary membership change and is not the discriminator"
+      ]
+    }
+  },
+  "monitors": [
+    {
+      "id": "m-committed-config-backed",
+      "checker_id": "ck-committed-config-backed",
+      "event": "committed_config_state",
+      "binding_ids": ["bind-leader-commit-configuration"],
+      "grounding": {
+        "source_ids": ["SR-LEADER-LOOP", "SR-COMMITMENT", "SR-CONFIG-CORE"],
+        "expectation_ids": [],
+        "binding_ids": ["bind-leader-commit-configuration"],
+        "derivation": "configurations.committed is defined as the latest configuration in the log or snapshot that has been committed, and configurations.latestIndex is the index where that configuration was written; processConfigurationLogEntry is the only intended writer from an actual entry. A committed configuration whose index holds a different kind of entry therefore contradicts the state it claims to describe.",
+        "applicability": "Applies to the admitted adoption scenario when the node's committed configuration contains two voters; the compared quantity is whether the log entry at the committed configuration index is a configuration entry.",
+        "unresolved": [],
+        "conflicts": [],
+        "alternatives": []
+      },
+      "applicability_conditions": [],
+      "admission_alias": "adopted"
+    }
+  ],
+  "observable_properties": [
+    {
+      "checker_id": "ck-committed-config-backed",
+      "kind": "event_implication",
+      "trigger": {"field": "phase", "op": "eq", "value": "after_recovery"},
+      "antecedent": {"field": "committed_voter_count", "op": "eq", "value": 2},
+      "assertion": {"field": "log_entry_is_configuration", "op": "eq", "value": true},
+      "identity_fields": ["scenario"],
+      "description": "When the node's committed configuration contains the adopted voter set, the log entry stored at that configuration index must be a configuration entry."
+    }
+  ],
+  "uncertainties": [
+    "The scenario uses one fresh peer and one injected failure; other recovery routes (for example a surviving majority that repairs the log) are outside this unit."
+  ]
+}

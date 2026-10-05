@@ -1,0 +1,106 @@
+{
+  "description": "Exercise one configuration change on a stable single-voter leader while the injected LogStore fails the next durable write. The admitted operation is the configuration-append attempt on the real AddVoter -> configurationChangeCh -> appendConfigurationEntry path; the result event reports the node's latest configuration after the failed write. The check discriminates whether the node still reports only the configuration that is actually present in its log, rather than a voter set whose entry was never stored.",
+  "claim_id": "oblig-config-from-durable-entry",
+  "binding_ids": [
+    "bind-append-configuration-entry"
+  ],
+  "harness": {
+    "execution_package": ".",
+    "files": {},
+    "kind": "go_test",
+    "source": "package raft\n\nimport (\n\t\"encoding/json\"\n\t\"errors\"\n\t\"fmt\"\n\t\"testing\"\n\t\"time\"\n)\n\n// assuranceFailingLogStore wraps an InmemStore so that a bounded number of\n// durable log writes can be made to fail without changing any target code.\ntype assuranceFailingLogStore struct {\n\t*InmemStore\n\tinjectFailures int\n\tinjected       int\n}\n\nfunc (s *assuranceFailingLogStore) StoreLogs(logs []*Log) error {\n\tif s.injectFailures > 0 {\n\t\ts.injectFailures--\n\t\ts.injected++\n\t\treturn errors.New(\"assurance: injected log store failure\")\n\t}\n\treturn s.InmemStore.StoreLogs(logs)\n}\n\nfunc assuranceEmit(t *testing.T, event map[string]interface{}) {\n\tpayload, err := json.Marshal(event)\n\tif err != nil {\n\t\tt.Fatalf(\"assurance: cannot encode event: %v\", err)\n\t}\n\tfmt.Println(\"CA_EVENT \" + string(payload))\n}\n\nfunc assuranceVoterCount(c Configuration) int {\n\tvoters := 0\n\tfor _, server := range c.Servers {\n\t\tif server.Suffrage == Voter {\n\t\t\tvoters++\n\t\t}\n\t}\n\treturn voters\n}\n\n// TestAssuranceConfigAppendStoreFailure drives one configuration change through\n// a leader whose next durable log write fails, and observes whether the node's\n// latest configuration still describes only the configuration that is actually\n// present in the log.\nfunc TestAssuranceConfigAppendStoreFailure(t *testing.T) {\n\tbase := NewInmemStore()\n\tlogs := &assuranceFailingLogStore{InmemStore: base}\n\tsnaps := NewInmemSnapshotStore()\n\taddr, trans := NewInmemTransport(\"\")\n\n\tconfiguration := Configuration{Servers: []Server{{\n\t\tSuffrage: Voter,\n\t\tID:       ServerID(addr),\n\t\tAddress:  addr,\n\t}}}\n\n\tconf := DefaultConfig()\n\tconf.LocalID = ServerID(addr)\n\tconf.LogLevel = \"ERROR\"\n\tconf.HeartbeatTimeout = 50 * time.Millisecond\n\tconf.ElectionTimeout = 50 * time.Millisecond\n\tconf.LeaderLeaseTimeout = 50 * time.Millisecond\n\tconf.CommitTimeout = 5 * time.Millisecond\n\n\tif err := BootstrapCluster(conf, logs, base, snaps, trans, configuration); err != nil {\n\t\tt.Fatalf(\"assurance: bootstrap failed: %v\", err)\n\t}\n\n\tr, err := NewRaft(conf, &MockFSM{}, logs, base, snaps, trans)\n\tif err != nil {\n\t\tt.Fatalf(\"assurance: NewRaft failed: %v\", err)\n\t}\n\tdefer r.Shutdown()\n\n\t// Wait for the single-voter cluster to elect itself and commit its no-op,\n\t// so that the configuration-change gate is open before the attempt.\n\tdeadline := time.Now().Add(5 * time.Second)\n\tfor time.Now().Before(deadline) {\n\t\tif r.State() == Leader && r.CommitIndex() >= 2 {\n\t\t\tbreak\n\t\t}\n\t\ttime.Sleep(5 * time.Millisecond)\n\t}\n\tif r.State() != Leader || r.CommitIndex() < 2 {\n\t\tt.Fatalf(\"assurance: cluster did not stabilise: state=%v commit=%d\", r.State(), r.CommitIndex())\n\t}\n\n\tpreVoters := assuranceVoterCount(r.configurations.latest)\n\tassuranceEmit(t, map[string]interface{}{\n\t\t\"event\":              \"config_append_attempt\",\n\t\t\"attempt\":            \"config-append-1\",\n\t\t\"pre_voter_count\":    preVoters,\n\t\t\"pre_log_last_index\": r.LastIndex(),\n\t})\n\n\t// Make the next durable log write - the configuration entry itself - fail.\n\tlogs.injectFailures = 1\n\tpeerAddr := ServerAddress(NewInmemAddr())\n\tpeerID := ServerID(peerAddr)\n\tfuture := r.AddVoter(peerID, peerAddr, 0, 5*time.Second)\n\tappendErr := future.Error()\n\n\t// Let the main loop finish the configuration-append path.\n\tdeadline = time.Now().Add(3 * time.Second)\n\tfor time.Now().Before(deadline) && r.State() == Leader {\n\t\ttime.Sleep(5 * time.Millisecond)\n\t}\n\ttime.Sleep(200 * time.Millisecond)\n\n\tassuranceEmit(t, map[string]interface{}{\n\t\t\"event\":              \"config_state_after_failure\",\n\t\t\"attempt\":            \"config-append-1\",\n\t\t\"phase\":              \"after_failed_append\",\n\t\t\"store_failed\":       logs.injected > 0,\n\t\t\"append_error\":       fmt.Sprintf(\"%v\", appendErr),\n\t\t\"latest_voter_count\": assuranceVoterCount(r.configurations.latest),\n\t\t\"latest_index\":       r.configurations.latestIndex,\n\t\t\"committed_index\":    r.configurations.committedIndex,\n\t\t\"log_last_index\":     r.LastIndex(),\n\t})\n}\n",
+    "description": "Single-voter in-memory cluster; a LogStore wrapper fails exactly one StoreLogs call; the harness admits a configuration-append attempt and reports the node's latest/committed configuration indexes and latest voter count afterwards.",
+    "semantic_changes": [
+      "A LogStore wrapper fails exactly one StoreLogs call; no target source is replaced",
+      "election/heartbeat/lease timeouts are shortened and the log level is raised to ERROR so the single-voter election completes quickly",
+      "the harness reads the Raft instance's latest/committed configuration after the injected failure"
+    ],
+    "prerequisites": [
+      {
+        "alias": "attempt",
+        "event": "config_append_attempt",
+        "conditions": []
+      }
+    ],
+    "legality": {
+      "source_ids": [
+        "SR-APPEND-CONFIG",
+        "SR-DISPATCH",
+        "SR-CONFIG-CORE",
+        "SR-NEXT-CONFIG"
+      ],
+      "expectation_ids": [],
+      "binding_ids": [
+        "bind-append-configuration-entry"
+      ],
+      "derivation": "appendConfigurationEntry calls dispatchLogs with the new configuration entry and then, without inspecting the dispatch outcome, publishes the new configuration through setLatestConfiguration(configuration, future.Index()), recomputes commitment.setConfiguration and calls startStopReplication. dispatchLogs assigns the log index and pushes the future before StoreLogs and, on a StoreLogs error, answers the future with the error and sets state Follower. The unit therefore asks whether a failed configuration write still advances the node's latest configuration beyond the last entry actually present in its log.",
+      "applicability": "A single-voter leader whose next durable log write is made to fail; the configuration change is a valid AddVoter with prevIndex 0 and the leader has already committed an entry of its own term (the no-op), so configurationChangeChIfStable admits the request. Only the durable log write is faulted; StableStore, the transport and the clock are untouched.",
+      "unresolved": [
+        "Whether a node that later regains leadership actually commits the phantom configuration is not exercised by this unit."
+      ],
+      "conflicts": [],
+      "alternatives": [
+        "the same code path with a successful StoreLogs is the ordinary configuration change and is not the discriminator"
+      ]
+    }
+  },
+  "monitors": [
+    {
+      "id": "m-config-from-durable-entry",
+      "checker_id": "ck-config-from-durable-entry",
+      "event": "config_state_after_failure",
+      "binding_ids": [
+        "bind-append-configuration-entry"
+      ],
+      "grounding": {
+        "source_ids": [
+          "SR-APPEND-CONFIG",
+          "SR-DISPATCH",
+          "SR-CONFIG-CORE"
+        ],
+        "expectation_ids": [],
+        "binding_ids": [
+          "bind-append-configuration-entry"
+        ],
+        "derivation": "configurations.latest is documented as the latest configuration in the log/snapshot and latestIndex as the index where it was written; the only intended writer from an entry is processConfigurationLogEntry. A failed StoreLogs leaves no such entry, so the observed latest voter count must not exceed the configuration that was stored and committed before the attempt.",
+        "applicability": "Applies to the admitted configuration-append attempt whose durable write is observed to have failed (store_failed true); the compared quantity is the latest voter count against the pre-attempt committed configuration's voter count.",
+        "unresolved": [],
+        "conflicts": [],
+        "alternatives": []
+      },
+      "applicability_conditions": [],
+      "admission_alias": "attempt"
+    }
+  ],
+  "observable_properties": [
+    {
+      "checker_id": "ck-config-from-durable-entry",
+      "kind": "event_implication",
+      "trigger": {
+        "field": "phase",
+        "op": "eq",
+        "value": "after_failed_append",
+        "reference": null
+      },
+      "assertion": {
+        "field": "latest_voter_count",
+        "op": "eq",
+        "value": null,
+        "reference": "attempt.pre_voter_count"
+      },
+      "antecedent": {
+        "field": "store_failed",
+        "op": "eq",
+        "value": true,
+        "reference": null
+      },
+      "identity_fields": [
+        "attempt"
+      ],
+      "description": "When the configuration append's durable log write failed, the node's latest configuration must still contain exactly the voter set that was stored and committed before the attempt."
+    }
+  ],
+  "uncertainties": [
+    "The unit observes one injected failure on one single-voter leader; a different store failure point (for example inside a follower's log append) is a separate scenario."
+  ]
+}
