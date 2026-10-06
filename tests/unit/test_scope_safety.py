@@ -20,6 +20,10 @@ def test_scope_cannot_smuggle_semantics_or_other_writes(dependency_prepared,fiel
 
 def test_question_refinement_requires_sourced_assessment(dependency_prepared):
     state,patch,sources=dependency(dependency_prepared);unit=state.units[0]
+    from consensus_assurance.workflow.graph import apply_patch
+    before=state.model_dump()
+    with pytest.raises(ValueError):apply_patch(state,patch)
+    assert state.model_dump()==before
     q=AuditQuestion(question='Does the result stay inside the legal bound?',importance='A consumer relies on the bound',trigger_rationale='An actual consumer input exercises the bound',source_ids=[state.materials[0].id])
     unit.audit_question=q;patch.units[0].audit_question=q.model_copy(deep=True);patch.units[0].audit_question.event_paths=['Provider normalization precedes counter execution']
     update=from_patch(state,unit,patch)
@@ -28,6 +32,7 @@ def test_question_refinement_requires_sourced_assessment(dependency_prepared):
     update.assessment=ScopeAssessment(decision='refinement',source_ids=sources,addressed_fields=['audit_question'],preserved_question=q.question,rationale='The actually read provider refines the input production event without changing the original bounded result',remaining_unknowns=['No production history proof'])
     new=apply_scope_update(state,update)
     assert new.audit_question.question==q.question and new.scope==unit.scope
+    assert 'fresh_provider' in new.binding_ids and new.obligation_ids==unit.obligation_ids
 
 
 def test_new_binding_still_requires_real_symbol_and_association(dependency_prepared):

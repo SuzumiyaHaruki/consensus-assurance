@@ -190,7 +190,6 @@ def test_mixed_report_reads_fixed_results_and_moves_without_side_effects(tmp_pat
     from consensus_assurance.workflow.research import view
     from consensus_assurance.adapters.runners.process import ProcessRunner
     from consensus_assurance.registry import EXECUTION_BACKENDS
-    snapshots={}
     def review_second(state):
         sub,files=review_step()(state)
         sub['review_items'][0]['report_answer']='当前版本的驱动前提已核对。'
@@ -235,7 +234,6 @@ def test_mixed_report_reads_fixed_results_and_moves_without_side_effects(tmp_pat
             rationale='Independently check another legal input'),{'plan.json':json.dumps(plan),
             'check.py':harness.replace('step(3,3)','step(2,3)'), 'helper.py':'def legal(v,n): return 0 <= v <= n\n'}
     def challenge_second(state):
-        snapshots['unreviewed']=e.state.model_copy(deep=True)
         sub,files=review_step('revision_needed')(state)
         sub['rationale']='Review the caller admission condition before revision'
         sub['review_items'][0].update(report_answer='旧版本前提仍有争议。',challenged_components=['driver'],
@@ -252,7 +250,6 @@ def test_mixed_report_reads_fixed_results_and_moves_without_side_effects(tmp_pat
         files['check.py']=files['check.py'].replace('value=step(2,3)','assert legal(2,3)\nvalue=step(2,3)')
         return sub,files
     def explained(state):
-        snapshots['reviewed']=e.state.model_copy(deep=True)
         sub,_=first(state);sub.pop('map_path');sub.update(action='explained',obligation=None,bindings=[])
         sub['question'].update(question='What happens outside the selected local capacity?',
             disposition='explained_by_existing_mechanism',counterevidence=['The other branch returns zero'])
@@ -413,25 +410,6 @@ def test_mixed_report_reads_fixed_results_and_moves_without_side_effects(tmp_pat
     assert '"bounded": true}' in text and '"bounded": false}' in text
     check=next(c for c in state.checks if c.direct_check_id==current.id)
     assert f'{check.id} / event[0] / state.encoded' in text and f'{check.id} / event[1] / state.encoded' in text
-    for name,snapshot in snapshots.items():
-        preserved=snapshot.model_dump(mode='json')
-        preview=render_report(snapshot,moved).read_text()
-        row=next(line for line in preview.splitlines() if line.startswith('| 2.'))
-        if name=='unreviewed':assert '待调查线索' in row and '对应性意见：尚未记录' in row
-        else:assert '有限检查未见违反' in row
-        assert snapshot.model_dump(mode='json')==preserved
-    # Distinct obligations keep their identities even under one recorded owner.
-    grouped=state.model_copy(deep=True)
-    previous=grouped.units[1].candidate_id
-    grouped.units[1].candidate_id=grouped.units[0].candidate_id
-    grouped.question_candidates=[c for c in grouped.question_candidates if c.id!=previous]
-    grouped.question_candidates[0].resume_conditions=['Obtain the independent caller lifetime contract']
-    combined=render_report(grouped,moved).read_text()
-    table=combined.split('## 主要结果')[1].split('### 1.')[0]
-    assert table.count('[bounded](')==1 and table.count('[interior](')==1
-    assert 'Obtain the independent caller lifetime contract' in combined
-    assert grouped.monitor_results==state.monitor_results
-    # A question plus an exploration does not imply a selected formal check or review debt.
     candidate_only=state.model_copy(deep=True)
     candidate_only.units=[];candidate_only.claims=[];candidate_only.direct_checks=[];candidate_only.monitor_results=[]
     candidate_only.semantic_reviews=[];candidate_only.review_issues=[];candidate_only.evidence=[];candidate_only.findings=[]

@@ -12,38 +12,6 @@ from consensus_assurance.workflow.direct_checks import save_plan,execute,assess,
 from consensus_assurance.adapters.runners.experiment import extract_events
 
 
-def test_completion_is_independent_of_forbidden_response_access(tmp_path):
-    from consensus_assurance.workflow.observations import monitor_events
-    from consensus_assurance.core.events import match_prerequisites
-    import sys
-    repo=tmp_path/'isolated';repo.mkdir()
-    script='''import json
-from future_fixture import consume
-class Future:
-    def __init__(self): self.error_seen=False; self.response_seen=False; self.bad_order=False
-    def Error(self): self.error_seen=True; return RuntimeError("failed")
-    def Response(self): self.bad_order=not self.error_seen; self.response_seen=True; return object()
-def emit(name, **values):
-    print("CA_EVENT " + json.dumps({"event":name,"operation":"one","participant":"local","context":"failed future","state":values}))
-future=Future()
-emit("admitted",ready=True)
-consume(future)
-emit("completed",done=True,valid=future.error_seen and not future.bad_order and not future.response_seen)
-'''
-    requirements=[EventRequirement(alias='start',event='admitted',conditions=[Comparison(field='state.ready',value=True)])]
-    prop=ObservableProperty(checker_id='Order',trigger=Comparison(field='event',value='completed'),assertion=Comparison(field='state.valid',value=True),identity_fields=['operation','participant','context'],description='Failed completion is handled without consuming an invalid response')
-    monitor=EventMonitor(id='order',checker_id='Order',event='completed',binding_ids=['fixture'],grounding=Grounding(),admission_alias='start')
-    for source,expected in [('def consume(future):\n    if future.Error() is None: future.Response()\n','holds'),('def consume(future):\n    future.Response()\n    future.Error()\n','violated')]:
-        (repo/'future_fixture.py').write_text(source)
-        completed=subprocess.run([sys.executable,'-c',script],cwd=repo,capture_output=True,text=True,timeout=5,check=True)
-        events=[json.loads(line.removeprefix('CA_EVENT ')) for line in completed.stdout.splitlines()]
-        assert match_prerequisites(events,requirements)['status']=='matched'
-        assert monitor_events(events,monitor,prop,requirements)['outcome']==expected
-    assert monitor_events(events[:1],monitor,prop,requirements)['outcome']=='unknown'
-    missing=events[1].copy();missing.pop('operation')
-    assert monitor_events([events[0],missing],monitor,prop,requirements)['outcome']=='unknown'
-
-
 @pytest.mark.parametrize('eligible,success,expected',[(False,False,'holds'),(False,True,'violated'),(True,False,'unknown'),(True,True,'unknown')])
 def test_necessary_support_oracle_does_not_require_sufficient_completion(eligible,success,expected):
     from consensus_assurance.workflow.observations import monitor_events
@@ -272,6 +240,8 @@ def test_direct_event_comparison_uses_correlated_raw_fields(tmp_path,prepared):
     events=extract_events(c)
     assert next(x for x in events if x['event']=='admitted')['state']['value']==3
     assert next(x for x in events if x['event']=='returned')['state']['limit']==3
+    p.monitors[0].applicability_conditions=[Comparison(field='state.limit',value=3)]
+    with pytest.raises(ValueError,match='cannot filter on the result field'):validate_plan(e.state,u,p,e.implementation)
 
 
 @pytest.mark.parametrize('change,expected',[

@@ -2,7 +2,7 @@
 import json
 from pathlib import Path
 import pytest
-from audit_support import products, first, check_step, review_step, stop, engine_for, feedback, cargo_engine, diagnostics
+from audit_support import products, first, question_step, check_step, review_step, stop, engine_for, feedback, cargo_engine, diagnostics
 
 
 @pytest.mark.parametrize('outcome',['violated','compile_timeout'])
@@ -447,6 +447,7 @@ def test_draft_symlinks_and_fixed_helper_bytes(tmp_path):
 
 def test_accepted_check_recovers_without_remaining_model_call(tmp_path):
     e,repo=engine_for(tmp_path,[first,check_step()])
+    e.config.execution_isolation='bwrap'
     original=e.checkpoint
     def checkpoint(event):
         original(event)
@@ -455,11 +456,15 @@ def test_accepted_check_recovers_without_remaining_model_call(tmp_path):
     e.checkpoint=checkpoint
     with pytest.raises(KeyboardInterrupt):e.start(repo)
     assert e.state.usage['agent_calls']==2
+    for name in ('check.py','helper.py'):
+        (e.root/'draft'/name).write_text("raise RuntimeError('Mutable draft replaced after acceptance')")
     e.checkpoint=original
     state=e.resume()
     assert len([c for c in state.checks if c.direct_check_id])==1, state.stop_reason
     assert len(state.agent_turns)==2
     assert state.current_submission['phase']=='executed'
+    check=next(c for c in state.checks if c.direct_check_id)
+    assert check.exit_code==0 and 'CA_EVENT' in Path(check.stdout).read_text()
 
 
 @pytest.mark.usefixtures('full_refresh_equivalence')
@@ -486,6 +491,17 @@ def test_same_version_reading_and_independent_issues(tmp_path):
         condition=next(i for i in state['review_issues'] if i['conditions'])
         item=dict(target_id=artifact,aspect='checker_correspondence',status='no_issue_found',source_ids=['code','doc'],rationale='The actual README bounds the observed return for the explicitly admitted input')
         answer=dict(issue_id=issue['id'],source_ids=['code','doc'],rationale=item['rationale'],residual_issue_ids=[other['id']],scope_limitations=['Unrelated callers remain outside the observed invocation'])
+        from consensus_assurance.core.submissions import ReviewSubmission
+        from consensus_assurance.core.diagnostics import DiagnosticError
+        from consensus_assurance.workflow.reviews import accept_review
+        bad=ReviewSubmission(action='review',artifact_id=artifact,review_items=[item],rationale='Controlled invalid references',
+            resolutions=[dict(answer,source_ids=['not-a-material'],evidence_ids=['not-an-execution'])])
+        before=e.state.model_dump(mode='json')
+        with pytest.raises(DiagnosticError) as caught:accept_review(e.state,bad,'invalid-resolution')
+        details=[d.details for d in caught.value.diagnostics]
+        assert any(d.get('unknown_material_ids')==['not-a-material'] for d in details)
+        assert any(d.get('unknown_evidence_ids')==['not-an-execution'] for d in details)
+        assert e.state.model_dump(mode='json')==before
         return dict(action='review',artifact_id=artifact,review_items=[item,{**item,'aspect':'applicability'}],rationale='Answer the named reading issue',
             resolutions=[answer,{**answer,'issue_id':condition['id'],'condition_dispositions':[dict(
                 condition_id=condition['conditions'][0]['id'],applies_to='old_judgment',source_ids=['doc'],
@@ -757,11 +773,6 @@ def test_cancel_formal_tool_stops_before_another_agent_call(tmp_path,monkeypatch
 
 
 def test_candidate_parent_conflict_and_paused_return_keep_one_active_question(tmp_path):
-    def initial(state):
-        sub,files=first(state)
-        sub.update(action='continue',obligation=None,bindings=[])
-        sub['question'].update(disposition='needs_specific_evidence',unknowns=['Unexamined consumer'])
-        return sub,files
     def pause(index):
         def step(state):
             current=state['question_candidates'][index]
@@ -769,11 +780,11 @@ def test_candidate_parent_conflict_and_paused_return_keep_one_active_question(tm
                 resume_conditions=['Inspect the remaining consumer'],rationale='Retain this boundary',feedback=feedback(state)),{}
         return step
     def independent(state):
-        sub,files=initial(state);sub['question']['question']='Is a different local caller bounded?'
+        sub,files=question_step(state);sub['question']['question']='Is a different local caller bounded?'
         sub['feedback']=feedback(state)
         return sub,files
     def resume_parent(state):
-        sub,files=initial(state);sub['candidate_id']=state['question_candidates'][0]['id']
+        sub,files=question_step(state);sub['candidate_id']=state['question_candidates'][0]['id']
         sub['feedback']=feedback(state)
         return sub,files
     def conflicting_child(state):
@@ -785,13 +796,13 @@ def test_candidate_parent_conflict_and_paused_return_keep_one_active_question(tm
         sub['feedback']=feedback(state)
         sub['result_implications']={k:'Refine the local return discriminator; unexecuted consumer remains unknown' for k in ('holds','violated','incomplete')}
         return sub,{}
-    e,repo=engine_for(tmp_path,[initial,pause(0),independent,resume_parent,pause(1),resume_parent,conflicting_child,child,check_step(),review_step(),stop])
+    e,repo=engine_for(tmp_path,[question_step,pause(0),independent,resume_parent,pause(1),resume_parent,conflicting_child,child,stop])
     state=e.start(repo)
     assert len(state.question_candidates)==3 and len(state.units)==1,state.current_submission
-    assert state.usage['audit_units']==1 and len(state.direct_checks)==1
-    assert state.question_candidates[0].question.unknowns==['Unexamined consumer']
+    assert state.usage['audit_units']==1 and not state.direct_checks
+    assert state.question_candidates[0].question.unknowns==['Consumer unexamined']
     assert state.question_candidates[2].parent_candidate_id==state.question_candidates[0].id
-    assert state.question_candidates[0].status=='paused' and state.units[0].status=='checked'
+    assert state.question_candidates[0].status=='paused' and state.units[0].remaining_obligation_ids
     assert not any(c.status=='active' for c in state.question_candidates)
     assert len(list((e.root/'submissions').glob('*/diagnostics.json')))==1
 
@@ -873,22 +884,6 @@ def test_checker_correction_across_intermediate_harness_version(tmp_path):
     errors=[json.loads(p.read_text()) for p in (e.root/'submissions').glob('*/diagnostics.json')]
     assert len(errors)==1
     assert any(d['details'].get('unchanged_components')==['oracle'] for d in errors[0]['diagnostics'])
-
-
-def test_isolated_runner_sees_fixed_submitted_helpers(tmp_path):
-    e,repo=engine_for(tmp_path,[first,check_step(),stop])
-    e.config.execution_isolation='bwrap'
-    original=e.checkpoint
-    def mutate_after_acceptance(event):
-        original(event)
-        if event=='semantic_operation_committed' and e.state.current_submission.get('direct_check_id'):
-            (e.root/'draft'/'check.py').write_text("raise RuntimeError('changed draft')")
-            (e.root/'draft'/'helper.py').write_text("raise RuntimeError('changed helper')")
-    e.checkpoint=mutate_after_acceptance
-    state=e.start(repo)
-    result=next(c for c in state.checks if c.direct_check_id)
-    assert result.exit_code==0 and result.status.value=='completed'
-    assert 'CA_EVENT' in Path(result.stdout).read_text()
 
 
 @pytest.mark.parametrize('violated',[False,True])
@@ -1046,23 +1041,6 @@ def test_deadline_preserves_accepted_unexecuted_check_across_resume(tmp_path):
     assert recovered.usage.get('experiments',0)==0 and recovered.usage['agent_calls']==2
 
 
-def test_resolution_reports_independent_reference_errors_together(tmp_path):
-    def dispute(state):
-        return review_step('disputed')(state)
-    def invalid(state):
-        sub,_=review_step()(state)
-        sub['resolutions']=[dict(issue_id=state['review_issues'][0]['id'],source_ids=['not-a-material'],
-            evidence_ids=['not-an-execution'],rationale='Unresolved source claim',residual_issue_ids=[],scope_limitations=[])]
-        return sub,{}
-    e,repo=engine_for(tmp_path,[first,check_step(),dispute,invalid,stop]);state=e.start(repo)
-    diagnostics=[json.loads(p.read_text()) for p in (e.root/'submissions').glob('*/diagnostics.json')]
-    assert len(diagnostics)==1
-    details=[d['details'] for d in diagnostics[0]['diagnostics']]
-    assert any(d.get('unknown_material_ids')==['not-a-material'] for d in details)
-    assert any(d.get('unknown_evidence_ids')==['not-an-execution'] for d in details)
-    assert not state.review_issues[0].resolved_by
-
-
 def test_feedback_only_retains_exploration_before_a_map_and_recovers_once(tmp_path):
     from consensus_assurance.workflow.audit import accept, Inputs, AuditSubmission
     from consensus_assurance.workflow.transactions import commit_graph
@@ -1210,46 +1188,6 @@ def test_zero_review_budget_keeps_measured_violation_unconfirmed(tmp_path):
     assert '**已确认违反**' not in text and '机械比较：观察到违反' in text and '对应性意见：尚未记录' in text
 
 
-@pytest.mark.parametrize('selection',['diagnostic_control','formal_control','outside_only'])
-def test_go_control_applicability_preserves_independent_witness(tmp_path,go_module,selection):
-    import shutil
-    from consensus_assurance.adapters.runners.go_module import GoModuleBackend
-    from consensus_assurance.core.config import TargetConfig
-    from consensus_assurance.core.proposals import Comparison
-    from consensus_assurance.workflow.direct_checks import load_plan,validate_plan
-    if not shutil.which('go') or not shutil.which('bwrap'):pytest.skip('Local Go and bubblewrap required')
-    def initial(state):
-        sub,files=first(state);sub['sources'][0].update(file='value.go',end_line=4)
-        sub['bindings'][0].update(symbol='Step',start_line=2,end_line=4)
-        return sub,files
-    def check(state):
-        sub,files=check_step()(state);plan=json.loads(files['plan.json']);plan['harness']['kind']='go_test'
-        if selection!='formal_control':plan['monitors'][0]['applicability_conditions']=[{'field':'scenario','value':'principal'}]
-        principal='' if selection=='outside_only' else 'emit("admitted","principal",true); emit("returned","principal",Step(3,3)<=3);'
-        text='''package service
-import ("testing";"fmt")
-func emit(event,scenario string,ok bool) {fmt.Printf("CA_EVENT {\\"event\\":\\"%s\\",\\"scenario\\":\\"%s\\",\\"operation\\":\\"%s\\",\\"state\\":{\\"legal\\":true,\\"in_range\\":%t}}\\n",event,scenario,scenario,ok)}
-func TestAssurancePolicies(t *testing.T) { PRINCIPAL emit("returned","control",Step(2,3)<=3) }
-'''.replace('PRINCIPAL',principal)
-        sub.update(harness_path='check.go',files={})
-        return sub,{'plan.json':json.dumps(plan),'check.go':text}
-    e,repo=engine_for(tmp_path,[initial,check,review_step(),stop]);shutil.copytree(go_module,repo,dirs_exist_ok=True)
-    e.config.execution_backend='go_module';e.config.execution_isolation='bwrap';e.config.target=TargetConfig()
-    e.implementation=GoModuleBackend(e.config.target);e.agent.mock=False
-    state=e.start(repo)
-    assert not list((e.root/'submissions').glob('*/diagnostics.json')),state.stop_reason
-    result=state.monitor_results[0];prop=result['properties'][0]
-    assert result['confirmed']==(selection!='outside_only')
-    assert result['outcome']==('unknown' if selection=='outside_only' else 'violated')
-    assert result['bounded_complete']==(selection=='diagnostic_control')
-    assert bool(prop['missing_indices'])==(selection=='formal_control')
-    assert bool(prop['outside_applicability_indices'])==(selection!='formal_control')
-    if selection=='outside_only':assert not prop['evaluated_indices']
-    artifact=state.direct_checks[0];plan=load_plan(artifact.plan_path)
-    plan.monitors[0].applicability_conditions=[Comparison(field='state.in_range',value=False)]
-    with pytest.raises(ValueError,match='cannot filter on the result field'):validate_plan(state,state.units[0],plan,e.implementation)
-
-
 def test_one_investigation_fixes_packages_for_checks_exploration_and_revision(tmp_path,go_module):
     import shutil
     from consensus_assurance.adapters.runners.go_module import GoModuleBackend
@@ -1268,21 +1206,23 @@ def test_one_investigation_fixes_packages_for_checks_exploration_and_revision(tm
         return f'''package {package}
 import "testing"
 func TestAssuranceBound(t *testing.T) {{
- emit("admitted", true)
+ emit("admitted", true, "principal")
  value := Step({value},3)
- emit("returned", value >= 0 && value <= 3)
+ emit("returned", value >= 0 && value <= 3, "principal")
+ emit("returned", true, "control")
 }}
 '''
     def helpers(directory,package):
         return {f'{directory}/observe_test.go'.removeprefix('./'):f'''package {package}
 import "fmt"
-func emit(event string, value bool) {{ fmt.Printf("CA_EVENT {{\\"event\\":\\"%s\\",\\"operation\\":\\"one\\",\\"state\\":{{\\"legal\\":true,\\"in_range\\":%t}}}}\\n",event,value) }}
+func emit(event string, value bool, scenario string) {{ fmt.Printf("CA_EVENT {{\\"event\\":\\"%s\\",\\"operation\\":\\"%s\\",\\"scenario\\":\\"%s\\",\\"state\\":{{\\"legal\\":true,\\"in_range\\":%t}}}}\\n",event,scenario,scenario,value) }}
 '''}
     def check(package,revise=False,value=3):
         def step(state):
             sub,files=check_step(revise=revise)(state)
             plan=json.loads(files['plan.json'])
             plan['harness']['kind']='go_test'
+            plan['monitors'][0]['applicability_conditions']=[dict(field='scenario',value='principal')]
             if package is not None:plan['harness']['execution_package']=package
             name=('engine_test' if revise else 'engine') if package else 'service'
             # Both root and core use the same actual bound implementation.
@@ -1302,6 +1242,7 @@ func emit(event string, value bool) {{ fmt.Printf("CA_EVENT {{\\"event\\":\\"%s\
     e,repo=engine_for(tmp_path,steps)
     shutil.copytree(go_module,repo,dirs_exist_ok=True)
     e.config.execution_backend='go_module';e.config.execution_isolation='bwrap'
+    e.agent.mock=False
     e.config.target=TargetConfig(harness_path='custom_generated_test.go')
     e.config.budget.total_seconds=360;e.config.budget.action_timeout=120
     e.implementation=GoModuleBackend(e.config.target,120)
@@ -1337,6 +1278,8 @@ func emit(event string, value bool) {{ fmt.Printf("CA_EVENT {{\\"event\\":\\"%s\
         assert 'os/exec' not in plan.harness.source
     assert [r['outcome'] for r in state.monitor_results]==['holds','violated','violated']
     assert all(r['reviewed_complete'] for r in state.monitor_results)
+    assert [r['confirmed'] for r in state.monitor_results]==[False,True,True]
+    assert all(r['properties'][0]['outside_applicability_indices'] for r in state.monitor_results)
     conditional=next(c for c in state.checks if c.action=='exploration')
     assert conditional.exit_code!=0 and conditional.parameters['test_started'] and '2' in Path(conditional.stdout).read_text()
     assert conditional.command[-1]=='./internal/store' and conditional.parameters['harness_filename']=='internal/store/custom_generated_test.go'

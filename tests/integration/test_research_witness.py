@@ -83,26 +83,16 @@ def test_controller_interrupt_does_not_require_a_valid_draft(tmp_path,event):
             return stop(state)
         e.budget.previous=e.config.budget.total_seconds
         return '{',{}
-    e,repo=engine_for(tmp_path,[first,interrupted]);e.config.budget.agent_calls=20
+    steps=[interrupted] if event=='cancel' else [first,interrupted]
+    e,repo=engine_for(tmp_path,steps);e.config.budget.agent_calls=20
     state=e.start(repo)
     assert state.run_stop['origin']=='controller' and state.run_stop['reason']==('user_stop' if event=='cancel' else 'resource_limit')
-    assert state.usage['agent_calls']==2 and state.run_stop['pending_work']
+    assert state.usage['agent_calls']==len(steps)
     assert not state.evidence and not state.run_stop.get('frontier_comparison')
     assert not any(s['action']=='rejected' for s in state.selections)
     assert bool(diagnostics(e))==(event=='deadline')
     if event=='deadline':assert Path(diagnostics(e)[0]['raw_path']).read_text()=='{'
-
-
-def test_nonadjacent_history_support_retains_actual_core_relationship(tmp_path):
-    def submit(state):
-        sub,files=first(state);spec=json.loads(files['map.json'])
-        spec['behaviors'].append(dict(id='prefix',primary_activity='A1',execution_owner='caller',protocol_context='initialization',trigger='start',source_ids=['code']))
-        sub['question']['supporting_behavior_ids']={'prefix':'Legal initial invocation prefix; not a direct producer of the return'}
-        files['map.json']=json.dumps(spec)
-        return sub,files
-    e,repo=engine_for(tmp_path,[submit,stop]);state=e.start(repo)
-    assert not diagnostics(e) and state.units[0].audit_question.supporting_behavior_ids
-    assert not e.config.activity_focus
+    else:assert not state.audit_spec_path
 
 
 def test_controller_version_normalization_cannot_declare_semantic_changes(tmp_path):

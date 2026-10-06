@@ -11,7 +11,15 @@ def add_check(state):
 
 def test_F3_adds_actual_dependency_bindings(dependency_prepared):
     _, state, _  = dependency_prepared
-    expanded = expand_unit(state, state.units[0], ["input_dependency"])
+    first=state.relations[0]
+    second=first.model_copy(deep=True);second.id='second_edge';second.source=first.target;second.target='input_binding'
+    state.relations.insert(0,second)
+    reverse=state.model_copy(deep=True);reverse.relations.reverse()
+    feedback=Feedback(kind='F3',rationale='Inspect an actual dependency before building',evidence_ids=[state.materials[0].id],
+        target_ids=[state.units[0].id],relation_ids=[first.id,second.id],new_basis='')
+    expanded=apply_feedback(state,state.units[0],feedback)
+    reordered=apply_feedback(reverse,reverse.units[0],feedback)
+    assert expanded.binding_ids==reordered.binding_ids and expanded.obligation_ids==reordered.obligation_ids
     assert expanded.binding_ids == ["step_binding", "input_binding"]
     assert expanded.obligation_ids == ["step_obligation"]
     assert expanded.previous_id == "counter_unit"

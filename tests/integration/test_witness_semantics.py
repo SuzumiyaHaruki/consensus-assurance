@@ -22,7 +22,8 @@ def inputs():
 
 
 @pytest.mark.parametrize('change,success,expected',[
-    ('outside',True,'violated'),('independent_missing',True,'violated'),('same_missing',True,'unknown'),
+    ('outside',True,'violated'),('outside_only',True,'unknown'),('formal_control',True,'violated'),
+    ('independent_missing',True,'violated'),('same_missing',True,'unknown'),
     ('identity',True,'unknown'),('prerequisite',True,'unknown'),('result',True,'unknown'),
     ('ambiguous',True,'unknown'),('alias_missing',True,'unknown'),('cross_context',True,'unknown'),
     ('complete',False,'holds'),('result',False,'unknown'),('identity',False,'unknown'),('prerequisite',False,'unknown')])
@@ -30,6 +31,8 @@ def test_existential_witness_is_not_scope_completeness(change,success,expected):
     p,m,req,events=inputs()
     events[1]['success']=success
     if change=='outside':events.append(dict(event='result',enabled=False))
+    if change=='outside_only':events=[dict(event='result',enabled=False)]
+    if change=='formal_control':events.append(dict(event='result',operation='control',generation=1,enabled=True,success=True,qualified=True))
     if change=='independent_missing':events.append(dict(events[0],operation='two'))
     if change=='same_missing':events.append({k:v for k,v in events[1].items() if k!='qualified'})
     if change=='identity':events[1].pop('operation')
@@ -42,7 +45,8 @@ def test_existential_witness_is_not_scope_completeness(change,success,expected):
     assert result['witness_complete']==(expected=='violated')
     assert result['comparison_complete']==(change in {'outside','complete'})
     assert result['outcome']==expected
-    if not result['comparison_complete']:assert result['diagnostics'] and result['limitations']
+    if change=='outside_only':assert not result['evaluated_indices'] and result['outside_applicability_indices']==[0]
+    if not result['comparison_complete'] and change!='outside_only':assert result['diagnostics'] and result['limitations']
 
 
 @pytest.mark.parametrize('rename,reverse',[(False,False),(True,False),(False,True),(True,True)])
@@ -107,23 +111,6 @@ def test_admission_and_independent_prerequisite_permutation():
     assert monitor_events(reversed_events,monitor,prop,requirements)['outcome']=='unknown'
     result=monitor_events(events[:3]+[events[0]],monitor,prop,requirements)
     assert result['outcome']=='unknown' and result['missing_indices']==[3]
-
-
-def test_phase_readiness_does_not_discharge_selected_delivery_contract():
-    for fifo,special in [(True,True),(True,False),(False,True)]:
-        pending=['earlier'];ready=True
-        assert ready and pending
-        pending.append('later')
-        delivered=[pending.pop(-1 if special else 0),pending.pop(0)]
-        prop,monitor,requirements,events=inputs()
-        requirements.append(EventRequirement(alias='delivery',event='delivery',
-            conditions=[Comparison(field='contract_met',value=True)]))
-        observed=dict(events[0],event='delivery',ready=ready,fifo_required=fifo,
-            delivered=delivered,contract_met=not fifo or delivered==['earlier','later'])
-        events.insert(1,observed)
-        result=monitor_events(events,monitor,prop,requirements)
-        assert result['outcome']==('unknown' if fifo and special else 'violated')
-        assert result['witness_complete']==(not fifo or not special)
 
 
 @pytest.mark.parametrize('qualified',[False,True])

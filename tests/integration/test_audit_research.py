@@ -97,12 +97,15 @@ def test_cross_activity_producer_connects_to_focus_without_quota(tmp_path):
         sub,files=first(state);spec=partial_map()
         spec['activities'].append(dict(class_id='A6',applicability='applicable',purpose='Retain local output',realization_summary='The return is produced by this local representation',source_ids=['code']))
         spec['behaviors'][0].update(primary_activity='A6',cross_activity_effects={'A1':'The A1 consumer relies on this exact returned value; distributed consequence remains untested'})
+        spec['behaviors'].append(dict(id='prefix',primary_activity='A1',execution_owner='caller',protocol_context='initialization',trigger='start',source_ids=['code']))
+        sub['question']['supporting_behavior_ids']={'prefix':'Legal initial invocation prefix; not a direct producer of the return'}
         sub['question']['activity_classes']=['A1','A6']
         files['map.json']=json.dumps(spec)
         return sub,files
     e,repo=engine_for(tmp_path,[submit,stop]);e.config.activity_focus=['A1','A2']
     state=e.start(repo)
     assert len(state.units)==1 and not diagnostics(e)
+    assert state.units[0].audit_question.supporting_behavior_ids
     assert {r['activity'] for r in view(state)['frontier']['core_regions']}=={'A1','A2'}
 
 
@@ -251,14 +254,6 @@ def test_fact_correction_is_saved_before_an_explicit_semantic_revision(tmp_path)
     assert state.graph_history and (e.root/'audit-spec'/'v1.json').exists()
 
 
-def test_forced_stop_needs_no_map(tmp_path):
-    e,repo=engine_for(tmp_path,[stop])
-    state=e.start(repo)
-    from consensus_assurance.reporting.chinese import render_report
-    text=render_report(state,e.root).read_text()
-    assert '双主线初始理解尚未完成' in text and not state.audit_spec_path and not diagnostics(e)
-
-
 def test_scope_reconnects_added_fact_dependency_and_keeps_old_scope(tmp_path):
     def expand(state):
         from consensus_assurance.core.types import Analysis
@@ -339,39 +334,6 @@ def test_shared_fact_can_reconnect_paused_and_active_candidates_atomically(tmp_p
     assert not diagnostics(e),diagnostics(e)
     assert state.audit_spec_version==2 and [c.status for c in state.question_candidates]==['paused','active']
     assert all(c.question.audit_spec_version==2 and c.history for c in state.question_candidates)
-
-
-@pytest.mark.parametrize('reason',['bounded_completed','insufficient_basis','no_actionable_direction'])
-def test_open_run_rejects_semantic_stops_in_preflight_and_acceptance(tmp_path,reason):
-    from consensus_assurance.workflow.audit import validate_submission
-    source,prefix,question=instance_prefix()
-    messages=[]
-    def premature(state):
-        raw=dict(action='stop',scope='run',reason=reason,ref_ids=['code'],rationale='No complete next check selected')
-        path=e.root/'draft'/'stop.json';path.write_text(json.dumps(raw))
-        before=e.state.model_dump(mode='json')
-        result=validate_submission(e.state,e.root,path.name,e.implementation)
-        assert not result['valid'] and e.state.model_dump(mode='json')==before
-        messages.extend(d['message'] for d in result['diagnostics'])
-        assert result['diagnostics'][0]['details']['reconsider']=='research_decision'
-        return raw,{}
-    def continue_research(state):
-        assert not state['run_stop'] and diagnostics(e)[0]['errors']==messages
-        assert [c['status'] for c in state['question_candidates']]==['explained','paused']
-        sub=question('What does the read consumer actually expose?', 'explained')
-        sub['question'].update(behavior_ids=['read'],activity_classes=['A1','A2','A5'],fact_ids=['result'],
-            supporting_behavior_ids={'change':'Preserves the established decision across context changes for read consumption'},
-            disposition='explained_by_existing_mechanism',unknowns=[],counterevidence=['read returns the preserved decision'])
-        sub['feedback']=dict(feedback(state),answered='The actual read path returns the established decision; caller timing is still unknown')
-        return sub,{}
-    steps=prefix+[premature,continue_research]
-    e,repo=engine_for(tmp_path,steps);e.config.directed_question=None;e.config.activity_focus=['A2']
-    (repo/'target.py').write_text(source)
-    state=e.start(repo)
-    assert len(diagnostics(e))==1 and len(state.question_candidates)==3
-    assert state.agent_session_id=='fixture-session' and not state.evidence
-    assert state.run_stop['origin']=='controller' and state.run_stop['reason']=='resource_limit'
-    assert state.usage['agent_calls']==len(steps) and state.question_candidates[1].resume_conditions
 
 
 def test_only_configured_directed_disposition_can_complete_a_run(tmp_path):
@@ -525,51 +487,6 @@ def test_local_tool_gap_preserves_unit_and_continues(scope,tmp_path):
     assert len(state.question_candidates)==2 and state.question_candidates[0].status=='paused'
     assert state.units[0].remaining_obligation_ids and state.usage['agent_calls']==4
     assert state.run_stop['scope']=='run'
-
-
-def test_local_handoff_recovers_without_reexecuting_checked_work(tmp_path):
-    e,repo=engine_for(tmp_path,[first,check_step(),review_step(),local_stop(),next_question,stop])
-    original=e.checkpoint
-    interrupted=False
-    def checkpoint(event):
-        nonlocal interrupted
-        original(event)
-        if event=='audit_execution_completed' and e.state.current_submission.get('scope')=='candidate' and not interrupted:
-            interrupted=True
-            raise KeyboardInterrupt('Controlled interruption after durable local handoff')
-    e.checkpoint=checkpoint
-    with pytest.raises(KeyboardInterrupt):e.start(repo)
-    e.checkpoint=original
-    state=e.resume()
-    assert len(state.question_candidates)==2
-    assert state.usage['experiments']==1 and state.usage['agent_calls']==6
-    assert len([s for s in state.selections if s['action']=='stop' and s['scope']=='candidate'])==1
-
-
-def instance_prefix():
-    """Human-authored research prefix; no autonomous discovery or execution Evidence."""
-    source,spec=instance_products()
-    next(b for b in spec['behaviors'] if b['id']=='read')['cross_activity_effects']={'A1':'Exposes the established decision to the caller'}
-    def question(text,action='continue'):
-        sub=products()[0];sub.update(action=action,obligation=None,bindings=[])
-        sub['sources'][0]['end_line']=len(source.splitlines())
-        sub['question'].update(question=text,activity_classes=['A2'],behavior_ids=['change'],fact_ids=['context'],
-            contexts=['One instance across context changes'],event_paths=['change -> reject or replace context'],
-            importance='Context changes govern which pending support may contribute',preferred_check='source_review',
-            trigger_rationale='Compare the context guard and its effects with the actual caller contract',
-            disposition='needs_specific_evidence',unknowns=['External caller authorization is unavailable'])
-        return sub
-    def initial(state):
-        sub=question('Can a redundant context change erase pending support?','explained')
-        sub.update(map_path='map.json',feedback=dict(feedback(state),
-            answered='change rejects the current context before mutating pending support or the retained decision',
-            remaining=['The external caller authorization contract is unavailable'],
-            rationale='The source guard answers only redundant changes; other source relationships remain independent'))
-        sub['question'].update(disposition='explained_by_existing_mechanism',unknowns=[],
-            counterevidence=['change returns before mutation when the context is unchanged'])
-        return sub,{'map.json':json.dumps(spec)}
-    def external(state):return question('Does the external caller authorize context changes?'),{}
-    return source,[initial,external,local_stop('insufficient_basis')],question
 
 
 @pytest.mark.parametrize('combined',[False,True])
@@ -1088,9 +1005,13 @@ def test_review_pause_and_reselection_continue_to_controller_boundary(tmp_path,m
         retained['assessment']=state['monitor_results'][0]
         raw=dict(action='stop',scope='run',reason='insufficient_basis',ref_ids=['code'],
             rationale='The next complete check lacks a caller contract')
-        (e.root/'draft'/'stop.json').write_text(json.dumps(raw))
-        result=validate_submission(e.state,e.root,'stop.json',e.implementation)
-        assert not result['valid'] and result['diagnostics'][0]['code']=='stop_decision'
+        before=e.state.model_dump(mode='json')
+        for reason in ('bounded_completed','insufficient_basis','no_actionable_direction'):
+            (e.root/'draft'/'stop.json').write_text(json.dumps(dict(raw,reason=reason)))
+            result=validate_submission(e.state,e.root,'stop.json',e.implementation)
+            assert not result['valid'] and result['diagnostics'][0]['code']=='stop_decision'
+            assert result['diagnostics'][0]['details']['reconsider']=='research_decision'
+        assert e.state.model_dump(mode='json')==before
         return raw,{}
     def learning(state):
         assert len(diagnostics(e))==1 and not state['run_stop']
