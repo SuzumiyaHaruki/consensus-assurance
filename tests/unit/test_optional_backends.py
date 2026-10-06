@@ -93,6 +93,9 @@ def test_cargo_shared_seed_configuration_and_private_paths(tmp_path,monkeypatch)
     config=tmp_path/'cargo.yaml';config.write_text('execution_backend: cargo\nagent_backend: mock\ncargo_seed_cache_dir: seeds\n')
     cfg=load_config(config);backend=assemble(cfg)[0]
     assert cfg.cargo_seed_cache_dir==str(tmp_path/'seeds')==str(backend.seed_cache_dir)
+    for path in ('~/.cache/consensus-assurance/cargo-seeds',str(tmp_path/'seeds')):
+        config.write_text('execution_backend: cargo\ncargo_seed_cache_dir: '+path+'\n')
+        assert load_config(config).model_dump()['cargo_seed_cache_dir']==str(Path(path).expanduser())
     root=tmp_path/'run';root.mkdir();source=tmp_path/'original';source.mkdir()
     (root/'snapshot.json').write_text(json.dumps({'repo':str(source)}))
     link=tmp_path/'link';link.symlink_to(source,target_is_directory=True)
