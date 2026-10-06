@@ -1,0 +1,259 @@
+{
+  "description": "Generate a complete write-before-read history on two real RawNodes. Implicit joint demotion changes voters {1,2} to voter {2}, learner {1}. After finalization isolate old leader 1, campaign node 2 and complete register write new. Invoke ReadIndex on node 1 with fresh context, retain actual Ready.ReadStates, then deliver only generated entry data through the preceding no-op index. Serve the read only after strict applied>read index and compare its real register value to the preceding completed write.",
+  "claim_id": "C-demoted-read-linearizability",
+  "binding_ids": [
+    "L-singleton-read",
+    "L-demotion-role",
+    "L-read-response"
+  ],
+  "harness": {
+    "execution_package": ".",
+    "files": {},
+    "kind": "go_test",
+    "source": "package raft\n\nimport (\n \"encoding/json\"\n \"fmt\"\n \"testing\"\n pb \"go.etcd.io/raft/v3/raftpb\"\n)\n\nfunc TestAssuranceDemotedSingletonReadCheck(t *testing.T) {\n for _,stepdown:=range []bool{false,true} {\n  t.Run(fmt.Sprint(stepdown),func(t *testing.T){\n   nodes:=map[uint64]*RawNode{};stores:=map[uint64]*MemoryStorage{}\n   values:=map[uint64]string{1:\"old\",2:\"old\"}\n   applied:=map[uint64]uint64{}\n   readStates:=map[uint64][]ReadState{}\n   for id:=uint64(1);id<=2;id++ {\n    st:=NewMemoryStorage()\n    rn,err:=NewRawNode(&Config{ID:id,ElectionTick:10,HeartbeatTick:1,Storage:st,MaxSizePerMsg:0,MaxCommittedSizePerReady:4096,MaxInflightMsgs:256,ReadOnlyOption:ReadOnlySafe,StepDownOnRemoval:stepdown})\n    if err!=nil {t.Fatal(err)}\n    if err=rn.Bootstrap([]Peer{{ID:1},{ID:2}});err!=nil {t.Fatal(err)}\n    nodes[id]=rn;stores[id]=st\n   }\n   var queue []pb.Message\n   mode:=\"normal\"\n   prefix:=uint64(0)\n   writeIndex:=uint64(0)\n   drops:=0\n   historySeq:=0\n   requestCtx:=\"fresh-read-after-write\"\n   operation:=\"demoted-read-after-completed-write\"\n   emit:=func(stage string,extra map[string]interface{}) int {\n    historySeq++\n    r:=nodes[1].raft\n    e:=map[string]interface{}{\"event\":stage,\"operation\":operation,\"history_seq\":historySeq,\"request_ctx\":requestCtx,\"stepdown\":stepdown,\"old_role\":r.state.String(),\"old_term\":r.Term,\"old_is_learner\":r.isLearner,\"old_voters\":r.trk.Config.Voters[0].Slice(),\"old_applied\":applied[1],\"new_applied\":applied[2],\"old_value\":values[1],\"new_value\":values[2],\"new_term\":nodes[2].raft.Term,\"new_role\":nodes[2].raft.state.String(),\"write_index\":writeIndex,\"prefix_index\":prefix,\"drops\":drops,\"read_count\":len(readStates[1])}\n    for k,v:=range extra {e[k]=v};b,err:=json.Marshal(e);if err!=nil {t.Fatal(err)};fmt.Println(\"CA_EVENT \"+string(b));return historySeq\n   }\n   pump:=func(){\n    for rounds:=0;rounds<1000;rounds++ {\n     active:=false\n     for id:=uint64(1);id<=2;id++ {\n      rn:=nodes[id];st:=stores[id]\n      if !rn.HasReady(){continue};active=true;rd:=rn.Ready()\n      if !IsEmptySnap(rd.Snapshot){t.Fatal(\"unexpected snapshot\")}\n      if err:=st.Append(rd.Entries);err!=nil {t.Fatal(err)}\n      if !IsEmptyHardState(rd.HardState){if err:=st.SetHardState(rd.HardState);err!=nil {t.Fatal(err)}}\n      queue=append(queue,rd.Messages...)\n      for _,ent:=range rd.CommittedEntries {\n       if ent.Index!=applied[id]+1 {t.Fatalf(\"nonconsecutive application on %d: %d after %d\",id,ent.Index,applied[id])}\n       switch ent.Type {\n       case pb.EntryConfChange:\n        var cc pb.ConfChange;if err:=cc.Unmarshal(ent.Data);err!=nil {t.Fatal(err)};rn.ApplyConfChange(cc)\n       case pb.EntryConfChangeV2:\n        var cc pb.ConfChangeV2;if err:=cc.Unmarshal(ent.Data);err!=nil {t.Fatal(err)};rn.ApplyConfChange(cc)\n       case pb.EntryNormal:\n        if len(ent.Data)>0 {values[id]=string(ent.Data);if id==2 && string(ent.Data)==\"new\" {writeIndex=ent.Index}}\n       }\n       applied[id]=ent.Index\n      }\n      for _,rs:=range rd.ReadStates {\n       rs.RequestCtx=append([]byte(nil),rs.RequestCtx...)\n       readStates[id]=append(readStates[id],rs)\n      }\n      rn.Advance(rd)\n     }\n     if len(queue)>0 {\n      active=true;m:=queue[0];queue=queue[1:]\n      drop:=mode==\"isolate\"\n      if mode==\"prefix\" && m.From==2 && m.To==1 {\n       // Drop actual generated data beyond the selected no-op prefix.\n       for _,e:=range m.Entries {if e.Index>prefix {drop=true}}\n       if m.Type==pb.MsgHeartbeat && m.Commit>prefix {drop=true}\n      }\n      if mode!=\"normal\" {\n       emit(\"wire\",map[string]interface{}{\"message_type\":m.Type.String(),\"from\":m.From,\"to\":m.To,\"message_term\":m.Term,\"prev_index\":m.Index,\"prev_term\":m.LogTerm,\"message_commit\":m.Commit,\"entries\":m.Entries,\"dropped\":drop,\"delivery_mode\":mode})\n      }\n      if drop {drops++} else if err:=nodes[m.To].Step(m);err!=nil && err!=ErrStepPeerNotFound {t.Fatal(err)}\n     }\n     if !active{return}\n    }\n    t.Fatal(\"pump exceeded finite construction bound\")\n   }\n   pump();if err:=nodes[1].Campaign();err!=nil {t.Fatal(err)};pump()\n   if nodes[1].raft.state!=StateLeader {t.Fatal(\"initial leader missing\")}\n   cc:=pb.ConfChangeV2{Transition:pb.ConfChangeTransitionJointImplicit,Changes:[]pb.ConfChangeSingle{{Type:pb.ConfChangeAddLearnerNode,NodeID:1}}}\n   if err:=nodes[1].ProposeConfChange(cc);err!=nil {t.Fatal(err)};pump()\n   for id:=uint64(1);id<=2;id++ {\n    r:=nodes[id].raft\n    if !r.trk.IsSingleton() || len(r.trk.Config.Voters[1])!=0 || r.trk.Progress[1]==nil || !r.trk.Progress[1].IsLearner {t.Fatal(\"demotion/finalization not reached\")}\n   }\n   emit(\"demotion_applied\",nil)\n   mode=\"isolate\"\n   if err:=nodes[2].Campaign();err!=nil {t.Fatal(err)};pump()\n   if nodes[2].raft.state!=StateLeader {t.Fatal(\"new singleton leader missing\")}\n   prefix=applied[2]\n   if err:=nodes[2].Propose([]byte(\"new\"));err!=nil {t.Fatal(err)};pump()\n   if values[2]!=\"new\" || writeIndex<=prefix {t.Fatal(\"write completion not reached\")}\n   writeSeq:=emit(\"write_completed\",map[string]interface{}{\"write_value\":values[2],\"write_id\":\"write-new\",\"write_applied\":applied[2]>=writeIndex && nodes[2].raft.raftLog.committed>=writeIndex})\n   // The read invocation occurs after the write has completed application.\n   readSeq:=emit(\"read_admitted\",map[string]interface{}{\"write_completion_seq\":writeSeq,\"write_id\":\"write-new\"})\n   nodes[1].ReadIndex([]byte(requestCtx));pump()\n   barrierSeq:=0\n   if len(readStates[1])==1 {\n    rs:=readStates[1][0]\n    barrierSeq=emit(\"read_barrier_received\",map[string]interface{}{\"read_admission_seq\":readSeq,\"read_index\":rs.Index,\"request_ctx\":string(rs.RequestCtx)})\n   } else {emit(\"no_immediate_barrier\",nil)}\n   if len(readStates[1])>1 {t.Fatal(\"ambiguous local read result\")}\n   mode=\"prefix\"\n   for i:=0;i<5;i++ {nodes[2].Tick();pump()}\n   if len(readStates[1])==1 {\n    rs:=readStates[1][0]\n    if applied[1]>rs.Index {\n     serveSeq:=emit(\"ready_to_serve\",map[string]interface{}{\"barrier_seq\":barrierSeq,\"read_index\":rs.Index,\"request_ctx\":string(rs.RequestCtx),\"strict_application_boundary\":applied[1]>rs.Index})\n     emit(\"read_completed\",map[string]interface{}{\"serve_seq\":serveSeq,\"read_index\":rs.Index,\"request_ctx\":string(rs.RequestCtx),\"observed_value\":values[1]})\n    } else {emit(\"application_boundary_missing\",map[string]interface{}{\"read_index\":rs.Index})}\n   } else {emit(\"no_read_barrier\",nil)}\n  })\n }\n}\n",
+    "description": "Single-goroutine deterministic register application and real RawNode/MemoryStorage processing. Each application is consecutive and updates the register only for nonempty normal entries. Sender messages are generated by target code, queued FIFO, then selected for delivery/drop by declared phase and entry index. Appends with a higher commit hint but only the allowed prefix are delivered unchanged; follower maybeAppend bounds commitment. The stepdown=true scenario is a diagnostic control.",
+    "semantic_changes": [
+      "Simulated unreliable transport: normal delivery for all configuration work, full isolation during new election/write/read-barrier acquisition, then drop entries above the selected actual no-op prefix and heartbeats whose commit exceeds that prefix. No message bytes or target state are altered.",
+      "In-memory stable storage models successful persistence, without crashes.",
+      "Application is a deterministic one-register state machine; all reads and mutations occur on the same goroutine."
+    ],
+    "prerequisites": [
+      {
+        "alias": "written",
+        "event": "write_completed",
+        "conditions": [
+          {
+            "field": "stepdown",
+            "op": "eq",
+            "value": false,
+            "reference": null
+          },
+          {
+            "field": "write_id",
+            "op": "eq",
+            "value": "write-new",
+            "reference": null
+          },
+          {
+            "field": "write_applied",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          },
+          {
+            "field": "write_value",
+            "op": "eq",
+            "value": "new",
+            "reference": null
+          }
+        ]
+      },
+      {
+        "alias": "admit",
+        "event": "read_admitted",
+        "conditions": [
+          {
+            "field": "stepdown",
+            "op": "eq",
+            "value": false,
+            "reference": null
+          },
+          {
+            "field": "write_completion_seq",
+            "op": "eq",
+            "value": null,
+            "reference": "written.history_seq"
+          },
+          {
+            "field": "old_is_learner",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          },
+          {
+            "field": "old_role",
+            "op": "eq",
+            "value": "StateLeader",
+            "reference": null
+          }
+        ]
+      },
+      {
+        "alias": "barrier",
+        "event": "read_barrier_received",
+        "conditions": [
+          {
+            "field": "stepdown",
+            "op": "eq",
+            "value": false,
+            "reference": null
+          },
+          {
+            "field": "read_admission_seq",
+            "op": "eq",
+            "value": null,
+            "reference": "admit.history_seq"
+          }
+        ]
+      },
+      {
+        "alias": "serve",
+        "event": "ready_to_serve",
+        "conditions": [
+          {
+            "field": "stepdown",
+            "op": "eq",
+            "value": false,
+            "reference": null
+          },
+          {
+            "field": "barrier_seq",
+            "op": "eq",
+            "value": null,
+            "reference": "barrier.history_seq"
+          },
+          {
+            "field": "read_index",
+            "op": "eq",
+            "value": null,
+            "reference": "barrier.read_index"
+          },
+          {
+            "field": "strict_application_boundary",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          }
+        ]
+      }
+    ],
+    "legality": {
+      "source_ids": [
+        "S-read-safe-contract",
+        "S-read-contract",
+        "S-ready-read-contract",
+        "S-ready-softstate",
+        "S-stepdown-option",
+        "S-demotion",
+        "S-proposal",
+        "S-singleton",
+        "S-config",
+        "S-read",
+        "S-read-entry",
+        "S-ready",
+        "S-advance",
+        "S-bootstrap",
+        "S-log",
+        "S-response",
+        "S-roles",
+        "S-step",
+        "S-storage-append",
+        "S-heartbeat-producer"
+      ],
+      "expectation_ids": [
+        "S-read-contract",
+        "S-ready-read-contract",
+        "S-ready-softstate",
+        "S-stepdown-option"
+      ],
+      "binding_ids": [
+        "L-singleton-read",
+        "L-demotion-role",
+        "L-read-response"
+      ],
+      "derivation": "Public Bootstrap/Campaign/ProposeConfChange create the prefix; implicit joint demotion and exit complete before isolation. Caller persists and applies every Ready before Advance and checks consecutive application. The only write operation is new; its completion is measured at actual committed/applied index before ReadIndex invocation. ReadState is copied out of Ready by context and retained by the caller; no API requires SoftState consumption or later-term invalidation. Network phases use actual outputs only and may drop data beyond the selected prefix, which is the actual applied index of the newly elected singleton leader before the write. Dropping data while delivering independently generated heartbeat messages is ordinary unreliable network behavior; no local ordering/persistence duty is relaxed.",
+      "applicability": "ReadOnlySafe, default disabled stepdown formal input, retained learner participation and strict application threshold. Pending/no-barrier control produces diagnostics only.",
+      "unresolved": [],
+      "conflicts": [],
+      "alternatives": []
+    }
+  },
+  "monitors": [
+    {
+      "id": "M-demoted-read",
+      "checker_id": "P-demoted-read",
+      "event": "read_completed",
+      "binding_ids": [
+        "L-singleton-read",
+        "L-demotion-role",
+        "L-read-response"
+      ],
+      "grounding": {
+        "source_ids": [
+          "S-read-safe-contract",
+          "S-read-contract",
+          "S-ready-read-contract",
+          "S-ready-softstate",
+          "S-stepdown-option",
+          "S-demotion",
+          "S-proposal",
+          "S-singleton",
+          "S-config",
+          "S-read",
+          "S-read-entry",
+          "S-ready",
+          "S-advance",
+          "S-bootstrap",
+          "S-log",
+          "S-response",
+          "S-roles",
+          "S-step",
+          "S-storage-append",
+          "S-heartbeat-producer"
+        ],
+        "expectation_ids": [
+          "S-read-safe-contract",
+          "S-read-contract",
+          "S-ready-read-contract"
+        ],
+        "binding_ids": [
+          "L-singleton-read",
+          "L-demotion-role",
+          "L-read-response"
+        ],
+        "derivation": "The stable operation and request_ctx identity correlate the actual write completion, later read admission, target-produced barrier and strict application witness. Read result is the caller register value after serving conditions; assertion compares it to written.write_value. Sequence references declare causal predecessors without using a value as identity. There is one write and no overwrite, so a different completed read value contradicts the scoped linearizability requirement. Missing read/barrier/application/result stays unknown, never false or holds.",
+        "applicability": "Independent stepdown=false input; stepdown=true outputs excluded before prerequisite requirements.",
+        "unresolved": [],
+        "conflicts": [],
+        "alternatives": []
+      },
+      "applicability_conditions": [
+        {
+          "field": "stepdown",
+          "op": "eq",
+          "value": false,
+          "reference": null
+        }
+      ],
+      "admission_alias": "admit"
+    }
+  ],
+  "observable_properties": [
+    {
+      "checker_id": "P-demoted-read",
+      "kind": "event_assertion",
+      "trigger": {
+        "field": "stepdown",
+        "op": "eq",
+        "value": false,
+        "reference": null
+      },
+      "assertion": {
+        "field": "observed_value",
+        "op": "eq",
+        "value": null,
+        "reference": "written.write_value"
+      },
+      "antecedent": null,
+      "identity_fields": [
+        "operation",
+        "request_ctx"
+      ],
+      "description": "A completed read admitted after write completion and served after its returned barrier must include the completed write in this one-write register history."
+    }
+  ],
+  "uncertainties": [
+    "Scope is the demonstrated retained-learner, optional-stepdown-false history; other membership and storage modes are not covered.",
+    "Formal applicability and correspondence must be reviewed against actual execution and generated wire events."
+  ]
+}

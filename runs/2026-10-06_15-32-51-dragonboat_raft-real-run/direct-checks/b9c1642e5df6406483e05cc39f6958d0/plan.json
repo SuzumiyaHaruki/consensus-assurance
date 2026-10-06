@@ -1,0 +1,159 @@
+{
+  "description": "Observe remote ReadIndex response context under one later quorum confirmation that releases two distinct-origin requests.",
+  "claim_id": "C-read-response-context",
+  "binding_ids": [
+    "BIND-read-response"
+  ],
+  "harness": {
+    "execution_package": "./internal/raft",
+    "files": {},
+    "kind": "go_test",
+    "source": "package raft\n\nimport (\n    \"encoding/json\"\n    \"fmt\"\n    \"testing\"\n\n    \"github.com/lni/dragonboat/v3/config\"\n    pb \"github.com/lni/dragonboat/v3/raftpb\"\n)\n\n// The driver serializes Peer calls and persists each exported update before\n// delivering its messages. It substitutes a loss-capable transport and an\n// immediate application consumer, without writing any raft protocol fields.\ntype assuranceReadDriver struct {\n    t *testing.T\n    peers map[uint64]*Peer\n    db map[uint64]*TestLogDB\n    applied map[uint64]uint64\n    queue []pb.Message\n    expected map[uint64]pb.SystemCtx\n    active bool\n    seq int\n    term uint64\n    responses map[uint64]int\n    dropped int\n}\n\nfunc assuranceReadEvent(v map[string]interface{}) {\n    b, err := json.Marshal(v)\n    if err != nil { panic(err) }\n    fmt.Println(\"CA_EVENT \" + string(b))\n}\nfunc assuranceReadCtx(c pb.SystemCtx) string { return fmt.Sprintf(\"%d/%d\", c.High, c.Low) }\nfunc assuranceMessageCtx(m pb.Message) pb.SystemCtx { return pb.SystemCtx{High:m.HintHigh, Low:m.Hint} }\n\nfunc (d *assuranceReadDriver) collect(id uint64) {\n    p := d.peers[id]\n    if !p.HasUpdate(true) { return }\n    u := p.GetUpdate(true, d.applied[id])\n    if !pb.IsEmptySnapshot(u.Snapshot) { d.t.Fatal(\"unexpected snapshot\") }\n    if err := d.db[id].Append(u.EntriesToSave); err != nil { d.t.Fatal(err) }\n    if !pb.IsEmptyState(u.State) { d.db[id].SetState(u.State) }\n    // Apply only genuinely committed entries exported by the peer.\n    for _, e := range u.CommittedEntries {\n        if e.Index != d.applied[id]+1 { d.t.Fatalf(\"application gap at %d: %d after %d\", id, e.Index, d.applied[id]) }\n        if e.Type == pb.ConfigChangeEntry {\n            var cc pb.ConfigChange\n            if err := cc.Unmarshal(e.Cmd); err != nil { d.t.Fatal(err) }\n            p.ApplyConfigChange(cc)\n        }\n        d.applied[id] = e.Index\n    }\n    p.NotifyRaftLastApplied(d.applied[id])\n    for _, ready := range u.ReadyToReads {\n        assuranceReadEvent(map[string]interface{}{\"event\":\"origin_ready\", \"scenario\":\"prefix_release\", \"origin\":id, \"context\":assuranceReadCtx(ready.SystemCtx), \"index\":ready.Index, \"applied\":d.applied[id]})\n    }\n    for _, m := range u.Messages {\n        d.seq++\n        drop := d.active && m.Type == pb.Heartbeat && assuranceMessageCtx(m) == d.expected[2]\n        if d.active {\n            assuranceReadEvent(map[string]interface{}{\"event\":\"transport\", \"seq\":d.seq, \"type\":m.Type.String(), \"from\":m.From, \"to\":m.To, \"term\":m.Term, \"context\":assuranceReadCtx(assuranceMessageCtx(m)), \"drop\":drop})\n        }\n        if drop { d.dropped++; continue }\n        if d.active && m.Type == pb.ReadIndexResp {\n            d.responses[m.To]++\n            assuranceReadEvent(map[string]interface{}{\"event\":\"read_response\", \"scenario\":\"prefix_release\", \"origin\":m.To, \"context\":assuranceReadCtx(assuranceMessageCtx(m)), \"index\":m.LogIndex, \"term\":m.Term, \"from\":m.From})\n        }\n        // FIFO for all retained messages; the selected heartbeat loss is the\n        // only fault after the preparation traffic has drained.\n        d.queue = append(d.queue, m)\n    }\n    p.Commit(u)\n}\n\nfunc (d *assuranceReadDriver) pump() {\n    for step:=0; len(d.queue)>0; step++ {\n        if step >= 1000 { d.t.Fatal(\"driver did not drain\") }\n        m := d.queue[0]\n        d.queue = d.queue[1:]\n        p := d.peers[m.To]\n        if p == nil { d.t.Fatalf(\"unknown destination %d\",m.To) }\n        p.Handle(m)\n        if d.active && m.To == 1 && m.Type == pb.ReadIndex {\n            input, ok := d.expected[m.From]\n            s, exists := p.raft.readIndex.pending[input]\n            if !ok || !exists || s.from != m.From || s.ctx != input || p.raft.term != d.term || !p.raft.hasCommittedEntryAtCurrentTerm() {\n                d.t.Fatal(\"read admission premise not attained\")\n            }\n            assuranceReadEvent(map[string]interface{}{\"event\":\"read_admitted\", \"scenario\":\"prefix_release\", \"origin\":m.From, \"context\":assuranceReadCtx(input), \"index\":s.index, \"term\":p.raft.term, \"leader\":p.raft.nodeID, \"quorum\":p.raft.quorum()})\n        }\n        d.collect(m.To)\n    }\n}\n\nfunc TestAssuranceRemoteReadContextPrefix(t *testing.T) {\n    d := &assuranceReadDriver{t:t, peers:map[uint64]*Peer{}, db:map[uint64]*TestLogDB{}, applied:map[uint64]uint64{}, expected:map[uint64]pb.SystemCtx{2:{High:30,Low:101},3:{High:30,Low:202}}, responses:map[uint64]int{}}\n    addresses := []PeerAddress{{NodeID:1,Address:\"node1\"},{NodeID:2,Address:\"node2\"},{NodeID:3,Address:\"node3\"}}\n    for id:=uint64(1); id<=3; id++ {\n        db := NewTestLogDB().(*TestLogDB)\n        d.db[id] = db\n        cfg := config.Config{ClusterID:1,NodeID:id,ElectionRTT:10,HeartbeatRTT:1,CheckQuorum:true}\n        d.peers[id] = Launch(cfg,db,nil,addresses,true,true)\n        d.collect(id)\n    }\n    d.pump()\n    // Tick only node 1 until a real election completes; all vote requests and\n    // responses are generated by peers and passed through Peer.Handle.\n    for i:=0; i<30 && !d.peers[1].raft.isLeader(); i++ {\n        d.peers[1].Tick(); d.collect(1); d.pump()\n    }\n    leader := d.peers[1].raft\n    if !leader.isLeader() || !leader.hasCommittedEntryAtCurrentTerm() { t.Fatal(\"leader/current-term commit not attained\") }\n    d.term = leader.term\n    for id:=uint64(1); id<=3; id++ {\n        r := d.peers[id].raft\n        if r.term != d.term || r.leaderID != 1 || r.log.committed != leader.log.committed || d.applied[id] != leader.log.committed {\n            t.Fatalf(\"preparation did not converge on node %d\",id)\n        }\n    }\n    for _, origin := range []uint64{2,3} {\n        assuranceReadEvent(map[string]interface{}{\"event\":\"prepared\", \"scenario\":\"prefix_release\", \"origin\":origin, \"leader\":uint64(1), \"term\":d.term, \"commit\":leader.log.committed, \"voters\":3, \"fault_policy\":\"drop_first_context_heartbeats\", \"queue_length\":len(d.queue)})\n    }\n    d.active=true\n    d.peers[2].ReadIndex(d.expected[2]); d.collect(2); d.pump()\n    if len(leader.readIndex.pending)!=1 || d.dropped!=2 { t.Fatal(\"first pending context or heartbeat loss not attained\") }\n    d.peers[3].ReadIndex(d.expected[3]); d.collect(3); d.pump()\n    // These are measurements, not assertions of the property under test.\n    assuranceReadEvent(map[string]interface{}{\"event\":\"drained\", \"scenario\":\"prefix_release\", \"remaining_pending\":len(leader.readIndex.pending), \"queue_length\":len(d.queue), \"responses_origin2\":d.responses[2], \"responses_origin3\":d.responses[3], \"term\":leader.term})\n}\n",
+    "description": "TestAssuranceRemoteReadContextPrefix uses captured Peer and TestLogDB with generated election and read traffic. One origin identifies one operation independently of the compared context. Preparation observations carry the independent origin identity for each admitted operation; the same actual prepared cluster supports both.",
+    "semantic_changes": [],
+    "prerequisites": [
+      {
+        "alias": "setup",
+        "event": "prepared",
+        "conditions": [
+          {
+            "field": "fault_policy",
+            "op": "eq",
+            "value": "drop_first_context_heartbeats",
+            "reference": null
+          },
+          {
+            "field": "voters",
+            "op": "eq",
+            "value": 3,
+            "reference": null
+          },
+          {
+            "field": "queue_length",
+            "op": "eq",
+            "value": 0,
+            "reference": null
+          }
+        ]
+      },
+      {
+        "alias": "admitted",
+        "event": "read_admitted",
+        "conditions": [
+          {
+            "field": "scenario",
+            "op": "eq",
+            "value": null,
+            "reference": "setup.scenario"
+          },
+          {
+            "field": "term",
+            "op": "eq",
+            "value": null,
+            "reference": "setup.term"
+          }
+        ]
+      }
+    ],
+    "legality": {
+      "source_ids": [
+        "M-peer",
+        "M-update",
+        "M-updatecommit",
+        "M-bootstrap",
+        "M-testlogdb",
+        "M-engine",
+        "M-lossdriver",
+        "M-transitions",
+        "M-term",
+        "M-read",
+        "M-readqueue",
+        "M-confirm",
+        "M-batches"
+      ],
+      "expectation_ids": [
+        "M-prefixexpect",
+        "M-readyexpect"
+      ],
+      "binding_ids": [
+        "BIND-read-response"
+      ],
+      "derivation": "Launch three real peers with bootstrap membership. Driver reads exported updates, appends entries/sets state in captured TestLogDB, applies committed configuration entries and applied watermark, then commits update before FIFO delivery. Tick node 1 until real election/replication yields current-term commitment and all three peers applied that prefix. Invoke public Peer.ReadIndex at origins 2 and 3 with distinct valid contexts. Generated forwarding reaches leader through Peer.Handle. Drop exactly context A heartbeats to both voters; no reply is fabricated or reordered. Later context B heartbeats are delivered; real responses cause prefix confirmation. Exported ReadIndexResp observed before delivery, then delivered to origin. Whole driver is synchronous: the same goroutine owns protocol, storage adapter, queue, counters and observations. No target state mutation, sleeps, waiters or shutdown sampling. Preparation checks abort rather than emit admission if unachieved.",
+      "applicability": "Finite loss schedule with FIFO retained messages; same term, three full voters, distinct origin per request. In-memory TestLogDB substitutes storage without crash claims; immediate application implements caller duty for genuinely committed entries.",
+      "unresolved": [
+        "Public NodeHost client timeout and endpoint behavior remain outside this local response obligation."
+      ],
+      "conflicts": [],
+      "alternatives": [
+        "Reliable delivery of the first heartbeat can release it alone and would not exercise the selected prefix premise."
+      ]
+    }
+  },
+  "monitors": [
+    {
+      "id": "MON-read-response",
+      "checker_id": "CHK-read-context",
+      "event": "read_response",
+      "binding_ids": [
+        "BIND-read-response"
+      ],
+      "grounding": {
+        "source_ids": [
+          "M-confirm",
+          "M-batches",
+          "M-readqueue"
+        ],
+        "expectation_ids": [
+          "M-prefixexpect",
+          "M-readyexpect"
+        ],
+        "binding_ids": [
+          "BIND-read-response"
+        ],
+        "derivation": "Compare full High/Low SystemCtx string from actual emitted ReadIndexResp to independently recorded input context at admission. Correlate by scenario and origin, not context. Two distinct origins each have one operation; result emission depends on actual output message, never expected data.",
+        "applicability": "Result to a uniquely admitted remote origin in the fixed stable-term scenario.",
+        "unresolved": [
+          "Does not check index/value correctness or client completion."
+        ],
+        "conflicts": [],
+        "alternatives": []
+      },
+      "applicability_conditions": [
+        {
+          "field": "scenario",
+          "op": "eq",
+          "value": "prefix_release",
+          "reference": null
+        }
+      ],
+      "admission_alias": "admitted"
+    }
+  ],
+  "observable_properties": [
+    {
+      "checker_id": "CHK-read-context",
+      "kind": "event_assertion",
+      "trigger": {
+        "field": "event",
+        "op": "eq",
+        "value": "read_response",
+        "reference": null
+      },
+      "assertion": {
+        "field": "context",
+        "op": "eq",
+        "value": null,
+        "reference": "admitted.context"
+      },
+      "antecedent": null,
+      "identity_fields": [
+        "scenario",
+        "origin"
+      ],
+      "description": "Every emitted response for the uniquely admitted origin preserves that operation full context. Missing response is not observed false; it remains incomplete."
+    }
+  ],
+  "uncertainties": [
+    "Scoped local output boundary only; node-layer exact-context batch lookup establishes relevance but client timeout is not measured."
+  ]
+}

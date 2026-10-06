@@ -1,0 +1,155 @@
+{
+  "description": "Prepare a three-node group under node 1; move node 1 into the runtime actor. Isolate its generated acceptance of notify value 42. Nodes 2 and 3 acquire a newer ballot and decide 99 at slot 1. Restore node 1 through actual preparation and synchronization before its first five-second tick, then observe its pending result and decided content.",
+  "claim_id": "claim_notify_identity",
+  "binding_ids": [
+    "bind_notify_drain"
+  ],
+  "harness": {
+    "execution_package": "./omnipaxos_runtime",
+    "files": {},
+    "kind": "rust_test",
+    "source": "use std::{future::Future, time::{Duration, Instant}};\nuse omnipaxos::{ClusterConfig, OmniPaxos, OmniPaxosConfig, ServerConfig};\nuse omnipaxos::messages::{Message, sequence_paxos::PaxosMsg};\nuse omnipaxos::storage::{Entry, Snapshot};\nuse omnipaxos::util::LogEntry;\nuse omnipaxos_storage::memory_storage::MemoryStorage;\nuse omnipaxos_runtime::{spawn_actor, AsyncRuntime, RuntimeConfig};\n#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)] struct V(u64);\n#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)] struct NoSnap;\nimpl Entry for V {type Snapshot=NoSnap;}\nimpl Snapshot<V> for NoSnap {\n fn create(_: &[V])->Self{NoSnap} fn merge(&mut self,_:Self){} fn use_snapshots()->bool{false}\n}\nstruct Rt;\nimpl AsyncRuntime for Rt {\n type JoinHandle=tokio::task::JoinHandle<()>;\n fn spawn<F:Future<Output=()>+Send+'static>(f:F)->Self::JoinHandle{tokio::spawn(f)}\n fn sleep(d:Duration)->impl Future<Output=()>+Send+'static{tokio::time::sleep(d)}\n}\ntype N=OmniPaxos<V,MemoryStorage<V>>;\nfn pump(nodes:&mut [N], isolate_one:bool){\n for _ in 0..100 {\n  let mut messages=vec![];\n  for n in nodes.iter_mut(){n.take_outgoing_messages(&mut messages);}\n  if messages.is_empty(){return;}\n  for m in messages {\n   let from=m.get_sender();let to=m.get_receiver();\n   let drop=isolate_one&&(from==1||to==1);\n   println!(\"TRACE from={} to={} dropped={} {:?}\",from,to,drop,m);\n   if !drop {nodes[(to-1)as usize].handle_incoming(m);}\n  }\n }\n panic!(\"delivery bound\");\n}\n#[tokio::test(flavor=\"current_thread\")]\nasync fn notify_does_not_confirm_replacement(){\n let mut nodes:Vec<N>=(1..=3).map(|pid|OmniPaxosConfig{\n  cluster_config:ClusterConfig{configuration_id:1,nodes:vec![1,2,3],..Default::default()},\n  server_config:ServerConfig{pid,batch_size:1,..Default::default()},\n }.build(MemoryStorage::default()).unwrap()).collect();\n nodes[0].try_become_leader();pump(&mut nodes,false);\n for n in &nodes{assert_eq!(n.get_current_leader(),Some((1,true)));assert_eq!(n.get_decided_idx(),0);}\n // Keep the vector indexed by node id while moving the real node 1 into its actor.\n let placeholder=OmniPaxosConfig{cluster_config:ClusterConfig{configuration_id:1,nodes:vec![1,2,3],..Default::default()},server_config:ServerConfig{pid:1,..Default::default()}}.build(MemoryStorage::default()).unwrap();\n let old=std::mem::replace(&mut nodes[0],placeholder);\n // The unused placeholder is never delivered protocol traffic; discard its startup output.\n let mut discard=vec![];nodes[0].take_outgoing_messages(&mut discard);\n let old_ballot=old.get_promise();\n let start=Instant::now();\n let h=spawn_actor::<V,MemoryStorage<V>,Rt>(old,RuntimeConfig{tick_period:Duration::from_secs(5),egress_period:Duration::from_millis(1),append_notify_timeout:Duration::from_secs(20),..Default::default()});\n let out=h.outgoing_messages();\n let nh=h.clone();let notify=tokio::spawn(async move{nh.append_notify(V(42)).await});\n // Isolate old leader's outgoing acceptance. Its two real messages establish admission.\n let mut rejected=0;\n while rejected<2 {\n  let m=tokio::time::timeout(Duration::from_secs(2),out.recv()).await.unwrap().unwrap();\n  println!(\"TRACE isolated {:?}\",m);\n  if let Message::SequencePaxos(p)=&m {if let PaxosMsg::AcceptDecide(a)=&p.msg {assert_eq!(a.entries.len(),1);assert_eq!(a.entries[0].0,42);rejected+=1;}}\n }\n assert!(!notify.is_finished());\n println!(\"CA_EVENT {{\\\"event\\\":\\\"notify_admitted\\\",\\\"case\\\":\\\"replacement_before_drain\\\",\\\"operation\\\":1,\\\"proposed\\\":42,\\\"old_ballot_n\\\":{},\\\"isolated_accept_messages\\\":{}}}\",old_ballot.n,rejected);\n // Nodes 2 and 3 have never received 42. Form a new quorum and decide 99 at slot 1.\n nodes[1].try_become_leader();pump(&mut nodes,true);\n assert_eq!(nodes[1].get_current_leader(),Some((2,true)));\n nodes[1].append(V(99)).unwrap();pump(&mut nodes,true);\n assert_eq!(nodes[1].get_decided_idx(),1);assert_eq!(nodes[2].get_decided_idx(),1);\n let new_ballot=nodes[1].get_promise();assert!(new_ballot>old_ballot);\n // Restore the connection. Core 2 and actor 1 each receive the appropriate callback.\n nodes[1].reconnected(1);h.reconnected(2).await;\n let mut synced=false;\n for _ in 0..20 {\n  let mut messages=vec![];\n  nodes[1].take_outgoing_messages(&mut messages);nodes[2].take_outgoing_messages(&mut messages);\n  for m in messages {\n   let to=m.get_receiver();println!(\"TRACE restored {:?}\",m);\n   if to==1 {h.handle_incoming(m).await;}else{nodes[(to-1)as usize].handle_incoming(m);}\n  }\n  // This command is processed after the already-enqueued incoming messages.\n  if h.decided_idx().await==1 {synced=true;break;}\n  let m=tokio::time::timeout(Duration::from_secs(2),out.recv()).await.unwrap().unwrap();\n  println!(\"TRACE actor {:?}\",m);\n  let to=m.get_receiver();nodes[(to-1)as usize].handle_incoming(m);\n }\n assert!(synced);assert_eq!(h.current_leader().await,Some((2,true)));\n let read=h.read_decided_suffix(0).await.unwrap();\n assert_eq!(read.len(),1);let replacement=match &read[0]{LogEntry::Decided(v)=>v.0,_=>panic!(\"expected decided replacement\")};assert_eq!(replacement,99);\n assert!(start.elapsed()<Duration::from_secs(4),\"Setup must complete before first five-second tick\");\n println!(\"CA_EVENT {{\\\"event\\\":\\\"replacement_observed\\\",\\\"case\\\":\\\"replacement_before_drain\\\",\\\"operation\\\":1,\\\"new_ballot_n\\\":{},\\\"decided\\\":1,\\\"replacement\\\":{},\\\"setup_ms\\\":{}}}\",new_ballot.n,replacement,start.elapsed().as_millis());\n let result=tokio::time::timeout(Duration::from_secs(7),notify).await.expect(\"missing operation completion\").unwrap();\n let (success,idx)=match &result{Ok(idx)=>(true,*idx),Err(_)=>(false,0)};\n let final_read=h.read_decided_suffix(0).await.unwrap();\n let at_slot=if success {match final_read.get(idx-1){Some(LogEntry::Decided(v))=>v.0,_=>panic!(\"successful index has no decided content\")}}else{replacement};\n println!(\"CA_EVENT {{\\\"event\\\":\\\"notify_result\\\",\\\"case\\\":\\\"replacement_before_drain\\\",\\\"operation\\\":1,\\\"completed\\\":true,\\\"success\\\":{},\\\"index\\\":{},\\\"content_at_index\\\":{}}}\",success,idx,at_slot);\n println!(\"TRACE notification {:?}\",result);\n drop(out);drop(h);\n}\n",
+    "description": "Mixed public-API actor/core driver with conforming Tokio AsyncRuntime adapter. Real five-second timer permits construction before notifier polling.",
+    "semantic_changes": [
+      "No target modifications. Custom AsyncRuntime uses tokio::spawn and tokio::time::sleep without altered time.",
+      "Other two replicas are driven synchronously through core APIs. An unused node-1 placeholder preserves vector indexing and never receives protocol traffic."
+    ],
+    "prerequisites": [
+      {
+        "alias": "admitted",
+        "event": "notify_admitted",
+        "conditions": [
+          {
+            "field": "isolated_accept_messages",
+            "op": "eq",
+            "value": 2,
+            "reference": null
+          }
+        ]
+      },
+      {
+        "alias": "replacement",
+        "event": "replacement_observed",
+        "conditions": [
+          {
+            "field": "operation",
+            "op": "eq",
+            "value": null,
+            "reference": "admitted.operation"
+          },
+          {
+            "field": "decided",
+            "op": "eq",
+            "value": 1,
+            "reference": null
+          },
+          {
+            "field": "replacement",
+            "op": "eq",
+            "value": 99,
+            "reference": null
+          }
+        ]
+      }
+    ],
+    "legality": {
+      "source_ids": [
+        "s_runtime_drain",
+        "s_runtime_assign",
+        "s_runtime_pending",
+        "s_runtime_track",
+        "s_runtime_commands",
+        "s_follower",
+        "s_leader_decision",
+        "s_api"
+      ],
+      "expectation_ids": [
+        "s_notify_contract",
+        "s_superseded_contract",
+        "s_superseded_test"
+      ],
+      "binding_ids": [
+        "bind_notify_drain"
+      ],
+      "derivation": "Initial public prepare completes before actor ownership transfer. Admission is witnessed by two generated AcceptDecide messages for 42; neither reaches peers. The new quorum excludes the old leader, then a restored PrepareReq/Prepare/Promise/AcceptSync exchange replaces its log with actual decided 99. Incoming queue dispatch precedes following read commands because run prioritizes incoming over commands; read returns actual decided state. Setup asserts completion before the first five-second timer, but does not require any principal result. Timeout bounds missing completion rather than claiming a deadline violation. Event channel capacity exceeds generated state changes and needs no independent consumer for this finite run.",
+      "applicability": "One actor owning a locally assigned notify call; two other core replicas; non-Byzantine three-node configuration, no snapshots, default MemoryStorage, public API transport and a real Tokio timer.",
+      "unresolved": [],
+      "conflicts": [],
+      "alternatives": [
+        "A changed ballot alone does not prove value loss: a new leader may adopt the entry. This check instead establishes an actual different decided value at the returned position."
+      ]
+    }
+  },
+  "monitors": [
+    {
+      "id": "monitor_notify_identity",
+      "checker_id": "check_notify_identity",
+      "event": "notify_result",
+      "binding_ids": [
+        "bind_notify_drain"
+      ],
+      "grounding": {
+        "source_ids": [
+          "s_runtime_drain",
+          "s_runtime_assign",
+          "s_runtime_pending",
+          "s_runtime_track",
+          "s_runtime_commands",
+          "s_follower",
+          "s_leader_decision",
+          "s_api"
+        ],
+        "expectation_ids": [
+          "s_notify_contract",
+          "s_superseded_contract",
+          "s_superseded_test"
+        ],
+        "binding_ids": [
+          "bind_notify_drain"
+        ],
+        "derivation": "One operation identity is declared before the result. The observed replacement prerequisite independently establishes a different decided entry before the notifier tick. For an actual successful result, read_decided_suffix returns the content at returned index minus one, following the runtime index convention demonstrated by the existing test.",
+        "applicability": "One actor owning a locally assigned notify call; two other core replicas; non-Byzantine three-node configuration, no snapshots, default MemoryStorage, public API transport and a real Tokio timer.",
+        "unresolved": [],
+        "conflicts": [],
+        "alternatives": [
+          "A changed ballot alone does not prove value loss: a new leader may adopt the entry. This check instead establishes an actual different decided value at the returned position."
+        ]
+      },
+      "applicability_conditions": [],
+      "admission_alias": "admitted"
+    }
+  ],
+  "observable_properties": [
+    {
+      "checker_id": "check_notify_identity",
+      "kind": "event_implication",
+      "trigger": {
+        "field": "completed",
+        "op": "eq",
+        "value": true,
+        "reference": null
+      },
+      "assertion": {
+        "field": "content_at_index",
+        "op": "eq",
+        "value": null,
+        "reference": "admitted.proposed"
+      },
+      "antecedent": {
+        "field": "success",
+        "op": "eq",
+        "value": true,
+        "reference": null
+      },
+      "identity_fields": [
+        "case",
+        "operation"
+      ],
+      "description": "If the notify call succeeds, its returned index must contain its submitted value; observed non-success is bounded holds and does not prove universal notifier correctness."
+    }
+  ],
+  "uncertainties": [
+    "First runtime-package compilation is not yet prepared; build failure is not protocol evidence.",
+    "One schedule tests the local unbatched assignment path; remote assignment and batching are separate contexts."
+  ]
+}

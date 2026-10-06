@@ -1,0 +1,231 @@
+{
+  "description": "Fixed three-node implicit removal of voter 3, admitted while leader 1 remains in both voter sets. Application of the joint entry overlaps TransferLeader(2) before its Advance. Drop emitted TimeoutNow during that initial drain only, then restore reliable FIFO delivery. Tick every node and process all Ready work. Compare complete structural states after 20 and 30 ticks and record the intervening heartbeat-only schedule; 10 ticks is a proposed cycle length, not a completion deadline.",
+  "claim_id": "C-autoleave-continuation",
+  "binding_ids": [
+    "L-autoleave",
+    "L-transfer-timeout",
+    "L-advance"
+  ],
+  "harness": {
+    "execution_package": ".",
+    "files": {},
+    "kind": "go_test",
+    "source": "package raft\n\nimport (\n \"encoding/json\"\n \"fmt\"\n \"testing\"\n \"reflect\"\n \"sort\"\n \"strconv\"\n pb \"go.etcd.io/raft/v3/raftpb\"\n)\n\n// This driver uses actual RawNode outputs and a single FIFO delivery queue.\n// Storage and application work finish synchronously before Advance.\nfunc TestAssuranceAutoLeaveTransferCheck(t *testing.T) {\n if StateTraceDeployed {t.Fatal(\"check requires default no-tracing build\")}\n for _, overlap := range []bool{false, true} {\n  t.Run(fmt.Sprint(overlap), func(t *testing.T) {\n   nodes := map[uint64]*RawNode{}\n   stores := map[uint64]*MemoryStorage{}\n   for id:=uint64(1); id<=3; id++ {\n    st:=NewMemoryStorage()\n    rn,err:=NewRawNode(&Config{ID:id, ElectionTick:10, HeartbeatTick:1, Storage:st, MaxSizePerMsg:4096, MaxInflightMsgs:256, CheckQuorum:true, PreVote:true})\n    if err!=nil {t.Fatal(err)}\n    if err=rn.Bootstrap([]Peer{{ID:1},{ID:2},{ID:3}});err!=nil {t.Fatal(err)}\n    nodes[id]=rn;stores[id]=st\n   }\n   var queue []pb.Message\n   hooked:=false\n   dropped:=0\n   dropTransfer:=overlap\n   cycleActive:=false\n   cycleMessages:=map[string]int{}\n   cycleOnlyHeartbeats:=true\n   cycleAllJoint:=true\n   changeIndex:=uint64(0)\n   emit:=func(stage string) {\n    r:=nodes[1].raft\n    event:=map[string]interface{}{\"event\":stage,\"operation\":\"implicit-remove-3\", \"overlap\":overlap,\"term\":r.Term,\"role\":r.state.String(),\"applied\":r.raftLog.applied,\"committed\":r.raftLog.committed,\"last\":r.raftLog.lastIndex(),\"auto_leave\":r.trk.Config.AutoLeave,\"outgoing\":r.trk.Config.Voters[1].Slice(),\"incoming\":r.trk.Config.Voters[0].Slice(),\"transferee\":r.leadTransferee,\"pending_conf\":r.pendingConfIndex,\"change_index\":changeIndex,\"original_committed\":changeIndex>0 && r.raftLog.committed>=changeIndex,\"original_applied\":changeIndex>0 && r.raftLog.applied>=changeIndex,\"dropped_timeout_now\":dropped,\"queue_length\":len(queue),\"ready\":nodes[1].HasReady()}\n    data,err:=json.Marshal(event);if err!=nil {t.Fatal(err)}\n    fmt.Println(\"CA_EVENT \"+string(data))\n   }\n   pump:=func() {\n    for round:=0;round<1000;round++ {\n     progressed:=false\n     for id:=uint64(1);id<=3;id++ {\n      rn:=nodes[id];st:=stores[id]\n      if !rn.HasReady(){continue};progressed=true\n      rd:=rn.Ready()\n      if !IsEmptySnap(rd.Snapshot) {if err:=st.ApplySnapshot(rd.Snapshot);err!=nil {t.Fatal(err)}}\n      if err:=st.Append(rd.Entries);err!=nil {t.Fatal(err)}\n      if !IsEmptyHardState(rd.HardState) {if err:=st.SetHardState(rd.HardState);err!=nil {t.Fatal(err)}}\n      queue=append(queue,rd.Messages...)\n      for _,ent:=range rd.CommittedEntries {\n       switch ent.Type {\n       case pb.EntryConfChange:\n        var cc pb.ConfChange;if err:=cc.Unmarshal(ent.Data);err!=nil {t.Fatal(err)};rn.ApplyConfChange(cc)\n       case pb.EntryConfChangeV2:\n        var cc pb.ConfChangeV2;if err:=cc.Unmarshal(ent.Data);err!=nil {t.Fatal(err)};cs:=rn.ApplyConfChange(cc)\n        if id==1 && cs.AutoLeave && !hooked {\n         changeIndex=ent.Index;hooked=true\n         if overlap {rn.TransferLeader(2)}\n         emit(\"joint_applied_before_advance\")\n        }\n       }\n      }\n      rn.Advance(rd)\n     }\n     if len(queue)>0 {\n      m:=queue[0];queue=queue[1:];progressed=true\n      // This is a network loss policy, never a fabricated response.\n      if cycleActive {\n       cycleMessages[m.Type.String()]++\n       if m.Type!=pb.MsgHeartbeat && m.Type!=pb.MsgHeartbeatResp {cycleOnlyHeartbeats=false}\n      }\n      if dropTransfer && m.Type==pb.MsgTimeoutNow {dropped++} else if target:=nodes[m.To];target!=nil {\n       err:=target.Step(m)\n       // Removed peers may still have previously emitted responses in flight.\n       if err!=nil && err!=ErrStepPeerNotFound {t.Fatal(err)}\n      } else {t.Fatalf(\"unknown target %d\",m.To)}\n     }\n     if cycleActive {\n      for id:=uint64(1);id<=3;id++ {\n       r:=nodes[id].raft\n       if !r.trk.Config.AutoLeave || len(r.trk.Config.Voters[1])==0 {cycleAllJoint=false}\n      }\n     }\n     if !progressed {return}\n    }\n    t.Fatal(\"driver pump did not quiesce\")\n   }\n   pump()\n   if err:=nodes[1].Campaign();err!=nil {t.Fatal(err)};pump()\n   if nodes[1].raft.state!=StateLeader || nodes[1].raft.raftLog.applied!=nodes[1].raft.raftLog.lastIndex(){t.Fatal(\"initial election/application incomplete\")}\n   cc:=pb.ConfChangeV2{Transition:pb.ConfChangeTransitionJointImplicit, Changes:[]pb.ConfChangeSingle{{Type:pb.ConfChangeRemoveNode,NodeID:3}}}\n   if err:=nodes[1].ProposeConfChange(cc);err!=nil {t.Fatal(err)};pump()\n   if !hooked {t.Fatal(\"joint entry was not applied\")}\n   emit(\"after_joint_drain\")\n   // The only network fault is over. The measured suffix is fully reliable.\n   dropTransfer=false\n   var first,second string\n   for tick:=0;tick<30;tick++ {\n    for id:=uint64(1);id<=3;id++ {nodes[id].Tick()}\n    pump()\n    if tick==9 {emit(\"after_transfer_timeout\")}\n    if tick==19 && overlap {\n     first=assuranceState(t,nodes,queue)\n     cycleActive=true\n     fmt.Println(\"CA_EVENT \"+assuranceJSON(t,map[string]interface{}{\"event\":\"cycle_start\",\"operation\":\"implicit-remove-3\",\"overlap\":overlap,\"state\":first}))\n    }\n   }\n   emit(\"after_30_ticks\")\n   if overlap {\n    second=assuranceState(t,nodes,queue)\n    fmt.Println(\"CA_EVENT \"+assuranceJSON(t,map[string]interface{}{\"event\":\"cycle_end\",\"operation\":\"implicit-remove-3\",\"overlap\":overlap,\"state\":second}))\n    r:=nodes[1].raft\n    drained:=len(queue)==0\n    for _,rn:=range nodes {drained=drained && !rn.HasReady() && len(rn.stepsOnAdvance)==0}\n    recurrence:=first==second\n    completed:=!r.trk.Config.AutoLeave && len(r.trk.Config.Voters[1])==0\n    repeatable:=recurrence && cycleOnlyHeartbeats && cycleAllJoint && drained && r.leadTransferee==None && r.state==StateLeader && r.raftLog.applied==r.raftLog.lastIndex()\n    result:=map[string]interface{}{\"event\":\"cycle_diagnostic\",\"operation\":\"implicit-remove-3\",\"overlap\":overlap,\"state_equal\":recurrence,\"only_heartbeats\":cycleOnlyHeartbeats,\"joint_throughout\":cycleAllJoint,\"drained\":drained,\"completed\":completed,\"cycle_messages\":cycleMessages,\"dropped_timeout_now\":dropped,\"change_index\":changeIndex,\"term\":r.Term,\"last\":r.raftLog.lastIndex(),\"applied\":r.raftLog.applied,\"transferee\":r.leadTransferee,\"forbidden_cycle\":repeatable}\n    // An unequal state with no completion is inconclusive, not a passing check.\n    if completed || repeatable {result[\"event\"]=\"continuation_result\"}\n    fmt.Println(\"CA_EVENT \"+assuranceJSON(t,result))\n    cycleActive=false\n    if err:=nodes[1].Propose([]byte(\"diagnostic continuation stimulus\"));err!=nil {t.Fatal(err)};pump()\n    emit(\"after_new_proposal\")\n   }\n  })\n }\n}\n\nfunc assuranceJSON(t *testing.T, value interface{}) string {\n t.Helper(); b,err:=json.Marshal(value);if err!=nil {t.Fatal(err)};return string(b)\n}\n\n// Read-only structural snapshots include all RawNode/raft/log/storage/progress\n// fields, timers, buffers, saved Ready responses, and transport queue contents.\n// The only omitted fields are logger sinks and MemoryStorage call statistics.\n// These snapshots are compared directly: there is no digest or saved baseline.\nfunc assuranceState(t *testing.T, nodes map[uint64]*RawNode, queue []pb.Message) string {\n state:=map[string]interface{}{}\n for id:=uint64(1);id<=3;id++ {state[strconv.FormatUint(id,10)]=assuranceValue(t,reflect.ValueOf(nodes[id]))}\n state[\"network\"]=assuranceValue(t,reflect.ValueOf(queue))\n return assuranceJSON(t,state)\n}\n\nfunc assuranceValue(t *testing.T,v reflect.Value) interface{} {\n t.Helper()\n if !v.IsValid(){return nil}\n typ:=v.Type()\n switch v.Kind() {\n case reflect.Interface,reflect.Ptr:\n  if v.IsNil(){return map[string]interface{}{\"type\":typ.String(),\"nil\":true}}\n  return map[string]interface{}{\"type\":typ.String(),\"value\":assuranceValue(t,v.Elem())}\n case reflect.Struct:\n  fields:=map[string]interface{}{}\n  for i:=0;i<v.NumField();i++ {\n   name:=typ.Field(i).Name\n   if (typ.Name()==\"raft\" && (name==\"logger\" || name==\"traceLogger\")) || ((typ.Name()==\"raftLog\" || typ.Name()==\"unstable\") && name==\"logger\") || (typ.Name()==\"MemoryStorage\" && name==\"callStats\") {continue}\n   fields[name]=assuranceValue(t,v.Field(i))\n  }\n  return map[string]interface{}{\"type\":typ.String(),\"fields\":fields}\n case reflect.Map:\n  if v.IsNil(){return map[string]interface{}{\"type\":typ.String(),\"nil\":true}}\n  pairs:=[]string{}\n  for _,k:=range v.MapKeys(){pairs=append(pairs,assuranceJSON(t,[]interface{}{assuranceValue(t,k),assuranceValue(t,v.MapIndex(k))}))}\n  sort.Strings(pairs)\n  return map[string]interface{}{\"type\":typ.String(),\"pairs\":pairs}\n case reflect.Slice,reflect.Array:\n  values:=[]interface{}{}\n  for i:=0;i<v.Len();i++ {values=append(values,assuranceValue(t,v.Index(i)))}\n  result:=map[string]interface{}{\"type\":typ.String(),\"values\":values}\n  if v.Kind()==reflect.Slice {result[\"nil\"]=v.IsNil();result[\"capacity\"]=v.Cap()}\n  return result\n case reflect.Bool:return v.Bool()\n case reflect.String:return v.String()\n case reflect.Int,reflect.Int8,reflect.Int16,reflect.Int32,reflect.Int64:return v.Int()\n case reflect.Uint,reflect.Uint8,reflect.Uint16,reflect.Uint32,reflect.Uint64,reflect.Uintptr:return v.Uint()\n case reflect.Func:\n  // Function code identity is compared within this execution. Receiver state\n  // is serialized above; no callback replacement occurs in the suffix.\n  return map[string]interface{}{\"type\":typ.String(),\"function\":v.Pointer()}\n default:t.Fatalf(\"unsupported state kind %v of %v\",v.Kind(),typ);return nil\n }\n}\n",
+    "description": "Construct real RawNodes and MemoryStorage using Bootstrap, persist every Ready before sending messages, apply all committed configuration entries in order and Advance. The hook runs between ApplyConfChange of the committed implicit entry and Advance of that same Ready. Read-only reflection snapshots record current complete reachable protocol data, including mutex fields, unstable work, Ready completion responses, timers, function identities and capacities, omitting only diagnostic storage counters and logger sinks. No target mutation or fabricated reply. Fixed no-transfer control and post-result rescue retain contrary evidence.",
+    "semantic_changes": [
+      "Transport is a deterministic FIFO simulated network with one policy-selected loss of the transfer TimeoutNow; after the initial drain every generated message is delivered.",
+      "MemoryStorage supplies synchronous stable-storage semantics without simulating crashes; no source or protocol state is rewritten.",
+      "All RawNode calls, storage changes, message delivery and sampling occur on the test goroutine.",
+      "Read-only structural snapshot traversal excludes only raft/raftLog/unstable logger sinks, raft.traceLogger, and MemoryStorage.callStats."
+    ],
+    "prerequisites": [
+      {
+        "alias": "admit",
+        "event": "joint_applied_before_advance",
+        "conditions": [
+          {
+            "field": "overlap",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          },
+          {
+            "field": "auto_leave",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          },
+          {
+            "field": "transferee",
+            "op": "eq",
+            "value": 2,
+            "reference": null
+          },
+          {
+            "field": "original_committed",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          }
+        ]
+      },
+      {
+        "alias": "settled",
+        "event": "after_transfer_timeout",
+        "conditions": [
+          {
+            "field": "overlap",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          },
+          {
+            "field": "change_index",
+            "op": "eq",
+            "value": null,
+            "reference": "admit.change_index"
+          },
+          {
+            "field": "term",
+            "op": "eq",
+            "value": null,
+            "reference": "admit.term"
+          },
+          {
+            "field": "transferee",
+            "op": "eq",
+            "value": 0,
+            "reference": null
+          },
+          {
+            "field": "role",
+            "op": "eq",
+            "value": "StateLeader",
+            "reference": null
+          },
+          {
+            "field": "original_applied",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          },
+          {
+            "field": "dropped_timeout_now",
+            "op": "eq",
+            "value": 1,
+            "reference": null
+          },
+          {
+            "field": "queue_length",
+            "op": "eq",
+            "value": 0,
+            "reference": null
+          },
+          {
+            "field": "ready",
+            "op": "eq",
+            "value": false,
+            "reference": null
+          }
+        ]
+      }
+    ],
+    "legality": {
+      "source_ids": [
+        "S-autoleave",
+        "S-election",
+        "S-transfer-abort",
+        "S-proposal",
+        "S-advance",
+        "S-config",
+        "S-bootstrap",
+        "S-transfer-entry",
+        "S-ready",
+        "S-node-contract",
+        "S-raft-state",
+        "S-memory-stats",
+        "S-trace-default",
+        "S-heartbeat-producer",
+        "S-random-source"
+      ],
+      "expectation_ids": [
+        "S-node-contract",
+        "S-joint-contract",
+        "S-api"
+      ],
+      "binding_ids": [
+        "L-autoleave",
+        "L-transfer-timeout",
+        "L-advance"
+      ],
+      "derivation": "Bootstrap is the supplied initialization entry. A normal Campaign elects the leader; the driver verifies its initial log is fully applied before proposing the implicit change. Each Ready is persisted and applied before Advance, while network messages are serialized into one FIFO queue. TransferLeader is an ordinary serialized call with no documented prohibition between configuration application and Ready acknowledgement. Only its actual emitted TimeoutNow is lost, permitted for network messages; no local storage completion is dropped. Followers continue ticking and receive heartbeats. Later empty/message-only Readys are still advanced, but source only queues application responses for nonempty committed-entry batches. No goroutines or cleanup callbacks are left pending at cycle sampling.",
+      "applicability": "Single-threaded synchronous RawNode contract with completed persistence/application and reliable suffix. No asynchronous storage workers or external state-machine work remain.",
+      "unresolved": [],
+      "conflicts": [],
+      "alternatives": []
+    }
+  },
+  "monitors": [
+    {
+      "id": "M-autoleave-cycle",
+      "checker_id": "P-autoleave-cycle",
+      "event": "continuation_result",
+      "binding_ids": [
+        "L-autoleave",
+        "L-transfer-timeout",
+        "L-advance"
+      ],
+      "grounding": {
+        "source_ids": [
+          "S-autoleave",
+          "S-election",
+          "S-transfer-abort",
+          "S-proposal",
+          "S-advance",
+          "S-config",
+          "S-bootstrap",
+          "S-transfer-entry",
+          "S-ready",
+          "S-node-contract",
+          "S-raft-state",
+          "S-memory-stats",
+          "S-trace-default",
+          "S-heartbeat-producer",
+          "S-random-source"
+        ],
+        "expectation_ids": [
+          "S-joint-contract",
+          "S-joint-mode"
+        ],
+        "binding_ids": [
+          "L-autoleave",
+          "L-transfer-timeout",
+          "L-advance"
+        ],
+        "derivation": "Use C-autoleave-continuation. Compare a complete post-timeout protocol cycle, not elapsed ticks against an invented deadline. A forbidden cycle requires equal read-only structural snapshots of all three RawNodes including raft/log/storage/Progress/Ready-response state and the FIFO transport queue; joint state throughout; only heartbeat request/reply messages during the cycle; no queued work or pending transfer; leader with all log entries applied. The same tick order and drain policy can repeat. All random election timeouts are included; no state reset or election occurs in the heartbeat-only suffix, so global randomness is not consulted. MemoryStorage callStats are increment-only diagnostic counts, and logger sinks do not decide transitions. Function code identities and receiver state are retained. A completed exit produces a negative forbidden_cycle; otherwise an unequal/non-closed state produces only a diagnostic and no formal result.",
+        "applicability": "Formal scenario selected by overlap=true independently of results. Control and rescue events are diagnostic only. Default build, single-threaded real RawNode instances, no callbacks or external threads outside the driver.",
+        "unresolved": [],
+        "conflicts": [],
+        "alternatives": [
+          "A new proposal can supply application completion and rescue progress; it is deliberately issued only after the formal observation."
+        ]
+      },
+      "applicability_conditions": [
+        {
+          "field": "overlap",
+          "op": "eq",
+          "value": true,
+          "reference": null
+        }
+      ],
+      "admission_alias": "admit"
+    }
+  ],
+  "observable_properties": [
+    {
+      "checker_id": "P-autoleave-cycle",
+      "kind": "event_assertion",
+      "trigger": {
+        "field": "overlap",
+        "op": "eq",
+        "value": true,
+        "reference": null
+      },
+      "assertion": {
+        "field": "forbidden_cycle",
+        "op": "eq",
+        "value": false,
+        "reference": null
+      },
+      "antecedent": null,
+      "identity_fields": [
+        "operation"
+      ],
+      "description": "An admitted implicit transition must not remain joint in a closed, reliable, fully serviced periodic execution after transfer timeout. forbidden_cycle is the conjunction of actual structural state recurrence and the retained cycle diagnostics; no result is emitted merely for finite non-completion. Completion yields false and supports only this execution."
+    }
+  ],
+  "uncertainties": [
+    "Recurrence validity depends on reviewing the explicitly excluded diagnostic fields and the absence of unmodeled external callbacks/random draws in the observed suffix.",
+    "This check addresses the fixed transfer-overlap history, not every reason for membership finalization delay."
+  ]
+}

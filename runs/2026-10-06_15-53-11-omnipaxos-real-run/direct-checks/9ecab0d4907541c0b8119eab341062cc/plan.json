@@ -1,0 +1,147 @@
+{
+  "description": "Establish one decided key at three replicas. Disconnect follower 3, decide two distinct additional keys on nodes 1 and 2, then reconnect 3. Observe the actual generated delta AcceptSync and compare the state returned immediately after its synchronous handler with the leader state captured before dispatch. FIFO producer queues and public APIs construct all state; messages across the declared disconnect are dropped.",
+  "claim_id": "claim_snapshot_content",
+  "binding_ids": [
+    "bind_delta_sync"
+  ],
+  "harness": {
+    "execution_package": "./omnipaxos",
+    "files": {},
+    "kind": "rust_test",
+    "source": "use std::collections::BTreeMap;\nuse omnipaxos::{ClusterConfig, OmniPaxos, OmniPaxosConfig, ServerConfig};\nuse omnipaxos::messages::{Message, sequence_paxos::PaxosMsg};\nuse omnipaxos::storage::{Entry, Snapshot, SnapshotType};\nuse omnipaxos::util::LogEntry;\nuse omnipaxos_storage::memory_storage::MemoryStorage;\nuse serde::{Deserialize, Serialize};\nuse serde_json::json;\n\n#[derive(Clone, Debug, Serialize, Deserialize)]\nstruct Value { key: u64, value: u64 }\n#[derive(Clone, Debug, Default, Serialize, Deserialize)]\nstruct State(BTreeMap<u64, u64>);\nimpl Entry for Value { type Snapshot = State; }\nimpl Snapshot<Value> for State {\n    fn create(entries: &[Value]) -> Self {\n        let mut s = Self::default();\n        for e in entries { s.0.insert(e.key, e.value); }\n        s\n    }\n    fn merge(&mut self, delta: Self) { self.0.extend(delta.0); }\n    fn use_snapshots() -> bool { true }\n}\ntype Node = OmniPaxos<Value, MemoryStorage<Value>>;\nfn emit(v: serde_json::Value) { println!(\"CA_EVENT {}\", v); }\nfn application_state(n: &Node) -> String {\n    let mut state = State::default();\n    if let Some(entries) = n.read_decided_suffix(0) {\n        for e in entries {\n            match e {\n                LogEntry::Decided(v) => { state.0.insert(v.key, v.value); }\n                LogEntry::Snapshotted(s) => state.merge(s.snapshot),\n                other => panic!(\"Unexpected entry in decided read: {:?}\", other),\n            }\n        }\n    }\n    serde_json::to_string(&state.0).unwrap()\n}\n// Each drain preserves producer order, including each sender-to-receiver stream.\n// Only traffic across the declared disconnected link is discarded.\nfn deliver(nodes: &mut [Node], disconnected: bool, observe_sync: bool, seq: &mut usize) -> usize {\n    let mut syncs = 0;\n    for _ in 0..100 {\n        let mut batch = Vec::new();\n        for node in nodes.iter_mut() { node.take_outgoing_messages(&mut batch); }\n        if batch.is_empty() { return syncs; }\n        for m in batch {\n            *seq += 1;\n            let from = m.get_sender();\n            let to = m.get_receiver();\n            let dropped = disconnected && (from == 3 || to == 3);\n            emit(json!({\"event\":\"transport\", \"ordinal\":*seq,\"from\":from,\"to\":to,\"dropped\":dropped,\"message\":format!(\"{:?}\",m)}));\n            if dropped { continue; }\n            let targeted = observe_sync && to == 3 && matches!(&m, Message::SequencePaxos(p) if matches!(&p.msg, PaxosMsg::AcceptSync(_)));\n            if targeted {\n                if let Message::SequencePaxos(p) = &m {\n                    if let PaxosMsg::AcceptSync(s) = &p.msg {\n                        let delta = matches!(&s.log_sync.decided_snapshot, Some(SnapshotType::Delta(_)));\n                        let before_decided = nodes[2].get_decided_idx();\n                        let before_accepted = nodes[2].get_accepted_idx();\n                        assert_eq!(nodes[2].get_current_leader(), Some((1,false)));\n                        assert_eq!(nodes[2].get_promise(), s.n);\n                        assert_eq!(from,1);\n                        assert_eq!(before_decided,1);\n                        assert_eq!(before_accepted,1);\n                        assert_eq!(s.decided_idx,3);\n                        assert_eq!(s.log_sync.sync_idx,3);\n                        assert!(delta, \"This fixed check requires an actual delta transfer\");\n                        emit(json!({\"event\":\"sync_admitted\",\"case\":\"delta_missing_suffix\",\"node\":3,\"ordinal\":*seq,\"delta\":delta,\"before_decided\":before_decided,\"before_accepted\":before_accepted,\"transfer_decided\":s.decided_idx,\"transfer_compacted\":s.log_sync.sync_idx,\"expected_state\":application_state(&nodes[0]),\"old_state\":application_state(&nodes[2]),\"ballot\":format!(\"{:?}\",s.n)}));\n                    }\n                }\n            }\n            nodes[(to-1) as usize].handle_incoming(m);\n            if targeted {\n                syncs += 1;\n                emit(json!({\"event\":\"sync_result\",\"case\":\"delta_missing_suffix\",\"node\":3,\"ordinal\":*seq,\"returned\":true,\"actual_state\":application_state(&nodes[2]),\"decided\":nodes[2].get_decided_idx(),\"accepted\":nodes[2].get_accepted_idx(),\"compacted\":nodes[2].get_compacted_idx(),\"phase_accept\":nodes[2].get_current_leader()==Some((1,true))}));\n            }\n        }\n    }\n    panic!(\"Message delivery did not quiesce within the construction bound\");\n}\n#[test]\nfn delta_sync_preserves_decided_application_state() {\n    let mut nodes: Vec<Node> = (1..=3).map(|pid| {\n        OmniPaxosConfig {\n            cluster_config: ClusterConfig { configuration_id: 1, nodes: vec![1,2,3], ..Default::default() },\n            server_config: ServerConfig {\n                pid, batch_size: 1,\n                custom_logger: Some(slog::Logger::root(slog::Discard, slog::o!())),\n                ..Default::default()\n            },\n        }.build(MemoryStorage::default()).unwrap()\n    }).collect();\n    let mut seq = 0;\n    nodes[0].try_become_leader();\n    deliver(&mut nodes,false,false,&mut seq);\n    for n in &nodes { assert_eq!(n.get_current_leader(),Some((1,true))); }\n    nodes[0].append(Value{key:11,value:110}).unwrap();\n    deliver(&mut nodes,false,false,&mut seq);\n    for n in &nodes { assert_eq!(n.get_decided_idx(),1); }\n    let common = application_state(&nodes[0]);\n    assert_eq!(application_state(&nodes[2]),common);\n    emit(json!({\"event\":\"common_prefix\",\"decided\":1,\"state\":common}));\n    // Disconnect follower 3 after the common prefix is fully delivered.\n    for (key,value) in [(22,220),(33,330)] {\n        nodes[0].append(Value{key,value}).unwrap();\n        deliver(&mut nodes,true,false,&mut seq);\n    }\n    assert_eq!(nodes[0].get_decided_idx(),3);\n    assert_eq!(nodes[1].get_decided_idx(),3);\n    assert_eq!(nodes[2].get_decided_idx(),1);\n    assert_eq!(nodes[2].get_accepted_idx(),1);\n    assert_eq!(nodes[0].get_compacted_idx(),0);\n    assert_eq!(application_state(&nodes[0]),application_state(&nodes[1]));\n    // Restore the link and notify both endpoints using the documented callback.\n    nodes[2].reconnected(1);\n    nodes[0].reconnected(3);\n    let syncs = deliver(&mut nodes,false,true,&mut seq);\n    assert_eq!(syncs,1,\"Need one independently correlated synchronization\");\n    emit(json!({\"event\":\"final_state\",\"follower\":application_state(&nodes[2]),\"leader\":application_state(&nodes[0]),\"follower_decided\":nodes[2].get_decided_idx(),\"leader_decided\":nodes[0].get_decided_idx()}));\n}\n",
+    "description": "Single-thread public-API three-node driver with MemoryStorage and documented key/value snapshot semantics. Explicit try_become_leader selects leader; bounded queue drains drive generated messages. No wall-clock progress assertion is made.",
+    "semantic_changes": [
+      "No target changes. Transport is a deterministic FIFO delivery driver with an explicitly declared disconnection.",
+      "Application Entry/Snapshot uses a BTreeMap for canonical serialization and overwrite merge equivalent to documented HashMap semantics."
+    ],
+    "prerequisites": [
+      {
+        "alias": "admitted",
+        "event": "sync_admitted",
+        "conditions": [
+          {
+            "field": "delta",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          },
+          {
+            "field": "before_decided",
+            "op": "eq",
+            "value": 1,
+            "reference": null
+          },
+          {
+            "field": "before_accepted",
+            "op": "eq",
+            "value": 1,
+            "reference": null
+          },
+          {
+            "field": "transfer_decided",
+            "op": "eq",
+            "value": 3,
+            "reference": null
+          },
+          {
+            "field": "transfer_compacted",
+            "op": "eq",
+            "value": 3,
+            "reference": null
+          }
+        ]
+      }
+    ],
+    "legality": {
+      "source_ids": [
+        "s_sync",
+        "s_pending",
+        "s_leader_sync",
+        "s_follower",
+        "s_read",
+        "s_memory"
+      ],
+      "expectation_ids": [
+        "s_snapshot_doc",
+        "s_storage_contract",
+        "s_sync_test_expectation"
+      ],
+      "binding_ids": [
+        "bind_delta_sync"
+      ],
+      "derivation": "The public manual leadership API enters the real prepare protocol; every protocol message is generated by target nodes. A fully delivered common prefix is observed before disconnection. Node 3 misses only messages while disconnected. Both restored endpoints receive reconnected callbacks. Observed same-ballot Prepare/Promise precedes the targeted AcceptSync. All API calls, snapshot reads and observations occur serially with exclusive Rust ownership; no sleep or cache copy substitutes for completion. Timers are unnecessary within this finite manually driven transition and are not used to claim liveness. Each outgoing batch preserves sender-to-receiver order.",
+      "applicability": "Fault-free storage and Snapshot implementation matching documented key/value overwrite semantics; same-configuration transport disconnect followed by restored ordered delivery; no forged messages or direct private state injection.",
+      "unresolved": [],
+      "conflicts": [],
+      "alternatives": [
+        "The Complete snapshot branch installs a complete state directly and is outside this delta-specific input."
+      ]
+    }
+  },
+  "monitors": [
+    {
+      "id": "monitor_delta_content",
+      "checker_id": "check_delta_content",
+      "event": "sync_result",
+      "binding_ids": [
+        "bind_delta_sync"
+      ],
+      "grounding": {
+        "source_ids": [
+          "s_sync",
+          "s_pending",
+          "s_leader_sync",
+          "s_follower",
+          "s_read",
+          "s_memory"
+        ],
+        "expectation_ids": [
+          "s_snapshot_doc",
+          "s_storage_contract",
+          "s_sync_test_expectation"
+        ],
+        "binding_ids": [
+          "bind_delta_sync"
+        ],
+        "derivation": "The result is emitted after the exact admitted AcceptSync handler returns. The expected state is derived from a real decided leader read before dispatch, previously corroborated with node 2. Both maps are canonically serialized; ordinal, case and node independently identify the same transfer. Decided/accepted/compacted indices and phase are diagnostic output, not substituted for content equality.",
+        "applicability": "Fault-free storage and Snapshot implementation matching documented key/value overwrite semantics; same-configuration transport disconnect followed by restored ordered delivery; no forged messages or direct private state injection.",
+        "unresolved": [],
+        "conflicts": [],
+        "alternatives": [
+          "The Complete snapshot branch installs a complete state directly and is outside this delta-specific input."
+        ]
+      },
+      "applicability_conditions": [],
+      "admission_alias": "admitted"
+    }
+  ],
+  "observable_properties": [
+    {
+      "checker_id": "check_delta_content",
+      "kind": "event_assertion",
+      "trigger": {
+        "field": "returned",
+        "op": "eq",
+        "value": true,
+        "reference": null
+      },
+      "assertion": {
+        "field": "actual_state",
+        "op": "eq",
+        "value": null,
+        "reference": "admitted.expected_state"
+      },
+      "antecedent": null,
+      "identity_fields": [
+        "case",
+        "node",
+        "ordinal"
+      ],
+      "description": "State recovered from decided snapshot/suffix equals the current leader decided application state at the admitted synchronization boundary."
+    }
+  ],
+  "uncertainties": [
+    "One bounded same-ballot delta transfer does not establish all snapshot variants or disk-recovery behavior.",
+    "No target execution has yet established that prerequisites are reached; compilation or setup failures require repair rather than a property verdict."
+  ]
+}

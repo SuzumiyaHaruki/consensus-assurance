@@ -1,0 +1,128 @@
+package raft
+
+import (
+    "encoding/json"
+    "fmt"
+    "testing"
+
+    "github.com/lni/dragonboat/v3/config"
+    pb "github.com/lni/dragonboat/v3/raftpb"
+)
+
+// The driver serializes Peer calls and persists each exported update before
+// delivering its messages. It substitutes a loss-capable transport and an
+// immediate application consumer, without writing any raft protocol fields.
+type assuranceReadDriver struct {
+    t *testing.T
+    peers map[uint64]*Peer
+    db map[uint64]*TestLogDB
+    applied map[uint64]uint64
+    queue []pb.Message
+    expected map[uint64]pb.SystemCtx
+    active bool
+    seq int
+    term uint64
+    responses map[uint64]int
+    dropped int
+}
+
+func assuranceReadEvent(v map[string]interface{}) {
+    b, err := json.Marshal(v)
+    if err != nil { panic(err) }
+    fmt.Println("CA_EVENT " + string(b))
+}
+func assuranceReadCtx(c pb.SystemCtx) string { return fmt.Sprintf("%d/%d", c.High, c.Low) }
+func assuranceMessageCtx(m pb.Message) pb.SystemCtx { return pb.SystemCtx{High:m.HintHigh, Low:m.Hint} }
+
+func (d *assuranceReadDriver) collect(id uint64) {
+    p := d.peers[id]
+    if !p.HasUpdate(true) { return }
+    u := p.GetUpdate(true, d.applied[id])
+    if !pb.IsEmptySnapshot(u.Snapshot) { d.t.Fatal("unexpected snapshot") }
+    if err := d.db[id].Append(u.EntriesToSave); err != nil { d.t.Fatal(err) }
+    if !pb.IsEmptyState(u.State) { d.db[id].SetState(u.State) }
+    // Apply only genuinely committed entries exported by the peer.
+    for _, e := range u.CommittedEntries {
+        if e.Index != d.applied[id]+1 { d.t.Fatalf("application gap at %d: %d after %d", id, e.Index, d.applied[id]) }
+        if e.Type == pb.ConfigChangeEntry {
+            var cc pb.ConfigChange
+            if err := cc.Unmarshal(e.Cmd); err != nil { d.t.Fatal(err) }
+            p.ApplyConfigChange(cc)
+        }
+        d.applied[id] = e.Index
+    }
+    p.NotifyRaftLastApplied(d.applied[id])
+    for _, ready := range u.ReadyToReads {
+        assuranceReadEvent(map[string]interface{}{"event":"origin_ready", "scenario":"prefix_release", "origin":id, "context":assuranceReadCtx(ready.SystemCtx), "index":ready.Index, "applied":d.applied[id]})
+    }
+    for _, m := range u.Messages {
+        d.seq++
+        drop := d.active && m.Type == pb.Heartbeat && assuranceMessageCtx(m) == d.expected[2]
+        if d.active {
+            assuranceReadEvent(map[string]interface{}{"event":"transport", "seq":d.seq, "type":m.Type.String(), "from":m.From, "to":m.To, "term":m.Term, "context":assuranceReadCtx(assuranceMessageCtx(m)), "drop":drop})
+        }
+        if drop { d.dropped++; continue }
+        if d.active && m.Type == pb.ReadIndexResp {
+            d.responses[m.To]++
+            assuranceReadEvent(map[string]interface{}{"event":"read_response", "scenario":"prefix_release", "origin":m.To, "context":assuranceReadCtx(assuranceMessageCtx(m)), "index":m.LogIndex, "term":m.Term, "from":m.From})
+        }
+        // FIFO for all retained messages; the selected heartbeat loss is the
+        // only fault after the preparation traffic has drained.
+        d.queue = append(d.queue, m)
+    }
+    p.Commit(u)
+}
+
+func (d *assuranceReadDriver) pump() {
+    for step:=0; len(d.queue)>0; step++ {
+        if step >= 1000 { d.t.Fatal("driver did not drain") }
+        m := d.queue[0]
+        d.queue = d.queue[1:]
+        p := d.peers[m.To]
+        if p == nil { d.t.Fatalf("unknown destination %d",m.To) }
+        p.Handle(m)
+        if d.active && m.To == 1 && m.Type == pb.ReadIndex {
+            input, ok := d.expected[m.From]
+            s, exists := p.raft.readIndex.pending[input]
+            if !ok || !exists || s.from != m.From || s.ctx != input || p.raft.term != d.term || !p.raft.hasCommittedEntryAtCurrentTerm() {
+                d.t.Fatal("read admission premise not attained")
+            }
+            assuranceReadEvent(map[string]interface{}{"event":"read_admitted", "scenario":"prefix_release", "origin":m.From, "context":assuranceReadCtx(input), "index":s.index, "term":p.raft.term, "leader":p.raft.nodeID, "quorum":p.raft.quorum()})
+        }
+        d.collect(m.To)
+    }
+}
+
+func TestAssuranceRemoteReadContextPrefix(t *testing.T) {
+    d := &assuranceReadDriver{t:t, peers:map[uint64]*Peer{}, db:map[uint64]*TestLogDB{}, applied:map[uint64]uint64{}, expected:map[uint64]pb.SystemCtx{2:{High:30,Low:101},3:{High:30,Low:202}}, responses:map[uint64]int{}}
+    addresses := []PeerAddress{{NodeID:1,Address:"node1"},{NodeID:2,Address:"node2"},{NodeID:3,Address:"node3"}}
+    for id:=uint64(1); id<=3; id++ {
+        db := NewTestLogDB().(*TestLogDB)
+        d.db[id] = db
+        cfg := config.Config{ClusterID:1,NodeID:id,ElectionRTT:10,HeartbeatRTT:1,CheckQuorum:true}
+        d.peers[id] = Launch(cfg,db,nil,addresses,true,true)
+        d.collect(id)
+    }
+    d.pump()
+    // Tick only node 1 until a real election completes; all vote requests and
+    // responses are generated by peers and passed through Peer.Handle.
+    for i:=0; i<30 && !d.peers[1].raft.isLeader(); i++ {
+        d.peers[1].Tick(); d.collect(1); d.pump()
+    }
+    leader := d.peers[1].raft
+    if !leader.isLeader() || !leader.hasCommittedEntryAtCurrentTerm() { t.Fatal("leader/current-term commit not attained") }
+    d.term = leader.term
+    for id:=uint64(1); id<=3; id++ {
+        r := d.peers[id].raft
+        if r.term != d.term || r.leaderID != 1 || r.log.committed != leader.log.committed || d.applied[id] != leader.log.committed {
+            t.Fatalf("preparation did not converge on node %d",id)
+        }
+    }
+    assuranceReadEvent(map[string]interface{}{"event":"prepared", "scenario":"prefix_release", "leader":uint64(1), "term":d.term, "commit":leader.log.committed, "voters":3, "fault_policy":"drop_first_context_heartbeats", "queue_length":len(d.queue)})
+    d.active=true
+    d.peers[2].ReadIndex(d.expected[2]); d.collect(2); d.pump()
+    if len(leader.readIndex.pending)!=1 || d.dropped!=2 { t.Fatal("first pending context or heartbeat loss not attained") }
+    d.peers[3].ReadIndex(d.expected[3]); d.collect(3); d.pump()
+    // These are measurements, not assertions of the property under test.
+    assuranceReadEvent(map[string]interface{}{"event":"drained", "scenario":"prefix_release", "remaining_pending":len(leader.readIndex.pending), "queue_length":len(d.queue), "responses_origin2":d.responses[2], "responses_origin3":d.responses[3], "term":leader.term})
+}

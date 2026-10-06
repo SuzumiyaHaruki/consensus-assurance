@@ -1,0 +1,150 @@
+{
+  "description": "Observe remote ReadIndex response context under one later quorum confirmation that releases two distinct-origin requests.",
+  "claim_id": "C-read-response-context",
+  "binding_ids": [
+    "BIND-read-response"
+  ],
+  "harness": {
+    "kind": "go_test",
+    "source": "",
+    "files": {},
+    "execution_package": "internal/raft",
+    "description": "TestAssuranceRemoteReadContextPrefix uses captured Peer and TestLogDB with generated election and read traffic. One origin identifies one operation independently of the compared context.",
+    "semantic_changes": [],
+    "prerequisites": [
+      {
+        "alias": "setup",
+        "event": "prepared",
+        "conditions": [
+          {
+            "field": "fault_policy",
+            "op": "eq",
+            "value": "drop_first_context_heartbeats"
+          },
+          {
+            "field": "voters",
+            "op": "eq",
+            "value": 3
+          },
+          {
+            "field": "queue_length",
+            "op": "eq",
+            "value": 0
+          }
+        ]
+      },
+      {
+        "alias": "admitted",
+        "event": "read_admitted",
+        "conditions": [
+          {
+            "field": "scenario",
+            "op": "eq",
+            "reference": "setup.scenario"
+          },
+          {
+            "field": "term",
+            "op": "eq",
+            "reference": "setup.term"
+          }
+        ]
+      }
+    ],
+    "legality": {
+      "source_ids": [
+        "M-peer",
+        "M-update",
+        "M-updatecommit",
+        "M-bootstrap",
+        "M-testlogdb",
+        "M-engine",
+        "M-lossdriver",
+        "M-transitions",
+        "M-term",
+        "M-read",
+        "M-readqueue",
+        "M-confirm",
+        "M-batches"
+      ],
+      "expectation_ids": [
+        "M-prefixexpect",
+        "M-readyexpect"
+      ],
+      "binding_ids": [
+        "BIND-read-response"
+      ],
+      "derivation": "Launch three real peers with bootstrap membership. Driver reads exported updates, appends entries/sets state in captured TestLogDB, applies committed configuration entries and applied watermark, then commits update before FIFO delivery. Tick node 1 until real election/replication yields current-term commitment and all three peers applied that prefix. Invoke public Peer.ReadIndex at origins 2 and 3 with distinct valid contexts. Generated forwarding reaches leader through Peer.Handle. Drop exactly context A heartbeats to both voters; no reply is fabricated or reordered. Later context B heartbeats are delivered; real responses cause prefix confirmation. Exported ReadIndexResp observed before delivery, then delivered to origin. Whole driver is synchronous: the same goroutine owns protocol, storage adapter, queue, counters and observations. No target state mutation, sleeps, waiters or shutdown sampling. Preparation checks abort rather than emit admission if unachieved.",
+      "applicability": "Finite loss schedule with FIFO retained messages; same term, three full voters, distinct origin per request. In-memory TestLogDB substitutes storage without crash claims; immediate application implements caller duty for genuinely committed entries.",
+      "unresolved": [
+        "Public NodeHost client timeout and endpoint behavior remain outside this local response obligation."
+      ],
+      "conflicts": [],
+      "alternatives": [
+        "Reliable delivery of the first heartbeat can release it alone and would not exercise the selected prefix premise."
+      ]
+    }
+  },
+  "monitors": [
+    {
+      "id": "MON-read-response",
+      "checker_id": "CHK-read-context",
+      "event": "read_response",
+      "binding_ids": [
+        "BIND-read-response"
+      ],
+      "admission_alias": "admitted",
+      "applicability_conditions": [
+        {
+          "field": "scenario",
+          "op": "eq",
+          "value": "prefix_release"
+        }
+      ],
+      "grounding": {
+        "source_ids": [
+          "M-confirm",
+          "M-batches",
+          "M-readqueue"
+        ],
+        "expectation_ids": [
+          "M-prefixexpect",
+          "M-readyexpect"
+        ],
+        "binding_ids": [
+          "BIND-read-response"
+        ],
+        "derivation": "Compare full High/Low SystemCtx string from actual emitted ReadIndexResp to independently recorded input context at admission. Correlate by scenario and origin, not context. Two distinct origins each have one operation; result emission depends on actual output message, never expected data.",
+        "applicability": "Result to a uniquely admitted remote origin in the fixed stable-term scenario.",
+        "unresolved": [
+          "Does not check index/value correctness or client completion."
+        ],
+        "conflicts": [],
+        "alternatives": []
+      }
+    }
+  ],
+  "observable_properties": [
+    {
+      "checker_id": "CHK-read-context",
+      "kind": "event_assertion",
+      "trigger": {
+        "field": "event",
+        "op": "eq",
+        "value": "read_response"
+      },
+      "assertion": {
+        "field": "context",
+        "op": "eq",
+        "reference": "admitted.context"
+      },
+      "identity_fields": [
+        "scenario",
+        "origin"
+      ],
+      "description": "Every emitted response for the uniquely admitted origin preserves that operation full context. Missing response is not observed false; it remains incomplete."
+    }
+  ],
+  "uncertainties": [
+    "Scoped local output boundary only; node-layer exact-context batch lookup establishes relevance but client timeout is not measured."
+  ]
+}
