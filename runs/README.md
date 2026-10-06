@@ -1,17 +1,21 @@
 # 保留运行
 
-当前 Git 仅追踪最新的 DeepSeek HashiCorp Raft 实验及本索引：[2026-10-05 15:41:13](2026-10-05_15-41-13-hashicorp_raft-real-run/report.md)。之前的运行保留在本地，已提交版本仍可从 Git 历史查看。
+当前 Git 仅追踪以下最近五次实验及本索引。其余本地运行不因本次追踪切换而删除；旧归档及索引说明可从 Git 历史查看。
 
-本次使用 `audit-products-v52`、Codex CLI `0.155.0-alpha.16`、显式 provider `deepseek`，请求模型 `deepseek-flash` / `low`，总预算 2400 秒，目标工具为 Go 1.23.5。服务端实际模型／版本未记录，不以请求别名推断固定权重。非敏感连接输入和模型目录字节保存在实验内。
+五次均使用 `audit-products-v53`、Codex CLI `0.155.0-alpha.16`、Codex 默认 provider，请求模型 `gpt-6-astra` / `low`，各自总时间预算 2400 秒，使用独立会话。五次均因服务端提示可能存在网络安全风险而中断，未运行满时间预算；原始错误和已受理研究结果一并保留。
 
-| 实验 | 实际时间 | 报告中的正式结论 | 停止依据 |
-| --- | ---: | --- | --- |
-| [DeepSeek HashiCorp Raft](2026-10-05_15-41-13-hashicorp_raft-real-run/report.md) | 2400.24 秒 | 4 项正式检查：3 项范围内确认违反，1 项有限检查未见违反 | 总时间耗尽，控制器终止最后一次 Agent 调用 |
+| 实验 | 开始时间 | 实际时间 | 工具链 | 原报告中的确认命题 | Agent 调用／目标执行／复核 |
+| --- | --- | ---: | --- | ---: | --- |
+| [etcd Raft](2026-10-06_10-36-08-etcd_raft-real-run/report.md) | 2026-10-06 10:36:08 | 24.60 分钟 | Go 1.26.7 | 1 | 8／2／1 |
+| [HashiCorp Raft](2026-10-06_11-00-45-hashicorp_raft-real-run/report.md) | 2026-10-06 11:00:45 | 20.58 分钟 | Go 1.23.5 | 1 | 8／3／2 |
+| [Dragonboat](2026-10-06_11-21-20-dragonboat_raft-real-run/report.md) | 2026-10-06 11:21:20 | 18.91 分钟 | Go 1.23.5 | 1 | 6／1／1 |
+| [OmniPaxos](2026-10-06_11-40-15-omnipaxos-real-run/report.md) | 2026-10-06 11:40:15 | 27.35 分钟 | Rust 1.94.1 | 1 | 4／1／1 |
+| [EPaxos（SwiftPaxos 修订版）](2026-10-06_12-07-37-swiftpaxos_epaxos-real-run/report.md) | 2026-10-06 12:07:37 | 30.27 分钟 | Go 1.25.8 | 3 | 9／4／3 |
 
-以上摘录保存的状态与报告；使用 29 次 Agent 调用、6 次目标执行（4 次正式检查、2 次探索）和 4 次复核；其中 1 次探索执行失败，原始失败记录保留。具体适用条件、检查过程、证据、未完成回合及更广后果的边界以原始报告为准，不将局部确认扩展为完整集群结论。
+以上仅摘录原状态与报告，不重新评估。确认数量按义务命题计，不等于独立根因数；目标执行包含正式检查、探索和修订重跑。HashiCorp 保留修订前的争议及后续版本。具体适用条件、检查过程、证据、未受理回合与未决边界以各原始报告为准，不将局部确认扩展为完整集群结论。
 
 原始报告、研究状态、固定制品、来源、评估和日志保持原样；未完成回合不受理，历史归档不作为新自主实验的发现输入。
 
 归档保留源码快照、固定模型／构建输入、研究地图、草稿、受理输入、执行差异、版本、评估及原始日志；排除凭据、虚拟环境、临时锁、`.execution`、草稿临时目录（含嵌套 `.tmp`）、编译缓存（含嵌套 `.gocache`）、可重建的 `experiments/**/workspace` 和本地权限覆盖配置。
 
-报告中两处探索工作副本链接对应的文件保存在 [412d061e 执行后文件](2026-10-05_15-41-13-hashicorp_raft-real-run/experiments/412d061e522a4842bedbb368997e6cfc/workspace-outcome/files/assurance_generated_test.go)和 [af9083ba 执行后文件](2026-10-05_15-41-13-hashicorp_raft-real-run/experiments/af9083ba20bd47ffaa3ea4451b785321/workspace-outcome/files/assurance_generated_test.go)，均与本地工作副本逐字节一致。
+报告直接导航到保留的固定输入、执行前后 manifest 和原始日志，不依赖被排除的工作副本。

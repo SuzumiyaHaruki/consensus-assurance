@@ -1,0 +1,147 @@
+{
+  "description": "Exercise overlapping remote requests with distinct contexts. First-context heartbeats are lost; a later actual voter response releases the queued prefix. Observe emitted response context per unique destination and retain recipient ReadyToRead diagnostics.",
+  "claim_id": "O-read-response-context",
+  "binding_ids": [
+    "K-read-response-context"
+  ],
+  "harness": {
+    "execution_package": "./internal/raft",
+    "files": {},
+    "kind": "go_test",
+    "source": "package raft\n\nimport (\n    \"encoding/json\"\n    \"fmt\"\n    \"testing\"\n\n    \"github.com/lni/dragonboat/v3/config\"\n    pb \"github.com/lni/dragonboat/v3/raftpb\"\n)\n\nfunc assuranceReadEvent(v map[string]interface{}) {\n    data, err := json.Marshal(v)\n    if err != nil { panic(err) }\n    fmt.Println(\"CA_EVENT \" + string(data))\n}\n\nfunc assuranceCtx(c pb.SystemCtx) string { return fmt.Sprintf(\"%d/%d\", c.Low, c.High) }\n\ntype assuranceReadPeer struct {\n    peer *Peer\n    db ILogDB\n    applied uint64\n}\n\nfunc TestAssuranceReadResponseCorrelation(t *testing.T) {\n    // One outstanding request per origin makes destination an independent identity.\n    contexts := map[uint64]pb.SystemCtx{2: {Low: 101, High: 30}, 3: {Low: 202, High: 30}}\n    nodes := make(map[uint64]*assuranceReadPeer)\n    queue := []pb.Message{}\n    phase := \"prepare\"\n    qualified := false\n    emit := func(event string, origin uint64, fields map[string]interface{}) {\n        fields[\"event\"] = event\n        fields[\"scenario\"] = \"overlapping_remote_reads\"\n        fields[\"origin\"] = origin\n        fields[\"cluster\"] = uint64(7)\n        assuranceReadEvent(fields)\n    }\n    flush := func(id uint64) {\n        n := nodes[id]\n        ud := n.peer.GetUpdate(true, n.applied)\n        if !pb.IsEmptySnapshot(ud.Snapshot) { t.Fatal(\"unexpected snapshot\") }\n        if err := n.db.Append(ud.EntriesToSave); err != nil { t.Fatal(err) }\n        if !pb.IsEmptyState(ud.State) { n.db.SetState(ud.State) }\n        // Complete the accepted bootstrap configurations; no later configuration is proposed.\n        for _, e := range ud.CommittedEntries {\n            if e.Index != n.applied+1 { t.Fatalf(\"application gap at node %d\", id) }\n            if e.Type == pb.ConfigChangeEntry {\n                var cc pb.ConfigChange\n                if err := cc.Unmarshal(e.Cmd); err != nil { t.Fatal(err) }\n                if !cc.Initialize || cc.Type != pb.AddNode { t.Fatal(\"unexpected configuration\") }\n                n.peer.ApplyConfigChange(cc)\n            }\n            n.applied = e.Index\n        }\n        for _, ready := range ud.ReadyToReads {\n            emit(\"recipient_ready\", id, map[string]interface{}{\"context\": assuranceCtx(ready.SystemCtx), \"index\": ready.Index})\n        }\n        for _, msg := range ud.Messages {\n            if phase == \"reads\" && msg.Type == pb.ReadIndexResp {\n                emit(\"response\", msg.To, map[string]interface{}{\n                    \"context\": assuranceCtx(pb.SystemCtx{Low: msg.Hint, High: msg.HintHigh}),\n                    \"index\": msg.LogIndex, \"term\": msg.Term, \"sender\": msg.From,\n                    \"qualified\": qualified,\n                })\n            }\n            // Predetermined loss policy: suppress only first-context heartbeats.\n            // All retained messages use one FIFO delivery path.\n            if phase == \"reads\" && msg.Type == pb.Heartbeat && msg.Hint == contexts[2].Low && msg.HintHigh == contexts[2].High {\n                emit(\"dropped_heartbeat\", msg.To, map[string]interface{}{\"sender\": msg.From, \"context\": assuranceCtx(contexts[2])})\n                continue\n            }\n            queue = append(queue, msg)\n        }\n        n.peer.Commit(ud)\n        n.peer.NotifyRaftLastApplied(n.applied)\n    }\n    drain := func() {\n        for steps := 0; len(queue) > 0; steps++ {\n            if steps > 1000 { t.Fatal(\"message drain bound exceeded\") }\n            msg := queue[0]\n            queue = queue[1:]\n            dst, ok := nodes[msg.To]\n            if !ok { t.Fatalf(\"unknown destination %d\", msg.To) }\n            isConfirmation := phase == \"reads\" && !qualified && msg.To == 1 && msg.Type == pb.HeartbeatResp && msg.Hint == contexts[3].Low && msg.HintHigh == contexts[3].High\n            if isConfirmation {\n                r := dst.peer.raft\n                if r.state != leader || r.quorum() != 2 || msg.Term != r.term || msg.From == 1 { t.Fatal(\"invalid confirmation provenance\") }\n                if _, ok := r.remotes[msg.From]; !ok { t.Fatal(\"nonvoter confirmation\") }\n                for _, origin := range []uint64{2, 3} {\n                    s, ok := r.readIndex.pending[contexts[origin]]\n                    if !ok || s.from != origin || s.ctx != contexts[origin] { t.Fatal(\"missing pending request\") }\n                }\n            }\n            dst.peer.Handle(msg)\n            if isConfirmation {\n                qualified = true\n                for _, origin := range []uint64{2, 3} {\n                    _, remains := dst.peer.raft.readIndex.pending[contexts[origin]]\n                    emit(\"released\", origin, map[string]interface{}{\n                        \"expected_context\": assuranceCtx(contexts[origin]), \"removed\": !remains,\n                        \"term\": dst.peer.raft.term, \"confirming_sender\": msg.From,\n                        \"quorum\": dst.peer.raft.quorum(), \"confirmed_context\": assuranceCtx(contexts[3]),\n                    })\n                }\n            }\n            flush(msg.To)\n        }\n    }\n    for id := uint64(1); id <= 3; id++ {\n        db := NewTestLogDB()\n        cfg := config.Config{ClusterID: 7, NodeID: id, ElectionRTT: 10, HeartbeatRTT: 1, CheckQuorum: true}\n        p := Launch(cfg, db, nil, []PeerAddress{{NodeID: 1, Address: \"n1\"}, {NodeID: 2, Address: \"n2\"}, {NodeID: 3, Address: \"n3\"}}, true, true)\n        nodes[id] = &assuranceReadPeer{peer: p, db: db}\n        flush(id)\n    }\n    drain()\n    for tick := 0; tick < 100 && nodes[1].peer.raft.state != leader; tick++ {\n        nodes[1].peer.Tick()\n        flush(1)\n        drain()\n    }\n    r := nodes[1].peer.raft\n    if r.state != leader || !r.hasCommittedEntryAtCurrentTerm() { t.Fatal(\"current-term leader not established\") }\n    for id := uint64(1); id <= 3; id++ {\n        n := nodes[id]\n        if n.peer.raft.term != r.term || n.peer.raft.leaderID != 1 || n.applied != r.log.committed { t.Fatalf(\"prefix not complete on node %d\", id) }\n    }\n    emit(\"prefix\", 1, map[string]interface{}{\"term\": r.term, \"commit\": r.log.committed, \"queued_messages\": len(queue)})\n    phase = \"reads\"\n    for _, origin := range []uint64{2, 3} {\n        nodes[origin].peer.ReadIndex(contexts[origin])\n        flush(origin)\n        // The first drain loses its own context-bearing heartbeats by the fixed policy.\n        // The second drain confirms the later context, with the first request still pending.\n        drain()\n    }\n    emit(\"finished\", 1, map[string]interface{}{\"qualified\": qualified, \"pending\": len(r.readIndex.pending), \"queued_messages\": len(queue)})\n    if !qualified { t.Fatal(\"quorum-confirmation prerequisite not reached\") }\n}\n",
+    "description": "Three bootstrapped Peers, synchronous update storage/application/commit driver, real tick/vote election and deterministic FIFO message delivery with a fixed first-heartbeat loss policy.",
+    "semantic_changes": [
+      "No target code changes. Captured TestLogDB provides in-memory storage for a no-crash history.",
+      "Network and application scheduling are implemented by the driver; responses are produced only by Peer.Handle.",
+      "Read-only internal sampling verifies pending records, membership, term and completed setup."
+    ],
+    "prerequisites": [
+      {
+        "alias": "release",
+        "event": "released",
+        "conditions": [
+          {
+            "field": "removed",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          },
+          {
+            "field": "quorum",
+            "op": "eq",
+            "value": 2,
+            "reference": null
+          }
+        ]
+      }
+    ],
+    "legality": {
+      "source_ids": [
+        "S-peerlaunch",
+        "S-bootstrap",
+        "S-peerapply",
+        "S-update",
+        "S-updatecommit",
+        "S-peerread",
+        "S-testlogdb",
+        "S-testlogentries",
+        "S-ticks",
+        "S-peer",
+        "S-engine",
+        "S-send",
+        "S-transportloss",
+        "S-readqueue",
+        "S-readreply"
+      ],
+      "expectation_ids": [
+        "S-dbcontract",
+        "S-readtest"
+      ],
+      "binding_ids": [
+        "K-read-response-context"
+      ],
+      "derivation": "Launch three initial/new peers with identical unique bootstrap addresses and empty TestLogDBs. The synchronous driver saves entries/state before transmitting any update messages, applies only committed bootstrap AddNode configurations, commits updates, and notifies lastApplied. Tick only replica 1 until real vote exchange elects it and current-term no-op is committed/applied at all peers. No private Raft field or handler is substituted; private state is sampled only for prerequisite diagnostics. The driver issues Peer.ReadIndex on followers 2 and 3 with distinct nonzero contexts. A fixed policy discards context-101 heartbeats before delivery; retained messages share one FIFO. The first dropped heartbeat batch leaves its request pending, and the next context heartbeat is delivered and answered by real follower handlers. Loss is permitted by the asynchronous transport send boundary; no fabricated reply, stale authority or reorder is needed. TestLogDB implements the acquired ILogDB boundary; there is no crash in this history. Holding replication until after save is a permissible stronger persistence order, and it occurs in the setup rather than serializing the investigated read overlap.",
+      "applicability": "One single-threaded test owns all Peer calls, storage, queue and observation fields. No goroutines, background timers, external clients or shutdown-dependent observations. Both requests have distinct origins, one outstanding request per origin, making To an independent unambiguous response identity. Generated contexts are valid values allowed by Peer.ReadIndex and node context generation; test bypasses random selection only.",
+      "unresolved": [
+        "This driver does not execute NodeHost client batching or timeout callbacks; their exact-context consumer behavior is source-grounded only."
+      ],
+      "conflicts": [],
+      "alternatives": [
+        "Earlier source-only reading excluded a cumulative client-context consumer mechanism. A NodeHost endpoint test would add scheduler and timeout dependencies unnecessary for the local response identity proposition."
+      ]
+    }
+  },
+  "monitors": [
+    {
+      "id": "M-read-context",
+      "checker_id": "P-read-context",
+      "event": "response",
+      "binding_ids": [
+        "K-read-response-context"
+      ],
+      "grounding": {
+        "source_ids": [
+          "S-readqueue",
+          "S-readreply",
+          "S-readforward",
+          "S-readconsumer",
+          "S-readcaller"
+        ],
+        "expectation_ids": [
+          "S-readtest",
+          "S-followerreadtest",
+          "S-readcontract"
+        ],
+        "binding_ids": [
+          "K-read-response-context"
+        ],
+        "derivation": "The tracker returns each qualified readStatus with its own context and origin (S-readtest explicitly expects distinct contexts for a released prefix). The follower exports exactly the reply context, and the client consumer matches only that context. Therefore a reply reporting qualification to a requesting replica must preserve that request context. Index promotion to a later safe index is allowed; substituting identity is not equivalent to that promotion.",
+        "applicability": "Multi-voter leader, current-term commitment, stable term/membership, distinct contexts admitted from remote members and actually removed by one quorum confirmation. This is a local response-correlation duty, not a promise that all network requests succeed before a deadline.",
+        "unresolved": [],
+        "conflicts": [],
+        "alternatives": [
+          "Local completion already uses each record context; the single-voter branch is outside this queued-prefix check.",
+          "Packet loss or client timeout alone would not violate this requirement."
+        ]
+      },
+      "applicability_conditions": [
+        {
+          "field": "scenario",
+          "op": "eq",
+          "value": "overlapping_remote_reads",
+          "reference": null
+        }
+      ],
+      "admission_alias": "release"
+    }
+  ],
+  "observable_properties": [
+    {
+      "checker_id": "P-read-context",
+      "kind": "event_assertion",
+      "trigger": {
+        "field": "event",
+        "op": "eq",
+        "value": "response",
+        "reference": null
+      },
+      "assertion": {
+        "field": "context",
+        "op": "eq",
+        "value": null,
+        "reference": "release.expected_context"
+      },
+      "antecedent": null,
+      "identity_fields": [
+        "scenario",
+        "cluster",
+        "origin"
+      ],
+      "description": "Compare complete serialized Low/High context of each emitted response with the admitted released request. Destination is independent identity because only one request is outstanding from each origin."
+    }
+  ],
+  "uncertainties": [
+    "The measured boundary is the leader outgoing message, with follower ReadyToRead as diagnostics; client completion and read values are not measured.",
+    "Source-backed bootstrap acceptance replaces application callbacks only for initialized AddNode entries; no membership changes overlap the read requests."
+  ]
+}

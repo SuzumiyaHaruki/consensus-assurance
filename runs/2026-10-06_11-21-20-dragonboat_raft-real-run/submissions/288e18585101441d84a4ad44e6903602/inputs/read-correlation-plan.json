@@ -1,0 +1,136 @@
+{
+  "description": "Exercise overlapping remote requests with distinct contexts. First-context heartbeats are lost; a later actual voter response releases the queued prefix. Observe emitted response context per unique destination and retain recipient ReadyToRead diagnostics.",
+  "claim_id": "O-read-response-context",
+  "binding_ids": [
+    "K-read-response-context"
+  ],
+  "harness": {
+    "kind": "go_test",
+    "source": "",
+    "files": {},
+    "execution_package": "internal/raft",
+    "description": "Three bootstrapped Peers, synchronous update storage/application/commit driver, real tick/vote election and deterministic FIFO message delivery with a fixed first-heartbeat loss policy.",
+    "semantic_changes": [
+      "No target code changes. Captured TestLogDB provides in-memory storage for a no-crash history.",
+      "Network and application scheduling are implemented by the driver; responses are produced only by Peer.Handle.",
+      "Read-only internal sampling verifies pending records, membership, term and completed setup."
+    ],
+    "prerequisites": [
+      {
+        "alias": "release",
+        "event": "released",
+        "conditions": [
+          {
+            "field": "removed",
+            "value": true
+          },
+          {
+            "field": "quorum",
+            "value": 2
+          }
+        ]
+      }
+    ],
+    "legality": {
+      "source_ids": [
+        "S-peerlaunch",
+        "S-bootstrap",
+        "S-peerapply",
+        "S-update",
+        "S-updatecommit",
+        "S-peerread",
+        "S-testlogdb",
+        "S-testlogentries",
+        "S-ticks",
+        "S-peer",
+        "S-engine",
+        "S-send",
+        "S-transportloss",
+        "S-readqueue",
+        "S-readreply"
+      ],
+      "expectation_ids": [
+        "S-dbcontract",
+        "S-readtest"
+      ],
+      "binding_ids": [
+        "K-read-response-context"
+      ],
+      "derivation": "Launch three initial/new peers with identical unique bootstrap addresses and empty TestLogDBs. The synchronous driver saves entries/state before transmitting any update messages, applies only committed bootstrap AddNode configurations, commits updates, and notifies lastApplied. Tick only replica 1 until real vote exchange elects it and current-term no-op is committed/applied at all peers. No private Raft field or handler is substituted; private state is sampled only for prerequisite diagnostics. The driver issues Peer.ReadIndex on followers 2 and 3 with distinct nonzero contexts. A fixed policy discards context-101 heartbeats before delivery; retained messages share one FIFO. The first dropped heartbeat batch leaves its request pending, and the next context heartbeat is delivered and answered by real follower handlers. Loss is permitted by the asynchronous transport send boundary; no fabricated reply, stale authority or reorder is needed. TestLogDB implements the acquired ILogDB boundary; there is no crash in this history. Holding replication until after save is a permissible stronger persistence order, and it occurs in the setup rather than serializing the investigated read overlap.",
+      "applicability": "One single-threaded test owns all Peer calls, storage, queue and observation fields. No goroutines, background timers, external clients or shutdown-dependent observations. Both requests have distinct origins, one outstanding request per origin, making To an independent unambiguous response identity. Generated contexts are valid values allowed by Peer.ReadIndex and node context generation; test bypasses random selection only.",
+      "unresolved": [
+        "This driver does not execute NodeHost client batching or timeout callbacks; their exact-context consumer behavior is source-grounded only."
+      ],
+      "conflicts": [],
+      "alternatives": [
+        "Earlier source-only reading excluded a cumulative client-context consumer mechanism. A NodeHost endpoint test would add scheduler and timeout dependencies unnecessary for the local response identity proposition."
+      ]
+    }
+  },
+  "monitors": [
+    {
+      "id": "M-read-context",
+      "checker_id": "P-read-context",
+      "event": "response",
+      "binding_ids": [
+        "K-read-response-context"
+      ],
+      "grounding": {
+        "source_ids": [
+          "S-readqueue",
+          "S-readreply",
+          "S-readforward",
+          "S-readconsumer",
+          "S-readcaller"
+        ],
+        "expectation_ids": [
+          "S-readtest",
+          "S-followerreadtest",
+          "S-readcontract"
+        ],
+        "binding_ids": [
+          "K-read-response-context"
+        ],
+        "derivation": "The tracker returns each qualified readStatus with its own context and origin (S-readtest explicitly expects distinct contexts for a released prefix). The follower exports exactly the reply context, and the client consumer matches only that context. Therefore a reply reporting qualification to a requesting replica must preserve that request context. Index promotion to a later safe index is allowed; substituting identity is not equivalent to that promotion.",
+        "applicability": "Multi-voter leader, current-term commitment, stable term/membership, distinct contexts admitted from remote members and actually removed by one quorum confirmation. This is a local response-correlation duty, not a promise that all network requests succeed before a deadline.",
+        "unresolved": [],
+        "conflicts": [],
+        "alternatives": [
+          "Local completion already uses each record context; the single-voter branch is outside this queued-prefix check.",
+          "Packet loss or client timeout alone would not violate this requirement."
+        ]
+      },
+      "applicability_conditions": [
+        {
+          "field": "scenario",
+          "value": "overlapping_remote_reads"
+        }
+      ],
+      "admission_alias": "release"
+    }
+  ],
+  "observable_properties": [
+    {
+      "checker_id": "P-read-context",
+      "kind": "event_assertion",
+      "trigger": {
+        "field": "event",
+        "value": "response"
+      },
+      "assertion": {
+        "field": "context",
+        "reference": "release.expected_context"
+      },
+      "identity_fields": [
+        "scenario",
+        "cluster",
+        "origin"
+      ],
+      "description": "Compare complete serialized Low/High context of each emitted response with the admitted released request. Destination is independent identity because only one request is outstanding from each origin."
+    }
+  ],
+  "uncertainties": [
+    "The measured boundary is the leader outgoing message, with follower ReadyToRead as diagnostics; client completion and read values are not measured.",
+    "Source-backed bootstrap acceptance replaces application callbacks only for initialized AddNode entries; no membership changes overlap the read requests."
+  ]
+}

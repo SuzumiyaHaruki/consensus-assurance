@@ -1,0 +1,174 @@
+{
+  "description": "Fresh fixed check of nonvoter support substitution after real election and before any successful voter replication. Observes public future completion, transport successes by peer identity, configured voter threshold and state. No stale read is claimed. Initialization revision uses one bootstrap voter and checked empty joining nodes; no change to the obligation or implication oracle.",
+  "claim_id": "C-verify-eligible",
+  "binding_ids": [
+    "BD-verify-register"
+  ],
+  "harness": {
+    "execution_package": ".",
+    "files": {},
+    "kind": "go_test",
+    "source": "package raft\n\nimport (\n \"encoding/json\"\n \"fmt\"\n \"io\"\n \"sync\"\n \"testing\"\n \"time\"\n)\n\ntype assuranceVerifyTransport struct {\n *InmemTransport\n mu sync.Mutex\n blocked map[ServerID]bool\n positive map[ServerID]int\n denied map[ServerID]int\n}\nfunc (a *assuranceVerifyTransport) AppendEntries(id ServerID, addr ServerAddress, req *AppendEntriesRequest, resp *AppendEntriesResponse) error {\n a.mu.Lock()\n blocked := a.blocked[id]\n if blocked { a.denied[id]++ }\n a.mu.Unlock()\n if blocked { return fmt.Errorf(\"controlled unavailable voter %s\", id) }\n err := a.InmemTransport.AppendEntries(id, addr, req, resp)\n if err == nil && resp.Success { a.mu.Lock(); a.positive[id]++; a.mu.Unlock() }\n return err\n}\nfunc (a *assuranceVerifyTransport) AppendEntriesPipeline(id ServerID, addr ServerAddress) (AppendPipeline,error) {\n return nil, ErrPipelineReplicationNotSupported\n}\nfunc assuranceVerifyEvent(v map[string]interface{}) {\n b, _ := json.Marshal(v)\n fmt.Println(\"CA_EVENT \" + string(b))\n}\nfunc TestAssuranceVerifyNonvoterEligibility(t *testing.T) {\n ids := []ServerID{\"a\", \"b\", \"c\", \"n\"}\n membership := Configuration{}\n for i,id := range ids { suffrage:=Voter; if i==3 { suffrage=Nonvoter }; membership.Servers=append(membership.Servers,Server{ID:id,Address:ServerAddress(id),Suffrage:suffrage}) }\n nodes:=make([]*Raft,4)\n transports:=make([]*InmemTransport,4)\n var outbound *assuranceVerifyTransport\n for i,id:=range ids {\n  _,tr:=NewInmemTransport(ServerAddress(id));transports[i]=tr\n  cfg:=DefaultConfig();cfg.LocalID=id;cfg.skipStartup=true;cfg.PreVoteDisabled=true\n  cfg.HeartbeatTimeout=5*time.Second;cfg.ElectionTimeout=5*time.Second;cfg.LeaderLeaseTimeout=5*time.Second;cfg.LogOutput=io.Discard\n  store:=NewInmemStore();snaps:=NewInmemSnapshotStore()\n  var transport Transport=tr\n  if i==0 { outbound=&assuranceVerifyTransport{InmemTransport:tr,blocked:map[ServerID]bool{},positive:map[ServerID]int{},denied:map[ServerID]int{}};transport=outbound }\n  if i==0 {if err:=BootstrapCluster(cfg,store,store,snaps,transport,membership);err!=nil {t.Fatal(err)}}\n  initialIndex,err:=store.LastIndex();if err!=nil {t.Fatal(err)}\n  if i==0 && initialIndex!=1 {t.Fatalf(\"bootstrap index: %d\",initialIndex)}\n  if i!=0 && initialIndex!=0 {t.Fatalf(\"joining node must start empty: %d\",initialIndex)}\n  r,err:=NewRaft(cfg,&MockFSM{},store,store,snaps,transport);if err!=nil {t.Fatal(err)};nodes[i]=r\n }\n for i,tr:=range transports { for j,peer:=range transports {if i!=j {tr.Connect(ServerAddress(ids[j]),peer)}} }\n stop:=make(chan struct{});var pumps sync.WaitGroup\n // Serialize each follower's real handlers; election timers are not run during this bounded schedule.\n for i:=1;i<4;i++ {r:=nodes[i];pumps.Add(1);go func(){defer pumps.Done();for {select {case rpc:=<-r.rpcCh:r.processRPC(rpc);case <-stop:return}}}()}\n defer func(){for _,r:=range nodes {if err:=r.Shutdown().Error();err!=nil {t.Error(err)}};close(stop);pumps.Wait();for _,tr:=range transports {tr.Close()}}()\n leader:=nodes[0]\n leader.setState(Candidate)\n leader.runCandidate()\n if leader.State()!=Leader {t.Fatalf(\"election not won: %v\",leader.State())}\n // No replication goroutine has started, hence there are no earlier append replies to drain.\n outbound.mu.Lock();outbound.blocked[\"b\"]=true;outbound.blocked[\"c\"]=true;outbound.mu.Unlock()\n assuranceVerifyEvent(map[string]interface{}{\"event\":\"prepared\",\"operation\":\"verify-1\",\"term\":leader.CurrentTerm(),\"state\":leader.State().String(),\"voters\":3,\"nonvoters\":1,\"policy\":\"only_nonvoter_append_replies\",\"replication_started\":false,\"bootstrap_nodes\":1,\"empty_joining_nodes\":3})\n leader.goFunc(leader.runLeader)\n future:=leader.VerifyLeader()\n assuranceVerifyEvent(map[string]interface{}{\"event\":\"admitted\",\"operation\":\"verify-1\",\"policy\":\"only_nonvoter_append_replies\"})\n done:=make(chan error,1);go func(){done<-future.Error()}()\n select {\n case err:=<-done:\n  outbound.mu.Lock();positive:=map[ServerID]int{};denied:=map[ServerID]int{};for id,n:=range outbound.positive {positive[id]=n};for id,n:=range outbound.denied {denied[id]=n};outbound.mu.Unlock()\n  errText:=\"\";if err!=nil {errText=err.Error()}\n  eligible:=1;totalVoters:=0\n  for _,server:=range membership.Servers {if server.Suffrage==Voter {totalVoters++;if server.ID!=leader.localID && positive[server.ID]>0 {eligible++}}}\n  quorum:=totalVoters/2+1\n  assuranceVerifyEvent(map[string]interface{}{\"event\":\"result\",\"operation\":\"verify-1\",\"success\":err==nil,\"completed\":true,\"eligible_voter_quorum\":eligible>=quorum,\"eligible_voter_support\":eligible,\"quorum\":quorum,\"error\":errText,\"positive_append_responses\":positive,\"blocked_calls\":denied,\"state\":leader.State().String(),\"term\":leader.CurrentTerm()})\n case <-time.After(2*time.Second):\n  assuranceVerifyEvent(map[string]interface{}{\"event\":\"bounded_pending\",\"operation\":\"verify-1\"})\n  leader.Shutdown()\n  select {case <-done:case <-time.After(time.Second):t.Fatal(\"verification waiter did not exit after shutdown\")}\n }\n}\n",
+    "description": "Single voter bootstrap with the full three-voter/one-nonvoter configuration; three other NewRaft instances start with checked empty stores. The actual election and remaining verification driver are unchanged.",
+    "semantic_changes": [
+      "skipStartup and manual follower RPC pumps select a bounded schedule with follower election timers delayed",
+      "Transport wrapper returns errors to selected voter appends and declares pipelining unsupported; it delegates other operations unchanged",
+      "No edits to target implementation; mutex-protected counters instrument only transport responses"
+    ],
+    "prerequisites": [
+      {
+        "alias": "prepared",
+        "event": "prepared",
+        "conditions": [
+          {
+            "field": "state",
+            "op": "eq",
+            "value": "Leader",
+            "reference": null
+          },
+          {
+            "field": "voters",
+            "op": "eq",
+            "value": 3,
+            "reference": null
+          },
+          {
+            "field": "nonvoters",
+            "op": "eq",
+            "value": 1,
+            "reference": null
+          },
+          {
+            "field": "replication_started",
+            "op": "eq",
+            "value": false,
+            "reference": null
+          },
+          {
+            "field": "policy",
+            "op": "eq",
+            "value": "only_nonvoter_append_replies",
+            "reference": null
+          }
+        ]
+      },
+      {
+        "alias": "admitted",
+        "event": "admitted",
+        "conditions": [
+          {
+            "field": "operation",
+            "op": "eq",
+            "value": null,
+            "reference": "prepared.operation"
+          },
+          {
+            "field": "policy",
+            "op": "eq",
+            "value": null,
+            "reference": "prepared.policy"
+          }
+        ]
+      }
+    ],
+    "legality": {
+      "source_ids": [
+        "M-bootstrap",
+        "M-start",
+        "M-skip-start",
+        "M-elect-producer",
+        "M-election",
+        "M-leader",
+        "M-trans-contract",
+        "M-heartbeat",
+        "M-append",
+        "M-api-verify",
+        "M-future",
+        "M-bootstrap-contract",
+        "M-vote"
+      ],
+      "expectation_ids": [
+        "M-api-verify"
+      ],
+      "binding_ids": [],
+      "derivation": "Repair b57a5b7a10a44073b5404452dcc4e00e: call BootstrapCluster only for a, an included voter. Check its store LastIndex=1 and every other node store LastIndex=0 before NewRaft. M-bootstrap-contract authorizes a single participating voter with the initial configuration. M-start permits empty stores; M-vote permits an empty-configuration receiver to consider a vote, checks history, advances term and persists the vote. The actual runCandidate requests these real votes. No fabricated vote or membership mutation occurs. The leader latest membership remains the same fixed three voters and one nonvoter. As before, block other voter appends before any replication starts, then invoke public VerifyLeader with actual nonvoter handler replies. This replaces only bootstrap initialization and keeps the original eligibility discriminator, expectation and result predicate.",
+      "applicability": "Bounded prefix before the 5-second leader lease. Follower election timers are unscheduled during the finite experiment. Two-second observation limit is a harness bound, not a claimed protocol deadline. New leader noop is not committed; VerifyLeader has no current-term-commit admission requirement, and the obligation only concerns its tally eligibility.",
+      "unresolved": [],
+      "conflicts": [],
+      "alternatives": [
+        "A narrower direct vote(bool) call would omit public completion and actual response production; this check retains those paths."
+      ]
+    }
+  },
+  "monitors": [
+    {
+      "id": "MON-verify",
+      "checker_id": "CHK-verify",
+      "event": "result",
+      "binding_ids": [
+        "BD-verify-register"
+      ],
+      "grounding": {
+        "source_ids": [
+          "M-verify-register",
+          "M-verify-vote",
+          "M-notify",
+          "M-consume",
+          "M-leader",
+          "M-heartbeat",
+          "M-api-verify",
+          "M-future"
+        ],
+        "expectation_ids": [
+          "M-api-verify",
+          "M-suffrage-contract",
+          "M-lease"
+        ],
+        "binding_ids": [
+          "BD-verify-register"
+        ],
+        "derivation": "One operation ID correlates prepared policy, API admission and eventual future Error result. success is err==nil. eligible voter support counts local voter plus distinct configured voter IDs with successful append responses since before leader replication began. This is an upper bound on eligible support attributable to the request; observing no voter response even in that wider interval suffices for the selected missing-voter witness. No response sampling infers a quorum from nonvoters.",
+        "applicability": "Result fields sampled after Error returns and transport maps copied under their mutex. Absence of a result remains unknown. Non-completion event is diagnostic only.",
+        "unresolved": [
+          "The positive-support count does not prove exact per-request voter callback causality if other scenarios deliver voter responses; this declared scenario blocks all of them."
+        ],
+        "conflicts": [],
+        "alternatives": []
+      },
+      "applicability_conditions": [],
+      "admission_alias": "admitted"
+    }
+  ],
+  "observable_properties": [
+    {
+      "checker_id": "CHK-verify",
+      "kind": "event_implication",
+      "trigger": {
+        "field": "completed",
+        "op": "eq",
+        "value": true,
+        "reference": null
+      },
+      "assertion": {
+        "field": "eligible_voter_quorum",
+        "op": "eq",
+        "value": true,
+        "reference": null
+      },
+      "antecedent": {
+        "field": "success",
+        "op": "eq",
+        "value": true,
+        "reference": null
+      },
+      "identity_fields": [
+        "operation"
+      ],
+      "description": "Successful verification requires an eligible voter quorum; failed verification is not a claim that the quorum exists."
+    }
+  ],
+  "uncertainties": [
+    "Formal review must assess composed normative eligibility inference.",
+    "No second leader, stale read or infinite non-completion is asserted."
+  ]
+}

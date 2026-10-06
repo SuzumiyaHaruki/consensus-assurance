@@ -1,0 +1,851 @@
+{
+  "version": 1,
+  "target_profile": {
+    "system_boundary": "Captured OmniPaxos Rust core library with generic storage and caller-driven transport/ticks; repository storage and async runtime remain within audit boundary, with deeper variants explicitly open.",
+    "protocol_contexts": [
+      "Configuration instance",
+      "Ballot",
+      "Per-follower sequence session",
+      "Accepted and decided prefix"
+    ],
+    "external_interfaces": [
+      "append/reconfigure",
+      "handle_incoming/take_outgoing_messages",
+      "tick/reconnected",
+      "Storage and Snapshot traits",
+      "read/read_decided_suffix"
+    ],
+    "ownership": [
+      "Core methods serialize mutation through &mut self; application owns network delivery and application of decisions."
+    ],
+    "selection_injection": [],
+    "variants": [],
+    "source_ids": [
+      "M-api",
+      "M-transport",
+      "M-storage-contract",
+      "M-runtime"
+    ],
+    "unknowns": []
+  },
+  "activities": [
+    {
+      "class_id": "A1",
+      "applicability": "applicable",
+      "purpose": "Qualified support for decision formation and legal advancement",
+      "realization_summary": "Promise quorum selects inherited sequence; acceptance quorum advances decided boundary; sequenced messages propagate it.",
+      "entry_points": [],
+      "variants": [],
+      "unknowns": [],
+      "source_ids": [
+        "M-leader",
+        "M-quorum",
+        "M-sync",
+        "M-follower",
+        "M-sequence",
+        "M-order",
+        "M-batch"
+      ]
+    },
+    {
+      "class_id": "A2",
+      "applicability": "applicable",
+      "purpose": "Context validity and acquisition, transfer or loss of authority",
+      "realization_summary": "BLE or manual attempt nominates higher ballot; durable promises and role/phase/sequence guards constrain eligible work.",
+      "entry_points": [],
+      "variants": [],
+      "unknowns": [],
+      "source_ids": [
+        "M-ble",
+        "M-api",
+        "M-leader",
+        "M-follower",
+        "M-quorum"
+      ]
+    },
+    {
+      "class_id": "A3",
+      "applicability": "applicable",
+      "purpose": "Recovery and resynchronization of eligible participation",
+      "realization_summary": "Stored promises, reconnect notification and sequence gaps initiate preparation/synchronization; tick drives retries.",
+      "entry_points": [],
+      "variants": [],
+      "unknowns": [],
+      "source_ids": [
+        "M-dispatch",
+        "M-sequence",
+        "M-follower",
+        "M-leader"
+      ]
+    },
+    {
+      "class_id": "A4",
+      "applicability": "applicable",
+      "purpose": "Configuration and participant eligibility",
+      "realization_summary": "Cluster configuration determines peers/quorums; decided StopSign seals old log and caller starts next instance.",
+      "entry_points": [],
+      "variants": [],
+      "unknowns": [],
+      "source_ids": [
+        "M-config",
+        "M-api",
+        "M-sequence",
+        "M-leader",
+        "M-follower",
+        "M-reconfig-contract"
+      ]
+    },
+    {
+      "class_id": "A5",
+      "applicability": "applicable",
+      "purpose": "Decision application and consumption",
+      "realization_summary": "Synchronous reads expose decided entries or compacted snapshots; application applies them externally.",
+      "entry_points": [],
+      "variants": [],
+      "unknowns": [],
+      "source_ids": [
+        "M-api",
+        "M-cache",
+        "M-log-contract"
+      ]
+    },
+    {
+      "class_id": "A6",
+      "applicability": "applicable",
+      "purpose": "History, persistence and reconstruction of support",
+      "realization_summary": "Internal storage caches metadata and uses atomic backend operations for synchronization and compaction; provided storage implementations are in repository.",
+      "entry_points": [],
+      "variants": [],
+      "unknowns": [],
+      "source_ids": [
+        "M-sync",
+        "M-storage-contract",
+        "M-sequence",
+        "M-leader",
+        "M-follower",
+        "M-memory",
+        "M-storage-state"
+      ]
+    },
+    {
+      "class_id": "A7",
+      "applicability": "applicable",
+      "purpose": "Client contracts, invocation intervals and observed completion",
+      "realization_summary": "Actor assigns EntryId operations to accepted boundaries and ballots; tick drains completion by decided index before supersession. Caller owns transport; handle APIs await oneshot results. Subscription and shutdown details remain partly unread.",
+      "entry_points": [],
+      "variants": [],
+      "unknowns": [
+        "Success correlation across a replaced undecided suffix is under investigation.",
+        "Subscription fan-out and shutdown/backpressure continuation remain partly unread."
+      ],
+      "source_ids": [
+        "M-api",
+        "M-runtime",
+        "M-runtime-notify",
+        "M-runtime-assign",
+        "M-runtime-loop",
+        "M-runtime-handle",
+        "M-runtime-errors"
+      ]
+    }
+  ],
+  "behaviors": [
+    {
+      "id": "B-election",
+      "primary_activity": "A2",
+      "execution_owner": "BallotLeaderElection and OmniPaxos::election_timeout",
+      "protocol_context": "Configuration ballot and heartbeat round",
+      "trigger": "Caller ticks or try_become_leader",
+      "legal_preconditions": [],
+      "implementation_guards": [
+        "BLE replies require current heartbeat round and matching configuration; SequencePaxos handle_leader requires a ballot above both current leader state and promise."
+      ],
+      "reads": [],
+      "writes": [
+        "BLE leader, happiness, ballot; accepted election initializes fresh leader bookkeeping and persists own promise."
+      ],
+      "durable_effects": [],
+      "external_effects": [
+        "Heartbeat requests/replies; election invokes SequencePaxos preparation."
+      ],
+      "important_branches": [],
+      "async_boundaries": [],
+      "produces_fact_ids": [],
+      "consumes_fact_ids": [],
+      "cross_activity_effects": {
+        "A1": "Election alone does not decide; leader must gather prepare support then synchronize accepted history."
+      },
+      "existing_protections": [],
+      "source_ids": [
+        "M-ble",
+        "M-api"
+      ],
+      "unknowns": [
+        "BLE reply vector does not deduplicate by peer; transport duplication applicability remains unread."
+      ]
+    },
+    {
+      "id": "B-promise",
+      "primary_activity": "A2",
+      "execution_owner": "SequencePaxos leader/follower",
+      "protocol_context": "Promised ballot and phase",
+      "trigger": "handle_leader; handle_prepare; handle_preparereq; handle_notaccepted",
+      "legal_preconditions": [],
+      "implementation_guards": [
+        "Prepare requires a higher ballot or equal ballot in Recover.",
+        "Promise consumption requires Leader role and matching leader ballot."
+      ],
+      "reads": [],
+      "writes": [
+        "Flush batches before changing promise; follower resets sequence and caches Promise; new leader resets LeaderState; PrepareReq resets peer promise and outgoing accept metadata; NotAccepted marks peer PromisedHigher."
+      ],
+      "durable_effects": [
+        "Storage promise update precedes outgoing Promise."
+      ],
+      "external_effects": [
+        "Prepare and Promise contain accepted round/index and decided index; Promise optionally carries log synchronization."
+      ],
+      "important_branches": [],
+      "async_boundaries": [],
+      "produces_fact_ids": [
+        "F-promise"
+      ],
+      "consumes_fact_ids": [
+        "F-history"
+      ],
+      "cross_activity_effects": {
+        "A1": "Promise quorum chooses accepted history by accepted ballot then length; old ballot replies cannot enter a new leader ballot."
+      },
+      "existing_protections": [
+        "Per-peer promise slots prevent duplicate Promise messages from increasing quorum count."
+      ],
+      "source_ids": [
+        "M-leader",
+        "M-follower",
+        "M-quorum"
+      ],
+      "unknowns": [
+        "Configuration isolation at transport/instance replacement boundaries remains unverified; ballot ordering omits config_id although equality includes it."
+      ]
+    },
+    {
+      "id": "B-form",
+      "primary_activity": "A1",
+      "execution_owner": "SequencePaxos leader and LeaderState",
+      "protocol_context": "Leader Prepare to Accept in one ballot",
+      "trigger": "handle_promise_prepare reaches prepare quorum",
+      "legal_preconditions": [],
+      "implementation_guards": [
+        "Matching ballot and prepare quorum counted from per-peer promise slots."
+      ],
+      "reads": [
+        "Highest accepted-round/length log synchronization and maximum promised decided index."
+      ],
+      "writes": [
+        "sync_log selects inherited history, appends buffered proposals unless stopped, enters Accept, records own accepted index."
+      ],
+      "durable_effects": [],
+      "external_effects": [
+        "AcceptSync sent to promised followers with a new per-peer sequence session."
+      ],
+      "important_branches": [],
+      "async_boundaries": [],
+      "produces_fact_ids": [],
+      "consumes_fact_ids": [
+        "F-promise",
+        "F-history"
+      ],
+      "cross_activity_effects": {
+        "A2": "New authority is constrained by inherited support, not only by BLE nomination.",
+        "A3": "AcceptSync also initializes recovery participants."
+      },
+      "existing_protections": [],
+      "source_ids": [
+        "M-leader",
+        "M-quorum",
+        "M-sync"
+      ],
+      "unknowns": []
+    },
+    {
+      "id": "B-accept",
+      "primary_activity": "A1",
+      "execution_owner": "SequencePaxos leader/follower",
+      "protocol_context": "Accept phase in promised ballot",
+      "trigger": "append, AcceptDecide, Accepted, Decide, flush timeout",
+      "legal_preconditions": [],
+      "implementation_guards": [
+        "Leader accepts proposals only before StopSign. Follower requires promised ballot and correct phase; sequenced messages require the next sequence number.",
+        "Accepted requires current leader ballot and Leader/Accept; chosen index requires configured write quorum of per-peer indexes."
+      ],
+      "reads": [],
+      "writes": [
+        "Persist flushed entries; record accepted indexes; advance decided index after quorum; follower bounds received decided index by flushed accepted length."
+      ],
+      "durable_effects": [],
+      "external_effects": [
+        "AcceptDecide, Accepted, Decide messages; queued messages may be coalesced."
+      ],
+      "important_branches": [],
+      "async_boundaries": [
+        "Caller drains outgoing messages and delivers them; drain resets message-cache offsets.",
+        "Batch may defer persistence until configured tick-driven flush."
+      ],
+      "produces_fact_ids": [
+        "F-history",
+        "F-decided"
+      ],
+      "consumes_fact_ids": [
+        "F-promise"
+      ],
+      "cross_activity_effects": {},
+      "existing_protections": [],
+      "source_ids": [
+        "M-leader",
+        "M-follower",
+        "M-sequence",
+        "M-quorum",
+        "M-order",
+        "M-batch"
+      ],
+      "unknowns": [
+        "Lost/reset promise does not clear accepted_indexes; whether retained historical support is ever consumed outside its valid history remains a source question."
+      ]
+    },
+    {
+      "id": "B-recover",
+      "primary_activity": "A3",
+      "execution_owner": "SequencePaxos constructors and reconnect handlers",
+      "protocol_context": "Recovered durable promise or detected transport gap",
+      "trigger": "Construction with stored promise, reconnected, missing sequence, resend timeout",
+      "legal_preconditions": [],
+      "implementation_guards": [
+        "Old ballot accepts rejected; outdated sequence ignored; missing preceding sequence initiates recovery."
+      ],
+      "reads": [],
+      "writes": [
+        "Recover phase and PrepareReq; equal-ballot Prepare may reestablish promise in Recover."
+      ],
+      "durable_effects": [],
+      "external_effects": [
+        "Resends PrepareReq or cached Promise; leader resends Prepare to eligible peers and StopSign/decision messages."
+      ],
+      "important_branches": [],
+      "async_boundaries": [],
+      "produces_fact_ids": [],
+      "consumes_fact_ids": [
+        "F-promise",
+        "F-history"
+      ],
+      "cross_activity_effects": {
+        "A2": "Recovered node does not resume old authority immediately; requires preparation and synchronization.",
+        "A1": "AcceptSync establishes the chosen inherited log before follower acknowledges new ballot."
+      },
+      "existing_protections": [],
+      "source_ids": [
+        "M-dispatch",
+        "M-sequence",
+        "M-follower",
+        "M-leader"
+      ],
+      "unknowns": []
+    },
+    {
+      "id": "B-sync",
+      "primary_activity": "A6",
+      "execution_owner": "InternalStorage::sync_log, create_diff_snapshot and create_snapshot",
+      "protocol_context": "Log suffix and snapshot reconstruction across preparation/recovery",
+      "trigger": "Leader quorum formation or follower AcceptSync invokes sync_log; create_log_sync supplies history",
+      "legal_preconditions": [],
+      "implementation_guards": [],
+      "reads": [
+        "Existing compacted index, snapshot, stored log entries, incoming decided index and LogSync."
+      ],
+      "writes": [
+        "sync_log updates cached accepted round and decided index before snapshot reconstruction; Delta calls create_decided_snapshot then merges delta; suffix replacement and StopSign update follow."
+      ],
+      "durable_effects": [
+        "One write_atomically operation list installs accepted round, decided index, compaction/snapshot, suffix and StopSign changes."
+      ],
+      "external_effects": [],
+      "important_branches": [
+        "Complete snapshot directly replaces snapshot. Delta reconstructs a local decided snapshot before merge. No LogSync only updates round and decision metadata.",
+        "Sender create_diff_snapshot uses Complete when receiver decided boundary is at/below sender compaction, otherwise Delta from receiver boundary to sender decided end.",
+        "When incoming decided index exceeds local stored length, Delta base construction reads an incomplete interval; MemoryStorage returns empty before incoming Delta is merged. This condition is distinct from Complete replacement and from full-range reads."
+      ],
+      "async_boundaries": [],
+      "produces_fact_ids": [
+        "F-history",
+        "F-decided",
+        "F-snapshot"
+      ],
+      "consumes_fact_ids": [
+        "F-history",
+        "F-snapshot"
+      ],
+      "cross_activity_effects": {
+        "A1": "Reconstructed contents are later acknowledged and read as decided history.",
+        "A2": "Selected old-ballot support is installed under the new accepted round."
+      },
+      "existing_protections": [],
+      "source_ids": [
+        "M-sync",
+        "M-storage-contract",
+        "M-sequence",
+        "M-leader",
+        "M-follower",
+        "M-memory"
+      ],
+      "unknowns": []
+    },
+    {
+      "id": "B-read",
+      "primary_activity": "A5",
+      "execution_owner": "OmniPaxos and InternalStorage read methods",
+      "protocol_context": "Local accepted/decided/compacted ranges",
+      "trigger": "read, read_entries, read_decided_suffix",
+      "legal_preconditions": [],
+      "implementation_guards": [],
+      "reads": [
+        "Cached decided and compacted bounds plus backend content."
+      ],
+      "writes": [],
+      "durable_effects": [],
+      "external_effects": [
+        "Entries tagged Decided/Undecided by index; compacted ranges return snapshot or Trimmed; StopSign includes decided flag."
+      ],
+      "important_branches": [],
+      "async_boundaries": [],
+      "produces_fact_ids": [],
+      "consumes_fact_ids": [
+        "F-decided",
+        "F-snapshot"
+      ],
+      "cross_activity_effects": {
+        "A1": "Exposes decision consequences to application; docs guarantee Decided entries are not reverted."
+      },
+      "existing_protections": [],
+      "source_ids": [
+        "M-api",
+        "M-cache",
+        "M-log-contract"
+      ],
+      "unknowns": []
+    },
+    {
+      "id": "B-membership",
+      "primary_activity": "A4",
+      "execution_owner": "OmniPaxosConfig, ClusterConfig and SequencePaxos reconfiguration",
+      "protocol_context": "One instance configuration and successor StopSign",
+      "trigger": "build, reconfigure, AcceptStopSign",
+      "legal_preconditions": [],
+      "implementation_guards": [
+        "Build validates own pid membership, nonzero IDs/timeouts, quorum overlap and range. Reconfiguration validates successor config. Accepted StopSign rejects subsequent appends."
+      ],
+      "reads": [],
+      "writes": [
+        "StopSign stored as final accepted position and transferred by synchronization."
+      ],
+      "durable_effects": [],
+      "external_effects": [
+        "Application observes decided StopSign and starts next configuration with fresh storage; new nodes need caller-provided preceding application state."
+      ],
+      "important_branches": [],
+      "async_boundaries": [],
+      "produces_fact_ids": [],
+      "consumes_fact_ids": [],
+      "cross_activity_effects": {
+        "A1": "StopSign uses quorum decision machinery.",
+        "A2": "Configuration transition is completed by caller instance replacement after decision."
+      },
+      "existing_protections": [],
+      "source_ids": [
+        "M-config",
+        "M-api",
+        "M-sequence",
+        "M-leader",
+        "M-follower",
+        "M-reconfig-contract"
+      ],
+      "unknowns": [
+        "Increasing successor configuration ID is documented but reconfigure validates only the successor config in isolation.",
+        "Runtime ownership of old messages during instance replacement is unread."
+      ]
+    },
+    {
+      "id": "B-compaction",
+      "primary_activity": "A6",
+      "execution_owner": "SequencePaxos and InternalStorage",
+      "protocol_context": "Locally decided prefix",
+      "trigger": "trim or snapshot API or received compaction message",
+      "legal_preconditions": [],
+      "implementation_guards": [
+        "Internal trim/snapshot cannot exceed local decided bound; StopSign excluded from snapshotted entries."
+      ],
+      "reads": [],
+      "writes": [],
+      "durable_effects": [
+        "Atomic trim, compacted-index and optional snapshot update."
+      ],
+      "external_effects": [],
+      "important_branches": [],
+      "async_boundaries": [],
+      "produces_fact_ids": [
+        "F-snapshot"
+      ],
+      "consumes_fact_ids": [
+        "F-history",
+        "F-decided"
+      ],
+      "cross_activity_effects": {},
+      "existing_protections": [],
+      "source_ids": [
+        "M-storage-state",
+        "M-sync"
+      ],
+      "unknowns": [
+        "Sparse node IDs and minimum-all-accepted trim accounting need separate reading."
+      ]
+    },
+    {
+      "id": "B-runtime-assignment",
+      "primary_activity": "A7",
+      "execution_owner": "ActorState command/runtime-message handling",
+      "protocol_context": "Pending append_notify EntryId, assigned accepted boundary and ballot",
+      "trigger": "AppendNotify creates Pending; local append or remote Assigned establishes assignment",
+      "implementation_guards": [
+        "Local acceptance requires self as promised leader in Accept phase.",
+        "Pending cap bounds owned requests.",
+        "Batch tracking discards stale-ballot intents during reconciliation."
+      ],
+      "writes": [
+        "Immediate append records accepted_after and current promise; remote Assigned records the supplied index and ballot by EntryId; pending retains oneshot completion sender and deadline."
+      ],
+      "produces_fact_ids": [
+        "F-notify-assignment"
+      ],
+      "source_ids": [
+        "M-runtime-notify",
+        "M-runtime-assign",
+        "M-runtime-loop"
+      ],
+      "cross_activity_effects": {
+        "A1": "Correlates an application entry to accepted log position whose decision will complete the call.",
+        "A2": "Records assignment ballot for supersession checks when authority changes."
+      },
+      "unknowns": [
+        "Does completion correctly distinguish an old assigned entry from a replacement at the same decided index?"
+      ]
+    },
+    {
+      "id": "B-runtime-completion",
+      "primary_activity": "A7",
+      "execution_owner": "ActorState::drain_notifiers in tick branch",
+      "protocol_context": "Pending assigned index and current underlying log/promise",
+      "trigger": "Runtime tick after core tick, event detection, undispatched dispatch and batch reconciliation",
+      "reads": [
+        "Current decided index, current promise, Pending assignment and deadline."
+      ],
+      "important_branches": [
+        "Assigned idx <= decided sends Ok(idx) without comparing assignment ballot.",
+        "Only otherwise, assignment ballot below current promise sends Superseded.",
+        "Only otherwise, expired deadline sends Timeout; remaining pending calls retained."
+      ],
+      "external_effects": [
+        "Oneshot completion of append_notify."
+      ],
+      "consumes_fact_ids": [
+        "F-notify-assignment",
+        "F-decided",
+        "F-promise"
+      ],
+      "source_ids": [
+        "M-runtime-notify",
+        "M-runtime-loop",
+        "M-runtime-handle",
+        "M-runtime-errors"
+      ],
+      "cross_activity_effects": {
+        "A1": "Turns a log decision boundary into a success response for a particular submitted entry.",
+        "A2": "Ballot supersession is evaluated after the decision-boundary branch."
+      },
+      "unknowns": [
+        "Can an authentic higher-ballot log replacement and decision arrive between notifier ticks, causing old-entry success?"
+      ]
+    }
+  ],
+  "facts": [
+    {
+      "id": "F-promise",
+      "meaning": "This replica records a promised ballot; follower acceptance compares incoming ballot to this promise, with phase and sequence guards applied separately.",
+      "identity": {
+        "replica": "pid",
+        "context": "instance and promised ballot"
+      },
+      "validity_context": "Current stored/cached promise within a running instance; this is not proof of quorum leadership.",
+      "representation": [
+        "InternalStorage promise",
+        "Role/Phase",
+        "LeaderState promises_meta"
+      ],
+      "invalidators": [
+        "B-promise"
+      ],
+      "reinterpreters": [],
+      "durability": "Backend promise persists across reconstruction if backend is durable; memory backend does not survive process loss.",
+      "recovery": "Stored promise starts in Recover and requests prepare.",
+      "source_ids": [
+        "M-follower",
+        "M-leader",
+        "M-dispatch"
+      ],
+      "unknowns": []
+    },
+    {
+      "id": "F-history",
+      "meaning": "Locally stored accepted log prefix, optional compacted representation and StopSign, with accepted round and logical accepted length; batched unflushed entries are excluded.",
+      "identity": {
+        "replica": "pid",
+        "log": "configuration instance and logical indexes"
+      },
+      "validity_context": "Accepted round and local storage state; undecided suffix can be replaced by sync.",
+      "representation": [
+        "accepted_round",
+        "accepted_idx",
+        "backend log",
+        "compacted_idx",
+        "snapshot",
+        "StopSign"
+      ],
+      "invalidators": [],
+      "reinterpreters": [
+        "B-sync"
+      ],
+      "durability": "Depends on backend; synchronization requires atomic operations; in-memory batching is not accepted storage.",
+      "recovery": "load_cache restores metadata and derives length from backend; synchronization selects inherited suffix.",
+      "source_ids": [
+        "M-sync",
+        "M-cache",
+        "M-batch",
+        "M-storage-contract"
+      ],
+      "unknowns": []
+    },
+    {
+      "id": "F-decided",
+      "meaning": "The local decided index classifies preceding log entries as decided; it records a boundary rather than independently verifying content.",
+      "identity": {
+        "replica": "pid",
+        "log": "configuration instance"
+      },
+      "validity_context": "Current stored history and local decided boundary.",
+      "representation": [
+        "state_cache.decided_idx",
+        "backend decided index"
+      ],
+      "invalidators": [],
+      "reinterpreters": [],
+      "durability": "Backend dependent; quorum decisions persist index, synchronization installs index with history atomically.",
+      "recovery": "Loaded from backend and propagated by Promise/AcceptSync/Decide.",
+      "source_ids": [
+        "M-leader",
+        "M-follower",
+        "M-sync",
+        "M-cache"
+      ],
+      "unknowns": []
+    },
+    {
+      "id": "F-snapshot",
+      "meaning": "A stored snapshot is paired with a compacted boundary and returned as the representation of the compacted prefix; construction uses Snapshot::create and merge on selected local entries and received deltas.",
+      "identity": {
+        "replica": "pid",
+        "prefix": "configuration instance and compacted_idx"
+      },
+      "validity_context": "Local snapshot and compacted boundary after successful storage operation; content correspondence remains a responsibility to investigate.",
+      "representation": [
+        "backend snapshot",
+        "state_cache.compacted_idx",
+        "LogEntry::Snapshotted"
+      ],
+      "invalidators": [],
+      "reinterpreters": [
+        "B-sync"
+      ],
+      "durability": "Snapshot and compaction metadata are installed together through Storage::write_atomically; durability depends on backend.",
+      "recovery": "Complete synchronization replaces snapshot; Delta reconstructs local snapshot and merges incoming changes; load_cache restores boundary.",
+      "source_ids": [
+        "M-sync",
+        "M-storage-state",
+        "M-storage-contract",
+        "M-cache"
+      ],
+      "unknowns": []
+    },
+    {
+      "id": "F-notify-assignment",
+      "meaning": "An owned pending EntryId has been associated with an accepted log boundary and ballot by a local append/reconciliation or an Assigned message; this association alone does not establish decision or continued entry identity after a ballot change.",
+      "identity": {
+        "operation": "EntryId of one pending append_notify",
+        "owner": "origin actor"
+      },
+      "validity_context": "Pending lifetime with the recorded assignment ballot; downstream completion uses current core state.",
+      "representation": [
+        "Pending.assigned Option<(usize,Ballot)>",
+        "Pending.id",
+        "Pending.reply"
+      ],
+      "durability": "Volatile actor bookkeeping; not persisted with the core log.",
+      "recovery": "Actor reconstruction does not restore pending notification futures; core recovery can replace undecided suffix while an actor remains running.",
+      "source_ids": [
+        "M-runtime-notify",
+        "M-runtime-assign",
+        "M-runtime-loop"
+      ],
+      "unknowns": [
+        "Whether the success branch preserves entry identity across higher-ballot suffix replacement."
+      ]
+    }
+  ],
+  "surfaces": [
+    {
+      "entry_point": "InternalStorage::sync_log Delta branch",
+      "disposition": "mapped",
+      "behavior_ids": [
+        "B-sync"
+      ],
+      "reason": "Conditional incomplete-local-range mechanism is understood; scoped executed answer remains in Candidate and CheckRun records.",
+      "source_ids": [
+        "M-sync"
+      ],
+      "high_consequence": true
+    },
+    {
+      "entry_point": "OmniPaxos::handle_incoming configuration isolation",
+      "disposition": "deferred",
+      "behavior_ids": [],
+      "reason": "Core dispatch passes SequencePaxos messages without visible configuration filter. Need caller/runtime routing and legal transition history before attributing responsibility.",
+      "source_ids": [
+        "M-api",
+        "M-ble",
+        "M-reconfig-contract"
+      ],
+      "high_consequence": true
+    },
+    {
+      "entry_point": "omnipaxos_runtime::spawn_actor",
+      "disposition": "mapped",
+      "behavior_ids": [
+        "B-runtime-assignment",
+        "B-runtime-completion"
+      ],
+      "reason": "Assignment and tick completion paths are mapped; subscriber/backpressure and shutdown variants remain open.",
+      "source_ids": [
+        "M-runtime",
+        "M-runtime-notify",
+        "M-runtime-assign",
+        "M-runtime-loop"
+      ],
+      "high_consequence": true
+    },
+    {
+      "entry_point": "LeaderState::lost_promise / is_chosen",
+      "disposition": "deferred",
+      "behavior_ids": [],
+      "reason": "Accepted indexes remain when promise is lost; determine whether this is valid historical support or whether any legal continuation misuses it.",
+      "source_ids": [
+        "M-quorum",
+        "M-leader"
+      ],
+      "high_consequence": true
+    }
+  ],
+  "core_overview": {
+    "formation": {
+      "explanation": "Caller append buffers during Prepare or forwards to promised leader. Prepare quorum selects highest accepted round/length history; leader syncs it, preserves maximum reported decision boundary, appends pending work when not stopped, and sends AcceptSync. Accept-phase follower validates ballot, phase and sequence, persists entries and acknowledges accepted length. Leader stores one accepted index per pid and decides on configured write quorum, propagating Decide or piggybacking AcceptDecide. Reads classify entries by local decided index; application polls and consumes them.",
+      "behavior_ids": [
+        "B-form",
+        "B-accept",
+        "B-read"
+      ],
+      "fact_ids": [
+        "F-history",
+        "F-decided"
+      ],
+      "source_ids": [
+        "M-leader",
+        "M-follower",
+        "M-quorum",
+        "M-api",
+        "M-log-contract",
+        "M-sync",
+        "M-sequence",
+        "M-order",
+        "M-batch",
+        "M-cache",
+        "M-storage-contract"
+      ]
+    },
+    "context": {
+      "explanation": "BLE heartbeat rounds assess connectivity/happiness and propose ballots; manual attempt increments a ballot directly. SequencePaxos requires higher ballot before leader preparation and resets leader support. Higher Prepare flushes follower batches, persists promise, resets sequence and emits Promise. Lower-ballot accepts are rejected with NotAccepted; unseen higher accepts initiate recovery. New or recovered instances with stored promise enter Recover; equal-ballot Prepare is allowed there. Reconnect/gaps request prepare; ticks resend preparation and StopSign work. Configuration transition uses decided StopSign then caller constructs a fresh instance.",
+      "behavior_ids": [
+        "B-election",
+        "B-promise",
+        "B-recover",
+        "B-membership"
+      ],
+      "fact_ids": [
+        "F-promise"
+      ],
+      "source_ids": [
+        "M-ble",
+        "M-leader",
+        "M-follower",
+        "M-dispatch",
+        "M-api",
+        "M-reconfig-contract",
+        "M-quorum",
+        "M-sequence",
+        "M-config"
+      ]
+    },
+    "connection": {
+      "explanation": "Authority acquisition reads prior accepted history before creating new support: Promise metadata and optional log synchronization carry old accepted rounds and decisions into prepare quorum selection. AcceptSync reestablishes participation under a new ballot/session; old-ballot replies are excluded, old sequences ignored and gaps resynchronize. Stored decisions constrain selected history through maximum reported decided index; suffix/snapshot reconstruction must preserve its meaning. Pending leader proposals are appended after sync unless StopSign seals the log; followers forward buffered ordinary proposals after sync. Persistence and Snapshot traits supply history, while caller transport/ticks drive asynchronous propagation.",
+      "behavior_ids": [
+        "B-promise",
+        "B-form",
+        "B-sync",
+        "B-recover",
+        "B-accept"
+      ],
+      "fact_ids": [
+        "F-promise",
+        "F-history",
+        "F-decided",
+        "F-snapshot"
+      ],
+      "source_ids": [
+        "M-leader",
+        "M-follower",
+        "M-sync",
+        "M-sequence",
+        "M-storage-contract",
+        "M-quorum",
+        "M-memory",
+        "M-dispatch",
+        "M-order",
+        "M-batch",
+        "M-cache",
+        "M-storage-state"
+      ]
+    },
+    "open_details": [
+      "Configuration isolation and pending StopSign forwarding need deeper transition analysis.",
+      "Persistent backend failure behavior, async actor completion and feature-specific unicache branches remain open.",
+      "Async entry completion consumes decided boundaries after recording assignment ballot; replacement across authority change is the next discriminator."
+    ],
+    "core_gaps": [],
+    "status": "usable",
+    "rationale": "Both core paths and their storage, recovery, configuration and consumption connection are traced through concrete callers and guards; local anomalies and unread variants do not assert correctness."
+  }
+}
