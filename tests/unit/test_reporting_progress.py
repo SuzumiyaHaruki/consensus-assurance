@@ -194,8 +194,12 @@ def test_mixed_report_reads_fixed_results_and_moves_without_side_effects(tmp_pat
     from consensus_assurance.registry import EXECUTION_BACKENDS
     snapshots={}
     def review_second(state):
-        snapshots['unreviewed']=e.state.model_copy(deep=True)
-        return review_step()(state)
+        sub,files=review_step()(state)
+        issue=next(i for i in state['review_issues'] if i['target_id']==state['direct_checks'][-2]['id'])
+        sub['resolutions']=[dict(issue_id=issue['id'],source_ids=['code','doc'],
+            evidence_ids=[state['direct_checks'][-1]['id']],rationale='The revised driver checks admission before invoking the unchanged local comparison',
+            residual_issue_ids=[],scope_limitations=[])]
+        return sub,files
     def initial(state):
         sub,files=first(state);spec=json.loads(files['map.json'])
         spec['surfaces']=[dict(entry_point='external repeat policy',disposition='UNCLASSIFIED_PROTOCOL_RESPONSIBILITY',
@@ -231,6 +235,23 @@ def test_mixed_report_reads_fixed_results_and_moves_without_side_effects(tmp_pat
         return dict(action='check',candidate=candidate,plan_path='plan.json',harness_path='check.py',files={'helper.py':'helper.py'},
             rationale='Independently check another legal input'),{'plan.json':json.dumps(plan),
             'check.py':harness.replace('step(3,3)','step(2,3)'), 'helper.py':'def legal(v,n): return 0 <= v <= n\n'}
+    def challenge_second(state):
+        snapshots['unreviewed']=e.state.model_copy(deep=True)
+        sub,files=review_step('revision_needed')(state)
+        sub['rationale']='Review the caller admission condition before revision'
+        sub['review_items'][0].update(challenged_components=['driver'],
+            rationale='The caller admission condition is observed but not enforced before invocation',
+            counterevidence=['The driver must check admission before making the call'])
+        return sub,files
+    def repair_second(state):
+        sub,files=second(state);sub.pop('candidate')
+        sub.update(action='revise_check',unit_id=state['units'][1]['id'],previous_check_id=state['direct_checks'][-1]['id'],
+            repair_issue_ids=[state['review_issues'][-1]['id']],rationale='Enforce the sourced caller admission without changing the oracle')
+        plan=json.loads(files['plan.json'])
+        plan['harness']['legality']['derivation']='The driver checks the documented legal input before invoking the same return comparison'
+        files['plan.json']=json.dumps(plan)
+        files['check.py']=files['check.py'].replace('value=step(2,3)','assert legal(2,3)\nvalue=step(2,3)')
+        return sub,files
     def explained(state):
         snapshots['reviewed']=e.state.model_copy(deep=True)
         sub,_=first(state);sub.pop('map_path');sub.update(action='explained',obligation=None,bindings=[])
@@ -277,17 +298,18 @@ def test_mixed_report_reads_fixed_results_and_moves_without_side_effects(tmp_pat
         sub=json.loads(json.dumps(sub).replace('"bounded"','"pending-bound"').replace('"binding"','"pending-binding"'))
         sub['question']['question']='Does the second public entry preserve the local bound?'
         return sub,{}
-    steps=[initial,encoded_check(broken=True),encoded_check(revise=True),review,second,review_second,explained,
+    steps=[initial,encoded_check(broken=True),encoded_check(revise=True),review,second,challenge_second,repair_second,review_second,explained,
         independent_issue,contract_question,explore,retain(first_answer,[0]),explore,retain(repaired_answer,[1]),retain(joint_answer,[0,1]),
         explore,fact_feedback,paused_contract,unconstructed,stop]
     e,repo=engine_for(tmp_path,steps);e.agent.mock=False;e.config.execution_isolation='bwrap'
     (repo/'target.py').write_text('def step(value, limit):\n    return value + 1 if value <= limit else 0\n')
-    e.config.budget.experiments=7
+    e.config.budget.experiments=8
+    e.config.budget.semantic_reviews=5
     e.config.budget.audit_units=3
     state=e.start(repo)
     assert not list((e.root/'submissions').glob('*/diagnostics.json')),state.stop_reason
     assert [r['disposition'] for r in view(state)['conclusions']]==['confirmed_in_scope','bounded_no_violation']
-    assert state.usage['experiments']==6 and len(state.claims)==3
+    assert state.usage['experiments']==7 and len(state.claims)==3
     index=json.loads((e.root/'research.json').read_text())
     assert [len(entry['feedback']) for entry in index['explorations']]==[2,2,0]
     assert index['explorations'][0]['operation_id']!=index['explorations'][1]['operation_id']
@@ -369,6 +391,13 @@ def test_mixed_report_reads_fixed_results_and_moves_without_side_effects(tmp_pat
     assert exploration.id in text
     timeline=text.split('## 研究过程与认识增长')[1].split('## 当前未决事项')[0]
     assert '受理 review：边界返回责任' in timeline and 'Retain the conditional output and missing responsibility' in timeline
+    disputed=state.direct_checks[2];disputed_check=next(c for c in state.checks if c.direct_check_id==disputed.id)
+    history=next(line for line in timeline.splitlines() if f'logs/{disputed_check.id}/check.json' in line)
+    assert disputed_check.exit_code==0 and '目标进程执行成功' in history and '保存的机械比较：有限检查未见违反' in history
+    assert '已确认违反' not in history and '失败' not in history
+    assert timeline.count(f'logs/{disputed_check.id}/check.json')==1
+    assert timeline.index(disputed_check.id)<timeline.index('caller admission condition')<timeline.index('Enforce the sourced caller admission')
+    assert any(i.target_id==disputed.id and i.resolved_by for i in state.review_issues)
     visible_timeline=re.sub(r'\]\([^)]*\)',']',timeline)
     assert re.search(r'\d+\.\d+ 分钟',timeline) and not re.search(r'\b[0-9a-f]{32}\b',visible_timeline)
     assert all(answer not in timeline for answer in (first_answer,repaired_answer,joint_answer))
@@ -438,6 +467,15 @@ def test_mixed_report_reads_fixed_results_and_moves_without_side_effects(tmp_pat
     assert '问题原稿字节缺失' in text
     assert '执行输入文件清单（归档字节缺失）' in text and input_manifest.as_posix() not in valid_links(text)
     assert outcome_manifest.as_posix() in valid_links(text)
+    # Later confirmation cannot fill missing historical assessment or review bytes.
+    (moved/Path(disputed.plan_path).relative_to(e.root).parent/(disputed_check.id+'-assessment.json')).unlink()
+    old_review=next(r for r in state.semantic_reviews if disputed.id in r.target_versions)
+    (moved/f'submissions/{old_review.check_id}/accepted.json').unlink()
+    history=render_report(state,moved).read_text()
+    row=next(line for line in history.splitlines() if f'logs/{disputed_check.id}/check.json' in line)
+    assert '原保存评估（归档字节缺失）' in row and '保存的机械比较' not in row
+    assert '完整交接（归档字节缺失）' in history and '**已确认违反**' in history
+    valid_links(history)
     # Exact links survive absent accepted bytes; neither state text nor an unaccepted draft fills the gap.
     missing_handoff=next(s for s in state.selections if s.get('feedback',{}).get('answered')==repaired_answer)
     (moved/f'submissions/{missing_handoff["operation_id"]}/accepted.json').unlink()

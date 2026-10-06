@@ -252,19 +252,27 @@ def milestone_lines(state, research, archive, checks, titles):
             break
     growth = [s for s in state.selections if not s.get('duplicate_of') and (s.get('map_delta') or s.get('feedback',{}).get('understanding') == 'updated'
         or s.get('accepted_versions',{}).get('artifacts') or s.get('released_candidate_ids'))]
-    for s in growth[-3:]+[s for s in state.selections if s['action'] in {'review','pause','explained','continue','obligation'} and 'accepted_versions' in s]:
-        title = next((i.report_title for r in state.semantic_reviews if r.check_id==s['operation_id'] for i in r.items if i.report_title),None)
-        selected.setdefault(s['operation_id'], (f'受理 {s["action"]}：'+excerpt(title or s['rationale'],140),
+    for s in growth[-3:]+[s for s in state.selections if s['action'] in {'review','revise_check','pause','explained','continue','obligation'} and 'accepted_versions' in s]:
+        review=next((r for r in state.semantic_reviews if r.check_id==s['operation_id']),None)
+        title = next((i.report_title for i in review.items if i.report_title),None) if review else None
+        detail='；'+'、'.join(f'v{review.target_versions.get(i.target_id,"?")} {i.aspect}: {i.status}' for i in review.items) if review else ''
+        selected.setdefault(s['operation_id'], (f'受理 {s["action"]}：'+excerpt(title or s['rationale'],140)+detail,
             archive.link(f'submissions/{s["operation_id"]}/accepted.json','完整交接')))
     from consensus_assurance.workflow.reviews import lineage
     current = {a['id'] for a in research['artifacts']}
     ancestors = set().union(*(lineage(state,a) for a in state.direct_checks if a.id in current))
-    versions = {a.id:a.version for a in state.direct_checks}
+    artifacts = {a.id:a for a in state.direct_checks}
     for check in checks.values():
         if check.action == 'exploration' or (check.direct_check_id) in current:
             selected[check.id] = ('实际执行：'+excerpt(titles.get(check.id,execution_summary(check)[0]),140)+'；'+execution_summary(check)[1],archive.link(f'logs/{check.id}/check.json','执行记录'))
-        elif check.direct_check_id in ancestors and (check.status != ExecutionStatus.COMPLETED or check.exit_code not in (0,None)):
-            selected[check.id] = (f'修订前 v{versions[check.direct_check_id]}：'+failure_detail(check,archive)+'；后续版本独立执行与复核',archive.link(f'logs/{check.id}/check.json','原失败记录'))
+        elif check.direct_check_id in ancestors:
+            artifact=artifacts[check.direct_check_id]
+            assessment=str(Path(artifact.plan_path).parent/(check.id+'-assessment.json'))
+            saved=archive.read(assessment)
+            comparison='；保存的机械比较：'+OUTCOME.get(saved['outcome'],saved['outcome']) if saved.get('outcome') else ''
+            execution='目标进程执行成功' if check.status==ExecutionStatus.COMPLETED and check.exit_code==0 else failure_detail(check,archive)
+            selected[check.id] = (f'修订前 v{artifact.version}：'+execution+comparison+'；复核与修订见各自后续节点',
+                archive.link(artifact.plan_path,'原固定输入')+'；'+archive.link(f'logs/{check.id}/check.json','原执行记录')+'；'+archive.link(assessment,'原保存评估'))
     interrupted = [c for c in checks.values() if c.action == 'agent_turn' and c.status != ExecutionStatus.COMPLETED]
     for check in interrupted[-3:]:
         selected[check.id] = ('Agent 调查中断；后续记录不抹掉此失败',archive.link(f'logs/{check.id}/check.json','中断记录'))
