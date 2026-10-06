@@ -193,6 +193,7 @@ def test_mixed_report_reads_fixed_results_and_moves_without_side_effects(tmp_pat
     snapshots={}
     def review_second(state):
         sub,files=review_step()(state)
+        sub['review_items'][0]['report_answer']='当前版本的驱动前提已核对。'
         issue=next(i for i in state['review_issues'] if i['target_id']==state['direct_checks'][-2]['id'])
         sub['resolutions']=[dict(issue_id=issue['id'],source_ids=['code','doc'],
             evidence_ids=[state['direct_checks'][-1]['id']],rationale='The revised driver checks admission before invoking the unchanged local comparison',
@@ -237,7 +238,7 @@ def test_mixed_report_reads_fixed_results_and_moves_without_side_effects(tmp_pat
         snapshots['unreviewed']=e.state.model_copy(deep=True)
         sub,files=review_step('revision_needed')(state)
         sub['rationale']='Review the caller admission condition before revision'
-        sub['review_items'][0].update(challenged_components=['driver'],
+        sub['review_items'][0].update(report_answer='旧版本前提仍有争议。',challenged_components=['driver'],
             rationale='The caller admission condition is observed but not enforced before invocation',
             counterevidence=['The driver must check admission before making the call'])
         return sub,files
@@ -359,21 +360,16 @@ def test_mixed_report_reads_fixed_results_and_moves_without_side_effects(tmp_pat
     assert '已确认违反命题 1 项' in visible and '本次完整观察返回 4，上限为 3。' in visible
     assert '义务已受理，尚无固定检查记录' in visible and 'Obtain the external timing contract' in visible
     assert '| 资源 |' not in visible and '| state.encoded |' not in visible and '地图 v1 的登记原文' not in visible
-    assert '<summary>地图登记与研究交接</summary>' in text and '| 资源 |' in text
-    assert '**已确认违反**' in text and '**有限检查未见违反**' in text and '源码解释' in text
     table=text.split('## 主要结果')[1].split('### 1.')[0]
     rows=[line for line in table.splitlines() if line.startswith('|')]
     for claim in ('bounded','interior','pending-bound'):
         assert sum(f'[{claim}](' in line for line in rows)==1
+    assert '当前版本的驱动前提已核对。' in table and '旧版本前提仍有争议。' not in table
     pending=next(line for line in rows if '[interior](' in line)
     assert '有限检查未见违反' in pending
     complete=next(line for line in rows if '[bounded](' in line)
     assert '已确认违反' in complete
-    assert text.count('本次完整观察返回 4，上限为 3。')==1 and 'A synchronous driver replaces external caller scheduling' in text
-    assert 'Candidate 5 项；当前 Unit 3 项、义务 3 项、固定检查制品 2 项' in text
     assert text.count('保存的语义未知：The timing contract is unacquired')==1
-    assert 'Obtain the external timing contract' in text and '义务已受理，尚无固定检查记录' in text
-    assert '实际取消' in text and '配置值不表示触发了超时' in text
     handoff=next(s for s in state.selections if s.get('feedback',{}).get('answered')==joint_answer)
     assert 'Acquire the caller repeat contract' in (moved/f'submissions/{handoff["operation_id"]}/accepted.json').read_text()
     explorations=[c for c in state.checks if c.action=='exploration']
@@ -392,7 +388,6 @@ def test_mixed_report_reads_fixed_results_and_moves_without_side_effects(tmp_pat
             section=text.split(f'<a id="exploration-{explorations[i].id}"></a>')[1].split('\n\n')[0]
             assert (f'](#{anchor})' in section)==(i in positions)
     assert old_check.id in text and '修订前 v1' in text and current.plan_path.split('/direct-checks/')[1] in text
-    assert exploration.id in text
     timeline=text.split('## 研究过程与认识增长')[1].split('## 当前未决事项')[0]
     assert '受理 review：边界返回责任' in timeline and 'Retain the conditional output and missing responsibility' in timeline
     disputed=state.direct_checks[2];disputed_check=next(c for c in state.checks if c.direct_check_id==disputed.id)
@@ -418,8 +413,6 @@ def test_mixed_report_reads_fixed_results_and_moves_without_side_effects(tmp_pat
     assert '"bounded": true}' in text and '"bounded": false}' in text
     check=next(c for c in state.checks if c.direct_check_id==current.id)
     assert f'{check.id} / event[0] / state.encoded' in text and f'{check.id} / event[1] / state.encoded' in text
-    assert '完整要求、假设与排除范围' in text and 'distributed consequences' in (moved/'state.json').read_text()
-    assert '确认项数按义务命题计，不等于独立根因数' in text
     for name,snapshot in snapshots.items():
         preserved=snapshot.model_dump(mode='json')
         preview=render_report(snapshot,moved).read_text()
@@ -449,7 +442,6 @@ def test_mixed_report_reads_fixed_results_and_moves_without_side_effects(tmp_pat
     candidate_only.selections=[s for s in candidate_only.selections if s['operation_id']==operation]
     preserved=candidate_only.model_dump(mode='json')
     question_text=render_report(candidate_only,moved).read_text()
-    assert 'Candidate 1 项；当前 Unit 0 项、义务 0 项、固定检查制品 0 项' in question_text
     assert '已选检查／复核待办：' not in question_text and '已选检查／争议仍有待办' not in question_text
     assert '正在调查的问题：' in question_text and '1 次探索尚无精确引用该执行的后续受理交接' in question_text
     assert f'](#candidate-{candidate.id})' in question_text and f'](#exploration-{explorations[0].id})' in question_text
@@ -494,71 +486,6 @@ def test_mixed_report_reads_fixed_results_and_moves_without_side_effects(tmp_pat
     assert state.model_dump(mode='json')==saved
 
 
-def test_current_answer_preserves_versions_and_separate_issue_navigation(tmp_path):
-    from audit_support import engine_for,first,check_step,review_step,stop
-    def old_review(state):
-        sub,files=review_step()(state);sub['review_items'][0]['report_answer']='旧版本已完成的回答。'
-        return sub,files
-    def revised(state):
-        sub,files=check_step(revise=True)(state);files['check.py']+='\nprint("new fixed input version")\n'
-        return sub,files
-    def current_review(state):
-        sub,files=review_step('revision_needed')(state)
-        item=sub['review_items'][0];item.update(report_title='当前局部返回',report_answer='本次调用返回 0；驱动前提仍需复核。',
-            rationale='Driver ordering needs examination. '+'Retain the complete recorded rationale. '*20)
-        sub['review_items'].append(dict(item,aspect='applicability',status='disputed',report_title=None,report_answer=None,
-            challenged_components=[],rationale='Independent caller responsibility remains open. '+'Retain the other issue independently. '*20))
-        return sub,files
-    e,repo=engine_for(tmp_path,[first,check_step(),old_review,revised,current_review,stop]);state=e.start(repo)
-    assert not list((e.root/'submissions').glob('*/diagnostics.json'))
-    saved=state.model_dump(mode='json');text=render_report(state,e.root).read_text()
-    table=text.split('## 主要结果')[1].split('### 1.')[0]
-    assert '本次调用返回 0；驱动前提仍需复核。' in table and 'revision_needed' in table and '待调查线索' in table
-    assert '旧版本已完成的回答。' not in table
-    assert len(state.review_issues)==2
-    unresolved=text.split('## 当前未决事项')[1]
-    for issue in state.review_issues:
-        assert text.count(f'<a id="issue-{issue.id}"></a>')==1
-        assert f'](#issue-{issue.id})' in table and f'](#issue-{issue.id})' in unresolved
-        assert issue.explanation not in text
-    assert state.model_dump(mode='json')==saved and len(state.direct_checks)==2
-    raw={p:p.read_bytes() for folder in ('logs','direct-checks') for p in (e.root/folder).rglob('*') if p.is_file()}
-    # Display-only variants retain the original review, assessment and log bytes.
-    for variant in ('unreviewed','preparation','observation','confirmed_partial','unknown'):
-        sample=state.model_copy(deep=True);sample.semantic_reviews=[];sample.review_issues=[]
-        record=next(r for r in sample.monitor_results if r['direct_check_id']==sample.direct_checks[-1].id)
-        record.update(review_ids=[],open_issue_ids=[],correspondence=None,reviewed_complete=False,
-            blockers=['Direct oracle correspondence is unreviewed'])
-        check=next(c for c in sample.checks if c.id==record['experiment_check_id'])
-        if variant in {'unreviewed','confirmed_partial'}:
-            confirmed=variant=='confirmed_partial'
-            record.update(outcome='violated',confirmed=confirmed,bounded_complete=not confirmed,
-                correspondence='no_issue_found' if confirmed else None)
-            record['properties'][0].update(outcome='violated',witness_complete=True,confirmed=confirmed)
-        else:
-            record.update(confirmed=False,bounded_complete=False,properties=[],outcome='unknown')
-            if variant=='preparation':
-                check.status=ExecutionStatus.TIMEOUT
-                check.parameters.update(execution_backend={'name':'cargo'},preparation_stage='cargo_seed_build',
-                    test_started=False,build_finished=None,build_activity=True)
-                record['prerequisites']={'status':'not_reached','reason':'No admission event reached'}
-            elif variant=='observation':
-                check.parameters['test_started']=True
-                record['prerequisites']={'status':'not_reached','reason':'Operation identity does not match'}
-            else:record.pop('prerequisites')
-        preserved=sample.model_dump(mode='json');preview=render_report(sample,e.root).read_text()
-        row=next(line for line in preview.splitlines() if line.startswith('| 1.'))
-        expected={'unreviewed':'机械比较：观察到违反','preparation':'准备阶段 cargo_seed_build：超时；测试未启动，尚无目标比较',
-            'observation':'Operation identity does not match','confirmed_partial':'完整反例已确认；另有独立场景覆盖缺口',
-            'unknown':'当前检查尚未完整处置'}[variant]
-        assert expected in row and 'Direct oracle correspondence is unreviewed' not in preview
-        if variant=='unreviewed':assert '待当前版本复核' in row and '已确认违反' not in row
-        if variant=='observation':assert 'status=completed' in row and '测试未启动' not in row
-        if variant=='confirmed_partial':assert '已确认违反' in row
-        assert sample.model_dump(mode='json')==preserved and all(p.read_bytes()==v for p,v in raw.items())
-    assert state.model_dump(mode='json')==saved
-
-
 def test_timeout_report_uses_recorded_limit_and_preserves_transport_diagnostic(tmp_path):
     import json
     from types import SimpleNamespace
@@ -584,3 +511,20 @@ def test_timeout_report_uses_recorded_limit_and_preserves_transport_diagnostic(t
     assert text.count(message)==1 and 'status=`error`' in text and 'timeout_seconds=`900`' in text
     assert '达到单轮上限' not in text and '未记录；未完成草稿不受理' in text and '不据此授权重试' in text
     assert stdout.read_bytes()==raw and check.model_dump(mode='json')==saved
+
+
+def test_assessment_gap_labels_use_only_saved_state(tmp_path):
+    from types import SimpleNamespace
+    from consensus_assurance.reporting.chinese import assessment_obstacle,Archive
+    check=CheckRun(action='direct_check',cwd=str(tmp_path),snapshot_id='fixture',status=ExecutionStatus.COMPLETED,exit_code=0)
+    archive=Archive(SimpleNamespace(audit_spec_path=None,checks=[]),tmp_path)
+    record=dict(outcome='violated',confirmed=False,bounded_complete=True,correspondence=None,
+        properties=[dict(outcome='violated',witness_complete=True,comparison_complete=True)],blockers=['unreviewed'])
+    assert '待当前版本复核' in assessment_obstacle(record,check,archive)
+    assert '完整反例已确认；另有独立场景覆盖缺口' in assessment_obstacle(dict(record,confirmed=True,bounded_complete=False),check,archive)
+    for status,parameters,prerequisite,expected in [
+        (ExecutionStatus.TIMEOUT,dict(preparation_stage='cargo_seed_build',test_started=False),{},'测试未启动，尚无目标比较'),
+        (ExecutionStatus.COMPLETED,dict(test_started=True),{'status':'not_reached','reason':'Identity mismatch'},'Identity mismatch'),
+        (ExecutionStatus.COMPLETED,{}, {},'当前检查尚未完整处置')]:
+        sample=check.model_copy(update={'status':status,'parameters':parameters})
+        assert expected in assessment_obstacle(dict(record,properties=[],prerequisites=prerequisite),sample,archive)

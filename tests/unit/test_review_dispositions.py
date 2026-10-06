@@ -96,3 +96,27 @@ def test_F2_cannot_rename_unaddressed_condition(prepared):
     before=s.model_dump()
     with pytest.raises(ValueError):apply_feedback(s,s.units[0],f)
     assert s.model_dump()==before
+
+
+def test_review_target_inheritance_and_contract_diagnostics(tmp_path,prepared):
+    from consensus_assurance.core.submissions import ReviewSubmission,AuditSubmission
+    from consensus_assurance.core.types import SemanticCheck
+    from consensus_assurance.workflow.direct_checks import save_plan
+    from consensus_assurance.workflow.review_contract import validate_contract,target_contract
+    from regression_support import setup
+    engine,unit,plan=setup(tmp_path,prepared);artifact=save_plan(engine,unit,plan,'contract')
+    raw=dict(action='review',artifact_id=artifact.id,rationale='Controlled review contract',review_items=[dict(
+        aspect='checker_correspondence',status='no_issue_found',source_ids=target_contract(engine.state,artifact)['required_material_ids'],rationale='The selected fixed local oracle agrees with its cited scope')])
+    product=ReviewSubmission.model_validate(raw)
+    assert product.review_items[0].target_id==artifact.id
+    validate_contract(engine.state,artifact.id,product.review_items)
+    for fields,code in (({'target_id':plan.claim_id},'review_unknown_target'),
+        ({'counterevidence':['The endpoint is disputed']},'review_contradictory_judgment'),
+        ({'status':'revision_needed','counterevidence':['Wrong oracle']},'review_missing_component'),
+        ({'source_ids':['unacquired']},'review_unknown_source')):
+        item=product.review_items[0].model_copy(update=fields)
+        with pytest.raises(DiagnosticError) as caught:validate_contract(engine.state,artifact.id,[item])
+        assert code in {d.code for d in caught.value.diagnostics}
+    with pytest.raises(ValueError):ReviewSubmission.model_validate({**raw,'review_items':raw['review_items']*31})
+    with pytest.raises(ValueError):SemanticCheck.model_validate(raw['review_items'][0])
+    assert 'target_id' not in AuditSubmission.model_json_schema()['$defs']['ArtifactReviewItem']['required']

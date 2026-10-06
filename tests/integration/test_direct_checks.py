@@ -154,8 +154,7 @@ def test_unattributed_failures_and_exact_completed_witness(tmp_path,prepared):
     assert (Path(c.stdout).read_bytes(),Path(c.stderr).read_bytes())==raw
 
 
-@pytest.mark.parametrize('change',['source','review','issue','claim','binding','unit'])
-def test_assessment_refresh_preserves_unaffected_results(tmp_path,prepared,monkeypatch,change):
+def test_assessment_refresh_preserves_unaffected_results(tmp_path,prepared,monkeypatch):
     from consensus_assurance.workflow import direct_checks
     e,u,p=setup(tmp_path,prepared,True)
     artifacts=[save_plan(e,u,p,key) for key in ('first','second')]
@@ -164,39 +163,36 @@ def test_assessment_refresh_preserves_unaffected_results(tmp_path,prepared,monke
         c=execute(e,a)
         assess(e.state,u,a,p,c,extract_events(c))
     before=e.state.model_copy(deep=True)
-    if change=='source':e.state.materials.append(e.state.materials[0].model_copy(update={'id':'additional-source'}))
-    elif change=='review':e.state.semantic_reviews[0].items[0].status='disputed'
-    elif change=='issue':
-        e.state.review_issues.append(ReviewIssue(review_id='challenge',target_id=artifacts[0].id,target_version=1,
-            aspect='checker_correspondence',source_ids=u.audit_question.source_ids,explanation='Return boundary remains disputed',
-            disposition='investigation',reason='Check actual observation ownership'))
-    else:
-        objects = {'claim':e.state.claims,'binding':e.state.bindings,'unit':e.state.units}[change]
-        selected = {'claim':p.claim_id,'binding':u.binding_ids[0],'unit':u.id}[change]
-        next(o for o in objects if o.id==selected).version+=1
-    parsed=[]
-    def events(check):
-        parsed.append(check.direct_check_id)
-        return extract_events(check)
-    monkeypatch.setattr(direct_checks,'extract_events',events)
-    direct_checks.refresh_assessments(e.state,{a.id for a in artifacts},before=before)
-    semantic = change in {'claim','binding','unit'}
-    assert parsed==([] if change=='source' else [a.id for a in artifacts] if semantic else [artifacts[0].id])
-    records={r['direct_check_id']:r for r in e.state.monitor_results}
-    assert records[artifacts[0].id]['confirmed']==(change=='source')
-    assert records[artifacts[1].id]['confirmed']==(not semantic)
-    expected=e.state.model_copy(deep=True)
-    direct_checks.refresh_assessments(expected,{a.id for a in artifacts})
-    assert expected.monitor_results==e.state.monitor_results
-    assert expected.evidence==e.state.evidence and expected.findings==e.state.findings
-    if semantic:
-        assert all(e.assessment==Assessment.STALE for e in e.state.evidence)
-        assert all(f.stage==Investigation.INCONCLUSIVE for f in e.state.findings)
-        from consensus_assurance.reporting.chinese import render_report
-        saved=e.state.model_dump(mode='json')
-        text=render_report(e.state,e.root).read_text()
-        assert '对应性意见：no_issue_found' in text and 'Direct-check semantic inputs changed' in text
-        assert '尚未完成复核' not in text and e.state.model_dump(mode='json')==saved
+    for change in ('source','review','issue','claim','binding','unit'):
+        e.state=before.model_copy(deep=True)
+        if change=='source':e.state.materials.append(e.state.materials[0].model_copy(update={'id':'additional-source'}))
+        elif change=='review':e.state.semantic_reviews[0].items[0].status='disputed'
+        elif change=='issue':
+            e.state.review_issues.append(ReviewIssue(review_id='challenge',target_id=artifacts[0].id,target_version=1,
+                aspect='checker_correspondence',source_ids=u.audit_question.source_ids,explanation='Return boundary remains disputed',
+                disposition='investigation',reason='Check actual observation ownership'))
+        else:
+            objects = {'claim':e.state.claims,'binding':e.state.bindings,'unit':e.state.units}[change]
+            selected = {'claim':p.claim_id,'binding':u.binding_ids[0],'unit':u.id}[change]
+            next(o for o in objects if o.id==selected).version+=1
+        parsed=[]
+        def events(check):
+            parsed.append(check.direct_check_id)
+            return extract_events(check)
+        monkeypatch.setattr(direct_checks,'extract_events',events)
+        direct_checks.refresh_assessments(e.state,{a.id for a in artifacts},before=before)
+        semantic = change in {'claim','binding','unit'}
+        assert parsed==([] if change=='source' else [a.id for a in artifacts] if semantic else [artifacts[0].id])
+        records={r['direct_check_id']:r for r in e.state.monitor_results}
+        assert records[artifacts[0].id]['confirmed']==(change=='source')
+        assert records[artifacts[1].id]['confirmed']==(not semantic)
+        expected=e.state.model_copy(deep=True)
+        direct_checks.refresh_assessments(expected,{a.id for a in artifacts})
+        assert expected.monitor_results==e.state.monitor_results
+        assert expected.evidence==e.state.evidence and expected.findings==e.state.findings
+        if semantic:
+            assert all(e.assessment==Assessment.STALE for e in e.state.evidence)
+            assert all(f.stage==Investigation.INCONCLUSIVE for f in e.state.findings)
 
 
 @pytest.mark.parametrize('relationship',['revision','independent','shared_requirement'])

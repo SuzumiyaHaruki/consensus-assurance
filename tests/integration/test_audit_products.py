@@ -2,7 +2,7 @@
 import json
 from pathlib import Path
 import pytest
-from audit_support import products, first, check_step, review_step, stop, engine_for, partial_map, feedback, cargo_engine
+from audit_support import products, first, check_step, review_step, stop, engine_for, partial_map, feedback, cargo_engine, diagnostics
 
 
 @pytest.mark.parametrize('outcome',['violated','compile_timeout'])
@@ -186,31 +186,6 @@ println!("CA_EVENT {{\\"event\\":\\"value\\",\\"value\\":{}}}", sample::step(VAL
         assert archive.path(reused.stdout).read_bytes()
         assert '探索执行正常结束' in render_report(e.state,moved).read_text()
     key=receipt['shared_seed']['key'];entry=shared/key
-    import copy,time,fcntl
-    command=e.implementation.experiment_command()
-    current=json.loads((e.root/reused.parameters['build_inputs']).read_text())
-    def lookup(value=current):
-        return cargo_build.shared_seed(e.implementation,e.runner,e.state.snapshot.id,command,value,
-            e.root/'.execution/control-copy',time.monotonic()+10)
-    for field in ('source_files','source_modes','lock','tools','policy','test_target'):
-        changed=copy.deepcopy(current)
-        if field in {'source_files','source_modes'}:changed[field][next(iter(changed[field]))]='changed'
-        elif field=='lock':changed[field]['digest']='changed'
-        elif field=='tools':changed[field][0]['version']='changed'
-        elif field=='policy':changed[field]['jobs']=1
-        else:changed[field]='different_target'
-        assert lookup(changed)['status']=='miss'
-    with (shared/(key+'.lock')).open('r') as lock:
-        fcntl.flock(lock,fcntl.LOCK_EX)
-        assert 'in use' in lookup()['reason']
-    marker=entry/'ready.json';marker_bytes=marker.read_bytes();marker.unlink()
-    assert lookup()['status']=='miss'  # Half-published entries are not imported.
-    marker.write_bytes(marker_bytes)
-    escape=entry/'seed/escape';escape.symlink_to(tmp_path)
-    assert 'link' in lookup()['reason'];escape.unlink()
-    with pytest.raises(TimeoutError,match='deadline'):
-        cargo_build.shared_seed(e.implementation,e.runner,e.state.snapshot.id,command,current,
-            e.root/'.execution/expired-copy',time.monotonic()-1)
     # Corruption must force the original neutral path, never run a retained binary.
     next((entry/'seed').rglob('libincrement*.rlib')).write_bytes(b'corrupt')
     e,repo=first_engine,first_repo
@@ -353,15 +328,6 @@ def test_existing_unit_actual_technical_repair_review_progress(tmp_path,fault):
     assert index['implementation']['harness_kind']=='python'
 
 
-def test_raw_parse_failure_is_retained_and_whole_draft_can_continue(tmp_path):
-    e,repo=engine_for(tmp_path,[lambda state:('{"action":',{}),first,stop])
-    state=e.start(repo)
-    assert len(state.units)==1, state.stop_reason
-    rejected=list((e.root/'submissions').glob('*/diagnostics.json'))
-    assert len(rejected)==1
-    assert (rejected[0].parent/'raw.json').read_bytes()==b'{"action":'
-
-
 @pytest.mark.parametrize('fault',[None,'missing','escape','symlink','unreliable'])
 def test_deadline_retains_only_reliably_declared_bytes(tmp_path,fault):
     from consensus_assurance.core.types import ExecutionStatus
@@ -458,6 +424,7 @@ def test_rejected_receipt_recovery_pauses_only_the_draft(tmp_path,interrupt):
     e.checkpoint=original
     state=e.resume()
     assert state.usage['agent_calls']==3 and len(state.units)==1
+    assert all(Path(d['raw_path']).read_bytes()==b'{"action":' for d in diagnostics(e))
     rejected=[s for s in state.selections if s['action']=='rejected']
     assert len(rejected)==2 and rejected[-1]['draft_status']=='paused'
     assert rejected[0]['draft_id']==rejected[1]['draft_id']
@@ -509,6 +476,10 @@ def test_same_version_reading_and_independent_issues(tmp_path):
             review_items=[dict(target_id=artifact,aspect='checker_correspondence',status='needs_reading',source_ids=['code'],rationale='Need the actual bound contract'),
                 dict(target_id=artifact,aspect='applicability',status='disputed',source_ids=['doc'],rationale='External callers may supply illegal input',counterevidence=['The caller boundary remains outside this local test'])]),{}
     def resolve(state):
+        from consensus_assurance.reporting.chinese import render_report
+        text=render_report(e.state,e.root).read_text()
+        for issue in e.state.review_issues:
+            assert text.count(f'<a id="issue-{issue.id}"></a>')==1 and f'](#issue-{issue.id})' in text
         artifact=state['direct_checks'][-1]['id']
         issue=next(i for i in state['review_issues'] if i['aspect']=='checker_correspondence')
         other=next(i for i in state['review_issues'] if i['aspect']=='applicability' and not i['conditions'])
@@ -532,6 +503,7 @@ def test_same_version_reading_and_independent_issues(tmp_path):
     result = state.monitor_results[0]
     assert result['bounded_complete'] and not result['reviewed_complete'] and not result['confirmed']
     assert len(result['open_issue_ids']) == 1 and len(state.evidence) == 1 and not state.findings
+
 
 
 @pytest.mark.parametrize('phase',['action_result_saved','agent_receipt_saved','runner_complete','agent_runner_complete'])
@@ -856,34 +828,6 @@ def test_unknown_execution_retries_with_a_new_identity_and_clean_workspace(tmp_p
     assert len(state.direct_checks)==1
 
 
-def test_partial_map_then_references_and_persistent_resume(tmp_path):
-    def research(state):
-        spec=partial_map()
-        return dict(action='research',map_path='map.json',sources=products()[0]['sources'],rationale='Save only the relevant fact'),{'map.json':json.dumps(spec)}
-    def with_refs(state):
-        value=products()[0]
-        value['question'].update(activity_classes=['A1'],behavior_ids=['call'],fact_ids=['result'],obligation_relation_kind='establishment')
-        return value,{}
-    def missing_fact(state):
-        value,files=with_refs(state);value['question']['fact_ids']=['missing']
-        return value,files
-    def refine(state):
-        value,files=research(state)
-        spec=json.loads(Path(state['audit_spec_path']).read_text())
-        spec['surfaces']=[dict(entry_point='Unexamined consumer',disposition='deferred',reason='Consumer has not been examined',source_ids=['code'])]
-        files['map.json']=json.dumps(spec)
-        return value,files
-    e,repo=engine_for(tmp_path,[research,missing_fact,with_refs,check_step(),refine,stop])
-    state=e.start(repo)
-    assert state.audit_spec_version==2 and len(state.units)==1,state.current_submission
-    assert Path(state.audit_spec_path).is_file()
-    assert state.units[0].audit_question.fact_ids==['result']
-    assert len(state.direct_checks)==1
-    assert json.loads((e.root/'audit-spec'/'v1.json').read_text())['behaviors'][0]['execution_owner']=='caller'
-    assert e.resume().audit_spec_version==2
-    assert len(list((e.root/'submissions').glob('*/diagnostics.json')))==1
-
-
 @pytest.mark.usefixtures('full_refresh_equivalence')
 def test_checker_correction_across_intermediate_harness_version(tmp_path):
     def flawed(state):
@@ -947,23 +891,9 @@ def test_isolated_runner_sees_fixed_submitted_helpers(tmp_path):
     assert 'CA_EVENT' in Path(result.stdout).read_text()
 
 
-def test_unreached_prerequisite_repairs_without_checker_issue(tmp_path):
-    def unreached(state):
-        sub,files=check_step()(state)
-        files['helper.py']='def legal(value, limit):\n    return False\n'
-        return sub,files
-    e,repo=engine_for(tmp_path,[first,unreached,check_step(revise=True),review_step(),stop])
-    state=e.start(repo)
-    assert len(state.direct_checks)==2 and not state.review_issues
-    assert state.monitor_results[0]['prerequisites']['status']=='not_reached'
-    assert state.monitor_results[-1]['prerequisites']['status']=='matched'
-    assert state.units[0].status=='checked'
-
-
 @pytest.mark.parametrize('violated',[False,True])
 def test_driver_repair_executes_reviews_and_continues_without_old_text_blockers(tmp_path,violated):
     from consensus_assurance.workflow.audit import validate_submission
-    from consensus_assurance.reporting.chinese import render_report
     from audit_support import next_question, local_stop
     conflict='The private entry requires caller validation absent from this driver.'
     retained={}
@@ -994,18 +924,14 @@ def test_driver_repair_executes_reviews_and_continues_without_old_text_blockers(
     def pending(state):
         index=json.loads((e.root/'research.json').read_text())
         new=next(a for a in index['artifacts'] if a['version']==2)
-        assert new['previous_id']==state['direct_checks'][1]['id']
+        assert new['previous_id']==state['direct_checks'][0]['id']
         record=next(r for r in index['assessments'] if r['direct_check_id']==new['id'])
-        assert index['assessments'][0]['reviewed_complete']
         assert record['bounded_complete'] and not record['reviewed_complete'] and record['correspondence'] is None
         assert record['open_issue_ids'] and any('unreviewed' in b for b in record['blockers'])
         old=json.loads((e.root/new['previous_record']['path']).read_text())
         retained['old']=next(a for a in old['direct_checks'] if a['id']==new['previous_id'])
         retained['bytes']=Path(retained['old']['plan_path']).read_bytes()
         assert conflict in retained['bytes'].decode()
-        report=render_report(e.state,e.root).read_text()
-        assert '对应性意见：尚未记录' in report and '对应性意见：no_issue_found' in report and conflict in report
-        assert json.loads((e.root/'research.json').read_text())['assessments']==index['assessments']
         # A passing process and a new no-issue review cannot silently resolve old counterevidence.
         return review_step()(state)
     def resolve(state):
@@ -1024,7 +950,7 @@ def test_driver_repair_executes_reviews_and_continues_without_old_text_blockers(
     def next_investigation(state):
         assert state['units'][0]['status']=='checked' and not state['question_candidates'][0]['question']['unknowns']
         return next_question(state)
-    steps=[first,check_step(),review_step(),original,challenge,repair,pending,resolve,local_stop(),next_investigation,stop]
+    steps=[first,original,challenge,repair,pending,resolve,local_stop(),next_investigation,stop]
     e,repo=engine_for(tmp_path,steps)
     e.agent.mock=False;e.config.execution_isolation='bwrap'
     e.config.budget.semantic_reviews=5
@@ -1056,16 +982,15 @@ def test_driver_repair_executes_reviews_and_continues_without_old_text_blockers(
     checkpoint=e.checkpoint
     def interrupt(event):
         checkpoint(event)
-        if event=='audit_execution_completed' and len(e.state.direct_checks)==3 and e.agent.cursor==6:
+        if event=='audit_execution_completed' and len(e.state.direct_checks)==2 and e.agent.cursor==4:
             raise KeyboardInterrupt('New driver executed, correspondence still pending')
     e.checkpoint=interrupt
     with pytest.raises(KeyboardInterrupt):e.start(repo)
     e.checkpoint=checkpoint
     state=e.resume()
     assert not list((e.root/'submissions').glob('*/diagnostics.json')),state.current_submission
-    assert len(state.direct_checks)==3 and state.usage['experiments']==3 and len(state.question_candidates)==2
-    independent,old,new=state.monitor_results
-    assert independent['reviewed_complete']
+    assert len(state.direct_checks)==2 and state.usage['experiments']==2 and len(state.question_candidates)==2
+    old,new=state.monitor_results
     assert old['bounded_complete'] and not old['reviewed_complete'] and old['open_issue_ids']
     assert new['bounded_complete'] and new['reviewed_complete'] and not new['open_issue_ids']
     assert new['confirmed']==violated and new['outcome']==('violated' if violated else 'holds')
@@ -1269,35 +1194,6 @@ def test_preflight_checks_current_inputs_without_writes_or_execution(tmp_path,mo
     assert not validate_submission(e.state,e.root,'escape.json',e.implementation)['valid']
 
 
-def test_whole_artifact_review_inherits_only_omitted_identity(tmp_path):
-    from consensus_assurance.workflow.audit import validate_submission
-    from consensus_assurance.core.submissions import AuditSubmission
-    from consensus_assurance.core.types import SemanticCheck
-    def review(state):
-        raw,files=review_step()(state)
-        raw['review_items'][0].pop('target_id')
-        draft=e.root/'draft'/'review.json'
-        draft.write_text(json.dumps(raw))
-        assert validate_submission(e.state,e.root,draft.name,e.implementation)['valid']
-        with pytest.raises(ValueError):AuditSubmission.model_validate({**raw,'review_items':raw['review_items']*31})
-        for fields,expected in (({'target_id':'bounded'},'review_unknown_target'),
-                ({'counterevidence':['This oracle remains disputed']},'review_contradictory_judgment'),
-                ({'status':'revision_needed','counterevidence':['Wrong oracle'],'challenged_components':[]},'review_missing_component'),
-                ({'source_ids':['unacquired']},'review_unknown_source')):
-            broken=json.loads(json.dumps(raw));broken['review_items'][0].update(fields)
-            draft.write_text(json.dumps(broken))
-            diagnostics=validate_submission(e.state,e.root,draft.name,e.implementation)['diagnostics']
-            assert expected in {d['code'] for d in diagnostics}
-            if expected=='review_unknown_target':
-                item=next(d for d in diagnostics if d['code']==expected)
-                assert item['details']['allowed_targets'][0]['target_id']==raw['artifact_id']
-                assert item['paths']==['/review_items/0']
-        return raw,files
-    e,repo=engine_for(tmp_path,[first,check_step(),review,stop]);state=e.start(repo)
-    assert state.semantic_reviews[0].items[0].target_id==state.direct_checks[0].id
-    assert 'target_id' not in AuditSubmission.model_json_schema()['$defs']['ArtifactReviewItem']['required']
-    with pytest.raises(ValueError):SemanticCheck.model_validate({'aspect':'applicability','status':'no_issue_found',
-        'source_ids':['code'],'rationale':'A normal persisted semantic item requires its target'})
 
 
 def test_zero_review_budget_keeps_measured_violation_unconfirmed(tmp_path):

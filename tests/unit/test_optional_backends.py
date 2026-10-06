@@ -133,6 +133,40 @@ def test_cargo_shared_seed_configuration_and_private_paths(tmp_path,monkeypatch)
     assert '":root"="deny"' in options and json.dumps(str(root/'draft'))+'="write"' in options
 
 
+def test_shared_seed_identity_and_directory_boundaries(tmp_path):
+    import copy,fcntl
+    from types import SimpleNamespace
+    from consensus_assurance.adapters.runners import cargo_build
+    # Minimal controller cache fixture; these bytes are not claimed to be compiled target evidence.
+    root=tmp_path/'run';root.mkdir();cache=tmp_path/'cache'
+    adapter=SimpleNamespace(seed_cache_dir=cache);runner=ProcessRunner(root)
+    seed=root/'seed';seed.mkdir();(seed/'artifact').write_bytes(b'neutral fixture bytes')
+    basis=dict(source_files={'lib.rs':'source'},source_modes={'lib.rs':420},manifest='Cargo.toml',
+        test_target='check',workspace_manifest='Cargo.toml',package_id='local',package_name='local',
+        tools=[{'version':'fixture'}],policy={'jobs':2},resolved_features=[],lock={'path':'Cargo.lock','digest':'lock'})
+    command=['cargo','test','--','--nocapture']
+    expected=cargo_build.compatibility(basis,command)
+    for field in ('source_files','source_modes','lock','tools','policy','test_target'):
+        changed=copy.deepcopy(basis);changed[field]='different'
+        if field=='lock':changed[field]={'path':'Cargo.lock','digest':'different'}
+        assert cargo_build.compatibility(changed,command)!=expected
+    def access(**kwargs):
+        return cargo_build.shared_seed(adapter,runner,'fixture',command,basis,seed,time.monotonic()+5,**kwargs)
+    published=access(origin={'selected_features':[]});assert published['status']=='published'
+    key=published['key'];entry=cache/key
+    assert access()['status']=='hit' and (seed/'artifact').read_bytes()==b'neutral fixture bytes'
+    with (cache/(key+'.lock')).open() as lock:
+        fcntl.flock(lock,fcntl.LOCK_EX);assert 'in use' in access()['reason']
+    marker=entry/'ready.json';saved=marker.read_bytes();marker.unlink()
+    assert access()['status']=='miss'
+    marker.write_bytes(saved)
+    link=entry/'seed/link';link.symlink_to(tmp_path)
+    assert 'link' in access()['reason'];link.unlink()
+    (entry/'seed/artifact').chmod(0o600)
+    assert 'bytes or modes differ' in access()['reason']
+    with pytest.raises(TimeoutError):cargo_build.seed_inventory(entry/'seed',time.monotonic()-1)
+
+
 def test_selected_support_is_captured_once_and_cannot_replace_target(tmp_path):
     backend=assemble(Config(execution_backend='hashicorp_raft',agent_backend='mock'))[0]
     harness=Harness(kind='go_test',source='package raft\n',description='Helper input boundary',semantic_changes=[])
