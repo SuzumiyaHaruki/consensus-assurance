@@ -3,7 +3,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Literal
 from uuid import uuid4
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, model_validator
 
 
 def uid() -> str:
@@ -191,12 +191,22 @@ class QuestionCandidate(Record):
     obligation_id: str | None = None
 
 
+class ExecutionAttribution(Record):
+    check_id: str = Field(description="Exact retained target CheckRun, not the review operation or artifact ID")
+    witness_indices: dict[str, list[StrictInt]] = Field(description="Checker IDs and their valid violating parsed event indices; never raw file line numbers")
+    failure_stream: Literal["stdout", "stderr"]
+    failure_lines: tuple[StrictInt, StrictInt] = Field(description="Inclusive one-based lines in that CheckRun's retained stream")
+    harness_lines: tuple[StrictInt, StrictInt] = Field(description="Inclusive one-based lines in the artifact's fixed primary harness")
+
+
 class SemanticCheck(Record):
     target_id: str
     aspect: Literal["applicability", "decomposition", "checker_correspondence"]
     status: Literal["no_issue_found", "needs_reading", "disputed", "revision_needed"]
     source_ids: list[str] = Field(min_length=1)
     rationale: str
+    execution_attribution: ExecutionAttribution | None = Field(default=None,
+        description="Only direct checker_correspondence: cite completed violating witnesses and a subsequent independent failure. Source IDs and rationale must justify completion and causal independence; see evidence-review experiments guidance")
     report_title: str | None = Field(default=None, description="Optional short Chinese reading title for this target; presentation only, never a verdict")
     report_answer: str | None = Field(default=None, description="Optional Chinese observed-answer summary preserving applicability; numbers and status come from retained assessment")
     counterevidence: list[str] = []

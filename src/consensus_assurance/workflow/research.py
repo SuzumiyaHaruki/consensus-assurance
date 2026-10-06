@@ -45,8 +45,9 @@ def unit_progress(state, unit, artifacts, assessments):
             if not checks:rows.append({'claim_id':claim, 'artifact_id':artifact.id, 'record_status':'no_execution'})
             for check in checks:
                 records = [r for r in assessments if r.get('experiment_check_id')==check.id and r.get('claim_id')==claim]
-                status = ('execution_incomplete' if check.status.value!='completed' or check.exit_code not in (0,None) else
-                    'no_assessment' if not records else 'assessed' if all(r.get('reviewed_complete') for r in records) else 'assessment_incomplete')
+                status = ('assessed' if records and all(r.get('reviewed_complete') for r in records) else
+                    'execution_incomplete' if check.status.value!='completed' or check.exit_code not in (0,None) else
+                    'no_assessment' if not records else 'assessment_incomplete')
                 rows.append({'claim_id':claim, 'artifact_id':artifact.id, 'check_id':check.id, 'record_status':status,
                     'comparison_observed':True if any(comparison_observed(r) for r in records) else
                         False if records and all(comparison_observed(r) is False for r in records) else None})

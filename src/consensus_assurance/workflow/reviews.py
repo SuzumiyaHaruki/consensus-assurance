@@ -139,6 +139,19 @@ def accept_review(state, submission, operation_id):
         raise ValueError('Review must address the supplied whole-artifact contract')
     if any(not i.source_ids or not i.rationale.strip() for i in submission.review_items):
         raise ValueError('Review needs actual source citations and substantive reasoning')
+    for item in submission.review_items:
+        if item.execution_attribution is None:continue
+        if candidate:raise ValueError('Execution attribution requires a direct-check artifact')
+        from .direct_checks import load_plan, compute_assessment, validate_execution_attribution
+        from consensus_assurance.adapters.runners.experiment import extract_events
+        check=next((c for c in checks if c.id==item.execution_attribution.check_id),None)
+        if check is None:raise ValueError('Execution attribution must identify a completed execution of this artifact')
+        plan=load_plan(artifact.plan_path)
+        unit=next(u for u in state.units if u.id==artifact.unit_id)
+        observed=compute_assessment(state,unit,artifact,plan,check,extract_events(check))
+        validate_execution_attribution(state,artifact,plan,check,observed['properties'],item)
+        if observed['parsing_errors'] or observed['prerequisites']['status']!='matched':
+            raise ValueError('Execution attribution requires complete parsing and matched prerequisites')
     pending = {i.id:i for i in open_issues(state,artifact)}
     if len({r.issue_id for r in submission.resolutions}) != len(submission.resolutions):
         raise ValueError('Duplicate issue resolution')

@@ -134,6 +134,57 @@ def execute(engine,artifact):
     return check
 
 
+def validate_execution_attribution(state,artifact,plan,check,results,item):
+    """Validate exact retained references, not the review's causal independence argument."""
+    attribution=item.execution_attribution
+    if (not attribution or item.aspect!='checker_correspondence' or item.status!='no_issue_found' or
+            item.counterevidence or item.challenged_components or item.target_id!=artifact.id):
+        raise ValueError('Execution attribution requires unchallenged direct checker correspondence')
+    if (check is None or attribution.check_id!=check.id or not any(c==check for c in state.checks) or
+            artifact not in state.direct_checks or check.action!='direct_check' or check.direct_check_id!=artifact.id or
+            check.snapshot_id!=artifact.snapshot_id or check.snapshot_id!=state.snapshot.id):
+        raise ValueError('Execution attribution must identify this run and this exact artifact execution')
+    versions={o.id:o.version for o in state.claims+state.bindings+state.relations+state.units}
+    if (any(versions.get(id)!=version for id,version in artifact.graph_versions.items()) or
+            any(a.previous_id==artifact.id for a in state.direct_checks)):
+        raise ValueError('Execution attribution requires current artifact and semantic inputs')
+    if (check.status!=ExecutionStatus.COMPLETED or not check.started_at or not check.ended_at or
+            check.exit_code is None or not 0<check.exit_code<126 or check.outcome!='tests_failed' or
+            check.parameters.get('test_started') is False or check.parameters.get('failure_class')=='build_or_setup' or
+            check.parameters.get('changed_target_files')!=[] or
+            check.parameters.get('lock_unchanged') is False or state.mode=='mock' or
+            artifact.origin in {Origin.MOCK,Origin.SYNTHETIC,Origin.MUTATION,Origin.IMPORTED} or check.origin!=Origin.EXECUTED):
+        raise ValueError('Execution attribution requires ended original target-test failure with intact inputs')
+    by_checker={r['checker_id']:r for r in results}
+    if not attribution.witness_indices:
+        raise ValueError('Execution attribution needs exact violating witnesses')
+    for checker,indices in attribution.witness_indices.items():
+        result=by_checker.get(checker,{})
+        if (not indices or any(type(i) is not int or i<0 for i in indices) or len(set(indices))!=len(indices) or
+                not result.get('witness_complete') or not set(indices)<=set(result.get('valid_witness_indices',[]))):
+            raise ValueError('Execution attribution cites no valid complete violation for checker '+checker)
+        correlations=result['correlations']
+        if any(correlations[str(i)]['alias_indices']==correlations[str(j)]['alias_indices']
+                for i in indices for j in result['evaluated_indices'] if j!=i):
+            raise ValueError('Execution attribution cannot select one of competing same-operation observations')
+    folder=Path(artifact.plan_path).parent
+    root=folder.parent.parent
+    stream=Path(getattr(check,attribution.failure_stream))
+    harness=Path(artifact.harness_path)
+    if stream!=root/'logs'/check.id/(attribution.failure_stream+'.log') or not harness.is_relative_to(folder):
+        raise ValueError('Execution attribution must locate retained execution output and fixed harness')
+    for path,interval in ((stream,attribution.failure_lines),(harness,attribution.harness_lines)):
+        if any(p.is_symlink() for p in (path,*path.parents) if p.is_relative_to(root)) or not path.is_file():
+            raise ValueError('Execution attribution file is missing or not a retained regular file')
+        lines=path.read_text().splitlines()
+        start,end=interval
+        if not 1<=start<=end<=len(lines) or not any(line.strip() for line in lines[start-1:end]):
+            raise ValueError('Execution attribution line range is invalid or empty')
+    if harness.read_text()!=plan.harness.source:
+        raise ValueError('Execution attribution harness differs from the fixed plan')
+    return attribution.witness_indices
+
+
 def compute_assessment(state,unit,artifact,plan,check,events):
     """Compute observed values and current interpretation without mutating state."""
     prerequisite=match_prerequisites(events,plan.harness.prerequisites)
@@ -154,9 +205,13 @@ def compute_assessment(state,unit,artifact,plan,check,events):
         blockers.append('Direct oracle correspondence is unreviewed' if current_review is None else
             'Direct oracle correspondence remains disputed: '+current_review.rationale)
     blockers.extend('Open review issue '+i.id+' ['+','.join(i.source_ids)+']: '+'; '.join(issue_challenges(state,i)) for i in issues)
+    attributed={}
+    if check.exit_code!=0 and current_review and current_review.execution_attribution:
+        try:attributed=validate_execution_attribution(state,artifact,plan,check,results,current_review)
+        except ValueError as exc:blockers.append(str(exc))
     if check.status==ExecutionStatus.TIMEOUT:blockers.append('External timeout; target behavior and harness completion are unestablished')
     elif check.status!=ExecutionStatus.COMPLETED:blockers.append('Execution tool or build failed: '+check.reason)
-    elif check.exit_code!=0:blockers.append('Nonzero direct test exit ('+check.parameters.get('failure_class','unclassified')+'); inspect raw stack and target path before attribution')
+    elif check.exit_code!=0 and not attributed:blockers.append('Nonzero direct test exit ('+check.parameters.get('failure_class','unclassified')+'); inspect raw stack and target path before attribution')
     elif check.outcome=='not_applicable':blockers.append('No selected target test completed; absent or skipped tests cannot establish the check')
     associated=check.snapshot_id==artifact.snapshot_id and check.direct_check_id==artifact.id
     if not associated:blockers.append('Direct input association mismatch')
@@ -167,8 +222,11 @@ def compute_assessment(state,unit,artifact,plan,check,events):
     parsing=[e.get('_ca_observation') for e in events if e.get('event')=='invalid_observation']
     if parsing:blockers.append('Event output contains incomplete or invalid CA_EVENT records')
     for result in results:
-        result['confirmed']=result['witness_complete'] and not blockers and not provenance_blockers
-    execution_complete=check.status==ExecutionStatus.COMPLETED and check.exit_code==0 and check.outcome!='not_applicable' and associated and prerequisite['status']=='matched' and not parsing and not check.parameters.get('changed_target_files')
+        result['confirmed']=result['witness_complete'] and not blockers and not provenance_blockers and (check.exit_code==0 or result['checker_id'] in attributed)
+        if attributed:result['confirmed_witness_indices']=attributed.get(result['checker_id'],[]) if result['confirmed'] else []
+    covered_failure=bool(results) and all(r['checker_id'] in attributed and
+        set(r['evaluated_indices'])<=set(attributed[r['checker_id']]) for r in results)
+    execution_complete=check.status==ExecutionStatus.COMPLETED and (check.exit_code==0 or covered_failure) and check.outcome!='not_applicable' and associated and prerequisite['status']=='matched' and not parsing and not check.parameters.get('changed_target_files')
     bounded_complete=execution_complete and bool(results) and all(r['comparison_complete'] for r in results)
     semantic_boundaries=(current_review.limitations if current_review else claim.grounding.unresolved+plan.harness.legality.unresolved+
         [item for monitor in plan.monitors for item in monitor.grounding.unresolved])
@@ -184,6 +242,8 @@ def compute_assessment(state,unit,artifact,plan,check,events):
             'review_limitations':current_review.limitations if current_review else []},
         'blockers':list(dict.fromkeys(blockers+provenance_blockers)),'boundaries':boundaries,
         'review_ids':[r.id for r in state.semantic_reviews if r.target_versions.get(artifact.id)==artifact.version],
+        'execution_attribution':({'review_id':next(r.id for r in reversed(state.semantic_reviews) if current_review in r.items),
+            'check_id':check.id,'witness_indices':attributed} if attributed else None),
         'open_issue_ids':[i.id for i in issues],
         'correspondence':current_review.status if current_review else None,
         'reviewed_complete':bounded_complete and not blockers,

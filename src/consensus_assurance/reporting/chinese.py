@@ -429,6 +429,8 @@ def render_report(state, root):
                     link(artifact['plan_path'],'条件与检查器'),link(check.stdout,'原始观察'),
                     link(str(Path(artifact['plan_path']).parent / (check.id+'-assessment.json')),'assessment'),
                     *[link(f'submissions/{reviews[rid].check_id}/accepted.json','对应性复核') for rid in record.get('review_ids',[]) if rid in reviews]]), '']
+            if record.get('execution_attribution'):
+                lines += [f'原执行非零退出（{check.exit_code}）保留；上述复核对本次执行的指定违反见证作了独立失败归因。当前确认、其他缺口分别按评估列示。', '']
             if record.get('blockers'):
                 refs=[issue_links[id] for id in record.get('open_issue_ids',[]) if id in issue_links]
                 lines += ['当前争议／阻塞：'+'；'.join([assessment_obstacle(record,check,archive),*refs])+'；'+

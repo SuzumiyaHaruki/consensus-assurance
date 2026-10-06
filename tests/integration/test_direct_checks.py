@@ -61,38 +61,97 @@ def test_necessary_support_oracle_does_not_require_sufficient_completion(eligibl
         assert monitor_events([events[0],{k:v for k,v in events[1].items() if k!='operation'}],monitor,prop,requirements)['outcome']=='unknown'
 
 
-@pytest.mark.parametrize('failure',['prerequisite','missing','compile','test_failure','no_tests','disputed','unreviewed','identity','applicability'])
-def test_direct_failure_never_confirms(tmp_path,prepared,failure):
+def test_unattributed_failures_and_exact_completed_witness(tmp_path,prepared):
+    from copy import deepcopy
+    from consensus_assurance.core.submissions import ReviewSubmission
+    from consensus_assurance.workflow import direct_checks
+    from consensus_assurance.workflow.audit import accept, Inputs
+    from consensus_assurance.workflow.transactions import commit_graph
+    from consensus_assurance.workflow.reviews import accept_review
+    from consensus_assurance.workflow.research import unit_progress
     e,u,p=setup(tmp_path,prepared,True)
-    if failure=='prerequisite':p.harness.prerequisites[0].event='not_observed'
-    if failure=='missing':p.harness.source=p.harness.source.replace('in_range=0 <= returned <= limit','other=0 <= returned <= limit')
-    if failure=='compile':p.harness.source+='\ninvalid python syntax!'
-    if failure=='test_failure':p.harness.source+='\nraise AssertionError("Observed result outside range")'
-    if failure=='identity':p.harness.source=p.harness.source.replace("'operation': 'one'", "'operation': event")
-    if failure=='applicability':p.monitors[0].applicability_conditions=[Comparison(field='metadata.unknown',value=True)]
-    a=save_plan(e,u,p,'negative')
-    if failure!='unreviewed':review(e.state,u,a)
-    if failure=='disputed':e.state.semantic_reviews[0].items[0].status='disputed'
-    c=execute(e,a)
-    if failure=='no_tests':c.outcome='not_applicable'  # Controlled backend result; observations cannot override skipped checks.
-    result=assess(e.state,u,a,p,c,extract_events(c))
-    assert not result['confirmed'],result
-    assert result['outcome']==('unknown' if failure in {'prerequisite','missing','compile','identity','applicability'} else 'violated'),result
-    assert not any(f.level=='implementation_obligation' for f in e.state.findings)
+    normal=save_plan(e,u,p,'normal');review(e.state,u,normal)
+    normal_check=execute(e,normal)
+    assert assess(e.state,u,normal,p,normal_check,extract_events(normal_check))['confirmed']
+    # Real fixture call returns an out-of-range value, then unrelated local cleanup fails.
+    p.harness.source+='\nraise RuntimeError("Independent fixture cleanup failed")\n'
+    validate_plan(e.state,u,p,e.implementation)
+    a=save_plan(e,u,p,'failed-suffix',previous=normal);review(e.state,u,a)
+    c=execute(e,a);events=extract_events(c)
+    raw=(Path(c.stdout).read_bytes(),Path(c.stderr).read_bytes())
+    assert c.exit_code==1 and c.outcome=='tests_failed'
+    before=assess(e.state,u,a,p,c,events)
+    assert before['outcome']=='violated' and not before['confirmed'] and not before['reviewed_complete']
+    item=e.state.semantic_reviews[-1].items[0].model_copy(deep=True)
+    item.execution_attribution=ExecutionAttribution(check_id=c.id,witness_indices={'Range':[1]},failure_stream='stderr',
+        failure_lines=(len(raw[1].splitlines()),len(raw[1].splitlines())),harness_lines=(len(p.harness.source.splitlines()),)*2)
+    item.rationale='The synchronous source return and independent range comparison completed before a separate raise with no shared target state; no persistence, sampling or reply step depends on that raise.'
+    submission=ReviewSubmission(action='review',artifact_id=a.id,rationale='Controlled framework review; not an Agent discovery',review_items=[item.model_dump(mode="json")])
+    # Invalid references use the real acceptance function on private states, with no partial review.
+    for field,value in [('check_id',normal_check.id),('check_id','invented'),('witness_indices',{'Other':[1]}),
+            ('witness_indices',{'Range':[0]}),('witness_indices',{'Range':[999]}),('witness_indices',{}),
+            ('failure_lines',(0,1)),('failure_lines',(1,999)),('harness_lines',(999,999))]:
+        state=e.state.model_copy(deep=True);bad=submission.model_copy(deep=True)
+        setattr(bad.review_items[0].execution_attribution,field,value)
+        saved=state.model_dump(mode='json')
+        with pytest.raises(ValueError):accept_review(state,bad,'invalid')
+        assert state.model_dump(mode='json')==saved
+    commit_graph(e,'exact-failure-review',submission.model_dump(mode='json'),
+        lambda proxy:accept(proxy,submission,Inputs(e.root/'draft'),'exact-failure-review'))
+    result=next(r for r in e.state.monitor_results if r['experiment_check_id']==c.id)
+    assert result['confirmed'] and result['bounded_complete'] and result['reviewed_complete']
+    assert result['properties'][0]['confirmed_witness_indices']==[1]
+    assert direct_checks.obligation_progress(e.state,e.state.units[0])[1]==[]
+    assert unit_progress(e.state,u,[a],[result])[0]['record_status']=='assessed'
+    assert e.state.checks[-1].exit_code==1 and e.state.checks[-1].outcome=='tests_failed'
     from consensus_assurance.reporting.chinese import render_report
-    from consensus_assurance.workflow.research import current_view
-    assessment=Path(a.plan_path).parent/(c.id+'-assessment.json')
-    assessment.write_text(json.dumps(result))
-    saved=e.state.model_dump(mode='json')
-    index=current_view(e.state,e.root,e.implementation)
     text=render_report(e.state,e.root).read_text()
-    assert index['assessments'][0]['correspondence']==result['correspondence']
-    assert '对应性意见：'+(result['correspondence'] or '尚未记录') in text
-    assert '尚未完成复核' not in text
-    assert not result['blockers'] or '当前争议／阻塞：' in text
-    assert str(assessment.relative_to(e.root)) in text
-    assert json.loads(assessment.read_text())['blockers']==result['blockers']==index['assessments'][0]['blockers']
-    assert e.state.model_dump(mode='json')==saved
+    assert '原执行非零退出（1）保留' in text and '独立失败归因' in text
+    # Framework state/event variants reuse saved observations, never rerun the target.
+    for fault in ('unreviewed','withdrawn','disputed','issue','version','other_execution','wrong_artifact','snapshot',
+            'timeout','cancelled','signal','unknown','build','no_tests','not_started','changed_target','unknown_integrity',
+            'prerequisite','missing','identity','applicability','holds','parsing','contradiction'):
+        state=e.state.model_copy(deep=True);plan=p.model_copy(deep=True);observations=deepcopy(events)
+        check=next(x for x in state.checks if x.id==c.id)
+        latest=state.semantic_reviews[-1].items[0]
+        if fault=='unreviewed':state.semantic_reviews=[]
+        elif fault=='withdrawn':latest.execution_attribution=None
+        elif fault=='disputed':latest.status='disputed';latest.counterevidence=['The endpoint needs another step']
+        elif fault=='issue':state.review_issues.append(ReviewIssue(review_id='challenge',target_id=a.id,target_version=1,
+            aspect='checker_correspondence',source_ids=item.source_ids,explanation='Completion still depends on sampling',reason='Concrete new counterevidence',disposition='investigation'))
+        elif fault=='version':next(x for x in state.claims if x.id==p.claim_id).version+=1
+        elif fault=='other_execution':check.id='new-execution'
+        elif fault=='wrong_artifact':check.direct_check_id=normal.id
+        elif fault=='snapshot':check.snapshot_id='other-snapshot'
+        elif fault in {'timeout','cancelled','build'}:check.status={'timeout':ExecutionStatus.TIMEOUT,'cancelled':ExecutionStatus.CANCELLED,'build':ExecutionStatus.ERROR}[fault]
+        elif fault=='signal':check.exit_code=-9
+        elif fault=='unknown':check.exit_code=None
+        elif fault=='no_tests':check.outcome='not_applicable'
+        elif fault=='not_started':check.parameters['test_started']=False
+        elif fault=='changed_target':check.parameters['changed_target_files']=['counter.py']
+        elif fault=='unknown_integrity':check.parameters.pop('changed_target_files')
+        elif fault=='prerequisite':observations[0]['state']['input_valid']=False
+        elif fault=='missing':observations[1]['state'].pop('in_range')
+        elif fault=='identity':observations[1].pop('operation')
+        elif fault=='applicability':plan.monitors[0].applicability_conditions=[Comparison(field='metadata.unknown',value=True)]
+        elif fault=='holds':observations[1]['state']['in_range']=True
+        elif fault=='parsing':observations.append({'event':'invalid_observation','_ca_observation':{'error':'truncated'}})
+        elif fault=='contradiction':observations.append(deepcopy(observations[1]));observations[-1]['state']['in_range']=True
+        computed=direct_checks.compute_assessment(state,u,a,plan,check,observations)
+        assert not computed['confirmed'] and not computed['reviewed_complete'],fault
+    # An independent admitted scenario or checker keeps its debt, without erasing the completed counterexample.
+    more=deepcopy(events);more.append({**deepcopy(events[0]),'operation':'second'})
+    partial=direct_checks.compute_assessment(e.state,u,a,p,c,more)
+    assert partial['confirmed'] and not partial['bounded_complete'] and not partial['reviewed_complete']
+    more.append({**deepcopy(events[1]),'operation':'second','state':{'in_range':True}})
+    partial=direct_checks.compute_assessment(e.state,u,a,p,c,more)
+    assert partial['confirmed'] and not partial['reviewed_complete']  # A holds-only scenario has no failure attribution.
+    other=p.model_copy(deep=True)
+    other.monitors.append(other.monitors[0].model_copy(update={'id':'other','checker_id':'Other'}))
+    other.observable_properties.append(other.observable_properties[0].model_copy(update={'checker_id':'Other'}))
+    partial=direct_checks.compute_assessment(e.state,u,a,other,c,events)
+    assert partial['properties'][0]['confirmed'] and not partial['properties'][1]['confirmed'] and not partial['reviewed_complete']
+    assert (Path(c.stdout).read_bytes(),Path(c.stderr).read_bytes())==raw
 
 
 @pytest.mark.parametrize('change',['source','review','issue','claim','binding','unit'])
