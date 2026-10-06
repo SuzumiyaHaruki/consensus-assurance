@@ -14,6 +14,26 @@ from consensus_assurance.adapters.runners.experiment import install_harness
 from consensus_assurance.core.proposals import Harness
 
 
+@pytest.mark.parametrize('upstream_lock',[False,True])
+def test_cargo_preparation_retains_lock_origin(tmp_path,rust_workspace,upstream_lock):
+    import shutil
+    from audit_support import cargo_engine
+    from consensus_assurance.adapters.storage.snapshot import capture
+    if not shutil.which('cargo') or not shutil.which('bwrap'):pytest.skip('Local Rust and bubblewrap are required')
+    engine,repo=cargo_engine(tmp_path,rust_workspace)
+    if upstream_lock:
+        (repo/'Cargo.lock').write_text('version = 4\n\n[[package]]\nname = "increment"\nversion = "0.1.0"\n\n[[package]]\nname = "sample"\nversion = "0.1.0"\ndependencies = ["increment"]\n')
+    original=capture(repo).files
+    engine.start(repo,plan_only=True)
+    engine.implementation.prepare_run(engine.runner,engine.state.snapshot.id,60,'bwrap')
+    basis=json.loads(next((engine.root/'build-inputs/targets').rglob('basis.json')).read_text())
+    lock=engine.root/basis['lock']['record']
+    assert basis['lock']['origin']==('source' if upstream_lock else 'prepared') and lock.is_file()
+    if upstream_lock:assert lock.read_bytes()==(repo/'Cargo.lock').read_bytes()
+    assert capture(repo).files==original and not (engine.root/'.execution/cargo-seeds').exists()
+    assert not engine.state.checks and not engine.state.usage.get('experiments')
+
+
 def test_cargo_selected_target_phases_and_read_only_source(tmp_path,rust_workspace):
     import shutil
     from consensus_assurance.core.config import TargetConfig
@@ -48,9 +68,9 @@ def test_cargo_selected_target_phases_and_read_only_source(tmp_path,rust_workspa
         (workspace/filename).write_text(source)
         check=run_experiment(runner,command,workspace,'rust-fixture',60,'bwrap',adapter=backend)
         assert (check.outcome,check.parameters.get('failure_class'))==(outcome,failure),Path(check.stderr).read_text()
-    (workspace/filename).write_text('#[test] fn slow() { std::thread::sleep(std::time::Duration::from_secs(30)); }')
+    (workspace/filename).write_text('#[test] fn slow() { std::thread::sleep(std::time::Duration::from_secs(5)); }')
     check=run_experiment(runner,command,workspace,'rust-fixture',1,'bwrap',adapter=backend)
-    assert check.status==ExecutionStatus.TIMEOUT and check.outcome=='unknown'
+    assert check.status==ExecutionStatus.TIMEOUT and check.outcome=='unknown' and check.parameters['test_started']
     for package in ('../escape','/tmp','--workspace','sample/...'):
         with pytest.raises(ValueError):backend.resolve_harness(harness.model_copy(update={'execution_package':package}),rust_workspace,files)
     for name in ('Cargo.toml','Cargo.lock','sample/build.rs','.cargo/config.toml','rust-toolchain.toml'):

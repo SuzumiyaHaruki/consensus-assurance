@@ -358,20 +358,6 @@ def test_descriptive_noop_and_removal_are_explicit_without_reexecution(tmp_path)
     assert state.question_candidates[-1].question.unknowns==['Who invokes the later consumer?']
 
 
-def test_review_can_supply_feedback_without_an_extra_turn(tmp_path):
-    def review(state):
-        sub,_=review_step()(state)
-        sub['feedback']=feedback(state)
-        sub['feedback']['ref_ids'].append(state['direct_checks'][-1]['id'])
-        return sub,{}
-    def finish(state):
-        assert "feedback_due" not in state
-        return stop(state)
-    e,repo=engine_for(tmp_path,[first,check_step(),review,finish])
-    state=e.start(repo)
-    assert not diagnostics(e) and state.units[0].status=='checked'
-
-
 def test_map_transaction_recovery_has_one_version_and_unit(tmp_path):
     e,repo=engine_for(tmp_path,[first])
     def interrupt(key):raise KeyboardInterrupt('Prepared graph transaction before adoption')
@@ -420,11 +406,6 @@ def test_open_run_rejects_semantic_stops_in_preflight_and_acceptance(tmp_path,re
         assert not result['valid'] and e.state.model_dump(mode='json')==before
         messages.extend(d['message'] for d in result['diagnostics'])
         assert result['diagnostics'][0]['details']['reconsider']=='research_decision'
-        # The retired all-false frontier form cannot authorize a stop either.
-        raw['frontier_comparison']=[dict(ref_ids=['code'],next_step='None selected',actionable=False,rationale='No complete check')]
-        path.write_text(json.dumps(raw))
-        assert not validate_submission(e.state,e.root,path.name,e.implementation)['valid']
-        raw.pop('frontier_comparison')
         return raw,{}
     def continue_research(state):
         assert not state['run_stop'] and diagnostics(e)[0]['errors']==messages
@@ -905,6 +886,10 @@ def test_knowledge_growth_preserves_execution_and_supplies_the_next_check(tmp_pa
         snapshots['check']=next(c for c in state['checks'] if c['action']=='direct_check')
         snapshots['review']=state['semantic_reviews'][0]
         assert state['monitor_results'][0]['reviewed_complete']
+        if variant=='shared':
+            accepted=next(s for s in state['selections'] if s['operation_id']==snapshots['review']['check_id'])
+            assert snapshots['artifact']['id'] in accepted['feedback']['ref_ids']
+            assert snapshots['unit']['status']=='checked' and state['usage']['agent_calls']==7
         raw,files=record_map(state,variant=='refined')
         if variant=='shared':
             snapshots['map1']=(e.root/'audit-spec/v1.json').read_bytes()
@@ -993,7 +978,7 @@ def test_knowledge_growth_preserves_execution_and_supplies_the_next_check(tmp_pa
         if variant=='shared' and len(state['units'])==1:
             candidate=state['question_candidates'][0]['id']
             check=next(c['id'] for c in state['checks'] if c['action']=='direct_check')
-            raw['feedback']=dict(ref_ids=[candidate,'call','surface:local-return',check,'code'],
+            raw['feedback']=dict(ref_ids=[candidate,'call','surface:local-return',check,state['direct_checks'][0]['id'],'code'],
                 answered='The admitted boundary reaches the increment branch and returns 4 above 3. This answers the local boundary question only.',
                 remaining=['Clearing schedules remain independent'],understanding='updated',
                 rationale='Retain the actual scoped result for source backfill without closing the wider consumer question')
@@ -1042,6 +1027,7 @@ def test_knowledge_growth_preserves_execution_and_supplies_the_next_check(tmp_pa
         assert e.state.model_dump(mode='json')==before
         state=e.resume()
     else:state=e.start(repo)
+    assert state.usage['agent_calls']==len(steps)
     assert not diagnostics(e),diagnostics(e)
     assert state.audit_spec_version==3 and len(state.units)==2
     assert state.claims[0].model_dump(mode='json')==snapshots['claim']

@@ -20,6 +20,12 @@ def test_strict_structured_result(prepared):
     with pytest.raises(ValidationError): GraphDraft.model_validate(invalid)
     with pytest.raises(ValidationError): DirectCheckPlan.model_validate({"description": "not a check"})
 
+    from consensus_assurance.core.submissions import AuditSubmission
+    raw=dict(action='stop',scope='run',reason='bounded_completed',rationale='Scoped task completed')
+    AuditSubmission.model_validate(raw)
+    with pytest.raises(ValidationError) as error:AuditSubmission.model_validate(dict(raw,frontier_comparison=[]))
+    assert any(e['type']=='extra_forbidden' and e['loc'][-1]=='frontier_comparison' for e in error.value.errors())
+
 
 def test_evidence_associations_and_mock_isolation(prepared):
     _, state, _  = prepared

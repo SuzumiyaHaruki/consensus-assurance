@@ -59,6 +59,11 @@ def test_identity_renaming_and_independent_operation_order_preserve_witness(rena
     observed=events[result['valid_witness_indices'][0]]
     assert observed['operation']==('renamed-one' if rename else 'one')
 
+    for event in events:
+        if event['event']=='result':event['qualified']=True
+    result=monitor_events(events,m,p,req)
+    assert result['outcome']=='holds' and result['comparison_complete'] and not result['valid_witness_indices']
+
 
 def test_partial_valid_witness_is_retained_idempotently_without_completing_unit(tmp_path,prepared):
     from consensus_assurance.workflow.direct_checks import obligation_progress

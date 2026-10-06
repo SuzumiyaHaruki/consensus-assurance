@@ -137,6 +137,19 @@ def engine_for(tmp_path, steps):
     return e,repo
 
 
+def cargo_engine(tmp_path, rust_workspace, steps=(), seed_cache=None):
+    import shutil
+    from consensus_assurance.core.config import TargetConfig
+    from consensus_assurance.adapters.runners.cargo import CargoBackend
+    engine,repo=engine_for(tmp_path,steps)
+    shutil.copytree(rust_workspace,repo,dirs_exist_ok=True)
+    engine.config.target=TargetConfig(execution_package='sample')
+    engine.config.execution_backend='cargo';engine.config.execution_isolation='bwrap'
+    engine.config.cargo_seed_cache_dir=str(seed_cache) if seed_cache else None
+    engine.implementation=CargoBackend(engine.config.target,seed_cache_dir=seed_cache)
+    return engine,repo
+
+
 def completion_target(variant):
     """Offline controls; export only the selected source and its caller contract."""
     assert variant in {'overlap', 'guarded', 'ordered'}

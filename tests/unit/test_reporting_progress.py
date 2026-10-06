@@ -3,19 +3,17 @@ from consensus_assurance.reporting.chinese import render_report, execution_summa
 
 
 def test_report_distinguishes_configured_provider_from_unrecorded_history(tmp_path):
-    from audit_support import engine_for
-    from consensus_assurance.cli import load_config
-    e,repo=engine_for(tmp_path,[]);e.start(repo,plan_only=True)
-    e.state.config['agent_backend']='codex';e.state.config['agent_model']='deepseek-flash'
-    provider=load_config('configs/targets/deepseek.example.yaml').codex_provider.model_dump(mode='json')
-    for value,label in [(provider,'deepseek'),(None,'Codex 默认'),('absent','未记录')]:
-        if value=='absent':e.state.config.pop('codex_provider')
-        else:e.state.config['codex_provider']=value
-        before=e.state.model_dump(mode='json')
-        text=render_report(e.state,e.root).read_text()
-        assert f'配置 provider `{label}`' in text and '请求模型 `deepseek-flash`' in text
-        assert '服务端模型／版本：未记录' in text
-        assert e.state.model_dump(mode='json')==before
+    from consensus_assurance.core.config import Config
+    from consensus_assurance.core.types import Analysis,Snapshot
+    state=Analysis(mode='real',config=Config(agent_model='configured-model').model_dump(mode='json'),
+        snapshot=Snapshot(repo=str(tmp_path),files={},excluded=[]))
+    for value,label in [({'id':'example'},'example'),(None,'Codex 默认'),('absent','未记录')]:
+        if value=='absent':state.config.pop('codex_provider')
+        else:state.config['codex_provider']=value
+        before=state.model_dump(mode='json')
+        text=render_report(state,tmp_path).read_text()
+        assert f'配置 provider `{label}`' in text and '请求模型 `configured-model`' in text
+        assert '服务端模型／版本：未记录' in text and state.model_dump(mode='json')==before
 
 
 def test_target_action_costs_keep_process_time_missing_data_and_identity(tmp_path):
