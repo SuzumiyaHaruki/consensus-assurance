@@ -1,0 +1,141 @@
+{
+  "description": "Exercise C-read-prefix-identity with two distinct remote requesters after real bootstrap/election/current-term commit. Drop the first context heartbeat sends, admit a second context, deliver all surviving messages FIFO, and observe the complete per-requester response context lists and follower readiness after prefix release.",
+  "claim_id": "C-read-prefix-identity",
+  "binding_ids": [
+    "bind-read-publish",
+    "bind-read-consume"
+  ],
+  "harness": {
+    "kind": "go_test",
+    "execution_package": "internal/raft",
+    "source": "",
+    "files": {},
+    "description": "Single goroutine Peer network with real constructors and handlers, captured TestLogDB and deterministic loss of first-context heartbeats.",
+    "semantic_changes": [
+      "Replaces asynchronous engine/transport with a synchronous persist-before-send Peer driver and FIFO queue; protocol logic is unchanged.",
+      "Uses captured TestLogDB and applies only initialization config/no-op entries; excludes crash durability and user application execution."
+    ],
+    "prerequisites": [
+      {
+        "alias": "admit",
+        "event": "admitted",
+        "conditions": [
+          {
+            "field": "queued",
+            "value": true
+          },
+          {
+            "field": "current_term_committed",
+            "value": true
+          },
+          {
+            "field": "pending_count",
+            "value": 2
+          },
+          {
+            "field": "dropped_heartbeats",
+            "value": 2
+          }
+        ]
+      }
+    ],
+    "legality": {
+      "source_ids": [
+        "src-peer-launch",
+        "src-peer-bootstrap",
+        "src-test-storage",
+        "src-peer-update",
+        "src-engine-order",
+        "src-node-step",
+        "src-node-read-batch",
+        "src-wire-identity",
+        "src-transport-loss",
+        "src-nodehost-send",
+        "src-raft-timers"
+      ],
+      "expectation_ids": [
+        "src-read-prefix-expectation"
+      ],
+      "binding_ids": [
+        "bind-read-publish"
+      ],
+      "derivation": "Three Peers use Launch bootstrap, then actual ticks elect node 1 through generated vote/replication messages. collect saves entries/state in the captured TestLogDB before exposing messages, applies only bootstrap config/no-op committed entries, commits the Update, and reports lastApplied. There are no application commands or crashes. FIFO delivery uses only generated messages through Peer.Handle. The declared loss policy discards all heartbeat messages for the first context at enqueue and none for the second, modeling permitted admission loss. No ordinary message is delivered out of order. Each follower initiates one ReadIndex; independent event batches need not wait for earlier completion. The second forwarded request is delivered before recording admission, with its generated heartbeats still queued. Then the queue drains synchronously; no sleep or background worker is needed. Sampled state is owned by the sole test goroutine. No protocol state or handler is modified.",
+      "applicability": "Peer-level protocol isolation; TestLogDB represents successful synchronous storage, not filesystem durability. Application work is limited to bootstrap config and leader no-op. Only node 1 ticks during bounded election preparation; the read suffix has no ticks or membership changes.",
+      "unresolved": [],
+      "conflicts": [],
+      "alternatives": [
+        "Local client timeout and RSM consumer are outside the execution package; follower ReadyToRead is retained as the immediate result-consumption diagnostic."
+      ]
+    }
+  },
+  "monitors": [
+    {
+      "id": "M-read-prefix",
+      "checker_id": "K-read-prefix",
+      "event": "publication",
+      "binding_ids": [
+        "bind-read-publish",
+        "bind-read-consume"
+      ],
+      "grounding": {
+        "source_ids": [
+          "src-read-prefix-expectation",
+          "src-api-read",
+          "src-peer-update",
+          "src-read-prefix",
+          "src-read-confirm-send",
+          "src-read-follower",
+          "src-read-consume"
+        ],
+        "expectation_ids": [
+          "src-read-prefix-expectation"
+        ],
+        "binding_ids": [
+          "bind-read-publish",
+          "bind-read-consume"
+        ],
+        "derivation": "C-read-prefix-identity requires publication of each released remote prefix member with its own complete SystemCtx. Compare the full ordered singleton context list addressed to each distinct requester with the original retained context. Requester identity is independent of compared context; the two requests originate from different followers.",
+        "applicability": "Stable-term current-term-committed leader, unchanged membership, two admitted remote contexts, no crashes or storage faults.",
+        "unresolved": [],
+        "conflicts": [],
+        "alternatives": [
+          "If a request is not released, the implication does not test context preservation for that request. Follower readiness is diagnostic, not a full NodeHost endpoint."
+        ]
+      },
+      "admission_alias": "admit",
+      "applicability_conditions": [
+        {
+          "field": "term",
+          "reference": "admit.term"
+        }
+      ]
+    }
+  ],
+  "observable_properties": [
+    {
+      "checker_id": "K-read-prefix",
+      "kind": "event_implication",
+      "trigger": {
+        "field": "scenario",
+        "value": "remote_prefix"
+      },
+      "antecedent": {
+        "field": "released",
+        "value": true
+      },
+      "assertion": {
+        "field": "actual_contexts",
+        "reference": "admit.expected_contexts"
+      },
+      "identity_fields": [
+        "scenario",
+        "requester"
+      ],
+      "description": "For each admitted remote requester whose pending read is released, the emitted complete response context list equals the singleton original context list. Comparison includes both High and Low, not just response count."
+    }
+  ],
+  "uncertainties": [
+    "No full NodeHost completion/timeout observation or linearizable application read is included.",
+    "A non-release yields only a vacuous implication result for that operation; actual release is reported explicitly."
+  ]
+}

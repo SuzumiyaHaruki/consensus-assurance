@@ -1,0 +1,861 @@
+{
+  "version": 1,
+  "target_profile": {
+    "system_boundary": "Captured go.etcd.io/raft/v3 library: raft state machine, Node/RawNode APIs, tracker/quorum, configuration changes, Ready and Storage interfaces. Network, durable storage implementation and user state machine are caller-owned; their library-facing duties remain applicable.",
+    "protocol_contexts": [
+      "One raft group with nonzero unique node IDs",
+      "Terms, log index/term identity, applied simple or joint voter configuration"
+    ],
+    "external_interfaces": [
+      "Node/RawNode Step, Tick, Ready, Advance, Propose, ApplyConfChange, TransferLeadership",
+      "Storage, HardState, snapshots and asynchronous local append/apply messages"
+    ],
+    "ownership": [
+      "Node serializes requests in its run loop; RawNode callers serialize access.",
+      "Caller supplies transport, persistence and ordered application."
+    ],
+    "selection_injection": [],
+    "variants": [
+      "Conventional and asynchronous storage writes",
+      "PreVote, CheckQuorum, safe versus lease reads",
+      "Simple and joint configuration transitions"
+    ],
+    "source_ids": [
+      "S_usage",
+      "S_async_contract",
+      "S_node_contract",
+      "S_node_loop",
+      "S_raw_ready"
+    ],
+    "unknowns": []
+  },
+  "activities": [
+    {
+      "class_id": "A1",
+      "applicability": "applicable",
+      "purpose": "Qualified support for decision formation and legal advancement",
+      "realization_summary": "Leader proposals are replicated and durable support is aggregated using configured voters; current-term qualification controls commitment, which followers learn through matched append or bounded heartbeat commit.",
+      "entry_points": [],
+      "behavior_ids": [
+        "B_replication"
+      ],
+      "variants": [],
+      "unknowns": [],
+      "source_ids": [
+        "S_ack",
+        "S_commit_reset",
+        "S_joint",
+        "S_log_append",
+        "S_log_context",
+        "S_proposal",
+        "S_receive",
+        "S_send",
+        "S_tracker_commit"
+      ]
+    },
+    {
+      "class_id": "A2",
+      "applicability": "applicable",
+      "purpose": "Context validity and acquisition, transfer or loss of authority",
+      "realization_summary": "Term/role changes, quorum elections and transfers acquire or revoke authority; reset discards volatile support but retains established log decisions.",
+      "entry_points": [],
+      "behavior_ids": [
+        "B_election",
+        "B_context_reset",
+        "B_transfer"
+      ],
+      "variants": [],
+      "unknowns": [],
+      "source_ids": [
+        "S_campaign",
+        "S_commit_reset",
+        "S_config",
+        "S_dispatch",
+        "S_joint",
+        "S_proposal",
+        "S_roles",
+        "S_send",
+        "S_timers",
+        "S_transfer"
+      ]
+    },
+    {
+      "class_id": "A3",
+      "applicability": "applicable",
+      "purpose": "Recovery and resynchronization of eligible participation",
+      "realization_summary": "In-repository restart and snapshot mechanisms reconstruct eligible history and configuration; persistence is caller-provided.",
+      "entry_points": [],
+      "behavior_ids": [
+        "B_recovery"
+      ],
+      "variants": [],
+      "unknowns": [],
+      "source_ids": [
+        "S_log_context",
+        "S_receive",
+        "S_restore",
+        "S_restore_config",
+        "S_restore_init"
+      ]
+    },
+    {
+      "class_id": "A4",
+      "applicability": "applicable",
+      "purpose": "Configuration and participant eligibility",
+      "realization_summary": "In-repository Changer validates simple/joint transitions; application determines activation and automatic exit ownership.",
+      "entry_points": [],
+      "behavior_ids": [
+        "B_configuration"
+      ],
+      "variants": [],
+      "unknowns": [],
+      "source_ids": [
+        "S_conf_contract",
+        "S_confchange",
+        "S_config",
+        "S_node_contract",
+        "S_restore_config",
+        "S_tracker"
+      ]
+    },
+    {
+      "class_id": "A5",
+      "applicability": "applicable",
+      "purpose": "Decision application and consumption",
+      "realization_summary": "Committed Ready entries are consumed by the caller; in-repository accounting and completion responses determine subsequent application availability and joint-exit attempts.",
+      "entry_points": [],
+      "behavior_ids": [
+        "B_application"
+      ],
+      "variants": [],
+      "unknowns": [],
+      "source_ids": [
+        "S_auto_leave",
+        "S_dispatch",
+        "S_log_apply",
+        "S_log_commit",
+        "S_raw_completion"
+      ]
+    },
+    {
+      "class_id": "A6",
+      "applicability": "applicable",
+      "purpose": "History, persistence and reconstruction of support",
+      "realization_summary": "In-repository Ready/worker-message scheduling enforces persistence dependencies, with caller-provided storage and recovery input.",
+      "entry_points": [],
+      "behavior_ids": [
+        "B_storage_ready"
+      ],
+      "variants": [],
+      "unknowns": [],
+      "source_ids": [
+        "S_async_contract",
+        "S_dispatch",
+        "S_raw_completion",
+        "S_raw_ready",
+        "S_raw_storage",
+        "S_ready_contract",
+        "S_usage"
+      ]
+    },
+    {
+      "class_id": "A7",
+      "applicability": "applicable",
+      "purpose": "Client contracts, invocation intervals and observed completion",
+      "realization_summary": "Proposal admission does not guarantee commitment; read-index correlation and application waits are caller responsibilities, supported by library quorum-read processing.",
+      "entry_points": [],
+      "behavior_ids": [
+        "B_reads"
+      ],
+      "variants": [],
+      "unknowns": [],
+      "source_ids": [
+        "S_ack",
+        "S_proposal",
+        "S_read_queue",
+        "S_read_release",
+        "S_reads",
+        "S_roles"
+      ]
+    }
+  ],
+  "behaviors": [
+    {
+      "id": "B_election",
+      "primary_activity": "A2",
+      "execution_owner": "raft.Step, hup, campaign, stepCandidate",
+      "protocol_context": "Local node term and active voter configuration",
+      "trigger": "Tick or Campaign, eligible vote requests and responses",
+      "legal_preconditions": [],
+      "implementation_guards": [
+        "Campaign requires local voter eligibility, no pending snapshot, and no unapplied committed configuration change.",
+        "Vote eligibility uses recorded vote/current leader and candidate last log term/index; joint vote result requires both majorities.",
+        "Response type must match candidate versus pre-candidate phase."
+      ],
+      "reads": [],
+      "writes": [
+        "Real election increments term and records self vote; pre-election does neither.",
+        "Winning real votes installs leader and appends a current-term empty entry."
+      ],
+      "durable_effects": [],
+      "external_effects": [
+        "Vote and append responses, including self-votes, await the storage completion path."
+      ],
+      "important_branches": [],
+      "async_boundaries": [],
+      "produces_fact_ids": [
+        "F_authority"
+      ],
+      "consumes_fact_ids": [
+        "F_config"
+      ],
+      "cross_activity_effects": {
+        "A1": "Leader authority selects the term used to qualify replication support and new commitment."
+      },
+      "existing_protections": [],
+      "source_ids": [
+        "S_campaign",
+        "S_dispatch",
+        "S_roles",
+        "S_joint",
+        "S_send"
+      ],
+      "unknowns": []
+    },
+    {
+      "id": "B_context_reset",
+      "primary_activity": "A2",
+      "execution_owner": "raft.Step, reset, becomeFollower",
+      "protocol_context": "Node term, leader role and volatile aggregation",
+      "trigger": "Higher-term message, accepted leader message while candidate, or failed quorum check",
+      "legal_preconditions": [],
+      "implementation_guards": [],
+      "reads": [],
+      "writes": [
+        "New term clears vote; resets election timers, vote tally, per-peer progress, pendingConfIndex, transfer target and readOnly heartbeat-ack queue.",
+        "Preserves raftLog and committed entries across role changes."
+      ],
+      "durable_effects": [],
+      "external_effects": [],
+      "important_branches": [
+        "Future pre-votes and successful pre-vote responses do not change local term; a recent leader lease may reject disruptive vote requests.",
+        "Lower-term protocol messages are ignored or answered with current term; old storage append completions cannot stabilize entries, but snapshot completion remains applicable.",
+        "pendingReadIndexMessages is not cleared by reset, unlike readOnly."
+      ],
+      "async_boundaries": [],
+      "produces_fact_ids": [
+        "F_authority"
+      ],
+      "consumes_fact_ids": [],
+      "cross_activity_effects": {
+        "A1": "Old replication support is not retained as current leader match evidence; established committed history survives."
+      },
+      "existing_protections": [],
+      "source_ids": [
+        "S_dispatch",
+        "S_commit_reset",
+        "S_roles",
+        "S_proposal"
+      ],
+      "unknowns": [
+        "Determine whether retained pre-commit read requests can affect semantics after authority changes; no violation inferred from retention."
+      ]
+    },
+    {
+      "id": "B_replication",
+      "primary_activity": "A1",
+      "execution_owner": "stepLeader, handleAppendEntries, handleHeartbeat",
+      "protocol_context": "Leader term, per-peer Match and local log prefix",
+      "trigger": "Proposal, MsgApp, MsgAppResp, heartbeat and retry",
+      "legal_preconditions": [],
+      "implementation_guards": [
+        "Leader drops proposals during transfer or when its progress is absent; limits uncommitted bytes.",
+        "Follower requires matching previous entry term and forbids overwriting committed entries.",
+        "Leader uses configured quorum match index and only commits an index whose log term equals current term."
+      ],
+      "reads": [],
+      "writes": [
+        "Assigns proposal index/term; appends unstable entries; durable acknowledgements update Match; successful maybeCommit advances committed."
+      ],
+      "durable_effects": [],
+      "external_effects": [
+        "Successful ack-driven commitment releases pending reads and broadcasts appends.",
+        "Heartbeat commit is capped at recipient Match; rejection/backoff and heartbeat responses resume replication."
+      ],
+      "important_branches": [],
+      "async_boundaries": [
+        "Replication acknowledgements are queued until caller storage completion."
+      ],
+      "produces_fact_ids": [
+        "F_committed"
+      ],
+      "consumes_fact_ids": [
+        "F_authority",
+        "F_config"
+      ],
+      "cross_activity_effects": {},
+      "existing_protections": [],
+      "source_ids": [
+        "S_proposal",
+        "S_send",
+        "S_commit_reset",
+        "S_ack",
+        "S_receive",
+        "S_log_append",
+        "S_log_context",
+        "S_tracker_commit",
+        "S_joint"
+      ],
+      "unknowns": []
+    },
+    {
+      "id": "B_storage_ready",
+      "primary_activity": "A6",
+      "execution_owner": "RawNode Ready/acceptReady/Advance and caller storage workers",
+      "protocol_context": "Per-node Ready batches and term-tagged append completion",
+      "trigger": "Ready acceptance and conventional Advance or asynchronous append/apply responses",
+      "legal_preconditions": [
+        "Caller persists required state and preserves Ready processing order; async messages to each local worker are reliable and ordered."
+      ],
+      "implementation_guards": [],
+      "reads": [],
+      "writes": [
+        "Tracks in-progress unstable writes and application batches; append completion removes matching stable entries; apply completion advances applied."
+      ],
+      "durable_effects": [],
+      "external_effects": [
+        "Non-async Advance dispatches captured local responses; async Ready emits worker messages with dependent response lists."
+      ],
+      "important_branches": [
+        "Async application only exposes locally stable committed entries; conventional application may use unstable entries under the Ready persistence contract."
+      ],
+      "async_boundaries": [],
+      "produces_fact_ids": [],
+      "consumes_fact_ids": [
+        "F_committed"
+      ],
+      "cross_activity_effects": {
+        "A1": "Persist-before-response makes acknowledgement support usable across crashes.",
+        "A2": "Term-tagged append completions distinguish old writes from current unstable state.",
+        "A5": "Ordered application completions update applied state and can trigger automatic configuration exit."
+      },
+      "existing_protections": [],
+      "source_ids": [
+        "S_usage",
+        "S_async_contract",
+        "S_ready_contract",
+        "S_raw_ready",
+        "S_raw_storage",
+        "S_raw_completion",
+        "S_dispatch"
+      ],
+      "unknowns": []
+    },
+    {
+      "id": "B_application",
+      "primary_activity": "A5",
+      "execution_owner": "raft.appliedTo and raftLog application accounting",
+      "protocol_context": "Committed/applied/applying indexes and configuration currently active at node",
+      "trigger": "MsgStorageApplyResp, conventional Advance, or snapshot completion",
+      "legal_preconditions": [],
+      "implementation_guards": [],
+      "reads": [],
+      "writes": [
+        "Advances applied monotonically and releases application byte pressure."
+      ],
+      "durable_effects": [],
+      "external_effects": [],
+      "important_branches": [
+        "When AutoLeave is true, applied reaches pendingConfIndex and this node is leader, proposes empty ConfChangeV2.",
+        "The proposal can be rejected while a leadership transfer is active; code relies on a later applied entry to retry."
+      ],
+      "async_boundaries": [],
+      "produces_fact_ids": [],
+      "consumes_fact_ids": [
+        "F_committed",
+        "F_config"
+      ],
+      "cross_activity_effects": {
+        "A2": "Automatic joint exit proposal determines when authority can transition from joint voters to incoming voters."
+      },
+      "existing_protections": [],
+      "source_ids": [
+        "S_auto_leave",
+        "S_log_apply",
+        "S_log_commit",
+        "S_raw_completion",
+        "S_dispatch"
+      ],
+      "unknowns": [
+        "Does caller-owned ordinary Ready processing guarantee another appliedTo callback after a transfer rejects the only automatic exit attempt?"
+      ]
+    },
+    {
+      "id": "B_configuration",
+      "primary_activity": "A4",
+      "execution_owner": "raft.applyConfChange, switchToConfig and confchange.Changer",
+      "protocol_context": "Applied ConfChangeV2 and active incoming/outgoing voter sets",
+      "trigger": "Caller applies committed membership entry, or configuration is restored from snapshot",
+      "legal_preconditions": [],
+      "implementation_guards": [
+        "Simple changes alter at most one voter; EnterJoint refuses already-joint state; LeaveJoint requires outgoing voters.",
+        "Proposal admission serializes configuration changes behind applied pendingConfIndex and requires leaving joint state before another change."
+      ],
+      "reads": [],
+      "writes": [
+        "Installs incoming/outgoing voters, learners and staged learners; sets AutoLeave on EnterJoint and clears it on LeaveJoint."
+      ],
+      "durable_effects": [],
+      "external_effects": [],
+      "important_branches": [
+        "Leader removal/demotion may step down depending on StepDownOnRemoval; otherwise proposals are constrained separately.",
+        "switchToConfig reevaluates commitment and broadcasts if it changes, but does not call releasePendingReadIndexMessages."
+      ],
+      "async_boundaries": [],
+      "produces_fact_ids": [
+        "F_config",
+        "F_committed"
+      ],
+      "consumes_fact_ids": [],
+      "cross_activity_effects": {
+        "A1": "Installed joint voter sets determine eligible acknowledgement and vote quorums.",
+        "A2": "Applied configuration changes determine eligibility for future campaigns and transferred leadership."
+      },
+      "existing_protections": [],
+      "source_ids": [
+        "S_node_contract",
+        "S_conf_contract",
+        "S_config",
+        "S_confchange",
+        "S_tracker",
+        "S_restore_config"
+      ],
+      "unknowns": [
+        "Reachability of a first-current-term commitment caused by switchToConfig while an earlier read is pending needs history analysis."
+      ]
+    },
+    {
+      "id": "B_transfer",
+      "primary_activity": "A2",
+      "execution_owner": "stepLeader MsgTransferLeader, tickHeartbeat, abortLeaderTransfer",
+      "protocol_context": "Current leader and eligible transferee progress",
+      "trigger": "Transfer request, transferee catch-up, timeout, or transferee removal",
+      "legal_preconditions": [],
+      "implementation_guards": [
+        "Ignores learners/self transfers; catch-up uses tracked Match before TimeoutNow."
+      ],
+      "reads": [],
+      "writes": [
+        "Sets leadTransferee and resets electionElapsed; clears target on timeout or invalidated membership."
+      ],
+      "durable_effects": [],
+      "external_effects": [
+        "Sends append to catch up transferee or TimeoutNow to initiate real election."
+      ],
+      "important_branches": [
+        "While leadTransferee is nonzero, proposals are dropped, including internally proposed joint exits.",
+        "Timeout aborts transfer but does not itself call appliedTo or append an entry."
+      ],
+      "async_boundaries": [],
+      "produces_fact_ids": [],
+      "consumes_fact_ids": [
+        "F_authority",
+        "F_config"
+      ],
+      "cross_activity_effects": {
+        "A1": "Proposal admission is paused during transfer, then restored on abort."
+      },
+      "existing_protections": [],
+      "source_ids": [
+        "S_transfer",
+        "S_timers",
+        "S_config",
+        "S_roles"
+      ],
+      "unknowns": []
+    },
+    {
+      "id": "B_recovery",
+      "primary_activity": "A3",
+      "execution_owner": "newRaft, restore, handleSnapshot",
+      "protocol_context": "Stored HardState, snapshot configuration and committed prefix",
+      "trigger": "Construction/restart or snapshot receipt",
+      "legal_preconditions": [],
+      "implementation_guards": [
+        "Obsolete snapshots are ignored; receiver membership is required.",
+        "Matching snapshot log term permits commit fast-forward without replacing the log; otherwise restore replaces unstable history and reconstructs configuration."
+      ],
+      "reads": [],
+      "writes": [
+        "Reconstructs configuration and committed position; initializes follower role."
+      ],
+      "durable_effects": [],
+      "external_effects": [],
+      "important_branches": [],
+      "async_boundaries": [],
+      "produces_fact_ids": [
+        "F_config",
+        "F_committed"
+      ],
+      "consumes_fact_ids": [],
+      "cross_activity_effects": {
+        "A1": "Committed prefix and restored membership constrain subsequent quorum formation.",
+        "A2": "Pending snapshot prevents campaign until its completion; snapshot completion remains valid across term changes."
+      },
+      "existing_protections": [],
+      "source_ids": [
+        "S_restore_init",
+        "S_restore",
+        "S_receive",
+        "S_restore_config",
+        "S_log_context"
+      ],
+      "unknowns": []
+    },
+    {
+      "id": "B_reads",
+      "primary_activity": "A7",
+      "execution_owner": "stepLeader/stepFollower ReadIndex and readOnly queue",
+      "protocol_context": "Request context, leader term, committed index and active voters",
+      "trigger": "ReadIndex request, current-term commit, or heartbeat acknowledgement",
+      "legal_preconditions": [],
+      "implementation_guards": [
+        "Non-singleton leaders postpone reads before a current-term commit.",
+        "Safe mode counts unique voter acknowledgements under current voter sets; caller differentiates requests by RequestCtx."
+      ],
+      "reads": [],
+      "writes": [
+        "Records committed read index and request context; acknowledged queued requests produce ReadStates or ReadIndexResp."
+      ],
+      "durable_effects": [],
+      "external_effects": [],
+      "important_branches": [
+        "Singleton returns committed index directly; lease-based mode bypasses safe-mode heartbeat quorum.",
+        "Reset clears readOnly pending ack queue but not the separate pre-first-commit request list."
+      ],
+      "async_boundaries": [],
+      "produces_fact_ids": [],
+      "consumes_fact_ids": [
+        "F_authority",
+        "F_committed",
+        "F_config"
+      ],
+      "cross_activity_effects": {
+        "A1": "Consumes established commitment and quorum contact for safe read authority; caller still waits for state-machine application."
+      },
+      "existing_protections": [],
+      "source_ids": [
+        "S_proposal",
+        "S_ack",
+        "S_reads",
+        "S_read_release",
+        "S_read_queue",
+        "S_roles"
+      ],
+      "unknowns": []
+    }
+  ],
+  "facts": [
+    {
+      "id": "F_authority",
+      "meaning": "The node records a local term and role; becoming leader results from winning the configured vote quorum, while follower/pre-candidate states do not assert leader authority.",
+      "identity": {
+        "node": "raft.id",
+        "term": "raft.Term"
+      },
+      "established_by": [
+        "B_election",
+        "B_context_reset"
+      ],
+      "consumed_by": [
+        "B_replication",
+        "B_transfer",
+        "B_reads"
+      ],
+      "validity_context": "Local role/term and current applied configuration; role can change without term change.",
+      "representation": [
+        "raft.Term",
+        "raft.Vote",
+        "raft.state",
+        "raft.lead",
+        "tracker.Votes"
+      ],
+      "invalidators": [
+        "B_context_reset"
+      ],
+      "reinterpreters": [
+        "B_configuration"
+      ],
+      "durability": "Term and vote enter HardState and must be persisted; role, leader and tally are volatile.",
+      "recovery": "newRaft reloads HardState/configuration and becomes follower.",
+      "source_ids": [
+        "S_campaign",
+        "S_dispatch",
+        "S_restore_init"
+      ],
+      "unknowns": []
+    },
+    {
+      "id": "F_committed",
+      "meaning": "This local log records a committed prefix ending at committed. It does not assert completion of state-machine application or local persistence of every exposed entry.",
+      "identity": {
+        "node": "raft.id",
+        "prefix_end": "raftLog.committed"
+      },
+      "established_by": [
+        "B_replication",
+        "B_configuration",
+        "B_recovery"
+      ],
+      "consumed_by": [
+        "B_storage_ready",
+        "B_application",
+        "B_reads"
+      ],
+      "validity_context": "Log identity is index/term; commitment survives later terms. Leader advancement qualifies current-term quorum support; follower advancement uses leader matching-prefix evidence; recovery uses supplied persisted state.",
+      "representation": [
+        "raftLog.committed",
+        "HardState.Commit"
+      ],
+      "invalidators": [],
+      "reinterpreters": [],
+      "durability": "HardState commit and log/snapshot persistence are caller duties; committed is an in-memory observation until processed.",
+      "recovery": "Loaded HardState and snapshot reconstruct the prefix.",
+      "source_ids": [
+        "S_log_append",
+        "S_log_commit",
+        "S_log_context",
+        "S_config",
+        "S_restore_init",
+        "S_restore"
+      ],
+      "unknowns": []
+    },
+    {
+      "id": "F_config",
+      "meaning": "The node currently uses the installed incoming/outgoing voter sets and learner roles; AutoLeave marks that Raft owns initiation of leaving this joint configuration. This fact does not assert that an exit proposal has been admitted.",
+      "identity": {
+        "node": "raft.id",
+        "configuration": "applied incoming/outgoing voters and learners"
+      },
+      "established_by": [
+        "B_configuration",
+        "B_recovery"
+      ],
+      "consumed_by": [
+        "B_election",
+        "B_replication",
+        "B_application",
+        "B_transfer",
+        "B_reads"
+      ],
+      "validity_context": "Until another applied configuration or restored snapshot replaces it; joint voters remain authoritative during any pending automatic exit.",
+      "representation": [
+        "tracker.Config.Voters",
+        "tracker.Config.Learners",
+        "tracker.Config.LearnersNext",
+        "tracker.Config.AutoLeave"
+      ],
+      "invalidators": [
+        "B_configuration",
+        "B_recovery"
+      ],
+      "reinterpreters": [],
+      "durability": "Configuration is reflected in applied ConfState and snapshots, with committed entries for replay; volatile tracker state is not itself persistence.",
+      "recovery": "confchange.Restore reconstructs voters and passes snapshot AutoLeave to EnterJoint.",
+      "source_ids": [
+        "S_conf_contract",
+        "S_confchange",
+        "S_tracker",
+        "S_restore_config"
+      ],
+      "unknowns": [
+        "Configuration export via Clone may omit AutoLeave without changing the active tracker."
+      ]
+    }
+  ],
+  "surfaces": [
+    {
+      "entry_point": "tracker.Config.Clone -> getStatus",
+      "disposition": "deferred",
+      "behavior_ids": [],
+      "reason": "Clone copies voter/learner maps but omits AutoLeave; getStatus uses the clone. Active Changer EnterJoint explicitly sets AutoLeave and LeaveJoint clears it, so export loss must not be conflated with active transition loss.",
+      "source_ids": [
+        "S_tracker",
+        "S_status",
+        "S_confchange"
+      ],
+      "high_consequence": false
+    },
+    {
+      "entry_point": "raft.switchToConfig -> maybeCommit",
+      "disposition": "deferred",
+      "behavior_ids": [],
+      "reason": "Configuration-driven commit does not release pending pre-first-commit reads; legal reachability must account for the campaign guard against unapplied committed configuration entries.",
+      "source_ids": [
+        "S_config",
+        "S_campaign",
+        "S_ack"
+      ],
+      "high_consequence": false
+    },
+    {
+      "entry_point": "raft.appliedTo -> automatic joint exit",
+      "disposition": "mapped",
+      "behavior_ids": [
+        "B_application",
+        "B_transfer",
+        "B_configuration"
+      ],
+      "reason": "Specific continuation question selected; map association is not resolution.",
+      "source_ids": [
+        "S_auto_leave",
+        "S_timers",
+        "S_transfer"
+      ],
+      "high_consequence": true
+    }
+  ],
+  "core_overview": {
+    "formation": {
+      "explanation": "A leader assigns index and term to accepted proposals and queues a self acknowledgement behind persistence. Followers verify the predecessor term, replace only an uncommitted conflicting suffix, and return append responses after storage processing. Leader Match values are aggregated over the applied configuration: joint configurations require both majorities, and maybeCommit additionally requires current-term log identity. Changed commitment is broadcast; follower heartbeats are capped at known Match. Ready exposes committed entries for ordered caller application, and completion advances applied separately from committed.",
+      "behavior_ids": [
+        "B_replication",
+        "B_storage_ready",
+        "B_application"
+      ],
+      "fact_ids": [
+        "F_committed",
+        "F_config",
+        "F_authority"
+      ],
+      "source_ids": [
+        "S_ack",
+        "S_async_contract",
+        "S_auto_leave",
+        "S_campaign",
+        "S_commit_reset",
+        "S_conf_contract",
+        "S_confchange",
+        "S_config",
+        "S_dispatch",
+        "S_joint",
+        "S_log_append",
+        "S_log_apply",
+        "S_log_commit",
+        "S_log_context",
+        "S_proposal",
+        "S_raw_completion",
+        "S_raw_ready",
+        "S_raw_storage",
+        "S_ready_contract",
+        "S_receive",
+        "S_restore",
+        "S_restore_config",
+        "S_restore_init",
+        "S_send",
+        "S_tracker",
+        "S_tracker_commit",
+        "S_usage"
+      ]
+    },
+    "context": {
+      "explanation": "Tick or explicit campaign begins an election only for an eligible voter without pending snapshots or committed unapplied configuration changes. Vote choice is conditioned on local vote/leader state and candidate log freshness, with persistence-dependent replies and joint quorum counting. Higher terms normally install follower state; pre-vote and lease checks qualify this rule. Reset clears volatile aggregation and read-ack context, transfer target and pending configuration index, while committed history remains. Leader transfer pauses proposals, catches up a voter and sends TimeoutNow; it aborts on timeout or membership removal. Configuration changes activate on application, and snapshots/restart reconstruct configuration and history.",
+      "behavior_ids": [
+        "B_election",
+        "B_context_reset",
+        "B_transfer",
+        "B_configuration",
+        "B_recovery"
+      ],
+      "fact_ids": [
+        "F_authority",
+        "F_config",
+        "F_committed"
+      ],
+      "source_ids": [
+        "S_campaign",
+        "S_commit_reset",
+        "S_conf_contract",
+        "S_confchange",
+        "S_config",
+        "S_dispatch",
+        "S_joint",
+        "S_log_append",
+        "S_log_commit",
+        "S_log_context",
+        "S_node_contract",
+        "S_proposal",
+        "S_receive",
+        "S_restore",
+        "S_restore_config",
+        "S_restore_init",
+        "S_roles",
+        "S_send",
+        "S_timers",
+        "S_tracker",
+        "S_transfer"
+      ]
+    },
+    "connection": {
+      "explanation": "Applied voter membership supplies both election and replication quorum meaning. A new leader resets peer Match and conservatively postpones new configuration changes until its inherited log tail is applied; its empty current-term entry enables safe commitment of older history. Old network replies are filtered by term and role, while old storage append completion cannot stabilize overwritten entries. Committed application and snapshot completion remain term-independent. Pending reads waiting for a first current-term commit are distinct from the reset read-ack queue. Applied joint configurations continue to require outgoing and incoming quorums until a leave entry is committed and applied; application completion attempts automatic exit but transfer admission can reject that proposal.",
+      "behavior_ids": [
+        "B_election",
+        "B_context_reset",
+        "B_replication",
+        "B_configuration",
+        "B_application",
+        "B_storage_ready",
+        "B_reads"
+      ],
+      "fact_ids": [
+        "F_config",
+        "F_authority",
+        "F_committed"
+      ],
+      "source_ids": [
+        "S_ack",
+        "S_async_contract",
+        "S_auto_leave",
+        "S_campaign",
+        "S_commit_reset",
+        "S_conf_contract",
+        "S_confchange",
+        "S_config",
+        "S_dispatch",
+        "S_joint",
+        "S_log_append",
+        "S_log_apply",
+        "S_log_commit",
+        "S_log_context",
+        "S_node_contract",
+        "S_proposal",
+        "S_raw_completion",
+        "S_raw_ready",
+        "S_raw_storage",
+        "S_read_queue",
+        "S_read_release",
+        "S_reads",
+        "S_ready_contract",
+        "S_receive",
+        "S_restore",
+        "S_restore_config",
+        "S_restore_init",
+        "S_roles",
+        "S_send",
+        "S_tracker",
+        "S_tracker_commit",
+        "S_usage"
+      ]
+    },
+    "open_details": [
+      "Automatic exit continuation after a failed leadership transfer with no new client proposals.",
+      "AutoLeave representation in status copies.",
+      "Legal reachability of pending-read release differences at configuration-driven commitment.",
+      "Deeper snapshot, flow-control and client cancellation variants are not fully mapped."
+    ],
+    "core_gaps": [],
+    "status": "usable",
+    "rationale": "Representative formation and authority paths plus their supporting history, membership, recovery and completion boundaries have been traced. Local continuation and export anomalies remain open, not global readiness gaps."
+  }
+}
