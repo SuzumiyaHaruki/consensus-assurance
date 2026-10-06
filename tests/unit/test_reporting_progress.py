@@ -356,6 +356,12 @@ def test_mixed_report_reads_fixed_results_and_moves_without_side_effects(tmp_pat
     text=render_report(state,moved).read_text()
     assert text==live and valid_links(text)==files
     assert state.model_dump(mode='json')==saved and all((moved/p).read_bytes()==v for p,v in before.items())
+    assert len(text.split('## 主要结果')[0].splitlines())<15
+    visible=re.sub(r'<details>.*?</details>','',text,flags=re.S)
+    assert '已确认违反命题 1 项' in visible and '本次完整观察返回 4，上限为 3。' in visible
+    assert '义务已受理，尚无固定检查记录' in visible and 'Obtain the external timing contract' in visible
+    assert '| 资源 |' not in visible and '| state.encoded |' not in visible and '地图 v1 的登记原文' not in visible
+    assert '<summary>地图登记与研究交接</summary>' in text and '| 资源 |' in text
     assert '**已确认违反**' in text and '**有限检查未见违反**' in text and '源码解释' in text
     table=text.split('## 主要结果')[1].split('### 1.')[0]
     rows=[line for line in table.splitlines() if line.startswith('|')]
