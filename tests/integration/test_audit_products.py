@@ -82,7 +82,12 @@ def test_rust_cross_action_seed_isolation_inputs_and_recovery(tmp_path,rust_work
     original_lock=(repo/'Cargo.lock').read_bytes() if upstream_lock else None
     e.config.target=TargetConfig(execution_package='sample');e.config.execution_backend='cargo'
     e.config.execution_isolation='bwrap';e.config.budget.experiments=6;e.config.budget.action_timeout=60
-    e.implementation=CargoBackend(e.config.target);e.start(repo,plan_only=True)
+    shared=tmp_path/'shared-seeds' if not upstream_lock else None
+    if shared:
+        build='fn main() { assert!(std::fs::write('+json.dumps(str(shared/'build-script-write'))+', "untrusted").is_err()); }'
+        (rust_workspace/'increment/build.rs').write_text(build);(repo/'increment/build.rs').write_text(build)
+    e.config.cargo_seed_cache_dir=str(shared) if shared else None
+    e.implementation=CargoBackend(e.config.target,seed_cache_dir=shared);e.start(repo,plan_only=True)
     checks=[]
     from consensus_assurance.workflow.research import current_view
     def preparation():
@@ -105,6 +110,10 @@ std::fs::write("runtime-db", "private").unwrap();
 std::fs::write("../.execution/cargo-target/poison", "private").unwrap();
 println!("CA_EVENT {{\\"event\\":\\"value\\",\\"value\\":{}}}", sample::step(VALUE,9));
 }'''.replace('VALUE',str(value))
+        if shared and value is not None:
+            text=text.replace('assert!(!std::path::Path::new("runtime-db").exists());',
+                'assert!(std::fs::write('+json.dumps(str(shared/'forbidden-write'))+', "untrusted").is_err());\n'+
+                'assert!(!std::path::Path::new("runtime-db").exists());')
         if package=='increment':text=text.replace('sample::step(VALUE,9)'.replace('VALUE',str(value)),'increment::value()')
         h=Harness(kind='rust_test',execution_package=package,source=text,description='Actual changed input',semantic_changes=[])
         filename=e.implementation.resolve_harness(h,e.root/'source',e.state.snapshot.files)
@@ -147,6 +156,84 @@ println!("CA_EVENT {{\\"event\\":\\"value\\",\\"value\\":{}}}", sample::step(VAL
     with pytest.raises(ValueError,match='changed'):e.implementation.validate_builds(e.root,e.state.snapshot.id)
     manifest.write_bytes(saved)
     saved_receipt=(e.root/first_check.parameters['seed_record']).read_bytes()
+    if shared:
+        first_engine,first_repo=e,repo
+        (tmp_path/'independent').mkdir()
+        e,repo=engine_for(tmp_path/'independent',[]);shutil.copytree(rust_workspace,repo,dirs_exist_ok=True)
+        e.config.target=TargetConfig(execution_package='sample');e.config.execution_backend='cargo'
+        e.config.execution_isolation='bwrap';e.config.cargo_seed_cache_dir=str(shared)
+        e.implementation=CargoBackend(e.config.target,seed_cache_dir=shared);e.start(repo,plan_only=True)
+        assert e.state.id!=first_engine.state.id and e.state.snapshot.id!=first_engine.state.snapshot.id
+        assert not e.state.monitor_results and not e.state.semantic_reviews and not e.state.question_candidates
+        class Crash(BaseException):pass
+        runner=e.runner.run
+        with monkeypatch.context() as patch:
+            def interrupt(command,cwd,action,*args,**kwargs):
+                check=runner(command,cwd,action,*args,**kwargs)
+                if action=='cargo_seed_materialize':raise Crash()
+                return check
+            patch.setattr(e.runner,'run',interrupt)
+            with pytest.raises(Crash):run(12)
+        reused=run(12)
+        assert e.state.usage['experiments']==1 and reused.parameters['action_seconds'] is None
+        assert extract_events(reused)[0]['value']==13 and reused.parameters['seed_build'] is None
+        receipt=json.loads((e.root/reused.parameters['seed_record']).read_text())
+        assert receipt['shared_seed']['status']=='hit' and receipt['shared_seed']['origin']['build_id']==first_check.parameters['seed_build']
+        assert (e.root/'logs'/receipt['shared_seed']['copy_check_id']/'check.json').is_file()
+        assert not (e.root/'logs'/first_check.parameters['seed_build']).exists()
+        assert preparation()['sample/Cargo.toml']['latest_preparation']['stage']=='cargo_seed_materialize'
+        logs=[json.loads(p.read_text()) for p in (e.root/'logs').glob('*/check.json')]
+        assert not any(c['action']=='cargo_seed_build' for c in logs)
+        assert len([c for c in logs if c['action']=='cargo_seed_materialize'])==2
+        assert all(c['snapshot_id']==e.state.snapshot.id for c in logs)
+        e.advance('invalid');invalid=run(None)
+        assert invalid.status.value=='error' and not invalid.parameters['test_started'] and not extract_events(invalid)
+        assert not list(shared.rglob('poison')) and not list(shared.rglob('runtime-db')) and not (shared/'forbidden-write').exists()
+        assert not (shared/'build-script-write').exists()
+        from consensus_assurance.reporting.chinese import Archive,render_report
+        moved=tmp_path/'portable';shutil.copytree(e.root,moved,ignore=shutil.ignore_patterns('.execution','workspace'))
+        with monkeypatch.context() as patch:
+            opened=Path.open
+            def archive_only(path,*args,**kwargs):
+                assert not path.is_relative_to(e.root) and not path.is_relative_to(first_engine.root)
+                return opened(path,*args,**kwargs)
+            patch.setattr(Path,'open',archive_only)
+            patch.setattr(cargo_build,'tool_inputs',lambda *a,**kw:pytest.fail('Archive verified tools'))
+            archive=Archive(e.state,moved)
+            archived=cargo_build.build_inputs(e.implementation,moved,e.state,archive.read)[0]
+            assert archived['status']=='seed_unavailable'
+            assert (moved/archived['latest_preparation']['record']).is_file()
+            assert archive.path(reused.stdout).read_bytes()
+            assert '探索执行正常结束' in render_report(e.state,moved).read_text()
+        key=receipt['shared_seed']['key'];entry=shared/key
+        import copy,time,fcntl
+        command=e.implementation.experiment_command()
+        current=json.loads((e.root/reused.parameters['build_inputs']).read_text())
+        def lookup(value=current):
+            return cargo_build.shared_seed(e.implementation,e.runner,e.state.snapshot.id,command,value,
+                e.root/'.execution/control-copy',time.monotonic()+10)
+        for field in ('source_files','source_modes','lock','tools','policy','test_target'):
+            changed=copy.deepcopy(current)
+            if field in {'source_files','source_modes'}:changed[field][next(iter(changed[field]))]='changed'
+            elif field=='lock':changed[field]['digest']='changed'
+            elif field=='tools':changed[field][0]['version']='changed'
+            elif field=='policy':changed[field]['jobs']=1
+            else:changed[field]='different_target'
+            assert lookup(changed)['status']=='miss'
+        with (shared/(key+'.lock')).open('r') as lock:
+            fcntl.flock(lock,fcntl.LOCK_EX)
+            assert 'in use' in lookup()['reason']
+        marker=entry/'ready.json';marker_bytes=marker.read_bytes();marker.unlink()
+        assert lookup()['status']=='miss'  # Half-published entries are not imported.
+        marker.write_bytes(marker_bytes)
+        escape=entry/'seed/escape';escape.symlink_to(tmp_path)
+        assert 'link' in lookup()['reason'];escape.unlink()
+        with pytest.raises(TimeoutError,match='deadline'):
+            cargo_build.shared_seed(e.implementation,e.runner,e.state.snapshot.id,command,current,
+                e.root/'.execution/expired-copy',time.monotonic()-1)
+        # Corruption must force the original neutral path, never run a retained binary.
+        next((entry/'seed').rglob('libincrement*.rlib')).write_bytes(b'corrupt')
+        e,repo=first_engine,first_repo
     old=[c.model_dump(mode='json') for c in checks]
     shutil.rmtree(seed)
     assert all(p['status']=='seed_unavailable' and p['compilations'] for p in preparation().values())
@@ -159,16 +246,23 @@ println!("CA_EVENT {{\\"event\\":\\"value\\",\\"value\\":{}}}", sample::step(VAL
     assert (repo/'sample/src/lib.rs').read_bytes()==(rust_workspace/'sample/src/lib.rs').read_bytes()
     assert (e.root/first_check.parameters['seed_record']).read_bytes()==saved_receipt
     if not upstream_lock:
+        saved=json.loads((e.root/cold.parameters['seed_record']).read_text())
+        assert saved['shared_seed']['status']=='miss' and 'bytes or modes differ' in saved['shared_seed']['reason']
+        assert saved['shared_seed']['publication']['status']=='published'
         (tmp_path/'variant').mkdir()
         e,repo=engine_for(tmp_path/'variant',[]);shutil.copytree(rust_workspace,repo,dirs_exist_ok=True)
         manifest=repo/'sample/Cargo.toml';manifest.write_text(manifest.read_text().replace('["instrumented"]','["instrumented","alternate"]'))
         e.config.target=TargetConfig(execution_package='sample');e.config.execution_backend='cargo'
-        e.config.execution_isolation='bwrap';e.implementation=CargoBackend(e.config.target);e.start(repo,plan_only=True)
+        e.config.execution_isolation='bwrap';e.config.cargo_seed_cache_dir=str(shared)
+        e.implementation=CargoBackend(e.config.target,seed_cache_dir=shared);e.start(repo,plan_only=True)
         variant=run(1)
         assert extract_events(variant)[0]['value']==3
         artifacts=json.loads((e.root/'logs'/variant.parameters['seed_build']/'cargo-artifacts.json').read_text())
         assert any(a['target']['name']=='increment' and a['fresh'] is False and 'alternate' in a['features'] for a in artifacts)
         assert json.loads((e.root/variant.parameters['build_inputs']).read_text())['snapshot_id']!=basis['snapshot_id']
+        assert json.loads((e.root/variant.parameters['seed_record']).read_text())['shared_seed']['status']=='miss'
+        shutil.rmtree(shared)
+        assert (first_engine.root/first_check.parameters['seed_record']).read_bytes()==saved_receipt
 
 
 @pytest.mark.parametrize('cut',['copy','partial_copy','process','adapter','unknown_process'])
@@ -183,7 +277,10 @@ def test_rust_same_action_recovers_materialization_and_execution(tmp_path,rust_w
     if not shutil.which('cargo') or not shutil.which('bwrap'):pytest.skip('Local Rust and bubblewrap are required')
     e,repo=engine_for(tmp_path,[]);shutil.copytree(rust_workspace,repo,dirs_exist_ok=True)
     e.config.target=TargetConfig(execution_package='sample');e.config.execution_backend='cargo'
-    e.config.execution_isolation='bwrap';e.implementation=CargoBackend(e.config.target);e.start(repo,plan_only=True)
+    e.config.execution_isolation='bwrap'
+    shared=tmp_path/'shared-seeds' if cut in {'copy','process','adapter'} else None
+    e.config.cargo_seed_cache_dir=str(shared) if shared else None
+    e.implementation=CargoBackend(e.config.target,seed_cache_dir=shared);e.start(repo,plan_only=True)
     harness=Harness(kind='rust_test',source='''#[test] fn actual() {
 assert!(!std::path::Path::new("executed-once").exists());
 std::fs::write("executed-once", "actual execution").unwrap();
@@ -217,6 +314,7 @@ println!("CA_EVENT {{\\"event\\":\\"value\\",\\"value\\":{}}}",sample::step(4,9)
         path=e.root/'logs'/interrupted[0].id/'check.json';raw=json.loads(path.read_text())
         raw.update(ended_at=None,status='running');path.write_text(json.dumps(raw))
     frozen={p:p.read_bytes() for p in (e.root/'logs'/interrupted[0].id).glob('*.log')}
+    if shared:shutil.rmtree(shared)  # A lost shared entry cannot trigger replay of a completed target.
     monkeypatch.setattr('consensus_assurance.workflow.audit.execute',lambda engine:action())
     if cut=='unknown_process':
         with pytest.raises(ValueError,match='outcome unknown'):e.resume()

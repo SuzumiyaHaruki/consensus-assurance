@@ -80,6 +80,36 @@ assert not any("plugins.targets" in name for name in sys.modules)
     assert Config().activity_focus==[]
 
 
+def test_cargo_shared_seed_configuration_and_private_paths(tmp_path,monkeypatch):
+    import shutil
+    from consensus_assurance.cli import load_config
+    from consensus_assurance.adapters.runners import cargo_build
+    from consensus_assurance.adapters.agents.backend import CodexAgent
+    if not shutil.which('cargo'):pytest.skip('Local Rust is required')
+    assert Config().cargo_seed_cache_dir is None
+    for data in ({'cargo_seed_cache_dir':'seeds'}, {'execution_backend':'cargo','cargo_seed_cache_dir':''},
+            {'execution_backend':'cargo','runs_dir':str(tmp_path/'runs'),'cargo_seed_cache_dir':str(tmp_path/'runs/seeds')}):
+        with pytest.raises(ValueError,match='[Cc]argo'):Config.model_validate(data)
+    config=tmp_path/'cargo.yaml';config.write_text('execution_backend: cargo\nagent_backend: mock\ncargo_seed_cache_dir: seeds\n')
+    cfg=load_config(config);backend=assemble(cfg)[0]
+    assert cfg.cargo_seed_cache_dir==str(tmp_path/'seeds')==str(backend.seed_cache_dir)
+    root=tmp_path/'run';root.mkdir();source=tmp_path/'original';source.mkdir()
+    (root/'snapshot.json').write_text(json.dumps({'repo':str(source)}))
+    link=tmp_path/'link';link.symlink_to(source,target_is_directory=True)
+    public=tmp_path/'public';public.mkdir(mode=0o755)
+    for path in (root/'draft/cache',source/'cache',tmp_path,link/'cache',public,cargo_build.VIEW/'cache'):
+        backend.seed_cache_dir=path
+        with pytest.raises(ValueError,match='Cargo seed cache'):backend.prepare_run(ProcessRunner(root),'snapshot',1,'bwrap')
+    backend.seed_cache_dir=Path(cfg.cargo_seed_cache_dir)
+    assert cargo_build.cache_directory(backend,root)==backend.seed_cache_dir
+    assert not backend.seed_cache_dir.exists()  # Path validation does not prewarm.
+    monkeypatch.setattr('shutil.which',lambda name:'/usr/bin/'+name)
+    agent=CodexAgent();agent.read_only_roots=backend.read_only_roots()
+    options='\n'.join(agent.permission_options(root,root/'draft'))
+    assert json.dumps(str(backend.seed_cache_dir)) not in options
+    assert '":root"="deny"' in options and json.dumps(str(root/'draft'))+'="write"' in options
+
+
 def test_selected_support_is_captured_once_and_cannot_replace_target(tmp_path):
     backend=assemble(Config(execution_backend='hashicorp_raft',agent_backend='mock'))[0]
     harness=Harness(kind='go_test',source='package raft\n',description='Helper input boundary',semantic_changes=[])

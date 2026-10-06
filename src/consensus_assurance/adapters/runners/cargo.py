@@ -14,11 +14,12 @@ from consensus_assurance.adapters.runners.experiment import local_package
 
 class CargoBackend:
     name = "cargo"
-    version = "2"
+    version = "3"
     harness_kind = "rust_test"
     harness_instructions = "Write Rust #[test] integration tests using the captured crate's public API and existing dependencies. The controller fixes the workspace lock and tools; build reuse is specific to a manifest, integration test target and saved build basis. Switching crates may require a first heavy dependency build. Consult research.json build_inputs for preparation evidence and current seed availability; unlisted targets are not known to be prepared, and available seeds still require execution-time validation. Only the generated test target runs, serially with --nocapture and --locked --offline. Emit complete CA_EVENT JSON lines. Helpers are workspace-relative; never replace manifests, locks, build scripts or Cargo configuration. No extra feature flags are added; original dev-dependencies can enable additional features. Actual compiler-artifact records describe reuse; declaration syntax does not establish active cfg branches or private-state reachability."
 
-    def __init__(self, target=None, timeout=90):
+    def __init__(self, target=None, timeout=90, seed_cache_dir=None):
+        self.seed_cache_dir = Path(seed_cache_dir).expanduser().absolute() if seed_cache_dir is not None else None
         self.package = local_package(target.execution_package if target else ".")
         self.harness_filename = (target.harness_path if target else None) or str(Path(self.package)/"tests/assurance_generated.rs")
         self.destination(self.package,self.harness_filename)

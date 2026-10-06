@@ -18,12 +18,12 @@ def load_config(path=None, overrides=None):
     data = yaml.safe_load(Path(path).read_text()) or {} if path else {}
     if not isinstance(data, dict):
         raise ValueError("Configuration must be an object")
-    for name in ("repo_path", "runs_dir", "fixture"):
+    for name in ("repo_path", "runs_dir", "fixture", "cargo_seed_cache_dir"):
         if data.get(name):
             p = Path(data[name]).expanduser()
             if not p.is_absolute():
                 p = (Path(path).resolve().parent if path else Path.cwd()) / p
-            data[name] = str(p.resolve())
+            data[name] = str(p.absolute() if name == 'cargo_seed_cache_dir' else p.resolve())
     provider=data.get('codex_provider')
     if isinstance(provider,dict) and provider.get('model_catalog_path'):
         p=Path(provider['model_catalog_path']).expanduser()
@@ -82,7 +82,7 @@ def main(argv=None):
     try:
         if args.command == 'validate':
             from consensus_assurance.core.types import Analysis
-            from consensus_assurance.registry import EXECUTION_BACKENDS
+            from consensus_assurance.registry import execution_backend
             from consensus_assurance.workflow.audit import validate_submission, draft_bytes
             root = Path(args.run).expanduser().resolve()
             raw = json.loads(draft_bytes(root, 'state.json'))
@@ -90,7 +90,7 @@ def main(argv=None):
                 raise ValueError('Historical runs are read-only; validate requires the current framework revision')
             state = Analysis.model_validate(raw)
             config = Config.model_validate(state.config)
-            implementation = EXECUTION_BACKENDS[config.execution_backend](config.target, config.budget.action_timeout)
+            implementation = execution_backend(config)
             result = validate_submission(state, root, args.submission, implementation)
             print(json.dumps(result, ensure_ascii=False))
             return 0 if result['valid'] else 2

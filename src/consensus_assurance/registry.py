@@ -18,8 +18,13 @@ def hashicorp_backend(target, timeout):
 EXECUTION_BACKENDS['hashicorp_raft'] = hashicorp_backend
 
 
+def execution_backend(config):
+    options = {'seed_cache_dir':config.cargo_seed_cache_dir} if config.execution_backend == 'cargo' else {}
+    return EXECUTION_BACKENDS[config.execution_backend](config.target, config.budget.action_timeout, **options)
+
+
 def assemble(config):
     try:
-        return EXECUTION_BACKENDS[config.execution_backend](config.target, config.budget.action_timeout), AGENTS[config.agent_backend](config), KNOWLEDGE[config.protocol]()
+        return execution_backend(config), AGENTS[config.agent_backend](config), KNOWLEDGE[config.protocol]()
     except KeyError as exc:
         raise ValueError("Unknown configured backend: " + str(exc)) from exc

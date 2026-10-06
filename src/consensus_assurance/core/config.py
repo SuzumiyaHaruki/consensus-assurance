@@ -2,7 +2,7 @@ from pathlib import Path
 import re
 from typing import Literal
 from urllib.parse import urlsplit
-from pydantic import Field, model_validator
+from pydantic import Field, field_validator, model_validator
 from .types import ActivityClass, Record
 
 
@@ -72,6 +72,7 @@ class Config(Record):
     agent_model: str | None = None
     codex_provider: CodexProvider | None = None
     runs_dir: str = "runs"
+    cargo_seed_cache_dir: str | None = None
     budget: Budget = Budget()
     activity_focus: list[ActivityClass] = []
     directed_question: str | None = None
@@ -80,8 +81,20 @@ class Config(Record):
     allow_experiments: bool = True
     allow_agent_materials: bool = True
 
+    @field_validator('cargo_seed_cache_dir')
+    @classmethod
+    def seed_cache_path(cls, value):
+        return str(Path(value).expanduser().absolute()) if value and value.strip() else value
+
     @model_validator(mode="after")
     def provider_selection(self):
+        if self.cargo_seed_cache_dir is not None:
+            if self.execution_backend != 'cargo' or not self.cargo_seed_cache_dir.strip():
+                raise ValueError('cargo_seed_cache_dir requires the Cargo backend and a nonempty directory')
+            cache = Path(self.cargo_seed_cache_dir)
+            runs = Path(self.runs_dir).expanduser().resolve()
+            if cache.is_relative_to(runs) or runs.is_relative_to(cache):
+                raise ValueError('Cargo seed cache must be outside run directories')
         if self.codex_provider and (self.agent_backend!='codex' or not (self.agent_model or '').strip()):
             raise ValueError('A custom provider requires agent_backend=codex and an explicit agent_model')
         if self.codex_provider and (self.agent_model.startswith('-') or any(c.isspace() for c in self.agent_model)):

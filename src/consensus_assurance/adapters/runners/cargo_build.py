@@ -1,7 +1,10 @@
-"""Run-local Cargo inputs and private copies of an isolated, unexecuted build seed."""
+"""Fixed Cargo inputs and private copies of isolated, unexecuted dependency seeds."""
+import fcntl
+import hashlib
 import json
 import os
 import shutil
+import stat
 import time
 from pathlib import Path
 from .experiment import clean_environment, sandbox_command, run_experiment
@@ -11,6 +14,113 @@ from ..storage.snapshot import capture
 from ...core.types import CheckRun, ExecutionStatus, uid, now
 
 VIEW = Path('/tmp/consensus-cargo')
+PROBE = '#[test]\nfn assurance_build_ready() { assert!(cfg!(test)); }\n'
+
+
+def cache_directory(adapter, root):
+    path = adapter.seed_cache_dir
+    if path is None:return None
+    snapshot = root/'snapshot.json'
+    repo = Path(json.loads(snapshot.read_text())['repo']) if snapshot.is_file() else root/'source'
+    if '..' in path.parts or any(p.is_symlink() for p in (path,*path.parents)):
+        raise ValueError('Cargo seed cache must not traverse symlinks or parent components')
+    if any(path.is_relative_to(p) or p.is_relative_to(path) for p in (root.resolve(),repo.resolve(),VIEW)):
+        raise ValueError('Cargo seed cache must be outside source, run and sandbox workspace directories')
+    if path.exists() and (not path.is_dir() or path.stat().st_uid != os.getuid() or path.stat().st_mode & 0o077):
+        raise ValueError('Cargo seed cache must be a controller-owned private directory (mode 0700)')
+    return path
+
+
+def compatibility(basis, command):
+    # Execution identity stays in the run. Only these inputs determine a reusable build.
+    value={k:basis[k] for k in ('source_files','source_modes','manifest','test_target','workspace_manifest',
+        'package_id','package_name','tools','policy','resolved_features')}
+    value.update(lock={k:basis['lock'][k] for k in ('path','digest')},
+        maker='cargo-neutral-v1',probe=PROBE,compile_command=command[:command.index('--')]+['--no-run'],
+        clean_command=[command[0],'clean','--offline','--locked','--manifest-path',basis['manifest'],'--package',basis['package_name']])
+    return value
+
+
+def seed_inventory(directory, deadline):
+    """Compiled bytes are mutable non-Git inputs; a ready marker alone is insufficient."""
+    result={}
+    if directory.is_symlink() or not directory.is_dir():raise ValueError('Missing or linked seed directory')
+    for folder, dirs, files in os.walk(directory,followlinks=False):
+        for name in sorted(dirs+files):
+            if time.monotonic()>=deadline:raise TimeoutError('Runtime deadline reached during Cargo seed verification')
+            path=Path(folder)/name;info=path.lstat();mode=info.st_mode
+            if stat.S_ISLNK(mode) or not (stat.S_ISDIR(mode) or stat.S_ISREG(mode)):
+                raise ValueError('Seed contains a link or nonregular entry')
+            if info.st_uid!=os.getuid():raise ValueError('Seed is not controller-owned')
+            entry={'mode':stat.S_IMODE(mode)}
+            if stat.S_ISREG(mode):
+                checksum=hashlib.sha256()
+                with path.open('rb') as stream:
+                    while block:=stream.read(1024*1024):
+                        if time.monotonic()>=deadline:raise TimeoutError('Runtime deadline reached during Cargo seed verification')
+                        checksum.update(block)
+                entry['digest']=checksum.hexdigest()
+            result[str(path.relative_to(directory))]=entry
+    return result
+
+
+def shared_seed(adapter, runner, snapshot_id, command, basis, destination, deadline, *, origin=None):
+    """Under one local lock, validate/copy a hit or publish a newly cleaned neutral seed."""
+    cache=cache_directory(adapter,runner.root)
+    if cache is None:return None
+    cache.mkdir(parents=True,exist_ok=True,mode=0o700)
+    description=compatibility(basis,command);key=digest(json.dumps(description,sort_keys=True).encode())
+    entry=cache/key;started=time.monotonic()
+    details={'key':key,'maker':description['maker'],'status':'miss','reason':'No complete entry'}
+    stage=None
+    with os.fdopen(os.open(cache/(key+'.lock'),os.O_CREAT|os.O_RDWR|os.O_NOFOLLOW,0o600),'w') as lock:
+        try:
+            try:fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+            except BlockingIOError:
+                details['reason']='Entry is in use; no shared work awaited';return details
+            if origin is None:
+                marker=entry/'ready.json'
+                try:
+                    if entry.is_symlink() or marker.is_symlink():raise ValueError('Linked cache entry')
+                    if not marker.is_file() or marker.stat().st_uid!=os.getuid():
+                        raise ValueError('Missing or unowned cache receipt')
+                    saved=json.loads(marker.read_text())
+                    if saved['compatibility']!=description:raise ValueError('Incompatible entry')
+                    if not isinstance(saved['origin']['selected_features'],list):raise ValueError('Incomplete neutral origin')
+                    inventory=seed_inventory(entry/'seed',deadline)
+                    if not inventory or inventory!=saved['inventory']:raise ValueError('Seed bytes or modes differ')
+                    details['verification_seconds']=time.monotonic()-started
+                except TimeoutError:raise
+                except (OSError,ValueError,KeyError,TypeError) as exc:
+                    details['reason']='Entry unavailable: '+str(exc);return details
+                stage=destination.with_name('seed-import-'+uid());stage.mkdir(parents=True)
+                source=entry/'seed';action='cargo_seed_materialize'
+            else:
+                # This source has just passed the no-run build and selected-package clean.
+                inventory=seed_inventory(destination,deadline)
+                stage=cache/('.publishing-'+uid());stage.mkdir(mode=0o700)
+                (stage/'seed').mkdir();source=destination;action='cargo_seed_publish'
+            copy_started=time.monotonic()
+            copied=runner.run(['cp','-a','--reflink=auto',str(source)+'/.',str(stage if origin is None else stage/'seed')],
+                runner.root,action,snapshot_id,max(0,deadline-time.monotonic()))
+            if copied.status!=ExecutionStatus.COMPLETED or copied.exit_code!=0:raise PreparationFailed(copied)
+            copied_inventory=seed_inventory(stage if origin is None else stage/'seed',deadline)
+            if copied_inventory!=inventory:raise ValueError('Cargo seed changed during private copy')
+            details.update(copy_check_id=copied.id,materialization_seconds=time.monotonic()-copy_started)
+            if origin is None:
+                if destination.exists():shutil.rmtree(destination)
+                stage.rename(destination)
+                details.update(status='hit',reason='Exact inputs and retained seed bytes verified',origin=saved['origin'])
+            else:
+                write_json(stage/'ready.json',{'compatibility':description,'inventory':inventory,'origin':origin})
+                if entry.is_symlink() or entry.is_file():entry.unlink()
+                elif entry.exists():shutil.rmtree(entry)
+                stage.rename(entry)
+                details.update(status='published',reason='Fresh neutral build and selected-package clean completed',origin=origin)
+            return details
+        finally:
+            details['seconds']=time.monotonic()-started
+            if stage and stage.exists():shutil.rmtree(stage)
 
 
 def diagnostics(text):
@@ -52,11 +162,12 @@ def verify(adapter,root,snapshot_id,deadline=None):
     records=list((root/'build-inputs/targets').glob('**/basis.json'))
     if not records:return
     source_files=capture(root/'source').files
+    source_modes={p:(root/'source'/p).stat().st_mode & 0o777 for p in source_files}
     tools=tool_inputs(adapter,deadline)
     for path in records:
         basis=json.loads(path.read_text())
         lock=root/basis['lock']['record']
-        if (basis['snapshot_id']!=snapshot_id or basis['source_files']!=source_files or basis['tools']!=tools
+        if (basis['snapshot_id']!=snapshot_id or basis['source_files']!=source_files or basis['source_modes']!=source_modes or basis['tools']!=tools
                 or basis['policy']!=policy(adapter) or lock.is_symlink() or not lock.is_file()
                 or digest(lock.read_bytes())!=basis['lock']['digest']):
             raise ValueError('Cargo build inputs or tools changed; start a new run; cached results cannot be reused')
@@ -98,8 +209,10 @@ def build_inputs(adapter,root,state,read):
         for saved in sorted((root/path).parent.glob('*-seed.json')):
             name=str(saved.relative_to(root));receipt=read(name)
             if not basis or receipt.get('basis')!=str(path) or receipt.get('basis_digest')!=basis_digest:continue
-            compilations.append({'record':name,'compiled_features':receipt['selected_features']})
-            check=read(f'logs/{receipt["check_id"]}/check.json')
+            compilations.append({'record':name,'compiled_features':receipt['selected_features'],
+                'shared_seed':receipt.get('shared_seed')})
+            check_id=receipt.get('check_id') or receipt.get('shared_seed',{}).get('copy_check_id')
+            check=read(f'logs/{check_id}/check.json') if check_id else {}
             if check:preparations.append((check['started_at'] or '',{'record':f'logs/{check["id"]}/check.json',
                 'stage':check['action'],'status':check['status']}))
         cache=root/'.execution/cargo-seeds'/path.parent.relative_to('build-inputs/targets')
@@ -144,6 +257,7 @@ def invoke(adapter,runner,command,workspace,snapshot_id,deadline,action):
 
 def inputs(adapter,runner,snapshot_id,command,deadline):
     root=runner.root;source=root/'source'
+    cache_directory(adapter,root)
     if not source.is_dir():raise ValueError('Cargo preparation requires the retained source snapshot')
     manifest=command[command.index('--manifest-path')+1];target=command[command.index('--test')+1]
     package=Path(manifest).parent
@@ -179,6 +293,7 @@ def inputs(adapter,runner,snapshot_id,command,deadline):
         'tools':tool_inputs(adapter,deadline),'policy':policy(adapter),'metadata_check':metadata.id,
         'resolved_features':node['features'],'feature_evidence':'metadata resolution; selected test compilation is recorded separately',
         'preparation_checks':stages,'prepared_at':now()}
+    basis['source_modes']={p:(source/p).stat().st_mode & 0o777 for p in basis['source_files']}
     write_json(record,basis)
     return record,basis
 
@@ -188,39 +303,51 @@ def seed(adapter,runner,snapshot_id,command,record,basis,deadline):
     destination=root/'.execution/cargo-seeds'/record.parent.relative_to(root/'build-inputs/targets')
     receipt=destination/'ready.json'
     if receipt.is_file():return destination,json.loads(receipt.read_text())
+    filename=Path(basis['manifest']).parent/'tests'/(basis['test_target']+'.rs')
+    if (root/'source'/filename).exists():raise ValueError('Build seed cannot overwrite an existing source test')
+    data={'basis':str(record.relative_to(root)),'basis_digest':digest(record.read_bytes()),
+        'probe':str((record.parent/'probe.rs').relative_to(root))}
+    (record.parent/'probe.rs').write_text(PROBE)
+    shared=shared_seed(adapter,runner,snapshot_id,command,basis,destination,deadline)
+    if shared:
+        write_json(record.parent/'seed-cache.json',shared)
+        if shared['status']=='hit':
+            data.update(check_id=None,shared_seed=shared,selected_features=shared['origin']['selected_features'],
+                record=str((record.parent/(shared['copy_check_id']+'-seed.json')).relative_to(root)))
+            write_json(root/data['record'],data);write_json(receipt,data)
+            return destination,data
     work=root/'.execution/cargo-preparation'/uid()/'workspace'
     shutil.copytree(root/'source',work)
     (work/basis['lock']['path']).write_bytes((root/basis['lock']['record']).read_bytes())
-    filename=Path(basis['manifest']).parent/'tests'/(basis['test_target']+'.rs')
-    if (work/filename).exists():raise ValueError('Build seed cannot overwrite an existing source test')
     # A neutral integration target builds the original crate and dev-dependency graph, never a candidate.
-    probe='#[test]\nfn assurance_build_ready() { assert!(cfg!(test)); }\n'
-    (work/filename).parent.mkdir(parents=True,exist_ok=True);(work/filename).write_text(probe)
-    (record.parent/'probe.rs').write_text(probe)
+    (work/filename).parent.mkdir(parents=True,exist_ok=True);(work/filename).write_text(PROBE)
     compile_command=command[:command.index('--')]+['--no-run']
     check=invoke(adapter,runner,compile_command,work,snapshot_id,deadline,'cargo_seed_build')
     if check.parameters['build_finished'] is not True:raise ValueError('Cargo seed has no successful build-finished record')
-    if any(not (work/p).is_file() or digest((work/p).read_bytes())!=value for p,value in basis['source_files'].items()):
+    if any(not (work/p).is_file() or digest((work/p).read_bytes())!=value
+            or (work/p).stat().st_mode & 0o777 != basis['source_modes'][p] for p,value in basis['source_files'].items()):
         raise ValueError('Preparation modified captured source; no seed published')
     if digest((work/basis['lock']['path']).read_bytes())!=basis['lock']['digest']:
         raise ValueError('Preparation changed the fixed dependency lock; no seed published')
     # A submitted file can predate the seed. Let Cargo remove the selected package's
     # outputs so its neutral test binary can never masquerade as the actual harness.
-    cleaned=invoke(adapter,runner,[str(adapter.cargo),'clean','--offline','--locked','--manifest-path',basis['manifest'],
-        '--package',basis['package_name']],work,snapshot_id,deadline,'cargo_seed_clean_target')
+    cleaned=invoke(adapter,runner,compatibility(basis,command)['clean_command'],work,snapshot_id,deadline,'cargo_seed_clean_target')
     artifacts=json.loads(Path(check.parameters['cargo_artifacts']).read_text())
-    data={'basis':str(record.relative_to(root)),'check_id':check.id,
-        'record':str((record.parent/(check.id+'-seed.json')).relative_to(root)),
-        'clean_check_id':cleaned.id,
-        'compiler_artifacts':str(Path(check.parameters['cargo_artifacts']).relative_to(root)),
-        'selected_features':sorted({f for a in artifacts if a['package_id']==basis['package_id'] for f in a['features']}),
-        'probe':str((record.parent/'probe.rs').relative_to(root)),
-        'basis_digest':digest(record.read_bytes())}
-    write_json(root/data['record'],data)
+    data.update(check_id=check.id,
+        record=str((record.parent/(check.id+'-seed.json')).relative_to(root)),clean_check_id=cleaned.id,
+        compiler_artifacts=str(Path(check.parameters['cargo_artifacts']).relative_to(root)),
+        selected_features=sorted({f for a in artifacts if a['package_id']==basis['package_id'] for f in a['features']}))
     # Publish only after the isolated build exits; no target test has run in this directory.
     if destination.exists():shutil.rmtree(destination)
     destination.parent.mkdir(parents=True,exist_ok=True)
     (work/'.execution/cargo-target').rename(destination)
+    if shared:
+        origin={'build_id':check.id,'clean_id':cleaned.id,'prepared_at':check.ended_at,
+            'selected_features':data['selected_features'],
+            'compilation':{k:check.parameters[k] for k in ('fresh_artifacts','rebuilt_artifacts')}}
+        published=shared_seed(adapter,runner,snapshot_id,command,basis,destination,deadline,origin=origin)
+        data['shared_seed']={**shared,'publication':published}
+    write_json(root/data['record'],data)
     write_json(receipt,data)
     return destination,data
 
@@ -277,12 +404,16 @@ def execute(adapter,runner,command,workspace,snapshot_id,timeout,mode,action):
         if not check.parameters['lock_unchanged']:
             check.status=ExecutionStatus.ERROR;check.outcome='unknown';check.reason='Test changed fixed Cargo.lock'
         actual=capture(workspace,excluded_dirs={'.execution'}).files
-        check.parameters['changed_target_files']=[p for p,d in basis['source_files'].items() if actual.get(p)!=d]
+        check.parameters['changed_target_files']=[p for p,d in basis['source_files'].items() if actual.get(p)!=d
+            or (workspace/p).stat().st_mode & 0o777 != basis['source_modes'][p]]
         check.artifacts += [str(record),str(runner.root/basis['lock']['record']),str(runner.root/receipt['record'])]
-    except PreparationFailed as failure:
-        original=failure.check
+    except (PreparationFailed,TimeoutError) as failure:
+        original=failure.check if isinstance(failure,PreparationFailed) else CheckRun(action='cargo_seed_verify',
+            snapshot_id=snapshot_id,status=ExecutionStatus.TIMEOUT,reason=str(failure),
+            parameters={'timeout_limit':'total_seconds' if runner.deadline and time.monotonic()>=runner.deadline else 'action_timeout'})
+        write_json(runner.root/'logs'/original.id/'check.json',original)
         check=original.model_copy(deep=True,update={'id':uid(),'action':action,'cwd':str(workspace)})
-        check.parameters.update(preparation_failure=original.id,preparation_stage=original.action,
+        check.parameters.update(preparation_failure=original.id,preparation_stage=original.action,test_started=False,
             execution_backend={'name':adapter.name,'version':adapter.version})
         if check.status==ExecutionStatus.COMPLETED:check.status=ExecutionStatus.ERROR
         check.outcome='unknown';check.reason=original.action+' did not complete; inspect preparation logs'
