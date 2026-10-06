@@ -10,14 +10,6 @@ KNOWLEDGE = {"raft": raft_knowledge, "toy": toy_knowledge, "none": lambda: ""}
 AGENTS = {"codex": lambda cfg: CodexAgent(cfg.agent_reasoning_effort, cfg.agent_model, cfg.codex_provider), "mock": lambda cfg: MockAgent(cfg.fixture)}
 
 
-def hashicorp_backend(target, timeout):
-    from consensus_assurance.plugins.targets.hashicorp_raft.backend import HashicorpRaftBackend
-    return HashicorpRaftBackend(target, timeout)
-
-
-EXECUTION_BACKENDS['hashicorp_raft'] = hashicorp_backend
-
-
 def execution_backend(config):
     options = {'seed_cache_dir':config.cargo_seed_cache_dir} if config.execution_backend == 'cargo' else {}
     return EXECUTION_BACKENDS[config.execution_backend](config.target, config.budget.action_timeout, **options)

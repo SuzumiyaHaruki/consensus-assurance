@@ -1,7 +1,6 @@
 """Tool selection and timeout boundaries, without a real Codex or target process."""
 import ast
 import json
-import subprocess
 import sys
 import time
 from pathlib import Path
@@ -90,13 +89,8 @@ def test_default_assembly_respects_plugin_dependency_boundary():
             for node in ast.walk(ast.parse(path.read_text())):
                 if isinstance(node,ast.ImportFrom):assert 'plugins' not in (node.module or '').split('.')
                 if isinstance(node,ast.Import):assert all('plugins' not in a.name.split('.') for a in node.names)
-    code='''import sys
-from consensus_assurance.core.config import Config
-from consensus_assurance.registry import assemble
-backend, agent, knowledge = assemble(Config(execution_backend="python",agent_backend="mock"))
-assert not any("plugins.targets" in name for name in sys.modules)
-'''
-    subprocess.run([sys.executable,'-c',code],check=True)
+    with pytest.raises(ValueError,match='Unknown configured backend'):
+        assemble(Config(execution_backend='hashicorp_raft',agent_backend='mock'))
     assert Config().activity_focus==[]
 
 
@@ -168,8 +162,9 @@ def test_shared_seed_identity_and_directory_boundaries(tmp_path):
 
 
 def test_selected_support_is_captured_once_and_cannot_replace_target(tmp_path):
-    backend=assemble(Config(execution_backend='hashicorp_raft',agent_backend='mock'))[0]
-    harness=Harness(kind='go_test',source='package raft\n',description='Helper input boundary',semantic_changes=[])
+    from types import SimpleNamespace
+    backend=SimpleNamespace(harness_filename='check.py',support_files=lambda:{'support.py':'value = 1\n'})
+    harness=Harness(kind='python',source='import support\n',description='Helper input boundary',semantic_changes=[])
     add_support(backend,harness)
     expected=backend.support_files()
     assert harness.files==expected and len(expected)==1
@@ -177,7 +172,7 @@ def test_selected_support_is_captured_once_and_cannot_replace_target(tmp_path):
     with pytest.raises(ValueError,match='replace target'):install_harness(tmp_path,backend.harness_filename,harness,expected)
     install_harness(tmp_path,backend.harness_filename,harness,{})
     assert all((tmp_path/name).read_text()==content for name,content in expected.items())
-    harness.files[next(iter(expected))]='package raft\n'
+    harness.files['support.py']='value = 2\n'
     with pytest.raises(ValueError,match='saved artifact'):install_harness(tmp_path,backend.harness_filename,harness,{})
 
 

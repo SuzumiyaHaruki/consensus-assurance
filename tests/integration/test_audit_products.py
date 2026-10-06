@@ -2,7 +2,7 @@
 import json
 from pathlib import Path
 import pytest
-from audit_support import products, first, check_step, review_step, stop, engine_for, partial_map, feedback, cargo_engine, diagnostics
+from audit_support import products, first, check_step, review_step, stop, engine_for, feedback, cargo_engine, diagnostics
 
 
 @pytest.mark.parametrize('outcome',['violated','compile_timeout'])
