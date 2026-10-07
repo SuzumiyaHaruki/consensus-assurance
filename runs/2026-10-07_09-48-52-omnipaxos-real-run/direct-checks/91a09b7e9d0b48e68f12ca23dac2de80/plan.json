@@ -1,0 +1,175 @@
+{
+  "description": "Reproduce the lagging follower delta-base mismatch with a decided one-entry prefix and one further quorum-decided entry during a partition. Record genuine delta admission and synchronous result for the same message session; compare exact canonical key-value content with sender decided state read before delivery.",
+  "claim_id": "C-snapshot-preservation",
+  "binding_ids": [
+    "bind-sync"
+  ],
+  "harness": {
+    "execution_package": "./omnipaxos",
+    "files": {},
+    "kind": "rust_test",
+    "source": "use omnipaxos::{messages::{Message, sequence_paxos::PaxosMsg}, storage::{Entry, Snapshot, SnapshotType}, util::LogEntry, ClusterConfig, ServerConfig, OmniPaxos};\nuse omnipaxos_storage::memory_storage::MemoryStorage;\nuse serde::{Serialize, Deserialize};\nuse serde_json::json;\nuse std::collections::{BTreeMap, VecDeque};\n\n#[derive(Clone, Debug, Serialize, Deserialize)]\nstruct Value { key: String, value: u64 }\nimpl Entry for Value { type Snapshot = State; }\n#[derive(Clone, Debug, Default, Serialize, Deserialize)]\nstruct State(BTreeMap<String, u64>);\nimpl Snapshot<Value> for State {\n    fn create(entries: &[Value]) -> Self {\n        let mut s = Self::default();\n        for e in entries { s.0.insert(e.key.clone(), e.value); }\n        s\n    }\n    fn merge(&mut self, delta: Self) { self.0.extend(delta.0); }\n    fn use_snapshots() -> bool { true }\n}\ntype Node = OmniPaxos<Value, MemoryStorage<Value>>;\nfn observe(node: &Node) -> serde_json::Value {\n    let mut state = State::default();\n    if let Some(entries) = node.read_decided_suffix(0) {\n        for entry in entries {\n            match entry {\n                LogEntry::Decided(e) => { state.0.insert(e.key, e.value); }\n                LogEntry::Snapshotted(s) => state.merge(s.snapshot),\n                other => panic!(\"Unexpected decided representation: {:?}\", other),\n            }\n        }\n    }\n    json!({\"pid\": node.get_pid(), \"decided\": node.get_decided_idx(), \"accepted\": node.get_accepted_idx(), \"compacted\": node.get_compacted_idx(), \"state\": state.0})\n}\n// One FIFO queue contains all generated messages; the partition drops every message\n// to/from node 3. No delivered message is changed, forged, or reordered within a link.\nfn pump(nodes: &mut [Node], partitioned: bool, stage: &str) {\n    let mut queue = VecDeque::new();\n    let mut count = 0;\n    loop {\n        for node in nodes.iter_mut() {\n            let mut out = Vec::new(); node.take_outgoing_messages(&mut out);\n            queue.extend(out);\n        }\n        let Some(msg) = queue.pop_front() else { break };\n        count += 1; assert!(count < 1000, \"Message pump did not quiesce\");\n        let from = msg.get_sender(); let to = msg.get_receiver();\n        let dropped = partitioned && (from == 3 || to == 3);\n        println!(\"CA_EVENT {}\", json!({\"event\":\"transport\", \"stage\":stage,\"from\":from,\"to\":to,\"dropped\":dropped,\"message\":format!(\"{:?}\",msg)}));\n        if !dropped {\n            let mut selected_sync = None;\n            if let Message::SequencePaxos(p) = &msg {\n                if let PaxosMsg::AcceptSync(a) = &p.msg {\n                    if stage == \"reconnect\" && to == 3 {\n                        let delta = matches!(&a.log_sync.decided_snapshot, Some(SnapshotType::Delta(_)));\n                        let receiver = observe(&nodes[(to-1) as usize]);\n                        let leader = observe(&nodes[(from-1) as usize]);\n                        let expected = serde_json::to_string(&leader[\"state\"]).unwrap();\n                        println!(\"CA_EVENT {}\",json!({\"event\":\"sync_admitted\",\"case_id\":\"delta_reconnect\",\"receiver\":to,\"leader\":from,\"config\":a.n.config_id,\"round\":a.n.n,\"session\":a.seq_num.session,\"delta\":delta,\"old_decided\":receiver[\"decided\"],\"old_accepted\":receiver[\"accepted\"],\"old_state\":serde_json::to_string(&receiver[\"state\"]).unwrap(),\"leader_decided\":leader[\"decided\"],\"incoming_decided\":a.decided_idx,\"sync_idx\":a.log_sync.sync_idx,\"expected_state\":expected}));\n                        selected_sync = Some((a.n.config_id,a.n.n,a.seq_num.session,a.decided_idx));\n                    }\n                }\n            }\n            nodes[(to-1) as usize].handle_incoming(msg);\n            if let Some((config,round,session,incoming_decided)) = selected_sync {\n                let n = &nodes[(to-1) as usize];\n                let observed = observe(n);\n                let completed = n.get_current_leader() == Some((from,true)) && n.get_decided_idx() == incoming_decided && n.get_accepted_idx() >= incoming_decided;\n                println!(\"CA_EVENT {}\",json!({\"event\":\"sync_result\",\"case_id\":\"delta_reconnect\",\"receiver\":to,\"leader\":from,\"config\":config,\"round\":round,\"session\":session,\"completed\":completed,\"decided\":n.get_decided_idx(),\"accepted\":n.get_accepted_idx(),\"compacted\":n.get_compacted_idx(),\"actual_state\":serde_json::to_string(&observed[\"state\"]).unwrap(),\"read\":format!(\"{:?}\",n.read_decided_suffix(0))}));\n            }\n        }\n    }\n}\n#[test]\nfn check_delta_reconnect() {\n    let cluster = ClusterConfig { configuration_id: 1, nodes: vec![1,2,3], ..Default::default() };\n    let mut nodes: Vec<Node> = (1..=3).map(|pid| cluster.clone().build_for_server(ServerConfig {pid, ..Default::default()}, MemoryStorage::default()).unwrap()).collect();\n    nodes[0].try_become_leader();\n    pump(&mut nodes,false,\"leadership\");\n    nodes[0].append(Value {key:\"base\".into(),value:11}).unwrap();\n    pump(&mut nodes,false,\"prefix\");\n    for n in &nodes { assert_eq!(n.get_decided_idx(),1); }\n    println!(\"CA_EVENT {}\",json!({\"event\":\"prefix\",\"nodes\":nodes.iter().map(observe).collect::<Vec<_>>()}));\n    nodes[0].append(Value {key:\"tail\".into(),value:22}).unwrap();\n    pump(&mut nodes,true,\"partition\");\n    assert_eq!(nodes[0].get_decided_idx(),2); assert_eq!(nodes[2].get_decided_idx(),1);\n    println!(\"CA_EVENT {}\",json!({\"event\":\"partition_end\",\"nodes\":nodes.iter().map(observe).collect::<Vec<_>>()}));\n    // The simulated network link has now been restored in both directions.\n    nodes[2].reconnected(1); nodes[0].reconnected(3);\n    pump(&mut nodes,false,\"reconnect\");\n    println!(\"CA_EVENT {}\",json!({\"event\":\"result\",\"nodes\":nodes.iter().map(observe).collect::<Vec<_>>()}));\n}\n",
+    "description": "Three public OmniPaxos nodes with documented KV snapshot and MemoryStorage, FIFO generated-message pump and partition/reconnect schedule.",
+    "semantic_changes": [],
+    "prerequisites": [
+      {
+        "alias": "admit",
+        "event": "sync_admitted",
+        "conditions": [
+          {
+            "field": "case_id",
+            "op": "eq",
+            "value": "delta_reconnect",
+            "reference": null
+          },
+          {
+            "field": "delta",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          },
+          {
+            "field": "old_decided",
+            "op": "eq",
+            "value": 1,
+            "reference": null
+          },
+          {
+            "field": "old_accepted",
+            "op": "eq",
+            "value": 1,
+            "reference": null
+          },
+          {
+            "field": "old_state",
+            "op": "eq",
+            "value": "{\"base\":11}",
+            "reference": null
+          },
+          {
+            "field": "leader_decided",
+            "op": "eq",
+            "value": 2,
+            "reference": null
+          },
+          {
+            "field": "incoming_decided",
+            "op": "eq",
+            "value": 2,
+            "reference": null
+          },
+          {
+            "field": "sync_idx",
+            "op": "eq",
+            "value": 2,
+            "reference": null
+          },
+          {
+            "field": "expected_state",
+            "op": "eq",
+            "value": "{\"base\":11,\"tail\":22}",
+            "reference": null
+          }
+        ]
+      }
+    ],
+    "legality": {
+      "source_ids": [
+        "S-sync-storage",
+        "S-storage-getters",
+        "S-sync-producer",
+        "S-memory",
+        "S-follower-prepare",
+        "S-leader-accept",
+        "S-api",
+        "S-config",
+        "S-clock",
+        "S-proposal",
+        "S-dispatch",
+        "S-transport-doc"
+      ],
+      "expectation_ids": [
+        "S-snapshot-doc",
+        "S-storage-contract"
+      ],
+      "binding_ids": [
+        "bind-sync"
+      ],
+      "derivation": "Fresh nodes and default MemoryStorage are built through validated public configuration. try_become_leader starts genuine Prepare/Promise/AcceptSync. The queue delivers every generated message FIFO while connected, and drops all messages to/from follower 3 during the simulated partition. One base entry is decided everywhere before partition; a second distinct-key assignment is decided by nodes 1 and 2 while follower 3 retains base. Both endpoints are notified after connection restoration. Reconnect drives genuine PrepareReq/Prepare/Promise/AcceptSync. No manufactured protocol messages or storage seeds are used. The finite synchronous history needs no timer to complete: manual leadership and all relevant callbacks are delivered. There is no claim of bounded progress. Snapshot BTreeMap semantics match documented key-value snapshot. The result is sampled immediately after the real handler returns under exclusive ownership; the rest of the generated messages are then drained and all objects normally dropped.",
+      "applicability": "Valid fixed three-node configuration, correct key-value Snapshot implementation, fault-free MemoryStorage, generated FIFO messages with temporary partition and reconnect, no concurrent calls, no log trimming or reconfiguration.",
+      "unresolved": [],
+      "conflicts": [],
+      "alternatives": []
+    }
+  },
+  "monitors": [
+    {
+      "id": "M-content",
+      "checker_id": "snapshot_content",
+      "event": "sync_result",
+      "binding_ids": [
+        "bind-sync"
+      ],
+      "grounding": {
+        "source_ids": [
+          "S-sync-storage",
+          "S-storage-getters",
+          "S-sync-producer",
+          "S-memory",
+          "S-follower-prepare",
+          "S-leader-accept",
+          "S-api"
+        ],
+        "expectation_ids": [
+          "S-snapshot-doc",
+          "S-storage-contract",
+          "S-log-contract",
+          "S-snapshot-test"
+        ],
+        "binding_ids": [
+          "bind-sync"
+        ],
+        "derivation": "Snapshot documentation describes compaction without discarding data and key-value create/merge semantics. The Storage SnapshotType contract defines Delta as changes since an earlier snapshot. The log contract guarantees decided entries are not reverted. Therefore after valid synchronization, the snapshot plus decided suffix must represent the same decided key-value prefix as the selected sender history; a delta must preserve earlier keys not overwritten by later entries. Existing snapshot tests independently compare snapshot contents to the input prefix. sync_log and its caller bind that requirement to actual history installation, not just index equality.",
+        "applicability": "Valid fixed three-node configuration, correct key-value Snapshot implementation, fault-free MemoryStorage, generated FIFO messages with temporary partition and reconnect, no concurrent calls, no log trimming or reconfiguration.",
+        "unresolved": [],
+        "conflicts": [],
+        "alternatives": [
+          "Complete snapshot replacement bypasses the delta merge; not the selected input."
+        ]
+      },
+      "applicability_conditions": [],
+      "admission_alias": "admit"
+    }
+  ],
+  "observable_properties": [
+    {
+      "checker_id": "snapshot_content",
+      "kind": "event_assertion",
+      "trigger": {
+        "field": "completed",
+        "op": "eq",
+        "value": true,
+        "reference": null
+      },
+      "assertion": {
+        "field": "actual_state",
+        "op": "eq",
+        "value": null,
+        "reference": "admit.expected_state"
+      },
+      "antecedent": null,
+      "identity_fields": [
+        "case_id",
+        "receiver",
+        "leader",
+        "config",
+        "round",
+        "session"
+      ],
+      "description": "Exact canonical key-value map content, not just indexes, matches the sender decided prefix when the selected delta handling has completed."
+    }
+  ],
+  "uncertainties": [
+    "One follower-reconnect history; other snapshot paths and persistence faults remain independent."
+  ]
+}

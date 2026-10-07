@@ -1,0 +1,884 @@
+{
+  "version": 1,
+  "target_profile": {
+    "system_boundary": "Captured EPaxos package plus in-repository replica transport, master configuration, command execution and client admission; no other run inputs.",
+    "protocol_contexts": [
+      "Fixed participant rows, per-instance promises and value ballots, concurrent proposal owners"
+    ],
+    "external_interfaces": [
+      "Client PROPOSE TCP",
+      "Typed peer RPCs",
+      "Master registration and BeTheLeader RPC"
+    ],
+    "ownership": [
+      "Single protocol loop per replica; asynchronous transport and execution goroutines"
+    ],
+    "selection_injection": [],
+    "variants": [
+      "Default launcher: Thrifty true, Durable false, Dreply true, execution unless Noop"
+    ],
+    "source_ids": [
+      "S-init",
+      "S-config",
+      "S-base"
+    ],
+    "unknowns": [
+      "Crash-restart storage support and complete client retry policy remain unresolved."
+    ]
+  },
+  "activities": [
+    {
+      "class_id": "A1",
+      "applicability": "applicable",
+      "purpose": "Qualified support for decision formation and legal advancement",
+      "realization_summary": "Client proposal or recovery restart invokes startPhase1. PreAccept dispatch. PreAcceptReply or AcceptReply dispatch. Accept dispatch. Commit dispatch.",
+      "entry_points": [
+        "B-propose",
+        "B-preaccept",
+        "B-form",
+        "B-accept",
+        "B-commit"
+      ],
+      "behavior_ids": [
+        "B-propose",
+        "B-preaccept",
+        "B-form",
+        "B-accept",
+        "B-commit"
+      ],
+      "variants": [],
+      "unknowns": [],
+      "source_ids": [
+        "S-phase1",
+        "S-attrs",
+        "S-send",
+        "S-pre-reply",
+        "S-accept",
+        "S-base",
+        "S-commit"
+      ]
+    },
+    {
+      "class_id": "A2",
+      "applicability": "applicable",
+      "purpose": "Context validity and acquisition, transfer or loss of authority",
+      "realization_summary": "Recovery initiation, Prepare request or BeTheLeader RPC. Enough matching-ballot PrepareReply reports.",
+      "entry_points": [
+        "B-authority",
+        "B-select"
+      ],
+      "behavior_ids": [
+        "B-authority",
+        "B-select"
+      ],
+      "variants": [],
+      "unknowns": [],
+      "source_ids": [
+        "S-recovery",
+        "S-exec-recovery",
+        "S-election",
+        "S-base",
+        "S-attrs"
+      ]
+    },
+    {
+      "class_id": "A3",
+      "applicability": "applicable",
+      "purpose": "Recovery and resynchronization of eligible participation",
+      "realization_summary": "Execution loop repeatedly encounters missing/uncommitted instance.",
+      "entry_points": [
+        "B-recover-trigger"
+      ],
+      "behavior_ids": [
+        "B-recover-trigger"
+      ],
+      "variants": [],
+      "unknowns": [],
+      "source_ids": [
+        "S-exec-recovery",
+        "S-loop"
+      ]
+    },
+    {
+      "class_id": "A4",
+      "applicability": "applicable",
+      "purpose": "Configuration and participant eligibility",
+      "realization_summary": "Startup registration and replica construction. Outbound SendMsg and peer reader dispatch.",
+      "entry_points": [
+        "B-membership",
+        "B-transport"
+      ],
+      "behavior_ids": [
+        "B-membership",
+        "B-transport"
+      ],
+      "variants": [],
+      "unknowns": [],
+      "source_ids": [
+        "S-base",
+        "S-run",
+        "S-config",
+        "S-membership",
+        "S-dispatch",
+        "S-transport",
+        "S-loop"
+      ]
+    },
+    {
+      "class_id": "A5",
+      "applicability": "applicable",
+      "purpose": "Decision application and consumption",
+      "realization_summary": "Execution goroutine visits committed instances.",
+      "entry_points": [
+        "B-execute"
+      ],
+      "behavior_ids": [
+        "B-execute"
+      ],
+      "variants": [],
+      "unknowns": [],
+      "source_ids": [
+        "S-exec",
+        "S-exec-recovery",
+        "S-state"
+      ]
+    },
+    {
+      "class_id": "A6",
+      "applicability": "applicable",
+      "purpose": "History, persistence and reconstruction of support",
+      "realization_summary": "Protocol paths invoke recordInstanceMetadata/recordCommands/sync.",
+      "entry_points": [
+        "B-persist"
+      ],
+      "behavior_ids": [
+        "B-persist"
+      ],
+      "variants": [],
+      "unknowns": [],
+      "source_ids": [
+        "S-persist",
+        "S-base",
+        "S-config"
+      ]
+    },
+    {
+      "class_id": "A7",
+      "applicability": "applicable",
+      "purpose": "Client contracts, invocation intervals and observed completion",
+      "realization_summary": "Client PROPOSE dispatch.",
+      "entry_points": [
+        "B-client"
+      ],
+      "behavior_ids": [
+        "B-client"
+      ],
+      "variants": [],
+      "unknowns": [],
+      "source_ids": [
+        "S-client",
+        "S-phase1",
+        "S-exec",
+        "S-base"
+      ]
+    }
+  ],
+  "behaviors": [
+    {
+      "id": "B-propose",
+      "primary_activity": "A1",
+      "execution_owner": "Replica protocol event loop",
+      "protocol_context": "Fixed membership; instance identity (replica row, instance number)",
+      "trigger": "Client proposal or recovery restart invokes startPhase1",
+      "legal_preconditions": [],
+      "implementation_guards": [],
+      "reads": [
+        "Per-key conflict tables and instance sequence/dependencies"
+      ],
+      "writes": [
+        "Allocates instance PREACCEPTED with bal=vbal=ballot; replaces leader bookkeeping; tracks conflicts"
+      ],
+      "durable_effects": [],
+      "external_effects": [
+        "PreAccept sent to preferred alive peers up to FastQuorumSize()-1"
+      ],
+      "important_branches": [
+        "Client entry increments own row and batches; recovery restart reuses named instance and retained proposals"
+      ],
+      "async_boundaries": [],
+      "produces_fact_ids": [
+        "F-value"
+      ],
+      "consumes_fact_ids": [],
+      "cross_activity_effects": {
+        "A2": "Initial ownership uses row-owner ballot; recovery supplies its attempted ballot."
+      },
+      "existing_protections": [],
+      "source_ids": [
+        "S-phase1",
+        "S-attrs",
+        "S-send"
+      ],
+      "unknowns": []
+    },
+    {
+      "id": "B-preaccept",
+      "primary_activity": "A1",
+      "execution_owner": "Replica protocol event loop",
+      "protocol_context": "Fixed membership; instance identity (replica row, instance number)",
+      "trigger": "PreAccept dispatch",
+      "legal_preconditions": [],
+      "implementation_guards": [
+        "Reject lower ballot",
+        "At status >= ACCEPTED only fill missing commands; otherwise recompute attributes"
+      ],
+      "reads": [],
+      "writes": [
+        "On normal branch set Cmds, Seq, Deps, bal, vbal and PREACCEPTED/PREACCEPTED_EQ"
+      ],
+      "durable_effects": [],
+      "external_effects": [
+        "Report current ballot, value ballot, status and attributes"
+      ],
+      "important_branches": [],
+      "async_boundaries": [],
+      "produces_fact_ids": [
+        "F-value"
+      ],
+      "consumes_fact_ids": [
+        "F-value"
+      ],
+      "cross_activity_effects": {},
+      "existing_protections": [],
+      "source_ids": [
+        "S-phase1",
+        "S-attrs"
+      ],
+      "unknowns": [
+        "Missing-command branch indexes LeaderId rather than Replica; relevance when recovery owner differs remains open."
+      ]
+    },
+    {
+      "id": "B-form",
+      "primary_activity": "A1",
+      "execution_owner": "Replica protocol event loop",
+      "protocol_context": "Fixed membership; instance identity (replica row, instance number)",
+      "trigger": "PreAcceptReply or AcceptReply dispatch",
+      "legal_preconditions": [],
+      "implementation_guards": [
+        "Phase and attempted-ballot checks",
+        "Fast commit requires initial ballot, allEqual and conditional committed-dependency check; N<=3 thrifty skips equality",
+        "Accept commit requires acceptOKs+1 > N/2"
+      ],
+      "reads": [],
+      "writes": [
+        "Reply counters; selected/merged attributes; ACCEPTED or COMMITTED status"
+      ],
+      "durable_effects": [],
+      "external_effects": [
+        "Broadcast Accept or full Commit",
+        "Early client reply only if Dreply false"
+      ],
+      "important_branches": [],
+      "async_boundaries": [],
+      "produces_fact_ids": [
+        "F-value",
+        "F-decision"
+      ],
+      "consumes_fact_ids": [
+        "F-value"
+      ],
+      "cross_activity_effects": {},
+      "existing_protections": [],
+      "source_ids": [
+        "S-pre-reply",
+        "S-accept",
+        "S-send",
+        "S-base"
+      ],
+      "unknowns": [
+        "FastQuorumSize returns F+(F+1)/2 while callers subtract self; quorum intersection needs separate investigation.",
+        "AcceptReply greater-ballot handling is unreachable after inequality return."
+      ]
+    },
+    {
+      "id": "B-accept",
+      "primary_activity": "A1",
+      "execution_owner": "Replica protocol event loop",
+      "protocol_context": "Fixed membership; instance identity (replica row, instance number)",
+      "trigger": "Accept dispatch",
+      "legal_preconditions": [],
+      "implementation_guards": [
+        "Lower ballot or already committed/executed skips attribute update"
+      ],
+      "reads": [],
+      "writes": [
+        "Otherwise Seq, Deps, bal and vbal are set; Status is not set to ACCEPTED"
+      ],
+      "durable_effects": [],
+      "external_effects": [
+        "Always return current ballot in AcceptReply"
+      ],
+      "important_branches": [],
+      "async_boundaries": [],
+      "produces_fact_ids": [
+        "F-value"
+      ],
+      "consumes_fact_ids": [
+        "F-value"
+      ],
+      "cross_activity_effects": {
+        "A2": "The saved status and value ballot are subsequently reported in Prepare."
+      },
+      "existing_protections": [],
+      "source_ids": [
+        "S-accept"
+      ],
+      "unknowns": [
+        "Does missing ACCEPTED status allow recovery or delayed PreAccept to reinterpret support already counted for a decision?"
+      ]
+    },
+    {
+      "id": "B-commit",
+      "primary_activity": "A1",
+      "execution_owner": "Replica protocol event loop",
+      "protocol_context": "Fixed membership; instance identity (replica row, instance number)",
+      "trigger": "Commit dispatch",
+      "legal_preconditions": [],
+      "implementation_guards": [
+        "Return when already committed/executed or commit ballot below current bal"
+      ],
+      "reads": [],
+      "writes": [
+        "Install full command and attributes as COMMITTED; update conflicts and contiguous committed frontier"
+      ],
+      "durable_effects": [],
+      "external_effects": [
+        "For own-row NOOP with retained proposals, enqueue reproposals"
+      ],
+      "important_branches": [],
+      "async_boundaries": [],
+      "produces_fact_ids": [
+        "F-value",
+        "F-decision"
+      ],
+      "consumes_fact_ids": [
+        "F-value"
+      ],
+      "cross_activity_effects": {},
+      "existing_protections": [],
+      "source_ids": [
+        "S-commit",
+        "S-attrs"
+      ],
+      "unknowns": [
+        "Older Commit rejection after a promise needs preservation analysis through recovery."
+      ]
+    },
+    {
+      "id": "B-authority",
+      "primary_activity": "A2",
+      "execution_owner": "Replica protocol event loop",
+      "protocol_context": "Fixed membership; instance identity (replica row, instance number)",
+      "trigger": "Recovery initiation, Prepare request or BeTheLeader RPC",
+      "legal_preconditions": [],
+      "implementation_guards": [
+        "Recovery skips committed instance with commands",
+        "Prepare only increases promise ballot"
+      ],
+      "reads": [],
+      "writes": [
+        "Recovery preserves client proposals, resets bookkeeping, chooses own congruence-class ballot; raises both bal and vbal before self report",
+        "Remote Prepare updates bal but preserves vbal, status and value",
+        "BeTheLeader sets IsLeader true"
+      ],
+      "durable_effects": [],
+      "external_effects": [
+        "Recovery broadcasts Prepare; handler replies with current full local state"
+      ],
+      "important_branches": [],
+      "async_boundaries": [],
+      "produces_fact_ids": [
+        "F-value"
+      ],
+      "consumes_fact_ids": [
+        "F-value"
+      ],
+      "cross_activity_effects": {
+        "A1": "New attempted ballot filters support eligible for recovery selection and subsequent phase advancement."
+      },
+      "existing_protections": [],
+      "source_ids": [
+        "S-recovery",
+        "S-exec-recovery",
+        "S-election"
+      ],
+      "unknowns": [
+        "Self value-ballot promotion differs from remote Prepare reporting; can an empty or stale initiator mask established remote support?",
+        "Repeated makeBallot may reuse a ballot; role loss has no explicit IsLeader reset in captured source."
+      ]
+    },
+    {
+      "id": "B-select",
+      "primary_activity": "A2",
+      "execution_owner": "Replica protocol event loop",
+      "protocol_context": "Fixed membership; instance identity (replica row, instance number)",
+      "trigger": "Enough matching-ballot PrepareReply reports",
+      "legal_preconditions": [],
+      "implementation_guards": [
+        "Requires preparing and matching attempted ballot",
+        "Waits for SlowQuorumSize reports including self"
+      ],
+      "reads": [
+        "Report VBallot, Status, command, sequence and dependencies"
+      ],
+      "writes": [
+        "Last report with VBallot >= current selection overwrites selected value/status; installs selected state at attempted ballot"
+      ],
+      "durable_effects": [],
+      "external_effects": [
+        "Selected committed: no further broadcast",
+        "Selected accepted or case 3: broadcast Accept",
+        "Other cases: restart phase 1 with retained command or NOOP"
+      ],
+      "important_branches": [],
+      "async_boundaries": [],
+      "produces_fact_ids": [
+        "F-value",
+        "F-decision"
+      ],
+      "consumes_fact_ids": [
+        "F-value"
+      ],
+      "cross_activity_effects": {
+        "A1": "Determines the command and dependency value carried into subsequent decision formation."
+      },
+      "existing_protections": [],
+      "source_ids": [
+        "S-recovery",
+        "S-base",
+        "S-attrs"
+      ],
+      "unknowns": [
+        "Highest value ballot is considered before committed status; self promotion may suppress committed report.",
+        "Cases 3 and 4 have identical guards, making TryPreAccept branch unreachable from this selector."
+      ]
+    },
+    {
+      "id": "B-recover-trigger",
+      "primary_activity": "A3",
+      "execution_owner": "Execution goroutine produces; protocol loop consumes instancesToRecover",
+      "protocol_context": "Fixed membership; instance identity (replica row, instance number)",
+      "trigger": "Execution loop repeatedly encounters missing/uncommitted instance",
+      "legal_preconditions": [],
+      "implementation_guards": [],
+      "reads": [],
+      "writes": [
+        "Tracks per-row problem instance and synthetic accumulated sleep time"
+      ],
+      "durable_effects": [],
+      "external_effects": [
+        "After COMMIT_GRACE_PERIOD enqueue recovery for the known row suffix"
+      ],
+      "important_branches": [],
+      "async_boundaries": [],
+      "produces_fact_ids": [],
+      "consumes_fact_ids": [],
+      "cross_activity_effects": {
+        "A2": "Invokes startRecoveryForInstance serially through protocol loop."
+      },
+      "existing_protections": [],
+      "source_ids": [
+        "S-exec-recovery",
+        "S-loop"
+      ],
+      "unknowns": [
+        "Recovery detection does not establish a wall-clock completion deadline."
+      ]
+    },
+    {
+      "id": "B-execute",
+      "primary_activity": "A5",
+      "execution_owner": "Execution goroutine",
+      "protocol_context": "Fixed membership; instance identity (replica row, instance number)",
+      "trigger": "Execution goroutine visits committed instances",
+      "legal_preconditions": [],
+      "implementation_guards": [
+        "Require committed root; dependencies must have commands and be committed or executed"
+      ],
+      "reads": [],
+      "writes": [
+        "Tarjan SCC indexes, state-machine results and EXECUTED status"
+      ],
+      "durable_effects": [],
+      "external_effects": [
+        "SCC sorted by Seq, replica and proposeTime; executes PUT and client-owned commands; Dreply responses correlate retained proposal index"
+      ],
+      "important_branches": [],
+      "async_boundaries": [],
+      "produces_fact_ids": [],
+      "consumes_fact_ids": [
+        "F-decision"
+      ],
+      "cross_activity_effects": {
+        "A7": "Default Dreply completion follows command execution."
+      },
+      "existing_protections": [],
+      "source_ids": [
+        "S-exec",
+        "S-exec-recovery",
+        "S-state"
+      ],
+      "unknowns": [
+        "Protocol and execution goroutines share instance fields; coherent sampling needs explicit ownership in tests.",
+        "Local proposeTime tie-break and SCAN conflict integration need separate review."
+      ]
+    },
+    {
+      "id": "B-membership",
+      "primary_activity": "A4",
+      "execution_owner": "Master registration and replica startup",
+      "protocol_context": "Fixed membership; instance identity (replica row, instance number)",
+      "trigger": "Startup registration and replica construction",
+      "legal_preconditions": [],
+      "implementation_guards": [],
+      "reads": [],
+      "writes": [
+        "Master assigns fixed row IDs and list; base replica sets N, F and peer order; connections mark Alive"
+      ],
+      "durable_effects": [],
+      "external_effects": [
+        "EPaxos constructor forces Thrifty true; run path uses durable=false; F=(configured replica count-1)/2"
+      ],
+      "important_branches": [],
+      "async_boundaries": [],
+      "produces_fact_ids": [],
+      "consumes_fact_ids": [],
+      "cross_activity_effects": {
+        "A1": "N/F define reply thresholds and Alive/peer order select recipients.",
+        "A2": "Row IDs identify initial owner and ballot congruence classes."
+      },
+      "existing_protections": [],
+      "source_ids": [
+        "S-base",
+        "S-run",
+        "S-config",
+        "S-membership",
+        "S-dispatch"
+      ],
+      "unknowns": [
+        "No dynamic membership protocol was found in read paths; configuration mismatch validation not yet traced."
+      ]
+    },
+    {
+      "id": "B-persist",
+      "primary_activity": "A6",
+      "execution_owner": "Protocol loop",
+      "protocol_context": "Fixed membership; instance identity (replica row, instance number)",
+      "trigger": "Protocol paths invoke recordInstanceMetadata/recordCommands/sync",
+      "legal_preconditions": [],
+      "implementation_guards": [
+        "All methods return immediately when Durable false"
+      ],
+      "reads": [],
+      "writes": [
+        "Metadata writes bal then vbal into same four-byte slot; commands appended separately"
+      ],
+      "durable_effects": [
+        "When enabled call StableStore.Write/Sync without handling results"
+      ],
+      "external_effects": [],
+      "important_branches": [],
+      "async_boundaries": [],
+      "produces_fact_ids": [],
+      "consumes_fact_ids": [],
+      "cross_activity_effects": {
+        "A2": "Would retain protocol history only with externally supplied working storage; default launcher disables it."
+      },
+      "existing_protections": [],
+      "source_ids": [
+        "S-persist",
+        "S-base",
+        "S-config"
+      ],
+      "unknowns": [
+        "Captured constructor leaves StableStore nil and no replay reader found; crash-restart applicability is not established."
+      ]
+    },
+    {
+      "id": "B-transport",
+      "primary_activity": "A4",
+      "execution_owner": "Peer reader goroutines, delayed dispatch goroutines, protocol loop",
+      "protocol_context": "Fixed membership; instance identity (replica row, instance number)",
+      "trigger": "Outbound SendMsg and peer reader dispatch",
+      "legal_preconditions": [],
+      "implementation_guards": [],
+      "reads": [],
+      "writes": [],
+      "durable_effects": [],
+      "external_effects": [
+        "Serialize under replica mutex; each decoded message gets its own delayed goroutine into a type-specific channel"
+      ],
+      "important_branches": [],
+      "async_boundaries": [
+        "TCP receipt order is not guaranteed handler dispatch order; each decoded object has an independent goroutine",
+        "Protocol loop serializes handler calls"
+      ],
+      "produces_fact_ids": [],
+      "consumes_fact_ids": [],
+      "cross_activity_effects": {
+        "A1": "Delivers counted support without explicit sender deduplication in the read handlers.",
+        "A2": "Old in-flight messages can coexist with new recovery context."
+      },
+      "existing_protections": [],
+      "source_ids": [
+        "S-transport",
+        "S-dispatch",
+        "S-loop"
+      ],
+      "unknowns": [
+        "No transport duplication mechanism observed; tests must not invent duplicate delivery."
+      ]
+    },
+    {
+      "id": "B-client",
+      "primary_activity": "A7",
+      "execution_owner": "Client listener and proposal/execute owners",
+      "protocol_context": "Fixed membership; instance identity (replica row, instance number)",
+      "trigger": "Client PROPOSE dispatch",
+      "legal_preconditions": [],
+      "implementation_guards": [],
+      "reads": [],
+      "writes": [],
+      "durable_effects": [],
+      "external_effects": [
+        "Create GPropose with command ID, timestamp, writer and mutex; enqueue via delay channel",
+        "Default Dreply is true; normal response generated in execution"
+      ],
+      "important_branches": [],
+      "async_boundaries": [],
+      "produces_fact_ids": [],
+      "consumes_fact_ids": [],
+      "cross_activity_effects": {
+        "A1": "Client requests create own-row instances.",
+        "A5": "Retained proposal index associates execution with client reply."
+      },
+      "existing_protections": [],
+      "source_ids": [
+        "S-client",
+        "S-phase1",
+        "S-exec",
+        "S-base"
+      ],
+      "unknowns": [
+        "Retry handling is TODO in handlePropose; full client retry policy remains unread."
+      ]
+    }
+  ],
+  "facts": [
+    {
+      "id": "F-value",
+      "meaning": "The local instance stores a command/attribute/status report tagged by current promise bal and reported value ballot vbal. This is the report recovery consumes, not a guarantee that its status proves accepted or committed support.",
+      "identity": {
+        "replica": "InstanceSpace row",
+        "instance": "InstanceSpace column",
+        "observer": "local Replica.Id"
+      },
+      "established_by": [
+        "B-propose",
+        "B-preaccept",
+        "B-form",
+        "B-accept",
+        "B-commit",
+        "B-authority",
+        "B-select"
+      ],
+      "consumed_by": [
+        "B-preaccept",
+        "B-form",
+        "B-accept",
+        "B-commit",
+        "B-authority",
+        "B-select"
+      ],
+      "validity_context": "One live replica in fixed membership, between protocol state transitions; reported vbal can be changed by recovery initiation even without a new value.",
+      "representation": [
+        "Instance.Cmds, Seq, Deps, Status, bal, vbal",
+        "PrepareReply fields"
+      ],
+      "invalidators": [],
+      "reinterpreters": [],
+      "durability": "Volatile in default launcher; optional metadata encoding is not established replayable storage.",
+      "recovery": "startRecoveryForInstance adds promoted self report; handlePrepare reports current state; handlePrepareReply selects by maximum VBallot before status.",
+      "source_ids": [
+        "S-phase1",
+        "S-accept",
+        "S-commit",
+        "S-recovery"
+      ],
+      "unknowns": [
+        "Whether selected reports preserve a previously established decision under an actual legal recovery prefix."
+      ]
+    },
+    {
+      "id": "F-decision",
+      "meaning": "Local instance status is COMMITTED or EXECUTED and carries the command and dependency value offered to execution; this records local recognition, not independently established global agreement.",
+      "identity": {
+        "replica": "InstanceSpace row",
+        "instance": "InstanceSpace column",
+        "observer": "local Replica.Id"
+      },
+      "established_by": [
+        "B-form",
+        "B-commit",
+        "B-select"
+      ],
+      "consumed_by": [
+        "B-execute"
+      ],
+      "validity_context": "At the observing replica after a decision-producing transition, before any subsequent recovery/state replacement.",
+      "representation": [
+        "Instance.Status, Cmds, Seq, Deps"
+      ],
+      "invalidators": [],
+      "reinterpreters": [],
+      "durability": "Default configuration is volatile.",
+      "recovery": "Ordinary recovery skips committed records with commands; Prepare selection can install a selected committed report.",
+      "source_ids": [
+        "S-pre-reply",
+        "S-accept",
+        "S-commit",
+        "S-recovery",
+        "S-exec"
+      ],
+      "unknowns": [
+        "Global agreement across local decision records is not yet checked."
+      ]
+    }
+  ],
+  "surfaces": [
+    {
+      "entry_point": "Replica.handleAccept",
+      "disposition": "deferred",
+      "behavior_ids": [],
+      "reason": "Missing status transition before positive ballot reply; preserve as independent support-retention lead.",
+      "source_ids": [
+        "S-accept"
+      ],
+      "high_consequence": true
+    },
+    {
+      "entry_point": "Replica.FastQuorumSize",
+      "disposition": "deferred",
+      "behavior_ids": [],
+      "reason": "Formula and subtraction of self may undercount intended fast support; no safety history tested.",
+      "source_ids": [
+        "S-base",
+        "S-pre-reply"
+      ],
+      "high_consequence": true
+    },
+    {
+      "entry_point": "Replica.handleTryPreAccept",
+      "disposition": "deferred",
+      "behavior_ids": [],
+      "reason": "Selector branch appears unreachable; remaining handler variants not mapped.",
+      "source_ids": [
+        "S-try",
+        "S-recovery"
+      ],
+      "high_consequence": true
+    },
+    {
+      "entry_point": "Replica.recordInstanceMetadata",
+      "disposition": "deferred",
+      "behavior_ids": [],
+      "reason": "Overwrites ballot slot; enabled persistence and replay contract unresolved.",
+      "source_ids": [
+        "S-persist"
+      ],
+      "high_consequence": true
+    },
+    {
+      "entry_point": "Replica.updateAttributes",
+      "disposition": "deferred",
+      "behavior_ids": [],
+      "reason": "Uses exact key conflict lookup whereas state.Conflict defines range conflicts for SCAN.",
+      "source_ids": [
+        "S-attrs",
+        "S-state"
+      ],
+      "high_consequence": true
+    }
+  ],
+  "core_overview": {
+    "formation": {
+      "explanation": "Client admission batches commands into a new own-row instance. Local conflicts generate sequence/dependencies; PreAccept recipients qualify them against their history and return current context. Leader merges matching-ballot support. Initial-ballot equality and threshold permit fast commit; otherwise it sends Accept and counts a majority including self. Commit broadcasts full commands and attributes to alive peers; recipients reject lower ballots or already established decisions. Execution traverses committed dependencies, orders SCCs, updates the state machine and replies to retained clients. These are observed mechanisms, not proof of adequate quorum or agreement.",
+      "behavior_ids": [
+        "B-propose",
+        "B-preaccept",
+        "B-form",
+        "B-accept",
+        "B-commit",
+        "B-execute"
+      ],
+      "fact_ids": [
+        "F-value",
+        "F-decision"
+      ],
+      "source_ids": [
+        "S-phase1",
+        "S-pre-reply",
+        "S-accept",
+        "S-commit",
+        "S-exec"
+      ]
+    },
+    "context": {
+      "explanation": "Authority is per instance. Initial ballot is row owner ID. Recovery preserves proposals, resets bookkeeping and chooses a ballot congruent to the recovering replica, with higher-ballot adjustment conditional on IsLeader. Prepare raises a remote promise and returns retained value context. Initiator instead raises both promise and value ballot before self report. Matching Prepare replies fill a recovery quorum; maximum value ballot selects history, then status determines committed retention, Accept or restarted PreAccept. Master role assignment enables retry behavior but is not exclusive proposal ownership. Lower-ballot requests and mismatched replies are filtered; already queued messages remain independently dispatched.",
+      "behavior_ids": [
+        "B-authority",
+        "B-select",
+        "B-recover-trigger",
+        "B-transport"
+      ],
+      "fact_ids": [
+        "F-value"
+      ],
+      "source_ids": [
+        "S-recovery",
+        "S-exec-recovery",
+        "S-dispatch"
+      ]
+    },
+    "connection": {
+      "explanation": "The same local command/status/value-ballot record is both formed by proposal/accept/commit and consumed by later authority acquisition. Recovery is meant to carry eligible prior support into new formation: accepted selection re-enters Accept, committed selection stays committed, other selection restarts phase 1. Default execution detects stalled known instances and enqueues recovery. Local committed guards protect some old decisions, but report production/selection determines whether a new owner discovers another replica's decision. This producer-consumer distinction supplies the first question.",
+      "behavior_ids": [
+        "B-propose",
+        "B-accept",
+        "B-commit",
+        "B-authority",
+        "B-select",
+        "B-recover-trigger"
+      ],
+      "fact_ids": [
+        "F-value",
+        "F-decision"
+      ],
+      "source_ids": [
+        "S-phase1",
+        "S-accept",
+        "S-commit",
+        "S-recovery",
+        "S-exec-recovery"
+      ]
+    },
+    "open_details": [
+      "Legal recovery history discriminating self-report promotion from prior committed support remains to construct.",
+      "Independent quorum, Accept status, optional persistence and SCAN leads remain sourced surfaces."
+    ],
+    "core_gaps": [],
+    "status": "usable",
+    "rationale": "Both core relationships and their connection are traced through read handlers, actual transport dispatch, recovery trigger, membership inputs and execution consumer. Local anomalies remain explicit; usable is navigation readiness, not correctness."
+  }
+}

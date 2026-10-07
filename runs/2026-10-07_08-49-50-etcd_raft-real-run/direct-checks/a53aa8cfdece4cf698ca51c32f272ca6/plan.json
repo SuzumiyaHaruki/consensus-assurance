@@ -1,0 +1,131 @@
+{
+  "description": "Compare the flag returned by ApplyConfChange for an actual implicit joint entry with the immediately following public Status.Config flag. Complete the pending Ready and automatic exit afterward.",
+  "claim_id": "O-status-auto-fidelity",
+  "binding_ids": [
+    "bind-status-copy"
+  ],
+  "harness": {
+    "execution_package": ".",
+    "files": {},
+    "kind": "go_test",
+    "source": "package raft\nimport(\"encoding/json\";\"fmt\";\"testing\"; pb \"go.etcd.io/raft/v3/raftpb\")\nfunc assuranceEmit(v map[string]interface{}) {\n b, err := json.Marshal(v); if err != nil { panic(err) }; fmt.Println(\"CA_EVENT \" + string(b))\n}\nfunc assuranceConfig(id uint64, s *MemoryStorage) *Config {\n return &Config{ID:id, ElectionTick:10, HeartbeatTick:1, Storage:s, Applied:1, MaxSizePerMsg:4096, MaxInflightMsgs:16}\n}\nfunc assurancePersist(t *testing.T, s *MemoryStorage, rd Ready) {\n t.Helper()\n if !IsEmptySnap(rd.Snapshot) { if err:=s.ApplySnapshot(rd.Snapshot); err!=nil {t.Fatal(err)} }\n if len(rd.Entries)>0 {if err:=s.Append(rd.Entries);err!=nil {t.Fatal(err)}}\n if !IsEmptyHardState(rd.HardState) {if err:=s.SetHardState(rd.HardState);err!=nil {t.Fatal(err)}}\n}\nfunc assuranceApplyRaw(t *testing.T, r *RawNode, entries []pb.Entry) {\n t.Helper()\n for _,e:=range entries {\n  switch e.Type {\n  case pb.EntryConfChange:\n   var cc pb.ConfChange; if err:=cc.Unmarshal(e.Data);err!=nil {t.Fatal(err)};r.ApplyConfChange(cc)\n  case pb.EntryConfChangeV2:\n   var cc pb.ConfChangeV2; if err:=cc.Unmarshal(e.Data);err!=nil {t.Fatal(err)};r.ApplyConfChange(cc)\n  }\n }\n}\n\nfunc TestAssuranceStatusAutoLeaveFidelity(t *testing.T){\n s:=NewMemoryStorage()\n if err:=s.ApplySnapshot(pb.Snapshot{Metadata:pb.SnapshotMetadata{Index:1,Term:1,ConfState:pb.ConfState{Voters:[]uint64{1}}}});err!=nil{t.Fatal(err)}\n if err:=s.SetHardState(pb.HardState{Term:1,Commit:1});err!=nil{t.Fatal(err)}\n r,err:=NewRawNode(assuranceConfig(1,s));if err!=nil{t.Fatal(err)}\n observed:=false\n drain:=func(){\n  for round:=0;round<30;round++{\n   if !r.HasReady(){return};rd:=r.Ready();assurancePersist(t,s,rd)\n   for _,e:=range rd.CommittedEntries{\n    if e.Type==pb.EntryConfChangeV2{\n     var cc pb.ConfChangeV2;if err:=cc.Unmarshal(e.Data);err!=nil{t.Fatal(err)}\n     cs:=r.ApplyConfChange(cc)\n     if !cc.LeaveJoint(){\n      // ApplyConfChange's return is the installed configuration, independently\n      // observed before invoking the Status consumer. No protocol mutation intervenes.\n      assuranceEmit(map[string]interface{}{\"event\":\"installed\",\"scenario\":\"implicit_status_copy\",\"node\":1,\"entry_index\":e.Index,\"expected_auto_leave\":cs.AutoLeave,\"implicit\":cc.Transition==pb.ConfChangeTransitionJointImplicit})\n      status:=r.Status()\n      assuranceEmit(map[string]interface{}{\"event\":\"status_result\",\"scenario\":\"implicit_status_copy\",\"node\":1,\"entry_index\":e.Index,\"observed_auto_leave\":status.Config.AutoLeave,\"live_auto_leave\":r.raft.trk.Config.AutoLeave,\"outgoing_count\":len(status.Config.Voters[1])})\n      observed=true\n     }\n    }\n   }\n   // Remote messages target the learner and are dropped by the chosen transport;\n   // the only voter is local and its durable self-responses are handled by Advance.\n   r.Advance(rd)\n  };t.Fatal(\"Ready work did not drain\")\n }\n if err:=r.Campaign();err!=nil{t.Fatal(err)};drain()\n if r.BasicStatus().RaftState!=StateLeader{t.Fatal(\"no elected leader\")}\n if err:=r.ProposeConfChange(pb.ConfChangeV2{Transition:pb.ConfChangeTransitionJointImplicit,Changes:[]pb.ConfChangeSingle{{Type:pb.ConfChangeAddLearnerNode,NodeID:2}}});err!=nil{t.Fatal(err)};drain()\n if !observed{t.Fatal(\"joint entry not observed\")}\n assuranceEmit(map[string]interface{}{\"event\":\"cleanup\",\"scenario\":\"implicit_status_copy\",\"node\":1,\"has_ready\":r.HasReady(),\"applied\":r.BasicStatus().Applied,\"commit\":r.BasicStatus().Commit,\"live_auto_leave\":r.raft.trk.Config.AutoLeave})\n}\n",
+    "description": "Single serialized RawNode with MemoryStorage and actual proposal/Ready application. No state mutation instrumentation or forged acknowledgements. Drops only remote learner traffic.",
+    "semantic_changes": [
+      "Use MemoryStorage and a transport that loses learner-bound messages; sole-voter support remains local."
+    ],
+    "prerequisites": [
+      {
+        "alias": "installed",
+        "event": "installed",
+        "conditions": [
+          {
+            "field": "implicit",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          },
+          {
+            "field": "expected_auto_leave",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          }
+        ]
+      }
+    ],
+    "legality": {
+      "source_ids": [
+        "S-config-clone",
+        "S-status-clone",
+        "S-config",
+        "S-changer",
+        "S-raw-contract",
+        "S-advance",
+        "S-raw-advance",
+        "S-raw-status"
+      ],
+      "expectation_ids": [
+        "S-config-clone",
+        "S-status-contract",
+        "S-raw-status"
+      ],
+      "binding_ids": [
+        "bind-status-copy"
+      ],
+      "derivation": "A single-voter initial snapshot elects itself through ordinary durable self-vote/append completion. An actual JointImplicit proposal adds a learner; its committed entry is applied by ApplyConfChange. The installed event records that returned ConfState flag before calling Status, without intervening protocol work. The driver then completes Advance and drains automatic leave work. Learner messages may be lost and cannot affect the one-voter quorum.",
+      "applicability": "Serialized RawNode, synchronous persistence and apply-before-Advance; active implicit joint configuration at observation.",
+      "unresolved": [],
+      "conflicts": [],
+      "alternatives": [
+        "The active flag and ordinary automatic exit remain intact; the proposition concerns only returned Status fidelity."
+      ]
+    }
+  },
+  "monitors": [
+    {
+      "id": "monitor-status-fidelity",
+      "checker_id": "status-fidelity",
+      "event": "status_result",
+      "binding_ids": [
+        "bind-status-copy"
+      ],
+      "grounding": {
+        "source_ids": [
+          "S-config-clone",
+          "S-status-clone",
+          "S-config",
+          "S-changer",
+          "S-raw-contract",
+          "S-advance",
+          "S-raw-advance",
+          "S-raw-status"
+        ],
+        "expectation_ids": [
+          "S-config-clone",
+          "S-status-contract",
+          "S-raw-status"
+        ],
+        "binding_ids": [
+          "bind-status-copy"
+        ],
+        "derivation": "A single-voter initial snapshot elects itself through ordinary durable self-vote/append completion. An actual JointImplicit proposal adds a learner; its committed entry is applied by ApplyConfChange. The installed event records that returned ConfState flag before calling Status, without intervening protocol work. The driver then completes Advance and drains automatic leave work. Learner messages may be lost and cannot affect the one-voter quorum.",
+        "applicability": "Serialized RawNode, synchronous persistence and apply-before-Advance; active implicit joint configuration at observation.",
+        "unresolved": [],
+        "conflicts": [],
+        "alternatives": [
+          "The active flag and ordinary automatic exit remain intact; the proposition concerns only returned Status fidelity."
+        ]
+      },
+      "applicability_conditions": [],
+      "admission_alias": "installed"
+    }
+  ],
+  "observable_properties": [
+    {
+      "checker_id": "status-fidelity",
+      "kind": "event_assertion",
+      "trigger": {
+        "field": "event",
+        "op": "eq",
+        "value": "status_result",
+        "reference": null
+      },
+      "assertion": {
+        "field": "observed_auto_leave",
+        "op": "eq",
+        "value": null,
+        "reference": "installed.expected_auto_leave"
+      },
+      "antecedent": null,
+      "identity_fields": [
+        "scenario",
+        "node",
+        "entry_index"
+      ],
+      "description": "Current Status configuration preserves the independently observed installed AutoLeave value."
+    }
+  ],
+  "uncertainties": [
+    "Only AutoLeave value fidelity is compared; no downstream caller action or consensus consequence is measured."
+  ]
+}
