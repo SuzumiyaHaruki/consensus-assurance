@@ -1,0 +1,121 @@
+{
+  "action": "check",
+  "rationale": "New obligation and its first check for the persistence responsibility. The claim is derived from the recorder's own writes (it writes bal and then vbal into the same bytes and Status inside the 4-byte region a reader would use for vbal), and the harness observes the produced header with distinct field values through the real recorder and sync against a temp stable store. The local construction run showed header 04030201|03|100f0e0d|deps, i.e. vbal at offset 0 and bal absent, so the encoded predicate (bal_field_present) is expected to be violated; the trusted runner and a fresh correspondence review decide that. The plan declares a write-request prerequisite carrying the instance identity so the header observation is correlated with the write it judges.",
+  "plan_path": "plan-durable-record.json",
+  "harness_path": "explore_durable_test.go",
+  "files": {},
+  "candidate": {
+    "rationale": "The obligation and its binding are supplied with the check so the claim exists before the plan references it; this is an implementation-semantics duty of the recorder, bounded by the fact that the shipped configuration does not enable it and no reader exists in the snapshot.",
+    "action": "obligation",
+    "question": {
+      "audit_spec_version": 5,
+      "disposition": "ready_for_check",
+      "preferred_check": "direct_test",
+      "question": "When Durable is enabled, recordInstanceMetadata writes the current bal, vbal, Status, Seq and Deps of an instance into the stable store. Does the record it produces preserve the value written for bal at the offset where the recorder wrote it, or does a later write of the same record replace it, and does Status land inside the bytes a reader would use for vbal?",
+      "importance": "A record that cannot carry the fields the writer intended hides the ballot context of an instance from any reader of that layout (a recovery path or an external tool), so a replica that restarts from such a record would be missing the value it needs to compare ballots. The consequence is bounded here because the shipped configuration passes durable=false and no reader exists in the snapshot, which is why this is recorded as an implementation-semantics defect rather than a live availability or agreement failure.",
+      "source_ids": [
+        "S19-durable-record",
+        "S24-runReplica-epaxos",
+        "S2-instance-bookkeeping",
+        "S14-recovery-start-prepare",
+        "S4-execute-loop",
+        "S11-handleAccept",
+        "S5-broadcasters"
+      ],
+      "contexts": [
+        "Durable true reached through the constructor argument",
+        "one instance with distinct bal, vbal, Status, Seq"
+      ],
+      "event_paths": [
+        "recordInstanceMetadata builds a 9+4N byte buffer and writes bal, vbal, Status, Seq, Deps",
+        "the harness reads back the first 9+4N bytes and reports which written value appears at offset 0"
+      ],
+      "activity_classes": [
+        "A2"
+      ],
+      "behavior_ids": [
+        "B15-durable-record"
+      ],
+      "fact_ids": [
+        "F7-durable-bytes"
+      ],
+      "supporting_behavior_ids": {
+        "B9-recovery-trigger": "the ballut context a restarted replica would need comes from the recovery path that consumes such a record"
+      },
+      "obligation_relation_kind": "preservation",
+      "priority": 1,
+      "counterevidence": [
+        "scoped to the source: the function writes bal at [0:4) and then writes vbal at the same bytes before Status at [4) and Seq at [5:9), so the collision is visible in the source itself (S19-durable-record)",
+        "scoped to the launched configuration: run.go passes durable=false, so the recorder is inert in the default deployment and no in-repository reader parses the layout (S24-runReplica-epaxos)"
+      ],
+      "unknowns": [
+        "whether any external tool parses the stable store and expects a particular layout",
+        "whether a recovery path from the stable store is intended for a later revision"
+      ],
+      "trigger_rationale": "This is an A2-supporting question: the persisted bal and vbal are the instance's authority context, the values a restarted replica would need to compare ballots, and the backing behavior is the recorder that writes them. Source reading shows the collision directly (bal and vbal share [0:4), Status occupies [4)), so the check fixes the obligation and observes the produced bytes with the real recorder."
+    },
+    "obligation": {
+      "id": "C2-durable-record-preserves-written-fields",
+      "kind": "obligation",
+      "concern": "implementation_semantics",
+      "description": "When Durable is enabled, recordInstanceMetadata writes the current bal, vbal, Status, Seq and Deps of an instance into the stable store; the record it produces must let each field it writes be recovered at the offset where the writer placed it, so that no value it wrote is silently replaced by another field of the same record.",
+      "source_ids": [
+        "S19-durable-record",
+        "S24-runReplica-epaxos"
+      ],
+      "scope": {
+        "description": "One call to recordInstanceMetadata with Durable true, N=3, and distinct values for bal, vbal, Status and Seq, followed by sync.",
+        "assumptions": [
+          "the field order the writer uses is bal, vbal, Status, Seq, then Deps",
+          "the record begins at the current end of the stable store"
+        ],
+        "excluded": [
+          "recovery from the stable store (no reader exists in the captured snapshot)",
+          "the launched configuration, which passes durable=false",
+          "behaviour after a restart or a partially written record"
+        ]
+      },
+      "pending": [],
+      "grounding": {
+        "source_ids": [
+          "S19-durable-record",
+          "S24-runReplica-epaxos"
+        ],
+        "expectation_ids": [],
+        "binding_ids": [
+          "BB3-durable-record"
+        ],
+        "derivation": "The recorder itself fixes the obligation: it builds a buffer of 9+4N bytes and writes bal, vbal, Status, Seq and Deps in that order. A write that lands on bytes already written by an earlier field of the same record removes the earlier field's value, so the record cannot encode what the function intended to record, and the mismatch matters to any reader of the layout (a recovery path or an external tool) that needs the ballot context of the instance.",
+        "applicability": "Applies whenever Durable is true, which a caller can select through epaxos.New; the shipped run.go passes false, so the duty is owed by the implementation rather than exercised in the default deployment.",
+        "unresolved": [
+          "no reader of the layout exists in the snapshot, so the exact intended offsets are not fixed by a consumer",
+          "whether an external tool parses the stable store"
+        ],
+        "conflicts": [],
+        "alternatives": [
+          "an alternative reading is that the record deliberately stores vbal in place of bal and encodes Status inside the vbal field; then the buffer size and the presence of a bal write would both be vestigial, which the review can judge against the cited code"
+        ]
+      }
+    },
+    "bindings": [
+      {
+        "id": "BB3-durable-record",
+        "material_id": "S19-durable-record",
+        "symbol": "recordInstanceMetadata",
+        "start_line": 199,
+        "end_line": 215,
+        "description": "Stable-store recorder for per-instance metadata: buffer sizing and the field writes that decide the record layout.",
+        "associations": [
+          {
+            "claim_id": "C2-durable-record-preserves-written-fields",
+            "source_ids": [
+              "S19-durable-record"
+            ],
+            "rationale": "The function's own write order and buffer size are what the obligation is derived from: bal is written at [0:4), vbal is then written at the same bytes, and Status is written at [4] before Seq at [5:9)."
+          }
+        ],
+        "pending": []
+      }
+    ]
+  }
+}

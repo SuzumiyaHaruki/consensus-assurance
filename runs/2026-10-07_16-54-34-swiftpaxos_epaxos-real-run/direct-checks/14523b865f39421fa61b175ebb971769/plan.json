@@ -1,0 +1,114 @@
+{
+  "description": "Discriminator: with row 1 blocked at instance 0 by a record that has no commands and is not committed, does the executor enqueue that instance for recovery? Prefix: the harness prepares the blocked record with the package's own constructor, records the row watermarks in a prerequisite event, and starts the real executeCommands goroutine. Controls: the prerequisite prints the record's status, whether it has commands, crtInstance and ExecedUpTo, and the result prints whether the channel received the instance plus the wall-clock wait as a diagnostic.",
+  "claim_id": "C8-timeout-enqueues-blocked-instance",
+  "binding_ids": [
+    "BB9-timeout-trigger"
+  ],
+  "harness": {
+    "execution_package": "./epaxos",
+    "files": {},
+    "kind": "go_test",
+    "source": "package epaxos\n\n// Exploration harness: with an instance that cannot be executed (its record has no commands\n// and is not committed), does the executor's timeout path enqueue it for recovery, and after\n// roughly the configured grace period? The executor runs as its own goroutine, as in the\n// launched configuration, and the harness only reads the recovery channel.\n\nimport (\n\t\"bufio\"\n\t\"bytes\"\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"sync\"\n\t\"testing\"\n\t\"time\"\n\n\t\"github.com/imdea-software/swiftpaxos/dlog\"\n\t\"github.com/imdea-software/swiftpaxos/replica\"\n\t\"github.com/imdea-software/swiftpaxos/replica/defs\"\n\tfastrpc \"github.com/imdea-software/swiftpaxos/rpc\"\n\t\"github.com/imdea-software/swiftpaxos/state\"\n)\n\nfunc triggerNode() *Replica {\n\tw := make([]*bufio.Writer, 3)\n\tfor i := range w {\n\t\tw[i] = bufio.NewWriter(&bytes.Buffer{})\n\t}\n\tbase := &replica.Replica{\n\t\tLogger: dlog.New(\"\", false), N: 3, F: 1, Id: 0, Alias: \"r0\",\n\t\tPeerAddrList: []string{\"a\", \"b\", \"c\"}, PeerWriters: w,\n\t\tState: state.InitState(), Stats: &defs.Stats{M: map[string]int{}},\n\t\tAlive: []bool{true, true, true}, PreferredPeerOrder: []int32{1, 2, 0},\n\t\tProposeChan: make(chan *defs.GPropose, 8), RPC: fastrpc.NewTableId(defs.RPC_TABLE),\n\t\tThrifty: true, Dreply: true,\n\t}\n\tr := &Replica{\n\t\tReplica: base,\n\t\tprepareChan: make(chan fastrpc.Serializable, 4), preAcceptChan: make(chan fastrpc.Serializable, 4),\n\t\tacceptChan: make(chan fastrpc.Serializable, 4), commitChan: make(chan fastrpc.Serializable, 4),\n\t\tprepareReplyChan: make(chan fastrpc.Serializable, 4), preAcceptReplyChan: make(chan fastrpc.Serializable, 4),\n\t\tpreAcceptOKChan: make(chan fastrpc.Serializable, 4), acceptReplyChan: make(chan fastrpc.Serializable, 4),\n\t\ttryPreAcceptChan: make(chan fastrpc.Serializable, 4), tryPreAcceptReplyChan: make(chan fastrpc.Serializable, 4),\n\t\tInstanceSpace: make([][]*Instance, 3), crtInstance: make([]int32, 3),\n\t\tCommittedUpTo: make([]int32, 3), ExecedUpTo: make([]int32, 3),\n\t\tconflicts: make([]map[state.Key]*InstPair, 3), maxSeqPerKey: make(map[state.Key]int32),\n\t\tclientMutex: new(sync.Mutex), instancesToRecover: make(chan *instanceId, 8), maxRecvBallot: -1,\n\t}\n\tfor i := 0; i < 3; i++ {\n\t\tr.InstanceSpace[i] = make([]*Instance, 8)\n\t\tr.crtInstance[i], r.CommittedUpTo[i], r.ExecedUpTo[i] = -1, -1, -1\n\t\tr.conflicts[i] = make(map[state.Key]*InstPair)\n\t}\n\tr.prepareRPC = r.RPC.Register(new(Prepare), r.prepareChan)\n\tr.prepareReplyRPC = r.RPC.Register(new(PrepareReply), r.prepareReplyChan)\n\tr.preAcceptRPC = r.RPC.Register(new(PreAccept), r.preAcceptChan)\n\tr.preAcceptReplyRPC = r.RPC.Register(new(PreAcceptReply), r.preAcceptReplyChan)\n\tr.acceptRPC = r.RPC.Register(new(Accept), r.acceptChan)\n\tr.acceptReplyRPC = r.RPC.Register(new(AcceptReply), r.acceptReplyChan)\n\tr.commitRPC = r.RPC.Register(new(Commit), r.commitChan)\n\tr.tryPreAcceptRPC = r.RPC.Register(new(TryPreAccept), r.tryPreAcceptChan)\n\tr.tryPreAcceptReplyRPC = r.RPC.Register(new(TryPreAcceptReply), r.tryPreAcceptReplyChan)\n\treturn r\n}\n\nfunc tev(m map[string]any) {\n\tb, _ := json.Marshal(m)\n\tfmt.Println(\"CA_EVENT \" + string(b))\n}\n\nfunc TestAssuranceRecoveryTriggerOnTimeout(t *testing.T) {\n\tr := triggerNode()\n\towner, inst := int32(1), int32(0)\n\n\t// Row 1 is blocked at instance 0: the record exists but carries no commands and is not\n\t// committed, which is what a replica sees for an instance it never completed.\n\tr.InstanceSpace[owner][inst] = r.newInstanceDefault(owner, inst)\n\tr.crtInstance[owner] = inst\n\tr.ExecedUpTo[owner] = -1\n\trec := r.InstanceSpace[owner][inst]\n\ttev(map[string]any{\"event\": \"blocked_instance_prepared\", \"instance\": \"1.0\",\n\t\t\"status\": int(rec.Status), \"has_commands\": len(rec.Cmds) > 0, \"crt_instance\": r.crtInstance[owner],\n\t\t\"execed_up_to\": r.ExecedUpTo[owner]})\n\n\tgo r.executeCommands()\n\tdefer func() { r.Shutdown = true }()\n\n\tstart := time.Now()\n\tselect {\n\tcase iid := <-r.instancesToRecover:\n\t\ttev(map[string]any{\"event\": \"recovery_enqueued\", \"instance\": \"1.0\",\n\t\t\t\"enqueued\": true, \"waited_ms\": time.Since(start).Milliseconds(),\n\t\t\t\"enqueued_replica\": iid.replica, \"enqueued_instance\": iid.instance})\n\tcase <-time.After(25 * time.Second):\n\t\ttev(map[string]any{\"event\": \"recovery_enqueued\", \"instance\": \"1.0\",\n\t\t\t\"enqueued\": false, \"waited_ms\": time.Since(start).Milliseconds()})\n\t}\n}\n",
+    "description": "In-package Go test that blocks one row and waits for the executor's recovery enqueue, reading only the recovery channel.",
+    "semantic_changes": [
+      "harness-only scaffolding: the Replica is constructed in-package and executeCommands is started directly instead of by New(); the loop itself is unmodified",
+      "the harness reads instancesToRecover rather than letting the run loop consume it"
+    ],
+    "prerequisites": [
+      {
+        "alias": "blocked_instance",
+        "event": "blocked_instance_prepared",
+        "conditions": [
+          {
+            "field": "status",
+            "op": "eq",
+            "value": 0,
+            "reference": null
+          },
+          {
+            "field": "has_commands",
+            "op": "eq",
+            "value": false,
+            "reference": null
+          }
+        ]
+      }
+    ],
+    "legality": {
+      "source_ids": [
+        "S4-execute-loop"
+      ],
+      "expectation_ids": [],
+      "binding_ids": [
+        "BB9-timeout-trigger"
+      ],
+      "derivation": "The blocked record is the state a replica reaches when it has an instance number but no committed commands for it, and the loop is the implementation's own executor.",
+      "applicability": "One replica, one blocked row, executor running.",
+      "unresolved": [
+        "the wall-clock length of the grace period is an observation because the counter advances per loop iteration"
+      ],
+      "conflicts": [],
+      "alternatives": []
+    }
+  },
+  "monitors": [
+    {
+      "id": "M1-recovery-enqueued",
+      "checker_id": "CH1-recovery-enqueued",
+      "event": "recovery_enqueued",
+      "binding_ids": [
+        "BB9-timeout-trigger"
+      ],
+      "grounding": {
+        "source_ids": [
+          "S4-execute-loop"
+        ],
+        "expectation_ids": [],
+        "binding_ids": [
+          "BB9-timeout-trigger"
+        ],
+        "derivation": "The event reports whether the instance arrived on the recovery channel and which instance it was, which is the duty's observable.",
+        "applicability": "The row was blocked and the executor was running.",
+        "unresolved": [],
+        "conflicts": [],
+        "alternatives": []
+      },
+      "applicability_conditions": [
+        {
+          "field": "instance",
+          "op": "eq",
+          "value": null,
+          "reference": "blocked_instance.instance"
+        }
+      ],
+      "admission_alias": "blocked_instance"
+    }
+  ],
+  "observable_properties": [
+    {
+      "checker_id": "CH1-recovery-enqueued",
+      "kind": "event_assertion",
+      "trigger": {
+        "field": "event",
+        "op": "eq",
+        "value": "recovery_enqueued",
+        "reference": null
+      },
+      "assertion": {
+        "field": "enqueued",
+        "op": "eq",
+        "value": true,
+        "reference": null
+      },
+      "antecedent": null,
+      "identity_fields": [
+        "instance"
+      ],
+      "description": "A blocked instance must be enqueued for recovery once the executor's grace period elapses."
+    }
+  ],
+  "uncertainties": [
+    "the check observes the enqueue, not the recovery it triggers",
+    "the grace period's wall-clock length depends on loop iterations, so the measured wait is a diagnostic rather than a specification"
+  ]
+}

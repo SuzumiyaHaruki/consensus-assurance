@@ -1,0 +1,112 @@
+{
+  "description": "Discriminator: after a recovery commits the instance holding an admitted client operation as NOOP, does the owner's re-proposal carry the operation all the way to a client reply? Prefix: the harness admits the operation with the real client-proposal handler, delivers the NOOP commit, drains the re-proposed operation from the propose channel, runs the normal PreAccept/commit rounds with a peer through the real codec, and then applies the re-proposed instance with the real executor. Controls: the events print the pending count before the commit, whether a re-proposal appeared on the channel, the new instance's status at both replicas, and the bytes written to the client's reply writer.",
+  "claim_id": "C5-noop-commit-reproposes-admitted-operation",
+  "binding_ids": [
+    "BB6-repropose"
+  ],
+  "harness": {
+    "execution_package": "./epaxos",
+    "files": {},
+    "kind": "go_test",
+    "source": "package epaxos\n\n// Exploration harness: does a recovering replica that holds only a default record\n// adopt a remote PrepareReply that reports COMMITTED? Only real handlers are used and\n// messages travel through their real Marshal/Unmarshal form. No protocol code is changed.\n\nimport (\n\t\"bufio\"\n\t\"bytes\"\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"sync\"\n\t\"testing\"\n\n\t\"github.com/imdea-software/swiftpaxos/dlog\"\n\t\"github.com/imdea-software/swiftpaxos/replica\"\n\t\"github.com/imdea-software/swiftpaxos/replica/defs\"\n\tfastrpc \"github.com/imdea-software/swiftpaxos/rpc\"\n\t\"github.com/imdea-software/swiftpaxos/state\"\n)\n\nconst expN = 3\nconst expRow = 8\n\nfunc ev(m map[string]any) {\n\tb, _ := json.Marshal(m)\n\tfmt.Println(\"CA_EVENT \" + string(b))\n}\n\ntype expNode struct {\n\tr    *Replica\n\tout  []*bytes.Buffer\n\tw    []*bufio.Writer\n}\n\nfunc newExpNode(id int32, alive []bool) *expNode {\n\tn := &expNode{out: make([]*bytes.Buffer, expN), w: make([]*bufio.Writer, expN)}\n\tfor j := 0; j < expN; j++ {\n\t\tn.out[j] = &bytes.Buffer{}\n\t\tn.w[j] = bufio.NewWriter(n.out[j])\n\t}\n\tbase := &replica.Replica{\n\t\tLogger:             dlog.New(\"\", false),\n\t\tN:                  expN,\n\t\tF:                  (expN - 1) / 2,\n\t\tId:                 id,\n\t\tAlias:              fmt.Sprintf(\"r%d\", id),\n\t\tPeerAddrList:       []string{\"a\", \"b\", \"c\"},\n\t\tPeerWriters:        n.w,\n\t\tState:              state.InitState(),\n\t\tStats:              &defs.Stats{M: map[string]int{}},\n\t\tAlive:              alive,\n\t\tPreferredPeerOrder: []int32{},\n\t\tProposeChan:        make(chan *defs.GPropose, 8),\n\t\tRPC:                fastrpc.NewTableId(defs.RPC_TABLE),\n\t\tThrifty:            true,\n\t\tDreply:             true,\n\t}\n\tfor k := 0; k < expN; k++ {\n\t\tbase.PreferredPeerOrder = append(base.PreferredPeerOrder, int32((int(id)+1+k)%expN))\n\t}\n\tr := &Replica{\n\t\tReplica:               base,\n\t\tprepareChan:           make(chan fastrpc.Serializable, 8),\n\t\tpreAcceptChan:         make(chan fastrpc.Serializable, 8),\n\t\tacceptChan:            make(chan fastrpc.Serializable, 8),\n\t\tcommitChan:            make(chan fastrpc.Serializable, 8),\n\t\tprepareReplyChan:      make(chan fastrpc.Serializable, 8),\n\t\tpreAcceptReplyChan:    make(chan fastrpc.Serializable, 8),\n\t\tpreAcceptOKChan:       make(chan fastrpc.Serializable, 8),\n\t\tacceptReplyChan:       make(chan fastrpc.Serializable, 8),\n\t\ttryPreAcceptChan:      make(chan fastrpc.Serializable, 8),\n\t\ttryPreAcceptReplyChan: make(chan fastrpc.Serializable, 8),\n\t\tInstanceSpace:         make([][]*Instance, expN),\n\t\tcrtInstance:           make([]int32, expN),\n\t\tCommittedUpTo:         make([]int32, expN),\n\t\tExecedUpTo:            make([]int32, expN),\n\t\tconflicts:             make([]map[state.Key]*InstPair, expN),\n\t\tmaxSeqPerKey:          make(map[state.Key]int32),\n\t\tclientMutex:           new(sync.Mutex),\n\t\tinstancesToRecover:    make(chan *instanceId, 8),\n\t\tmaxRecvBallot:         -1,\n\t}\n\tfor i := 0; i < expN; i++ {\n\t\tr.InstanceSpace[i] = make([]*Instance, expRow)\n\t\tr.crtInstance[i] = -1\n\t\tr.CommittedUpTo[i] = -1\n\t\tr.ExecedUpTo[i] = -1\n\t\tr.conflicts[i] = make(map[state.Key]*InstPair)\n\t}\n\tr.prepareRPC = r.RPC.Register(new(Prepare), r.prepareChan)\n\tr.prepareReplyRPC = r.RPC.Register(new(PrepareReply), r.prepareReplyChan)\n\tr.preAcceptRPC = r.RPC.Register(new(PreAccept), r.preAcceptChan)\n\tr.preAcceptReplyRPC = r.RPC.Register(new(PreAcceptReply), r.preAcceptReplyChan)\n\tr.acceptRPC = r.RPC.Register(new(Accept), r.acceptChan)\n\tr.acceptReplyRPC = r.RPC.Register(new(AcceptReply), r.acceptReplyChan)\n\tr.commitRPC = r.RPC.Register(new(Commit), r.commitChan)\n\tr.tryPreAcceptRPC = r.RPC.Register(new(TryPreAccept), r.tryPreAcceptChan)\n\tr.tryPreAcceptReplyRPC = r.RPC.Register(new(TryPreAcceptReply), r.tryPreAcceptReplyChan)\n\tn.r = r\n\treturn n\n}\n\n// deliver drains everything node from wrote for node to and runs the matching handler.\nfunc deliver(from, to *expNode) []uint8 {\n\tb := from.out[to.r.Id]\n\tif b.Len() == 0 {\n\t\treturn nil\n\t}\n\trd := bytes.NewReader(b.Bytes())\n\tb.Reset()\n\tvar codes []uint8\n\tfor rd.Len() > 0 {\n\t\tcode, err := rd.ReadByte()\n\t\tif err != nil {\n\t\t\tbreak\n\t\t}\n\t\tp, ok := to.r.RPC.Get(code)\n\t\tif !ok {\n\t\t\tpanic(\"unknown message code\")\n\t\t}\n\t\tobj := p.Obj.New()\n\t\tif err := obj.Unmarshal(rd); err != nil {\n\t\t\tpanic(err)\n\t\t}\n\t\tcodes = append(codes, code)\n\t\tswitch code {\n\t\tcase to.r.prepareRPC:\n\t\t\tto.r.handlePrepare(obj.(*Prepare))\n\t\tcase to.r.prepareReplyRPC:\n\t\t\tto.r.handlePrepareReply(obj.(*PrepareReply))\n\t\tcase to.r.preAcceptRPC:\n\t\t\tto.r.handlePreAccept(obj.(*PreAccept))\n\t\tcase to.r.preAcceptReplyRPC:\n\t\t\tto.r.handlePreAcceptReply(obj.(*PreAcceptReply))\n\t\tcase to.r.acceptRPC:\n\t\t\tto.r.handleAccept(obj.(*Accept))\n\t\tcase to.r.acceptReplyRPC:\n\t\t\tto.r.handleAcceptReply(obj.(*AcceptReply))\n\t\tcase to.r.commitRPC:\n\t\t\tto.r.handleCommit(obj.(*Commit))\n\t\tcase to.r.tryPreAcceptRPC:\n\t\t\tto.r.handleTryPreAccept(obj.(*TryPreAccept))\n\t\tcase to.r.tryPreAcceptReplyRPC:\n\t\t\tto.r.handleTryPreAcceptReply(obj.(*TryPreAcceptReply))\n\t\t}\n\t}\n\treturn codes\n}\n\nfunc TestAssuranceRecoveryVBalSeed(t *testing.T) {\n\tkey := state.Key(9)\n\towner := int32(1)\n\tinst := int32(0)\n\n\t// Recovering replica 0 holds only a default record for (1,0) and reaches peer 1.\n\trec := newExpNode(0, []bool{false, true, false})\n\t// Peer 1 has already committed that instance with a real command.\n\tacc := newExpNode(1, []bool{true, false, false})\n\t// Third replica: it never saw the instance, but it will receive the commit broadcast.\n\tthird := newExpNode(2, []bool{true, true, false})\n\tcmds := []state.Command{{Op: state.PUT, K: key, V: state.Value([]byte{4})}}\n\tacc.r.InstanceSpace[owner][inst] = &Instance{\n\t\tCmds: cmds, bal: 0, vbal: 0, Status: COMMITTED, Seq: 3,\n\t\tDeps: []int32{-1, -1, -1}, id: &instanceId{owner, inst},\n\t}\n\n\trec.r.InstanceSpace[owner][inst] = rec.r.newInstanceDefault(owner, inst)\n\trec.r.startRecoveryForInstance(owner, inst)\n\n\tseed := rec.r.InstanceSpace[owner][inst]\n\tev(map[string]any{\n\t\t\"event\": \"recovery_seed\", \"recoverer\": 0, \"owner\": owner, \"instance\": inst,\n\t\t\"seed_lb_ballot\": seed.lb.ballot, \"record_vbal_reported_by_self\": seed.lb.prepareReplies[0].VBallot,\n\t\t\"instance_vbal_after_seed\": seed.vbal, \"self_status\": seed.lb.prepareReplies[0].Status,\n\t})\n\n\tdeliver(rec, acc) // real Prepare into the committed peer\n\tcodes := deliver(acc, rec)\n\tev(map[string]any{\"event\": \"reply_delivered\", \"codes\": codes, \"prepare_replies\": len(seed.lb.prepareReplies)})\n\tev(map[string]any{\n\t\t\"event\": \"peer_committed_reply\", \"instance\": \"1.0\", \"from_replica\": 1,\n\t\t\"status\": \"COMMITTED\", \"vbal\": 0, \"has_command\": true,\n\t})\n\n\tst := rec.r.InstanceSpace[owner][inst]\n\tadopted := st.Status == COMMITTED || st.lb.status == COMMITTED\n\tcmdOp := -1\n\tif len(st.Cmds) > 0 {\n\t\tcmdOp = int(st.Cmds[0].Op)\n\t}\n\tstatusName := \"NONE\"\n\tswitch st.Status {\n\tcase PREACCEPTED:\n\t\tstatusName = \"PREACCEPTED\"\n\tcase PREACCEPTED_EQ:\n\t\tstatusName = \"PREACCEPTED_EQ\"\n\tcase ACCEPTED:\n\t\tstatusName = \"ACCEPTED\"\n\tcase COMMITTED:\n\t\tstatusName = \"COMMITTED\"\n\tcase EXECUTED:\n\t\tstatusName = \"EXECUTED\"\n\t}\n\tcmdName := \"NIL\"\n\tif cmdOp == 0 {\n\t\tcmdName = \"NONE\"\n\t} else if cmdOp == 1 {\n\t\tcmdName = \"PUT\"\n\t}\n\tev(map[string]any{\n\t\t\"event\": \"recovery_resolution\", \"instance\": \"1.0\", \"recoverer\": 0,\n\t\t\"adopted_committed\": adopted, \"instance_status\": statusName,\n\t\t\"command_after\": cmdName, \"preaccept_sent\": len(rec.out[1].Bytes()) > 0,\n\t})\n\t// Drive the rounds the resolution started, in order: the phase-1 restart's PreAccept\n\t// and its reply, then the Accept the recoverer queues and its reply, so the accept\n\t// round is actually completed before anything about it is read.\n\tdeliver(rec, acc) // PreAccept of the phase-1 restart\n\tdeliver(acc, rec) // PreAcceptReply -> recoverer moves to ACCEPTED and queues Accept\n\tmid := rec.r.InstanceSpace[owner][inst]\n\tbefore := mid.lb.acceptOKs\n\tdeliver(rec, acc) // Accept\n\t// The accept reply makes the recoverer commit and broadcast; let that commit reach\n\t// the third replica as well, which never saw the instance before.\n\trec.r.Alive = []bool{false, true, true}\n\tdeliver(acc, rec) // AcceptReply\n\tafter := rec.r.InstanceSpace[owner][inst].lb.acceptOKs\n\tstatusAfter := \"NONE\"\n\tswitch st.Status {\n\tcase PREACCEPTED:\n\t\tstatusAfter = \"PREACCEPTED\"\n\tcase PREACCEPTED_EQ:\n\t\tstatusAfter = \"PREACCEPTED_EQ\"\n\tcase ACCEPTED:\n\t\tstatusAfter = \"ACCEPTED\"\n\tcase COMMITTED:\n\t\tstatusAfter = \"COMMITTED\"\n\tcase EXECUTED:\n\t\tstatusAfter = \"EXECUTED\"\n\t}\n\tev(map[string]any{\n\t\t\"event\": \"accept_round_after_commit\", \"instance\": \"1.0\", \"recoverer\": 0,\n\t\t\"accept_oks_before\": before, \"accept_oks_after\": after, \"reply_counted\": after > before,\n\t\t\"instance_status_after\": statusAfter,\n\t\t\"last_tried_ballot\": rec.r.InstanceSpace[owner][inst].lb.lastTriedBallot,\n\t\t\"committed_at_recoverer\": rec.r.InstanceSpace[owner][inst].Status == COMMITTED,\n\t})\n\tpeerCmd := \"NIL\"\n\tif len(acc.r.InstanceSpace[owner][inst].Cmds) > 0 {\n\t\tif op := acc.r.InstanceSpace[owner][inst].Cmds[0].Op; op == 0 {\n\t\t\tpeerCmd = \"NONE\"\n\t\t} else if op == 1 {\n\t\t\tpeerCmd = \"PUT\"\n\t\t}\n\t}\n\trecNow := rec.r.InstanceSpace[owner][inst]\n\trecCmd := \"NIL\"\n\tif len(recNow.Cmds) > 0 {\n\t\tif op := recNow.Cmds[0].Op; op == 0 {\n\t\t\trecCmd = \"NONE\"\n\t\t} else if op == 1 {\n\t\t\trecCmd = \"PUT\"\n\t\t}\n\t}\n\tcommittedNow := recNow.Status == COMMITTED\n\tev(map[string]any{\n\t\t\"event\": \"recovery_outcome\", \"instance\": \"1.0\",\n\t\t\"recoverer_committed\": committedNow, \"recoverer_command\": recCmd,\n\t\t\"peer_committed_command\": peerCmd,\n\t\t\"vectors_match\": !committedNow || recCmd == peerCmd, \"accept_oks\": after,\n\t})\n\t// Deliver the recoverer's commit broadcast to the committed peer and to the third replica.\n\tdeliver(rec, acc)\n\tdeliver(rec, third)\n\tcmdNameOf := func(r *Replica) string {\n\t\tin := r.InstanceSpace[owner][inst]\n\t\tif in == nil || len(in.Cmds) == 0 {\n\t\t\treturn \"NIL\"\n\t\t}\n\t\tif in.Cmds[0].Op == 0 {\n\t\t\treturn \"NONE\"\n\t\t}\n\t\tif in.Cmds[0].Op == 1 {\n\t\t\treturn \"PUT\"\n\t\t}\n\t\treturn \"OTHER\"\n\t}\n\tc0 := cmdNameOf(rec.r)\n\tc1 := cmdNameOf(acc.r)\n\tc2 := cmdNameOf(third.r)\n\tev(map[string]any{\n\t\t\"event\": \"commit_propagation_divergence\", \"instance\": \"1.0\",\n\t\t\"replica0_command\": c0, \"replica1_command\": c1, \"replica2_command\": c2,\n\t\t\"all_committed_match\": c0 == c1 && c1 == c2,\n\t})\n\t// Apply each replica's committed instance to its own state machine and compare.\n\thexOf := func(r *Replica) string {\n\t\tr.exec = &Exec{r}\n\t\tr.exec.executeCommand(owner, inst)\n\t\tprobe := state.Command{Op: state.GET, K: key}\n\t\tv := probe.Execute(r.State)\n\t\tvv := state.Value(v)\n\t\treturn vv.String()\n\t}\n\tv0, v1, v2 := hexOf(rec.r), hexOf(acc.r), hexOf(third.r)\n\tev(map[string]any{\n\t\t\"event\": \"applied_state_divergence\", \"instance\": \"1.0\",\n\t\t\"recoverer_value\": v0, \"peer_value\": v1, \"third_value\": v2,\n\t\t\"applied_match\": v0 == v1 && v1 == v2,\n\t})\n\tev(map[string]any{\n\t\t\"event\": \"resolution\", \"lb_status\": int(st.lb.status), \"instance_status\": int(st.Status),\n\t\t\"instance_cmds_len\": len(st.Cmds), \"instance_first_op\": cmdOp,\n\t\t\"adopted_committed_vector\": adopted, \"preaccept_sent\": len(rec.out[1].Bytes()) > 0,\n\t\t\"out_codes\": rec.out[1].Bytes(),\n\t})\n\tif adopted {\n\t\tev(map[string]any{\"event\": \"remote_committed_value_adopted\", \"result\": true})\n\t} else {\n\t\tev(map[string]any{\"event\": \"remote_committed_value_ignored\", \"remote_status\": int(COMMITTED),\n\t\t\t\"instance_status_after\": int(st.Status), \"command_after\": cmdOp})\n\t}\n}\n\nfunc TestAssuranceClientReplyAfterNoopRecovery(t *testing.T) {\n\tkey := state.Key(9)\n\towner, inst := int32(0), int32(0)\n\trec := newExpNode(0, []bool{false, true, false})\n\tpeer := newExpNode(1, []bool{true, false, false})\n\n\treplyBuf := &bytes.Buffer{}\n\treply := bufio.NewWriter(replyBuf)\n\tgp := &defs.GPropose{Propose: &defs.Propose{CommandId: 1, ClientId: 1,\n\t\tCommand: state.Command{Op: state.PUT, K: key, V: state.Value([]byte{4})}, Timestamp: 1},\n\t\tReply: reply, Mutex: &sync.Mutex{}}\n\trec.r.handlePropose(gp)\n\tev(map[string]any{\"event\": \"operation_admitted\", \"instance\": \"0.0\",\n\t\t\"pending\": len(rec.r.InstanceSpace[owner][inst].lb.clientProposals)})\n\n\t// A recovery commits the instance as NOOP; the owner re-proposes the operation.\n\trec.r.handleCommit(&Commit{LeaderId: 1, Replica: owner, Instance: inst, Ballot: 4,\n\t\tCommand: []state.Command{{Op: state.NONE, K: 0, V: state.NIL()}}, Seq: 0, Deps: []int32{-1, -1, -1}})\n\tvar p2 *defs.GPropose\n\tselect {\n\tcase p2 = <-rec.r.ProposeChan:\n\tdefault:\n\t}\n\tev(map[string]any{\"event\": \"operation_reproposed\", \"instance\": \"0.0\", \"reproposed\": p2 != nil})\n\tif p2 == nil {\n\t\treturn\n\t}\n\n\t// The re-proposed operation becomes a fresh instance and runs the normal rounds.\n\trec.r.handlePropose(p2)\n\tnewInst := rec.r.crtInstance[owner]\n\tdeliver(rec, peer) // PreAccept of the re-proposed operation\n\tdeliver(peer, rec) // its reply\n\tdeliver(rec, peer) // the commit the fast path broadcast\n\tst := rec.r.InstanceSpace[owner][newInst]\n\tev(map[string]any{\"event\": \"reproposal_committed\", \"instance\": \"0.0\",\n\t\t\"new_instance\": int(newInst), \"status\": int(st.Status), \"peer_status\": int(peer.r.InstanceSpace[owner][newInst].Status)})\n\n\trec.r.exec = &Exec{rec.r}\n\texecuted := rec.r.exec.executeCommand(owner, newInst)\n\tev(map[string]any{\"event\": \"client_reply_after_recovery\", \"instance\": \"0.0\",\n\t\t\"executed\": executed, \"bytes_written\": replyBuf.Len(), \"replied\": replyBuf.Len() > 0})\n}\n",
+    "description": "In-package Go test that drives admit, NOOP commit, re-propose, commit of the re-proposed instance and execution, reporting the client's reply bytes.",
+    "semantic_changes": [
+      "harness-only scaffolding: two Replica values are constructed in-package with buffer peer writers; the handlers are unmodified and messages travel through the real codec",
+      "the client's reply writer is a harness buffer, so the observation is the bytes the implementation wrote"
+    ],
+    "prerequisites": [
+      {
+        "alias": "admitted",
+        "event": "operation_admitted",
+        "conditions": [
+          {
+            "field": "pending",
+            "op": "eq",
+            "value": 1,
+            "reference": null
+          }
+        ]
+      }
+    ],
+    "legality": {
+      "source_ids": [
+        "S13-handleCommit",
+        "S8-handlePropose-startPhase1",
+        "S12-handleAcceptReply",
+        "S20-exec"
+      ],
+      "expectation_ids": [],
+      "binding_ids": [
+        "BB6-repropose"
+      ],
+      "derivation": "Every step is the implementation's own: the client-proposal handler, the commit handler's re-proposal branch, the pre-accept and commit rounds, and the executor that answers the client.",
+      "applicability": "Owner-alive case, one operation, N=3 Thrifty.",
+      "unresolved": [
+        "the peer is a second harness replica rather than a separately configured participant"
+      ],
+      "conflicts": [],
+      "alternatives": []
+    }
+  },
+  "monitors": [
+    {
+      "id": "M1-client-reply",
+      "checker_id": "CH2-client-reply",
+      "event": "client_reply_after_recovery",
+      "binding_ids": [
+        "BB6-repropose"
+      ],
+      "grounding": {
+        "source_ids": [
+          "S12-handleAcceptReply",
+          "S20-exec"
+        ],
+        "expectation_ids": [],
+        "binding_ids": [
+          "BB6-repropose"
+        ],
+        "derivation": "The event reports whether the re-proposed instance executed and how many bytes reached the client's writer, which is the completion the client contract needs.",
+        "applicability": "The operation was admitted and re-proposed, and the re-proposed instance committed.",
+        "unresolved": [],
+        "conflicts": [],
+        "alternatives": []
+      },
+      "applicability_conditions": [
+        {
+          "field": "instance",
+          "op": "eq",
+          "value": null,
+          "reference": "admitted.instance"
+        }
+      ],
+      "admission_alias": "admitted"
+    }
+  ],
+  "observable_properties": [
+    {
+      "checker_id": "CH2-client-reply",
+      "kind": "event_assertion",
+      "trigger": {
+        "field": "event",
+        "op": "eq",
+        "value": "client_reply_after_recovery",
+        "reference": null
+      },
+      "assertion": {
+        "field": "replied",
+        "op": "eq",
+        "value": true,
+        "reference": null
+      },
+      "antecedent": null,
+      "identity_fields": [
+        "instance"
+      ],
+      "description": "An operation that a NOOP recovery forced the owner to re-propose must still be answered on the client's connection."
+    }
+  ],
+  "uncertainties": [
+    "the harness supplies the client's reply writer, so it observes the bytes the implementation wrote rather than a socket",
+    "one operation and one re-proposal round are exercised"
+  ]
+}

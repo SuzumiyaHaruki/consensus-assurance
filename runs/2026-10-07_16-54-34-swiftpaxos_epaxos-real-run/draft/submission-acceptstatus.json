@@ -1,0 +1,101 @@
+{
+  "action": "continue",
+  "rationale": "The frontier is without an open Candidate and the two recovery reachability questions are disposed, so this product opens the next one on the premise carried forward by the last two products: the accept phase stores accepted attributes without recording an accepted status. handleAccept writes Deps, Seq, bal and vbal and leaves Status at whatever it was (NONE for a record created by the Accept, PREACCEPTED/PREACCEPTED_EQ when the peer had already replied to the PreAccept), while three places in the code expect an acceptor's accepted status to be observable: handlePreAccept's >= ACCEPTED guard exists to avoid regressing accepted attributes, findPreAcceptConflicts' shortcut treats Status >= ACCEPTED as fixed, and handlePrepareReply's sub-case 2 is defined by lb.status == ACCEPTED. The question is therefore whether any decision actually depends on that status, and in particular whether an accepted record can have its attributes recomputed afterwards or whether a recovery that should re-accept an accepted value instead restarts phase 1.",
+  "question": {
+    "audit_spec_version": 4,
+    "disposition": "concrete_suspicion",
+    "preferred_check": "source_review",
+    "question": "handleAccept stores Deps, Seq, bal and vbal for instance (Replica, Instance) and never writes inst.Status, so a replica in the accept quorum that never saw the PreAccept holds accepted attributes with Status NONE, and one that did see it keeps PREACCEPTED or PREACCEPTED_EQ. Does any decision depend on an accepted record carrying status ACCEPTED: can a later PreAccept for the same instance overwrite the accepted attributes because handlePreAccept's >= ACCEPTED guard cannot fire, and can a recovery that should re-accept an already accepted value instead take the phase-1 restart path because handlePrepareReply's sub-case 2 needs a reply whose Status is ACCEPTED?",
+    "importance": "An acceptor that stores accepted attributes without recording that it accepted them can (a) have those attributes recomputed by a later PreAccept at the same or a higher ballot instead of being preserved, and (b) hide from a recovering leader the fact that the value reached the accept phase, which is the distinction between re-proposing the accepted value and starting a fresh phase 1. Either effect can change the value a majority eventually commits for the instance, which is agreement-relevant rather than cosmetic; the accept phase is also the only place where a value is fixed without commands being stored, so a wrong reconstruction can also drop a command that only some replicas hold.",
+    "source_ids": [
+      "S11-handleAccept",
+      "S9-handlePreAccept",
+      "S17-find-conflicts",
+      "S15-handlePrepareReply",
+      "S10-handlePreAcceptReply",
+      "S12-handleAcceptReply",
+      "S13-handleCommit",
+      "S2-instance-bookkeeping",
+      "S5-broadcasters",
+      "S7-attributes",
+      "S8-handlePropose-startPhase1",
+      "S14-recovery-start-prepare",
+      "S19-durable-record",
+      "S21-quorum-sizes",
+      "S24-runReplica-epaxos",
+      "S4-execute-loop",
+      "S20-exec"
+    ],
+    "participants": [
+      "instance leader that broadcasts Accept and counts AcceptReply",
+      "acceptor in the accept quorum that did not receive the earlier PreAccept",
+      "recovering replica that later runs prepare for the same instance"
+    ],
+    "objects": [
+      "Instance.Status, Instance.bal, Instance.vbal, Instance.Seq, Instance.Deps, Instance.Cmds",
+      "LeaderBookkeeping.status, preAcceptOKs, acceptOKs"
+    ],
+    "contexts": [
+      "slow path of a proposal: leader records ACCEPTED, acceptors store attributes only",
+      "accept-only acceptor: no PreAccept was delivered because the alive peer set changed between bcastPreAccept and bcastAccept",
+      "recovery of the instance after the leader stops before the Commit broadcast"
+    ],
+    "event_paths": [
+      "leader sends Accept with (Seq, Deps, Ballot) to the accept quorum",
+      "acceptor stores Seq, Deps, bal and vbal and replies with its bal, leaving Status unchanged",
+      "a later PreAccept for the same instance arrives at that acceptor and handlePreAccept decides between the status >= ACCEPTED guard and recomputing attributes",
+      "a recovering replica runs prepare and the accept-only acceptor's reply carries Status NONE together with the accepted vbal"
+    ],
+    "activity_classes": [
+      "A2"
+    ],
+    "behavior_ids": [
+      "B5-slow-path-accept"
+    ],
+    "fact_ids": [
+      "F1-instance-record"
+    ],
+    "supporting_behavior_ids": {
+      "B11-prepare-resolution": "shows the status-based sub-case dispatch, including sub-case 2 (lb.status == ACCEPTED) and the highest-vbal value selection that decides whether the accepted value is re-proposed",
+      "B3-preaccept-recipient": "shows the >= ACCEPTED guard and the attribute recomputation that the guard is supposed to skip",
+      "B4-fast-path-decision": "shows the leader-side accept branch that does record ACCEPTED, which is the only place the status is produced today",
+      "B12-try-preaccept": "shows that the one other status-based shortcut in findPreAcceptConflicts is inside a path that is now known to be unreachable"
+    },
+    "obligation_relation_kind": "preservation",
+    "priority": 2,
+    "counterevidence": [
+      "scoped to the accept-phase record: I found no read path that both sets an accepted status on an acceptor and stores accept-phase attributes; the leader-side accept branch does set inst.Status = ACCEPTED together with inst.Cmds and the merged attributes, so recovery sub-case 2 is reachable through a recovering replica's own record even though acceptors never report it (S10-handlePreAcceptReply, S11-handleAccept, S15-handlePrepareReply)",
+      "scoped to ordering: bcastPreAccept and bcastAccept select peers from the same PreferredPeerOrder prefix, so with an unchanged alive set the accept quorum's peers also received the PreAccept and hold the command; an accept-only acceptor requires the alive set to change between the two broadcasts (S5-broadcasters, S4-execute-loop)",
+      "scoped to status use: findPreAcceptConflicts' Status >= ACCEPTED shortcut is unreachable because its only caller is the dead TryPreAccept path, so the omission cannot change that decision (S17-find-conflicts, S15-handlePrepareReply)",
+      "scoped to the code comment: the comment near handlePreAccept's branch says accepted or committed records must not regress to PREACCEPTED, which shows the intent but is not a normative requirement by itself (S9-handlePreAccept)"
+    ],
+    "unknowns": [
+      "whether a later PreAccept can reach an accept-only acceptor at the same ballot as its Accept, which is what a downgrade of accepted attributes to PREACCEPTED/PREACCEPTED_EQ would require (S11-handleAccept, S9-handlePreAccept, S5-broadcasters)",
+      "whether the missing accepted status changes the value a recovery reconstructs: an accept-only acceptor's reply carries the accepted vbal but Status NONE and no command, so the highest-vbal selection may take a command-less record and the resolution may fall to the phase-1 restart instead of re-accepting the accepted attributes (S15-handlePrepareReply, S14-recovery-start-prepare)",
+      "whether the intended acceptor discipline is external to this snapshot, since no in-repository caller other than the guards above distinguishes ACCEPTED from PREACCEPTED (S2-instance-bookkeeping, S11-handleAccept)"
+    ],
+    "trigger_rationale": "Source reading of the accept path shows the transition is absent: handleAccept writes Deps, Seq, bal and vbal and never Status, while the same handler family elsewhere records status transitions (handlePreAccept sets PREACCEPTED/PREACCEPTED_EQ, handleCommit sets COMMITTED, the leader-side accept branch sets ACCEPTED). Two guards and one recovery sub-case are written as if an acceptor could report ACCEPTED, so the omission is a sourced discrepancy with an unresolved effect; the discriminator is whether a legal history can reach an accept-only acceptor and then have its accepted attributes recomputed or its accepted value reconstructed differently."
+  },
+  "feedback": {
+    "ref_ids": [
+      "B5-slow-path-accept",
+      "B3-preaccept-recipient",
+      "B11-prepare-resolution",
+      "F1-instance-record",
+      "S11-handleAccept",
+      "S9-handlePreAccept",
+      "S15-handlePrepareReply",
+      "S17-find-conflicts",
+      "S5-broadcasters"
+    ],
+    "answered": "The two reachability questions carried from the previous products are disposed: the TryPreAccept machinery is unreachable dead code (identical guards for sub-cases 3 and 4, and bcastTryPreAccept's only call site is the dead sub-case), so findPreAcceptConflicts' Status >= ACCEPTED shortcut and the possibleQuorum counting error cannot affect any decision; and the N <= 3 Thrifty equality exemption is explained for an owner-led instance by the dominance structure of updateAttributes plus mergeAttributes' row exception.",
+    "remaining": [
+      "whether an accept-only acceptor (accept quorum member that never received the PreAccept) can have its accepted attributes recomputed by a later PreAccept, since handlePreAccept's guard cannot see the acceptance (S11-handleAccept, S9-handlePreAccept)",
+      "whether that missing status changes which value a recovery re-proposes, because an accept-only acceptor reports the accepted vbal together with Status NONE and no command (S15-handlePrepareReply)",
+      "whether the residual recovery-led row-component gap of the N <= 3 exemption needs a restarted leader to become reachable (S19-durable-record, S24-runReplica-epaxos)"
+    ],
+    "rationale": "The new Candidate is grounded in a sourced discrepancy inside the slow path and is kept to one responsibility: the acceptor's record of an accepted value. Its supporting behaviours are named so the guards and the recovery dispatch that presuppose the status stay visible, and the counterevidence already excludes the one status shortcut that is unreachable, so the open question is specifically about accept-only acceptors and recovery. No map object is changed by this product, so the map's B5 unknown continues to describe the same premise at the level recorded there.",
+    "understanding": "updated",
+    "question_updates": {}
+  }
+}

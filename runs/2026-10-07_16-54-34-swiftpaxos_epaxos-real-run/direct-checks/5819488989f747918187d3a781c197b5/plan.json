@@ -1,0 +1,115 @@
+{
+  "description": "Discriminator: a leader in ACCEPTED state at ballot 3 receives an AcceptReply with ballot 5 from a peer that has promised a higher ballot. Prefix: the harness builds the leader's round with the reviewed constructors and calls the real handleAcceptReply. Controls: the events print the round's ballot and status, then the reply ballot together with the nack count, accept count, whether any message was emitted and the status after the call.",
+  "claim_id": "C7-accept-reply-higher-ballot-is-a-rejection",
+  "binding_ids": [
+    "BB8-accept-reply"
+  ],
+  "harness": {
+    "execution_package": "./epaxos",
+    "files": {},
+    "kind": "go_test",
+    "source": "package epaxos\n\n// Exploration harness: a leader in the ACCEPTED phase of instance (1,0) receives an\n// AcceptReply whose ballot is higher than the ballot it is using. The handler has a branch\n// for that case (count a nack, and re-prepare once a majority nacks). The harness reports\n// what the real handler does with the reply.\n\nimport (\n\t\"bufio\"\n\t\"bytes\"\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"sync\"\n\t\"testing\"\n\n\t\"github.com/imdea-software/swiftpaxos/dlog\"\n\t\"github.com/imdea-software/swiftpaxos/replica\"\n\t\"github.com/imdea-software/swiftpaxos/replica/defs\"\n\tfastrpc \"github.com/imdea-software/swiftpaxos/rpc\"\n\t\"github.com/imdea-software/swiftpaxos/state\"\n)\n\nfunc nev2(m map[string]any) {\n\tb, _ := json.Marshal(m)\n\tfmt.Println(\"CA_EVENT \" + string(b))\n}\n\nfunc newAcceptNode() *Replica {\n\tw := make([]*bufio.Writer, 3)\n\tbufs := make([]*bytes.Buffer, 3)\n\tfor i := range w {\n\t\tbufs[i] = &bytes.Buffer{}\n\t\tw[i] = bufio.NewWriter(bufs[i])\n\t}\n\tbase := &replica.Replica{\n\t\tLogger: dlog.New(\"\", false), N: 3, F: 1, Id: 0, Alias: \"r0\",\n\t\tPeerAddrList: []string{\"a\", \"b\", \"c\"}, PeerWriters: w,\n\t\tState: state.InitState(), Stats: &defs.Stats{M: map[string]int{}},\n\t\tAlive: []bool{true, true, true}, PreferredPeerOrder: []int32{1, 2, 0},\n\t\tProposeChan: make(chan *defs.GPropose, 8), RPC: fastrpc.NewTableId(defs.RPC_TABLE),\n\t\tThrifty: true, Dreply: true,\n\t}\n\tr := &Replica{\n\t\tReplica: base,\n\t\tprepareChan:           make(chan fastrpc.Serializable, 4),\n\t\tpreAcceptChan:         make(chan fastrpc.Serializable, 4),\n\t\tacceptChan:            make(chan fastrpc.Serializable, 4),\n\t\tcommitChan:            make(chan fastrpc.Serializable, 4),\n\t\tprepareReplyChan:      make(chan fastrpc.Serializable, 4),\n\t\tpreAcceptReplyChan:    make(chan fastrpc.Serializable, 4),\n\t\tpreAcceptOKChan:       make(chan fastrpc.Serializable, 4),\n\t\tacceptReplyChan:       make(chan fastrpc.Serializable, 4),\n\t\ttryPreAcceptChan:      make(chan fastrpc.Serializable, 4),\n\t\ttryPreAcceptReplyChan: make(chan fastrpc.Serializable, 4),\n\t\tInstanceSpace:         make([][]*Instance, 3),\n\t\tcrtInstance:           make([]int32, 3),\n\t\tCommittedUpTo:         make([]int32, 3),\n\t\tExecedUpTo:            make([]int32, 3),\n\t\tconflicts:             make([]map[state.Key]*InstPair, 3),\n\t\tmaxSeqPerKey:          make(map[state.Key]int32),\n\t\tclientMutex:           new(sync.Mutex),\n\t\tinstancesToRecover:    make(chan *instanceId, 4),\n\t\tmaxRecvBallot:         -1,\n\t\tIsLeader:              true,\n\t}\n\tfor i := 0; i < 3; i++ {\n\t\tr.InstanceSpace[i] = make([]*Instance, 8)\n\t\tr.crtInstance[i], r.CommittedUpTo[i], r.ExecedUpTo[i] = -1, -1, -1\n\t\tr.conflicts[i] = make(map[state.Key]*InstPair)\n\t}\n\tr.prepareRPC = r.RPC.Register(new(Prepare), r.prepareChan)\n\tr.prepareReplyRPC = r.RPC.Register(new(PrepareReply), r.prepareReplyChan)\n\tr.preAcceptRPC = r.RPC.Register(new(PreAccept), r.preAcceptChan)\n\tr.preAcceptReplyRPC = r.RPC.Register(new(PreAcceptReply), r.preAcceptReplyChan)\n\tr.acceptRPC = r.RPC.Register(new(Accept), r.acceptChan)\n\tr.acceptReplyRPC = r.RPC.Register(new(AcceptReply), r.acceptReplyChan)\n\tr.commitRPC = r.RPC.Register(new(Commit), r.commitChan)\n\tr.tryPreAcceptRPC = r.RPC.Register(new(TryPreAccept), r.tryPreAcceptChan)\n\tr.tryPreAcceptReplyRPC = r.RPC.Register(new(TryPreAcceptReply), r.tryPreAcceptReplyChan)\n\treturn r\n}\n\nfunc TestAssuranceAcceptReplyHigherBallot(t *testing.T) {\n\tr := newAcceptNode()\n\towner, inst := int32(1), int32(0)\n\tround := int32(3)\n\n\t// The leader is in the accept phase for (1,0) at ballot 3.\n\tin := r.newInstance(owner, inst, []state.Command{{Op: state.PUT, K: state.Key(5), V: state.Value([]byte{1})}},\n\t\tround, round, ACCEPTED, 1, []int32{-1, -1, -1})\n\tin.lb = r.newLeaderBookkeeping(nil, r.newNilDeps(), r.newNilDeps(), r.newNilDeps(), round, in.Cmds, ACCEPTED, 1)\n\tr.InstanceSpace[owner][inst] = in\n\tnev2(map[string]any{\"event\": \"leader_round\", \"instance\": \"1.0\", \"last_tried_ballot\": round,\n\t\t\"status\": int(in.lb.status), \"is_leader\": r.IsLeader})\n\n\t// A peer that has promised a higher ballot answers the accept round.\n\tr.handleAcceptReply(&AcceptReply{Replica: owner, Instance: inst, Ballot: round + 2})\n\tafter := r.InstanceSpace[owner][inst]\n\tnev2(map[string]any{\"event\": \"accept_reply_higher_ballot\", \"instance\": \"1.0\",\n\t\t\"reply_ballot\": round + 2, \"nacks\": after.lb.nacks, \"accept_oks\": after.lb.acceptOKs,\n\t\t\"prepare_sent\": r.PeerWriters[1].Buffered() > 0 || r.PeerWriters[2].Buffered() > 0,\n\t\t\"status_after\": int(after.lb.status)})\n}\n",
+    "description": "In-package Go test that prepares an ACCEPTED leader round and delivers one higher-ballot AcceptReply to the real handler, reporting the counters and any emitted message.",
+    "semantic_changes": [
+      "harness-only scaffolding: the Replica is constructed in-package with buffer peer writers, the round is built with the package's own instance and bookkeeping constructors, and the reply is delivered directly to the handler",
+      "the reply is the value handleAccept produces for a peer with a higher stored bal; no protocol code is modified"
+    ],
+    "prerequisites": [
+      {
+        "alias": "accept_round",
+        "event": "leader_round",
+        "conditions": [
+          {
+            "field": "status",
+            "op": "eq",
+            "value": 3,
+            "reference": null
+          },
+          {
+            "field": "last_tried_ballot",
+            "op": "eq",
+            "value": 3,
+            "reference": null
+          }
+        ]
+      }
+    ],
+    "legality": {
+      "source_ids": [
+        "S12-handleAcceptReply",
+        "S11-handleAccept"
+      ],
+      "expectation_ids": [],
+      "binding_ids": [
+        "BB8-accept-reply"
+      ],
+      "derivation": "Both sides are the implementation's own: the round is the state a leader reaches after the accept branch, and the reply is what handleAccept sends when its bal exceeds the accept ballot.",
+      "applicability": "N=3, Thrifty, IsLeader true, one reply.",
+      "unresolved": [
+        "the timeout-driven recovery path is not exercised"
+      ],
+      "conflicts": [],
+      "alternatives": []
+    }
+  },
+  "monitors": [
+    {
+      "id": "M1-accept-reply",
+      "checker_id": "CH1-accept-reply",
+      "event": "accept_reply_higher_ballot",
+      "binding_ids": [
+        "BB8-accept-reply"
+      ],
+      "grounding": {
+        "source_ids": [
+          "S12-handleAcceptReply"
+        ],
+        "expectation_ids": [],
+        "binding_ids": [
+          "BB8-accept-reply"
+        ],
+        "derivation": "The event reports the rejection counters and whether the leader reacted, which is the branch's own duty.",
+        "applicability": "The leader was in the accept phase and the reply's ballot exceeded the round's.",
+        "unresolved": [],
+        "conflicts": [],
+        "alternatives": []
+      },
+      "applicability_conditions": [
+        {
+          "field": "instance",
+          "op": "eq",
+          "value": null,
+          "reference": "accept_round.instance"
+        }
+      ],
+      "admission_alias": "accept_round"
+    }
+  ],
+  "observable_properties": [
+    {
+      "checker_id": "CH1-accept-reply",
+      "kind": "event_assertion",
+      "trigger": {
+        "field": "event",
+        "op": "eq",
+        "value": "accept_reply_higher_ballot",
+        "reference": null
+      },
+      "assertion": {
+        "field": "nacks",
+        "op": "eq",
+        "value": 1,
+        "reference": null
+      },
+      "antecedent": null,
+      "identity_fields": [
+        "instance"
+      ],
+      "description": "A reply whose ballot exceeds the accept round's ballot must be recorded as one nack."
+    }
+  ],
+  "uncertainties": [
+    "the check does not exercise the timeout-driven recovery that can also advance the instance",
+    "the majority-nack consequence is not reached because the check delivers a single reply"
+  ]
+}

@@ -1,0 +1,110 @@
+{
+  "description": "Discriminator: a replica owning instance (0,0) whose record was created by a recovery-led PreAccept receives a legal NOOP Commit. Prefix: the harness runs the real handlePreAccept (creating the record without bookkeeping) and then the real handleCommit. Controls: the same events print whether bookkeeping was nil, the status after the PreAccept, whether the handler panicked, the panic value and whether the commit had any effect, so a mis-built record is visible.",
+  "claim_id": "C4-noop-commit-without-bookkeeping",
+  "binding_ids": [
+    "BB5-noop-commit"
+  ],
+  "harness": {
+    "execution_package": "./epaxos",
+    "files": {},
+    "kind": "go_test",
+    "source": "package epaxos\n\n// Exploration harness: a replica that owns instance (0,0) but holds a record created by a\n// message (no leader bookkeeping) receives a legal NOOP Commit for that instance, as a\n// recovering replica would broadcast after restarting phase 1 with NOOP. The handler runs\n// unmodified; the harness observes whether it panics instead of letting the test process die.\n\nimport (\n\t\"bufio\"\n\t\"bytes\"\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"sync\"\n\t\"testing\"\n\n\t\"github.com/imdea-software/swiftpaxos/dlog\"\n\t\"github.com/imdea-software/swiftpaxos/replica\"\n\t\"github.com/imdea-software/swiftpaxos/replica/defs\"\n\tfastrpc \"github.com/imdea-software/swiftpaxos/rpc\"\n\t\"github.com/imdea-software/swiftpaxos/state\"\n)\n\nfunc nev(m map[string]any) {\n\tb, _ := json.Marshal(m)\n\tfmt.Println(\"CA_EVENT \" + string(b))\n}\n\nfunc newNoopNode() *Replica {\n\tbase := &replica.Replica{\n\t\tLogger:             dlog.New(\"\", false),\n\t\tN:                  3,\n\t\tF:                  1,\n\t\tId:                 0,\n\t\tAlias:              \"r0\",\n\t\tPeerAddrList:       []string{\"a\", \"b\", \"c\"},\n\t\tState:              state.InitState(),\n\t\tStats:              &defs.Stats{M: map[string]int{}},\n\t\tAlive:              []bool{true, true, true},\n\t\tPreferredPeerOrder: []int32{1, 2, 0},\n\t\tProposeChan:        make(chan *defs.GPropose, 8),\n\t\tRPC:                fastrpc.NewTableId(defs.RPC_TABLE),\n\t\tThrifty:            true,\n\t\tDreply:             true,\n\t}\n\tw := make([]*bufio.Writer, 3)\n\tfor i := range w {\n\t\tw[i] = bufio.NewWriter(&bytes.Buffer{})\n\t}\n\tbase.PeerWriters = w\n\tr := &Replica{\n\t\tReplica:               base,\n\t\tprepareChan:           make(chan fastrpc.Serializable, 4),\n\t\tpreAcceptChan:         make(chan fastrpc.Serializable, 4),\n\t\tacceptChan:            make(chan fastrpc.Serializable, 4),\n\t\tcommitChan:            make(chan fastrpc.Serializable, 4),\n\t\tprepareReplyChan:      make(chan fastrpc.Serializable, 4),\n\t\tpreAcceptReplyChan:    make(chan fastrpc.Serializable, 4),\n\t\tpreAcceptOKChan:       make(chan fastrpc.Serializable, 4),\n\t\tacceptReplyChan:       make(chan fastrpc.Serializable, 4),\n\t\ttryPreAcceptChan:      make(chan fastrpc.Serializable, 4),\n\t\ttryPreAcceptReplyChan: make(chan fastrpc.Serializable, 4),\n\t\tInstanceSpace:         make([][]*Instance, 3),\n\t\tcrtInstance:           make([]int32, 3),\n\t\tCommittedUpTo:         make([]int32, 3),\n\t\tExecedUpTo:            make([]int32, 3),\n\t\tconflicts:             make([]map[state.Key]*InstPair, 3),\n\t\tmaxSeqPerKey:          make(map[state.Key]int32),\n\t\tclientMutex:           new(sync.Mutex),\n\t\tinstancesToRecover:    make(chan *instanceId, 4),\n\t\tmaxRecvBallot:         -1,\n\t}\n\tfor i := 0; i < 3; i++ {\n\t\tr.InstanceSpace[i] = make([]*Instance, 8)\n\t\tr.crtInstance[i], r.CommittedUpTo[i], r.ExecedUpTo[i] = -1, -1, -1\n\t\tr.conflicts[i] = make(map[state.Key]*InstPair)\n\t}\n\tr.prepareRPC = r.RPC.Register(new(Prepare), r.prepareChan)\n\tr.prepareReplyRPC = r.RPC.Register(new(PrepareReply), r.prepareReplyChan)\n\tr.preAcceptRPC = r.RPC.Register(new(PreAccept), r.preAcceptChan)\n\tr.preAcceptReplyRPC = r.RPC.Register(new(PreAcceptReply), r.preAcceptReplyChan)\n\tr.acceptRPC = r.RPC.Register(new(Accept), r.acceptChan)\n\tr.acceptReplyRPC = r.RPC.Register(new(AcceptReply), r.acceptReplyChan)\n\tr.commitRPC = r.RPC.Register(new(Commit), r.commitChan)\n\tr.tryPreAcceptRPC = r.RPC.Register(new(TryPreAccept), r.tryPreAcceptChan)\n\tr.tryPreAcceptReplyRPC = r.RPC.Register(new(TryPreAcceptReply), r.tryPreAcceptReplyChan)\n\treturn r\n}\n\nfunc TestAssuranceNoopCommitWithoutBookkeeping(t *testing.T) {\n\tr := newNoopNode()\n\towner, inst := int32(0), int32(0)\n\n\t// The record exists because a message created it (a recovery-led PreAccept reached this\n\t// replica after it restarted): newInstanceDefault leaves leader bookkeeping nil.\n\tpa := &PreAccept{LeaderId: 1, Replica: owner, Instance: inst, Ballot: 3,\n\t\tCommand: []state.Command{{Op: state.PUT, K: state.Key(5), V: state.Value([]byte{7})}}, Seq: 1,\n\t\tDeps: []int32{-1, -1, -1}}\n\tr.handlePreAccept(pa)\n\trec := r.InstanceSpace[owner][inst]\n\tnev(map[string]any{\"event\": \"record_from_message\", \"instance\": \"0.0\",\n\t\t\"bookkeeping_nil\": rec.lb == nil, \"status\": int(rec.Status), \"has_command\": len(rec.Cmds) > 0})\n\n\t// The recovering replica commits instance (0,0) as a NOOP and broadcasts it; this replica\n\t// owns the instance, so handleCommit takes the re-proposal branch.\n\tcommit := &Commit{LeaderId: 1, Replica: owner, Instance: inst, Ballot: 4,\n\t\tCommand: []state.Command{{Op: state.NONE, K: 0, V: state.NIL()}}, Seq: 0, Deps: []int32{-1, -1, -1}}\n\n\tpanicked := false\n\tvar panicValue string\n\tfunc() {\n\t\tdefer func() {\n\t\t\tif v := recover(); v != nil {\n\t\t\t\tpanicked = true\n\t\t\t\tpanicValue = fmt.Sprint(v)\n\t\t\t}\n\t\t}()\n\t\tr.handleCommit(commit)\n\t}()\n\n\tafter := r.InstanceSpace[owner][inst]\n\tstatusAfter := int(after.Status)\n\tnev(map[string]any{\"event\": \"handle_commit_result\", \"instance\": \"0.0\", \"panicked\": panicked,\n\t\t\"panic_value\": panicValue, \"instance_status_after\": statusAfter,\n\t\t\"no_effect\": statusAfter != int(COMMITTED)})\n}\n",
+    "description": "In-package Go test that creates the message-made record with the real handler and then delivers a legal NOOP Commit, recovering the panic so the observation is reported instead of killing the test process.",
+    "semantic_changes": [
+      "harness-only scaffolding: the Replica is constructed in-package, peer writers are buffers, and the two handlers are called directly; the handlers are unmodified",
+      "the harness wraps the commit delivery in recover() purely to observe a panic; production runs the handler inside the run loop where no recover exists"
+    ],
+    "prerequisites": [
+      {
+        "alias": "message_record",
+        "event": "record_from_message",
+        "conditions": [
+          {
+            "field": "bookkeeping_nil",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          }
+        ]
+      }
+    ],
+    "legality": {
+      "source_ids": [
+        "S13-handleCommit",
+        "S9-handlePreAccept",
+        "S15-handlePrepareReply"
+      ],
+      "expectation_ids": [],
+      "binding_ids": [
+        "BB5-noop-commit"
+      ],
+      "derivation": "Both messages are the ones the protocol sends for a recovery-led NOOP: a PreAccept at the recovery ballot and the Commit for the resulting instance.",
+      "applicability": "One instance, one commit, direct handler calls.",
+      "unresolved": [
+        "the production dispatcher's treatment of a panicking handler is not modelled"
+      ],
+      "conflicts": [],
+      "alternatives": []
+    }
+  },
+  "monitors": [
+    {
+      "id": "M1-noop-commit",
+      "checker_id": "CH1-noop-commit",
+      "event": "handle_commit_result",
+      "binding_ids": [
+        "BB5-noop-commit"
+      ],
+      "grounding": {
+        "source_ids": [
+          "S13-handleCommit"
+        ],
+        "expectation_ids": [],
+        "binding_ids": [
+          "BB5-noop-commit"
+        ],
+        "derivation": "The event reports whether the handler panicked and whether the commit had an effect, which is the observable form of the duty.",
+        "applicability": "The record existed without bookkeeping and the commit was well formed.",
+        "unresolved": [],
+        "conflicts": [],
+        "alternatives": []
+      },
+      "applicability_conditions": [
+        {
+          "field": "instance",
+          "op": "eq",
+          "value": null,
+          "reference": "message_record.instance"
+        }
+      ],
+      "admission_alias": "message_record"
+    }
+  ],
+  "observable_properties": [
+    {
+      "checker_id": "CH1-noop-commit",
+      "kind": "event_assertion",
+      "trigger": {
+        "field": "event",
+        "op": "eq",
+        "value": "handle_commit_result",
+        "reference": null
+      },
+      "assertion": {
+        "field": "panicked",
+        "op": "eq",
+        "value": false,
+        "reference": null
+      },
+      "antecedent": null,
+      "identity_fields": [
+        "instance"
+      ],
+      "description": "Delivering a legal NOOP commit for an instance the replica owns must not terminate the handler."
+    }
+  ],
+  "uncertainties": [
+    "the harness observes the panic rather than the replica process terminating, since the run loop is not driven",
+    "the client-side and history sides of the NOOP recovery are outside this check"
+  ]
+}

@@ -1,0 +1,116 @@
+{
+  "description": "Discriminator: with the transitive-skip flag on, does executing a committed instance whose command commutes with its uncommitted dependency succeed, or does it wait for that dependency as if the flag were off? Prefix: the harness builds the two records with the package's own constructors and calls the executor's entry for the committed instance. Controls: the prerequisite prints the flag, both statuses and that the two commands commute, and the result prints whether execution happened and the statuses afterwards.",
+  "claim_id": "C12-transitive-skip-executes-commuting-command",
+  "binding_ids": [
+    "BB13-transconf"
+  ],
+  "harness": {
+    "execution_package": "./epaxos",
+    "files": {},
+    "kind": "go_test",
+    "source": "package epaxos\n\n// Exploration harness: the executor has a branch for transitive conflicts, gated on the\n// transconf flag, whose stated purpose is to skip waiting for prior commands that commute\n// with the instance being executed. The harness builds exactly that situation - a committed\n// instance whose dependency is an uncommitted command on a different key - with the flag on\n// and asks the real executor to run it.\n\nimport (\n\t\"bufio\"\n\t\"bytes\"\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"sync\"\n\t\"testing\"\n\n\t\"github.com/imdea-software/swiftpaxos/dlog\"\n\t\"github.com/imdea-software/swiftpaxos/replica\"\n\t\"github.com/imdea-software/swiftpaxos/replica/defs\"\n\tfastrpc \"github.com/imdea-software/swiftpaxos/rpc\"\n\t\"github.com/imdea-software/swiftpaxos/state\"\n)\n\nfunc xev(m map[string]any) {\n\tb, _ := json.Marshal(m)\n\tfmt.Println(\"CA_EVENT \" + string(b))\n}\n\nfunc transconfNode() *Replica {\n\tw := make([]*bufio.Writer, 3)\n\tfor i := range w {\n\t\tw[i] = bufio.NewWriter(&bytes.Buffer{})\n\t}\n\tbase := &replica.Replica{\n\t\tLogger: dlog.New(\"\", false), N: 3, F: 1, Id: 0, Alias: \"r0\",\n\t\tPeerAddrList: []string{\"a\", \"b\", \"c\"}, PeerWriters: w,\n\t\tState: state.InitState(), Stats: &defs.Stats{M: map[string]int{}},\n\t\tAlive: []bool{true, true, true}, PreferredPeerOrder: []int32{1, 2, 0},\n\t\tProposeChan: make(chan *defs.GPropose, 8), RPC: fastrpc.NewTableId(defs.RPC_TABLE),\n\t\tThrifty: true, Dreply: true, Exec: true,\n\t}\n\tr := &Replica{\n\t\tReplica: base,\n\t\tprepareChan: make(chan fastrpc.Serializable, 4), preAcceptChan: make(chan fastrpc.Serializable, 4),\n\t\tacceptChan: make(chan fastrpc.Serializable, 4), commitChan: make(chan fastrpc.Serializable, 4),\n\t\tprepareReplyChan: make(chan fastrpc.Serializable, 4), preAcceptReplyChan: make(chan fastrpc.Serializable, 4),\n\t\tpreAcceptOKChan: make(chan fastrpc.Serializable, 4), acceptReplyChan: make(chan fastrpc.Serializable, 4),\n\t\ttryPreAcceptChan: make(chan fastrpc.Serializable, 4), tryPreAcceptReplyChan: make(chan fastrpc.Serializable, 4),\n\t\tInstanceSpace: make([][]*Instance, 3), crtInstance: make([]int32, 3),\n\t\tCommittedUpTo: make([]int32, 3), ExecedUpTo: make([]int32, 3),\n\t\tconflicts: make([]map[state.Key]*InstPair, 3), maxSeqPerKey: make(map[state.Key]int32),\n\t\tclientMutex: new(sync.Mutex), instancesToRecover: make(chan *instanceId, 8),\n\t\tmaxRecvBallot: -1, transconf: true,\n\t}\n\tfor i := 0; i < 3; i++ {\n\t\tr.InstanceSpace[i] = make([]*Instance, 8)\n\t\tr.crtInstance[i], r.CommittedUpTo[i], r.ExecedUpTo[i] = -1, -1, -1\n\t\tr.conflicts[i] = make(map[state.Key]*InstPair)\n\t}\n\tr.prepareRPC = r.RPC.Register(new(Prepare), r.prepareChan)\n\tr.prepareReplyRPC = r.RPC.Register(new(PrepareReply), r.prepareReplyChan)\n\tr.preAcceptRPC = r.RPC.Register(new(PreAccept), r.preAcceptChan)\n\tr.preAcceptReplyRPC = r.RPC.Register(new(PreAcceptReply), r.preAcceptReplyChan)\n\tr.acceptRPC = r.RPC.Register(new(Accept), r.acceptChan)\n\tr.acceptReplyRPC = r.RPC.Register(new(AcceptReply), r.acceptReplyChan)\n\tr.commitRPC = r.RPC.Register(new(Commit), r.commitChan)\n\tr.tryPreAcceptRPC = r.RPC.Register(new(TryPreAccept), r.tryPreAcceptChan)\n\tr.tryPreAcceptReplyRPC = r.RPC.Register(new(TryPreAcceptReply), r.tryPreAcceptReplyChan)\n\treturn r\n}\n\nfunc TestAssuranceTransitiveCommutingDependency(t *testing.T) {\n\tr := transconfNode()\n\tk1 := state.Key(101)\n\tk2 := state.Key(202)\n\t// Row 1 holds an uncommitted command on k1; row 0's instance is committed with a\n\t// dependency on it, but its own command touches k2 only, so the two commute.\n\tr.InstanceSpace[1][0] = &Instance{\n\t\tCmds: []state.Command{{Op: state.PUT, K: k1, V: state.Value([]byte{1})}},\n\t\tbal: 0, vbal: 0, Status: PREACCEPTED, Seq: 0, Deps: []int32{-1, -1, -1},\n\t\tid: &instanceId{1, 0},\n\t}\n\tr.InstanceSpace[0][0] = &Instance{\n\t\tCmds: []state.Command{{Op: state.PUT, K: k2, V: state.Value([]byte{2})}},\n\t\tbal: 0, vbal: 0, Status: COMMITTED, Seq: 0,\n\t\tDeps: []int32{-1, 0, -1}, id: &instanceId{0, 0},\n\t}\n\tr.crtInstance[1], r.crtInstance[0] = 0, 0\n\txev(map[string]any{\"event\": \"transconf_prepared\", \"transconf\": r.transconf,\n\t\t\"dependency_status\": int(r.InstanceSpace[1][0].Status),\n\t\t\"executing_status\":  int(r.InstanceSpace[0][0].Status),\n\t\t\"commands_commute\": !state.Conflict(&r.InstanceSpace[1][0].Cmds[0], &r.InstanceSpace[0][0].Cmds[0])})\n\n\tr.exec = &Exec{r}\n\texecuted := r.exec.executeCommand(0, 0)\n\txev(map[string]any{\"event\": \"transconf_execution\", \"executed\": executed,\n\t\t\"status_after\":      int(r.InstanceSpace[0][0].Status),\n\t\t\"dependency_status\": int(r.InstanceSpace[1][0].Status)})\n}\n",
+    "description": "In-package Go test that prepares a commuting uncommitted dependency and asks the real executor to run the committed instance with the flag set.",
+    "semantic_changes": [
+      "harness-only scaffolding: the Replica is constructed in-package with the flag set and the two records are built directly with the package's types",
+      "the harness calls the executor entry directly instead of the execution loop"
+    ],
+    "prerequisites": [
+      {
+        "alias": "transconf_case",
+        "event": "transconf_prepared",
+        "conditions": [
+          {
+            "field": "transconf",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          },
+          {
+            "field": "commands_commute",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          }
+        ]
+      }
+    ],
+    "legality": {
+      "source_ids": [
+        "S45-transconf-block",
+        "S46-transconf-doc",
+        "S47-run-transconf"
+      ],
+      "expectation_ids": [],
+      "binding_ids": [
+        "BB13-transconf"
+      ],
+      "derivation": "The flag is set exactly as a caller would through epaxos.New, and the records are the states a replica reaches (one committed with a dependency on one uncommitted instance).",
+      "applicability": "One replica, two records, flag on.",
+      "unresolved": [
+        "the soundness of skipping is out of scope"
+      ],
+      "conflicts": [],
+      "alternatives": []
+    }
+  },
+  "monitors": [
+    {
+      "id": "M1-transconf",
+      "checker_id": "CH1-transconf",
+      "event": "transconf_execution",
+      "binding_ids": [
+        "BB13-transconf"
+      ],
+      "grounding": {
+        "source_ids": [
+          "S45-transconf-block"
+        ],
+        "expectation_ids": [],
+        "binding_ids": [
+          "BB13-transconf"
+        ],
+        "derivation": "The event reports whether the executor ran the instance and the statuses afterwards, which is the observable of the documented skipping.",
+        "applicability": "The flag was on and the commands commute.",
+        "unresolved": [],
+        "conflicts": [],
+        "alternatives": []
+      },
+      "applicability_conditions": [
+        {
+          "field": "dependency_status",
+          "op": "eq",
+          "value": null,
+          "reference": "transconf_case.dependency_status"
+        }
+      ],
+      "admission_alias": "transconf_case"
+    }
+  ],
+  "observable_properties": [
+    {
+      "checker_id": "CH1-transconf",
+      "kind": "event_assertion",
+      "trigger": {
+        "field": "event",
+        "op": "eq",
+        "value": "transconf_execution",
+        "reference": null
+      },
+      "assertion": {
+        "field": "executed",
+        "op": "eq",
+        "value": true,
+        "reference": null
+      },
+      "antecedent": null,
+      "identity_fields": [
+        "dependency_status"
+      ],
+      "description": "With transitive-conflict skipping enabled, execution must not wait for a prior command it commutes with."
+    }
+  ],
+  "uncertainties": [
+    "the check does not establish whether skipping is sound in general, only whether the documented behaviour occurs",
+    "the flag is false in the shipped configuration"
+  ]
+}

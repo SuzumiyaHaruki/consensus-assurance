@@ -1,0 +1,111 @@
+{
+  "action": "continue",
+  "candidate_id": "229322fc84e94259a5609cbcad40732d",
+  "rationale": "Resumes the paused accept-status Candidate with its proposition unchanged and sharper unknowns, now that the surrounding reachability questions are decided: the TryPreAccept path and its already-ACCEPTED shortcut are dead code, recovery sub-case 2 is reachable only through a recovering replica's own record, and the recovery value selection has been confirmed to commit a NOOP vector when it does not adopt a committed reply. That makes the accept-only acceptor's command-less reply at the accepted vbal the natural next discriminator rather than a variant of the closed recovery-vbal finding.",
+  "question": {
+    "audit_spec_version": 4,
+    "disposition": "concrete_suspicion",
+    "preferred_check": "source_review",
+    "question": "handleAccept stores Deps, Seq, bal and vbal for instance (Replica, Instance) and never writes inst.Status, so a replica in the accept quorum that never saw the PreAccept holds accepted attributes with Status NONE, and one that did see it keeps PREACCEPTED or PREACCEPTED_EQ. Does any decision depend on an accepted record carrying status ACCEPTED: can a later PreAccept for the same instance overwrite the accepted attributes because handlePreAccept's >= ACCEPTED guard cannot fire, and can a recovery that should re-accept an already accepted value instead take the phase-1 restart path because handlePrepareReply's sub-case 2 needs a reply whose Status is ACCEPTED?",
+    "importance": "An acceptor that stores accepted attributes without recording that it accepted them can (a) have those attributes recomputed by a later PreAccept at the same or a higher ballot instead of being preserved, and (b) hide from a recovering leader the fact that the value reached the accept phase, which is the distinction between re-proposing the accepted value and starting a fresh phase 1. Either effect can change the value a majority eventually commits for the instance, which is agreement-relevant rather than cosmetic; the accept phase is also the only place where a value is fixed without commands being stored, so a wrong reconstruction can also drop a command that only some replicas hold.",
+    "source_ids": [
+      "S11-handleAccept",
+      "S9-handlePreAccept",
+      "S17-find-conflicts",
+      "S15-handlePrepareReply",
+      "S10-handlePreAcceptReply",
+      "S12-handleAcceptReply",
+      "S13-handleCommit",
+      "S2-instance-bookkeeping",
+      "S5-broadcasters",
+      "S7-attributes",
+      "S8-handlePropose-startPhase1",
+      "S14-recovery-start-prepare",
+      "S19-durable-record",
+      "S21-quorum-sizes",
+      "S24-runReplica-epaxos",
+      "S4-execute-loop",
+      "S20-exec"
+    ],
+    "participants": [
+      "instance leader that broadcasts Accept and counts AcceptReply",
+      "acceptor in the accept quorum that did not receive the earlier PreAccept",
+      "recovering replica that later runs prepare for the same instance"
+    ],
+    "objects": [
+      "Instance.Status, Instance.bal, Instance.vbal, Instance.Seq, Instance.Deps, Instance.Cmds",
+      "LeaderBookkeeping.status, preAcceptOKs, acceptOKs"
+    ],
+    "contexts": [
+      "slow path of a proposal: leader records ACCEPTED, acceptors store attributes only",
+      "accept-only acceptor: no PreAccept was delivered because the alive peer set changed between bcastPreAccept and bcastAccept",
+      "recovery of the instance after the leader stops before the Commit broadcast"
+    ],
+    "event_paths": [
+      "leader sends Accept with (Seq, Deps, Ballot) to the accept quorum",
+      "acceptor stores Seq, Deps, bal and vbal and replies with its bal, leaving Status unchanged",
+      "a later PreAccept for the same instance arrives at that acceptor and handlePreAccept decides between the status >= ACCEPTED guard and recomputing attributes",
+      "a recovering replica runs prepare and the accept-only acceptor's reply carries Status NONE together with the accepted vbal"
+    ],
+    "activity_classes": [
+      "A2"
+    ],
+    "behavior_ids": [
+      "B5-slow-path-accept"
+    ],
+    "fact_ids": [
+      "F1-instance-record"
+    ],
+    "supporting_behavior_ids": {
+      "B11-prepare-resolution": "shows the status-based sub-case dispatch, including sub-case 2 (lb.status == ACCEPTED) and the highest-vbal value selection that decides whether the accepted value is re-proposed",
+      "B3-preaccept-recipient": "shows the >= ACCEPTED guard and the attribute recomputation that the guard is supposed to skip",
+      "B4-fast-path-decision": "shows the leader-side accept branch that does record ACCEPTED, which is the only place the status is produced today",
+      "B12-try-preaccept": "shows that the one other status-based shortcut in findPreAcceptConflicts is inside a path that is now known to be unreachable"
+    },
+    "obligation_relation_kind": "preservation",
+    "counterevidence": [
+      "scoped to the accept-phase record: I found no read path that both sets an accepted status on an acceptor and stores accept-phase attributes; the leader-side accept branch does set inst.Status = ACCEPTED together with inst.Cmds and the merged attributes, so recovery sub-case 2 is reachable through a recovering replica's own record even though acceptors never report it (S10-handlePreAcceptReply, S11-handleAccept, S15-handlePrepareReply)",
+      "scoped to ordering: bcastPreAccept and bcastAccept select peers from the same PreferredPeerOrder prefix, so with an unchanged alive set the accept quorum's peers also received the PreAccept and hold the command; an accept-only acceptor requires the alive set to change between the two broadcasts (S5-broadcasters, S4-execute-loop)",
+      "scoped to status use: findPreAcceptConflicts' Status >= ACCEPTED shortcut is unreachable because its only caller is the dead TryPreAccept path, so the omission cannot change that decision (S17-find-conflicts, S15-handlePrepareReply)",
+      "scoped to the code comment: the comment near handlePreAccept's branch says accepted or committed records must not regress to PREACCEPTED, which shows the intent but is not a normative requirement by itself (S9-handlePreAccept)"
+    ],
+    "unknowns": [
+      "whether a later PreAccept can reach an accept-only acceptor at the same ballot as its Accept, which is what a downgrade of accepted attributes to PREACCEPTED/PREACCEPTED_EQ would require (S11-handleAccept, S9-handlePreAccept, S5-broadcasters)",
+      "whether the missing accepted status changes the value a recovery reconstructs: an accept-only acceptor's reply carries the accepted vbal but Status NONE and no command, so the highest-vbal selection may take a command-less record and the resolution may fall to the phase-1 restart instead of re-accepting the accepted attributes (S15-handlePrepareReply, S14-recovery-start-prepare)",
+      "whether the intended acceptor discipline is external to this snapshot, since no in-repository caller other than the guards above distinguishes ACCEPTED from PREACCEPTED (S2-instance-bookkeeping, S11-handleAccept)"
+    ],
+    "priority": 2,
+    "trigger_rationale": "Source reading of the accept path shows the transition is absent: handleAccept writes Deps, Seq, bal and vbal and never Status, while the same handler family elsewhere records status transitions (handlePreAccept sets PREACCEPTED/PREACCEPTED_EQ, handleCommit sets COMMITTED, the leader-side accept branch sets ACCEPTED). Two guards and one recovery sub-case are written as if an acceptor could report ACCEPTED, so the omission is a sourced discrepancy with an unresolved effect; the discriminator is whether a legal history can reach an accept-only acceptor and then have its accepted attributes recomputed or its accepted value reconstructed differently."
+  },
+  "feedback": {
+    "ref_ids": [
+      "229322fc84e94259a5609cbcad40732d",
+      "B5-slow-path-accept",
+      "B3-preaccept-recipient",
+      "B11-prepare-resolution",
+      "F1-instance-record",
+      "S11-handleAccept",
+      "S15-handlePrepareReply",
+      "S17-find-conflicts"
+    ],
+    "answered": "Two premises that shaped this Candidate are settled. findPreAcceptConflicts' Status >= ACCEPTED shortcut cannot matter because its only caller is the unreachable TryPreAccept path, and recovery sub-case 2 can be reached only through the record of a replica that led the instance (the leader-side accept branch is the one place that stores ACCEPTED with the merged attributes), so an accept-only acceptor never reports an accepted status. Independently, the trusted checks for claim C1-recovery-adopts-committed-vector confirmed that the recovery value selection can end in a NOOP vector when it does not adopt a value another replica holds, which is the same outcome shape an accept-only acceptor's command-less reply would produce.",
+    "remaining": [
+      "whether an accept-only acceptor's command-less reply at the accepted vbal can be preferred over an equal-vbal reply carrying the value (S15-handlePrepareReply, S11-handleAccept)",
+      "whether the missing ACCEPTED transition changes any decision now that the only other status shortcut is dead code (S11-handleAccept, S9-handlePreAccept)",
+      "whether the intended acceptor status semantics are external to this snapshot (S2-instance-bookkeeping)",
+      "the work that would resume this question if it is paused again: a source fixing the intended acceptor status semantics, or an executed schedule in which an accept-only acceptor's reply is the last element at the accepted vbal"
+    ],
+    "rationale": "The Candidate is resumed on its original proposition so its basis is not reinterpreted; new material is recorded as refined unknowns and resume conditions, and the confirmed recovery finding is cited as an analogue rather than folded in.",
+    "understanding": "updated",
+    "question_updates": {
+      "229322fc84e94259a5609cbcad40732d": {
+        "unknowns": [
+          "whether the recovery value selection can prefer an accept-only acceptor's command-less reply at the accepted vbal over an equal-vbal reply that carries the value, given the last-element-at-or-above-the-running-maximum rule (S15-handlePrepareReply, S11-handleAccept)",
+          "whether the missing ACCEPTED transition affects any decision now that findPreAcceptConflicts' shortcut is unreachable, or whether it is observable only through that selection tie (S11-handleAccept, S17-find-conflicts)",
+          "whether the intended acceptor discipline is fixed by a source outside this snapshot (specification or reference implementation) (S2-instance-bookkeeping)"
+        ],
+        "resume_conditions": []
+      }
+    }
+  }
+}

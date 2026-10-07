@@ -1,0 +1,110 @@
+{
+  "description": "Discriminator: with recording enabled and the recovering replica's own row already holding a different instance at the same number, which record's metadata reaches the stable store when phase 1 starts for another replica's instance? Prefix: the harness seeds the own row with distinctive metadata (seq 0x33333333, status ACCEPTED) and calls the real startPhase1 for the owner's instance. Controls: the prerequisite prints the durability flag and the own row's seq and status, and the result prints the bytes written together with the recorded seq and status, the new instance's seq and the own row's seq.",
+  "claim_id": "C9-durable-recorder-uses-the-instance-row",
+  "binding_ids": [
+    "BB10-phase1-record"
+  ],
+  "harness": {
+    "execution_package": "./epaxos",
+    "files": {},
+    "kind": "go_test",
+    "source": "package epaxos\n\n// Exploration harness: with Durable enabled, a recovery-led phase 1 writes for an instance\n// owned by another replica. The recorder is called with r.InstanceSpace[r.Id][instance], the\n// recovering replica's own row, which need not hold that instance at all.\n\nimport (\n\t\"bufio\"\n\t\"bytes\"\n\t\"encoding/binary\"\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"os\"\n\t\"path/filepath\"\n\t\"sync\"\n\t\"testing\"\n\n\t\"github.com/imdea-software/swiftpaxos/dlog\"\n\t\"github.com/imdea-software/swiftpaxos/replica\"\n\t\"github.com/imdea-software/swiftpaxos/replica/defs\"\n\tfastrpc \"github.com/imdea-software/swiftpaxos/rpc\"\n\t\"github.com/imdea-software/swiftpaxos/state\"\n)\n\nfunc dev2(m map[string]any) {\n\tb, _ := json.Marshal(m)\n\tfmt.Println(\"CA_EVENT \" + string(b))\n}\n\nfunc durableNode(t *testing.T, f *os.File) *Replica {\n\tw := make([]*bufio.Writer, 3)\n\tfor i := range w {\n\t\tw[i] = bufio.NewWriter(&bytes.Buffer{})\n\t}\n\tbase := &replica.Replica{\n\t\tLogger: dlog.New(\"\", false), N: 3, F: 1, Id: 0, Alias: \"r0\",\n\t\tPeerAddrList: []string{\"a\", \"b\", \"c\"}, PeerWriters: w,\n\t\tState: state.InitState(), Stats: &defs.Stats{M: map[string]int{}},\n\t\tAlive: []bool{true, true, true}, PreferredPeerOrder: []int32{1, 2, 0},\n\t\tProposeChan: make(chan *defs.GPropose, 8), RPC: fastrpc.NewTableId(defs.RPC_TABLE),\n\t\tThrifty: true, Dreply: true, Durable: true, StableStore: f,\n\t}\n\tr := &Replica{\n\t\tReplica: base,\n\t\tprepareChan: make(chan fastrpc.Serializable, 4), preAcceptChan: make(chan fastrpc.Serializable, 4),\n\t\tacceptChan: make(chan fastrpc.Serializable, 4), commitChan: make(chan fastrpc.Serializable, 4),\n\t\tprepareReplyChan: make(chan fastrpc.Serializable, 4), preAcceptReplyChan: make(chan fastrpc.Serializable, 4),\n\t\tpreAcceptOKChan: make(chan fastrpc.Serializable, 4), acceptReplyChan: make(chan fastrpc.Serializable, 4),\n\t\ttryPreAcceptChan: make(chan fastrpc.Serializable, 4), tryPreAcceptReplyChan: make(chan fastrpc.Serializable, 4),\n\t\tInstanceSpace: make([][]*Instance, 3), crtInstance: make([]int32, 3),\n\t\tCommittedUpTo: make([]int32, 3), ExecedUpTo: make([]int32, 3),\n\t\tconflicts: make([]map[state.Key]*InstPair, 3), maxSeqPerKey: make(map[state.Key]int32),\n\t\tclientMutex: new(sync.Mutex), instancesToRecover: make(chan *instanceId, 8), maxRecvBallot: -1,\n\t}\n\tfor i := 0; i < 3; i++ {\n\t\tr.InstanceSpace[i] = make([]*Instance, 8)\n\t\tr.crtInstance[i], r.CommittedUpTo[i], r.ExecedUpTo[i] = -1, -1, -1\n\t\tr.conflicts[i] = make(map[state.Key]*InstPair)\n\t}\n\tr.prepareRPC = r.RPC.Register(new(Prepare), r.prepareChan)\n\tr.prepareReplyRPC = r.RPC.Register(new(PrepareReply), r.prepareReplyChan)\n\tr.preAcceptRPC = r.RPC.Register(new(PreAccept), r.preAcceptChan)\n\tr.preAcceptReplyRPC = r.RPC.Register(new(PreAcceptReply), r.preAcceptReplyChan)\n\tr.acceptRPC = r.RPC.Register(new(Accept), r.acceptChan)\n\tr.acceptReplyRPC = r.RPC.Register(new(AcceptReply), r.acceptReplyChan)\n\tr.commitRPC = r.RPC.Register(new(Commit), r.commitChan)\n\tr.tryPreAcceptRPC = r.RPC.Register(new(TryPreAccept), r.tryPreAcceptChan)\n\tr.tryPreAcceptReplyRPC = r.RPC.Register(new(TryPreAcceptReply), r.tryPreAcceptReplyChan)\n\treturn r\n}\n\nfunc TestAssuranceDurableRowOfRecoveryLedPhase1(t *testing.T) {\n\tpath := filepath.Join(t.TempDir(), \"stable_store\")\n\tf, err := os.Create(path)\n\tif err != nil {\n\t\tt.Fatal(err)\n\t}\n\tdefer f.Close()\n\tr := durableNode(t, f)\n\towner, inst := int32(1), int32(0)\n\n\tdev2(map[string]any{\"event\": \"durable_phase1_prepared\", \"instance\": \"1.0\",\n\t\t\"durable\": r.Durable, \"recoverer\": r.Id, \"owner\": owner,\n\t\t\"own_row_record_present\": r.InstanceSpace[r.Id][inst] != nil})\n\n\tpanicked := false\n\tpanicValue := \"\"\n\tfunc() {\n\t\tdefer func() {\n\t\t\tif v := recover(); v != nil {\n\t\t\t\tpanicked = true\n\t\t\t\tpanicValue = fmt.Sprint(v)\n\t\t\t}\n\t\t}()\n\t\tr.startPhase1([]state.Command{{Op: state.PUT, K: state.Key(3), V: state.Value([]byte{5})}},\n\t\t\towner, inst, 3, nil)\n\t}()\n\tdev2(map[string]any{\"event\": \"durable_phase1_result\", \"instance\": \"1.0\",\n\t\t\"panicked\": panicked, \"panic_value\": panicValue,\n\t\t\"owner_record_written\": r.InstanceSpace[owner][inst] != nil,\n\t\t\"own_row_record_written\": r.InstanceSpace[r.Id][inst] != nil})\n}\n\nfunc TestAssuranceDurableRowRecordsOwnInstance(t *testing.T) {\n\tpath := filepath.Join(t.TempDir(), \"stable_store\")\n\tf, err := os.Create(path)\n\tif err != nil {\n\t\tt.Fatal(err)\n\t}\n\tdefer f.Close()\n\tr := durableNode(t, f)\n\towner, inst := int32(1), int32(0)\n\n\t// The recovering replica's own row holds a different instance at the same number, with\n\t// distinctive metadata; the recorder is asked about that slot rather than the new one.\n\town := &Instance{Cmds: []state.Command{{Op: state.PUT, K: state.Key(9), V: state.Value([]byte{2})}},\n\t\tbal: 0x11111111, vbal: 0x22222222, Status: ACCEPTED, Seq: 0x33333333,\n\t\tDeps: []int32{7, 8, 9}, id: &instanceId{r.Id, inst}}\n\tr.InstanceSpace[r.Id][inst] = own\n\tdev2(map[string]any{\"event\": \"durable_two_rows_prepared\", \"instance\": \"1.0\",\n\t\t\"durable\": r.Durable, \"own_row_seq\": int(own.Seq), \"own_row_status\": int(own.Status)})\n\n\tr.startPhase1([]state.Command{{Op: state.PUT, K: state.Key(3), V: state.Value([]byte{5})}}, owner, inst, 3, nil)\n\tr.sync()\n\tf.Close()\n\traw, err := os.ReadFile(path)\n\tif err != nil {\n\t\tt.Fatal(err)\n\t}\n\twritten := r.InstanceSpace[owner][inst]\n\trecordedSeq := int32(0)\n\trecordedStatus := int8(0)\n\tif len(raw) >= 9 {\n\t\trecordedSeq = int32(binary.LittleEndian.Uint32(raw[5:9]))\n\t\trecordedStatus = int8(raw[4])\n\t}\n\tdev2(map[string]any{\"event\": \"durable_wrong_row_recorded\", \"instance\": \"1.0\",\n\t\t\"bytes_written\": len(raw), \"recorded_seq\": int(recordedSeq), \"recorded_status\": int(recordedStatus),\n\t\t\"new_instance_seq\": int(written.Seq), \"own_row_seq\": int(own.Seq),\n\t\t\"recorded_matches_new_instance\": recordedSeq == written.Seq,\n\t\t\"recorded_matches_own_row\":      recordedSeq == own.Seq})\n}\n",
+    "description": "In-package Go test that seeds the recovering replica's own row, runs the real phase-1 entry with recording enabled and decodes the metadata the recorder wrote.",
+    "semantic_changes": [
+      "harness-only scaffolding: the Replica is constructed in-package with a harness temp stable store and startPhase1 is called directly with the owner's coordinates",
+      "the own row is seeded with a synthetic instance so the two rows differ; protocol code is unmodified"
+    ],
+    "prerequisites": [
+      {
+        "alias": "two_rows",
+        "event": "durable_two_rows_prepared",
+        "conditions": [
+          {
+            "field": "durable",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          }
+        ]
+      }
+    ],
+    "legality": {
+      "source_ids": [
+        "S8-handlePropose-startPhase1",
+        "S19-durable-record"
+      ],
+      "expectation_ids": [],
+      "binding_ids": [
+        "BB10-phase1-record"
+      ],
+      "derivation": "A replica can hold its own instance at a number while restarting phase 1 for another replica's instance of the same number, which is what the two rows represent.",
+      "applicability": "Durable true, recovery-led phase 1, own row occupied.",
+      "unresolved": [
+        "the recorded bytes are decoded with the layout the recorder uses, not with a reader's layout (see claim C2)"
+      ],
+      "conflicts": [],
+      "alternatives": []
+    }
+  },
+  "monitors": [
+    {
+      "id": "M1-wrong-row-record",
+      "checker_id": "CH2-wrong-row-record",
+      "event": "durable_wrong_row_recorded",
+      "binding_ids": [
+        "BB10-phase1-record"
+      ],
+      "grounding": {
+        "source_ids": [
+          "S8-handlePropose-startPhase1",
+          "S19-durable-record"
+        ],
+        "expectation_ids": [],
+        "binding_ids": [
+          "BB10-phase1-record"
+        ],
+        "derivation": "The event compares the metadata the recorder wrote with the two candidate records, which is the claim's question.",
+        "applicability": "The own row held an instance and the new instance was installed under the owner's row.",
+        "unresolved": [],
+        "conflicts": [],
+        "alternatives": []
+      },
+      "applicability_conditions": [
+        {
+          "field": "instance",
+          "op": "eq",
+          "value": null,
+          "reference": "two_rows.instance"
+        }
+      ],
+      "admission_alias": "two_rows"
+    }
+  ],
+  "observable_properties": [
+    {
+      "checker_id": "CH2-wrong-row-record",
+      "kind": "event_assertion",
+      "trigger": {
+        "field": "event",
+        "op": "eq",
+        "value": "durable_wrong_row_recorded",
+        "reference": null
+      },
+      "assertion": {
+        "field": "recorded_matches_new_instance",
+        "op": "eq",
+        "value": true,
+        "reference": null
+      },
+      "antecedent": null,
+      "identity_fields": [
+        "instance"
+      ],
+      "description": "The metadata recorded for a phase-1 write must belong to the instance being written."
+    }
+  ],
+  "uncertainties": [
+    "the check relies on the recorder's own byte layout to decode what was written, which claim C2 shows is not readable as documented",
+    "the durable path is inert in the shipped configuration"
+  ]
+}

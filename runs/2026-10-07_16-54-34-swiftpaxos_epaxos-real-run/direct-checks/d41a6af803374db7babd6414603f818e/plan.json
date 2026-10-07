@@ -1,0 +1,174 @@
+{
+  "description": "Discriminator: with the recovering replica holding only a default record for (1,0) and a peer reporting the instance COMMITTED at vbal 0, does the recovery adopt the committed vector or restart phase 1? Prefix: the peer's record is prepared as COMMITTED with a real PUT command; the recovering replica's record is a default NONE record; the peer's real PrepareReply is delivered through the real wire form. Controls: the same harness also prints the seed state (lb.ballot and the self VBallot) and which message the recoverer emits next, so an unreached prerequisite is visible rather than silent. This version also follows the accept round the resolution starts: the Accept reaches the replica that already committed the instance and its AcceptReply returns to the recoverer, so the second property observes whether that reply is counted. A trailing diagnostic event is printed after the accept round, so its instance_status reflects the post-accept state; the canonical resolution event used by the first property is printed before it.",
+  "claim_id": "C1-recovery-adopts-committed-vector",
+  "binding_ids": [
+    "BB1-recovery-start",
+    "BB2-prepare-resolution"
+  ],
+  "harness": {
+    "execution_package": "./epaxos",
+    "files": {},
+    "kind": "go_test",
+    "source": "package epaxos\n\n// Exploration harness: does a recovering replica that holds only a default record\n// adopt a remote PrepareReply that reports COMMITTED? Only real handlers are used and\n// messages travel through their real Marshal/Unmarshal form. No protocol code is changed.\n\nimport (\n\t\"bufio\"\n\t\"bytes\"\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"sync\"\n\t\"testing\"\n\n\t\"github.com/imdea-software/swiftpaxos/dlog\"\n\t\"github.com/imdea-software/swiftpaxos/replica\"\n\t\"github.com/imdea-software/swiftpaxos/replica/defs\"\n\tfastrpc \"github.com/imdea-software/swiftpaxos/rpc\"\n\t\"github.com/imdea-software/swiftpaxos/state\"\n)\n\nconst expN = 3\nconst expRow = 8\n\nfunc ev(m map[string]any) {\n\tb, _ := json.Marshal(m)\n\tfmt.Println(\"CA_EVENT \" + string(b))\n}\n\ntype expNode struct {\n\tr    *Replica\n\tout  []*bytes.Buffer\n\tw    []*bufio.Writer\n}\n\nfunc newExpNode(id int32, alive []bool) *expNode {\n\tn := &expNode{out: make([]*bytes.Buffer, expN), w: make([]*bufio.Writer, expN)}\n\tfor j := 0; j < expN; j++ {\n\t\tn.out[j] = &bytes.Buffer{}\n\t\tn.w[j] = bufio.NewWriter(n.out[j])\n\t}\n\tbase := &replica.Replica{\n\t\tLogger:             dlog.New(\"\", false),\n\t\tN:                  expN,\n\t\tF:                  (expN - 1) / 2,\n\t\tId:                 id,\n\t\tAlias:              fmt.Sprintf(\"r%d\", id),\n\t\tPeerAddrList:       []string{\"a\", \"b\", \"c\"},\n\t\tPeerWriters:        n.w,\n\t\tState:              state.InitState(),\n\t\tStats:              &defs.Stats{M: map[string]int{}},\n\t\tAlive:              alive,\n\t\tPreferredPeerOrder: []int32{},\n\t\tProposeChan:        make(chan *defs.GPropose, 8),\n\t\tRPC:                fastrpc.NewTableId(defs.RPC_TABLE),\n\t\tThrifty:            true,\n\t\tDreply:             true,\n\t}\n\tfor k := 0; k < expN; k++ {\n\t\tbase.PreferredPeerOrder = append(base.PreferredPeerOrder, int32((int(id)+1+k)%expN))\n\t}\n\tr := &Replica{\n\t\tReplica:               base,\n\t\tprepareChan:           make(chan fastrpc.Serializable, 8),\n\t\tpreAcceptChan:         make(chan fastrpc.Serializable, 8),\n\t\tacceptChan:            make(chan fastrpc.Serializable, 8),\n\t\tcommitChan:            make(chan fastrpc.Serializable, 8),\n\t\tprepareReplyChan:      make(chan fastrpc.Serializable, 8),\n\t\tpreAcceptReplyChan:    make(chan fastrpc.Serializable, 8),\n\t\tpreAcceptOKChan:       make(chan fastrpc.Serializable, 8),\n\t\tacceptReplyChan:       make(chan fastrpc.Serializable, 8),\n\t\ttryPreAcceptChan:      make(chan fastrpc.Serializable, 8),\n\t\ttryPreAcceptReplyChan: make(chan fastrpc.Serializable, 8),\n\t\tInstanceSpace:         make([][]*Instance, expN),\n\t\tcrtInstance:           make([]int32, expN),\n\t\tCommittedUpTo:         make([]int32, expN),\n\t\tExecedUpTo:            make([]int32, expN),\n\t\tconflicts:             make([]map[state.Key]*InstPair, expN),\n\t\tmaxSeqPerKey:          make(map[state.Key]int32),\n\t\tclientMutex:           new(sync.Mutex),\n\t\tinstancesToRecover:    make(chan *instanceId, 8),\n\t\tmaxRecvBallot:         -1,\n\t}\n\tfor i := 0; i < expN; i++ {\n\t\tr.InstanceSpace[i] = make([]*Instance, expRow)\n\t\tr.crtInstance[i] = -1\n\t\tr.CommittedUpTo[i] = -1\n\t\tr.ExecedUpTo[i] = -1\n\t\tr.conflicts[i] = make(map[state.Key]*InstPair)\n\t}\n\tr.prepareRPC = r.RPC.Register(new(Prepare), r.prepareChan)\n\tr.prepareReplyRPC = r.RPC.Register(new(PrepareReply), r.prepareReplyChan)\n\tr.preAcceptRPC = r.RPC.Register(new(PreAccept), r.preAcceptChan)\n\tr.preAcceptReplyRPC = r.RPC.Register(new(PreAcceptReply), r.preAcceptReplyChan)\n\tr.acceptRPC = r.RPC.Register(new(Accept), r.acceptChan)\n\tr.acceptReplyRPC = r.RPC.Register(new(AcceptReply), r.acceptReplyChan)\n\tr.commitRPC = r.RPC.Register(new(Commit), r.commitChan)\n\tr.tryPreAcceptRPC = r.RPC.Register(new(TryPreAccept), r.tryPreAcceptChan)\n\tr.tryPreAcceptReplyRPC = r.RPC.Register(new(TryPreAcceptReply), r.tryPreAcceptReplyChan)\n\tn.r = r\n\treturn n\n}\n\n// deliver drains everything node from wrote for node to and runs the matching handler.\nfunc deliver(from, to *expNode) []uint8 {\n\tb := from.out[to.r.Id]\n\tif b.Len() == 0 {\n\t\treturn nil\n\t}\n\trd := bytes.NewReader(b.Bytes())\n\tb.Reset()\n\tvar codes []uint8\n\tfor rd.Len() > 0 {\n\t\tcode, err := rd.ReadByte()\n\t\tif err != nil {\n\t\t\tbreak\n\t\t}\n\t\tp, ok := to.r.RPC.Get(code)\n\t\tif !ok {\n\t\t\tpanic(\"unknown message code\")\n\t\t}\n\t\tobj := p.Obj.New()\n\t\tif err := obj.Unmarshal(rd); err != nil {\n\t\t\tpanic(err)\n\t\t}\n\t\tcodes = append(codes, code)\n\t\tswitch code {\n\t\tcase to.r.prepareRPC:\n\t\t\tto.r.handlePrepare(obj.(*Prepare))\n\t\tcase to.r.prepareReplyRPC:\n\t\t\tto.r.handlePrepareReply(obj.(*PrepareReply))\n\t\tcase to.r.preAcceptRPC:\n\t\t\tto.r.handlePreAccept(obj.(*PreAccept))\n\t\tcase to.r.preAcceptReplyRPC:\n\t\t\tto.r.handlePreAcceptReply(obj.(*PreAcceptReply))\n\t\tcase to.r.acceptRPC:\n\t\t\tto.r.handleAccept(obj.(*Accept))\n\t\tcase to.r.acceptReplyRPC:\n\t\t\tto.r.handleAcceptReply(obj.(*AcceptReply))\n\t\tcase to.r.commitRPC:\n\t\t\tto.r.handleCommit(obj.(*Commit))\n\t\tcase to.r.tryPreAcceptRPC:\n\t\t\tto.r.handleTryPreAccept(obj.(*TryPreAccept))\n\t\tcase to.r.tryPreAcceptReplyRPC:\n\t\t\tto.r.handleTryPreAcceptReply(obj.(*TryPreAcceptReply))\n\t\t}\n\t}\n\treturn codes\n}\n\nfunc TestAssuranceRecoveryVBalSeed(t *testing.T) {\n\tkey := state.Key(9)\n\towner := int32(1)\n\tinst := int32(0)\n\n\t// Recovering replica 0 holds only a default record for (1,0) and reaches peer 1.\n\trec := newExpNode(0, []bool{false, true, false})\n\t// Peer 1 has already committed that instance with a real command.\n\tacc := newExpNode(1, []bool{true, false, false})\n\tcmds := []state.Command{{Op: state.PUT, K: key, V: state.Value([]byte{4})}}\n\tacc.r.InstanceSpace[owner][inst] = &Instance{\n\t\tCmds: cmds, bal: 0, vbal: 0, Status: COMMITTED, Seq: 3,\n\t\tDeps: []int32{-1, -1, -1}, id: &instanceId{owner, inst},\n\t}\n\n\trec.r.InstanceSpace[owner][inst] = rec.r.newInstanceDefault(owner, inst)\n\trec.r.startRecoveryForInstance(owner, inst)\n\n\tseed := rec.r.InstanceSpace[owner][inst]\n\tev(map[string]any{\n\t\t\"event\": \"recovery_seed\", \"recoverer\": 0, \"owner\": owner, \"instance\": inst,\n\t\t\"seed_lb_ballot\": seed.lb.ballot, \"record_vbal_reported_by_self\": seed.lb.prepareReplies[0].VBallot,\n\t\t\"instance_vbal_after_seed\": seed.vbal, \"self_status\": seed.lb.prepareReplies[0].Status,\n\t})\n\n\tdeliver(rec, acc) // real Prepare into the committed peer\n\tcodes := deliver(acc, rec)\n\tev(map[string]any{\"event\": \"reply_delivered\", \"codes\": codes, \"prepare_replies\": len(seed.lb.prepareReplies)})\n\tev(map[string]any{\n\t\t\"event\": \"peer_committed_reply\", \"instance\": \"1.0\", \"from_replica\": 1,\n\t\t\"status\": \"COMMITTED\", \"vbal\": 0, \"has_command\": true,\n\t})\n\n\tst := rec.r.InstanceSpace[owner][inst]\n\tadopted := st.Status == COMMITTED || st.lb.status == COMMITTED\n\tcmdOp := -1\n\tif len(st.Cmds) > 0 {\n\t\tcmdOp = int(st.Cmds[0].Op)\n\t}\n\tstatusName := \"NONE\"\n\tswitch st.Status {\n\tcase PREACCEPTED:\n\t\tstatusName = \"PREACCEPTED\"\n\tcase PREACCEPTED_EQ:\n\t\tstatusName = \"PREACCEPTED_EQ\"\n\tcase ACCEPTED:\n\t\tstatusName = \"ACCEPTED\"\n\tcase COMMITTED:\n\t\tstatusName = \"COMMITTED\"\n\tcase EXECUTED:\n\t\tstatusName = \"EXECUTED\"\n\t}\n\tcmdName := \"NIL\"\n\tif cmdOp == 0 {\n\t\tcmdName = \"NONE\"\n\t} else if cmdOp == 1 {\n\t\tcmdName = \"PUT\"\n\t}\n\tev(map[string]any{\n\t\t\"event\": \"recovery_resolution\", \"instance\": \"1.0\", \"recoverer\": 0,\n\t\t\"adopted_committed\": adopted, \"instance_status\": statusName,\n\t\t\"command_after\": cmdName, \"preaccept_sent\": len(rec.out[1].Bytes()) > 0,\n\t})\n\t// Follow the accept round the resolution started: the accept reaches the replica\n\t// that already committed the instance, and its reply comes back to the recoverer.\n\tbefore := st.lb.acceptOKs\n\tdeliver(rec, acc)\n\tdeliver(acc, rec)\n\tafter := st.lb.acceptOKs\n\tstatusAfter := \"NONE\"\n\tswitch st.Status {\n\tcase PREACCEPTED:\n\t\tstatusAfter = \"PREACCEPTED\"\n\tcase PREACCEPTED_EQ:\n\t\tstatusAfter = \"PREACCEPTED_EQ\"\n\tcase ACCEPTED:\n\t\tstatusAfter = \"ACCEPTED\"\n\tcase COMMITTED:\n\t\tstatusAfter = \"COMMITTED\"\n\tcase EXECUTED:\n\t\tstatusAfter = \"EXECUTED\"\n\t}\n\tev(map[string]any{\n\t\t\"event\": \"accept_round_after_commit\", \"instance\": \"1.0\", \"recoverer\": 0,\n\t\t\"accept_oks_before\": before, \"accept_oks_after\": after, \"reply_counted\": after > before,\n\t\t\"instance_status_after\": statusAfter, \"last_tried_ballot\": st.lb.lastTriedBallot,\n\t\t\"committed_at_recoverer\": st.Status == COMMITTED,\n\t})\n\tev(map[string]any{\n\t\t\"event\": \"resolution\", \"lb_status\": int(st.lb.status), \"instance_status\": int(st.Status),\n\t\t\"instance_cmds_len\": len(st.Cmds), \"instance_first_op\": cmdOp,\n\t\t\"adopted_committed_vector\": adopted, \"preaccept_sent\": len(rec.out[1].Bytes()) > 0,\n\t\t\"out_codes\": rec.out[1].Bytes(),\n\t})\n\tif adopted {\n\t\tev(map[string]any{\"event\": \"remote_committed_value_adopted\", \"result\": true})\n\t} else {\n\t\tev(map[string]any{\"event\": \"remote_committed_value_ignored\", \"remote_status\": int(COMMITTED),\n\t\t\t\"instance_status_after\": int(st.Status), \"command_after\": cmdOp})\n\t}\n}\n",
+    "description": "In-package Go test building two real Replica values and delivering Prepare/PrepareReply through their real Marshal/Unmarshal form.",
+    "semantic_changes": [
+      "harness-only scaffolding: two Replica values are constructed in-package instead of through New(), per-peer buffers replace the TCP transport, and the recovery is entered directly through startRecoveryForInstance instead of the execution timeout; all protocol messages still travel through the real Marshal/Unmarshal form and all decisions are made by the unmodified handlers",
+      "prepared history: the peer's record for the instance is installed as COMMITTED with a real PUT command and the recovering replica's record is a default NONE record, because the check discriminates the resolution step rather than the proposal round that produced the commit"
+    ],
+    "prerequisites": [
+      {
+        "alias": "committed_reply",
+        "event": "peer_committed_reply",
+        "conditions": [
+          {
+            "field": "status",
+            "op": "eq",
+            "value": "COMMITTED",
+            "reference": null
+          },
+          {
+            "field": "has_command",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          }
+        ]
+      }
+    ],
+    "legality": {
+      "source_ids": [
+        "S14-recovery-start-prepare",
+        "S15-handlePrepareReply",
+        "S11-handleAccept",
+        "S13-handleCommit"
+      ],
+      "expectation_ids": [],
+      "binding_ids": [
+        "BB1-recovery-start",
+        "BB2-prepare-resolution"
+      ],
+      "derivation": "The obligation follows from the role of recovery in EPaxos: the value that could have been committed is the one with the highest vbal among a slow quorum, and a reply reporting COMMITTED is authoritative for the instance. The harness fixes the recovering replica's record as a default NONE record so the only value in the history is the peer's committed vector.",
+      "applicability": "N=3, Thrifty, IsLeader false, one COMMITTED reply and one local default record; the recovery is entered directly through startRecoveryForInstance.",
+      "unresolved": [
+        "whether a full legal history (proposal, accept round, commit broadcast, execution timeout) reaches the same state",
+        "whether the launched configuration permits the recovering replica to be in that state at all"
+      ],
+      "conflicts": [],
+      "alternatives": []
+    }
+  },
+  "monitors": [
+    {
+      "id": "M1-recovery-resolution",
+      "checker_id": "CH1-recovery-adopts-committed",
+      "event": "recovery_resolution",
+      "binding_ids": [
+        "BB2-prepare-resolution"
+      ],
+      "grounding": {
+        "source_ids": [
+          "S15-handlePrepareReply"
+        ],
+        "expectation_ids": [],
+        "binding_ids": [
+          "BB2-prepare-resolution"
+        ],
+        "derivation": "The resolution event is the completed recovery decision for the instance: it records whether the committed vector was adopted, the resulting local status and which message the recoverer emitted.",
+        "applicability": "Resolution reached with the prerequisite reply present for the same instance identity.",
+        "unresolved": [],
+        "conflicts": [],
+        "alternatives": []
+      },
+      "applicability_conditions": [
+        {
+          "field": "instance",
+          "op": "eq",
+          "value": null,
+          "reference": "committed_reply.instance"
+        }
+      ],
+      "admission_alias": "committed_reply"
+    },
+    {
+      "id": "M2-accept-round",
+      "checker_id": "CH2-accept-round-counted",
+      "event": "accept_round_after_commit",
+      "binding_ids": [
+        "BB2-prepare-resolution"
+      ],
+      "grounding": {
+        "source_ids": [
+          "S11-handleAccept",
+          "S12-handleAcceptReply"
+        ],
+        "expectation_ids": [],
+        "binding_ids": [
+          "BB2-prepare-resolution"
+        ],
+        "derivation": "The accept round is the only continuation of a resolution that did not adopt the committed vector; the event records whether the already-committed replica's reply advanced the leader's accept count.",
+        "applicability": "Resolution ran for the same instance and entered the accept phase.",
+        "unresolved": [],
+        "conflicts": [],
+        "alternatives": []
+      },
+      "applicability_conditions": [
+        {
+          "field": "instance",
+          "op": "eq",
+          "value": null,
+          "reference": "committed_reply.instance"
+        }
+      ],
+      "admission_alias": "committed_reply"
+    }
+  ],
+  "observable_properties": [
+    {
+      "checker_id": "CH1-recovery-adopts-committed",
+      "kind": "event_assertion",
+      "trigger": {
+        "field": "event",
+        "op": "eq",
+        "value": "recovery_resolution",
+        "reference": null
+      },
+      "assertion": {
+        "field": "adopted_committed",
+        "op": "eq",
+        "value": true,
+        "reference": null
+      },
+      "antecedent": null,
+      "identity_fields": [
+        "instance"
+      ],
+      "description": "A completed recovery resolution in which a reply reported the instance COMMITTED must adopt that committed vector."
+    },
+    {
+      "checker_id": "CH2-accept-round-counted",
+      "kind": "event_assertion",
+      "trigger": {
+        "field": "event",
+        "op": "eq",
+        "value": "accept_round_after_commit",
+        "reference": null
+      },
+      "assertion": {
+        "field": "reply_counted",
+        "op": "eq",
+        "value": true,
+        "reference": null
+      },
+      "antecedent": null,
+      "identity_fields": [
+        "instance"
+      ],
+      "description": "When the accept round of a recovery reaches a replica that has already committed the instance, that replica's reply must be counted so the recovery can continue."
+    }
+  ],
+  "uncertainties": [
+    "The harness prepares the peer's COMMITTED record directly; a full history is not constructed.",
+    "Only the resolution decision is observed, not the later accept round or execution.",
+    "The second property observes only whether the committed replica's AcceptReply advanced the leader's count for this attempt; the periodic re-trigger of recovery and the eventual state of the row are not modelled."
+  ]
+}

@@ -1,0 +1,115 @@
+{
+  "description": "Discriminator: a real PreAccept message carries two commands, the first with a 70000-byte value; after marshalling, does the implementation's own decoder recover the message, or does the truncated length make it panic? Prefix: the harness builds the message and marshals it with the implementation's codec, then unmarshals from those bytes, wrapping only the decode in recover so a panic is reported instead of killing the test. Controls: the prerequisite prints the command count, the first value's size and the wire size, and the result prints whether the decoder panicked, the panic value and the bytes left.",
+  "claim_id": "C10-command-value-length-survives-the-wire",
+  "binding_ids": [
+    "BB11-value-codec"
+  ],
+  "harness": {
+    "execution_package": "./epaxos",
+    "files": {},
+    "kind": "go_test",
+    "source": "package epaxos\n\n// Exploration harness: a real protocol message carries a command array. With the first\n// command's value beyond the two-byte length field, does the message still decode with the\n// commands that were written? Only the implementation's own message and command codecs run.\n\nimport (\n\t\"bytes\"\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"testing\"\n\n\t\"github.com/imdea-software/swiftpaxos/state\"\n)\n\nfunc mev(m map[string]any) {\n\tb, _ := json.Marshal(m)\n\tfmt.Println(\"CA_EVENT \" + string(b))\n}\n\nfunc TestAssuranceMessageCommandArrayShift(t *testing.T) {\n\tbig := make([]byte, 70000)\n\tfor i := range big {\n\t\tbig[i] = byte((i * 7) % 251)\n\t}\n\tfirst := state.Command{Op: state.PUT, K: state.Key(11), V: state.Value(big)}\n\tsecond := state.Command{Op: state.PUT, K: state.Key(22), V: state.Value([]byte{9, 9, 9})}\n\tmsg := &PreAccept{LeaderId: 1, Replica: 0, Instance: 0, Ballot: 1,\n\t\tCommand: []state.Command{first, second}, Seq: 1, Deps: []int32{-1, -1, -1}}\n\n\tvar buf bytes.Buffer\n\tmsg.Marshal(&buf)\n\tmev(map[string]any{\"event\": \"message_marshalled\", \"message\": \"PreAccept\",\n\t\t\"commands\": len(msg.Command), \"first_bytes\": len(big), \"second_key\": int(second.K),\n\t\t\"wire_bytes\": buf.Len()})\n\n\tdecoded := &PreAccept{}\n\tpanicked := false\n\tpanicValue := \"\"\n\terrText := \"\"\n\tfunc() {\n\t\tdefer func() {\n\t\t\tif v := recover(); v != nil {\n\t\t\t\tpanicked = true\n\t\t\t\tpanicValue = fmt.Sprint(v)\n\t\t\t}\n\t\t}()\n\t\tif err := decoded.Unmarshal(&buf); err != nil {\n\t\t\terrText = err.Error()\n\t\t}\n\t}()\n\tif panicked {\n\t\tmev(map[string]any{\"event\": \"message_shifted\", \"message\": \"PreAccept\",\n\t\t\t\"panicked\": true, \"panic_value\": panicValue, \"second_matches\": false,\n\t\t\t\"bytes_left\": buf.Len()})\n\t\treturn\n\t}\n\tif errText != \"\" {\n\t\tmev(map[string]any{\"event\": \"message_shifted\", \"message\": \"PreAccept\", \"panicked\": false,\n\t\t\t\"error\": errText, \"second_matches\": false})\n\t\treturn\n\t}\n\tmatches := len(decoded.Command) == 2\n\tif matches {\n\t\tgot := decoded.Command[1]\n\t\tmatches = got.Op == second.Op && got.K == second.K && len(got.V) == len(second.V)\n\t}\n\tsecondOp := -1\n\tsecondKey := int64(0)\n\tsecondLen := -1\n\tif len(decoded.Command) > 1 {\n\t\tsecondOp = int(decoded.Command[1].Op)\n\t\tsecondKey = int64(decoded.Command[1].K)\n\t\tsecondLen = len(decoded.Command[1].V)\n\t}\n\tmev(map[string]any{\"event\": \"message_shifted\", \"message\": \"PreAccept\",\n\t\t\"commands_decoded\": len(decoded.Command), \"first_decoded_bytes\": len(decoded.Command[0].V),\n\t\t\"second_op\": secondOp, \"second_key\": secondKey, \"second_value_len\": secondLen,\n\t\t\"second_matches\": matches, \"panicked\": false, \"bytes_left\": buf.Len()})\n}\n",
+    "description": "In-package Go test that marshals a PreAccept with an oversized first command value and decodes it with the real unmarshaller.",
+    "semantic_changes": [
+      "harness-only scaffolding: no replica is constructed; the message and command codecs are called directly",
+      "the decode is wrapped in recover() to observe a panic; the replica reader in production has no recover around its unmarshal"
+    ],
+    "prerequisites": [
+      {
+        "alias": "message_built",
+        "event": "message_marshalled",
+        "conditions": [
+          {
+            "field": "commands",
+            "op": "eq",
+            "value": 2,
+            "reference": null
+          },
+          {
+            "field": "first_bytes",
+            "op": "eq",
+            "value": 70000,
+            "reference": null
+          }
+        ]
+      }
+    ],
+    "legality": {
+      "source_ids": [
+        "S37-state-value-codec",
+        "S25-defs-channels"
+      ],
+      "expectation_ids": [],
+      "binding_ids": [
+        "BB11-value-codec"
+      ],
+      "derivation": "The PreAccept is the message a leader sends for a proposal and it carries its commands in exactly this array form, so the input is a real protocol message.",
+      "applicability": "One message, two commands, no replica.",
+      "unresolved": [
+        "the reader's own path around unmarshal is not exercised, only the decode itself"
+      ],
+      "conflicts": [],
+      "alternatives": []
+    }
+  },
+  "monitors": [
+    {
+      "id": "M1-message-shift",
+      "checker_id": "CH3-message-shift",
+      "event": "message_shifted",
+      "binding_ids": [
+        "BB11-value-codec"
+      ],
+      "grounding": {
+        "source_ids": [
+          "S37-state-value-codec"
+        ],
+        "expectation_ids": [],
+        "binding_ids": [
+          "BB11-value-codec"
+        ],
+        "derivation": "The event reports whether the decoder survived the message and what it had left, which is the receiver-side consequence of the truncated length.",
+        "applicability": "The message carried a value beyond the length field's range.",
+        "unresolved": [],
+        "conflicts": [],
+        "alternatives": []
+      },
+      "applicability_conditions": [
+        {
+          "field": "message",
+          "op": "eq",
+          "value": null,
+          "reference": "message_built.message"
+        }
+      ],
+      "admission_alias": "message_built"
+    }
+  ],
+  "observable_properties": [
+    {
+      "checker_id": "CH3-message-shift",
+      "kind": "event_assertion",
+      "trigger": {
+        "field": "event",
+        "op": "eq",
+        "value": "message_shifted",
+        "reference": null
+      },
+      "assertion": {
+        "field": "panicked",
+        "op": "eq",
+        "value": false,
+        "reference": null
+      },
+      "antecedent": null,
+      "identity_fields": [
+        "message"
+      ],
+      "description": "Decoding a message the implementation itself marshalled must not panic."
+    }
+  ],
+  "uncertainties": [
+    "the harness observes the decode panic rather than the replica reader terminating; the reader has no recover around its unmarshal, so the panic is inferred to end the process",
+    "the shipped configuration's 1000-byte commands never reach the boundary"
+  ]
+}

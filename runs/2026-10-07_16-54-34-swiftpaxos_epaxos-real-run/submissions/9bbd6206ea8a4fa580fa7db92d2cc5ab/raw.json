@@ -1,0 +1,97 @@
+{
+  "action": "continue",
+  "rationale": "The understood frontier is unchanged and usable, so this product opens a new Candidate instead of re-describing it. Source review resolved two of the recorded open details without execution: handlePrepareReply's sub-cases 3 and 4 carry identical guards, so sub-case 3 always wins, sub-case 4 never runs, and everything only reachable from it (bcastTryPreAccept, handleTryPreAccept, findPreAcceptConflicts, handleTryPreAcceptReply, the possibleQuorum bookkeeping and the deferMap defer-cycle check) is unreachable; a recovery with weaker pre-accept support falls to sub-case 5, which restarts phase 1 with the recovered value, so the missing sub-case is a more conservative path and the counting error inside it has no reachable consequence. With the previously explained PreAccept wrong-slot branch, that closes the reachability questions around recovery. The new Candidate therefore targets the remaining core-path safety question: the fast-path exemption for N <= 3 with Thrifty, where the reply-wise equality result is discarded while the commit condition still needs only FastQuorumSize-1 = 1 reply, so with N = 3 the leader commits its own attribute vector even when the single fast-quorum peer recomputed different attributes at the same ballot.",
+  "question": {
+    "audit_spec_version": 2,
+    "disposition": "concrete_suspicion",
+    "preferred_check": "controlled_schedule",
+    "question": "handlePreAcceptReply commits when preAcceptOKs >= FastQuorumSize-1 and inst.lb.allEqual && allCommitted && isInitialBallot, but for r.N <= 3 with Thrifty the reply-wise equality result is discarded (the allEqual accumulator is never updated), so with N = 3 the leader fast-commits its own (seq, deps) after a single reply whose recomputed attributes may differ. Can such a commit leave two attribute vectors for one instance at the same vbal -- the leader's committed vector and the fast-quorum peer's pre-accepted vector -- so that a later recovery, which selects the reply with the highest vbal by iterating the reply slice with element.VBallot >= lb.ballot, can adopt the peer's vector instead of the committed one; and does the legal crash point between the leader's local fast commit and bcastCommit make that reachable while some replica has already executed the committed vector?",
+    "importance": "If reachable, one instance is committed with different (seq, deps) at different replicas, so the same command is ordered differently against conflicting commands on different replicas; execution then applies the same commands in different orders, the surviving replicas' state diverges, and a reply already produced under the old order is contradicted. That is a consensus-safety consequence (agreement and state-machine convergence), not a performance or liveness one.",
+    "source_ids": [
+      "S10-handlePreAcceptReply",
+      "S21-quorum-sizes",
+      "S8-handlePropose-startPhase1",
+      "S9-handlePreAccept",
+      "S11-handleAccept",
+      "S15-handlePrepareReply",
+      "S12-handleAcceptReply",
+      "S13-handleCommit",
+      "S7-attributes",
+      "S4-execute-loop",
+      "S14-recovery-start-prepare",
+      "S20-exec",
+      "S24-runReplica-epaxos"
+    ],
+    "participants": [
+      "instance leader (owner of the instance row)",
+      "one fast-quorum peer that recomputed different attributes",
+      "recovering replica that later runs prepare for the instance"
+    ],
+    "objects": [
+      "LeaderBookkeeping.allEqual, preAcceptOKs, lastTriedBallot",
+      "Instance.bal, Instance.vbal, Instance.Seq, Instance.Deps, Instance.Status"
+    ],
+    "contexts": [
+      "N = 3 with Thrifty (the configuration replica.New hardcodes and run.go passes through unchanged)",
+      "fast path with exactly FastQuorumSize-1 = 1 reply whose attributes differ from the leader's",
+      "leader crash after the local fast commit but before the Commit broadcast is delivered"
+    ],
+    "event_paths": [
+      "leader starts phase 1 for its own instance with deps d1/seq s1 and sends PreAccept to one peer",
+      "peer recomputes d2 != d1 (or s2 != s1) against its own conflict index and replies PREACCEPTED",
+      "leader adds the reply, skips the allEqual update because N <= 3 and Thrifty, and commits its own d1/s1, then broadcasts Commit",
+      "recoverer runs prepare and selects the candidate value among replies with element.VBallot >= lb.ballot",
+      "compare the (Seq, Deps) the recoverer re-commits with the vector the leader committed"
+    ],
+    "activity_classes": [
+      "A1"
+    ],
+    "behavior_ids": [
+      "B4-fast-path-decision"
+    ],
+    "fact_ids": [
+      "F2-committed-decision"
+    ],
+    "supporting_behavior_ids": {
+      "B3-preaccept-recipient": "establishes the peer's differently recomputed attributes and the PREACCEPTED reply that carries them",
+      "B9-recovery-trigger": "shows when a leader or peer that holds an uncommitted or committed record initiates recovery of the instance",
+      "B11-prepare-resolution": "shows the highest-vbal selection that decides which vector is re-proposed",
+      "B7-execute-scheduler": "shows that execution applies the committed vector and that a reply can already have been produced before the divergence becomes visible"
+    },
+    "obligation_relation_kind": "establishment",
+    "priority": 3,
+    "counterevidence": [
+      "scoped to the fast-path branch: the source comment states there is no need to check equality for N <= 3 with Thrifty (S10-handlePreAcceptReply), so an author argument for the exemption may exist even though it is not written down",
+      "scoped to quorum arithmetic: for N = 3 a fast quorum of FastQuorumSize = 2 is already a majority, so the exemption may be intended to rely on fast-quorum/slow-quorum intersection instead of attribute equality (S21-quorum-sizes)",
+      "scoped to project documents: the README states that the bundled EPaxos is the corrected version and that thriftiness is required for correct recovery, which suggests the N = 3 thrifty configuration was deliberately exercised (S27-readme)"
+    ],
+    "unknowns": [
+      "whether the fast-commit branch and a pre-accepting peer really hold the same vbal for the instance: the fast-commit branch sets inst.bal but not inst.vbal (S10-handlePreAcceptReply) while startPhase1 sets both to the proposal ballot and handleAccept sets vbal = accept.Ballot (S8-handlePropose-startPhase1, S11-handleAccept)",
+      "whether a legal history can place a leader crash between the local fast commit and bcastCommit with a peer that still holds the differing pre-accepted vector, and whether any replica has already executed the committed vector at that point (S10-handlePreAcceptReply, S12-handleAcceptReply, S20-exec)",
+      "whether the recoverer's iteration order over lb.prepareReplies plus the element.VBallot >= lb.ballot rule can actually select the differing vector over the committed one when both carry the same vbal (S15-handlePrepareReply)",
+      "whether N = 3 with Thrifty is a supported deployment at all, since run.go supplies N from the peer address list and no code constrains N (S24-runReplica-epaxos, S21-quorum-sizes)"
+    ],
+    "trigger_rationale": "The exemption is explicit in the source: in handlePreAcceptReply the equality result computed by mergeAttributes is only accumulated in the else branch, so for r.N <= 3 && r.Thrifty inst.lb.allEqual keeps its initial true value from newLeaderBookkeeping (S10-handlePreAcceptReply, S2-instance-bookkeeping). With FastQuorumSize = F + (F+1)/2 = 2 for N = 3 (S21-quorum-sizes) and the commit condition preAcceptOKs >= FastQuorumSize-1 = 1, one disagreeing reply is enough to commit the leader's own vector. The candidate pairs the commit with the recovery rule that must reconstruct the same value: handlePrepareReply keeps the attributes of the reply with the highest vbal (S15-handlePrepareReply), so two vectors at one vbal are the discriminator. A controlled multi-replica schedule is the check that could distinguish an actual same-vbal split from the author's intended majority-intersection argument."
+  },
+  "feedback": {
+    "ref_ids": [
+      "d8fd7f585e054fdba265f29c8f7bff4d",
+      "B11-prepare-resolution",
+      "B12-try-preaccept",
+      "B4-fast-path-decision",
+      "F2-committed-decision",
+      "S15-handlePrepareReply",
+      "S16-handleTryPreAccept",
+      "S17-find-conflicts",
+      "S18-handleTryPreAcceptReply",
+      "S21-quorum-sizes"
+    ],
+    "answered": "The TryPreAccept open details are resolved as unreachable rather than as defects. handlePrepareReply's sub-case 3 guard (preAcceptCount >= SlowQuorumSize-1 and not leaderResponded and allEqual) is textually identical to sub-case 4's guard, so sub-case 3 is always selected and sub-case 4 never runs (S15-handlePrepareReply). bcastTryPreAccept is called only from sub-case 4, so the whole TryPreAccept path is dead: handleTryPreAccept, findPreAcceptConflicts, handleTryPreAcceptReply, the possibleQuorum bookkeeping and the deferMap/updateDeferred/deferredByInstance defer-cycle check (S16-handleTryPreAccept, S17-find-conflicts, S18-handleTryPreAcceptReply). The counting error lb.possibleQuorum[tpar.AcceptorId] inside a loop over q therefore has no reachable consequence, and the missing sub-case is conservative rather than unsafe: with weaker pre-accept support the resolution falls to sub-case 5, which restarts phase 1 with the recovered value (or NOOP when no command is known) (S15-handlePrepareReply). Combined with the previously explained PreAccept wrong-slot branch, the reachability questions around the recovery and pre-accept handlers are now answered on sources.",
+    "remaining": [
+      "whether the N <= 3 Thrifty fast-path exemption from the attribute-equality check can produce two same-vbal vectors for one instance and let a recovery re-commit the non-committed one (S10-handlePreAcceptReply, S21-quorum-sizes, S15-handlePrepareReply)",
+      "whether the accept-phase omission of an ACCEPTED status changes any decision, including whether handlePrepareReply's value selection can adopt a command-less reply at the highest vbal (S11-handleAccept, S15-handlePrepareReply)"
+    ],
+    "rationale": "The dead-code result follows from the guard text and the only call site of bcastTryPreAccept, so it needs no execution and does not weaken any requirement: the recoveries that would have used TryPreAccept take a strictly more conservative path. The delivered Candidate selects only the newly grounded safety suspicion; the earlier PreAccept-branch proposition stays explained and is referenced rather than reopened. No map object is changed by this product, so the dead-code clarification is recorded here and can be carried into the next already-needed map handoff.",
+    "understanding": "updated"
+  }
+}

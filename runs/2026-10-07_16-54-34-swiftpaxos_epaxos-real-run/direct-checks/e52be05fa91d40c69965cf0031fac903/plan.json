@@ -1,0 +1,115 @@
+{
+  "description": "Discriminator: in the owner-alive case, does a legal single-NONE Commit for the owner's instance leave the admitted operation pending nowhere, or is it re-proposed onto the propose channel? Prefix: the harness admits the operation with the real handlePropose (which attaches it and broadcasts the PreAccept) and then delivers the commit to the real handleCommit. Controls: the same events print whether bookkeeping and a pending proposal existed before the commit, the instance status after it, the remaining pending count and the number of proposals on the channel.",
+  "claim_id": "C5-noop-commit-reproposes-admitted-operation",
+  "binding_ids": [
+    "BB6-repropose"
+  ],
+  "harness": {
+    "execution_package": "./epaxos",
+    "files": {},
+    "kind": "go_test",
+    "source": "package epaxos\n\n// Exploration harness: the owner of an instance that a recovery commits as NOOP receives\n// that commit while it still holds the admitted client proposal. Does handleCommit\n// re-propose the operation, and is the proposal then pending on the replica's propose\n// channel (the path that later produces the client's reply)?\n\nimport (\n\t\"bufio\"\n\t\"bytes\"\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"sync\"\n\t\"testing\"\n\n\t\"github.com/imdea-software/swiftpaxos/dlog\"\n\t\"github.com/imdea-software/swiftpaxos/replica\"\n\t\"github.com/imdea-software/swiftpaxos/replica/defs\"\n\tfastrpc \"github.com/imdea-software/swiftpaxos/rpc\"\n\t\"github.com/imdea-software/swiftpaxos/state\"\n)\n\nfunc rev(m map[string]any) {\n\tb, _ := json.Marshal(m)\n\tfmt.Println(\"CA_EVENT \" + string(b))\n}\n\nfunc newReproposeNode() *Replica {\n\tw := make([]*bufio.Writer, 3)\n\tfor i := range w {\n\t\tw[i] = bufio.NewWriter(&bytes.Buffer{})\n\t}\n\tbase := &replica.Replica{\n\t\tLogger: dlog.New(\"\", false), N: 3, F: 1, Id: 0, Alias: \"r0\",\n\t\tPeerAddrList: []string{\"a\", \"b\", \"c\"}, PeerWriters: w,\n\t\tState: state.InitState(), Stats: &defs.Stats{M: map[string]int{}},\n\t\tAlive: []bool{true, true, true}, PreferredPeerOrder: []int32{1, 2, 0},\n\t\tProposeChan: make(chan *defs.GPropose, 8), RPC: fastrpc.NewTableId(defs.RPC_TABLE),\n\t\tThrifty: true, Dreply: true,\n\t}\n\tr := &Replica{\n\t\tReplica: base,\n\t\tprepareChan:           make(chan fastrpc.Serializable, 4),\n\t\tpreAcceptChan:         make(chan fastrpc.Serializable, 4),\n\t\tacceptChan:            make(chan fastrpc.Serializable, 4),\n\t\tcommitChan:            make(chan fastrpc.Serializable, 4),\n\t\tprepareReplyChan:      make(chan fastrpc.Serializable, 4),\n\t\tpreAcceptReplyChan:    make(chan fastrpc.Serializable, 4),\n\t\tpreAcceptOKChan:       make(chan fastrpc.Serializable, 4),\n\t\tacceptReplyChan:       make(chan fastrpc.Serializable, 4),\n\t\ttryPreAcceptChan:      make(chan fastrpc.Serializable, 4),\n\t\ttryPreAcceptReplyChan: make(chan fastrpc.Serializable, 4),\n\t\tInstanceSpace:         make([][]*Instance, 3),\n\t\tcrtInstance:           make([]int32, 3),\n\t\tCommittedUpTo:         make([]int32, 3),\n\t\tExecedUpTo:            make([]int32, 3),\n\t\tconflicts:             make([]map[state.Key]*InstPair, 3),\n\t\tmaxSeqPerKey:          make(map[state.Key]int32),\n\t\tclientMutex:           new(sync.Mutex),\n\t\tinstancesToRecover:    make(chan *instanceId, 4),\n\t\tmaxRecvBallot:         -1,\n\t}\n\tfor i := 0; i < 3; i++ {\n\t\tr.InstanceSpace[i] = make([]*Instance, 8)\n\t\tr.crtInstance[i], r.CommittedUpTo[i], r.ExecedUpTo[i] = -1, -1, -1\n\t\tr.conflicts[i] = make(map[state.Key]*InstPair)\n\t}\n\tr.prepareRPC = r.RPC.Register(new(Prepare), r.prepareChan)\n\tr.prepareReplyRPC = r.RPC.Register(new(PrepareReply), r.prepareReplyChan)\n\tr.preAcceptRPC = r.RPC.Register(new(PreAccept), r.preAcceptChan)\n\tr.preAcceptReplyRPC = r.RPC.Register(new(PreAcceptReply), r.preAcceptReplyChan)\n\tr.acceptRPC = r.RPC.Register(new(Accept), r.acceptChan)\n\tr.acceptReplyRPC = r.RPC.Register(new(AcceptReply), r.acceptReplyChan)\n\tr.commitRPC = r.RPC.Register(new(Commit), r.commitChan)\n\tr.tryPreAcceptRPC = r.RPC.Register(new(TryPreAccept), r.tryPreAcceptChan)\n\tr.tryPreAcceptReplyRPC = r.RPC.Register(new(TryPreAcceptReply), r.tryPreAcceptReplyChan)\n\treturn r\n}\n\nfunc TestAssuranceNoopCommitReproposes(t *testing.T) {\n\tr := newReproposeNode()\n\towner, inst := int32(0), int32(0)\n\tkey := state.Key(5)\n\n\t// The owner admits a client operation: handlePropose attaches the proposal to the\n\t// instance it allocates and broadcasts the PreAccept.\n\treply := bufio.NewWriter(&bytes.Buffer{})\n\tgp := &defs.GPropose{Propose: &defs.Propose{CommandId: 1, ClientId: 1,\n\t\tCommand: state.Command{Op: state.PUT, K: key, V: state.Value([]byte{9})}, Timestamp: 1},\n\t\tReply: reply, Mutex: &sync.Mutex{}}\n\tr.handlePropose(gp)\n\trec := r.InstanceSpace[owner][inst]\n\trev(map[string]any{\"event\": \"proposal_admitted\", \"instance\": \"0.0\",\n\t\t\"has_bookkeeping\": rec.lb != nil, \"pending\": len(rec.lb.clientProposals)})\n\n\t// A recoverer commits the instance as NOOP and the commit reaches the owner.\n\tcommit := &Commit{LeaderId: 1, Replica: owner, Instance: inst, Ballot: 4,\n\t\tCommand: []state.Command{{Op: state.NONE, K: 0, V: state.NIL()}}, Seq: 0, Deps: []int32{-1, -1, -1}}\n\tr.handleCommit(commit)\n\tafter := r.InstanceSpace[owner][inst]\n\trev(map[string]any{\"event\": \"noop_commit_at_owner\", \"instance\": \"0.0\",\n\t\t\"instance_status\": int(after.Status), \"pending_after\": len(after.lb.clientProposals),\n\t\t\"reproposed_on_channel\": len(r.ProposeChan)})\n}\n",
+    "description": "In-package Go test that admits one proposal with the real handler and delivers one legal NOOP commit, reporting the pending counts and the propose channel.",
+    "semantic_changes": [
+      "harness-only scaffolding: the Replica is constructed in-package with buffer peer writers and the two handlers are called directly; the handlers are unmodified",
+      "the commit is delivered directly instead of through the run loop, so only the handler's effect on the proposal is observed"
+    ],
+    "prerequisites": [
+      {
+        "alias": "admitted_proposal",
+        "event": "proposal_admitted",
+        "conditions": [
+          {
+            "field": "has_bookkeeping",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          },
+          {
+            "field": "pending",
+            "op": "eq",
+            "value": 1,
+            "reference": null
+          }
+        ]
+      }
+    ],
+    "legality": {
+      "source_ids": [
+        "S13-handleCommit",
+        "S8-handlePropose-startPhase1"
+      ],
+      "expectation_ids": [],
+      "binding_ids": [
+        "BB6-repropose"
+      ],
+      "derivation": "Both steps are the protocol's own: handlePropose is what admits a client operation and the commit is what a recoverer broadcasts for a NOOP instance.",
+      "applicability": "One instance, one admitted operation, one commit.",
+      "unresolved": [
+        "the run loop's later handling of the re-proposed proposal is not driven"
+      ],
+      "conflicts": [],
+      "alternatives": []
+    }
+  },
+  "monitors": [
+    {
+      "id": "M1-repropose",
+      "checker_id": "CH1-repropose",
+      "event": "noop_commit_at_owner",
+      "binding_ids": [
+        "BB6-repropose"
+      ],
+      "grounding": {
+        "source_ids": [
+          "S13-handleCommit"
+        ],
+        "expectation_ids": [],
+        "binding_ids": [
+          "BB6-repropose"
+        ],
+        "derivation": "The event reports the instance status after the commit, the remaining pending proposals and the proposals waiting on the channel, which together say whether the operation was re-proposed.",
+        "applicability": "The owner held the admitted proposal and the commit was for its own instance.",
+        "unresolved": [],
+        "conflicts": [],
+        "alternatives": []
+      },
+      "applicability_conditions": [
+        {
+          "field": "instance",
+          "op": "eq",
+          "value": null,
+          "reference": "admitted_proposal.instance"
+        }
+      ],
+      "admission_alias": "admitted_proposal"
+    }
+  ],
+  "observable_properties": [
+    {
+      "checker_id": "CH1-repropose",
+      "kind": "event_assertion",
+      "trigger": {
+        "field": "event",
+        "op": "eq",
+        "value": "noop_commit_at_owner",
+        "reference": null
+      },
+      "assertion": {
+        "field": "reproposed_on_channel",
+        "op": "eq",
+        "value": 1,
+        "reference": null
+      },
+      "antecedent": null,
+      "identity_fields": [
+        "instance"
+      ],
+      "description": "After the owner processes a NOOP commit for an instance holding its admitted operation, the operation must be waiting on the propose channel."
+    }
+  ],
+  "uncertainties": [
+    "the check covers the owner-alive case only; the restarted-owner case is claim C4's crash",
+    "the later commit and execution of the re-proposed operation are not driven, so the client's reply is not observed"
+  ]
+}
