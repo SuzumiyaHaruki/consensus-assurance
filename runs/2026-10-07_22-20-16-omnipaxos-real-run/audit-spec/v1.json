@@ -1,0 +1,731 @@
+{
+  "version": 1,
+  "target_profile": {
+    "system_boundary": "Captured OmniPaxos core, storage implementations and optional in-repository runtime. Networking and application state machine are caller responsibilities; injected storage implementations remain part of the relevant boundary.",
+    "protocol_contexts": [
+      "Static configured instance, leader ballots, follower synchronization sessions",
+      "Terminal StopSign followed by caller-created new configuration"
+    ],
+    "external_interfaces": [
+      "OmniPaxos append/reconfigure/tick/handle_incoming/take_outgoing_messages/read",
+      "Storage and Snapshot traits",
+      "Optional OmniPaxosHandle tracked appends"
+    ],
+    "ownership": [
+      "Mutable core API serializes each instance; caller owns network delivery",
+      "Storage backend owns atomic transaction implementation; runtime actor is in repository"
+    ],
+    "selection_injection": [],
+    "variants": [
+      "Majority or flexible quorums",
+      "Memory or persistent storage",
+      "Batching and optional snapshots",
+      "Optional runtime and unicache"
+    ],
+    "source_ids": [
+      "S-api",
+      "S-storage-contract",
+      "S-config",
+      "S-runtime-contract",
+      "S-communication"
+    ],
+    "unknowns": []
+  },
+  "activities": [
+    {
+      "class_id": "A1",
+      "applicability": "applicable",
+      "purpose": "Qualified support for decision formation and legal advancement",
+      "realization_summary": "Prepare selects highest accepted history using per-node promises; Accept counts per-node acknowledged indexes under current ballot and propagates decisions.",
+      "entry_points": [],
+      "behavior_ids": [
+        "B-prepare-quorum",
+        "B-accept-decide"
+      ],
+      "variants": [],
+      "unknowns": [],
+      "source_ids": [
+        "S-follower",
+        "S-formation",
+        "S-proposal",
+        "S-seq-quorum",
+        "S-support"
+      ]
+    },
+    {
+      "class_id": "A2",
+      "applicability": "applicable",
+      "purpose": "Context validity and acquisition, transfer or loss of authority",
+      "realization_summary": "BLE proposes leadership; SequencePaxos acquires authority with persistent promises and Prepare quorum. Old ballot and sequence guards restrict consumption.",
+      "entry_points": [],
+      "behavior_ids": [
+        "B-authority"
+      ],
+      "variants": [],
+      "unknowns": [],
+      "source_ids": [
+        "S-api",
+        "S-election",
+        "S-follower",
+        "S-leader"
+      ]
+    },
+    {
+      "class_id": "A3",
+      "applicability": "applicable",
+      "purpose": "Recovery and resynchronization of eligible participation",
+      "realization_summary": "Restart, reconnect and missing sequence trigger PrepareReq; retry callbacks restore prepared participation.",
+      "entry_points": [],
+      "behavior_ids": [
+        "B-recovery"
+      ],
+      "variants": [],
+      "unknowns": [],
+      "source_ids": [
+        "S-api",
+        "S-follower-recovery",
+        "S-proposal",
+        "S-retry-leader",
+        "S-start"
+      ]
+    },
+    {
+      "class_id": "A4",
+      "applicability": "applicable",
+      "purpose": "Configuration and participant eligibility",
+      "realization_summary": "Validated cluster settings define participant list and quorums. StopSign seals an instance; caller installs the next configuration.",
+      "entry_points": [],
+      "behavior_ids": [
+        "B-membership"
+      ],
+      "variants": [],
+      "unknowns": [],
+      "source_ids": [
+        "S-config",
+        "S-formation",
+        "S-proposal",
+        "S-reconfig-contract"
+      ]
+    },
+    {
+      "class_id": "A5",
+      "applicability": "applicable",
+      "purpose": "Decision application and consumption",
+      "realization_summary": "Read APIs expose decided entries and compacted snapshots; application execution is outside the core library.",
+      "entry_points": [],
+      "behavior_ids": [
+        "B-read"
+      ],
+      "variants": [],
+      "unknowns": [],
+      "source_ids": [
+        "S-api",
+        "S-cache",
+        "S-read"
+      ]
+    },
+    {
+      "class_id": "A6",
+      "applicability": "applicable",
+      "purpose": "History, persistence and reconstruction of support",
+      "realization_summary": "InternalStorage and captured MemoryStorage implement history access and synchronization; generic Storage requires atomic ordered transactions.",
+      "entry_points": [],
+      "behavior_ids": [
+        "B-sync-produce",
+        "B-sync-install"
+      ],
+      "variants": [],
+      "unknowns": [],
+      "source_ids": [
+        "S-follower",
+        "S-formation",
+        "S-memory",
+        "S-storage-contract",
+        "S-sync-consumer",
+        "S-sync-producer"
+      ]
+    },
+    {
+      "class_id": "A7",
+      "applicability": "applicable",
+      "purpose": "Client contracts, invocation intervals and observed completion",
+      "realization_summary": "Raw callers drive ticks, network and reads; in-repository runtime adds asynchronous tracked completion and remains partially unmapped.",
+      "entry_points": [],
+      "behavior_ids": [
+        "B-client"
+      ],
+      "variants": [],
+      "unknowns": [],
+      "source_ids": [
+        "S-api",
+        "S-communication",
+        "S-proposal"
+      ]
+    }
+  ],
+  "behaviors": [
+    {
+      "id": "B-authority",
+      "primary_activity": "A2",
+      "execution_owner": "SequencePaxos::handle_leader / handle_prepare",
+      "protocol_context": "One configured OmniPaxos instance; serialized mutable API calls and caller-delivered messages",
+      "trigger": "BLE timeout or try_become_leader; incoming Prepare",
+      "legal_preconditions": [],
+      "implementation_guards": [
+        "Locally elected ballot must exceed leader_state and persistent promise; Prepare must exceed promise or equal it in Recover"
+      ],
+      "reads": [],
+      "writes": [
+        "Flush old batches; persist promise; enter Prepare; reset leader support on local acquisition and follower sequence on Prepare"
+      ],
+      "durable_effects": [],
+      "external_effects": [
+        "Local acquisition emits Prepare; received Prepare emits cached Promise with accepted round/index and decided index"
+      ],
+      "important_branches": [
+        "A new remote leader notification only changes role; incoming Prepare installs its promise",
+        "Old Prepare is ignored outside equal-ballot Recover"
+      ],
+      "async_boundaries": [],
+      "produces_fact_ids": [
+        "F-promise"
+      ],
+      "consumes_fact_ids": [
+        "F-promise"
+      ],
+      "cross_activity_effects": {
+        "A1": "Promise binds which leader can subsequently accept and which prior history is reported"
+      },
+      "existing_protections": [],
+      "source_ids": [
+        "S-leader",
+        "S-follower",
+        "S-election",
+        "S-api"
+      ],
+      "unknowns": [
+        "Ballot ordering ignores config_id while equality includes it; cross-configuration routing boundary remains unexamined"
+      ]
+    },
+    {
+      "id": "B-prepare-quorum",
+      "primary_activity": "A1",
+      "execution_owner": "SequencePaxos leader and LeaderState",
+      "protocol_context": "One configured OmniPaxos instance; serialized mutable API calls and caller-delivered messages",
+      "trigger": "Promise in leader Prepare or Accept phase",
+      "legal_preconditions": [],
+      "implementation_guards": [
+        "Promise ballot equals current leader ballot; prepare support counted per pid"
+      ],
+      "reads": [],
+      "writes": [
+        "Prepare selects maximal accepted round then index, tracks maximum decided index, synchronizes leader log, installs own accepted index and enters Accept",
+        "Accept-phase Promise records follower metadata without replacing selected leader history"
+      ],
+      "durable_effects": [],
+      "external_effects": [
+        "Send AcceptSync with per-follower new sequence session after quorum formation or late Promise"
+      ],
+      "important_branches": [],
+      "async_boundaries": [],
+      "produces_fact_ids": [],
+      "consumes_fact_ids": [
+        "F-promise"
+      ],
+      "cross_activity_effects": {
+        "A2": "Formation under a newly acquired ballot preserves selected prior accepted history"
+      },
+      "existing_protections": [],
+      "source_ids": [
+        "S-formation",
+        "S-support",
+        "S-seq-quorum"
+      ],
+      "unknowns": []
+    },
+    {
+      "id": "B-accept-decide",
+      "primary_activity": "A1",
+      "execution_owner": "SequencePaxos leader and follower",
+      "protocol_context": "One configured OmniPaxos instance; serialized mutable API calls and caller-delivered messages",
+      "trigger": "append/forwarded proposal; AcceptSync, AcceptDecide, Accepted, Decide",
+      "legal_preconditions": [],
+      "implementation_guards": [
+        "Follower checks promised ballot, phase and ordered sequence; leader checks Accepted ballot and Leader/Accept state",
+        "Leader is_chosen counts accepted indexes meeting proposed decision index against write quorum"
+      ],
+      "reads": [],
+      "writes": [
+        "Batch or append log entries; update per-node accepted indexes; leader persists decided index when chosen",
+        "Follower advances decided index, flushing pending batch if needed and clamping advancement to accepted index"
+      ],
+      "durable_effects": [],
+      "external_effects": [
+        "Accepted replies; Decide or piggybacked decided index to promised followers"
+      ],
+      "important_branches": [
+        "Batch writes and acknowledgments may be deferred until flush",
+        "Repeated or old sequence messages ignored; missing sequence requests recovery"
+      ],
+      "async_boundaries": [],
+      "produces_fact_ids": [
+        "F-decided"
+      ],
+      "consumes_fact_ids": [
+        "F-promise"
+      ],
+      "cross_activity_effects": {
+        "A5": "Decided index qualifies the entries exposed as decided"
+      },
+      "existing_protections": [],
+      "source_ids": [
+        "S-formation",
+        "S-follower",
+        "S-support",
+        "S-proposal"
+      ],
+      "unknowns": []
+    },
+    {
+      "id": "B-recovery",
+      "primary_activity": "A3",
+      "execution_owner": "SequencePaxos construction, reconnected, retry callbacks",
+      "protocol_context": "One configured OmniPaxos instance; serialized mutable API calls and caller-delivered messages",
+      "trigger": "Stored promise at construction; caller reconnect; sequence gap; tick timeout",
+      "legal_preconditions": [],
+      "implementation_guards": [],
+      "reads": [],
+      "writes": [
+        "Enter Follower/Recover on restart or reconnect to current leader; leader resets reconnecting peer promise and accept-message cache"
+      ],
+      "durable_effects": [],
+      "external_effects": [
+        "PrepareReq initiates/resends Prepare; follower Prepare phase resends cached Promise; leader retries unpromised peers and StopSign traffic"
+      ],
+      "important_branches": [],
+      "async_boundaries": [],
+      "produces_fact_ids": [],
+      "consumes_fact_ids": [
+        "F-promise"
+      ],
+      "cross_activity_effects": {
+        "A2": "Equal-ballot Prepare becomes eligible in Recover",
+        "A1": "Recovery resynchronizes follower before accepting new sequence traffic"
+      },
+      "existing_protections": [],
+      "source_ids": [
+        "S-start",
+        "S-proposal",
+        "S-follower-recovery",
+        "S-retry-leader",
+        "S-api"
+      ],
+      "unknowns": [
+        "Delayed same-ballot synchronization across reconnect sessions has not been analyzed"
+      ]
+    },
+    {
+      "id": "B-sync-produce",
+      "primary_activity": "A6",
+      "execution_owner": "SequencePaxos::create_log_sync and InternalStorage::create_diff_snapshot",
+      "protocol_context": "One configured OmniPaxos instance; serialized mutable API calls and caller-delivered messages",
+      "trigger": "Follower Promise construction or leader AcceptSync construction",
+      "legal_preconditions": [],
+      "implementation_guards": [],
+      "reads": [
+        "Peer decided boundary; common accepted prefix; local snapshot and log"
+      ],
+      "writes": [
+        "Construct LogSync: optional complete/delta snapshot, suffix, sync index and StopSign"
+      ],
+      "durable_effects": [],
+      "external_effects": [],
+      "important_branches": [
+        "Snapshots enabled and local decided index beyond common prefix selects snapshot path",
+        "Delta begins at peer decided index only when that index exceeds sender compacted boundary; otherwise use complete snapshot"
+      ],
+      "async_boundaries": [],
+      "produces_fact_ids": [
+        "F-delta"
+      ],
+      "consumes_fact_ids": [],
+      "cross_activity_effects": {
+        "A1": "Transfers chosen history into the log selected during Prepare or synchronized follower history",
+        "A2": "Prior accepted-round comparison chooses common prefix"
+      },
+      "existing_protections": [],
+      "source_ids": [
+        "S-sync-producer",
+        "S-sync-consumer",
+        "S-follower",
+        "S-formation"
+      ],
+      "unknowns": []
+    },
+    {
+      "id": "B-sync-install",
+      "primary_activity": "A6",
+      "execution_owner": "InternalStorage::sync_log",
+      "protocol_context": "One configured OmniPaxos instance; serialized mutable API calls and caller-delivered messages",
+      "trigger": "Leader quorum adoption or follower AcceptSync handling",
+      "legal_preconditions": [],
+      "implementation_guards": [],
+      "reads": [
+        "LogSync snapshot variant; cached decided boundary; current log and snapshot"
+      ],
+      "writes": [
+        "Assign cached accepted round and decided index before inspecting snapshot variant",
+        "Delta reconstructs create_decided_snapshot then merges received delta; complete replaces snapshot; update compacted index, accepted index and StopSign"
+      ],
+      "durable_effects": [
+        "Ordered StorageOp transaction writes accepted round, decided index, trim, snapshot, prefix suffix and StopSign as applicable"
+      ],
+      "external_effects": [],
+      "important_branches": [],
+      "async_boundaries": [],
+      "produces_fact_ids": [
+        "F-decided"
+      ],
+      "consumes_fact_ids": [
+        "F-delta"
+      ],
+      "cross_activity_effects": {
+        "A1": "Installed history is acknowledged and can contribute to future decisions",
+        "A2": "Accepted-round installation associates transferred history with new authority"
+      },
+      "existing_protections": [],
+      "source_ids": [
+        "S-sync-consumer",
+        "S-storage-contract",
+        "S-memory",
+        "S-formation",
+        "S-follower"
+      ],
+      "unknowns": [
+        "Does reconstructing the delta base after updating decided_idx preserve the old decided prefix when new decided_idx exceeds the locally available log?"
+      ]
+    },
+    {
+      "id": "B-read",
+      "primary_activity": "A5",
+      "execution_owner": "InternalStorage::read / read_decided_suffix",
+      "protocol_context": "One configured OmniPaxos instance; serialized mutable API calls and caller-delivered messages",
+      "trigger": "Public read and read_decided_suffix",
+      "legal_preconditions": [],
+      "implementation_guards": [],
+      "reads": [
+        "Cached compacted, accepted and decided indexes; stored snapshot and entries"
+      ],
+      "writes": [],
+      "durable_effects": [],
+      "external_effects": [
+        "Return decided/undecided entries, compacted snapshot, or StopSign with decided flag"
+      ],
+      "important_branches": [],
+      "async_boundaries": [],
+      "produces_fact_ids": [],
+      "consumes_fact_ids": [
+        "F-decided"
+      ],
+      "cross_activity_effects": {},
+      "existing_protections": [],
+      "source_ids": [
+        "S-read",
+        "S-cache",
+        "S-api"
+      ],
+      "unknowns": []
+    },
+    {
+      "id": "B-membership",
+      "primary_activity": "A4",
+      "execution_owner": "ClusterConfig validation and SequencePaxos reconfiguration",
+      "protocol_context": "One configured OmniPaxos instance; serialized mutable API calls and caller-delivered messages",
+      "trigger": "Build or reconfigure; StopSign acceptance",
+      "legal_preconditions": [],
+      "implementation_guards": [
+        "At least two configured nodes, nonzero config id, own pid present; flexible read/write quorums overlap and each >=2",
+        "Accepted StopSign blocks append and further reconfigure"
+      ],
+      "reads": [],
+      "writes": [],
+      "durable_effects": [],
+      "external_effects": [
+        "Replicated StopSign describes next configuration; caller starts next instance only after decision and transfers prior state"
+      ],
+      "important_branches": [],
+      "async_boundaries": [],
+      "produces_fact_ids": [],
+      "consumes_fact_ids": [],
+      "cross_activity_effects": {
+        "A1": "Configuration defines quorum sizes; StopSign occupies final accepted/decided index",
+        "A2": "New instance lifecycle crosses configuration boundary under caller control"
+      },
+      "existing_protections": [],
+      "source_ids": [
+        "S-config",
+        "S-proposal",
+        "S-formation",
+        "S-reconfig-contract"
+      ],
+      "unknowns": [
+        "Duplicate/nonzero peer validation and inter-configuration message routing require further source investigation"
+      ]
+    },
+    {
+      "id": "B-client",
+      "primary_activity": "A7",
+      "execution_owner": "OmniPaxos public API and caller network",
+      "protocol_context": "One configured OmniPaxos instance; serialized mutable API calls and caller-delivered messages",
+      "trigger": "Append, tick, take_outgoing_messages, handle_incoming and reads",
+      "legal_preconditions": [],
+      "implementation_guards": [],
+      "reads": [],
+      "writes": [],
+      "durable_effects": [],
+      "external_effects": [
+        "append returns admission or rejection, not a decision future; caller fetches messages and reads decisions",
+        "tick invokes election, resend and batch flush clocks"
+      ],
+      "important_branches": [],
+      "async_boundaries": [],
+      "produces_fact_ids": [],
+      "consumes_fact_ids": [],
+      "cross_activity_effects": {
+        "A1": "Caller driving and message delivery enable support aggregation",
+        "A5": "Caller consumption is separate from consensus decision"
+      },
+      "existing_protections": [],
+      "source_ids": [
+        "S-api",
+        "S-communication",
+        "S-proposal"
+      ],
+      "unknowns": [
+        "Runtime adds tracked append completion; assignment and reassignment semantics not yet mapped"
+      ]
+    }
+  ],
+  "facts": [
+    {
+      "id": "F-promise",
+      "meaning": "Stored ballot currently promised by this replica; acceptance guards compare incoming ballots with this context.",
+      "identity": {
+        "node": "local pid",
+        "instance": "configured instance"
+      },
+      "established_by": [
+        "B-authority"
+      ],
+      "consumed_by": [
+        "B-authority",
+        "B-prepare-quorum",
+        "B-accept-decide",
+        "B-recovery"
+      ],
+      "validity_context": "From promise installation until a newer Prepare or local leader acquisition; equal promise can reenter Prepare in recovery.",
+      "representation": [
+        "InternalStorage.state_cache.promise",
+        "Storage.get_promise"
+      ],
+      "invalidators": [
+        "B-authority"
+      ],
+      "reinterpreters": [],
+      "durability": "Written through Storage; durability depends on chosen backend, MemoryStorage does not survive process loss.",
+      "recovery": "Construction loads promise and starts Recover with PrepareReq.",
+      "source_ids": [
+        "S-start",
+        "S-leader",
+        "S-follower"
+      ],
+      "unknowns": []
+    },
+    {
+      "id": "F-decided",
+      "meaning": "Replica records a decided boundary used to label log entries and expose its compacted history; this numeric state alone does not establish correctness of transferred snapshot contents.",
+      "identity": {
+        "node": "local pid",
+        "instance": "configured instance",
+        "boundary": "decided_idx"
+      },
+      "established_by": [
+        "B-accept-decide",
+        "B-sync-install"
+      ],
+      "consumed_by": [
+        "B-read"
+      ],
+      "validity_context": "Current stored log/snapshot representation and accepted round; changed by quorum decision, follower decision or synchronization.",
+      "representation": [
+        "StateCache.decided_idx",
+        "Storage decided index",
+        "stored entries and snapshot"
+      ],
+      "invalidators": [],
+      "reinterpreters": [
+        "B-sync-install"
+      ],
+      "durability": "Backend persistence and atomic synchronization requirements apply.",
+      "recovery": "Cache reloads persisted index/log/snapshot and protocol resynchronizes.",
+      "source_ids": [
+        "S-formation",
+        "S-follower",
+        "S-sync-consumer",
+        "S-cache",
+        "S-read"
+      ],
+      "unknowns": []
+    },
+    {
+      "id": "F-delta",
+      "meaning": "A produced Delta snapshot represents sender decided changes from the reported receiver decided index to the sender log decided boundary, excluding a final StopSign.",
+      "identity": {
+        "transfer": "LogSync carried by Promise or AcceptSync",
+        "base": "other_logs_decided_idx",
+        "end": "sync_idx"
+      },
+      "established_by": [
+        "B-sync-produce"
+      ],
+      "consumed_by": [
+        "B-sync-install"
+      ],
+      "validity_context": "Snapshot path when sender decided index exceeds common prefix and receiver reported decided index exceeds sender compacted index; receiver base history is required separately.",
+      "representation": [
+        "LogSync.decided_snapshot = SnapshotType::Delta",
+        "LogSync.sync_idx",
+        "LogSync.suffix"
+      ],
+      "invalidators": [],
+      "reinterpreters": [],
+      "durability": "Message value; not persisted until consumed by sync_log.",
+      "recovery": "Produced during Prepare/Promise or AcceptSync, with complete-snapshot alternative when base is compacted at sender.",
+      "source_ids": [
+        "S-sync-producer",
+        "S-sync-consumer",
+        "S-storage-contract"
+      ],
+      "unknowns": [
+        "Consumer must reconstruct the correct old base; current cached boundary is changed before reconstruction."
+      ]
+    }
+  ],
+  "surfaces": [
+    {
+      "entry_point": "InternalStorage::sync_log Delta branch",
+      "disposition": "mapped",
+      "behavior_ids": [
+        "B-sync-install"
+      ],
+      "reason": "New decided index is assigned before reconstructing old snapshot base; selected for investigation.",
+      "source_ids": [
+        "S-sync-consumer"
+      ],
+      "high_consequence": true
+    },
+    {
+      "entry_point": "Ballot::cmp and OmniPaxos::handle_incoming",
+      "disposition": "deferred",
+      "behavior_ids": [],
+      "reason": "Ordering omits configuration id; routing responsibility needs investigation before attributing cross-configuration input.",
+      "source_ids": [
+        "S-ballot",
+        "S-api"
+      ],
+      "high_consequence": true
+    },
+    {
+      "entry_point": "OmniPaxos runtime append_notify / drain_notifiers",
+      "disposition": "UNCLASSIFIED_PROTOCOL_RESPONSIBILITY",
+      "behavior_ids": [],
+      "reason": "Runtime completes by assigned index before testing supersession; assignment producer and full legal history remain unread.",
+      "source_ids": [
+        "S-runtime-contract",
+        "S-runtime-notify"
+      ],
+      "high_consequence": true
+    },
+    {
+      "entry_point": "SequencePaxos::trim / LeaderState::get_min_all_accepted_idx",
+      "disposition": "deferred",
+      "behavior_ids": [],
+      "reason": "Accepted-index vector is sized by maximum pid rather than participant count; consequences for sparse ids require separate review.",
+      "source_ids": [
+        "S-support"
+      ],
+      "high_consequence": false
+    }
+  ],
+  "core_overview": {
+    "formation": {
+      "explanation": "The local leader flushes/batches proposals and sends AcceptDecide only after Prepare collected a read quorum and adopted maximum accepted-round/index history. Followers in the promised ballot and Accept phase append ordered traffic and reply Accepted. The leader counts distinct pid slots against a write quorum, persists the chosen decided index and sends Decide or piggybacks it. Followers flush as needed and expose decided entries through read APIs. Append admission itself is not completion.",
+      "behavior_ids": [
+        "B-prepare-quorum",
+        "B-accept-decide",
+        "B-read",
+        "B-client"
+      ],
+      "fact_ids": [
+        "F-decided"
+      ],
+      "source_ids": [
+        "S-formation",
+        "S-support",
+        "S-follower",
+        "S-read",
+        "S-api"
+      ]
+    },
+    "context": {
+      "explanation": "BLE heartbeat rounds select potential authority; try_become_leader is also public. SequencePaxos only acquires a strictly higher local ballot, persists its promise, clears leader support and requests promises. Receiving a higher Prepare flushes pending batches, persists promise and resets follower sequencing. Prior ballot accept/decide traffic is rejected; phase and session/counter checks protect ordered acceptance. Recovery starts from persisted promise and uses PrepareReq to allow equal-ballot Prepare. Reconfiguration replicates a terminal StopSign and leaves new instance startup/state transfer to callers.",
+      "behavior_ids": [
+        "B-authority",
+        "B-recovery",
+        "B-membership"
+      ],
+      "fact_ids": [
+        "F-promise"
+      ],
+      "source_ids": [
+        "S-election",
+        "S-leader",
+        "S-follower",
+        "S-follower-recovery",
+        "S-start",
+        "S-reconfig-contract"
+      ]
+    },
+    "connection": {
+      "explanation": "Promises report accepted round/index and decided boundary. The new leader selects the highest accepted history, retains the maximum reported decided boundary and synchronizes before admitting new formation. AcceptSync transfers the selected suffix or snapshot and starts a new per-follower sequence session; follower acknowledgment then feeds decision accounting in the leader ballot. Pending batches are flushed before promises, buffered proposals are appended after adoption unless a StopSign is present, or forwarded after follower sync. Established decisions constrain snapshot production and public reads, but correctness of delta base reconstruction remains an explicit local question.",
+      "behavior_ids": [
+        "B-authority",
+        "B-prepare-quorum",
+        "B-sync-produce",
+        "B-sync-install",
+        "B-accept-decide"
+      ],
+      "fact_ids": [
+        "F-promise",
+        "F-delta",
+        "F-decided"
+      ],
+      "source_ids": [
+        "S-leader",
+        "S-formation",
+        "S-follower",
+        "S-sync-producer",
+        "S-sync-consumer"
+      ]
+    },
+    "open_details": [
+      "Delta snapshot base reconstruction after decided-boundary update",
+      "Cross-configuration routing and ballot ordering/equality boundary",
+      "Runtime append identity correlation across leader changes",
+      "Compaction bookkeeping for non-contiguous participant ids and storage-failure recovery"
+    ],
+    "core_gaps": [],
+    "status": "usable",
+    "rationale": "Representative formation, authority transition, old work, recovery, configuration and consumption paths have been traced. This is a navigation basis, not a coverage or correctness claim."
+  }
+}

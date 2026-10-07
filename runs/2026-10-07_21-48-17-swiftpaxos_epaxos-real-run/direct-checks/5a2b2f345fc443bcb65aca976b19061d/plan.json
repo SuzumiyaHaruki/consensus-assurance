@@ -1,0 +1,144 @@
+{
+  "description": "A replica-1 proposal establishes nonzero value ballot; a generated Prepare asks its owner to report retained history. Compare producer vbal sampled synchronously after reply emission to the matching actual decoded value ballot.",
+  "claim_id": "O_prepare_value_ballot",
+  "binding_ids": [
+    "binding_prepare_wire"
+  ],
+  "harness": {
+    "execution_package": "./epaxos",
+    "files": {},
+    "kind": "go_test",
+    "source": "package epaxos\n\nimport (\n \"bufio\"\n \"bytes\"\n \"encoding/json\"\n \"fmt\"\n \"sync\"\n \"testing\"\n\n \"github.com/imdea-software/swiftpaxos/dlog\"\n base \"github.com/imdea-software/swiftpaxos/replica\"\n \"github.com/imdea-software/swiftpaxos/replica/defs\"\n rpc \"github.com/imdea-software/swiftpaxos/rpc\"\n \"github.com/imdea-software/swiftpaxos/state\"\n)\n\n// Single-owner handler schedule. SendMsg and all message codecs are unchanged.\n// Each directed link is a byte stream; receive consumes its next actual message.\ntype assuranceNetwork struct {\n replicas []*Replica\n links [][]*bytes.Buffer\n}\n\nfunc assuranceNewNetwork(n int) *assuranceNetwork {\n net := &assuranceNetwork{replicas: make([]*Replica,n), links:make([][]*bytes.Buffer,n)}\n for id:=0; id<n; id++ {\n  br:= &base.Replica{Logger:dlog.New(\"\",false), N:n,F:(n-1)/2,Id:int32(id),\n   Alive:make([]bool,n),PreferredPeerOrder:make([]int32,n),PeerWriters:make([]*bufio.Writer,n),\n   State:state.InitState(),RPC:rpc.NewTableId(defs.RPC_TABLE),Stats:&defs.Stats{M:make(map[string]int)},\n   ProposeChan:make(chan *defs.GPropose,16),Thrifty:true,Exec:true,Dreply:true}\n  r:= &Replica{Replica:br, InstanceSpace:make([][]*Instance,n),crtInstance:make([]int32,n),\n   CommittedUpTo:make([]int32,n),ExecedUpTo:make([]int32,n),conflicts:make([]map[state.Key]*InstPair,n),\n   maxSeqPerKey:make(map[state.Key]int32),latestCPInstance:-1,clientMutex:new(sync.Mutex),\n   instancesToRecover:make(chan *instanceId,16),maxRecvBallot:-1}\n  r.exec=&Exec{r}\n  r.prepareRPC=r.RPC.Register(new(Prepare),nil)\n  r.prepareReplyRPC=r.RPC.Register(new(PrepareReply),nil)\n  r.preAcceptRPC=r.RPC.Register(new(PreAccept),nil)\n  r.preAcceptReplyRPC=r.RPC.Register(new(PreAcceptReply),nil)\n  r.acceptRPC=r.RPC.Register(new(Accept),nil)\n  r.acceptReplyRPC=r.RPC.Register(new(AcceptReply),nil)\n  r.commitRPC=r.RPC.Register(new(Commit),nil)\n  r.tryPreAcceptRPC=r.RPC.Register(new(TryPreAccept),nil)\n  r.tryPreAcceptReplyRPC=r.RPC.Register(new(TryPreAcceptReply),nil)\n  net.links[id]=make([]*bytes.Buffer,n)\n  for peer:=0;peer<n;peer++ {\n   r.InstanceSpace[peer]=make([]*Instance,16)\n   r.crtInstance[peer]=-1;r.CommittedUpTo[peer]=-1;r.ExecedUpTo[peer]=-1\n   r.conflicts[peer]=make(map[state.Key]*InstPair)\n   r.PreferredPeerOrder[peer]=int32((id+1+peer)%n)\n   r.Alive[peer]=peer!=id\n   net.links[id][peer]=new(bytes.Buffer)\n   r.PeerWriters[peer]=bufio.NewWriter(net.links[id][peer])\n  }\n  net.replicas[id]=r\n }\n return net\n}\n\nfunc assuranceEvent(t *testing.T, fields map[string]any) {\n t.Helper(); b,err:=json.Marshal(fields);if err!=nil {t.Fatal(err)}\n fmt.Println(\"CA_EVENT \"+string(b))\n}\n\nfunc (n *assuranceNetwork) receive(t *testing.T,from,to int) rpc.Serializable {\n t.Helper()\n stream:=n.links[from][to]\n code,err:=stream.ReadByte();if err!=nil {t.Fatalf(\"missing message %d -> %d: %v\",from,to,err)}\n pair,ok:=n.replicas[to].RPC.Get(code);if !ok {t.Fatalf(\"unknown message code %d\",code)}\n msg:=pair.Obj.New();if err:=msg.Unmarshal(stream);err!=nil {t.Fatalf(\"decode %d -> %d: %v\",from,to,err)}\n assuranceEvent(t,map[string]any{\"event\":\"delivery\",\"from\":from,\"to\":to,\"message_type\":fmt.Sprintf(\"%T\",msg),\"message\":msg})\n return msg\n}\n\nfunc assurancePropose(r *Replica, commandID int32, value string) {\n r.handlePropose(&defs.GPropose{Propose:&defs.Propose{CommandId:commandID,ClientId:r.Id,\n  Command:state.Command{Op:state.PUT,K:17,V:state.Value(value)}},Mutex:new(sync.Mutex)})\n}\n\nfunc TestAssurancePrepareValueBallot(t *testing.T) {\n n:=assuranceNewNetwork(3)\n owner,peer:=n.replicas[1],n.replicas[2]\n assurancePropose(owner,201,\"value-history\")\n pa,ok:=n.receive(t,1,2).(*PreAccept);if !ok {t.Fatal(\"expected emitted PreAccept\")}\n peer.handlePreAccept(pa)\n if peer.crtInstance[1]<0 || peer.InstanceSpace[1][0].Status>=COMMITTED {t.Fatal(\"recovery slot not eligible\")}\n // The PreAcceptReply remains pending on 2 -> 1. Receive and dispatch it\n // only after Prepare, using the production type-channel dispatch boundary.\n // Here we instead receive it now without dispatch, retaining the exact object.\n pending,ok:=n.receive(t,2,1).(*PreAcceptReply);if !ok {t.Fatal(\"expected pending reply\")}\n _=pending\n peer.startRecoveryForInstance(1,0)\n prepare,ok:=n.receive(t,2,1).(*Prepare);if !ok {t.Fatal(\"expected emitted Prepare\")}\n current:=owner.InstanceSpace[1][0]\n if prepare.Replica!=1 || prepare.Instance!=0 || prepare.Ballot<=current.bal || current.vbal!=1 {t.Fatal(\"wrong established context\")}\n owner.handlePrepare(prepare)\n // The source producer copies this same local field synchronously into the\n // reply passed to SendMsg. No owner writes intervene before decode below.\n assuranceEvent(t,map[string]any{\"event\":\"prepare_sent\",\"origin\":prepare.Replica,\"instance\":prepare.Instance,\n  \"acceptor\":owner.Id,\"recipient\":peer.Id,\"request_ballot\":prepare.Ballot,\"producer_vballot\":current.vbal,\n  \"producer_status\":current.Status,\"bytes_queued\":n.links[1][2].Len(),\"emitted\":n.links[1][2].Len()>0})\n reply,ok:=n.receive(t,1,2).(*PrepareReply);if !ok {t.Fatal(\"expected actual PrepareReply\")}\n if reply.AcceptorId!=owner.Id || reply.Replica!=prepare.Replica || reply.Instance!=prepare.Instance || reply.Ballot!=prepare.Ballot {t.Fatal(\"wrong report correlation\")}\n assuranceEvent(t,map[string]any{\"event\":\"prepare_decoded\",\"origin\":reply.Replica,\"instance\":reply.Instance,\n  \"acceptor\":reply.AcceptorId,\"recipient\":peer.Id,\"request_ballot\":reply.Ballot,\"decoded_vballot\":reply.VBallot,\n  \"decoded_status\":reply.Status,\"seq\":reply.Seq,\"deps\":reply.Deps,\"commands\":reply.Command,\"completed\":true})\n // The pending PreAcceptReply was decoded before Prepare but remains undispatched.\n // This is permitted by distinct production channels. No goroutines were started.\n}\n",
+    "description": "TestAssurancePrepareValueBallot; unchanged handlers and codecs, byte-stream links and deterministic dispatch, no workers or resources requiring cleanup.",
+    "semantic_changes": [
+      "Bounded constructor-equivalent replicas omit network and execution goroutine startup.",
+      "Real SendMsg/Marshal and New/Unmarshal operate over per-link byte buffers.",
+      "A decoded PreAcceptReply is held pending while a later Prepare on a different message-type channel is dispatched.",
+      "Recovery entry is invoked for a known unresolved slot instead of waiting for the scanner timer."
+    ],
+    "prerequisites": [
+      {
+        "alias": "sent",
+        "event": "prepare_sent",
+        "conditions": [
+          {
+            "field": "emitted",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          }
+        ]
+      }
+    ],
+    "legality": {
+      "source_ids": [
+        "S_prepare",
+        "S_prepare_codec",
+        "S_prepare_new",
+        "S_recover_select",
+        "S_wire",
+        "S_transport",
+        "S_receive",
+        "S_rpc_codec",
+        "S_init",
+        "S_base",
+        "S_propose",
+        "S_preaccept",
+        "S_start_recovery",
+        "S_recovery_trigger",
+        "S_send",
+        "S_client_types",
+        "S_dispatch"
+      ],
+      "expectation_ids": [
+        "S_prepare",
+        "S_recover_select"
+      ],
+      "binding_ids": [
+        "binding_prepare_wire"
+      ],
+      "derivation": "Reuse only constructor and wire helpers after checking this history: N=3,F=1, original owner replica 1 proposes through handlePropose, establishing vbal=1. Replica 2 receives its actual PreAccept and has a known uncommitted slot covered by crtInstance, permitting the recovery entry. The original PreAcceptReply is decoded first on link 2->1 but retained without handler dispatch. Then an actual startRecoveryForInstance emits Prepare ballot 5; owner 1 handles it before the earlier PreAcceptReply dispatch. This is legal: S_receive decodes before asynchronous per-message channel enqueue and S_dispatch selects separate channels without global FIFO. No reply is fabricated or repeated. All delivered messages are emitted by target handlers and actual codecs. After handlePrepare returns, the same single-owner local vbal copied by that handler is recorded while its serialized reply is queued. Unmarshal decodes that reply into New-produced storage; correlation checks enforce acceptor, instance and request ballot. No recovery reply consumer is invoked and no expected value is written into protocol state.",
+      "applicability": "Bounded single-thread handler history with explicit per-message dispatch substitution, real codecs, non-durable constructor-equivalent state and small arrays. Recovery timer delay is not measured and no timing property is checked.",
+      "unresolved": [
+        "No end-to-end TCP or recovery quorum decision is executed."
+      ],
+      "conflicts": [],
+      "alternatives": [
+        "If the earlier PreAcceptReply were dispatched first the owner might commit; that is another allowed schedule and not required by the observed transport boundary."
+      ]
+    }
+  },
+  "monitors": [
+    {
+      "id": "monitor_prepare_vballot",
+      "checker_id": "prepare_vballot",
+      "event": "prepare_decoded",
+      "binding_ids": [
+        "binding_prepare_wire"
+      ],
+      "grounding": {
+        "source_ids": [
+          "S_prepare",
+          "S_prepare_codec",
+          "S_prepare_new",
+          "S_recover_select",
+          "S_wire",
+          "S_transport",
+          "S_receive",
+          "S_rpc_codec"
+        ],
+        "expectation_ids": [
+          "S_prepare",
+          "S_recover_select",
+          "S_rpc_codec",
+          "S_wire"
+        ],
+        "binding_ids": [
+          "binding_prepare_wire"
+        ],
+        "derivation": "handlePrepare explicitly copies local inst.vbal into the reply separate from the promise ballot. The registered Serializable interface and sender/receiver call chain transfer that object; handlePrepareReply uses VBallot to rank retained values. Therefore successful reply transport owes equality of this semantic field with the producer local value ballot for the same report. This is a local preservation duty from actual producer and consumer, not an assumed protocol theorem or arbitrary serialization of unused state.",
+        "applicability": "An implementation-produced PrepareReply is serialized through SendMsg and decoded into the registered fresh message type; compare the local value ballot copied by handlePrepare with the corresponding decoded report.",
+        "unresolved": [
+          "Global recovery consequence is not claimed."
+        ],
+        "conflicts": [],
+        "alternatives": [
+          "Other fields and local coordinator history can remain correct despite this field loss."
+        ]
+      },
+      "applicability_conditions": [],
+      "admission_alias": "sent"
+    }
+  ],
+  "observable_properties": [
+    {
+      "checker_id": "prepare_vballot",
+      "kind": "event_assertion",
+      "trigger": {
+        "field": "completed",
+        "op": "eq",
+        "value": true,
+        "reference": null
+      },
+      "assertion": {
+        "field": "decoded_vballot",
+        "op": "eq",
+        "value": null,
+        "reference": "sent.producer_vballot"
+      },
+      "antecedent": null,
+      "identity_fields": [
+        "origin",
+        "instance",
+        "acceptor",
+        "recipient",
+        "request_ballot"
+      ],
+      "description": "The value ballot read from the decoded reply equals the producer field that handlePrepare copied into the sent report. Identity uses acceptor/origin/instance/recipient and the same fixed Prepare request ballot, never the compared vbal."
+    }
+  ],
+  "uncertainties": [
+    "One nonzero original-owner value ballot is exercised.",
+    "No later recovery decision or application effect is claimed."
+  ]
+}

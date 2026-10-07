@@ -1,0 +1,864 @@
+{
+  "version": 1,
+  "target_profile": {
+    "system_boundary": "Captured Dragonboat Go module: NodeHost/node/engine, internal Raft state machine, RSM, storage and transport integration. In-repository implementations remain in scope even where injectable.",
+    "protocol_contexts": [
+      "ClusterID/NodeID, term/vote/log, applied membership, read SystemCtx"
+    ],
+    "external_interfaces": [
+      "NodeHost.ReadIndex and RequestState.ResultC",
+      "Peer update persistence/message delivery contract",
+      "Application state-machine callbacks"
+    ],
+    "ownership": [
+      "node.raftMu serializes Raft stepping and membership callbacks",
+      "Engine saves updates and application workers consume committed tasks"
+    ],
+    "selection_injection": [],
+    "variants": [
+      "Voters, observers, witnesses",
+      "Snapshot recovery and optional on-disk/concurrent state machines"
+    ],
+    "source_ids": [
+      "src-read-api",
+      "src-node-step",
+      "src-update-order",
+      "src-membership-rules",
+      "src-new-raft"
+    ],
+    "unknowns": [
+      "Backend crash atomicity and application-specific behavior remain unread"
+    ]
+  },
+  "activities": [
+    {
+      "class_id": "A1",
+      "applicability": "applicable",
+      "purpose": "Qualified support for decision formation and legal advancement",
+      "realization_summary": "Proposal admission and Replicate/ReplicateResp dispatch. Leader ReadIndex admission and nonzero-context HeartbeatResp.",
+      "entry_points": [
+        "B-replicate",
+        "B-read-qualification"
+      ],
+      "variants": [],
+      "unknowns": [],
+      "source_ids": [
+        "src-quorum-commit",
+        "src-read-release",
+        "src-replication-receive",
+        "src-log-safety",
+        "src-proposal",
+        "src-read-queue"
+      ]
+    },
+    {
+      "class_id": "A2",
+      "applicability": "applicable",
+      "purpose": "Context validity and acquisition, transfer or loss of authority",
+      "realization_summary": "Election ticks, vote requests/responses, higher/lower-term messages, quorum loss and transfer.",
+      "entry_points": [
+        "B-authority"
+      ],
+      "variants": [],
+      "unknowns": [],
+      "source_ids": [
+        "src-authority-reset",
+        "src-term-election",
+        "src-peer-boundary",
+        "src-handler-membership",
+        "src-authority-timers",
+        "src-transfer",
+        "src-quorum-loss"
+      ]
+    },
+    {
+      "class_id": "A3",
+      "applicability": "applicable",
+      "purpose": "Recovery and resynchronization of eligible participation",
+      "realization_summary": "InstallSnapshot, async RSM Recover and RestoreRemotes callback.",
+      "entry_points": [
+        "B-recovery"
+      ],
+      "variants": [],
+      "unknowns": [],
+      "source_ids": [
+        "src-snapshot-restore",
+        "src-replication-receive",
+        "src-rsm-recovery",
+        "src-rsm-load",
+        "src-restore-callback",
+        "src-log-safety"
+      ]
+    },
+    {
+      "class_id": "A4",
+      "applicability": "applicable",
+      "purpose": "Configuration and participant eligibility",
+      "realization_summary": "Committed config change applies or is rejected; snapshot restores membership.",
+      "entry_points": [
+        "B-membership"
+      ],
+      "variants": [],
+      "unknowns": [],
+      "source_ids": [
+        "src-membership-rules",
+        "src-rsm-config",
+        "src-config-apply",
+        "src-peer-config",
+        "src-membership-raft",
+        "src-restore-callback"
+      ]
+    },
+    {
+      "class_id": "A5",
+      "applicability": "applicable",
+      "purpose": "Decision application and consumption",
+      "realization_summary": "readIndex.confirm returns one or more statuses; recipient dispatches ReadIndexResp. Engine queues committed entries; RSM processes config/session/application/no-op entries. Session-managed application rejects unknown clients, ignores acknowledged retries and replays cached results; batch completion schedules the node to consume updated application progress.",
+      "entry_points": [
+        "B-read-publication",
+        "B-apply"
+      ],
+      "variants": [],
+      "unknowns": [],
+      "source_ids": [
+        "src-read-reply",
+        "src-forward-read",
+        "src-peer-update",
+        "src-update-order",
+        "src-rsm-application",
+        "src-node-application",
+        "src-node-step",
+        "src-session-update",
+        "src-session-manager",
+        "src-session-guarantee",
+        "src-apply-wakeup"
+      ]
+    },
+    {
+      "class_id": "A6",
+      "applicability": "applicable",
+      "purpose": "History, persistence and reconstruction of support",
+      "realization_summary": "GetUpdate/SaveRaftState/processRaftUpdate/Commit; restart replay. Snapshot metadata serializes session histories and LRU order into an in-memory buffer for recovery.",
+      "entry_points": [
+        "B-persist"
+      ],
+      "variants": [],
+      "unknowns": [],
+      "source_ids": [
+        "src-update-order",
+        "src-peer-boundary",
+        "src-peer-update",
+        "src-node-step",
+        "src-replay",
+        "src-new-raft",
+        "src-peer-launch",
+        "src-log-safety",
+        "src-delivery",
+        "src-session-checkpoint",
+        "src-session-lru",
+        "src-session-order-test"
+      ]
+    },
+    {
+      "class_id": "A7",
+      "applicability": "applicable",
+      "purpose": "Client contracts, invocation intervals and observed completion",
+      "realization_summary": "ReadIndex API enqueues request; node step creates batch and forwards; ReadyToRead/applied progress/timeout consume it.",
+      "entry_points": [
+        "B-client-read"
+      ],
+      "variants": [],
+      "unknowns": [],
+      "source_ids": [
+        "src-read-api",
+        "src-read-admission",
+        "src-read-consumer",
+        "src-read-ready",
+        "src-node-step",
+        "src-forward-read"
+      ]
+    }
+  ],
+  "behaviors": [
+    {
+      "id": "B-replicate",
+      "primary_activity": "A1",
+      "execution_owner": "raft leader/follower under node.raftMu",
+      "protocol_context": "Cluster, current term, log prefix, voter/witness membership",
+      "trigger": "Proposal admission and Replicate/ReplicateResp dispatch",
+      "legal_preconditions": [],
+      "implementation_guards": [
+        "Drop proposals during leader transfer; only one pending configuration proposal",
+        "Follower preceding term match; refuse conflicts with committed prefix",
+        "Commit quorum order statistic over remotes and witnesses, then current-term check"
+      ],
+      "reads": [],
+      "writes": [
+        "Leader appends indexed current-term entries; remote response progress updates match/next",
+        "Follower appends matching suffix and advances commit bounded by received entries"
+      ],
+      "durable_effects": [],
+      "external_effects": [
+        "Replication broadcast on proposal and on successful commit; rejected replication retries with reduced next"
+      ],
+      "important_branches": [],
+      "async_boundaries": [],
+      "produces_fact_ids": [
+        "F-committed"
+      ],
+      "consumes_fact_ids": [],
+      "cross_activity_effects": {
+        "A5": "Committed entries become available to the update/application pipeline",
+        "A2": "Current-term commitment is required before multi-voter read confirmation admission"
+      },
+      "existing_protections": [],
+      "source_ids": [
+        "src-quorum-commit",
+        "src-read-release",
+        "src-replication-receive",
+        "src-log-safety",
+        "src-proposal"
+      ],
+      "unknowns": []
+    },
+    {
+      "id": "B-authority",
+      "primary_activity": "A2",
+      "execution_owner": "raft state machine entered through Peer and serialized node step",
+      "protocol_context": "Term, vote, leader identity and participant membership",
+      "trigger": "Election ticks, vote requests/responses, higher/lower-term messages, quorum loss and transfer",
+      "legal_preconditions": [],
+      "implementation_guards": [
+        "Peer filters unknown response senders; observers excluded from candidate vote counting",
+        "Election waits for committed entries to be applied; witness/observer do not campaign",
+        "Vote availability and up-to-date log; recent leader can suppress disruptive higher-term vote requests",
+        "Leader transfer requires known full member and caught-up progress before TimeoutNow"
+      ],
+      "reads": [],
+      "writes": [
+        "Reset votes, pending readIndex, remote progress and transfer state; clear vote only on term change",
+        "Leader promotion appends no-op and reconstructs pending configuration proposal"
+      ],
+      "durable_effects": [],
+      "external_effects": [
+        "Lower-term leader traffic may elicit NoOP; other stale work is dropped",
+        "Check-quorum loss and self-removal step down; transfer expires on election timeout"
+      ],
+      "important_branches": [],
+      "async_boundaries": [],
+      "produces_fact_ids": [],
+      "consumes_fact_ids": [
+        "F-committed"
+      ],
+      "cross_activity_effects": {
+        "A1": "Reset invalidates accumulated read support and replication progress; new-term commitment must be re-established"
+      },
+      "existing_protections": [],
+      "source_ids": [
+        "src-authority-reset",
+        "src-term-election",
+        "src-peer-boundary",
+        "src-handler-membership",
+        "src-authority-timers",
+        "src-transfer",
+        "src-quorum-loss"
+      ],
+      "unknowns": [
+        "Read-support interaction with live membership change beyond stable-membership case"
+      ]
+    },
+    {
+      "id": "B-read-qualification",
+      "primary_activity": "A1",
+      "execution_owner": "leader raft.readIndex",
+      "protocol_context": "Term-local queue keyed by SystemCtx, requester node and committed index",
+      "trigger": "Leader ReadIndex admission and nonzero-context HeartbeatResp",
+      "legal_preconditions": [],
+      "implementation_guards": [
+        "Multi-voter admission requires a committed current-term entry",
+        "Duplicate context ignored; distinct peer IDs counted; heartbeat confirmation context must be pending"
+      ],
+      "reads": [],
+      "writes": [
+        "Admit readStatus(ctx, from, committed index)",
+        "On quorum, remove prefix through confirmed ctx and return statuses with original ctx/from and confirming status index"
+      ],
+      "durable_effects": [],
+      "external_effects": [],
+      "important_branches": [
+        "Single-voter path directly publishes readiness, separate from queued quorum path",
+        "Heartbeat broadcast targets voters/witnesses; periodic broadcast carries latest pending context"
+      ],
+      "async_boundaries": [],
+      "produces_fact_ids": [
+        "F-read-status"
+      ],
+      "consumes_fact_ids": [
+        "F-committed"
+      ],
+      "cross_activity_effects": {
+        "A2": "Quorum heartbeat responses qualify current leadership for read use",
+        "A5": "Returns released read statuses to the publication path"
+      },
+      "existing_protections": [],
+      "source_ids": [
+        "src-read-release",
+        "src-read-queue",
+        "src-quorum-commit"
+      ],
+      "unknowns": []
+    },
+    {
+      "id": "B-read-publication",
+      "primary_activity": "A5",
+      "execution_owner": "raft leader confirmation handler and follower read response handler",
+      "protocol_context": "Released status identity versus wire reply context",
+      "trigger": "readIndex.confirm returns one or more statuses; recipient dispatches ReadIndexResp",
+      "legal_preconditions": [],
+      "implementation_guards": [],
+      "reads": [
+        "Each released status index/from/ctx; confirming HeartbeatResp Hint and HintHigh"
+      ],
+      "writes": [],
+      "durable_effects": [],
+      "external_effects": [
+        "Local status publishes s.ctx with s.index",
+        "Remote status emits ReadIndexResp to s.from with s.index but m.Hint/m.HintHigh",
+        "Follower converts wire context/index to ReadyToRead without replacing context"
+      ],
+      "important_branches": [],
+      "async_boundaries": [],
+      "produces_fact_ids": [],
+      "consumes_fact_ids": [
+        "F-read-status"
+      ],
+      "cross_activity_effects": {
+        "A7": "ReadyToRead is matched against the local pending request batch by exact SystemCtx"
+      },
+      "existing_protections": [],
+      "source_ids": [
+        "src-read-reply",
+        "src-forward-read",
+        "src-peer-update"
+      ],
+      "unknowns": []
+    },
+    {
+      "id": "B-client-read",
+      "primary_activity": "A7",
+      "execution_owner": "node incoming queue and locked pendingReadIndex",
+      "protocol_context": "Local request batches keyed by random nonzero SystemCtx.Low and tick-based High",
+      "trigger": "ReadIndex API enqueues request; node step creates batch and forwards; ReadyToRead/applied progress/timeout consume it",
+      "legal_preconditions": [],
+      "implementation_guards": [],
+      "reads": [],
+      "writes": [
+        "Create one context per drained request batch",
+        "addReady assigns index only to exact-context batch; applied emits completion only after index reached and before deadline"
+      ],
+      "durable_effects": [],
+      "external_effects": [
+        "Caller waits on RequestState.ResultC then may ReadLocal",
+        "Unknown contexts do not update other batches; timed out requests are collected"
+      ],
+      "important_branches": [],
+      "async_boundaries": [
+        "API admission precedes node step and network round trip; application progress may follow readiness"
+      ],
+      "produces_fact_ids": [],
+      "consumes_fact_ids": [],
+      "cross_activity_effects": {
+        "A1": "Supplies distinct read requests that consume quorum-qualified read indexes"
+      },
+      "existing_protections": [],
+      "source_ids": [
+        "src-read-api",
+        "src-read-admission",
+        "src-read-consumer",
+        "src-read-ready",
+        "src-node-step",
+        "src-forward-read"
+      ],
+      "unknowns": []
+    },
+    {
+      "id": "B-membership",
+      "primary_activity": "A4",
+      "execution_owner": "RSM membership owner then node callback holding raftMu",
+      "protocol_context": "Applied config entry and ConfigChangeId; current remotes/observers/witnesses",
+      "trigger": "Committed config change applies or is rejected; snapshot restores membership",
+      "legal_preconditions": [],
+      "implementation_guards": [
+        "Optional ordered ConfigChangeId check; reject removed-ID reuse and invalid role conversions",
+        "Pending config proposal clears after apply/rejection; observer promotion inherits progress"
+      ],
+      "reads": [],
+      "writes": [
+        "Membership state changes at application; callback updates Raft participation and node registry",
+        "Self-removal requests node removal and steps down leader; removing another node can trigger tryCommit"
+      ],
+      "durable_effects": [],
+      "external_effects": [],
+      "important_branches": [],
+      "async_boundaries": [
+        "Config log application is separate from Raft step; callback takes raftMu"
+      ],
+      "produces_fact_ids": [],
+      "consumes_fact_ids": [],
+      "cross_activity_effects": {
+        "A1": "Voter/witness set determines quorum and replication aggregation",
+        "A2": "Participant role and self-removal constrain authority acquisition/retention"
+      },
+      "existing_protections": [],
+      "source_ids": [
+        "src-membership-rules",
+        "src-rsm-config",
+        "src-config-apply",
+        "src-peer-config",
+        "src-membership-raft",
+        "src-restore-callback"
+      ],
+      "unknowns": [
+        "All overlapping read/configuration transition variants remain unexamined"
+      ]
+    },
+    {
+      "id": "B-persist",
+      "primary_activity": "A6",
+      "execution_owner": "engine step worker, log reader and Peer update owner",
+      "protocol_context": "Per-node saved term/vote/commit, entries, snapshot and processed/applied positions",
+      "trigger": "GetUpdate/SaveRaftState/processRaftUpdate/Commit; restart replay",
+      "legal_preconditions": [],
+      "implementation_guards": [],
+      "reads": [],
+      "writes": [],
+      "durable_effects": [
+        "SaveRaftState persists updates before ordinary message sends",
+        "Replay obtains newest snapshot, saved state and log range; newRaft loads term/vote/commit and snapshot membership"
+      ],
+      "external_effects": [],
+      "important_branches": [
+        "Replicate/Ping may be sent before persistence; fast apply only when committed entries do not overlap unsaved entries and no snapshot",
+        "Peer.Commit retires messages/readiness and advances processed/in-memory state after update processing"
+      ],
+      "async_boundaries": [],
+      "produces_fact_ids": [],
+      "consumes_fact_ids": [],
+      "cross_activity_effects": {
+        "A1": "Recovered committed/log state constrains subsequent append and commitment",
+        "A2": "Recovered term/vote constrains grants after restart"
+      },
+      "existing_protections": [],
+      "source_ids": [
+        "src-update-order",
+        "src-peer-boundary",
+        "src-peer-update",
+        "src-node-step",
+        "src-replay",
+        "src-new-raft",
+        "src-peer-launch",
+        "src-log-safety",
+        "src-delivery"
+      ],
+      "unknowns": [
+        "Storage backend failure atomicity and crash windows not deeply audited"
+      ]
+    },
+    {
+      "id": "B-recovery",
+      "primary_activity": "A3",
+      "execution_owner": "raft snapshot receiver, node recovery worker and RSM",
+      "protocol_context": "Snapshot index/term/membership and applied state",
+      "trigger": "InstallSnapshot, async RSM Recover and RestoreRemotes callback",
+      "legal_preconditions": [],
+      "implementation_guards": [
+        "Snapshot at/below committed rejected; matching log term can advance commit without replacing log",
+        "RSM rejects obsolete recovery and abort state"
+      ],
+      "reads": [],
+      "writes": [
+        "Snapshot restore establishes committed/processed index",
+        "RSM loads sessions/state and membership; callback reconstructs participant progress under raftMu"
+      ],
+      "durable_effects": [],
+      "external_effects": [],
+      "important_branches": [],
+      "async_boundaries": [],
+      "produces_fact_ids": [],
+      "consumes_fact_ids": [],
+      "cross_activity_effects": {
+        "A1": "Restores eligible history and membership for replication",
+        "A2": "Restored self-membership and roles determine continued participation"
+      },
+      "existing_protections": [],
+      "source_ids": [
+        "src-snapshot-restore",
+        "src-replication-receive",
+        "src-rsm-recovery",
+        "src-rsm-load",
+        "src-restore-callback",
+        "src-log-safety"
+      ],
+      "unknowns": [
+        "Snapshot transport failures and on-disk recovery variants remain open"
+      ]
+    },
+    {
+      "id": "B-apply",
+      "primary_activity": "A5",
+      "execution_owner": "RSM apply worker and node completion callbacks",
+      "protocol_context": "Committed ordered entries and state-machine/session state",
+      "trigger": "Engine queues committed entries; RSM processes config/session/application/no-op entries",
+      "legal_preconditions": [],
+      "implementation_guards": [],
+      "reads": [],
+      "writes": [
+        "Application processing advances internal applied state and publishes lastApplied at batch completion. Proposal/read callbacks depend on entry type and ignored/rejected branches."
+      ],
+      "durable_effects": [],
+      "external_effects": [
+        "StateMachine.Handle schedules node.StepReady after processing a task, even when individual entries skip ApplyUpdate; the subsequent node step reads lastApplied and calls pendingReadIndexes.applied."
+      ],
+      "important_branches": [],
+      "async_boundaries": [
+        "Apply worker separate from Raft step; applied index read back through synchronized accessor"
+      ],
+      "produces_fact_ids": [],
+      "consumes_fact_ids": [
+        "F-committed"
+      ],
+      "cross_activity_effects": {
+        "A2": "Applied position permits election after committed membership is consumed",
+        "A7": "Read batch completion requires confirmed read index at/below applied"
+      },
+      "existing_protections": [],
+      "source_ids": [
+        "src-update-order",
+        "src-rsm-application",
+        "src-node-application",
+        "src-node-step",
+        "src-apply-wakeup",
+        "src-apply-index",
+        "src-apply-dispatch",
+        "src-session-update"
+      ],
+      "unknowns": [
+        "Application-specific result buffer ownership and on-disk durability variants remain open."
+      ]
+    },
+    {
+      "id": "B-session-dedup",
+      "primary_activity": "A5",
+      "execution_owner": "RSM StateMachine under s.mu and SessionManager",
+      "protocol_context": "Registered ClientID, proposal SeriesID, RespondedTo and applied log index",
+      "trigger": "Committed session registration/unregistration and session-managed update entries",
+      "implementation_guards": [
+        "Unknown client rejected; already acknowledged series ignored; stored unacknowledged result replayed without user state update",
+        "Client ProposalCompleted increments serial/responded state and enforces expected sequence"
+      ],
+      "writes": [
+        "New application result recorded in session history; RespondedTo prunes acknowledged results; every processed update advances applied index"
+      ],
+      "external_effects": [
+        "Unacknowledged duplicate returns cached result; already-acknowledged duplicate is intentionally ignored"
+      ],
+      "cross_activity_effects": {
+        "A1": "Determines application effects of the committed history rather than selecting a new consensus decision",
+        "A7": "Implements documented at-most-once retry behavior subject to registered-session eligibility"
+      },
+      "source_ids": [
+        "src-session-update",
+        "src-session-manager",
+        "src-session-record",
+        "src-session-client-duty",
+        "src-session-guarantee"
+      ],
+      "unknowns": [
+        "Ownership/immutability of Result.Data retained in history versus returned to callers is not explicit in the inspected Result contract."
+      ]
+    },
+    {
+      "id": "B-session-checkpoint",
+      "primary_activity": "A6",
+      "execution_owner": "RSM snapshot metadata builder and locked LRU session store",
+      "protocol_context": "Session IDs, acknowledged prefix, cached results and LRU eligibility order",
+      "trigger": "getSSMeta builds Session buffer; SaveSessions serializes; LoadSessions restores",
+      "writes": [
+        "Snapshots preserve session history and traverse LRU-first order; successful lookup traversal restores the same final recency order",
+        "Load builds entries in serialized order and restores configured cache capacity"
+      ],
+      "important_branches": [
+        "Production getSSMeta supplies bytes.Buffer; arbitrary fallible writers are not the inspected production path",
+        "Snapshot tests require restored LRU order and matching future eviction behavior"
+      ],
+      "cross_activity_effects": {
+        "A5": "Restored sessions control whether later committed retries update, replay or reject",
+        "A2": "Recovery reconstructs participation history needed to consume committed operations consistently"
+      },
+      "source_ids": [
+        "src-session-lru",
+        "src-session-record",
+        "src-session-manager",
+        "src-session-checkpoint",
+        "src-session-order-test"
+      ],
+      "unknowns": [
+        "Result.Data aliasing contract remains separate from successful serialization order."
+      ]
+    }
+  ],
+  "facts": [
+    {
+      "id": "F-committed",
+      "meaning": "The local entry log has a committed prefix through its committed index. Leader advancement by replica counting requires a quorum match at a current-term entry; follower and snapshot paths have distinct establishment conditions.",
+      "identity": {
+        "cluster": "clusterID",
+        "prefix": "log index and term"
+      },
+      "validity_context": "Local log history across terms, bounded by snapshot/log consistency checks and the installed participant configuration.",
+      "representation": [
+        "entryLog.committed",
+        "pb.State.Commit"
+      ],
+      "invalidators": [],
+      "reinterpreters": [],
+      "durability": "Exported as Raft State and saved by engine; in-memory advancement precedes SaveRaftState.",
+      "recovery": "Restored from persisted state and snapshot; old committed prefix cannot be overwritten by tryAppend.",
+      "source_ids": [
+        "src-quorum-commit",
+        "src-log-safety",
+        "src-replication-receive",
+        "src-snapshot-restore",
+        "src-update-order"
+      ],
+      "unknowns": []
+    },
+    {
+      "id": "F-read-status",
+      "meaning": "A queued readStatus binds an admitted context to its originating node and a captured committed index. Quorum confirmation releases the prefix through the confirmed context, retaining each original ctx/from while raising its index to the confirming status index. Release alone does not establish remote notification or application completion.",
+      "identity": {
+        "cluster": "leader cluster",
+        "request": "SystemCtx Low/High",
+        "origin": "readStatus.from"
+      },
+      "validity_context": "Leader term-local pending queue; multi-voter admission follows current-term commitment. Authority reset discards pending statuses. Returned statuses exist synchronously for publication.",
+      "representation": [
+        "readIndex.pending",
+        "readIndex.queue",
+        "readStatus.ctx/from/index",
+        "confirm return slice"
+      ],
+      "invalidators": [
+        "B-authority"
+      ],
+      "reinterpreters": [],
+      "durability": "Volatile; not logged or restored.",
+      "recovery": "New authority creates an empty readIndex; caller timeout/drop handling is separate.",
+      "source_ids": [
+        "src-read-queue",
+        "src-read-release",
+        "src-authority-reset"
+      ],
+      "unknowns": []
+    }
+  ],
+  "surfaces": [
+    {
+      "entry_point": "raft.handleReadIndexLeaderConfirmation",
+      "disposition": "mapped",
+      "behavior_ids": [
+        "B-read-publication"
+      ],
+      "reason": "When a later context releases a prefix, remote replies use the confirming message context for all statuses; local readiness uses each status context. Execution/attribution is owned by Candidate 51a7dd248e1c419c9107303d486e486a and its retained check.",
+      "source_ids": [
+        "src-read-reply",
+        "src-read-queue"
+      ],
+      "high_consequence": false
+    },
+    {
+      "entry_point": "StateMachine.update",
+      "disposition": "mapped",
+      "behavior_ids": [
+        "B-session-dedup"
+      ],
+      "reason": "Session retry branches are traced; Result.Data ownership remains a separate unresolved interface premise.",
+      "source_ids": [
+        "src-session-update",
+        "src-result-data-contract"
+      ],
+      "high_consequence": true
+    },
+    {
+      "entry_point": "Transport.send",
+      "disposition": "deferred",
+      "behavior_ids": [],
+      "reason": "Loss is sourced; detailed reconnection ordering and snapshot transfer remain open.",
+      "source_ids": [
+        "src-transport-loss"
+      ],
+      "high_consequence": true
+    },
+    {
+      "entry_point": "statemachine.Result.Data",
+      "disposition": "UNCLASSIFIED_PROTOCOL_RESPONSIBILITY",
+      "reason": "Session.addResponse retains a Result whose Data is a slice; inspected interface describes creation/return but not reuse or caller mutation ownership. Need inspect return and snapshot consumers before attributing any isolation duty.",
+      "source_ids": [
+        "src-result-data-contract",
+        "src-session-record",
+        "src-session-update"
+      ],
+      "high_consequence": true
+    }
+  ],
+  "core_overview": {
+    "formation": {
+      "explanation": "The leader indexes proposals and aggregates per-voter/witness match acknowledgments into current-term commitment; followers validate the preceding term and protect the committed prefix. Commit propagates via replication and bounded heartbeats. Engine exports/persists state and queues committed entries to RSM, whose callbacks complete proposals and expose applied position. For reads, current-term commitment precedes distinct-voter heartbeat confirmation and prefix release; publication then feeds exact-context local batches, which additionally wait for application.",
+      "behavior_ids": [
+        "B-replicate",
+        "B-read-qualification",
+        "B-read-publication",
+        "B-persist",
+        "B-apply",
+        "B-client-read"
+      ],
+      "fact_ids": [
+        "F-committed",
+        "F-read-status"
+      ],
+      "source_ids": [
+        "src-quorum-commit",
+        "src-read-release",
+        "src-read-queue",
+        "src-update-order",
+        "src-rsm-application",
+        "src-read-consumer",
+        "src-replication-receive",
+        "src-log-safety",
+        "src-proposal",
+        "src-read-reply",
+        "src-forward-read",
+        "src-peer-update",
+        "src-peer-boundary",
+        "src-node-step",
+        "src-replay",
+        "src-new-raft",
+        "src-peer-launch",
+        "src-delivery",
+        "src-node-application",
+        "src-read-api",
+        "src-read-admission",
+        "src-read-ready",
+        "src-snapshot-restore",
+        "src-authority-reset",
+        "src-apply-wakeup",
+        "src-apply-index",
+        "src-apply-dispatch",
+        "src-session-update"
+      ]
+    },
+    "context": {
+      "explanation": "Election ticks campaign only for eligible nodes with no committed-but-unapplied entries. Available votes and up-to-date logs qualify support; known-peer response filtering and term dispatch precede aggregation. Higher terms, lost quorum and self-removal can remove authority; transfer waits for a full member to catch up and has a timeout. Reset discards pending read support and remote progress but preserves log commitment. New leadership appends a no-op and reconstructs pending config state. Membership changes are applied by the RSM then reflected in Raft under raftMu; recovery reconstructs snapshot membership and saved term/vote/log before later formation.",
+      "behavior_ids": [
+        "B-authority",
+        "B-membership",
+        "B-recovery",
+        "B-persist"
+      ],
+      "fact_ids": [
+        "F-committed",
+        "F-read-status"
+      ],
+      "source_ids": [
+        "src-authority-reset",
+        "src-term-election",
+        "src-peer-boundary",
+        "src-authority-timers",
+        "src-transfer",
+        "src-rsm-config",
+        "src-config-apply",
+        "src-rsm-recovery",
+        "src-new-raft",
+        "src-handler-membership",
+        "src-quorum-loss",
+        "src-membership-rules",
+        "src-peer-config",
+        "src-membership-raft",
+        "src-restore-callback",
+        "src-snapshot-restore",
+        "src-replication-receive",
+        "src-rsm-load",
+        "src-log-safety",
+        "src-update-order",
+        "src-peer-update",
+        "src-node-step",
+        "src-replay",
+        "src-peer-launch",
+        "src-delivery",
+        "src-quorum-commit",
+        "src-read-queue",
+        "src-read-release"
+      ]
+    },
+    "connection": {
+      "explanation": "Support is owned by the current term and installed membership. Authority transitions clear volatile votes/read support/progress, while persisted term/vote and protected committed history constrain future elections and replication. Applied membership updates redefine eligible participants and quorum; election blocking prevents campaigning before committed history is consumed. Confirmed reads bridge leadership support and client consumption through request context and application position, so release and notification are separate responsibilities. Stale-term replies are rejected; forwarded pending requests have distinct context, drop/timeout handling and no implicit completion guarantee from role acquisition.",
+      "behavior_ids": [
+        "B-authority",
+        "B-membership",
+        "B-replicate",
+        "B-read-qualification",
+        "B-read-publication",
+        "B-client-read",
+        "B-apply"
+      ],
+      "fact_ids": [
+        "F-committed",
+        "F-read-status"
+      ],
+      "source_ids": [
+        "src-term-election",
+        "src-authority-reset",
+        "src-membership-raft",
+        "src-read-queue",
+        "src-read-reply",
+        "src-forward-read",
+        "src-read-consumer",
+        "src-peer-boundary",
+        "src-handler-membership",
+        "src-authority-timers",
+        "src-transfer",
+        "src-quorum-loss",
+        "src-membership-rules",
+        "src-rsm-config",
+        "src-config-apply",
+        "src-peer-config",
+        "src-restore-callback",
+        "src-quorum-commit",
+        "src-read-release",
+        "src-replication-receive",
+        "src-log-safety",
+        "src-proposal",
+        "src-peer-update",
+        "src-read-api",
+        "src-read-admission",
+        "src-read-ready",
+        "src-node-step",
+        "src-update-order",
+        "src-rsm-application",
+        "src-node-application",
+        "src-snapshot-restore",
+        "src-apply-wakeup",
+        "src-apply-index",
+        "src-apply-dispatch",
+        "src-session-update"
+      ]
+    },
+    "open_details": [
+      "Remote read prefix publication uses the confirming context for earlier remote statuses; the scoped execution/attribution is retained with its Candidate.",
+      "Read confirmations across membership transitions, snapshot transport failures, storage crash atomicity and result buffer ownership remain open."
+    ],
+    "core_gaps": [],
+    "status": "usable",
+    "rationale": "Representative formation, authority change and old-work handling are traced through actual membership, recovery, persistence and completion owners. Usable navigation does not certify these paths."
+  }
+}
