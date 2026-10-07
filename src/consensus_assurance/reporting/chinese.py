@@ -166,6 +166,24 @@ def report_view(state, archive):
     return view(state.model_copy(update={'audit_spec_path':str(path) if path else None}))
 
 
+def result_item(record, artifact, reviews, checks):
+    """Use the latest correspondence only when attributable to this valid execution."""
+    if not (record.get('confirmed') or record.get('reviewed_complete')):return None
+    items = [i for rid in record.get('review_ids',[]) if rid in reviews
+        and reviews[rid].target_versions.get(artifact['id']) == artifact['version']
+        for i in reviews[rid].items if i.target_id == artifact['id'] and i.aspect == 'checker_correspondence']
+    item = items[-1] if items else None
+    if not item or item.status != 'no_issue_found' or item.counterevidence:return None
+    check_id = record['experiment_check_id']
+    check = checks.get(check_id)
+    if not check or check.direct_check_id != artifact['id']:return None
+    executions = {c.id for c in checks.values() if c.direct_check_id == artifact['id']}
+    if item.execution_attribution:
+        if item.execution_attribution.check_id != check_id:return None
+    elif executions != {check_id}:return None
+    return item
+
+
 def observation_lines(record, artifact, check, archive, event_cache):
     """Select recorded comparisons and operands; never re-assess or invent an oracle."""
     from consensus_assurance.adapters.runners.experiment import extract_events
@@ -254,7 +272,7 @@ def milestone_lines(state, research, archive, checks, titles):
         or s.get('accepted_versions',{}).get('artifacts') or s.get('released_candidate_ids'))]
     for s in growth[-3:]+[s for s in state.selections if s['action'] in {'review','revise_check','pause','explained','continue','obligation'} and 'accepted_versions' in s]:
         review=next((r for r in state.semantic_reviews if r.check_id==s['operation_id']),None)
-        title = next((i.report_title for i in review.items if i.report_title),None) if review else None
+        title = next((i.report_title for i in review.items if i.aspect=='checker_correspondence' and i.report_title),None) if review else None
         detail='；'+'、'.join(f'v{review.target_versions.get(i.target_id,"?")} {i.aspect}: {i.status}' for i in review.items) if review else ''
         selected.setdefault(s['operation_id'], (f'受理 {s["action"]}：'+excerpt(title or s['rationale'],140)+detail,
             archive.link(f'submissions/{s["operation_id"]}/accepted.json','完整交接')))
@@ -294,7 +312,9 @@ def render_report(state, root):
     archive = Archive(state,root)
     research = report_view(state,archive)
     link = archive.link
-    map_link = link(research['audit_spec_path'],f'地图 v{state.audit_spec_version}：概览、Behavior／Fact 与来源')
+    map_link = ('尚无受理地图' if state.audit_spec_version == 0 and not state.audit_spec_path else
+        link(research['audit_spec_path'],f'地图 v{state.audit_spec_version}：概览、Behavior／Fact 与来源'))
+    if research['audit_spec_path'] and research['understanding_status'] != 'usable':map_link += '（已受理部分理解）'
     checks = {c.id:c for c in state.checks}
     artifacts = {a['id']:a for a in research['artifacts']}
     results = sorted(research['conclusions'],key=lambda r:(list(DISPOSITIONS).index(r['disposition']),
@@ -337,6 +357,10 @@ def render_report(state, root):
     stop_label = ({'user_stop':'实际取消','resource_limit':'资源边界','tool_gap':'服务／权限／工具中断'}.get(stop.get('reason'),'中断')
         if stop.get('origin') == 'controller' else {'insufficient_basis':'研究依据不足','bounded_completed':'所声明范围完成',
         'no_actionable_direction':'未选择可推进方向'}.get(stop.get('reason'),'研究停止')) if stop else '尚未结束'
+    stopped_check = checks.get(stop.get('operation_id'))
+    if (stopped_check and stopped_check.action == 'agent_turn' and stopped_check.status == ExecutionStatus.TIMEOUT
+            and stopped_check.parameters.get('timeout_limit') == 'agent_turn_timeout'):
+        stop_label = 'Agent 单轮上限到达'
     lines = ['# 共识审计研究报告', '', '## 运行概览', '',
         f'审计目标 **{cell(config.get("target",{}).get("variant") or Path(state.snapshot.repo).name)}**；'
         f'实际持续 **{state.elapsed_seconds/60:.2f} 分钟**；结束类型：**'+
@@ -373,7 +397,6 @@ def render_report(state, root):
         ('；'+link('agent-inputs/catalog.json','固定目录来源与摘要') if provider and provider.get('model_catalog_path') else '')+
         ('；'+link(f'logs/{last_turn.id}/check.json','最近调用的 CLI、session 与 usage（缺失项仍未知）') if last_turn else '；尚无 Agent 调用记录')+'。', '',
         '停止依据（记录摘录）：'+excerpt(stop.get('rationale') or state.stop_reason,190)+'；'+link('state.json','完整停止记录')+'。', '']
-    stopped_check = checks.get(stop.get('operation_id'))
     if stopped_check and (stopped_check.status != ExecutionStatus.COMPLETED or stopped_check.exit_code not in (0,None)):
         details += interruption_lines(stopped_check,archive)
     lines += ['', '## 主要结果', '']
@@ -384,19 +407,13 @@ def render_report(state, root):
     entries = []
     for n,result in enumerate(results,1):
         records = [r for r in research['assessments'] if r.get('claim_id') == result['claim_id']]
-        current_reviews=[]
-        for record in records:
-            latest=next((reviews[rid] for rid in reversed(record.get('review_ids',[])) if rid in reviews and
-                reviews[rid].target_versions.get(record['direct_check_id'])==artifacts[record['direct_check_id']]['version']),None)
-            if latest:current_reviews.append((record,latest))
-        items=[i for record,review in current_reviews for i in review.items if i.target_id==record['direct_check_id']]
-        title = next((i.report_title for i in reversed(items) if i.report_title),None)
-        title = title or excerpt(result['question'] or result['description'],130)+'（原文摘录）'
-        review_operations={review.check_id for _,review in current_reviews}
-        relevant={r['direct_check_id'] for r in records}|{r['experiment_check_id'] for r in records}
-        feedback=next((s.get('feedback',{}) for s in reversed(state.selections) if s['operation_id'] in review_operations and
-            relevant & set(s.get('feedback',{}).get('ref_ids',[]))),{})
-        answer = next((i.report_answer for i in reversed(items) if i.report_answer),None) or feedback.get('answered')
+        # First supporting assessment in retained order; later scenarios remain individually visible.
+        supporting = next((r for r in records if
+            result['disposition']=='confirmed_in_scope' and r.get('confirmed') and r.get('outcome')=='violated' or
+            result['disposition']=='bounded_no_violation' and r.get('reviewed_complete') and r.get('outcome')=='holds'),None)
+        item = result_item(supporting,artifacts[supporting['direct_check_id']],reviews,checks) if supporting else None
+        title = (item.report_title if item else None) or excerpt(result['description'],130)+'（原文摘录）'
+        answer = (item.report_answer if item else None) or (assessment_progress(supporting) if supporting else None)
         entries.append((result,records,answer,title))
         progress = progress_text(result['claim_id'])
         disposition = conclusion_label(result)+('；另有场景尚未完成' if progress and result['disposition']=='confirmed_in_scope' else '')
@@ -423,6 +440,9 @@ def render_report(state, root):
         for record in records:
             artifact = artifacts[record.get('direct_check_id')]
             check = checks[record['experiment_check_id']]
+            item = result_item(record,artifact,reviews,checks)
+            if item and (item.report_title or item.report_answer):
+                lines += ['', '本场景复核摘录：'+'；'.join(filter(None,[item.report_title,item.report_answer]))]
             lines += ['', f'制品 v{artifact["version"]}；'+('对应性意见：'+str(record.get('correspondence','信息不足')) if record.get('reviewed_complete') else
                 assessment_progress(record)+f'；场景比较完整：{record.get("bounded_complete","未记录")}；独立场景完整处置：{record.get("reviewed_complete","未记录")}')+'。',
                 '；'.join([link(artifact['harness_path'],'固定测试'),
@@ -485,7 +505,8 @@ def render_report(state, root):
         for key,label in [('formation','共识形成与推进'),('context','上下文／权威转换'),('connection','两条主线的连接')]:
             lines.append('- '+label+'（原文导航摘录）：'+excerpt(research['core_overview'][key]['explanation'],220))
     if research['understanding_status'] != 'usable':lines.append('双主线初始理解尚未完成；定向问题之外不能据片段宣称整体就绪。')
-    titles = {r['experiment_check_id']:title for _,records,_,title in entries for r in records}
+    titles = {r['experiment_check_id']:(item.report_title if item else None) or assessment_progress(r)
+        for r in research['assessments'] for item in [result_item(r,artifacts[r['direct_check_id']],reviews,checks)]}
     titles.update({x['check_id']:e['rationale'] or e['question'] or '探索原稿缺失' for e in exploration_records for x in e['executions']})
     lines += ['累计分钟从本轮创建起计，含暂停间隔；详细墙钟与耗时见执行记录。']+milestone_lines(state,research,archive,checks,titles)
     lines += ['', '<a id="pending-work"></a>', '', '## 当前未决事项', '']

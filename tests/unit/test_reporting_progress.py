@@ -14,6 +14,7 @@ def test_report_distinguishes_configured_provider_from_unrecorded_history(tmp_pa
         text=render_report(state,tmp_path).read_text()
         assert f'配置 provider `{label}`' in text and '请求模型 `configured-model`' in text
         assert '服务端模型／版本：未记录' in text and state.model_dump(mode='json')==before
+        assert '尚无受理地图' in text and '地图 v0' not in text
 
 
 def test_target_action_costs_keep_process_time_missing_data_and_identity(tmp_path):
@@ -410,6 +411,59 @@ def test_mixed_report_reads_fixed_results_and_moves_without_side_effects(tmp_pat
     assert '"bounded": true}' in text and '"bounded": false}' in text
     check=next(c for c in state.checks if c.direct_check_id==current.id)
     assert f'{check.id} / event[0] / state.encoded' in text and f'{check.id} / event[1] / state.encoded' in text
+    # Reuse saved executions: an independent later holds scenario must not narrate the violation.
+    mixed=state.model_copy(deep=True)
+    holds=mixed.direct_checks[-1];holds.claim_id=current.claim_id;holds.unit_id=current.unit_id
+    holds.graph_versions=dict(current.graph_versions)
+    for record in mixed.monitor_results:
+        if record['direct_check_id']==holds.id:record['claim_id']=current.claim_id
+    violated=next(r for r in mixed.monitor_results if r['direct_check_id']==current.id)
+    correspondence=next(r for r in mixed.semantic_reviews if current.id in r.target_versions)
+    holds_review=next(r for r in mixed.semantic_reviews if holds.id in r.target_versions)
+    holds_review.items[0].report_title='内部输入返回责任'
+    holds_review.items[0].report_answer='本场景返回 3，上限为 3。'
+    optional=correspondence.items[0].model_copy(update={'aspect':'applicability',
+        'report_title':'适用性说明', 'report_answer':'仅说明该义务适用。'})
+    def main_row(copy):
+        before=copy.model_dump(mode='json')
+        report=render_report(copy,moved).read_text()
+        assert copy.model_dump(mode='json')==before
+        valid_links(report)
+        return next(line for line in report.splitlines() if f'[{current.claim_id}](' in line),report
+    for items in ([optional,correspondence.items[0]],[correspondence.items[0],optional]):
+        correspondence.items=items
+        row,report=main_row(mixed)
+        assert '边界返回责任' in row and '本次完整观察返回 4' in row and '已确认违反' in row
+        assert '适用性说明' not in row and '本场景返回 3' not in row
+        scenario_check=next(c for c in mixed.checks if c.direct_check_id==holds.id)
+        timeline=report.split('## 研究过程与认识增长')[1].split('## 当前未决事项')[0]
+        scenario=next(line for line in timeline.splitlines() if f'logs/{scenario_check.id}/check.json' in line)
+        assert '内部输入返回责任' in scenario and '边界返回责任' not in scenario
+        assert '本场景返回 3，上限为 3。' in report
+    supplement=correspondence.model_copy(deep=True,update={'id':'applicability-only','items':[optional]})
+    mixed.semantic_reviews.append(supplement);violated['review_ids'].append(supplement.id)
+    assert '本次完整观察返回 4' in main_row(mixed)[0]
+    for change in ('challenge','new_version','no_answer','answer_only','ambiguous_execution'):
+        changed=mixed.model_copy(deep=True)
+        record=next(r for r in changed.monitor_results if r['direct_check_id']==current.id)
+        review=next(r for r in changed.semantic_reviews if r.id==correspondence.id)
+        item=next(i for i in review.items if i.aspect=='checker_correspondence')
+        if change=='challenge':
+            newer=review.model_copy(deep=True,update={'id':'new-challenge','items':[item.model_copy(update={'status':'disputed'})]})
+            changed.semantic_reviews.append(newer);record['review_ids'].append(newer.id)
+            record.update(confirmed=False,reviewed_complete=False,correspondence='disputed',blockers=['New correspondence challenge'])
+        if change=='new_version':
+            next(a for a in changed.direct_checks if a.id==current.id).version+=1
+            record.update(confirmed=False,reviewed_complete=False,correspondence=None,blockers=['Current version requires review'])
+        if change=='no_answer':item.report_answer=None
+        if change=='answer_only':item.report_title=None
+        if change=='ambiguous_execution':changed.checks.append(check.model_copy(update={'id':'another-execution'}))
+        row,_=main_row(changed)
+        assert '适用性说明' not in row and '仅说明该义务适用' not in row and '本场景返回 3' not in row
+        if change=='answer_only':assert '边界返回责任' not in row and '本次完整观察返回 4' in row
+        else:assert '本次完整观察返回 4' not in row
+        if change in {'challenge','new_version'}:assert '已确认违反' not in row and ('争议' in row or '复核' in row)
+    assert state.model_dump(mode='json')==saved
     candidate_only=state.model_copy(deep=True)
     candidate_only.units=[];candidate_only.claims=[];candidate_only.direct_checks=[];candidate_only.monitor_results=[]
     candidate_only.semantic_reviews=[];candidate_only.review_issues=[];candidate_only.evidence=[];candidate_only.findings=[]
@@ -432,6 +486,10 @@ def test_mixed_report_reads_fixed_results_and_moves_without_side_effects(tmp_pat
     missing=render_report(state,moved).read_text()
     assert '部分归档事件缺失' in missing and '**已确认违反**' in missing
     assert '| state.encoded |' not in missing
+    assert '已受理部分理解' in render_report(state,moved).read_text()
+    (moved/f'audit-spec/v{state.audit_spec_version}.json').unlink()
+    map_missing=render_report(state,moved).read_text()
+    assert '来源（归档字节缺失）' in map_missing and '尚无受理地图' not in map_missing
     # A missing archived version must not silently resolve against the still-existing original run.
     (moved/Path(current.plan_path).relative_to(e.root)).unlink()
     (moved/index['explorations'][1]['submission']).unlink()
@@ -466,18 +524,24 @@ def test_mixed_report_reads_fixed_results_and_moves_without_side_effects(tmp_pat
 
 def test_timeout_report_uses_recorded_limit_and_preserves_transport_diagnostic(tmp_path):
     import json
-    from types import SimpleNamespace
+    from consensus_assurance.core.config import Config
+    from consensus_assurance.core.types import Analysis, Snapshot
     from consensus_assurance.reporting.chinese import Archive, interruption_lines
     stdout=tmp_path/'stdout.log'
     stdout.write_text(json.dumps({'type':'error','message':'stream disconnected before completion'})+'\n')
     check=CheckRun(action='agent_turn',cwd=str(tmp_path),snapshot_id='fixture',stdout=str(stdout),status=ExecutionStatus.TIMEOUT)
-    archive=Archive(SimpleNamespace(audit_spec_path=None,checks=[check]),tmp_path)
+    state=Analysis(mode='real',config=Config().model_dump(mode='json'),
+        snapshot=Snapshot(repo=str(tmp_path),files={},excluded=[]),checks=[check],
+        run_stop={'origin':'controller','reason':'tool_gap','operation_id':check.id})
+    archive=Archive(state,tmp_path)
     for limit,label in [('total_seconds','总运行预算到达'),('agent_turn_timeout','单轮上限'),
         ('action_timeout','目标动作达到执行上限'),(None,'超时上限依据不足')]:
         check.parameters={'timeout_limit':limit} if limit else {}
         saved=check.model_dump(mode='json');raw=stdout.read_bytes()
         text='\n'.join(interruption_lines(check,archive))
         assert label in text and 'stream disconnected before completion' in text
+        overview=render_report(state,tmp_path).read_text().split('## 主要结果')[0]
+        assert ('Agent 单轮上限到达' in overview)==(limit=='agent_turn_timeout')
         assert '单轮超时，具体原因未知' not in text
         assert check.model_dump(mode='json')==saved and stdout.read_bytes()==raw
     message='This content was flagged for possible cybersecurity risk.'
@@ -489,6 +553,7 @@ def test_timeout_report_uses_recorded_limit_and_preserves_transport_diagnostic(t
     assert text.count(message)==1 and 'status=`error`' in text and 'timeout_seconds=`900`' in text
     assert '达到单轮上限' not in text and '未记录；未完成草稿不受理' in text and '不据此授权重试' in text
     assert stdout.read_bytes()==raw and check.model_dump(mode='json')==saved
+    assert 'Agent 单轮上限到达' not in render_report(state,tmp_path).read_text().split('## 主要结果')[0]
 
 
 def test_assessment_gap_labels_use_only_saved_state(tmp_path):
