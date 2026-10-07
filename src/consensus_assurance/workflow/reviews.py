@@ -10,9 +10,13 @@ def review_objects(state):
     return {o.id:o for o in state.claims+state.bindings+state.relations+state.units+state.direct_checks+state.question_candidates}
 
 
-def issue_challenges(state,issue):
+def issue_review_item(state,issue):
     review=next((r for r in state.semantic_reviews if r.id==issue.review_id),None)
-    item=next((x for x in review.items if x.target_id==issue.target_id and x.aspect==issue.aspect),None) if review else None
+    return next((x for x in review.items if x.target_id==issue.target_id and x.aspect==issue.aspect),None) if review else None
+
+
+def issue_challenges(state,issue):
+    item=issue_review_item(state,issue)
     return item.counterevidence if item and item.counterevidence else [c['text'] for c in issue.conditions] or [issue.explanation]
 
 
@@ -115,7 +119,8 @@ def repair_changes(old, artifact, version=None):
     semantic = old.graph_versions != artifact.graph_versions
     return {'configuration':inputs, 'initialization':inputs, 'driver':inputs,
         'observation':inputs or predicate or observation, 'oracle':predicate,
-        'expectation':semantic, 'scope':semantic or old.scope != artifact.scope}
+        'expectation':semantic, 'scope':semantic or old.scope != artifact.scope or
+            {p.checker_id for p in after.observable_properties} < {p.checker_id for p in before.observable_properties}}
 
 
 def accept_review(state, submission, operation_id):
@@ -190,6 +195,11 @@ def accept_review(state, submission, operation_id):
             executed = any(c.action == 'direct_check' and c.exit_code == 0 for c in checks)
             changes = repair_changes(old,artifact,issue.target_version)
             unchanged = [c for c in components if not changes[c]]
+            challenged=issue_review_item(state,issue)
+            if challenged and challenged.out_of_scope_checker_ids:
+                from .direct_checks import load_plan
+                if set(challenged.out_of_scope_checker_ids)&{p.checker_id for p in load_plan(artifact.plan_path).observable_properties}:
+                    unchanged.append('out_of_scope_checkers')
             sourced_answer = (artifact.id==old.id and
                 not includes(state,resolution.source_ids,issue.source_ids))
             if not sourced_answer and (artifact.id == old.id or unchanged or not executed):

@@ -67,6 +67,16 @@ def validate_contract(state,target_id,items):
             issue('review_wrong_component',item.target_id,'Review an executed artifact for component repairs; Candidate applicability uses sourced disputes or reading questions',i)
         if item.status == 'no_issue_found' and item.challenged_components:
             issue('review_contradictory_component',item.target_id,'A current repair challenge requires a negative judgment',i)
+        if item.out_of_scope_checker_ids:
+            if (kind!='direct_check' or item.aspect!='checker_correspondence' or item.status!='revision_needed' or
+                    not set(item.challenged_components)&{'scope','oracle'}):
+                issue('review_checker_scope',item.target_id,'Extra checker removal needs a direct correspondence scope/oracle challenge',i)
+            else:
+                from .direct_checks import load_plan
+                ids={p.checker_id for p in load_plan(objects[item.target_id].plan_path).observable_properties}
+                extra=set(item.out_of_scope_checker_ids)
+                if len(extra)!=len(item.out_of_scope_checker_ids) or not extra<ids:
+                    issue('review_checker_scope',item.target_id,'Name distinct existing extra checkers and retain the responsibility checks',i)
         for source,status in citation_status(state,item.source_ids,supplied).items():
             if status!='provided':issue('review_unknown_source' if status=='unknown' else 'review_unavailable_source',item.target_id,'Citation '+source+': '+status+'; correct the reference or attach the actual range',i)
     if errors:raise DiagnosticError(errors)

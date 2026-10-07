@@ -213,6 +213,8 @@ class SemanticCheck(Record):
     limitations: list[str] = []
     challenged_components: list[RepairComponent] = Field(default_factory=list,
         description="Components requiring repair, distinct from the review aspect; revision_needed must name them")
+    out_of_scope_checker_ids: list[str] = Field(default_factory=list,
+        description="Exact extra checker IDs challenged as outside this obligation, not a change to the obligation. Only direct checker_correspondence revision_needed with a scope/oracle challenge; retained checkers must still express the responsibility")
 
 
 class SemanticReview(Record):

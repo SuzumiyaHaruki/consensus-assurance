@@ -191,6 +191,123 @@ def test_direct_encoding_observation_change_must_be_declared(tmp_path,prepared):
     validate_direct_encoding(e.state,old,old_plan,fixed,revision)
 
 
+def test_out_of_scope_checker_removal_keeps_responsibility_and_issue_lineage(tmp_path):
+    from audit_support import engine_for,first,check_step,review_step,stop,diagnostics
+    from consensus_assurance.core.submissions import CheckSubmission,ReviewSubmission
+    from consensus_assurance.workflow.audit import validate_check_revision
+    from consensus_assurance.workflow.direct_checks import load_plan,compute_assessment
+    from consensus_assurance.workflow.reviews import open_issues,accept_review
+    saved={}
+    def extra(state):
+        sub,files=check_step()(state);plan=json.loads(files['plan.json'])
+        plan['observable_properties'].append(dict(plan['observable_properties'][0],checker_id='Zero',
+            assertion={'field':'state.value','value':0},description='The returned value must be zero'))
+        plan['monitors'].append(dict(plan['monitors'][0],id='zero',checker_id='Zero'))
+        files['plan.json']=json.dumps(plan)
+        files['check.py']=files['check.py'].replace("'in_range':0 <= value <= 3", "'in_range':0 <= value <= 3,'value':value")
+        saved['files']=files
+        return sub,files
+    def challenge(state,precise=False):
+        sub,_=review_step('revision_needed')(state)
+        sub['review_items'][0].update(rationale='The obligation requires a bounded return, not a zero return',
+            counterevidence=['Zero asserts an additional property outside the accepted responsibility'],
+            challenged_components=['scope'])
+        if precise:
+            sub['sources']=[dict(id='boundary',file='README.md',start_line=2,end_line=2,kind='interface_statement')]
+            sub['review_items'][0].update(rationale='The explicit contract retains Bounded; only the extra Zero checker misstates the oracle',
+                challenged_components=['oracle'],source_ids=['code','doc','boundary'],out_of_scope_checker_ids=['Zero'])
+        return sub,{}
+    def corrected(state,linked=True):
+        sub,_=check_step(revise=linked)(state)
+        files=dict(saved['files']);plan=json.loads(files['plan.json'])
+        plan['observable_properties']=plan['observable_properties'][:1];plan['monitors']=plan['monitors'][:1]
+        files['plan.json']=json.dumps(plan)
+        if not linked:
+            saved['old']=e.state.model_copy(deep=True)
+            return sub,files
+        old=e.state.direct_checks[0];sub['previous_check_id']=old.id
+        issue=state['review_issues'][-1]
+        sub['encoding_revision']=dict(old_direct_check_id=old.id,issue_id=issue['id'],source_ids=['code','doc','boundary'],
+            rationale='Remove only the extra zero predicate; preserve the bounded responsibility and actual observations')
+        original=load_plan(old.plan_path)
+        repaired=original.model_copy(deep=True);repaired.observable_properties=repaired.observable_properties[:1];repaired.monitors=repaired.monitors[:1]
+        product=CheckSubmission.model_validate(sub)
+        validate_check_revision(e.state,old,repaired,product)
+        from consensus_assurance.workflow.review_contract import validate_contract
+        item=e.state.semantic_reviews[-1].items[0]
+        for update in ({'out_of_scope_checker_ids':['missing']},{'out_of_scope_checker_ids':['Zero','Zero']},
+                {'out_of_scope_checker_ids':['Zero','Bounded']},{'status':'no_issue_found'},
+                {'challenged_components':['driver']},{'aspect':'applicability'}):
+            with pytest.raises(ValueError):validate_contract(e.state,old.id,[item.model_copy(update=update)])
+        for fault in ('required','all','new_checker','predicate','identity','prerequisite','endpoint','harness','legality',
+                'undeclared_issue','ordinary','wrong_previous','renaming','semantic_version'):
+            private=e.state.model_copy(deep=True);bad=repaired.model_copy(deep=True);request=product.model_copy(deep=True)
+            if fault=='required':bad.observable_properties=original.observable_properties[1:];bad.monitors=original.monitors[1:]
+            elif fault=='all':bad=bad.model_copy(update={'observable_properties':[],'monitors':[]})
+            elif fault=='new_checker':bad.observable_properties[0].checker_id='New'
+            elif fault=='predicate':bad.observable_properties[0].assertion.value=False
+            elif fault=='identity':bad.observable_properties[0].identity_fields=['context']
+            elif fault=='prerequisite':bad.harness.prerequisites=[]
+            elif fault=='endpoint':bad.monitors[0].event='another-return'
+            elif fault=='harness':bad.harness.source+='\nprint("unrelated output")\n'
+            elif fault=='legality':bad.harness.legality.applicability='Any input without the original admission'
+            elif fault=='undeclared_issue':request.encoding_revision.issue_id=state['review_issues'][0]['id']
+            elif fault=='ordinary':request.encoding_revision=None
+            elif fault=='wrong_previous':request.encoding_revision.old_direct_check_id=state['direct_checks'][-1]['id']
+            elif fault=='renaming':bad=original.model_copy(update={'description':'Only a renamed scenario'})
+            else:private.claims[0].version+=1
+            with pytest.raises(ValueError):validate_check_revision(private,old,bad,request)
+        return sub,files
+    def resolve(state):
+        sub,_=review_step()(state)
+        sub['review_items'][0]['source_ids']=['code','doc','boundary']
+        sub['resolutions']=[dict(issue_id=i['id'],source_ids=['code','doc','boundary'],
+            rationale='The inherited correction removes only Zero; a fresh execution still observes the bounded return violation',
+            residual_issue_ids=[],scope_limitations=['External consumers remain outside this local obligation']) for i in state['review_issues']]
+        return sub,{}
+    e,repo=engine_for(tmp_path,[first,extra,challenge,lambda state:challenge(state,True),
+        lambda state:corrected(state,False),resolve,corrected,resolve,stop])
+    (repo/'target.py').write_text('def step(value, limit):\n    return value + 1\n')
+    with (repo/'README.md').open('a') as stream:stream.write('Only the range is required; returning zero is not a separate responsibility.\n')
+    state=e.start(repo)
+    errors=diagnostics(e)
+    assert len(errors)==1 and all('lineage' in d['message'] for d in errors[0]['diagnostics']),errors
+    old,independent,new=state.direct_checks
+    assert new.previous_id==old.id and independent.previous_id is None
+    current=next(r for r in state.monitor_results if r['direct_check_id']==new.id)
+    assert current['reviewed_complete'] and current['outcome']=='violated'
+    assert len(open_issues(state,old))==2 and not open_issues(state,new)
+    assert not open_issues(state,new.model_copy(update={'id':'descendant','previous_id':new.id}))
+    assert state.usage['experiments']==3 and state.usage['revisions']==1
+    before=saved['old']
+    assert state.claims==before.claims and state.units[0].version==before.units[0].version
+    assert old==before.direct_checks[0]
+    assert next(r for r in state.monitor_results if r['direct_check_id']==old.id)==before.monitor_results[0]
+    assert [e for e in state.evidence if e.direct_check_id==old.id]==before.evidence
+    assert load_plan(old.plan_path).harness==load_plan(new.plan_path).harness
+    assert len(load_plan(old.plan_path).observable_properties)==2
+    old_check=next(c for c in state.checks if c.direct_check_id==old.id)
+    assert '"value": 4' in Path(old_check.stdout).read_text()
+    borrowed=compute_assessment(state,state.units[0],new,load_plan(new.plan_path),old_check,extract_events(old_check))
+    assert not borrowed['reviewed_complete'] and not borrowed['confirmed']
+    # Resolving this correction does not erase an independent issue on the same lineage.
+    private=state.model_copy(deep=True)
+    separate=state.review_issues[0].model_copy(update={'id':'independent-issue','resolved_by':None})
+    private.review_issues.append(separate)
+    assert [i.id for i in open_issues(private,new)]==[separate.id]
+    # Saved ancestor outputs do not authorize review of an unexecuted successor.
+    private=state.model_copy(deep=True);private.checks=[c for c in private.checks if c.direct_check_id!=new.id]
+    request=ReviewSubmission.model_validate(resolve(state.model_dump(mode='json'))[0])
+    with pytest.raises(ValueError,match='actual completed execution'):accept_review(private,request,'no-execution')
+    # Rewording scope on a fresh execution cannot repair an explicitly named extra checker.
+    private=state.model_copy(deep=True);private.semantic_reviews.pop()
+    private.direct_checks[-1].plan_path=old.plan_path
+    private.direct_checks[-1].scope.description='Reworded local scope'
+    private.review_issues[-1].challenged_components=['scope']
+    with pytest.raises(ValueError) as caught:accept_review(private,request,'scope-text-only')
+    assert any('out_of_scope_checkers' in d.details.get('unchanged_components',[]) for d in caught.value.diagnostics)
+
+
 @pytest.mark.parametrize('change',['semantic_input','knowledge_challenge'])
 def test_changed_interpretation_updates_current_direct_result(tmp_path,prepared,change):
     e,u,p=setup(tmp_path,prepared,True)

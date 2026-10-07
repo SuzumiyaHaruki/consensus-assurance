@@ -19,26 +19,34 @@ def direct_changes(before, after):
 
 
 def validate_direct_encoding(state,artifact,previous,repaired,revision):
-    from .reviews import lineage, open_issues
+    from .reviews import lineage, open_issues, issue_review_item
     ancestors = lineage(state, artifact) if artifact else set()
     issue=next((i for i in open_issues(state,artifact) if i.id==revision.issue_id),None)
     if artifact is None or revision.old_direct_check_id!=artifact.id or not issue or issue.target_id not in ancestors or issue.aspect!='checker_correspondence':
         raise ValueError('Direct encoding correction must name the current artifact and its open checker issue')
     components=set(issue.challenged_components)
-    if not components&{'oracle','observation'}:
-        raise ValueError('Encoding correction needs an oracle or observation challenge; configuration and driver repairs preserve the oracle')
     if not revision.rationale.strip() or not set(revision.source_ids)<={m.id for m in state.materials} or not set(issue.source_ids)&set(revision.source_ids):
         raise ValueError('Direct encoding correction needs actual source and the disputed issue basis')
     if not any(c.direct_check_id==artifact.id and c.status.value=='completed' for c in state.checks):raise ValueError('An accepted direct encoding correction requires the original completed execution')
     versions={o.id:o.version for o in state.claims+state.bindings+state.relations+state.units}
     if any(versions.get(id)!=v for id,v in artifact.graph_versions.items()):raise ValueError('Semantic inputs changed; encoding correction cannot repair a changed obligation')
-    changed=direct_changes(previous,repaired)
-    if changed['contract'] or changed['legality'] or changed['inputs']!=bool(revision.input_changes) or (previous.harness.semantic_changes!=repaired.harness.semantic_changes)!=bool(revision.input_changes):
-        raise ValueError('Observation input changes must be declared and preserve harness prerequisites, legality and scope')
     old={p.checker_id:p for p in previous.observable_properties}
     new={p.checker_id:p for p in repaired.observable_properties}
     if old.keys()!=new.keys():
-        raise ValueError('Direct encoding correction cannot change checker attribution')
+        item=issue_review_item(state,issue)
+        extra=set(item.out_of_scope_checker_ids) if item else set()
+        if not new or not new.keys()<old.keys() or not old.keys()-new.keys()<=extra:
+            raise ValueError('Checker removal must select only extra checkers named by this exact open review issue')
+        retained=previous.model_copy(update={'observable_properties':[p for p in previous.observable_properties if p.checker_id in new],
+            'monitors':[m for m in previous.monitors if m.checker_id in new]})
+        if revision.input_changes or previous.harness.semantic_changes!=repaired.harness.semantic_changes or any(direct_changes(retained,repaired).values()):
+            raise ValueError('Extra checker removal preserves all retained predicates, identities, prerequisites, observations and harness inputs')
+        return
+    if not components&{'oracle','observation'}:
+        raise ValueError('Encoding correction needs an oracle or observation challenge; configuration and driver repairs preserve the oracle')
+    changed=direct_changes(previous,repaired)
+    if changed['contract'] or changed['legality'] or changed['inputs']!=bool(revision.input_changes) or (previous.harness.semantic_changes!=repaired.harness.semantic_changes)!=bool(revision.input_changes):
+        raise ValueError('Observation input changes must be declared and preserve harness prerequisites, legality and scope')
     if 'observation' not in components and changed['observation']:
         raise ValueError('Oracle correction cannot change the observation endpoint')
     for id in old:
