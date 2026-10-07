@@ -41,6 +41,24 @@ def compatibility(basis, command):
     return value
 
 
+def seed_search_path(description, read_only_roots):
+    """Ignore duplicate and masked PATH entries, preserving visible lookup order."""
+    environment=description['policy'].get('inherited_environment',{})
+    if 'PATH' not in environment:return description
+    visible=[VIEW,*map(Path,read_only_roots)]
+    entries=[]
+    for entry in dict.fromkeys(environment['PATH'].split(os.pathsep)):
+        path=Path(entry)
+        if (path.is_absolute() and '..' not in path.parts
+                and any(path.is_relative_to(root) for root in ('/home','/root','/tmp'))
+                and not any(path.is_relative_to(root) or root.is_relative_to(path) for root in visible)):
+            continue
+        entries.append(entry)
+    if not entries:return description  # An empty PATH would add the current directory.
+    return {**description,'policy':{**description['policy'],
+        'inherited_environment':{**environment,'PATH':os.pathsep.join(entries)}}}
+
+
 def seed_inventory(directory, deadline):
     """Compiled bytes are mutable non-Git inputs; a ready marker alone is insufficient."""
     result={}
@@ -69,8 +87,20 @@ def shared_seed(adapter, runner, snapshot_id, command, basis, destination, deadl
     cache=cache_directory(adapter,runner.root)
     if cache is None:return None
     cache.mkdir(parents=True,exist_ok=True,mode=0o700)
-    description=compatibility(basis,command);key=digest(json.dumps(description,sort_keys=True).encode())
-    entry=cache/key;started=time.monotonic()
+    roots=adapter.read_only_roots();started=time.monotonic()
+    description=seed_search_path(compatibility(basis,command),roots)
+    key=digest(json.dumps(description,sort_keys=True).encode())
+    if origin is None and not (cache/key/'ready.json').exists():
+        # Older receipts retain the raw PATH. Recheck any match under its own lock below.
+        for marker in sorted(cache.glob('*/ready.json')):
+            if time.monotonic()>=deadline:raise TimeoutError('Runtime deadline reached during Cargo seed lookup')
+            try:
+                if marker.parent.name.startswith('.') or marker.parent.is_symlink() or marker.is_symlink() or marker.stat().st_uid!=os.getuid():continue
+                saved=json.loads(marker.read_text())
+                if seed_search_path(saved['compatibility'],roots)==description:
+                    key=marker.parent.name;break
+            except (OSError,ValueError,KeyError,TypeError,AttributeError):continue
+    entry=cache/key
     details={'key':key,'maker':description['maker'],'status':'miss','reason':'No complete entry'}
     stage=None
     with os.fdopen(os.open(cache/(key+'.lock'),os.O_CREAT|os.O_RDWR|os.O_NOFOLLOW,0o600),'w') as lock:
@@ -85,13 +115,13 @@ def shared_seed(adapter, runner, snapshot_id, command, basis, destination, deadl
                     if not marker.is_file() or marker.stat().st_uid!=os.getuid():
                         raise ValueError('Missing or unowned cache receipt')
                     saved=json.loads(marker.read_text())
-                    if saved['compatibility']!=description:raise ValueError('Incompatible entry')
+                    if seed_search_path(saved['compatibility'],roots)!=description:raise ValueError('Incompatible entry')
                     if not isinstance(saved['origin']['selected_features'],list):raise ValueError('Incomplete neutral origin')
                     inventory=seed_inventory(entry/'seed',deadline)
                     if not inventory or inventory!=saved['inventory']:raise ValueError('Seed bytes or modes differ')
                     details['verification_seconds']=time.monotonic()-started
                 except TimeoutError:raise
-                except (OSError,ValueError,KeyError,TypeError) as exc:
+                except (OSError,ValueError,KeyError,TypeError,AttributeError) as exc:
                     details['reason']='Entry unavailable: '+str(exc);return details
                 stage=destination.with_name('seed-import-'+uid());stage.mkdir(parents=True)
                 source=entry/'seed';action='cargo_seed_materialize'

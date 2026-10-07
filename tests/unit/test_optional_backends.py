@@ -133,11 +133,14 @@ def test_shared_seed_identity_and_directory_boundaries(tmp_path):
     from consensus_assurance.adapters.runners import cargo_build
     # Minimal controller cache fixture; these bytes are not claimed to be compiled target evidence.
     root=tmp_path/'run';root.mkdir();cache=tmp_path/'cache'
-    adapter=SimpleNamespace(seed_cache_dir=cache);runner=ProcessRunner(root)
+    roots=[Path('/home/toolchain'),Path('/home/cargo/registry')]
+    adapter=SimpleNamespace(seed_cache_dir=cache,read_only_roots=lambda:roots);runner=ProcessRunner(root)
     seed=root/'seed';seed.mkdir();(seed/'artifact').write_bytes(b'neutral fixture bytes')
     basis=dict(source_files={'lib.rs':'source'},source_modes={'lib.rs':420},manifest='Cargo.toml',
         test_target='check',workspace_manifest='Cargo.toml',package_id='local',package_name='local',
-        tools=[{'version':'fixture'}],policy={'jobs':2},resolved_features=[],lock={'path':'Cargo.lock','digest':'lock'})
+        tools=[{'version':'fixture'}],policy={'jobs':2,'inherited_environment':{
+            'PATH':'/home/hidden:/usr/bin:/bin:/usr/bin:/home/toolchain/bin','LANG':'C'}},
+        resolved_features=[],lock={'path':'Cargo.lock','digest':'lock'})
     command=['cargo','test','--','--nocapture']
     expected=cargo_build.compatibility(basis,command)
     for field in ('source_files','source_modes','lock','tools','policy','test_target'):
@@ -148,7 +151,29 @@ def test_shared_seed_identity_and_directory_boundaries(tmp_path):
         return cargo_build.shared_seed(adapter,runner,'fixture',command,basis,seed,time.monotonic()+5,**kwargs)
     published=access(origin={'selected_features':[]});assert published['status']=='published'
     key=published['key'];entry=cache/key
+    normalized=cargo_build.seed_search_path(expected,roots)
+    assert normalized['policy']['inherited_environment']['PATH']=='/usr/bin:/bin:/home/toolchain/bin'
+    assert expected['policy']==basis['policy']  # Preserve the recorded raw environment.
+    environment=basis['policy']['inherited_environment'];original_path=environment['PATH']
+    environment['PATH']='/usr/bin:/root/hidden:/bin:/home/toolchain/bin:/usr/bin'
     assert access()['status']=='hit' and (seed/'artifact').read_bytes()==b'neutral fixture bytes'
+    for changed in ('/bin:/usr/bin:/home/toolchain/bin','/usr/bin:/bin',
+            '/home/cargo/registry/bin:/usr/bin:/bin:/home/toolchain/bin',
+            ':/usr/bin:/bin:/home/toolchain/bin','relative:/usr/bin:/bin:/home/toolchain/bin',
+            '/home/hidden', '',
+            '/tmp/consensus-cargo/bin:/usr/bin:/bin:/home/toolchain/bin'):
+        environment['PATH']=changed
+        assert access()['status']=='miss'
+    environment['PATH']=original_path;environment['LANG']='different'
+    assert access()['status']=='miss'
+    environment['LANG']='C'
+    # Existing raw-PATH receipts remain usable without rewriting their provenance.
+    marker=entry/'ready.json';legacy=json.loads(marker.read_text());legacy['compatibility']=expected
+    marker.write_text(json.dumps(legacy));saved=marker.read_bytes()
+    key=cargo_build.digest(json.dumps(expected,sort_keys=True).encode())
+    entry.rename(cache/key);entry=cache/key
+    assert access()['status']=='hit' and access()['key']==key
+    assert (entry/'ready.json').read_bytes()==saved
     with (cache/(key+'.lock')).open() as lock:
         fcntl.flock(lock,fcntl.LOCK_EX);assert 'in use' in access()['reason']
     marker=entry/'ready.json';saved=marker.read_bytes();marker.unlink()

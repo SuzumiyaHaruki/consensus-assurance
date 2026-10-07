@@ -61,7 +61,7 @@ fn actual_boundary() {
 
 
 def test_rust_cross_action_seed_isolation_inputs_and_recovery(tmp_path,rust_workspace,monkeypatch):
-    import shutil
+    import os,shutil
     from consensus_assurance.adapters.runners import cargo_build
     from consensus_assurance.adapters.runners.experiment import extract_events
     from consensus_assurance.core.proposals import Harness
@@ -140,6 +140,8 @@ println!("CA_EVENT {{\\"event\\":\\"value\\",\\"value\\":{}}}", sample::step(VAL
     manifest.write_bytes(saved)
     saved_receipt=(e.root/first_check.parameters['seed_record']).read_bytes()
     first_engine,first_repo=e,repo
+    original_path=os.environ['PATH']
+    monkeypatch.setenv('PATH','/home/hidden-cargo-bin:'+original_path+':/root/hidden-cargo-bin:'+original_path)
     (tmp_path/'independent').mkdir()
     e,repo=cargo_engine(tmp_path/'independent',rust_workspace,seed_cache=shared)
     e.start(repo,plan_only=True)
@@ -189,6 +191,7 @@ println!("CA_EVENT {{\\"event\\":\\"value\\",\\"value\\":{}}}", sample::step(VAL
     # Corruption must force the original neutral path, never run a retained binary.
     next((entry/'seed').rglob('libincrement*.rlib')).write_bytes(b'corrupt')
     e,repo=first_engine,first_repo
+    monkeypatch.setenv('PATH',original_path)
     old=[c.model_dump(mode='json') for c in checks]
     shutil.rmtree(seed)
     assert all(p['status']=='seed_unavailable' and p['compilations'] for p in preparation().values())
