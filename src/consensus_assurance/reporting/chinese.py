@@ -372,6 +372,9 @@ def render_report(state, root):
         refs += [link(artifacts[p['artifact_id']]['plan_path'],'固定计划') for p in current if p['record_status'] in {'no_execution','no_assessment'}]
         refs += [link(f'logs/{p["check_id"]}/check.json','执行记录') for p in current if p['record_status']=='no_assessment']
         reasons=records or [PROGRESS[p['record_status']] for p in current]
+        if records and len(records)==len(current) and sum(a['claim_id']==claim_id for a in research['artifacts'])>1:
+            issues={id for r in research['assessments'] if r['claim_id']==claim_id for id in r.get('open_issue_ids',[])}
+            return cell(excerpt(reasons[0],180))+f'；待办检查 {len(current)} 项，开放争议 {len(issues)} 项；完整依据见义务详情'
         return '；'.join([cell(excerpt(reason,180)) for reason in list(dict.fromkeys(reasons))[:2]]+list(dict.fromkeys(refs)))
     stop = state.run_stop
     stop_label = ({'user_stop':'实际取消','resource_limit':'资源边界','tool_gap':'服务／权限／工具中断'}.get(stop.get('reason'),'中断')

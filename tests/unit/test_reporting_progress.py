@@ -480,6 +480,15 @@ def test_mixed_report_reads_fixed_results_and_moves_without_side_effects(tmp_pat
         assert copy.model_dump(mode='json')==before
         valid_links(report)
         return next(line for line in report.splitlines() if f'[{current.claim_id}](' in line),report
+    pending=mixed.model_copy(deep=True)
+    issue=pending.review_issues[0].model_copy(update={'id':'current-scenario-issue','target_id':holds.id,'resolved_by':None})
+    pending.review_issues.append(issue)
+    record=next(r for r in pending.monitor_results if r['direct_check_id']==holds.id)
+    record.update(reviewed_complete=False,correspondence='disputed',open_issue_ids=[issue.id])
+    row,report=main_row(pending)
+    assert '已确认违反；另有场景尚未完成' in row and '待办检查 1 项，开放争议 1 项' in row
+    assert '-assessment.json' not in row and '#issue-' not in row and row.count('](')==1
+    assert f'](#issue-{issue.id})' in report and '-assessment.json)' in report
     for items in ([optional,correspondence.items[0]],[correspondence.items[0],optional]):
         correspondence.items=items
         row,report=main_row(mixed)
