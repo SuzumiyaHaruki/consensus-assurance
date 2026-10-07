@@ -1,0 +1,81 @@
+{
+  "action": "continue",
+  "rationale": "New sourced discrepancy on the durability path (A6) that links to the A2 authority context, and one that is deterministic enough to execute later. recordInstanceMetadata (epaxos/epaxos.go:199-215) allocates a record of 9+r.N*4 bytes and writes inst.bal into b[0:4] and then inst.vbal into the same b[0:4], so the intended bal field is overwritten by vbal and the ballot is never persisted; status, seq and deps are written correctly afterwards. The map now records B-DURABLE-META (the write) and F-DURABLE-META (the assertion that the record encodes bal, vbal, status, seq and deps), and the previously deferred Surface for this entry point is mapped. Because the persisted ballot is the per-instance authority context that recovery compares against (handlePrepare adopts a higher prepare ballot, handlePrepareReply classifies by the highest VBallot), losing the bal in the durable record is an A2-relevant consequence of an A6 write, not merely a formatting issue. No replay reader exists in the captured files, so I am raising this as a Candidate rather than a validated defect: the requirement that the record round-trip its fields, and the consequence under a restart that reads it, are not yet sourced. The write itself is deterministic and unit-observable, so this Candidate is the closest of the run so far to a directly checkable proposition.",
+  "sources": [
+    {
+      "id": "S-DURABLE-META",
+      "file": "epaxos/epaxos.go",
+      "start_line": 199,
+      "end_line": 215,
+      "kind": "code_observation"
+    }
+  ],
+  "map_path": "map.json",
+  "map_changes": {
+    "surface:epaxos.Replica.recordInstanceMetadata / recordCommands / sync": {
+      "impact": "clarification",
+      "rationale": "The durability entry point is no longer deferred for the metadata write: it is mapped to B-DURABLE-META with F-DURABLE-META describing the record layout, and the reason now names the bal/vbal overlap that the original reason only hinted at. The command-log write and the sync callers stay explicitly unmapped.",
+      "source_ids": ["S-DURABLE-META", "S-PROPOSE-PHASE1"],
+      "preserves": "The Surface still covers the same entry point and the same unread replay question; only its disposition, behavior association and wording change.",
+      "challenges": {}
+    }
+  },
+  "feedback": {
+    "ref_ids": [
+      "surface:epaxos.Replica.recordInstanceMetadata / recordCommands / sync",
+      "S-PROPOSE-PHASE1"
+    ],
+    "answered": "recordInstanceMetadata writes inst.bal and inst.vbal to the same b[0:4] offset (epaxos/epaxos.go:205-206), so the durable record cannot recover bal. The write is now mapped (B-DURABLE-META + F-DURABLE-META) with the layout recorded, and the Surface moved from deferred to mapped.",
+    "remaining": [
+      "Whether a requirement exists that the durable metadata record round-trip bal and vbal separately, and whether any restart reader consumes it (none found in the captured files).",
+      "Whether to execute a direct unit check of recordInstanceMetadata: with Durable=true and a buffer StableStore, the record bytes for an instance with bal != vbal can be compared against the fields written, which would give a deterministic observation.",
+      "A1 fast-path qualification and A2 ballot/authority transitions still have no executed check; membership (A4) remains unread.",
+      "Client reply correlation is explained for the modelled client; the multi-replica/Dreply=false variants remain only as latent questions."
+    ],
+    "understanding": "updated",
+    "rationale": "Records a fresh, deterministic durability discrepancy with an explicit A2 consequence and makes it the next checkable proposition, while keeping the missing-requirement and missing-reader premises visible."
+  },
+  "question": {
+    "audit_spec_version": 4,
+    "disposition": "concrete_suspicion",
+    "preferred_check": "direct_test",
+    "question": "Does recordInstanceMetadata persist the instance's bal as intended, given that its bal and vbal writes target the same b[0:4] offset, so that a durable record cannot distinguish the ballot from the pre-accept ballot?",
+    "importance": "Durability of per-instance authority context: the persisted ballot is the value a restart would compare against later prepare/accept ballots, so a record that stores vbal in bal's slot loses the device that distinguishes a raised ballot from the pre-accept ballot. The consequence would be a wrong authority context after recovery; the deterministic write itself is unit-observable.",
+    "source_ids": ["S-DURABLE-META", "S-PROPOSE-PHASE1", "S-RECOVERY"],
+    "participants": [
+      "replica writing per-instance metadata while Durable",
+      "any restart reader of the stable-store record"
+    ],
+    "objects": [
+      "the StableStore byte record produced by recordInstanceMetadata",
+      "inst.bal",
+      "inst.vbal"
+    ],
+    "contexts": [
+      "Durable build (Durable=true) where the metadata write executes",
+      "restart/recovery that would read the record back"
+    ],
+    "event_paths": [
+      "startPhase1 / handlePreAccept / handleAccept / handleCommit call recordInstanceMetadata then sync",
+      "recordInstanceMetadata writes bal then vbal to b[0:4] (epaxos/epaxos.go:205-206)"
+    ],
+    "activity_classes": ["A6", "A2"],
+    "behavior_ids": ["B-DURABLE-META"],
+    "fact_ids": ["F-DURABLE-META"],
+    "supporting_behavior_ids": {
+      "B-PROPOSE": "calls the metadata write on the proposal path where bal and vbal first differ from -1",
+      "B-RECOVERY-START": "is the path that would re-establish authority from the persisted ballot after a restart"
+    },
+    "obligation_relation_kind": "preservation",
+    "counterevidence": [
+      "Durable is false in the default replica construction (replica/replica.go:95) and no replay reader was found in the captured files, so the write is latent rather than currently exercised.",
+      "The record still carries status, seq and all deps, so a reader could observe an instance's committed content even though bal is lost."
+    ],
+    "unknowns": [
+      "Whether a written requirement exists that the record round-trips bal and vbal separately.",
+      "Whether any restart path reads the record, and therefore whether the lost bal has an observable consequence."
+    ],
+    "priority": 2,
+    "trigger_rationale": "Two consecutive writes to the same offset are deterministic and can be observed directly, and the overwritten field is the authority context that the recovery path relies on, so the remaining premises (requirement and reader) are worth resolving before claiming a defect."
+  }
+}

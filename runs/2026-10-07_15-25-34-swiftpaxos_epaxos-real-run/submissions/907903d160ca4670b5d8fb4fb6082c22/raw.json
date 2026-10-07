@@ -1,0 +1,70 @@
+{
+  "action": "explained",
+  "candidate_id": "3de2a473694c4613ab082d19bdde9d54",
+  "rationale": "Source investigation answers the pairing premise negatively for this server, so the Candidate is explained rather than escalated. The client's positional pairing would be wrong only if replies arrived in an order different from the requests, but on this server they cannot for a single client. runSingleClient sets Leaderless=true and Fast=false for epaxos, so every proposal from one client is sent to ClosestId (client/client.go:175-196) and B-CLIENT-ISSUE's SendWrite/SendRead/SendScan therefore land on one replica; handlePropose assigns each batch to that replica's own row and allocates consecutive instances (epaxos/epaxos.go:724-749). Dreply is true (replica/replica.go:94), so the coordinator does not answer at commit (the !Dreply branches at epaxos/epaxos.go:931 and 1044 are skipped) and the only reply path is execution, where shouldRespond replies per command in w.Cmds order (epaxos/exec.go:119-140). Within the proposing replica's row, execution is head-driven: executeCommands walks each row from ExecedUpTo+1 and stops at the first non-executable instance (epaxos/epaxos.go:385-435), and a same-row instance cannot be a dependency of an earlier one, so same-row instances are never mutual SCC members and are emitted in increasing instance order; a batched proposal replies for cmds[0..k] in order. So arrival order equals request order for one client, and the missing identity check has no observable consequence under the modelled leaderless client. I keep the gap visible as a latent contract question (it would matter for a client that talks to more than one replica or if replies were emitted per-RPC rather than at execution).",
+  "feedback": {
+    "ref_ids": [
+      "3de2a473694c4613ab082d19bdde9d54",
+      "B-CLIENT-OBSERVE",
+      "F-CLIENT-REPLY-LINK",
+      "B-EXEC"
+    ],
+    "answered": "The client's positional reply pairing cannot misattribute in this server: with Dreply=true the only replies come from execution (epaxos/exec.go:119-140), all of one client's proposals go to ClosestId and into that replica's own row with consecutive instances, and executeCommands executes each row head-first so same-row instances are executed and answered in increasing instance order. Arrival order therefore equals request order and B-CLIENT-OBSERVE's identity check is unnecessary for the modelled client.",
+    "remaining": [
+      "Whether the client contract would require identity matching for a configuration where replies can arrive out of request order (multi-replica clients, Dreply=false, or per-RPC replies); this is a latent robustness question rather than an observed defect.",
+      "A1 fast-path qualification and A2 ballot/authority transitions still have no executed check; membership (A4) and durability/restart (A6) remain unread.",
+      "Residual latency question for the earlier explained Accept-reply candidate: makeBallot cannot always raise the ballot, so repeated failed recoveries could extend a delay."
+    ],
+    "understanding": "updated",
+    "rationale": "Resolves the correlation-duty Candidate by showing reply order must equal request order for the modelled client, and keeps the latent contract question explicit instead of dismissing it."
+  },
+  "question": {
+    "audit_spec_version": 4,
+    "disposition": "explained_by_existing_mechanism",
+    "question": "Does the client's observed-completion path require and check that a reply answers the specific outstanding request (F-CLIENT-REPLY-LINK identity), or can a reply be paired with the wrong request so that a Read/Scan returns another request's value and the reported completion is misattributed?",
+    "importance": "Client contract and observed completion. Resolved as not observable for the modelled client: replies are emitted only at execution and every proposal from one client goes to a single replica's own row, which is executed head-first, so reply order equals request order.",
+    "source_ids": ["S-CLIENT-REPLY", "S-EXEC", "S-PROPOSE-PHASE1"],
+    "participants": [
+      "client invocation loop (BufferClient.Loop and Write/Read/Scan)",
+      "reply reader (WaitReplies/RegisterReply)",
+      "closest replica that proposes and executes the client's commands"
+    ],
+    "objects": [
+      "ProposeReplyTS.CommandId",
+      "ReqReply.Seqnum",
+      "c.Reply arrival order",
+      "InstanceSpace[closest][instance] and ExecedUpTo"
+    ],
+    "contexts": [
+      "EPaxos client with Leaderless=true and Fast=false, all proposals to ClosestId",
+      "Dreply=true so replies are emitted only from execution",
+      "pipelined mode where several requests are outstanding"
+    ],
+    "event_paths": [
+      "B-CLIENT-ISSUE issues proposals to ClosestId",
+      "handlePropose allocates consecutive own-row instances and batches queued proposals",
+      "executeCommands executes row heads in order; exec replies per command in w.Cmds order (epaxos/exec.go:119-140)",
+      "B-CLIENT-OBSERVE consumes c.Reply in arrival order and pairs positionally"
+    ],
+    "activity_classes": ["A7", "A1"],
+    "behavior_ids": ["B-CLIENT-OBSERVE"],
+    "fact_ids": ["F-CLIENT-REPLY-LINK"],
+    "supporting_behavior_ids": {
+      "B-CLIENT-REPLY": "establishes the reply and its CommandId",
+      "B-CLIENT-ISSUE": "sends every proposal of one client to the same closest replica",
+      "B-EXEC": "emits the only replies, in head-driven execution order, which is why arrival order equals request order",
+      "B-PROPOSE": "assigns consecutive own-row instances in the order the proposals were received"
+    },
+    "obligation_relation_kind": "consumption",
+    "counterevidence": [
+      "The client's identity is not discarded: ReqReply.Seqnum carries the CommandId and is used to index c.reqTime, so the match could be made but is not.",
+      "The source comment 'TODO: if the return value != i, something's wrong' records that identity is unchecked at the pairing site, so the gap is a latent robustness issue even though the modelled arrival order makes it harmless.",
+      "A reply order different from request order would require a client that spreads proposals across replicas, or Dreply=false, or per-RPC replies, none of which the modelled client uses."
+    ],
+    "unknowns": [
+      "Whether any supported configuration (multi-replica client, Dreply=false, or per-RPC replies) can produce out-of-request-order replies."
+    ],
+    "priority": 1,
+    "trigger_rationale": "The reply identity is available but unused and flagged by the source's own TODO, so it was worth resolving whether the server's reply order makes the match unnecessary; the sourced execution/reply ordering shows it does for the modelled client."
+  }
+}

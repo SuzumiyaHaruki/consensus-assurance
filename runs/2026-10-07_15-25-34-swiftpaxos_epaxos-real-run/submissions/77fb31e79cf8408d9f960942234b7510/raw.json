@@ -1,0 +1,69 @@
+{
+  "action": "explained",
+  "candidate_id": "0069a1fe5be04660b3b91f31ac2394d4",
+  "rationale": "Source investigation answers the remaining discriminator as a bounded delay rather than an unbounded stall, so the Candidate is explained by an existing mechanism instead of escalated. The gap itself is real and now recorded in the map: a higher-ballot AcceptReply is dropped at the equality gate (epaxos/epaxos.go:1024-1026) so handleAcceptReply never counts a nack or calls makeBallot/bcastPrepare. But non-completion at a ballot is not final for the instance. Every replica's executeCommands loop re-examines each row from ExecedUpTo+1 and, when a head instance stays non-executable for COMMIT_GRACE_PERIOD, enqueues instancesToRecover for that instance (epaxos/epaxos.go:385-435); the local loop then runs startRecoveryForInstance, which rebuilds the instance bookkeeping and calls makeBallot then bcastPrepare (epaxos/epaxos.go:1127-1169). makeBallot chooses the recovering replica's own ballot slot, and for a replica that is not the row owner it uses r.Id + N, while an IsLeader additionally raises past maxRecvBallot (epaxos/epaxos.go:439-451), so a recovery attempt at an equal-or-higher ballot is available without the Accept-path escalation. Acceptors then adopt that prepare ballot (handlePrepare, epaxos/epaxos.go:1183-1187) and handlePrepareReply rebuilds the instance and re-enters Accept or phase 1 (epaxos/epaxos.go:1204-1314). So the missing Accept-path nack costs at most the timer interval and a recovery round, not permanent stalling. I keep visible that this is a liveness/latency argument, not a proof of bounded latency, and that IsLeader gating and the non-leader ballot range bound how much a single recovery can raise the ballot.",
+  "feedback": {
+    "ref_ids": [
+      "0069a1fe5be04660b3b91f31ac2394d4",
+      "B-ACCEPT-REPLY-LEADER",
+      "B-EXEC",
+      "B-RECOVERY-START",
+      "B-PREPARE-REPLY-LEADER"
+    ],
+    "answered": "The dropped higher-ballot AcceptReply does not permanently stall the instance: the Accept path's missing escalation is replaced in practice by the executeCommands recovery timer, which enqueues a recovery for a non-advancing head instance after COMMIT_GRACE_PERIOD, and startRecoveryForInstance re-enters the ballot/Prapareo protocol at an equal-or-higher ballot (r.Id, r.Id+N, or above maxRecvBallot for a leader). The gap therefore costs a timer interval and a recovery round rather than losing progress, and the behavior now records both the real equality gate and the gap as an unknown.",
+    "remaining": [
+      "Whether the delay can be extended by repeated failed recoveries when an acceptor holds a ballot higher than any a non-leader recoverer can produce (ballot range bounded by r.Id+N), which is a latency question rather than a permanent stall.",
+      "Grounding an explicit progress duty for the Accept path instead of relying on the recovery timer as an incidental protection.",
+      "A1 fast-path qualification and A2 ballot/authority transitions still have no executed check; membership (A4) and durability/restart (A6) remain unread."
+    ],
+    "understanding": "updated",
+    "rationale": "Resolves the Candidate as bounded by an existing, sourced retry mechanism and keeps the residual latency/ballot-range and duty-grounding questions explicit."
+  },
+  "question": {
+    "audit_spec_version": 2,
+    "disposition": "explained_by_existing_mechanism",
+    "question": "When a coordinator's Accept replies report a higher ballot than lb.lastTriedBallot, does the coordinator ever escalate (count a nack, raise its ballot, issue Prepare), or are those replies dropped so the instance stalls until the recovery timer?",
+    "importance": "Progress of the slow Accept path. Resolved: the Accept-path escalation is genuinely absent, but the instance is retried by the executeCommands recovery timer, so the effect is a delay rather than a permanent stall.",
+    "source_ids": ["S-ACCEPT", "S-PREACCEPT-REPLY", "S-PREPARE-REPLY", "S-EXEC", "S-RECOVERY"],
+    "participants": [
+      "coordinator in ACCEPTED status for the instance",
+      "acceptor replying with a higher instance ballot",
+      "any replica's executeCommands loop and recovery path"
+    ],
+    "objects": [
+      "lb.lastTriedBallot",
+      "lb.nacks",
+      "AcceptReply.Ballot",
+      "instancesToRecover",
+      "lb.lastTriedBallot produced by makeBallot"
+    ],
+    "contexts": [
+      "slow path after the fast quorum disagreed, so the coordinator broadcast Accept",
+      "concurrent recovery of the same instance at a higher ballot, bounded by COMMIT_GRACE_PERIOD recovery retries"
+    ],
+    "event_paths": [
+      "handleAcceptReply equality gate (epaxos/epaxos.go:1024-1026) and unreachable greater-than block (epaxos/epaxos.go:1028-1035)",
+      "executeCommands COMMIT_GRACE_PERIOD -> instancesToRecover -> startRecoveryForInstance -> makeBallot -> bcastPrepare (epaxos/epaxos.go:385-451, 1127-1169)",
+      "handlePrepare adopts the higher ballot (epaxos/epaxos.go:1183-1187); handlePrepareReply re-enters Accept or phase 1 (epaxos/epaxos.go:1204-1314)"
+    ],
+    "activity_classes": ["A1", "A2"],
+    "behavior_ids": ["B-ACCEPT-REPLY-LEADER"],
+    "fact_ids": ["F-DECISION"],
+    "supporting_behavior_ids": {
+      "B-EXEC": "supplies the timer that re-enqueues the non-advancing instance for recovery, which is the mechanism that replaces the missing Accept-path escalation",
+      "B-RECOVERY-START": "rebuilds bookkeeping and issues the higher-ballot Prepare",
+      "B-PREPARE-REPLY-LEADER": "re-enters Accept or phase 1 and therefore can complete the instance",
+      "B-PREACCEPT-REPLY-LEADER": "shows the escalation that the Accept path lacks, and bounds the claim to progress rather than safety"
+    },
+    "obligation_relation_kind": "recovery",
+    "counterevidence": [
+      "The escalation block is still structurally unreachable, so the protection is not the handler's own nack logic but the independent recovery timer.",
+      "makeBallot does not always raise the ballot: for the row owner it reuses r.Id, and for a non-leader non-owner it is fixed at r.Id+N, so a recovery can fail against a higher stored ballot and only a later recovery by another replica or a leader can advance it."
+    ],
+    "unknowns": [
+      "Whether repeated failed recoveries can extend the delay beyond one timer interval when a stored ballot exceeds any a non-leader recoverer can produce."
+    ],
+    "priority": 1,
+    "trigger_rationale": "The specific suspicion (an instance that cannot complete because its coordinator never escalates) is answered by the sourced recovery retry, so it needs no execution; the residual latency and duty-grounding questions are retained."
+  }
+}

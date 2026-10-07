@@ -1,0 +1,93 @@
+{
+  "rationale": "New sourced discrepancy on the slow Accept path. handlePreAcceptReply acts on a reply carrying a higher ballot than the coordinator's: it increments lb.nacks and, once a majority nacks and the replica is the leader, calls makeBallot then bcastPrepare (epaxos/epaxos.go:855-870). handleAcceptReply has the analogous block but it is unreachable: the preceding guard returns whenever lb.lastTriedBallot != areply.Ballot (epaxos/epaxos.go:1024-1026), so the following test areply.Ballot > lb.lastTriedBallot (epaxos/epaxos.go:1028-1035) can never be true. Consequently an Accept reply that reports a higher ballot (handleAccept replies with inst.bal, epaxos/epaxos.go:1001-1004) is silently dropped: no nack is counted, the coordinator's ballot is not raised, and no Prepare is issued. A coordinator stuck at its Accept ballot then cannot assemble acceptOKs+1 > N/2 (epaxos/epaxos.go:1040) and the instance can only progress through the executeCommands recovery timer. I am raising this as a Candidate rather than a claimed defect because the stall may be bounded by that timer and the legality of a concurrent higher-ballot AcceptReply is not yet sourced.",
+  "sources": [],
+  "feedback": {
+    "ref_ids": [
+      "B-ACCEPT-REPLY-LEADER",
+      "B-PREACCEPT-REPLY-LEADER",
+      "B-EXEC",
+      "F-DECISION"
+    ],
+    "answered": "The higher-ballot handling on the Accept reply path is dead: handleAcceptReply returns on any ballot mismatch before its greater-than test, so a reply reporting a higher ballot is dropped without a nack, a ballot raise, or a Prepare, unlike the equivalent PreAccept reply path which does escalate. The remaining question is whether this can stall an instance long enough to matter, given the executeCommands recovery timer.",
+    "remaining": [
+      "Whether a higher-ballot AcceptReply can legally arrive while the coordinator is in ACCEPTED status at its own ballot (concurrent recovery of the same instance).",
+      "Whether the resulting non-completion is bounded by the executeCommands COMMIT_GRACE_PERIOD recovery timer in all cases.",
+      "Whether the IsLeader gating on the PreAccept path means a non-leader coordinator has no escalation route at all in either path.",
+      "A1 fast-path qualification and A2 ballot/authority transitions still have no executed check; membership (A4) and durability (A6) remain unread."
+    ],
+    "understanding": "updated",
+    "rationale": "Records a concrete, sourced asymmetry between two structurally parallel reply handlers and keeps the boundedness and legality premises explicit instead of presuming a defect.",
+    "question_updates": {}
+  },
+  "repair_of": null,
+  "map_path": null,
+  "map_changes": {},
+  "reconnect_questions": {},
+  "action": "continue",
+  "candidate_id": null,
+  "parent_candidate_id": null,
+  "question": {
+    "audit_spec_version": 1,
+    "disposition": "concrete_suspicion",
+    "preferred_check": "source_review",
+    "question": "When a coordinator's Accept replies report a higher ballot than lb.lastTriedBallot, does the coordinator ever escalate (count a nack, raise its ballot, issue Prepare), or are those replies dropped so the instance stalls until the recovery timer?",
+    "importance": "Progress of the slow Accept path: a coordinator that cannot learn about a higher ballot from Accept replies may be unable to complete the instance at its ballot, leaving progress dependent on the executeCommands recovery timer. This is a liveness concern, not a claim that a decided value can be corrupted.",
+    "source_ids": [
+      "S-ACCEPT",
+      "S-PREACCEPT-REPLY",
+      "S-RECOVERY",
+      "S-EXEC"
+    ],
+    "participants": [
+      "coordinator in ACCEPTED status for the instance",
+      "acceptor replying with a higher instance ballot"
+    ],
+    "objects": [
+      "lb.lastTriedBallot",
+      "lb.nacks",
+      "AcceptReply.Ballot",
+      "inst.lb.acceptOKs"
+    ],
+    "contexts": [
+      "slow path after the fast quorum disagreed, so the coordinator broadcast Accept",
+      "concurrent recovery of the same instance at a higher ballot"
+    ],
+    "event_paths": [
+      "handleAcceptReply: equality guard (epaxos/epaxos.go:1024-1026) -> unreachable greater-than block (epaxos/epaxos.go:1028-1035)",
+      "contrast: handlePreAcceptReply greater-than block -> makeBallot + bcastPrepare (epaxos/epaxos.go:855-870)",
+      "executeCommands COMMIT_GRACE_PERIOD -> instancesToRecover"
+    ],
+    "activity_classes": [
+      "A1",
+      "A2"
+    ],
+    "behavior_ids": [
+      "B-ACCEPT-REPLY-LEADER"
+    ],
+    "fact_ids": [
+      "F-DECISION"
+    ],
+    "supporting_behavior_ids": {
+      "B-PREACCEPT-REPLY-LEADER": "shows the intent to escalate on a higher ballot on the structurally parallel fast path",
+      "B-RECOVERY-START": "is the escalation target (makeBallot + bcastPrepare) that the Accept path never invokes",
+      "B-EXEC": "is the recovery timer that may bound the stall"
+    },
+    "obligation_relation_kind": "recovery",
+    "counterevidence": [
+      "The greater-than block is structurally redundant: the preceding guard returns whenever lb.lastTriedBallot != areply.Ballot, so no comparison against lastTriedBallot can be true afterwards.",
+      "The higher-ballot information is not wholly lost: the acceptor replied with inst.bal, and executeCommands enqueues recovery for a non-advancing instance after COMMIT_GRACE_PERIOD, so the stall may be bounded.",
+      "handlePreAcceptReply does act on a higher ballot, so the omission is a path asymmetry rather than a uniformly absent mechanism."
+    ],
+    "unknowns": [
+      "Whether a higher-ballot AcceptReply can legally arrive while lb.status == ACCEPTED at the coordinator's ballot (concurrent recovery of the same instance).",
+      "Whether the resulting non-completion is always bounded by the executeCommands recovery timer.",
+      "Whether IsLeader gating leaves a non-leader coordinator with any escalation route."
+    ],
+    "priority": 1,
+    "trigger_rationale": "A structurally parallel pair of handlers treats a higher-ballot reply differently, and the Accept one is unreachable because of an earlier equality guard; that is a concrete progress mechanism whose premise (legality of the concurrent higher-ballot reply) is worth resolving before claiming a defect."
+  },
+  "resume_conditions": [],
+  "result_implications": {},
+  "obligation": null,
+  "bindings": []
+}

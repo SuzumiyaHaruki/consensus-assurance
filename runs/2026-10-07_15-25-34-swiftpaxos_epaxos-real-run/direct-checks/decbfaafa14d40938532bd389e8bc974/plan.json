@@ -1,0 +1,122 @@
+{
+  "description": "Deterministic direct check of CLM-DURABLE-BAL: with a Durable replica and a fixed instance (bal=7, vbal=2, Status=ACCEPTED, Seq=5, Deps=[-1,-1,-1]), call the real recordInstanceMetadata with an os.Pipe StableStore and observe whether the record's first four bytes carry bal. The discriminator is the bal slot of the emitted record; the prefix is a legal local construction (no network, no protocol-run) permitted because the obligation is about the bytes this function produces.",
+  "claim_id": "CLM-DURABLE-BAL",
+  "binding_ids": [
+    "BND-DURABLE-WRITE"
+  ],
+  "harness": {
+    "execution_package": "./epaxos",
+    "files": {},
+    "kind": "go_test",
+    "source": "package epaxos\n\nimport (\n\t\"encoding/binary\"\n\t\"fmt\"\n\t\"io\"\n\t\"os\"\n\t\"testing\"\n\n\t\"github.com/imdea-software/swiftpaxos/replica\"\n)\n\n// TestAssuranceDurableMetaBallotPersisted checks the obligation CLM-DURABLE-BAL:\n// in a Durable replica the per-instance metadata record must carry bal as its own\n// field, distinct from vbal. The harness calls the real recordInstanceMetadata on\n// a fixed instance and reports the record bytes as CA_EVENT lines.\nfunc TestAssuranceDurableMetaBallotPersisted(t *testing.T) {\n\tconst (\n\t\tcaseId = \"bal7_vbal2\"\n\t\twantBal = int32(7)\n\t\twantVBal = int32(2)\n\t)\n\n\tpr, pw, err := os.Pipe()\n\tif err != nil {\n\t\tt.Fatalf(\"pipe: %v\", err)\n\t}\n\n\tbase := &replica.Replica{N: 3, Id: 0, Durable: true, StableStore: pw}\n\tr := &Replica{Replica: base}\n\tinst := &Instance{\n\t\tbal:    wantBal,\n\t\tvbal:   wantVBal,\n\t\tStatus: ACCEPTED,\n\t\tSeq:    5,\n\t\tDeps:   []int32{-1, -1, -1},\n\t}\n\n\tfmt.Printf(\"CA_EVENT {\\\"event\\\":\\\"durable_meta_case\\\",\\\"case\\\":%q,\\\"durable\\\":true,\\\"bal\\\":%d,\\\"vbal\\\":%d}\\n\", caseId, inst.bal, inst.vbal)\n\n\tr.recordInstanceMetadata(inst)\n\tpw.Close()\n\tdata, rerr := io.ReadAll(pr)\n\tpr.Close()\n\tif rerr != nil {\n\t\tt.Fatalf(\"read: %v\", rerr)\n\t}\n\n\tif len(data) < 9 {\n\t\tfmt.Printf(\"CA_EVENT {\\\"event\\\":\\\"durable_meta_record\\\",\\\"case\\\":%q,\\\"len\\\":%d,\\\"bal_persisted\\\":false}\\n\", caseId, len(data))\n\t\tt.Errorf(\"record too short: %d bytes\", len(data))\n\t\treturn\n\t}\n\n\tfield0 := binary.LittleEndian.Uint32(data[0:4])\n\tstatus := int8(data[4])\n\tseq := binary.LittleEndian.Uint32(data[5:9])\n\tbalPersisted := field0 == uint32(inst.bal)\n\tfmt.Printf(\"CA_EVENT {\\\"event\\\":\\\"durable_meta_record\\\",\\\"case\\\":%q,\\\"len\\\":%d,\\\"field0_4\\\":%d,\\\"status\\\":%d,\\\"seq\\\":%d,\\\"bal_persisted\\\":%t,\\\"field0_equals_vbal\\\":%t}\\n\",\n\t\tcaseId, len(data), field0, status, seq, balPersisted, field0 == uint32(inst.vbal))\n\n\tif !balPersisted {\n\t\tt.Errorf(\"bal not persisted: first field is %d, expected bal %d (vbal is %d)\", field0, inst.bal, inst.vbal)\n\t}\n}\n",
+    "description": "Internal package-epaxos Go test that emits a durable_meta_case prerequisite event and a durable_meta_record result event carrying the case identity, the raw first four bytes and the bal_persisted boolean.",
+    "semantic_changes": [
+      "Test-only harness file added under epaxos/assurance_generated_test.go; no target source or protocol logic is modified.",
+      "StableStore is provided as an os.Pipe so the record bytes can be read without touching the filesystem.",
+      "The harness calls recordInstanceMetadata directly rather than driving a full replica, because the obligation constrains the bytes this function writes."
+    ],
+    "prerequisites": [
+      {
+        "alias": "setup",
+        "event": "durable_meta_case",
+        "conditions": [
+          {
+            "field": "durable",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          },
+          {
+            "field": "bal",
+            "op": "eq",
+            "value": 7,
+            "reference": null
+          },
+          {
+            "field": "vbal",
+            "op": "eq",
+            "value": 2,
+            "reference": null
+          }
+        ]
+      }
+    ],
+    "legality": {
+      "source_ids": [
+        "S-DURABLE-META"
+      ],
+      "expectation_ids": [],
+      "binding_ids": [
+        "BND-DURABLE-WRITE"
+      ],
+      "derivation": "recordInstanceMetadata is unexported and reachable from an internal package-epaxos test; it reads only r.Durable, r.N, the instance fields and r.StableStore, so a minimal replica plus an os.Pipe is a complete and legal construction for observing the bytes it writes. Callers pass every instance state change through it when Durable, so the observed call shape matches production use.",
+      "applicability": "Applies when Durable is true; the fixed case uses bal=7 and vbal=2, which differ, as the obligation requires.",
+      "unresolved": [
+        "No in-repository reader of the record was found, so the consequence of the lost bal for recovery is not part of this observation."
+      ],
+      "conflicts": [],
+      "alternatives": [
+        "A full-replica run with Durable=true would exercise the same function through startPhase1, but it adds peers, RPC registration and timing without changing which bytes are written."
+      ]
+    }
+  },
+  "monitors": [
+    {
+      "id": "MON-DURABLE-BAL",
+      "checker_id": "CHK-DURABLE-BAL",
+      "event": "durable_meta_record",
+      "binding_ids": [
+        "BND-DURABLE-WRITE"
+      ],
+      "grounding": {
+        "source_ids": [
+          "S-DURABLE-META"
+        ],
+        "expectation_ids": [],
+        "binding_ids": [
+          "BND-DURABLE-WRITE"
+        ],
+        "derivation": "The record's first four bytes are the slot the function reserves for bal before the second PutUint32 overwrites it, so bal_persisted records exactly the field the obligation covers.",
+        "applicability": "Durable=true, one fixed case.",
+        "unresolved": [],
+        "conflicts": [],
+        "alternatives": []
+      },
+      "applicability_conditions": [
+        {
+          "field": "durable",
+          "op": "eq",
+          "value": true,
+          "reference": null
+        }
+      ],
+      "admission_alias": "setup"
+    }
+  ],
+  "observable_properties": [
+    {
+      "checker_id": "CHK-DURABLE-BAL",
+      "kind": "event_assertion",
+      "trigger": {
+        "field": "event",
+        "op": "eq",
+        "value": "durable_meta_record",
+        "reference": null
+      },
+      "assertion": {
+        "field": "bal_persisted",
+        "op": "eq",
+        "value": true,
+        "reference": null
+      },
+      "antecedent": null,
+      "identity_fields": [
+        "case"
+      ],
+      "description": "For an instance whose bal and vbal differ, the durable metadata record produced by recordInstanceMetadata must carry bal in its own field, so bal_persisted must be true on the result event of the same case as the admitted setup event."
+    }
+  ],
+  "uncertainties": [
+    "The check observes only the bytes the function writes; it does not observe any restart that would consume the record, because no such reader exists in the captured files."
+  ]
+}
