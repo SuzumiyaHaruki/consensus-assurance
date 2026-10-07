@@ -489,6 +489,98 @@ def test_local_tool_gap_preserves_unit_and_continues(scope,tmp_path):
     assert state.run_stop['scope']=='run'
 
 
+def test_focus_pause_preserves_mixed_dispositions_and_independent_work(tmp_path):
+    from consensus_assurance.core.types import ReviewIssue
+    from consensus_assurance.workflow.research import pending_work
+    from consensus_assurance.workflow.transactions import commit_graph
+    saved={}
+    def explained(state):
+        sub,_=question_step(state);sub.pop('map_path')
+        sub.update(action='explained',rationale='The sourced function keeps no shared caller state')
+        sub['question'].update(question='Does the function retain shared caller state?',
+            disposition='explained_by_existing_mechanism',counterevidence=['Only parameters are read'],unknowns=[])
+        return sub,{}
+    def focus(state,second=False):
+        if not second:
+            completed,answer=e.state.question_candidates
+            for status in ('closed','paused','active','blocked','escalated','outside'):
+                c=(completed if status=='escalated' else answer).model_copy(deep=True);c.id=status;c.check_ids=[]
+                c.status='active' if status=='outside' else status
+                c.stop_reason=status+' local reason';c.resume_conditions=[status+' local prerequisite']
+                c.question.unknowns=[status+' local unknown']
+                if status=='outside':c.question.activity_classes=['A6']
+                if status=='escalated':c.obligation_id=completed.obligation_id
+                e.state.question_candidates.append(c)
+            unit=e.state.units[0].model_copy(deep=True)
+            unit.id='unfinished';unit.candidate_id='escalated';unit.status='pending';unit.remaining_obligation_ids=unit.obligation_ids[:]
+            unit.audit_question=next(c.question.model_copy(deep=True) for c in e.state.question_candidates if c.id=='escalated')
+            e.state.units.append(unit)
+            e.state.review_issues.append(ReviewIssue(id='independent-issue',review_id='controlled',target_id='escalated',
+                target_version=1,aspect='applicability',source_ids=['code'],explanation='Caller ownership remains unexamined',
+                reason='Read the independent caller',disposition='reading'))
+            e.state.active_unit_id=unit.id
+            # This separate selection belongs to the completed work, not the released Unit.
+            e.state.active_direct_check_id=e.state.direct_checks[0].id
+            from consensus_assurance.workflow.audit import sync_progress
+            sync_progress(e)
+            saved['before']=e.state.model_copy(deep=True)
+        else:
+            verify()
+            saved['after']=e.state.model_copy(deep=True)
+        return dict(action='stop',scope='focus',reason='tool_gap' if second else 'resource_limit',ref_ids=['code'],
+            rationale='Second focus handoff' if second else 'Release current focus work',
+            resume_conditions=['Restore a different tool' if second else 'Provide further review capacity']),{}
+    def verify():
+        state=e.state;before=saved['before']
+        released={'active','blocked','escalated'}
+        for old in before.question_candidates:
+            c=next(c for c in state.question_candidates if c.id==old.id)
+            assert c==old.model_copy(update={'status':'paused'} if c.id in released else {})
+        for field in ('units','claims','bindings','direct_checks','monitor_results','evidence','findings','semantic_reviews','review_issues','usage'):
+            if field=='usage':
+                assert {k:v for k,v in state.usage.items() if k!='agent_calls'}=={k:v for k,v in before.usage.items() if k!='agent_calls'}
+            else:assert getattr(state,field)==getattr(before,field),field
+        assert state.active_unit_id is None and state.active_direct_check_id==before.active_direct_check_id
+        assert not state.run_stop
+        assert {w['id'] for w in pending_work(state)}=={'unfinished','independent-issue','outside'}
+        assert state.selections[:len(before.selections)]==before.selections
+        stops=[s for s in state.selections if s['action']=='stop']
+        assert stops[0]['candidate_ids']==sorted(released) and stops[0]['ref_ids']==['code']
+        if len(stops)==2:assert stops[1]['candidate_ids']==[]
+        index=json.loads((e.root/'research.json').read_text())
+        assert {w['id'] for w in index['pending_work']}=={w['id'] for w in pending_work(state)}
+        assert {c['id']:c['status'] for c in index['candidates']}=={c.id:c.status for c in state.question_candidates}
+        text=render_report(state,e.root).read_text()
+        assert 'The sourced function keeps no shared caller state' in text and '源码解释' in text
+        assert 'Caller ownership remains unexamined' in text
+        loaded=e.store.load()
+        assert loaded==state
+        decision=stops[-1];key='submission-'+decision['operation_id']
+        payload=json.loads((e.root/'graph-commits'/f'{key}.json').read_text())['input']
+        commit_graph(e,key,payload,lambda proxy:pytest.fail('Accepted focus operation replayed'))
+        assert e.state==loaded
+    def independent(state):
+        verify()
+        assert e.state.question_candidates==saved['after'].question_candidates
+        sub=dict(action='research',feedback=feedback(state),rationale='Continue independent sourced investigation')
+        sub['feedback']['answered']='The direct source leaves external caller ownership unexamined'
+        return sub,{}
+    def reopen(state):
+        c=state['question_candidates'][1]
+        sub,_=question_step(state);sub.pop('map_path')
+        sub.update(candidate_id=c['id'],question=c['question'],feedback=feedback(state))
+        sub['question']['unknowns']=['An independent caller may retain state outside this function']
+        return sub,{}
+    e,repo=engine_for(tmp_path,[open_first,check_step(),review_step(),explained,focus,
+        lambda state:focus(state,True),independent,reopen,stop])
+    e.config.directed_question=None
+    state=e.start(repo)
+    assert not diagnostics(e),diagnostics(e)
+    assert state.question_candidates[1].status=='active' and state.question_candidates[1].history
+    assert state.usage['experiments']==1 and state.usage['semantic_reviews']==1
+    assert state.run_stop['reason']=='user_stop'
+
+
 @pytest.mark.parametrize('combined',[False,True])
 def test_default_overview_precedes_focus_without_requiring_both_labels_per_question(tmp_path,combined):
     import copy

@@ -395,10 +395,12 @@ def release(state, ids, reason, resume_conditions, closed=False):
     for c in state.question_candidates:
         if c.id in ids:
             c.status='closed' if closed else 'paused'
-            c.stop_reason=reason
-            c.resume_conditions=[] if closed else resume_conditions
-    if any(u.id==state.active_unit_id and u.candidate_id in ids for u in state.units):
-        state.active_unit_id=state.active_direct_check_id=None
+            if reason is not None:c.stop_reason=reason
+            if closed or resume_conditions is not None:c.resume_conditions=[] if closed else resume_conditions
+    units={u.id for u in state.units if u.candidate_id in ids}
+    if state.active_unit_id in units:state.active_unit_id=None
+    if any(a.id==state.active_direct_check_id and a.unit_id in units for a in state.direct_checks):
+        state.active_direct_check_id=None
 
 
 def reject_local(state, operation_id, errors, raw):
@@ -494,7 +496,12 @@ def record_decision(engine, submission, operation_id, map_changed=False):
         ids={c.id for c in state.question_candidates if c.id in submission.ref_ids}
         if submission.scope=='focus':
             focus=state.config.get('activity_focus',[]) or ['A1','A2']
-            ids={c.id for c in state.question_candidates if set(c.question.activity_classes)&set(focus)}
+            work={w['id'] for w in pending_work(state)} | {i.target_id for i in open_issues(state)}
+            unfinished={u.candidate_id for u in state.units if work &
+                {u.id,*u.obligation_ids,*u.binding_ids,*u.relation_ids,
+                    *(a.id for a in state.direct_checks if a.unit_id==u.id)}}
+            ids={c.id for c in state.question_candidates if set(c.question.activity_classes)&set(focus) and
+                (c.status in {'active','blocked'} or c.status=='escalated' and c.id in work|unfinished)}
         related.update(u.id for u in state.units if u.candidate_id in ids)
         related.update(i.id for i in state.review_issues if any(a.id==i.target_id and
             a.unit_id in related for a in state.direct_checks))
@@ -509,7 +516,8 @@ def record_decision(engine, submission, operation_id, map_changed=False):
         if submission.scope!='run':
             if submission.reason!='bounded_completed' and not submission.resume_conditions:
                 raise ValueError('Local pause needs concrete resume_conditions; pending Units and issues remain visible')
-            release(state,ids,submission.rationale,submission.resume_conditions,submission.reason=='bounded_completed')
+            release(state,ids,None if submission.scope=='focus' else submission.rationale,
+                None if submission.scope=='focus' else submission.resume_conditions,submission.reason=='bounded_completed')
         record.update(origin='agent',scope=submission.scope,reason=submission.reason,ref_ids=submission.ref_ids,
             pending_work=pending_work(state),candidate_ids=sorted(ids),resume_conditions=submission.resume_conditions)
     state.selections.append(record)
