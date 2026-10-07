@@ -491,7 +491,9 @@ def validate_submission(state, root, name, implementation):
         budget=BudgetTracker(config.budget,trial))
     result = {'valid':False,'run_id':state.id,'audit_spec_version':state.audit_spec_version,
         'elapsed_seconds':state.elapsed_seconds,'diagnostics':[],
-        'meaning':'Validation against the state and bytes read; this is not acceptance, execution or evidence'}
+        'meaning':'Validation against the state and bytes read; this is not acceptance, execution or evidence. '
+            'elapsed_seconds is run usage at the last saved checkpoint, not live elapsed time in this turn. '
+            'A valid preflight reserves no future budget; use the current turn allocation and its CheckRun for timing.'}
     try:
         context.budget.timeout()
         inputs = Inputs(root/'draft')
@@ -775,7 +777,7 @@ def execute(engine):
                     raise Blocked('Codex permission probe is inconclusive or denied; inspect probe logs; no model payload sent')
             payload = engine.action('agent_turn', 'agent_calls', lambda:engine.agent.investigate(
                 engine.runner, request, draft, state.snapshot.id,
-                min(engine.budget.remaining(), engine.config.budget.agent_turn_timeout), state.agent_session_id),
+                engine.config.budget.agent_turn_timeout, state.agent_session_id),
                 {'session_id':state.agent_session_id, 'turn':len(state.agent_turns)})
             receive(engine, payload)
             accepted = accept_received(engine)

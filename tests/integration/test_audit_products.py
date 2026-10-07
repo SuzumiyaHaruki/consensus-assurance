@@ -331,7 +331,7 @@ def test_existing_unit_actual_technical_repair_review_progress(tmp_path,fault):
 @pytest.mark.parametrize('fault',[None,'missing','escape','symlink','unreliable'])
 def test_deadline_retains_only_reliably_declared_bytes(tmp_path,fault):
     from consensus_assurance.core.types import ExecutionStatus
-    from consensus_assurance.workflow.audit import Inputs
+    from consensus_assurance.workflow.audit import Inputs, validate_submission
     saved={}
     def combined(state):
         candidate,files=first(state)
@@ -352,6 +352,7 @@ def test_deadline_retains_only_reliably_declared_bytes(tmp_path,fault):
         if fault=='symlink':
             helper=e.root/'draft'/'helper.py';helper.unlink();helper.symlink_to(tmp_path/'outside.py')
         if fault=='unreliable':
+            assert validate_submission(e.state,e.root,result['submission'],e.implementation)['valid']
             check.status=ExecutionStatus.TIMEOUT;check.reason='No reliable completed turn';result=None
         return check,session,result
     e.agent.investigate=investigate
@@ -1140,7 +1141,11 @@ def test_preflight_checks_current_inputs_without_writes_or_execution(tmp_path,mo
         commit_graph(e,'bad-combined',broken,lambda proxy:accept(proxy,AuditSubmission.model_validate(broken),
             Inputs(draft),'bad-combined'))
     assert {d['code'] for d in rejected['diagnostics']}=={d.code for d in formal.value.diagnostics}
-    assert validate(sub)['valid']
+    e.state.elapsed_seconds=1.401
+    result=validate(sub)
+    assert result['valid'] and result['elapsed_seconds']==1.401
+    assert 'last saved checkpoint' in result['meaning'] and 'not live elapsed time' in result['meaning']
+    assert 'reserves no future budget' in result['meaning']
     assert not e.state.units and not e.state.direct_checks
     for fields in ({'derivation':''},{'applicability':''},{'source_ids':[],'expectation_ids':[]}):
         missing=copy.deepcopy(plan)

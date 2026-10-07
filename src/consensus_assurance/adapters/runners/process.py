@@ -2,6 +2,8 @@ import os
 import signal
 import subprocess
 import time
+import json
+from datetime import datetime, timedelta
 from pathlib import Path
 from consensus_assurance.core.types import CheckRun, ExecutionStatus, now
 from consensus_assurance.adapters.storage.files import redact, write_json
@@ -42,6 +44,16 @@ class ProcessRunner:
         run.transition(ExecutionStatus.RUNNING)
         run.started_at = now()
         write_json(logs / "check.json", run)
+        if action == 'agent_turn' and stdin is not None:
+            stdin += '\n\nCurrent turn time allocation (controller record):\n'+json.dumps({
+                'action_id':run.pending_action_id, 'check_id':run.id,
+                'check_record':str(logs/'check.json'), 'generated_at':run.started_at,
+                'timeout_seconds':timeout, 'timeout_limit':limit,
+                'estimated_deadline_utc':(datetime.fromisoformat(run.started_at)+timedelta(seconds=timeout)).isoformat(),
+                'meaning':'This CheckRun records the allocated interval and start, not the exact process spawn time. '
+                    'UTC deadline is an estimate; the runner enforces the timeout using a monotonic clock. '
+                    'research.json capacity and preflight elapsed_seconds are saved run checkpoints, '
+                    'not live turn timers; they do not refresh during your tool loop.'})
         process = None
         try:
             process = subprocess.Popen(command, cwd=cwd, stdin=subprocess.PIPE,

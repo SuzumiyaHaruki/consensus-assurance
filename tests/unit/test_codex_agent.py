@@ -75,14 +75,26 @@ def test_new_session_or_exact_resume_counts_unique_completed_tool_items(tmp_path
     from consensus_assurance.core.config import CodexProvider
     monkeypatch.setattr('shutil.which',lambda name:'/usr/bin/'+name)
     monkeypatch.setenv('PROVIDER_TICKET','canary-client-only')
-    class Runner:
-        root=tmp_path
-        active_action_id='operation'
-        def run(self,command,cwd,action,snapshot_id,timeout,stdin=None,env=None,sensitive_env=()):
-            self.command=command
-            assert (env is not None)==custom
-            if custom:assert env['PROVIDER_TICKET']=='canary-client-only' and sensitive_env==('PROVIDER_TICKET',)
-            log=tmp_path/'events.jsonl'
+    from datetime import datetime
+    from consensus_assurance.adapters.runners.process import ProcessRunner
+    clock=[100.0];calls=[]
+    monkeypatch.setattr('time.monotonic',lambda:clock[0])
+    monkeypatch.setattr('os.killpg',lambda *a:None)
+    class Process:
+        pid=123;returncode=0
+        def __init__(self,command,**kwargs):
+            calls.append(command)
+            assert (kwargs['env'] is not None)==custom
+            if custom:assert kwargs['env']['PROVIDER_TICKET']=='canary-client-only'
+        def communicate(self,stdin,timeout):
+            context=json.loads(stdin.split('Current turn time allocation (controller record):\n')[1])
+            record=json.loads(Path(context['check_record']).read_text())
+            assert context['action_id']=='operation' and context['check_id']==record['id']
+            assert context['generated_at']==record['started_at']
+            assert timeout==context['timeout_seconds']==record['parameters']['timeout_seconds']==(80 if session_id else 900)
+            assert context['timeout_limit']==('total_seconds' if session_id else 'agent_turn_timeout')
+            assert (datetime.fromisoformat(context['estimated_deadline_utc'])-datetime.fromisoformat(context['generated_at'])).total_seconds()==timeout
+            assert 'saved run checkpoints' in context['meaning'] and 'estimate' in context['meaning']
             events=[{'type':'thread.started','thread_id':'exact-session'},
                 {'type':'item.started','item':{'id':'tool-1','type':'command_execution'}},
                 {'type':'item.updated','item':{'id':'tool-1','type':'command_execution'}},
@@ -90,34 +102,46 @@ def test_new_session_or_exact_resume_counts_unique_completed_tool_items(tmp_path
                 {'type':'item.completed','item':{'id':'tool-1','type':'command_execution'}},
                 {'type':'item.completed','item':{'id':'answer','type':'agent_message'}},
                 {'type':'turn.completed','usage':{'input_tokens':10,'output_tokens':2}}]
-            log.write_text('\n'.join(json.dumps(e) for e in events))
+            command=calls[-1]
             response=Path(command[command.index('--output-last-message')+1]);response.write_text(json.dumps({'submission':'submission.json','summary':'Done'}))
-            return CheckRun(action=action,cwd=str(cwd),snapshot_id=snapshot_id,status=ExecutionStatus.COMPLETED,exit_code=0,stdout=str(log))
+            return '\n'.join(json.dumps(e) for e in events),''
+    monkeypatch.setattr('subprocess.Popen',Process)
     provider=CodexProvider(id='deepseek',base_url='https://api.deepseek.com',env_key='PROVIDER_TICKET') if custom else None
-    runner=Runner();agent=CodexAgent('low','deepseek-flash' if custom else 'gpt-6-astra',provider);agent.available=True;agent.version='fixture-cli'
+    runner=ProcessRunner(tmp_path);runner.active_action_id='operation';runner.deadline=clock[0]+(100 if session_id else 2000)
+    agent=CodexAgent('low','deepseek-flash' if custom else 'gpt-6-astra',provider);agent.available=True;agent.version='fixture-cli'
     agent.sandbox_command=lambda root:['codex']
-    agent.permission_probe=lambda *a:(True,[])
+    def permission(*args):
+        clock[0]+=20
+        return True,[]
+    agent.permission_probe=permission
     agent.prepare(runner,tmp_path/'draft','snapshot')
-    check,session,result=agent.investigate(runner,'Investigate',tmp_path/'draft','snapshot',10,session_id)
+    check,session,result=agent.investigate(runner,'Investigate',tmp_path/'draft','snapshot',900,session_id)
+    # Replaying the same completed action must not recalculate timing or launch another turn.
+    before={p:p.read_bytes() for p in tmp_path.glob('logs/*/check.json')}
+    monkeypatch.setattr('time.monotonic',lambda:pytest.fail('Completed receipt must precede allocation'))
+    replay=runner.run(check.command,tmp_path/'draft','agent_turn','snapshot',900,stdin='Must not be sent')
+    assert replay.id==check.id and replay.started_at==check.started_at and replay.ended_at==check.ended_at
+    assert replay.parameters['timeout_seconds']==check.parameters['timeout_seconds']
+    assert len(calls)==1 and all(p.read_bytes()==raw for p,raw in before.items())
     assert session=='exact-session' and result['submission']=='submission.json'
-    assert runner.command[:2]==['codex','exec'] and ('resume' in runner.command)==bool(session_id)
-    assert not {'--ignore-rules','--ephemeral','--last','fork'} & set(runner.command)
-    assert '--ignore-user-config' in runner.command
-    assert {'memories.use_memories=false','memories.generate_memories=false'} <= set(runner.command)
+    assert check.command[:2]==['codex','exec'] and ('resume' in check.command)==bool(session_id)
+    assert not {'--ignore-rules','--ephemeral','--last','fork'} & set(check.command)
+    assert '--ignore-user-config' in check.command
+    assert {'memories.use_memories=false','memories.generate_memories=false'} <= set(check.command)
     assert check.parameters['agent_tool_events']==1 and check.parameters['agent_usage']['input_tokens']==10
-    assert ('exact-session' in runner.command)==bool(session_id) and 'model_reasoning_effort="low"' in runner.command
-    assert runner.command[runner.command.index('-m')+1]==agent.model
+    assert ('exact-session' in check.command)==bool(session_id) and 'model_reasoning_effort="low"' in check.command
+    assert check.command[check.command.index('-m')+1]==agent.model
     assert check.parameters['codex_provider']==(provider.model_dump(mode='json') if custom else None)
     if custom:
         try:import tomllib
         except ModuleNotFoundError:import tomli as tomllib
-        overrides=tomllib.loads('\n'.join(runner.command[i+1] for i,arg in enumerate(runner.command) if arg=='-c'))
+        overrides=tomllib.loads('\n'.join(check.command[i+1] for i,arg in enumerate(check.command) if arg=='-c'))
         assert overrides['model_provider']=='deepseek'
         assert overrides['model_providers']['deepseek']==dict(name='deepseek',base_url='https://api.deepseek.com',
             env_key='PROVIDER_TICKET',wire_api='responses',requires_openai_auth=False,supports_websockets=False)
         assert overrides['shell_environment_policy']['filters']=={'PROVIDER_TICKET':'exclude'}
         assert 'PROVIDER_TICKET' not in overrides['shell_environment_policy']['set']
-    else:assert not any('model_provider=' in arg or 'model_providers.' in arg for arg in runner.command)
+    else:assert not any('model_provider=' in arg or 'model_providers.' in arg for arg in check.command)
     assert 'canary-client-only' not in json.dumps(check.model_dump(mode='json'))
 
 
