@@ -184,6 +184,26 @@ def result_item(record, artifact, reviews, checks):
     return item
 
 
+def explained_summary(state, candidate_id, archive):
+    """Locate the current accepted disposition, never nearby feedback or draft text."""
+    candidate = next(c for c in state.question_candidates if c.id == candidate_id)
+    record = next((s for s in reversed(state.selections) if candidate.check_ids and
+        s['operation_id'] == candidate.check_ids[-1]), {})
+    if (candidate.status == 'explained' and record.get('action') == 'explained'
+            and 'accepted_versions' in record and candidate_id in record.get('candidate_ids',[])):
+        operation = record['operation_id']
+        path = f'submissions/{operation}/accepted.json'
+        for product, source in [(archive.read(path),path),(record,'state.json')]:
+            if product.get('action') != 'explained' or product.get('candidate_id') not in (None,candidate_id):continue
+            feedback = product.get('feedback') or {}
+            answer = (feedback.get('answered') or '').strip() if candidate_id in feedback.get('ref_ids',[]) else ''
+            answer = answer or (product.get('rationale') or '').strip()
+            if answer:
+                label = '受理解释' if source == path else f'保存状态中的受理解释（操作 {operation}）'
+                return answer, archive.link(source,label)
+    return '原状态为源码解释，具体受理解释未定位／原文缺失', archive.link('state.json','候选原文与来源')
+
+
 def observation_lines(record, artifact, check, archive, event_cache):
     """Select recorded comparisons and operands; never re-assess or invent an oracle."""
     from consensus_assurance.adapters.runners.experiment import extract_events
@@ -419,7 +439,12 @@ def render_report(state, root):
         disposition = conclusion_label(result)+('；另有场景尚未完成' if progress and result['disposition']=='confirmed_in_scope' else '')
         summary='；'.join(filter(None,[cell(excerpt(answer,170)) if answer else '',progress])) or cell(excerpt(result['description'],170))
         lines.append(f'| {n}. {cell(title)} | {disposition} | {summary} | {claim_links[result["claim_id"]]} |')
-    for c in explained:lines.append(f'| {cell(excerpt(c["question"]["question"],130))} | 源码解释，未经性质执行 | {cell(excerpt("；".join(c["question"]["counterevidence"]),170))} | {link("state.json","候选原文与来源")} |')
+    for c in explained:
+        answer, source = explained_summary(state,c['id'],archive)
+        disputes = [issue_links[id] for id in c['open_issue_ids'] if id in issue_links]
+        disposition = '源码解释（研究者处置，未经性质执行）'+('；仍有开放争议' if disputes else '')
+        lines.append(f'| {cell(excerpt(c["question"]["question"],130))} | {disposition} | {cell(excerpt(answer,170))} | '+
+            '；'.join([source,*disputes])+' |')
     for claim in research['claims']:
         if any(r['claim_id']==claim['id'] for r in results):continue
         unit = next(u for u in research['units'] if claim['id'] in u['obligation_ids'])

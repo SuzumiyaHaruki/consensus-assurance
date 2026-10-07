@@ -250,10 +250,18 @@ def test_mixed_report_reads_fixed_results_and_moves_without_side_effects(tmp_pat
         files['plan.json']=json.dumps(plan)
         files['check.py']=files['check.py'].replace('value=step(2,3)','assert legal(2,3)\nvalue=step(2,3)')
         return sub,files
-    def explained(state):
-        sub,_=first(state);sub.pop('map_path');sub.update(action='explained',obligation=None,bindings=[])
+    explanation='The selected capacity duty excludes this input; its return does not contradict that scoped requirement.'
+    explanation_reason='Close this local suspicion because the sourced duty applies only within the selected capacity.'
+    def explained(state,initial=False):
+        sub,_=first(state);sub.pop('map_path')
+        sub.update(action='continue' if initial else 'explained',obligation=None,bindings=[],rationale=explanation_reason)
         sub['question'].update(question='What happens outside the selected local capacity?',
-            disposition='explained_by_existing_mechanism',counterevidence=['The other branch returns zero'])
+            disposition='needs_specific_evidence' if initial else 'explained_by_existing_mechanism',
+            unknowns=['Determine the caller duty'] if initial else [],counterevidence=['The other branch returns zero'])
+        if not initial:
+            candidate=state['question_candidates'][-1]['id']
+            sub.update(candidate_id=candidate,feedback=dict(ref_ids=[candidate,'code'],answered=explanation,
+                remaining=[],understanding='updated',rationale='Retain the scoped answer without a property judgment'))
         return sub,{}
     def explore(state):
         setup="ready.append('initialized')\n" if any(c['action']=='exploration' for c in state['checks']) else ''
@@ -295,7 +303,7 @@ def test_mixed_report_reads_fixed_results_and_moves_without_side_effects(tmp_pat
         sub=json.loads(json.dumps(sub).replace('"bounded"','"pending-bound"').replace('"binding"','"pending-binding"'))
         sub['question']['question']='Does the second public entry preserve the local bound?'
         return sub,{}
-    steps=[initial,encoded_check(broken=True),encoded_check(revise=True),review,second,challenge_second,repair_second,review_second,explained,
+    steps=[initial,encoded_check(broken=True),encoded_check(revise=True),review,second,challenge_second,repair_second,review_second,lambda s:explained(s,True),explained,
         independent_issue,contract_question,explore,retain(first_answer,[0]),explore,retain(repaired_answer,[1]),retain(joint_answer,[0,1]),
         explore,fact_feedback,paused_contract,unconstructed,stop]
     e,repo=engine_for(tmp_path,steps);e.agent.mock=False;e.config.execution_isolation='bwrap'
@@ -367,6 +375,48 @@ def test_mixed_report_reads_fixed_results_and_moves_without_side_effects(tmp_pat
     assert '有限检查未见违反' in pending
     complete=next(line for line in rows if '[bounded](' in line)
     assert '已确认违反' in complete
+    closed=next(c for c in state.question_candidates if c.status=='explained')
+    operation=closed.check_ids[-1];accepted=moved/f'submissions/{operation}/accepted.json'
+    original=accepted.read_bytes()
+    def explained_row(copy):
+        before=copy.model_dump(mode='json')
+        report=render_report(copy,moved).read_text()
+        assert copy.model_dump(mode='json')==before
+        valid_links(report)
+        return next(line for line in report.splitlines() if line.startswith('| ') and closed.question.question in line)
+    row=explained_row(state)
+    assert explanation in row and 'The other branch returns zero' not in row
+    assert f'(submissions/{operation}/accepted.json)' in row and '研究者处置，未经性质执行' in row
+    assert '仍有开放争议' in row and '#issue-' in row
+    assert closed.question.counterevidence==['The other branch returns zero']
+    for change in ('no_feedback','unlinked_feedback','missing_product','missing_text','rejected','reopened','paused'):
+        copy=state.model_copy(deep=True)
+        selection=next(s for s in copy.selections if s['operation_id']==operation)
+        product=json.loads(original)
+        if change in {'no_feedback','unlinked_feedback'}:
+            product['feedback']=selection['feedback']={} if change=='no_feedback' else dict(
+                ref_ids=['result'],answered='An unrelated Fact answer must not replace the disposition')
+            accepted.write_text(json.dumps(product))
+        if change in {'missing_product','missing_text'}:accepted.unlink()
+        if change=='missing_text':selection.update(feedback={},rationale=' ')
+        if change=='rejected':
+            copy.selections.append(dict(operation_id='unaccepted',action='rejected',candidate_ids=[closed.id],
+                rationale='Do not show this rejected answer',feedback=dict(ref_ids=[closed.id],answered='Rejected answer')))
+            (moved/'draft/unaccepted.json').write_text(json.dumps(copy.selections[-1]))
+        if change in {'reopened','paused'}:
+            candidate=next(c for c in copy.question_candidates if c.id==closed.id)
+            candidate.status='active' if change=='reopened' else 'paused'
+            candidate.resume_conditions=['Investigate the caller duty'] if change=='paused' else []
+        row=explained_row(copy)
+        if change in {'no_feedback','unlinked_feedback'}:
+            assert explanation_reason in row and explanation not in row and f'(submissions/{operation}/accepted.json)' in row
+        elif change=='missing_product':assert explanation in row and operation in row and '(state.json)' in row
+        elif change=='missing_text':assert '具体受理解释未定位／原文缺失' in row and explanation not in row
+        elif change=='rejected':assert explanation in row and 'Rejected answer' not in row
+        else:assert explanation not in row and '源码解释' not in row
+        assert 'The other branch returns zero' not in row
+        accepted.write_bytes(original)
+    assert state.model_dump(mode='json')==saved
     assert text.count('保存的语义未知：The timing contract is unacquired')==1
     handoff=next(s for s in state.selections if s.get('feedback',{}).get('answered')==joint_answer)
     assert 'Acquire the caller repeat contract' in (moved/f'submissions/{handoff["operation_id"]}/accepted.json').read_text()
