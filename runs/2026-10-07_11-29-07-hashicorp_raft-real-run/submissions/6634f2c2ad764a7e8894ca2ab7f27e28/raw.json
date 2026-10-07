@@ -1,0 +1,112 @@
+{
+  "action": "check",
+  "rationale": "Combined product: one new obligation for the frontier question the first confirmed defect left open, and its first direct check. The obligation c-single-vote-per-term fixes the local half of Raft's election safety as a requirement on the durable vote record: once a node has recorded a vote (T, C), any later persisted vote for term T must be for C. The check exercises the escalation that the first candidate recorded as unknown, namely whether a published-term regression can lead to a second vote in a term the node already voted in: a stale heartbeat from a deposed leader is held inside the node's StableStore CurrentTerm write, a higher-term vote is granted while the write is held, the release publishes a term one below the granted one, and the node's own election then proposes that same term again and persists a self-vote over the earlier record. The plan states the fixed inputs, the binding that locates electSelf, the oracle (the two durable records and the invariant itself), the applicability condition that requires the candidates to differ, and the limits (local violation only, timing bounded by the election timer, one node and one prefix).",
+  "candidate": {
+    "action": "obligation",
+    "rationale": "Third Candidate, opened from the remaining discriminator of the first confirmed defect. It states the local vote-once requirement over the durable vote record and binds it to the two code paths that write that record: the grant path, which refuses a second different vote in a term it has already voted in, and the candidate path, which persists a self-vote for its proposed term without consulting the record. The question asks whether a published-term regression can make those two constraints disagree, which is exactly the escalation recorded as unknown when the term-context obligation was registered.",
+    "question": {
+      "question": "Can a node that has already persisted a vote for a candidate in term T later persist a second, different vote for the same term T, when its published current term has been dropped below the term it voted in by a delayed write from the heartbeat callback?",
+      "importance": "Raft's election safety rests on each voter persisting at most one vote per term. If the durable record for a term can be overwritten with a different candidate, the local premise of at most one leader per term is gone: a node that has already contributed a vote to candidate C in term T can contribute another to a different candidate, and other voters that suffer the same overwrite would let two leaders be elected in one term. The path needs no faulty storage: the term value published by setCurrentTerm is not serialized with the main goroutine, and the candidate path derives its proposed term from that value, so a drop of one in the published term makes the next election propose exactly the term already voted in.",
+      "trigger_rationale": "The durable vote record is written by two paths: requestVote refuses a request for a different candidate in a term it has already voted in, by comparing the request term and candidate with the record, while electSelf persists a self-vote for getCurrentTerm()+1 before it contacts any peer. The published term itself can be dropped by a heartbeat-shaped AppendEntries handled on the transport connection goroutine: that path adopts a greater term through setCurrentTerm, which writes the StableStore before publishing the value in memory, so a delayed store write can land below a term the main goroutine has already adopted and voted in. Combining the two, the next election proposes a term that already has a recorded vote and overwrites the record with the node's own address.",
+      "disposition": "ready_for_check",
+      "preferred_check": "direct_test",
+      "participants": ["the voter node", "the deposed leader whose heartbeat is delayed", "the higher-term candidate whose vote is granted", "the node's own election"],
+      "objects": ["StableStore LastVoteTerm/LastVoteCand", "raftState.currentTerm", "Raft.electSelf", "Raft.requestVote", "Raft.processHeartbeat"],
+      "contexts": [
+        "a single voter whose StableStore write for one term is delayed while the transport connection goroutine handles a stale heartbeat",
+        "the same node later running its own election after the delayed write published a term one below the one it voted in"
+      ],
+      "event_paths": [
+        "connection goroutine: handleCommand -> heartbeatFn -> Raft.processHeartbeat -> appendEntries -> setState(Follower) then the held setCurrentTerm(6)",
+        "main loop: requestVote for term 7 -> adopts 7 and persists the vote record (7, candidate) because the record is still empty",
+        "release: the held StableStore write publishes term 6, one below the term just voted in",
+        "main loop election: runFollower heartbeat timeout -> runCandidate -> electSelf -> setCurrentTerm(7) and persistVote(7, self), overwriting the record"
+      ],
+      "activity_classes": ["A1"],
+      "behavior_ids": ["b-elect-self", "b-vote-grant"],
+      "fact_ids": ["f-vote-record"],
+      "supporting_behavior_ids": {
+        "b-heartbeat-fastpath": "the entry point that lets one node publish a lower term without being serialized with the main goroutine",
+        "b-term-observation": "shows that the same term field is adopted in both directions and that a greater term is the only one accepted"
+      },
+      "obligation_relation_kind": "preservation",
+      "counterevidence": [
+        "requestVote re-grants a duplicate request for the same (term, candidate) without writing the record again, so two identical votes in one term are not a violation and the check's applicability requires the candidates to differ.",
+        "Without the delayed write the invariant holds: the published term is monotonic, a recorded vote for term T implies the published term was T, and electSelf proposes published+1, a strictly greater term.",
+        "The witness shows the local record only; a second leader additionally needs other voters' records to be corrupted, which the check does not exercise.",
+        "A reader may consider the grant path the only place the rule matters, in which case overwriting the record is harmless; the requirement's basis is that the durable record is what a restarted voter consults."
+      ],
+      "unknowns": [
+        "whether the same overwrite can be produced without a delayed store write, for instance by any other path that publishes a lower term",
+        "whether the intended repair belongs in the term publishing path or in the candidate path's unconditional vote record write",
+        "how many voters would have to be affected before two leaders in one term actually become reachable"
+      ],
+      "priority": 3,
+      "source_ids": ["s-raft-vote-record", "s-raft-elect-self", "s-raft-request-vote-filter", "s-raft-candidate-vote", "s-raft-set-current-term", "s-state-term-atomic", "s-raft-process-heartbeat", "s-net-fastpath", "s-raft-append-term", "s-raft-set-state"]
+    },
+    "obligation": {
+      "id": "c-single-vote-per-term",
+      "kind": "obligation",
+      "concern": "consensus_safety",
+      "description": "A node must not persist a second, different vote for a term in which it has already persisted a vote: once the durable record holds (T, C), any later write of the record for term T must be for C. The requirement binds every path that writes the record, including the candidate's own self-vote, and it must hold independently of how the node's published current term was established.",
+      "source_ids": ["s-raft-vote-record", "s-raft-elect-self", "s-raft-set-current-term", "s-state-term-atomic", "s-raft-candidate-vote"],
+      "scope": {
+        "description": "A single Raft node that is a voter in its configuration, over a caller-supplied StableStore whose writes may be delayed, while it handles a heartbeat-shaped AppendEntries on the transport callback and later runs its own election.",
+        "assumptions": [
+          "the StableStore accepts SetUint64 for the LastVoteTerm and CurrentTerm keys",
+          "the vote record is the durable record the node consults before granting a vote",
+          "the delayed store write is a legal environment for an injected dependency"
+        ],
+        "excluded": [
+          "log replication and commitment correctness, which the earlier obligations covered",
+          "the wider outcome of two leaders in one term, which depends on other voters",
+          "any requirement on transports outside this module"
+        ]
+      },
+      "pending": [
+        "whether any path other than a delayed store write can publish a term below one the node has voted in",
+        "whether the repair belongs in the publishing path or in the candidate path"
+      ],
+      "grounding": {
+        "source_ids": ["s-raft-vote-record", "s-raft-elect-self", "s-raft-set-current-term", "s-state-term-atomic", "s-raft-process-heartbeat", "s-net-fastpath", "s-raft-append-term"],
+        "expectation_ids": [],
+        "binding_ids": ["bind-raft-elect-self"],
+        "derivation": "The grant path writes the record with persistVote and refuses a second different vote in a term already voted in, so it enforces one vote per term by comparing the record with the request (s-raft-vote-record); the candidate path proposes getCurrentTerm()+1 and persists a self-vote for that term before contacting any peer, without consulting the record (s-raft-elect-self). Both publish the term through setCurrentTerm, which writes StableStore before the in-memory value (s-raft-set-current-term, s-state-term-atomic), and a heartbeat-shaped AppendEntries reaches that same adoption step from the transport connection goroutine (s-raft-process-heartbeat, s-net-fastpath) after adopting a greater term (s-raft-append-term). A delayed store write on that goroutine therefore leaves the published term one below the term the main goroutine has just voted in, and the next election derives exactly that term again, so the record is overwritten with a different candidate.",
+        "applicability": "Applies to a voter that can be reached by the transport callback while another RPC is handled on the main goroutine; the check's substitute transport exercises the documented callback contract and no target file is modified.",
+        "unresolved": [
+          "the number of voters that must be affected before two leaders in one term can result",
+          "whether a repair in the term publishing path alone is sufficient given the candidate path's unconditional write"
+        ],
+        "conflicts": [
+          "the grant path refuses a second different vote in the same term from the durable record while the candidate path persists a self-vote for its proposed term without consulting that record, so the rule is enforced on only one of the two paths that write it"
+        ],
+        "alternatives": [
+          "if the rule is read as binding only the grant path, the record overwrite is harmless and only the recorded vote history is lost",
+          "the candidate path could be repaired by consulting the record before persisting, or the publishing path by making the term non-decreasing again"
+        ]
+      }
+    },
+    "bindings": [
+      {
+        "id": "bind-raft-elect-self",
+        "material_id": "s-raft-elect-self",
+        "symbol": "electSelf",
+        "start_line": 1976,
+        "end_line": 2048,
+        "description": "Raft.electSelf increments the current term, persists a self-vote for the new term, and only then asks the peers for votes. It is the second writer of the durable vote record and the path that overwrites an existing record for the same term when the published term has dropped.",
+        "pending": [
+          "whether a guard against rewriting a term that already holds a vote is the intended repair"
+        ],
+        "associations": [
+          {
+            "claim_id": "c-single-vote-per-term",
+            "source_ids": ["s-raft-elect-self", "s-raft-vote-record", "s-raft-set-current-term"],
+            "rationale": "This entry point is the located implementation of the violated half of the requirement: it writes the durable vote record for its proposed term without comparing it with the record that already exists for that term."
+          }
+        ]
+      }
+    ]
+  },
+  "plan_path": "check-plan-vote.json",
+  "harness_path": "check-harness-vote.go"
+}

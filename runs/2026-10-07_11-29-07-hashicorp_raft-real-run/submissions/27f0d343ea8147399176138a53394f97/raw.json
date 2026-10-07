@@ -1,0 +1,62 @@
+{
+  "action": "review",
+  "artifact_id": "fd84d4e3d70848ad82ab90ca4c4f3cc5",
+  "rationale": "Review of the second scenario of obligation c-client-request-completes-on-inactive-raft, artifact fd84d4e3d70848ad82ab90ca4c4f3cc5 (version 1). It supplies the required checker_correspondence item, the applicability item and a resolution for the inherited input issue aa5f0ccb4bf14c69994ca8160b854bea, which still applies to this artifact because the earlier resolution covered the first scenario's lineage only. The reviewed execution is check 2464f92489d641b78350760c130f2029: exit 0, completed, prerequisites matched, and the retained stdout shows the node reporting itself Leader when 200 requests were issued while its main goroutine was parked, then 64 accepted futures that never completed, 136 requests rejected with ErrRaftShutdown, and the node left in Shutdown.",
+  "review_items": [
+    {
+      "target_id": "fd84d4e3d70848ad82ab90ca4c4f3cc5",
+      "aspect": "checker_correspondence",
+      "status": "no_issue_found",
+      "source_ids": ["s-api-apply-select", "s-api-apply-buffer", "s-api-err-shutdown", "s-future-defer-error", "s-state-wait-shutdown", "s-future-shutdown-future", "s-raft-run-shutdown", "s-raft-dispatch-logs", "s-api-verify-leader"],
+      "rationale": "The obligation under review says that an operation the API accepts must complete rather than leaving the caller's future permanently unresolved, and the accepted claim's scope already covers the window in which a client call is raced with Shutdown, so this artifact is the second scenario of the same requirement rather than a new proposition. Its fixed inputs are a single-voter node built by the package's own NewRaft with the documented BatchApplyCh option so applyCh is buffered, a LogStore that holds exactly one StoreLogs call after it is armed (a latency injection on an injected dependency), 200 requests issued from goroutines while the main goroutine is parked inside the leader's dispatch path, and the public Shutdown. No target file is modified. The prefix is legal and each step is the target's own code: ApplyLog offers the request to applyCh in a select that also watches the shutdown channel (s-api-apply-select) and applyCh is buffered under BatchApplyCh (s-api-apply-buffer); the dispatch path writes the entry to the LogStore before the request is inflight (s-raft-dispatch-logs), which is where the gate parks the main goroutine; Shutdown closes the shutdown channel, run returns on it and shutdownFuture.Error joins the goroutine group (s-raft-run-shutdown, s-state-wait-shutdown, s-future-shutdown-future); after that join nothing drains applyCh and the queued futures have no escape because deferError consults only ShutdownCh, which logFuture never sets (s-future-defer-error); and requests blocked inside the enqueue select when shutdown was signalled take the shutdown case and report ErrRaftShutdown (s-api-err-shutdown), which is why the harness counts them separately as completed. The oracle counts the accepted futures whose own completion channels are still empty after the join, so a nonzero value means the node accepted work it never answered; the admission event records that the requests were issued while the node reported itself Leader and while the main goroutine was parked, and it precedes the result event in the single runner stream with the same node and op identity. The retained observation is the violation: requests_issued_while_active with node_state Leader and main_thread_busy true, then accepted_requests_observed with accepted 64, rejected_shutdown 136, completed_other 0, unresolved_total 64, node_state_after_shutdown Shutdown and the parked write finishing with leadership lost, at exit 0. Counterevidence was reviewed with the inputs: the parked dispatch path is what makes the buffer fill deterministically; the exact counts depend on the buffer size and on how many requests the loop picks up before it takes the shutdown case, which is why the check asserts only that the unresolved count is zero; the default unbuffered channel cannot accept a request that shutdown abandons, as the first scenario showed; only the Apply path with BatchApplyCh is exercised here; and no caller-side timeout is measured. What the check does not establish is listed in limitations.",
+      "counterevidence": [],
+      "limitations": [
+        "The parked dispatch path is a latency injection on the injected LogStore; a schedule without it would queue fewer requests before shutdown.",
+        "The number of accepted requests depends on the buffered channel size and on how many the loop picks up before it takes the shutdown case, so the exact counts vary between runs even though the violation is repeatable.",
+        "The harness reads the accepted futures as live objects and does not call Error(), so it measures non-completion after the join plus a short inspection rather than consuming any late response.",
+        "Only the Apply path with the documented BatchApplyCh option is exercised; the default unbuffered channel and the other request paths are covered by the first scenario or not at all.",
+        "No caller-side timeout is exercised, so the practical blocking of a caller that does not bound its wait remains inferred rather than measured."
+      ],
+      "challenged_components": [],
+      "report_title": "运行中接受的请求在停机后仍未完成",
+      "report_answer": "节点在主协程被阻塞于派发路径时接受了 200 次请求，其中 64 个 future 在停机完成（goroutine 组已 join）之后仍未完成，另外 136 次以 ErrRaftShutdown 返回；测试以退出码 0 结束，违规体现在被测量的未完成计数上。该场景通过注入式 LogStore 的延迟构造，计数随缓冲大小变动，但未完成的结论可重复。"
+    },
+    {
+      "target_id": "fd84d4e3d70848ad82ab90ca4c4f3cc5",
+      "aspect": "applicability",
+      "status": "no_issue_found",
+      "source_ids": ["s-api-apply-select", "s-api-apply-buffer", "s-api-err-shutdown", "s-future-defer-error", "s-state-wait-shutdown", "s-future-shutdown-future", "s-raft-run-shutdown", "s-raft-verify-mainloop", "s-api-verify-leader"],
+      "rationale": "The implementation owes completion for a request it accepted while it was leading, for the same reasons the first scenario established and one more that this scenario makes explicit. Apply's contract is that the returned future carries the result and that its Error is the completion channel, and the implementation answers accepted work when it can: work already inflight when leadership ends is failed with ErrLeadershipLost (as the parked write in this run shows), and work that cannot be enqueued because the node is inactive is failed with ErrRaftShutdown. What is left unanswered is exactly the work the library itself accepted into a buffered channel and then abandoned when it shut down, and the library owns every element of that path: the buffering it creates under BatchApplyCh, the enqueue select, the shutdown join that removes the last responder, and the futures whose only escape would be a ShutdownCh they never set. The retained condition records the in-repo test's intent against its own TODO, which the earlier review answered as an outstanding-repair boundary; the same answer applies here, since the acknowledgment is about where the repair lies and not about whether accepted work is owed an answer. The condition is therefore retained as an independent scope boundary for this artifact as well.",
+      "counterevidence": [],
+      "limitations": [
+        "The repair location stays open and is retained as an independent boundary: draining the buffered channel on shutdown, giving these futures a shutdown escape, and never offering the send case once shutdown is signalled are all consistent with the duty.",
+        "The duty is established for the Apply path with a buffered channel and the request paths exercised; other request channels are not claimed to share it.",
+        "Whether a caller would block indefinitely depends on the caller not bounding the wait, which this artifact does not measure."
+      ],
+      "challenged_components": [],
+      "report_title": "运行中接受的请求同样属于完成义务范围",
+      "report_answer": "Apply 返回的 future 就是完成通道，实现本身会对失去领导权的在途请求返回 ErrLeadershipLost、对无法入队的请求返回 ErrRaftShutdown；被留在缓冲通道中而在停机后无人应答的请求正处于同一义务之下，缓存、入队选择、停机 join 与 future 缺乏退出通道都由该库掌控。"
+    }
+  ],
+  "resolutions": [
+    {
+      "issue_id": "aa5f0ccb4bf14c69994ca8160b854bea",
+      "source_ids": ["s-api-apply-select", "s-api-apply-buffer", "s-api-err-shutdown", "s-future-defer-error", "s-state-wait-shutdown", "s-future-shutdown-future", "s-raft-run-shutdown", "s-raft-verify-mainloop", "s-api-verify-leader"],
+      "evidence_ids": ["2464f92489d641b78350760c130f2029", "fd84d4e3d70848ad82ab90ca4c4f3cc5", "fbb6404d8a05409a945aee193402861f"],
+      "rationale": "The condition is the in-repo after-shutdown test's intent set against its own TODO comment, and it is answered the same way for this artifact as for the first scenario: the assertion states the duty that operations against an inactive node fail rather than hang, the TODO records that the current implementation does not always achieve it, and the library controls everything that decides which happens - the buffering it creates under BatchApplyCh (s-api-apply-buffer), the enqueue select that can still accept work while the node is shutting down (s-api-apply-select), the shutdown join that removes the last responder (s-state-wait-shutdown, s-future-shutdown-future, s-raft-run-shutdown) and the futures whose only escape is a ShutdownCh they never set (s-future-defer-error), with the documented ErrRaftShutdown behaviour for requests it does reject (s-api-err-shutdown). This scenario's execution then shows the consequence for work accepted while the node was still leading: 64 accepted futures never completed, 136 requests were rejected with ErrRaftShutdown, and the node was left in Shutdown (check 2464f92489d641b78350760c130f2029 of artifact fd84d4e3d70848ad82ab90ca4c4f3cc5, alongside the first scenario's check fbb6404d8a05409a945aee193402861f). The condition is retained as an independent boundary about the outstanding repair rather than as a discharge of the obligation.",
+      "residual_issue_ids": [],
+      "scope_limitations": [
+        "The repair location remains open: draining the buffered channel, adding a shutdown escape to these futures, or refusing the send case once shutdown is signalled are all consistent with the duty.",
+        "The resolution covers the Apply path with a buffered channel and the requests exercised here; the exact counts depend on the buffer and on the schedule, and no caller-side timeout is measured."
+      ],
+      "condition_dispositions": [
+        {
+          "condition_id": "c-client-request-completes-on-inactive-raft/grounding/condition/1",
+          "applies_to": "independent_scope",
+          "rationale": "This condition records an in-repo acknowledgment of the same gap the obligation names. It does not remove the duty for work the API accepted: the assertion states the intended completion behaviour, the TODO states that the implementation does not always achieve it, and the library owns the buffering, the enqueue select, the shutdown join and the futures' completion path. It is retained as an independent boundary describing where the repair remains outstanding.",
+          "source_ids": ["s-api-apply-select", "s-api-apply-buffer", "s-api-err-shutdown", "s-future-defer-error", "s-state-wait-shutdown", "s-future-shutdown-future", "s-raft-run-shutdown", "s-raft-verify-mainloop", "s-api-verify-leader"]
+        }
+      ]
+    }
+  ]
+}

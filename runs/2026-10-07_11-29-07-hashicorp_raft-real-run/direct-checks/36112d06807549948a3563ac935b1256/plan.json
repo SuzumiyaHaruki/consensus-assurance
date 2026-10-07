@@ -1,0 +1,117 @@
+{
+  "description": "Discriminator: the commit index a node publishes immediately after it installs a snapshot. A single-voter source node commits forty entries and takes a snapshot at index J; a second node that is a voter of the same configuration installs exactly that snapshot through the module's own InstallSnapshot path, and no AppendEntries occurs inside the observed prefix. Observation: the installing node's own report of its commit index (the exported accessor, with the same value recorded from Stats) is compared with the index the installed snapshot established, and the node's applied index, last index and state are recorded beside it. Control: the snapshot is produced by a real leader through the public Snapshot API, so the compared index is an index that node itself reported as committed and applied; the request carries that snapshot's own metadata rather than a harness constant.",
+  "claim_id": "c-snapshot-install-commit-context",
+  "binding_ids": [
+    "bind-raft-install-snapshot-commit"
+  ],
+  "harness": {
+    "execution_package": ".",
+    "files": {},
+    "kind": "go_test",
+    "source": "// Copyright (c) HashiCorp, Inc.\n// SPDX-License-Identifier: MPL-2.0\n//\n// Generated assurance harness. One node acts as the source of a committed\n// snapshot and a second node installs that snapshot through the module's own\n// InstallSnapshot path; the harness then records the index the installing node\n// reports as its commit index beside the index the snapshot established and the\n// index the node reports as applied and last. It reports raw fields only.\n\npackage raft\n\nimport (\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"io\"\n\t\"testing\"\n\t\"time\"\n)\n\nfunc assuranceSnapEvent(v map[string]interface{}) {\n\tpayload, err := json.Marshal(v)\n\tif err != nil {\n\t\tfmt.Println(\"assurance: event marshal failed:\", err)\n\t\treturn\n\t}\n\tfmt.Println(\"CA_EVENT \" + string(payload))\n}\n\ntype assuranceSnapFSM struct{}\n\nfunc (assuranceSnapFSM) Apply(*Log) interface{}         { return nil }\nfunc (assuranceSnapFSM) Snapshot() (FSMSnapshot, error) { return assuranceSnapSnapshot{}, nil }\nfunc (assuranceSnapFSM) Restore(rc io.ReadCloser) error { return rc.Close() }\n\ntype assuranceSnapSnapshot struct{}\n\nfunc (assuranceSnapSnapshot) Persist(s SnapshotSink) error { return s.Close() }\nfunc (assuranceSnapSnapshot) Release()                     {}\n\nfunc TestAssuranceSnapshotInstalledCommitContext(t *testing.T) {\n\tconst (\n\t\top      = \"snapshot-installed-commit-context\"\n\t\tcluster = \"c1\"\n\t\tsrcID   = ServerID(\"n1\")\n\t\trcvID   = ServerID(\"n2\")\n\t)\n\n\t// ---- Source node: a single-voter leader that commits entries and then\n\t// takes a snapshot, so the snapshot index is an index the source itself\n\t// reported as committed and applied.\n\tsrcAddr, srcTrans := NewInmemTransport(ServerAddress(\"n1\"))\n\tsrcSnaps := NewInmemSnapshotStore()\n\tsrcLog := NewInmemStore()\n\tsrcStable := NewInmemStore()\n\tsrcConf := DefaultConfig()\n\tsrcConf.LocalID = srcID\n\tsrcConf.ProtocolVersion = 3\n\tsrcConf.LogLevel = \"ERROR\"\n\tsrcConf.SnapshotInterval = time.Hour\n\tsrcConf.SnapshotThreshold = 100000\n\tsrcConf.TrailingLogs = 100000\n\tsrcCfg := Configuration{Servers: []Server{{ID: srcID, Address: srcAddr, Suffrage: Voter}}}\n\tif err := BootstrapCluster(srcConf, srcLog, srcStable, srcSnaps, srcTrans, srcCfg); err != nil {\n\t\tassuranceSnapEvent(map[string]interface{}{\"event\": \"assurance_setup_failed\", \"cluster\": cluster, \"op\": op, \"node\": string(srcID), \"detail\": \"bootstrap source: \" + err.Error()})\n\t\tt.Fatalf(\"assurance: bootstrap source: %v\", err)\n\t}\n\tsrc, err := NewRaft(srcConf, assuranceSnapFSM{}, srcLog, srcStable, srcSnaps, srcTrans)\n\tif err != nil {\n\t\tassuranceSnapEvent(map[string]interface{}{\"event\": \"assurance_setup_failed\", \"cluster\": cluster, \"op\": op, \"node\": string(srcID), \"detail\": \"NewRaft source: \" + err.Error()})\n\t\tt.Fatalf(\"assurance: NewRaft source: %v\", err)\n\t}\n\tdefer func() { src.Shutdown().Error() }()\n\n\twaitUntil := time.Now().Add(5 * time.Second)\n\tfor src.State() != Leader {\n\t\tif time.Now().After(waitUntil) {\n\t\t\tassuranceSnapEvent(map[string]interface{}{\"event\": \"assurance_setup_failed\", \"cluster\": cluster, \"op\": op, \"node\": string(srcID), \"detail\": \"source never became leader\"})\n\t\t\tt.Fatalf(\"assurance: source never became leader\")\n\t\t}\n\t\ttime.Sleep(5 * time.Millisecond)\n\t}\n\tfor i := 0; i < 40; i++ {\n\t\tif err := src.Apply([]byte(\"entry\"), 2*time.Second).Error(); err != nil {\n\t\t\tassuranceSnapEvent(map[string]interface{}{\"event\": \"assurance_setup_failed\", \"cluster\": cluster, \"op\": op, \"node\": string(srcID), \"detail\": fmt.Sprintf(\"apply %d: %v\", i, err)})\n\t\t\tt.Fatalf(\"assurance: apply %d: %v\", i, err)\n\t\t}\n\t}\n\tif err := src.Barrier(3 * time.Second).Error(); err != nil {\n\t\tassuranceSnapEvent(map[string]interface{}{\"event\": \"assurance_setup_failed\", \"cluster\": cluster, \"op\": op, \"node\": string(srcID), \"detail\": \"barrier: \" + err.Error()})\n\t\tt.Fatalf(\"assurance: barrier: %v\", err)\n\t}\n\tif err := src.Snapshot().Error(); err != nil {\n\t\tassuranceSnapEvent(map[string]interface{}{\"event\": \"assurance_setup_failed\", \"cluster\": cluster, \"op\": op, \"node\": string(srcID), \"detail\": \"snapshot: \" + err.Error()})\n\t\tt.Fatalf(\"assurance: snapshot: %v\", err)\n\t}\n\tmetas, err := srcSnaps.List()\n\tif err != nil || len(metas) == 0 {\n\t\tassuranceSnapEvent(map[string]interface{}{\"event\": \"assurance_setup_failed\", \"cluster\": cluster, \"op\": op, \"node\": string(srcID), \"detail\": fmt.Sprintf(\"no snapshot produced (err=%v, n=%d)\", err, len(metas))})\n\t\tt.Fatalf(\"assurance: no snapshot produced: %v\", err)\n\t}\n\tmeta := metas[0]\n\t_, reader, err := srcSnaps.Open(meta.ID)\n\tif err != nil {\n\t\tassuranceSnapEvent(map[string]interface{}{\"event\": \"assurance_setup_failed\", \"cluster\": cluster, \"op\": op, \"node\": string(srcID), \"detail\": \"open snapshot: \" + err.Error()})\n\t\tt.Fatalf(\"assurance: open snapshot: %v\", err)\n\t}\n\tdefer reader.Close()\n\n\tassuranceSnapEvent(map[string]interface{}{\n\t\t\"event\":                \"snapshot_committed_at_source\",\n\t\t\"cluster\":              cluster,\n\t\t\"op\":                   op,\n\t\t\"node\":                 string(srcID),\n\t\t\"index\":                meta.Index,\n\t\t\"term\":                 meta.Term,\n\t\t\"source_commit_index\":  src.CommitIndex(),\n\t\t\"source_applied_index\": src.AppliedIndex(),\n\t\t\"source_last_index\":    src.LastIndex(),\n\t})\n\n\t// ---- Receiving node: a voter in the source cluster that installs the\n\t// snapshot. Its own election timeouts are long, so nothing but the\n\t// InstallSnapshot RPC below changes its state during the observation.\n\trcvAddr, rcvTrans := NewInmemTransport(ServerAddress(\"n2\"))\n\trcvLog := NewInmemStore()\n\trcvStable := NewInmemStore()\n\trcvSnaps := NewInmemSnapshotStore()\n\trcvConf := DefaultConfig()\n\trcvConf.LocalID = rcvID\n\trcvConf.ProtocolVersion = 3\n\trcvConf.LogLevel = \"ERROR\"\n\trcvConf.HeartbeatTimeout = 5 * time.Second\n\trcvConf.ElectionTimeout = 5 * time.Second\n\trcvConf.LeaderLeaseTimeout = 5 * time.Second\n\trcvConf.CommitTimeout = 5 * time.Second\n\trcvConf.SnapshotInterval = time.Hour\n\trcvConf.SnapshotThreshold = 100000\n\trcvCfg := Configuration{Servers: []Server{\n\t\t{ID: srcID, Address: srcAddr, Suffrage: Voter},\n\t\t{ID: rcvID, Address: rcvAddr, Suffrage: Voter},\n\t}}\n\tif err := BootstrapCluster(rcvConf, rcvLog, rcvStable, rcvSnaps, rcvTrans, rcvCfg); err != nil {\n\t\tassuranceSnapEvent(map[string]interface{}{\"event\": \"assurance_setup_failed\", \"cluster\": cluster, \"op\": op, \"node\": string(rcvID), \"detail\": \"bootstrap receiver: \" + err.Error()})\n\t\tt.Fatalf(\"assurance: bootstrap receiver: %v\", err)\n\t}\n\trcv, err := NewRaft(rcvConf, assuranceSnapFSM{}, rcvLog, rcvStable, rcvSnaps, rcvTrans)\n\tif err != nil {\n\t\tassuranceSnapEvent(map[string]interface{}{\"event\": \"assurance_setup_failed\", \"cluster\": cluster, \"op\": op, \"node\": string(rcvID), \"detail\": \"NewRaft receiver: \" + err.Error()})\n\t\tt.Fatalf(\"assurance: NewRaft receiver: %v\", err)\n\t}\n\tdefer func() { rcv.Shutdown().Error() }()\n\n\t// Route only this one RPC from the source transport to the receiver, so no\n\t// AppendEntries follows the install inside the observed prefix.\n\tsrcTrans.Connect(rcvAddr, rcvTrans)\n\n\treq := &InstallSnapshotRequest{\n\t\tRPCHeader:          RPCHeader{ProtocolVersion: 3, ID: []byte(srcID), Addr: srcTrans.EncodePeer(srcID, srcAddr)},\n\t\tSnapshotVersion:    meta.Version,\n\t\tTerm:               meta.Term,\n\t\tLeader:             srcTrans.EncodePeer(srcID, srcAddr),\n\t\tLastLogIndex:       meta.Index,\n\t\tLastLogTerm:        meta.Term,\n\t\tConfiguration:      EncodeConfiguration(meta.Configuration),\n\t\tConfigurationIndex: meta.ConfigurationIndex,\n\t\tSize:               meta.Size,\n\t}\n\tvar resp InstallSnapshotResponse\n\tif err := srcTrans.InstallSnapshot(srcID, rcvAddr, req, &resp, reader); err != nil {\n\t\tassuranceSnapEvent(map[string]interface{}{\"event\": \"assurance_setup_failed\", \"cluster\": cluster, \"op\": op, \"node\": string(rcvID), \"detail\": \"install snapshot: \" + err.Error()})\n\t\tt.Fatalf(\"assurance: install snapshot: %v\", err)\n\t}\n\tassuranceSnapEvent(map[string]interface{}{\n\t\t\"event\":         \"snapshot_installed\",\n\t\t\"cluster\":       cluster,\n\t\t\"op\":            op,\n\t\t\"node\":          string(rcvID),\n\t\t\"installed\":     resp.Success,\n\t\t\"term\":          resp.Term,\n\t\t\"request_index\": meta.Index,\n\t})\n\n\t// Let the asynchronous FSM restore settle before reading the context.\n\ttime.Sleep(200 * time.Millisecond)\n\tstats := rcv.Stats()\n\tassuranceSnapEvent(map[string]interface{}{\n\t\t\"event\":          \"commit_context_observed\",\n\t\t\"cluster\":        cluster,\n\t\t\"op\":             op,\n\t\t\"node\":           string(rcvID),\n\t\t\"installed\":      resp.Success,\n\t\t\"snapshot_index\": meta.Index,\n\t\t\"commit_index\":   rcv.CommitIndex(),\n\t\t\"applied_index\":  rcv.AppliedIndex(),\n\t\t\"last_index\":     rcv.LastIndex(),\n\t\t\"stats_commit\":   stats[\"commit_index\"],\n\t\t\"stats_applied\":  stats[\"applied_index\"],\n\t\t\"node_state\":     rcv.State().String(),\n\t})\n}\n",
+    "description": "TestAssuranceSnapshotInstalledCommitContext: the commit index reported by a node that has installed a committed snapshot, compared with the index that snapshot established",
+    "semantic_changes": [
+      "No target file is modified; the harness adds one external test file to the captured package.",
+      "The snapshot is produced by a real single-voter leader through the public Snapshot API and is opened from that node's own SnapshotStore, so the installed index is an index the source reported as committed and applied.",
+      "The InstallSnapshot request is built from that snapshot's metadata and delivered through the module's own InmemTransport InstallSnapshot method, so installSnapshot, its sink handling, the FSM restore path and the log truncation are the target's own code.",
+      "Only the InstallSnapshot RPC is routed from the source transport to the receiver, and the receiver's election timeouts are long, so neither AppendEntries nor an election changes the receiver inside the observed prefix."
+    ],
+    "prerequisites": [
+      {
+        "alias": "admit",
+        "event": "snapshot_committed_at_source",
+        "conditions": []
+      }
+    ],
+    "legality": {
+      "source_ids": [
+        "s-raft-install-snapshot",
+        "s-api-commit-index",
+        "s-snapshot-take",
+        "s-raft-append-commit",
+        "s-api-newraft-config"
+      ],
+      "expectation_ids": [],
+      "binding_ids": [
+        "bind-raft-install-snapshot-commit"
+      ],
+      "derivation": "Raft.CommitIndex() is documented as the committed index and as the basis for the read-index optimisation, and it returns raftState.commitIndex (s-api-commit-index). On a follower that value is otherwise advanced only from the leader's advertised commit index in appendEntries, where it is set to min(LeaderCommitIndex, lastIndex) and then applied through processLogs (s-raft-append-commit). takeSnapshot persists the FSM at an index the node has already applied and compacts the log (s-snapshot-take), and installSnapshot, after restoring that payload, publishes raftState.lastApplied and lastSnapshot from req.LastLogIndex and truncates the log, but it never writes the commit index (s-raft-install-snapshot). The admitted index is therefore an index the source had committed and applied, while the installing node's own last index after the install is that same index, so a commit index at least J and a commit index equal to J coincide inside this prefix and the reported value can be compared with the admitted one directly.",
+      "applicability": "A voter node that has just installed a snapshot sent by a leader that had committed through the snapshot index, observed before any later AppendEntries. The harness reports the receiver's state, applied index and last index next to the compared value so the scope is visible in the record.",
+      "unresolved": [
+        "whether the library intends the follower's published commit index to be strictly the value the leader last advertised, which would make the omission deliberate rather than a defect",
+        "whether the intended repair advances the commit index inside installSnapshot or derives the published value from the last snapshot index",
+        "whether the same omission on the startup restore path (api.go restoreSnapshot) should be treated as one requirement or a second entry point"
+      ],
+      "conflicts": [],
+      "alternatives": [
+        "the low value could be read as 'no leader has advertised a commit index yet', but the node has just installed and applied committed state, and the accessor is documented as the committed index rather than as the leader's last advertisement"
+      ]
+    }
+  },
+  "monitors": [
+    {
+      "id": "m-snapshot-install-commit-context",
+      "checker_id": "p-snapshot-install-commit-context",
+      "event": "commit_context_observed",
+      "binding_ids": [
+        "bind-raft-install-snapshot-commit"
+      ],
+      "grounding": {
+        "source_ids": [
+          "s-raft-install-snapshot",
+          "s-api-commit-index",
+          "s-snapshot-take"
+        ],
+        "expectation_ids": [],
+        "binding_ids": [
+          "bind-raft-install-snapshot-commit"
+        ],
+        "derivation": "The admission event reports the index, term and the source node's own commit and applied indexes for the snapshot that is about to be installed, and the result event reports the installing node's commit index, applied index, last index, state and the index of the snapshot it accepted, so applicability can require that the install actually succeeded before the published value is judged (s-raft-install-snapshot, s-snapshot-take). The compared numbers come from the same export path the requirement names (s-api-commit-index).",
+        "applicability": "The prefix spans the source node that produced the committed snapshot and the receiving voter that installs it; the operation identity is the cluster and the operation name, and each event names the node it was observed on.",
+        "unresolved": [
+          "whether a later AppendEntries in a live cluster advances the value before a caller could read it, which this prefix does not produce"
+        ],
+        "conflicts": [],
+        "alternatives": []
+      },
+      "applicability_conditions": [
+        {
+          "field": "installed",
+          "op": "eq",
+          "value": true,
+          "reference": null
+        }
+      ],
+      "admission_alias": "admit"
+    }
+  ],
+  "observable_properties": [
+    {
+      "checker_id": "p-snapshot-install-commit-context",
+      "kind": "event_assertion",
+      "trigger": {
+        "field": "op",
+        "op": "eq",
+        "value": "snapshot-installed-commit-context",
+        "reference": null
+      },
+      "assertion": {
+        "field": "commit_index",
+        "op": "eq",
+        "value": null,
+        "reference": "admit.index"
+      },
+      "antecedent": null,
+      "identity_fields": [
+        "cluster",
+        "op"
+      ],
+      "description": "After the node admitted by 'admit' installed a snapshot at the index that node had committed and applied, the installing node's published commit index must be that index. Within this prefix the installing node's own last index is the admitted index, so a commit index below it is below the committed state the node has just applied, and equality is exactly the requirement that the published value may not under-report it."
+    }
+  ],
+  "uncertainties": [
+    "The prefix observes the receiver before any later AppendEntries, so it does not measure how long the value stays low in a live cluster; a live follower would have its commit index advanced by the next heartbeat, while a node restarted from a snapshot keeps the low value until a leader contacts it.",
+    "The observable is an index value rather than a state transition, so the check reports what the node published rather than a downstream consequence for a caller.",
+    "The receiver's cluster contains two voters while the source produced the snapshot as a single-voter leader; the configuration carried by the snapshot is not read by the requirement under test, but the difference is recorded here."
+  ]
+}

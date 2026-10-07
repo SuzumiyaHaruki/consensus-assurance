@@ -1,0 +1,132 @@
+{
+  "action": "obligation",
+  "rationale": "Second Candidate for the captured hashicorp/raft snapshot, opened from the remaining frontier after the first obligation was confirmed in scope. While checking how the client-visible authority surface is observed (the map's A7 support behavior b-client-apply-verify, whose VerifyLeader is the client-side counterpart of the A2 authority checks), the request-enqueue paths were read and found to admit a request that can never complete once the node is inactive: VerifyLeader, ApplyLog and Barrier select between an already-closed shutdownCh and a send on a request channel, and when that channel has buffer space both cases are ready, so the request is enqueued after shutdown; nothing drains verifyCh/applyCh once the run, fsm and snapshot goroutines have exited, and neither logFuture nor verifyFuture sets deferError.ShutdownCh, so the returned future blocks forever in Error(). The claim states the completion duty and the binding locates Raft.VerifyLeader, whose channel is buffered with 64 slots in the default configuration. A construction-time probe of the captured source measured 64 of 128 VerifyLeader calls after a completed Shutdown() returning unresolved futures, and 54 to 74 of 128 Apply calls with BatchApplyCh enabled, while Barrier with the default unbuffered applyCh returned ErrRaftShutdown 8 of 8 times. The retained in-repo test comment already records that Barrier, VerifyLeader and GetConfiguration can get stuck, so the obligation is about the documented contract rather than about an unobserved corner; the question keeps the concurrency-with-shutdown case and the in-repo consumers as explicit unknowns.",
+  "sources": [
+    {"id": "s-api-err-shutdown", "file": "api.go", "start_line": 54, "end_line": 56, "kind": "document_statement"},
+    {"id": "s-api-verify-leader", "file": "api.go", "start_line": 880, "end_line": 893, "kind": "code_observation"},
+    {"id": "s-api-verify-ch-buffer", "file": "api.go", "start_line": 566, "end_line": 570, "kind": "code_observation"},
+    {"id": "s-api-apply-buffer", "file": "api.go", "start_line": 540, "end_line": 544, "kind": "code_observation"},
+    {"id": "s-api-apply-select", "file": "api.go", "start_line": 844, "end_line": 851, "kind": "code_observation"},
+    {"id": "s-api-barrier-select", "file": "api.go", "start_line": 870, "end_line": 877, "kind": "code_observation"},
+    {"id": "s-future-defer-error", "file": "future.go", "start_line": 90, "end_line": 119, "kind": "code_observation"},
+    {"id": "s-future-shutdown-future", "file": "future.go", "start_line": 167, "end_line": 180, "kind": "code_observation"},
+    {"id": "s-state-wait-shutdown", "file": "state.go", "start_line": 142, "end_line": 155, "kind": "code_observation"},
+    {"id": "s-raft-run-shutdown", "file": "raft.go", "start_line": 134, "end_line": 155, "kind": "code_observation"},
+    {"id": "s-raft-verify-mainloop", "file": "raft.go", "start_line": 848, "end_line": 856, "kind": "code_observation"},
+    {"id": "s-test-after-shutdown", "file": "raft_test.go", "start_line": 30, "end_line": 42, "kind": "test_expectation"}
+  ],
+  "feedback": {
+    "ref_ids": ["78e4fd0d22b74afbbe4de6c6a912156d"],
+    "answered": "The obligation c-adopted-term-never-regresses is answered in scope: the fixed direct check and its correspondence review confirmed that a heartbeat-shaped AppendEntries processed by Raft.processHeartbeat on a NetworkTransport connection goroutine can publish a current term lower than a term the same node adopted and reported, with the retained execution showing the node reporting adopted term 6 while context_term and the durable CurrentTerm are 5.",
+    "remaining": [
+      "whether a stored-term regression can be escalated to a second vote in a term the node already voted in, which is a separate proposition about the vote record rather than about the term context",
+      "whether the same off-main-goroutine entry point can roll the known-leader context back to a deposed leader, which is a separate fact consumed by vote filtering and by the client leader API"
+    ],
+    "understanding": "updated",
+    "rationale": "Handoff for the next selection: the previously open b-heartbeat-fastpath premise is settled, so the term-context question no longer needs to be re-investigated; the term, vote-record and known-leader lines stay separate facts with their own obligations. The Candidate below opens an independent responsibility found while reading the client-visible authority surface, not a variant of the confirmed term-context check."
+  },
+  "question": {
+    "question": "Does a client request issued against an inactive Raft node complete, as the ErrRaftShutdown contract states, or can it return a future that can never complete? Concretely: after Shutdown has returned (the run, fsm and snapshot goroutines have exited), can Raft.VerifyLeader return a verifyFuture whose Error() waits forever because the request was enqueued on the buffered verifyCh after shutdownCh closed, and can ApplyLog or Barrier do the same when the BatchApplyCh option buffers applyCh?",
+    "importance": "ErrRaftShutdown is documented as the result of operations requested against an inactive Raft, and the in-repo after-shutdown test asserts that everything should fail now. VerifyLeader and Barrier take no timeout parameter and the returned future's Error() is the only completion channel, so a request that is enqueued after shutdown leaves the caller blocked forever with no way to observe completion: a process that calls VerifyLeader while or after shutting raft down leaks the request and cannot distinguish shutdown from still working. VerifyLeader is also the client-visible check that the node still holds the authority it claims, so a verification that can never complete leaves that authority claim unresolved for the client. The path is reachable with the default configuration because verifyCh is always buffered with 64 slots.",
+    "trigger_rationale": "VerifyLeader, ApplyLog and Barrier each select over r.shutdownCh and a send on an internal request channel. When shutdownCh is already closed and the channel has buffer space, both cases are ready, so Go may choose the send and the request is enqueued after shutdown was signalled. Nothing drains verifyCh or applyCh once the raft goroutines return: run returns on shutdownCh, and shutdownFuture.Error waits for the goroutine group before returning, so no handler remains. The enqueued future has no escape either, because deferError only consults ShutdownCh, which logFuture and verifyFuture never set. A construction-time probe of the captured source observed 64 of 128 VerifyLeader calls made after a completed Shutdown() returning futures that were still unresolved after a bounded wait, and 54 to 74 of 128 Apply calls with BatchApplyCh=true; Barrier with the default unbuffered applyCh returned ErrRaftShutdown 8 of 8 times, which shows the failure depends on the channel being buffered rather than on the API.",
+    "disposition": "ready_for_check",
+    "preferred_check": "direct_test",
+    "participants": ["client caller of VerifyLeader/Barrier/ApplyLog", "Raft client API (api.go)", "deferError future (future.go)", "Shutdown/shutdownFuture and raftState.waitShutdown", "raft main goroutine run()"],
+    "objects": ["Raft.verifyCh", "Raft.applyCh", "Raft.shutdownCh", "deferError.errCh", "deferError.ShutdownCh", "verifyFuture", "logFuture", "shutdownFuture"],
+    "contexts": [
+      "a single-node Raft instance whose Shutdown() has completed, so every raft goroutine has exited, receiving further client calls",
+      "a client calling VerifyLeader concurrently with Shutdown() so the request is enqueued on a buffered channel that is never drained",
+      "an ApplyLog call with BatchApplyCh=true, which is the documented option that buffers applyCh"
+    ],
+    "event_paths": [
+      "caller path: VerifyLeader -> select{<-r.shutdownCh | r.verifyCh <- f} -> returns the verifyFuture -> f.Error() blocks on deferError.errCh, which nothing can write after shutdown",
+      "shutdown path: Shutdown closes shutdownCh -> runFollower/runCandidate/runLeader return on that channel -> shutdownFuture.Error calls waitShutdown, which waits for the run, fsm and snapshot goroutines -> verifyCh/applyCh are left with unprocessed entries",
+      "batched apply path: ApplyLog with BatchApplyCh=true -> select picks r.applyCh <- logFuture -> the logFuture is never responded to, so its Error() blocks",
+      "comparison path: Barrier with the default unbuffered applyCh -> the send case can never be ready once the receiver has exited, so only the shutdown case can be selected and ErrRaftShutdown is returned"
+    ],
+    "activity_classes": ["A2", "A7"],
+    "behavior_ids": ["b-client-apply-verify", "b-leader-identity"],
+    "fact_ids": ["f-known-leader"],
+    "supporting_behavior_ids": {
+      "b-leader-lease-stepdown": "the leader-side authority check that VerifyLeader complements for clients, so the client-visible completion duty sits next to a core authority mechanism",
+      "b-heartbeat-fastpath": "shows that the observation surface around this node is not confined to the main goroutine, which is why an undrained channel after shutdown cannot be recovered by another handler"
+    },
+    "obligation_relation_kind": "consumption",
+    "counterevidence": [
+      "With the default configuration applyCh is unbuffered, so Apply and Barrier do return ErrRaftShutdown deterministically unless the caller enables BatchApplyCh; the failure reachable without configuration options is VerifyLeader, whose channel is always buffered with 64 slots.",
+      "The in-repo after-shutdown test asserts only Apply and the configuration-change APIs and its TODO comment states that Barrier, VerifyLeader and GetConfiguration can get stuck, so the gap is acknowledged in the captured source rather than hidden.",
+      "A caller could bound the wait itself by running Error() in a goroutine with its own timer, but VerifyLeader and Barrier expose no timeout parameter, so the API itself does not promise completion.",
+      "The select choosing the send case is a schedule choice rather than a data race, so a single call can return ErrRaftShutdown; the witness requires repetition, and a bounded wait alone cannot distinguish a permanently stuck future from a slow one without the argument that no handler remains after shutdown."
+    ],
+    "unknowns": [
+      "whether a request enqueued before shutdown (rather than issued after Shutdown returned) can also remain permanently unresolved through the same channel structure; this investigation measured only the after-shutdown case",
+      "whether the GetConfiguration path contributes to the same gap, since its current implementation responds immediately from the atomic configuration copy while the in-repo TODO still lists it",
+      "whether any in-repo consumer relies on VerifyLeader completing during or after shutdown, and how long a caller can be blocked in practice"
+    ],
+    "priority": 2,
+    "source_ids": ["s-api-verify-leader", "s-api-err-shutdown", "s-future-defer-error", "s-api-verify-ch-buffer", "s-api-apply-buffer", "s-api-leaderwithid", "s-raft-append-leader", "s-raft-set-state", "s-raft-leader-lease", "s-raft-process-heartbeat", "s-test-after-shutdown", "s-state-wait-shutdown"]
+  },
+  "obligation": {
+    "id": "c-client-request-completes-on-inactive-raft",
+    "kind": "obligation",
+    "concern": "bounded_liveness",
+    "description": "A client request issued against an inactive Raft node must complete, either with ErrRaftShutdown or with a real result, and must not leave the caller's future permanently unresolved. In particular, once Shutdown has returned and the run, fsm and snapshot goroutines have exited, VerifyLeader - and ApplyLog or Barrier when applyCh is buffered - must not return a future whose Error() waits forever, because those calls take no timeout parameter and no handler remains that could ever respond.",
+    "source_ids": ["s-api-verify-leader", "s-api-err-shutdown", "s-future-defer-error", "s-api-verify-ch-buffer", "s-raft-run-shutdown", "s-state-wait-shutdown", "s-future-shutdown-future", "s-api-apply-buffer"],
+    "scope": {
+      "description": "A Raft node after Shutdown has completed, or the window in which a client call is raced with Shutdown. Applies to the client request paths whose destination channel is buffered (VerifyLeader always; ApplyLog and Barrier when BatchApplyCh is set). It does not cover the configuration-change, bootstrap, snapshot and restore channels, which are unbuffered in the captured source.",
+      "assumptions": [
+        "the caller waits on the returned future through Future.Error(), which is the documented completion channel",
+        "Shutdown().Error() has returned or is in progress, so no raft goroutine will process further requests",
+        "the caller does not add its own bound around the wait, because the API provides none"
+      ],
+      "excluded": [
+        "requests that are already being processed when shutdown begins and whose futures the shutdown paths respond to",
+        "network or transport shutdown behaviour",
+        "the correctness of the local apply, commit and authority logic that the first obligation covered"
+      ]
+    },
+    "pending": [
+      "whether the same permanent non-completion is reachable for a request enqueued before Shutdown (not only after it)",
+      "whether the intended repair is to drain the buffered channels on shutdown, to set deferError.ShutdownCh for these futures, or to stop selecting the send case once shutdown is signalled"
+    ],
+    "grounding": {
+      "source_ids": ["s-api-verify-leader", "s-api-apply-select", "s-api-barrier-select", "s-api-err-shutdown", "s-future-defer-error", "s-raft-verify-mainloop"],
+      "expectation_ids": ["s-test-after-shutdown", "s-state-wait-shutdown", "s-future-shutdown-future"],
+      "binding_ids": ["bind-raft-verify-leader"],
+      "derivation": "VerifyLeader, ApplyLog and Barrier select between r.shutdownCh and a send on an internal channel (s-api-verify-leader, s-api-apply-select, s-api-barrier-select); the shutdown channel is closed by Shutdown, and shutdownFuture.Error then waits for the goroutine group, which contains run, runFSM and runSnapshots (s-state-wait-shutdown, s-future-shutdown-future, s-raft-run-shutdown), so after that point the only producer of responses for verifyCh and applyCh - the main loop's verify case and apply case - is gone (s-raft-verify-mainloop). verifyCh is always buffered with 64 slots (s-api-verify-ch-buffer) and applyCh is buffered whenever BatchApplyCh is set (s-api-apply-buffer), so with the shutdown channel already closed both select cases can be ready and the request can be enqueued rather than rejected. The returned future cannot escape either: deferError.Error waits on errCh or ShutdownCh (s-future-defer-error) and neither logFuture nor verifyFuture ever sets ShutdownCh, while ErrRaftShutdown is documented as the result for operations against an inactive Raft (s-api-err-shutdown). The in-repo after-shutdown test asserts that Apply and the configuration APIs fail while a TODO records that Barrier, VerifyLeader and GetConfiguration can get stuck (s-test-after-shutdown).",
+      "applicability": "Applies to the default configuration for VerifyLeader, whose channel is created with 64 slots in NewRaft, and to ApplyLog and Barrier under the documented BatchApplyCh option; it does not depend on any fault injection, on timing beyond the shutdown ordering, or on a modified target file.",
+      "unresolved": [
+        "whether the select's send case is ever chosen for a caller that races Shutdown rather than calling after it, which the same channel structure suggests but this investigation did not measure",
+        "whether GetConfiguration can contribute to the same gap despite responding immediately from the atomic configuration copy"
+      ],
+      "conflicts": [
+        "the after-shutdown test asserts that everything should fail while its own TODO comment records that Barrier, VerifyLeader and GetConfiguration can instead get stuck"
+      ],
+      "alternatives": [
+        "the send-before-shutdown ordering could be treated as the caller's race rather than the library's duty, but ErrRaftShutdown is documented for operations against an inactive Raft and the API offers no timeout, so the completion duty remains with the library",
+        "a repair could drain the buffered channels during shutdown, set ShutdownCh on these futures, or stop offering the send case once shutdown is signalled"
+      ]
+    }
+  },
+  "bindings": [
+    {
+      "id": "bind-raft-verify-leader",
+      "material_id": "s-api-verify-leader",
+      "symbol": "VerifyLeader",
+      "start_line": 883,
+      "end_line": 893,
+      "description": "Raft.VerifyLeader builds a verifyFuture and selects between the shutdown channel and a send on the 64-slot verifyCh, returning the future itself when the send case is chosen. It is the default-configuration instance of the completion duty: the request can be enqueued after shutdown and the returned future has no timeout and no shutdown escape.",
+      "pending": [
+        "whether the repair belongs in this select, in the channel draining during shutdown, or in deferError",
+        "whether a request raced with shutdown (rather than issued after it) is also affected"
+      ],
+      "associations": [
+        {
+          "claim_id": "c-client-request-completes-on-inactive-raft",
+          "source_ids": ["s-api-verify-leader", "s-api-err-shutdown", "s-api-verify-ch-buffer"],
+          "rationale": "This entry point is the located implementation of the completion duty for a buffered request channel: the same select structure that returns ErrRaftShutdown when the shutdown case is chosen also returns an unresolvable future when the send case is chosen and nothing remains to process it."
+        }
+      ]
+    }
+  ]
+}

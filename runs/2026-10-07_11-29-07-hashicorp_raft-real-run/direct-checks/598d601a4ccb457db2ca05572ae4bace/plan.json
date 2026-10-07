@@ -1,0 +1,112 @@
+{
+  "description": "Second scenario of the same requirement, fixed on the production transport: the first check exercised the interleaving with a substitute StreamLayer, and this one uses the real NetworkTransport over the TCP stream layer instead, leaving everything else identical. Discriminator: a node is bootstrapped with both voters, a StableStore wrapper is armed, a heartbeat-shaped AppendEntries is sent so the transport's own classification invokes the registered callback on its connection goroutine, that callback's CurrentTerm write is held, a higher-term AppendEntries is then sent through the main loop on a second connection, and the held write is released. Observation: the harness reports the term the node acknowledged for the higher-term request, the term context in effect afterwards, the sequence of CurrentTerm writes the injected store saw, the transport kind and the local address; the assertion compares the observed context term with the admitted term. Control: the same node and caller policy as the substitute-layer scenario, with the transport kind reported so the two executions cannot be confused; the harness skips when the TCP transport cannot bind rather than reporting a result.",
+  "claim_id": "c-adopted-term-never-regresses",
+  "binding_ids": [
+    "bind-raft-process-heartbeat"
+  ],
+  "harness": {
+    "execution_package": ".",
+    "files": {},
+    "kind": "go_test",
+    "source": "// Copyright (c) HashiCorp, Inc.\n// SPDX-License-Identifier: MPL-2.0\n//\n// Generated assurance harness. It repeats the interleaving that the first\n// check exercised - a heartbeat-shaped AppendEntries whose term write is held\n// while a higher-term AppendEntries is handled - but with the production\n// NetworkTransport over the real TCP stream layer instead of an in-process\n// substitute, and it skips when that transport cannot bind. It reports raw\n// fields only.\n\npackage raft\n\nimport (\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"io\"\n\t\"sync\"\n\t\"sync/atomic\"\n\t\"testing\"\n\t\"time\"\n)\n\nfunc assuranceTCPEvent(v map[string]interface{}) {\n\tpayload, err := json.Marshal(v)\n\tif err != nil {\n\t\tfmt.Println(\"assurance: event marshal failed:\", err)\n\t\treturn\n\t}\n\tfmt.Println(\"CA_EVENT \" + string(payload))\n}\n\ntype assuranceTCPFSM struct{}\n\nfunc (assuranceTCPFSM) Apply(*Log) interface{}         { return nil }\nfunc (assuranceTCPFSM) Snapshot() (FSMSnapshot, error) { return assuranceTCPSnapshot{}, nil }\nfunc (assuranceTCPFSM) Restore(io.ReadCloser) error    { return nil }\n\ntype assuranceTCPSnapshot struct{}\n\nfunc (assuranceTCPSnapshot) Persist(s SnapshotSink) error { return s.Close() }\nfunc (assuranceTCPSnapshot) Release()                     {}\n\n// assuranceTCPStore holds exactly one CurrentTerm write inside SetUint64.\ntype assuranceTCPStore struct {\n\t*InmemStore\n\tarm     atomic.Bool\n\tblocked atomic.Bool\n\tentered chan struct{}\n\trelease chan struct{}\n\tmu      sync.Mutex\n\twrites  []uint64\n}\n\nfunc (s *assuranceTCPStore) SetUint64(key []byte, val uint64) error {\n\tif string(key) == \"CurrentTerm\" {\n\t\ts.mu.Lock()\n\t\ts.writes = append(s.writes, val)\n\t\ts.mu.Unlock()\n\t\tif s.arm.Load() && s.blocked.CompareAndSwap(false, true) {\n\t\t\ts.entered <- struct{}{}\n\t\t\t<-s.release\n\t\t}\n\t}\n\treturn s.InmemStore.SetUint64(key, val)\n}\n\nfunc (s *assuranceTCPStore) termWrites() []uint64 {\n\ts.mu.Lock()\n\tdefer s.mu.Unlock()\n\tout := make([]uint64, len(s.writes))\n\tcopy(out, s.writes)\n\treturn out\n}\n\nfunc TestAssuranceHeartbeatTermContextOverTCP(t *testing.T) {\n\tconst (\n\t\top         = \"heartbeat-vs-append-over-tcp\"\n\t\tstaleTerm  = uint64(5)\n\t\thigherTerm = uint64(6)\n\t)\n\tnodeID := ServerID(\"tcp-follower\")\n\n\tconf := DefaultConfig()\n\tconf.LocalID = nodeID\n\tconf.ProtocolVersion = 3\n\tconf.HeartbeatTimeout = 20 * time.Second\n\tconf.ElectionTimeout = 20 * time.Second\n\tconf.LeaderLeaseTimeout = 20 * time.Second\n\tconf.CommitTimeout = 20 * time.Second\n\tconf.SnapshotInterval = time.Hour\n\tconf.SnapshotThreshold = 100000\n\tconf.TrailingLogs = 100000\n\tconf.LogLevel = \"ERROR\"\n\n\tfollowerTrans, err := NewTCPTransport(\"127.0.0.1:0\", nil, 2, 5*time.Second, io.Discard)\n\tif err != nil {\n\t\tt.Skipf(\"assurance: tcp transport unavailable on the loopback interface: %v\", err)\n\t}\n\tdefer followerTrans.Close()\n\tsenderTrans, err := NewTCPTransport(\"127.0.0.1:0\", nil, 2, 5*time.Second, io.Discard)\n\tif err != nil {\n\t\tt.Skipf(\"assurance: tcp transport unavailable on the loopback interface: %v\", err)\n\t}\n\tdefer senderTrans.Close()\n\n\tstable := &assuranceTCPStore{InmemStore: NewInmemStore(), entered: make(chan struct{}, 1), release: make(chan struct{})}\n\tr, err := NewRaft(conf, assuranceTCPFSM{}, NewInmemStore(), stable, NewInmemSnapshotStore(), followerTrans)\n\tif err != nil {\n\t\tassuranceTCPEvent(map[string]interface{}{\"event\": \"assurance_setup_failed\", \"node\": string(nodeID), \"op\": op, \"detail\": err.Error()})\n\t\tt.Fatalf(\"assurance: NewRaft: %v\", err)\n\t}\n\tdefer func() { r.Shutdown().Error() }()\n\n\tbootstrap := Configuration{Servers: []Server{\n\t\t{ID: nodeID, Address: followerTrans.LocalAddr(), Suffrage: Voter},\n\t\t{ID: ServerID(\"leader\"), Address: senderTrans.LocalAddr(), Suffrage: Voter},\n\t}}\n\tif err := r.BootstrapCluster(bootstrap).Error(); err != nil {\n\t\tassuranceTCPEvent(map[string]interface{}{\"event\": \"assurance_setup_failed\", \"node\": string(nodeID), \"op\": op, \"detail\": \"bootstrap: \" + err.Error()})\n\t\tt.Fatalf(\"assurance: bootstrap: %v\", err)\n\t}\n\n\tleaderAddr := senderTrans.EncodePeer(\"leader\", senderTrans.LocalAddr())\n\theartbeat := AppendEntriesRequest{\n\t\tRPCHeader: RPCHeader{ProtocolVersion: 3, ID: []byte(\"leader\"), Addr: leaderAddr},\n\t\tTerm:      staleTerm,\n\t\tLeader:    leaderAddr,\n\t}\n\thigher := AppendEntriesRequest{\n\t\tRPCHeader:         RPCHeader{ProtocolVersion: 3, ID: []byte(\"leader-2\"), Addr: leaderAddr},\n\t\tTerm:              higherTerm,\n\t\tLeader:            leaderAddr,\n\t\tLeaderCommitIndex: 1,\n\t}\n\n\tstable.arm.Store(true)\n\tvar heartbeatResp AppendEntriesResponse\n\theartbeatDone := make(chan error, 1)\n\tgo func() {\n\t\theartbeatDone <- senderTrans.AppendEntries(nodeID, followerTrans.LocalAddr(), &heartbeat, &heartbeatResp)\n\t}()\n\tselect {\n\tcase <-stable.entered:\n\tcase <-time.After(10 * time.Second):\n\t\tassuranceTCPEvent(map[string]interface{}{\"event\": \"assurance_setup_failed\", \"node\": string(nodeID), \"op\": op, \"detail\": \"heartbeat never reached the gated term write\"})\n\t\tt.Fatalf(\"assurance: heartbeat did not reach the gated term write\")\n\t}\n\n\tvar higherResp AppendEntriesResponse\n\tif err := senderTrans.AppendEntries(nodeID, followerTrans.LocalAddr(), &higher, &higherResp); err != nil {\n\t\tassuranceTCPEvent(map[string]interface{}{\"event\": \"assurance_setup_failed\", \"node\": string(nodeID), \"op\": op, \"detail\": \"higher-term append: \" + err.Error()})\n\t\tt.Fatalf(\"assurance: higher-term append: %v\", err)\n\t}\n\n\tclose(stable.release)\n\tselect {\n\tcase err := <-heartbeatDone:\n\t\tif err != nil {\n\t\t\tassuranceTCPEvent(map[string]interface{}{\"event\": \"assurance_setup_failed\", \"node\": string(nodeID), \"op\": op, \"detail\": \"heartbeat: \" + err.Error()})\n\t\t\tt.Fatalf(\"assurance: heartbeat: %v\", err)\n\t\t}\n\tcase <-time.After(10 * time.Second):\n\t\tt.Fatalf(\"assurance: heartbeat response never arrived\")\n\t}\n\n\tcontextTerm := r.CurrentTerm()\n\tassuranceTCPEvent(map[string]interface{}{\n\t\t\"event\":   \"term_advanced\",\n\t\t\"node\":    string(nodeID),\n\t\t\"op\":      op,\n\t\t\"term\":    higherResp.Term,\n\t\t\"success\": higherResp.Success,\n\t\t\"stale_term_from_transport\": staleTerm,\n\t})\n\tassuranceTCPEvent(map[string]interface{}{\n\t\t\"event\":        \"term_context_observed\",\n\t\t\"node\":         string(nodeID),\n\t\t\"op\":           op,\n\t\t\"context_term\": contextTerm,\n\t\t\"store_writes\": stable.termWrites(),\n\t\t\"transport\":    \"tcp\",\n\t\t\"local_addr\":   string(followerTrans.LocalAddr()),\n\t})\n}\n",
+    "description": "TestAssuranceHeartbeatTermContextOverTCP: the term-context interleaving over the production TCP transport",
+    "semantic_changes": [
+      "No target file is modified; the harness adds one external test file to the captured package.",
+      "Both endpoints are NewTCPTransport instances bound to 127.0.0.1, so the transport, its heartbeat classification, the callback invocation on its connection goroutine and the wire encoding are the target's own code; the substitute fabric of the first scenario is absent.",
+      "StableStore is an InmemStore wrapper that holds exactly one CurrentTerm write inside SetUint64, the same latency injection the first scenario used.",
+      "The harness skips when the TCP transport cannot bind, so an environment without a usable loopback records an unavailable execution rather than a result."
+    ],
+    "prerequisites": [
+      {
+        "alias": "admit",
+        "event": "term_advanced",
+        "conditions": []
+      }
+    ],
+    "legality": {
+      "source_ids": [
+        "s-raft-process-heartbeat",
+        "s-net-fastpath",
+        "s-net-handle-conn",
+        "s-net-set-heartbeat",
+        "s-raft-append-term",
+        "s-raft-set-current-term",
+        "s-state-term-atomic",
+        "s-api-fastpath-contract"
+      ],
+      "expectation_ids": [],
+      "binding_ids": [
+        "bind-raft-process-heartbeat"
+      ],
+      "derivation": "The first scenario's legality holds unchanged: NewRaft registers r.processHeartbeat as the transport heartbeat handler (s-api-fastpath-contract), NetworkTransport.handleCommand decides heartbeat shape from the decoded request and calls that callback directly on the connection goroutine (s-net-fastpath, s-net-handle-conn, s-net-set-heartbeat), processHeartbeat forwards to appendEntries (s-raft-process-heartbeat), and appendEntries adopts a greater term by setState and setCurrentTerm, which writes StableStore before publishing the value in memory (s-raft-append-term, s-raft-set-current-term, s-state-term-atomic). The only difference here is that the transport is the production TCP one, so the wire path, the connection handling and the callback dispatch are exercised without a substitute.",
+      "applicability": "A single follower over two real TCP transports on the loopback interface, with a committed configuration naming itself and a peer, and timers far longer than the prefix; when the loopback is unusable the harness skips.",
+      "unresolved": [
+        "whether the same interleaving appears under a network with realistic latency, which this loopback prefix does not model"
+      ],
+      "conflicts": [],
+      "alternatives": [
+        "the substitute-layer scenario remains the primary record; this scenario exists only to remove the substitution as an explanation"
+      ]
+    }
+  },
+  "monitors": [
+    {
+      "id": "m-term-context-over-tcp",
+      "checker_id": "p-term-context-over-tcp",
+      "event": "term_context_observed",
+      "binding_ids": [
+        "bind-raft-process-heartbeat"
+      ],
+      "grounding": {
+        "source_ids": [
+          "s-raft-append-term",
+          "s-raft-set-current-term",
+          "s-state-term-atomic"
+        ],
+        "expectation_ids": [],
+        "binding_ids": [
+          "bind-raft-process-heartbeat"
+        ],
+        "derivation": "The result event reports the live term context through the public accessor together with the durable write sequence the injected store saw and the transport kind, and the admission event is the term the node itself reported adopting for the higher-term request, so the comparison is between the value the node acknowledged and the value in effect afterwards (s-raft-append-term, s-raft-set-current-term, s-state-term-atomic).",
+        "applicability": "Same node and prefix as the harness, with the transport kind reported beside the compared value.",
+        "unresolved": [
+          "whether a slower network changes the ordering the loopback prefix produces"
+        ],
+        "conflicts": [],
+        "alternatives": []
+      },
+      "applicability_conditions": [],
+      "admission_alias": "admit"
+    }
+  ],
+  "observable_properties": [
+    {
+      "checker_id": "p-term-context-over-tcp",
+      "kind": "event_assertion",
+      "trigger": {
+        "field": "op",
+        "op": "eq",
+        "value": "heartbeat-vs-append-over-tcp",
+        "reference": null
+      },
+      "assertion": {
+        "field": "context_term",
+        "op": "eq",
+        "value": null,
+        "reference": "admit.term"
+      },
+      "antecedent": null,
+      "identity_fields": [
+        "node",
+        "op"
+      ],
+      "description": "After the operation admitted by 'admit' completed over the production transport, the term context in effect on that node must equal the term the node reported adopting for it. The prefix admits exactly two term writes, so equality with the admitted term and 'the later establishment did not store a lower value' coincide within this scope, exactly as in the substitute-layer scenario."
+    }
+  ],
+  "uncertainties": [
+    "The transport is the production NetworkTransport over TCP, but the prefix is a loopback with no latency, so a slower or lossy network is not modelled.",
+    "The harness skips when the loopback is unusable, so a skip records an unavailable execution rather than a result; the substitute-layer scenario remains the primary record for the requirement.",
+    "The equality encoding coincides with 'not lower than the admitted term' only inside this prefix, where exactly two term writes are admitted.",
+    "The scenario varies the transport only; the store latency injection, the caller policy and the observation are those of the first scenario."
+  ]
+}

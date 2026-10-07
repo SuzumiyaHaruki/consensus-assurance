@@ -1,0 +1,112 @@
+{
+ "description": "Second scenario of the same requirement, removing the first artifact's limitation that the receiver's log was left intact: the receiving node is configured with no trailing logs, so installing the snapshot really truncates the log it was holding, and the harness then records the same commit context. Discriminator: the commit index the installing node publishes once its log has been truncated at the snapshot index. Observation: the receiver's commit index compared with the index the snapshot established, with its applied index, last index and state recorded beside it. Control: the same source-produced snapshot and the same install path as the first scenario, with the receiver's trailing-log setting reflected in causing an actual truncation rather than none.",
+ "claim_id": "c-snapshot-install-commit-context",
+ "binding_ids": [
+  "bind-raft-install-snapshot-commit"
+ ],
+ "harness": {
+  "kind": "go_test",
+  "description": "TestAssuranceSnapshotCompactedCommitContext: the commit index published by a node that installed a committed snapshot after its log was truncated there",
+  "source": "",
+  "files": {},
+  "semantic_changes": [
+   "No target file is modified; the harness adds one external test file to the captured package.",
+   "The receiving node is configured with no trailing logs, so the bootstrap entry it holds is really removed by the install's compaction, unlike the first scenario which left the log intact.",
+   "The snapshot is produced by a real single-voter leader through the public Snapshot API and delivered through the module's own InmemTransport install path, as in the first scenario.",
+   "Only the InstallSnapshot RPC is routed to the receiver and its election timeouts are long, so nothing else changes it inside the prefix."
+  ],
+  "prerequisites": [
+   {
+    "alias": "admit",
+    "event": "snapshot_committed_at_source",
+    "conditions": []
+   }
+  ],
+  "legality": {
+   "source_ids": [
+    "s-raft-install-snapshot",
+    "s-api-commit-index",
+    "s-snapshot-take",
+    "s-raft-append-commit",
+    "s-api-newraft-config"
+   ],
+   "expectation_ids": [],
+   "binding_ids": [
+    "bind-raft-install-snapshot-commit"
+   ],
+   "derivation": "Raft.CommitIndex() is documented as the committed index and as the basis for the read-index optimisation, and it returns raftState.commitIndex (s-api-commit-index). On a follower that value is otherwise advanced only from the leader's advertised commit index in appendEntries, where it is set to min(LeaderCommitIndex, lastIndex) and then applied through processLogs (s-raft-append-commit). takeSnapshot persists the FSM at an index the node has already applied and compacts the log (s-snapshot-take), and installSnapshot, after restoring that payload, publishes raftState.lastApplied and lastSnapshot from req.LastLogIndex and truncates the log, but it never writes the commit index (s-raft-install-snapshot). The admitted index is therefore an index the source had committed and applied, while the installing node's own last index after the install is that same index, so a commit index at least J and a commit index equal to J coincide inside this prefix and the reported value can be compared with the admitted one directly.",
+   "applicability": "A voter node that installs a source-produced snapshot while configured with no trailing logs, so its log is truncated at the snapshot index, observed before any later AppendEntries. The harness reports the receiver's state, applied index and last index beside the compared value.",
+   "unresolved": [
+    "whether the library intends the follower's published commit index to be strictly the value the leader last advertised, which would make the omission deliberate rather than a defect",
+    "whether the intended repair advances the commit index inside installSnapshot or derives the published value from the last snapshot index",
+    "whether the same omission on the startup restore path (api.go restoreSnapshot) should be treated as one requirement or a second entry point"
+   ],
+   "conflicts": [],
+   "alternatives": [
+    "the low value could be read as 'no leader has advertised a commit index yet', but the node has just installed and applied committed state, and the accessor is documented as the committed index rather than as the leader's last advertisement"
+   ]
+  }
+ },
+ "monitors": [
+  {
+   "id": "m-snapshot-compacted-commit-context",
+   "checker_id": "p-snapshot-compacted-commit-context",
+   "event": "commit_context_observed",
+   "binding_ids": [
+    "bind-raft-install-snapshot-commit"
+   ],
+   "admission_alias": "admit",
+   "applicability_conditions": [
+    {
+     "field": "installed",
+     "op": "eq",
+     "value": true
+    }
+   ],
+   "grounding": {
+    "source_ids": [
+     "s-raft-install-snapshot",
+     "s-api-commit-index",
+     "s-snapshot-take"
+    ],
+    "expectation_ids": [],
+    "binding_ids": [
+     "bind-raft-install-snapshot-commit"
+    ],
+    "derivation": "The admission event reports the index, term and the source node's own commit and applied indexes for the snapshot that is about to be installed, and the result event reports the installing node's commit index, applied index, last index, state and the index of the snapshot it accepted, so applicability can require that the install actually succeeded before the published value is judged (s-raft-install-snapshot, s-snapshot-take). The compared numbers come from the same export path the requirement names (s-api-commit-index).",
+    "applicability": "Same node and prefix as the harness, with the receiver's trailing-log setting chosen so the log is truncated by the install.",
+    "unresolved": [
+     "whether a later AppendEntries in a live cluster advances the value before a caller could read it, which this prefix does not produce"
+    ],
+    "conflicts": [],
+    "alternatives": []
+   }
+  }
+ ],
+ "observable_properties": [
+  {
+   "checker_id": "p-snapshot-compacted-commit-context",
+   "kind": "event_assertion",
+   "trigger": {
+    "field": "op",
+    "op": "eq",
+    "value": "snapshot-compacted-commit-context"
+   },
+   "assertion": {
+    "field": "commit_index",
+    "op": "eq",
+    "reference": "admit.index"
+   },
+   "identity_fields": [
+    "cluster",
+    "op"
+   ],
+   "description": "After the node admitted by 'admit' installed a snapshot at the index that node had committed and applied, and its log was truncated there, the installing node's published commit index must be that index. Within this prefix the receiver's own last index is the admitted index, so a commit index below it is below the committed state it has just applied, and equality is exactly that requirement."
+  }
+ ],
+ "uncertainties": [
+  "The observation is a single prefix immediately after the install and does not measure how long the value stays low in a live cluster.",
+  "The receiver's log is truncated, so this prefix cannot tell whether the value would differ if entries remained; the first scenario covers the intact-log case.",
+  "The equality encoding coincides with 'not below the admitted index' only because the receiver's own last index is the admitted index inside this prefix."
+ ]
+}

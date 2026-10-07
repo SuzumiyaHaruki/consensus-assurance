@@ -1,0 +1,86 @@
+{
+  "description": "Discriminator: whether two nodes can hold the leadership of one term. Three voters are created by the package's own NewRaft over the real NetworkTransport with a socket-free StreamLayer; the two that already observed term 2 are seeded from stores that contain the bootstrap configuration entry, while the third is bootstrapped normally at term 1 and its StableStore holds exactly one CurrentTerm write. A heartbeat-shaped AppendEntries carrying term 2 is delivered to that lagging voter and its term write is parked, so the voter grants the next election (which proposes term 3) while its published term is still 1. One other voter is unreachable for that election, so its vote record for term 3 stays empty, and after the parked write is released the lagging voter's published term drops to 2. The leader, whose own intervals were lengthened so no further traffic reaches the lagging voter, then transfers to it; the transfer candidate proposes term 3 again and keeps the vote record for that term as a self-vote. Observation: the harness records the moment the transfer target advertises Leader and, at that instant, the other node's own published state and term through the public accessors, so the comparison is on two live observations taken at one moment rather than on a later snapshot. Control: the leader's own transition to Leader is the admission event, the abstaining voter is reported beside the pair, and the final states show the transient resolution.",
+  "claim_id": "c-at-most-one-leader-per-term",
+  "binding_ids": ["bind-raft-elect-self-transfer"],
+  "harness": {
+    "kind": "go_test",
+    "description": "TestAssuranceTwoLeadersOneTerm: held stale term, abstaining voter, and a leadership transfer that proposes an already-voted term",
+    "source": "",
+    "files": {},
+    "semantic_changes": [
+      "StreamLayer is replaced by an in-process net.Pipe fabric with a per-endpoint block flag; NetworkTransport, its heartbeat classification, the SetHeartbeatHandler registration, requestVote, appendEntries, runCandidate, electSelf and the leadership transfer are the target's own code.",
+      "Two nodes' stores are seeded before NewRaft with the bootstrap configuration entry and CurrentTerm = 2, which is the state a node that already observed term 2 carries; the third node is bootstrapped normally, so the difference is initialization data, not modified protocol logic.",
+      "The lagging node's StableStore holds exactly one CurrentTerm write inside SetUint64 (a latency injection on an injected dependency), and one endpoint is blocked at the fabric for the duration of the first election (message loss).",
+      "The leader's reloadable intervals are lengthened through the public ReloadConfig once it is leader, so no further AppendEntries reaches the lagging node inside the observation window; the values used come from ReloadableConfig so no unrelated field is zeroed.",
+      "The harness registers an Observer with a nil channel on the transfer target; its filter runs synchronously on the emitting goroutine and reads the target's term and the other node's published state and term at that instant through the public accessors.",
+      "No target file is modified; the harness adds one external test file to the captured package."
+    ],
+    "prerequisites": [
+      {
+        "alias": "admit",
+        "event": "first_leader_adopted",
+        "conditions": []
+      }
+    ],
+    "legality": {
+      "source_ids": ["s-raft-vote-record", "s-raft-request-vote-filter", "s-raft-elect-self", "s-raft-candidate-vote", "s-raft-set-state", "s-raft-vote-record", "s-raft-set-current-term", "s-raft-process-heartbeat", "s-net-fastpath", "s-raft-candidate-prevote"],
+      "expectation_ids": [],
+      "binding_ids": ["bind-raft-elect-self-transfer"],
+      "derivation": "A node becomes leader only after runCandidate counts grants from a quorum and then records itself as the known leader (s-raft-candidate-vote); the vote-granting handler refuses a second different vote in a term it has already voted in (s-raft-vote-record) but accepts a request that carries the leadership-transfer flag even while a leader is known (s-raft-request-vote-filter); the candidate path persists a self-vote for its proposed term, which is the published term plus one, without consulting the record (s-raft-elect-self, s-raft-set-current-term); and a heartbeat-shaped AppendEntries reaches the term adoption step from the transport connection goroutine, whose write can be delayed (s-raft-process-heartbeat, s-net-fastpath, s-raft-candidate-prevote for the pre-vote bypass). The prefix therefore places a voter whose record already holds term 3 for the sitting leader, drops its published term to 2 by releasing the delayed write, and lets the transfer stimulus make it propose term 3 again; the abstaining voter's record for term 3 is empty, so its grant completes a second quorum in that term. Every step is a public API call, a transport delivery or a store write on an injected dependency; no protocol branch is altered.",
+      "applicability": "Three voters, one of them unreachable for exactly one election and one lagging by one published term, with pre-vote disabled because the substitute transport does not implement WithPreVote. The observation window is bounded by the lengthened heartbeat interval, and the leader keeps its own lease because the lagging voter still answers its traffic.",
+      "unresolved": [
+        "the second leadership is transient: once the two leaders exchange traffic they revert to follower, so the check observes the dual-leader state at the instant it is created rather than a lasting one",
+        "whether the same chain can be produced without seeding a store, for instance by letting the cluster observe the extra term through ordinary elections"
+      ],
+      "conflicts": [
+        "the vote path accepts a leadership-transfer request while another leader is known, so a voter's own record is the only barrier between that stimulus and a second quorum in a term that already has a leader"
+      ],
+      "alternatives": [
+        "the abstaining voter could be replaced by any voter whose record for that term is empty and that can receive the transfer candidate's request",
+        "the seeded term could be reached by ordinary elections, at the cost of a longer choreography"
+      ]
+    }
+  },
+  "monitors": [
+    {
+      "id": "m-one-leader-per-term",
+      "checker_id": "p-one-leader-per-term",
+      "event": "second_leader_observed",
+      "binding_ids": ["bind-raft-elect-self-transfer"],
+      "admission_alias": "admit",
+      "applicability_conditions": [
+        {"field": "other_node_state", "op": "eq", "value": "Leader"},
+        {"field": "other_node_term", "op": "eq", "reference": "admit.term"}
+      ],
+      "grounding": {
+        "source_ids": ["s-raft-candidate-vote", "s-raft-vote-record", "s-raft-request-vote-filter"],
+        "expectation_ids": [],
+        "binding_ids": ["bind-raft-elect-self-transfer"],
+        "derivation": "The result event reports the term in which the transfer target advertised Leader together with the other node's published state and term read at that instant, and the admission event reports the term in which that other node had become leader. Applicability restricts the comparison to the case the requirement is about - the other node still holds Leader and its term equals the admitted one - so a comparison where the earlier leadership had already ended is never judged, and a target whose term advanced normally is not reported.",
+        "applicability": "Same cluster and prefix as the harness; the abstaining voter's state and the final states are reported beside the pair as diagnostics.",
+        "unresolved": [
+          "whether a lasting dual-leader state is reachable, since this prefix observes the instant the second leadership is created"
+        ],
+        "conflicts": [],
+        "alternatives": []
+      }
+    }
+  ],
+  "observable_properties": [
+    {
+      "checker_id": "p-one-leader-per-term",
+      "kind": "event_assertion",
+      "trigger": {"field": "witness_recorded", "op": "eq", "value": true},
+      "assertion": {"field": "term", "op": "ne", "reference": "admit.term"},
+      "identity_fields": ["cluster", "op"],
+      "description": "When a node advertises Leader for a term while another node already advertises Leader for the term reported by the admission event, the two terms must differ. Equality means one term has two leaders, which is the property the vote rule and the leader self-identification exist to prevent; applicability already restricts the comparison to that case, so a target that took leadership after the earlier leader had ended is never judged."
+    }
+  ],
+  "uncertainties": [
+    "The dual leadership observed here is transient: the two leaders revert to follower when they exchange traffic, and the check records the instant the second leadership is created through an observer filter rather than claiming a lasting split.",
+    "Two nodes are seeded with CurrentTerm = 2 and the bootstrap entry, and one endpoint is blocked for one election; both are initialisation and message-loss choices on injected dependencies, and the derivation notes how ordinary elections could reach the same terms.",
+    "The comparison depends on the observation captured inside the observer filter, which reads the other node's published state and term through public accessors at that instant; a later read would show the resolution instead.",
+    "No client write or commit is exercised, so the consequence of two leaders accepting conflicting entries is not observed here and remains a limit of this check.",
+    "Only one cluster shape and one transfer target are exercised."
+  ]
+}

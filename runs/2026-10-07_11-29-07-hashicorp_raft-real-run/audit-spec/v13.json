@@ -1,0 +1,1521 @@
+{
+  "version": 13,
+  "target_profile": {
+    "system_boundary": "github.com/hashicorp/raft as captured (single module; module path github.com/hashicorp/raft). One Raft instance is one node of a cluster; the module also ships NetworkTransport/TCPStreamLayer/InmemTransport, an in-memory FSM/store for tests, and the raft-compat and fuzzy nested modules. FSM, LogStore, StableStore and SnapshotStore are caller-supplied interfaces, so durability of applied state is outside this module.",
+    "protocol_contexts": [
+      "leader election with optional pre-vote (PreVoteDisabled, transport WithPreVote)",
+      "log replication via AppendEntries and InstallSnapshot",
+      "single-uncommitted-configuration membership change with Voter/Nonvoter/Staging suffrage",
+      "leadership transfer via TimeoutNow and candidateFromLeadershipTransfer",
+      "protocol versions 0..3 with legacy AddPeerDeprecated/RemovePeerDeprecated entries"
+    ],
+    "external_interfaces": [
+      "FSM.Apply/Snapshot/Restore and BatchingFSM.ApplyBatch/ConfigurationStore.StoreConfiguration",
+      "LogStore (with optional MonotonicLogStore) and StableStore",
+      "SnapshotStore (Create/List/Open) and SnapshotSink",
+      "Transport with optional WithPreVote, WithClose, WithPeers, SetHeartbeatHandler",
+      "client futures: Apply/ApplyLog/Barrier/VerifyLeader/GetConfiguration/AddVoter/AddNonvoter/DemoteVoter/RemoveServer/Snapshot/Restore/LeadershipTransfer"
+    ],
+    "ownership": [
+      "the raft main goroutine started by run() owns raftState, configurations, leaderState and all RPC handling through the rpcCh consumer channel",
+      "one followerReplication goroutine per peer plus one heartbeat goroutine owns replication progress and the commitment match table",
+      "the NetworkTransport spawns one connection-handler goroutine per inbound connection and may invoke the registered heartbeat callback on that goroutine",
+      "the fsm goroutine consumes fsmMutateCh and the snapshot goroutine consumes fsmSnapshotCh"
+    ],
+    "selection_injection": [
+      "Config.LocalID/ProtocolVersion/PreVoteDisabled and store/transport implementations are supplied by the embedding application",
+      "timers use the process clock with randomized HeartbeatTimeout/ElectionTimeout",
+      "NoLegacyTelemetry and reloadable timeouts are supplied by configuration"
+    ],
+    "variants": [
+      "pre-vote enabled (default when the transport implements WithPreVote) vs disabled",
+      "pipelined vs synchronous replication (MaxRPCsInFlight)",
+      "protocol version 0..3 and snapshot version 0/1",
+      "MonotonicLogStore vs gapped LogStore after user snapshot restore"
+    ],
+    "source_ids": [
+      "s-raft-run-loop",
+      "s-transport-interface",
+      "s-api-newraft-config",
+      "s-net-handle-conn"
+    ],
+    "unknowns": [
+      "whether the transport heartbeat callback is expected by contract to be serialized with the main goroutine, or only to be free of the main goroutine's disk latency"
+    ]
+  },
+  "activities": [
+    {
+      "class_id": "A1",
+      "applicability": "applicable",
+      "purpose": "Form a cluster decision and advance it legally: gather support that is qualified by the current voting configuration, and only advance the commit index for entries a quorum has stored when this leader may commit them.",
+      "realization_summary": "A candidate becomes leader only after grantedVotes reaches quorumSize() (or pre-vote grants first reach the same quorum); a leader records each voter's acknowledged match index in commitment.matchIndexes and commitment.recalculate advances commitIndex only when the majority match index is at least commitment.startIndex, the first index created in the leader's own term. Followers advance their own commit index only from the leader's LeaderCommitIndex bounded by their own last index.",
+      "entry_points": [
+        "runCandidate vote tally",
+        "electSelf/preElectSelf",
+        "commitment.match/recalculate",
+        "leaderLoop commitCh consumer",
+        "appendEntries commit branch"
+      ],
+      "behavior_ids": [
+        "b-follower-append-entries",
+        "b-follower-commit-advance",
+        "b-replication-ack",
+        "b-commit-advance",
+        "b-elect-self",
+        "b-vote-grant",
+        "b-pre-vote-grant"
+      ],
+      "variants": [],
+      "unknowns": [],
+      "source_ids": [
+        "s-raft-candidate-vote",
+        "s-raft-candidate-prevote",
+        "s-commitment-core",
+        "s-commitment-recalc",
+        "s-raft-append-commit"
+      ]
+    },
+    {
+      "class_id": "A2",
+      "applicability": "applicable",
+      "purpose": "Keep the election-term and leadership context valid, and acquire, transfer or lose authority only through the term/leader fields that every subsequent decision is evaluated against.",
+      "realization_summary": "Inbound AppendEntries/RequestVote/InstallSnapshot adopt a strictly greater term and drop to Follower; accepted AppendEntries/InstallSnapshot record the leader identity; requestVote/requestPreVote reject support while a different leader is known; checkLeaderLease steps the leader down when it cannot contact a quorum within LeaderLeaseTimeout; TimeoutNow moves authority by putting the target into Candidate with candidateFromLeadershipTransfer. NetworkTransport can additionally drive the AppendEntries term/leader update from a connection goroutine through the heartbeat callback.",
+      "entry_points": [
+        "appendEntries term/leader update",
+        "requestVote/requestPreVote term update",
+        "checkLeaderLease",
+        "timeoutNow",
+        "NetworkTransport heartbeat callback"
+      ],
+      "behavior_ids": [
+        "b-term-observation",
+        "b-leader-identity",
+        "b-heartbeat-fastpath",
+        "b-leader-lease-stepdown",
+        "b-timeout-now-transfer",
+        "b-heartbeat-liveness"
+      ],
+      "variants": [],
+      "unknowns": [],
+      "source_ids": [
+        "s-raft-append-term",
+        "s-raft-request-vote-filter",
+        "s-raft-leader-lease",
+        "s-raft-timeout-now",
+        "s-net-fastpath"
+      ]
+    },
+    {
+      "class_id": "A3",
+      "applicability": "applicable",
+      "purpose": "Recover and resynchronize a participant that cannot be caught up by log replay, and re-establish eligible participation.",
+      "realization_summary": "When setPreviousLog cannot find an index the leader sends the newest snapshot with sendLatestSnapshot/InstallSnapshot; the follower streams it to a SnapshotSink, restores the FSM through fsmMutateCh, then sets lastApplied/lastSnapshot/configuration and truncates logs. NewRaft restores the newest usable snapshot at start.",
+      "entry_points": [
+        "sendLatestSnapshot",
+        "installSnapshot",
+        "NewRaft restoreSnapshot"
+      ],
+      "behavior_ids": [
+        "b-install-snapshot",
+        "b-send-snapshot"
+      ],
+      "variants": [],
+      "unknowns": [],
+      "source_ids": [
+        "s-replication-replicateTo",
+        "s-raft-install-snapshot",
+        "s-api-newraft-config"
+      ]
+    },
+    {
+      "class_id": "A4",
+      "applicability": "applicable",
+      "purpose": "Maintain the configuration that decides who is a participant and whose support counts.",
+      "realization_summary": "Configuration changes are accepted only while the latest configuration is committed and this leader has committed an entry of its own term; nextConfiguration derives the new configuration and checkConfiguration rejects an empty/duplicated participant set or a configuration without a voter; the new configuration is written as a LogConfiguration entry, applied to configurations.latest, pushed into commitment.setConfiguration and used to start/stop replication.",
+      "entry_points": [
+        "configurationChangeChIfStable",
+        "appendConfigurationEntry",
+        "nextConfiguration/checkConfiguration",
+        "startStopReplication"
+      ],
+      "behavior_ids": [
+        "b-config-change"
+      ],
+      "variants": [],
+      "unknowns": [],
+      "source_ids": [
+        "s-raft-append-config",
+        "s-config-next",
+        "s-raft-leader-commit-consume"
+      ]
+    },
+    {
+      "class_id": "A5",
+      "applicability": "applicable",
+      "purpose": "Apply committed decisions to the client FSM in commit order and report completion to callers.",
+      "realization_summary": "processLogs converts committed indices into commitTuple batches (LogCommand/LogBarrier/LogConfiguration) and hands them to fsmMutateCh; the fsm goroutine applies them through FSM.Apply or BatchingFSM.ApplyBatch and responds to the logFuture, and snapshot requests report the last applied index/term.",
+      "entry_points": [
+        "processLogs",
+        "runFSM apply/applyBatch",
+        "runFSM snapshot"
+      ],
+      "behavior_ids": [
+        "b-fsm-apply"
+      ],
+      "variants": [],
+      "unknowns": [],
+      "source_ids": [
+        "s-raft-process-logs",
+        "s-fsm-run"
+      ]
+    },
+    {
+      "class_id": "A6",
+      "applicability": "applicable",
+      "purpose": "Persist and reconstruct the history that support is evaluated against (term, vote, log, configuration).",
+      "realization_summary": "setCurrentTerm and persistVote write StableStore before the in-memory state changes; dispatchLogs writes the leader's new entries to the LogStore before notifying replicators; NewRaft reloads the term, last log and snapshots and replays configuration entries from the log to rebuild configurations.latest/committed; snapshotting persists FSM state and compacts logs.",
+      "entry_points": [
+        "setCurrentTerm/persistVote",
+        "dispatchLogs StoreLogs",
+        "NewRaft log scan",
+        "takeSnapshot/compactLogs"
+      ],
+      "behavior_ids": [
+        "b-newraft-recovery"
+      ],
+      "variants": [],
+      "unknowns": [],
+      "source_ids": [
+        "s-raft-set-current-term",
+        "s-raft-vote-record",
+        "s-raft-dispatch-logs",
+        "s-api-newraft-config",
+        "s-snapshot-take"
+      ]
+    },
+    {
+      "class_id": "A7",
+      "applicability": "applicable",
+      "purpose": "Expose the client contract: which node may be asked to act, what completion means, and what leader identity is reported.",
+      "realization_summary": "Apply/ApplyLog/Barrier enqueue a logFuture and complete when the FSM path responds; VerifyLeader drives an immediate heartbeat round and completes when a quorum answers; Leader/LeaderWithID report the stored leader identity under leaderLock; CommitIndex/AppliedIndex export the internal indices.",
+      "entry_points": [
+        "Apply/ApplyLog/Barrier",
+        "VerifyLeader",
+        "Leader/LeaderWithID/CommitIndex/AppliedIndex"
+      ],
+      "behavior_ids": [
+        "b-client-apply-verify"
+      ],
+      "variants": [],
+      "unknowns": [],
+      "source_ids": [
+        "s-api-leaderwithid",
+        "s-raft-leader-commit-consume",
+        "s-raft-leader-lease"
+      ]
+    }
+  ],
+  "behaviors": [
+    {
+      "id": "b-follower-append-entries",
+      "primary_activity": "A1",
+      "execution_owner": "the receiving node's raft main goroutine (runFollower/runCandidate/runLeader select on rpcCh, then processRPC, then appendEntries)",
+      "protocol_context": "Raft AppendEntries log replication; an entry of type LogConfiguration carries a full Configuration",
+      "trigger": "an AppendEntriesRequest that carries entries and is therefore not served by the transport heartbeat callback",
+      "legal_preconditions": [
+        "request term is not older than the adopted term",
+        "the previous log entry matches the local log, or PrevLogEntry is 0"
+      ],
+      "implementation_guards": [
+        "a.Term < getCurrentTerm() returns immediately",
+        "a previous-log term mismatch returns a failed response with NoRetryBackoff",
+        "a conflicting suffix is removed with DeleteRange before the new entries are stored"
+      ],
+      "reads": [
+        "AppendEntriesRequest.Term/PrevLogEntry/PrevLogTerm/Entries",
+        "raftState lastLog",
+        "LogStore entries"
+      ],
+      "writes": [
+        "LogStore entries through StoreLogs/DeleteRange",
+        "raftState.lastLog"
+      ],
+      "durable_effects": [],
+      "external_effects": [],
+      "important_branches": [
+        "already-present entries are skipped",
+        "a truncated configuration entry reverts configurations.latest to the committed configuration",
+        "each new entry is passed to processConfigurationLogEntry",
+        "the conflict loop compares terms only: when the incoming entry's index and term match what is already stored, nothing is written and success is reported, so the acknowledgement the leader counts asserts the position rather than the contents"
+      ],
+      "async_boundaries": [
+        "log writes complete on the main goroutine before the response is sent"
+      ],
+      "produces_fact_ids": [
+        "f-follower-log-state",
+        "f-latest-configuration"
+      ],
+      "consumes_fact_ids": [
+        "f-term-adopted"
+      ],
+      "cross_activity_effects": {
+        "A6": "the durable log history is rewritten in place (suffix truncation) before the node acknowledges the append"
+      },
+      "existing_protections": [
+        "log matching follows from the vote rule wherever one leader exists per term, so the term-only comparison is sound there and the leader's match accounting is only at risk when a term has two leaders"
+      ],
+      "source_ids": [
+        "s-raft-append-entries-log",
+        "s-raft-append-config"
+      ],
+      "unknowns": []
+    },
+    {
+      "id": "b-follower-commit-advance",
+      "primary_activity": "A1",
+      "execution_owner": "the receiving node's raft main goroutine (appendEntries commit branch)",
+      "protocol_context": "AppendEntries carries the leader's commit index",
+      "trigger": "LeaderCommitIndex is greater than the local commitIndex",
+      "legal_preconditions": [],
+      "implementation_guards": [
+        "the applied index is bounded by min(LeaderCommitIndex, getLastIndex())"
+      ],
+      "reads": [
+        "AppendEntriesRequest.LeaderCommitIndex",
+        "raftState.commitIndex and lastLog"
+      ],
+      "writes": [
+        "raftState.commitIndex",
+        "configuration committed index",
+        "raftState.lastApplied through processLogs"
+      ],
+      "durable_effects": [],
+      "external_effects": [],
+      "important_branches": [
+        "a configuration index at or below the new commit index is marked committed"
+      ],
+      "async_boundaries": [
+        "application to the FSM is handed to fsmMutateCh, so commitIndex can lead lastApplied"
+      ],
+      "produces_fact_ids": [
+        "f-commit-index"
+      ],
+      "consumes_fact_ids": [
+        "f-term-adopted"
+      ],
+      "cross_activity_effects": {},
+      "existing_protections": [],
+      "source_ids": [
+        "s-raft-append-commit",
+        "s-raft-process-logs"
+      ],
+      "unknowns": []
+    },
+    {
+      "id": "b-replication-ack",
+      "primary_activity": "A1",
+      "execution_owner": "the leader's per-follower replication goroutine (replicate/replicateTo/pipelineDecode) and, for the leader itself, the leader main goroutine in dispatchLogs",
+      "protocol_context": "replication of the leader's log to Voter and Nonvoter peers",
+      "trigger": "a successful AppendEntries response or a successful InstallSnapshot response from a peer",
+      "legal_preconditions": [
+        "the response term is not greater than the request term"
+      ],
+      "implementation_guards": [
+        "a response term greater than the request term stops replication and asks the leader to step down"
+      ],
+      "reads": [
+        "AppendEntriesResponse.Success/Term/LastLog",
+        "AppendEntriesRequest.Entries"
+      ],
+      "writes": [
+        "followerReplication.nextIndex",
+        "commitment.matchIndexes for that peer"
+      ],
+      "durable_effects": [],
+      "external_effects": [],
+      "important_branches": [
+        "a failed response lowers nextIndex to max(min(nextIndex-1, resp.LastLog+1), 1)"
+      ],
+      "async_boundaries": [
+        "match updates happen on replication goroutines while commit advancement is consumed on the leader main goroutine"
+      ],
+      "produces_fact_ids": [
+        "f-follower-match"
+      ],
+      "consumes_fact_ids": [
+        "f-follower-log-state"
+      ],
+      "cross_activity_effects": {},
+      "existing_protections": [],
+      "source_ids": [
+        "s-replication-replicateTo",
+        "s-replication-ack",
+        "s-raft-dispatch-logs"
+      ],
+      "unknowns": []
+    },
+    {
+      "id": "b-commit-advance",
+      "primary_activity": "A1",
+      "execution_owner": "commitment.match/recalculate, called from the leader's replication goroutines and from dispatchLogs for the leader's own disk write",
+      "protocol_context": "leader-side commitment bookkeeping for the current term",
+      "trigger": "a tracked voter's match index increases",
+      "legal_preconditions": [
+        "the entry being considered belongs to this leader's term or an earlier entry has already been committed in this term"
+      ],
+      "implementation_guards": [
+        "commitIndex only advances when quorumMatchIndex >= commitment.startIndex",
+        "matchIndexes contains only servers with Voter suffrage from configurations.latest"
+      ],
+      "reads": [
+        "commitment.matchIndexes",
+        "commitment.startIndex"
+      ],
+      "writes": [
+        "commitment.commitIndex"
+      ],
+      "durable_effects": [],
+      "external_effects": [],
+      "important_branches": [
+        "a new configuration resets matchIndexes for the new voter set and recalculates immediately"
+      ],
+      "async_boundaries": [
+        "the advance is published to the leader main goroutine by a non-blocking notification on commitCh"
+      ],
+      "produces_fact_ids": [
+        "f-commit-index"
+      ],
+      "consumes_fact_ids": [
+        "f-follower-match",
+        "f-latest-configuration"
+      ],
+      "cross_activity_effects": {},
+      "existing_protections": [
+        "a match recorded while a configuration change is being appended is counted against the voter set the commitment table still holds, and because a change is admitted only once the previous one is committed and only one may be uncommitted at a time, the old and the new quorum intersect, so any index committed inside that window is also held by a quorum of the resulting configuration"
+      ],
+      "source_ids": [
+        "s-commitment-core",
+        "s-commitment-recalc",
+        "s-raft-dispatch-logs"
+      ],
+      "unknowns": []
+    },
+    {
+      "id": "b-elect-self",
+      "primary_activity": "A1",
+      "execution_owner": "the candidate's raft main goroutine (runCandidate, then preElectSelf or electSelf)",
+      "protocol_context": "leader election with pre-vote when the transport implements WithPreVote and candidateFromLeadershipTransfer is not set",
+      "trigger": "the node enters Candidate: heartbeat timeout, TimeoutNow, or an election timeout while already candidate",
+      "legal_preconditions": [
+        "the local server has Voter suffrage in configurations.latest",
+        "the latest configuration is not a stable non-voter configuration"
+      ],
+      "implementation_guards": [
+        "a pre-vote round is skipped during a leadership transfer",
+        "responses with a term greater than the proposed term fall back to Follower"
+      ],
+      "reads": [
+        "raftState currentTerm and lastEntry",
+        "configurations.latest"
+      ],
+      "writes": [
+        "StableStore CurrentTerm through setCurrentTerm (real election only)",
+        "StableStore LastVoteTerm/LastVoteCand for the local vote"
+      ],
+      "durable_effects": [],
+      "external_effects": [],
+      "important_branches": [
+        "pre-vote proposes currentTerm+1 without changing the term",
+        "the real election persists a self-vote before requesting votes",
+        "the self-vote is persisted for the proposed term without comparing it with the record that may already exist for that term, and the transfer path keeps pre-vote from filtering this campaign, so a published term that has dropped below a recorded vote's term lets the campaign propose exactly that term, overwrite the record and collect a quorum while another voter's record for it is still empty"
+      ],
+      "async_boundaries": [
+        "votes are requested from one goroutine per voter and tallied on the main goroutine",
+        "the proposed term is derived from the published current term, and that value can be lowered by an out-of-order write from another entry point, so the proposal depends on a value that is not monotonic across entry points"
+      ],
+      "produces_fact_ids": [
+        "f-term-adopted",
+        "f-vote-record",
+        "f-leadership-held"
+      ],
+      "consumes_fact_ids": [],
+      "cross_activity_effects": {},
+      "existing_protections": [
+        "the vote-granting path refuses a second different vote in the same term by comparing the record with the request, so the rule is enforced on that path only"
+      ],
+      "source_ids": [
+        "s-raft-candidate-prevote",
+        "s-raft-candidate-vote",
+        "s-raft-elect-self",
+        "s-raft-vote-record",
+        "s-raft-set-current-term"
+      ],
+      "unknowns": []
+    },
+    {
+      "id": "b-vote-grant",
+      "primary_activity": "A1",
+      "execution_owner": "the voter's raft main goroutine (requestVote)",
+      "protocol_context": "RequestVote RPC, including the LeadershipTransfer bypass flag",
+      "trigger": "an inbound RequestVoteRequest",
+      "legal_preconditions": [
+        "the candidate is a member of configurations.latest, or the configuration is empty",
+        "no other leader is known, or the request carries LeadershipTransfer",
+        "the request term is not older than the adopted term",
+        "the candidate's last log term/index is at least as up to date"
+      ],
+      "implementation_guards": [
+        "a candidate that is not a voter is rejected even when its term is newer, after the local term is adopted",
+        "a duplicate request for the same (term, candidate) is re-granted without persisting the vote again"
+      ],
+      "reads": [
+        "RequestVoteRequest.Term/Candidate/LastLogIndex/LastLogTerm",
+        "configurations.latest",
+        "StableStore LastVoteTerm/LastVoteCand",
+        "LocalID of the known leader"
+      ],
+      "writes": [
+        "StableStore LastVoteTerm and LastVoteCand"
+      ],
+      "durable_effects": [],
+      "external_effects": [],
+      "important_branches": [
+        "the candidate membership check is skipped when the configuration is empty",
+        "the leader filter is bypassed by LeadershipTransfer"
+      ],
+      "async_boundaries": [],
+      "produces_fact_ids": [
+        "f-vote-record"
+      ],
+      "consumes_fact_ids": [
+        "f-term-adopted",
+        "f-known-leader",
+        "f-vote-record"
+      ],
+      "cross_activity_effects": {
+        "A4": "vote eligibility is decided from configurations.latest, so a participant change immediately constrains who can be granted support"
+      },
+      "existing_protections": [],
+      "source_ids": [
+        "s-raft-request-vote-filter",
+        "s-raft-vote-record"
+      ],
+      "unknowns": []
+    },
+    {
+      "id": "b-pre-vote-grant",
+      "primary_activity": "A1",
+      "execution_owner": "the voter's raft main goroutine (requestPreVote)",
+      "protocol_context": "RequestPreVote RPC used by the pre-vote extension",
+      "trigger": "an inbound RequestPreVoteRequest",
+      "legal_preconditions": [
+        "the candidate is a member and a voter of configurations.latest, or the configuration is empty",
+        "no other leader is known",
+        "the request term is not older than the adopted term",
+        "the candidate's last log is at least as up to date"
+      ],
+      "implementation_guards": [
+        "a pre-vote grant does not change the local term or the durable vote record"
+      ],
+      "reads": [
+        "RequestPreVoteRequest.Term/LastLogIndex/LastLogTerm",
+        "configurations.latest",
+        "known leader identity"
+      ],
+      "writes": [],
+      "durable_effects": [],
+      "external_effects": [],
+      "important_branches": [
+        "a request with a newer term is granted without adopting that term locally"
+      ],
+      "async_boundaries": [],
+      "produces_fact_ids": [],
+      "consumes_fact_ids": [
+        "f-term-adopted",
+        "f-known-leader"
+      ],
+      "cross_activity_effects": {},
+      "existing_protections": [],
+      "source_ids": [
+        "s-raft-pre-vote",
+        "s-raft-request-vote-filter"
+      ],
+      "unknowns": []
+    },
+    {
+      "id": "b-term-observation",
+      "primary_activity": "A2",
+      "execution_owner": "the receiving node's raft main goroutine (appendEntries/requestVote/installSnapshot term handling)",
+      "protocol_context": "term comparison on inbound AppendEntries, RequestVote and InstallSnapshot",
+      "trigger": "an inbound RPC with a term greater than the adopted term, or, for AppendEntries, any accepted RPC received while the node is not a Follower",
+      "legal_preconditions": [
+        "the RPC term is not older than the adopted term"
+      ],
+      "implementation_guards": [
+        "an older term is ignored before any state change",
+        "a candidate that is mid-leadership-transfer does not step down on an equal-term AppendEntries"
+      ],
+      "reads": [
+        "RPC term",
+        "raftState currentTerm and state"
+      ],
+      "writes": [
+        "StableStore CurrentTerm through setCurrentTerm",
+        "raftState.state = Follower",
+        "clears the known leader through setState"
+      ],
+      "durable_effects": [],
+      "external_effects": [],
+      "important_branches": [
+        "the adopted term is written with a plain atomic Store, not a compare-and-swap"
+      ],
+      "async_boundaries": [],
+      "produces_fact_ids": [
+        "f-term-adopted"
+      ],
+      "consumes_fact_ids": [
+        "f-term-adopted"
+      ],
+      "cross_activity_effects": {},
+      "existing_protections": [],
+      "source_ids": [
+        "s-raft-append-term",
+        "s-raft-request-vote-filter",
+        "s-raft-set-current-term",
+        "s-raft-set-state"
+      ],
+      "unknowns": []
+    },
+    {
+      "id": "b-leader-identity",
+      "primary_activity": "A2",
+      "execution_owner": "the receiving node's raft main goroutine (the Save the current leader block of appendEntries and installSnapshot)",
+      "protocol_context": "leader identity propagation in AppendEntries/InstallSnapshot",
+      "trigger": "an accepted AppendEntries or InstallSnapshot RPC",
+      "legal_preconditions": [],
+      "implementation_guards": [],
+      "reads": [
+        "RPCHeader.Addr/ID or the deprecated Leader field"
+      ],
+      "writes": [
+        "raftState.leaderAddr and leaderID under leaderLock"
+      ],
+      "durable_effects": [],
+      "external_effects": [],
+      "important_branches": [
+        "setState clears the leader identity on any state transition, so the identity must be written after the state update"
+      ],
+      "async_boundaries": [],
+      "produces_fact_ids": [
+        "f-known-leader"
+      ],
+      "consumes_fact_ids": [],
+      "cross_activity_effects": {},
+      "existing_protections": [],
+      "source_ids": [
+        "s-raft-append-leader",
+        "s-raft-set-state",
+        "s-api-leaderwithid"
+      ],
+      "unknowns": []
+    },
+    {
+      "id": "b-heartbeat-fastpath",
+      "primary_activity": "A2",
+      "execution_owner": "the transport connection goroutine: NetworkTransport.handleCommand calls the registered callback directly instead of placing the RPC on the consumer channel; the callback is Raft.processHeartbeat",
+      "protocol_context": "heartbeat-shaped AppendEntries (Term != 0, PrevLogEntry == 0, PrevLogTerm == 0, no Entries, LeaderCommitIndex == 0) delivered over NetworkTransport/TCPStreamLayer",
+      "trigger": "an inbound connection carries a heartbeat-shaped AppendEntriesRequest while a heartbeat handler is registered",
+      "legal_preconditions": [
+        "the transport was given a heartbeat handler by NewRaft"
+      ],
+      "implementation_guards": [
+        "the local handler only re-checks shutdown and the command type, then re-uses appendEntries unchanged",
+        "the classification excludes requests carrying entries or a commit index"
+      ],
+      "reads": [
+        "raftState.currentTerm and state",
+        "AppendEntriesRequest term and leader fields"
+      ],
+      "writes": [
+        "StableStore CurrentTerm",
+        "raftState.state",
+        "raftState.leaderAddr/leaderID",
+        "lastContact"
+      ],
+      "durable_effects": [],
+      "external_effects": [],
+      "important_branches": [
+        "isHeartbeat is decided from the decoded request before the RPC is offered to the main consumer channel",
+        "the response term is not inspected here: only the reads and writes listed above are performed, so a request whose term is older than the node's own is rejected by the term comparison while an equal or greater one reaches the writes"
+      ],
+      "async_boundaries": [
+        "invoked synchronously by the per-connection goroutine, so it can run concurrently with the raft main goroutine; the response is written back on the same connection",
+        "the term, state and leader writes performed here are not serialized with the main goroutine: currentTerm is published with a plain atomic store rather than a compare-and-swap, so a StableStore write delayed on this goroutine can publish a term lower than one the main goroutine has already adopted and answered with"
+      ],
+      "produces_fact_ids": [
+        "f-term-adopted",
+        "f-known-leader"
+      ],
+      "consumes_fact_ids": [
+        "f-term-adopted"
+      ],
+      "cross_activity_effects": {
+        "A7": "the fast path answers heartbeats without waiting for the main goroutine's disk IO, which is the documented purpose of the callback"
+      },
+      "existing_protections": [
+        "the fast path cannot append log entries, advance the commit index or run processLogs, because those fields are excluded by the heartbeat classification"
+      ],
+      "source_ids": [
+        "s-raft-process-heartbeat",
+        "s-net-fastpath",
+        "s-net-handle-conn",
+        "s-net-set-heartbeat",
+        "s-api-fastpath-contract",
+        "s-transport-interface",
+        "s-integ-fastpath",
+        "s-raft-append-term",
+        "s-raft-append-leader",
+        "s-raft-set-current-term",
+        "s-state-term-atomic"
+      ],
+      "unknowns": [
+        "whether the production TCP scheduling, as opposed to the in-process substitute stream layer used to exercise this entry point, produces the same interleaving"
+      ]
+    },
+    {
+      "id": "b-leader-lease-stepdown",
+      "primary_activity": "A2",
+      "execution_owner": "the leader's raft main goroutine (leaderLoop lease timer)",
+      "protocol_context": "leader lease check used to bound how long a partitioned leader keeps serving",
+      "trigger": "LeaderLeaseTimeout elapsed since the timer was armed",
+      "legal_preconditions": [],
+      "implementation_guards": [
+        "the leader steps down when the number of contacted voters is below quorumSize()"
+      ],
+      "reads": [
+        "followerReplication lastContact for Voter servers of configurations.latest"
+      ],
+      "writes": [
+        "raftState.state"
+      ],
+      "durable_effects": [],
+      "external_effects": [],
+      "important_branches": [
+        "the next check interval is shortened by the maximum observed contact gap",
+        "the lease timeout is fixed at construction and validated only against the heartbeat timeout, while the cadence at which contact with a reachable peer is refreshed derives from the heartbeat and commit timeouts, so a reload that lengthens those intervals leaves the check unsatisfiable with a reachable quorum"
+      ],
+      "async_boundaries": [],
+      "produces_fact_ids": [],
+      "consumes_fact_ids": [
+        "f-term-adopted"
+      ],
+      "cross_activity_effects": {},
+      "existing_protections": [
+        "the check compares the elapsed time since each voter's last contact with LeaderLeaseTimeout and counts the local server itself, so a leader whose peers are unreachable is still stepped down as intended"
+      ],
+      "source_ids": [
+        "s-raft-leader-lease"
+      ],
+      "unknowns": [
+        "how wide the interval relation must be before the step-down becomes certain rather than likely, since the lease can also be broken by the same accepted configuration applied at construction - the relation does not depend on the reload, only the first election is then delayed by the same long heartbeat timeout"
+      ]
+    },
+    {
+      "id": "b-timeout-now-transfer",
+      "primary_activity": "A2",
+      "execution_owner": "the leader's main goroutine starts and monitors the transfer through leadershipTransferCh; the target's main goroutine executes timeoutNow",
+      "protocol_context": "leadership transfer through TimeoutNow",
+      "trigger": "LeadershipTransfer/LeadershipTransferToServer is accepted while no transfer is in progress",
+      "legal_preconditions": [
+        "the target replication nextIndex has caught up past the leader's last index"
+      ],
+      "implementation_guards": [
+        "new client work is rejected with ErrLeadershipTransferInProgress during the transfer",
+        "the target election uses candidateFromLeadershipTransfer so it skips pre-vote and neighbours vote despite a known leader"
+      ],
+      "reads": [
+        "leaderState.replState nextIndex",
+        "getLastIndex"
+      ],
+      "writes": [
+        "raftState.state = Candidate on the target",
+        "candidateFromLeadershipTransfer on the target",
+        "clears the known leader through setState"
+      ],
+      "durable_effects": [],
+      "external_effects": [],
+      "important_branches": [
+        "the transfer is reported unsuccessful after ElectionTimeout"
+      ],
+      "async_boundaries": [],
+      "produces_fact_ids": [],
+      "consumes_fact_ids": [
+        "f-term-adopted"
+      ],
+      "cross_activity_effects": {},
+      "existing_protections": [],
+      "source_ids": [
+        "s-raft-leadership-transfer",
+        "s-raft-timeout-now"
+      ],
+      "unknowns": []
+    },
+    {
+      "id": "b-install-snapshot",
+      "primary_activity": "A3",
+      "execution_owner": "the receiving node's raft main goroutine (installSnapshot)",
+      "protocol_context": "InstallSnapshot RPC from a leader that cannot replay the log",
+      "trigger": "an inbound InstallSnapshotRequest with a term not older than the adopted term",
+      "legal_preconditions": [
+        "the snapshot version is supported"
+      ],
+      "implementation_guards": [
+        "a short read or sink error cancels the snapshot and fails the RPC",
+        "the received byte count must equal the declared size"
+      ],
+      "reads": [
+        "InstallSnapshotRequest version/index/term/configuration",
+        "snapshot stream from the RPC reader"
+      ],
+      "writes": [
+        "SnapshotStore sink",
+        "raftState.lastApplied/lastSnapshot",
+        "configurations.latest/committed",
+        "log truncation through compactLogs or removeOldLogs"
+      ],
+      "durable_effects": [],
+      "external_effects": [],
+      "important_branches": [
+        "the snapshot data is always drained from the stream before responding"
+      ],
+      "async_boundaries": [],
+      "produces_fact_ids": [
+        "f-follower-log-state"
+      ],
+      "consumes_fact_ids": [
+        "f-term-adopted"
+      ],
+      "cross_activity_effects": {},
+      "existing_protections": [],
+      "source_ids": [
+        "s-raft-install-snapshot",
+        "s-raft-append-term"
+      ],
+      "unknowns": []
+    },
+    {
+      "id": "b-send-snapshot",
+      "primary_activity": "A3",
+      "execution_owner": "the leader's per-follower replication goroutine (replicateTo, SEND_SNAP)",
+      "protocol_context": "snapshot replication to a lagging follower",
+      "trigger": "setPreviousLog cannot find the entry at nextIndex-1",
+      "legal_preconditions": [],
+      "implementation_guards": [
+        "installSnapshot responses with a greater term stop replication and ask the leader to step down"
+      ],
+      "reads": [
+        "snapshot store listing and metadata"
+      ],
+      "writes": [
+        "followerReplication.nextIndex",
+        "commitment.matchIndexes for that peer after a successful install"
+      ],
+      "durable_effects": [],
+      "external_effects": [],
+      "important_branches": [],
+      "async_boundaries": [],
+      "produces_fact_ids": [],
+      "consumes_fact_ids": [],
+      "cross_activity_effects": {},
+      "existing_protections": [],
+      "source_ids": [
+        "s-replication-replicateTo",
+        "s-snapshot-take"
+      ],
+      "unknowns": []
+    },
+    {
+      "id": "b-config-change",
+      "primary_activity": "A4",
+      "execution_owner": "the leader's raft main goroutine (configurationChangeChIfStable, then appendConfigurationEntry) using nextConfiguration/checkConfiguration",
+      "protocol_context": "membership change with at most one uncommitted configuration entry",
+      "trigger": "a configuration change future is accepted while the latest configuration is committed and the leader has committed an entry of its own term",
+      "legal_preconditions": [
+        "the latest configuration is committed",
+        "getCommitIndex() >= commitment.startIndex"
+      ],
+      "implementation_guards": [
+        "prevIndex mismatch is rejected when a different configuration has been added in the meantime",
+        "checkConfiguration rejects duplicate IDs/addresses, empty IDs/addresses and a configuration with no voter"
+      ],
+      "reads": [
+        "configurations.latest/latestIndex/committedIndex",
+        "configurationChangeRequest"
+      ],
+      "writes": [
+        "LogConfiguration or LogRemovePeerDeprecated log entry",
+        "configurations.latest/latestIndex",
+        "commitment configuration",
+        "starts or stops per-peer replication"
+      ],
+      "durable_effects": [],
+      "external_effects": [],
+      "important_branches": [
+        "protocol versions below 2 translate the change into a legacy remove-peer message carrying the whole configuration"
+      ],
+      "async_boundaries": [],
+      "produces_fact_ids": [
+        "f-latest-configuration"
+      ],
+      "consumes_fact_ids": [],
+      "cross_activity_effects": {
+        "A1": "quorumSize() and commitment are recomputed from the new voter set, so the qualified support base changes with the configuration",
+        "A2": "the committed configuration decides whether the local server may keep leading or must step down"
+      },
+      "existing_protections": [],
+      "source_ids": [
+        "s-raft-append-config",
+        "s-config-next",
+        "s-raft-leader-commit-consume"
+      ],
+      "unknowns": []
+    },
+    {
+      "id": "b-fsm-apply",
+      "primary_activity": "A5",
+      "execution_owner": "the fsm goroutine (runFSM) fed by fsmMutateCh from processLogs",
+      "protocol_context": "application of committed entries to the client FSM",
+      "trigger": "a batch of commitTuple values delivered after a commit index advance",
+      "legal_preconditions": [],
+      "implementation_guards": [
+        "a LogConfiguration entry is only applied when the FSM implements ConfigurationStore",
+        "barriers and no-ops are not sent to the FSM"
+      ],
+      "reads": [
+        "commitTuple batches produced by processLogs"
+      ],
+      "writes": [
+        "the FSM state owned by the caller",
+        "lastIndex/lastTerm tracked by runFSM for snapshot requests"
+      ],
+      "durable_effects": [],
+      "external_effects": [],
+      "important_branches": [
+        "BatchingFSM.ApplyBatch is used when the FSM implements it, and the response count must match"
+      ],
+      "async_boundaries": [
+        "application is asynchronous with respect to commitIndex, so AppliedIndex can lag CommitIndex"
+      ],
+      "produces_fact_ids": [],
+      "consumes_fact_ids": [
+        "f-commit-index"
+      ],
+      "cross_activity_effects": {},
+      "existing_protections": [],
+      "source_ids": [
+        "s-fsm-run",
+        "s-raft-process-logs"
+      ],
+      "unknowns": []
+    },
+    {
+      "id": "b-newraft-recovery",
+      "primary_activity": "A6",
+      "execution_owner": "NewRaft during construction, before any raft goroutine is started",
+      "protocol_context": "process start with existing state",
+      "trigger": "a Raft instance is created over stores that already hold state",
+      "legal_preconditions": [],
+      "implementation_guards": [
+        "no snapshot is restored when NoSnapshotRestoreOnStart is set",
+        "an error from the log scan fails construction"
+      ],
+      "reads": [
+        "StableStore CurrentTerm",
+        "LogStore entries",
+        "SnapshotStore listing"
+      ],
+      "writes": [
+        "raftState.currentTerm/lastLog/lastSnapshot/lastApplied",
+        "configurations.latest/committed rebuilt from the configuration entries in the log"
+      ],
+      "durable_effects": [],
+      "external_effects": [],
+      "important_branches": [
+        "each replayed configuration entry first records the previous latest configuration as committed"
+      ],
+      "async_boundaries": [],
+      "produces_fact_ids": [
+        "f-term-adopted"
+      ],
+      "consumes_fact_ids": [],
+      "cross_activity_effects": {},
+      "existing_protections": [],
+      "source_ids": [
+        "s-api-newraft-config",
+        "s-snapshot-take"
+      ],
+      "unknowns": []
+    },
+    {
+      "id": "b-client-apply-verify",
+      "primary_activity": "A7",
+      "execution_owner": "client goroutines calling Apply/Barrier/VerifyLeader; the leader main goroutine serves applyCh/verifyCh",
+      "protocol_context": "client-facing contract of acting as leader",
+      "trigger": "a client call on a node that may or may not be leader",
+      "legal_preconditions": [],
+      "implementation_guards": [
+        "a follower or candidate answers ErrNotLeader on applyCh/verifyCh/configurationChangeCh",
+        "VerifyLeader steps down when a quorum does not answer"
+      ],
+      "reads": [
+        "raftState state/commitIndex",
+        "leader identity"
+      ],
+      "writes": [
+        "responses on the futures"
+      ],
+      "durable_effects": [],
+      "external_effects": [],
+      "important_branches": [
+        "a single-voter cluster answers VerifyLeader immediately",
+        "when Shutdown has already closed the shutdown channel the select can still enqueue the request on a buffered request channel instead of returning ErrRaftShutdown"
+      ],
+      "async_boundaries": [
+        "the future completes only when a raft handler writes its channel; after Shutdown has joined the run, fsm and snapshot goroutines no handler remains, and these futures never set deferError.ShutdownCh"
+      ],
+      "produces_fact_ids": [],
+      "consumes_fact_ids": [
+        "f-commit-index",
+        "f-known-leader",
+        "f-latest-configuration",
+        "f-leadership-held"
+      ],
+      "cross_activity_effects": {},
+      "existing_protections": [
+        "when the select chooses the shutdown case the call returns ErrRaftShutdown, and with the default unbuffered applyCh the send case can never be ready, so Barrier and Apply complete on every call"
+      ],
+      "source_ids": [
+        "s-api-leaderwithid",
+        "s-raft-leader-commit-consume",
+        "s-api-verify-leader",
+        "s-api-apply-select",
+        "s-api-barrier-select",
+        "s-api-err-shutdown",
+        "s-api-verify-ch-buffer",
+        "s-api-apply-buffer",
+        "s-future-defer-error",
+        "s-future-shutdown-future",
+        "s-state-wait-shutdown",
+        "s-raft-verify-mainloop"
+      ],
+      "unknowns": [
+        "which repair is intended for the accepted requests that a completed Shutdown leaves unresolved: draining the buffered channels, giving these futures a shutdown escape, or never offering the send case once shutdown is signalled"
+      ]
+    },
+    {
+      "id": "b-heartbeat-liveness",
+      "primary_activity": "A2",
+      "execution_owner": "the leader's per-peer heartbeat goroutine (Raft.heartbeat), started by replicate",
+      "protocol_context": "periodic heartbeat-shaped AppendEntries on a peer connection, asynchronous of the replication loop so the follower's disk IO cannot block it",
+      "trigger": "the heartbeat interval elapses, a verify request notifies the peer, or the leader is notified that the configuration changed",
+      "legal_preconditions": [],
+      "implementation_guards": [
+        "the request term is fixed at leader start and the response term is not compared here",
+        "a transport error applies a capped exponential backoff derived from HeartbeatTimeout"
+      ],
+      "reads": [
+        "followerReplication.currentTerm and peer",
+        "AppendEntriesResponse.Success"
+      ],
+      "writes": [
+        "followerReplication.lastContact",
+        "answers pending verify futures through notifyAll"
+      ],
+      "durable_effects": [],
+      "external_effects": [],
+      "important_branches": [
+        "a response with Success false answers pending verify futures negatively, which steps the leader down",
+        "contact is refreshed for any non-error response, including one whose term is greater, because this entry point measures reachability rather than term currency"
+      ],
+      "async_boundaries": [],
+      "produces_fact_ids": [],
+      "consumes_fact_ids": [],
+      "cross_activity_effects": {},
+      "existing_protections": [
+        "term discovery is left to the replication path, which calls handleStaleTerm when a response term exceeds the request term, and to checkLeaderLease, which steps the leader down when it cannot contact a quorum of voters",
+        "a heartbeat response that reports failure makes a pending VerifyLeader fail, so a deposed leader is stepped down when a client verifies authority"
+      ],
+      "source_ids": [
+        "s-replication-heartbeat",
+        "s-replication-stale-term",
+        "s-raft-leader-lease",
+        "s-raft-leader-commit-consume"
+      ],
+      "unknowns": []
+    }
+  ],
+  "facts": [
+    {
+      "id": "f-term-adopted",
+      "meaning": "The node has adopted election term T as its durable current term, and every subsequent vote grant, append-entries acceptance, pre-vote answer and leadership decision is evaluated against T. A vote is only re-granted for the same (T, candidate), and RPCs with a term below T are ignored.",
+      "identity": {
+        "node": "local Raft instance",
+        "term": "T"
+      },
+      "established_by": [
+        "b-elect-self",
+        "b-term-observation",
+        "b-heartbeat-fastpath",
+        "b-newraft-recovery"
+      ],
+      "consumed_by": [
+        "b-follower-append-entries",
+        "b-follower-commit-advance",
+        "b-vote-grant",
+        "b-pre-vote-grant",
+        "b-term-observation",
+        "b-heartbeat-fastpath",
+        "b-leader-lease-stepdown",
+        "b-timeout-now-transfer",
+        "b-install-snapshot"
+      ],
+      "validity_context": "Holds from the moment T is persisted until a strictly greater term is adopted. The library's design assumes the adopted value never decreases.",
+      "representation": [
+        "raftState.currentTerm, an atomic uint64",
+        "StableStore key \"CurrentTerm\" through SetUint64"
+      ],
+      "invalidators": [],
+      "reinterpreters": [],
+      "durability": "setCurrentTerm writes StableStore first and panics if that fails, then updates the in-memory atomic",
+      "recovery": "NewRaft reloads the term from StableStore before any goroutine starts",
+      "source_ids": [
+        "s-raft-append-term",
+        "s-raft-set-current-term",
+        "s-state-term-atomic",
+        "s-api-newraft-config",
+        "s-raft-vote-record",
+        "s-raft-request-vote-filter"
+      ],
+      "unknowns": []
+    },
+    {
+      "id": "f-known-leader",
+      "meaning": "The node's stored leader identity is (leaderAddr, leaderID), being the leader that last contacted it in the adopted term; the identity is used to reject vote and pre-vote requests while another leader is known and is reported to clients through Leader/LeaderWithID and Stats.",
+      "identity": {
+        "node": "local Raft instance",
+        "leader_id": "L"
+      },
+      "established_by": [
+        "b-leader-identity",
+        "b-heartbeat-fastpath"
+      ],
+      "consumed_by": [
+        "b-vote-grant",
+        "b-pre-vote-grant",
+        "b-client-apply-verify"
+      ],
+      "validity_context": "Cleared by every state transition, because setState clears the leader before changing state, and replaced by each accepted AppendEntries or InstallSnapshot.",
+      "representation": [
+        "raftState.leaderAddr and leaderID under leaderLock"
+      ],
+      "invalidators": [],
+      "reinterpreters": [],
+      "durability": "in-memory only; not persisted across restarts",
+      "recovery": "relearned from the next accepted AppendEntries or InstallSnapshot",
+      "source_ids": [
+        "s-raft-append-leader",
+        "s-raft-set-state",
+        "s-api-leaderwithid"
+      ],
+      "unknowns": []
+    },
+    {
+      "id": "f-follower-log-state",
+      "meaning": "The node's durable log agrees with the leader's log through index I at term T, with any conflicting local suffix already removed.",
+      "identity": {
+        "node": "local Raft instance",
+        "index": "I",
+        "term": "T"
+      },
+      "established_by": [
+        "b-follower-append-entries",
+        "b-install-snapshot"
+      ],
+      "consumed_by": [
+        "b-replication-ack"
+      ],
+      "validity_context": "Established only after StoreLogs/DeleteRange completed on the main goroutine, or after a snapshot install placed the state at I; superseded when a later term rewrites the suffix.",
+      "representation": [
+        "LogStore entries",
+        "raftState.lastLog and lastSnapshot"
+      ],
+      "invalidators": [],
+      "reinterpreters": [],
+      "durability": "written to the caller-supplied LogStore",
+      "recovery": "rebuilt by InstallSnapshot or by the NewRaft log scan",
+      "source_ids": [
+        "s-raft-append-entries-log",
+        "s-raft-install-snapshot",
+        "s-api-newraft-config"
+      ],
+      "unknowns": []
+    },
+    {
+      "id": "f-follower-match",
+      "meaning": "The leader's commitment table records that voter V stores the leader's log through index I, which is the support the leader may count toward a commit decision.",
+      "identity": {
+        "leader": "local Raft instance",
+        "voter": "V",
+        "index": "I"
+      },
+      "established_by": [
+        "b-replication-ack"
+      ],
+      "consumed_by": [
+        "b-commit-advance"
+      ],
+      "validity_context": "Usable for commitment only while V is a Voter in configurations.latest; a new configuration rebuilds the table from the old values.",
+      "representation": [
+        "commitment.matchIndexes"
+      ],
+      "invalidators": [],
+      "reinterpreters": [],
+      "durability": "in-memory and per leader term; a new commitment is created on each leadership acquisition",
+      "recovery": "not recovered; re-derived from the next successful AppendEntries or InstallSnapshot responses",
+      "source_ids": [
+        "s-commitment-core",
+        "s-commitment-recalc",
+        "s-replication-ack"
+      ],
+      "unknowns": []
+    },
+    {
+      "id": "f-vote-record",
+      "meaning": "The node has durably recorded the vote (T, C) for election term T; a duplicate request for the same (T, C) is re-granted from this record, and a request for a different candidate in T is refused.",
+      "identity": {
+        "node": "local Raft instance",
+        "term": "T",
+        "candidate": "C"
+      },
+      "established_by": [
+        "b-elect-self",
+        "b-vote-grant"
+      ],
+      "consumed_by": [
+        "b-vote-grant"
+      ],
+      "validity_context": "Holds for the adopted term T; adopting a greater term makes the record unusable for new grants because the duplicate check only matches the request term.",
+      "representation": [
+        "StableStore key \"LastVoteTerm\" through SetUint64",
+        "StableStore key \"LastVoteCand\""
+      ],
+      "invalidators": [],
+      "reinterpreters": [],
+      "durability": "persisted through StableStore before the vote is granted; a persistence error leaves the vote ungranted",
+      "recovery": "read back on each RequestVote; not rebuilt from any other state",
+      "source_ids": [
+        "s-raft-vote-record",
+        "s-raft-set-current-term",
+        "s-raft-elect-self"
+      ],
+      "unknowns": []
+    },
+    {
+      "id": "f-latest-configuration",
+      "meaning": "The node's latest configuration is the set of servers and suffrages in effect for it, together with the log index at which that configuration was established: the leader writes it when it appends a configuration entry, and followers adopt it from the log or from an installed snapshot.",
+      "identity": {
+        "node": "local Raft instance",
+        "configuration_index": "N"
+      },
+      "established_by": [
+        "b-follower-append-entries",
+        "b-config-change"
+      ],
+      "consumed_by": [
+        "b-commit-advance",
+        "b-client-apply-verify"
+      ],
+      "validity_context": "Holds from the moment the configuration is established until a later configuration entry replaces it; its index identifies where it was written and is the same index a snapshot records with the configuration.",
+      "representation": [
+        "configurations.latest and latestIndex on the main goroutine",
+        "a copy in Raft.latestConfiguration for readers outside the main loop",
+        "SnapshotMeta.ConfigurationIndex inside snapshots"
+      ],
+      "invalidators": [],
+      "reinterpreters": [],
+      "durability": "carried in the log entry or snapshot that established it",
+      "recovery": "rebuilt by NewRaft from the snapshot and the log scan, and by installSnapshot from the leader's snapshot",
+      "source_ids": [
+        "s-raft-append-config",
+        "s-config-next",
+        "s-api-newraft-config",
+        "s-snapshot-take"
+      ],
+      "unknowns": []
+    },
+    {
+      "id": "f-commit-index",
+      "meaning": "The node's commit index is I: an entry at I has been stored by a quorum of the current voting configuration and may be applied to the FSM.",
+      "identity": {
+        "node": "local Raft instance",
+        "index": "I"
+      },
+      "established_by": [
+        "b-follower-commit-advance",
+        "b-commit-advance"
+      ],
+      "consumed_by": [
+        "b-fsm-apply",
+        "b-client-apply-verify"
+      ],
+      "validity_context": "On a leader, indices before commitment.startIndex cannot be advanced by match indexes alone, so at least one entry of the leader's own term must be replicated first; on a follower the value is min(LeaderCommitIndex, lastIndex).",
+      "representation": [
+        "raftState.commitIndex, an atomic uint64",
+        "configurations.committedIndex when the committed entry is a configuration"
+      ],
+      "invalidators": [],
+      "reinterpreters": [],
+      "durability": "in-memory only; the FSM state may be persisted by the caller",
+      "recovery": "not recovered across restarts; re-committed by the next leader",
+      "source_ids": [
+        "s-commitment-recalc",
+        "s-raft-append-commit",
+        "s-raft-leader-commit-consume"
+      ],
+      "unknowns": []
+    },
+    {
+      "id": "f-leadership-held",
+      "meaning": "The node holds the leadership of term T: it counted a quorum of grants for T, recorded itself as the known leader and has not left the leadership since.",
+      "identity": {
+        "node": "local Raft instance",
+        "term": "T"
+      },
+      "established_by": [
+        "b-elect-self"
+      ],
+      "consumed_by": [
+        "b-client-apply-verify"
+      ],
+      "validity_context": "Holds from the transition to Leader until the node leaves the leadership, whether by receiving traffic from another leader, by its own lease check, or by adopting a higher term; leaving the leadership does not change the term itself.",
+      "representation": [
+        "raftState.state",
+        "raftState.leaderAddr and leaderID set to the local server"
+      ],
+      "invalidators": [
+        "b-leader-lease-stepdown",
+        "b-term-observation"
+      ],
+      "reinterpreters": [],
+      "durability": "in-memory only",
+      "recovery": "re-established only by a new election",
+      "source_ids": [
+        "s-raft-candidate-vote",
+        "s-raft-leader-lease",
+        "s-raft-set-state"
+      ],
+      "unknowns": []
+    }
+  ],
+  "surfaces": [
+    {
+      "entry_point": "Transport.SetHeartbeatHandler (any caller or third-party transport)",
+      "disposition": "deferred",
+      "behavior_ids": [],
+      "reason": "The interface lets a transport run the registered callback on its own goroutine; this module implements the fast path only in NetworkTransport and InmemTransport ignores the call, so the concurrency contract of other transports is unread.",
+      "source_ids": [
+        "s-transport-interface",
+        "s-net-set-heartbeat"
+      ],
+      "high_consequence": true
+    },
+    {
+      "entry_point": "NetworkTransport.handleCommand heartbeat classification",
+      "disposition": "mapped",
+      "behavior_ids": [
+        "b-heartbeat-fastpath"
+      ],
+      "reason": "The shape test on the decoded AppendEntriesRequest decides whether the RPC bypasses the main consumer channel, which is the entry point of the selected Candidate.",
+      "source_ids": [
+        "s-net-fastpath",
+        "s-net-handle-conn"
+      ],
+      "high_consequence": true
+    },
+    {
+      "entry_point": "LogStore.MonotonicLogStore and snapshot compaction interplay",
+      "disposition": "deferred",
+      "behavior_ids": [],
+      "reason": "removeOldLogs and compactLogsWithTrailing were read only at the call sites used by the snapshot behaviors; the effect of a non-monotonic store on history reconstruction is not mapped here.",
+      "source_ids": [
+        "s-snapshot-take",
+        "s-raft-install-snapshot"
+      ],
+      "high_consequence": false
+    },
+    {
+      "entry_point": "nested modules fuzzy/ and raft-compat/",
+      "disposition": "deferred",
+      "behavior_ids": [],
+      "reason": "These are separate Go modules with their own go.mod files and are outside the single module selected for execution.",
+      "source_ids": [
+        "s-raft-run-loop"
+      ],
+      "high_consequence": false
+    },
+    {
+      "entry_point": "Raft.GetConfiguration / ConfigurationFuture.Index (client-visible configuration index)",
+      "disposition": "mapped",
+      "behavior_ids": [
+        "b-client-apply-verify"
+      ],
+      "reason": "Selected and answered in scope: the obligation c-reported-configuration-index fixed the index the accessor reports against the log index at which the configuration it returns was established, and a served check observed a reported index of zero while the configuration had been established at index 1 with the returned configuration still current. The entry stays mapped to the client contract behavior that reports it.",
+      "source_ids": [
+        "s-api-get-configuration",
+        "s-api-stats-config-index",
+        "s-api-newraft-config"
+      ],
+      "high_consequence": false
+    },
+    {
+      "entry_point": "Raft.installSnapshot on the follower (commit context)",
+      "disposition": "mapped",
+      "behavior_ids": [
+        "b-install-snapshot",
+        "b-client-apply-verify"
+      ],
+      "reason": "Selected and answered in scope: obligation c-snapshot-install-commit-context fixed that a node installing a snapshot carrying state the source had committed and applied through index J must publish a commit context at least J, and a served check observed a node that had installed such a snapshot (index 43) publishing commit_index 0 while applied_index and last_index were 43 and Stats published the same pair. The entry stays mapped to the behaviour that installs the snapshot and to the client contract that reports the value; the repair location remains open between advancing the commit index in installSnapshot and deriving it from the last snapshot index.",
+      "source_ids": [
+        "s-raft-install-snapshot-decl",
+        "s-raft-install-snapshot",
+        "s-api-commit-index",
+        "s-snapshot-take",
+        "s-raft-append-commit"
+      ],
+      "high_consequence": false
+    },
+    {
+      "entry_point": "NewRaft startup restoreSnapshot (commit context)",
+      "disposition": "mapped",
+      "behavior_ids": [
+        "b-newraft-recovery",
+        "b-client-apply-verify"
+      ],
+      "reason": "Selected and answered in scope: obligation c-snapshot-restore-commit-context fixed that a node reconstructing its state at startup from a stored snapshot at index J must publish a commit context at least J, and a served check observed a node that had itself reported index 43 as committed, applied and last before the restart publishing commit_index 0 after the restart while applied_index and last_index were 43 and the node reported last_snapshot_index 43. The entry stays mapped to the construction-time recovery behaviour and to the client contract that reports the value.",
+      "source_ids": [
+        "s-api-restore-snapshot",
+        "s-api-commit-index",
+        "s-api-newraft-config",
+        "s-snapshot-take"
+      ],
+      "high_consequence": false
+    },
+    {
+      "entry_point": "Raft.VerifyLeader quorum accounting (leader confirmation)",
+      "disposition": "mapped",
+      "behavior_ids": [
+        "b-client-apply-verify",
+        "b-heartbeat-liveness"
+      ],
+      "reason": "Selected and answered in scope: obligation c-verify-leader-voter-quorum fixed that the confirmation may rest only on acknowledgements from voters, and a served check observed a leader of a two-voter configuration with one non-voter reporting success from its own vote plus the non-voter's heartbeat while the other voter was unreachable. The entry stays mapped to the client contract that returns the future and to the heartbeat behaviour that delivers the counted acknowledgements; the repair location remains open between filtering votes by suffrage and excluding non-voter replication states from verification.",
+      "source_ids": [
+        "s-api-verify-leader",
+        "s-replication-heartbeat",
+        "s-raft-candidate-vote",
+        "s-raft-leader-lease"
+      ],
+      "high_consequence": true
+    }
+  ],
+  "core_overview": {
+    "formation": {
+      "explanation": "Qualified support is gathered before a decision is formed. A candidate counts granted votes (or pre-vote grants) and only becomes leader when the count reaches quorumSize(); the leader then records each voter's acknowledged match index through commitment.match, and commitment.recalculate advances commitIndex only when the majority match index is at least commitment.startIndex, the first index created in the leader's own term, so entries of earlier terms are never committed on match indexes alone. Followers advance their own commit index only from the leader's LeaderCommitIndex bounded by their own last index.",
+      "behavior_ids": [
+        "b-elect-self",
+        "b-vote-grant",
+        "b-replication-ack",
+        "b-commit-advance",
+        "b-follower-commit-advance",
+        "b-follower-append-entries"
+      ],
+      "fact_ids": [
+        "f-follower-log-state",
+        "f-follower-match",
+        "f-commit-index"
+      ],
+      "source_ids": [
+        "s-raft-candidate-vote",
+        "s-raft-candidate-prevote",
+        "s-raft-vote-record",
+        "s-commitment-core",
+        "s-commitment-recalc",
+        "s-replication-ack",
+        "s-raft-append-commit",
+        "s-raft-append-entries-log"
+      ]
+    },
+    "context": {
+      "explanation": "The context that qualifies support and authority is the adopted term plus the known leader identity. Inbound AppendEntries/RequestVote/InstallSnapshot ignore older terms and adopt a strictly greater one by writing StableStore and dropping to Follower; accepted AppendEntries/InstallSnapshot then record the leader identity, which requestVote/requestPreVote use to refuse support while a different leader is known. A leader loses authority locally through checkLeaderLease when it cannot contact a quorum of voters within LeaderLeaseTimeout, and gains it at the target through TimeoutNow, which puts the target into Candidate with candidateFromLeadershipTransfer. The same term/leader update is additionally reachable from a NetworkTransport connection goroutine through the registered heartbeat callback.",
+      "behavior_ids": [
+        "b-term-observation",
+        "b-leader-identity",
+        "b-heartbeat-fastpath",
+        "b-leader-lease-stepdown",
+        "b-timeout-now-transfer"
+      ],
+      "fact_ids": [
+        "f-term-adopted",
+        "f-known-leader"
+      ],
+      "source_ids": [
+        "s-raft-append-term",
+        "s-raft-append-leader",
+        "s-raft-set-state",
+        "s-raft-set-current-term",
+        "s-raft-process-heartbeat",
+        "s-net-fastpath",
+        "s-net-handle-conn",
+        "s-api-fastpath-contract",
+        "s-raft-leader-lease",
+        "s-raft-timeout-now",
+        "s-raft-request-vote-filter"
+      ]
+    },
+    "connection": {
+      "explanation": "The two lines meet at the term and at the own-term replication rule. A durable vote record is only re-granted for the same (term, candidate) and is otherwise superseded once a greater term is adopted, so support gathered in term T cannot be consumed in term T+1; conversely an RPC whose term is older than the adopted term is ignored, so a deposed leader cannot re-establish authority. On the leader side, a follower's match index only becomes usable support after the leader has matched a quorum at or beyond commitment.startIndex, so pending work from an earlier term constrains what the new leader may commit; and leadership transfer explicitly requires the target's nextIndex to be past the leader's lastIndex before TimeoutNow, so an up-to-date support context is a precondition for moving authority. Because both lines read and write the same current-term context, an entry point that updates that context outside the main goroutine (the transport heartbeat callback) is the point where the connection is not obviously serialized.",
+      "behavior_ids": [
+        "b-commit-advance",
+        "b-term-observation",
+        "b-follower-append-entries",
+        "b-timeout-now-transfer",
+        "b-replication-ack"
+      ],
+      "fact_ids": [
+        "f-term-adopted",
+        "f-commit-index",
+        "f-follower-match"
+      ],
+      "source_ids": [
+        "s-commitment-core",
+        "s-commitment-recalc",
+        "s-raft-append-term",
+        "s-raft-set-current-term",
+        "s-raft-append-entries-log",
+        "s-raft-append-config",
+        "s-raft-leadership-transfer",
+        "s-raft-timeout-now",
+        "s-replication-ack",
+        "s-replication-replicateTo",
+        "s-raft-dispatch-logs"
+      ]
+    },
+    "open_details": [
+      "The pre-vote grant path was read at the level needed for the context path; its interaction with a concurrently observed leader was not traced to completion.",
+      "Snapshot-driven log truncation was read at its call sites; the interaction with a MonotonicLogStore implementation is recorded as a deferred surface.",
+      "The verification path is no longer unread for the quorum question: obligation c-verify-leader-voter-quorum was confirmed with a served check, and the remaining questions there are the repair location and whether any consumer outside the module relies on the confirmation."
+    ],
+    "core_gaps": [],
+    "status": "usable",
+    "rationale": "Both core relationships and their connection are explained from actual code: formation and advancement are grounded in the vote tally, the pre-vote round, commitment.match/recalculate and the startIndex own-term rule; context and authority are grounded in the term/state update, leader identity update, the leader lease step-down and TimeoutNow. The connection is sourced: votes are only re-granted for the same term, older-term RPCs are ignored, match indexes are only usable at or after startIndex, and a transfer requires the target to be caught up. Three mechanisms that earlier versions of this map left as unknowns are now recorded where they belong: the transport heartbeat callback performs its term, state and leader writes without being serialized with the main goroutine and publishes the term through a plain atomic store; a client future for VerifyLeader or a batched Apply carries no shutdown escape once a completed Shutdown has left the buffered request channels unprocessed; and the candidate's self-vote is written for the proposed term without comparing it with the vote record, so a published term that has dropped by one makes the next election propose a term that already holds a vote and overwrite it while the transfer exemption keeps the campaign from being filtered. The third links to the first: the overwritten record is the only barrier the vote path's exemption leaves, and with the dual leadership in place the commit line inherits the consequence - a leader can count a voter's position for a command that voter never stored, because the follower's acknowledgement compares terms and not contents - and the overlap did not persist in the prefix that observed it: the second leader stepped down inside the window, which the review attributed by exclusion to the leader's own lease check, so the lease question that raised has since been answered: with the peers reachable and in the leader's own term, an accepted configuration, including one applied through the reload API, can make the lease end a leadership that a quorum could still contact, which is recorded as a bounded-liveness obligation of its own. The counter-parts that bound each mechanism are recorded beside them (the fast path cannot append logs or advance the commit index; the default unbuffered applyCh always completes and the leader lease and the replication path cover term discovery; the vote-granting path still refuses a second different vote in one term and a leader refuses a transfer request whose vote it already recorded), so no core gap is claimed and the overview stays usable."
+  }
+}

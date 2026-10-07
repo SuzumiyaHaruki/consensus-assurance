@@ -1,0 +1,112 @@
+{
+  "description": "Discriminator: a heartbeat-shaped AppendEntries is executed by Raft.processHeartbeat (the callback NewRaft registers through Transport.SetHeartbeatHandler) on a NetworkTransport connection goroutine while the same node's main goroutine handles a second, higher-term AppendEntries on a separate connection. Prefix: the node is bootstrapped, idle and a follower; the callback first reads the current term, then its CurrentTerm write is held inside the injected StableStore (a plain latency injection) at a point after it decided to adopt term 5; while it is held, the main goroutine adopts and reports term 6; then the held write completes. Observation: the term context in effect afterwards, read both from Raft.CurrentTerm and from the durable CurrentTerm value, compared with the term the node itself reported adopting in its response to the higher-term request. Control: the second request is not heartbeat-shaped (LeaderCommitIndex is non-zero) so it must take the main-loop path, and the callback only ever receives a heartbeat-shaped request.",
+  "claim_id": "c-adopted-term-never-regresses",
+  "binding_ids": [
+    "bind-raft-process-heartbeat"
+  ],
+  "harness": {
+    "execution_package": ".",
+    "files": {},
+    "kind": "go_test",
+    "source": "// Copyright (c) HashiCorp, Inc.\n// SPDX-License-Identifier: MPL-2.0\n//\n// Generated assurance harness. It drives one heartbeat-shaped AppendEntries\n// through Raft.processHeartbeat, the callback NewRaft registers through\n// Transport.SetHeartbeatHandler, while the node's main goroutine handles a\n// second, higher-term AppendEntries on a separate connection.\n\npackage raft\n\nimport (\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"io\"\n\t\"net\"\n\t\"sync\"\n\t\"sync/atomic\"\n\t\"testing\"\n\t\"time\"\n)\n\n// assuranceEvent writes one CA_EVENT record for the trusted runner.\nfunc assuranceEvent(v map[string]interface{}) {\n\tpayload, err := json.Marshal(v)\n\tif err != nil {\n\t\tfmt.Println(\"assurance: event marshal failed:\", err)\n\t\treturn\n\t}\n\tfmt.Println(\"CA_EVENT \" + string(payload))\n}\n\n// assurancePipeAddr names one simulated stream endpoint.\ntype assurancePipeAddr struct{ name string }\n\nfunc (a assurancePipeAddr) Network() string { return \"pipe\" }\nfunc (a assurancePipeAddr) String() string  { return a.name }\n\n// assurancePipeNet is a socket-free fabric of net.Pipe endpoint pairs. It only\n// substitutes StreamLayer; NetworkTransport itself is the real implementation.\ntype assurancePipeNet struct {\n\tmu     sync.Mutex\n\tlayers map[string]*assurancePipeLayer\n}\n\nfunc newAssurancePipeNet() *assurancePipeNet {\n\treturn &assurancePipeNet{layers: make(map[string]*assurancePipeLayer)}\n}\n\nfunc (n *assurancePipeNet) newLayer(name string) *assurancePipeLayer {\n\tl := &assurancePipeLayer{net: n, name: name, conns: make(chan net.Conn), closed: make(chan struct{})}\n\tn.mu.Lock()\n\tn.layers[name] = l\n\tn.mu.Unlock()\n\treturn l\n}\n\nfunc (n *assurancePipeNet) dial(to string, timeout time.Duration) (net.Conn, error) {\n\tn.mu.Lock()\n\tl := n.layers[to]\n\tn.mu.Unlock()\n\tif l == nil {\n\t\treturn nil, fmt.Errorf(\"no such pipe endpoint %q\", to)\n\t}\n\tlocal, remote := net.Pipe()\n\tselect {\n\tcase l.conns <- local:\n\t\treturn remote, nil\n\tcase <-l.closed:\n\t\tlocal.Close()\n\t\tremote.Close()\n\t\treturn nil, fmt.Errorf(\"pipe endpoint %q closed\", to)\n\tcase <-time.After(timeout):\n\t\tlocal.Close()\n\t\tremote.Close()\n\t\treturn nil, fmt.Errorf(\"pipe dial to %q timed out\", to)\n\t}\n}\n\n// assurancePipeLayer implements StreamLayer over assurancePipeNet.\ntype assurancePipeLayer struct {\n\tnet      *assurancePipeNet\n\tname     string\n\tconns    chan net.Conn\n\tclosed   chan struct{}\n\tcloseOne sync.Once\n}\n\nfunc (l *assurancePipeLayer) Accept() (net.Conn, error) {\n\tselect {\n\tcase c := <-l.conns:\n\t\treturn c, nil\n\tcase <-l.closed:\n\t\treturn nil, fmt.Errorf(\"pipe listener %q closed\", l.name)\n\t}\n}\n\nfunc (l *assurancePipeLayer) Close() error {\n\tl.closeOne.Do(func() {\n\t\tclose(l.closed)\n\t\tl.net.mu.Lock()\n\t\tdelete(l.net.layers, l.name)\n\t\tl.net.mu.Unlock()\n\t})\n\treturn nil\n}\n\nfunc (l *assurancePipeLayer) Addr() net.Addr { return assurancePipeAddr{l.name} }\n\nfunc (l *assurancePipeLayer) Dial(address ServerAddress, timeout time.Duration) (net.Conn, error) {\n\treturn l.net.dial(string(address), timeout)\n}\n\n// assuranceGatedStore is an InmemStore that records CurrentTerm writes and can\n// hold exactly one of them inside StableStore.SetUint64, i.e. after the caller\n// decided to adopt a term and before it publishes that term in memory.\ntype assuranceGatedStore struct {\n\t*InmemStore\n\tarm     atomic.Bool\n\tblocked atomic.Bool\n\tentered chan struct{}\n\trelease chan struct{}\n\tmu      sync.Mutex\n\twrites  []uint64\n}\n\nfunc (s *assuranceGatedStore) SetUint64(key []byte, val uint64) error {\n\tif string(key) == \"CurrentTerm\" {\n\t\ts.mu.Lock()\n\t\ts.writes = append(s.writes, val)\n\t\ts.mu.Unlock()\n\t\tif s.arm.Load() && s.blocked.CompareAndSwap(false, true) {\n\t\t\ts.entered <- struct{}{}\n\t\t\t<-s.release\n\t\t}\n\t}\n\treturn s.InmemStore.SetUint64(key, val)\n}\n\nfunc (s *assuranceGatedStore) termWrites() []uint64 {\n\ts.mu.Lock()\n\tdefer s.mu.Unlock()\n\tout := make([]uint64, len(s.writes))\n\tcopy(out, s.writes)\n\treturn out\n}\n\ntype assuranceFSM struct {\n\tmu      sync.Mutex\n\tapplied []uint64\n}\n\nfunc (f *assuranceFSM) Apply(l *Log) interface{} {\n\tf.mu.Lock()\n\tf.applied = append(f.applied, l.Index)\n\tf.mu.Unlock()\n\treturn nil\n}\n\nfunc (f *assuranceFSM) appliedIndexes() []uint64 {\n\tf.mu.Lock()\n\tdefer f.mu.Unlock()\n\tout := make([]uint64, len(f.applied))\n\tcopy(out, f.applied)\n\treturn out\n}\n\nfunc (f *assuranceFSM) Snapshot() (FSMSnapshot, error) { return assuranceFSMSnapshot{}, nil }\n\nfunc (f *assuranceFSM) Restore(rc io.ReadCloser) error { return nil }\n\ntype assuranceFSMSnapshot struct{}\n\nfunc (assuranceFSMSnapshot) Persist(sink SnapshotSink) error { return sink.Close() }\n\nfunc (assuranceFSMSnapshot) Release() {}\n\n// TestAssuranceHeartbeatTermContext drives one heartbeat-shaped AppendEntries\n// through the registered transport callback while a separate main-loop\n// AppendEntries adopts a higher term, then reports the term context that is in\n// effect afterwards.\nfunc TestAssuranceHeartbeatTermContext(t *testing.T) {\n\tconst (\n\t\tnodeID     = ServerID(\"f1\")\n\t\tstaleID    = ServerID(\"l1\")\n\t\thigherID   = ServerID(\"l2\")\n\t\tstaleTerm  = uint64(5)\n\t\thigherTerm = uint64(6)\n\t\top         = \"heartbeat-vs-append\"\n\t)\n\n\tconf := DefaultConfig()\n\tconf.LocalID = nodeID\n\tconf.ProtocolVersion = 3\n\tconf.HeartbeatTimeout = 20 * time.Second\n\tconf.ElectionTimeout = 20 * time.Second\n\tconf.LeaderLeaseTimeout = 20 * time.Second\n\tconf.CommitTimeout = 20 * time.Second\n\tconf.SnapshotInterval = time.Hour\n\tconf.SnapshotThreshold = 100000\n\tconf.TrailingLogs = 100000\n\tconf.LogLevel = \"ERROR\"\n\n\tstable := &assuranceGatedStore{InmemStore: NewInmemStore(), entered: make(chan struct{}, 1), release: make(chan struct{})}\n\tlogs := NewInmemStore()\n\tsnaps := NewInmemSnapshotStore()\n\tfsm := &assuranceFSM{}\n\n\tfabric := newAssurancePipeNet()\n\tfollowerLayer := fabric.newLayer(\"f1-pipe\")\n\tleaderLayer := fabric.newLayer(\"l1-pipe\")\n\tfollowerTrans := NewNetworkTransport(followerLayer, 4, 10*time.Second, io.Discard)\n\tleaderTrans := NewNetworkTransport(leaderLayer, 4, 10*time.Second, io.Discard)\n\tdefer leaderTrans.Close()\n\n\tr, err := NewRaft(conf, fsm, logs, stable, snaps, followerTrans)\n\tif err != nil {\n\t\tassuranceEvent(map[string]interface{}{\"event\": \"assurance_setup_failed\", \"node\": string(nodeID), \"op\": op, \"detail\": err.Error()})\n\t\tt.Fatalf(\"assurance: NewRaft: %v\", err)\n\t}\n\tdefer func() { r.Shutdown().Error() }()\n\n\tbootstrap := Configuration{Servers: []Server{\n\t\t{ID: nodeID, Address: followerTrans.LocalAddr(), Suffrage: Voter},\n\t\t{ID: staleID, Address: leaderTrans.LocalAddr(), Suffrage: Voter},\n\t}}\n\tif err := r.BootstrapCluster(bootstrap).Error(); err != nil {\n\t\tassuranceEvent(map[string]interface{}{\"event\": \"assurance_setup_failed\", \"node\": string(nodeID), \"op\": op, \"detail\": \"bootstrap: \" + err.Error()})\n\t\tt.Fatalf(\"assurance: bootstrap: %v\", err)\n\t}\n\n\t// AdmittedRequests are the two AppendEntries RPCs of this prefix: a stale\n\t// heartbeat from the previous leader and a higher-term request whose\n\t// completion the node reports to its sender.\n\theartbeat := AppendEntriesRequest{\n\t\tRPCHeader: RPCHeader{ProtocolVersion: 3, ID: []byte(staleID), Addr: leaderTrans.EncodePeer(staleID, leaderTrans.LocalAddr())},\n\t\tTerm:      staleTerm,\n\t\tLeader:    leaderTrans.EncodePeer(staleID, leaderTrans.LocalAddr()),\n\t}\n\thigher := AppendEntriesRequest{\n\t\tRPCHeader:         RPCHeader{ProtocolVersion: 3, ID: []byte(higherID), Addr: leaderTrans.EncodePeer(higherID, leaderTrans.LocalAddr())},\n\t\tTerm:              higherTerm,\n\t\tLeader:            leaderTrans.EncodePeer(higherID, leaderTrans.LocalAddr()),\n\t\tLeaderCommitIndex: 1,\n\t}\n\n\t// Arm the gate so the first CurrentTerm write after this point (the\n\t// heartbeat's) is held inside StableStore.\n\tstable.arm.Store(true)\n\n\tvar heartbeatResp AppendEntriesResponse\n\theartbeatDone := make(chan error, 1)\n\tgo func() {\n\t\theartbeatDone <- leaderTrans.AppendEntries(nodeID, followerTrans.LocalAddr(), &heartbeat, &heartbeatResp)\n\t}()\n\n\tselect {\n\tcase <-stable.entered:\n\tcase <-time.After(10 * time.Second):\n\t\tassuranceEvent(map[string]interface{}{\"event\": \"assurance_setup_failed\", \"node\": string(nodeID), \"op\": op, \"detail\": \"heartbeat never reached the gated term write\"})\n\t\tt.Fatalf(\"assurance: heartbeat did not reach the gated term write\")\n\t}\n\n\t// While the heartbeat is parked, a second connection carries a request\n\t// whose term is higher, so the main goroutine adopts it and reports it.\n\tvar higherResp AppendEntriesResponse\n\tif err := leaderTrans.AppendEntries(nodeID, followerTrans.LocalAddr(), &higher, &higherResp); err != nil {\n\t\tassuranceEvent(map[string]interface{}{\"event\": \"assurance_setup_failed\", \"node\": string(nodeID), \"op\": op, \"detail\": \"higher-term append: \" + err.Error()})\n\t\tt.Fatalf(\"assurance: higher-term append: %v\", err)\n\t}\n\n\t// Let the parked stale write finish and publish its term in memory.\n\tclose(stable.release)\n\tselect {\n\tcase err := <-heartbeatDone:\n\t\tif err != nil {\n\t\t\tassuranceEvent(map[string]interface{}{\"event\": \"assurance_setup_failed\", \"node\": string(nodeID), \"op\": op, \"detail\": \"heartbeat: \" + err.Error()})\n\t\t\tt.Fatalf(\"assurance: heartbeat: %v\", err)\n\t\t}\n\tcase <-time.After(10 * time.Second):\n\t\tassuranceEvent(map[string]interface{}{\"event\": \"assurance_setup_failed\", \"node\": string(nodeID), \"op\": op, \"detail\": \"heartbeat response never arrived\"})\n\t\tt.Fatalf(\"assurance: heartbeat response never arrived\")\n\t}\n\n\tcontextTerm := r.CurrentTerm()\n\tcontextLeader, contextLeaderID := r.LeaderWithID()\n\tstoredTerm, storedErr := stable.GetUint64([]byte(\"CurrentTerm\"))\n\tstoredDetail := \"unknown\"\n\tif storedErr == nil {\n\t\tstoredDetail = fmt.Sprintf(\"%d\", storedTerm)\n\t}\n\n\tassuranceEvent(map[string]interface{}{\n\t\t\"event\":   \"term_advanced\",\n\t\t\"node\":    string(nodeID),\n\t\t\"op\":      op,\n\t\t\"term\":    higherResp.Term,\n\t\t\"success\": higherResp.Success,\n\t})\n\tassuranceEvent(map[string]interface{}{\n\t\t\"event\":          \"term_context_observed\",\n\t\t\"node\":           string(nodeID),\n\t\t\"op\":             op,\n\t\t\"context_term\":   contextTerm,\n\t\t\"stored_terms\":   stable.termWrites(),\n\t\t\"stored_term\":    storedDetail,\n\t\t\"stale_term\":     staleTerm,\n\t\t\"leader_id\":      string(contextLeaderID),\n\t\t\"leader_address\": string(contextLeader),\n\t})\n}\n",
+    "description": "TestAssuranceHeartbeatTermContext: interleaved heartbeat callback versus main-loop higher-term AppendEntries on one node",
+    "semantic_changes": [
+      "StreamLayer is replaced by an in-process net.Pipe fabric (assurancePipeNet/assurancePipeLayer). NetworkTransport, its heartbeat classification in handleCommand, the SetHeartbeatHandler registration performed by NewRaft, Raft.processHeartbeat and Raft.appendEntries are the target's own code and are not re-implemented.",
+      "StableStore is an InmemStore wrapper whose SetUint64 holds exactly one CurrentTerm write. This is a latency injection on an injected dependency; it changes no term comparison, no branch condition and no write performed by the target.",
+      "The harness adds one external test file to the captured package and modifies no target file."
+    ],
+    "prerequisites": [
+      {
+        "alias": "admit",
+        "event": "term_advanced",
+        "conditions": []
+      }
+    ],
+    "legality": {
+      "source_ids": [
+        "s-raft-process-heartbeat",
+        "s-net-fastpath",
+        "s-net-handle-conn",
+        "s-net-set-heartbeat",
+        "s-raft-append-term",
+        "s-raft-set-current-term",
+        "s-state-term-atomic",
+        "s-api-fastpath-contract"
+      ],
+      "expectation_ids": [],
+      "binding_ids": [
+        "bind-raft-process-heartbeat"
+      ],
+      "derivation": "NewRaft registers r.processHeartbeat as the transport heartbeat handler (s-api-fastpath-contract); NetworkTransport.handleCommand decides heartbeat shape from the decoded request and then calls the registered callback directly on the connection goroutine instead of offering the RPC to the consumer channel (s-net-fastpath, s-net-handle-conn, s-net-set-heartbeat); processHeartbeat forwards the request to appendEntries unmodified (s-raft-process-heartbeat); appendEntries reads the current term, adopts a greater one through setState+setCurrentTerm (s-raft-append-term), and setCurrentTerm writes StableStore before publishing the value in raftState (s-raft-set-current-term, s-state-term-atomic). Holding that one StableStore write therefore parks the callback between its term decision and the term it publishes, which is exactly the interval in which a second, main-goroutine term adoption can complete.",
+      "applicability": "The node holds a committed configuration with itself as the only local voter and is otherwise idle; HeartbeatTimeout, ElectionTimeout and LeaderLeaseTimeout are far longer than the prefix, so no election, lease step-down or further term is established while the two requests are handled. The prefix contains exactly two AppendEntries RPCs on two connections of the same real NetworkTransport, so the heartbeat callback and the main loop run on different goroutines of one node.",
+      "unresolved": [
+        "the wire medium is substituted (net.Pipe instead of TCP), so TCP framing and kernel scheduling are not exercised",
+        "that NetworkTransport invokes the callback off the main goroutine is established from source and re-used here, not re-derived by the execution"
+      ],
+      "conflicts": [],
+      "alternatives": [
+        "a caller-supplied StableStore that never blocks would make this particular interleaving unlikely, but the requirement under test is independent of store latency"
+      ]
+    }
+  },
+  "monitors": [
+    {
+      "id": "m-term-context-after-higher-term",
+      "checker_id": "p-term-context-not-regressed",
+      "event": "term_context_observed",
+      "binding_ids": [
+        "bind-raft-process-heartbeat"
+      ],
+      "grounding": {
+        "source_ids": [
+          "s-raft-append-term",
+          "s-raft-set-current-term",
+          "s-state-term-atomic",
+          "s-raft-vote-record"
+        ],
+        "expectation_ids": [],
+        "binding_ids": [
+          "bind-raft-process-heartbeat"
+        ],
+        "derivation": "The term value a node publishes is the value that requestVote evaluates against and the value NewRaft reloads after restart, so the assertion reads the live context through Raft.CurrentTerm and the durable CurrentTerm value rather than a cached intermediate. The prerequisite is the node's own response to the higher-term AppendEntries, which is the point at which the higher term has been adopted and reported by the target (s-raft-append-term, s-raft-set-current-term, s-state-term-atomic).",
+        "applicability": "Same node, same prefix and same configuration as the harness; the result event is emitted only after both RPCs have completed and the held write has been published.",
+        "unresolved": [
+          "the comparison is equality with the admitted term, which coincides with 'not lower than the admitted term' only because this prefix admits exactly two term writes"
+        ],
+        "conflicts": [],
+        "alternatives": []
+      },
+      "applicability_conditions": [],
+      "admission_alias": "admit"
+    }
+  ],
+  "observable_properties": [
+    {
+      "checker_id": "p-term-context-not-regressed",
+      "kind": "event_assertion",
+      "trigger": {
+        "field": "op",
+        "op": "eq",
+        "value": "heartbeat-vs-append",
+        "reference": null
+      },
+      "assertion": {
+        "field": "context_term",
+        "op": "eq",
+        "value": null,
+        "reference": "admit.term"
+      },
+      "antecedent": null,
+      "identity_fields": [
+        "node",
+        "op"
+      ],
+      "description": "After the operation admitted by 'admit' completed, the term context in effect on that node must equal the term the node reported adopting for it. The prefix admits exactly two CurrentTerm writes (the stale heartbeat's 5 and the higher request's 6) and no election or further RPC can establish a third value, so equality with the admitted term and 'the later establishment did not store a value lower than the adopted term' coincide within this scope; a general ordering comparison is not expressible with the supported event comparisons."
+    }
+  ],
+  "uncertainties": [
+    "The equality encoding coincides with the obligation's 'not lower than' only inside this prefix, where exactly two term writes are admitted (5 then 6) and nothing else can establish a term.",
+    "The dispatch of the heartbeat callback off the main goroutine is the documented SetHeartbeatHandler contract and is exercised here with the real NetworkTransport over a substituted StreamLayer; the production TCP deployment's scheduling is a source-level premise of this check rather than an execution result.",
+    "The check observes the term context only. It does not observe the downstream consequence, e.g. whether a later vote could be granted in a term the node has already voted in, and it does not test any node other than the one receiving both RPCs."
+  ]
+}

@@ -1,0 +1,114 @@
+{
+  "rationale": "First review of the accepted direct check 8a6ae38fcccb410d978d216bee9565d0 (version 1) for obligation c-adopted-term-never-regresses. It supplies the required checker_correspondence item that compares the written obligation, the encoded predicate, the fixed inputs, the oracle, the correlated observations and the retained completion; it also supplies the applicability item needed to answer the one open input issue on that artifact, and resolves that issue with a retained condition disposition. The reviewed execution is check 78e4fd0d22b74afbbe4de6c6a912156d: exit 0, completed, prerequisites matched, and the retained stdout shows the node reporting adopted term 6 while the term context in effect afterwards is 5 in memory and 5 in StableStore.",
+  "sources": [],
+  "feedback": null,
+  "repair_of": null,
+  "action": "review",
+  "artifact_id": "8a6ae38fcccb410d978d216bee9565d0",
+  "review_items": [
+    {
+      "target_id": "8a6ae38fcccb410d978d216bee9565d0",
+      "aspect": "checker_correspondence",
+      "status": "no_issue_found",
+      "source_ids": [
+        "s-raft-process-heartbeat",
+        "s-net-fastpath",
+        "s-net-handle-conn",
+        "s-net-set-heartbeat",
+        "s-raft-append-term",
+        "s-raft-set-current-term",
+        "s-state-term-atomic",
+        "s-raft-vote-record",
+        "s-api-fastpath-contract",
+        "s-transport-interface",
+        "s-integ-fastpath",
+        "s-commitment-recalc"
+      ],
+      "rationale": "The obligation under review says that once a node has adopted and persisted term T, no later establishment of the term context may store a lower value, and that this binds every entry point able to update the context, including a heartbeat-shaped AppendEntries processed outside the main goroutine. The fixed check encodes exactly that interval. Its entry point is Raft.processHeartbeat, the callback NewRaft registers through Transport.SetHeartbeatHandler (s-api-fastpath-contract); NetworkTransport.handleCommand classifies a heartbeat from the decoded request and then calls that callback directly on the per-connection goroutine instead of offering the RPC to the single consumer channel (s-net-fastpath, s-net-handle-conn, s-net-set-heartbeat); processHeartbeat forwards the request to appendEntries unmodified (s-raft-process-heartbeat), and appendEntries adopts a greater term through setState plus setCurrentTerm, which writes StableStore before publishing the value in memory (s-raft-append-term, s-raft-set-current-term, s-state-term-atomic). The harness substitutes only StreamLayer, an injected interface, with an in-process net.Pipe fabric, so the real NetworkTransport, its heartbeat classification and the real callback dispatch are used without a kernel network; it injects latency at exactly one StableStore.SetUint64(CurrentTerm) call, which is a point inside the target's own setCurrentTerm, after the target itself decided to adopt the stale term and before the target itself publishes it. No branch condition, comparison or write order inside the target is changed and no target file is touched. Oracle and correlation: the harness emits raw observations only, namely the term the node reported in its own response to the higher-term AppendEntries (term_advanced: term 6, success true) and, after both RPCs completed, the live context term and the durable CurrentTerm value (term_context_observed: context_term 5, stored_term 5, admitted writes 0,1,1,5,6); the assertion compares the measured context_term with the admitted term carried by the prerequisite, so the verdict is computed from measured fields rather than printed by the harness. The prerequisite matched exactly once in the single runner stream with the same node/op identity, and the admitted operation has a later complete applicable result, so the comparison is complete rather than a holds-only observation. Completion: the formal run is a completed direct_check with exit code 0, test_started true, no parsing errors, changed_target_files empty and the captured snapshot id; its retained stdout shows the same measured values as the local reproduction. Counterevidence considered: the fast-path classification excludes entries and commit indexes so the reachable damage is confined to the term and leader context; currentTerm is an atomic field, so this is a lost update of a read-compare-write rather than an unsynchronized access; InmemTransport ignores SetHeartbeatHandler, so in-memory clusters do not exercise the path; and api.go and raft.go state opposite concurrency requirements for the callback. That last point concerns which component must change, not whether the context may regress, and the observation is a strict regression (5 against an adopted 6), so it violates the weaker 'not lower than the admitted term' reading as well as the equality encoding the plan uses; the equality encoding is a recorded scope limit, not the origin of this violation. What the check does not establish is listed in limitations.",
+      "execution_attribution": null,
+      "report_title": "心跳快速通道与主循环并发更新任期导致任期回退",
+      "report_answer": "在捕获的 hashicorp/raft 中，心跳回调由 NetworkTransport 的连接协程直接调用，而主循环同时处理更高任期的 AppendEntries；节点在响应中报告已采纳任期 6 之后，其内存 currentTerm 与持久化的 CurrentTerm 都停留在 5（写入序列 0,1,1,5,6）。该观测在使用真实 NetworkTransport 的固定前缀内可完成并重复，目标代码未被修改；相等编码与「不低于已采纳任期」在本前缀内一致，因为只有两次任期写入。",
+      "counterevidence": [],
+      "limitations": [
+        "The equality encoding coincides with 'not lower than the admitted term' only within this prefix, which admits exactly two term writes and no election; the witness is nevertheless a strict regression, so the weaker reading is violated too.",
+        "The wire medium is substituted: StreamLayer is an in-process net.Pipe fabric, so TCP framing and kernel scheduling are not exercised.",
+        "That NetworkTransport dispatches the callback off the main goroutine is cited from source (s-net-fastpath, s-net-handle-conn) and re-used by the check rather than re-derived by this execution.",
+        "The prerequisite identity is a fixed harness label (node, op) and the prefix contains exactly one admission, so the correlation is unique but not discriminating across multiple operations.",
+        "No downstream consequence was observed: the check does not show whether the regressed context can later be consumed to grant a second vote in a term the node has already voted in, and only one node and one prefix were exercised."
+      ],
+      "challenged_components": []
+    },
+    {
+      "target_id": "8a6ae38fcccb410d978d216bee9565d0",
+      "aspect": "applicability",
+      "status": "no_issue_found",
+      "source_ids": [
+        "s-raft-append-term",
+        "s-raft-set-current-term",
+        "s-state-term-atomic",
+        "s-raft-vote-record",
+        "s-api-fastpath-contract",
+        "s-integ-fastpath",
+        "s-raft-process-heartbeat",
+        "s-net-fastpath",
+        "s-net-handle-conn",
+        "s-transport-interface",
+        "s-api-newraft-config"
+      ],
+      "rationale": "The implementation owes this responsibility in the selected scope because the value published by setCurrentTerm is the value requestVote compares against when granting or refusing a vote and when recognising a duplicate request in the same term (s-raft-append-term, s-raft-vote-record), and it is the value reloaded from StableStore when the node restarts (s-raft-set-current-term, s-api-newraft-config); a later establishment that publishes a lower value lets the node be asked to vote in a term it has already used, which is the election-safety condition of Raft. The responsibility therefore belongs to the component that owns the term context rather than to the network medium: transport.go describes the registered callback as a fast pass and api.go requires it to be safe to call concurrently with a blocking RPC (s-transport-interface, s-api-fastpath-contract), while the shipped NetworkTransport does invoke it on a connection goroutine (s-net-fastpath, s-net-handle-conn, s-raft-process-heartbeat), and integ_test.go shows the same pattern being used in-repo (s-integ-fastpath). The retained condition observes that raft.go's processHeartbeat comment says the opposite, that it must only be called from the main thread. That conflict concerns how the update may be driven and which layer must be repaired; it does not remove the responsibility, because every reading of the two statements still requires the adopted term context to stay non-regressing, and the reviewed execution observed a strict regression under the shipped transport's documented contract.",
+      "execution_attribution": null,
+      "report_title": "被审计义务对当前范围适用",
+      "report_answer": "由于已发布任期同时决定投票裁决与重启后的恢复值，保持任期上下文不回退是拥有该上下文组件的责任；仓库内两条注释对回调是否可在主线程之外调用存在冲突，但无论采用哪种读法，都不能使已采纳的任期被更低的任期覆盖。",
+      "counterevidence": [],
+      "limitations": [
+        "The comment conflict is retained as an independent boundary: this review does not decide whether a repair belongs in the transport or in the handler.",
+        "The applicability argument binds the current-term context only; the known-leader context is a separate fact and is not covered by this claim."
+      ],
+      "challenged_components": []
+    }
+  ],
+  "resolutions": [
+    {
+      "condition_dispositions": [
+        {
+          "condition_id": "c-adopted-term-never-regresses/grounding/condition/1",
+          "condition": "",
+          "applies_to": "independent_scope",
+          "rationale": "This condition is a conflict between two in-repo statements about who may invoke the heartbeat callback, not a claim about the term value. It is retained as an independent boundary: whichever statement is treated as the contract, the obligation binds the component that publishes the term context, and the observed regression is against a value the node itself reported adopting.",
+          "source_ids": [
+            "s-raft-append-term",
+            "s-raft-set-current-term",
+            "s-state-term-atomic",
+            "s-raft-vote-record",
+            "s-api-fastpath-contract",
+            "s-integ-fastpath"
+          ]
+        }
+      ],
+      "issue_id": "9bb534c3914b40c79ce849c715918da5",
+      "source_ids": [
+        "s-raft-append-term",
+        "s-raft-set-current-term",
+        "s-state-term-atomic",
+        "s-raft-vote-record",
+        "s-api-fastpath-contract",
+        "s-integ-fastpath",
+        "s-raft-process-heartbeat",
+        "s-net-fastpath",
+        "s-net-handle-conn",
+        "s-transport-interface"
+      ],
+      "evidence_ids": [
+        "78e4fd0d22b74afbbe4de6c6a912156d",
+        "8a6ae38fcccb410d978d216bee9565d0",
+        "18a6133ed6104e7f9d94cd86357ae000"
+      ],
+      "rationale": "The issue records one input conflict: raft.go's processHeartbeat comment demands main-thread-only invocation while api.go requires the registered callback to be safe to call concurrently with a blocking RPC. The applicability answer separates the two questions. The implementation owes the non-regressing term context because the published value is what vote evaluation and restart recovery read (s-raft-append-term, s-raft-vote-record, s-raft-set-current-term), and the shipped NetworkTransport does drive the callback off the main goroutine (s-net-fastpath, s-net-handle-conn, s-raft-process-heartbeat). The observed result is a strict regression under that documented contract: the node reported adopting term 6 in its own response while the term context afterwards is 5 in memory and 5 in StableStore (check 78e4fd0d22b74afbbe4de6c6a912156d, artifact 8a6ae38fcccb410d978d216bee9565d0, evidence 18a6133ed6104e7f9d94cd86357ae000). The conflict is retained as an independent boundary because it identifies where a repair may go - serialise the callback, make appendEntries safe to run concurrently, or stop dispatching it off the main goroutine - and it does not discharge the obligation, since no reading of the two statements permits the published term to fall below an already adopted term.",
+      "residual_issue_ids": [],
+      "scope_limitations": [
+        "The conflict between the two in-repo statements is not resolved by this review; both repair locations remain open and are recorded as an independent boundary.",
+        "The wire medium is substituted and the check covers one node and one prefix, so TCP scheduling and multi-node histories remain outside this resolution."
+      ]
+    }
+  ]
+}

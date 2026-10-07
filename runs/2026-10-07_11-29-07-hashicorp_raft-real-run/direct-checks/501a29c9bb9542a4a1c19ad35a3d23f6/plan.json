@@ -1,0 +1,116 @@
+{
+  "description": "Second scenario of the same requirement, and the one the earlier review recorded as outside its prefix: a request accepted by the API while the node is still leading and then left unresolved by a shutdown. Discriminator: a single-voter node is created by the package's own NewRaft with the documented BatchApplyCh option (so applyCh is buffered) and a LogStore that holds exactly one StoreLogs call after it is armed; once the node is leading, the gate parks the main goroutine inside the leader's dispatch path, 200 further requests are issued from goroutines so that the buffered request channel fills and the rest block in the API's enqueue select, and the node is then shut down. Observation: after the shutdown future has joined every raft goroutine, the harness classifies each issued request as accepted (the API returned a future) or rejected with ErrRaftShutdown, and inspects each accepted future's own completion channel without blocking; the asserted field is the number of accepted futures that still had not completed. Control: the admission event records that the requests were issued while the node reported itself Leader and while the main goroutine was known to be parked in the dispatch path, and the results report both the accepted and the shutdown-rejected counts beside the unresolved total.",
+  "claim_id": "c-client-request-completes-on-inactive-raft",
+  "binding_ids": [
+    "bind-raft-verify-leader"
+  ],
+  "harness": {
+    "execution_package": ".",
+    "files": {},
+    "kind": "go_test",
+    "source": "// Copyright (c) HashiCorp, Inc.\n// SPDX-License-Identifier: MPL-2.0\n//\n// Generated assurance harness. A single-voter leader is parked inside its own\n// dispatch path while more client requests are queued than the buffered apply\n// channel can hold, and the node is then shut down; the harness counts how many\n// requests were accepted while the node was leading and how many of their\n// futures still had not completed after the shutdown joined. It reports raw\n// counts only.\n\npackage raft\n\nimport (\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"io\"\n\t\"sync/atomic\"\n\t\"testing\"\n\t\"time\"\n)\n\nfunc assuranceRaceEvent(v map[string]interface{}) {\n\tpayload, err := json.Marshal(v)\n\tif err != nil {\n\t\tfmt.Println(\"assurance: event marshal failed:\", err)\n\t\treturn\n\t}\n\tfmt.Println(\"CA_EVENT \" + string(payload))\n}\n\ntype assuranceRaceFSM struct{}\n\nfunc (assuranceRaceFSM) Apply(*Log) interface{}         { return nil }\nfunc (assuranceRaceFSM) Snapshot() (FSMSnapshot, error) { return assuranceRaceSnapshot{}, nil }\nfunc (assuranceRaceFSM) Restore(io.ReadCloser) error    { return nil }\n\ntype assuranceRaceSnapshot struct{}\n\nfunc (assuranceRaceSnapshot) Persist(s SnapshotSink) error { return s.Close() }\nfunc (assuranceRaceSnapshot) Release()                     {}\n\n// assuranceGateLogs holds exactly one StoreLogs call after it is armed, which\n// parks the main goroutine inside the leader's dispatch path.\ntype assuranceGateLogs struct {\n\t*InmemStore\n\tarm     atomic.Bool\n\tblocked atomic.Bool\n\tentered chan struct{}\n\trelease chan struct{}\n}\n\nfunc (g *assuranceGateLogs) StoreLog(l *Log) error { return g.StoreLogs([]*Log{l}) }\n\nfunc (g *assuranceGateLogs) StoreLogs(logs []*Log) error {\n\tif g.arm.Load() && g.blocked.CompareAndSwap(false, true) {\n\t\tg.entered <- struct{}{}\n\t\t<-g.release\n\t}\n\treturn g.InmemStore.StoreLogs(logs)\n}\n\nfunc assuranceRaceWaitFor(what string, cond func() bool, limit time.Duration) bool {\n\tdeadline := time.Now().Add(limit)\n\tfor time.Now().Before(deadline) {\n\t\tif cond() {\n\t\t\treturn true\n\t\t}\n\t\ttime.Sleep(500 * time.Microsecond)\n\t}\n\treturn false\n}\n\nfunc TestAssuranceAcceptedRequestThenShutdown(t *testing.T) {\n\tconst (\n\t\top    = \"requests-accepted-before-shutdown\"\n\t\tnode  = ServerID(\"n1\")\n\t\textra = 200\n\t)\n\n\tconf := DefaultConfig()\n\tconf.LocalID = node\n\tconf.ProtocolVersion = 3\n\tconf.LogLevel = \"ERROR\"\n\tconf.BatchApplyCh = true\n\tconf.HeartbeatTimeout = 100 * time.Millisecond\n\tconf.ElectionTimeout = 200 * time.Millisecond\n\tconf.LeaderLeaseTimeout = 100 * time.Millisecond\n\tconf.CommitTimeout = 50 * time.Millisecond\n\tconf.SnapshotInterval = time.Hour\n\tconf.SnapshotThreshold = 100000\n\tconf.TrailingLogs = 100000\n\n\tlogs := &assuranceGateLogs{InmemStore: NewInmemStore(), entered: make(chan struct{}, 1), release: make(chan struct{})}\n\t_, trans := NewInmemTransport(ServerAddress(node))\n\tr, err := NewRaft(conf, assuranceRaceFSM{}, logs, NewInmemStore(), NewInmemSnapshotStore(), trans)\n\tif err != nil {\n\t\tassuranceRaceEvent(map[string]interface{}{\"event\": \"assurance_setup_failed\", \"node\": string(node), \"op\": op, \"detail\": err.Error()})\n\t\tt.Fatalf(\"assurance: NewRaft: %v\", err)\n\t}\n\tconfiguration := Configuration{Servers: []Server{{ID: node, Address: trans.LocalAddr(), Suffrage: Voter}}}\n\tif err := r.BootstrapCluster(configuration).Error(); err != nil {\n\t\tassuranceRaceEvent(map[string]interface{}{\"event\": \"assurance_setup_failed\", \"node\": string(node), \"op\": op, \"detail\": \"bootstrap: \" + err.Error()})\n\t\tt.Fatalf(\"assurance: bootstrap: %v\", err)\n\t}\n\tif !assuranceRaceWaitFor(\"leader\", func() bool { return r.State() == Leader }, 5*time.Second) {\n\t\tassuranceRaceEvent(map[string]interface{}{\"event\": \"assurance_setup_failed\", \"node\": string(node), \"op\": op, \"detail\": \"node never became leader\"})\n\t\tt.Fatalf(\"assurance: node never became leader\")\n\t}\n\ttime.Sleep(100 * time.Millisecond)\n\n\t// Park the main goroutine inside the leader's dispatch path, then queue more\n\t// requests than the buffered apply channel can hold.\n\tlogs.arm.Store(true)\n\tblocker := r.Apply([]byte(\"blocker\"), 5*time.Second)\n\tselect {\n\tcase <-logs.entered:\n\tcase <-time.After(5 * time.Second):\n\t\tassuranceRaceEvent(map[string]interface{}{\"event\": \"assurance_setup_failed\", \"node\": string(node), \"op\": op, \"detail\": \"the main goroutine never reached the gated store call\"})\n\t\tt.Fatalf(\"assurance: main goroutine never reached the gated store call\")\n\t}\n\n\tresults := make(chan Future, extra)\n\tfor i := 0; i < extra; i++ {\n\t\tgo func() { results <- r.Apply([]byte(\"queued\"), 0) }()\n\t}\n\ttime.Sleep(300 * time.Millisecond)\n\n\tshutdown := r.Shutdown()\n\tclose(logs.release)\n\tif err := shutdown.Error(); err != nil {\n\t\tt.Fatalf(\"assurance: shutdown: %v\", err)\n\t}\n\n\tvar accepted []*logFuture\n\trejectedShutdown, other := 0, 0\n\tfor i := 0; i < extra; i++ {\n\t\tselect {\n\t\tcase f := <-results:\n\t\t\tswitch v := f.(type) {\n\t\t\tcase errorFuture:\n\t\t\t\tif v.err == ErrRaftShutdown {\n\t\t\t\t\trejectedShutdown++\n\t\t\t\t} else {\n\t\t\t\t\tother++\n\t\t\t\t}\n\t\t\tcase *logFuture:\n\t\t\t\taccepted = append(accepted, v)\n\t\t\t}\n\t\tcase <-time.After(5 * time.Second):\n\t\t\tt.Fatalf(\"assurance: a queued request never returned from Apply\")\n\t\t}\n\t}\n\tunresolved := 0\n\tfor _, f := range accepted {\n\t\tselect {\n\t\tcase <-f.errCh:\n\t\tdefault:\n\t\t\tunresolved++\n\t\t}\n\t}\n\tblockerErr := fmt.Sprintf(\"%v\", blocker.Error())\n\tlogLast, _ := logs.LastIndex()\n\n\tassuranceRaceEvent(map[string]interface{}{\n\t\t\"event\":           \"requests_issued_while_active\",\n\t\t\"node\":            string(node),\n\t\t\"op\":              op,\n\t\t\"issued\":          extra,\n\t\t\"node_state\":      \"Leader\",\n\t\t\"main_thread_busy\": true,\n\t})\n\tassuranceRaceEvent(map[string]interface{}{\n\t\t\"event\":                      \"accepted_requests_observed\",\n\t\t\"node\":                       string(node),\n\t\t\"op\":                         op,\n\t\t\"issued\":                     extra,\n\t\t\"accepted\":                   len(accepted),\n\t\t\"rejected_shutdown\":          rejectedShutdown,\n\t\t\"completed_other\":            other,\n\t\t\"unresolved_total\":           unresolved,\n\t\t\"node_state_after_shutdown\":  r.State().String(),\n\t\t\"blocker_result\":             blockerErr,\n\t\t\"log_last_index\":             logLast,\n\t})\n}\n",
+    "description": "TestAssuranceAcceptedRequestThenShutdown: requests accepted while the node leads, then an unresolved shutdown",
+    "semantic_changes": [
+      "No target file is modified; the harness adds one external test file to the captured package and uses the public NewRaft, BootstrapCluster, Apply and Shutdown.",
+      "The LogStore is an InmemStore wrapper that holds exactly one StoreLogs call until released, which is a latency injection on an injected dependency and changes no rule inside the target.",
+      "The harness classifies each request by the value the public API returned (a future for an accepted request, ErrRaftShutdown for a rejected one) and inspects the accepted futures' own completion channels instead of calling Error(), which would block on exactly the futures under investigation; that read is sound because the shutdown join has removed every writer.",
+      "The node is configured with the documented BatchApplyCh option so applyCh is buffered, and with short timeouts so the single voter elects itself promptly."
+    ],
+    "prerequisites": [
+      {
+        "alias": "active",
+        "event": "requests_issued_while_active",
+        "conditions": []
+      }
+    ],
+    "legality": {
+      "source_ids": [
+        "s-api-apply-select",
+        "s-api-apply-buffer",
+        "s-api-err-shutdown",
+        "s-future-defer-error",
+        "s-state-wait-shutdown",
+        "s-future-shutdown-future",
+        "s-raft-run-shutdown",
+        "s-raft-dispatch-logs",
+        "s-api-verify-leader"
+      ],
+      "expectation_ids": [],
+      "binding_ids": [
+        "bind-raft-verify-leader"
+      ],
+      "derivation": "ApplyLog offers the request to applyCh in a select that also watches the shutdown channel (s-api-apply-select), and applyCh is buffered whenever the documented BatchApplyCh option is set (s-api-apply-buffer); the leader's dispatch path writes the entry to the LogStore before it is inflight (s-raft-dispatch-logs), which is where the harness parks the main goroutine so that further requests queue. Shutdown closes the shutdown channel, run returns on it and shutdownFuture.Error joins the goroutine group (s-raft-run-shutdown, s-state-wait-shutdown, s-future-shutdown-future); after that join nothing drains applyCh, and the futures held by the queued requests have no escape because deferError only consults ShutdownCh, which logFuture never sets (s-future-defer-error). Requests that were blocked inside the enqueue select when shutdown was signalled take the shutdown case and report ErrRaftShutdown (s-api-err-shutdown), so the measured difference between the two counts is exactly the accepted-but-unresolved set. The binding bind-raft-verify-leader is the same representative select structure already selected for this unit, and the apply path is cited by its own source ranges.",
+      "applicability": "A single-voter leader with a buffered apply channel and a parked dispatch path, so requests are accepted while the node is leading and then left in the buffer when it is shut down.",
+      "unresolved": [
+        "how many queued requests a running node would leave behind in a less contrived schedule, since the number depends on how full the buffer is when shutdown is signalled",
+        "which repair is intended: draining the buffered channel on shutdown, giving these futures a shutdown escape, or never offering the send case once shutdown is signalled"
+      ],
+      "conflicts": [],
+      "alternatives": [
+        "an unbuffered apply channel cannot accept a request that shutdown later abandons, which is what the earlier scenario showed for the default configuration"
+      ]
+    }
+  },
+  "monitors": [
+    {
+      "id": "m-accepted-requests-complete",
+      "checker_id": "p-accepted-requests-complete",
+      "event": "accepted_requests_observed",
+      "binding_ids": [
+        "bind-raft-verify-leader"
+      ],
+      "grounding": {
+        "source_ids": [
+          "s-api-apply-select",
+          "s-future-defer-error",
+          "s-state-wait-shutdown",
+          "s-api-err-shutdown"
+        ],
+        "expectation_ids": [],
+        "binding_ids": [
+          "bind-raft-verify-leader"
+        ],
+        "derivation": "The result event is emitted only after the shutdown future returned, which is the point at which the goroutine group has been joined (s-state-wait-shutdown), and it reports both the number of requests the API accepted and the number it rejected with ErrRaftShutdown (s-api-apply-select, s-api-err-shutdown). The unresolved count is measured on the accepted futures' own completion channels, which only a raft handler writes (s-future-defer-error), so after the join the count is the number of accepted requests whose completion is still owed.",
+        "applicability": "Same node and prefix as the harness; the admission event records the leading state and the parked main goroutine, and the rejected count is reported beside the accepted one.",
+        "unresolved": [
+          "whether any accepted request was picked up and completed before the loop exited, which the rejected count alone cannot separate"
+        ],
+        "conflicts": [],
+        "alternatives": []
+      },
+      "applicability_conditions": [],
+      "admission_alias": "active"
+    }
+  ],
+  "observable_properties": [
+    {
+      "checker_id": "p-accepted-requests-complete",
+      "kind": "event_assertion",
+      "trigger": {
+        "field": "op",
+        "op": "eq",
+        "value": "requests-accepted-before-shutdown",
+        "reference": null
+      },
+      "assertion": {
+        "field": "unresolved_total",
+        "op": "eq",
+        "value": 0,
+        "reference": null
+      },
+      "antecedent": null,
+      "identity_fields": [
+        "node",
+        "op"
+      ],
+      "description": "Every request the API accepted while the node was leading must have completed by the time the shutdown has joined the raft goroutines, so the number of accepted futures that still had not completed must be zero. The field counts owed completions directly: requests rejected with ErrRaftShutdown are counted separately as completed, so a nonzero value means the node accepted work it never answered."
+    }
+  ],
+  "uncertainties": [
+    "The parked dispatch path is a latency injection on the injected LogStore; it is what lets the buffered channel fill deterministically, and a schedule without it would queue fewer requests.",
+    "The number of accepted requests depends on the buffer size and on how many the loop picks up before it takes the shutdown case, so the exact counts vary between runs even though the violation is repeatable.",
+    "The check reads the accepted futures as live objects and does not call Error(), so it measures non-completion after the join plus a short inspection rather than consuming any late response.",
+    "Only the Apply path with the documented BatchApplyCh option is exercised; the default unbuffered channel and the other request paths are covered by the earlier scenario or not at all.",
+    "No caller-side timeout is exercised, so the practical blocking of a caller that does not bound the wait remains inferred rather than measured."
+  ]
+}

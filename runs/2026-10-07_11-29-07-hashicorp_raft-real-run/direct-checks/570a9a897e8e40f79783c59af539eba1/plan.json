@@ -1,0 +1,112 @@
+{
+  "description": "Discriminator: the index a client-visible configuration is reported at. One node is created by the package's own NewRaft and bootstraps a single-voter configuration, so the configuration entry is the only entry in the log and the index at which the configuration was established is the log's last index. Observation: Raft.GetConfiguration returns a future whose Configuration is read back and whose Error is checked, and the harness records the index that future reports, the configuration it returns (whether it still contains the local voter), the value Raft.Stats publishes for the same future's index, and the log's last index. Control: the returned configuration is compared with the configuration that was bootstrapped so the observation cannot be explained by a stale or empty configuration, and the node's state and log length are reported beside the pair.",
+  "claim_id": "c-reported-configuration-index",
+  "binding_ids": [
+    "bind-raft-get-configuration"
+  ],
+  "harness": {
+    "execution_package": ".",
+    "files": {},
+    "kind": "go_test",
+    "source": "// Copyright (c) HashiCorp, Inc.\n// SPDX-License-Identifier: MPL-2.0\n//\n// Generated assurance harness. One node bootstraps a single-voter\n// configuration, and the harness compares the index the configuration future\n// reports with the log index at which that configuration was established, and\n// with the value the same future supplies to Stats. It reports raw fields only.\n\npackage raft\n\nimport (\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"io\"\n\t\"testing\"\n\t\"time\"\n)\n\nfunc assuranceCfgEvent(v map[string]interface{}) {\n\tpayload, err := json.Marshal(v)\n\tif err != nil {\n\t\tfmt.Println(\"assurance: event marshal failed:\", err)\n\t\treturn\n\t}\n\tfmt.Println(\"CA_EVENT \" + string(payload))\n}\n\ntype assuranceCfgFSM struct{}\n\nfunc (assuranceCfgFSM) Apply(*Log) interface{}         { return nil }\nfunc (assuranceCfgFSM) Snapshot() (FSMSnapshot, error) { return assuranceCfgSnapshot{}, nil }\nfunc (assuranceCfgFSM) Restore(io.ReadCloser) error    { return nil }\n\ntype assuranceCfgSnapshot struct{}\n\nfunc (assuranceCfgSnapshot) Persist(s SnapshotSink) error { return s.Close() }\nfunc (assuranceCfgSnapshot) Release()                     {}\n\nfunc TestAssuranceConfigurationIndexReported(t *testing.T) {\n\tconst (\n\t\top   = \"client-visible-configuration-index\"\n\t\tnode = ServerID(\"n1\")\n\t)\n\n\tconf := DefaultConfig()\n\tconf.LocalID = node\n\tconf.ProtocolVersion = 3\n\tconf.LogLevel = \"ERROR\"\n\tconf.SnapshotInterval = time.Hour\n\tconf.SnapshotThreshold = 100000\n\tconf.TrailingLogs = 100000\n\n\t_, trans := NewInmemTransport(ServerAddress(node))\n\tr, err := NewRaft(conf, assuranceCfgFSM{}, NewInmemStore(), NewInmemStore(), NewInmemSnapshotStore(), trans)\n\tif err != nil {\n\t\tassuranceCfgEvent(map[string]interface{}{\"event\": \"assurance_setup_failed\", \"node\": string(node), \"op\": op, \"detail\": err.Error()})\n\t\tt.Fatalf(\"assurance: NewRaft: %v\", err)\n\t}\n\tdefer func() { r.Shutdown().Error() }()\n\n\tconfiguration := Configuration{Servers: []Server{{ID: node, Address: trans.LocalAddr(), Suffrage: Voter}}}\n\tif err := r.BootstrapCluster(configuration).Error(); err != nil {\n\t\tassuranceCfgEvent(map[string]interface{}{\"event\": \"assurance_setup_failed\", \"node\": string(node), \"op\": op, \"detail\": \"bootstrap: \" + err.Error()})\n\t\tt.Fatalf(\"assurance: bootstrap: %v\", err)\n\t}\n\n\t// The bootstrap configuration entry is the only entry in the log, so the\n\t// index at which the configuration was established is the log's last index.\n\testablished := r.LastIndex()\n\n\tfuture := r.GetConfiguration()\n\tif err := future.Error(); err != nil {\n\t\tassuranceCfgEvent(map[string]interface{}{\"event\": \"assurance_setup_failed\", \"node\": string(node), \"op\": op, \"detail\": \"get configuration: \" + err.Error()})\n\t\tt.Fatalf(\"assurance: get configuration: %v\", err)\n\t}\n\treported := future.Index()\n\treturned := future.Configuration()\n\tstatsIndex := r.Stats()[\"latest_configuration_index\"]\n\thasSelf, servers := false, len(returned.Servers)\n\tfor _, server := range returned.Servers {\n\t\tif server.ID == node && server.Suffrage == Voter {\n\t\t\thasSelf = true\n\t\t}\n\t}\n\n\tassuranceCfgEvent(map[string]interface{}{\n\t\t\"event\":          \"configuration_established\",\n\t\t\"node\":           string(node),\n\t\t\"op\":             op,\n\t\t\"index\":          established,\n\t\t\"log_last_index\": established,\n\t})\n\tassuranceCfgEvent(map[string]interface{}{\n\t\t\"event\":                  \"configuration_index_observed\",\n\t\t\"node\":                   string(node),\n\t\t\"op\":                     op,\n\t\t\"reported_index\":         reported,\n\t\t\"stats_index\":            statsIndex,\n\t\t\"log_last_index\":         r.LastIndex(),\n\t\t\"configuration_has_self\": hasSelf,\n\t\t\"servers\":                servers,\n\t\t\"node_state\":             r.State().String(),\n\t})\n}\n",
+    "description": "TestAssuranceConfigurationIndexReported: the configuration future's Index compared with the index at which the configuration was established",
+    "semantic_changes": [
+      "No target file is modified; the harness adds one external test file to the captured package and uses only public APIs (NewRaft, BootstrapCluster, GetConfiguration, Stats, LastIndex, State).",
+      "The harness reads the configuration future's Index directly and separately reads the configuration it returns, so a correct configuration with an unset index cannot be mistaken for an absent configuration."
+    ],
+    "prerequisites": [
+      {
+        "alias": "admit",
+        "event": "configuration_established",
+        "conditions": []
+      }
+    ],
+    "legality": {
+      "source_ids": [
+        "s-api-get-configuration",
+        "s-api-stats-config-index",
+        "s-api-newraft-config",
+        "s-raft-append-config"
+      ],
+      "expectation_ids": [],
+      "binding_ids": [
+        "bind-raft-get-configuration"
+      ],
+      "derivation": "Raft.GetConfiguration builds a configurations value from the copy of the latest configuration and responds immediately, so the future's Configuration is the live configuration while the index field it never sets stays zero (s-api-get-configuration), even though the same future's Index is published as latest_configuration_index in Raft.Stats (s-api-stats-config-index). The index at which a configuration is established is the log index where its entry was written, which for a bootstrapped single-voter node is the configuration entry appended by BootstrapCluster, i.e. the log's last index (s-api-newraft-config, s-raft-append-config). Comparing the two numbers therefore exercises the requirement directly: the returned configuration is the live one, and the reported index must identify where it was established.",
+      "applicability": "A single-voter node that has just bootstrapped, so the configuration entry is the only log entry and the log's last index is exactly the index of that configuration; no election, snapshot or configuration change occurs inside the prefix.",
+      "unresolved": [
+        "whether the index is considered unavailable off the main loop, which no source states; the value is nevertheless published in Stats as if it were meaningful",
+        "whether the intended repair is to carry the index alongside the atomic configuration copy or to fetch both from the main loop"
+      ],
+      "conflicts": [],
+      "alternatives": [
+        "the field could be read as an unset placeholder rather than a reported index, but the same value is published as a metric and the accessor's contract names the index of the applied entry"
+      ]
+    }
+  },
+  "monitors": [
+    {
+      "id": "m-reported-configuration-index",
+      "checker_id": "p-reported-configuration-index",
+      "event": "configuration_index_observed",
+      "binding_ids": [
+        "bind-raft-get-configuration"
+      ],
+      "grounding": {
+        "source_ids": [
+          "s-api-get-configuration",
+          "s-api-stats-config-index"
+        ],
+        "expectation_ids": [],
+        "binding_ids": [
+          "bind-raft-get-configuration"
+        ],
+        "derivation": "The result event reports the index the future returned, the value Stats publishes for it, and whether the configuration the future returned still contains the local voter, so applicability can require that the returned value really is the live configuration before the index is judged (s-api-get-configuration, s-api-stats-config-index). The admission event reports the index at which the configuration was established, taken from the log the node itself reports.",
+        "applicability": "Same node and prefix as the harness; the node state and log length are reported beside the compared pair.",
+        "unresolved": [
+          "whether a delayed atomic copy could ever make the returned configuration differ from the established one, which this single-node prefix does not produce"
+        ],
+        "conflicts": [],
+        "alternatives": []
+      },
+      "applicability_conditions": [
+        {
+          "field": "configuration_has_self",
+          "op": "eq",
+          "value": true,
+          "reference": null
+        }
+      ],
+      "admission_alias": "admit"
+    }
+  ],
+  "observable_properties": [
+    {
+      "checker_id": "p-reported-configuration-index",
+      "kind": "event_assertion",
+      "trigger": {
+        "field": "op",
+        "op": "eq",
+        "value": "client-visible-configuration-index",
+        "reference": null
+      },
+      "assertion": {
+        "field": "reported_index",
+        "op": "eq",
+        "value": null,
+        "reference": "admit.index"
+      },
+      "antecedent": null,
+      "identity_fields": [
+        "node",
+        "op"
+      ],
+      "description": "The index reported by the configuration future, for a future whose returned configuration is the live one, must equal the log index at which that configuration was established. Equality is the requirement itself for a node whose configuration entry is the only log entry, so a different number means the accessor reports an index that does not identify the configuration it returned."
+    }
+  ],
+  "uncertainties": [
+    "The prefix contains a single configuration entry, so the comparison cannot distinguish a generally wrong index from one that happens to differ only for the first configuration; a second configuration change inside the same prefix would need an additional scenario.",
+    "The observable is an index value rather than a state transition, so the check reports what the accessor and the metric said rather than any downstream consequence for callers.",
+    "Only the first node and one configuration are exercised; nothing is claimed about how other consumers use the value."
+  ]
+}

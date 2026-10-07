@@ -1,0 +1,83 @@
+{
+  "description": "Third scenario of the same requirement, aimed at the question the earlier review left open: whether the two-leader overlap of one term persists. The prefix is the overlap harness - a stale term write held inside a lagging voter's StableStore, an endpoint unreachable for one election, and a leadership transfer that makes the lagging voter propose the term it already voted in - after which both leaders are kept from reaching each other. Discriminator: the harness records the sitting leader's claim at the moment the overlap is created and then observes both nodes' published states and terms after a window of several seconds. Observation: the asserted field is the second node's published state, judged only when the first node still leads and both nodes' terms equal the admitted term; the window length, the third voter's state and both nodes' terms are reported beside it. What this scenario settles is the persistence question, and its outcome is expected to be a bounded negative rather than a violation, because the lease check can end the second leadership before the window closes.",
+  "claim_id": "c-at-most-one-leader-per-term",
+  "binding_ids": ["bind-raft-elect-self-transfer"],
+  "harness": {
+    "kind": "go_test",
+    "description": "TestAssuranceTwoLeadersOneTerm window variant: the overlap observed after several seconds of separation",
+    "source": "",
+    "files": {},
+    "semantic_changes": [
+      "StreamLayer is replaced by an in-process net.Pipe fabric with a per-destination block flag; NetworkTransport, its heartbeat classification, the SetHeartbeatHandler registration, requestVote, appendEntries, runCandidate, electSelf and checkLeaderLease are the target's own code.",
+      "Two nodes' stores are seeded before NewRaft with the bootstrap configuration entry and CurrentTerm = 2; the lagging node is bootstrapped normally and its StableStore holds exactly one CurrentTerm write inside SetUint64.",
+      "The leader's reloadable intervals are lengthened through ReloadConfig so the prefix's sequencing holds, and after the overlap both leaders are prevented from reaching each other through the fabric's per-destination block; the second leader's own replication to the third voter is left open, so its lease check can be satisfied or not on its own timing.",
+      "The harness records the sitting leader's claim immediately when the overlap is created and both nodes' published states and terms after a fixed window, using only public accessors.",
+      "No target file is modified; the harness adds one external test file to the captured package."
+    ],
+    "prerequisites": [
+      {
+        "alias": "claim",
+        "event": "leader_claim_observed",
+        "conditions": []
+      }
+    ],
+    "legality": {
+      "source_ids": ["s-raft-leader-lease", "s-raft-elect-self", "s-raft-vote-record", "s-raft-request-vote-filter", "s-raft-set-current-term", "s-raft-process-heartbeat", "s-net-fastpath"],
+      "expectation_ids": [],
+      "binding_ids": ["bind-raft-elect-self-transfer"],
+      "derivation": "The overlap is built exactly as in the committed-entry scenario, so the second leadership of the term is reachable when the candidate path proposes a term already voted in and the vote path grants it (s-raft-elect-self, s-raft-vote-record, s-raft-request-vote-filter, with the published term lowered by a delayed write from the heartbeat callback per s-raft-process-heartbeat, s-net-fastpath, s-raft-set-current-term). Whether it survives is then decided by the leader's own lease check, which counts a voter as contacted only if its last contact is within LeaderLeaseTimeout and steps the leader down otherwise; a leader's contact with a peer is refreshed by its replication loop and by a heartbeat goroutine whose interval is derived from HeartbeatTimeout, so a lease shorter than that interval can end the leadership while the peer is perfectly reachable (s-raft-leader-lease). The scenario therefore measures how long the overlap lasts under the configuration the harness fixes, not whether it can be created.",
+      "applicability": "Three voters with the two leaders kept from reaching each other by the fabric block, one of them with a lease timeout shorter than its own contact refresh interval, and pre-vote disabled because the substitute transport does not implement it.",
+      "unresolved": [
+        "whether the same overlap persists when the lease timeout is long enough to cover the contact refresh interval",
+        "whether a longer or repeated window would eventually see the second leadership end for a different reason"
+      ],
+      "conflicts": [],
+      "alternatives": [
+        "the second leadership can also end by receiving traffic from the other leader, which the block prevents in this prefix",
+        "a configuration with a lease longer than the contact refresh interval would test the opposite timing"
+      ]
+    }
+  },
+  "monitors": [
+    {
+      "id": "m-overlap-window",
+      "checker_id": "p-overlap-window",
+      "event": "persistence_observed",
+      "binding_ids": ["bind-raft-elect-self-transfer"],
+      "admission_alias": "claim",
+      "applicability_conditions": [
+        {"field": "first_leader_state", "op": "eq", "value": "Leader"},
+        {"field": "first_leader_term", "op": "eq", "reference": "claim.term"},
+        {"field": "second_leader_term", "op": "eq", "reference": "claim.term"}
+      ],
+      "grounding": {
+        "source_ids": ["s-raft-leader-lease", "s-raft-set-current-term"],
+        "expectation_ids": [],
+        "binding_ids": ["bind-raft-elect-self-transfer"],
+        "derivation": "The result event reports both nodes' published states and terms at the end of the window and the length of that window, and the admission event reports the sitting leader's claim at the moment the overlap was created. Applicability restricts judgement to the case the requirement is about - the first node still leads in the admitted term and the second node's term is that same term - so a second node that has moved to a different term or already stepped down is not counted as a violation, and the assertion then reads the second node's state (s-raft-leader-lease, s-raft-set-current-term).",
+        "applicability": "Same cluster and prefix as the harness; the window length and the third voter's state are reported beside the compared states.",
+        "unresolved": [
+          "whether a longer window with a lease that covers the contact refresh interval would leave the second node leading"
+        ],
+        "conflicts": [],
+        "alternatives": []
+      }
+    }
+  ],
+  "observable_properties": [
+    {
+      "checker_id": "p-overlap-window",
+      "kind": "event_assertion",
+      "trigger": {"field": "op", "op": "eq", "value": "two-leaders-one-term"},
+      "assertion": {"field": "second_leader_state", "op": "ne", "value": "Leader"},
+      "identity_fields": ["cluster", "op"],
+      "description": "At the end of a window in which the first node still leads the admitted term and the second node's published term is that same term, the second node must not also be a leader. Applicability already restricts the comparison to two nodes sharing the term, so the assertion is the requirement itself over the window rather than at the instant the overlap was created."
+    }
+  ],
+  "uncertainties": [
+    "The expected outcome is a bounded negative: in the construction runs the second node had stepped down by the end of the window, so the requirement held over the window instead of being violated as it was at the instant the overlap was created.",
+    "The excluded explanations for that step-down are a higher term, an unreachable peer and a transport failure: the blocked peer cannot raise the term, the reachable voter stayed in the same term, and transport errors only back off replication without stepping a leader down; the remaining and sourced explanation is the lease check, which counts a voter as contacted only within LeaderLeaseTimeout while the leader's own contact refresh interval here (derived from HeartbeatTimeout) is longer than that lease.",
+    "Whether the overlap persists under a lease long enough to cover the refresh interval is not exercised, nor is a longer or repeated window, nor the same prefix without the block between the two leaders.",
+    "Only one cluster shape and one window length are used, and the harness reports the third voter's state without probing its reachability from the harness side."
+  ]
+}

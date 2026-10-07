@@ -1,0 +1,78 @@
+{
+  "description": "Discriminator: the commit index a node publishes when it reconstructs its state at startup from a stored snapshot. One node commits forty entries, takes a snapshot at index J through the public Snapshot API, reports J as committed, applied and last, and is shut down; the node is then constructed again over the same stores, so the library restores that snapshot during construction. Observation: the restarted node's own report of its commit index is compared with J, and the node's applied index, last index, the snapshot index it restored and its state are recorded beside it. Control: the compared index is the index the same node reported as committed and applied before the restart, and the restored flag is taken from the node's own last-snapshot report, so the comparison cannot be explained by a snapshot that was not restored.",
+  "claim_id": "c-snapshot-restore-commit-context",
+  "binding_ids": ["bind-raft-restore-snapshot-commit"],
+  "harness": {
+    "kind": "go_test",
+    "description": "TestAssuranceRestoreCommitContext: the commit index reported by a node after it reconstructs its state from a stored snapshot at startup",
+    "source": "",
+    "files": {},
+    "semantic_changes": [
+      "No target file is modified; the harness adds one external test file to the captured package and uses only public APIs (NewRaft, BootstrapCluster, Apply, Barrier, Snapshot, Shutdown, CommitIndex, AppliedIndex, LastIndex, Stats, State).",
+      "The snapshot is produced by the node itself through the public Snapshot API, so the restored index is an index that node had committed and applied and had published as such.",
+      "The same LogStore, StableStore and SnapshotStore instances are reused across the restart, so the second construction restores the state the first one left rather than a fixture.",
+      "The restarted instance's election timers are long only so that nothing campaigns between construction and the read; the observation is taken immediately after NewRaft returns."
+    ],
+    "prerequisites": [
+      {
+        "alias": "admit",
+        "event": "snapshot_committed_before_restart",
+        "conditions": []
+      }
+    ],
+    "legality": {
+      "source_ids": ["s-api-restore-snapshot", "s-api-commit-index", "s-api-newraft-config", "s-snapshot-take"],
+      "expectation_ids": [],
+      "binding_ids": ["bind-raft-restore-snapshot-commit"],
+      "derivation": "Raft.CommitIndex() is documented as the committed index and as the basis for the read-index optimisation, and it returns raftState.commitIndex (s-api-commit-index). During construction NewRaft restores the newest snapshot that loads, and restoreSnapshot then publishes raftState.lastApplied and lastSnapshot from the snapshot index and rebuilds the committed and latest configurations, but never writes the commit index, so the restarted node publishes a commit index of zero while reporting the snapshot index as applied and as its last snapshot (s-api-restore-snapshot, s-api-newraft-config). takeSnapshot had persisted the FSM at an index the node had already applied and committed (s-snapshot-take), so the compared index is one the same node reported as committed before the restart. Within this prefix the restarted node's own last index is the snapshot index, so a commit index at least J and a commit index equal to J coincide and the reported value can be compared with the admitted one directly.",
+      "applicability": "A node that is constructed over stores that already hold a snapshot and its log, observed before any election or leader contact. The harness reports the restored flag, the restored snapshot index, the applied index, the last index and the state so the scope is visible in the record.",
+      "unresolved": [
+        "whether the omission is deliberate, i.e. whether the published commit index is intended to mean only the value the leader last advertised",
+        "whether the intended repair advances the commit index during the restore or derives the published value from the last snapshot index"
+      ],
+      "conflicts": [],
+      "alternatives": [
+        "the zero could be read as 'no commit index has been advertised yet', but the node has itself restored and applied the committed state the snapshot carries and reports that snapshot index in Stats"
+      ]
+    }
+  },
+  "monitors": [
+    {
+      "id": "m-restore-commit-context",
+      "checker_id": "p-restore-commit-context",
+      "event": "restore_context_observed",
+      "binding_ids": ["bind-raft-restore-snapshot-commit"],
+      "admission_alias": "admit",
+      "applicability_conditions": [
+        {"field": "restored", "op": "eq", "value": true}
+      ],
+      "grounding": {
+        "source_ids": ["s-api-restore-snapshot", "s-api-commit-index", "s-snapshot-take"],
+        "expectation_ids": [],
+        "binding_ids": ["bind-raft-restore-snapshot-commit"],
+        "derivation": "The admission event reports the snapshot index, its term and the indexes the node itself published as committed, applied and last before the restart, and the result event reports the restarted node's commit index, applied index, last index, the snapshot index it reports as restored and its state, so applicability can require that the restore actually happened before the published value is judged (s-api-restore-snapshot, s-snapshot-take). The compared numbers come from the same export path the requirement names (s-api-commit-index).",
+        "applicability": "The same node before and after the restart, sharing one operation identity; each event names the node it was observed on.",
+        "unresolved": [
+          "whether a leader election immediately after the restart advances the value before a caller could read it, which this prefix deliberately does not produce"
+        ],
+        "conflicts": [],
+        "alternatives": []
+      }
+    }
+  ],
+  "observable_properties": [
+    {
+      "checker_id": "p-restore-commit-context",
+      "kind": "event_assertion",
+      "trigger": {"field": "op", "op": "eq", "value": "restart-restore-commit-context"},
+      "assertion": {"field": "commit_index", "op": "eq", "reference": "admit.index"},
+      "identity_fields": ["node", "op"],
+      "description": "After the node admitted by 'admit' restored the snapshot at the index it had committed and applied, the node's published commit index must be that index. Within this prefix the restarted node's own last index is the admitted index, so a commit index below it is below the committed state the node has just restored and applied, and equality is exactly the requirement that the published value may not under-report it."
+    }
+  ],
+  "uncertainties": [
+    "The observation is taken immediately after construction, so it does not measure how long the value stays low before a leader contacts the node or an election occurs; a single-voter configuration would advance it as soon as the node campaigns.",
+    "The observable is an index value rather than a state transition, so the check reports what the node published rather than a downstream consequence for a caller.",
+    "The restart keeps the log entries the snapshot covers, because TrailingLogs is left large; a configuration that compacted them away is not exercised."
+  ]
+}

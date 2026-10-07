@@ -1,0 +1,133 @@
+{
+  "description": "Discriminator: which servers may count toward the quorum that Raft.VerifyLeader requires. A three-server configuration with two voters and one non-voter elects a leader; the leader's route to the other voter is then removed, so the leader can no longer reach a quorum of voters but can still reach the non-voter, and the leader is asked whether it is still the leader. Observation: the harness records the verification result, its error, the configuration that produced it (voter count, non-voter count, quorum size), the disconnected voter and the leader's state. Control: the configuration, the quorum size and the unreachable voter are reported beside the result, and applicability requires the voter quorum to be unreachable, so the judged operation is exactly the leader-only-plus-non-voter case.",
+  "claim_id": "c-verify-leader-voter-quorum",
+  "binding_ids": [
+    "bind-raft-verify-leader-quorum"
+  ],
+  "harness": {
+    "execution_package": ".",
+    "files": {},
+    "kind": "go_test",
+    "source": "// Copyright (c) HashiCorp, Inc.\n// SPDX-License-Identifier: MPL-2.0\n//\n// Generated assurance harness. A three-server configuration with two voters and\n// one non-voter elects a leader, the leader's route to the other voter is\n// removed, and the leader then asks the library whether it is still the leader.\n// The harness records the verification result together with the configuration\n// that produced it. It reports raw fields only.\n\npackage raft\n\nimport (\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"io\"\n\t\"testing\"\n\t\"time\"\n)\n\nfunc assuranceVerifyEvent(v map[string]interface{}) {\n\tpayload, err := json.Marshal(v)\n\tif err != nil {\n\t\tfmt.Println(\"assurance: event marshal failed:\", err)\n\t\treturn\n\t}\n\tfmt.Println(\"CA_EVENT \" + string(payload))\n}\n\ntype assuranceVerifyFSM struct{}\n\nfunc (assuranceVerifyFSM) Apply(*Log) interface{}         { return nil }\nfunc (assuranceVerifyFSM) Snapshot() (FSMSnapshot, error) { return assuranceVerifySnapshot{}, nil }\nfunc (assuranceVerifyFSM) Restore(io.ReadCloser) error    { return nil }\n\ntype assuranceVerifySnapshot struct{}\n\nfunc (assuranceVerifySnapshot) Persist(s SnapshotSink) error { return s.Close() }\nfunc (assuranceVerifySnapshot) Release()                     {}\n\nfunc TestAssuranceVerifyLeaderVoterQuorum(t *testing.T) {\n\tconst (\n\t\top      = \"verify-leader-voter-quorum\"\n\t\tcluster = \"c1\"\n\t)\n\n\taddr1, trans1 := NewInmemTransport(ServerAddress(\"n1\"))\n\taddr2, trans2 := NewInmemTransport(ServerAddress(\"n2\"))\n\taddr3, trans3 := NewInmemTransport(ServerAddress(\"n3\"))\n\ttrans1.Connect(addr2, trans2)\n\ttrans2.Connect(addr1, trans1)\n\ttrans1.Connect(addr3, trans3)\n\ttrans3.Connect(addr1, trans1)\n\ttrans2.Connect(addr3, trans3)\n\ttrans3.Connect(addr2, trans2)\n\n\tconfiguration := Configuration{Servers: []Server{\n\t\t{ID: ServerID(\"n1\"), Address: addr1, Suffrage: Voter},\n\t\t{ID: ServerID(\"n2\"), Address: addr2, Suffrage: Voter},\n\t\t{ID: ServerID(\"n3\"), Address: addr3, Suffrage: Nonvoter},\n\t}}\n\n\ttype member struct {\n\t\tid    ServerID\n\t\taddr  ServerAddress\n\t\ttrans *InmemTransport\n\t\tr     *Raft\n\t}\n\tmembers := []*member{\n\t\t{id: ServerID(\"n1\"), addr: addr1, trans: trans1},\n\t\t{id: ServerID(\"n2\"), addr: addr2, trans: trans2},\n\t\t{id: ServerID(\"n3\"), addr: addr3, trans: trans3},\n\t}\n\tfor _, m := range members {\n\t\tlogStore := NewInmemStore()\n\t\tstableStore := NewInmemStore()\n\t\tsnapStore := NewInmemSnapshotStore()\n\t\tconf := DefaultConfig()\n\t\tconf.LocalID = m.id\n\t\tconf.ProtocolVersion = 3\n\t\tconf.LogLevel = \"ERROR\"\n\t\tconf.HeartbeatTimeout = 500 * time.Millisecond\n\t\tconf.ElectionTimeout = 1 * time.Second\n\t\tconf.LeaderLeaseTimeout = 500 * time.Millisecond\n\t\tconf.CommitTimeout = 50 * time.Millisecond\n\t\tconf.SnapshotInterval = time.Hour\n\t\tconf.SnapshotThreshold = 100000\n\t\tconf.TrailingLogs = 100000\n\t\tif err := BootstrapCluster(conf, logStore, stableStore, snapStore, m.trans, configuration); err != nil {\n\t\t\tassuranceVerifyEvent(map[string]interface{}{\"event\": \"assurance_setup_failed\", \"cluster\": cluster, \"op\": op, \"node\": string(m.id), \"detail\": \"bootstrap: \" + err.Error()})\n\t\t\tt.Fatalf(\"assurance: bootstrap %s: %v\", m.id, err)\n\t\t}\n\t\tr, err := NewRaft(conf, assuranceVerifyFSM{}, logStore, stableStore, snapStore, m.trans)\n\t\tif err != nil {\n\t\t\tassuranceVerifyEvent(map[string]interface{}{\"event\": \"assurance_setup_failed\", \"cluster\": cluster, \"op\": op, \"node\": string(m.id), \"detail\": \"NewRaft: \" + err.Error()})\n\t\t\tt.Fatalf(\"assurance: NewRaft %s: %v\", m.id, err)\n\t\t}\n\t\tm.r = r\n\t\tdefer func(r *Raft) { r.Shutdown().Error() }(r)\n\t}\n\n\tvar leader *member\n\twaitUntil := time.Now().Add(5 * time.Second)\n\tfor leader == nil {\n\t\tfor _, m := range members {\n\t\t\tif m.r.State() == Leader {\n\t\t\t\tleader = m\n\t\t\t}\n\t\t}\n\t\tif time.Now().After(waitUntil) {\n\t\t\tassuranceVerifyEvent(map[string]interface{}{\"event\": \"assurance_setup_failed\", \"cluster\": cluster, \"op\": op, \"detail\": \"no leader elected\"})\n\t\t\tt.Fatalf(\"assurance: no leader elected\")\n\t\t}\n\t\ttime.Sleep(10 * time.Millisecond)\n\t}\n\tif err := leader.r.Barrier(3 * time.Second).Error(); err != nil {\n\t\tassuranceVerifyEvent(map[string]interface{}{\"event\": \"assurance_setup_failed\", \"cluster\": cluster, \"op\": op, \"node\": string(leader.id), \"detail\": \"barrier: \" + err.Error()})\n\t\tt.Fatalf(\"assurance: barrier: %v\", err)\n\t}\n\n\tvar otherVoter *member\n\tvar nonVoter *member\n\tfor _, m := range members {\n\t\tif m == leader {\n\t\t\tcontinue\n\t\t}\n\t\tif m.id == ServerID(\"n3\") {\n\t\t\tnonVoter = m\n\t\t} else {\n\t\t\totherVoter = m\n\t\t}\n\t}\n\tif otherVoter == nil || nonVoter == nil {\n\t\tt.Fatalf(\"assurance: unexpected membership\")\n\t}\n\n\tvoters, nonvoters := 0, 0\n\tfor _, server := range configuration.Servers {\n\t\tif server.Suffrage == Voter {\n\t\t\tvoters++\n\t\t} else {\n\t\t\tnonvoters++\n\t\t}\n\t}\n\tquorumSize := voters/2 + 1\n\n\tassuranceVerifyEvent(map[string]interface{}{\n\t\t\"event\":          \"verification_setup\",\n\t\t\"cluster\":        cluster,\n\t\t\"op\":             op,\n\t\t\"node\":           string(leader.id),\n\t\t\"term\":           leader.r.CurrentTerm(),\n\t\t\"voters\":         voters,\n\t\t\"nonvoters\":      nonvoters,\n\t\t\"quorum_size\":    quorumSize,\n\t\t\"other_voter\":    string(otherVoter.id),\n\t\t\"non_voter\":      string(nonVoter.id),\n\t\t\"leader_state\":   leader.r.State().String(),\n\t})\n\n\t// Remove the leader's route to the only other voter, so the leader can no\n\t// longer reach a quorum of voters but can still reach the non-voter.\n\tleader.trans.Disconnect(otherVoter.addr)\n\ttime.Sleep(200 * time.Millisecond)\n\n\ttype verifyOutcome struct {\n\t\tresult string\n\t\terr    error\n\t}\n\tdone := make(chan verifyOutcome, 1)\n\tgo func() {\n\t\terr := leader.r.VerifyLeader().Error()\n\t\tif err != nil {\n\t\t\tdone <- verifyOutcome{result: \"error\", err: err}\n\t\t\treturn\n\t\t}\n\t\tdone <- verifyOutcome{result: \"success\"}\n\t}()\n\toutcome := verifyOutcome{result: \"unfinished\"}\n\tselect {\n\tcase outcome = <-done:\n\tcase <-time.After(3 * time.Second):\n\t\toutcome = verifyOutcome{result: \"unfinished\"}\n\t}\n\n\tdetail := \"\"\n\tif outcome.err != nil {\n\t\tdetail = outcome.err.Error()\n\t}\n\tstats := leader.r.Stats()\n\tassuranceVerifyEvent(map[string]interface{}{\n\t\t\"event\":                  \"verification_observed\",\n\t\t\"cluster\":                cluster,\n\t\t\"op\":                     op,\n\t\t\"node\":                   string(leader.id),\n\t\t\"voters\":                 voters,\n\t\t\"nonvoters\":              nonvoters,\n\t\t\"quorum_size\":            quorumSize,\n\t\t\"other_voter\":            string(otherVoter.id),\n\t\t\"non_voter\":              string(nonVoter.id),\n\t\t\"other_voter_reachable\":  false,\n\t\t\"verification_result\":    outcome.result,\n\t\t\"verification_error\":     detail,\n\t\t\"leader_state\":           leader.r.State().String(),\n\t\t\"leader_stats_state\":     stats[\"state\"],\n\t})\n}\n",
+    "description": "TestAssuranceVerifyLeaderVoterQuorum: the result of VerifyLeader on a leader that can reach only a non-voter",
+    "semantic_changes": [
+      "No target file is modified; the harness adds one external test file to the captured package and uses only public APIs (NewRaft, BootstrapCluster, State, Barrier, VerifyLeader, CurrentTerm, Stats, Shutdown) plus the module's own InmemTransport Connect and Disconnect for routing.",
+      "The configuration is a real two-voter configuration with one non-voter, bootstrapped on all three servers, so the quorum the leader computes is the voter majority and the non-voter is a genuine member.",
+      "The leader's route to the other voter is removed with the transport's own Disconnect; the non-voter keeps working normally, so the leader still sends and receives heartbeats.",
+      "Election and lease timeouts are long enough that the leader has not stepped down when the verification is issued, so the judged operation is the verification itself."
+    ],
+    "prerequisites": [
+      {
+        "alias": "admit",
+        "event": "verification_setup",
+        "conditions": []
+      }
+    ],
+    "legality": {
+      "source_ids": [
+        "s-api-verify-leader",
+        "s-replication-heartbeat",
+        "s-raft-leader-lease",
+        "s-raft-candidate-vote"
+      ],
+      "expectation_ids": [],
+      "binding_ids": [
+        "bind-raft-verify-leader-quorum"
+      ],
+      "derivation": "VerifyLeader is documented as the guard against returning stale data after the peer has lost leadership, and it hands a verifyFuture to the leader's main loop (s-api-verify-leader). There verifyLeader sets the future's votes to one for the leader itself, sets quorumSize to r.quorumSize(), and registers the future with every follower replication state, non-voters included, then triggers immediate heartbeats. r.quorumSize() counts only servers whose suffrage is Voter (s-raft-candidate-vote, s-raft-leader-lease), and each replication goroutine adds one vote when its heartbeat RPC succeeds (s-replication-heartbeat). The numerator and the denominator therefore come from different sets: a leader of a two-voter configuration reaches the required two votes with its own vote plus the acknowledgement of a single non-voter, although the voter majority it claims to have confirmed is not reachable. The obligation requires the confirmation to rest on voters, so the harness judges exactly that case.",
+      "applicability": "A leader whose configuration contains non-voters and whose only reachable peer is a non-voter, observed before any lease expiry or election has changed its state. The harness reports the voter and non-voter counts, the quorum size, the unreachable voter and the leader's state so the scope is visible in the record.",
+      "unresolved": [
+        "whether the heartbeat acknowledgement of a non-voter was intended to count toward verification, which no source states",
+        "whether the repair filters the counted acknowledgements by suffrage or stops registering non-voter replication states for verification"
+      ],
+      "conflicts": [],
+      "alternatives": [
+        "the success could be read as 'the leader is still in the leader state', but VerifyLeader's contract is about confirming leadership against a quorum, and the leader state alone is exactly what the caller is trying to check"
+      ]
+    }
+  },
+  "monitors": [
+    {
+      "id": "m-verify-leader-voter-quorum",
+      "checker_id": "p-verify-leader-voter-quorum",
+      "event": "verification_observed",
+      "binding_ids": [
+        "bind-raft-verify-leader-quorum"
+      ],
+      "grounding": {
+        "source_ids": [
+          "s-api-verify-leader",
+          "s-replication-heartbeat"
+        ],
+        "expectation_ids": [],
+        "binding_ids": [
+          "bind-raft-verify-leader-quorum"
+        ],
+        "derivation": "The admission event reports the leader's term, the voter and non-voter counts, the quorum size and the identity of the unreachable voter, and the result event reports the verification's outcome together with the same configuration and the leader's state, so applicability can require the intended membership and the unreachable voter before the outcome is judged (s-api-verify-leader, s-replication-heartbeat). Applicability is not conditioned on the outcome itself; a verification that never finished would be recorded as the harness reports it and is listed as a limit of this check rather than filtered out.",
+        "applicability": "One three-server configuration, one leader, one unreachable voter and one reachable non-voter; the identity is the cluster and the operation name.",
+        "unresolved": [
+          "whether a slower or lossier transport would change which acknowledgements arrive inside the verification"
+        ],
+        "conflicts": [],
+        "alternatives": []
+      },
+      "applicability_conditions": [
+        {
+          "field": "voters",
+          "op": "eq",
+          "value": 2,
+          "reference": null
+        },
+        {
+          "field": "nonvoters",
+          "op": "eq",
+          "value": 1,
+          "reference": null
+        },
+        {
+          "field": "quorum_size",
+          "op": "eq",
+          "value": 2,
+          "reference": null
+        },
+        {
+          "field": "other_voter_reachable",
+          "op": "eq",
+          "value": false,
+          "reference": null
+        }
+      ],
+      "admission_alias": "admit"
+    }
+  ],
+  "observable_properties": [
+    {
+      "checker_id": "p-verify-leader-voter-quorum",
+      "kind": "event_assertion",
+      "trigger": {
+        "field": "op",
+        "op": "eq",
+        "value": "verify-leader-voter-quorum",
+        "reference": null
+      },
+      "assertion": {
+        "field": "verification_result",
+        "op": "ne",
+        "value": "success",
+        "reference": null
+      },
+      "antecedent": null,
+      "identity_fields": [
+        "cluster",
+        "op"
+      ],
+      "description": "When the leader of a two-voter configuration cannot reach the other voter, its verification of leadership must not report success: the quorum the accessor claims to confirm is the voter majority, and a non-voter's acknowledgement is not part of it. Reporting success is the violation; an error or an unfinished verification is not."
+    }
+  ],
+  "uncertainties": [
+    "The prefix contains one leader and one unreachable voter; configurations with several non-voters, or with the unreachable peer being the non-voter instead, are not exercised.",
+    "The check reports the verification outcome and the configuration, not a downstream stale read, so the consumer that would be misled by the confirmation is not part of the observation.",
+    "An unfinished verification is not distinguished from a failure by the compared predicate, so a run in which the future never resolves would be recorded without a violation rather than as a violation or a distinct outcome.",
+    "The leader is judged before its lease expires, so nothing here says how long the false confirmation remains available to callers."
+  ]
+}

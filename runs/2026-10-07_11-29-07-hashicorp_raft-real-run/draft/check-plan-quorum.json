@@ -1,0 +1,81 @@
+{
+  "description": "Discriminator: whether a committed index names the entry the other voters store. The prefix first builds the two-leader overlap of one term (a stale term write held inside a lagging voter's StableStore, an abstaining voter, and a leadership transfer that makes the lagging voter propose the term it already voted in), then keeps the two leaders from reaching each other while both can reach the third voter. With the overlap in place, one leader commits a client write, and the harness reads that leader's own log entry and applied value at the acknowledged index together with the other voter's log entry and applied value at the same index. Observation: the acknowledged command and its index come from the write's own future and the leader's log, and the replica's entry at that index is read from its log store and its applied state; the asserted field is whether the replica's log data at that index equals the acknowledged command. Control: the admission event reports the leader's log type, term and data at the index and requires the replica's entry to be at the same term before the comparison is judged, so a replica that simply lags behind is not reported.",
+  "claim_id": "c-committed-entry-stored-by-quorum",
+  "binding_ids": ["bind-commitment-recalculate"],
+  "harness": {
+    "kind": "go_test",
+    "description": "TestAssuranceTwoLeadersOneTerm: two-leader overlap, then a committed client write the other voter does not hold",
+    "source": "",
+    "files": {},
+    "semantic_changes": [
+      "StreamLayer is replaced by an in-process net.Pipe fabric with a per-destination block flag; NetworkTransport, its heartbeat classification, the SetHeartbeatHandler registration, requestVote, appendEntries, runCandidate, electSelf, the commitment bookkeeping and the leadership transfer are the target's own code.",
+      "Two nodes' stores are seeded before NewRaft with the bootstrap configuration entry and CurrentTerm = 2; the lagging node is bootstrapped normally and its StableStore holds exactly one CurrentTerm write inside SetUint64.",
+      "The harness uses the public Apply, and reads the leader's and the replica's log entries directly from the InmemStore instances it supplied (a lock-protected store read) and their applied values from the FSMs it supplied, which record the command data per index.",
+      "The leader's reloadable intervals are lengthened through ReloadConfig once it is leader, and after the overlap both leaders are prevented from reaching each other through the fabric's per-destination block, so the transient overlap persists long enough for the consequence to be observed.",
+      "No target file is modified; the harness adds one external test file to the captured package."
+    ],
+    "prerequisites": [
+      {
+        "alias": "admit",
+        "event": "command_acknowledged",
+        "conditions": []
+      }
+    ],
+    "legality": {
+      "source_ids": ["s-commitment-recalc", "s-raft-append-commit", "s-raft-append-entries-log", "s-raft-append-config", "s-raft-elect-self", "s-raft-vote-record", "s-raft-request-vote-filter"],
+      "expectation_ids": [],
+      "binding_ids": ["bind-commitment-recalculate"],
+      "derivation": "Commitment advances when the majority of the tracked voter indexes reaches an index, and the tracked indexes are the positions each voter has acknowledged in the leader's log (s-commitment-recalc). A follower that receives an entry whose index it already holds compares terms only: when the terms match it treats the entry as a duplicate and stores nothing, so its acknowledgement tells the leader that the position is written without asserting that the same command is written there (s-raft-append-entries-log). Under a single leadership that assumption is sound because log matching follows from the vote rule; with two leaders of one term, one of which was able to propose the term it had already voted in after its published term dropped (s-raft-elect-self, s-raft-vote-record, s-raft-request-vote-filter), two different entries with the same index and term exist, and a leader can therefore count a quorum for a command the other voter never applied (s-raft-append-commit, s-raft-append-config).",
+      "applicability": "Three voters, one of them unreachable for exactly one election and one lagging by one published term, with pre-vote disabled because the substitute transport does not implement it; after the overlap the two leaders are kept apart by the fabric so neither can settle the term before the observation.",
+      "unresolved": [
+        "the overlap is kept alive by a block between the two leaders, so the observation depends on that fault rather than on the natural transience of the overlap",
+        "the harness reads one index only and does not attempt to detect a wider divergence or a client-visible read of the wrong value"
+      ],
+      "conflicts": [],
+      "alternatives": [
+        "the duplicate rule could be strengthened by comparing entry contents, which the captured implementation does not do",
+        "the overlap could be ended immediately by letting the two leaders exchange traffic, in which case no committed command is observed"
+      ]
+    }
+  },
+  "monitors": [
+    {
+      "id": "m-committed-entry-stored-by-quorum",
+      "checker_id": "p-committed-entry-stored-by-quorum",
+      "event": "replica_entry_observed",
+      "binding_ids": ["bind-commitment-recalculate"],
+      "admission_alias": "admit",
+      "applicability_conditions": [
+        {"field": "log_term", "op": "eq", "reference": "admit.leader_log_term"}
+      ],
+      "grounding": {
+        "source_ids": ["s-commitment-recalc", "s-raft-append-entries-log", "s-raft-append-commit"],
+        "expectation_ids": [],
+        "binding_ids": ["bind-commitment-recalculate"],
+        "derivation": "The result event reports the replica's log type, term and data at the acknowledged index together with its applied value and commit index, and the admission event reports the command the leader acknowledged with its index, log type, term and data. Applicability requires the replica's entry to be at the same term as the leader's, which is the case the commit rule assumes to be identical, so a replica that merely lags behind is not judged; the assertion then compares the replica's data with the acknowledged command (s-commitment-recalc, s-raft-append-entries-log, s-raft-append-commit).",
+        "applicability": "Same cluster and prefix as the harness; the replica's commit index and last index are reported beside the compared data.",
+        "unresolved": [
+          "whether the replica later replaces its entry, which this prefix does not exercise"
+        ],
+        "conflicts": [],
+        "alternatives": []
+      }
+    }
+  ],
+  "observable_properties": [
+    {
+      "checker_id": "p-committed-entry-stored-by-quorum",
+      "kind": "event_assertion",
+      "trigger": {"field": "node", "op": "eq", "value": "e1"},
+      "assertion": {"field": "log_data", "op": "eq", "reference": "admit.command"},
+      "identity_fields": ["cluster", "op"],
+      "description": "For a replica entry at the same index and term as the entry a leader acknowledged to its client, the replica's stored data must equal the acknowledged command. Equality means the committed index names the same entry on the voter that acknowledged it; a different value means a client write was acknowledged at a position where the configuration stores something else."
+    }
+  ],
+  "uncertainties": [
+    "The observation depends on the staged chain: a seeded term, a blocked endpoint during the first election, a delayed store write, a leadership transfer, a lengthened heartbeat interval, and a block between the two leaders that keeps the overlap alive; each step is a legal fault or public call, but the chain is constructed rather than organic.",
+    "Only one index and one acknowledged write are observed; a wider divergence and any client read of the wrong value are not exercised.",
+    "The replica's entry is read from the InmemStore the harness supplied and its applied value from the FSM it supplied, so the observation is of the library's own writes into those injected dependencies.",
+    "The comparison treats the replica's data as the value the client should see, which is exact for a LogCommand entry and empty for the noop the captured implementation stored in its place."
+  ]
+}

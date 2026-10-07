@@ -1,0 +1,132 @@
+{
+  "description": "Third scenario of the same requirement, aimed at the question the earlier review left open: whether the two-leader overlap of one term persists. The prefix is the overlap harness - a stale term write held inside a lagging voter's StableStore, an endpoint unreachable for one election, and a leadership transfer that makes the lagging voter propose the term it already voted in - after which both leaders are kept from reaching each other. Discriminator: the harness records the sitting leader's claim at the moment the overlap is created and then observes both nodes' published states and terms after a window of several seconds. Observation: the asserted field is the second node's published state, judged only when the first node still leads and both nodes' terms equal the admitted term; the window length, the third voter's state and both nodes' terms are reported beside it. What this scenario settles is the persistence question, and its outcome is expected to be a bounded negative rather than a violation, because the lease check can end the second leadership before the window closes.",
+  "claim_id": "c-at-most-one-leader-per-term",
+  "binding_ids": [
+    "bind-raft-elect-self-transfer"
+  ],
+  "harness": {
+    "execution_package": ".",
+    "files": {},
+    "kind": "go_test",
+    "source": "// Copyright (c) HashiCorp, Inc.\n// SPDX-License-Identifier: MPL-2.0\n//\n// Generated assurance harness. It builds the two-leader overlap of one term\n// with the same prefix as the committed-entry harness, records the sitting\n// leader's claim, and then observes both leaders' published states and terms\n// after a window in which the two leaders are kept from reaching each other. It\n// reports raw fields only.\n\npackage raft\n\nimport (\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"io\"\n\t\"net\"\n\t\"sync\"\n\t\"sync/atomic\"\n\t\"testing\"\n\t\"time\"\n)\n\nfunc assuranceTwoEvent(v map[string]interface{}) {\n\tpayload, err := json.Marshal(v)\n\tif err != nil {\n\t\tfmt.Println(\"assurance: event marshal failed:\", err)\n\t\treturn\n\t}\n\tfmt.Println(\"CA_EVENT \" + string(payload))\n}\n\ntype assuranceTwoAddr struct{ name string }\n\nfunc (a assuranceTwoAddr) Network() string { return \"pipe\" }\nfunc (a assuranceTwoAddr) String() string  { return a.name }\n\ntype assuranceTwoFabric struct {\n\tmu      sync.Mutex\n\tlayers  map[string]*assuranceTwoLayer\n\tblocked map[string]bool\n}\n\nfunc newAssuranceTwoFabric() *assuranceTwoFabric {\n\treturn &assuranceTwoFabric{layers: make(map[string]*assuranceTwoLayer), blocked: make(map[string]bool)}\n}\n\nfunc (f *assuranceTwoFabric) newLayer(name string) *assuranceTwoLayer {\n\tl := &assuranceTwoLayer{fabric: f, name: name, conns: make(chan net.Conn), closed: make(chan struct{})}\n\tf.mu.Lock()\n\tf.layers[name] = l\n\tf.mu.Unlock()\n\treturn l\n}\n\nfunc (f *assuranceTwoFabric) block(name string, v bool) {\n\tf.mu.Lock()\n\tf.blocked[name] = v\n\tf.mu.Unlock()\n}\n\nfunc (f *assuranceTwoFabric) dial(to string, timeout time.Duration) (net.Conn, error) {\n\tf.mu.Lock()\n\tl, blocked := f.layers[to], f.blocked[to]\n\tf.mu.Unlock()\n\tif blocked {\n\t\treturn nil, fmt.Errorf(\"pipe endpoint %q unreachable\", to)\n\t}\n\tif l == nil {\n\t\treturn nil, fmt.Errorf(\"no pipe endpoint %q\", to)\n\t}\n\tlocal, remote := net.Pipe()\n\tselect {\n\tcase l.conns <- local:\n\t\treturn remote, nil\n\tcase <-l.closed:\n\t\tlocal.Close()\n\t\tremote.Close()\n\t\treturn nil, fmt.Errorf(\"pipe endpoint %q closed\", to)\n\tcase <-time.After(timeout):\n\t\tlocal.Close()\n\t\tremote.Close()\n\t\treturn nil, fmt.Errorf(\"pipe dial to %q timed out\", to)\n\t}\n}\n\ntype assuranceTwoLayer struct {\n\tfabric   *assuranceTwoFabric\n\tname     string\n\tconns    chan net.Conn\n\tclosed   chan struct{}\n\tcloseOne sync.Once\n}\n\nfunc (l *assuranceTwoLayer) Accept() (net.Conn, error) {\n\tselect {\n\tcase c := <-l.conns:\n\t\treturn c, nil\n\tcase <-l.closed:\n\t\treturn nil, fmt.Errorf(\"pipe listener %q closed\", l.name)\n\t}\n}\n\nfunc (l *assuranceTwoLayer) Close() error {\n\tl.closeOne.Do(func() {\n\t\tclose(l.closed)\n\t\tl.fabric.mu.Lock()\n\t\tdelete(l.fabric.layers, l.name)\n\t\tl.fabric.mu.Unlock()\n\t})\n\treturn nil\n}\n\nfunc (l *assuranceTwoLayer) Addr() net.Addr { return assuranceTwoAddr{l.name} }\n\nfunc (l *assuranceTwoLayer) Dial(address ServerAddress, timeout time.Duration) (net.Conn, error) {\n\treturn l.fabric.dial(string(address), timeout)\n}\n\n// assuranceTwoStore holds exactly one CurrentTerm write inside SetUint64.\ntype assuranceTwoStore struct {\n\t*InmemStore\n\tarm     atomic.Bool\n\tblocked atomic.Bool\n\tentered chan struct{}\n\trelease chan struct{}\n}\n\nfunc (s *assuranceTwoStore) SetUint64(key []byte, val uint64) error {\n\tif string(key) == \"CurrentTerm\" && s.arm.Load() && s.blocked.CompareAndSwap(false, true) {\n\t\ts.entered <- struct{}{}\n\t\t<-s.release\n\t}\n\treturn s.InmemStore.SetUint64(key, val)\n}\n\ntype assuranceTwoFSM struct {\n\tmu      sync.Mutex\n\tapplied map[uint64]string\n}\n\nfunc newAssuranceTwoFSM() *assuranceTwoFSM { return &assuranceTwoFSM{applied: make(map[uint64]string)} }\n\nfunc (f *assuranceTwoFSM) Apply(l *Log) interface{} {\n\tif l.Type == LogCommand {\n\t\tf.mu.Lock()\n\t\tf.applied[l.Index] = string(l.Data)\n\t\tf.mu.Unlock()\n\t}\n\treturn nil\n}\n\nfunc (f *assuranceTwoFSM) appliedAt(index uint64) string {\n\tf.mu.Lock()\n\tdefer f.mu.Unlock()\n\treturn f.applied[index]\n}\n\nfunc (f *assuranceTwoFSM) Snapshot() (FSMSnapshot, error) { return assuranceTwoSnapshot{}, nil }\nfunc (f *assuranceTwoFSM) Restore(io.ReadCloser) error    { return nil }\n\ntype assuranceTwoSnapshot struct{}\n\nfunc (assuranceTwoSnapshot) Persist(s SnapshotSink) error { return s.Close() }\nfunc (assuranceTwoSnapshot) Release()                     {}\n\n// assuranceTwoWatch records the instant a node advertises a state change, and\n// what the other node's own published state and term were at that instant.\ntype assuranceTwoWatch struct {\n\tmu        sync.Mutex\n\tother     *Raft\n\tstate     string\n\tterm      uint64\n\totherSt   string\n\totherTerm uint64\n\tfired     bool\n}\n\nfunc (w *assuranceTwoWatch) filter(o *Observation) bool {\n\tif st, ok := o.Data.(RaftState); ok && st == Leader {\n\t\tw.mu.Lock()\n\t\tif !w.fired {\n\t\t\tw.fired = true\n\t\t\tw.state, w.term = \"Leader\", o.Raft.CurrentTerm()\n\t\t\tif w.other != nil {\n\t\t\t\tw.otherSt, w.otherTerm = w.other.State().String(), w.other.CurrentTerm()\n\t\t\t}\n\t\t}\n\t\tw.mu.Unlock()\n\t}\n\treturn false\n}\n\nfunc (w *assuranceTwoWatch) snapshot() (bool, string, uint64, string, uint64) {\n\tw.mu.Lock()\n\tdefer w.mu.Unlock()\n\treturn w.fired, w.state, w.term, w.otherSt, w.otherTerm\n}\n\nfunc assuranceTwoWaitFor(t *testing.T, what string, cond func() bool, limit time.Duration) bool {\n\tdeadline := time.Now().Add(limit)\n\tfor time.Now().Before(deadline) {\n\t\tif cond() {\n\t\t\treturn true\n\t\t}\n\t\ttime.Sleep(200 * time.Microsecond)\n\t}\n\treturn false\n}\n\nfunc TestAssuranceTwoLeadersOneTerm(t *testing.T) {\n\tconst (\n\t\top    = \"two-leaders-one-term\"\n\t\tcls   = \"three-voter-stale-follower\"\n\t\tterm  = uint64(2) // the stale heartbeat's term; the election that follows proposes one above it\n\t\tghost = ServerID(\"g1\")\n\t)\n\tdID, eID, tID := ServerID(\"d1\"), ServerID(\"e1\"), ServerID(\"t1\")\n\n\tfabric := newAssuranceTwoFabric()\n\tdLayer, eLayer, tLayer, gLayer := fabric.newLayer(\"d1-pipe\"), fabric.newLayer(\"e1-pipe\"), fabric.newLayer(\"t1-pipe\"), fabric.newLayer(\"g1-pipe\")\n\tdTrans := NewNetworkTransport(dLayer, 4, 10*time.Second, io.Discard)\n\teTrans := NewNetworkTransport(eLayer, 4, 10*time.Second, io.Discard)\n\ttTrans := NewNetworkTransport(tLayer, 4, 10*time.Second, io.Discard)\n\tgTrans := NewNetworkTransport(gLayer, 4, 10*time.Second, io.Discard)\n\tdefer func() { dTrans.Close(); eTrans.Close(); tTrans.Close(); gTrans.Close() }()\n\n\tconfig := Configuration{Servers: []Server{\n\t\t{ID: dID, Address: dTrans.LocalAddr(), Suffrage: Voter},\n\t\t{ID: eID, Address: eTrans.LocalAddr(), Suffrage: Voter},\n\t\t{ID: tID, Address: tTrans.LocalAddr(), Suffrage: Voter},\n\t}}\n\tentry := &Log{Index: 1, Term: 1, Type: LogConfiguration, Data: EncodeConfiguration(config)}\n\n\t// d and e are already past the bootstrap term: they observed term 2 without\n\t// voting, which is what a node that lost an election and stayed a follower\n\t// would carry.\n\tseeded := func(conf *Config, id ServerID) (LogStore, StableStore) {\n\t\tlogs, stable := NewInmemStore(), NewInmemStore()\n\t\tif err := logs.StoreLog(entry); err != nil {\n\t\t\tt.Fatalf(\"assurance: store log: %v\", err)\n\t\t}\n\t\tif err := stable.SetUint64(keyCurrentTerm, term); err != nil {\n\t\t\tt.Fatalf(\"assurance: seed term: %v\", err)\n\t\t}\n\t\treturn logs, stable\n\t}\n\tcfgFor := func(id ServerID, heartbeat, election time.Duration) *Config {\n\t\tconf := DefaultConfig()\n\t\tconf.LocalID = id\n\t\tconf.ProtocolVersion = 3\n\t\tconf.PreVoteDisabled = true\n\t\tconf.HeartbeatTimeout = heartbeat\n\t\tconf.ElectionTimeout = election\n\t\tconf.LeaderLeaseTimeout = 2 * time.Second\n\t\tconf.CommitTimeout = 30 * time.Second\n\t\tconf.SnapshotInterval = time.Hour\n\t\tconf.SnapshotThreshold = 100000\n\t\tconf.TrailingLogs = 100000\n\t\tconf.LogLevel = \"ERROR\"\n\t\treturn conf\n\t}\n\n\tdLogs, dStable := seeded(cfgFor(dID, 0, 0), dID)\n\teLogs, eStable := seeded(cfgFor(eID, 0, 0), eID)\n\tdFSM, eFSM, tFSM := newAssuranceTwoFSM(), newAssuranceTwoFSM(), newAssuranceTwoFSM()\n\tdConf := cfgFor(dID, 1*time.Second, 2*time.Second)\n\tdConf.LeaderLeaseTimeout = 1 * time.Second\n\td, err := NewRaft(dConf, dFSM, dLogs, dStable, NewInmemSnapshotStore(), dTrans)\n\tif err != nil {\n\t\tt.Fatalf(\"assurance: NewRaft d: %v\", err)\n\t}\n\tdefer func() { d.Shutdown().Error() }()\n\te, err := NewRaft(cfgFor(eID, 30*time.Second, 30*time.Second), eFSM, eLogs, eStable, NewInmemSnapshotStore(), eTrans)\n\tif err != nil {\n\t\tt.Fatalf(\"assurance: NewRaft e: %v\", err)\n\t}\n\tdefer func() { e.Shutdown().Error() }()\n\n\ttStable := &assuranceTwoStore{InmemStore: NewInmemStore(), entered: make(chan struct{}, 1), release: make(chan struct{})}\n\ttNode, err := NewRaft(cfgFor(tID, 30*time.Second, 30*time.Second), tFSM, NewInmemStore(), tStable, NewInmemSnapshotStore(), tTrans)\n\tif err != nil {\n\t\tt.Fatalf(\"assurance: NewRaft t: %v\", err)\n\t}\n\tdefer func() { tNode.Shutdown().Error() }()\n\tif err := tNode.BootstrapCluster(config).Error(); err != nil {\n\t\tt.Fatalf(\"assurance: bootstrap t: %v\", err)\n\t}\n\n\twatch := &assuranceTwoWatch{other: d}\n\ttNode.RegisterObserver(NewObserver(nil, false, watch.filter))\n\n\t// Hold the stale heartbeat's term write on the lagging node, then keep e out\n\t// of the election that follows so its vote record for that term stays empty.\n\ttStable.arm.Store(true)\n\tghostAddr := gTrans.EncodePeer(ghost, gTrans.LocalAddr())\n\theartbeat := AppendEntriesRequest{\n\t\tRPCHeader: RPCHeader{ProtocolVersion: 3, ID: []byte(ghost), Addr: ghostAddr},\n\t\tTerm:      term,\n\t\tLeader:    ghostAddr,\n\t}\n\tvar heartbeatResp AppendEntriesResponse\n\theartbeatDone := make(chan error, 1)\n\tgo func() {\n\t\theartbeatDone <- gTrans.AppendEntries(tID, tTrans.LocalAddr(), &heartbeat, &heartbeatResp)\n\t}()\n\tselect {\n\tcase <-tStable.entered:\n\tcase <-time.After(10 * time.Second):\n\t\tassuranceTwoEvent(map[string]interface{}{\"event\": \"assurance_setup_failed\", \"op\": op, \"detail\": \"stale heartbeat never reached the gated write\"})\n\t\tt.Fatalf(\"assurance: stale heartbeat did not reach the gated write\")\n\t}\n\tfabric.block(\"e1-pipe\", true)\n\n\tif !assuranceTwoWaitFor(t, \"d leader\", func() bool { return d.State() == Leader }, 5*time.Second) {\n\t\tassuranceTwoEvent(map[string]interface{}{\"event\": \"assurance_setup_failed\", \"op\": op, \"detail\": \"d did not become leader\"})\n\t\tt.Fatalf(\"assurance: d did not become leader\")\n\t}\n\tfirstTerm := d.CurrentTerm()\n\tfirstState := d.State().String()\n\tfirstPeers := fmt.Sprintf(\"e=%s t=%s\", e.State().String(), tNode.State().String())\n\n\t// Lengthen the leader's own intervals so the corruption window is wide.\n\treload := d.ReloadableConfig()\n\treload.HeartbeatTimeout = 5 * time.Second\n\treload.ElectionTimeout = 5 * time.Second\n\tif err := d.ReloadConfig(reload); err != nil {\n\t\tt.Fatalf(\"assurance: reload: %v\", err)\n\t}\n\ttime.Sleep(400 * time.Millisecond)\n\n\t// Publish the stale term on the lagging node: it now sits one below the term\n\t// it voted in.\n\tclose(tStable.release)\n\tselect {\n\tcase err := <-heartbeatDone:\n\t\tif err != nil {\n\t\t\tassuranceTwoEvent(map[string]interface{}{\"event\": \"assurance_setup_failed\", \"op\": op, \"detail\": \"stale heartbeat: \" + err.Error()})\n\t\t\tt.Fatalf(\"assurance: stale heartbeat: %v\", err)\n\t\t}\n\tcase <-time.After(10 * time.Second):\n\t\tt.Fatalf(\"assurance: stale heartbeat response never arrived\")\n\t}\n\ttermAfterRelease := tNode.CurrentTerm()\n\tfabric.block(\"e1-pipe\", false)\n\n\t// The leader transfers to the lagging node, which proposes the term it has\n\t// already voted in and can still win a vote from the voter that abstained.\n\tfabric.block(\"d1-pipe\", true)\n\ttransferErr := d.LeadershipTransferToServer(tID, tTrans.LocalAddr()).Error()\n\tsecondLeader := assuranceTwoWaitFor(t, \"t leader\", func() bool { return tNode.State() == Leader }, 5*time.Second)\n\n\tfired, state, secondTerm, otherState, otherTerm := watch.snapshot()\n\tassuranceTwoEvent(map[string]interface{}{\n\t\t\"event\":       \"first_leader_adopted\",\n\t\t\"cluster\":     cls,\n\t\t\"op\":          op,\n\t\t\"node\":        string(dID),\n\t\t\"term\":        firstTerm,\n\t\t\"state\":       firstState,\n\t\t\"peer_states\": firstPeers,\n\t})\n\tassuranceTwoEvent(map[string]interface{}{\n\t\t\"event\":                 \"second_leader_observed\",\n\t\t\"cluster\":               cls,\n\t\t\"op\":                    op,\n\t\t\"node\":                  string(tID),\n\t\t\"term\":                  secondTerm,\n\t\t\"state\":                 state,\n\t\t\"witness_recorded\":      fired,\n\t\t\"other_node_state\":      otherState,\n\t\t\"other_node_term\":       otherTerm,\n\t\t\"other_node_now\":        d.State().String(),\n\t\t\"other_node_term_now\":   d.CurrentTerm(),\n\t\t\"term_after_release\":    termAfterRelease,\n\t\t\"transfer_error\":        fmt.Sprintf(\"%v\", transferErr),\n\t\t\"second_leader_reached\": secondLeader,\n\t\t\"final_voter_states\":    fmt.Sprintf(\"e=%s d=%s\", e.State().String(), d.State().String()),\n\t})\n\toverlapStart := time.Now()\n\tassuranceTwoEvent(map[string]interface{}{\n\t\t\"event\":   \"leader_claim_observed\",\n\t\t\"cluster\": cls,\n\t\t\"op\":      op,\n\t\t\"node\":    string(dID),\n\t\t\"term\":    d.CurrentTerm(),\n\t\t\"state\":   d.State().String(),\n\t})\n\n\t// Keep the two leaders from settling the term while the consequence is\n\t// observed: neither can reach the other, while both can reach the third\n\t// voter. The leader that started the transfer stops rejecting client work\n\t// once its transfer attempt times out.\n\tfabric.block(\"t1-pipe\", true)\n\ttime.Sleep(6 * time.Second)\n\n\tapplyFuture := d.Apply([]byte(\"from-d\"), 5*time.Second)\n\tapplyErr := applyFuture.Error()\n\tapplyIndex := applyFuture.Index()\n\ttime.Sleep(500 * time.Millisecond)\n\n\tvar leaderEntry, replicaEntry Log\n\tleaderErr := dLogs.GetLog(applyIndex, &leaderEntry)\n\treplicaErr := eLogs.GetLog(applyIndex, &replicaEntry)\n\tleaderState := \"unknown\"\n\tif leaderErr == nil {\n\t\tleaderState = leaderEntry.Type.String()\n\t}\n\treplicaState := \"unknown\"\n\tif replicaErr == nil {\n\t\treplicaState = replicaEntry.Type.String()\n\t}\n\n\tassuranceTwoEvent(map[string]interface{}{\n\t\t\"event\":                 \"command_acknowledged\",\n\t\t\"cluster\":               cls,\n\t\t\"op\":                    op,\n\t\t\"node\":                  string(dID),\n\t\t\"index\":                 applyIndex,\n\t\t\"command\":               \"from-d\",\n\t\t\"acknowledge_error\":     fmt.Sprintf(\"%v\", applyErr),\n\t\t\"leader_log_type\":       leaderState,\n\t\t\"leader_log_term\":       leaderEntry.Term,\n\t\t\"leader_log_data\":       string(leaderEntry.Data),\n\t\t\"leader_state\":          d.State().String(),\n\t\t\"leader_commit_index\":   d.CommitIndex(),\n\t\t\"applied_on_leader\":     dFSM.appliedAt(applyIndex),\n\t})\n\tassuranceTwoEvent(map[string]interface{}{\n\t\t\"event\":             \"replica_entry_observed\",\n\t\t\"cluster\":           cls,\n\t\t\"op\":                op,\n\t\t\"node\":              string(eID),\n\t\t\"index\":             applyIndex,\n\t\t\"log_type\":          replicaState,\n\t\t\"log_term\":          replicaEntry.Term,\n\t\t\"log_data\":          string(replicaEntry.Data),\n\t\t\"applied_on_replica\": eFSM.appliedAt(applyIndex),\n\t\t\"replica_state\":     e.State().String(),\n\t\t\"replica_commit\":    e.CommitIndex(),\n\t\t\"replica_last_index\": e.LastIndex(),\n\t})\n\n\t// The two leaders stay apart for the rest of the prefix, so the overlap can\n\t// be observed over a window rather than at the instant it was created.\n\ttime.Sleep(5 * time.Second)\n\twindow := time.Since(overlapStart)\n\tassuranceTwoEvent(map[string]interface{}{\n\t\t\"event\":               \"persistence_observed\",\n\t\t\"cluster\":             cls,\n\t\t\"op\":                  op,\n\t\t\"first_leader_node\":   string(dID),\n\t\t\"first_leader_state\":  d.State().String(),\n\t\t\"first_leader_term\":   d.CurrentTerm(),\n\t\t\"second_leader_node\":  string(tID),\n\t\t\"second_leader_state\": tNode.State().String(),\n\t\t\"second_leader_term\":  tNode.CurrentTerm(),\n\t\t\"third_voter_state\":   e.State().String(),\n\t\t\"window_seconds\":      int(window.Seconds()),\n\t})\n}\n",
+    "description": "TestAssuranceTwoLeadersOneTerm window variant: the overlap observed after several seconds of separation",
+    "semantic_changes": [
+      "StreamLayer is replaced by an in-process net.Pipe fabric with a per-destination block flag; NetworkTransport, its heartbeat classification, the SetHeartbeatHandler registration, requestVote, appendEntries, runCandidate, electSelf and checkLeaderLease are the target's own code.",
+      "Two nodes' stores are seeded before NewRaft with the bootstrap configuration entry and CurrentTerm = 2; the lagging node is bootstrapped normally and its StableStore holds exactly one CurrentTerm write inside SetUint64.",
+      "The leader's reloadable intervals are lengthened through ReloadConfig so the prefix's sequencing holds, and after the overlap both leaders are prevented from reaching each other through the fabric's per-destination block; the second leader's own replication to the third voter is left open, so its lease check can be satisfied or not on its own timing.",
+      "The harness records the sitting leader's claim immediately when the overlap is created and both nodes' published states and terms after a fixed window, using only public accessors.",
+      "No target file is modified; the harness adds one external test file to the captured package."
+    ],
+    "prerequisites": [
+      {
+        "alias": "claim",
+        "event": "leader_claim_observed",
+        "conditions": []
+      }
+    ],
+    "legality": {
+      "source_ids": [
+        "s-raft-leader-lease",
+        "s-raft-elect-self",
+        "s-raft-vote-record",
+        "s-raft-request-vote-filter",
+        "s-raft-set-current-term",
+        "s-raft-process-heartbeat",
+        "s-net-fastpath"
+      ],
+      "expectation_ids": [],
+      "binding_ids": [
+        "bind-raft-elect-self-transfer"
+      ],
+      "derivation": "The overlap is built exactly as in the committed-entry scenario, so the second leadership of the term is reachable when the candidate path proposes a term already voted in and the vote path grants it (s-raft-elect-self, s-raft-vote-record, s-raft-request-vote-filter, with the published term lowered by a delayed write from the heartbeat callback per s-raft-process-heartbeat, s-net-fastpath, s-raft-set-current-term). Whether it survives is then decided by the leader's own lease check, which counts a voter as contacted only if its last contact is within LeaderLeaseTimeout and steps the leader down otherwise; a leader's contact with a peer is refreshed by its replication loop and by a heartbeat goroutine whose interval is derived from HeartbeatTimeout, so a lease shorter than that interval can end the leadership while the peer is perfectly reachable (s-raft-leader-lease). The scenario therefore measures how long the overlap lasts under the configuration the harness fixes, not whether it can be created.",
+      "applicability": "Three voters with the two leaders kept from reaching each other by the fabric block, one of them with a lease timeout shorter than its own contact refresh interval, and pre-vote disabled because the substitute transport does not implement it.",
+      "unresolved": [
+        "whether the same overlap persists when the lease timeout is long enough to cover the contact refresh interval",
+        "whether a longer or repeated window would eventually see the second leadership end for a different reason"
+      ],
+      "conflicts": [],
+      "alternatives": [
+        "the second leadership can also end by receiving traffic from the other leader, which the block prevents in this prefix",
+        "a configuration with a lease longer than the contact refresh interval would test the opposite timing"
+      ]
+    }
+  },
+  "monitors": [
+    {
+      "id": "m-overlap-window",
+      "checker_id": "p-overlap-window",
+      "event": "persistence_observed",
+      "binding_ids": [
+        "bind-raft-elect-self-transfer"
+      ],
+      "grounding": {
+        "source_ids": [
+          "s-raft-leader-lease",
+          "s-raft-set-current-term"
+        ],
+        "expectation_ids": [],
+        "binding_ids": [
+          "bind-raft-elect-self-transfer"
+        ],
+        "derivation": "The result event reports both nodes' published states and terms at the end of the window and the length of that window, and the admission event reports the sitting leader's claim at the moment the overlap was created. Applicability restricts judgement to the case the requirement is about - the first node still leads in the admitted term and the second node's term is that same term - so a second node that has moved to a different term or already stepped down is not counted as a violation, and the assertion then reads the second node's state (s-raft-leader-lease, s-raft-set-current-term).",
+        "applicability": "Same cluster and prefix as the harness; the window length and the third voter's state are reported beside the compared states.",
+        "unresolved": [
+          "whether a longer window with a lease that covers the contact refresh interval would leave the second node leading"
+        ],
+        "conflicts": [],
+        "alternatives": []
+      },
+      "applicability_conditions": [
+        {
+          "field": "first_leader_state",
+          "op": "eq",
+          "value": "Leader",
+          "reference": null
+        },
+        {
+          "field": "first_leader_term",
+          "op": "eq",
+          "value": null,
+          "reference": "claim.term"
+        },
+        {
+          "field": "second_leader_term",
+          "op": "eq",
+          "value": null,
+          "reference": "claim.term"
+        }
+      ],
+      "admission_alias": "claim"
+    }
+  ],
+  "observable_properties": [
+    {
+      "checker_id": "p-overlap-window",
+      "kind": "event_assertion",
+      "trigger": {
+        "field": "op",
+        "op": "eq",
+        "value": "two-leaders-one-term",
+        "reference": null
+      },
+      "assertion": {
+        "field": "second_leader_state",
+        "op": "ne",
+        "value": "Leader",
+        "reference": null
+      },
+      "antecedent": null,
+      "identity_fields": [
+        "cluster",
+        "op"
+      ],
+      "description": "At the end of a window in which the first node still leads the admitted term and the second node's published term is that same term, the second node must not also be a leader. Applicability already restricts the comparison to two nodes sharing the term, so the assertion is the requirement itself over the window rather than at the instant the overlap was created."
+    }
+  ],
+  "uncertainties": [
+    "The expected outcome is a bounded negative: in the construction runs the second node had stepped down by the end of the window, so the requirement held over the window instead of being violated as it was at the instant the overlap was created.",
+    "The excluded explanations for that step-down are a higher term, an unreachable peer and a transport failure: the blocked peer cannot raise the term, the reachable voter stayed in the same term, and transport errors only back off replication without stepping a leader down; the remaining and sourced explanation is the lease check, which counts a voter as contacted only within LeaderLeaseTimeout while the leader's own contact refresh interval here (derived from HeartbeatTimeout) is longer than that lease.",
+    "Whether the overlap persists under a lease long enough to cover the refresh interval is not exercised, nor is a longer or repeated window, nor the same prefix without the block between the two leaders.",
+    "Only one cluster shape and one window length are used, and the harness reports the third voter's state without probing its reachability from the harness side."
+  ]
+}

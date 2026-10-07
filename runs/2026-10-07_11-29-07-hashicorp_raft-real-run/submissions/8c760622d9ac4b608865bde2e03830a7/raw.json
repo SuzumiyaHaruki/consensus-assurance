@@ -1,0 +1,142 @@
+{
+  "action": "obligation",
+  "rationale": "First investigation of the captured hashicorp/raft snapshot (commit c0dc6a0b2c7e889f31e5ab2f7ed90ceb159acffe). It records a usable map of both core relationships (A1 qualified support for decision formation/advancement, A2 context validity and authority transfer/loss) and their connection, and fixes one obligation about the adopted-term context after finding that the network transport can drive the appendEntries term/leader update from a per-connection goroutine through the heartbeat callback. The question is registered as the first Candidate with its counterevidence and unknowns, so the obligation states a required relation without asserting a violation.",
+  "map_path": "map-v1.json",
+  "map_changes": {},
+  "question": {
+    "question": "Does the transport heartbeat callback establish the election-term and known-leader context under the same serialization as the raft main goroutine, i.e. can Raft.processHeartbeat run on a NetworkTransport connection goroutine concurrently with main-goroutine RPC handling and store a current term lower than a term the node has already adopted, or replace the currently known leader?",
+    "importance": "The adopted current term is the value against which vote granting, duplicate-vote rejection and the acceptance of newer-term RPCs are all evaluated. If a heartbeat handled off the main goroutine stores a term lower than one the node has already adopted, the node can subsequently grant a vote in a term in which it has already voted, which is the election-safety condition of Raft; the same entry point also rewrites the stored leader identity that clients and requestVote rely on. The packaged NetworkTransport/TCPStreamLayer is the production transport, so the path is on the default deployment and not only in tests.",
+    "trigger_rationale": "Three sourced facts point at this premise and conflict: api.go states a requirement that the heartbeat callback MUST be safe to be called concurrently with a blocking RPC; raft.go's processHeartbeat comment states the opposite, that it must only be called from the main thread; and NetworkTransport.handleCommand invokes the registered callback directly on a per-connection goroutine while non-heartbeat RPCs are serialized through the single rpcCh consumer. appendEntries performs a read-compare-write on currentTerm through a plain atomic Store (no compare-and-swap) and then unconditionally rewrites the leader identity, so the premise is a concrete interleaving question rather than a generic concurrency caution.",
+    "disposition": "ready_for_check",
+    "preferred_check": "direct_test",
+    "participants": ["NetworkTransport connection goroutine (handleCommand heartbeat fast path)", "Raft main goroutine (run -> processRPC)", "Raft.processHeartbeat", "Raft.appendEntries", "StableStore CurrentTerm"],
+    "objects": ["Raft.raftState.currentTerm", "Raft.raftState.state", "Raft.leaderAddr/leaderID", "NetworkTransport.heartbeatFn", "commitment.startIndex", "StableStore LastVoteTerm/LastVoteCand"],
+    "contexts": ["a node in Follower state, with a heartbeat handler registered by NewRaft, receiving a heartbeat-shaped AppendEntries from a leader of term T over NetworkTransport while the main goroutine handles another RPC", "a NetworkTransport whose connection-handler goroutine invokes the callback while the main goroutine is inside appendEntries or requestVote"],
+    "event_paths": ["connection goroutine: handleConn -> handleCommand (isHeartbeat) -> heartbeatFn(rpc) -> Raft.processHeartbeat -> Raft.appendEntries -> setState/setCurrentTerm/setLeader", "main goroutine: run -> rpcCh -> processRPC -> appendEntries (setState/setCurrentTerm/setLeader) or requestVote (setState/setCurrentTerm/persistVote)", "vote reuse path: requestVote reads LastVoteTerm/LastVoteCand and re-grants only for the same (term, candidate), else persists a new vote for req.Term"],
+    "activity_classes": ["A2"],
+    "behavior_ids": ["b-term-observation", "b-heartbeat-fastpath", "b-vote-grant"],
+    "fact_ids": ["f-term-adopted"],
+    "supporting_behavior_ids": {
+      "b-leader-identity": "the same fast-path entry point also writes the known-leader context, which is the sibling fact consumed by vote-grant filtering and by the client API",
+      "b-commit-advance": "shows which later decisions depend on the adopted term context by gating commitment on commitment.startIndex"
+    },
+    "obligation_relation_kind": "preservation",
+    "counterevidence": [
+      "The heartbeat classification keeps the fast path to requests with PrevLogEntry==0, PrevLogTerm==0, no Entries and LeaderCommitIndex==0, so it cannot append log entries, advance the commit index or run processLogs, which bounds the reachable damage.",
+      "currentTerm is read and written with atomic LoadUint64/StoreUint64 on raftState, so the hazard is a lost update (read-modify-write) rather than a plain unsynchronized access to that specific field; state and leaderAddr/leaderID are also individually atomic or lock-protected.",
+      "InmemTransport ignores SetHeartbeatHandler and always offers AppendEntries to the consumer channel, so in-memory clusters do not exercise the fast path; the integ_test.go pre-vote test installs a custom handler that itself calls processHeartbeat, which shows the pattern is used but does not establish a legal interleaving.",
+      "The heartbeat fast path is documented as existing to avoid head-of-line blocking from disk IO, i.e. to be concurrent by design; if the concurrent dispatch is intentional, the defect would be that appendEntries does not uphold the stated requirement rather than that the dispatch exists."
+    ],
+    "unknowns": [
+      "Whether the connection goroutine and the main goroutine can actually interleave between the currentTerm read and the setCurrentTerm write on the same node in a legal history, and therefore whether a lower term can be stored after a higher one.",
+      "Whether a stored-term regression, if reachable, can be escalated to two votes in one term given the LastVoteTerm/LastVoteCand duplicate check, or is bounded to a transient context error.",
+      "Whether NetworkTransport is expected to serialize connection goroutines with the raft main goroutine at all, or whether the requirement in api.go only means the callback must not block on the main goroutine's disk IO.",
+      "Whether the same premise exists for other transport implementations that honour SetHeartbeatHandler, since only the in-module NetworkTransport path was read."
+    ],
+    "priority": 3,
+    "source_ids": ["s-raft-append-term", "s-raft-append-leader", "s-raft-set-current-term", "s-raft-set-state", "s-state-term-atomic", "s-raft-process-heartbeat", "s-net-fastpath", "s-net-handle-conn", "s-net-set-heartbeat", "s-api-fastpath-contract", "s-transport-interface", "s-integ-fastpath", "s-raft-vote-record", "s-raft-request-vote-filter", "s-commitment-core", "s-commitment-recalc", "s-raft-dispatch-logs"]
+  },
+  "obligation": {
+    "id": "c-adopted-term-never-regresses",
+    "kind": "obligation",
+    "concern": "consensus_safety",
+    "description": "Once a node has adopted and persisted election term T as its current term, no later establishment of that term context may store a value lower than T, because vote granting, duplicate-vote rejection and the acceptance of newer-term RPCs are all evaluated against the adopted value; the requirement applies to every entry point that can update the term context, including a heartbeat-shaped AppendEntries processed outside the raft main goroutine.",
+    "source_ids": ["s-raft-append-term", "s-raft-set-current-term", "s-state-term-atomic", "s-raft-vote-record", "s-raft-process-heartbeat", "s-api-fastpath-contract"],
+    "scope": {
+      "description": "A single Raft node using the in-module NetworkTransport (or any transport that honours SetHeartbeatHandler) with a heartbeat handler registered by NewRaft, while it is handling RPCs. Applies to the current-term context only, not to the log content, the commit index or the configuration.",
+      "assumptions": [
+        "the node is not shut down while the RPCs are processed",
+        "the StableStore accepts SetUint64 for the CurrentTerm key, since setCurrentTerm panics otherwise",
+        "an RPC with a term greater than the adopted term is a legal event, because appendEntries and requestVote adopt it"
+      ],
+      "excluded": [
+        "log replication correctness and the commit-index rule (a separate obligation)",
+        "the leader-identity fact, which is tracked separately as f-known-leader",
+        "behaviour of transports outside this module that do not implement a heartbeat fast path"
+      ]
+    },
+    "pending": [
+      "whether the connection goroutine and the main goroutine can interleave between the term read and the term store on the same node in a legal history",
+      "whether a regressed term can be observed by requestVote soon enough to yield a second vote in an already-used term"
+    ],
+    "grounding": {
+      "source_ids": ["s-raft-append-term", "s-raft-set-current-term", "s-state-term-atomic", "s-raft-vote-record"],
+      "expectation_ids": ["s-api-fastpath-contract", "s-integ-fastpath"],
+      "binding_ids": ["bind-raft-process-heartbeat"],
+      "derivation": "appendEntries ignores an older term but adopts a greater one, and it writes the term with setCurrentTerm, which is a plain atomic Store rather than a compare-and-swap (s-raft-append-term, s-raft-set-current-term, s-state-term-atomic); api.go requires the heartbeat callback to be safe to call concurrently with a blocking RPC (s-api-fastpath-contract); NetworkTransport.handleCommand calls that callback directly from the per-connection goroutine instead of offering the RPC to the single consumer channel, and processHeartbeat forwards it to appendEntries (s-net-fastpath, s-net-handle-conn, s-raft-process-heartbeat); the heartbeat classification is decided inside the transport from the request shape, so the callback receives a request that nevertheless performs the term and leader writes. Since the adopted term is the value that requestVote evaluates against and duplicates are only recognised for the same (term, candidate) (s-raft-vote-record), a lower stored value would permit a second vote in a used term.",
+      "applicability": "Applies when a transport runs the registered heartbeat callback on a goroutine other than the raft main goroutine, which is what NetworkTransport does for heartbeat-shaped AppendEntries; it does not apply to InmemTransport, which ignores SetHeartbeatHandler.",
+      "unresolved": [
+        "whether the two goroutines can interleave between the read of currentTerm and the store inside one appendEntries call",
+        "whether a concurrent equal-term or greater-term main-loop RPC is required for the hazard, or a single heartbeat suffices"
+      ],
+      "conflicts": [
+        "raft.go states that processHeartbeat must only be called from the main thread while api.go states the callback MUST be safe to call concurrently with a blocking RPC"
+      ],
+      "alternatives": [
+        "the requirement may be read as 'the callback must not be blocked by the main goroutine's disk IO' rather than 'the callback may run concurrently'; under that reading the implementation is consistent and only the comment is stale",
+        "the atomic store may be intended to be last-writer-wins and protected in practice by the transport offering non-heartbeat RPCs to the main loop"
+      ]
+    }
+  },
+  "bindings": [
+    {
+      "id": "bind-raft-process-heartbeat",
+      "material_id": "s-raft-process-heartbeat",
+      "symbol": "processHeartbeat",
+      "start_line": 1418,
+      "end_line": 1433,
+      "description": "Raft.processHeartbeat is the callback registered through Transport.SetHeartbeatHandler; it checks only shutdown and the command type and then forwards the AppendEntriesRequest to appendEntries, which performs the term and leader writes.",
+      "pending": [
+        "whether this callback is serialized with the raft main goroutine by the transport that invokes it"
+      ],
+      "associations": [
+        {
+          "claim_id": "c-adopted-term-never-regresses",
+          "source_ids": ["s-raft-process-heartbeat", "s-api-fastpath-contract", "s-net-fastpath"],
+          "rationale": "This entry point is the located implementation of the requirement: it is the callback that can be invoked from a transport goroutine yet performs the same current-term update as the main-loop RPC path."
+        }
+      ]
+    }
+  ],
+  "sources": [
+    {"id": "s-raft-run-loop", "file": "raft.go", "start_line": 134, "end_line": 151, "kind": "code_observation"},
+    {"id": "s-raft-follower-election", "file": "raft.go", "start_line": 213, "end_line": 245, "kind": "code_observation"},
+    {"id": "s-raft-candidate-prevote", "file": "raft.go", "start_line": 326, "end_line": 352, "kind": "code_observation"},
+    {"id": "s-raft-pre-vote", "file": "raft.go", "start_line": 1789, "end_line": 1808, "kind": "code_observation"},
+    {"id": "s-raft-candidate-vote", "file": "raft.go", "start_line": 363, "end_line": 390, "kind": "code_observation"},
+    {"id": "s-raft-leader-commit-consume", "file": "raft.go", "start_line": 785, "end_line": 800, "kind": "code_observation"},
+    {"id": "s-raft-leadership-transfer", "file": "raft.go", "start_line": 990, "end_line": 1030, "kind": "code_observation"},
+    {"id": "s-raft-leader-lease", "file": "raft.go", "start_line": 1036, "end_line": 1080, "kind": "code_observation"},
+    {"id": "s-raft-append-config", "file": "raft.go", "start_line": 1203, "end_line": 1242, "kind": "code_observation"},
+    {"id": "s-raft-dispatch-logs", "file": "raft.go", "start_line": 1244, "end_line": 1290, "kind": "code_observation"},
+    {"id": "s-raft-process-logs", "file": "raft.go", "start_line": 1292, "end_line": 1345, "kind": "code_observation"},
+    {"id": "s-raft-process-heartbeat", "file": "raft.go", "start_line": 1415, "end_line": 1433, "kind": "code_observation"},
+    {"id": "s-raft-append-term", "file": "raft.go", "start_line": 1455, "end_line": 1467, "kind": "code_observation"},
+    {"id": "s-raft-append-leader", "file": "raft.go", "start_line": 1469, "end_line": 1474, "kind": "code_observation"},
+    {"id": "s-raft-append-entries-log", "file": "raft.go", "start_line": 1505, "end_line": 1530, "kind": "code_observation"},
+    {"id": "s-raft-append-commit", "file": "raft.go", "start_line": 1565, "end_line": 1580, "kind": "code_observation"},
+    {"id": "s-raft-request-vote-filter", "file": "raft.go", "start_line": 1650, "end_line": 1684, "kind": "code_observation"},
+    {"id": "s-raft-vote-record", "file": "raft.go", "start_line": 1685, "end_line": 1734, "kind": "code_observation"},
+    {"id": "s-raft-elect-self", "file": "raft.go", "start_line": 1976, "end_line": 2048, "kind": "code_observation"},
+    {"id": "s-raft-install-snapshot", "file": "raft.go", "start_line": 1880, "end_line": 1965, "kind": "code_observation"},
+    {"id": "s-raft-set-current-term", "file": "raft.go", "start_line": 2141, "end_line": 2146, "kind": "code_observation"},
+    {"id": "s-raft-set-state", "file": "raft.go", "start_line": 2150, "end_line": 2160, "kind": "code_observation"},
+    {"id": "s-raft-timeout-now", "file": "raft.go", "start_line": 2208, "end_line": 2214, "kind": "code_observation"},
+    {"id": "s-commitment-core", "file": "commitment.go", "start_line": 12, "end_line": 31, "kind": "code_observation"},
+    {"id": "s-commitment-recalc", "file": "commitment.go", "start_line": 67, "end_line": 104, "kind": "code_observation"},
+    {"id": "s-replication-replicateTo", "file": "replication.go", "start_line": 200, "end_line": 235, "kind": "code_observation"},
+    {"id": "s-replication-ack", "file": "replication.go", "start_line": 653, "end_line": 665, "kind": "code_observation"},
+    {"id": "s-net-handle-conn", "file": "net_transport.go", "start_line": 597, "end_line": 614, "kind": "code_observation"},
+    {"id": "s-net-fastpath", "file": "net_transport.go", "start_line": 720, "end_line": 740, "kind": "code_observation"},
+    {"id": "s-net-set-heartbeat", "file": "net_transport.go", "start_line": 298, "end_line": 305, "kind": "interface_statement"},
+    {"id": "s-api-fastpath-contract", "file": "api.go", "start_line": 613, "end_line": 616, "kind": "interface_statement"},
+    {"id": "s-transport-interface", "file": "transport.go", "start_line": 58, "end_line": 63, "kind": "interface_statement"},
+    {"id": "s-integ-fastpath", "file": "integ_test.go", "start_line": 564, "end_line": 583, "kind": "test_expectation"},
+    {"id": "s-config-next", "file": "configuration.go", "start_line": 228, "end_line": 300, "kind": "code_observation"},
+    {"id": "s-snapshot-take", "file": "snapshot.go", "start_line": 125, "end_line": 200, "kind": "code_observation"},
+    {"id": "s-fsm-run", "file": "fsm.go", "start_line": 86, "end_line": 160, "kind": "code_observation"},
+    {"id": "s-api-newraft-config", "file": "api.go", "start_line": 597, "end_line": 612, "kind": "code_observation"},
+    {"id": "s-api-leaderwithid", "file": "api.go", "start_line": 796, "end_line": 804, "kind": "code_observation"},
+    {"id": "s-state-term-atomic", "file": "state.go", "start_line": 88, "end_line": 95, "kind": "code_observation"}
+  ]
+}

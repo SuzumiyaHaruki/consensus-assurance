@@ -1,0 +1,133 @@
+{
+  "description": "Discriminator: whether a leader leaves the leadership while a quorum of voters is reachable and in its own term. Three connected voters are created by the package's own NewRaft with a five second heartbeat timeout, election timeout and leader lease, so one is elected within a few seconds; every node's reloadable intervals are then lengthened through the public ReloadConfig to three hundred seconds, which the library accepts, so the leader's own contact refresh interval becomes far longer than the lease it was created with. Observation: an observer with a nil channel records the leader's first departure from the leadership, the term it held at that instant and its peers' published states and terms at the same instant, and immediately afterwards the harness probes a peer to record whether a quorum answers. The asserted field is the leader's published state at the end of the window; the recorded transition, its term, the peers' states and terms and the probe are reported beside it. Control: applicability requires the recorded term and both peers' terms to equal the admitted term and the probe to have succeeded, so a leader that stepped down because a peer adopted a higher term, or whose peers were unreachable, is never judged.",
+  "claim_id": "c-reachable-quorum-keeps-leadership",
+  "binding_ids": [
+    "bind-raft-check-leader-lease"
+  ],
+  "harness": {
+    "execution_package": ".",
+    "files": {},
+    "kind": "go_test",
+    "source": "// Copyright (c) HashiCorp, Inc.\n// SPDX-License-Identifier: MPL-2.0\n//\n// Generated assurance harness. Three connected voters elect a leader, every\n// node's own reloadable intervals are lengthened through the public API, and an\n// observer records the leader's first departure from the leadership together\n// with the term it held then and its peers' states and terms at that instant;\n// a probe afterwards records whether a peer still answers. It reports raw\n// fields only.\n\npackage raft\n\nimport (\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"io\"\n\t\"sync\"\n\t\"testing\"\n\t\"time\"\n)\n\nfunc assuranceLeaseEvent(v map[string]interface{}) {\n\tpayload, err := json.Marshal(v)\n\tif err != nil {\n\t\tfmt.Println(\"assurance: event marshal failed:\", err)\n\t\treturn\n\t}\n\tfmt.Println(\"CA_EVENT \" + string(payload))\n}\n\ntype assuranceLeaseFSM struct{}\n\nfunc (assuranceLeaseFSM) Apply(*Log) interface{}         { return nil }\nfunc (assuranceLeaseFSM) Snapshot() (FSMSnapshot, error) { return assuranceLeaseSnapshot{}, nil }\nfunc (assuranceLeaseFSM) Restore(io.ReadCloser) error    { return nil }\n\ntype assuranceLeaseSnapshot struct{}\n\nfunc (assuranceLeaseSnapshot) Persist(s SnapshotSink) error { return s.Close() }\nfunc (assuranceLeaseSnapshot) Release()                     {}\n\ntype assuranceLeaseWatch struct {\n\tpeers     []*Raft\n\tmu        sync.Mutex\n\tfired     bool\n\tstate     string\n\tterm      uint64\n\tpeerState []string\n\tpeerTerm  []uint64\n}\n\nfunc (w *assuranceLeaseWatch) filter(o *Observation) bool {\n\tif st, ok := o.Data.(RaftState); ok && st != Leader {\n\t\tw.mu.Lock()\n\t\tif !w.fired {\n\t\t\tw.fired = true\n\t\t\tw.state, w.term = st.String(), o.Raft.CurrentTerm()\n\t\t\tw.peerState, w.peerTerm = w.peerState[:0], w.peerTerm[:0]\n\t\t\tfor _, p := range w.peers {\n\t\t\t\tw.peerState = append(w.peerState, p.State().String())\n\t\t\t\tw.peerTerm = append(w.peerTerm, p.CurrentTerm())\n\t\t\t}\n\t\t}\n\t\tw.mu.Unlock()\n\t}\n\treturn false\n}\n\nfunc (w *assuranceLeaseWatch) snapshot() (bool, string, uint64, []string, []uint64) {\n\tw.mu.Lock()\n\tdefer w.mu.Unlock()\n\treturn w.fired, w.state, w.term, append([]string(nil), w.peerState...), append([]uint64(nil), w.peerTerm...)\n}\n\nfunc assuranceLeaseWaitFor(cond func() bool, limit time.Duration) bool {\n\tdeadline := time.Now().Add(limit)\n\tfor time.Now().Before(deadline) {\n\t\tif cond() {\n\t\t\treturn true\n\t\t}\n\t\ttime.Sleep(time.Millisecond)\n\t}\n\treturn false\n}\n\nfunc assuranceLeaseNode(t *testing.T, id ServerID, addr ServerAddress) (*Raft, *InmemTransport) {\n\tconf := DefaultConfig()\n\tconf.LocalID = id\n\tconf.ProtocolVersion = 3\n\tconf.LogLevel = \"ERROR\"\n\tconf.HeartbeatTimeout = 5 * time.Second\n\tconf.ElectionTimeout = 6 * time.Second\n\tconf.LeaderLeaseTimeout = 5 * time.Second\n\tconf.CommitTimeout = 30 * time.Second\n\tconf.SnapshotInterval = time.Hour\n\tconf.SnapshotThreshold = 100000\n\tconf.TrailingLogs = 100000\n\t_, trans := NewInmemTransport(addr)\n\tr, err := NewRaft(conf, assuranceLeaseFSM{}, NewInmemStore(), NewInmemStore(), NewInmemSnapshotStore(), trans)\n\tif err != nil {\n\t\tt.Fatalf(\"assurance: NewRaft %s: %v\", id, err)\n\t}\n\treturn r, trans\n}\n\nfunc TestAssuranceLeaderLeaseCoherence(t *testing.T) {\n\tconst op = \"leader-lease-refresh-coherence\"\n\tids := []ServerID{\"n1\", \"n2\", \"n3\"}\n\taddrs := []ServerAddress{\"lease-1\", \"lease-2\", \"lease-3\"}\n\n\trafts := make([]*Raft, 0, len(ids))\n\ttransports := make([]*InmemTransport, 0, len(ids))\n\tfor i, id := range ids {\n\t\tr, trans := assuranceLeaseNode(t, id, addrs[i])\n\t\trafts = append(rafts, r)\n\t\ttransports = append(transports, trans)\n\t}\n\tfor i := range transports {\n\t\tfor j := range transports {\n\t\t\tif i != j {\n\t\t\t\ttransports[i].Connect(addrs[j], transports[j])\n\t\t\t}\n\t\t}\n\t}\n\tdefer func() {\n\t\tfor _, r := range rafts {\n\t\t\tr.Shutdown()\n\t\t}\n\t}()\n\n\tconfiguration := Configuration{}\n\tfor i, id := range ids {\n\t\tconfiguration.Servers = append(configuration.Servers, Server{ID: id, Address: addrs[i], Suffrage: Voter})\n\t}\n\tfor _, r := range rafts {\n\t\tif err := r.BootstrapCluster(configuration).Error(); err != nil {\n\t\t\tassuranceLeaseEvent(map[string]interface{}{\"event\": \"assurance_setup_failed\", \"op\": op, \"detail\": \"bootstrap: \" + err.Error()})\n\t\t\tt.Fatalf(\"assurance: bootstrap: %v\", err)\n\t\t}\n\t}\n\n\t// Wait for one node to become the leader, then lengthen its own intervals so\n\t// the interval at which it refreshes contact with a reachable voter exceeds\n\t// the lease it was created with. Everything stays reachable throughout.\n\tvar leader *Raft\n\tvar leaderID ServerID\n\tdeadline := time.Now().Add(30 * time.Second)\n\tfor time.Now().Before(deadline) && leader == nil {\n\t\tfor i, r := range rafts {\n\t\t\tif r.State() == Leader {\n\t\t\t\tleader, leaderID = r, ids[i]\n\t\t\t}\n\t\t}\n\t\tif leader == nil {\n\t\t\ttime.Sleep(5 * time.Millisecond)\n\t\t}\n\t}\n\tif leader == nil {\n\t\tassuranceLeaseEvent(map[string]interface{}{\"event\": \"assurance_setup_failed\", \"op\": op, \"detail\": \"no leader was elected\"})\n\t\tt.Fatalf(\"assurance: no leader was elected\")\n\t}\n\tfor _, r := range rafts {\n\t\treload := r.ReloadableConfig()\n\t\treload.HeartbeatTimeout = 300 * time.Second\n\t\treload.ElectionTimeout = 300 * time.Second\n\t\tif err := r.ReloadConfig(reload); err != nil {\n\t\t\tassuranceLeaseEvent(map[string]interface{}{\"event\": \"assurance_setup_failed\", \"op\": op, \"detail\": \"reload: \" + err.Error()})\n\t\t\tt.Fatalf(\"assurance: reload: %v\", err)\n\t\t}\n\t}\n\tadmittedTerm := leader.CurrentTerm()\n\tpeers := make([]*Raft, 0, len(rafts)-1)\n\tfor _, r := range rafts {\n\t\tif r != leader {\n\t\t\tpeers = append(peers, r)\n\t\t}\n\t}\n\twatch := &assuranceLeaseWatch{peers: peers}\n\tleader.RegisterObserver(NewObserver(nil, false, watch.filter))\n\n\t// Wait for the leader to leave the leadership on its own.\n\tif !assuranceLeaseWaitFor(func() bool { fired, _, _, _, _ := watch.snapshot(); return fired }, 30*time.Second) {\n\t\tassuranceLeaseEvent(map[string]interface{}{\"event\": \"assurance_setup_failed\", \"op\": op, \"detail\": \"the leader never left the leadership\"})\n\t\tt.Fatalf(\"assurance: the leader never left the leadership\")\n\t}\n\ttime.Sleep(200 * time.Millisecond)\n\n\tfired, stepState, stepTerm, peerStates, peerTerms := watch.snapshot()\n\tleaderState := leader.State().String()\n\tleaderTerm := leader.CurrentTerm()\n\tfollowerStates := \"\"\n\tvar probeReachable bool\n\tvar probeTerm uint64\n\tfor i, r := range rafts {\n\t\tif ids[i] == leaderID {\n\t\t\tcontinue\n\t\t}\n\t\tfollowerStates += fmt.Sprintf(\"%s=%s/%d \", ids[i], r.State().String(), r.CurrentTerm())\n\t\tif !probeReachable {\n\t\t\t_, trans := NewInmemTransport(ServerAddress(\"probe-1\"))\n\t\t\tfor j := range transports {\n\t\t\t\ttrans.Connect(addrs[j], transports[j])\n\t\t\t}\n\t\t\tprobe := AppendEntriesRequest{\n\t\t\t\tRPCHeader: RPCHeader{ProtocolVersion: 3, ID: []byte(leaderID), Addr: trans.EncodePeer(leaderID, addrs[0])},\n\t\t\t\tTerm:      leaderTerm,\n\t\t\t\tLeader:    trans.EncodePeer(leaderID, addrs[0]),\n\t\t\t}\n\t\t\tvar resp AppendEntriesResponse\n\t\t\tif err := trans.AppendEntries(ids[i], addrs[i], &probe, &resp); err == nil {\n\t\t\t\tprobeReachable = resp.Success\n\t\t\t\tprobeTerm = resp.Term\n\t\t\t}\n\t\t\ttrans.Close()\n\t\t}\n\t}\n\n\tassuranceLeaseEvent(map[string]interface{}{\n\t\t\"event\":            \"leader_claim_observed\",\n\t\t\"cluster\":          ids[0],\n\t\t\"op\":               op,\n\t\t\"node\":             string(leaderID),\n\t\t\"term\":             admittedTerm,\n\t\t\"state\":            \"Leader\",\n\t\t\"heartbeat_window\": \"5s before reload, 300s after\",\n\t})\n\tassuranceLeaseEvent(map[string]interface{}{\n\t\t\"event\":               \"stepdown_observed\",\n\t\t\"cluster\":             ids[0],\n\t\t\"op\":                  op,\n\t\t\"leader_node\":         string(leaderID),\n\t\t\"stepdown_recorded\":   fired,\n\t\t\"stepdown_state\":      stepState,\n\t\t\"stepdown_term\":       stepTerm,\n\t\t\"peer1_state\":         peerStates[0],\n\t\t\"peer1_term\":          peerTerms[0],\n\t\t\"peer2_state\":         peerStates[1],\n\t\t\"peer2_term\":          peerTerms[1],\n\t\t\"probe_reachable\":     probeReachable,\n\t\t\"probe_term\":          probeTerm,\n\t\t\"leader_state_at_end\": leaderState,\n\t\t\"leader_term_at_end\":  leaderTerm,\n\t\t\"follower_states\":     followerStates,\n\t\t\"lease_timeout_ms\":    int((5 * time.Second).Milliseconds()),\n\t})\n\tassuranceLeaseEvent(map[string]interface{}{\n\t\t\"event\":            \"lease_observation\",\n\t\t\"cluster\":          ids[0],\n\t\t\"op\":               op,\n\t\t\"leader_node\":      string(leaderID),\n\t\t\"leader_state\":     leaderState,\n\t\t\"leader_term\":      leaderTerm,\n\t\t\"follower_states\":  followerStates,\n\t\t\"probe_reachable\":  probeReachable,\n\t\t\"probe_term\":       probeTerm,\n\t\t\"lease_timeout_ms\": int((5 * time.Second).Milliseconds()),\n\t})\n}\n",
+    "description": "TestAssuranceLeaderLeaseCoherence: a leader leaves the leadership with its peers reachable and in its own term",
+    "semantic_changes": [
+      "No target file is modified; the harness adds one external test file to the captured package and uses the public NewRaft, BootstrapCluster, ReloadConfig, Apply-free paths, State, CurrentTerm and the transport's own AppendEntries for the probe.",
+      "The harness registers an Observer with a nil channel whose filter runs synchronously on the emitting goroutine and records the leader's first departure from the leadership together with the term it held then and, at that same instant, its peers' published states and terms through public accessors.",
+      "The probe is a heartbeat-shaped AppendEntries sent through a separate in-memory transport connected to all three voters, so it does not disturb the leader's own replication state."
+    ],
+    "prerequisites": [
+      {
+        "alias": "claim",
+        "event": "leader_claim_observed",
+        "conditions": []
+      }
+    ],
+    "legality": {
+      "source_ids": [
+        "s-raft-leader-lease",
+        "s-replication-heartbeat",
+        "s-raft-set-current-term",
+        "s-raft-candidate-vote",
+        "s-raft-set-state"
+      ],
+      "expectation_ids": [],
+      "binding_ids": [
+        "bind-raft-check-leader-lease"
+      ],
+      "derivation": "checkLeaderLease counts a voter as contacted only when the time since its last contact is within LeaderLeaseTimeout and steps the leader down otherwise (s-raft-leader-lease), while a leader's contact with a reachable peer is refreshed by its replication loop and by a heartbeat goroutine whose interval is derived from HeartbeatTimeout (s-replication-heartbeat, s-raft-set-current-term). ReloadConfig accepts a longer heartbeat interval because it validates only that the configured values are individually sane, so a running node can be moved into a relation in which its own refresh interval exceeds the lease it was created with. The prefix therefore produces, on a fully connected cluster, a leader that counts itself and one reachable peer as a quorum and still leaves the leadership, which is the behaviour the lease's own purpose statement excludes; the observer and the probe record it without relying on any later election.",
+      "applicability": "Three connected voters with no partition, a lease of five seconds fixed at creation, and intervals lengthened through the library's own reload API after the election.",
+      "unresolved": [
+        "whether the repair belongs in ValidateConfig, in the reload path, or in the lease check's treatment of a reachable quorum",
+        "how much the heartbeat interval may exceed the lease before the behaviour becomes certain rather than likely"
+      ],
+      "conflicts": [],
+      "alternatives": [
+        "the configuration combination could be called the operator's error, since the library's defaults keep the relation coherent; the harness records the library accepting the combination itself, including through its reload API"
+      ]
+    }
+  },
+  "monitors": [
+    {
+      "id": "m-reachable-quorum-keeps-leadership",
+      "checker_id": "p-reachable-quorum-keeps-leadership",
+      "event": "stepdown_observed",
+      "binding_ids": [
+        "bind-raft-check-leader-lease"
+      ],
+      "grounding": {
+        "source_ids": [
+          "s-raft-leader-lease",
+          "s-replication-heartbeat"
+        ],
+        "expectation_ids": [],
+        "binding_ids": [
+          "bind-raft-check-leader-lease"
+        ],
+        "derivation": "The result event reports the transition the observer recorded, the term the leader held at that instant, its peers' states and terms at the same instant, and whether a peer answered a probe afterwards, while the admission event reports the leadership claim and its term. Applicability requires the recorded term and both peers' terms to be the admitted term and the probe to have succeeded, so the comparison is judged only in the case the requirement is about - no higher term and a reachable quorum (s-raft-leader-lease, s-replication-heartbeat).",
+        "applicability": "Same cluster and prefix as the harness; the recorded transition state, the peers' states and the window length are reported beside the compared field.",
+        "unresolved": [
+          "whether a longer window or a different interval relation changes the outcome"
+        ],
+        "conflicts": [],
+        "alternatives": []
+      },
+      "applicability_conditions": [
+        {
+          "field": "stepdown_term",
+          "op": "eq",
+          "value": null,
+          "reference": "claim.term"
+        },
+        {
+          "field": "peer1_term",
+          "op": "eq",
+          "value": null,
+          "reference": "claim.term"
+        },
+        {
+          "field": "peer2_term",
+          "op": "eq",
+          "value": null,
+          "reference": "claim.term"
+        },
+        {
+          "field": "probe_reachable",
+          "op": "eq",
+          "value": true,
+          "reference": null
+        }
+      ],
+      "admission_alias": "claim"
+    }
+  ],
+  "observable_properties": [
+    {
+      "checker_id": "p-reachable-quorum-keeps-leadership",
+      "kind": "event_assertion",
+      "trigger": {
+        "field": "op",
+        "op": "eq",
+        "value": "leader-lease-refresh-coherence",
+        "reference": null
+      },
+      "assertion": {
+        "field": "leader_state_at_end",
+        "op": "eq",
+        "value": "Leader",
+        "reference": null
+      },
+      "antecedent": null,
+      "identity_fields": [
+        "cluster",
+        "op"
+      ],
+      "description": "At the end of a window in which the leader held its own term and a quorum of voters was reachable in that term, the node must still hold the leadership, so its published state must still be Leader. Applicability already excludes the higher-term and unreachable-peer cases, and the recorded transition shows when and at which term the node actually left the leadership, so the comparison is the requirement itself rather than an observation that the node merely is not leading."
+    }
+  ],
+  "uncertainties": [
+    "The observable depends on the library accepting the interval combination: the lease is five seconds at creation because ValidateConfig requires it not to exceed the heartbeat timeout, and the reload then lengthens the heartbeat interval without touching the lease.",
+    "The step-down is attributed to the lease by construction and exclusion: no partition exists, no peer adopts a higher term before the recorded transition, and a probe afterwards answers in the same term; the harness does not read the lease state itself, which is cleared when the leader steps down.",
+    "Only one interval relation, one cluster shape and one window are exercised, and the harness does not measure how quickly the cluster recovers a leader afterwards.",
+    "The alternative that the combination is the operator's error rather than the library's is retained; the harness records only that the library accepts it, including through its own reload API."
+  ]
+}

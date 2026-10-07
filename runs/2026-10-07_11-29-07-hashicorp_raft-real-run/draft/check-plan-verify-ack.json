@@ -1,0 +1,82 @@
+{
+  "description": "Discriminator: which servers may count toward the quorum that Raft.VerifyLeader requires. A three-server configuration with two voters and one non-voter elects a leader; the leader's route to the other voter is then removed, so the leader can no longer reach a quorum of voters but can still reach the non-voter, and the leader is asked whether it is still the leader. Observation: the harness records the verification result, its error, the configuration that produced it (voter count, non-voter count, quorum size), the disconnected voter and the leader's state. Control: the configuration, the quorum size and the unreachable voter are reported beside the result, and applicability requires the voter quorum to be unreachable, so the judged operation is exactly the leader-only-plus-non-voter case.",
+  "claim_id": "c-verify-leader-voter-quorum",
+  "binding_ids": ["bind-raft-verify-leader-quorum"],
+  "harness": {
+    "kind": "go_test",
+    "description": "TestAssuranceVerifyLeaderVoterQuorum: the result of VerifyLeader on a leader that can reach only a non-voter",
+    "source": "",
+    "files": {},
+    "semantic_changes": [
+      "No target file is modified; the harness adds one external test file to the captured package and uses only public APIs (NewRaft, BootstrapCluster, State, Barrier, VerifyLeader, CurrentTerm, Stats, Shutdown) plus the module's own InmemTransport Connect and Disconnect for routing.",
+      "The configuration is a real two-voter configuration with one non-voter, bootstrapped on all three servers, so the quorum the leader computes is the voter majority and the non-voter is a genuine member.",
+      "The leader's route to the other voter is removed with the transport's own Disconnect; the non-voter keeps working normally, so the leader still sends and receives heartbeats.",
+      "Election and lease timeouts are long enough that the leader has not stepped down when the verification is issued, so the judged operation is the verification itself."
+    ],
+    "prerequisites": [
+      {
+        "alias": "admit",
+        "event": "verification_setup",
+        "conditions": []
+      }
+    ],
+    "legality": {
+      "source_ids": ["s-api-verify-leader", "s-replication-heartbeat", "s-raft-leader-lease", "s-raft-candidate-vote"],
+      "expectation_ids": [],
+      "binding_ids": ["bind-raft-verify-leader-quorum"],
+      "derivation": "VerifyLeader is documented as the guard against returning stale data after the peer has lost leadership, and it hands a verifyFuture to the leader's main loop (s-api-verify-leader). There verifyLeader sets the future's votes to one for the leader itself, sets quorumSize to r.quorumSize(), and registers the future with every follower replication state, non-voters included, then triggers immediate heartbeats. r.quorumSize() counts only servers whose suffrage is Voter (s-raft-candidate-vote, s-raft-leader-lease), and each replication goroutine adds one vote when its heartbeat RPC succeeds (s-replication-heartbeat). The numerator and the denominator therefore come from different sets: a leader of a two-voter configuration reaches the required two votes with its own vote plus the acknowledgement of a single non-voter, although the voter majority it claims to have confirmed is not reachable. The obligation requires the confirmation to rest on voters, so the harness judges exactly that case.",
+      "applicability": "A leader whose configuration contains non-voters and whose only reachable peer is a non-voter, observed before any lease expiry or election has changed its state. The harness reports the voter and non-voter counts, the quorum size, the unreachable voter and the leader's state so the scope is visible in the record.",
+      "unresolved": [
+        "whether the heartbeat acknowledgement of a non-voter was intended to count toward verification, which no source states",
+        "whether the repair filters the counted acknowledgements by suffrage or stops registering non-voter replication states for verification"
+      ],
+      "conflicts": [],
+      "alternatives": [
+        "the success could be read as 'the leader is still in the leader state', but VerifyLeader's contract is about confirming leadership against a quorum, and the leader state alone is exactly what the caller is trying to check"
+      ]
+    }
+  },
+  "monitors": [
+    {
+      "id": "m-verify-leader-voter-quorum",
+      "checker_id": "p-verify-leader-voter-quorum",
+      "event": "verification_observed",
+      "binding_ids": ["bind-raft-verify-leader-quorum"],
+      "admission_alias": "admit",
+      "applicability_conditions": [
+        {"field": "voters", "op": "eq", "value": 2},
+        {"field": "nonvoters", "op": "eq", "value": 1},
+        {"field": "quorum_size", "op": "eq", "value": 2},
+        {"field": "other_voter_reachable", "op": "eq", "value": false}
+      ],
+      "grounding": {
+        "source_ids": ["s-api-verify-leader", "s-replication-heartbeat"],
+        "expectation_ids": [],
+        "binding_ids": ["bind-raft-verify-leader-quorum"],
+        "derivation": "The admission event reports the leader's term, the voter and non-voter counts, the quorum size and the identity of the unreachable voter, and the result event reports the verification's outcome together with the same configuration and the leader's state, so applicability can require the intended membership and the unreachable voter before the outcome is judged (s-api-verify-leader, s-replication-heartbeat). Applicability is not conditioned on the outcome itself; a verification that never finished would be recorded as the harness reports it and is listed as a limit of this check rather than filtered out.",
+        "applicability": "One three-server configuration, one leader, one unreachable voter and one reachable non-voter; the identity is the cluster and the operation name.",
+        "unresolved": [
+          "whether a slower or lossier transport would change which acknowledgements arrive inside the verification"
+        ],
+        "conflicts": [],
+        "alternatives": []
+      }
+    }
+  ],
+  "observable_properties": [
+    {
+      "checker_id": "p-verify-leader-voter-quorum",
+      "kind": "event_assertion",
+      "trigger": {"field": "op", "op": "eq", "value": "verify-leader-voter-quorum"},
+      "assertion": {"field": "verification_result", "op": "ne", "value": "success"},
+      "identity_fields": ["cluster", "op"],
+      "description": "When the leader of a two-voter configuration cannot reach the other voter, its verification of leadership must not report success: the quorum the accessor claims to confirm is the voter majority, and a non-voter's acknowledgement is not part of it. Reporting success is the violation; an error or an unfinished verification is not."
+    }
+  ],
+  "uncertainties": [
+    "The prefix contains one leader and one unreachable voter; configurations with several non-voters, or with the unreachable peer being the non-voter instead, are not exercised.",
+    "The check reports the verification outcome and the configuration, not a downstream stale read, so the consumer that would be misled by the confirmation is not part of the observation.",
+    "An unfinished verification is not distinguished from a failure by the compared predicate, so a run in which the future never resolves would be recorded without a violation rather than as a violation or a distinct outcome.",
+    "The leader is judged before its lease expires, so nothing here says how long the false confirmation remains available to callers."
+  ]
+}
