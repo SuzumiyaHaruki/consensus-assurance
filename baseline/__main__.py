@@ -33,8 +33,15 @@ class Config(BaseModel):
     allow_agent_materials: bool = False
     allow_experiments: bool = False
     go_mod_cache_dir: str | None = None
-    cargo_seed_cache_dir: str | None = None
+    cargo_dependency_cache_dir: str | None = None
     budget: Budget = Field(default_factory=Budget)
+
+    @model_validator(mode="before")
+    @classmethod
+    def migrate_dependency_name(cls, value):
+        if isinstance(value, dict) and "cargo_seed_cache_dir" in value:
+            raise ValueError("Rename cargo_seed_cache_dir to cargo_dependency_cache_dir; use a Cargo home dependency cache, not a compiled seed")
+        return value
 
     @model_validator(mode="after")
     def validate_connection(self):
@@ -82,7 +89,7 @@ def load_config(path):
     path = Path(path).expanduser().resolve()
     raw = read_yaml(path)
     config = Config.model_validate(raw)
-    for name in ("target_config", "repo_path", "runs_dir", "go_mod_cache_dir", "cargo_seed_cache_dir"):
+    for name in ("target_config", "repo_path", "runs_dir", "go_mod_cache_dir", "cargo_dependency_cache_dir"):
         value = getattr(config, name)
         if value is not None:
             p = Path(value).expanduser()

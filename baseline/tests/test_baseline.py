@@ -301,3 +301,63 @@ def test_process_cancellation_and_credential_redaction(tmp_path):
     result = subprocess.run([sys.executable, "-c", script], cwd=tmp_path, env=env, capture_output=True, text=True, timeout=10)
     assert result.returncode == 0 and "cancelled" in result.stdout
     assert (tmp_path / "logs/stdout.jsonl").read_text().strip() == "[REDACTED_CREDENTIAL]"
+
+
+def test_cargo_dependency_field_migration(tmp_path):
+    c = configuration(tmp_path, 'cargo')
+    raw = c.model_dump()
+    raw['cargo_seed_cache_dir'] = str(tmp_path / 'old-seed')
+    with pytest.raises(ValueError, match='Rename cargo_seed_cache_dir to cargo_dependency_cache_dir'):
+        Config.model_validate(raw)
+    raw.pop('cargo_seed_cache_dir')
+    raw['cargo_dependency_cache_dir'] = str(tmp_path / 'cargo-home')
+    assert Config.model_validate(raw).cargo_dependency_cache_dir == raw['cargo_dependency_cache_dir']
+    # Historical records remain data; they are not loaded as a new configuration.
+    historical = json.loads('{"cargo_seed_cache_dir": "old-cache"}')
+    assert historical['cargo_seed_cache_dir'] == 'old-cache'
+
+
+def test_implementation_identity_tracks_loaded_bytes_and_preserves_start(tmp_path, monkeypatch):
+    project = make_repo(tmp_path / 'implementation')
+    base = project / 'baseline'
+    base.mkdir()
+    for name in ('__main__.py', 'runner.py', 'codex.py', 'task.md'):
+        (base / name).write_text('initial execution input\n')
+    runner.git(project, 'add', 'baseline')
+    runner.git(project, '-c', 'user.name=T', '-c', 'user.email=t@example.invalid', 'commit', '-qm', 'Implementation')
+    monkeypatch.setattr(runner, '__file__', str(base / 'runner.py'))
+    module = sys.modules['consensus_assurance.adapters.storage.snapshot']
+    installed = tmp_path / 'installed.py'
+    installed.write_text('installed module bytes\n')
+    monkeypatch.setattr(module, '__file__', str(installed))
+    root = tmp_path / 'record'
+    first = runner.implementation_identity(root)
+    assert not first['execution_inputs_dirty']
+    assert first['inputs'] == runner.implementation_identity(root)['inputs']
+    entry = first['inputs'][module.__name__]
+    assert entry['path'] == str(installed) and entry['framework_relative_path'] is None
+    assert entry['version_basis'].startswith('external installed bytes')
+    (base / 'runner.py').write_text('changed execution input\n')
+    installed.write_text('changed installed bytes\n')
+    (project / 'unrelated.env').write_text('PRIVATE_NOT_AN_EXECUTION_INPUT')
+    later = runner.implementation_identity(root / 'later')
+    assert later['execution_inputs_dirty'] and later['framework_commit'] == first['framework_commit']
+    assert later['inputs']['baseline/runner.py']['sha256'] != first['inputs']['baseline/runner.py']['sha256']
+    result = runner.finish_identity(root, first)
+    assert not result['inputs_unchanged'] and set(result['changed_inputs']) == {'baseline/runner.py', module.__name__}
+    assert first['inputs']['baseline/runner.py']['sha256'] != later['inputs']['baseline/runner.py']['sha256']
+    assert all(b'PRIVATE_NOT_AN_EXECUTION_INPUT' not in p.read_bytes() for p in root.rglob('*') if p.is_file())
+
+
+def test_optional_main_profile_uses_explicit_settings_without_changing_method(tmp_path):
+    from consensus_assurance.adapters.agents.backend import CodexAgent, common_settings
+    c = configuration(tmp_path)
+    legacy = CodexAgent(c.agent_reasoning_effort, c.agent_model, c.codex_provider)
+    common = CodexAgent(c.agent_reasoning_effort, c.agent_model, c.codex_provider, 'single_agent')
+    assert legacy.profile_settings == {}
+    assert common.profile_settings == common_settings(c.codex_provider)
+    command = common.connection_options(tmp_path)
+    assert 'features.multi_agent=false' in command
+    assert 'model_providers.deepseek.stream_idle_timeout_ms=300000' in command
+    assert '--output-schema' not in command
+    assert not any('network.enabled=true' in value for value in command)

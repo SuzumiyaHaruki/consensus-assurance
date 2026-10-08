@@ -10,29 +10,11 @@ import time
 from pathlib import Path
 from uuid import UUID
 
-from consensus_assurance.adapters.agents.backend import classify_failure, codex_diagnostic
+from consensus_assurance.adapters.agents.backend import (
+    classify_failure, codex_diagnostic, common_settings, DISABLED_FEATURES, toml, codex_options as options,
+)
 from consensus_assurance.adapters.runners.go_module import GoModuleBackend
 from consensus_assurance.adapters.storage.files import write_json
-
-
-DISABLED_FEATURES = (
-    "apps", "plugins", "remote_plugin", "hooks", "memories", "multi_agent", "multi_agent_v2",
-    "skill_search", "skill_mcp_dependency_install", "shell_snapshot", "browser_use",
-    "browser_use_external", "computer_use", "image_generation", "external_agent_memory_import",
-    "unbounded_connection_retries", "workspace_dependencies", "in_app_local_automation",
-)
-
-
-def toml(value):
-    if isinstance(value, dict):
-        return "{" + ",".join(json.dumps(k) + "=" + toml(v) for k, v in value.items()) + "}"
-    if isinstance(value, list):
-        return "[" + ",".join(toml(v) for v in value) + "]"
-    return json.dumps(value)
-
-
-def options(values):
-    return [arg for key, value in values.items() for arg in ("-c", key + "=" + toml(value))]
 
 
 def process(command, cwd, folder, timeout, *, env, stdin="", secrets=()):
@@ -232,10 +214,12 @@ class Codex:
                     raise ValueError("go_mod_cache_dir must be a separate existing module cache directory")
                 self.tool_environment["GOMODCACHE"] = str(cache)
                 self.read_roots.append(str(cache))
-        elif self.config.cargo_seed_cache_dir:
-            cache = Path(self.config.cargo_seed_cache_dir)
+        elif self.config.cargo_dependency_cache_dir:
+            cache = Path(self.config.cargo_dependency_cache_dir)
             if not cache.is_dir() or cache.is_symlink() or self.root.is_relative_to(cache) or cache.is_relative_to(self.root):
-                raise ValueError("cargo_seed_cache_dir must be a separate existing Cargo home")
+                raise ValueError("cargo_dependency_cache_dir must be a separate existing Cargo home")
+            if not any((cache / name).is_dir() for name in ("registry", "git")):
+                raise ValueError("cargo_dependency_cache_dir needs registry/ or git/; a compiled seed directory is not a dependency cache")
             # Match CargoBackend: expose only dependency trees through the private Cargo home.
             for name in ("registry", "git"):
                 dependency = cache / name
@@ -255,29 +239,19 @@ class Codex:
                          "shell_environment_policy.set": self.tool_environment,
                          "shell_environment_policy.ignore_default_excludes": False,
                          "shell_environment_policy.experimental_use_profile": False,
-                         "project_doc_max_bytes": 0, "web_search": "disabled", "mcp_servers": {},
+                         **common_settings(self.config.codex_provider),
                          "projects": {str(self.work): {"trust_level": "untrusted"}},
-                         "allow_login_shell": False,
-                         "memories.use_memories": False, "memories.generate_memories": False,
-                         "features.skip_host_skill_discovery": True,
-                         **{"features." + name: False for name in DISABLED_FEATURES},
                          "model": self.config.agent_model}
         if self.config.agent_reasoning_effort is not None:
             self.settings["model_reasoning_effort"] = self.config.agent_reasoning_effort
         provider = self.config.codex_provider
-        provider_id = provider.id if provider else "openai"
         if provider:
             self.settings["model_provider"] = provider.id
             for key, value in {"name": provider.id, "base_url": provider.base_url, "env_key": provider.env_key,
-                               "wire_api": "responses", "requires_openai_auth": False,
-                               "supports_websockets": False}.items():
+                               "wire_api": "responses", "requires_openai_auth": False, "supports_websockets": False}.items():
                 self.settings[f"model_providers.{provider.id}.{key}"] = value
         else:
             self.settings["forced_login_method"] = "api" if self.config.auth_mode == "api_key" else "chatgpt"
-        if provider:
-            for key, value in {"request_max_retries": 4, "stream_max_retries": 5,
-                               "stream_idle_timeout_ms": 300000}.items():
-                self.settings[f"model_providers.{provider_id}.{key}"] = value
         if provider and provider.model_catalog_path:
             raw = Path(provider.model_catalog_path).read_bytes()
             catalog = json.loads(raw)
@@ -306,8 +280,18 @@ class Codex:
             self.settings["model_catalog_json"] = str(self.root / "inputs/models.json")
         self.permission_probe()
         self.prompt_probe()
+        versions = {}
+        commands = {"platform": ["uname", "-sm"], "go": ["go", "version"],
+                    "go_environment": ["go", "env", "GOOS", "GOARCH", "GOVERSION", "GOROOT", "GOMODCACHE", "GOCACHE", "GOFLAGS", "GOWORK"]} if tool == "go" else {
+                    "platform": ["uname", "-sm"], "cargo": ["cargo", "--version", "--verbose"], "rustc": ["rustc", "--version", "--verbose"]}
+        for name, command in commands.items():
+            result, text = self.local(["sandbox", "--include-managed-config", "-P", "codex_plain", *options(self.settings),
+                                      "-C", str(self.work), *command], "tool-" + name)
+            if result["status"] != "completed" or result["exit_code"]:
+                raise ValueError("Cannot record the actual sandbox tool version: " + name)
+            versions[name] = text.strip()
         write_json(self.root / "inputs/cli-settings.json", self.settings)
-        return {"cli": self.version, "tool_root": str(tool_root), "tool_environment": self.tool_environment,
+        return {"cli": self.version, "tool_root": str(tool_root), "tool_environment": self.tool_environment, "versions": versions,
                 "network": "tools: disabled, including loopback; model client: selected provider",
                 "subagents": False, "cache_policy": "private cold builds; optional read-only shared dependencies",
                 "native_retries": {"request_max_retries": 4, "stream_max_retries": 5} if provider else

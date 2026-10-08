@@ -1,5 +1,7 @@
 """Fixed input capture, bounded same-session turns, and append-only handoffs."""
 import json
+import hashlib
+import importlib.metadata
 import os
 import re
 import shutil
@@ -23,6 +25,77 @@ from .codex import Codex, options
 TASK = Path(__file__).with_name("task.md")
 EXCLUDED = EXCLUDED_DIRS | {".execution", ".pytest_cache", ".mypy_cache"}
 WORK_EXCLUDED = EXCLUDED | {".runtime"}
+
+
+def implementation_identity(root):
+    """Record only loaded execution inputs, not the repository or dependency trees."""
+    project = Path(__file__).resolve().parents[1]
+    paths = {"baseline/" + name: project / "baseline" / name for name in ("__main__.py", "codex.py", "runner.py", "task.md")}
+    neutral = ("consensus_assurance.core.config", "consensus_assurance.core.types",
+               "consensus_assurance.adapters.agents.backend", "consensus_assurance.adapters.runners.go_module",
+               "consensus_assurance.adapters.runners.experiment", "consensus_assurance.adapters.runners.process",
+               "consensus_assurance.adapters.storage.files", "consensus_assurance.adapters.storage.snapshot")
+    paths.update({name: Path(sys.modules[name].__file__).resolve() for name in neutral})
+    relative = [str(path.relative_to(project)) for path in paths.values() if path.is_relative_to(project)]
+    dirty = git(project, "status", "--porcelain", "--untracked-files=all", "--", *relative).decode()
+    commit = git(project, "rev-parse", "HEAD").decode().strip()
+    entries = {}
+    for label, path in paths.items():
+        data = path.read_bytes()
+        entries[label] = {"path": str(path), "sha256": digest(data),
+                          "framework_relative_path": str(path.relative_to(project)) if path.is_relative_to(project) else None,
+                          "version_basis": "framework Git and recorded bytes" if path.is_relative_to(project) else "external installed bytes; framework HEAD does not identify this module"}
+        if dirty or not path.is_relative_to(project):
+            # Save only execution inputs, and never archive credential-like source bytes.
+            if SENSITIVE_CONTENT.search(data):
+                entries[label]["saved_bytes"] = "excluded: credential-like content"
+            else:
+                destination = root / "inputs/implementation-source" / (label.replace("/", "__") + ".txt")
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.write_bytes(data)
+                entries[label]["saved_bytes"] = str(destination.relative_to(root))
+    try:
+        package_version = importlib.metadata.version("consensus-assurance")
+    except importlib.metadata.PackageNotFoundError:
+        package_version = "unknown"
+    return {"generated_at": now(), "framework_commit": commit, "execution_inputs_dirty": bool(dirty),
+            "execution_input_changes": dirty.splitlines(), "inputs": entries, "package_version": package_version,
+            "python": sys.executable, "catalog_record": "inputs/models.json", "server_model_revision": "unknown",
+            "config_record": "inputs/config.json", "task_record": "inputs/task.md"}
+
+
+def executable_identity(client):
+    path = getattr(client, "executable", None)
+    if not path:
+        return {"status": "not measured: test double"}
+    path = Path(path)
+    hasher = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            hasher.update(block)
+    info = path.stat()
+    return {"path": str(path), "version": client.version, "sha256": hasher.hexdigest(),
+            "stat": [info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns]}
+
+
+def finish_identity(root, identity):
+    changed = []
+    for label, entry in identity["inputs"].items():
+        path = Path(entry["path"])
+        if not path.is_file() or digest(path.read_bytes()) != entry["sha256"]:
+            changed.append(label)
+    executable = identity.get("codex", {})
+    if "path" in executable:
+        try:
+            info = Path(executable["path"]).stat()
+            if [info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns] != executable["stat"]:
+                changed.append("codex_binary_metadata")
+        except OSError:
+            changed.append("codex_binary_metadata")
+    result = {"checked_at": now(), "inputs_unchanged": not changed, "changed_inputs": changed,
+              "basis": "entry bytes rechecked; binary stat rechecked; startup identity preserved"}
+    write_json(root / "inputs/implementation-end.json", result)
+    return result
 
 
 def now():
@@ -317,9 +390,10 @@ def run(config, target, *, smoke=False, client_factory=Codex, environment_only=F
     print(f"运行目录：{root}", file=sys.stderr, flush=True)
     def phase(name, message):
         record["phase"] = name
+        record.setdefault("phase_times", {})[name] = {"at": now(), "elapsed_seconds": time.monotonic() - start}
         write_json(root / "run.json", {k: v for k, v in record.items() if k != "monotonic_start"})
         print(message, file=sys.stderr, flush=True)
-    client = None
+    client = identity = None
     old_handler = signal.getsignal(signal.SIGTERM)
     signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt()))
     try:
@@ -327,6 +401,9 @@ def run(config, target, *, smoke=False, client_factory=Codex, environment_only=F
         (root / "inputs/task.md").write_bytes(TASK.read_bytes())
         write_json(root / "inputs/config.json", config.model_dump())
         write_json(root / "inputs/target.json", target)
+        identity = implementation_identity(root)
+        record["implementation"] = "inputs/implementation.json"
+        write_json(root / record["implementation"], identity)
         source = synthetic_source(root / "source", target["execution_backend"]) if smoke else capture_source(
             config.repo_path, root / "source", deadline)
         if not smoke and target.get("expected_module"):
@@ -341,6 +418,8 @@ def run(config, target, *, smoke=False, client_factory=Codex, environment_only=F
         client = client_factory(config, root, target, deadline)
         phase("environment_check", "正在检查本地权限和工具环境；尚未调用模型。")
         record["environment"] = client.prepare()
+        identity["codex"] = executable_identity(client)
+        write_json(root / record["implementation"], identity)
         if environment_only:
             phase("dependency_check", "正在检查离线依赖；尚未调用模型。")
             client.dependency_probe()
@@ -361,6 +440,8 @@ def run(config, target, *, smoke=False, client_factory=Codex, environment_only=F
     except (ValueError, OSError, subprocess.CalledProcessError) as exc:
         record.update(stop="preflight_or_runtime_error", reason=str(exc))
     finally:
+        if identity:
+            record["implementation_check"] = finish_identity(root, identity)
         if client:
             client.close()
         signal.signal(signal.SIGTERM, old_handler)
