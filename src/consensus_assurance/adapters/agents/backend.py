@@ -8,6 +8,38 @@ from consensus_assurance.adapters.runners.process import output
 from consensus_assurance.adapters.storage.files import write_json, redact, digest
 
 
+DISABLED_FEATURES = (
+    "apps", "plugins", "remote_plugin", "hooks", "memories", "multi_agent", "multi_agent_v2",
+    "skill_search", "skill_mcp_dependency_install", "shell_snapshot", "browser_use",
+    "browser_use_external", "computer_use", "image_generation", "external_agent_memory_import",
+    "unbounded_connection_retries", "workspace_dependencies", "in_app_local_automation",
+)
+
+
+def toml(value):
+    if isinstance(value, dict):
+        return "{" + ",".join(json.dumps(k) + "=" + toml(v) for k, v in value.items()) + "}"
+    if isinstance(value, list):
+        return "[" + ",".join(toml(v) for v in value) + "]"
+    return json.dumps(value)
+
+
+def codex_options(settings):
+    return [arg for key, value in settings.items() for arg in ("-c", key + "=" + toml(value))]
+
+
+def common_settings(provider=None):
+    """Optional neutral single-agent policy; no research instructions or permissions."""
+    settings = {"project_doc_max_bytes": 0, "web_search": "disabled", "mcp_servers": {}, "approval_policy": "never",
+                "allow_login_shell": False, "memories.use_memories": False, "memories.generate_memories": False,
+                "features.skip_host_skill_discovery": True,
+                **{"features." + name: False for name in DISABLED_FEATURES}}
+    if provider:
+        settings.update({f"model_providers.{provider.id}.{key}": value for key, value in {
+            "request_max_retries": 4, "stream_max_retries": 5, "stream_idle_timeout_ms": 300000}.items()})
+    return settings
+
+
 def classify_failure(text: str) -> ExecutionStatus:
     low = text.lower()
     if any(s in low for s in ["insufficient_quota", "quota exceeded", "usage limit", "rate limit", "quota exhausted", "credits exhausted"]):
@@ -71,10 +103,12 @@ class CodexAgent:
     name = "codex"
     mock = False
 
-    def __init__(self, reasoning_effort: str | None = None, model: str | None = None, provider=None):
+    def __init__(self, reasoning_effort: str | None = None, model: str | None = None, provider=None, profile=None):
         self.reasoning_effort = reasoning_effort
         self.model = model
         self.provider = provider
+        self.profile = profile
+        self.profile_settings = common_settings(provider) if profile == 'single_agent' else {}
 
     def bind_inputs(self, root, repo):
         """Capture an explicitly selected catalog, including any behavioral template."""
@@ -115,7 +149,7 @@ class CodexAgent:
             raise ValueError('Codex model catalog changed; start a new run')
 
     def connection_options(self, root, *, sandbox=False):
-        options=[]
+        options=codex_options(self.profile_settings)
         if self.model:options += ['-c','model='+json.dumps(self.model)] if sandbox else ['-m',self.model]
         if self.reasoning_effort is not None:options += ['-c','model_reasoning_effort='+json.dumps(self.reasoning_effort)]
         if self.provider:
@@ -266,14 +300,45 @@ class CodexAgent:
     def prepare(self, runner, directory, snapshot_id):
         self.client_environment()
         (directory / "tmp").mkdir(parents=True, exist_ok=True)
+        profile_checks = []
+        profile_key = (str(runner.root), os.environ.get('CODEX_HOME', str(Path.home() / '.codex')))
+        if self.profile == 'single_agent' and getattr(self, '_profile_prepared', None) != profile_key:
+            # --ignore-user-config is used on real turns, so the policy must be explicit argv.
+            for name in ('bootstrap', 'prompt', 'features'):
+                args = ['features', 'list'] if name == 'features' else ['debug', 'prompt-input', 'Local configuration inspection only.']
+                command = self.sandbox_command(runner.root)
+                if command[0].endswith('bwrap'):
+                    command = [command[0], '--unshare-net', *command[1:]]
+                else:
+                    command = ['bwrap', '--unshare-net', '--ro-bind', '/', '/', '--bind', str(runner.root), str(runner.root), '--', *command]
+                check = runner.run([*command, *args, *self.permission_options(runner.root, directory),
+                    *self.connection_options(runner.root, sandbox=True)], directory, 'codex_profile_' + name, snapshot_id, 30,
+                    env=self.client_environment(), sensitive_env=(self.provider.env_key,) if self.provider else ())
+                profile_checks.append(check)
+                if check.status != ExecutionStatus.COMPLETED or check.exit_code != 0:
+                    return False, profile_checks
+                if name == 'bootstrap':
+                    home = Path(os.environ.get('CODEX_HOME', Path.home() / '.codex')).resolve()
+                    self.profile_settings['skills.config'] = [{'path':str(path),'enabled':False} for path in sorted(home.glob('skills/**/SKILL.md'))]
+                elif name == 'prompt':
+                    items = json.loads(Path(check.stdout).read_text())
+                    kinds = [kind for item in items for kind in item.get('internal_chat_message_metadata_passthrough',{}).get('content_item_kinds',[])]
+                    if any(kind in {'host_skills.instructions','agents_md.instructions'} or 'memory' in kind or 'plugin' in kind for kind in kinds):
+                        check.reason = 'Unexpected automatic instructions'; return False, profile_checks
+                else:
+                    features = {line.split()[0]:line.split()[-1] for line in Path(check.stdout).read_text().splitlines() if len(line.split()) >= 3}
+                    if any(features.get(name) != 'false' for name in DISABLED_FEATURES):
+                        check.reason = 'Single-agent settings were not effective'; return False, profile_checks
+            write_json(runner.root/'agent-inputs/runtime-settings.json', self.profile_settings)
+            self._profile_prepared = profile_key
         options = self.permission_options(runner.root, directory)
         key = (str(runner.root), tuple(options), tuple(self.connection_options(runner.root)), getattr(self, 'version', 'unknown'))
         if getattr(self, '_permission_key', None) == key:
-            return True, []
+            return True, profile_checks
         permitted, checks = self.permission_probe(runner, directory, snapshot_id, options)
         if permitted:
             self._permission_key = key
-        return permitted, checks
+        return permitted, profile_checks + checks
 
     def investigate(self, runner, prompt, directory, snapshot_id, timeout, session_id=None):
         """Run one Codex turn and retain the exact session and tool events."""

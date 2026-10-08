@@ -32,7 +32,7 @@ def sandbox_command(command, workspace, mode, read_only_roots=(), view_path=None
     executable = shutil.which("bwrap")
     if not executable:
         raise FileNotFoundError("bubblewrap is required by execution_isolation=bwrap")
-    args = [executable, "--die-with-parent", "--new-session", "--unshare-net", "--ro-bind", "/", "/",
+    args = [executable, "--die-with-parent", "--new-session", "--unshare-net", "--unshare-pid", "--ro-bind", "/", "/",
             "--tmpfs", "/home", "--tmpfs", "/root", "--tmpfs", "/tmp", "--dev", "/dev", "--proc", "/proc"]
     # Only the experiment workspace is writable; raw run logs and source repositories are hidden.
     visible = str(view_path or workspace)

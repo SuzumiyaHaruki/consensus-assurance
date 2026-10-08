@@ -71,6 +71,7 @@ class Config(Record):
     agent_reasoning_effort: str | None = None
     agent_model: str | None = None
     codex_provider: CodexProvider | None = None
+    codex_profile: Literal['single_agent'] | None = None
     runs_dir: str = "runs"
     cargo_seed_cache_dir: str | None = None
     budget: Budget = Budget()
