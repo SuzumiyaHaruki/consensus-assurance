@@ -2,6 +2,10 @@ import json
 import os
 import re
 import shutil
+try:
+    import tomllib
+except ModuleNotFoundError:
+    import tomli as tomllib
 from pathlib import Path
 from consensus_assurance.core.types import CheckRun, ExecutionStatus, Origin
 from consensus_assurance.adapters.runners.process import output
@@ -129,9 +133,10 @@ class CodexAgent:
         write_json(folder/'catalog.json',{'source':str(path),'digest':digest(raw),'record':'agent-inputs/models.json'})
 
     def validate_inputs(self, root, config):
-        expected=(config.agent_model,config.agent_reasoning_effort,config.codex_provider)
-        if (self.model,self.reasoning_effort,self.provider)!=expected:
+        expected=(config.agent_model,config.agent_reasoning_effort,config.codex_provider,config.codex_profile)
+        if (self.model,self.reasoning_effort,self.provider,self.profile)!=expected:
             raise ValueError('Codex connection changed; start a new run')
+        self.validate_profile(root)
         def connection(argv):
             return sorted((arg,argv[i+1]) for i,arg in enumerate(argv[:-1]) if arg=='-m' or
                 arg=='-c' and (argv[i+1].split('=',1)[0] in {'model_reasoning_effort','model_provider','model_catalog_json','web_search'}
@@ -147,6 +152,46 @@ class CodexAgent:
         if (record['source']!=str(source) or digest((root/'agent-inputs/models.json').read_bytes())!=record['digest']
                 or source.is_file() and digest(source.read_bytes())!=record['digest']):
             raise ValueError('Codex model catalog changed; start a new run')
+
+    def validate_profile(self, root, *, bind=False):
+        """Compare durable policy before probes or cached actions can replace it."""
+        path = root/'agent-inputs/runtime-settings.json'
+        if self.profile is None:
+            if path.exists():
+                raise ValueError('Codex profile changed; start a new run')
+            return
+        home = Path(os.environ.get('CODEX_HOME', Path.home()/'.codex')).resolve()
+        def normalized(settings):
+            result = dict(settings)
+            result['skills.config'] = [{**item, 'path': '$CODEX_HOME/' + str(Path(item['path']).relative_to(home))
+                if Path(item['path']).is_relative_to(home) else item['path']} for item in settings.get('skills.config', [])]
+            return result
+        saved = json.loads(path.read_text()) if path.exists() else None
+        if saved is not None and (saved.get('profile') != self.profile or 'settings' not in saved):
+            raise ValueError('Missing or changed Codex profile basis; start a new run')
+        if saved and 'skills.config' not in self.profile_settings:
+            self.profile_settings['skills.config'] = [{**item, 'path': item['path'].replace('$CODEX_HOME/', str(home)+'/')}
+                for item in saved['settings'].get('skills.config', [])]
+        record = {'profile': self.profile, 'settings': normalized(self.profile_settings)}
+        if saved is not None and saved != record:
+            raise ValueError('Codex profile settings changed; start a new run')
+        historical = []
+        for log in (root/'logs').glob('*/check.json'):
+            check = json.loads(log.read_text())
+            if check.get('action') != 'agent_turn':continue
+            historical.append(check)
+            argv = check['command']; settings = {}
+            for i, arg in enumerate(argv[:-1]):
+                if arg == '-c':
+                    key, value = argv[i+1].split('=', 1)
+                    if key in self.profile_settings:settings[key] = tomllib.loads('value='+value)['value']
+            if normalized(settings) != record['settings']:
+                raise ValueError('Codex profile argv changed or incomplete; start a new run')
+        if saved is None and historical:
+            raise ValueError('Historical run has no durable Codex profile basis; start a new run')
+        if bind and saved is None:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            write_json(path, record)
 
     def connection_options(self, root, *, sandbox=False):
         options=codex_options(self.profile_settings)
@@ -298,6 +343,7 @@ class CodexAgent:
                 path.unlink(missing_ok=True)
 
     def prepare(self, runner, directory, snapshot_id):
+        self.validate_profile(runner.root)
         self.client_environment()
         (directory / "tmp").mkdir(parents=True, exist_ok=True)
         profile_checks = []
@@ -310,7 +356,10 @@ class CodexAgent:
                 if command[0].endswith('bwrap'):
                     command = [command[0], '--unshare-net', *command[1:]]
                 else:
-                    command = ['bwrap', '--unshare-net', '--ro-bind', '/', '/', '--bind', str(runner.root), str(runner.root), '--', *command]
+                    home = Path(os.environ.get('CODEX_HOME', Path.home()/'.codex')).resolve()
+                    home.mkdir(parents=True, exist_ok=True)
+                    command = ['bwrap', '--unshare-net', '--ro-bind', '/', '/', '--bind', str(runner.root), str(runner.root),
+                        '--bind', str(home), str(home), '--', *command]
                 check = runner.run([*command, *args, *self.permission_options(runner.root, directory),
                     *self.connection_options(runner.root, sandbox=True)], directory, 'codex_profile_' + name, snapshot_id, 30,
                     env=self.client_environment(), sensitive_env=(self.provider.env_key,) if self.provider else ())
@@ -329,7 +378,7 @@ class CodexAgent:
                     features = {line.split()[0]:line.split()[-1] for line in Path(check.stdout).read_text().splitlines() if len(line.split()) >= 3}
                     if any(features.get(name) != 'false' for name in DISABLED_FEATURES):
                         check.reason = 'Single-agent settings were not effective'; return False, profile_checks
-            write_json(runner.root/'agent-inputs/runtime-settings.json', self.profile_settings)
+            self.validate_profile(runner.root, bind=True)
             self._profile_prepared = profile_key
         options = self.permission_options(runner.root, directory)
         key = (str(runner.root), tuple(options), tuple(self.connection_options(runner.root)), getattr(self, 'version', 'unknown'))

@@ -173,7 +173,7 @@ class Engine:
         if not hasattr(self.agent,'validate_inputs'):return
         saved=Config.model_validate(self.state.config)
         original=Config.model_validate_json((self.root/'config.json').read_text())
-        for key in ('agent_backend','agent_model','agent_reasoning_effort','codex_provider'):
+        for key in ('agent_backend','agent_model','agent_reasoning_effort','codex_provider','codex_profile'):
             if getattr(saved,key)!=getattr(self.config,key) or getattr(original,key)!=getattr(saved,key):
                 raise ValueError('Codex connection changed; start a new run')
         self.agent.validate_inputs(self.root,saved)

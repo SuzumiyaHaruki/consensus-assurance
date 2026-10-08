@@ -297,7 +297,7 @@ def test_provider_configuration_and_catalog_inputs_precede_cached_results(tmp_pa
         options=e.agent.connection_options(e.root)
         patched.setattr(e.agent,'connection_options',lambda root:[v.replace('supports_websockets=false','supports_websockets=true') for v in options])
         with pytest.raises(ValueError,match='connection options changed'):reused()
-    for name,value in [('agent_model','another-model'),('agent_reasoning_effort','high'),
+    for name,value in [('agent_model','another-model'),('agent_reasoning_effort','high'),('codex_profile','single_agent'),
             ('codex_provider',e.config.codex_provider.model_copy(update={'base_url':'https://other.example'}))]:
         original=getattr(e.config,name);setattr(e.config,name,value)
         with pytest.raises(ValueError,match='connection changed'):reused()
@@ -345,3 +345,62 @@ print(json.dumps({'type':'turn.failed','error':{'message':'Client diagnostic '+o
     check=runner.run([sys.executable,'-c',"import os; assert 'PROVIDER_TICKET' not in os.environ; print('CREDENTIAL_ABSENT')"],
         workspace,'target-environment','fixture',10,env=clean_environment(workspace))
     assert check.exit_code==0 and Path(check.stdout).read_text().strip()=='CREDENTIAL_ABSENT'
+
+
+@pytest.mark.parametrize('custom', [False, True])
+def test_profile_binding_restore_and_tamper_before_paid_call(tmp_path, monkeypatch, custom):
+    from consensus_assurance.adapters.agents.backend import DISABLED_FEATURES
+    from consensus_assurance.core.config import Config, CodexProvider
+    home = tmp_path/'private-home'; home.mkdir()
+    monkeypatch.setenv('CODEX_HOME', str(home))
+    monkeypatch.setenv('PROFILE_TEST_KEY', 'local-canary')
+    provider = CodexProvider(id='fixture', base_url='https://example.org', env_key='PROFILE_TEST_KEY') if custom else None
+    agent = CodexAgent('high', 'fixture-model', provider, 'single_agent')
+    class Runner:
+        root = tmp_path
+        calls = []
+        def run(self, command, directory, action, snapshot, timeout, **kwargs):
+            self.calls.append(action)
+            log = tmp_path/(action+'.txt')
+            if action.endswith('bootstrap'):
+                skill = home/'skills/system/SKILL.md'; skill.parent.mkdir(parents=True, exist_ok=True); skill.write_text('fixture')
+            log.write_text('\n'.join(name+' stable false' for name in DISABLED_FEATURES) if action.endswith('features') else '[]')
+            return CheckRun(action=action, cwd=str(directory), snapshot_id=snapshot,
+                status=ExecutionStatus.COMPLETED, exit_code=0, stdout=str(log))
+    runner = Runner()
+    monkeypatch.setattr(CodexAgent, 'permission_options', lambda *args: [])
+    monkeypatch.setattr(CodexAgent, 'permission_probe', lambda *args: (True, []))
+    monkeypatch.setattr(CodexAgent, 'sandbox_command', lambda *args: ['codex'])
+    assert agent.prepare(runner, tmp_path/'draft', 's')[0]
+    path = tmp_path/'agent-inputs/runtime-settings.json'; raw = path.read_bytes()
+    cfg = Config(agent_model='fixture-model', agent_reasoning_effort='high', codex_provider=provider, codex_profile='single_agent')
+    log = tmp_path/'logs/turn/check.json'; log.parent.mkdir(parents=True)
+    log.write_text(json.dumps({'action':'agent_turn', 'command':['codex', 'exec', *agent.connection_options(tmp_path)]}))
+    restored = CodexAgent('high', 'fixture-model', provider, 'single_agent')
+    restored.validate_inputs(tmp_path, cfg)
+    assert restored.prepare(runner, tmp_path/'draft', 's')[0]
+    assert path.read_bytes() == raw
+    # Equivalent serialization must not alter the policy or require a model call.
+    path.write_text(json.dumps(json.loads(raw), sort_keys=True))
+    restored.validate_inputs(tmp_path, cfg)
+    before = path.read_bytes()
+    restored.profile_settings['features.shell_snapshot'] = True
+    with pytest.raises(ValueError, match='profile settings changed'):
+        restored.prepare(runner, tmp_path/'draft', 's')
+    assert path.read_bytes() == before
+    restored.profile_settings['features.shell_snapshot'] = False
+    changed = json.loads(raw); changed['settings']['mcp_servers'] = {'unapproved': {'command':'bad'}}
+    path.write_text(json.dumps(changed))
+    with pytest.raises(ValueError, match='profile settings changed'):restored.validate_inputs(tmp_path, cfg)
+    path.write_bytes(raw)
+    # Editing record and instance together still disagrees with retained real-turn argv.
+    restored.profile_settings['allow_login_shell'] = True
+    changed = json.loads(raw); changed['settings']['allow_login_shell'] = True
+    path.write_text(json.dumps(changed))
+    with pytest.raises(ValueError, match='profile argv changed'):restored.validate_inputs(tmp_path, cfg)
+    path.unlink()
+    with pytest.raises(ValueError, match='profile'):
+        CodexAgent('high', 'fixture-model', provider, 'single_agent').prepare(runner, tmp_path/'draft', 's')
+    # The unprofiled historical path remains available; pure receipt files remain readable.
+    assert json.loads(log.read_text())['action'] == 'agent_turn'
+    CodexAgent().validate_profile(tmp_path)
