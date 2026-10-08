@@ -1,4 +1,4 @@
-"""Real CLI sandbox and real compilers; never invoke a model endpoint."""
+"""Real CLI sandbox and compilers; loopback fixtures never invoke remote inference."""
 import json
 import asyncio
 import os
@@ -20,6 +20,7 @@ from mcp.client.stdio import stdio_client
 from baseline import codex, local_exec, runner
 from baseline.__main__ import load_target
 from baseline.tests.test_baseline import SESSION, configuration, events
+from baseline.tests.request_capture import ResponsesFixture, message
 
 
 toolchains = pytest.mark.parametrize('environment', ['go_module', 'cargo'], indirect=True, scope='module')
@@ -257,6 +258,113 @@ def test_real_catalog_copy_and_native_text_command(environment, monkeypatch):
     finally:client.settings['mcp_servers'].pop('unexpected')
 
 
+@pytest.mark.parametrize('search', [True, False])
+def test_real_exec_resume_request_tools_and_result_consumption(environment, monkeypatch, search):
+    """Scripted loopback Responses exchanges prove routing, never model competence."""
+    import jsonschema
+    client = environment
+    catalog = client.root/'inputs/models.json'
+    original = catalog.read_bytes()
+    selected = json.loads(original)
+    assert selected['models'][0]['supports_search_tool'] is True
+    selected['models'][0]['supports_search_tool'] = search
+    variant = original if search else original.replace(b'"supports_search_tool": true', b'"supports_search_tool": false', 1)
+    catalog.write_bytes(variant)
+    folder = client.root/'inputs'/('request-tools-search-' + str(search).lower())
+    tcp = "import socket; s=socket.socket();s.bind(('127.0.0.1',0));s.listen();c=socket.create_connection(s.getsockname());a,_=s.accept();c.sendall(b'ping');assert a.recv(4)==b'ping';a.sendall(b'pong');assert c.recv(4)==b'pong';print('LOCAL_FIXTURE_TCP_ROUNDTRIP')"
+    arguments = {'argv': ['python3', '-c', tcp], 'timeout_seconds': 10}
+    turn = {}
+
+    def reply(body, number):
+        output = next((item for item in body['input'] if item.get('type') == 'function_call_output'
+                       and item.get('call_id') == turn['call_id']), None)
+        if output:
+            actual = json.loads(output['output'].split('Output:\n', 1)[1])
+            path = client.root/'executions'/actual['execution_id']/'result.json'
+            assert actual == json.loads(path.read_text())
+            assert actual['turn'] == turn['folder'].name and actual['argv'] == arguments['argv']
+            assert actual['status'] == 'completed' and actual['exit_code'] == 0
+            assert 'LOCAL_FIXTURE_TCP_ROUNDTRIP' in (path.parent/'stdout.txt').read_text()
+            turn['execution_id'] = actual['execution_id']
+            return message()
+        surfaces = list(body['tools'])
+        for item in body['input']:
+            if item.get('type') == 'tool_search_output' and item.get('status') == 'completed':
+                surfaces.extend(item['tools'])
+        namespace = next((tool for tool in surfaces if tool.get('type') == 'namespace'
+                          and tool.get('name') == 'mcp__baseline_local'), None)
+        if namespace is None:
+            assert search and any(tool.get('type') == 'tool_search' and tool.get('execution') == 'client'
+                                  for tool in body['tools'])
+            return {'type': 'tool_search_call', 'id': turn['call_id'] + '-search', 'call_id': turn['call_id'] + '-search',
+                    'status': 'completed', 'execution': 'client', 'arguments': {'query': 'baseline_local isolated_exec TCP', 'limit': 1}}
+        tool, = namespace['tools']
+        assert tool['type'] == 'function' and tool['name'] == 'isolated_exec'
+        schema = tool['parameters']
+        assert set(schema['properties']) == {'argv', 'cwd', 'timeout_seconds'}
+        assert schema['required'] == ['argv'] and schema['additionalProperties'] is False
+        jsonschema.validate(arguments, schema)
+        with pytest.raises(jsonschema.ValidationError):jsonschema.validate({'cmd': 'echo invalid'}, schema)
+        return {'type': 'function_call', 'id': turn['call_id'], 'call_id': turn['call_id'],
+                'namespace': namespace['name'], 'name': tool['name'], 'arguments': json.dumps(arguments)}
+
+    try:
+        with ResponsesFixture(folder, reply) as capture:
+            (folder/'catalog.json').write_bytes(variant)
+            # Only endpoint and dummy credential differ from the production provider assembly.
+            monkeypatch.setitem(client.settings, 'model_providers.deepseek.base_url', capture.url)
+            monkeypatch.setitem(client.environment, client.config.codex_provider.env_key, 'synthetic-local-fixture')
+            session, results = None, []
+            for number in (1, 2):
+                turn.clear()
+                turn.update(folder=client.root/'turns'/f'fixture-search-{search}-{number}', call_id=f'fixture-{search}-{number}')
+                result = client.turn(turn['folder'], 'Synthetic local routing fixture only; no remote inference.', 30, session)
+                assert result['status'] == 'completed', result
+                assert turn.get('execution_id') and not capture.errors
+                session = result['session_id']
+                results.append({**result, 'execution_id': turn['execution_id']})
+            assert results[0]['session_id'] == results[1]['session_id']
+            initial = capture.requests[0]['tools']
+            assert any(t.get('type') == 'tool_search' for t in initial) == search
+            assert any(t.get('name') == 'mcp__baseline_local' for t in initial) == (not search)
+            runner.write_json(folder/'observations.json', {'evidence': 'scripted_local_fixture_not_model_inference',
+                'cli': client.version, 'supports_search_tool': search, 'tool_mode': selected['models'][0].get('tool_mode'),
+                'endpoint_override': capture.url, 'credential': 'synthetic-local-fixture',
+                'provider_id_unchanged': client.config.codex_provider.id, 'turns': results,
+                'requests': len(capture.requests), 'remote_model_calls': 0})
+    finally:
+        catalog.write_bytes(original)
+
+
+def test_profile_override_semantics_in_installed_cli(environment):
+    client = environment
+    async def inspect():
+        cases = {'equal_repeat': ['features.multi_agent=false', 'features.multi_agent=false'],
+                 'last_value': ['features.multi_agent=true', 'features.multi_agent=false'],
+                 'parent_table': ['features={multi_agent=false}'],
+                 'quoted_key': ['features."multi_agent"=true']}
+        observed = {}
+        for name, overrides in cases.items():
+            command = [*client.prefix(offline=True), 'app-server', '--strict-config', *codex.options(client.settings),
+                       *[arg for setting in overrides for arg in ('-c', setting)]]
+            folder = client.root/'inputs'/('profile-parser-' + name)
+            try:
+                async with local_exec.app_server(command, client.work, client.environment, folder, 15) as request:
+                    result = await request('config/read', {'includeLayers': False, 'cwd': str(client.work)})
+                    observed[name] = result['config'].get('features')
+            except ValueError:
+                assert name == 'quoted_key'
+                observed[name] = (folder/'stderr.log').read_text()
+                assert 'unknown configuration field' in observed[name] and 'features."multi_agent"' in observed[name]
+        assert observed['equal_repeat']['multi_agent'] is False
+        assert observed['last_value']['multi_agent'] is False
+        assert observed['parent_table']['multi_agent'] is False
+        assert observed['parent_table'].get('hooks') != observed['equal_repeat']['hooks']
+        runner.write_json(client.root/'inputs/profile-parser-observations.json',
+                          {'cli': client.version, 'overrides': cases, 'features': observed, 'remote_model_calls': 0})
+    asyncio.run(inspect())
+
+
 def test_native_openai_connection_and_key_boundary(tmp_path, monkeypatch):
     if not all(shutil.which(name) for name in ("codex", "bwrap", "go")):
         pytest.skip("Codex, Bubblewrap and Go are required")
@@ -299,6 +407,71 @@ def test_check_env_runs_no_model_and_retains_real_probes(tmp_path):
     assert record["kind"] == "check-env" and record["turns"] == []
     assert (root / "inputs/dependency-probe/result.json").exists()
     assert not (root / "work/.runtime").exists()
+    assert result['tool_evidence'] == {'local_registration_and_tcp': 'verified',
+        'model_request_tool_surface': 'not_inspected_by_check_env', 'real_model_tool_use': 'not_evaluated'}
+
+
+@toolchains
+def test_smoke_correlates_two_real_tcp_executions_and_rejects_false_positives(environment, tmp_path):
+    """Real MCP/compiler observations, scripted native receipts; no model is involved."""
+    config = environment.config.model_copy(deep=True)
+    config.runs_dir = str(tmp_path/'runs')
+    backend = load_target(config)['execution_backend']
+    case = runner.tcp_smoke_case(backend)
+    class Scripted(codex.Codex):
+        def authenticate(self):
+            pass
+        def turn(self, folder, prompt, timeout, session_id):
+            token = (self.work/'fixture.txt').read_text().strip()
+            (self.work/'note.txt').write_text(token)
+            if session_id:
+                assert session_id == SESSION
+                (self.work/case['path']).write_text(case['after'])
+            self.execution_control.update(turn=folder.name, turn_deadline=min(self.deadline, time.monotonic()+timeout))
+            runner.write_json(self.control_path, self.execution_control)
+            arguments = {'argv': case['argv'], 'cwd': '.', 'timeout_seconds': 90}
+            async def execute():
+                async with mcp_session(self) as (session, _):
+                    return await session.call_tool('isolated_exec', arguments)
+            result = asyncio.run(execute())
+            assert not result.isError, result
+            native = events(folder, final='SCRIPTED_LOCAL_FIXTURE_ONLY: TCP_REPLY_ASSERTION corrected; ' + token)
+            path = folder/'stdout.jsonl'
+            items = [json.loads(line) for line in path.read_text().splitlines()]
+            items.insert(-1, {'type': 'item.completed', 'item': {'id': 'fixture-call-' + folder.name,
+                'type': 'mcp_tool_call', 'server': 'baseline_local', 'tool': 'isolated_exec', 'status': 'completed',
+                'arguments': arguments, 'error': None, 'result': {'content': [item.model_dump(mode='json') for item in result.content],
+                                                              'structured_content': result.structuredContent}}})
+            path.write_text(''.join(json.dumps(item) + '\n' for item in items))
+            return codex.decode(folder, native, session_id)
+    result = runner.run(config, load_target(config), smoke=True, client_factory=Scripted)
+    assert result['ok'], result
+    root = Path(result['run_dir'])
+    record = json.loads((root/'run.json').read_text())
+    observation = root/'inputs/smoke-observations.json'
+    observation.parent.chmod(0o755)
+    observation.chmod(0o644)
+    observed = json.loads(observation.read_text())
+    assert [c['turn'] for c in observed['calls']] == [1, 2]
+    assert observed['calls'][0]['exit_code'] != 0 and observed['calls'][1]['exit_code'] == 0
+    paths = [root/'turns'/f'{n:04d}'/'stdout.jsonl' for n in (1, 2)]
+    original = [p.read_bytes() for p in paths]
+    for p in paths:p.chmod(0o644)
+    for failure in ('environment_only', 'first_only', 'second_shell', 'wrong_id', 'incomplete_tool', 'wrong_argv', 'no_native_completion'):
+        for number, path in enumerate(paths):
+            items = [json.loads(line) for line in original[number].decode().splitlines()]
+            call = next(e for e in items if e.get('item', {}).get('type') == 'mcp_tool_call')
+            if failure == 'environment_only' or number == 1 and failure == 'first_only':items.remove(call)
+            elif number == 1:
+                if failure == 'second_shell':call['item'] = {'id': 'shell', 'type': 'command_execution', 'status': 'completed', 'exit_code': 0}
+                elif failure == 'wrong_id':call['item']['result']['structured_content']['execution_id'] = '0'*32
+                elif failure == 'incomplete_tool':call.update(type='item.started'); call['item']['status'] = 'in_progress'
+                elif failure == 'wrong_argv':call['item']['arguments']['argv'] = ['echo', 'TCP_OBSERVED request=ping reply=pong']
+                elif failure == 'no_native_completion':items = [e for e in items if e['type'] != 'turn.completed']
+            path.write_text(''.join(json.dumps(item) + '\n' for item in items))
+        assert not runner.smoke_observations(root, record), failure
+    for path, raw in zip(paths, original):path.write_bytes(raw)
+    assert runner.smoke_observations(root, record)
 
 
 @toolchains

@@ -21,11 +21,23 @@
 .venv/bin/python -m pytest baseline/tests -q -o cache_dir=baseline/.pytest_cache
 ```
 
-[DeepSeek](configs/deepseek.example.yaml)、[OpenAI](configs/openai.example.yaml)、[自定义服务](configs/custom-provider.example.yaml) 示例默认关闭授权，需要填写 `repo_path`；相对路径以配置文件所在目录为准。新 [DeepSeek＋HashiCorp 配对草案](PAIRING.md) 也默认关闭授权；本地 TCP 能力已对齐，线上新工具调用仍待单独授权的合成冒烟。目标必须是干净 Git 提交，`runs_dir` 与源仓库分离；运行器不会替用户清理工作树。
+[DeepSeek](configs/deepseek.example.yaml)、[OpenAI](configs/openai.example.yaml)、[自定义服务](configs/custom-provider.example.yaml) 示例默认关闭授权，需要填写 `repo_path`；相对路径以配置文件所在目录为准。[DeepSeek＋HashiCorp 配对草案](PAIRING.md) 也默认关闭授权；本地 TCP、请求中的工具发现和结果回传已分别核对，真实模型调用仍待用户运行合成冒烟。目标必须是干净 Git 提交，`runs_dir` 与源仓库分离；运行器不会替用户清理工作树。
 
-`check-env` 保存快照，检查实际 CLI、权限、自动提示、沙箱内工具版本和离线依赖；Go 使用 `go list -m all`，Rust 使用离线 `cargo metadata`。它不发送目标给模型、不执行目标测试、不使用真实认证；API 凭据只记录是否存在。MCP 工具发现和固定合成 TCP 探针通过同一个本地 Codex 会话完成，省去独立 Python 客户端探针；仅创建本地合成会话，不启动模型回合。`environment_checked` 表示这些本地检查完成，不表示线上模型已经调用新工具。
+`check-env` 保存快照，检查实际 CLI、权限、自动提示、沙箱内工具版本和离线依赖；Go 使用 `go list -m all`，Rust 使用离线 `cargo metadata`。它不发送目标给模型、不执行目标测试、不使用真实认证；API 凭据只记录是否存在。MCP 工具发现和固定合成 TCP 探针通过同一个本地 Codex 会话完成，省去独立 Python 客户端探针；仅创建本地合成会话，不启动模型回合。输出中的 `tool_evidence` 明确区分本地注册与 TCP 已验证、模型请求工具面未在本次环境检查中检查、真实模型使用未评估；`environment_checked` 不代表三层全部通过。独立的本地请求捕获证据见 [配对状态](PAIRING.md)。
 
-`run` 要求 `allow_agent_materials`、`allow_experiments` 都为 `true`；`smoke` 还要求 `--allow-paid`。合成冒烟最多两回合、300 秒，验证工具失败修复、隔离工具的 TCP 测试、文件交接与上下文连续性；成功状态仍需核对原始 TCP 观察。不会自动登录、联网补依赖、换 provider 或追加免费总结。本次实施没有执行付费冒烟或新共识审计。
+`run` 要求 `allow_agent_materials`、`allow_experiments` 都为 `true`；`smoke` 还要求 `--allow-paid`。合成冒烟最多两回合、300 秒：第一回合通过 `isolated_exec` 执行自带的双向 TCP 测试并观察有意设置的回复断言失败；第二回合精确续接，只修正预期回复，再通过同一工具执行并解释结果。`inputs/smoke-observations.json` 关联两轮原生 MCP item、执行 ID、命令、原始输出及前后测试文件；仅环境探针、单轮 MCP 或第二轮普通 shell 成功都不算通过。机械结果只表示合成接入观察齐全，仍须阅读第二轮说明及原始材料，不证明共识正确性或模型语义理解。不会自动登录、联网补依赖、换 provider 或追加免费总结。本次修改没有调用远端模型或启动共识审计。
+
+用户后续可先复制默认未授权的 [HashiCorp 配置](configs/hashicorp.deepseek-pair.baseline.yaml)，确认路径并自行将两个授权开关设为 `true`。终端须已设置 `DEEPSEEK_API_KEY`，不要将密钥写入 YAML 或 Git。以下命令由用户执行；合成接入通过并核对原始材料后，再执行最后一条启动独立 40 分钟审计：
+
+```bash
+cp baseline/configs/hashicorp.deepseek-pair.baseline.yaml baseline/configs/hashicorp.deepseek-pair.local.yaml
+# Edit the local YAML: allow_agent_materials: true; allow_experiments: true.
+.venv/bin/python -m baseline check-env --config baseline/configs/hashicorp.deepseek-pair.local.yaml
+.venv/bin/python -m baseline smoke --config baseline/configs/hashicorp.deepseek-pair.local.yaml --allow-paid
+.venv/bin/python -m baseline run --config baseline/configs/hashicorp.deepseek-pair.local.yaml
+```
+
+smoke 超时、服务拒绝或资料不足时保留实际原因，不自动加时或改服务；不能直接推断模型绝对不兼容。正式运行不继承合成会话、文件或 smoke 的强制调用要求，普通审计任务保持原样。
 
 目录使用本地时间，例如 `2026-10-08_13-11-14-hashicorp_raft-baseline`，环境检查以 `-check-env` 结尾，同秒重名追加序号。启动时打印源码捕获、环境检查和模型调用阶段，`run.json.phase_times` 保存时点与累计耗时；进入模型调用时为 `stop: running`、`phase: model_audit`。服务端是否接收请求仍以原始调用输出为据。没有跨进程 resume 入口，再次运行会创建新目录和新 session。
 
@@ -86,6 +98,6 @@ runs/<run-id>/
 | 原生 OpenAI | 本地 catalog、命令构造与 API-key 隔离检查 | 真实模型调用、登录刷新和两组配对 |
 | 其他 provider | 通用 Responses 配置入口 | 不因 DeepSeek 成功推断已适配，不自动进行付费接入 |
 
-复用已有能力证据，不为补一个 smoke 名称重新付费。当前最终测试命令、环境、通过／失败／跳过、原始输出和已知缺口见 [验收记录](acceptance/2026-10-08-tcp/summary.json)。本地链路通过不能替代线上工具调用验收，也不证明任何共识实现正确。
+本次请求工具面、两轮关联和 profile 检查的最终命令、结果及原始材料见 [本次验收记录](acceptance/2026-10-08-tool-surface/summary.json)；此前 [隔离 TCP 验收](acceptance/2026-10-08-tcp/summary.json) 保持原样。本地脚本响应通过不能替代真实模型调用验收，也不证明任何共识实现正确。
 
 共同条件表、历史 40／120 分钟试运行的定位及空白离线裁决表统一见 [PAIRING.md](PAIRING.md)，不另外建设调度或评价平台。

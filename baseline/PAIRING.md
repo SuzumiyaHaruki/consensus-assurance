@@ -1,6 +1,6 @@
 # 配对准备与离线裁决
 
-本轮从 `b8917c6b60483aa554ebff557a6fffed7369fcdc` 开始，主系统方法仍为 `audit-products-v58`。这里记录宿主侧条件，不进入普通组提示。两组可以采用不同的调查路线，不预设完整组获胜。本地链路已通过，baseline 不再缺少隔离内 TCP 测试能力；线上工具调用待单独授权的合成冒烟，不使用历史 shell 调用记录替代。
+本轮从 `ffc4d1e2a9841719e2c480e7eea18ff447b1b753` 开始，主系统方法仍为 `audit-products-v58`。这里记录宿主侧条件，不进入普通组提示。两组可以采用不同的调查路线，不预设完整组获胜。本地服务、请求工具面和结果回传分别核对；真实模型使用工具仍待用户执行合成冒烟，不使用历史 shell 调用记录或本地脚本响应替代。
 
 ## 新配对草案
 
@@ -83,7 +83,28 @@ baseline 在真实 `exec` 与精确 `exec resume` 使用的显式参数中配置
 
 用户提供的上轮离线复查意见是：EnsureSamePeers 的过期参考值有源码与执行依据；EnsureLeader 的实际失败需要区分即时断言职责与调用者等待前提，“不重试”不自动构成 helper 违约。本轮未追加模型或目标复验来改变这些结论。模型对上游版本的强调、报告内状态不一致和末尾重复总结原样保留；这些观察不进入后续普通组任务。
 
-## 本轮交付与验证
+## 本次工具暴露与 profile 检查
+
+固定 CLI 仍为 `0.155.0-alpha.16`，共同 catalog、行为模板、上下文预算和 `high` 推理档位均未修改。两组仍引用同一份 `configs/providers/deepseek-flash.models.json`，其中 `supports_search_tool=true`、`tool_mode=null`。本机真实请求先提供带有 `baseline_local` 来源说明的客户端 `tool_search`；经该入口发现后，`tool_search_output` 提供 `mcp__baseline_local` namespace 中的 `isolated_exec` 及参数 schema，随后调用和执行结果回传均成功，精确 `exec resume` 也已验证。因此，当前本机证据没有复现 [上游 #36382](https://github.com/openai/codex/issues/36382) 所述的“既无工具也无搜索入口”。该 issue 针对较早版本，不能据此断言历史 DeepSeek 未调用 MCP 的原因。
+
+仅将 `supports_search_tool` 改为 `false` 的测试副本会直接暴露同一 namespace；候选值的 exec、resume、schema 和结果回传也已核对。既有目录已具有可用的发现路径，按本轮要求保留它，不将候选值写入生产 catalog。旧 run 的 `inputs/models.json` 保持原样；也没有通过改变普通审计提示来补偿工具选择。
+
+| 证据层次 | 当前结论 | 边界与入口 |
+|---|---|---|
+| 服务与隔离执行 | 本地已验证 | 真实 MCP 协议、Go／Rust 双向 TCP、非零断言与修复结果；原安全和生命周期回归保留 |
+| Codex 注册 | 本地已验证 | 现有 app-server 清单及固定 TCP 探针；不等于模型侧选择工具 |
+| 请求工具面与结果回传 | 本地已验证 | 真实生产 `Codex.turn()` 装配的 exec 与精确 resume，请求中先确认工具搜索或直接定义，再发脚本化调用；执行结果与受保护记录匹配并进入后续请求 |
+| 真实模型选择、调用和理解结果 | 本轮未运行 | 用户后续执行两回合 smoke；未调用 DeepSeek、GPT 或其他远端模型，不能从本地成功推断服务端接受请求或模型能力 |
+
+请求捕获只使用合成项目、虚拟凭据和临时回环 HTTP fixture，不转发请求。保留 provider ID、Responses、目录字节、工具策略和配置装配路径；不可避免的差异为 endpoint 从 DeepSeek HTTPS 改为本地 HTTP、认证环境变量及值使用合成内容。请求和脚本返回保存在 [验收目录](acceptance/2026-10-08-tool-surface/summary.json)，不记录认证头；这些材料证明本机客户端连接链路，不证明真实服务的能力协商、TLS、认证、模型推理或线上可用性。原生 OpenAI 的目录、权限和认证隔离继续用原回归验证，没有套用 DeepSeek 候选配置。
+
+主系统 profile 漏检已通过真实 `validate_profile()` 复现：正常历史 argv 追加 `mcp_servers.fixture.command` 曾被接受，测试没有启动该服务。现在按所拥有的配置路径边界检查 MCP、features、skills、memories、标量策略和共同重试设置；历史参数、准备命令、最终 exec／resume 及 Engine 预算前入口均检查。相同值重复和字典顺序变化可接受；冲突重复、未声明子键、父表替换及无法可靠解释的受保护引号路径报具体参数并停止。本机 `config/read` 验证了 CLI 的顺序覆盖、父表替换和严格模式对引号路径的拒绝；没有用排序或重复键 TOML 拼接替代真实语义。已有 provider 连接校验、默认 profile、旧回执复用与私有目录归一化继续保留。
+
+本次 smoke 用一个固定的小型 TCP 测试贯穿两回合，替代“任何失败命令后再有成功命令”和“任一轮成功隔离执行”的弱判据。两轮都必须出现批准工具的已完成 MCP item，返回 execution ID 必须对应相同回合、argv、状态和结果；第一轮须实际到达 TCP 后触发指定断言，第二轮修正同一测试后通过。前后版本按回合留存，不冒充命令开始瞬间的快照；第二轮说明仍须人工阅读。普通自主审计不因零调用自动失效，也不携带合成约束。
+
+最终相关回归、提交、净增减及原始记录统一见 [summary.json](acceptance/2026-10-08-tool-surface/summary.json)。运行步骤见 [README](README.md)，草案仍默认未授权，预算仍为 2400／900／600 秒及 120 回合。本轮本地完成不表示正式配对条件全部满足。
+
+## 前次交付与验证（隔离 TCP）
 
 主系统 profile 保持修复为 `ba8d17d8`，中性文件视图函数为 `995f0455`，直接调用核对和系统编译器链接补充为 `7ca3c2ac`；baseline 工具及接入为 `3583feb4`，最终测试修正为 `fd76f7f3`。`backend.py`／`engine.py` 核对 profile，`experiment.py::isolated_command()` 组装最小视图；默认未启用 profile 的行为及原 `sandbox_command()` 固定执行职责保持。baseline 新增一个 `local_exec.py`、固定协议依赖声明，并扩展现有配置、回合留存及两份测试。相对本轮起点，运行实现增加 400 行、删除 11 行，测试增加 297 行、删除 17 行。没有任务队列、服务管理 CLI、研究状态机或主系统语义对象。
 

@@ -317,6 +317,9 @@ class Codex:
                 "native_retries": {"request_max_retries": 4, "stream_max_retries": 5} if provider else
                     {"policy": "bundled provider defaults, tied to recorded CLI version; reserved provider cannot be overridden"},
                 "unbounded_connection_retries": False, "outer_retries": 0,
+                "tool_evidence": {"local_registration_and_tcp": "verified",
+                                  "model_request_tool_surface": "not_inspected_by_check_env",
+                                  "real_model_tool_use": "not_evaluated"},
                 "reasoning": self.config.agent_reasoning_effort, "permission_probe": "verified"}
 
     async def mcp_probe(self):

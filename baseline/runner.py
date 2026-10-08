@@ -19,7 +19,7 @@ from consensus_assurance.adapters.storage.snapshot import (
     EXCLUDED_DIRS, KEY_NAME, SOURCE_SUFFIXES, SENSITIVE_CONTENT, SENSITIVE_NAME,
 )
 
-from .codex import Codex, options
+from .codex import Codex, decode, options
 
 
 TASK = Path(__file__).with_name("task.md")
@@ -231,12 +231,64 @@ def scrub_work(root):
             path.unlink()
 
 
-def synthetic_source(destination, backend):
+def tcp_smoke_case(backend):
+    """A small, inspectable two-way TCP test; only its reply assertion changes between turns."""
+    if backend == 'go_module':
+        path, command = 'sample/tcp_test.go', ['go', 'test', '-count=1', '-run', '^TestTCPRoundtrip$', '-v', './sample']
+        before = '''package sample
+import ("io"; "net"; "testing"; "time")
+func TestTCPRoundtrip(t *testing.T) {
+    const wantReply = "wrong"
+    listener, err := net.Listen("tcp", "127.0.0.1:0"); if err != nil { t.Fatal(err) }; defer listener.Close()
+    client, err := net.DialTimeout("tcp", listener.Addr().String(), 5*time.Second); if err != nil { t.Fatal(err) }; defer client.Close()
+    server, err := listener.Accept(); if err != nil { t.Fatal(err) }; defer server.Close()
+    if err = client.SetDeadline(time.Now().Add(5*time.Second)); err != nil { t.Fatal(err) }
+    if err = server.SetDeadline(time.Now().Add(5*time.Second)); err != nil { t.Fatal(err) }
+    if _, err = client.Write([]byte("ping")); err != nil { t.Fatal(err) }
+    request := make([]byte, 4); if _, err = io.ReadFull(server, request); err != nil { t.Fatal(err) }
+    if _, err = server.Write([]byte("pong")); err != nil { t.Fatal(err) }
+    reply := make([]byte, 4); if _, err = io.ReadFull(client, reply); err != nil { t.Fatal(err) }
+    t.Logf("TCP_OBSERVED request=%s reply=%s", request, reply)
+    if string(request) != "ping" { t.Fatalf("request mismatch: %q", request) }
+    if string(reply) != wantReply { t.Fatalf("TCP_REPLY_ASSERTION: want %q, got %q", wantReply, reply) }
+}
+'''
+        passed = '--- PASS: TestTCPRoundtrip'
+    else:
+        path, command = 'tests/tcp_roundtrip.rs', ['cargo', 'test', '--offline', '--test', 'tcp_roundtrip', '--', '--exact', 'tcp_roundtrip', '--nocapture']
+        before = '''use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
+use std::time::Duration;
+#[test]
+fn tcp_roundtrip() {
+    let want_reply = "wrong";
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let mut client = TcpStream::connect_timeout(&listener.local_addr().unwrap(), Duration::from_secs(5)).unwrap();
+    let (mut server, _) = listener.accept().unwrap();
+    client.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    server.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    client.write_all(b"ping").unwrap();
+    let mut request = [0; 4]; server.read_exact(&mut request).unwrap();
+    server.write_all(b"pong").unwrap();
+    let mut reply = [0; 4]; client.read_exact(&mut reply).unwrap();
+    println!("TCP_OBSERVED request={} reply={}", std::str::from_utf8(&request).unwrap(), std::str::from_utf8(&reply).unwrap());
+    assert_eq!(&request, b"ping");
+    assert_eq!(std::str::from_utf8(&reply).unwrap(), want_reply, "TCP_REPLY_ASSERTION");
+}
+'''
+        passed = 'test result: ok. 1 passed'
+    return {'path': path, 'argv': command, 'before': before, 'after': before.replace('"wrong"', '"pong"'), 'passed': passed}
+
+
+def synthetic_source(destination, backend, *, tcp=False):
     files = {"go.mod": "module baseline.local/smoke\n\ngo 1.20\n", "sample/value.go":
              "package sample\nfunc Add(a, b int) int { return a + b }\n"} if backend == "go_module" else {
              "Cargo.toml": '[package]\nname = "baseline-smoke"\nversion = "0.1.0"\nedition = "2021"\n',
              "src/lib.rs": "pub fn add(a: i32, b: i32) -> i32 { a + b }\n"}
     files["fixture.txt"] = "context-token-" + uuid4().hex + "\n"
+    if tcp:
+        case = tcp_smoke_case(backend)
+        files[case['path']] = case['before']
     for name, text in files.items():
         path = destination / name
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -257,52 +309,82 @@ def brief(root, source, target, deadline, timeout, calls_left):
         "deadline_basis": "Host monotonic clock; preparation, tool work and model waiting all consume total time."}, indent=2)
 
 
-def smoke_prompt(second=False):
+def smoke_prompt(second=False, backend='go_module'):
+    case = tcp_smoke_case(backend)
+    execution = json.dumps({'argv': case['argv'], 'cwd': '.', 'timeout_seconds': 90})
     if second:
-        return ("Continue this same compatibility session. State the token you remembered from the previous "
-                "conversation before reading note.txt, then read note.txt and fixture.txt to verify it. "
-                "Modify your test, run it, inspect the output, and give a normal text handoff. "
-                "Include that same token in the final handoff. "
-                "Do not audit a consensus implementation. If externally blocked, begin RUN_BLOCKED:.")
+        return ("Continue this same synthetic compatibility session. Read the previous isolated_exec result and note.txt. "
+                f"In {case['path']}, change only the expected reply from wrong to pong; preserve the TCP test body. "
+                f"Call baseline_local.isolated_exec again with {execution}, and inspect its actual result and output. "
+                "Explain the previous TCP_REPLY_ASSERTION failure and the new result in your normal text handoff; "
+                "include the fixture token. Do not audit consensus code. If externally blocked, begin RUN_BLOCKED:.")
     return ("This is an authorized synthetic coding-tool compatibility check, not a consensus audit. "
             "Read fixture.txt and the source. Remember the fixture token in this conversation and in note.txt. "
-            "Write an ordinary test in the existing Go subpackage or Rust crate. Run an intentionally failing assertion, "
-            "read its failure output, fix the test, and run it again. Preserve files and command outputs. "
-            "Also write a TCP roundtrip test and execute it through isolated_exec, starting all communicating processes in one invocation. "
-            "Return a normal text handoff. If externally blocked, begin RUN_BLOCKED:.")
+            f"Read {case['path']}; it manages both TCP endpoints in one test and deliberately expects the wrong reply. "
+            f"Leave the test unchanged in this turn. Call baseline_local.isolated_exec with {execution}. "
+            "Use tool_search if the tool is deferred. Read the actual failure output; a nonzero test exit is expected "
+            "and is not an MCP service failure. Preserve the test for correction in the next turn. "
+            "Return a normal text handoff explaining the observed result. If externally blocked, begin RUN_BLOCKED:.")
 
 
 def smoke_observations(root, record):
     turns = record["turns"]
-    commands = []
+    case = tcp_smoke_case(json.loads((root/'inputs/target.json').read_text())['execution_backend'])
+    calls, completions = [], []
     for turn in turns:
-        path = root / turn["path"] / "stdout.jsonl"
-        if not path.is_file():
-            continue
-        for line in path.read_text(errors="replace").splitlines():
+        folder = root / turn['path']
+        receipt = json.loads((folder/'result.json').read_text())
+        decoded = decode(folder, {'status': receipt['status'], 'exit_code': receipt.get('exit_code')}, turn.get('session_id'))
+        completions.append(turn['status'] == decoded['status'] == 'completed')
+        for line in (folder/'stdout.jsonl').read_text(errors='replace').splitlines():
             try:
                 event = json.loads(line)
-            except ValueError:
+                item = event.get('item', {})
+                if (event.get('type') != 'item.completed' or item.get('type') != 'mcp_tool_call'
+                        or item.get('status') != 'completed' or item.get('server') != 'baseline_local'
+                        or item.get('tool') != 'isolated_exec' or item.get('error') or not item.get('id')):
+                    continue
+                returned = item['result']['structured_content']
+                execution_id = returned['execution_id']
+                if not re.fullmatch(r'[0-9a-f]{32}', execution_id):continue
+                path = root/'executions'/execution_id/'result.json'
+                if path.is_symlink() or path.resolve().parent.parent != (root/'executions').resolve():continue
+                actual = json.loads(path.read_text())
+                args = item['arguments']
+                if (returned != actual or actual['turn'] != folder.name or actual['status'] != 'completed'
+                        or actual['argv'] != args['argv'] or args['argv'] != case['argv']
+                        or args.get('cwd', '.') != '.' or actual['cwd'] != str(root/'work')
+                        or actual['requested_timeout_seconds'] != args.get('timeout_seconds')):
+                    continue
+                output = ''.join((path.parent/(name+'.txt')).read_text(errors='replace') for name in ('stdout', 'stderr'))
+                calls.append({'turn': turn['number'], 'item_id': item['id'], 'execution_id': execution_id,
+                              'mcp_request_id': actual['mcp_request_id'], 'exit_code': actual['exit_code'],
+                              'tcp_observed': 'TCP_OBSERVED request=ping reply=pong' in output,
+                              'assertion_failed': 'TCP_REPLY_ASSERTION' in output, 'test_passed': case['passed'] in output})
+            except (ValueError, KeyError, TypeError, AttributeError, OSError):
                 continue
-            item = event.get("item", {})
-            if event.get("type") == "item.completed" and item.get("type") == "command_execution":
-                commands.append((turn["number"], item.get("exit_code")))
     token = (root / "source/fixture.txt").read_text().strip()
     note, final = root / "work/note.txt", root / "turns/0002/final.txt"
+    versions = []
+    path = root/'source'/case['path']
+    for number in (1, 2):
+        changed = root/'turns'/f'{number:04d}'/'changes/files'/case['path']
+        if changed.is_file():path = changed
+        versions.append(path.read_text() if path.is_file() and not path.is_symlink() else '')
     observed = {
-        "two_completed_turns": len(turns) == 2 and all(t["status"] == "completed" for t in turns),
+        "two_completed_turns": len(turns) == 2 and all(completions),
         "same_session": len(turns) == 2 and bool(turns[0]["session_id"]) and turns[0]["session_id"] == turns[1]["session_id"],
-        "failure_then_another_command": any(code not in (0, None) and i < len(commands) - 1
-                                           for i, (_, code) in enumerate(commands)),
-        "successful_second_turn_command": any(turn == 2 and code == 0 for turn, code in commands),
+        "first_turn_tcp_assertion_failure": any(c['turn'] == 1 and c['exit_code'] not in (0, None)
+                                                and c['tcp_observed'] and c['assertion_failed'] for c in calls),
+        "second_turn_tcp_test_passed": any(c['turn'] == 2 and c['exit_code'] == 0
+                                           and c['tcp_observed'] and c['test_passed'] for c in calls),
+        "same_test_repaired": versions == [case['before'], case['after']],
         "file_read_and_written": note.is_file() and not note.is_symlink() and token in note.read_text(errors="replace"),
         "context_token_in_second_final": final.is_file() and token in final.read_text(errors="replace"),
-        "isolated_tool_execution": any(json.loads(p.read_text()).get('turn') in {'0001','0002'} and
-            json.loads(p.read_text()).get('status') == 'completed' and json.loads(p.read_text()).get('exit_code') == 0
-            for p in (root/'executions').glob('*/result.json')),
+        "second_final_discusses_failure": final.is_file() and 'TCP_REPLY_ASSERTION' in final.read_text(errors='replace'),
     }
-    write_json(root / "inputs/smoke-observations.json", {"observed": observed, "complete": all(observed.values()),
-               "review": "Inspect actual tool arguments, TCP roundtrip observations, test edits, failure reading and final text. Tool success alone does not prove TCP coverage or consensus defects."})
+    write_json(root / "inputs/smoke-observations.json", {"observed": observed, "calls": calls, "complete": all(observed.values()),
+               "review": "Synthetic tool compatibility only, not autonomous discovery or a consensus verdict. Inspect both native MCP items, correlated raw execution outputs, test versions and the second explanation. Retained test versions describe turn boundaries, not the exact instant each command started; response text alone does not prove semantic understanding."})
     return all(observed.values())
 
 
@@ -318,7 +400,7 @@ def loop(config, root, source, target, client, deadline, record, *, smoke=False)
         timeout = min(config.budget.agent_turn_timeout, remaining)
         folder = root / "turns" / f"{number:04d}"
         folder.mkdir()
-        prompt = smoke_prompt(number > 1) if smoke else (task if number == 1 else continuation)
+        prompt = smoke_prompt(number > 1, target['execution_backend']) if smoke else (task if number == 1 else continuation)
         prompt += brief(root, source, target, deadline, timeout, config.budget.agent_calls - number + 1)
         (folder / "request.txt").write_text(prompt)
         remaining = max(0, deadline - time.monotonic())
@@ -416,7 +498,7 @@ def run(config, target, *, smoke=False, client_factory=Codex, environment_only=F
         identity = implementation_identity(root)
         record["implementation"] = "inputs/implementation.json"
         write_json(root / record["implementation"], identity)
-        source = synthetic_source(root / "source", target["execution_backend"]) if smoke else capture_source(
+        source = synthetic_source(root / "source", target["execution_backend"], tcp=True) if smoke else capture_source(
             config.repo_path, root / "source", deadline)
         if not smoke and target.get("expected_module"):
             if not (root / "source/go.mod").is_file() or not any(
@@ -468,6 +550,7 @@ def run(config, target, *, smoke=False, client_factory=Codex, environment_only=F
                    record["stop"] in {"agent_call_limit", "total_deadline", "smoke_call_limit"})
                   and (not smoke or record.get("smoke_observations_complete", False)),
             "run_dir": str(root), "stop": record["stop"], "reason": record.get("reason"),
+            "tool_evidence": record.get('environment', {}).get('tool_evidence', {}),
             "model_compatibility": "not evaluated" if environment_only else "requires review of raw tool and session evidence"}
 
 
