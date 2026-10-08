@@ -48,6 +48,28 @@ def sandbox_command(command, workspace, mode, read_only_roots=(), view_path=None
     return args
 
 
+def isolated_command(command, workspace, directory, tool_roots=(), read_only_roots=()):
+    """Allowlisted filesystem for caller-selected commands; roots are trusted inputs."""
+    executable = shutil.which('bwrap')
+    if not executable:
+        raise FileNotFoundError('Bubblewrap is required; no host execution fallback')
+    args = [executable, '--die-with-parent', '--new-session', '--unshare-net', '--unshare-pid',
+            '--unshare-ipc', '--unshare-uts', '--cap-drop', 'ALL']
+    for name in ('/usr/bin', '/usr/lib', '/usr/lib64', '/usr/libexec', '/usr/include', '/usr/share'):
+        if Path(name).is_dir():args += ['--ro-bind', name, name]
+    for name in ('/bin', '/sbin', '/lib', '/lib64'):
+        path = Path(name)
+        if path.is_symlink():args += ['--symlink', os.readlink(path), name]
+        elif path.is_dir():args += ['--ro-bind', name, name]
+    if Path('/etc/ld.so.cache').is_file():args += ['--ro-bind', '/etc/ld.so.cache', '/etc/ld.so.cache']
+    for path in (*tool_roots, *read_only_roots):
+        args += ['--ro-bind', str(path), str(path)]
+    args += ['--tmpfs', '/tmp', '--tmpfs', '/run', '--dir', '/var', '--symlink', '/run', '/var/run',
+             '--dev', '/dev', '--proc', '/proc', '--bind', str(workspace), str(workspace),
+             '--chdir', str(directory), '--', *command]
+    return args
+
+
 def install_harness(workspace, filename, harness, target_files, *, write=True):
     """Assemble fixed generated inputs without replacing any captured target file."""
     raw = [(filename, harness.source), *harness.files.items()]
