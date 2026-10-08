@@ -44,6 +44,39 @@ def common_settings(provider=None):
     return settings
 
 
+def profile_options(argv, expected):
+    """Accept generated policy paths and equal repeats; reject ambiguous policy overrides."""
+    scopes = {tuple(key.split('.')) if key.startswith('model_providers.') else (key.split('.')[0],)
+              for key in expected} | {('skills',)}
+    settings = {}
+    args = iter(argv)
+    for arg in args:
+        if arg in {'-c', '--config', '--enable', '--disable'}:
+            value = next(args, '')
+            option = 'features.' + value + '=' + str(arg == '--enable').lower() if arg in {'--enable', '--disable'} else value
+        elif arg.startswith(('--config=', '-c', '--enable=', '--disable=')):
+            option = arg[2:] if arg.startswith('-c') else arg.split('=', 1)[1]
+            if arg.startswith(('--enable=', '--disable=')):
+                option = 'features.' + option + '=' + str(arg.startswith('--enable=')).lower()
+        else:
+            continue
+        key, separator, value = option.partition('=')
+        key = key.strip()
+        parts = tuple(part.strip().strip('\"\'') for part in key.split('.'))
+        if not any(parts[:len(scope)] == scope or scope[:len(parts)] == parts for scope in scopes):
+            continue
+        if not separator or key not in expected:
+            raise ValueError('Codex profile argv changed: unsupported protected override ' + key)
+        try:
+            parsed = tomllib.loads('value=' + value)['value']
+        except (ValueError, KeyError) as exc:
+            raise ValueError('Codex profile argv changed: cannot parse protected override ' + key) from exc
+        if key in settings and json.dumps(settings[key], sort_keys=True) != json.dumps(parsed, sort_keys=True):
+            raise ValueError('Codex profile argv changed: conflicting repeated override ' + key)
+        settings[key] = parsed
+    return settings
+
+
 def classify_failure(text: str) -> ExecutionStatus:
     low = text.lower()
     if any(s in low for s in ["insufficient_quota", "quota exceeded", "usage limit", "rate limit", "quota exhausted", "credits exhausted"]):
@@ -153,7 +186,7 @@ class CodexAgent:
                 or source.is_file() and digest(source.read_bytes())!=record['digest']):
             raise ValueError('Codex model catalog changed; start a new run')
 
-    def validate_profile(self, root, *, bind=False):
+    def validate_profile(self, root, *, bind=False, argv=None):
         """Compare durable policy before probes or cached actions can replace it."""
         path = root/'agent-inputs/runtime-settings.json'
         if self.profile is None:
@@ -161,10 +194,18 @@ class CodexAgent:
                 raise ValueError('Codex profile changed; start a new run')
             return
         home = Path(os.environ.get('CODEX_HOME', Path.home()/'.codex')).resolve()
-        def normalized(settings):
+        def normalized(settings, argv=()):
+            source_home = home
+            # Old full commands identify their private home through the helper read root.
+            for i, arg in enumerate(argv[:-1]):
+                if arg == '-c' and argv[i+1].startswith('permissions.ca_audit.filesystem='):
+                    filesystem = tomllib.loads('value=' + argv[i+1].split('=', 1)[1])['value']
+                    homes = [Path(key).parent.parent for key in filesystem if Path(key).parts[-2:] == ('tmp', 'arg0')]
+                    if len(homes) == 1:source_home = homes[0]
             result = dict(settings)
             result['skills.config'] = [{**item, 'path': '$CODEX_HOME/' + str(Path(item['path']).relative_to(home))
-                if Path(item['path']).is_relative_to(home) else item['path']} for item in settings.get('skills.config', [])]
+                if Path(item['path']).is_relative_to(home) else '$CODEX_HOME/' + str(Path(item['path']).relative_to(source_home))
+                if Path(item['path']).is_relative_to(source_home) else item['path']} for item in settings.get('skills.config', [])]
             return result
         saved = json.loads(path.read_text()) if path.exists() else None
         if saved is None and getattr(self, '_profile_prepared', None):
@@ -182,13 +223,13 @@ class CodexAgent:
             check = json.loads(log.read_text())
             if check.get('action') != 'agent_turn':continue
             historical.append(check)
-            argv = check['command']; settings = {}
-            for i, arg in enumerate(argv[:-1]):
-                if arg == '-c':
-                    key, value = argv[i+1].split('=', 1)
-                    if key in self.profile_settings:settings[key] = tomllib.loads('value='+value)['value']
-            if normalized(settings) != record['settings']:
+            settings = profile_options(check['command'], self.profile_settings)
+            if normalized(settings, check['command']) != record['settings']:
                 raise ValueError('Codex profile argv changed or incomplete; start a new run')
+        current = [*self.sandbox_command(root), *self.connection_options(root)] if argv is None else argv
+        settings = profile_options(current, self.profile_settings)
+        if normalized(settings) != record['settings']:
+            raise ValueError('Codex profile argv changed or incomplete; start a new run')
         if saved is None and historical:
             raise ValueError('Historical run has no durable Codex profile basis; start a new run')
         if bind and saved is None:
@@ -362,8 +403,9 @@ class CodexAgent:
                     home.mkdir(parents=True, exist_ok=True)
                     command = ['bwrap', '--unshare-net', '--ro-bind', '/', '/', '--bind', str(runner.root), str(runner.root),
                         '--bind', str(home), str(home), '--', *command]
-                check = runner.run([*command, *args, *self.permission_options(runner.root, directory),
-                    *self.connection_options(runner.root, sandbox=True)], directory, 'codex_profile_' + name, snapshot_id, 30,
+                command += [*args, *self.permission_options(runner.root, directory), *self.connection_options(runner.root, sandbox=True)]
+                self.validate_profile(runner.root, argv=command)
+                check = runner.run(command, directory, 'codex_profile_' + name, snapshot_id, 30,
                     env=self.client_environment(), sensitive_env=(self.provider.env_key,) if self.provider else ())
                 profile_checks.append(check)
                 if check.status != ExecutionStatus.COMPLETED or check.exit_code != 0:
@@ -383,6 +425,7 @@ class CodexAgent:
             self.validate_profile(runner.root, bind=True)
             self._profile_prepared = profile_key
         options = self.permission_options(runner.root, directory)
+        self.validate_profile(runner.root, argv=[*self.sandbox_command(runner.root), *options, *self.connection_options(runner.root)])
         key = (str(runner.root), tuple(options), tuple(self.connection_options(runner.root)), getattr(self, 'version', 'unknown'))
         if getattr(self, '_permission_key', None) == key:
             return True, profile_checks
@@ -414,6 +457,7 @@ class CodexAgent:
         command += ["--skip-git-repo-check", "--ignore-user-config", "--json",
             "--output-schema", str(schema), "--output-last-message", str(response), *options,*self.connection_options(runner.root)]
         command += [session_id, "-"] if session_id else ["-"]
+        self.validate_profile(runner.root, argv=command)
         check = runner.run(command, directory, "agent_turn", snapshot_id, timeout, stdin=prompt,
             **({'env':self.client_environment(),'sensitive_env':(self.provider.env_key,)} if self.provider else {}))
         return self.decode(check, response, session_id)

@@ -375,7 +375,9 @@ def test_profile_binding_restore_and_tamper_before_paid_call(tmp_path, monkeypat
     path = tmp_path/'agent-inputs/runtime-settings.json'; raw = path.read_bytes()
     cfg = Config(agent_model='fixture-model', agent_reasoning_effort='high', codex_provider=provider, codex_profile='single_agent')
     log = tmp_path/'logs/turn/check.json'; log.parent.mkdir(parents=True)
-    log.write_text(json.dumps({'action':'agent_turn', 'command':['codex', 'exec', *agent.connection_options(tmp_path)]}))
+    filesystem = json.dumps(str(home/'tmp/arg0')) + '="read"'
+    log.write_text(json.dumps({'action':'agent_turn', 'command':['codex', 'exec',
+        '-c', 'permissions.ca_audit.filesystem={' + filesystem + '}', *agent.connection_options(tmp_path)]}))
     restored = CodexAgent('high', 'fixture-model', provider, 'single_agent')
     restored.validate_inputs(tmp_path, cfg)
     assert restored.prepare(runner, tmp_path/'draft', 's')[0]
@@ -383,6 +385,54 @@ def test_profile_binding_restore_and_tamper_before_paid_call(tmp_path, monkeypat
     # Equivalent serialization must not alter the policy or require a model call.
     path.write_text(json.dumps(json.loads(raw), sort_keys=True))
     restored.validate_inputs(tmp_path, cfg)
+    normal = restored.connection_options(tmp_path)
+    historical = json.loads(log.read_text())
+    overrides = [(['-c', 'mcp_servers.fixture.command="/usr/bin/true"'], False),
+        (['-c', 'mcp_servers.fixture.args=["--fixture"]'], False),
+        (['-c', 'mcp_servers.fixture.env={FIXTURE="local"}'], False),
+        (['-c', 'mcp_servers.fixture.enabled_tools=["fixture"]'], False),
+        (['-c', 'features={multi_agent=true}'], False),
+        (['-c', 'features.unlisted_feature=true'], False),
+        (['-c', 'memories={use_memories=true}'], False),
+        (['-c', 'skills.config=[]'], False),
+        (['--config=mcp_servers.fixture.command="/usr/bin/true"'], False),
+        (['-c', '"mcp_servers".fixture.command="/usr/bin/true"'], False),
+        (['--enable', 'multi_agent'], False),
+        (['-c', 'web_search="disabled"'], True),
+        (['-c', 'features.multi_agent=false'], True),
+        (['-c', 'skills.config=[{enabled=false,path=' + json.dumps(str(home/'skills/system/SKILL.md')) + '}]'], True),
+        (['-c', 'features_extra={fixture=true}'], True),
+        (['-c', 'web_search="cached"', '-c', 'web_search="disabled"'], False)]
+    if custom:
+        overrides += [(['-c', 'model_providers.fixture.request_max_retries=99'], False),
+                      (['-c', 'model_providers.fixture={request_max_retries=4}'], False)]
+    for extra, allowed in overrides:
+        for current in (False, True):
+            with monkeypatch.context() as patch:
+                if current:
+                    patch.setattr(restored, 'connection_options', lambda *a, **k: normal + extra)
+                else:
+                    log.write_text(json.dumps({**historical, 'command': historical['command'] + extra}))
+                if allowed:
+                    restored.validate_profile(tmp_path)
+                else:
+                    with pytest.raises(ValueError, match='profile argv changed'):
+                        restored.validate_profile(tmp_path)
+            log.write_text(json.dumps(historical))
+    with monkeypatch.context() as patch:
+        patch.setenv('CODEX_HOME', str(tmp_path/'another-private-home'))
+        moved = CodexAgent('high', 'fixture-model', provider, 'single_agent')
+        moved.validate_inputs(tmp_path, cfg)
+        assert '$CODEX_HOME/' in path.read_text()
+    # Validate the fully assembled exec/resume command before the runner can send a request.
+    restored.available = True
+    runner.active_action_id = None
+    for session in (None, 'exact-session'):
+        with monkeypatch.context() as patch:
+            patch.setattr(restored, 'sandbox_command', lambda *a: ['codex', '-c', 'mcp_servers.fixture.command="/usr/bin/true"'])
+            patch.setattr(runner, 'run', lambda *a, **k: pytest.fail('Invalid argv reached execution'))
+            with pytest.raises(ValueError, match='profile argv changed'):
+                restored.investigate(runner, 'Never sent', tmp_path/'draft', 's', 10, session)
     before = path.read_bytes()
     restored.profile_settings['features.shell_snapshot'] = True
     with pytest.raises(ValueError, match='profile settings changed'):
@@ -404,3 +454,25 @@ def test_profile_binding_restore_and_tamper_before_paid_call(tmp_path, monkeypat
     # The unprofiled historical path remains available; pure receipt files remain readable.
     assert json.loads(log.read_text())['action'] == 'agent_turn'
     CodexAgent().validate_profile(tmp_path)
+
+
+def test_current_profile_override_stops_before_engine_budget_and_preserves_receipt(tmp_path, monkeypatch):
+    from audit_support import engine_for
+    engine, repo = engine_for(tmp_path, [])
+    engine.config.agent_backend = 'codex'
+    engine.config.agent_model = 'fixture-model'
+    engine.config.codex_profile = 'single_agent'
+    engine.config.budget.agent_calls = 1
+    engine.agent = CodexAgent(engine.config.agent_reasoning_effort, 'fixture-model', profile='single_agent')
+    engine.start(repo, plan_only=True)
+    engine.agent.validate_profile(engine.root, bind=True)
+    options = engine.agent.connection_options(engine.root)
+    for entry, normal in (('connection_options', options), ('sandbox_command', ['codex'])):
+        with monkeypatch.context() as patch:
+            patch.setattr(engine.agent, entry, lambda *a: normal + ['-c', 'mcp_servers.fixture.command="/usr/bin/true"'])
+            with pytest.raises(ValueError, match='profile argv changed'):
+                engine.action('agent_turn', 'agent_calls', lambda: pytest.fail('Invalid profile executed'), {'turn': 1})
+            assert engine.state.usage.get('agent_calls', 0) == 0
+    expected = engine.action('agent_turn', 'agent_calls', lambda: {'retained': True}, {'turn': 1})
+    assert engine.action('agent_turn', 'agent_calls', lambda: pytest.fail('Receipt was rerun'), {'turn': 1}) == expected
+    assert engine.state.usage['agent_calls'] == 1
