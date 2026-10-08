@@ -16,6 +16,7 @@ from baseline.__main__ import Config, load_config, load_target, main, read_yaml,
 
 SESSION = "00000000-0000-4000-8000-000000000001"
 PROJECT = Path(__file__).resolve().parents[2]
+RECONNECT_FIXTURE = Path(__file__).parent / "fixtures/recovered_reconnect.jsonl"
 
 
 def make_repo(path, backend="go_module"):
@@ -73,7 +74,8 @@ def test_configuration_paths_and_neutral_target(tmp_path):
 @pytest.mark.parametrize("update", [{"unknown": True}, {"budget": {"agent_calls": -1}},
     {"budget": {"total_seconds": float("nan")}}, {"allow_experiments": "true"},
     {"codex_provider": {"id": "other", "base_url": "https://example.org", "env_key": "HOME"}},
-    {"auth_mode": "api_key", "api_key_env": "HOME"}, {"agent_model": "--bad"}])
+    {"auth_mode": "api_key", "api_key_env": "HOME"}, {"agent_model": "--bad"},
+    {"cargo_seed_cache_dir": "obsolete-field"}])
 def test_invalid_config_rejected(update):
     values = {"target_config": "target.yaml", "agent_model": "chosen-model", "agent_reasoning_effort": "high",
               "auth_mode": "codex_login", **update}
@@ -134,6 +136,28 @@ def test_native_events_and_only_top_level_errors(tmp_path, kwargs, status):
     result = codex.decode(tmp_path, events(tmp_path, **kwargs), SESSION)
     assert result["status"] == status
     assert result["usage_semantics"] == "unverified_do_not_sum"
+
+
+@pytest.mark.parametrize("ending,status", [("recovered", "completed"), ("failed", "external_error"),
+    ("incomplete", "external_error"), ("nonzero_exit", "external_error"),
+    ("missing_final", "external_blocker_needs_review"), ("changed_session", "session_mismatch")])
+def test_reconnect_notification_and_terminal_outcome(tmp_path, ending, status):
+    # Excerpt from the 2026-10-08 19:28 HashiCorp run; no model call is replayed.
+    items = [json.loads(line) for line in RECONNECT_FIXTURE.read_text().splitlines()]
+    session = items[0]["thread_id"]
+    result = events(tmp_path, final=None if ending == "missing_final" else "Partial handoff.")
+    if ending == "incomplete":
+        items.pop()
+    elif ending == "failed":
+        items.append({"type": "turn.failed", "error": {"message": "stream disconnected"}})
+    elif ending == "nonzero_exit":
+        result["exit_code"] = 1
+    elif ending == "changed_session":
+        session = SESSION
+    (tmp_path / "stdout.jsonl").write_text("".join(json.dumps(item) + "\n" for item in items))
+    result = codex.decode(tmp_path, result, session)
+    assert result["status"] == status
+    assert "Reconnecting... 1/5" in result["diagnostic"]["message"]
 
 
 def test_non_json_and_startup_failure_are_retained(tmp_path):
@@ -213,7 +237,13 @@ class ScriptedClient:
 def test_continuing_run_and_completed_report_retention(tmp_path, statuses, stop, turns, report):
     c = configuration(tmp_path)
     class Client(ScriptedClient):
-        pass
+        def turn(self, folder, prompt, timeout, session):
+            result = super().turn(folder, prompt, timeout, session)
+            notification = next(json.loads(line) for line in RECONNECT_FIXTURE.read_text().splitlines()
+                                if json.loads(line).get("type") == "error")
+            path = folder / "stdout.jsonl"
+            path.write_text(json.dumps(notification) + "\n" + path.read_text())
+            return codex.decode(folder, result, session)
     Client.statuses = statuses
     result = runner.run(c, load_target(c), client_factory=Client)
     assert result["stop"] == stop
@@ -303,20 +333,6 @@ def test_process_cancellation_and_credential_redaction(tmp_path):
     assert (tmp_path / "logs/stdout.jsonl").read_text().strip() == "[REDACTED_CREDENTIAL]"
 
 
-def test_cargo_dependency_field_migration(tmp_path):
-    c = configuration(tmp_path, 'cargo')
-    raw = c.model_dump()
-    raw['cargo_seed_cache_dir'] = str(tmp_path / 'old-seed')
-    with pytest.raises(ValueError, match='Rename cargo_seed_cache_dir to cargo_dependency_cache_dir'):
-        Config.model_validate(raw)
-    raw.pop('cargo_seed_cache_dir')
-    raw['cargo_dependency_cache_dir'] = str(tmp_path / 'cargo-home')
-    assert Config.model_validate(raw).cargo_dependency_cache_dir == raw['cargo_dependency_cache_dir']
-    # Historical records remain data; they are not loaded as a new configuration.
-    historical = json.loads('{"cargo_seed_cache_dir": "old-cache"}')
-    assert historical['cargo_seed_cache_dir'] == 'old-cache'
-
-
 def test_implementation_identity_tracks_loaded_bytes_and_preserves_start(tmp_path, monkeypatch):
     project = make_repo(tmp_path / 'implementation')
     base = project / 'baseline'
@@ -347,17 +363,3 @@ def test_implementation_identity_tracks_loaded_bytes_and_preserves_start(tmp_pat
     assert not result['inputs_unchanged'] and set(result['changed_inputs']) == {'baseline/runner.py', module.__name__}
     assert first['inputs']['baseline/runner.py']['sha256'] != later['inputs']['baseline/runner.py']['sha256']
     assert all(b'PRIVATE_NOT_AN_EXECUTION_INPUT' not in p.read_bytes() for p in root.rglob('*') if p.is_file())
-
-
-def test_optional_main_profile_uses_explicit_settings_without_changing_method(tmp_path):
-    from consensus_assurance.adapters.agents.backend import CodexAgent, common_settings
-    c = configuration(tmp_path)
-    legacy = CodexAgent(c.agent_reasoning_effort, c.agent_model, c.codex_provider)
-    common = CodexAgent(c.agent_reasoning_effort, c.agent_model, c.codex_provider, 'single_agent')
-    assert legacy.profile_settings == {}
-    assert common.profile_settings == common_settings(c.codex_provider)
-    command = common.connection_options(tmp_path)
-    assert 'features.multi_agent=false' in command
-    assert 'model_providers.deepseek.stream_idle_timeout_ms=300000' in command
-    assert '--output-schema' not in command
-    assert not any('network.enabled=true' in value for value in command)

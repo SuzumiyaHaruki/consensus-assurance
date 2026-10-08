@@ -85,7 +85,9 @@ def decode(folder, result, session_id=None):
                   tool_events=len(tools), invalid_jsonl_lines=invalid, final_present=bool(final))
     if result["status"] != "completed":
         return result
-    if result["exit_code"] != 0 or diagnostic["message"] or any(e.get("type") == "turn.failed" for e in events):
+    # Match src: native retries can emit error notifications before successful completion.
+    if (result["exit_code"] != 0 or any(e.get("type") == "turn.failed" for e in events)
+            or (not completed and any(e.get("type") == "error" for e in events))):
         failure = diagnostic["message"] or (folder / "stderr.log").read_text(errors="replace")
         result.update(status="external_error", failure_kind=classify_failure(failure).value,
                       reason=failure or "Native turn failed; inspect retained output")
@@ -176,15 +178,15 @@ class Codex:
             raise TimeoutError("Total deadline reached during local preparation")
         return result, (folder / "stdout.jsonl").read_text(errors="replace")
 
-    def authenticate(self, *, probe=False):
+    def authenticate(self):
         key = self.config.credential_name
         if self.config.auth_mode == "api_key":
-            value = "baseline-credential-canary" if probe else os.environ.get(key)
+            value = os.environ.get(key)
             if not value:
                 raise ValueError(f"Missing credential environment variable: {key}; no model request sent")
             self.environment[key if self.config.codex_provider else "CODEX_API_KEY"] = value
             self.secrets = [value]
-        elif not probe:
+        else:
             original = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")) / "auth.json"
             if not original.is_file() or original.is_symlink():
                 raise ValueError("codex_login requires existing file-backed authentication; no automatic login")
@@ -198,14 +200,10 @@ class Codex:
                             if key in {"access_token", "refresh_token", "id_token"} and isinstance(value, str)]
 
     def prepare(self):
-        for args, name, required in [(["--version"], "cli-version", ["codex"]),
-                (["exec", "--help"], "cli-exec", ["--json", "--output-last-message", "--ignore-user-config", "--strict-config"]),
-                (["exec", "resume", "--help"], "cli-resume", ["SESSION_ID", "--output-last-message"]),
-                (["sandbox", "--help"], "cli-sandbox", ["--permission-profile", "--include-managed-config"])]:
-            result, text = self.local(args, name)
-            if result["status"] != "completed" or result["exit_code"] != 0 or not all(x in text for x in required):
-                raise ValueError(f"Required CLI capability unavailable: {name}")
-        self.version = (self.root / "inputs/cli-version/stdout.jsonl").read_text().strip()
+        result, text = self.local(['--version'], 'cli-version')
+        if result['status'] != 'completed' or result['exit_code'] or 'codex' not in text:
+            raise ValueError('Codex CLI version unavailable')
+        self.version = text.strip()
         tool = "go" if self.target["execution_backend"] == "go_module" else "rustc"
         command = [tool, "env", "GOROOT"] if tool == "go" else [tool, "--print", "sysroot"]
         discovered = subprocess.run(command, capture_output=True, text=True, timeout=self.limit(), check=True)
@@ -297,21 +295,11 @@ class Codex:
             (self.root / "inputs/models.json").write_bytes(raw)
             self.settings["model_catalog_json"] = str(self.root / "inputs/models.json")
         self.permission_probe()
-        mcp_probe = asyncio.run(local_exec.probe(self.mcp_settings))
-        write_json(self.root/'inputs/local-exec-probe.json', mcp_probe)
-        observed = mcp_probe['call'].get('structuredContent', {})
-        if observed.get('status') != 'completed' or observed.get('exit_code') != 0 or 'ISOLATED_TCP_VERIFIED' not in observed.get('stdout', {}).get('preview', ''):
-            raise ValueError('Isolated execution MCP probe failed; no model request sent')
+        asyncio.run(self.mcp_probe())
         write_json(self.root/'inputs/local-exec.json', local_exec.identity(self.mcp_settings, self.execution_control))
         self.execution_control['allow_experiments'] = self.config.allow_agent_materials and self.config.allow_experiments
         write_json(self.control_path, self.execution_control)
         self.prompt_probe()
-        inventory = asyncio.run(local_exec.discover([*self.prefix(offline=True), 'app-server', '--strict-config',
-            *options(self.settings)], self.work, self.environment, self.root/'inputs/mcp-discovery', self.limit(30)))
-        if [server['name'] for server in inventory['data']] != ['baseline_local']:
-            raise ValueError('Unexpected Codex MCP server inventory')
-        if inventory['data'][0]['tools'] != {'isolated_exec': local_exec.tool().model_dump(mode='json', exclude_none=True)}:
-            raise ValueError('Codex cannot discover the isolated execution tool')
         versions = {}
         commands = {"platform": ["uname", "-sm"], "go": ["go", "version"],
                     "go_environment": ["go", "env", "GOOS", "GOARCH", "GOVERSION", "GOROOT", "GOMODCACHE", "GOCACHE", "GOFLAGS", "GOWORK"]} if tool == "go" else {
@@ -330,6 +318,22 @@ class Codex:
                     {"policy": "bundled provider defaults, tied to recorded CLI version; reserved provider cannot be overridden"},
                 "unbounded_connection_retries": False, "outer_retries": 0,
                 "reasoning": self.config.agent_reasoning_effort, "permission_probe": "verified"}
+
+    async def mcp_probe(self):
+        async with local_exec.app_server([*self.prefix(offline=True), 'app-server', '--strict-config',
+                *options(self.settings)], self.work, self.environment, self.root/'inputs/mcp-probe', self.limit()) as request:
+            thread = (await request('thread/start', {'cwd': str(self.work)}))['thread']['id']
+            inventory = await request('mcpServerStatus/list', {'threadId': thread})
+            if ([server['name'] for server in inventory['data']] != ['baseline_local'] or
+                    inventory['data'][0]['tools'] != {'isolated_exec': local_exec.tool().model_dump(mode='json', exclude_none=True)}):
+                raise ValueError('Codex MCP inventory differs from the authorized tool')
+            result = await request('mcpServer/tool/call', {'threadId': thread, 'server': 'baseline_local',
+                'tool': 'isolated_exec', 'arguments': {'argv': ['python3', '-c',
+                    "import socket; s=socket.socket();s.bind(('127.0.0.1',0));s.listen();c=socket.create_connection(s.getsockname());a,_=s.accept();c.sendall(b'ping');assert a.recv(4)==b'ping';a.sendall(b'pong');assert c.recv(4)==b'pong';print('ISOLATED_TCP_VERIFIED')"], 'timeout_seconds': 10.0}})
+            write_json(self.root/'inputs/local-exec-probe.json', {'inventory': inventory, 'call': result})
+            observed = result.get('structuredContent', {})
+            if observed.get('status') != 'completed' or observed.get('exit_code') != 0 or 'ISOLATED_TCP_VERIFIED' not in observed.get('stdout', {}).get('preview', ''):
+                raise ValueError('Isolated execution MCP probe failed; no model request sent')
 
     def permission_probe(self):
         canary = self.home / "credential-canary"

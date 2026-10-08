@@ -1,6 +1,5 @@
 """One run-scoped STDIO tool; commands execute only in an isolated filesystem."""
 import asyncio
-import ctypes
 import importlib.metadata
 import json
 import os
@@ -8,13 +7,13 @@ import signal
 import sys
 import sysconfig
 import time
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
 
 import anyio
-from mcp import ClientSession, StdioServerParameters, types
-from mcp.client.stdio import stdio_client
+from mcp import types
 from mcp.server.lowlevel import Server
 from mcp.server.stdio import stdio_server
 from pydantic import BaseModel, ConfigDict, Field
@@ -129,7 +128,7 @@ async def execute(control, arguments, request_id):
                 except asyncio.TimeoutError:
                     record['status'] = 'timeout'
     except asyncio.CancelledError:
-        record['status'] = 'cancelled'
+        record.update(status='cancelled', reason=control.get('cancellation_reason', 'request_cancelled'))
         raise
     except OSError as exc:
         record.update(status='launch_error', reason=str(exc))
@@ -153,7 +152,7 @@ async def execute(control, arguments, request_id):
     return record
 
 
-async def serve(path):
+async def serve(path, parent_fd):
     control = json.loads(path.read_text())
     server = Server('baseline_local')
     lock = anyio.Lock()
@@ -168,32 +167,29 @@ async def serve(path):
     # STDIO EOF and termination cancel in-flight work rather than waiting for its requested time.
     with anyio.CancelScope() as scope:
         loop = asyncio.get_running_loop()
-        for sig in (signal.SIGTERM, signal.SIGINT):loop.add_signal_handler(sig, scope.cancel)
+        def stop(reason):
+            control.setdefault('cancellation_reason', reason)
+            scope.cancel()
+        for sig in (signal.SIGTERM, signal.SIGINT):loop.add_signal_handler(sig, stop, sig.name)
+        # A pidfd tracks the parent process, not the transient thread that spawned us.
+        loop.add_reader(parent_fd, stop, 'parent_exit')
+        reader = asyncio.StreamReader(limit=sys.maxsize)
+        transport = None
         class Input:
             def __aiter__(self):return self
             async def __anext__(self):
-                line = await anyio.to_thread.run_sync(sys.stdin.readline, abandon_on_cancel=True)
+                line = await reader.readline()
                 if not line:
-                    scope.cancel()
+                    stop('stdio_eof')
                     raise StopAsyncIteration
-                return line
-        async with stdio_server(stdin=Input()) as streams:
-            await server.run(*streams, server.create_initialization_options())
-
-
-async def probe(settings, command=None):
-    """Use the actual protocol, never a direct call to the execution function."""
-    params = StdioServerParameters(command=settings['command'], args=settings['args'], cwd=settings['cwd'], env={})
-    async with stdio_client(params) as streams:
-        async with ClientSession(*streams) as session:
-            initialized = await session.initialize()
-            tools = await session.list_tools()
-            if [t.model_dump(mode='json', exclude_none=True) for t in tools.tools] != [tool().model_dump(mode='json', exclude_none=True)]:
-                raise ValueError('Unexpected MCP tool list')
-            result = await session.call_tool('isolated_exec', {'argv': command or ['python3', '-c',
-                "import socket; s=socket.socket();s.bind(('127.0.0.1',0));s.listen();c=socket.create_connection(s.getsockname());a,_=s.accept();c.sendall(b'ping');assert a.recv(4)==b'ping';a.sendall(b'pong');assert c.recv(4)==b'pong';print('ISOLATED_TCP_VERIFIED')"], 'timeout_seconds': 10.0})
-            return {'initialize': initialized.model_dump(mode='json'), 'tools': tools.model_dump(mode='json'),
-                    'call': result.model_dump(mode='json')}
+                return line.decode('utf-8')
+        try:
+            transport, _ = await loop.connect_read_pipe(lambda: asyncio.StreamReaderProtocol(reader), sys.stdin.buffer)
+            async with stdio_server(stdin=Input()) as streams:
+                await server.run(*streams, server.create_initialization_options())
+        finally:
+            loop.remove_reader(parent_fd)
+            if transport:transport.close()
 
 
 def reconcile(records, turn, reason):
@@ -205,40 +201,33 @@ def reconcile(records, turn, reason):
             write_json(path, record)
 
 
-
-
-async def discover(command, cwd, environment, folder, timeout, *, create_thread=False):
-    """Inspect this CLI's actual MCP inventory without starting a model turn."""
+@asynccontextmanager
+async def app_server(command, cwd, environment, folder, timeout):
+    """Bounded local Codex protocol session with raw responses retained."""
     folder.mkdir(parents=True, exist_ok=True)
     child = None
     with (folder/'stderr.log').open('wb') as err, (folder/'stdout.jsonl').open('wb') as out:
         try:
             child = await asyncio.create_subprocess_exec(*command, cwd=cwd, env=environment,
                 stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=err, start_new_session=True)
-            async def request(number, method, params):
+            number = 0
+            async def request(method, params):
+                nonlocal number
+                number += 1
                 child.stdin.write((json.dumps({'id':number, 'method':method, 'params':params})+'\n').encode())
                 await child.stdin.drain()
                 while True:
                     line = await child.stdout.readline()
-                    if not line:raise ValueError('Codex MCP discovery ended before a response')
+                    if not line:raise ValueError('Codex app server ended before a response')
                     out.write(line); out.flush()
                     response = json.loads(line)
                     if response.get('id') == number:
                         if 'error' in response:raise ValueError(str(response['error']))
                         return response['result']
-            async def inspect():
-                await request(1, 'initialize', {'clientInfo': {'name':'baseline-local-probe', 'version':'1'},
+            with anyio.fail_after(timeout):
+                await request('initialize', {'clientInfo': {'name':'baseline-local-probe', 'version':'1'},
                     'capabilities': {'experimentalApi': True}})
-                result = await request(2, 'mcpServerStatus/list', {})
-                if create_thread:
-                    result['local_thread'] = await request(3, 'thread/start', {'cwd': str(cwd)})
-                    await request(4, 'thread/inject_items', {'threadId': result['local_thread']['thread']['id'],
-                        'items': [{'type':'message', 'role':'user', 'content':[{'type':'input_text',
-                            'text':'Offline MCP configuration fixture; no model turn has occurred.'}]}]})
-                return result
-            result = await asyncio.wait_for(inspect(), timeout)
-            write_json(folder/'result.json', {'command':command, 'inventory':result})
-            return result
+                yield request
         finally:
             if child:
                 try:os.killpg(child.pid, signal.SIGKILL)
@@ -248,7 +237,9 @@ async def discover(command, cwd, environment, folder, timeout, *, create_thread=
 
 if __name__ == '__main__':
     parent = os.getppid()
-    if ctypes.CDLL(None, use_errno=True).prctl(1, signal.SIGTERM, 0, 0, 0):
-        raise OSError(ctypes.get_errno(), 'Cannot bind execution service to its parent')
-    if os.getppid() != parent:sys.exit(1)
-    anyio.run(serve, Path(sys.argv[1]))
+    parent_fd = os.pidfd_open(parent)
+    try:
+        if os.getppid() != parent:sys.exit(1)
+        anyio.run(serve, Path(sys.argv[1]), parent_fd)
+    finally:
+        os.close(parent_fd)

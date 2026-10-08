@@ -6,32 +6,49 @@ import signal
 import shutil
 import socket
 import subprocess
+import sys
 import tempfile
 import threading
 import time
+from contextlib import ExitStack, asynccontextmanager
 from pathlib import Path
 
 import pytest
+from mcp import ClientSession, StdioServerParameters, types
+from mcp.client.stdio import stdio_client
 
-from baseline import codex, runner
+from baseline import codex, local_exec, runner
 from baseline.__main__ import load_target
 from baseline.tests.test_baseline import SESSION, configuration, events
 
 
-@pytest.fixture(scope="module", params=["go_module", "cargo"])
-def environment(request, tmp_path_factory):
+toolchains = pytest.mark.parametrize('environment', ['go_module', 'cargo'], indirect=True, scope='module')
+
+
+@pytest.fixture(scope="module")
+def environments():
+    with ExitStack() as cleanup:
+        yield {}, cleanup
+
+
+@pytest.fixture(scope="module")
+def environment(request, environments):
+    clients, cleanup = environments
+    backend = getattr(request, 'param', 'go_module')
+    if backend in clients:
+        return clients[backend]
     retained = os.environ.get("BASELINE_ACCEPTANCE_DIR")
     # The main Agent deliberately hides host /tmp; real run directories live outside it.
-    temporary = None if retained else tempfile.TemporaryDirectory(prefix=".capability-", dir=runner.TASK.parent / "runs")
-    tmp_path = Path(retained).resolve() / request.param if retained else Path(temporary.name)
+    tmp_path = Path(retained).resolve() / backend if retained else Path(cleanup.enter_context(
+        tempfile.TemporaryDirectory(prefix=".capability-", dir=runner.TASK.parent / "runs")))
     tmp_path.mkdir(parents=True, exist_ok=True)
-    required = ["codex", "bwrap", "go" if request.param == "go_module" else "cargo"]
+    required = ["codex", "bwrap", "go" if backend == "go_module" else "cargo"]
     missing = [name for name in required if not shutil.which(name)]
     if missing:
         pytest.skip("Missing real local tools: " + ", ".join(missing))
-    config = configuration(tmp_path, request.param)
+    config = configuration(tmp_path, backend)
     cache = tmp_path / "dependency-cache"
-    if request.param == "go_module":
+    if backend == "go_module":
         config.go_mod_cache_dir = str(cache)
         folders = [cache]
     else:
@@ -41,7 +58,7 @@ def environment(request, tmp_path_factory):
         folder.mkdir(parents=True)
         (folder / "writable-host-canary").write_text("dependency canary")
     (tmp_path / "private-canary").write_text("private")
-    if request.param == "cargo":
+    if backend == "cargo":
         (cache / "credentials.toml").write_text("private")
     root = tmp_path / "run"
     for name in ("source", "inputs", "turns"):
@@ -54,13 +71,10 @@ def environment(request, tmp_path_factory):
     # Adversarial repository instructions must not be automatically injected.
     (root / "work/AGENTS.md").write_text("METHOD_AND_ANSWER_CANARY_7301")
     client = codex.Codex(config, root, load_target(config), time.monotonic() + 900)
-    try:
-        client.prepare()
-        yield client
-    finally:
-        client.close()
-        if temporary:
-            temporary.cleanup()
+    cleanup.callback(client.close)
+    client.prepare()
+    clients[backend] = client
+    return client
 
 
 def sandbox(client, command, name):
@@ -68,6 +82,17 @@ def sandbox(client, command, name):
                                *codex.options(client.settings), "-C", str(client.work), *command], name, maximum=90)
     stderr = (client.root / "inputs" / name / "stderr.log").read_text()
     return result, text + stderr
+
+
+@asynccontextmanager
+async def mcp_session(client, server=None):
+    settings = client.mcp_settings
+    server = server or StdioServerParameters(command=settings['command'], args=settings['args'], cwd=settings['cwd'],
+        env={'PYTHONPATH': str(client.work), 'BASELINE_TEST_KEY': 'must-not-be-inherited'})
+    async with stdio_client(server) as streams:
+        async with ClientSession(*streams) as session:
+            await session.initialize()
+            yield session, streams
 
 
 @pytest.fixture(params=["baseline", "full_agent", "full_fixed", "baseline_mcp"])
@@ -81,20 +106,13 @@ def execution(request, environment, monkeypatch):
     from consensus_assurance.adapters.storage.files import write_json
     client = environment
     if request.param == 'baseline_mcp':
-        from mcp import ClientSession, StdioServerParameters
-        from mcp.client.stdio import stdio_client
         async def call(command, timeout):
-            settings = client.mcp_settings
-            async with stdio_client(StdioServerParameters(command=settings['command'], args=settings['args'], cwd=settings['cwd'])) as streams:
-                async with ClientSession(*streams) as session:
-                    await session.initialize()
-                    listed = await session.list_tools()
-                    assert [t.name for t in listed.tools] == ['isolated_exec']
-                    response = await session.call_tool('isolated_exec', {'argv': command, 'timeout_seconds': float(timeout)})
-                    assert not response.isError, response
-                    result = response.structuredContent
-                    text = Path(result['stdout']['path']).read_text() + Path(result['stderr']['path']).read_text()
-                    return result, text
+            async with mcp_session(client) as (session, _):
+                response = await session.call_tool('isolated_exec', {'argv': command, 'timeout_seconds': float(timeout)})
+                assert not response.isError, response
+                result = response.structuredContent
+                text = Path(result['stdout']['path']).read_text() + Path(result['stderr']['path']).read_text()
+                return result, text
         def execute(command, name, timeout=90):
             client.execution_control.update(turn=name, turn_deadline=time.monotonic()+timeout, run_deadline=client.deadline, allow_experiments=True)
             write_json(client.control_path, client.execution_control)
@@ -155,6 +173,7 @@ def execution(request, environment, monkeypatch):
     return request.param, work, execute
 
 
+@toolchains
 def test_real_tools_failure_repair_and_prompt_isolation(environment, execution):
     client = environment
     route, work, execute = execution
@@ -182,6 +201,7 @@ def test_real_tools_failure_repair_and_prompt_isolation(environment, execution):
     assert not (client.root / "source" / path.relative_to(work)).exists()
 
 
+@toolchains
 def test_shared_dependencies_are_read_only_and_not_copied(environment):
     client = environment
     if client.target["execution_backend"] == "go_module":
@@ -281,6 +301,7 @@ def test_check_env_runs_no_model_and_retains_real_probes(tmp_path):
     assert not (root / "work/.runtime").exists()
 
 
+@toolchains
 def test_network_capabilities_with_host_success_control(environment, execution):
     from consensus_assurance.adapters.storage.files import write_json
     route, work, execute = execution
@@ -338,6 +359,7 @@ print(json.dumps(r))
         assert observed["host_errno"] in (1, 13)
 
 
+@toolchains
 def test_common_effective_settings_and_material_boundaries(environment, execution):
     from consensus_assurance.adapters.storage.files import write_json
     route, work, execute = execution
@@ -381,9 +403,8 @@ print('MATERIAL_BOUNDARIES_VERIFIED')
     assert result['status'] == 'completed' and result['exit_code'] == 0 and 'MATERIAL_BOUNDARIES_VERIFIED' in text, text
 
 
+@pytest.mark.parametrize('environment', ['cargo'], indirect=True, scope='module')
 def test_cargo_compiled_seed_is_not_a_dependency_cache(environment):
-    if environment.target['execution_backend'] != 'cargo':
-        return
     seed = environment.root.parent / 'compiled-seed'
     seed.mkdir()
     (seed / 'manifest.json').write_text('{}')
@@ -397,6 +418,7 @@ def test_cargo_compiled_seed_is_not_a_dependency_cache(environment):
 
 
 @pytest.mark.parametrize("stop", ["turn_timeout", "total_deadline", "cancelled"])
+@pytest.mark.parametrize('execution', ['baseline', 'full_agent', 'full_fixed'], indirect=True)
 def test_execution_stops_descendants(environment, execution, stop):
     route, work, execute = execution
     heartbeat = work / ("heartbeat-" + stop)
@@ -418,8 +440,8 @@ def test_execution_stops_descendants(environment, execution, stop):
             timer.start()
             timeout = 8
         else:
-            timeout = 3 if route == 'baseline_mcp' else .7
-        if stop == "total_deadline" and route in {"baseline", "baseline_mcp"}:
+            timeout = .7
+        if stop == "total_deadline" and route == 'baseline':
             environment.deadline = time.monotonic() + timeout
             timeout = 8
         elif stop == "total_deadline":
@@ -428,7 +450,7 @@ def test_execution_stops_descendants(environment, execution, stop):
         try:
             result, _ = execute(["python3", "-c", script], "stop-" + stop, timeout)
         except (TimeoutError, KeyboardInterrupt):
-            assert route in {"baseline", "baseline_mcp"}
+            assert route == 'baseline'
         else:
             assert result["status"] == ("cancelled" if stop == "cancelled" else "timeout")
             if stop == "total_deadline":
@@ -444,9 +466,9 @@ def test_execution_stops_descendants(environment, execution, stop):
             timer.join(timeout=6)
 
 
-def test_mcp_ipc_files_and_process_visibility(environment):
+@toolchains
+def test_mcp_permissions_arguments_and_results(environment):
     client = environment
-    from baseline import local_exec
     socket_directory = tempfile.TemporaryDirectory(prefix='baseline-ipc-')
     host_socket = Path(socket_directory.name)/'host-control.sock'
     unix = socket.socket(socket.AF_UNIX)
@@ -485,65 +507,46 @@ except OSError as e:assert e.errno==errno.ESPIPE
 else:raise AssertionError('Raw log is seekable by test process')
 print(json.dumps({'denied':blocked,'pids':[p.name for p in pids],'env':dict(os.environ),'fds':[os.readlink(p) for p in pathlib.Path('/proc/self/fd').glob('*') if p.exists()]}))
 '''.replace('PRIVATE', repr(list(map(str,[secret, log, client.control_path, client.root/'inputs/task.md', runner.TASK.parent/'README.md'])))).replace('READONLY', repr([str(client.root/'source/fixture.txt'), *canaries])).replace('SOCKET', repr(str(host_socket)))
-    try:
-        client.execution_control.update(turn='ipc-controls', allow_experiments=True, turn_deadline=time.monotonic()+30)
-        runner.write_json(client.control_path,client.execution_control)
-        record = asyncio.run(local_exec.probe(client.mcp_settings,['python3','-c',script]))
-        runner.write_json(client.root/'inputs/mcp-ipc-controls.json',record)
-        result=record['call']['structuredContent']
-        assert result['exit_code']==0, result
-        assert all(Path(p).read_text()=='dependency canary' for p in canaries)
-    finally:
-        unix.close()
-        socket_directory.cleanup()
-
-
-def test_mcp_contract_output_and_path_boundaries(environment):
-    from mcp import ClientSession, StdioServerParameters
-    from mcp.client.stdio import stdio_client
-    client=environment
     link=client.work/'outside';link.symlink_to(client.root.parent,target_is_directory=True)
     host_program=client.root.parent/'host-only.py'
     host_program.write_text("#!/usr/bin/python3\nprint('HOST_PROGRAM_CONTROL')\n");host_program.chmod(0o755)
     assert subprocess.check_output([str(host_program)],text=True).strip()=='HOST_PROGRAM_CONTROL'
-    client.execution_control.update(turn='contract',allow_experiments=True,turn_deadline=time.monotonic()+60)
-    runner.write_json(client.control_path,client.execution_control)
+    client.execution_control.update(turn='mcp-boundaries', allow_experiments=True, turn_deadline=time.monotonic()+60)
+    runner.write_json(client.control_path, client.execution_control)
     async def scenario():
-        settings=client.mcp_settings
-        async with stdio_client(StdioServerParameters(command=settings['command'],args=settings['args'],cwd=settings['cwd'],
-            env={'PYTHONPATH':str(client.work),'BASELINE_TEST_KEY':'must-not-be-inherited'})) as streams:
-            async with ClientSession(*streams) as session:
-                await session.initialize()
-                assert [t.name for t in (await session.list_tools()).tools]==['isolated_exec']
-                for args in ({'argv':[]},{'argv':['true'],'cwd':'..'},{'argv':['true'],'cwd':str(client.work)},
-                             {'argv':['true'],'cwd':'outside'},{'argv':['true'],'env':{'PATH':'bad'}},
-                             {'argv':['true'],'mounts':['/']},{'argv':['true'],'timeout_seconds':0}):
-                    response=await session.call_tool('isolated_exec',args)
-                    assert response.isError,response
-                response=await session.call_tool('isolated_exec',{'argv':[str(host_program)]})
-                assert response.structuredContent['status']=='launch_error' and response.structuredContent['exit_code']!=0
-                assert 'HOST_PROGRAM_CONTROL' not in response.structuredContent['stdout']['preview']
-                response=await session.call_tool('isolated_exec',{'argv':['python3','-c',"import sys;print('x'*20000);print('diagnostic',file=sys.stderr);sys.exit(7)"]})
-                assert not response.isError
-                result=response.structuredContent
-                assert result['status']=='completed' and result['exit_code']==7 and result['stdout']['truncated']
-                assert Path(result['stdout']['path']).stat().st_size==20001
-                response=await session.call_tool('isolated_exec',{'argv':['sh','-c','printf ordinary | cat']})
-                assert response.structuredContent['stdout']['preview']=='ordinary'
-                concurrent=await asyncio.gather(*(session.call_tool('isolated_exec',{'argv':['python3','-c','import time;time.sleep(.1)']}) for _ in range(2)))
-                ordered=sorted((r.structuredContent for r in concurrent),key=lambda r:r['started_at'])
-                assert ordered[1]['started_at']>=ordered[0]['ended_at'], 'Tool calls overlapped'
-                return result
+        async with mcp_session(client) as (session, _):
+            response = await session.call_tool('isolated_exec', {'argv': ['python3', '-c', script]})
+            runner.write_json(client.root/'inputs/mcp-ipc-controls.json', response.model_dump(mode='json'))
+            assert response.structuredContent['exit_code'] == 0, response
+            assert all(Path(p).read_text() == 'dependency canary' for p in canaries)
+            for args in ({'argv':[]},{'argv':['true'],'cwd':'..'},{'argv':['true'],'cwd':str(client.work)},
+                         {'argv':['true'],'cwd':'outside'},{'argv':['true'],'env':{'PATH':'bad'}},
+                         {'argv':['true'],'mounts':['/']},{'argv':['true'],'timeout_seconds':0}):
+                response=await session.call_tool('isolated_exec',args)
+                assert response.isError,response
+            response=await session.call_tool('isolated_exec',{'argv':[str(host_program)]})
+            assert response.structuredContent['status']=='launch_error' and response.structuredContent['exit_code']!=0
+            assert 'HOST_PROGRAM_CONTROL' not in response.structuredContent['stdout']['preview']
+            response=await session.call_tool('isolated_exec',{'argv':['python3','-c',"import sys;print('x'*20000);print('diagnostic',file=sys.stderr);sys.exit(7)"]})
+            assert not response.isError
+            result=response.structuredContent
+            assert result['status']=='completed' and result['exit_code']==7 and result['stdout']['truncated']
+            assert Path(result['stdout']['path']).stat().st_size==20001
+            concurrent=await asyncio.gather(*(session.call_tool('isolated_exec',{'argv':['python3','-c','import time;time.sleep(.1)']}) for _ in range(2)))
+            ordered=sorted((r.structuredContent for r in concurrent),key=lambda r:r['started_at'])
+            assert ordered[1]['started_at']>=ordered[0]['ended_at'], 'Tool calls overlapped'
+            return result
     try:
-        runner.write_json(client.root/'inputs/mcp-contract.json',asyncio.run(scenario()))
-    finally:link.unlink()
+        runner.write_json(client.root/'inputs/mcp-contract.json', asyncio.run(scenario()))
+    finally:
+        link.unlink()
+        unix.close()
+        socket_directory.cleanup()
 
 
-@pytest.mark.parametrize('stop', ['action_timeout','agent_turn_timeout','total_seconds','cancelled','stdio_disconnect','service_death','background_exit'])
+@pytest.mark.parametrize('stop', ['action_timeout','agent_turn_timeout','total_seconds','cancelled',
+                               'stdio_disconnect','service_death','background_exit','parent_exit','parent_kill'])
 def test_mcp_lifecycle_retains_partial_output_and_kills_detached_children(environment, stop):
-    from mcp import ClientSession, StdioServerParameters, types
-    from mcp.client.stdio import stdio_client
-    from baseline.local_exec import reconcile
     client=environment
     heartbeat=client.work/('mcp-heartbeat-'+stop)
     child="import pathlib,time\np=pathlib.Path("+repr(str(heartbeat))+")\nwhile True:\n p.write_text(str(time.monotonic_ns()));time.sleep(.02)"
@@ -554,63 +557,91 @@ def test_mcp_lifecycle_retains_partial_output_and_kills_detached_children(enviro
     if stop=='action_timeout':control['action_timeout']=.5
     if stop in {'agent_turn_timeout','total_seconds'}:control['turn_deadline' if stop=='agent_turn_timeout' else 'run_deadline']=time.monotonic()+3
     runner.write_json(client.control_path,control)
+    server = None
+    if stop in {'parent_exit', 'parent_kill'}:
+        # The client keeps STDIO open after this parent exits, so EOF cannot mask a broken pidfd watch.
+        wrapper = ('import signal,subprocess,sys,time; signal.signal(signal.SIGTERM,lambda *_:sys.exit(0)); '
+                   'subprocess.Popen(sys.argv[1:]); time.sleep(60)')
+        server = StdioServerParameters(command=sys.executable, args=['-c', wrapper,
+            client.mcp_settings['command'], *client.mcp_settings['args']], env={})
     async def scenario():
-        settings=client.mcp_settings
-        async with stdio_client(StdioServerParameters(command=settings['command'],args=settings['args'],cwd=settings['cwd'])) as streams:
-            async with ClientSession(*streams) as session:
-                await session.initialize()
-                task=asyncio.create_task(session.call_tool('isolated_exec',{'argv':['python3','-c',script],'timeout_seconds':15.0}))
-                end=time.monotonic()+8
-                while not heartbeat.exists() and time.monotonic()<end:await asyncio.sleep(.02)
-                assert heartbeat.exists(), 'The child did not start'
-                records=[p for p in (client.root/'executions').glob('*/result.json') if json.loads(p.read_text())['turn']==control['turn']]
-                assert len(records)==1
-                record=json.loads(records[0].read_text())
-                captured=records[0].parent/'stdout.txt'
-                while (not captured.exists() or 'CHILD_STARTED' not in captured.read_text()) and time.monotonic()<end:
-                    await asyncio.sleep(.01)
-                assert captured.exists() and 'CHILD_STARTED' in captured.read_text(), 'Partial output was not produced before termination'
-                if stop=='cancelled':
-                    await session.send_notification(types.ClientNotification(types.CancelledNotification(params=types.CancelledNotificationParams(requestId=record['mcp_request_id'],reason='acceptance cancellation'))))
-                elif stop=='stdio_disconnect':await streams[1].aclose()
-                elif stop=='service_death':os.kill(record['service_pid'],signal.SIGKILL)
-                try:
-                    response=await asyncio.wait_for(task,8)
-                    if stop in {'action_timeout','agent_turn_timeout','total_seconds'}:
-                        assert response.structuredContent['status']=='timeout'
-                        assert response.structuredContent['timeout_limit']==stop
-                    elif stop=='background_exit':assert response.structuredContent['exit_code']==0
-                except Exception:
-                    if stop not in {'cancelled','stdio_disconnect','service_death'}:raise
-                return records[0]
+        async with mcp_session(client, server) as (session, streams):
+            task=asyncio.create_task(session.call_tool('isolated_exec',{'argv':['python3','-c',script],'timeout_seconds':15.0}))
+            end=time.monotonic()+8
+            while not heartbeat.exists() and time.monotonic()<end:await asyncio.sleep(.02)
+            assert heartbeat.exists(), 'The child did not start'
+            records=[p for p in (client.root/'executions').glob('*/result.json') if json.loads(p.read_text())['turn']==control['turn']]
+            assert len(records)==1
+            record=json.loads(records[0].read_text())
+            captured=records[0].parent/'stdout.txt'
+            while (not captured.exists() or 'CHILD_STARTED' not in captured.read_text()) and time.monotonic()<end:
+                await asyncio.sleep(.01)
+            assert captured.exists() and 'CHILD_STARTED' in captured.read_text(), 'Partial output was not produced before termination'
+            if stop=='cancelled':
+                await session.send_notification(types.ClientNotification(types.CancelledNotification(params=types.CancelledNotificationParams(requestId=record['mcp_request_id'],reason='acceptance cancellation'))))
+            elif stop=='stdio_disconnect':await streams[1].aclose()
+            elif stop=='service_death':os.kill(record['service_pid'],signal.SIGKILL)
+            elif stop in {'parent_exit', 'parent_kill'}:
+                parent = int(Path(f"/proc/{record['service_pid']}/stat").read_text().split()[3])
+                os.kill(parent, signal.SIGTERM if stop == 'parent_exit' else signal.SIGKILL)
+            try:
+                response=await asyncio.wait_for(task,8)
+                if stop in {'action_timeout','agent_turn_timeout','total_seconds'}:
+                    assert response.structuredContent['status']=='timeout'
+                    assert response.structuredContent['timeout_limit']==stop
+                elif stop=='background_exit':assert response.structuredContent['exit_code']==0
+            except Exception as exc:
+                if stop not in {'cancelled','stdio_disconnect','service_death','parent_exit','parent_kill'}:raise
+                if stop in {'parent_exit', 'parent_kill'}:
+                    assert not isinstance(exc, asyncio.TimeoutError), 'MCP hung on open stdin after parent exit'
+            return records[0]
     path=asyncio.run(scenario())
-    reconcile(client.root/'executions',control['turn'],'Abrupt service termination')
+    local_exec.reconcile(client.root/'executions',control['turn'],'Abrupt service termination')
     record=json.loads(path.read_text())
     assert record['status']!='running'
+    if stop in {'parent_exit', 'parent_kill'}:
+        assert record['status'] == 'cancelled' and record['reason'] == 'parent_exit', record
     assert 'CHILD_STARTED' in (path.parent/'stdout.txt').read_text()
     time.sleep(.1);before=heartbeat.read_text();time.sleep(.2)
     assert heartbeat.read_text()==before, 'Detached descendant survived the service lifecycle'
 
 
-def test_real_exec_and_resume_require_the_explicit_mcp(environment):
-    """A deliberately unavailable required service stops both actual entry points before inference."""
-    client=environment
-    client.authenticate(probe=True)
-    broken={**client.settings,'mcp_servers':{'baseline_local':{**client.mcp_settings,
-            'args':['-i','/nonexistent-baseline-acceptance-service']}}}
-    from baseline.local_exec import discover
-    inspected=asyncio.run(discover([*client.prefix(offline=True),'app-server','--strict-config',*codex.options(client.settings)],
-        client.work,client.environment,client.root/'inputs/resume-fixture',30,create_thread=True))
-    session=inspected['local_thread']['thread']['id']
-    for name in ('exec','resume'):
-        args=['exec',*(['resume',session] if name=='resume' else []),'--ignore-user-config','--strict-config',
-              '--skip-git-repo-check','--json',*codex.options(broken),'-']
-        result,text=client.local(args,'required-mcp-'+name,stdin='Synthetic startup check; no inference is authorized.',maximum=30)
-        error=(client.root/'inputs'/('required-mcp-'+name)/'stderr.log').read_text()
-        assert result['exit_code']!=0 and 'baseline_local' in text+error, text+error
-        assert 'Required MCP' in text+error or 'required MCP' in text+error, text+error
-        events=[json.loads(line) for line in text.splitlines() if line.startswith('{')]
-        assert not any(e.get('type')=='turn.completed' for e in events)
+def test_real_codex_long_command_and_required_service(environment, monkeypatch):
+    """Exercise real tool execution and both model entry points without inference."""
+    client = environment
+    monkeypatch.setenv(client.config.credential_name, 'baseline-credential-canary')
+    client.authenticate()
+    runner.write_json(client.control_path, {**client.execution_control, 'turn': 'native-long-command',
+        'allow_experiments': True, 'action_timeout': 30, 'turn_deadline': time.monotonic()+60,
+        'run_deadline': time.monotonic()+90})
+    async def scenario():
+        async with local_exec.app_server([*client.prefix(offline=True), 'app-server', '--strict-config',
+                *codex.options(client.settings)], client.work, client.environment,
+                client.root/'inputs/mcp-long-command', 30) as request:
+            thread = (await request('thread/start', {'cwd': str(client.work)}))['thread']['id']
+            result = await request('mcpServer/tool/call', {'threadId': thread, 'server': 'baseline_local',
+                'tool': 'isolated_exec', 'arguments': {'argv': ['python3', '-c',
+                    'import time; print("START",flush=True); time.sleep(12); print("DONE",flush=True)'],
+                    'timeout_seconds': 25.0}})
+            record = result['structuredContent']
+            assert record['status'] == 'completed' and record['exit_code'] == 0, result
+            assert record['elapsed_seconds'] >= 12 and record['stdout']['preview'] == 'START\nDONE\n'
+            await request('thread/inject_items', {'threadId': thread, 'items': [
+                {'type': 'message', 'role': 'user', 'content': [{'type': 'input_text',
+                 'text': 'Offline MCP fixture; no model turn has occurred.'}]}]})
+            return thread
+    session = asyncio.run(scenario())
+    broken = {**client.settings, 'mcp_servers': {'baseline_local': {**client.mcp_settings,
+        'args': ['-i', '/nonexistent-baseline-acceptance-service']}}}
+    for name in ('exec', 'resume'):
+        args = ['exec', *(['resume', session] if name == 'resume' else []), '--ignore-user-config', '--strict-config',
+                '--skip-git-repo-check', '--json', *codex.options(broken), '-']
+        result, text = client.local(args, 'required-mcp-'+name, stdin='Synthetic startup check; no inference is authorized.')
+        error = (client.root/'inputs'/('required-mcp-'+name)/'stderr.log').read_text()
+        assert result['exit_code'] != 0 and 'baseline_local' in text+error, text+error
+        assert 'required mcp' in (text+error).lower(), text+error
+        events = [json.loads(line) for line in text.splitlines() if line.startswith('{')]
+        assert not any(e.get('type') == 'turn.completed' for e in events)
 
 
 def test_native_full_profile_creates_and_preserves_its_own_record(environment, monkeypatch):

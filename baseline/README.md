@@ -6,7 +6,7 @@
 
 ## 使用
 
-需要 Linux、Bubblewrap、支持命名权限及本地提示检查的 Codex CLI，以及目标工具链。实施阶段先在已有环境安装固定的 MCP 协议依赖，审计期间不在线安装：
+需要支持 `pidfd` 的 Linux、Bubblewrap、支持命名权限及本地提示检查的 Codex CLI，以及目标工具链。实施阶段先在已有环境安装固定的 MCP 协议依赖，审计期间不在线安装：
 
 ```bash
 .venv/bin/python -m pip install -r baseline/requirements.txt
@@ -23,7 +23,7 @@
 
 [DeepSeek](configs/deepseek.example.yaml)、[OpenAI](configs/openai.example.yaml)、[自定义服务](configs/custom-provider.example.yaml) 示例默认关闭授权，需要填写 `repo_path`；相对路径以配置文件所在目录为准。新 [DeepSeek＋HashiCorp 配对草案](PAIRING.md) 也默认关闭授权；本地 TCP 能力已对齐，线上新工具调用仍待单独授权的合成冒烟。目标必须是干净 Git 提交，`runs_dir` 与源仓库分离；运行器不会替用户清理工作树。
 
-`check-env` 保存快照，检查实际 CLI、权限、自动提示、沙箱内工具版本和离线依赖；Go 使用 `go list -m all`，Rust 使用离线 `cargo metadata`。它不发送目标给模型、不执行目标测试、不使用真实认证；API 凭据只记录是否存在。`check-env` 还通过真实 STDIO 协议运行固定合成 TCP 探针，并由本机 Codex 发现唯一工具。`environment_checked` 表示这些本地检查完成，不表示线上模型已经调用新工具。
+`check-env` 保存快照，检查实际 CLI、权限、自动提示、沙箱内工具版本和离线依赖；Go 使用 `go list -m all`，Rust 使用离线 `cargo metadata`。它不发送目标给模型、不执行目标测试、不使用真实认证；API 凭据只记录是否存在。MCP 工具发现和固定合成 TCP 探针通过同一个本地 Codex 会话完成，省去独立 Python 客户端探针；仅创建本地合成会话，不启动模型回合。`environment_checked` 表示这些本地检查完成，不表示线上模型已经调用新工具。
 
 `run` 要求 `allow_agent_materials`、`allow_experiments` 都为 `true`；`smoke` 还要求 `--allow-paid`。合成冒烟最多两回合、300 秒，验证工具失败修复、隔离工具的 TCP 测试、文件交接与上下文连续性；成功状态仍需核对原始 TCP 观察。不会自动登录、联网补依赖、换 provider 或追加免费总结。本次实施没有执行付费冒烟或新共识审计。
 
@@ -37,7 +37,7 @@
 
 两组共同策略由 `src/consensus_assurance/adapters/agents/backend.py::common_settings()` 提供。普通组直接使用，完整组显式选择 `codex_profile: single_agent` 后使用；未选择时保留原有配置行为。共同策略关闭子 Agent、shell snapshot、自动 skills/plugins/MCP/memory/hooks，保留普通 shell 与原生压缩。baseline 随后显式注册唯一 `baseline_local.isolated_exec`；完整组继续使用原固定执行器，默认没有这个 MCP。自定义 provider 固定请求／流重试为 4／5、流空闲 300000 ms，关闭无限连接重试；原生 provider 的保留设置不覆盖。用实际 `features list` 和本地 `debug prompt-input` 检查生效结果；缺工具或探针失败不算通过。完整组的方法和结构化回执仍保留。主系统首次有效配置检查后记录 profile 名称和展开设置，后续调用与恢复先比较原配置、状态、持久记录及历史 argv；同名设置漂移停止并要求新 run，不覆盖旧记录。profile 为 `None` 的原有路径不强制迁移。
 
-可选 `go_mod_cache_dir` 只读作为 `GOMODCACHE`；Go 离线变量直接复用 `GoModuleBackend.environment()`。可选 `cargo_dependency_cache_dir` 表示普通 Cargo home，只读连接其中的 `registry/` 和 `git/`；宿主认证和全局配置不开放。旧 `cargo_seed_cache_dir` 在新 baseline 配置中明确报迁移错误；历史 JSON 不回写，主系统的编译种子字段不改名。仅有编译 seed 而没有依赖树的目录会报类型不匹配。
+可选 `go_mod_cache_dir` 只读作为 `GOMODCACHE`；Go 离线变量直接复用 `GoModuleBackend.environment()`。可选 `cargo_dependency_cache_dir` 表示普通 Cargo home，只读连接其中的 `registry/` 和 `git/`；宿主认证和全局配置不开放。旧 `cargo_seed_cache_dir` 由严格配置校验作为未知字段拒绝，使用依赖目录时应改为 `cargo_dependency_cache_dir`；历史 JSON 不回写，主系统的编译种子字段不改名。仅有编译 seed 而没有依赖树的目录会报类型不匹配。
 
 不全量扫描、逐文件哈希或复制宿主依赖缓存。没有配置目录时使用空离线缓存；缺依赖直接报错，不联网补齐。构建与临时目录位于每 run 私有 `work/.runtime/`，冷构建成本计入预算。源码依赖缓存不等于编译种子，Rust 成本可比性仍须另行核对。
 
@@ -51,7 +51,9 @@
 
 Git HEAD 不能标识 dirty 文件或另一个安装位置的模块，CLI 版本字符串也不能区分同版本构建，因此这里只为有限执行字节记录摘要，不增加审批门槛。开发运行允许 dirty，并仅保存相关执行输入的安全字节，不打包无关未提交文件。结束时保存 `inputs/implementation-end.json`，重新检查入口字节及 CLI 文件元数据；启动身份不覆盖，期间变更会标为条件未固定。身份文件不进入模型提示。
 
-总时间由单调时钟执行，源码、身份记录、环境准备、工具、等待模型都计入。每轮上限为单回合限制与总剩余时间的较小值；`isolated_exec` 串行执行，时间上限取请求值、`budget.action_timeout`（默认 600 秒）、当前回合和整轮剩余时间的最小值；排队也计时，工具耗时不重复加到回合耗时上。有预算时精确续接原 session。超时、取消、拒绝、配额和 session 变化保留分类；到时只做留存。回合数、内部工具调用与主系统正式检查数是不同计量，不互换。
+总时间由单调时钟执行，源码、身份记录、环境准备、工具、等待模型都计入。每轮上限为单回合限制与总剩余时间的较小值；`isolated_exec` 串行执行，时间上限取请求值、`budget.action_timeout`（默认 600 秒）、当前回合和整轮剩余时间的最小值；排队也计时，工具耗时不重复加到回合耗时上。回合正常完成且有预算时精确续接原 session；单回合超时会终止整个 run，因此 40 分钟配置是总上限。超时、取消、拒绝、配额和 session 变化保留分类；到时只做留存。回合数、内部工具调用与主系统正式检查数是不同计量，不互换。
+
+2026-10-08 18:17 的试运行暴露了 MCP 生命周期问题：创建服务的 Codex 工作线程空闲退出触发 `PR_SET_PDEATHSIG`，误杀仍在运行的工具；阻塞的标准输入读取线程又阻止服务退出，调用方一直等到单回合超时。服务现通过 `pidfd` 监控父进程并异步读取输入；保留父进程退出、断开和取消时的子进程清理，同时记录取消来源。新增真实 Codex 长任务、创建线程退出、父进程退出及强杀回归；诊断信号跟踪和验证结果见 [生命周期修复记录](acceptance/2026-10-08-mcp-lifecycle/summary.json)。旧实验按异常中断保留。
 
 ```text
 runs/<run-id>/

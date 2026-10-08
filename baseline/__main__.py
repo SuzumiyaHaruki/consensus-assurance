@@ -37,13 +37,6 @@ class Config(BaseModel):
     cargo_dependency_cache_dir: str | None = None
     budget: Budget = Field(default_factory=Budget)
 
-    @model_validator(mode="before")
-    @classmethod
-    def migrate_dependency_name(cls, value):
-        if isinstance(value, dict) and "cargo_seed_cache_dir" in value:
-            raise ValueError("Rename cargo_seed_cache_dir to cargo_dependency_cache_dir; use a Cargo home dependency cache, not a compiled seed")
-        return value
-
     @model_validator(mode="after")
     def validate_connection(self):
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/-]*", self.agent_model):
