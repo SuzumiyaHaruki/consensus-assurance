@@ -55,7 +55,7 @@ def isolated_command(command, workspace, directory, tool_roots=(), read_only_roo
         raise FileNotFoundError('Bubblewrap is required; no host execution fallback')
     args = [executable, '--die-with-parent', '--new-session', '--unshare-net', '--unshare-pid',
             '--unshare-ipc', '--unshare-uts', '--cap-drop', 'ALL']
-    for name in ('/usr/bin', '/usr/lib', '/usr/lib64', '/usr/libexec', '/usr/include', '/usr/share'):
+    for name in ('/usr/bin', '/usr/lib', '/usr/lib64', '/usr/libexec', '/usr/include', '/usr/share', '/etc/alternatives'):
         if Path(name).is_dir():args += ['--ro-bind', name, name]
     for name in ('/bin', '/sbin', '/lib', '/lib64'):
         path = Path(name)

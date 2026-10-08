@@ -167,6 +167,8 @@ class CodexAgent:
                 if Path(item['path']).is_relative_to(home) else item['path']} for item in settings.get('skills.config', [])]
             return result
         saved = json.loads(path.read_text()) if path.exists() else None
+        if saved is None and getattr(self, '_profile_prepared', None):
+            raise ValueError('Codex profile record disappeared; start a new run')
         if saved is not None and (saved.get('profile') != self.profile or 'settings' not in saved):
             raise ValueError('Missing or changed Codex profile basis; start a new run')
         if saved and 'skills.config' not in self.profile_settings:
@@ -391,6 +393,7 @@ class CodexAgent:
 
     def investigate(self, runner, prompt, directory, snapshot_id, timeout, session_id=None):
         """Run one Codex turn and retain the exact session and tool events."""
+        self.validate_profile(runner.root)
         directory.mkdir(parents=True, exist_ok=True)
         schema = runner.root / "agent-final.schema.json"
         write_json(schema, {"type":"object","properties":{
