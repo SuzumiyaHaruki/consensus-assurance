@@ -1,0 +1,16 @@
+This pass extended Finding 1 and closed out concurrency coverage. Report updated at [report.md](/home/nitro/Desktop/consensus-assurance/baseline/runs/2026-10-08_13-11-14-hashicorp_raft-baseline/work/report.md).
+
+**What I ran**
+
+- Full non-network suite under `-race`: **ok, 0 data races** (`audit/test-race-full.log`) — no concurrency defect surfaced in the exercised paths.
+- Non-network suite ×3: surfaced a **third** victim of the same defect, `TestRaft_HasExistingState`, failing once with the identical `testing.go:705 peer mismatch: {2 servers} {3 servers}` signature (`audit/test-repeat3.log`).
+
+**Finding 1 widened**
+
+The defect is `(*cluster).EnsureSamePeers` in `testing.go:692-715`: it captures `c.rafts[0]`'s configuration once and never refreshes it across the `CHECK`/`WAIT` retry loop. A single early read of a not-yet-converged node freezes the reference at the old configuration, so the comparison can never succeed and the test fails after `longstopTimeout`. Observed victims now: `TestRaft_ProtocolVersion_Upgrade_1_2`, `_2_3`, and `TestRaft_HasExistingState`. Enumerating callers, **10 tests** use the helper and are exposed (`RecoverCluster`, `HasExistingState`, `JoinNode`, `JoinNode_ConfigStore`, `RemoveFollower_SplitCluster`, `SnapshotRestore_PeerChange`, both `ProtocolVersion_Upgrade_*`, `LeaderID_Propagated`, `FollowerRemovalNoElection`).
+
+**Root cause isolated and fix verified**
+
+The diagnostic test (`audit_diag_test.go`) shows the never-refreshed capture goes stale in ~30% of runs while all three nodes live-report the new configuration within ~20 ms — i.e. the Raft implementation converges; the helper is at fault. I then ran the same scenario with the corrected logic (re-read the reference node each pass): **20/20 pass, 0 failures** (`audit/audit-fixed.log`), versus the ~25-50% failure rate of the unrefreshed helper. The fix is a one-line re-read in `EnsureSamePeers` and resolves it for all 10 callers.
+
+No defect was found in the core consensus/agreement logic, and the artifact remains byte-identical to upstream v1.7.3 (no planted mutation). `source/` was not modified; my only additions are `audit/`, `audit_diag_test.go`, and `report.md`.

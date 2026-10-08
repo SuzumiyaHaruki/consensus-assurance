@@ -1,0 +1,13 @@
+The audit budget is nearly exhausted, so this is the final pass. The report at [report.md](/home/nitro/Desktop/consensus-assurance/baseline/runs/2026-10-08_13-11-14-hashicorp_raft-baseline/work/report.md) is complete and self-contained.
+
+**Final action this pass:** a static scan for the same class of defect across the other `cluster` test helpers. `WaitEvent`, `WaitForReplication`, `GetInState`, `WaitForFollowers`, and `EnsureSame` all poll against `longstopTimeout`/`CommitTimeout`; `EnsureLeader` (`testing.go:582-604`) is the only assertion helper with no retry loop. That confines the secondary suspicion to a single function and is now recorded in §3.5.
+
+**Overall result**
+
+- **Finding 1 (concrete, reproduced):** `(*cluster).EnsureSamePeers` (`testing.go:692-715`) captures `c.rafts[0]`'s configuration once and never refreshes it, so a single early read of a not-yet-converged node permanently poisons the retry comparison and fails the test after `longstopTimeout`. Observed victims: `TestRaft_ProtocolVersion_Upgrade_1_2`, `_2_3`, and `TestRaft_HasExistingState` (3/120 in a focused campaign over the 10 callers). The nodes themselves converge within ~20 ms, proving the helper — not the consensus logic — is at fault; the one-line re-read fix was verified 20/20.
+- **Secondary, source-based only:** `EnsureLeader` is the sole non-retrying assertion helper.
+- **No defect found in the core consensus/agreement logic,** with positive negative-evidence: full non-network suite clean under `-race`; committed-entry churn soak 2/2 with zero loss; snapshot region 50/50 under `-race`; build and `go vet` clean.
+- **Artifact identity:** byte-for-byte identical to upstream `hashicorp/raft` v1.7.3 (no planted mutation), so Finding 1 is a pre-existing upstream harness defect.
+- **Open/uncovered** (§5): network transport and the nested `fuzzy`/`raft-compat` modules (cannot run offline), plus disk-backed/restart soak.
+
+All reproduction artifacts are preserved in `work/audit/` (13 logs) plus the diagnostic-only `audit_diag_test.go`. `source/` was never modified; my only additions are `audit/`, `audit_diag_test.go`, and `report.md`.
