@@ -503,7 +503,9 @@ def test_mcp_contract_output_and_path_boundaries(environment):
     from mcp.client.stdio import stdio_client
     client=environment
     link=client.work/'outside';link.symlink_to(client.root.parent,target_is_directory=True)
-    host_program=client.root.parent/'host-only.py';host_program.write_text("raise AssertionError('host program ran')")
+    host_program=client.root.parent/'host-only.py'
+    host_program.write_text("#!/usr/bin/python3\nprint('HOST_PROGRAM_CONTROL')\n");host_program.chmod(0o755)
+    assert subprocess.check_output([str(host_program)],text=True).strip()=='HOST_PROGRAM_CONTROL'
     client.execution_control.update(turn='contract',allow_experiments=True,turn_deadline=time.monotonic()+60)
     runner.write_json(client.control_path,client.execution_control)
     async def scenario():
@@ -518,8 +520,9 @@ def test_mcp_contract_output_and_path_boundaries(environment):
                              {'argv':['true'],'mounts':['/']},{'argv':['true'],'timeout_seconds':0}):
                     response=await session.call_tool('isolated_exec',args)
                     assert response.isError,response
-                response=await session.call_tool('isolated_exec',{'argv':['python3',str(host_program)]})
-                assert response.structuredContent['exit_code']!=0
+                response=await session.call_tool('isolated_exec',{'argv':[str(host_program)]})
+                assert response.structuredContent['status']=='launch_error' and response.structuredContent['exit_code']!=0
+                assert 'HOST_PROGRAM_CONTROL' not in response.structuredContent['stdout']['preview']
                 response=await session.call_tool('isolated_exec',{'argv':['python3','-c',"import sys;print('x'*20000);print('diagnostic',file=sys.stderr);sys.exit(7)"]})
                 assert not response.isError
                 result=response.structuredContent
@@ -563,6 +566,10 @@ def test_mcp_lifecycle_retains_partial_output_and_kills_detached_children(enviro
                 records=[p for p in (client.root/'executions').glob('*/result.json') if json.loads(p.read_text())['turn']==control['turn']]
                 assert len(records)==1
                 record=json.loads(records[0].read_text())
+                captured=records[0].parent/'stdout.txt'
+                while (not captured.exists() or 'CHILD_STARTED' not in captured.read_text()) and time.monotonic()<end:
+                    await asyncio.sleep(.01)
+                assert captured.exists() and 'CHILD_STARTED' in captured.read_text(), 'Partial output was not produced before termination'
                 if stop=='cancelled':
                     await session.send_notification(types.ClientNotification(types.CancelledNotification(params=types.CancelledNotificationParams(requestId=record['mcp_request_id'],reason='acceptance cancellation'))))
                 elif stop=='stdio_disconnect':await streams[1].aclose()
