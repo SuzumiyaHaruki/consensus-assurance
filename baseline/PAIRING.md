@@ -79,7 +79,7 @@ baseline 在真实 `exec` 与精确 `exec resume` 使用的显式参数中配置
 
 ## 历史试运行
 
-[40 分钟 baseline 原始归档](runs/2026-10-08_13-11-14-hashicorp_raft-baseline/index.md) 完全保留；它不能与本机 `runs/2026-10-07_11-29-07-hashicorp_raft-real-run` 的 120 分钟 DeepSeek high 完整组运行配成同条件样本。前者使用 Go 1.25.8，后者记录 Go 1.23.5，网络与功能条件也不同。
+当前 Git 跟踪最新的 [40 分钟 baseline 原始归档](runs/2026-10-08_19-48-15-hashicorp_raft-baseline/index.md)，此前归档保留在 Git 历史及本机；它不能与本机 `runs/2026-10-07_11-29-07-hashicorp_raft-real-run` 的 120 分钟 DeepSeek high 完整组运行配成同条件样本。前者使用 Go 1.25.8，后者记录 Go 1.23.5，网络与功能条件也不同。
 
 用户提供的上轮离线复查意见是：EnsureSamePeers 的过期参考值有源码与执行依据；EnsureLeader 的实际失败需要区分即时断言职责与调用者等待前提，“不重试”不自动构成 helper 违约。本轮未追加模型或目标复验来改变这些结论。模型对上游版本的强调、报告内状态不一致和末尾重复总结原样保留；这些观察不进入后续普通组任务。
 

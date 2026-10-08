@@ -1,0 +1,106 @@
+import os
+import signal
+import subprocess
+import time
+import json
+from datetime import datetime, timedelta
+from pathlib import Path
+from consensus_assurance.core.types import CheckRun, ExecutionStatus, now
+from consensus_assurance.adapters.storage.files import redact, write_json
+
+
+class ProcessRunner:
+    """Run adapter-owned argv, never model-produced shell commands."""
+    def __init__(self, root: Path):
+        self.root = root.resolve()
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.deadline = None
+        self.active_action_id = None
+
+    def run(self, command: list[str], cwd: Path, action: str, snapshot_id: str,
+            timeout: float = 60, stdin: str | None = None, env: dict | None = None, sensitive_env=()) -> CheckRun:
+        if self.active_action_id:
+            for path in (self.root / "logs").glob("*/check.json"):
+                saved = CheckRun.model_validate_json(path.read_text())
+                if (saved.pending_action_id == self.active_action_id and saved.ended_at
+                        and saved.command == command and saved.cwd == str(cwd.resolve())
+                        and saved.action == action and saved.snapshot_id == snapshot_id):
+                    return saved
+        remaining = self.deadline - time.monotonic() if self.deadline is not None else float('inf')
+        limit = 'total_seconds' if remaining <= timeout else 'agent_turn_timeout' if action == 'agent_turn' else 'action_timeout'
+        timeout = min(timeout, remaining)
+        if timeout <= 0:
+            return CheckRun(action=action, command=command, cwd=str(cwd), snapshot_id=snapshot_id,
+                status=ExecutionStatus.CANCELLED, reason="Total runtime budget exhausted before execution",
+                parameters={"timeout_limit":"total_seconds", "timeout_seconds":timeout})
+        cwd = cwd.resolve()
+        if not cwd.is_relative_to(self.root):
+            raise ValueError("Execution directory must be inside the run directory")
+        cwd.mkdir(parents=True, exist_ok=True)
+        run = CheckRun(action=action, command=command, cwd=str(cwd), snapshot_id=snapshot_id, pending_action_id=self.active_action_id,
+            parameters={'timeout_limit':limit, 'timeout_seconds':timeout})
+        logs = self.root / "logs" / run.id
+        logs.mkdir(parents=True)
+        run.transition(ExecutionStatus.RUNNING)
+        run.started_at = now()
+        write_json(logs / "check.json", run)
+        if action == 'agent_turn' and stdin is not None:
+            stdin += '\n\nCurrent turn time allocation (controller record):\n'+json.dumps({
+                'action_id':run.pending_action_id, 'check_id':run.id,
+                'check_record':str(logs/'check.json'), 'generated_at':run.started_at,
+                'timeout_seconds':timeout, 'timeout_limit':limit,
+                'estimated_deadline_utc':(datetime.fromisoformat(run.started_at)+timedelta(seconds=timeout)).isoformat(),
+                'meaning':'This CheckRun records the allocated interval and start, not the exact process spawn time. '
+                    'UTC deadline is an estimate; the runner enforces the timeout using a monotonic clock. '
+                    'research.json capacity and preflight elapsed_seconds are saved run checkpoints, '
+                    'not live turn timers; they do not refresh during your tool loop.'})
+        process = None
+        try:
+            process = subprocess.Popen(command, cwd=cwd, stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, errors="replace",
+                start_new_session=True, env=env)
+            out, err = process.communicate(stdin, timeout=timeout)
+            run.exit_code = process.returncode
+            run.transition(ExecutionStatus.COMPLETED)
+        except FileNotFoundError as exc:
+            out, err = "", str(exc)
+            run.transition(ExecutionStatus.TOOL_MISSING)
+            run.reason = "Executable not found"
+        except subprocess.TimeoutExpired:
+            os.killpg(process.pid, signal.SIGKILL)
+            out, err = process.communicate()
+            run.exit_code = process.returncode
+            run.transition(ExecutionStatus.TIMEOUT)
+            run.reason = "Action timeout exceeded; process group killed"
+        except KeyboardInterrupt:
+            if process:
+                os.killpg(process.pid, signal.SIGKILL)
+                out, err = process.communicate()
+                run.exit_code = process.returncode
+            else:
+                out, err = "", "Interrupted before start"
+            run.transition(ExecutionStatus.CANCELLED)
+            run.reason = "User cancelled action"
+        except OSError as exc:
+            out, err = "", str(exc)
+            run.transition(ExecutionStatus.ERROR)
+            run.reason = "Process could not start"
+        finally:
+            if process:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+        run.ended_at = now()
+        run.stdout, run.stderr = str(logs / "stdout.log"), str(logs / "stderr.log")
+        secrets=[(os.environ if env is None else env).get(k) for k in sensitive_env]
+        for value in secrets:
+            if value:out=out.replace(value,'[REDACTED]');err=err.replace(value,'[REDACTED]')
+        Path(run.stdout).write_text(redact(out))
+        Path(run.stderr).write_text(redact(err))
+        write_json(logs / "check.json", run)
+        return run
+
+
+def output(run: CheckRun) -> str:
+    return "\n".join(Path(p).read_text() for p in (run.stdout, run.stderr) if p and Path(p).is_file())

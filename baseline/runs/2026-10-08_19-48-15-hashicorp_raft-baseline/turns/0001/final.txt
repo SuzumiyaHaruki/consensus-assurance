@@ -1,0 +1,21 @@
+## Audit result (turn 1)
+
+**No concrete correctness defect found in this pass.** The captured implementation is the unmodified upstream `github.com/hashicorp/raft` release, and all in-process correctness tests pass.
+
+### What I established (executed)
+
+- **The tree was not modified.** `diff -rq` between the captured `source/` and the pristine module `.../raft@v1.7.3` in the module cache shows **no differences in any tracked file** — only `fuzzy/` and `raft-compat/` exist as separate modules (excluded from the module zip). Metadata ties the cache copy to the exact requested identity: `v1.7.3.info` → `Hash c0dc6a0b…`, `Ref refs/tags/v1.7.3` (same as the run brief's `source_identity`), and `v1.7.3.ziphash = h1:DxpEqZ…` matches the cached `sum.golang.org` lookup line. In other words, there is no injected delta in the tracked Go files to find.
+- **Tests.** `go test -count=1 .` → **173 pass**; the only 17 failures are `TestNetworkTransport_*` / `TestTCPTransport_*` with `listen tcp … socket: operation not permitted` (my shell sandbox forbids AF_INET). No logic assertion failed. `gofmt -l` empty, `go vet .` clean.
+- **Race run** over the core election/replication/snapshot/membership scenarios → **no `DATA RACE`**. One assertion flaked (`TestRaft_SnapshotRestore_PeerChange`, `bad last: 102`); I characterized it: 2 failures in 40 `-race` runs vs. 0 in 60 non-race runs. It's a test-timing artifact (the test's `EnsureSame` wait doesn't guarantee the leader's post-election no-op is applied), not an implementation defect.
+- **Source review** of the consensus-critical paths (election/quorum counting, `commitment.recalculate` quorum rule, `appendEntries` log matching + truncation, `replicateTo` next-index `max(min(nextIndex-1, LastLog+1),1)`, leader lease, snapshot/user-restore, config-change semantics, index accessors) found no deviation from the specified algorithm.
+
+### Limitations to carry forward
+
+- The TCP transport tests were **not executed** here. The ordinary shell blocks AF_INET, and although the run brief exposes the `isolated_exec` MCP tool (private local TCP), I could not dispatch it this turn — every attempted call routed to the ordinary shell — and `bwrap --unshare-net` is itself blocked. `net_transport.go`/`tcp_transport.go` were reviewed by reading only.
+- `fuzzy/` and `raft-compat/` aren't buildable offline (missing `raft-boltdb`/`bolt` zips), so their fuzz/linearizability and compat suites didn't run.
+
+### Artifacts
+
+Report: [report.md](/home/nitro/Desktop/consensus-assurance/baseline/runs/2026-10-08_19-48-15-hashicorp_raft-baseline/work/report.md). Raw evidence: `logs/provenance.txt`, `logs/test_full.log`, `logs/test_verbose.log`, `logs/test_race.log`.
+
+Useful next step if continued: run the full suite (including TCP tests) plus the `fuzzy` linearizability tests through `isolated_exec` once dependencies are available, to close the two open coverage gaps.
