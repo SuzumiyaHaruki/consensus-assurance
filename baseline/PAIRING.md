@@ -1,6 +1,6 @@
 # 配对准备与离线裁决
 
-本轮从 `2dd96315430eea5156ec6c7907ec4cfa2e601b83` 开始，主系统方法仍为 `audit-products-v58`。这里记录宿主侧条件，不进入普通组提示。两组可以采用不同的调查路线，不预设完整组获胜。当前全范围 HashiCorp 配对仍有 TCP 能力阻塞，不能以全目标发现数计算方法增益。
+本轮从 `b8917c6b60483aa554ebff557a6fffed7369fcdc` 开始，主系统方法仍为 `audit-products-v58`。这里记录宿主侧条件，不进入普通组提示。两组可以采用不同的调查路线，不预设完整组获胜。本地链路已通过，baseline 不再缺少隔离内 TCP 测试能力；线上工具调用待单独授权的合成冒烟，不使用历史 shell 调用记录替代。
 
 ## 新配对草案
 
@@ -11,31 +11,46 @@
 | 目标 | 已核对 | HashiCorp Raft；`c0dc6a0b2c7e889f31e5ab2f7ed90ceb159acffe`；相同干净仓库、模块、`.` 范围；实际可见文件核对见 [source-parity.json](acceptance/2026-10-08/source-parity.json) |
 | 模型连接 | 已核对 | `deepseek-flash`、`high`、`https://api.deepseek.com`、Responses、`DEEPSEEK_API_KEY`；认证值不保存；只核对客户端配置，不推断服务端模型修订 |
 | 模型目录 | 已核对 | 两组读取同一 `configs/providers/deepseek-flash.models.json` 原字节；行为模板、上下文和压缩设置一起保留；原生并发工具能力由该目录声明 |
-| CLI 与实现 | 已核对 | 同一本机 Codex 可执行文件；路径、版本、一次性摘要、框架提交和实际导入位置见 [implementation.json](acceptance/2026-10-08/implementation.json)；正式运行须在冻结实现后重新记录各侧身份 |
-| 基础功能 | 已核对 | 共同单 Agent；关闭 shell snapshot、自动 skills/plugins/MCP/memory/hooks；保留普通 shell、原生压缩和目录声明的并发工具能力；两条 Agent 路径的完整 `features list` 实际相等，见 [能力记录](acceptance/2026-10-08/summary.json) |
+| CLI 与实现 | 已核对 | 同一本机 Codex 可执行文件；路径、版本、一次性摘要、框架提交和实际导入位置见 [implementation.json](acceptance/2026-10-08-tcp/implementation.json)；正式运行须在冻结实现后重新记录各侧身份 |
+| 基础功能 | 已核对 | 共同单 Agent；关闭 shell snapshot、自动 skills/plugins/MCP/memory/hooks；baseline 另显式注册唯一中性 MCP，完整组仍无此 MCP；保留普通 shell、原生压缩和目录声明的并发工具能力；两条 Agent 路径的完整 `features list` 实际相等，见 [能力记录](acceptance/2026-10-08-tcp/summary.json) |
 | 重试与等待 | 已核对 | 自定义 provider 两组显式请求重试 4、流重试 5、流空闲 300000 ms，关闭无限连接重试；主系统既有研究动作回流保留在总预算中；原生 provider 的保留设置不覆盖 |
 | 工具链 | 已核对 | 沙箱内 Go 1.25.8、Linux x86_64；Rust/Cargo 1.88.0 合成程序也已验证；正式 Go 配对使用相同 `/usr/local/go/bin` 和同一 CLI 路径，不能拿旧 Go 1.23.5 的结果配对 |
-| 普通程序／管道／线程 | 已核对 | 三条路径均能执行合成 Go/Rust 测试，先失败再修复；真实管道与线程有成功控制；见能力记录中的原始输出 |
-| 隔离内 TCP | 具体差异 | baseline 工具与完整组 Agent 工具拒绝 socket（EPERM）；完整组固定执行器可完成 listen/connect/send/recv。`allow_local_binding=true` 与嵌套 bwrap 不能消除父级 socket 限制；未设置 `network.enabled=true` |
-| 外部／宿主隔离 | 已核对 | 受控宿主 TCP 服务先由宿主客户端成功收发；隔离测试访问失败。两个工具入口被 socket 过滤器拒绝；固定执行器处在不同 network namespace，仅有 loopback 路由，无 IPv4 外部路由；未探测第三方服务 |
+| 普通程序／管道／线程 | 已核对 | 四条路径均能执行合成 Go/Rust 测试，先失败再修复；真实管道与线程有成功控制；见能力记录中的原始输出 |
+| 隔离内 TCP | 已核对 | 两个普通 shell 继续拒绝 socket；baseline MCP 和完整组固定执行器均完成同一次调用内多进程 listen/connect/send/recv，网络 namespace 与宿主不同 |
+| 外部／宿主隔离 | 已核对 | 受控宿主 TCP 服务有成功控制，四路径均拒绝连接；支持 TCP 的路径无外部路由。新工具另有宿主路径型 Unix socket 成功／拒绝控制、文件允许列表、私有 procfs 及凭据／文件描述符检查，原始依据见能力记录 |
 | 文件与凭据 | 已核对 | 普通组不可读方法、历史 run、实现身份或凭据；源码／日志／共享依赖只读，工作区可写。完整组保留其方法与校验器读取权限，属于有意差异；固定执行器隐藏原始材料，仅暴露工作副本与工具依赖 |
 | 工具环境传递 | 具体差异 | baseline 使用 `inherit=none` 与显式工具 PATH；完整组 Agent 沿用 `inherit=core` 加凭据排除，固定执行器使用 `clean_environment()`。实际工具版本相同、凭据拒绝控制通过，但不宣称环境变量集合完全相同；原始环境记录随能力探针保存 |
-| 终止 | 已核对 | 三条路径实测单轮超时、总期限与 SIGINT 取消；子进程停止写入心跳。正式执行器新增 PID namespace，修复原先进程组终止后仍有子进程持有管道的问题 |
+| 终止 | 已核对 | 四路径超时／总期限／取消检查；新工具另验证单工具上限、MCP 取消、STDIO 断开、服务强杀及正常父进程退出，脱离原 session 的子进程停止心跳，原始输出保留 |
 | Go 依赖与构建起点 | 已核对 | 同一只读 `~/go/pkg/mod`，不扫描、哈希或复制全缓存；各 run 独立干净构建目录，构建时间计入预算；依赖预备和独立环境验收成本另列 |
 | run 内构建复用 | 具体差异 | 普通组工作区与完整组 Agent 草稿可各自复用本 run 的构建缓存；完整组固定检查按隔离 workspace 建立 Go 缓存。共同冷起点不代表后续构建次数或复用完全相同，该成本须随实际执行记录报告 |
 | Rust 编译复用 | 具体差异 | 普通组只有只读源码依赖缓存；完整组另有编译种子机制。此次验证普通 Cargo 能力，不宣称两组 Rust 热构建成本相同 |
-| 预算 | 已核对 | 新草案两组均 2400 秒、单 Agent 回合 900 秒、高层回合上限 120；完整组额外配额在 YAML 中列明，不给普通组虚构相同对象；须报告实际哪个容量成为瓶颈 |
+| 预算 | 已核对 | 新草案两组均 2400 秒、单 Agent 回合 900 秒、高层回合上限 120、普通执行／正式执行上限 600 秒；完整组额外配额在 YAML 中列明，不给普通组虚构相同对象；须报告实际哪个容量成为瓶颈 |
 | 预算起算 | 已核对 | baseline 从创建 run 前起算并保存各准备阶段时点；主系统 `Engine.start()` 从源码捕获前起算，捕获耗时进入 `BudgetTracker`，环境探针、地图、构造和复核继续计时。两侧都不免费扣除准备或截止后追加总结 |
 | 宿主资源与运行顺序 | 未知 | 正式执行前填写 CPU／内存及其他负载、重复次数、随机或交错顺序；不得并行抢占后再视为同条件；不补跑替换中断或零结果 |
 | 线上变更与完整组回执 | 未知 | 本轮未调用模型；历史 DeepSeek 证明普通文本与工具能力，不证明本次完整组结构化回执成功，也不证明服务端别名对应固定模型修订 |
 
 完整组读取双主线、Behavior/Fact、Candidate/Obligation、固定检查、复核和知识回流说明；普通组保留原 `task.md`、自由笔记与普通报告。输出 schema、正式命名、验证及回流工具是有意差异，不要求普通组生成 `CA_EVENT` 或 finding JSON。
 
-## TCP 阻塞及最小后续方案
+## 隔离工具与四条实际路径
 
-当前 CLI 的网络权限文档把 `network.enabled` 与代理的本地地址许可区分开；本机实测关闭网络时 `allow_local_binding` 仍拒绝 socket。[官方权限说明](https://learn.chatgpt.com/docs/permissions) 与 [配置参考](https://learn.chatgpt.com/docs/config-file/config-reference) 仅用于解释设置，验收以原始探针为准。直接在受限工具中嵌套 bwrap 也不能撤销已继承的 syscall 限制。
+| 路径 | 普通程序／管道／线程 | TCP | 宿主 TCP |
+|---|---|---|---|
+| baseline 普通 shell | 成功 | 拒绝 | 拒绝 |
+| 完整组 Agent 普通 shell | 成功 | 拒绝 | 拒绝 |
+| baseline `isolated_exec` | 成功 | 隔离内多进程双向收发 | 拒绝 |
+| 完整组固定执行器 | 成功 | 隔离内多进程双向收发 | 拒绝 |
 
-要让普通组获得固定执行器的本地 TCP 能力，需要一个宿主控制、生命周期受总期限约束的薄执行入口：仅接受本 run 的工作目录及 argv，复用现有 Bubblewrap 的文件、网络与 PID 隔离，使用清洁环境，不提供凭据、宿主网络或任意宿主执行。它不应要求 Candidate、检查计划或额外模型回合。现有原生 CLI 没有这样的接入点；新增 IPC 与执行服务超出本轮小型参数对齐，因此本轮留下这一具体方案，没有悄悄扩大权限。全目标配对保持受阻；若后续预先限定共同的非 TCP 子范围，必须明确声明范围，不能沿用全目标方法增益口径。
+baseline 在真实 `exec` 与精确 `exec resume` 使用的显式参数中配置 `mcp_servers.baseline_local`，唯一白名单工具为 `isolated_exec`，`required=true`。本机 app-server 实际发现的工具 schema、服务来源和原始结果随验收保存；真实 exec/resume 的必需服务失败测试在推理之前停止。后者使用本地创建并注入合成说明的空会话，不是模型生成历史。线上模型是否正确选择和调用工具仍待付费冒烟。
+
+服务由 `/usr/bin/env -i` 清空环境，再以可信 Python 的 `-I -S` 加显式安装目录启动；不加载工作副本、PYTHONPATH、site hooks 或宿主个人配置。STDIO 仅传协议。MCP 使用固定 `mcp==1.26.0`，安装方法见 README；不手写 JSON-RPC，也不在运行时安装依赖。[官方 MCP 配置说明](https://learn.chatgpt.com/docs/extend/mcp?surface=cli) 提供字段依据，实际可用性以保存的本机探针为准。
+
+工具接受普通 argv，不生成 harness、协议前史或语义判断。例如模型可调用 `isolated_exec({"argv":["go","test","./sample"],"cwd":".","timeout_seconds":60})`。返回形如 `{"execution_id":"<实际ID>","status":"completed","exit_code":1,"timeout_seconds":60,"timeout_limit":"requested","stdout":{"preview":"<实际输出>","truncated":false,"path":"<run>/executions/<ID>/stdout.txt"}}`；这只是字段示例，不是验收结果。非零测试、启动错误、超时、取消和无完成回执的中断分别保留。
+
+每次调用独立创建网络、PID、IPC 和文件视图，工具根只来自可信准备，模型路径不增加宿主挂载。工作副本可写，源码和依赖只读；宿主控制目录与记录不在测试视图中。输出经管道由服务写入宿主日志，测试不能 seek 或改写原始日志；普通 shell 可只读查看完整记录。模型自行 tee 的文件仍属于可写工作材料。
+
+执行上限取请求值、600 秒配置上限、回合剩余和整轮剩余的最小值；串行排队也消耗预算。每回合更新可信期限，run 期限不重置。客户端等待上限为较大的回合／命令上限加 5 秒清理余量；测试本身仍受宿主硬期限约束。取消、断开或服务死亡不保留常驻集群，多个通信进程应放进一次调用。
+
+共同配置仍来自 `common_settings()`，完整组的方法资源、固定执行和复核保留。主系统首次本地有效检查后保存 profile 名称和展开设置；后续和恢复先核对持久记录及历史 argv。同名功能或工具策略变化会在付费调用前要求新 run，不覆盖旧依据；未启用 profile 的历史路径不强制迁移。原生 provider 无 catalog 时也可独立创建记录。
 
 ## 正式执行前填写
 
@@ -70,6 +85,6 @@
 
 ## 本轮交付与验证
 
-相对 `2dd96315`，运行实现增加 184 行、删除 46 行；现有两份 baseline 测试增加 313 行、删除 12 行。主体仍是三个文件，共同配置函数从 baseline 移到已有主系统适配器，删除原重复实现；没有新增运行器或服务。主系统中性改动单独提交为 `140a35dd`，baseline 身份与能力验收为 `986751b8`。新增两份默认无授权的配置草案，本文件承载配对及裁决口径，README 只链接这些规则。
+主系统 profile 保持修复为 `ba8d17d8`，中性文件视图函数为 `995f0455`，直接调用核对和系统编译器链接补充为 `7ca3c2ac`；baseline 工具及接入为 `3583feb4`，最终测试修正为 `fd76f7f3`。`backend.py`／`engine.py` 核对 profile，`experiment.py::isolated_command()` 组装最小视图；默认未启用 profile 的行为及原 `sandbox_command()` 固定执行职责保持。baseline 新增一个 `local_exec.py`、固定协议依赖声明，并扩展现有配置、回合留存及两份测试。相对本轮起点，运行实现增加 400 行、删除 11 行，测试增加 297 行、删除 17 行。没有任务队列、服务管理 CLI、研究状态机或主系统语义对象。
 
-最终命令 `.venv/bin/python -m pytest baseline/tests tests/unit/test_codex_agent.py tests/unit/test_execution.py -q -o cache_dir=baseline/.pytest_cache` 在设置 `BASELINE_ACCEPTANCE_DIR` 留存目录后得到 **154 passed in 103.32s**，失败和跳过均为 0；其中 TCP 拒绝被记录为能力差异，不被改写为 TCP 验收通过。随后通过两条主系统路径对真实只读依赖元数据做正向读取、宿主可打开写句柄控制、沙箱拒绝写句柄和字节未改变检查，没有写入依赖内容。最终 HashiCorp `check-env` 用已提交执行输入耗时 1.69 秒，零模型回合，入口未变化且无相关 dirty 输入。命令、结果、原始输出和配置依据见 [summary.json](acceptance/2026-10-08/summary.json)。
+最终非付费回归为 **190 passed in 231.99s**，失败和跳过均为 0，覆盖既有 baseline 与指定主系统回归及新增职责，不代表全仓测试。HashiCorp `check-env` 为 4.90 秒，0 模型回合，相关执行输入已提交且前后未变化；Go 为 1.25.8，Rust/Cargo 为 1.88.0，CLI 为 0.155.0-alpha.16。原始命令、结果、代码体积和实现身份见 [summary.json](acceptance/2026-10-08-tcp/summary.json)。此前 [154 项验收](acceptance/2026-10-08/summary.json) 保持原样，新结果不回写为旧实验能力。本轮不启动线上模型、目标审计或历史会话恢复；本地合成会话仅用于验证 CLI 配置及启动失败行为。
