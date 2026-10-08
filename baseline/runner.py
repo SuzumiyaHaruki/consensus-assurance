@@ -30,7 +30,7 @@ WORK_EXCLUDED = EXCLUDED | {".runtime"}
 def implementation_identity(root):
     """Record only loaded execution inputs, not the repository or dependency trees."""
     project = Path(__file__).resolve().parents[1]
-    paths = {"baseline/" + name: project / "baseline" / name for name in ("__main__.py", "codex.py", "runner.py", "task.md")}
+    paths = {"baseline/" + name: project / "baseline" / name for name in ("__main__.py", "codex.py", "runner.py", "local_exec.py", "requirements.txt", "task.md")}
     neutral = ("consensus_assurance.core.config", "consensus_assurance.core.types",
                "consensus_assurance.adapters.agents.backend", "consensus_assurance.adapters.runners.go_module",
                "consensus_assurance.adapters.runners.experiment", "consensus_assurance.adapters.runners.process",
@@ -61,7 +61,9 @@ def implementation_identity(root):
     return {"generated_at": now(), "framework_commit": commit, "execution_inputs_dirty": bool(dirty),
             "execution_input_changes": dirty.splitlines(), "inputs": entries, "package_version": package_version,
             "python": sys.executable, "catalog_record": "inputs/models.json", "server_model_revision": "unknown",
-            "config_record": "inputs/config.json", "task_record": "inputs/task.md"}
+            "config_record": "inputs/config.json", "task_record": "inputs/task.md",
+            "execution_service_record": "inputs/local-exec.json",
+            "protocol_dependencies": {name: importlib.metadata.version(name) for name in ('mcp','anyio','pydantic','jsonschema')}}
 
 
 def executable_identity(client):
@@ -248,7 +250,7 @@ def brief(root, source, target, deadline, timeout, calls_left):
         "working_directory": str(root / "work"), "read_only_source": str(root / "source"),
         "source_identity": source.get("commit") or source.get("kind"), "scope": target,
         "report_path": str(root / "work/report.md"), "retained_logs": str(root / "turns"),
-        "permissions": "Source/logs read only; work writable; local tools only; no external or loopback network.",
+        "permissions": "Source/logs read only; work writable; ordinary shell has no network. isolated_exec supports private local TCP; no host or external network.",
         "tool_environment": "Offline Go/Cargo; writable temporary and cache paths in work/.runtime.",
         "remaining_total_seconds": remaining, "turn_timeout_seconds": timeout, "remaining_agent_calls": calls_left,
         "generated_at": now(), "estimated_turn_deadline_utc": (datetime.now(timezone.utc) + timedelta(seconds=timeout)).isoformat(),
@@ -266,6 +268,7 @@ def smoke_prompt(second=False):
             "Read fixture.txt and the source. Remember the fixture token in this conversation and in note.txt. "
             "Write an ordinary test in the existing Go subpackage or Rust crate. Run an intentionally failing assertion, "
             "read its failure output, fix the test, and run it again. Preserve files and command outputs. "
+            "Also write a TCP roundtrip test and execute it through isolated_exec, starting all communicating processes in one invocation. "
             "Return a normal text handoff. If externally blocked, begin RUN_BLOCKED:.")
 
 
@@ -294,9 +297,12 @@ def smoke_observations(root, record):
         "successful_second_turn_command": any(turn == 2 and code == 0 for turn, code in commands),
         "file_read_and_written": note.is_file() and not note.is_symlink() and token in note.read_text(errors="replace"),
         "context_token_in_second_final": final.is_file() and token in final.read_text(errors="replace"),
+        "isolated_tool_execution": any(json.loads(p.read_text()).get('turn') in {'0001','0002'} and
+            json.loads(p.read_text()).get('status') == 'completed' and json.loads(p.read_text()).get('exit_code') == 0
+            for p in (root/'executions').glob('*/result.json')),
     }
     write_json(root / "inputs/smoke-observations.json", {"observed": observed, "complete": all(observed.values()),
-               "review": "Inspect actual tool arguments, test edits, failure reading and final text. These observations do not assess consensus defects."})
+               "review": "Inspect actual tool arguments, TCP roundtrip observations, test edits, failure reading and final text. Tool success alone does not prove TCP coverage or consensus defects."})
     return all(observed.values())
 
 
@@ -355,6 +361,12 @@ def index(root, record):
         path = turn["path"]
         lines.append(f"- 回合 {turn['number']}：{turn['status']}；[记录]({path}/result.json)、"
                      f"[原始输出]({path}/stdout.jsonl)、[最终回答]({path}/final.txt)、[变更]({path}/changes/manifest.json)")
+    executions = sorted((root/'executions').glob('*/result.json'))
+    if executions:
+        lines += ['', '隔离执行记录（不代表缺陷确认）：', '']
+        for path in executions:
+            execution = json.loads(path.read_text())
+            lines.append(f"- {execution['turn']} / {execution['execution_id']}：{execution['status']}；[原始记录]({path.relative_to(root)})")
     (root / "index.md").write_text("\n".join(lines) + "\n")
 
 

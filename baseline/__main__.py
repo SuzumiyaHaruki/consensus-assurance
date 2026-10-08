@@ -17,6 +17,7 @@ class Budget(BaseModel):
     total_seconds: float = Field(default=7200, gt=0)
     agent_calls: int = Field(default=120, gt=0)
     agent_turn_timeout: float = Field(default=900, gt=0)
+    action_timeout: float = Field(default=600, gt=0)
 
 
 class Config(BaseModel):

@@ -321,7 +321,7 @@ def test_implementation_identity_tracks_loaded_bytes_and_preserves_start(tmp_pat
     project = make_repo(tmp_path / 'implementation')
     base = project / 'baseline'
     base.mkdir()
-    for name in ('__main__.py', 'runner.py', 'codex.py', 'task.md'):
+    for name in ('__main__.py', 'runner.py', 'codex.py', 'local_exec.py', 'requirements.txt', 'task.md'):
         (base / name).write_text('initial execution input\n')
     runner.git(project, 'add', 'baseline')
     runner.git(project, '-c', 'user.name=T', '-c', 'user.email=t@example.invalid', 'commit', '-qm', 'Implementation')

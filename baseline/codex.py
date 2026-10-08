@@ -1,5 +1,6 @@
 """Native text turns, isolated configuration, and verified local permissions."""
 import json
+import asyncio
 import os
 import re
 import shutil
@@ -14,7 +15,8 @@ from consensus_assurance.adapters.agents.backend import (
     classify_failure, codex_diagnostic, common_settings, DISABLED_FEATURES, toml, codex_options as options,
 )
 from consensus_assurance.adapters.runners.go_module import GoModuleBackend
-from consensus_assurance.adapters.storage.files import write_json
+from consensus_assurance.adapters.storage.files import write_json, digest
+from . import local_exec
 
 
 def process(command, cwd, folder, timeout, *, env, stdin="", secrets=()):
@@ -144,6 +146,8 @@ class Codex:
         self.settings = {}
 
     def close(self):
+        if hasattr(self, 'execution_control'):
+            local_exec.reconcile(self.root/'executions', self.execution_control['turn'], 'Client lifecycle ended without a completion record')
         self.private.cleanup()
 
     def limit(self, maximum=30):
@@ -229,9 +233,22 @@ class Codex:
                     (self.work / ".runtime/cargo" / name).symlink_to(dependency, target_is_directory=True)
                     self.read_roots.append(str(dependency))
         self.tool_environment["PATH"] = str(tool_root / "bin") + ":" + str(self.helpers) + ":/usr/bin:/bin"
+        self.execution_control = {'work': str(self.work), 'records': str(self.root/'executions'),
+            'tool_roots': [str(tool_root)], 'read_only_roots': [str(self.root/'source'),
+                *[p for p in self.read_roots if p not in {str(tool_root), str(Path(self.executable).parent), str(self.client_home/'tmp/arg0'), str(self.helpers)}]],
+            'environment': {**self.tool_environment, 'PATH': str(tool_root/'bin')+':/usr/bin:/bin'},
+            'action_timeout': self.config.budget.action_timeout, 'run_deadline': self.deadline,
+            'turn_deadline': min(self.deadline, time.monotonic()+30), 'turn': 'environment-check',
+            'allow_experiments': True}
+        # check-env authorizes only the fixed local probe. Real calls require both original switches.
+        self.control_path = self.home/'local-exec.json'
+        write_json(self.control_path, self.execution_control)
+        (self.root/'executions').mkdir(exist_ok=True)
+        self.mcp_settings = local_exec.server_settings(self.control_path, max(self.config.budget.action_timeout, self.config.budget.agent_turn_timeout))
         filesystem = {":root": "deny", ":minimal": "read",
                       str(self.root / "source"): "read", str(self.work): "write",
                       str(self.root / "turns"): "read", str(self.root / "inputs/task.md"): "read",
+                      str(self.root / "executions"): "read",
                       **{path: "read" for path in self.read_roots}}
         self.settings = {"default_permissions": "codex_plain", "permissions.codex_plain.filesystem": filesystem,
                          "permissions.codex_plain.network.enabled": False, "approval_policy": "never",
@@ -242,6 +259,7 @@ class Codex:
                          **common_settings(self.config.codex_provider),
                          "projects": {str(self.work): {"trust_level": "untrusted"}},
                          "model": self.config.agent_model}
+        self.settings['mcp_servers'] = {'baseline_local': self.mcp_settings}
         if self.config.agent_reasoning_effort is not None:
             self.settings["model_reasoning_effort"] = self.config.agent_reasoning_effort
         provider = self.config.codex_provider
@@ -279,7 +297,21 @@ class Codex:
             (self.root / "inputs/models.json").write_bytes(raw)
             self.settings["model_catalog_json"] = str(self.root / "inputs/models.json")
         self.permission_probe()
+        mcp_probe = asyncio.run(local_exec.probe(self.mcp_settings))
+        write_json(self.root/'inputs/local-exec-probe.json', mcp_probe)
+        observed = mcp_probe['call'].get('structuredContent', {})
+        if observed.get('status') != 'completed' or observed.get('exit_code') != 0 or 'ISOLATED_TCP_VERIFIED' not in observed.get('stdout', {}).get('preview', ''):
+            raise ValueError('Isolated execution MCP probe failed; no model request sent')
+        write_json(self.root/'inputs/local-exec.json', local_exec.identity(self.mcp_settings, self.execution_control))
+        self.execution_control['allow_experiments'] = self.config.allow_agent_materials and self.config.allow_experiments
+        write_json(self.control_path, self.execution_control)
         self.prompt_probe()
+        inventory = asyncio.run(local_exec.discover([*self.prefix(offline=True), 'app-server', '--strict-config',
+            *options(self.settings)], self.work, self.environment, self.root/'inputs/mcp-discovery', self.limit(30)))
+        if [server['name'] for server in inventory['data']] != ['baseline_local']:
+            raise ValueError('Unexpected Codex MCP server inventory')
+        if inventory['data'][0]['tools'] != {'isolated_exec': local_exec.tool().model_dump(mode='json', exclude_none=True)}:
+            raise ValueError('Codex cannot discover the isolated execution tool')
         versions = {}
         commands = {"platform": ["uname", "-sm"], "go": ["go", "version"],
                     "go_environment": ["go", "env", "GOOS", "GOARCH", "GOVERSION", "GOROOT", "GOMODCACHE", "GOCACHE", "GOFLAGS", "GOWORK"]} if tool == "go" else {
@@ -292,7 +324,7 @@ class Codex:
             versions[name] = text.strip()
         write_json(self.root / "inputs/cli-settings.json", self.settings)
         return {"cli": self.version, "tool_root": str(tool_root), "tool_environment": self.tool_environment, "versions": versions,
-                "network": "tools: disabled, including loopback; model client: selected provider",
+                "network": "ordinary shell: disabled; isolated_exec: private loopback; model client: selected provider",
                 "subagents": False, "cache_policy": "private cold builds; optional read-only shared dependencies",
                 "native_retries": {"request_max_retries": 4, "stream_max_retries": 5} if provider else
                     {"policy": "bundled provider defaults, tied to recorded CLI version; reserved provider cannot be overridden"},
@@ -370,9 +402,25 @@ print('PERMISSIONS_VERIFIED')
         # An agent-written project configuration must never become a new client configuration.
         if any((self.work / name).exists() for name in (".codex", ".agents")):
             raise ValueError("Unauthorized project configuration appeared in the working copy")
+        if not (self.config.allow_agent_materials and self.config.allow_experiments):
+            raise ValueError('Model transmission and local execution must both be authorized')
+        saved = json.loads((self.root/'inputs/local-exec.json').read_text())
+        if (saved != local_exec.identity(self.mcp_settings, self.execution_control)
+                or self.settings.get('mcp_servers') != {'baseline_local': self.mcp_settings}
+                or self.execution_control['run_deadline'] != self.deadline):
+            raise ValueError('Isolated execution policy changed; start a new run')
+        implementation = json.loads((self.root/'inputs/implementation.json').read_text())
+        for label in ('baseline/local_exec.py', 'consensus_assurance.adapters.runners.experiment'):
+            entry = implementation['inputs'][label]
+            if digest(Path(entry['path']).read_bytes()) != entry['sha256']:
+                raise ValueError('Isolated execution implementation changed; start a new run')
+        self.execution_control.update(turn=folder.name, turn_deadline=min(self.deadline, time.monotonic()+timeout),
+                                      allow_experiments=True)
+        write_json(self.control_path, self.execution_control)
         command = [*self.prefix(), "exec", *(["resume"] if session_id else []), "--strict-config",
                    "--skip-git-repo-check", "--ignore-user-config", "--json",
                    "--output-last-message", str(folder / "final.txt"), *options(self.settings)]
         command += [session_id, "-"] if session_id else ["-"]
         result = process(command, self.work, folder, timeout, env=self.environment, stdin=prompt, secrets=self.secrets)
+        local_exec.reconcile(self.root/'executions', folder.name, 'Codex turn ended: '+result['status'])
         return decode(folder, result, session_id)
