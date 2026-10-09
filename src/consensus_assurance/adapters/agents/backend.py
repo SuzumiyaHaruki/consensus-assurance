@@ -139,9 +139,7 @@ class CodexAgent:
         self.load_profile(root)
         if not self.provider or not self.provider.model_catalog_path:return
         record=json.loads((root/'agent-inputs/catalog.json').read_text())
-        source=Path(self.provider.model_catalog_path).expanduser().resolve()
-        if (record['source']!=str(source) or digest((root/'agent-inputs/models.json').read_bytes())!=record['digest']
-                or source.is_file() and digest(source.read_bytes())!=record['digest']):
+        if digest((root/'agent-inputs/models.json').read_bytes())!=record['digest']:
             raise ValueError('Codex model catalog changed; start a new run')
 
     def load_profile(self, root):

@@ -289,7 +289,9 @@ def test_provider_configuration_and_catalog_inputs_precede_cached_results(tmp_pa
     from consensus_assurance.adapters.storage.files import write_json
     write_json(e.root/'logs/fixture/check.json',CheckRun(action='agent_turn',cwd=str(e.root/'draft'),snapshot_id='fixture',
         command=['codex','exec','--ignore-user-config',*e.agent.connection_options(e.root)]))
-    result=e.action('agent_turn','agent_calls',lambda:{'retained':True},{'turn':1})
+    check=CheckRun(action='agent_turn',cwd=str(e.root/'draft'),snapshot_id='fixture',
+        status=ExecutionStatus.CANCELLED,reason='Fixture cancellation')
+    result=e.action('agent_turn','agent_calls',lambda:[check.model_dump(mode='json'),None,None],{'turn':1})
     saved={p:p.read_bytes() for p in e.root.rglob('*') if p.is_file()}
     def reused():return e.action('agent_turn','agent_calls',lambda:pytest.fail('Cached action executed'),{'turn':1})
     assert reused()==result
@@ -299,13 +301,19 @@ def test_provider_configuration_and_catalog_inputs_precede_cached_results(tmp_pa
         with pytest.raises(ValueError,match='connection changed'):reused()
         setattr(e.config,name,original)
     original=catalog.read_bytes();catalog.write_bytes(original+b'\n')
-    with pytest.raises(ValueError,match='catalog changed'):reused()
-    with pytest.raises(ValueError,match='catalog changed'):e.resume()
+    assert reused()==result and all(p.read_bytes()==v for p,v in saved.items())
     from consensus_assurance.workflow.audit import execute
-    with pytest.raises(ValueError,match='catalog changed'):execute(e)
-    catalog.write_bytes(original)
+    with monkeypatch.context() as context:
+        context.setattr(e,'probe_tools',lambda:None)
+        assert e.resume().stop_reason == 'Agent stopped: Fixture cancellation'
+        assert execute(e).stop_reason == 'Agent stopped: Fixture cancellation'
+    assert frozen.read_bytes()==original
+    assert 'model_catalog_json='+json.dumps(str(frozen)) in e.agent.connection_options(e.root)
+    saved={p:p.read_bytes() for p in e.root.rglob('*') if p.is_file()}
     frozen.chmod(0o644);frozen.write_bytes(original+b'\n')
     with pytest.raises(ValueError,match='catalog changed'):reused()
+    with pytest.raises(ValueError,match='catalog changed'):e.resume()
+    with pytest.raises(ValueError,match='catalog changed'):execute(e)
     frozen.write_bytes(original);frozen.chmod(0o444)
     e.agent.version='fixture-cli-v2'
     with pytest.raises(ValueError,match='CLI version changed'):reused()
