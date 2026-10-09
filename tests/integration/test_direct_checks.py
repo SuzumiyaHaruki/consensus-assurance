@@ -107,6 +107,12 @@ def test_unattributed_failures_and_exact_completed_witness(tmp_path,prepared):
         elif fault=='contradiction':observations.append(deepcopy(observations[1]));observations[-1]['state']['in_range']=True
         computed=direct_checks.compute_assessment(state,u,a,plan,check,observations)
         assert not computed['confirmed'] and not computed['reviewed_complete'],fault
+        if fault=='identity':
+            from consensus_assurance.workflow.research import current_view
+            state.monitor_results=[computed]
+            summary=current_view(state,e.root,e.implementation)['assessments'][0]
+            assert not summary['comparison_observed'] and 'operation' in summary['comparison_diagnostics'][0]['reason']
+            assert summary['record']['match']['experiment_check_id']==check.id
     # An independent admitted scenario or checker keeps its debt, without erasing the completed counterexample.
     more=deepcopy(events);more.append({**deepcopy(events[0]),'operation':'second'})
     partial=direct_checks.compute_assessment(e.state,u,a,p,c,more)

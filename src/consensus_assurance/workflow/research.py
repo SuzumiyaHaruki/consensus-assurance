@@ -333,6 +333,8 @@ def current_view(state, root, implementation=None):
     result['assessments'] = [{**{k:r[k] for k in ('claim_id','direct_check_id','experiment_check_id',
         'confirmed','outcome','blockers','bounded_complete','reviewed_complete','correspondence','review_ids','open_issue_ids') if k in r},
         'comparison_observed':comparison_observed(r),
+        'comparison_diagnostics':[{'checker_id':p['checker_id'],'reason':preview(d['reason'])}
+            for p in r.get('properties',[]) for d in p.get('diagnostics',[])[:1]],
         'record':record('monitor_results', {'experiment_check_id':r['experiment_check_id'], 'claim_id':r['claim_id']})}
         for r in result['assessments']]
     for conclusion in result['conclusions']:
@@ -375,7 +377,12 @@ def current_view(state, root, implementation=None):
         directed_question=state.config.get('directed_question'),tools=state.tools,
         implementation={'name':implementation.name,'harness_kind':implementation.harness_kind,
             'default_execution_package':getattr(implementation,'package',None),
-            'harness_filename':implementation.harness_filename,'instructions':implementation.harness_instructions,
+            'harness_filename':implementation.harness_filename,
+            'execution_isolation':state.config.get('execution_isolation'),
+            'instructions':implementation.harness_instructions + '\nOrdinary Codex shell networking is disabled. ' + {
+                'bwrap':'Formal execution uses a private network namespace: TCP between processes in the same invocation is available; host and external networking are unavailable.',
+                'workspace':'Formal execution uses workspace mode without network namespace isolation; this mode supplies no private-network boundary.',
+            }.get(state.config.get('execution_isolation'),'Formal execution isolation is not recorded; consult the run configuration.'),
             'support_path':str(root/'target-support')} if implementation else None,
         validation=validation_tool(root),
         rejected_drafts=[str(p) for p in sorted((root/'submissions').glob('*/diagnostics.json'))],

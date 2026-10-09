@@ -9,7 +9,7 @@ POLICY={
  'binding': {'decomposition':'Check the source anchor and behavior range, the semantic association to responsibilities, and the selected unit use. Location alone does not establish an obligation.'},
  'relation': {'decomposition':'Check the direction, kind, conditions and actual endpoint responsibilities; explain the implementing handoff and alternatives.'},
  'unit': {'decomposition':'Check that the audit question, selected obligations, direct/support code uses and boundary assumptions form a coherent executable scope.'},
- 'direct_check': {'checker_correspondence':'Explain which part of the current question the obligation and actual observations answer, under which premises. Distinguish the original cause hypothesis and wider consequences from the checked proposition. Review fixed inputs, source bindings, oracle, correlated observations, legality and contrary evidence together; no separate object approvals are required. Matching IDs alone are not correspondence.'}}
+ 'direct_check': {'checker_correspondence':'Under the evidence-review experiments criteria, what establishes the premises of this written obligation and the validity of its measured result? Which unresolved conditions cannot affect that judgment? Cite fixed inputs, sources and observations; preserve necessary gaps through existing issue/revision paths. Separate the checked proposition from its cause hypothesis and wider consequences.'}}
 
 OPTIONAL={'binding':{'applicability':'Evaluate whether the code mapping applies to the current implementation configuration.'},'unit':{'applicability':'Evaluate whether the unit scope is applicable under the supplied execution conditions.'}}
 OPTIONAL['direct_check'] = dict(POLICY['obligation'])

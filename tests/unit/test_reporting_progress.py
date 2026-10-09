@@ -86,7 +86,11 @@ def test_current_projection_rebuilds_at_deadline_without_old_budget_or_paths(tmp
         assert current['source_path']==str(e.root/'agent-source')
         assert current['draft_path']==str(e.root/'draft') and current['method_path']
         assert current['validation']['command'] and current['implementation']['harness_kind']=='python'
+        assert 'without network namespace isolation' in current['implementation']['instructions']
         assert current['conclusions']==full['conclusions'] and current['stop']==full['stop']
+    e.state.config['execution_isolation']='bwrap'
+    instructions=current_view(e.state,e.root,e.implementation)['implementation']['instructions']
+    assert 'Ordinary Codex shell networking is disabled' in instructions and 'TCP between processes in the same invocation' in instructions
     assert '剩余 0.00 秒' in report
 
 

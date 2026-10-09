@@ -506,10 +506,16 @@ def test_same_version_reading_and_independent_issues(tmp_path):
         assert any(d.get('unknown_material_ids')==['not-a-material'] for d in details)
         assert any(d.get('unknown_evidence_ids')==['not-an-execution'] for d in details)
         assert e.state.model_dump(mode='json')==before
-        return dict(action='review',artifact_id=artifact,review_items=[item,{**item,'aspect':'applicability'}],rationale='Answer the named reading issue',
+        submission=dict(action='review',artifact_id=artifact,review_items=[item,{**item,'aspect':'applicability'}],rationale='Answer the named reading issue',
             resolutions=[answer,{**answer,'issue_id':condition['id'],'condition_dispositions':[dict(
                 condition_id=condition['conditions'][0]['id'],applies_to='old_judgment',source_ids=['doc'],
-                rationale='The documented legal bound applies to the actual admitted input; no input change is needed.')]}]),{}
+                rationale='The documented legal bound applies to the actual admitted input; no input change is needed.')]}])
+        bad=ReviewSubmission.model_validate(submission)
+        bad.resolutions[-1].condition_dispositions[0].applies_to='current_judgment'
+        with pytest.raises(ValueError,match='Current unresolved conditions cannot discharge'):
+            accept_review(e.state,bad,'unresolved-current-condition')
+        assert e.state.model_dump(mode='json')==before
+        return submission,{}
     e,repo=engine_for(tmp_path,[first,original,issues,resolve,stop])
     state=e.start(repo)
     assert len(state.direct_checks)==1
