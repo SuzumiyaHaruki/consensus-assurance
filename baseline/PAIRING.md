@@ -52,4 +52,4 @@ baseline 输出到 `baseline/runs/`，完整组输出到根目录 `runs/`。两�
 
 历史 [40 分钟 baseline](https://github.com/SuzumiyaHaruki/consensus-assurance/blob/29dd0aab5e38a5381ac69fbe61db3ffaa8230548/baseline/runs/2026-10-09_08-06-10-hashicorp_raft-baseline/index.md) 与早期 120 分钟完整组的预算、Go 版本和网络条件不同，不能据此推断方法优劣。
 
-当前追踪 2026-10-09 的 [baseline](runs/2026-10-09_14-01-25-hashicorp_raft-baseline/index.md) 和[完整组](../runs/2026-10-09_14-01-36-hashicorp_raft-real-run/report.md)。两者均使用 DeepSeek high、一小时预算，实际运行约一小时；baseline 记录 `total_deadline`，完整组记录最后一次 Agent 调用超时、`run_stop.reason=resource_limit` 且剩余时间为 0。两次开始时间仅相差 11 秒，存在并行资源竞争，不能仅凭相同时长视作等资源表现比较。原始停止状态、失败与未决事项保持原样。
+当前追踪 2026-10-09 的 [baseline](runs/2026-10-09_16-23-12-hashicorp_raft-baseline/index.md) 和[完整组](../runs/2026-10-09_14-01-36-hashicorp_raft-real-run/report.md)。baseline 使用 Astra low、40 分钟预算，约 13 分 7 秒时因服务端网安风险拒绝中断；完整组使用 DeepSeek high、一小时预算，记录最后一次 Agent 调用超时、`run_stop.reason=resource_limit` 且剩余时间为 0。它们不构成同模型配对。此前的一小时 [DeepSeek baseline](https://github.com/SuzumiyaHaruki/consensus-assurance/blob/25f48e19/baseline/runs/2026-10-09_14-01-25-hashicorp_raft-baseline/index.md) 保留在 Git 历史中；原始停止状态、失败与未决事项保持原样。

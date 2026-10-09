@@ -275,9 +275,18 @@ def test_native_openai_connection_and_key_boundary(tmp_path, monkeypatch):
     runner.capture_source(config.repo_path, root / "source", time.monotonic() + 30)
     shutil.copytree(root / "source", root / "work")
     (root / "inputs/task.md").write_bytes(runner.TASK.read_bytes())
+    connection = {'HTTPS_PROXY':'http://proxy.example.invalid:7890', 'https_proxy':'http://proxy.example.invalid:7890',
+                  'NO_PROXY':'localhost,127.0.0.1', 'SSL_CERT_DIR':'/etc/ssl/certs'}
+    for key,value in {**connection,'UNRELATED_SECRET':'not-for-client'}.items():monkeypatch.setenv(key,value)
     client = codex.Codex(config, root, load_target(config), time.monotonic() + 60)
     try:
         client.prepare()
+        assert all(client.environment[key]==value for key,value in connection.items())
+        assert 'UNRELATED_SECRET' not in client.environment
+        assert not connection.keys() & client.execution_control['environment'].keys()
+        result,text=sandbox(client,['/usr/bin/python3','-c',
+            'import os; assert not '+repr(set(connection))+' & os.environ.keys()'], 'connection-env-boundary')
+        assert result['status']=='completed' and result['exit_code']==0,text
         assert "model_provider" not in client.settings
         assert client.settings["forced_login_method"] == "api"
         monkeypatch.delenv(config.api_key_env, raising=False)
