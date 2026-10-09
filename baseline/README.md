@@ -1,103 +1,72 @@
 # 普通 Codex 审计基线
 
-`codex_plain` 使用原生 Codex 自主阅读、编辑、测试、记录和复查。外层负责固定输入、核对权限、预算、同一 session 续接和文件留存，不提供完整组的研究产品、结果 schema、发现配额或语义受理。普通任务及中性续接保留在 [task.md](task.md)，本轮没有修改。README、配对表、框架源码和历史答案不提供给普通组模型。
-
-本轮从 `b8917c6b` 增量修改，在原有三个主体文件外增加 `local_exec.py`，提供一个本地 STDIO MCP 工具。复用主系统的共同 Codex 设置、Go 离线环境和中性沙箱原语；主系统仅完善 profile 保持检查并提供最小文件视图组装函数，原固定执行流程及 `audit-products-v58` 方法保持不变。
+`codex_plain` 使用原生 Codex 自主阅读、编辑、测试、记录和修订，外层只负责源码捕获、权限、预算、精确 session 续接和留存。[task.md](task.md) 是普通任务与中性续接说明；不注入完整组的方法、历史答案、开发任务书或评价规则。完整组的研究产品、固定检查、复核和知识回流仍由主系统负责。
 
 ## 使用
 
-需要支持 `pidfd` 的 Linux、Bubblewrap、支持命名权限及本地提示检查的 Codex CLI，以及目标工具链。实施阶段先在已有环境安装固定的 MCP 协议依赖，审计期间不在线安装：
+需要支持 `pidfd` 的 Linux、Bubblewrap、支持命名权限的 Codex CLI 和目标工具链。依赖在审计前安装，运行中不联网补齐：
 
 ```bash
 .venv/bin/python -m pip install -r baseline/requirements.txt
-```
-
-在仓库根目录运行：
-
-```bash
+export PATH="$HOME/.local/bin:$PATH"
 .venv/bin/python -m baseline check-env --config /absolute/path/to/local-config.yaml
-.venv/bin/python -m baseline smoke --config /absolute/path/to/local-config.yaml --allow-paid
 .venv/bin/python -m baseline run --config /absolute/path/to/local-config.yaml
-.venv/bin/python -m pytest baseline/tests -q -o cache_dir=baseline/.pytest_cache
 ```
 
-[DeepSeek](configs/deepseek.example.yaml)、[OpenAI](configs/openai.example.yaml)、[自定义服务](configs/custom-provider.example.yaml) 示例默认关闭授权，需要填写 `repo_path`；相对路径以配置文件所在目录为准。[DeepSeek＋HashiCorp 配对草案](PAIRING.md) 也默认关闭授权；本地 TCP、请求中的工具发现和结果回传已分别核对，真实模型调用仍待用户运行合成冒烟。目标必须是干净 Git 提交，`runs_dir` 与源仓库分离；运行器不会替用户清理工作树。
+[DeepSeek](configs/deepseek.example.yaml)、[OpenAI](configs/openai.example.yaml)、[自定义服务](configs/custom-provider.example.yaml) 和 [HashiCorp 配对草案](PAIRING.md) 默认关闭授权。填写 `repo_path`、实际模型和连接；相对路径以 YAML 所在目录为准。`run` 要求 `allow_agent_materials`、`allow_experiments` 同时为 `true`，凭据只放环境变量。目标必须是干净 Git 提交，输出与源仓库分离；不会替用户清理工作树。
 
-`check-env` 保存快照，检查实际 CLI、权限、自动提示、沙箱内工具版本和离线依赖；Go 使用 `go list -m all`，Rust 使用离线 `cargo metadata`。它不发送目标给模型、不执行目标测试、不使用真实认证；API 凭据只记录是否存在。MCP 工具发现和固定合成 TCP 探针通过同一个本地 Codex 会话完成，省去独立 Python 客户端探针；仅创建本地合成会话，不启动模型回合。输出中的 `tool_evidence` 明确区分本地注册与 TCP 已验证、模型请求工具面未在本次环境检查中检查、真实模型使用未评估；`environment_checked` 不代表三层全部通过。独立的本地请求捕获证据见 [配对状态](PAIRING.md)。
+`check-env` 是独立的本地检查：捕获源码、验证权限、提示隔离、功能设置、工具版本、离线依赖，以及标准 MCP STDIO 工具清单和固定 TCP 收发。它不调用模型、不执行目标测试、不创建 app-server 会话，也不使用真实认证。Go 依赖检查为 `go list -m all`，Rust 为离线 `cargo metadata`。`environment_checked` 只证明这些本地项目通过。
 
-`run` 要求 `allow_agent_materials`、`allow_experiments` 都为 `true`；`smoke` 还要求 `--allow-paid`。合成冒烟最多两回合、300 秒：第一回合通过 `isolated_exec` 执行自带的双向 TCP 测试并观察有意设置的回复断言失败；第二回合精确续接，只修正预期回复，再通过同一工具执行并解释结果。`inputs/smoke-observations.json` 关联两轮原生 MCP item、执行 ID、命令、原始输出及前后测试文件；仅环境探针、单轮 MCP 或第二轮普通 shell 成功都不算通过。机械结果只表示合成接入观察齐全，仍须阅读第二轮说明及原始材料，不证明共识正确性或模型语义理解。不会自动登录、联网补依赖、换 provider 或追加免费总结。本次修改没有调用远端模型或启动共识审计。
+普通 `run` 每次验证新运行的权限、捕获实际目录和工具版本，完成必要的 skills 初始化后直接进入审计。它不执行合成修复、不读取兼容性证书、不强制模型调用 MCP，也不重复执行 `check-env` 的服务和提示诊断。`tool_evidence` 分别记录服务探测、模型请求工具面和真实模型使用的证据范围；未检查的项目不会标成已验证。
 
-用户后续可先复制默认未授权的 [HashiCorp 配置](configs/hashicorp.deepseek-pair.baseline.yaml)，确认路径并自行将两个授权开关设为 `true`。终端须已设置 `DEEPSEEK_API_KEY`，不要将密钥写入 YAML 或 Git。以下命令由用户执行；合成接入通过并核对原始材料后，再执行最后一条启动独立 40 分钟审计：
+独立的小样本兼容性练习使用现有测试入口，固定本地 Responses 回复，经过真实生产 `exec`／指定 session 的 `exec resume` 参数，保留请求、结果和命令记录；不消耗线上模型预算：
 
 ```bash
-cp baseline/configs/hashicorp.deepseek-pair.baseline.yaml baseline/configs/hashicorp.deepseek-pair.local.yaml
-# Edit the local YAML: allow_agent_materials: true; allow_experiments: true.
-.venv/bin/python -m baseline check-env --config baseline/configs/hashicorp.deepseek-pair.local.yaml
-.venv/bin/python -m baseline smoke --config baseline/configs/hashicorp.deepseek-pair.local.yaml --allow-paid
-.venv/bin/python -m baseline run --config baseline/configs/hashicorp.deepseek-pair.local.yaml
+BASELINE_ACCEPTANCE_DIR="$HOME/.cache/consensus-assurance/local-compat-$(date +%Y%m%d-%H%M%S)" \
+.venv/bin/python -m pytest -q baseline/tests/test_environment.py \
+  -k 'request_tools or pairing_uses'
 ```
 
-smoke 超时、服务拒绝或资料不足时保留实际原因，不自动加时或改服务；不能直接推断模型绝对不兼容。正式运行不继承合成会话、文件或 smoke 的强制调用要求，普通审计任务保持原样。
+原 `smoke` 子命令和自动评分已退出。已有真实模型的双回合 TCP 失败／修复证据见 [本次核对](acceptance/2026-10-09-source-review/README.md)。环境变化后才需要有针对性的复验；脚本回复通过不能代替真实服务或模型推理证据。
 
-目录使用本地时间，例如 `2026-10-08_13-11-14-hashicorp_raft-baseline`，环境检查以 `-check-env` 结尾，同秒重名追加序号。启动时打印源码捕获、环境检查和模型调用阶段，`run.json.phase_times` 保存时点与累计耗时；进入模型调用时为 `stop: running`、`phase: model_audit`。服务端是否接收请求仍以原始调用输出为据。没有跨进程 resume 入口，再次运行会创建新目录和新 session。
+## 配置与隔离
 
-## 连接、共同设置与依赖
+配置拒绝未知字段、重复 YAML 键和无效预算。目标配置只读取中性执行后端、模块、范围和路径，不继承研究问题、旧结论或完整组预算。模型写入的 `.codex`、`.agents` 会阻止后续回合启动。
 
-配置拒绝未知字段、重复 YAML 键和无效预算。目标配置只读取中性 `execution_backend` 与 `target` 的模块、范围和路径，不继承问题、旧结论、主系统预算或检查命名。模型自写的 `.codex`、`.agents` 不会在后续回合被加载。
+自定义 provider 使用 Responses 和只含所选模型的 catalog，原字节保存到 `inputs/models.json`，推理档位必须匹配。原生 OpenAI 使用本机 `debug models --bundled` 目录；API 认证使用显式环境变量，ChatGPT 登录只读取已有文件认证。不会自动登录、切换模型或降档。
 
-自定义 provider 复用 `CodexProvider` 和 Responses 接口，必须提供仅包含所选模型的真实 catalog；原字节保存到 `inputs/models.json`。模型、推理档位与目录匹配，不静默降档。原生 OpenAI 的目录来自本机 `debug models --bundled`；`auth_mode: api_key` 使用 `api_key_env`，`auth_mode: codex_login` 仅使用已有文件形式的 ChatGPT 登录，不自动登录或复制宿主配置。API key 只进入客户端，工具环境不继承它。
+共同设置来自 `common_settings()`：关闭子 Agent、shell snapshot、自动 skills/plugins/MCP/memory/hooks，保留普通 shell、目录声明的工具发现和原生压缩。自定义 provider 保持请求／流重试 4／5、流空闲 300000 ms；原生 provider 使用记录版本的内置默认值。两个入口均以显式参数配置并使用 `--ignore-user-config`。
 
-两组共同策略由 `src/consensus_assurance/adapters/agents/backend.py::common_settings()` 提供。普通组直接使用，完整组显式选择 `codex_profile: single_agent` 后使用；未选择时保留原有配置行为。共同策略关闭子 Agent、shell snapshot、自动 skills/plugins/MCP/memory/hooks，保留普通 shell 与原生压缩。baseline 随后显式注册唯一 `baseline_local.isolated_exec`；完整组继续使用原固定执行器，默认没有这个 MCP。自定义 provider 固定请求／流重试为 4／5、流空闲 300000 ms，关闭无限连接重试；原生 provider 的保留设置不覆盖。用实际 `features list` 和本地 `debug prompt-input` 检查生效结果；缺工具或探针失败不算通过。完整组的方法和结构化回执仍保留。主系统首次有效配置检查后记录 profile 名称和展开设置，后续调用与恢复先比较原配置、状态、持久记录及历史 argv；同名设置漂移停止并要求新 run，不覆盖旧记录。profile 为 `None` 的原有路径不强制迁移。
+完整组只有显式选择 `codex_profile: single_agent` 才启用共同设置，记录在既有 `agent-inputs/runtime-settings.json`。初始回合和恢复读取同一记录；模型、provider、推理档位、catalog、CLI 及 profile 的实际配置变化仍在模型调用前拒绝。恢复须使用原 `CODEX_HOME`，旧记录不自动迁移。`codex_profile: null` 不创建配对记录或运行 baseline 探针。
 
-可选 `go_mod_cache_dir` 只读作为 `GOMODCACHE`；Go 离线变量直接复用 `GoModuleBackend.environment()`。可选 `cargo_dependency_cache_dir` 表示普通 Cargo home，只读连接其中的 `registry/` 和 `git/`；宿主认证和全局配置不开放。旧 `cargo_seed_cache_dir` 由严格配置校验作为未知字段拒绝，使用依赖目录时应改为 `cargo_dependency_cache_dir`；历史 JSON 不回写，主系统的编译种子字段不改名。仅有编译 seed 而没有依赖树的目录会报类型不匹配。
+当前 CLI 会在首次提示初始化时安装内置 skills；空私有 home 和 `skip_host_skill_discovery` 不足以阻止注入。因此保留一次离线初始化，再显式设置 `skills.config`。详细提示／features 诊断属于环境检查，日常回合不解析任意 CLI 参数或扫描历史 argv。
 
-不全量扫描、逐文件哈希或复制宿主依赖缓存。没有配置目录时使用空离线缓存；缺依赖直接报错，不联网补齐。构建与临时目录位于每 run 私有 `work/.runtime/`，冷构建成本计入预算。源码依赖缓存不等于编译种子，Rust 成本可比性仍须另行核对。
+普通组使用私有 Codex home、空工作区 Git 边界和严格文件权限：源码／日志只读，工作区可写；框架方法、旧实验、控制文件和凭据不可读。权限探针验证实际正反控制及环境、procfs 凭据隔离，失败便停止。
 
-## 权限、身份与留存
+baseline 的唯一 MCP 是 `baseline_local.isolated_exec`，设置 `required=true`，参数只有普通 `argv`、工作副本内相对 `cwd` 和可选 `timeout_seconds`。普通 shell 禁止网络；该工具每次创建独立网络、PID、IPC 和文件视图，允许同次调用内的本地 TCP，不开放宿主网络或任意挂载。源码和依赖只读，输出由宿主服务保留；命令退出、取消、断开及父进程退出均清理后代进程。完整组继续使用自己原有的固定执行器。
 
-普通组使用私有 Codex home、显式参数和空白工作区 Git 边界。工具根目录默认不可读，只开放捕获源码、当前工作区、本次日志、普通任务和必要工具及只读依赖。源码与宿主日志不可写，工作区可写；方法、历史 run、实现身份文件和凭据不可读。实际探针包含正向控制、拒绝控制、环境及 procfs 凭据检查，不以启动成功代替权限证据。
+可选 `go_mod_cache_dir` 只读作为 `GOMODCACHE`；`cargo_dependency_cache_dir` 仅只读提供 Cargo home 的 `registry/`、`git/`，不开放认证配置。没有共享依赖时使用空离线缓存。每 run 的构建和临时目录位于 `work/.runtime/`，构建耗时计入预算；不复制或全量扫描宿主缓存。完整组 Rust 编译种子与普通组依赖复用存在差异，成本须分别说明。
 
-两个普通 shell 仍拒绝 TCP；baseline 的 `isolated_exec` 与主系统固定执行器均能在隔离内运行 TCP 测试。新工具每次创建独立网络、PID 和 IPC namespace，文件视图只包含固定工具、库、只读源码／依赖及可写工作副本；宿主 `/run`、路径型 socket 和宿主进程视图不开放。参数仅为 `argv`、工作副本内相对 `cwd`、可选 `timeout_seconds`，不接收 mount、环境或权限覆盖。实际四路径结果与调用示例统一见 [PAIRING.md](PAIRING.md)。
+## 预算与记录
 
-模型调用前写入 `inputs/implementation.json`，由 `run.json` 引用：框架 Git 提交、相关执行输入 dirty 状态、baseline 入口、任务及 MCP 依赖声明文件、实际导入的中性模块路径与版本依据、Codex 可执行路径／版本／一次性摘要，以及配置、任务和 catalog 引用。`inputs/local-exec.json` 保存服务启动方式、工具 schema 和权限依据；实现记录保存 MCP 及实际协议依赖版本。服务端实际模型修订保持 `unknown`。只检查这些执行输入，不扫描 runs、目标历史、依赖缓存或整个 Python 环境。
+总时间从源码捕获前起算，包含准备、工具和模型等待；每回合取单回合限制与总剩余的较小值，正常完成且有预算时精确续接同一 session。工具串行执行，请求上限、动作上限、回合剩余和总剩余共同约束。单回合超时会结束整个 run，配置时长是上限；局部准备超时不冒充总预算耗尽。到时只保留已有材料，不追加总结。
 
-Git HEAD 不能标识 dirty 文件或另一个安装位置的模块，CLI 版本字符串也不能区分同版本构建，因此这里只为有限执行字节记录摘要，不增加审批门槛。开发运行允许 dirty，并仅保存相关执行输入的安全字节，不打包无关未提交文件。结束时保存 `inputs/implementation-end.json`，重新检查入口字节及 CLI 文件元数据；启动身份不覆盖，期间变更会标为条件未固定。身份文件不进入模型提示。
+每次启动创建新目录、新 session；baseline 没有跨进程 resume 入口。`run.json` 保存阶段时点、实际停止原因和回合索引；`index.md` 链接最近完成报告与原始输出。usage 保留逐事件值，不未经核对求和。
 
-总时间由单调时钟执行，源码、身份记录、环境准备、工具、等待模型都计入。每轮上限为单回合限制与总剩余时间的较小值；`isolated_exec` 串行执行，时间上限取请求值、`budget.action_timeout`（默认 600 秒）、当前回合和整轮剩余时间的最小值；排队也计时，工具耗时不重复加到回合耗时上。回合正常完成且有预算时精确续接原 session；单回合超时会终止整个 run，因此 40 分钟配置是总上限。超时、取消、拒绝、配额和 session 变化保留分类；到时只做留存。回合数、内部工具调用与主系统正式检查数是不同计量，不互换。
-
-2026-10-08 18:17 的试运行暴露了 MCP 生命周期问题：创建服务的 Codex 工作线程空闲退出触发 `PR_SET_PDEATHSIG`，误杀仍在运行的工具；阻塞的标准输入读取线程又阻止服务退出，调用方一直等到单回合超时。服务现通过 `pidfd` 监控父进程并异步读取输入；保留父进程退出、断开和取消时的子进程清理，同时记录取消来源。新增真实 Codex 长任务、创建线程退出、父进程退出及强杀回归；诊断信号跟踪和验证结果见 [生命周期修复记录](acceptance/2026-10-08-mcp-lifecycle/summary.json)。旧实验按异常中断保留。
+`inputs/implementation.json` 用 Git 提交和 runtime dirty 状态标识干净同仓代码，另保存修改文件及外部安装模块的安全字节。CLI 保留路径、版本和一次性摘要，catalog 保留原字节。`inputs/local-exec.json` 保存一份服务配置、工具说明和权限依据；不在每回合重建 schema 或扫描整个 Python 环境。MCP 会延后加载代码，因此仍在启动回合前核对执行服务及其存储模块的字节；不另建部署锁定系统。
 
 ```text
 runs/<run-id>/
-  run.json                       # 配置、环境、身份引用、阶段时点、停止原因和回合索引
-  inputs/                        # 固定任务、catalog、源码清单、身份和本地探针
-  source/                        # 只读 Git 快照，无历史
-  work/                          # 最终工作文件，可能含未完成轮的修改
-  executions/<id>/               # 工具命令、所属回合／MCP ID、限制来源、状态、原始 stdout/stderr
+  run.json, index.md
+  inputs/                        # 配置、任务、目录、身份及本地检查
+  source/                        # 只读 Git 快照
+  work/                          # 最终工作文件，可能含未完成修改
+  executions/<id>/               # argv、回合／请求 ID、期限、状态、原始 stdout/stderr
   turns/0001/
-    request.txt
-    stdout.jsonl
-    stderr.log
-    final.txt
-    result.json
-    report.md                    # 该回合实际存在的安全报告副本
-    changes/files/
-    changes/manifest.json
-  index.md                       # 最近完成报告和原始记录入口
+    request.txt, stdout.jsonl, stderr.log, final.txt, result.json
+    changes/files/, changes/manifest.json
 ```
 
-按回合保存工作文件差异，回合末版本不冒充每条命令执行前的版本。模型自行 tee 的日志是可写材料，不冒充宿主原始输出。原始 CLI 字节仅做精确凭据脱敏；usage 保持逐事件记录，未核实累计语义时不求和。结束后归档只读，排除 `.runtime`、`.execution`、虚拟环境、缓存、凭据、临时锁和权限覆盖；清理当前临时区不会删除共享依赖。
+报告也在工作区变更中保留，`last_completed_report` 指向实际保留的版本；报告未变时复用该路径，后续超时修改不覆盖它。不再复制 `turns/N/report.md`；历史归档及旧链接不改写。回合末文件不冒充每条命令开始时的快照，模型自行 tee 的内容不冒充宿主原始输出。
 
-当前 Git 仅跟踪 [2026-10-09_08-06-10-hashicorp_raft-baseline](runs/2026-10-09_08-06-10-hashicorp_raft-baseline/index.md) 这一份正式运行，保留 37 个完成回合及第 38 回合因总时间上限中断的原始记录。旧实验及两回合 smoke 仍保留在本地，曾提交的归档也保留在 Git 历史中。无模型验收保留在 `acceptance/2026-10-08/`、`acceptance/2026-10-08-tcp/` 和 `acceptance/2026-10-08-tool-surface/`；其他本机运行继续忽略。
-
-## 接入事实与验收
-
-| 服务 | 已有证据 | 尚未验证 |
-|---|---|---|
-| DeepSeek | [正式运行索引](runs/2026-10-09_08-06-10-hashicorp_raft-baseline/index.md) 保留 40 分钟原始记录；本机 `runs/2026-10-09_08-04-05-hashicorp_raft-smoke/inputs/smoke-observations.json` 记录模型在同一会话中两次调用隔离 TCP 工具，先观察断言失败，再修改测试并通过 | smoke 的原始归档尚未纳入 Git；正式运行未记录模型调用隔离 MCP 工具，完整组结构化回执和正式配对仍未执行 |
-| 原生 OpenAI | 本地 catalog、命令构造与 API-key 隔离检查 | 真实模型调用、登录刷新和两组配对 |
-| 其他 provider | 通用 Responses 配置入口 | 不因 DeepSeek 成功推断已适配，不自动进行付费接入 |
-
-本次请求工具面、两轮关联和 profile 检查的最终命令、结果及原始材料见 [本次验收记录](acceptance/2026-10-08-tool-surface/summary.json)；此前 [隔离 TCP 验收](acceptance/2026-10-08-tcp/summary.json) 保持原样。本地脚本响应通过不能替代真实模型调用验收，也不证明任何共识实现正确。
-
-共同条件表、历史 40／120 分钟试运行的定位及空白离线裁决表统一见 [PAIRING.md](PAIRING.md)，不另外建设调度或评价平台。
+结束后归档只读，排除凭据、虚拟环境、缓存、临时锁及权限覆盖。当前正式归档为 [40 分钟 HashiCorp baseline](runs/2026-10-09_08-06-10-hashicorp_raft-baseline/index.md)，历史能力证据保留在 `acceptance/`；它们不进入新审计的上下文。
