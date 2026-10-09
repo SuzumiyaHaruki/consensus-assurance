@@ -88,13 +88,13 @@ runs/<run-id>/
 
 按回合保存工作文件差异，回合末版本不冒充每条命令执行前的版本。模型自行 tee 的日志是可写材料，不冒充宿主原始输出。原始 CLI 字节仅做精确凭据脱敏；usage 保持逐事件记录，未核实累计语义时不求和。结束后归档只读，排除 `.runtime`、`.execution`、虚拟环境、缓存、凭据、临时锁和权限覆盖；清理当前临时区不会删除共享依赖。
 
-当前 Git 仅跟踪 [2026-10-08_19-48-15-hashicorp_raft-baseline](runs/2026-10-08_19-48-15-hashicorp_raft-baseline/index.md) 这一份运行，保留 41 个完成回合及第 42 回合因总时间上限中断的原始记录。旧实验仍保留在本地，曾提交的归档也保留在 Git 历史中。无模型验收保留在 `acceptance/2026-10-08/` 和 `acceptance/2026-10-08-tcp/`；其他本机运行继续忽略。
+当前 Git 仅跟踪 [2026-10-09_08-06-10-hashicorp_raft-baseline](runs/2026-10-09_08-06-10-hashicorp_raft-baseline/index.md) 这一份正式运行，保留 37 个完成回合及第 38 回合因总时间上限中断的原始记录。旧实验及两回合 smoke 仍保留在本地，曾提交的归档也保留在 Git 历史中。无模型验收保留在 `acceptance/2026-10-08/`、`acceptance/2026-10-08-tcp/` 和 `acceptance/2026-10-08-tool-surface/`；其他本机运行继续忽略。
 
 ## 接入事实与验收
 
 | 服务 | 已有证据 | 尚未验证 |
 |---|---|---|
-| DeepSeek | [真实运行索引](runs/2026-10-08_19-48-15-hashicorp_raft-baseline/index.md)、[第一回合](runs/2026-10-08_19-48-15-hashicorp_raft-baseline/turns/0001/result.json)、[续接回合](runs/2026-10-08_19-48-15-hashicorp_raft-baseline/turns/0002/result.json) 展示普通文本、多回合同 session、工具读写和执行 | 本次隔离 MCP 执行仅发生在环境检查，不能据此证明模型使用了该工具；线上 TCP 合成冒烟、完整组结构化回执和正式配对仍未执行 |
+| DeepSeek | [正式运行索引](runs/2026-10-09_08-06-10-hashicorp_raft-baseline/index.md) 保留 40 分钟原始记录；本机 `runs/2026-10-09_08-04-05-hashicorp_raft-smoke/inputs/smoke-observations.json` 记录模型在同一会话中两次调用隔离 TCP 工具，先观察断言失败，再修改测试并通过 | smoke 的原始归档尚未纳入 Git；正式运行未记录模型调用隔离 MCP 工具，完整组结构化回执和正式配对仍未执行 |
 | 原生 OpenAI | 本地 catalog、命令构造与 API-key 隔离检查 | 真实模型调用、登录刷新和两组配对 |
 | 其他 provider | 通用 Responses 配置入口 | 不因 DeepSeek 成功推断已适配，不自动进行付费接入 |
 

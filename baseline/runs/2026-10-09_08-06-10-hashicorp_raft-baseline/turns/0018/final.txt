@@ -1,0 +1,19 @@
+Final consolidation pass complete. Headings normalized, and the module still passes `go vet` and `go build` cleanly.
+
+**Handoff summary of the audit**
+
+The captured implementation is byte-identical to the upstream release `github.com/hashicorp/raft@v1.7.3` (tag hash `c0dc6a0b…`, equal to the brief's `source_identity`), verified against both the module-cache extraction and a re-extraction of the module `.zip`. No local mutation/injected defect exists, and none is claimed.
+
+Concrete, reproducible findings — one localized class of RPC-reachable panics on unvalidated peer bytes, with no `recover()` in the RPC main loop:
+
+- **F1** — malformed `InstallSnapshot.Configuration` (`SnapshotVersion>0`) panics `installSnapshot` (`DecodeConfiguration`); reproduced directly and end-to-end (process abort).
+- **F2** — unknown `LogType` in `AppendEntries` panics `prepareLog` via `processLogs` on the follower.
+- **F3** — `LogConfiguration` entry with non-msgpack `Data` panics `processConfigurationLogEntry`.
+
+Supporting analysis: 7-case battery with 4 graceful controls pinning the defect to exactly three call sites; no auth/membership check in `net_transport.go` and only a sender-chosen protocol-version gate in `checkRPCHeader`, making the surface a remote, unauthenticated DoS (source-based, since loopback TCP is unavailable here); and the upstream test-coverage gap (`InstallSnapshot` tests only exercise the legacy `Peers` path) explaining why the suite stays green.
+
+Negative/benign evidence: broad `-race` (0 races/panics), randomized partition/heal + leadership-transfer consistency (no divergence), crash/restart durability incl. snapshot restore, and the analogous local/legacy decode paths all clean.
+
+Every claim is reproducible with `bash audit/run_all.sh`; logs and diagnostic tests are preserved under `work/audit/` and distinguished from the untouched captured source. Report: [report.md](/home/nitro/Desktop/consensus-assurance/baseline/runs/2026-10-09_08-06-10-hashicorp_raft-baseline/work/report.md).
+
+Remaining work is external to this sandbox and documented in §5: run the ~15 TCP/loopback test groups via the private-loopback `isolated_exec`, and byte-verify/run `fuzzy/` and `raft-compat/` once a reference or their dependencies are available. Within the current permissions, the audit is saturated and I have nothing further that changes the conclusions.

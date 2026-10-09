@@ -1,0 +1,22 @@
+Confirmed and recorded. This turn I closed the last reachability question for F2.
+
+**F2 reachable via the real RPC dispatch (executed, `audit/f2_via_processrpc.log`).** Driving the malformed `AppendEntries` through the actual `processRPC` entry point — with a header that passes `checkRPCHeader` (`ProtocolVersion = ProtocolVersionMax`) — still panics (`REPRODUCED via processRPC dispatch: unrecognized log type: …Type:0x63`). So F2 does not depend on a direct handler invocation; it is reachable via the normal message path, consistent with F1's end-to-end transport demonstration. Report updated (§3.3 + artifact list).
+
+Final state: `go vet ./...` clean, 16 artifacts preserved under `work/audit/`, report at 609 lines. The audit is complete within the granted permissions.
+
+**Full handoff**
+
+Target `github.com/hashicorp/raft` is byte-identical to upstream `v1.7.3` (hash `c0dc6a0b…` = `source_identity`); no injected mutation — nothing claimed as such.
+
+Findings (one localized class of RPC-reachable panics on unvalidated peer bytes; no `recover()` in the RPC main loop; unauthenticated/remote given `net_transport.go` accepts all connections and `checkRPCHeader` only gates on a sender-chosen protocol version):
+- **F1** `InstallSnapshot.Configuration` (bad msgpack, `SnapshotVersion>0`) → `installSnapshot`→`DecodeConfiguration` panic — direct + end-to-end (process abort).
+- **F2** `AppendEntries` entry with unknown `LogType` → `prepareLog` panic — direct + via `processRPC`.
+- **F3** `AppendEntries` `LogConfiguration` entry with bad `Data` → `processConfigurationLogEntry`→`DecodeConfiguration` panic.
+
+Corroboration: 7-case battery with four graceful controls isolating the three call sites; documented upstream test-coverage gap that keeps the suite green; suggested (unapplied) fix directions.
+
+Negative/benign evidence: broad `-race` (0 races/panics), partition/heal + leadership-transfer consistency (no divergence), crash/restart durability incl. snapshot restore, snapshot retention, config-change semantics, and analogous local/legacy decode paths.
+
+Reproduce all with `bash audit/run_all.sh`. Report: [report.md](/home/nitro/Desktop/consensus-assurance/baseline/runs/2026-10-09_08-06-10-hashicorp_raft-baseline/work/report.md).
+
+Remaining work is external to this sandbox (§5): run the ~15 TCP/loopback test groups via the private-loopback `isolated_exec`, and byte-verify/run `fuzzy/` and `raft-compat/` once a reference or their dependencies are available.
