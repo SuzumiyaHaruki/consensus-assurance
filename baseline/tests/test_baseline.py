@@ -129,11 +129,7 @@ def test_source_capture_commit_cleanliness_and_links(tmp_path):
 @pytest.mark.parametrize("kwargs,status", [({}, "completed"), ({"tool_failure": True}, "completed"),
     ({"error": "quota exceeded"}, "external_error"), ({"error": "stream disconnected"}, "external_error"),
     ({"final": "RUN_BLOCKED: Access is unavailable."}, "run_blocked"),
-    ({"final": "I cannot assist with this request."}, "external_blocker_needs_review"),
-    ({"final": "I’m sorry, but I can’t help with this request."}, "external_blocker_needs_review"),
-    ({"final": "I cannot confirm this suspicion yet."}, "completed"),
-    ({"final": "我无法确认这个猜测，还需要检查其他路径。"}, "completed"),
-    ({"final": "抱歉，无法协助。"}, "external_blocker_needs_review"),
+    ({"final": 'The retained output says "I cannot assist with this request."'}, "completed"),
     ({"final": None}, "external_blocker_needs_review"), ({"completed": False}, "external_blocker_needs_review"),
     ({"identity": "00000000-0000-4000-8000-000000000002"}, "session_mismatch")])
 def test_native_events_and_only_top_level_errors(tmp_path, kwargs, status):
@@ -165,11 +161,47 @@ def test_non_json_and_startup_failure_are_retained(tmp_path):
     result = events(tmp_path)
     with (tmp_path / "stdout.jsonl").open("a") as stream:
         stream.write("broken event\n")
-    assert codex.decode(tmp_path, result)["status"] == "external_blocker_needs_review"
+    decoded = codex.decode(tmp_path, result)
+    assert decoded['status'] == 'completed' and decoded['invalid_jsonl_lines'] == 1
     (tmp_path / "stdout.jsonl").write_text("")
     (tmp_path / "stderr.log").write_text("authentication required")
     result = codex.decode(tmp_path, {"status": "completed", "exit_code": 1})
     assert result["status"] == "external_error" and result["failure_kind"] == "login_required"
+
+
+@pytest.mark.parametrize('identity', ['opaque/session-1', '', None, 42])
+def test_session_identity_is_opaque_and_exact(tmp_path, identity):
+    result = codex.decode(tmp_path, events(tmp_path, identity=identity), identity)
+    assert result['status'] == ('completed' if identity == 'opaque/session-1' else 'external_blocker_needs_review')
+
+
+@pytest.mark.parametrize('event', [{'type':'refusal'}, {'type':'item.completed','item':{'type':'refusal'}}])
+def test_native_refusal_still_stops_a_completed_turn(tmp_path, event):
+    result = events(tmp_path)
+    with (tmp_path/'stdout.jsonl').open('a') as stream:stream.write(json.dumps(event)+'\n')
+    assert codex.decode(tmp_path, result)['status'] == 'external_blocker_needs_review'
+
+
+@pytest.mark.parametrize('shape', ['absent','empty','nonempty','file','symlink','dangling','fifo','denied'])
+def test_reserved_paths_remove_only_real_empty_directories(tmp_path, monkeypatch, shape):
+    client = object.__new__(codex.Codex)
+    client.work, client.config = tmp_path, SimpleNamespace(allow_agent_materials=False)
+    path = tmp_path/'.codex'
+    (tmp_path/'.agents').mkdir()
+    if shape in {'empty','nonempty','denied'}:path.mkdir()
+    if shape == 'nonempty':(path/'config.toml').write_text('retained')
+    if shape == 'file':path.write_text('retained')
+    if shape in {'symlink','dangling'}:path.symlink_to(tmp_path/('.agents' if shape=='symlink' else 'missing'))
+    if shape == 'fifo':os.mkfifo(path)
+    if shape == 'denied':
+        monkeypatch.setattr(Path, 'rmdir', lambda p: (_ for _ in ()).throw(PermissionError(13, 'Permission denied', str(p))))
+    before = path.lstat() if shape != 'absent' else None
+    with pytest.raises(ValueError, match='Model transmission' if shape in {'absent','empty'} else 'Pre-invocation reserved path') as error:
+        client.turn(tmp_path/'turn', 'Unused', 1, None)
+    if shape in {'absent','empty'}:assert not path.exists() and not (tmp_path/'.agents').exists()
+    else:
+        assert str(path) in str(error.value) and path.lstat() == before
+        if shape == 'nonempty':assert (path/'config.toml').read_text() == 'retained'
 
 
 def test_delta_deletions_modes_and_unsafe_files(tmp_path):
@@ -223,6 +255,9 @@ class ScriptedClient:
         else:
             assert session is None
             (self.root / "work/note.txt").write_text("first turn")
+            for name, text in {'reproduction/check.py':'print(42)\n', 'reproduction/output.txt':'42\n', '.runtime/cache':'disposable'}.items():
+                path = self.root/'work'/name;path.parent.mkdir(parents=True,exist_ok=True);path.write_text(text)
+            assert 'work/.runtime is disposable' in prompt
         self.calls.append((timeout, session))
         (self.root / "work/report.md").write_text(f"report {index + 1}")
         result = events(folder, tool_failure=True)
@@ -250,6 +285,9 @@ def test_continuing_run_and_completed_report_retention(tmp_path, statuses, stop,
     else:
         assert record["last_completed_report"] is None
     assert not (root / "work/.git").exists()
+    assert not (root / 'work/.runtime').exists()
+    for name in ('check.py','output.txt'):
+        assert (root/'work/reproduction'/name).read_bytes() == (root/'turns/0001/changes/files/reproduction'/name).read_bytes()
     assert not (root / "run.json").stat().st_mode & 0o222
     assert (root / f"turns/{turns:04d}/changes/files/report.md").exists()
 
@@ -302,6 +340,9 @@ def test_late_turn_error_keeps_work_and_previous_handoff(tmp_path):
     assert result["stop"] == "external_blocker_needs_review"
     assert (root / "turns/0001/changes/files/report.md").read_text() == "report 1"
     assert (root / "turns/0002/changes/files/report.md").read_text() == "unfinished report"
+    index = (root/'index.md').read_text()
+    assert 'turns/0002/result.json' in index
+    assert all('turns/0002/'+name not in index for name in ('stdout.jsonl','stderr.log','final.txt'))
 
 
 def test_check_env_deadline_does_not_mean_verified(tmp_path, monkeypatch):
@@ -355,6 +396,24 @@ def test_execution_keeps_empty_arguments_but_rejects_invalid_executable_and_nul(
     else:
         with pytest.raises(ValueError, match="nonempty executable.*NUL"):
             asyncio.run(local_exec.execute(control, {"argv": argv}, "arguments"))
+
+
+def test_tool_arguments_and_directory_boundary(tmp_path):
+    for args in ({'argv':[]}, {'argv':[1]}, {'argv':['true'],'env':{}}, {'argv':['true'],'mounts':['/']},
+                 {'argv':['true'],'timeout_seconds':0}):
+        with pytest.raises(ValueError):local_exec.Arguments.model_validate(args)
+    work=tmp_path/'work';work.mkdir();(work/'outside').symlink_to(tmp_path)
+    assert local_exec.validate_directory(work,'.') == work
+    for relative in ('..',str(work),'outside','missing'):
+        with pytest.raises((ValueError, OSError)):local_exec.validate_directory(work,relative)
+
+
+@pytest.mark.parametrize('basis,value', [('requested',1),('action_timeout',2),('agent_turn_timeout',3),('total_seconds',4),('total_seconds',-1)])
+def test_local_execution_limit_selection(monkeypatch, basis, value):
+    monkeypatch.setattr(local_exec.time,'monotonic',lambda:100)
+    control={'action_timeout':20,'turn_deadline':130,'run_deadline':140}
+    if basis != 'requested':control[{'agent_turn_timeout':'turn_deadline','total_seconds':'run_deadline'}.get(basis,basis)] = value + (100 if basis in {'agent_turn_timeout','total_seconds'} else 0)
+    assert local_exec.remaining(control, value if basis=='requested' else 99) == (max(0,value),basis)
 
 
 def test_process_timeout_kills_descendant_and_keeps_bytes(tmp_path):

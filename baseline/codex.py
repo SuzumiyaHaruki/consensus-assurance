@@ -5,14 +5,12 @@ import asyncio
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 import os
-import re
 import shutil
 import signal
 import subprocess
 import tempfile
 import time
 from pathlib import Path
-from uuid import UUID
 
 from consensus_assurance.adapters.agents.backend import (
     classify_failure, codex_diagnostic, common_settings, DISABLED_FEATURES, codex_options as options,
@@ -100,25 +98,18 @@ def decode(folder, result, session_id=None):
         result.update(status="external_error", failure_kind=classify_failure(failure).value,
                       reason=failure or "Native turn failed; inspect retained output")
         return result
-    try:
-        UUID(identity)
-    except (ValueError, TypeError, AttributeError):
-        result.update(status="external_blocker_needs_review", reason="Missing valid native session identity")
+    if not isinstance(identity, str) or not identity.strip():
+        result.update(status="external_blocker_needs_review", reason="Missing native session identity")
         return result
     if any(x != identity for x in identities) or session_id and identity != session_id:
         result.update(status="session_mismatch", reason="Exact session changed; no replacement session allowed")
-    elif not completed or invalid or not final:
+    elif not completed or not final:
         result.update(status="external_blocker_needs_review", reason="Incomplete or unrecognized native completion")
     elif final.lstrip().startswith("RUN_BLOCKED:"):
         result.update(status="run_blocked", reason=final)
     elif any(e.get("type") == "refusal" or e.get("item", {}).get("type") == "refusal"
-             for e in events if isinstance(e.get("item", {}), dict)) or re.search(
-                 r"(?is)\bi(?: am|'m)? (?:cannot|can't|will not|won't|must refuse|unable to) "
-                 r"(?:help|assist|comply|fulfil|fulfill|do that|provide (?:that|those|the requested)|"
-                 r"(?:perform|continue|proceed with) (?:this|the) (?:request|audit))\b|"
-                 r"(?:我(?:不能|无法|必须拒绝)|(?:抱歉|对不起)[^。\n]{0,60})(?:协助|帮助|执行此审计|提供此类)",
-                 final[:1000].replace("’", "'")):
-        result.update(status="external_blocker_needs_review", reason="Possible final refusal; inspect original final text")
+             for e in events if isinstance(e.get("item", {}), dict)):
+        result.update(status="external_blocker_needs_review", reason="Native refusal event; inspect retained output")
     return result
 
 
@@ -427,9 +418,15 @@ print('PERMISSIONS_VERIFIED')
             write_json(self.control_path, self.execution_control)
 
     def turn(self, folder, prompt, timeout, session_id):
-        # An agent-written project configuration must never become a new client configuration.
-        if any((self.work / name).exists() for name in (".codex", ".agents")):
-            raise ValueError("Unauthorized project configuration appeared in the working copy")
+        # rmdir removes only real empty sandbox residue; it never follows links.
+        for name in (".codex", ".agents"):
+            path = self.work / name
+            try:
+                path.rmdir()
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                raise ValueError(f"Pre-invocation reserved path {path}: {exc}") from exc
         if not (self.config.allow_agent_materials and self.config.allow_experiments):
             raise ValueError('Model transmission and local execution must both be authorized')
         implementation = json.loads((self.root/'inputs/implementation.json').read_text())

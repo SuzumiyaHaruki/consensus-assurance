@@ -80,7 +80,7 @@ def validate_directory(work, relative):
     return resolved
 
 
-def isolated_command(command, workspace, directory, tool_roots=(), read_only_roots=()):
+def isolated_command(command, workspace, directory, hosts, tool_roots=(), read_only_roots=()):
     """Allowlisted filesystem for caller-selected commands; roots are trusted inputs."""
     executable = shutil.which('bwrap')
     if not executable:
@@ -96,7 +96,8 @@ def isolated_command(command, workspace, directory, tool_roots=(), read_only_roo
     if Path('/etc/ld.so.cache').is_file():args += ['--ro-bind', '/etc/ld.so.cache', '/etc/ld.so.cache']
     for path in (*tool_roots, *read_only_roots):
         args += ['--ro-bind', str(path), str(path)]
-    args += ['--tmpfs', '/tmp', '--tmpfs', '/run', '--dir', '/var', '--symlink', '/run', '/var/run',
+    args += ['--ro-bind', str(hosts), '/etc/hosts',
+             '--tmpfs', '/tmp', '--tmpfs', '/run', '--dir', '/var', '--symlink', '/run', '/var/run',
              '--dev', '/dev', '--proc', '/proc', '--bind', str(workspace), str(workspace),
              '--chdir', str(directory), '--', *command]
     return args
@@ -126,7 +127,9 @@ async def execute(control, arguments, request_id):
         if limit <= 0:
             record['status'] = 'timeout'
         else:
-            command = isolated_command(args.argv, work, cwd, control['tool_roots'], control['read_only_roots'])
+            hosts = folder/'hosts'
+            hosts.write_text('127.0.0.1 localhost\n::1 localhost\n')
+            command = isolated_command(args.argv, work, cwd, hosts, control['tool_roots'], control['read_only_roots'])
             record['command'] = command
             write_json(folder/'result.json', record)
             async def capture(stream, path):

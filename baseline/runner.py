@@ -212,7 +212,7 @@ def brief(root, source, target, deadline, timeout, calls_left):
         "source_identity": source.get("commit") or source.get("kind"), "scope": target,
         "report_path": str(root / "work/report.md"), "retained_logs": str(root / "turns"),
         "permissions": "Source/logs read only; work writable; ordinary shell has no network. isolated_exec supports private local TCP; no host or external network.",
-        "tool_environment": "Offline Go/Cargo; writable temporary and cache paths in work/.runtime.",
+        "tool_environment": "Offline Go/Cargo. work/.runtime is disposable, excluded from retained artifacts and removed at cleanup. Keep reproduction source, scripts, notes and outputs needed for review elsewhere under work.",
         "remaining_total_seconds": remaining, "turn_timeout_seconds": timeout, "remaining_agent_calls": calls_left,
         "generated_at": now(), "estimated_turn_deadline_utc": (datetime.now(timezone.utc) + timedelta(seconds=timeout)).isoformat(),
         "deadline_basis": "Host monotonic clock; preparation, tool work and model waiting all consume total time."}, indent=2)
@@ -274,8 +274,10 @@ def index(root, record):
     lines += [f"[最近完成回合的报告]({report})" if report else "未交付完成回合报告；不能据此解释为没有缺陷。", ""]
     for turn in record["turns"]:
         path = turn["path"]
-        lines.append(f"- 回合 {turn['number']}：{turn['status']}；[记录]({path}/result.json)、"
-                     f"[原始输出]({path}/stdout.jsonl)、[最终回答]({path}/final.txt)、[变更]({path}/changes/manifest.json)")
+        links = [f"[{label}]({path}/{name})" for label, name in (
+            ('记录', 'result.json'), ('原始输出', 'stdout.jsonl'), ('错误输出', 'stderr.log'),
+            ('最终回答', 'final.txt'), ('变更', 'changes/manifest.json')) if (root/path/name).is_file()]
+        lines.append(f"- 回合 {turn['number']}：{turn['status']}；" + '、'.join(links))
     executions = sorted((root/'executions').glob('*/result.json'))
     if executions:
         lines += ['', '隔离执行记录（不代表缺陷确认）：', '']

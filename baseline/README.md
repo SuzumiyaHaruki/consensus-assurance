@@ -31,7 +31,7 @@ BASELINE_ACCEPTANCE_DIR="$HOME/.cache/consensus-assurance/local-compat-$(date +%
 
 ## 配置与隔离
 
-配置拒绝未知字段、重复 YAML 键和无效预算。目标配置只读取中性执行后端、模块、范围和路径，不继承研究问题、旧结论或完整组预算。模型写入的 `.codex`、`.agents` 会阻止后续回合启动。
+配置拒绝未知字段、重复 YAML 键和无效预算。目标配置只读取中性执行后端、模块、范围和路径，不继承研究问题、旧结论或完整组预算。回合启动前仅用 `rmdir` 清理工作根目录下真实为空的 `.codex`、`.agents` 沙箱残留；非空目录、文件和任何链接均阻断调用。检查失败记录具体路径和文件系统原因，不推断模型意图。
 
 自定义 provider 使用 Responses 和只含所选模型的 catalog，原字节保存到 `inputs/models.json`，推理档位必须匹配。原生 OpenAI 使用本机 `debug models --bundled` 目录；API 认证使用显式环境变量，ChatGPT 登录只读取已有文件认证。不会自动登录、切换模型或降档。
 
@@ -43,15 +43,15 @@ BASELINE_ACCEPTANCE_DIR="$HOME/.cache/consensus-assurance/local-compat-$(date +%
 
 普通组使用私有 Codex home、空工作区 Git 边界和严格文件权限：源码／日志只读，工作区可写；框架方法、旧实验、控制文件和凭据不可读。权限探针验证实际正反控制及环境、procfs 凭据隔离，失败便停止。
 
-baseline 的唯一 MCP 是 `baseline_local.isolated_exec`，设置 `required=true`，参数只有普通 `argv`、工作副本内相对 `cwd` 和可选 `timeout_seconds`。普通 shell 禁止网络；该工具每次创建独立网络、PID、IPC 和文件视图，允许同次调用内的本地 TCP，不开放宿主网络或任意挂载。源码和依赖只读，输出由宿主服务保留；命令退出、取消、断开及父进程退出均清理后代进程。完整组继续使用自己原有的固定执行器。
+baseline 的唯一 MCP 是 `baseline_local.isolated_exec`，设置 `required=true`，参数只有普通 `argv`、工作副本内相对 `cwd` 和可选 `timeout_seconds`。普通 shell 禁止网络；该工具每次创建独立网络、PID、IPC 和文件视图，提供固定的 IPv4／IPv6 localhost 映射，允许同次调用内的本地 TCP，不开放宿主网络或任意挂载。源码和依赖只读，输出由宿主服务保留；命令退出、取消、断开及父进程退出均清理后代进程。完整组继续使用自己原有的固定执行器。
 
-可选 `go_mod_cache_dir` 只读作为 `GOMODCACHE`；`cargo_dependency_cache_dir` 仅只读提供 Cargo home 的 `registry/`、`git/`，不开放认证配置。没有共享依赖时使用空离线缓存。每 run 的构建和临时目录位于 `work/.runtime/`，构建耗时计入预算；不复制或全量扫描宿主缓存。完整组 Rust 编译种子与普通组依赖复用存在差异，成本须分别说明。
+可选 `go_mod_cache_dir` 只读作为 `GOMODCACHE`；`cargo_dependency_cache_dir` 仅只读提供 Cargo home 的 `registry/`、`git/`，不开放认证配置。没有共享依赖时使用空离线缓存。每 run 的构建和临时目录位于 `work/.runtime/`，构建耗时计入预算；该临时目录不留存并在收尾删除；复现源码、脚本、笔记和必要输出须由 Agent 放在 `work` 下其他普通目录，沿用安全文件差异留存。已有实验被清理的复现文件不因此恢复。不复制或全量扫描宿主缓存。完整组 Rust 编译种子与普通组依赖复用存在差异，成本须分别说明。
 
 ## 预算与记录
 
 总时间从源码捕获前起算，包含准备、工具和模型等待；每回合取单回合限制与总剩余的较小值，正常完成且有预算时精确续接同一 session。工具串行执行，请求上限、动作上限、回合剩余和总剩余共同约束。单回合超时会结束整个 run，配置时长是上限；局部准备超时不冒充总预算耗尽。到时只保留已有材料，不追加总结。
 
-每次启动创建新目录、新 session；baseline 没有跨进程 resume 入口。`run.json` 保存阶段时点、实际停止原因和回合索引；`index.md` 链接最近完成报告与原始输出。usage 保留逐事件值，不未经核对求和。
+每次启动创建新目录、新 session；baseline 没有跨进程 resume 入口。`run.json` 保存阶段时点、实际停止原因和回合索引；`index.md` 链接最近完成报告与原始输出。usage 保留逐事件值，不未经核对求和。停止依据采用原生失败／拒绝事件、真实退出状态、控制器边界及明确的 `RUN_BLOCKED:`；报告中的拒绝引文或单条非 JSON 诊断不推翻有效完成。session 按非空字符串原样续接，不要求 UUID 格式。
 
 `inputs/implementation.json` 用 Git 提交和 runtime dirty 状态标识干净同仓代码，另保存修改文件及外部安装模块的安全字节。CLI 保留路径、版本和一次性摘要，catalog 保留原字节。`inputs/local-exec.json` 保存一份服务配置、工具说明和权限依据；不在每回合重建 schema 或扫描整个 Python 环境。MCP 会延后加载代码，因此仍在启动回合前核对执行服务及其存储模块的字节；不另建部署锁定系统。
 
