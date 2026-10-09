@@ -1,0 +1,18 @@
+Turn complete. Report updated at [report.md](/home/nitro/Desktop/consensus-assurance/baseline/runs/2026-10-09_14-01-25-hashicorp_raft-baseline/work/report.md).
+
+This turn I extended the independent verification to the snapshot path, the one consensus-critical area my earlier harness didn't reach.
+
+`work/zz_audit_snapshot_test.go` (gated behind `-tags auditdiag`) runs a 5-node in-memory cluster with `SnapshotThreshold=10`, `SnapshotInterval=50ms`, `TrailingLogs=5`. It disconnects a follower, has the leader commit ~900–1000 entries while taking snapshots, then reconnects the follower and requires it to catch up — which forces `InstallSnapshot` because the log has been compacted. It then checks that all FSMs converge to an identical applied sequence and that no acked command is lost.
+
+```
+go test -tags auditdiag -v -count=5 -run '^TestAuditSnapshotCatchupInvariants$' .
+--- PASS ×5   ok  github.com/hashicorp/raft
+# acked=1014 node0_applied=1014 missing=0
+# straggler_last_snapshot=1016 straggler_last_idx=2 straggler_applied=1016
+```
+
+The `straggler_last_idx=2` readings are the important detail: the follower's log was fully compacted (down to the trailing-logs floor) and its state was rebuilt from a snapshot before re-joining, so the `InstallSnapshot` + compaction + catch-up path was genuinely exercised — not merely log replication. 5/5 converged with `missing=0`.
+
+Combined with the prior randomized leader-isolation harness (10 runs, 40 partition rounds, ~7k acked commands, zero divergence), the independent checks now cover leadership failover, log truncation/rejoin, and snapshot install/compaction under partition, all clean.
+
+Current state of the audit is unchanged at the top level: one confirmed low-severity defect (Finding 1 in `testing.go`'s `EnsureSamePeers`), no consensus-level defect found by source review or by three independent methods (repo test suite, core-consensus batch, and my two invariant harnesses), and the one honest open question is whether Finding 1 is the injected mutation or a latent upstream flake, which cannot be settled offline. Further useful work would be narrower still: mixed protocol-version variants of these harnesses, or a trustworthy upstream reference for a byte diff (currently blocked by no network).

@@ -1,0 +1,69 @@
+{
+  "action": "continue",
+  "rationale": "Map addition plus first Candidate for the snapshot-store listing responsibility recorded as sourced feedback last turn. The map adds B-snapshot-store-list (A6, producer) and the Fact F-snapshot-list-order, and makes B-snapshot-install consume that Fact because the leader's sendLatestSnapshot and the startup restore both select the first List entry. The Candidate's principal Fact is that ordering, lifecycle preservation, with the listing Behavior as the direct producer and B-snapshot-install as the consumer/consequence; the A1 relationship is declared through B-snapshot-install's cross-activity effect and the supporting consumer path. Sourced discrepancy: the interface documents descending order with the highest index first, while snapMetaSlice.Less compares Term before Index, so inversely ordered retained snapshots put a lower-index snapshot first - which the consumers would ship or restore. No defect is presumed; the reachability of inversely ordered retained snapshots and the consequence are the discriminators.",
+  "map_path": "maps/core-v1.json",
+  "map_changes": {
+    "B-snapshot-install": {
+      "impact": "dependency",
+      "rationale": "The leader-side half of this Behavior (sendLatestSnapshot) selects snapshots[0] from r.snapshots.List(), so the install/send duty depends on the list-order Fact. The edge is added rather than assumed; identity, activity, trigger, guards and the sink-side behavior are unchanged.",
+      "source_ids": [
+        "S-replication",
+        "S-snapshot-list-contract",
+        "S-file-snapshot-list"
+      ],
+      "preserves": "B-snapshot-install keeps its id, primary Activity (A3), execution owner, protocol context, trigger, legal preconditions, sink-side writes and its cross-activity effect on A1; only a new consumes edge to the newly added F-snapshot-list-order is declared. Candidate 0e6f2e68d1704626a7ad26a172426d66, which cited this Behavior as cause/context support, is unaffected: its premise concerns the follower sink resetting the log store, not the leader's snapshot selection, and the previously corrected writes/branches remain as recorded."
+    }
+  },
+  "question": {
+    "question": "Does SnapshotStore.List return snapshots in descending applied-index order as the interface states, so that the first entry is the snapshot with the highest Index - or does FileSnapshotStore's Term-before-Index comparison return a lower-index snapshot first when two retained snapshots are inversely ordered, so that the leader ships and a restarting node restores an older applied state than the store actually holds?",
+    "importance": "The first list element is the snapshot the leader opens in sendLatestSnapshot to bring a lagging follower up to date and the first one NewRaft's restoreSnapshot tries to load. Selecting a lower-index snapshot because its last-entry term is higher can ship an outdated snapshot or restore an older applied state, which for a local storage duty is a state-recovery concern rather than a consensus-safety claim; the interface wording fixes the required order regardless of the consequence.",
+    "trigger_rationale": "The interface document and the comparator are two different statements of the same ordering obligation, and they disagree exactly when term order and index order are inverted across two retained snapshots - a situation the code neither prevents nor checks. Because the disagreement depends on a data configuration (which snapshots the store retains) rather than on a single call path, the obligation must be fixed and the comparison tested with snapshots created in the inverted order.",
+    "disposition": "needs_specific_evidence",
+    "preferred_check": "direct_test",
+    "priority": 2,
+    "obligation_relation_kind": "preservation",
+    "activity_classes": [
+      "A1",
+      "A6"
+    ],
+    "behavior_ids": [
+      "B-snapshot-store-list"
+    ],
+    "fact_ids": [
+      "F-snapshot-list-order"
+    ],
+    "supporting_behavior_ids": {
+      "B-snapshot-install": "Consumer/consequence: the leader's sendLatestSnapshot opens snapshots[0] to ship to a lagging follower and NewRaft's restoreSnapshot loads the first snapshot that succeeds, so the list order decides which snapshot is sent or restored and therefore which applied state the peer or the restarting node adopts."
+    },
+    "contexts": [
+      "FileSnapshotStore with retention >= 2 holding two snapshots whose (term, index) positions are inversely ordered",
+      "Leader replication goroutine running sendLatestSnapshot for a far-behind follower",
+      "Node startup running restoreSnapshot over the same store"
+    ],
+    "event_paths": [
+      "snapshot store Create(version,index,term,...) -> sink Close -> directory renamed into place with meta.json",
+      "r.snapshots.List() -> getSnapshots reads each meta.json, skips .tmp and unreadable entries, sorts with sort.Reverse(snapMetaSlice)",
+      "snapMetaSlice.Less compares Term first, then Index, so the reversed order puts the higher-term snapshot first even when its Index is lower",
+      "sendLatestSnapshot -> snapshots[0].ID -> r.snapshots.Open(snapID) -> InstallSnapshot to the follower",
+      "NewRaft -> restoreSnapshot -> tryRestoreSingleSnapshot for each listed snapshot until one succeeds -> setLastApplied(snapshot.Index)"
+    ],
+    "counterevidence": [
+      "Within a single log lineage, terms are non-decreasing with index, so snapshots taken from one node's own log are ordered consistently by both comparators",
+      "The SnapshotStore interface is caller-implementable, so only the in-repository FileSnapshotStore is bound by this comparator",
+      "List returns at most the retain count and skips unreadable or unsupported snapshots, which limits how many entries can participate",
+      "NewRaft's restoreSnapshot falls through to the next listed snapshot when one fails to load, so a bad first choice does not necessarily prevent startup"
+    ],
+    "unknowns": [
+      "Whether a node can retain two snapshots whose positions are inversely ordered, for example a local snapshot with a high last-entry term next to a snapshot installed from a leader whose last entry has a lower term but a higher index",
+      "Whether selecting the lower-index snapshot in restoreSnapshot regresses applied state or makes the startup configuration scan fail on logs that were compacted up to the higher index",
+      "Whether the term-first comparator is deliberate authority ordering, in which case only the interface description is wrong"
+    ],
+    "source_ids": [
+      "S-snapshot-list-contract",
+      "S-file-snapshot-list",
+      "S-file-snapshot-sort",
+      "S-replication",
+      "S-raft-installsnapshot"
+    ]
+  }
+}

@@ -1,0 +1,61 @@
+{
+  "action": "continue",
+  "rationale": "Map addition plus a new Candidate on the bootstrap responsibility. The map adds B-bootstrap-config (A4), the Behavior that seeds a brand-new server's storage: it writes the current term first and then stores the index-1 configuration entry, and the guard that decides whether bootstrapping is still allowed reads that same term key. The Candidate's principal Fact is F-term-vote (the persisted current term), lifecycle establishment, with B-bootstrap-config as a producer and B-term-vote-persist as context for the same StableStore key. Sourced discrepancy: the two durable writes are ordered and not atomic, so a StoreLog failure after the term write leaves the store reporting existing state and every retry returns ErrCantBootstrap; the guard's own comment calls such an error safely ignorable, which presumes the state really is bootstrapped. No defect is presumed; whether a shipped store fails that call and whether RecoverCluster is the intended remedy are the discriminators.",
+  "sources": [
+    {"id": "S-api-bootstrap", "file": "api.go", "start_line": 239, "end_line": 284, "kind": "code_observation"},
+    {"id": "S-api-hasstate", "file": "api.go", "start_line": 462, "end_line": 492, "kind": "code_observation"}
+  ],
+  "map_path": "maps/core-v1.json",
+  "question": {
+    "audit_spec_version": 8,
+    "question": "When BootstrapCluster fails after writing the current term but before storing the bootstrap configuration entry, does the server remain bootstrappable - does a subsequent BootstrapCluster attempt still seed the store - or does HasExistingState's current-term check make the store look already bootstrapped so every retry returns ErrCantBootstrap while no configuration entry exists?",
+    "importance": "BootstrapCluster is the supported way to seed a brand-new server's storage. A partially completed bootstrap that permanently blocks retries would leave the server unable to form or join a cluster without operator intervention through a different recovery path, so the consequence is bounded availability and recovery rather than consensus safety.",
+    "trigger_rationale": "The two durable writes run in a fixed order with no rollback, and the key the first write sets is exactly what the bootstrap guard reads. The guard's own comment says a further attempt's error can be safely ignored, which presumes the state really is bootstrapped; whether a store failure can split the two writes and what the guard then reports is what must be tested.",
+    "disposition": "needs_specific_evidence",
+    "preferred_check": "direct_test",
+    "priority": 1,
+    "obligation_relation_kind": "establishment",
+    "activity_classes": [
+      "A2",
+      "A4"
+    ],
+    "behavior_ids": [
+      "B-bootstrap-config"
+    ],
+    "fact_ids": [
+      "F-term-vote"
+    ],
+    "supporting_behavior_ids": {
+      "B-term-vote-persist": "Context: this Behavior writes the same StableStore current-term key on the normal term-transition path, so the bootstrap write is a second establishment path for the same fact and the value alone cannot distinguish a bootstrapped server from one whose log write failed."
+    },
+    "contexts": [
+      "Caller invoking BootstrapCluster on a store that HasExistingState reports as clean",
+      "Injected LogStore whose StoreLog call fails once after the stable current-term write succeeded",
+      "A later bootstrap attempt or NewRaft start reading the same store"
+    ],
+    "event_paths": [
+      "BootstrapCluster -> ValidateConfig/checkConfiguration -> HasExistingState (reports false) -> stable.SetUint64(keyCurrentTerm, 1)",
+      "BootstrapCluster -> logs.StoreLog(configuration entry at index 1) fails -> error returned to the caller",
+      "later BootstrapCluster -> HasExistingState reads keyCurrentTerm = 1 -> reports existing state -> ErrCantBootstrap before any log check",
+      "NewRaft on the same store -> setCurrentTerm(1) and lastLogIndex 0 -> follower with an empty configuration"
+    ],
+    "counterevidence": [
+      "The failure requires the injected LogStore to return an error from StoreLog, which is outside the library's own control and does not occur for a healthy store",
+      "RecoverCluster exists as an operator path that can force a configuration onto such a store, so the state is not necessarily unrecoverable",
+      "HasExistingState also treats a non-empty log or snapshot as existing state, so a store that had genuinely been bootstrapped is still detected through those checks",
+      "The guard's error is documented as safe to ignore when a cluster really has been bootstrapped, so the behaviour is correct for the intended case"
+    ],
+    "unknowns": [
+      "Whether an in-repository or caller-supplied LogStore returns an error from StoreLog after the stable write succeeded, i.e. whether the partial bootstrap is reachable rather than merely expressible",
+      "Whether every retry is rejected as already bootstrapped, or whether some later path re-derives the configuration",
+      "Whether RecoverCluster is the intended and sufficient operator remedy, which would bound the consequence to an explicit recovery step"
+    ],
+    "source_ids": [
+      "S-api-bootstrap",
+      "S-api-hasstate",
+      "S-stablestore",
+      "S-raft-persistvote",
+      "S-raft-setstate"
+    ]
+  }
+}

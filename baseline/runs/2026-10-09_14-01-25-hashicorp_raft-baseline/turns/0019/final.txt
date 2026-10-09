@@ -1,0 +1,24 @@
+Turn complete. Report updated at [report.md](/home/nitro/Desktop/consensus-assurance/baseline/runs/2026-10-09_14-01-25-hashicorp_raft-baseline/work/report.md).
+
+This turn I turned Finding 1 from "consistent with" into a quantified, mechanism-level confirmation by measuring the actual configuration-propagation timing.
+
+`work/zz_audit_lag_test.go` (gated behind `-tags auditdiag`) records, immediately after `AddVoter` returns, whether node 0 is already updated, and how long each node takes to observe the new configuration:
+
+```
+go test -tags auditdiag -v -count=20 -run '^TestAuditConfigPropagationLag$' .
+# staleAtFirstRead=true : 3/20 runs (15%)
+# per-node lag after AddVoter returns: 4-12µs typical, up to ~1.2ms
+```
+
+Two conclusions, both recorded in the report:
+
+1. The propagation lag is inherently tiny — microseconds, at worst about a millisecond — because a follower that isn't in the committing quorum simply learns the entry on its next AppendEntries. So the implementation is healthy; there is no "stuck or slow follower" defect, which rules out the alternative hypothesis I had been carrying since the first stall observation.
+2. Node 0 is stale at the exact instant `EnsureSamePeers` snapshots it in **15%** of runs, matching the observed flake rate. That is direct evidence the frozen `peerSet` — not the Raft protocol — causes the failures.
+
+Hygiene holds: six `zz_audit_*` diagnostics now exist, all behind `-tags auditdiag`, and `go vet .` is clean with no tags, so the captured suite's default build is untouched.
+
+Final state of the audit:
+
+- Finding 1 (confirmed, low severity): `testing.go`'s `EnsureSamePeers` freezes its reference peer set outside the retry loop, so tests that check peers after a config change can fail on a fully consistent cluster. Confirmed in two shipped tests (`TestRaft_ProtocolVersion_Upgrade_2_3` ~6/20; `TestRaft_HasExistingState` 1/3), reproduced against a 0/20 refresh-each-poll control, mechanism-verified by goroutine dump and now by propagation-lag measurement.
+- No consensus-level defect, by five independent methods (full source review, shipped suite, core-consensus batch, three invariant harnesses ~16k acked commands, plus this timing study).
+- One open item, unanswerable offline: whether the one-line frozen-snapshot pattern is the injected mutation or a latent upstream flake, since no trustworthy upstream reference is obtainable without network.

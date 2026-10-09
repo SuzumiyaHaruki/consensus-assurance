@@ -1,0 +1,21 @@
+Turn complete. Report updated at [report.md](/home/nitro/Desktop/consensus-assurance/baseline/runs/2026-10-09_14-01-25-hashicorp_raft-baseline/work/report.md).
+
+This turn I stress-ran the `TestRaft_*` suite three times and found a **second** affected test, which also forced me to correct an earlier explanation.
+
+Results (`work/.runtime/raft3.log`):
+
+- `TestRaft_ProtocolVersion_Upgrade_2_3` — 1/3 failed
+- `TestRaft_HasExistingState` — 1/3 failed
+- `TestRaft_runFollower_*` — 3/3, but those are the known socket-permission failures
+
+Both failures are the same `peer mismatch` at `testing.go:705` (frozen 2-voter set vs current 3-voter set), so Finding 1's impact extends to a second shipped test.
+
+Crucially, `TestRaft_HasExistingState` uses the default protocol version (3) and a plain `MockFSM`, which falsifies my turn-8 explanation that the window only opens for protocol-2 leaders. The correct account, now in the report:
+
+- `EnsureSame` compares only the `MockFSM` **command** logs (`fsm.logs`), and a committed configuration entry never enters those logs — `LogConfiguration` is either skipped or routed to `ConfigurationStore.StoreConfiguration` (a separate `configurations` slice).
+- So `EnsureSame` never waits for a committed config entry to be applied on all nodes, for any protocol version, and the frozen-`peerSet` race is open in any test that calls `EnsureSamePeers` shortly after a config change.
+- Why `TestRaft_JoinNode` and friends didn't flake in a 60-run sample is then just timing/probability (how many calls sit between `AddVoter` returning and the first `getConfiguration(rafts[0])` read), not a structural difference.
+
+I corrected both the summary and the finding text so the report no longer overstates a protocol-2-specific trigger.
+
+Everything else stands: Finding 1 is the only concrete defect, no consensus-level defect was found across five independent methods, and the sole open item — whether the one-line frozen-snapshot pattern is the injected mutation or a latent upstream flake — remains unanswerable offline without a trustworthy upstream reference.

@@ -1,0 +1,98 @@
+{
+  "description": "Direct check of C-bootstrap-partial-state: call BootstrapCluster against a store whose StoreLog fails once, then observe whether the same store remains bootstrappable. The oracle is that a second BootstrapCluster on the now-healthy store seeds the configuration entry (retry_allowed == true); identity is the storage instance labelled on every event. Because the term write precedes the log write and the existing-state guard reads the term, observing retry_allowed false is the violating observation for the bounded recovery responsibility.",
+  "claim_id": "C-bootstrap-partial-state",
+  "binding_ids": [
+    "BND-bootstrap-order"
+  ],
+  "harness": {
+    "kind": "go_test",
+    "description": "In-package Go test that runs BootstrapCluster on a fresh in-memory store with a single simulated StoreLog failure, checks HasExistingState afterwards, then retries BootstrapCluster on the now-healthy store and reports both outcomes.",
+    "semantic_changes": [
+      "The LogStore wrapper fails exactly one StoreLog call to expose the ordering between the term write and the configuration-entry write; all other store behaviour is the in-repository InmemStore.",
+      "Protocol version 3 is used so the seeded entry is a LogConfiguration entry; no protocol logic is altered."
+    ],
+    "prerequisites": [
+      {
+        "alias": "partial",
+        "event": "bootstrap_attempt",
+        "conditions": [
+          {"field": "node", "value": "n1"},
+          {"field": "first_error", "value": true},
+          {"field": "store_log_failed", "value": true}
+        ]
+      }
+    ],
+    "legality": {
+      "source_ids": [
+        "S-api-bootstrap",
+        "S-api-hasstate",
+        "S-stablestore"
+      ],
+      "expectation_ids": [],
+      "binding_ids": [
+        "BND-bootstrap-order"
+      ],
+      "derivation": "BootstrapCluster is a public function that accepts caller-supplied LogStore and StableStore implementations, and the LogStore interface permits StoreLog to return an error, so a store that fails that call after the stable write is a legal object. The retry uses the same function and a healthy store, which is exactly the sequence an operator would attempt.",
+      "applicability": "The store starts clean (HasExistingState false), the configuration lists the local server as a single voter, and only one StoreLog call is simulated to fail; the proposition is local to this store instance.",
+      "unresolved": [
+        "Whether a production store fails StoreLog in this position."
+      ],
+      "conflicts": [],
+      "alternatives": [
+        "RecoverCluster is an operator path that can force a configuration onto such a store, which bounds but does not remove the blocked retry."
+      ]
+    }
+  },
+  "monitors": [
+    {
+      "checker_id": "P-retry-allowed",
+      "grounding": {
+        "source_ids": [
+          "S-api-bootstrap",
+          "S-api-hasstate"
+        ],
+        "expectation_ids": [],
+        "binding_ids": [
+          "BND-bootstrap-order"
+        ],
+        "derivation": "The guard is what decides whether the seed may run again, and the observed log index shows whether the seed actually completed; reporting both lets the comparison distinguish a genuine already-bootstrapped store from one whose term exists without its configuration entry.",
+        "applicability": "Admitted only for the store instance that experienced the simulated failure, correlated by the storage label shared between the prerequisite and the result event.",
+        "unresolved": [],
+        "conflicts": [],
+        "alternatives": [
+          "A retry failure on an already-bootstrapped store would be correct behaviour; the harness reports the log index so that case is distinguishable."
+        ]
+      },
+      "applicability_conditions": [],
+      "event": "bootstrap_outcome",
+      "id": "M-bootstrap-outcome",
+      "binding_ids": [
+        "BND-bootstrap-order"
+      ],
+      "admission_alias": "partial"
+    }
+  ],
+  "observable_properties": [
+    {
+      "checker_id": "P-retry-allowed",
+      "kind": "event_assertion",
+      "trigger": {
+        "field": "node",
+        "value": "n1"
+      },
+      "assertion": {
+        "field": "retry_allowed",
+        "op": "eq",
+        "value": true
+      },
+      "identity_fields": [
+        "node"
+      ],
+      "description": "After a bootstrap attempt fails at the log store, a subsequent attempt on the healthy store must still be able to seed the configuration entry; the compared field combines the retry error with the observed log index."
+    }
+  ],
+  "uncertainties": [
+    "The check uses an in-memory store with a single simulated failure; it establishes the local bootstrap responsibility, not a cluster-wide consequence, and does not exercise RecoverCluster.",
+    "Only the single-StoreLog failure point is instantiated."
+  ]
+}

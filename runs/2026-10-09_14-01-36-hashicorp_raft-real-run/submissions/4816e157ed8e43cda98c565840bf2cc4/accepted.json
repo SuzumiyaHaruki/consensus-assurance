@@ -1,0 +1,49 @@
+{
+  "rationale": "Closing another unread peripheral area with a sourced explanation: the network transport's RPC admission and its heartbeat fast-path. The transport decodes each command, classifies strictly entry-less AppendEntries as heartbeats, and either calls the registered heartbeat handler directly on the connection goroutine or dispatches the RPC to the main consumer. The NewRaft comment requires that fast path to be safe when called concurrently with a blocking RPC, so the question is what the fast-path handler actually touches; reading it shows only atomic state writes, the leader lock and the last-contact lock, which is what makes the concurrent call safe. No discrepancy was found and no map object changes.",
+  "sources": [
+    {
+      "id": "S-net-transport-command",
+      "file": "net_transport.go",
+      "start_line": 639,
+      "end_line": 742,
+      "kind": "code_observation"
+    },
+    {
+      "id": "S-raft-process-heartbeat",
+      "file": "raft.go",
+      "start_line": 1415,
+      "end_line": 1437,
+      "kind": "code_observation"
+    },
+    {
+      "id": "S-raft-heartbeat-fastpath",
+      "file": "api.go",
+      "start_line": 613,
+      "end_line": 616,
+      "kind": "document_statement"
+    }
+  ],
+  "feedback": {
+    "ref_ids": [
+      "S-net-transport-command",
+      "S-raft-process-heartbeat",
+      "S-raft-heartbeat-fastpath"
+    ],
+    "answered": "The heartbeat fast path is safe as documented, and the transport's RPC admission adds no separate obligation. In the transport, each command is decoded, an InstallSnapshot reader is bounded by io.LimitReader(r, req.Size), and an AppendEntries command is treated as a heartbeat only under a strict conjunction - non-zero term, a leader address, PrevLogEntry and PrevLogTerm zero, no entries and LeaderCommitIndex zero - so an entry-carrying or commit-carrying AppendEntries always goes to the main consumer. When the fast path applies and a handler is registered, the handler is invoked directly on the connection goroutine; reading processHeartbeat and the appendEntries path it reaches shows that for such an entry-less heartbeat the handler can only call setState/setCurrentTerm (atomic stores), setLeader (which takes leaderLock and publishes an observation only on change), the previous-log check (skipped because PrevLogEntry is zero), the entries block (skipped because there are no entries), the commit update (skipped because LeaderCommitIndex is zero) and setLastContact (lastContactLock), and it reads the cached last index for the response under the state lock. No plain configurations field is written and no LogStore call is made on that path, so calling it concurrently with a blocking RPC does not race the main loop's configuration or storage mutations. The heartbeat classification is therefore load-bearing: it is what keeps the fast path free of the state the main thread owns.",
+    "remaining": [
+      "The in-repository tcp_transport.go stream layer and the connection/pipeline pooling code were not read in this pass; only the command admission and fast-path classification were.",
+      "The FSM batch manager, NewRaft startup reconstruction and the testing helpers remain unread or only partially read, as recorded in the previous residual feedback.",
+      "The Raft.Restore reporting ambiguity recorded previously is unchanged."
+    ],
+    "understanding": "unchanged",
+    "rationale": "Recorded so the network transport's admission responsibilities are sourced rather than assumed: the classification is what constrains the fast path, and the fast path's field set is what makes the documented concurrency requirement hold. Nothing here contradicts an accepted map object, so no map change is proposed; the surface for RPC dispatch already maps to the append and vote handlers, and the transport's own layer remains infrastructure.",
+    "question_updates": {}
+  },
+  "repair_of": null,
+  "map_path": null,
+  "map_changes": {},
+  "reconnect_questions": {},
+  "action": "research",
+  "graph_path": null,
+  "scope_path": null
+}

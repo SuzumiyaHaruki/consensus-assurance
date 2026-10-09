@@ -1,0 +1,98 @@
+{
+  "description": "Second independent scenario for C-snapshot-list-order, exercising the other consumer named by the claim: the leader's send path. Two real snapshots are retained in inverse (term, index) order, and sendLatestSnapshot is driven directly with a spy transport that records which snapshot the leader chose. The oracle is that the leader ships the retained snapshot with the highest applied index (newest_sent == true); identity is the node label on both events. Because the send path takes the first listed snapshot, observing newest_sent false is the violating observation for the same ordering responsibility.",
+  "claim_id": "C-snapshot-list-order",
+  "binding_ids": [
+    "BND-snapshot-list-order"
+  ],
+  "harness": {
+    "kind": "go_test",
+    "description": "In-package Go test that seeds two real snapshots through FileSnapshotStore.Create/Write/Close in inverse order, then calls the leader's sendLatestSnapshot with a follower replication state and a transport that records the InstallSnapshot metadata instead of forwarding it.",
+    "semantic_changes": [
+      "The transport wrapper records the InstallSnapshot request and answers success instead of sending it to a peer, so no real follower is needed; all other transport methods delegate to the in-memory transport.",
+      "skipStartup is set and leaderState is created directly, so the send path runs without the main loop or a real election.",
+      "The snapshots use an empty Configuration and a real in-memory transport only to satisfy the Create signature."
+    ],
+    "prerequisites": [
+      {
+        "alias": "prepared",
+        "event": "snapshots_prepared",
+        "conditions": [
+          {"field": "node", "value": "n1"},
+          {"field": "retained", "value": 2}
+        ]
+      }
+    ],
+    "legality": {
+      "source_ids": [
+        "S-replication",
+        "S-snapshot-list-contract",
+        "S-file-snapshot-sort"
+      ],
+      "expectation_ids": [],
+      "binding_ids": [
+        "BND-snapshot-list-order"
+      ],
+      "derivation": "sendLatestSnapshot is the leader-side consumer that lists the store, opens the first entry and sends it with LastLogIndex/LastLogTerm from that snapshot's metadata; the SnapshotStore interface states the list is ordered with the highest index first, so the metadata the leader sends must be the most advanced retained snapshot. The transport is caller-supplied, so recording the request instead of forwarding it is a legal substitution for observing which snapshot was chosen.",
+      "applicability": "The node holds a leader state and a store retaining two readable inversely ordered snapshots; the send path is the real one and only the RPC delivery is intercepted. The proposition is local to this node.",
+      "unresolved": [
+        "Whether a running node retains such a pair."
+      ],
+      "conflicts": [],
+      "alternatives": [
+        "A conformant list order would make the leader send the highest-index snapshot, so the observed choice is attributable to the order alone."
+      ]
+    }
+  },
+  "monitors": [
+    {
+      "checker_id": "P-newest-sent",
+      "grounding": {
+        "source_ids": [
+          "S-replication",
+          "S-snapshot-list-contract"
+        ],
+        "expectation_ids": [],
+        "binding_ids": [
+          "BND-snapshot-list-order"
+        ],
+        "derivation": "The LastLogIndex the leader puts on the wire is the applied index of the snapshot it chose, so comparing that value with the highest index the store holds tests whether the first-listed snapshot was the most advanced one.",
+        "applicability": "Admitted for the leader that prepared and sent from the retained pair, correlated by the shared node label.",
+        "unresolved": [],
+        "conflicts": [],
+        "alternatives": [
+          "A send failure would be a different cause; the spy records a successful send so the compared value is the chosen snapshot rather than an error."
+        ]
+      },
+      "applicability_conditions": [],
+      "event": "snapshot_sent",
+      "id": "M-newest-sent",
+      "binding_ids": [
+        "BND-snapshot-list-order"
+      ],
+      "admission_alias": "prepared"
+    }
+  ],
+  "observable_properties": [
+    {
+      "checker_id": "P-newest-sent",
+      "kind": "event_assertion",
+      "trigger": {
+        "field": "node",
+        "value": "n1"
+      },
+      "assertion": {
+        "field": "newest_sent",
+        "op": "eq",
+        "value": true
+      },
+      "identity_fields": [
+        "node"
+      ],
+      "description": "The leader must ship the retained snapshot with the highest applied index to a lagging follower; the compared field is the LastLogIndex actually sent against the highest index the store holds."
+    }
+  ],
+  "uncertainties": [
+    "The check intercepts the RPC rather than exercising a live follower, and it constructs the inversely ordered retention directly; it establishes the selection duty, not the follower-side install outcome.",
+    "Only the in-repository FileSnapshotStore is exercised."
+  ]
+}

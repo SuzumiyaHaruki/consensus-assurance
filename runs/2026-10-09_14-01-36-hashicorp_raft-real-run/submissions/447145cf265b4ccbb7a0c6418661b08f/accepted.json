@@ -1,0 +1,91 @@
+{
+  "rationale": "New Candidate selected from an unread surface (Raft.restoreUserSnapshot, previously recorded as deferred) and from the same family of failure-path reasoning that produced the first finding, but for a genuinely different responsibility: the client-visible meaning of ErrAbortedByRestore versus when that error can actually be delivered. The public Apply contract states that ErrAbortedByRestore means 'the write effectively failed since its effects will not be present in the FSM after the restore', while restoreUserSnapshot answers every inflight logFuture with ErrAbortedByRestore before it creates and writes the replacement snapshot. If that snapshot creation or write then fails, the futures have already been told the write effectively failed even though no restore happened and the entries remain in the log. The question is scoped to the client/history boundary of F-committed and asks whether the abort can precede a failed restore, and whether those entries can still be committed and applied (making the reported outcome misleading). No defect is presumed: the configuration guard, the success path and the inflight bookkeeping are recorded as counterevidence.",
+  "sources": [
+    {
+      "id": "S-api-restore-contract",
+      "file": "api.go",
+      "start_line": 815,
+      "end_line": 817,
+      "kind": "interface_statement"
+    },
+    {
+      "id": "S-api-restore",
+      "file": "api.go",
+      "start_line": 1056,
+      "end_line": 1080,
+      "kind": "interface_statement"
+    }
+  ],
+  "feedback": null,
+  "repair_of": null,
+  "map_path": null,
+  "map_changes": {},
+  "reconnect_questions": {},
+  "action": "continue",
+  "candidate_id": null,
+  "parent_candidate_id": null,
+  "question": {
+    "audit_spec_version": 2,
+    "disposition": "concrete_suspicion",
+    "preferred_check": "direct_test",
+    "question": "On the leader, restoreUserSnapshot answers every inflight logFuture with ErrAbortedByRestore before it creates and writes the replacement snapshot; if that snapshot creation, write or close then fails, do the aborted client operations really fail as the documented ErrAbortedByRestore contract states (their effects absent from the FSM), or can their log entries still be committed by the quorum and applied, so that a client is told the write effectively failed while the entry is in fact committed and consumed?",
+    "importance": "The Apply contract gives ErrAbortedByRestore a definite meaning - the write effectively failed and its effects will not be present after the restore - which callers may rely on when deciding whether an operation needs re-issuing. If the abort is delivered before a restore that then fails, a client could treat a still-persisted entry as failed, or treat a committed entry as gone, at the A5/A7 completion boundary; a genuinely different outcome for the same reported error would be a client-contract discrepancy rather than a consensus-safety violation.",
+    "source_ids": [
+      "S-raft-restoresnapshot",
+      "S-api-restore-contract",
+      "S-api-restore",
+      "S-raft-leaderloop",
+      "S-raft-processlogs",
+      "S-commitment",
+      "S-api-apply",
+      "S-raft-configstable"
+    ],
+    "participants": [],
+    "objects": [],
+    "contexts": [
+      "Leader main goroutine handling a user-triggered restore (Raft.Restore -> userRestoreCh -> restoreUserSnapshot)",
+      "One or more client Apply/Barrier futures still in leaderState.inflight when the restore begins",
+      "Injected SnapshotStore whose Create, sink Write or sink Close fails after the inflight abort has already run"
+    ],
+    "event_paths": [
+      "Raft.Restore -> userRestoreCh -> leaderLoop userRestoreCh case -> restoreUserSnapshot",
+      "restoreUserSnapshot -> committedIndex != latestIndex check -> inflight loop responds ErrAbortedByRestore and removes each entry",
+      "restoreUserSnapshot -> r.snapshots.Create(version,lastIndex,term,...) fails -> return error to the Restore caller while the futures already carry ErrAbortedByRestore",
+      "leaderLoop dispatchLogs/commitment.match -> commitIndex advance -> processLogs -> FSM apply of the still-logged entries",
+      "follower appendEntries with LeaderCommitIndex -> setCommitIndex -> processLogs applies the same committed index on followers"
+    ],
+    "activity_classes": [
+      "A1",
+      "A7"
+    ],
+    "behavior_ids": [
+      "B-leader-apply"
+    ],
+    "fact_ids": [
+      "F-committed"
+    ],
+    "supporting_behavior_ids": {
+      "B-quorum-commit": "Context: the commitment path is independent of the inflight list, so removing aborted futures from leaderState.inflight does not by itself prevent their entries from being counted committed.",
+      "B-apply-api": "Consequence/contract: Apply/Barrier return the logFuture whose Error() resolves to ErrAbortedByRestore, which is the client-visible signal whose documented meaning is under test.",
+      "B-config-eligibility": "Prehistory/guard: restoreUserSnapshot refuses to proceed while a configuration change is outstanding (committedIndex != latestIndex), which bounds when the abort can be delivered."
+    },
+    "obligation_relation_kind": "consumption",
+    "counterevidence": [
+      "restoreUserSnapshot returns before the inflight abort when a configuration change is outstanding (committedIndex != latestIndex), so the abort cannot be delivered while the cluster is mid-membership-change",
+      "On a successful restore the FSM is replaced with the snapshot contents and a burned index is appended, so ErrAbortedByRestore is accurate for the success path",
+      "The abort loop removes each future from leaderState.inflight, so this leader's inflight completion bookkeeping no longer tracks those entries",
+      "deferError.respond is single-shot, so a future answered ErrAbortedByRestore cannot later be answered nil"
+    ],
+    "unknowns": [
+      "Whether a user-triggered restore can fail after the inflight abort in practice, i.e. whether SnapshotStore.Create or the sink Write/Close realistically returns an error at that point",
+      "Whether the aborted operations' entries are still counted committed by commitment.recalculate and applied by processLogs afterwards, which would make the reported 'write effectively failed' outcome misleading for that client",
+      "Whether any consumer or caller relies on the documented ErrAbortedByRestore meaning to decide re-issuing, which would determine the practical consequence"
+    ],
+    "priority": 2,
+    "trigger_rationale": "restoreUserSnapshot's abort loop runs before sink creation, and the documented ErrAbortedByRestore meaning is asserted in api.go; the failure handling of the snapshot store in between (sink.Cancel, error returns) is what could separate the abort from an actual restore. Because the abort and the restore are two distinct effects in one function, the ordering and the resulting committed state are not evident from the doc comment alone and merit a direct comparison under an injected failing SnapshotStore."
+  },
+  "resume_conditions": [],
+  "result_implications": {},
+  "obligation": null,
+  "bindings": []
+}

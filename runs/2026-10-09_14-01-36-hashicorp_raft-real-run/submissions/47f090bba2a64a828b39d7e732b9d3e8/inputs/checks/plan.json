@@ -1,0 +1,106 @@
+{
+  "description": "Direct check of C-snapshot-install-log-identity: a follower with a monotonic LogStore and a cached last log index above the incoming snapshot index handles a real InstallSnapshot RPC, then receives the AppendEntries the leader would send from the snapshot index. The oracle is the follower's own acceptance of that follow-up request (accepted == true); identity is the single node the history belongs to. Because installSnapshot empties the log store for monotonic stores without updating the cached last log identity, observing accepted false is the violating observation for the fixed recovery responsibility.",
+  "claim_id": "C-snapshot-install-log-identity",
+  "binding_ids": [
+    "BND-install-snapshot-reset-logs"
+  ],
+  "harness": {
+    "kind": "go_test",
+    "description": "In-package Go test that seeds a log suffix, marks the LogStore monotonic, drives the real InstallSnapshot handler with a real RPC reader, then drives the real appendEntries handler with the leader's post-install request and observes the follower's cached identity, the emptied store and the acceptance result.",
+    "semantic_changes": [
+      "skipStartup is set and only the FSM goroutine is started, so the install handler runs without the main loop; installSnapshot's restore step therefore reaches the real FSM goroutine and the FSM is a no-op stub that ignores the snapshot bytes.",
+      "The single-voter configuration is installed directly rather than bootstrapped, so the handler's peer-set update and log reset run without real peers.",
+      "The snapshot payload is three arbitrary bytes with a matching Size; the content is irrelevant because the stub FSM performs no restore work."
+    ],
+    "prerequisites": [
+      {
+        "alias": "install",
+        "event": "snapshot_installed",
+        "conditions": [
+          {"field": "node", "value": "n1"},
+          {"field": "success", "value": true}
+        ]
+      },
+      {
+        "alias": "identity",
+        "event": "post_install_identity",
+        "conditions": [
+          {"field": "node", "value": "n1"}
+        ]
+      }
+    ],
+    "legality": {
+      "source_ids": [
+        "S-raft-installsnapshot",
+        "S-logstore-monotonic",
+        "S-raft-appendentries"
+      ],
+      "expectation_ids": [],
+      "binding_ids": [
+        "BND-install-snapshot-reset-logs"
+      ],
+      "derivation": "installSnapshot is the follower entry point for a remote snapshot and accepts a request with a supported version, a term not older than currentTerm and a size matching the streamed bytes; the snapshot store is a real in-repository InmemSnapshotStore so Open succeeds during the restore step. The LogStore interface permits a monotonic implementation, and the MonotonicLogStore contract states that removing all logs after snapshot restore is expected, so the injected monotonic store is a legal caller-supplied object. The follow-up AppendEntries mirrors what sendLatestSnapshot prepares after a successful install (nextIndex = snapshot index + 1).",
+      "applicability": "The node is Follower with a cached last log index above the incoming snapshot index and a monotonic LogStore; the handler and the follow-up request use real target code with no protocol modification. The proposition is local to this node and makes no cluster-wide claim.",
+      "unresolved": [
+        "Whether a legal history produces a cached last log index above the leader's chosen snapshot index."
+      ],
+      "conflicts": [],
+      "alternatives": [
+        "A non-monotonic store keeps trailing entries and would not empty the store, which this check excludes."
+      ]
+    }
+  },
+  "monitors": [
+    {
+      "checker_id": "P-recovery-accepted",
+      "grounding": {
+        "source_ids": [
+          "S-raft-installsnapshot",
+          "S-raft-appendentries"
+        ],
+        "expectation_ids": [],
+        "binding_ids": [
+          "BND-install-snapshot-reset-logs"
+        ],
+        "derivation": "After a successful install the leader replicates from the snapshot index, so the follower must accept an AppendEntries whose PrevLog entry is the snapshot index and whose entries follow it. The follower's own Success field is the discriminator, and the harness records the cached and stored identities so the reason a rejection occurs can be inspected.",
+        "applicability": "Admitted only for the node that completed the snapshot install, correlated by the node field shared between the prerequisite events and the result event.",
+        "unresolved": [],
+        "conflicts": [],
+        "alternatives": [
+          "A rejection could in principle come from an unrelated term or PrevLog mismatch; the harness fixes the request term to the node's current term and the PrevLog to the installed snapshot, so those do not differ."
+        ]
+      },
+      "applicability_conditions": [],
+      "event": "recovery_probe",
+      "id": "M-recovery-probe",
+      "binding_ids": [
+        "BND-install-snapshot-reset-logs"
+      ],
+      "admission_alias": "install"
+    }
+  ],
+  "observable_properties": [
+    {
+      "checker_id": "P-recovery-accepted",
+      "kind": "event_assertion",
+      "trigger": {
+        "field": "node",
+        "value": "n1"
+      },
+      "assertion": {
+        "field": "accepted",
+        "op": "eq",
+        "value": true
+      },
+      "identity_fields": [
+        "node"
+      ],
+      "description": "A follower that has installed a snapshot must still accept the leader's subsequent AppendEntries restarting from the snapshot index; the compared field is the append handler's own Success result for the same node."
+    }
+  ],
+  "uncertainties": [
+    "The check uses one follower without the main loop and a single-voter configuration; it establishes the local recovery responsibility, not a cluster-wide consequence.",
+    "The FSM is a no-op stub, so only raft's own bookkeeping (cached log identity, log store contents, append acceptance) is exercised.",
+    "Only the monotonic-store branch is instantiated; the non-monotonic compactLogs branch is a recorded alternative."
+  ]
+}

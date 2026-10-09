@@ -1,0 +1,115 @@
+{
+  "description": "Direct check of C-restore-abort-outcome: on a leader with one inflight client entry, invoke the real user-restore handler with a SnapshotStore whose Create fails, so the handler aborts the inflight future with ErrAbortedByRestore and then returns an error without restoring. The oracle is the documented meaning of ErrAbortedByRestore - the write's effects are absent - encoded as effects_absent == true; the identity is the single node the history belongs to. Observing effects_absent false (the aborted entry still stored and still counted committed by the commitment object) is the violating observation for the fixed responsibility.",
+  "claim_id": "C-restore-abort-outcome",
+  "binding_ids": [
+    "BND-restore-abort-before-sink"
+  ],
+  "harness": {
+    "execution_package": ".",
+    "files": {},
+    "kind": "go_test",
+    "source": "package raft\n\nimport (\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"io\"\n\t\"strings\"\n\t\"testing\"\n\t\"time\"\n)\n\n// assuranceRestoreStore fails SnapshotStore.Create once so a user restore\n// aborts its inflight futures and then fails before replacing the FSM.\ntype assuranceRestoreStore struct {\n\t*InmemSnapshotStore\n\tfailCreate bool\n}\n\nfunc (s *assuranceRestoreStore) Create(version SnapshotVersion, index, term uint64, configuration Configuration,\n\tconfigurationIndex uint64, trans Transport) (SnapshotSink, error) {\n\tif s.failCreate {\n\t\treturn nil, fmt.Errorf(\"assurance: simulated snapshot create failure\")\n\t}\n\treturn s.InmemSnapshotStore.Create(version, index, term, configuration, configurationIndex, trans)\n}\n\ntype assuranceFSM struct{}\n\nfunc (assuranceFSM) Apply(*Log) interface{}         { return nil }\nfunc (assuranceFSM) Snapshot() (FSMSnapshot, error) { return assuranceSnapshot{}, nil }\nfunc (assuranceFSM) Restore(io.ReadCloser) error    { return nil }\n\ntype assuranceSnapshot struct{}\n\nfunc (assuranceSnapshot) Persist(sink SnapshotSink) error { return sink.Close() }\nfunc (assuranceSnapshot) Release()                        {}\n\nfunc assuranceEmit(m map[string]interface{}) {\n\tb, _ := json.Marshal(m)\n\tfmt.Println(\"CA_EVENT \" + string(b))\n}\n\nfunc TestAssuranceRestoreAbortBeforeFailedRestore(t *testing.T) {\n\tnode := \"n1\"\n\tstore := NewInmemStore()\n\tconf := DefaultConfig()\n\tconf.LocalID = ServerID(node)\n\tconf.ProtocolVersion = 3\n\tconf.HeartbeatTimeout = 100 * time.Millisecond\n\tconf.ElectionTimeout = 100 * time.Millisecond\n\tconf.LeaderLeaseTimeout = 100 * time.Millisecond\n\tconf.CommitTimeout = 5 * time.Millisecond\n\tconf.SnapshotThreshold = 100000\n\tconf.skipStartup = true\n\n\t_, trans := NewInmemTransport(NewInmemAddr())\n\tsnaps := &assuranceRestoreStore{InmemSnapshotStore: NewInmemSnapshotStore(), failCreate: true}\n\tr, err := NewRaft(conf, assuranceFSM{}, store, store, snaps, trans)\n\tif err != nil {\n\t\tt.Fatalf(\"NewRaft: %v\", err)\n\t}\n\n\t// Leader with a single-voter configuration so a dispatched entry reaches a quorum.\n\tcfg := Configuration{Servers: []Server{{ID: ServerID(node), Address: trans.LocalAddr(), Suffrage: Voter}}}\n\tr.setLatestConfiguration(cfg, 1)\n\tr.setCommittedConfiguration(cfg, 1)\n\tr.setCurrentTerm(2)\n\tr.setState(Leader)\n\tr.setupLeaderState()\n\n\t// Dispatch a real client entry; without a running leaderLoop it stays inflight.\n\tfut := &logFuture{log: Log{Type: LogCommand, Data: []byte(\"assurance-value\")}}\n\tfut.init()\n\tr.dispatchLogs([]*logFuture{fut})\n\tidx := fut.Index()\n\tcommittedBefore := r.getCommitIndex()\n\n\t// User-triggered restore whose snapshot creation fails after the inflight abort.\n\tmeta := &SnapshotMeta{\n\t\tVersion:            1,\n\t\tID:                 \"assurance-restore\",\n\t\tIndex:              idx,\n\t\tTerm:               2,\n\t\tSize:               3,\n\t\tConfiguration:      cfg,\n\t\tConfigurationIndex: 1,\n\t}\n\trestoreErr := r.restoreUserSnapshot(meta, strings.NewReader(\"abc\"))\n\tfutureErr := fut.Error()\n\n\tvar stored Log\n\tgetErr := store.GetLog(idx, &stored)\n\tcommittedAfter := r.getCommitIndex()\n\tcommitmentIndex := r.leaderState.commitment.getCommitIndex()\n\tentryPresent := getErr == nil && stored.Index == idx\n\t// The commitment object owns the commit decision before the leader loop\n\t// consumes it onto raftState.commitIndex.\n\tcommitted := commitmentIndex >= idx || committedAfter >= idx\n\t// The documented meaning of ErrAbortedByRestore is that the write's effects\n\t// are absent after the restore; that holds only if the entry can no longer\n\t// take effect on the FSM.\n\teffectsAbsent := !(entryPresent && committed)\n\n\tassuranceEmit(map[string]interface{}{\n\t\t\"event\": \"abort_delivered\", \"node\": node,\n\t\t\"restore_failed\": restoreErr != nil,\n\t\t\"future_error\":   fmt.Sprint(futureErr),\n\t\t\"index\":          idx,\n\t})\n\tassuranceEmit(map[string]interface{}{\n\t\t\"event\": \"abort_outcome\", \"node\": node,\n\t\t\"effects_absent\": effectsAbsent,\n\t\t\"entry_present\":  entryPresent,\n\t\t\"committed\":      committed,\n\t\t\"committed_before\": committedBefore,\n\t\t\"committed_after\":  committedAfter,\n\t\t\"commitment_index\": commitmentIndex,\n\t\t\"future_error\":     fmt.Sprint(futureErr),\n\t\t\"restore_failed\":   restoreErr != nil,\n\t})\n}\n",
+    "description": "In-package Go test that places a real dispatched client entry inflight on a single-voter leader, injects a SnapshotStore whose Create fails, calls restoreUserSnapshot with a real SnapshotMeta, and observes the aborted future's error, the entry's presence in the LogStore and the commitment's commit decision.",
+    "semantic_changes": [
+      "skipStartup is set so the main goroutine does not run; leaderState is set up directly and the restore handler is called with the committed==latest configuration guard satisfied.",
+      "The single-voter configuration is installed directly rather than by bootstrapping a cluster, so a dispatched entry reaches the commitment's quorum without real peers.",
+      "The commit decision is read from the commitment object (commitment.getCommitIndex) because no leader loop consumes commitCh in this controlled schedule."
+    ],
+    "prerequisites": [
+      {
+        "alias": "abort",
+        "event": "abort_delivered",
+        "conditions": [
+          {
+            "field": "node",
+            "op": "eq",
+            "value": "n1",
+            "reference": null
+          },
+          {
+            "field": "restore_failed",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          }
+        ]
+      }
+    ],
+    "legality": {
+      "source_ids": [
+        "S-raft-restoresnapshot",
+        "S-api-restore-contract",
+        "S-api-restore"
+      ],
+      "expectation_ids": [],
+      "binding_ids": [
+        "BND-restore-abort-before-sink"
+      ],
+      "derivation": "restoreUserSnapshot is the leader handler reached through Raft.Restore; it requires only a Leader with leaderState and a configuration whose committed index equals its latest index, both of which the harness establishes directly. The SnapshotStore interface allows Create to return an error, so a faithful store failing Create is a legal caller-supplied object, and the handler is invoked with a real SnapshotMeta and reader.",
+      "applicability": "The node is Leader with one inflight client entry and a matching committed/latest configuration; the injected SnapshotStore is faithful except for the single simulated Create failure. The proposition is local to this node and makes no cluster-wide claim.",
+      "unresolved": [
+        "Whether a SnapshotStore fails Create in production after the abort point."
+      ],
+      "conflicts": [],
+      "alternatives": [
+        "A successful restore would make ErrAbortedByRestore accurate and is excluded from this check."
+      ]
+    }
+  },
+  "monitors": [
+    {
+      "id": "M-abort-outcome",
+      "checker_id": "P-effects-absent",
+      "event": "abort_outcome",
+      "binding_ids": [
+        "BND-restore-abort-before-sink"
+      ],
+      "grounding": {
+        "source_ids": [
+          "S-api-restore-contract",
+          "S-raft-restoresnapshot"
+        ],
+        "expectation_ids": [],
+        "binding_ids": [
+          "BND-restore-abort-before-sink"
+        ],
+        "derivation": "The Apply contract states that ErrAbortedByRestore means the write effectively failed and its effects will not be present in the FSM after the restore. Because the abort is delivered before the fallible snapshot creation, the documented outcome can only hold if the entry can no longer take effect; the harness therefore observes both the aborted future's error and whether the entry is still stored and still counted committed.",
+        "applicability": "Admitted only for the node whose restore was attempted and failed, correlated by the node field shared between the prerequisite and the result event.",
+        "unresolved": [],
+        "conflicts": [],
+        "alternatives": [
+          "A partitioned or replaced leader whose entry never reaches commit would make the abort effectively accurate even after a failed restore."
+        ]
+      },
+      "applicability_conditions": [],
+      "admission_alias": "abort"
+    }
+  ],
+  "observable_properties": [
+    {
+      "checker_id": "P-effects-absent",
+      "kind": "event_assertion",
+      "trigger": {
+        "field": "node",
+        "op": "eq",
+        "value": "n1",
+        "reference": null
+      },
+      "assertion": {
+        "field": "effects_absent",
+        "op": "eq",
+        "value": true,
+        "reference": null
+      },
+      "antecedent": null,
+      "identity_fields": [
+        "node"
+      ],
+      "description": "After a leader delivers ErrAbortedByRestore to an inflight client future and the restore then fails, the write's effects must be absent as the documented contract states; the compared field is derived from the aborted entry's presence in the LogStore and the commitment's commit decision for that index."
+    }
+  ],
+  "uncertainties": [
+    "The check uses a single-voter leader without the running main loop and reads the commit decision from the commitment object; it establishes the local responsibility, not a cluster-wide consequence.",
+    "Only the Create failure point is exercised; sink Write and Close failures are the same handler error path but are not separately instantiated."
+  ]
+}
