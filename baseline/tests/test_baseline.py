@@ -1,3 +1,4 @@
+import asyncio
 import json
 import os
 import signal
@@ -10,7 +11,7 @@ from types import SimpleNamespace
 import pytest
 import yaml
 
-from baseline import codex, runner
+from baseline import codex, local_exec, runner
 from baseline.__main__ import Config, load_config, load_target, main, read_yaml, validate_selection
 
 
@@ -311,6 +312,38 @@ def test_check_env_deadline_does_not_mean_verified(tmp_path, monkeypatch):
     monkeypatch.setattr(runner, "time", SimpleNamespace(monotonic=lambda: next(ticks, 300.0)))
     result = runner.check_environment(c, load_target(c))
     assert not result["ok"] and result["stop"] == "total_deadline"
+
+
+@pytest.mark.parametrize("exception", [subprocess.TimeoutExpired(["go", "env", "GOROOT"], 30), TimeoutError()])
+@pytest.mark.parametrize("elapsed,stop,ok", [(30, "preflight_or_runtime_error", False), (120, "total_deadline", True)])
+def test_preparation_timeout_distinguishes_local_limit_from_total_deadline(tmp_path, monkeypatch, exception, elapsed, stop, ok):
+    config = configuration(tmp_path)
+    clock = [100.0]
+    monkeypatch.setattr(runner, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+    class Client(ScriptedClient):
+        def prepare(self):
+            clock[0] += elapsed
+            raise exception
+    result = runner.run(config, load_target(config), client_factory=Client)
+    assert result["stop"] == stop and result["ok"] is ok
+    assert result["reason"]
+    assert Client.instances[-1].calls == []
+
+
+@pytest.mark.parametrize("argv,valid", [(["/bin/printf", "[%s]", ""], True), ([""], False), (["/bin/echo", "\0"], False)])
+def test_execution_keeps_empty_arguments_but_rejects_invalid_executable_and_nul(tmp_path, monkeypatch, argv, valid):
+    # Only argument handling is under test here; real isolation is covered by test_environment.
+    monkeypatch.setattr(local_exec, "isolated_command", lambda argv, *args: argv)
+    control = {"work": str(tmp_path), "records": str(tmp_path / "executions"), "turn": "arguments",
+               "tool_roots": [], "read_only_roots": [], "environment": {}, "allow_experiments": True,
+               "action_timeout": 5, "turn_deadline": time.monotonic() + 10, "run_deadline": time.monotonic() + 20}
+    if valid:
+        result = asyncio.run(local_exec.execute(control, {"argv": argv}, "arguments"))
+        assert result["status"] == "completed" and result["exit_code"] == 0
+        assert result["argv"] == argv and result["stdout"]["preview"] == "[]"
+    else:
+        with pytest.raises(ValueError, match="nonempty executable.*NUL"):
+            asyncio.run(local_exec.execute(control, {"argv": argv}, "arguments"))
 
 
 def test_process_timeout_kills_descendant_and_keeps_bytes(tmp_path):

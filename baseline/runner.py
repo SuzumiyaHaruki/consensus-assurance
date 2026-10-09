@@ -527,8 +527,10 @@ def run(config, target, *, smoke=False, client_factory=Codex, environment_only=F
             loop(config, root, source, target, client, deadline, record, smoke=smoke)
             if smoke:
                 record["smoke_observations_complete"] = smoke_observations(root, record)
-    except (TimeoutError, subprocess.TimeoutExpired):
-        record["stop"] = "total_deadline"
+    except (TimeoutError, subprocess.TimeoutExpired) as exc:
+        exhausted = time.monotonic() >= deadline
+        record.update(stop="total_deadline" if exhausted else "preflight_or_runtime_error",
+                      reason=str(exc) or ("Total deadline reached" if exhausted else "Local operation timed out before total deadline"))
     except KeyboardInterrupt:
         record["stop"] = "cancelled"
     except (ValueError, OSError, subprocess.CalledProcessError) as exc:

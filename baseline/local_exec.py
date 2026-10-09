@@ -83,8 +83,8 @@ def validate_directory(work, relative):
 
 async def execute(control, arguments, request_id):
     args = Arguments.model_validate(arguments)
-    if not all(value and '\0' not in value for value in args.argv):
-        raise ValueError('argv must contain nonempty strings without NUL')
+    if not args.argv[0] or any('\0' in value for value in args.argv):
+        raise ValueError('argv needs a nonempty executable and must not contain NUL')
     if not control['allow_experiments']:
         raise ValueError('Local execution is not authorized')
     work = Path(control['work'])
