@@ -2,10 +2,6 @@ import json
 import os
 import re
 import shutil
-try:
-    import tomllib
-except ModuleNotFoundError:
-    import tomli as tomllib
 from pathlib import Path
 from consensus_assurance.core.types import CheckRun, ExecutionStatus, Origin
 from consensus_assurance.adapters.runners.process import output
@@ -41,39 +37,6 @@ def common_settings(provider=None):
     if provider:
         settings.update({f"model_providers.{provider.id}.{key}": value for key, value in {
             "request_max_retries": 4, "stream_max_retries": 5, "stream_idle_timeout_ms": 300000}.items()})
-    return settings
-
-
-def profile_options(argv, expected):
-    """Accept generated policy paths and equal repeats; reject ambiguous policy overrides."""
-    scopes = {tuple(key.split('.')) if key.startswith('model_providers.') else (key.split('.')[0],)
-              for key in expected} | {('skills',)}
-    settings = {}
-    args = iter(argv)
-    for arg in args:
-        if arg in {'-c', '--config', '--enable', '--disable'}:
-            value = next(args, '')
-            option = 'features.' + value + '=' + str(arg == '--enable').lower() if arg in {'--enable', '--disable'} else value
-        elif arg.startswith(('--config=', '-c', '--enable=', '--disable=')):
-            option = arg[2:] if arg.startswith('-c') else arg.split('=', 1)[1]
-            if arg.startswith(('--enable=', '--disable=')):
-                option = 'features.' + option + '=' + str(arg.startswith('--enable=')).lower()
-        else:
-            continue
-        key, separator, value = option.partition('=')
-        key = key.strip()
-        parts = tuple(part.strip().strip('\"\'') for part in key.split('.'))
-        if not any(parts[:len(scope)] == scope or scope[:len(parts)] == parts for scope in scopes):
-            continue
-        if not separator or key not in expected:
-            raise ValueError('Codex profile argv changed: unsupported protected override ' + key)
-        try:
-            parsed = tomllib.loads('value=' + value)['value']
-        except (ValueError, KeyError) as exc:
-            raise ValueError('Codex profile argv changed: cannot parse protected override ' + key) from exc
-        if key in settings and json.dumps(settings[key], sort_keys=True) != json.dumps(parsed, sort_keys=True):
-            raise ValueError('Codex profile argv changed: conflicting repeated override ' + key)
-        settings[key] = parsed
     return settings
 
 
@@ -148,7 +111,11 @@ class CodexAgent:
         self.profile_settings = common_settings(provider) if profile == 'single_agent' else {}
 
     def bind_inputs(self, root, repo):
-        """Capture an explicitly selected catalog, including any behavioral template."""
+        """Bind optional neutral settings and the explicitly selected model catalog."""
+        if self.profile == 'single_agent':
+            write_json(root/'agent-inputs/runtime-settings.json', {
+                'profile': self.profile, 'codex_home': str(Path(os.environ.get('CODEX_HOME', Path.home()/'.codex')).resolve()),
+                'settings': common_settings(self.provider)})
         if not self.provider or not self.provider.model_catalog_path:return
         path=Path(self.provider.model_catalog_path).expanduser().resolve()
         if path.is_relative_to(repo.resolve()) or path.is_relative_to(root):
@@ -169,16 +136,7 @@ class CodexAgent:
         expected=(config.agent_model,config.agent_reasoning_effort,config.codex_provider,config.codex_profile)
         if (self.model,self.reasoning_effort,self.provider,self.profile)!=expected:
             raise ValueError('Codex connection changed; start a new run')
-        self.validate_profile(root)
-        def connection(argv):
-            return sorted((arg,argv[i+1]) for i,arg in enumerate(argv[:-1]) if arg=='-m' or
-                arg=='-c' and (argv[i+1].split('=',1)[0] in {'model_reasoning_effort','model_provider','model_catalog_json','web_search'}
-                    or argv[i+1].startswith('model_providers.')))
-        options=connection(self.connection_options(root))
-        for path in (root/'logs').glob('*/check.json'):
-            record=json.loads(path.read_text())
-            if record['action']=='agent_turn' and connection(record['command'])!=options:
-                raise ValueError('Codex connection options changed; start a new run')
+        self.load_profile(root)
         if not self.provider or not self.provider.model_catalog_path:return
         record=json.loads((root/'agent-inputs/catalog.json').read_text())
         source=Path(self.provider.model_catalog_path).expanduser().resolve()
@@ -186,55 +144,17 @@ class CodexAgent:
                 or source.is_file() and digest(source.read_bytes())!=record['digest']):
             raise ValueError('Codex model catalog changed; start a new run')
 
-    def validate_profile(self, root, *, bind=False, argv=None):
-        """Compare durable policy before probes or cached actions can replace it."""
-        path = root/'agent-inputs/runtime-settings.json'
+    def load_profile(self, root):
         if self.profile is None:
-            if path.exists():
-                raise ValueError('Codex profile changed; start a new run')
             return
-        home = Path(os.environ.get('CODEX_HOME', Path.home()/'.codex')).resolve()
-        def normalized(settings, argv=()):
-            source_home = home
-            # Old full commands identify their private home through the helper read root.
-            for i, arg in enumerate(argv[:-1]):
-                if arg == '-c' and argv[i+1].startswith('permissions.ca_audit.filesystem='):
-                    filesystem = tomllib.loads('value=' + argv[i+1].split('=', 1)[1])['value']
-                    homes = [Path(key).parent.parent for key in filesystem if Path(key).parts[-2:] == ('tmp', 'arg0')]
-                    if len(homes) == 1:source_home = homes[0]
-            result = dict(settings)
-            result['skills.config'] = [{**item, 'path': '$CODEX_HOME/' + str(Path(item['path']).relative_to(home))
-                if Path(item['path']).is_relative_to(home) else '$CODEX_HOME/' + str(Path(item['path']).relative_to(source_home))
-                if Path(item['path']).is_relative_to(source_home) else item['path']} for item in settings.get('skills.config', [])]
-            return result
-        saved = json.loads(path.read_text()) if path.exists() else None
-        if saved is None and getattr(self, '_profile_prepared', None):
-            raise ValueError('Codex profile record disappeared; start a new run')
-        if saved is not None and (saved.get('profile') != self.profile or 'settings' not in saved):
-            raise ValueError('Missing or changed Codex profile basis; start a new run')
-        if saved and 'skills.config' not in self.profile_settings:
-            self.profile_settings['skills.config'] = [{**item, 'path': item['path'].replace('$CODEX_HOME/', str(home)+'/')}
-                for item in saved['settings'].get('skills.config', [])]
-        record = {'profile': self.profile, 'settings': normalized(self.profile_settings)}
-        if saved is not None and saved != record:
-            raise ValueError('Codex profile settings changed; start a new run')
-        historical = []
-        for log in (root/'logs').glob('*/check.json'):
-            check = json.loads(log.read_text())
-            if check.get('action') != 'agent_turn':continue
-            historical.append(check)
-            settings = profile_options(check['command'], self.profile_settings)
-            if normalized(settings, check['command']) != record['settings']:
-                raise ValueError('Codex profile argv changed or incomplete; start a new run')
-        current = [*self.sandbox_command(root), *self.connection_options(root)] if argv is None else argv
-        settings = profile_options(current, self.profile_settings)
-        if normalized(settings) != record['settings']:
-            raise ValueError('Codex profile argv changed or incomplete; start a new run')
-        if saved is None and historical:
-            raise ValueError('Historical run has no durable Codex profile basis; start a new run')
-        if bind and saved is None:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            write_json(path, record)
+        path = root/'agent-inputs/runtime-settings.json'
+        if not path.is_file():
+            raise ValueError('Missing retained Codex settings; start a new run')
+        saved = json.loads(path.read_text())
+        home = str(Path(os.environ.get('CODEX_HOME', Path.home()/'.codex')).resolve())
+        if saved.get('profile') != self.profile or saved.get('codex_home') != home:
+            raise ValueError('Codex profile environment differs from this run; start a new run')
+        self.profile_settings = saved['settings']
 
     def connection_options(self, root, *, sandbox=False):
         options=codex_options(self.profile_settings)
@@ -386,47 +306,29 @@ class CodexAgent:
                 path.unlink(missing_ok=True)
 
     def prepare(self, runner, directory, snapshot_id):
-        self.validate_profile(runner.root)
         self.client_environment()
         (directory / "tmp").mkdir(parents=True, exist_ok=True)
         profile_checks = []
-        profile_key = (str(runner.root), os.environ.get('CODEX_HOME', str(Path.home() / '.codex')))
-        if self.profile == 'single_agent' and getattr(self, '_profile_prepared', None) != profile_key:
-            # --ignore-user-config is used on real turns, so the policy must be explicit argv.
-            for name in ('bootstrap', 'prompt', 'features'):
-                args = ['features', 'list'] if name == 'features' else ['debug', 'prompt-input', 'Local configuration inspection only.']
-                command = self.sandbox_command(runner.root)
-                if command[0].endswith('bwrap'):
-                    command = [command[0], '--unshare-net', *command[1:]]
-                else:
-                    home = Path(os.environ.get('CODEX_HOME', Path.home()/'.codex')).resolve()
-                    home.mkdir(parents=True, exist_ok=True)
-                    command = ['bwrap', '--unshare-net', '--ro-bind', '/', '/', '--bind', str(runner.root), str(runner.root),
-                        '--bind', str(home), str(home), '--', *command]
-                command += [*args, *self.permission_options(runner.root, directory), *self.connection_options(runner.root, sandbox=True)]
-                self.validate_profile(runner.root, argv=command)
-                check = runner.run(command, directory, 'codex_profile_' + name, snapshot_id, 30,
-                    env=self.client_environment(), sensitive_env=(self.provider.env_key,) if self.provider else ())
-                profile_checks.append(check)
-                if check.status != ExecutionStatus.COMPLETED or check.exit_code != 0:
-                    return False, profile_checks
-                if name == 'bootstrap':
-                    home = Path(os.environ.get('CODEX_HOME', Path.home() / '.codex')).resolve()
-                    self.profile_settings['skills.config'] = [{'path':str(path),'enabled':False} for path in sorted(home.glob('skills/**/SKILL.md'))]
-                elif name == 'prompt':
-                    items = json.loads(Path(check.stdout).read_text())
-                    kinds = [kind for item in items for kind in item.get('internal_chat_message_metadata_passthrough',{}).get('content_item_kinds',[])]
-                    if any(kind in {'host_skills.instructions','agents_md.instructions'} or 'memory' in kind or 'plugin' in kind for kind in kinds):
-                        check.reason = 'Unexpected automatic instructions'; return False, profile_checks
-                else:
-                    features = {line.split()[0]:line.split()[-1] for line in Path(check.stdout).read_text().splitlines() if len(line.split()) >= 3}
-                    if any(features.get(name) != 'false' for name in DISABLED_FEATURES):
-                        check.reason = 'Single-agent settings were not effective'; return False, profile_checks
-            self.validate_profile(runner.root, bind=True)
-            self._profile_prepared = profile_key
+        self.load_profile(runner.root)
+        if self.profile == 'single_agent' and 'skills.config' not in self.profile_settings:
+            # The CLI installs bundled skills on first prompt initialization, even in an empty home.
+            home = Path(os.environ.get('CODEX_HOME', Path.home()/'.codex')).resolve()
+            home.mkdir(parents=True, exist_ok=True)
+            command = ['bwrap', '--unshare-net', '--ro-bind', '/', '/', '--bind', str(runner.root), str(runner.root),
+                '--bind', str(home), str(home), '--proc', '/proc', '--dev', '/dev', '--', 'codex',
+                'debug', 'prompt-input', 'Local configuration initialization only.',
+                *self.permission_options(runner.root, directory), *self.connection_options(runner.root, sandbox=True)]
+            check = runner.run(command, directory, 'codex_profile_bootstrap', snapshot_id, 30,
+                env=self.client_environment(), sensitive_env=(self.provider.env_key,) if self.provider else ())
+            profile_checks.append(check)
+            if check.status != ExecutionStatus.COMPLETED or check.exit_code != 0:
+                return False, profile_checks
+            self.profile_settings['skills.config'] = [{'path':str(path),'enabled':False} for path in sorted(home.glob('skills/**/SKILL.md'))]
+            write_json(runner.root/'agent-inputs/runtime-settings.json', {
+                'profile': self.profile, 'codex_home': str(home), 'settings': self.profile_settings})
         options = self.permission_options(runner.root, directory)
-        self.validate_profile(runner.root, argv=[*self.sandbox_command(runner.root), *options, *self.connection_options(runner.root)])
-        key = (str(runner.root), tuple(options), tuple(self.connection_options(runner.root)), getattr(self, 'version', 'unknown'))
+        connection = self.connection_options(runner.root)
+        key = (str(runner.root), tuple(options), tuple(connection), getattr(self, 'version', 'unknown'))
         if getattr(self, '_permission_key', None) == key:
             return True, profile_checks
         permitted, checks = self.permission_probe(runner, directory, snapshot_id, options)
@@ -436,7 +338,6 @@ class CodexAgent:
 
     def investigate(self, runner, prompt, directory, snapshot_id, timeout, session_id=None):
         """Run one Codex turn and retain the exact session and tool events."""
-        self.validate_profile(runner.root)
         directory.mkdir(parents=True, exist_ok=True)
         schema = runner.root / "agent-final.schema.json"
         write_json(schema, {"type":"object","properties":{
@@ -447,7 +348,8 @@ class CodexAgent:
                 status=ExecutionStatus.TOOL_MISSING if getattr(self, "missing", False) else ExecutionStatus.ERROR,
                 reason="Codex capability probe failed"), None, None
         options=self.permission_options(runner.root,directory)
-        if getattr(self, '_permission_key', None) != (str(runner.root), tuple(options), tuple(self.connection_options(runner.root)), getattr(self, 'version', 'unknown')):
+        connection = self.connection_options(runner.root)
+        if getattr(self, '_permission_key', None) != (str(runner.root), tuple(options), tuple(connection), getattr(self, 'version', 'unknown')):
             raise RuntimeError("Codex permission profile must be prepared before reserving a model call")
         response = runner.root / "actions" / (runner.active_action_id or "standalone") / "agent-response.json"
         response.parent.mkdir(parents=True, exist_ok=True)
@@ -455,9 +357,8 @@ class CodexAgent:
         if session_id:
             command.append("resume")
         command += ["--skip-git-repo-check", "--ignore-user-config", "--json",
-            "--output-schema", str(schema), "--output-last-message", str(response), *options,*self.connection_options(runner.root)]
+            "--output-schema", str(schema), "--output-last-message", str(response), *options, *connection]
         command += [session_id, "-"] if session_id else ["-"]
-        self.validate_profile(runner.root, argv=command)
         check = runner.run(command, directory, "agent_turn", snapshot_id, timeout, stdin=prompt,
             **({'env':self.client_environment(),'sensitive_env':(self.provider.env_key,)} if self.provider else {}))
         return self.decode(check, response, session_id)
