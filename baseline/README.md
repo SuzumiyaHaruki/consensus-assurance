@@ -71,4 +71,4 @@ runs/<run-id>/
 
 报告也在工作区变更中保留，`last_completed_report` 指向实际保留的版本；报告未变时复用该路径，后续超时修改不覆盖它。不再复制 `turns/N/report.md`；历史归档及旧链接不改写。回合末文件不冒充每条命令开始时的快照，模型自行 tee 的内容不冒充宿主原始输出。
 
-结束后归档只读，排除凭据、虚拟环境、缓存、临时锁及权限覆盖。当前追踪 [HashiCorp baseline](runs/2026-10-09_16-23-12-hashicorp_raft-baseline/index.md)：`gpt-6-astra` / `low`，预设 40 分钟，约 13 分 7 秒时因模型服务网安风险拒绝而中断；保留未完成回合、工作报告、测试和原始输出。历史运行可从 Git 历史查看，能力证据保留在 `acceptance/`；它们不进入新审计的上下文。
+结束后归档只读，排除凭据、虚拟环境、缓存、临时锁及权限覆盖。当前追踪 HashiCorp、etcd、Dragonboat、OmniPaxos、EPaxos 各一次 baseline：`gpt-6-astra` / `low`，预设各 40 分钟；目录与实际停止状态见[保留运行](../runs/README.md)。保留未完成回合、工作报告、测试和原始输出。历史运行可从 Git 历史查看，能力证据保留在 `acceptance/`；它们不进入新审计的上下文。

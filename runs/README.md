@@ -1,15 +1,19 @@
 # 保留运行
 
-当前 Git 分别追踪完整组与 baseline 各自最新的一次实验。其余本地运行不因追踪切换而删除；旧归档可从 Git 历史查看。
+当前 Git 追踪一次 HashiCorp 完整组实验，以及 HashiCorp、etcd、Dragonboat、OmniPaxos、EPaxos 各一次 baseline 实验。其余本地运行不因追踪切换而删除；旧归档可从 Git 历史查看。
 
-两次均审计 HashiCorp Raft，使用独立会话；模型、推理档位和预算不同，不构成同模型配对。各次具体额度、输入版本与执行条件以原始配置、状态及日志为准。
+各次使用独立会话。HashiCorp 两组的模型、推理档位和预算不同，不构成同模型配对。各次具体额度、输入版本与执行条件以原始配置、状态及日志为准。
 
 | 实验 | 模型／推理档位 | 开始时间（2026-10-09） | 预算／实际时间 | 停止原因 |
 | --- | --- | --- | --- | --- |
-| [baseline](../baseline/runs/2026-10-09_16-23-12-hashicorp_raft-baseline/index.md) | `gpt-6-astra` / `low` | 16:23:12 | 40／13.11 分钟 | `external_error`；模型服务返回网安风险拒绝，首回合未完成 |
-| [完整组](2026-10-09_14-01-36-hashicorp_raft-real-run/report.md) | `deepseek-flash` / `high` | 14:01:36 | 60／60.01 分钟 | 剩余期限内 Agent 调用超时；`run_stop.reason=resource_limit`，剩余时间为 0 |
+| [HashiCorp baseline](../baseline/runs/2026-10-09_16-23-12-hashicorp_raft-baseline/index.md) | `gpt-6-astra` / `low` | 16:23:12 | 40／13.11 分钟 | `external_error`；模型服务返回网安风险拒绝，首回合未完成 |
+| [etcd baseline](../baseline/runs/2026-10-09_19-51-11-etcd_raft-baseline/index.md) | `gpt-6-astra` / `low` | 19:51:11 | 40／10.28 分钟 | `external_error`；模型服务返回网安风险拒绝 |
+| [Dragonboat baseline](../baseline/runs/2026-10-09_20-01-29-dragonboat_raft-baseline/index.md) | `gpt-6-astra` / `low` | 20:01:29 | 40／12.74 分钟 | `external_error`；模型服务返回网安风险拒绝 |
+| [OmniPaxos baseline](../baseline/runs/2026-10-09_20-14-15-omnipaxos-baseline/index.md) | `gpt-6-astra` / `low` | 20:14:15 | 40／35.59 分钟 | `external_error`；模型服务返回网安风险拒绝 |
+| [EPaxos baseline](../baseline/runs/2026-10-09_20-49-52-swiftpaxos_epaxos-baseline/index.md) | `gpt-6-astra` / `low` | 20:49:52 | 40／28.13 分钟 | `turn_timeout`；第二回合超时 |
+| [HashiCorp 完整组](2026-10-09_14-01-36-hashicorp_raft-real-run/report.md) | `deepseek-flash` / `high` | 14:01:36 | 60／60.01 分钟 | 剩余期限内 Agent 调用超时；`run_stop.reason=resource_limit`，剩余时间为 0 |
 
-baseline 保留 32 次工具调用记录、6 份测试文件及输出，包含 3 次隔离执行；[工作报告](../baseline/runs/2026-10-09_16-23-12-hashicorp_raft-baseline/work/report.md)是中断时草稿，尚未覆盖全部已执行调查。完整组使用方法 v59，记录 84 次 Agent 调用、10 次目标执行和 10 次复核。两侧的回合、工具和执行记录采用自身口径，不直接对等。
+HashiCorp baseline 保留 32 次工具调用记录、6 份测试文件及输出，包含 3 次隔离执行；[工作报告](../baseline/runs/2026-10-09_16-23-12-hashicorp_raft-baseline/work/report.md)是中断时草稿，尚未覆盖全部已执行调查。完整组使用方法 v59，记录 84 次 Agent 调用、10 次目标执行和 10 次复核。两侧的回合、工具和执行记录采用自身口径，不直接对等。
 
 以上仅摘录原状态与报告，不重新评估。模型自报及完整组的确认状态均需结合适用条件、实际观察、反证及未决边界复核，不将局部结论扩展为完整集群结论。
 
