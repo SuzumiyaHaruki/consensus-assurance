@@ -69,4 +69,4 @@ runs/<run-id>/
 
 报告也在工作区变更中保留，`last_completed_report` 指向实际保留的版本；报告未变时复用该路径，后续超时修改不覆盖它。不再复制 `turns/N/report.md`；历史归档及旧链接不改写。回合末文件不冒充每条命令开始时的快照，模型自行 tee 的内容不冒充宿主原始输出。
 
-结束后归档只读，排除凭据、虚拟环境、缓存、临时锁及权限覆盖。当前正式归档为 [40 分钟 HashiCorp baseline](runs/2026-10-09_08-06-10-hashicorp_raft-baseline/index.md)，历史能力证据保留在 `acceptance/`；它们不进入新审计的上下文。
+结束后归档只读，排除凭据、虚拟环境、缓存、临时锁及权限覆盖。当前追踪 [HashiCorp baseline](runs/2026-10-09_12-07-16-hashicorp_raft-baseline/index.md)：预设一小时，实际运行约 35 分 44 秒，在第七回合启动前因工作副本配置目录检查停止；保留已完成的六回合及原始失败。历史运行可从 Git 历史查看，能力证据保留在 `acceptance/`；它们不进入新审计的上下文。

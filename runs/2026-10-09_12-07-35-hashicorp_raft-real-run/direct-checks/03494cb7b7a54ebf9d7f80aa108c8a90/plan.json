@@ -1,0 +1,122 @@
+{
+  "description": "Require that a successful InstallSnapshot at index N leaves the receiver's effective last entry no higher than N when the receiver no longer holds a log entry at N matching the snapshot's term, i.e. that it does not keep reporting a log tail the snapshot did not confirm.",
+  "claim_id": "claim-install-snapshot-alignment",
+  "binding_ids": [
+    "binding-install-snapshot-align"
+  ],
+  "harness": {
+    "execution_package": ".",
+    "files": {},
+    "kind": "go_test",
+    "source": "package raft\n\nimport (\n\t\"bytes\"\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"io\"\n\t\"testing\"\n)\n\ntype snFSM struct{}\n\nfunc (f *snFSM) Apply(l *Log) interface{}       { return nil }\nfunc (f *snFSM) Snapshot() (FSMSnapshot, error) { return &snSnapshot{}, nil }\nfunc (f *snFSM) Restore(r io.ReadCloser) error  { r.Close(); return nil }\n\ntype snSnapshot struct{}\n\nfunc (s *snSnapshot) Persist(sink SnapshotSink) error { return sink.Close() }\nfunc (s *snSnapshot) Release()                        {}\n\nfunc snEmit(t *testing.T, ev map[string]interface{}) {\n\tt.Helper()\n\tb, err := json.Marshal(ev)\n\tif err != nil {\n\t\tt.Fatalf(\"marshal event: %v\", err)\n\t}\n\tfmt.Println(\"CA_EVENT \" + string(b))\n}\n\n// TestAssuranceInstallSnapshotLogTailAlignment observes the node's bookkeeping\n// after an InstallSnapshot installs a snapshot at an index below log entries the\n// node already holds.\nfunc TestAssuranceInstallSnapshotLogTailAlignment(t *testing.T) {\n\tconst localID = ServerID(\"node1\")\n\tconst installedIndex = uint64(3)\n\tconst installedTerm = uint64(1)\n\tconst tailIndex = uint64(5)\n\n\tconf := inmemConfig(t)\n\tconf.ProtocolVersion = ProtocolVersionMax\n\tconf.skipStartup = true\n\tconf.LocalID = localID\n\tconf.TrailingLogs = 0\n\n\tlogs, stable, snaps := NewInmemStore(), NewInmemStore(), NewInmemSnapshotStore()\n\t_, trans := NewInmemTransport(ServerAddress(localID))\n\n\t// A configuration whose only voter is another server, so this node is a\n\t// follower that never campaigns, followed by command entries 2..5.\n\totherConfig := Configuration{Servers: []Server{{Suffrage: Voter, ID: \"other\", Address: \"other\"}}}\n\tentries := []*Log{{Index: 1, Term: installedTerm, Type: LogConfiguration, Data: EncodeConfiguration(otherConfig)}}\n\tfor idx := uint64(2); idx <= tailIndex; idx++ {\n\t\tentries = append(entries, &Log{Index: idx, Term: installedTerm, Type: LogCommand, Data: []byte(\"x\")})\n\t}\n\tif err := logs.StoreLogs(entries); err != nil {\n\t\tt.Fatalf(\"seed log: %v\", err)\n\t}\n\n\tr, err := NewRaft(conf, &snFSM{}, logs, stable, snaps, trans)\n\tif err != nil {\n\t\tt.Fatalf(\"NewRaft: %v\", err)\n\t}\n\n\t// Substitute FSM schedule: with skipStartup there is no runFSM goroutine, so\n\t// snapshot restores are answered here. The proposition under test is the\n\t// handler's own bookkeeping, for which a successful restore is a premise.\n\tdone := make(chan struct{})\n\tdefer close(done)\n\tgo func() {\n\t\tfor {\n\t\t\tselect {\n\t\t\tcase msg := <-r.fsmMutateCh:\n\t\t\t\tif rf, ok := msg.(*restoreFuture); ok {\n\t\t\t\t\trf.respond(nil)\n\t\t\t\t}\n\t\t\tcase <-done:\n\t\t\t\treturn\n\t\t\t}\n\t\t}\n\t}()\n\n\tbeforeIndex, beforeTerm := r.getLastEntry()\n\trawBefore, _ := logs.LastIndex()\n\tsnEmit(t, map[string]interface{}{\n\t\t\"event\":                               \"snapshot_install_declared\",\n\t\t\"op_id\":                               \"snap-1\",\n\t\t\"installed_index\":                     installedIndex,\n\t\t\"installed_term\":                      installedTerm,\n\t\t\"node_last_index\":                     beforeIndex,\n\t\t\"node_last_term\":                      beforeTerm,\n\t\t\"log_raw_last_index\":                  rawBefore,\n\t\t\"holds_entries_above_installed_index\": rawBefore > installedIndex,\n\t})\n\n\tpayload := []byte(\"snapshot-bytes\")\n\treq := &InstallSnapshotRequest{\n\t\tRPCHeader:          RPCHeader{ProtocolVersion: ProtocolVersionMax, ID: []byte(\"other\"), Addr: trans.EncodePeer(\"other\", \"other\")},\n\t\tSnapshotVersion:    1,\n\t\tTerm:               installedTerm,\n\t\tLeader:             trans.EncodePeer(\"other\", \"other\"),\n\t\tLastLogIndex:       installedIndex,\n\t\tLastLogTerm:        installedTerm,\n\t\tConfiguration:      EncodeConfiguration(otherConfig),\n\t\tConfigurationIndex: 1,\n\t\tSize:               int64(len(payload)),\n\t}\n\tch := make(chan RPCResponse, 1)\n\tr.installSnapshot(RPC{Command: req, Reader: bytes.NewReader(payload), RespChan: ch}, req)\n\tresp := <-ch\n\n\tafterIndex, afterTerm := r.getLastEntry()\n\trawAfter, _ := logs.LastIndex()\n\tremain := 0\n\tfor idx := uint64(1); idx <= rawAfter; idx++ {\n\t\tvar l Log\n\t\tif err := logs.GetLog(idx, &l); err == nil {\n\t\t\tremain++\n\t\t}\n\t}\n\tsnEmit(t, map[string]interface{}{\n\t\t\"event\":                     \"snapshot_install_result\",\n\t\t\"op_id\":                     \"snap-1\",\n\t\t\"installed_index\":           installedIndex,\n\t\t\"rejected\":                  resp.Error != nil,\n\t\t\"error\":                     fmt.Sprintf(\"%v\", resp.Error),\n\t\t\"last_applied\":              r.getLastApplied(),\n\t\t\"snapshot_index\":            func() uint64 { i, _ := r.getLastSnapshot(); return i }(),\n\t\t\"node_last_index_after\":     afterIndex,\n\t\t\"node_last_term_after\":      afterTerm,\n\t\t\"log_raw_last_index_after\":  rawAfter,\n\t\t\"log_entries_remaining\":     remain,\n\t\t\"within_installed_snapshot\": afterIndex <= installedIndex,\n\t})\n}\n",
+    "description": "TestAssuranceInstallSnapshotLogTailAlignment seeds a log with a configuration entry at index 1 and command entries through index 5, builds a node with background goroutines disabled (conf.skipStartup, TrailingLogs 0) whose only configured voter is another server, installs a snapshot at index 3 through the production handler installSnapshot, and reports the declared state before the install (last entry, raw log last index, whether entries above the installed index are held) and the result afterwards (rejection, lastApplied, snapshot index, effective last entry, raw log last index, how many log entries remain, and whether the effective last entry is within the installed snapshot index).",
+    "semantic_changes": [
+      "The handler installSnapshot is invoked directly on the main-thread code path (there is no running main loop because skipStartup is set), with an RPC whose Reader carries the snapshot bytes; in production processRPC dispatches it the same way from the transport consumer channel.",
+      "Because runFSM is not running with skipStartup, an explicit substitute goroutine drains fsmMutateCh and answers restore futures with success. The proposition concerns the handler's log/snapshot bookkeeping, for which a successful restore is a premise; the substitute never inspects or modifies log or snapshot state.",
+      "The log content is written directly to the caller-owned LogStore before NewRaft, and the snapshot payload is synthetic bytes, because the FSM in this harness ignores snapshot content.",
+      "conf.TrailingLogs is set to 0 so compaction actually runs at the snapshot index instead of being skipped by the trailing-log guard. No target code is modified."
+    ],
+    "prerequisites": [
+      {
+        "alias": "longer-tail",
+        "event": "snapshot_install_declared",
+        "conditions": [
+          {
+            "field": "holds_entries_above_installed_index",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          }
+        ]
+      }
+    ],
+    "legality": {
+      "source_ids": [
+        "S57",
+        "S58",
+        "S54",
+        "S8",
+        "S59"
+      ],
+      "expectation_ids": [],
+      "binding_ids": [
+        "binding-install-snapshot-align"
+      ],
+      "derivation": "S57 shows the receive path adopting the request's index and term into lastApplied and lastSnapshot and then compacting, with no setLastLog; S58 shows the compaction bound is the snapshot index, so entries above it survive; S54 shows the effective last entry is the maximum of log and snapshot position, so such a tail is what the node reports; S8 shows the only later truncation lives in appendEntries. S59 is the contiguous range of the handler including its declaration.",
+      "applicability": "Applies when the receiver holds log entries above the installed snapshot index and the install succeeds; the harness declares the first from its own seeded log and the second from the response.",
+      "unresolved": [
+        "Whether a real leader drives a follower into this state rather than only a seeded local log.",
+        "How long the retained tail persists before the leader's next AppendEntries truncates it, and whether any vote or election can depend on it."
+      ],
+      "conflicts": [
+        "The snapshot protocol requires discarding the log when the receiver cannot confirm the snapshot's last included entry, while this implementation leaves that removal to a later AppendEntries."
+      ],
+      "alternatives": [
+        "If the following AppendEntries always arrives before the state can be observed by a vote, the correct disposition is a documented transient rather than a violation."
+      ]
+    }
+  },
+  "monitors": [
+    {
+      "id": "m-install-snapshot-align",
+      "checker_id": "c-install-snapshot-align",
+      "event": "snapshot_install_result",
+      "binding_ids": [
+        "binding-install-snapshot-align"
+      ],
+      "grounding": {
+        "source_ids": [
+          "S57",
+          "S58",
+          "S54"
+        ],
+        "expectation_ids": [],
+        "binding_ids": [
+          "binding-install-snapshot-align"
+        ],
+        "derivation": "The obligation requires the receiver's effective last entry to stay within the installed snapshot when it cannot confirm the snapshot's last included entry. The event reports exactly that predicate together with the ingredients (lastApplied, snapshot index, effective last entry, surviving entries) so the comparison can be read against the implementation.",
+        "applicability": "Only evaluated for an accepted install of a receiver that declared it holds entries above the installed snapshot index.",
+        "unresolved": [],
+        "conflicts": [],
+        "alternatives": []
+      },
+      "applicability_conditions": [
+        {
+          "field": "rejected",
+          "op": "eq",
+          "value": false,
+          "reference": null
+        }
+      ],
+      "admission_alias": "longer-tail"
+    }
+  ],
+  "observable_properties": [
+    {
+      "checker_id": "c-install-snapshot-align",
+      "kind": "event_assertion",
+      "trigger": {
+        "field": "event",
+        "op": "eq",
+        "value": "snapshot_install_result",
+        "reference": null
+      },
+      "assertion": {
+        "field": "within_installed_snapshot",
+        "op": "eq",
+        "value": true,
+        "reference": null
+      },
+      "antecedent": null,
+      "identity_fields": [
+        "op_id"
+      ],
+      "description": "After a successful InstallSnapshot, the receiver's effective last entry does not exceed the installed snapshot index while it holds no matching entry at that index."
+    }
+  ],
+  "uncertainties": [
+    "Reachability of the state under a real leader rather than a seeded local log.",
+    "The duration of the retained tail and whether a vote or election can depend on it.",
+    "Whether the design intends the tail to be transient in every deployment."
+  ]
+}

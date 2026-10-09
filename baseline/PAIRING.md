@@ -12,7 +12,7 @@
 | 配对开关 | 完整组显式 `codex_profile: single_agent`；默认 `null` 保持原方法路径，无 baseline 探针 |
 | 调查方法 | 完整组保留双主线、研究问题、部分产品、固定执行、复核及知识回流；普通组使用原 `task.md` 和自由笔记 |
 | 工具面 | baseline 的唯一 MCP 为必需的 `isolated_exec`；完整组沿用既有固定执行器，无此 MCP |
-| 预算 | 两份草案均 2400 秒、单回合 900 秒、120 回合、动作 600 秒；完整组另有研究配额，须记录实际耗尽项 |
+| 预算 | 两份草案均 3600 秒、单回合 900 秒、120 回合、动作 600 秒；完整组另有研究配额，须记录实际耗尽项 |
 | 时间口径 | 两侧均从源码捕获前计时；准备、构建、工具、模型等待计入，不在截止后追加付费总结 |
 | 工具链 | 本机所选 Go 1.25.8、Codex 0.155.0-alpha.16；正式实验固定相同 PATH，不能与旧 Go 1.23.5 运行混称同条件 |
 | 依赖／构建 | 共享只读源码依赖，各 run 独立构建；run 内缓存复用和固定检查次数有差异。完整组 Rust 编译种子与普通组 Cargo 依赖复用不等价 |
@@ -36,16 +36,20 @@
 
 `single_agent` 的展开设置与原 `CODEX_HOME` 保存在既有 adapter 输入记录里；后续从该记录构造显式参数，不解析历史 CLI 语法或自动迁移 home。模型／provider／档位／目录等真实配置变化仍由现有 run 配置检查拒绝。旧记录可以离线阅读，不兼容的运行应新开。已生成的宿主 skills 必须显式禁用；空 home 不足以证明提示隔离。
 
-当前所选 catalog 保持 `supports_search_tool=true`：真实请求通过客户端 `tool_search` 发现 `mcp__baseline_local.isolated_exec`。不再维护仅为诊断而翻转目录开关的测试变体。前次原始依据仍在 [工具暴露记录](acceptance/2026-10-08-tool-surface/summary.json)、[隔离 TCP 记录](acceptance/2026-10-08-tcp/summary.json)、[生命周期记录](acceptance/2026-10-08-mcp-lifecycle/summary.json)。本次命令、失败诊断和结果见 [修改与验证报告](acceptance/2026-10-09-source-review/README.md)。
+当前所选 catalog 保持 `supports_search_tool=true`：真实请求通过客户端 `tool_search` 发现 `mcp__baseline_local.isolated_exec`。不再维护仅为诊断而翻转目录开关的测试变体。旧验收已从工作树清理，原始失败、版本与限制仍可从 [Git 归档](https://github.com/SuzumiyaHaruki/consensus-assurance/tree/29dd0aab5e38a5381ac69fbe61db3ffaa8230548/baseline/acceptance) 查看；未归档的本地初始化失败仅保留其[原始回执](acceptance/2026-10-09-source-review/raw/bootstrap-failure/check.json)及 stdout/stderr。当前核对与真实 TCP 证据保留在 [修改与验证报告](acceptance/2026-10-09-source-review/README.md)。
 
 ## 正式配对与离线复核
 
 每次独立运行新建输出目录、研究状态和 session。完整组使用新建、位于 `/tmp` 以外的私有 `CODEX_HOME`，正常续接保持该目录；Codex helper 在 `/tmp` 下的限制已由历史实际环境暴露。运行器不继承旧审计或合成练习的答案。
 
+baseline 输出到 `baseline/runs/`，完整组输出到根目录 `runs/`。两组可以在不同终端同时运行，各自拥有工作区、session 和 Codex home，仅共享只读目标与依赖。相同机器上的并行运行会竞争 CPU、内存和磁盘，也可能共同占用 API 额度；以时间为预算的正式配对宜顺序或交错运行，并记录顺序。
+
 正式重复实验前记录：实现提交及 dirty 状态、目标提交、CLI／模型／目录／工具版本、缓存起点、机器负载、预设预算、重复次数与运行顺序、两侧授权和人工中断／复验政策。中断、失败、拒绝及零结果都保留，不能补跑替换后只报告成功样本。
 
 人工对两组采用同一外部复核，记录原始主张、适用要求、合法前史、实际执行、反证、未决前提及去重关系。完整组 `confirmed` 与模型自报都只是材料，不是最终研究裁决；缺失前提的部分交付仍保留。共识相关缺陷是主要研究结果，一般鲁棒性问题可另述；不能仅凭 panic、代码位置数或“局部错误”判定类别或独立数量。
 
-当前 baseline 报告有三个可复现的畸形输入 panic 案例：F1 的内存传输／运行节点用例实际终止进程；F2/F3 的 dispatch 测试捕获了 panic。F1/F3 涉及 `DecodeConfiguration`，该函数文档允许解码错误时 panic，问题在调用者的畸形字段处理责任。现有交付没有证明正常生产者、合法 CFT 执行前史或实际 TCP 部署可达性，因此不能写成三个已建立的独立共识正确性缺陷。按责任及修复关系去重，也不能只因共享函数而直接合并。
+历史 40 分钟 baseline 报告有三个可复现的畸形输入 panic 案例：F1 的内存传输／运行节点用例实际终止进程；F2/F3 的 dispatch 测试捕获了 panic。F1/F3 涉及 `DecodeConfiguration`，该函数文档允许解码错误时 panic，问题在调用者的畸形字段处理责任。该次交付没有证明正常生产者、合法 CFT 执行前史或实际 TCP 部署可达性，因此不能写成三个已建立的独立共识正确性缺陷。按责任及修复关系去重，也不能只因共享函数而直接合并。
 
-历史 [40 分钟 baseline](runs/2026-10-09_08-06-10-hashicorp_raft-baseline/index.md) 与早期 120 分钟完整组的预算、Go 版本和网络条件不同，不能据此推断方法优劣。下一步是在条件确认后按预案重复同模型配对；本次精简不修改普通任务、不新增运行时分类或评价字段。
+历史 [40 分钟 baseline](https://github.com/SuzumiyaHaruki/consensus-assurance/blob/29dd0aab5e38a5381ac69fbe61db3ffaa8230548/baseline/runs/2026-10-09_08-06-10-hashicorp_raft-baseline/index.md) 与早期 120 分钟完整组的预算、Go 版本和网络条件不同，不能据此推断方法优劣。
+
+当前追踪 2026-10-09 的 [baseline](runs/2026-10-09_12-07-16-hashicorp_raft-baseline/index.md) 和[完整组](../runs/2026-10-09_12-07-35-hashicorp_raft-real-run/report.md)。两者均使用 DeepSeek high、一小时预算；baseline 在约 35 分 44 秒因本地目录检查停止，完整组在约 39 分 44 秒由用户取消。两次开始时间仅相差 19 秒，存在并行资源竞争，且均提前中断，不能当作完整一小时的等资源表现比较。原始停止状态、失败与未决事项保持原样。

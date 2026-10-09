@@ -1,0 +1,206 @@
+{
+  "rationale": "Fourth candidate, grounded on the accepted map. The snapshot receive path adopts the installed snapshot's index and term but never aligns the log with it: it does not set the last log, and its compaction stops at the snapshot index, while the effective last entry is the maximum of log and snapshot position. A direct local run of the receive path (single node, log seeded to index 5, snapshot installed at index 3) produced compaction from 1 to 3, two surviving entries, lastApplied 3 and an effective last entry of (5, term 1). The claim fixes the alignment responsibility rather than asserting the violation; real-leader reachability, the duration of the window and the possibility that the state is always transient are recorded as counterevidence and unknowns. The map gains behavior b-install-snapshot-align and fact f-log-snapshot-agreement; no existing object's meaning, identity or edges change.",
+  "sources": [
+    {
+      "id": "S57",
+      "file": "raft.go",
+      "start_line": 1928,
+      "end_line": 1953,
+      "kind": "code_observation"
+    },
+    {
+      "id": "S58",
+      "file": "snapshot.go",
+      "start_line": 213,
+      "end_line": 259,
+      "kind": "code_observation"
+    },
+    {
+      "id": "S59",
+      "file": "raft.go",
+      "start_line": 1810,
+      "end_line": 1953,
+      "kind": "code_observation"
+    }
+  ],
+  "feedback": null,
+  "repair_of": null,
+  "map_path": "map.json",
+  "map_changes": {
+    "b-install-snapshot-align": {
+      "impact": "dependency",
+      "rationale": "New A3 Behavior for the snapshot receive path's log bookkeeping, recording that lastLog is never set and that compaction stops at the snapshot index, plus the observed local result. Independently addable; no existing object's meaning changes.",
+      "source_ids": [
+        "S57",
+        "S58",
+        "S54",
+        "S8"
+      ],
+      "preserves": "",
+      "challenges": {}
+    },
+    "f-log-snapshot-agreement": {
+      "impact": "dependency",
+      "rationale": "New Fact giving the agreement between a receiver's retained log and the snapshot it adopted its own identity and validity context, so vote comparisons and later replication can be reasoned about against it. No existing Fact's meaning changes.",
+      "source_ids": [
+        "S57",
+        "S58",
+        "S54",
+        "S8"
+      ],
+      "preserves": "",
+      "challenges": {}
+    }
+  },
+  "reconnect_questions": {},
+  "action": "obligation",
+  "candidate_id": null,
+  "parent_candidate_id": null,
+  "question": {
+    "audit_spec_version": 12,
+    "disposition": "ready_for_check",
+    "preferred_check": "direct_test",
+    "question": "After a successful InstallSnapshot at index N, does the receiver discard the log entries it cannot reconcile with the snapshot - so that its effective last entry never comes from a branch the snapshot did not confirm - or does it retain and report a tail above N even when it no longer holds an entry at N matching the snapshot's term?",
+    "importance": "The receiver's last log entry is what it advertises in RequestVote and what it uses for its own vote comparisons, and the AppendEntries success rule is what lets a leader count it towards a quorum. If a receiver installs a snapshot at N while keeping entries above N that the snapshot's history did not confirm, then until the next matching AppendEntries arrives the node votes and is counted on a log position that no longer describes its state; a candidate elected on that position would have to be brought back by a snapshot. The Raft snapshot protocol requires discarding the log in exactly this case, so the duty is well grounded rather than a stylistic preference.",
+    "source_ids": [
+      "S57",
+      "S58",
+      "S54",
+      "S8",
+      "S26",
+      "S17",
+      "S18",
+      "S20",
+      "S16",
+      "S24",
+      "S21"
+    ],
+    "participants": [
+      "leader sending the snapshot",
+      "receiving Raft node",
+      "the receiver's log store and FSM"
+    ],
+    "objects": [
+      "Raft.installSnapshot",
+      "compactLogs/compactLogsWithTrailing",
+      "getLastEntry",
+      "LogStore contents"
+    ],
+    "contexts": [
+      "a receiver whose log holds entries above the snapshot index",
+      "a snapshot whose last included entry the receiver no longer holds"
+    ],
+    "event_paths": [
+      "leader -> InstallSnapshot -> installSnapshot -> snapshot restore -> compaction up to N -> response success",
+      "later leader -> AppendEntries with prevLogEntry N -> conflict truncation -> setLastLog"
+    ],
+    "activity_classes": [
+      "A1",
+      "A3"
+    ],
+    "behavior_ids": [
+      "b-install-snapshot-align"
+    ],
+    "fact_ids": [
+      "f-log-snapshot-agreement"
+    ],
+    "supporting_behavior_ids": {
+      "b-append-entries-sync": "The only later place the tail is removed, via conflict truncation followed by setLastLog.",
+      "b-replication-recovery": "The leader-side counterpart that decides to send a snapshot instead of entries.",
+      "b-stable-position-reconstruction": "Explains why the retained tail is visible at all: the effective last entry is the maximum of log and snapshot position."
+    },
+    "obligation_relation_kind": "preservation",
+    "counterevidence": [
+      "The retained tail may be harmless in practice because the leader's next AppendEntries starts at N+1 and truncates on term mismatch, so the window can be short.",
+      "The observable local run used a single node with no leader traffic, so it shows the state rather than how long it persists or what the next AppendEntries does.",
+      "The library may rely on the transport and the leader to re-drive replication immediately, treating the state as transient rather than as a retained branch."
+    ],
+    "unknowns": [
+      "Whether a receiver can actually be driven into that state by a real leader (the leader sends a snapshot when its own log no longer covers the follower's nextIndex, and a longer divergent follower log can reach it, but the exact sequence is not established).",
+      "Whether the window is ever long enough for a vote comparison or an election to depend on it.",
+      "Whether the intended design is that the tail is always transient."
+    ],
+    "priority": 2,
+    "trigger_rationale": "Reading the snapshot receive path after recording the log/snapshot position mechanism produced a concrete sourced difference rather than an untested case: installSnapshot updates lastApplied and lastSnapshot and compacts only up to the snapshot index (S57, S58), never calls setLastLog, and the effective last entry is the maximum of log and snapshot position (S54) while the only later truncation lives in appendEntries (S8). A direct local run of the receive path confirmed the retained tail, so the question is which responsibility the receiver owes at that moment, not whether the state exists."
+  },
+  "resume_conditions": [],
+  "result_implications": {},
+  "obligation": {
+    "id": "claim-install-snapshot-alignment",
+    "kind": "obligation",
+    "concern": "implementation_semantics",
+    "description": "On a successful InstallSnapshot at index N, a receiver that no longer holds a log entry at N matching the snapshot's last included term must discard the log entries above N, so that its effective last entry and its later vote comparisons and replication decisions are not based on a branch the snapshot did not confirm.",
+    "source_ids": [
+      "S57",
+      "S58",
+      "S54",
+      "S8"
+    ],
+    "scope": {
+      "description": "A Raft node receiving an InstallSnapshot whose last included index is below log entries the node already holds. The obligation concerns the receiver's log after the snapshot is installed, not the snapshot transport or the FSM restore.",
+      "assumptions": [
+        "The FSM restore succeeds and lastApplied and the snapshot index are adopted from the request.",
+        "The receiver's log store is not a monotonic store that removes all old logs (that branch empties the store but still leaves the in-memory last log as it was)."
+      ],
+      "excluded": [
+        "The leader's choice to send a snapshot rather than entries.",
+        "Log safety of the entries themselves; the question is the receiver's bookkeeping."
+      ],
+      "parameters": {}
+    },
+    "pending": [
+      "Establish whether a real leader can drive a follower into this state.",
+      "Measure how long the retained tail persists before the next AppendEntries truncates it."
+    ],
+    "grounding": {
+      "source_ids": [
+        "S57",
+        "S58",
+        "S54",
+        "S8"
+      ],
+      "expectation_ids": [],
+      "binding_ids": [
+        "binding-install-snapshot-align"
+      ],
+      "derivation": "S57 shows the receive path adopting the snapshot's index/term into lastApplied and lastSnapshot and then compacting, with no setLastLog; S58 shows the compaction bound is the snapshot index, so entries above it survive; S54 shows the effective last entry is the maximum of log and snapshot position, so the surviving tail is what the node reports; S8 shows the only later removal path. Together they locate the duty and the current behaviour.",
+      "applicability": "Applicable when the receiver holds entries above the snapshot index; the local observation used entries up to 5 with a snapshot at 3 and saw two entries survive with lastApplied 3.",
+      "unresolved": [
+        "Real-leader reachability of the state.",
+        "Duration and any consequence of the window."
+      ],
+      "conflicts": [
+        "The snapshot protocol requires discarding the log whenever the receiver cannot confirm the snapshot's last included entry, while this implementation relies on a later AppendEntries to truncate the tail."
+      ],
+      "alternatives": [
+        "If the tail is guaranteed to be replaced by the immediately following AppendEntries in every deployment, the correct disposition is a documented transient rather than a violation."
+      ]
+    }
+  },
+  "bindings": [
+    {
+      "associations": [
+        {
+          "claim_id": "claim-install-snapshot-alignment",
+          "source_ids": [
+            "S57",
+            "S58",
+            "S54",
+            "S8"
+          ],
+          "rationale": "Locates the missing alignment step (S57), the compaction bound that leaves the tail (S58), the accessor that reports it (S54) and the only later truncation (S8)."
+        }
+      ],
+      "anchor": null,
+      "id": "binding-install-snapshot-align",
+      "material_id": "S59",
+      "symbol": "installSnapshot",
+      "start_line": 1814,
+      "end_line": 1953,
+      "description": "The tail of the snapshot receive path: it adopts lastApplied and lastSnapshot from the request and then compacts, without ever setting the last log, so a tail above the snapshot index survives and is reported through getLastEntry.",
+      "pending": [
+        "Confirm the compaction bound against a store that actually retains the tail."
+      ]
+    }
+  ]
+}

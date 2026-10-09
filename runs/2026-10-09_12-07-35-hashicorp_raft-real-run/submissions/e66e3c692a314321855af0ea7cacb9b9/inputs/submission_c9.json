@@ -1,0 +1,119 @@
+{
+  "action": "obligation",
+  "map_path": "map.json",
+  "map_changes": {
+    "b-heartbeat-fast-path": {
+      "impact": "dependency",
+      "source_ids": ["S40", "S41", "S42", "S43", "S16"],
+      "rationale": "New A1 Behavior mapping the heartbeat fast path, which was previously only a deferred Surface. It records the transport seam (net_transport heartbeatFn installed at api.go:616), that the handler reaches appendEntries without checkRPCHeader, and that the effects are term/state/leader/last-contact updates. Source-backed and independently addable; no existing object's meaning changes."
+    },
+    "f-durable-term-vote": {
+      "impact": "dependency",
+      "source_ids": ["S40", "S14", "S16"],
+      "rationale": "New producer of an existing principal Fact. f-durable-term-vote previously had producers b-vote-grant and b-term-authority; the fast path is a third path that can persist a newer term through setCurrentTerm (S14) reached from appendEntries (S40). The Fact's meaning, identity, validity context and durability are unchanged; only the producer set grows."
+    },
+    "surface:processHeartbeat / net_transport heartbeat fast path": {
+      "impact": "clarification",
+      "source_ids": ["S40", "S41", "S42", "S43", "S16"],
+      "rationale": "The Surface moves from deferred to mapped because the entry path is now understood and mapped to b-heartbeat-fast-path. The recorded discrepancy itself is not deleted: it is carried into the new Behavior's guards and unknowns and into the Candidate question."
+    }
+  },
+  "sources": [
+    {"id": "S40", "file": "raft.go", "start_line": 1415, "end_line": 1436, "kind": "code_observation"},
+    {"id": "S41", "file": "raft.go", "start_line": 1390, "end_line": 1413, "kind": "code_observation"},
+    {"id": "S42", "file": "raft.go", "start_line": 43, "end_line": 71, "kind": "code_observation"},
+    {"id": "S43", "file": "net_transport.go", "start_line": 660, "end_line": 733, "kind": "code_observation"}
+  ],
+  "question": {
+    "question": "Does the heartbeat fast path apply the RPC-header compatibility gate that the normal AppendEntries path applies, so that a peer whose RPCHeader.ProtocolVersion is outside the window checkRPCHeader accepts cannot step this server down, advance its persisted term, be adopted as known leader and refresh its last contact?",
+    "importance": "The header gate is the only guard that keeps a server from participating with a peer outside its supported protocol-version window. On the fast path a pure heartbeat still reaches appendEntries, which can persist a newer term, transition the receiver out of candidate/leader state, record the sender as the known leader and refresh lastContact. If an out-of-window peer can reach that path, this server can be held out of its own elections by a peer whose RPCs the same process rejects on every other route, which is an availability consequence on a core formation path; the guard asymmetry itself is an implementation-semantics concern.",
+    "trigger_rationale": "Reading the previously deferred transport surfaces produced a concrete sourced asymmetry rather than a generic untested case: processRPC calls checkRPCHeader before appendEntries (S41, S42), while processHeartbeat calls appendEntries directly (S40) and is installed as the transport fast path for every pure AppendEntries heartbeat (S16, S43). The next action distinguishes whether this is an unintended omission or deliberate design, and whether the bypassing peer can exist in a legal deployment.",
+    "disposition": "ready_for_check",
+    "preferred_check": "direct_test",
+    "priority": 2,
+    "obligation_relation_kind": "preservation",
+    "activity_classes": ["A1", "A2"],
+    "fact_ids": ["f-durable-term-vote"],
+    "behavior_ids": ["b-heartbeat-fast-path"],
+    "supporting_behavior_ids": {
+      "b-append-entries-sync": "The A1 counterpart the fast path shares: the same handler body, reached through the normal path only after checkRPCHeader, which locates exactly which guard is dropped and which effects remain.",
+      "b-term-authority": "Explains the A2 consequence of the missing gate: the receiver's context is changed by the bypass (step-down and persisted term) without the compatibility decision the other route makes."
+    },
+    "objects": ["Raft.processHeartbeat", "Raft.appendEntries", "Raft.checkRPCHeader", "net_transport heartbeat classification", "Transport.SetHeartbeatHandler"],
+    "contexts": ["pure AppendEntries heartbeat routed to the fast path", "RPC header outside the supported protocol-version window", "single node with a Transport that implements the fast path"],
+    "participants": ["another Raft server (possibly outside the supported protocol window)", "transport connection goroutine", "the receiving Raft node"],
+    "event_paths": [
+      "peer -> net_transport decode -> heartbeat classification -> heartbeatFn -> processHeartbeat -> appendEntries (no checkRPCHeader)",
+      "peer -> net_transport decode -> consumeCh -> processRPC -> checkRPCHeader -> appendEntries (rejected when out of window)"
+    ],
+    "source_ids": ["S40", "S41", "S42", "S43", "S16", "S14", "S8"],
+    "counterevidence": [
+      "checkRPCHeader's purpose may be satisfied elsewhere for the fast path: the transport decodes the header before dispatch (S43), so the version is known even if not checked.",
+      "The fast path only carries pure heartbeats and performs no log matching or commit propagation, so any consequence is confined to term, state, leader identity and last contact rather than to log safety.",
+      "No comment on processHeartbeat or on the transport fast path states that the header gate is intentionally skipped, but the fast path was introduced as a head-of-line-blocking optimisation (Transport.SetHeartbeatHandler doc) and may assume already-validated peers."
+    ],
+    "unknowns": [
+      "Whether a peer outside the supported protocol-version window can in practice produce a pure heartbeat (Term != 0 with a leader address and zero prev-log/commit fields) that reaches the fast path.",
+      "Whether the consequence on elections is observable: does a bypassing peer's heartbeat refresh lastContact often enough to keep the receiver from starting its own election.",
+      "Whether the asymmetry is deliberate, making the correct disposition a documented assumption rather than an obligation."
+    ]
+  },
+  "obligation": {
+    "id": "claim-heartbeat-header-gate",
+    "kind": "obligation",
+    "concern": "implementation_semantics",
+    "description": "Every AppendEntries RPC a server processes, including a pure heartbeat handled by the transport fast path, is subject to the same RPC-header compatibility check that the normal RPC path applies before appendEntries, so a peer outside the supported protocol-version window cannot step the server down, advance its persisted term, be adopted as the known leader or refresh its last contact.",
+    "source_ids": ["S40", "S41", "S42", "S43", "S16", "S14"],
+    "scope": {
+      "description": "A Raft node whose Transport implements the heartbeat fast path, receiving a pure AppendEntries heartbeat from a peer whose RPCHeader.ProtocolVersion is outside the window checkRPCHeader accepts. The obligation concerns the guard applied to that entry path, not the concurrency of the handler or the content of the heartbeat.",
+      "assumptions": [
+        "The transport classifies the request as a heartbeat exactly as net_transport does: Term != 0, a leader address present, PrevLogEntry/PrevLogTerm zero, no entries and LeaderCommitIndex zero.",
+        "checkRPCHeader is the authoritative protocol-version gate for AppendEntries on the normal path."
+      ],
+      "excluded": [
+        "Whether the handler's concurrent execution is safe is a separate question; here it only touches lock- or atomic-protected fields.",
+        "Log safety is out of scope: this path carries no entries, prev-log fields or commit index."
+      ]
+    },
+    "pending": [
+      "Establish whether an out-of-window peer can reach the fast path in a legal deployment.",
+      "Confirm with a direct comparison whether the fast path accepts and acts on a request that the normal path rejects."
+    ],
+    "grounding": {
+      "source_ids": ["S40", "S41", "S42", "S43", "S16", "S14"],
+      "expectation_ids": [],
+      "binding_ids": ["binding-heartbeat-header-gate"],
+      "derivation": "S42 defines checkRPCHeader and its protocol-version window; S41 shows processRPC calling it before dispatching AppendEntries; S40 shows processHeartbeat calling appendEntries with no such call; S16 shows the same handler installed as the transport heartbeat callback; S43 shows net_transport routing pure heartbeats to that callback; S14 shows the term persistence that appendEntries can trigger on this path.",
+      "applicability": "Applicable whenever a Transport implements the fast path and a peer sends a pure AppendEntries heartbeat; the normal path remains gated.",
+      "unresolved": [
+        "Reachability of the fast path with an out-of-window peer.",
+        "Whether the omission is deliberate design."
+      ],
+      "conflicts": [
+        "processHeartbeat's own comment says it must only be called from the main thread, while the transport invokes it from a connection goroutine; that comment discrepancy is not the subject here but reduces confidence that the fast path's guard requirements were reasoned through."
+      ],
+      "alternatives": [
+        "The fast path may intentionally assume a peer already accepted by the transport; if so the correct disposition is a documented assumption, not a delivery-style defect."
+      ]
+    }
+  },
+  "bindings": [
+    {
+      "id": "binding-heartbeat-header-gate",
+      "material_id": "S40",
+      "symbol": "processHeartbeat",
+      "start_line": 1418,
+      "end_line": 1436,
+      "description": "The heartbeat fast-path handler, which invokes appendEntries directly and therefore is the sole AppendEntries entry point that does not consult checkRPCHeader.",
+      "pending": ["Confirm the transport callback installed at api.go:616 is this function for every pure heartbeat."],
+      "associations": [
+        {
+          "claim_id": "claim-heartbeat-header-gate",
+          "source_ids": ["S40", "S41", "S42", "S43", "S16"],
+          "rationale": "Locates the implementation site of the dropped guard (S40) and the contrasted gated path (S41, S42), together with the transport seam that makes the fast path reachable in production (S16, S43)."
+        }
+      ]
+    }
+  ],
+  "rationale": "Second obligation, grounded on the accepted map. The heartbeat fast path is the only entry into appendEntries that skips checkRPCHeader, and the network transport routes every pure AppendEntries heartbeat to it, so the same request shape is version-gated on one path and not on the other. The claim fixes that responsibility without asserting a violation: reachability of an out-of-window peer and the election consequence remain explicit unresolved premises and the claim's own counterevidence records the plausible benign reading (the fast path assumes already-validated peers, and no log matching or commit propagation happens here). The map is extended with behavior b-heartbeat-fast-path, records the fast path as a new producer of the existing principal Fact f-durable-term-vote, and moves the corresponding Surface from deferred to mapped while keeping the discrepancy inside the behavior's guards and unknowns. No previously accepted object's meaning, identity or edges are changed."
+}

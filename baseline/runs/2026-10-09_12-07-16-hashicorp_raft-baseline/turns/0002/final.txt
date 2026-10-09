@@ -1,0 +1,37 @@
+Found and reproduced a concrete defect this round.
+
+## Finding 1 — `cluster.EnsureSamePeers` compares a stale configuration snapshot (`testing.go:689`)
+
+`testing.go` is a shipped, non-`_test.go` package file, so its helpers are part of the library surface (`MakeCluster` is exported and its value exposes `EnsureSamePeers`). The helper is a bounded polling loop that is supposed to re-read every node's configuration until they match. But it snapshots the first node's config **once, before the loop**, and never refreshes it:
+
+```go
+peerSet := c.getConfiguration(c.rafts[0])   // read ONCE
+CHECK:
+	for i, raft := range c.rafts {
+		...
+		otherSet := c.getConfiguration(raft)   // re-read, but compared to the frozen peerSet
+		if !reflect.DeepEqual(peerSet, otherSet) { ... goto WAIT ... }
+	}
+```
+
+If `c.rafts[0]` is the node catching up (the common case in `TestRaft_HasExistingState`, where node 0 is a follower), the recalculated `otherSet` advances to the new config while `peerSet` stays frozen at the old one — the loop can never converge, and the helper fails after the 5s `longstopTimeout` even though the cluster is fine.
+
+Executed evidence, not suspicion:
+
+- Instrumenting the exact test to dump state right before the failure showed **all three nodes fully converged** (`state=Follower/Leader last=3 commit=3 applied=3 latestCfgN=3`) while the assertion still printed the old 2-voter `peerSet` — proving the compared value was stale.
+- Unmodified tree: 4–9 failures per 40 runs (`.runtime/audit/diag_inst.log`, `diag_orig.log`, `stress_hasstate2.log`).
+- One-line causal fix — move `peerSet := c.getConfiguration(c.rafts[0])` inside the `CHECK:` block — yields **0/60** and **0/40**, everything else unchanged.
+
+Self-contained repro: `.runtime/audit/repro_ensurepeers.sh` (this run: unmodified 6/40 failures vs fixed 0/40, with the applied change printed).
+
+Alternatives I checked and rejected: load/slowness (present at low load, and the dump shows convergence at failure), instrumentation perturbation (the causal change is only *where* the read happens), and injected sabotage (the file is byte-identical to authenticated upstream — see below).
+
+## Source identity (unchanged from last round, restated)
+
+The whole published module is byte-identical to the authenticated upstream `v1.7.3` (SHA-256 manifests match the extracted zip; recomputed zip `h1:` equals the signed `sum.golang.org` record). So Finding 1 is a **genuine upstream latent defect**, not an injected edit — but it is a concrete correctness defect within scope. The captured source remains untouched (verified `SOURCE_UNCHANGED_OK`).
+
+## Report / artifacts
+
+Updated [report.md](/home/nitro/Desktop/consensus-assurance/baseline/runs/2026-10-09_12-07-16-hashicorp_raft-baseline/work/report.md) with Finding 1 as the primary result, plus preserved logs and two replay scripts (`repro.sh` for identity/behavior, `repro_ensurepeers.sh` for Finding 1) under `work/.runtime/audit/`.
+
+Next useful targets (recorded as unresolved): audit the sibling helpers in `testing.go` for the same stale-snapshot pattern (`EnsureSame` re-reads under lock and looks correct; `EnsureLeader`/`WaitForPeers` not yet exhaustively reviewed), and confirm Finding 1 against a pristine `v1.7.3` checkout before filing upstream.

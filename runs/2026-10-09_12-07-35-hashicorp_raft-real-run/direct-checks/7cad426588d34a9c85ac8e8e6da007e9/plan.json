@@ -1,0 +1,136 @@
+{
+  "description": "Independent scenario for the same requirement: observe the effect of the transfer privilege on a voter. For a configured candidate whose log is not older, a voter that already follows a different leader grants the vote when RequestVoteRequest.LeadershipTransfer is set, and rejects the identical request when it is not; the flag does not defeat the configuration-membership check.",
+  "claim_id": "claim-timeout-now-attribution",
+  "binding_ids": [
+    "binding-timeout-now-attribution"
+  ],
+  "harness": {
+    "execution_package": ".",
+    "files": {},
+    "kind": "go_test",
+    "source": "package raft\n\nimport (\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"io\"\n\t\"testing\"\n)\n\ntype tnvFSM struct{}\n\nfunc (f *tnvFSM) Apply(l *Log) interface{}       { return nil }\nfunc (f *tnvFSM) Snapshot() (FSMSnapshot, error) { return &tnvSnapshot{}, nil }\nfunc (f *tnvFSM) Restore(r io.ReadCloser) error  { r.Close(); return nil }\n\ntype tnvSnapshot struct{}\n\nfunc (s *tnvSnapshot) Persist(sink SnapshotSink) error { return sink.Close() }\nfunc (s *tnvSnapshot) Release()                        {}\n\nfunc tnvEmit(t *testing.T, ev map[string]interface{}) {\n\tt.Helper()\n\tb, err := json.Marshal(ev)\n\tif err != nil {\n\t\tt.Fatalf(\"marshal event: %v\", err)\n\t}\n\tfmt.Println(\"CA_EVENT \" + string(b))\n}\n\n// tnvNode builds a voter node with a bootstrapped configuration and a known\n// leader, with all background goroutines disabled.\nfunc tnvNode(t *testing.T, localID ServerID, voters []ServerID, leader ServerID) *Raft {\n\tt.Helper()\n\tconf := inmemConfig(t)\n\tconf.ProtocolVersion = ProtocolVersionMax\n\tconf.skipStartup = true\n\tconf.LocalID = localID\n\t_, trans := NewInmemTransport(ServerAddress(localID))\n\tlogs, stable, snaps := NewInmemStore(), NewInmemStore(), NewInmemSnapshotStore()\n\tconfiguration := Configuration{}\n\tfor _, v := range voters {\n\t\tconfiguration.Servers = append(configuration.Servers, Server{\n\t\t\tSuffrage: Voter, ID: v, Address: ServerAddress(v),\n\t\t})\n\t}\n\tif err := BootstrapCluster(conf, logs, stable, snaps, trans, configuration); err != nil {\n\t\tt.Fatalf(\"BootstrapCluster(%s): %v\", localID, err)\n\t}\n\tr, err := NewRaft(conf, &tnvFSM{}, logs, stable, snaps, trans)\n\tif err != nil {\n\t\tt.Fatalf(\"NewRaft(%s): %v\", localID, err)\n\t}\n\tr.setState(Follower)\n\tr.setLeader(ServerAddress(leader), leader)\n\treturn r\n}\n\nfunc tnvAskVote(r *Raft, candidate ServerID, lastIdx, lastTerm uint64, transfer bool) (bool, string) {\n\tch := make(chan RPCResponse, 1)\n\tencoded := r.trans.EncodePeer(candidate, ServerAddress(candidate))\n\treq := &RequestVoteRequest{\n\t\tRPCHeader:          RPCHeader{ProtocolVersion: ProtocolVersionMax, ID: []byte(candidate), Addr: encoded},\n\t\tTerm:               r.getCurrentTerm(),\n\t\tCandidate:          encoded,\n\t\tLastLogIndex:       lastIdx,\n\t\tLastLogTerm:        lastTerm,\n\t\tLeadershipTransfer: transfer,\n\t}\n\tr.processRPC(RPC{Command: req, RespChan: ch})\n\tres := <-ch\n\tif res.Error != nil {\n\t\treturn false, fmt.Sprintf(\"%v\", res.Error)\n\t}\n\tresp, ok := res.Response.(*RequestVoteResponse)\n\tif !ok || resp == nil {\n\t\treturn false, \"unexpected response type\"\n\t}\n\treturn resp.Granted, \"\"\n}\n\n// TestAssuranceLeadershipTransferVotePrivilege observes the effect of\n// RequestVoteRequest.LeadershipTransfer: a voter that already has a known\n// leader grants the vote only when the flag is set.\nfunc TestAssuranceLeadershipTransferVotePrivilege(t *testing.T) {\n\tconst receiver = ServerID(\"node1\")\n\tconst leader = ServerID(\"node2\")\n\tconst voter = ServerID(\"node3\")\n\tconst outsider = ServerID(\"outsider\")\n\tvoters := []ServerID{receiver, leader, voter}\n\n\t// Case: configured voter, flag set, receiver already follows a leader.\n\tprivileged := tnvNode(t, receiver, voters, leader)\n\tlastIdx, lastTerm := privileged.getLastEntry()\n\ttnvEmit(t, map[string]interface{}{\n\t\t\"event\":                         \"privileged_vote_declared\",\n\t\t\"op_id\":                         \"vote-1\",\n\t\t\"transfer_privilege_set\":        true,\n\t\t\"candidate_is_configured_voter\": true,\n\t\t\"receiver_has_leader\":           true,\n\t\t\"candidate\":                     string(voter),\n\t\t\"known_leader\":                  string(leader),\n\t})\n\tgranted, errStr := tnvAskVote(privileged, voter, lastIdx, lastTerm, true)\n\ttnvEmit(t, map[string]interface{}{\n\t\t\"event\":                         \"privileged_vote_result\",\n\t\t\"op_id\":                         \"vote-1\",\n\t\t\"transfer_privilege_set\":        true,\n\t\t\"candidate_is_configured_voter\": true,\n\t\t\"granted\":                       granted,\n\t\t\"error\":                         errStr,\n\t})\n\n\t// Control: identical request without the flag.\n\tplain := tnvNode(t, receiver, voters, leader)\n\tpIdx, pTerm := plain.getLastEntry()\n\tpGranted, pErr := tnvAskVote(plain, voter, pIdx, pTerm, false)\n\ttnvEmit(t, map[string]interface{}{\n\t\t\"event\":                  \"control_plain_vote_result\",\n\t\t\"op_id\":                  \"vote-2\",\n\t\t\"granted\":                pGranted,\n\t\t\"error\":                  pErr,\n\t\t\"transfer_privilege_set\": false,\n\t})\n\n\t// Control: the flag does not defeat the membership check.\n\tunconfigured := tnvNode(t, receiver, voters, leader)\n\tuIdx, uTerm := unconfigured.getLastEntry()\n\tuGranted, uErr := tnvAskVote(unconfigured, outsider, uIdx, uTerm, true)\n\ttnvEmit(t, map[string]interface{}{\n\t\t\"event\":                         \"control_unconfigured_candidate_result\",\n\t\t\"op_id\":                         \"vote-3\",\n\t\t\"granted\":                       uGranted,\n\t\t\"error\":                         uErr,\n\t\t\"transfer_privilege_set\":        true,\n\t\t\"candidate_is_configured_voter\": false,\n\t})\n}\n",
+    "description": "TestAssuranceLeadershipTransferVotePrivilege builds voter nodes with background goroutines disabled, each with a bootstrapped three-voter configuration and a known leader, and drives RequestVote through processRPC: the privileged case (configured candidate, LeadershipTransfer true) and two controls (the same request without the flag, and the flag with a candidate absent from the configuration). CA_EVENT lines report the declaration and each result.",
+    "semantic_changes": [
+      "Nodes are built with conf.skipStartup so no background goroutines run, and the vote is driven through processRPC, the production dispatch for RequestVote, with a response channel as the transport supplies.",
+      "Each node is bootstrapped with the same configuration and given a known leader through the setLeader/setState accessors appendEntries uses, representing the state in which a transfer vote arrives.",
+      "No target code is modified."
+    ],
+    "prerequisites": [
+      {
+        "alias": "privileged-vote",
+        "event": "privileged_vote_declared",
+        "conditions": [
+          {
+            "field": "transfer_privilege_set",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          },
+          {
+            "field": "candidate_is_configured_voter",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          },
+          {
+            "field": "receiver_has_leader",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          }
+        ]
+      }
+    ],
+    "legality": {
+      "source_ids": [
+        "S6",
+        "S21",
+        "S48",
+        "S49",
+        "S51"
+      ],
+      "expectation_ids": [],
+      "binding_ids": [
+        "binding-timeout-now-attribution"
+      ],
+      "derivation": "The claim is about the privilege TimeoutNow grants; S49 shows the handler raising it, S51 shows the campaign skipping pre-vote and marking its RequestVote, and S6 shows requestVote refusing a candidate while a different leader is known unless req.LeadershipTransfer is set, with S21 supplying the membership helpers that the flag does not bypass. This scenario observes that effect directly at the voter, which is the consequence the claim's importance rests on.",
+      "applicability": "Applies to a voter that follows a different leader, asked for a vote by a configured candidate whose log is not older.",
+      "unresolved": [
+        "Whether such a transfer vote is reachable from a sender that is itself not the legitimate leader is the claim's own open premise; this scenario assumes the flag is set, as the receiving voter cannot distinguish.",
+        "The scenario has no live leader traffic and no timing, so it measures the grant decision only."
+      ],
+      "conflicts": [],
+      "alternatives": [
+        "If the flag is only ever set by the legitimate leader, the grant is intended behaviour and the obligation's question remains the attribution on the receive side."
+      ]
+    }
+  },
+  "monitors": [
+    {
+      "id": "m-transfer-vote-privilege",
+      "checker_id": "c-transfer-vote-privilege",
+      "event": "privileged_vote_result",
+      "binding_ids": [
+        "binding-timeout-now-attribution"
+      ],
+      "grounding": {
+        "source_ids": [
+          "S6",
+          "S21",
+          "S51"
+        ],
+        "expectation_ids": [],
+        "binding_ids": [
+          "binding-timeout-now-attribution"
+        ],
+        "derivation": "S6 contains the only place a vote is granted while a different leader is known, guarded solely by req.LeadershipTransfer, and S51 shows that flag is what the privilege sets. The event reports the grant decision for exactly that configuration.",
+        "applicability": "Only evaluated for a request that declares the transfer privilege set and a configured candidate.",
+        "unresolved": [],
+        "conflicts": [],
+        "alternatives": []
+      },
+      "applicability_conditions": [
+        {
+          "field": "transfer_privilege_set",
+          "op": "eq",
+          "value": true,
+          "reference": null
+        },
+        {
+          "field": "candidate_is_configured_voter",
+          "op": "eq",
+          "value": true,
+          "reference": null
+        }
+      ],
+      "admission_alias": "privileged-vote"
+    }
+  ],
+  "observable_properties": [
+    {
+      "checker_id": "c-transfer-vote-privilege",
+      "kind": "event_assertion",
+      "trigger": {
+        "field": "event",
+        "op": "eq",
+        "value": "privileged_vote_result",
+        "reference": null
+      },
+      "assertion": {
+        "field": "granted",
+        "op": "eq",
+        "value": true,
+        "reference": null
+      },
+      "antecedent": null,
+      "identity_fields": [
+        "op_id"
+      ],
+      "description": "A voter that already follows a different leader grants a vote to a configured candidate when the transfer privilege is set, while the unprivileged control is rejected."
+    }
+  ],
+  "uncertainties": [
+    "The scenario assumes the flag is set; whether an unattributed sender can cause it to be set is the claim's separate open premise.",
+    "No live cluster or timing is exercised, so only the grant decision is measured, not the resulting election."
+  ]
+}

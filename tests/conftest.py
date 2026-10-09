@@ -14,7 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 @pytest.fixture
 def prepared(tmp_path):
     repo = tmp_path / "repo"
-    shutil.copytree(ROOT / "examples/toy_protocol", repo)
+    shutil.copytree(ROOT / "tests/fixtures/toy_protocol", repo)
     snapshot = capture(repo)
     from regression_support import toy_responses
     responses = toy_responses(repo)

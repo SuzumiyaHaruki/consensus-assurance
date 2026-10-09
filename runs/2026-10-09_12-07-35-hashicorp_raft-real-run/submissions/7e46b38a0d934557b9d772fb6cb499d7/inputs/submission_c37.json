@@ -1,0 +1,112 @@
+{
+  "action": "obligation",
+  "map_path": "map.json",
+  "map_changes": {
+    "b-client-future": {
+      "impact": "dependency",
+      "source_ids": ["S67", "S68", "S23", "S11"],
+      "rationale": "Adds the shutdown branch to the existing A7 Behavior, which previously covered only the step-down path, and extends its sources. Its meaning, trigger, ownership, consumers and the Fact it already consumed are unchanged."
+    },
+    "f-client-completion-escape": {
+      "impact": "dependency",
+      "source_ids": ["S23", "S67", "S68", "S11"],
+      "rationale": "New A7 Fact giving an enqueued client operation's ability to complete its own identity, so that the shutdown escape can be reasoned about independently of the advancement path that usually responds it. No existing Fact's meaning changes."
+    }
+  },
+  "sources": [
+    {"id": "S67", "file": "future.go", "start_line": 92, "end_line": 120, "kind": "code_observation"},
+    {"id": "S68", "file": "api.go", "start_line": 1012, "end_line": 1030, "kind": "code_observation"}
+  ],
+  "question": {
+    "question": "Does every client-facing future the library hands to a caller have a way to complete after the node shuts down - either because a raft loop responded it or because it carries the node's shutdown channel - or can a request that was accepted into a buffered channel be dropped by shutdown with no response and no shutdown escape, leaving the caller blocked in Error() forever?",
+    "importance": "The library documents Future.Error as returning generic raft errors such as ErrLeadershipLost or ErrRaftShutdown, and callers are told to check it. A request that the library accepted and then dropped on shutdown leaves the caller with no error path at all: with BatchApplyCh the apply channel is buffered, so Apply can return a future for a request the loops never see, and Shutdown closes the node without draining that buffer. The consequence is a permanently blocked caller (a hang in application code, for example a goroutine holding a lock) rather than a consensus-safety violation, which is why it is classified as an implementation-semantics duty on the client contract.",
+    "trigger_rationale": "Reading the client facing future types after the earlier findings showed that the library wires a shutdown escape into some futures (restoreFuture in restoreUserSnapshot and installSnapshot, configurationsFuture in takeSnapshot) but not into the logFuture created by Apply, ApplyLog and Barrier, while the deferError.Error implementation returns ErrRaftShutdown only through that field. A local construction run of the buffered case observed responded_after_shutdown=false and shutdown_escape=false after Shutdown, so the gap is an observed condition rather than a guess; the next action is to fix the observation as a check.",
+    "disposition": "ready_for_check",
+    "preferred_check": "direct_test",
+    "priority": 2,
+    "obligation_relation_kind": "establishment",
+    "activity_classes": ["A1", "A7"],
+    "fact_ids": ["f-client-completion-escape"],
+    "behavior_ids": ["b-client-future"],
+    "supporting_behavior_ids": {
+      "b-leader-loop-commit-consume": "The A1 path that normally responds an accepted operation, and the place whose deferred cleanup responds only what it has already taken on, which is why a buffered request can be left out.",
+      "b-commit-index-advance": "Supplies the advancement lifecycle the client's completion belongs to: the future is answered when the entry commits."
+    },
+    "objects": ["Raft.Apply/ApplyLog/Barrier", "logFuture", "deferError.Error", "Raft.Shutdown"],
+    "contexts": ["BatchApplyCh enabled so the apply channel is buffered", "shutdown before the loops consume the queued request"],
+    "participants": ["application goroutine holding the future", "raft main loop", "Shutdown"],
+    "event_paths": [
+      "Apply -> applyCh buffer -> Shutdown -> no loop dequeues the request -> future unresponded and with no shutdown escape",
+      "Apply -> applyCh -> leaderLoop dispatch -> commit -> processLogs responds the future"
+    ],
+    "source_ids": ["S23", "S67", "S68", "S11", "S9"],
+    "counterevidence": [
+      "Shutdown is usually the end of the process, so a blocked caller may not matter; the library may consider completion guarantees unnecessary once Close has been requested.",
+      "With the default BatchApplyCh=false the apply channel is unbuffered, so a send only succeeds when a loop is receiving it, which narrows the window to the moment of shutdown.",
+      "The docs for Apply mention an enqueue timeout rather than a completion guarantee, so the duty may be weaker than the question states."
+    ],
+    "unknowns": [
+      "Whether other future types (VerifyLeader's verifyFuture, configurationChangeFuture, userSnapshotFuture) have the same gap.",
+      "Whether a caller can observe the difference in a supported way rather than by inspecting the future's internals.",
+      "Whether the maintainers intend Error to be blocking-until-shutdown only for futures the library explicitly wires."
+    ]
+  },
+  "obligation": {
+    "id": "claim-client-future-shutdown-escape",
+    "kind": "obligation",
+    "concern": "implementation_semantics",
+    "description": "Every client-facing future the library returns to a caller can complete: a request the library accepted is either responded by a raft loop, or its future carries the node's shutdown channel so that Error() returns ErrRaftShutdown when the node shuts down before the request is handled.",
+    "source_ids": ["S23", "S67", "S68", "S11"],
+    "scope": {
+      "description": "A Raft node with a buffered apply channel (BatchApplyCh) that accepts an Apply/ApplyLog/Barrier request and is then shut down before a loop dequeues it. The obligation concerns the caller's future completing, not the fate of the log entry.",
+      "assumptions": [
+        "The request was accepted, i.e. the send into the apply channel succeeded.",
+        "Shutdown closes the node without draining the apply channel."
+      ],
+      "excluded": [
+        "The step-down path, where the loops do respond queued requests with ErrNotLeader.",
+        "Durability or ordering of the dropped request."
+      ]
+    },
+    "pending": [
+      "Establish whether other future types share the gap.",
+      "Confirm with a fixed check that an accepted-then-dropped request has neither a response nor an escape."
+    ],
+    "grounding": {
+      "source_ids": ["S23", "S67", "S68", "S11"],
+      "expectation_ids": [],
+      "binding_ids": ["binding-client-future-shutdown-escape"],
+      "derivation": "S67 shows Error returning from either the response channel or ShutdownCh, and that ShutdownCh is a field the creator must set; S23 shows Apply/ApplyLog/Barrier creating a logFuture and only calling init; S68 shows Shutdown closing the node without draining the apply channel; S11 shows the loops responding only the requests they have taken on. A local construction run observed both the response channel empty and no escape after shutdown.",
+      "applicability": "Applicable when BatchApplyCh is enabled so a request can be accepted before any loop dequeues it; with the default unbuffered channel the window is limited to the moment of shutdown.",
+      "unresolved": [
+        "Whether other future types share the gap.",
+        "Whether the maintainers intend this asymmetry."
+      ],
+      "conflicts": [
+        "The Future.Error documentation promises ErrRaftShutdown among the errors a caller may see, while the futures returned by Apply/Barrier have no mechanism to produce it when they are dropped by shutdown."
+      ],
+      "alternatives": [
+        "If completion after Shutdown is deliberately not guaranteed, the correct disposition is a documented caveat on Apply rather than wiring an escape."
+      ]
+    }
+  },
+  "bindings": [
+    {
+      "id": "binding-client-future-shutdown-escape",
+      "material_id": "S23",
+      "symbol": "ApplyLog",
+      "start_line": 826,
+      "end_line": 852,
+      "description": "ApplyLog creates the logFuture, calls init and enqueues it, but never sets its ShutdownCh, so a request accepted into the buffered channel and dropped by shutdown has no error path.",
+      "pending": ["Confirm that no other creator sets ShutdownCh for log futures."],
+      "associations": [
+        {
+          "claim_id": "claim-client-future-shutdown-escape",
+          "source_ids": ["S23", "S67", "S68", "S11"],
+          "rationale": "Locates the future creation site without the escape (S23), the Error implementation that depends on it (S67), the shutdown that drops the request (S68) and the loops whose cleanup only covers what they took on (S11)."
+        }
+      ]
+    }
+  ],
+  "rationale": "Fifth candidate, grounded on the accepted map. The library wires a shutdown escape into some futures but not into the logFuture returned by Apply/ApplyLog/Barrier, and Error returns ErrRaftShutdown only through that field; with the documented BatchApplyCh option a request can be accepted into the buffer and then dropped by Shutdown, which a local construction run confirmed leaves the future with neither a response nor an escape. The claim fixes the completion duty without asserting the violation; whether other future types share the gap, whether the maintainers intend the asymmetry, and whether the default unbuffered channel makes it moot are recorded as counterevidence and unknowns. The map gains the shutdown branch on b-client-future and the Fact f-client-completion-escape; no accepted object's meaning, identity or edges change."
+}

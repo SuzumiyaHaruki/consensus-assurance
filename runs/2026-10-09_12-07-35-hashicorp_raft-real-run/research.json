@@ -1,0 +1,3122 @@
+{
+  "audit_spec_path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-09_12-07-35-hashicorp_raft-real-run/audit-spec/v19.json",
+  "audit_spec_version": 19,
+  "activity_roles": {
+    "A1": {
+      "role": "core",
+      "relation": "Qualified support for decision formation and legal advancement"
+    },
+    "A2": {
+      "role": "core",
+      "relation": "Context validity and acquisition, transfer or loss of authority"
+    },
+    "A3": {
+      "role": "support",
+      "relation": "Recovery and resynchronization of eligible participation"
+    },
+    "A4": {
+      "role": "support",
+      "relation": "Configuration and participant eligibility"
+    },
+    "A5": {
+      "role": "support",
+      "relation": "Decision application and consumption"
+    },
+    "A6": {
+      "role": "support",
+      "relation": "History, persistence and reconstruction of support"
+    },
+    "A7": {
+      "role": "support",
+      "relation": "Client contracts, invocation intervals and observed completion"
+    }
+  },
+  "activity_focus": [],
+  "understanding_status": "usable",
+  "core_overview": {
+    "formation": {
+      "explanation": "A follower whose heartbeat timer expires while it is an eligible voter transitions to Candidate and runCandidate starts a pre-vote campaign (preElectSelf) that proposes currentTerm+1 without touching the term. Each other voter answers in requestPreVote with the leader-stickiness, membership and log-up-to-date guards and without persisting anything. If a quorum of pre-votes is granted the candidate runs electSelf, which persists the new term and a self-vote, then requests votes; voters persist the vote in requestVote subject to the same guards plus one-vote-per-term. The first tally to reach quorumSize() sets the candidate to Leader. The leader then appends a no-op for its term and replicates; the commitment struct advances commitIndex only when an actual quorum's matchIndex reaches at least startIndex, the first index of the leader's own term.",
+      "behavior_ids": [
+        "b-prevote-campaign",
+        "b-vote-campaign",
+        "b-vote-grant",
+        "b-prevote-grant",
+        "b-commit-index-advance",
+        "b-leader-loop-commit-consume",
+        "b-append-entries-sync",
+        "b-leader-lease"
+      ],
+      "fact_ids": [
+        "f-campaign-tally",
+        "f-leader-commit-index",
+        "f-matching-index"
+      ],
+      "source_ids": [
+        "S2",
+        "S3",
+        "S4",
+        "S5",
+        "S6",
+        "S7",
+        "S8",
+        "S9",
+        "S11",
+        "S18",
+        "S19",
+        "S21",
+        "S24"
+      ]
+    },
+    "context": {
+      "explanation": "Authority is the durable current term plus the durable per-term vote; there is no global leader identity. setCurrentTerm persists a term before it is exposed and setState clears the known leader on every transition. A newer term seen in RequestVote or AppendEntries forces a step-down and term update, so context is lost by observation, not by a clock. Leadership transfer pre-replicates to the target and sends TimeoutNow; the target marks candidateFromLeadershipTransfer so that it skips pre-vote and is not stepped down by an equal-term AppendEntries from the outgoing leader, and the flag is cleared after the candidate run. The configuration context is the pair (latest, committed); latest is in effect from the moment its entry is appended.",
+      "behavior_ids": [
+        "b-term-authority",
+        "b-leadership-transfer",
+        "b-config-change",
+        "b-vote-grant",
+        "b-append-entries-sync"
+      ],
+      "fact_ids": [
+        "f-durable-term-vote",
+        "f-latest-configuration"
+      ],
+      "source_ids": [
+        "S3",
+        "S5",
+        "S6",
+        "S8",
+        "S12",
+        "S13",
+        "S14",
+        "S15",
+        "S16",
+        "S21",
+        "S22",
+        "S24"
+      ]
+    },
+    "connection": {
+      "explanation": "The two lines meet in three places. (1) Eligibility for formation is read from the configuration context: only voters of the latest configuration are asked for votes and only their match indexes count for commitment, and the commitment struct is rebuilt from the configuration at leader setup and at each configuration change. (2) The leader's advancement duty is gated by its term context: configurationChangeChIfStable is only non-nil once latest==committed and the leader has committed an entry of its own term (commitIndex >= startIndex), which is why a no-op is dispatched on election even with no client work. (3) Old work is bounded by present authority: a persisted vote is only honoured for its own term, an AppendEntries reply that reports a newer term drives handleStaleTerm and a step-down, a conflicting suffix truncation rolls latest back to committed, and on step-down the leader fails all inflight log futures with ErrLeadershipLost while replication goroutines are stopped.",
+      "behavior_ids": [
+        "b-commit-index-advance",
+        "b-config-change",
+        "b-leadership-transfer",
+        "b-replication-recovery",
+        "b-client-future",
+        "b-term-authority"
+      ],
+      "fact_ids": [
+        "f-latest-configuration",
+        "f-matching-index",
+        "f-leader-commit-index",
+        "f-durable-term-vote"
+      ],
+      "source_ids": [
+        "S3",
+        "S5",
+        "S6",
+        "S8",
+        "S9",
+        "S11",
+        "S12",
+        "S13",
+        "S14",
+        "S15",
+        "S16",
+        "S17",
+        "S18",
+        "S21",
+        "S22",
+        "S23",
+        "S24"
+      ]
+    },
+    "open_details": [
+      "appendEntries has an explicit TODO (raft.go:1541): if StoreLogs fails after a truncation, lastLog is left stale. Whether any real store can fail there, and its consequence, is unresolved.",
+      "electSelf returns a nil response channel when persisting the self-vote fails (raft.go:2023), leaving the candidate to wait out its election timer; this is a storage-failure path only.",
+      "checkLeaderLease assumes leaderState.replState contains every voter of the latest configuration (raft.go:1054); ordering on the main thread appears to guarantee this, but a nil-map lookup would panic and was not tested.",
+      "The pre-vote path treats a transport 'unexpected command' error as a granted pre-vote (raft.go:2084-2090), which is intentional for mixed versions but was not analysed for a genuinely unreachable peer.",
+      "Four implementation-level duties on the mapped paths are confirmed in scope and belong to their claim/check records rather than here: batching FSMs never receive ConfigurationStore.StoreConfiguration (claim-config-store-delivery); the heartbeat fast path reaches appendEntries without checkRPCHeader (claim-heartbeat-header-gate); TimeoutNow grants the pre-vote-skipping vote privilege without attributing the sender to the configuration (claim-timeout-now-attribution); and an accepted InstallSnapshot retains and reports an unconfirmed log tail (claim-install-snapshot-alignment). Their residual premises - real-deployment reachability, election/quorum consequence, contract exemption and tail lifetime - remain open.",
+      "The ReloadConfig notification scope (only a decreased HeartbeatTimeout signals the notify channels) and the processHeartbeat concurrency contract are recorded as leads/limits with no obligation."
+    ],
+    "core_gaps": [],
+    "status": "usable",
+    "rationale": "Both core relationships are explained from read code and the membership design document, and the connection (configuration context gating formation, own-term commit gating configuration changes, and stale/old work being bounded by term and vote context) is sourced. Residual anomalies are local and recorded under open_details rather than blocking the overview."
+  },
+  "understanding_changes": [
+    {
+      "operation_id": "18811c1f162f487fa26b4d2ae7160b61",
+      "version": 1,
+      "record": {
+        "path": "state.json",
+        "collection": "selections",
+        "match": {
+          "operation_id": "18811c1f162f487fa26b4d2ae7160b61"
+        }
+      }
+    },
+    {
+      "operation_id": "180169d9f6754d0db9292bb81f4c9fad",
+      "version": 2,
+      "record": {
+        "path": "state.json",
+        "collection": "selections",
+        "match": {
+          "operation_id": "180169d9f6754d0db9292bb81f4c9fad"
+        }
+      }
+    },
+    {
+      "operation_id": "80175045278242a0a258766c5b0fcfa3",
+      "version": 3,
+      "record": {
+        "path": "state.json",
+        "collection": "selections",
+        "match": {
+          "operation_id": "80175045278242a0a258766c5b0fcfa3"
+        }
+      }
+    },
+    {
+      "operation_id": "14aa3adf385a43e8b332cf7ecd36405c",
+      "version": 4,
+      "record": {
+        "path": "state.json",
+        "collection": "selections",
+        "match": {
+          "operation_id": "14aa3adf385a43e8b332cf7ecd36405c"
+        }
+      }
+    },
+    {
+      "operation_id": "e66e3c692a314321855af0ea7cacb9b9",
+      "version": 5,
+      "record": {
+        "path": "state.json",
+        "collection": "selections",
+        "match": {
+          "operation_id": "e66e3c692a314321855af0ea7cacb9b9"
+        }
+      }
+    },
+    {
+      "operation_id": "e0aba13d5ce743538af1b92465ebc588",
+      "version": 6,
+      "record": {
+        "path": "state.json",
+        "collection": "selections",
+        "match": {
+          "operation_id": "e0aba13d5ce743538af1b92465ebc588"
+        }
+      }
+    },
+    {
+      "operation_id": "0a08129a8e41457eb986dc99612f6030",
+      "version": 7,
+      "record": {
+        "path": "state.json",
+        "collection": "selections",
+        "match": {
+          "operation_id": "0a08129a8e41457eb986dc99612f6030"
+        }
+      }
+    },
+    {
+      "operation_id": "75cb0e649dc041a9897548dc10ba1ec6",
+      "version": 8,
+      "record": {
+        "path": "state.json",
+        "collection": "selections",
+        "match": {
+          "operation_id": "75cb0e649dc041a9897548dc10ba1ec6"
+        }
+      }
+    },
+    {
+      "operation_id": "73e87b0def0f4aaea8bf94dc658ddb2c",
+      "version": 9,
+      "record": {
+        "path": "state.json",
+        "collection": "selections",
+        "match": {
+          "operation_id": "73e87b0def0f4aaea8bf94dc658ddb2c"
+        }
+      }
+    },
+    {
+      "operation_id": "c3a3eb7e17fa4f9eb6c850a413f4e3ab",
+      "version": 10,
+      "record": {
+        "path": "state.json",
+        "collection": "selections",
+        "match": {
+          "operation_id": "c3a3eb7e17fa4f9eb6c850a413f4e3ab"
+        }
+      }
+    },
+    {
+      "operation_id": "70dc2989d458407ab58c40fc69c542a4",
+      "version": 11,
+      "record": {
+        "path": "state.json",
+        "collection": "selections",
+        "match": {
+          "operation_id": "70dc2989d458407ab58c40fc69c542a4"
+        }
+      }
+    },
+    {
+      "operation_id": "1019b638881546d280dc346289306ac3",
+      "version": 12,
+      "record": {
+        "path": "state.json",
+        "collection": "selections",
+        "match": {
+          "operation_id": "1019b638881546d280dc346289306ac3"
+        }
+      }
+    },
+    {
+      "operation_id": "059d7d80cb3f441daf4d2d9c16ee20c8",
+      "version": 13,
+      "record": {
+        "path": "state.json",
+        "collection": "selections",
+        "match": {
+          "operation_id": "059d7d80cb3f441daf4d2d9c16ee20c8"
+        }
+      }
+    },
+    {
+      "operation_id": "7a1185fc025c43cf87a81a58998f38b2",
+      "version": 14,
+      "record": {
+        "path": "state.json",
+        "collection": "selections",
+        "match": {
+          "operation_id": "7a1185fc025c43cf87a81a58998f38b2"
+        }
+      }
+    },
+    {
+      "operation_id": "bded47505ce744ddb0ffbf039c280e1f",
+      "version": 15,
+      "record": {
+        "path": "state.json",
+        "collection": "selections",
+        "match": {
+          "operation_id": "bded47505ce744ddb0ffbf039c280e1f"
+        }
+      }
+    },
+    {
+      "operation_id": "441bda4cbd724c2594dc441a914f0cf0",
+      "version": 16,
+      "record": {
+        "path": "state.json",
+        "collection": "selections",
+        "match": {
+          "operation_id": "441bda4cbd724c2594dc441a914f0cf0"
+        }
+      }
+    },
+    {
+      "operation_id": "7efcd413317c4d9caef6e258b717f30d",
+      "version": 17,
+      "record": {
+        "path": "state.json",
+        "collection": "selections",
+        "match": {
+          "operation_id": "7efcd413317c4d9caef6e258b717f30d"
+        }
+      }
+    },
+    {
+      "operation_id": "7e46b38a0d934557b9d772fb6cb499d7",
+      "version": 18,
+      "record": {
+        "path": "state.json",
+        "collection": "selections",
+        "match": {
+          "operation_id": "7e46b38a0d934557b9d772fb6cb499d7"
+        }
+      }
+    },
+    {
+      "operation_id": "9fc379e5daf847fbbe4e45b7d88adea9",
+      "version": 19,
+      "record": {
+        "path": "state.json",
+        "collection": "selections",
+        "match": {
+          "operation_id": "9fc379e5daf847fbbe4e45b7d88adea9"
+        }
+      }
+    }
+  ],
+  "next_objective": {
+    "action": "investigate_and_refocus",
+    "boundary": "both_core_paths",
+    "reason": "Use results to update understanding and compare the remaining frontier",
+    "core_gaps": []
+  },
+  "drafts": [],
+  "candidates": [
+    {
+      "id": "831856452d6b4e1985b8de082764a214",
+      "status": "paused",
+      "parent_candidate_id": null,
+      "fork_reason": "",
+      "obligation_id": "claim-config-store-delivery",
+      "question_preview": "When a FSM implements both BatchingFSM and ConfigurationStore, does the library invoke StoreConfiguration(index, configuration) for a committed LogConfiguration entry, as the ConfigurationStore contract states, or does the batching dispatch…",
+      "audit_spec_version": 2,
+      "result_claim_ids": [
+        "claim-config-store-delivery"
+      ],
+      "open_issue_ids": [],
+      "executions": [
+        {
+          "check_id": "41bb5656bcc7426dab29aae5e648536f",
+          "artifact_id": "3052d8d823d14854a617fe006f2a30a5",
+          "action": "direct_check",
+          "status": "completed",
+          "outcome": "tests_passed",
+          "record": {
+            "path": "state.json",
+            "collection": "checks",
+            "match": {
+              "id": "41bb5656bcc7426dab29aae5e648536f"
+            }
+          }
+        },
+        {
+          "check_id": "a898e05630e6440d97b856d7527274bd",
+          "artifact_id": "d37a13c51a594f278bc23ed2af078007",
+          "action": "direct_check",
+          "status": "completed",
+          "outcome": "tests_passed",
+          "record": {
+            "path": "state.json",
+            "collection": "checks",
+            "match": {
+              "id": "a898e05630e6440d97b856d7527274bd"
+            }
+          }
+        }
+      ],
+      "record": {
+        "path": "state.json",
+        "collection": "question_candidates",
+        "match": {
+          "id": "831856452d6b4e1985b8de082764a214"
+        }
+      }
+    },
+    {
+      "id": "3bf994e1d1c54186b73ed96e82d39802",
+      "status": "paused",
+      "parent_candidate_id": null,
+      "fork_reason": "",
+      "obligation_id": "claim-heartbeat-header-gate",
+      "question_preview": "Does the heartbeat fast path apply the RPC-header compatibility gate that the normal AppendEntries path applies, so that a peer whose RPCHeader.ProtocolVersion is outside the window checkRPCHeader accepts cannot step this server down, advan…",
+      "audit_spec_version": 5,
+      "result_claim_ids": [
+        "claim-heartbeat-header-gate"
+      ],
+      "open_issue_ids": [],
+      "executions": [
+        {
+          "check_id": "1987811182294bfbb372a36548be8d8b",
+          "artifact_id": "a7ab7f884023425182fec9595c00ba14",
+          "action": "direct_check",
+          "status": "completed",
+          "outcome": "tests_passed",
+          "record": {
+            "path": "state.json",
+            "collection": "checks",
+            "match": {
+              "id": "1987811182294bfbb372a36548be8d8b"
+            }
+          }
+        },
+        {
+          "check_id": "7628b537f51c4a868e8ebb80cf019fc2",
+          "artifact_id": "f8caf123581f4c9abfa7d55569cfcfbe",
+          "action": "direct_check",
+          "status": "completed",
+          "outcome": "tests_passed",
+          "record": {
+            "path": "state.json",
+            "collection": "checks",
+            "match": {
+              "id": "7628b537f51c4a868e8ebb80cf019fc2"
+            }
+          }
+        }
+      ],
+      "record": {
+        "path": "state.json",
+        "collection": "question_candidates",
+        "match": {
+          "id": "3bf994e1d1c54186b73ed96e82d39802"
+        }
+      }
+    },
+    {
+      "id": "90fabf4609b545a2a911e245ce254742",
+      "status": "paused",
+      "parent_candidate_id": null,
+      "fork_reason": "",
+      "obligation_id": "claim-timeout-now-attribution",
+      "question_preview": "Is a TimeoutNow request honoured only when its sender is attributed to the receiver's authority context - a voter of the receiver's latest configuration - or can any peer whose RPC header passes the version window make the receiver clear it…",
+      "audit_spec_version": 8,
+      "result_claim_ids": [
+        "claim-timeout-now-attribution"
+      ],
+      "open_issue_ids": [],
+      "executions": [
+        {
+          "check_id": "554a0abcf056483ba255f00545e30713",
+          "artifact_id": "7815ca48454b4d919a20810718683b41",
+          "action": "direct_check",
+          "status": "completed",
+          "outcome": "tests_passed",
+          "record": {
+            "path": "state.json",
+            "collection": "checks",
+            "match": {
+              "id": "554a0abcf056483ba255f00545e30713"
+            }
+          }
+        },
+        {
+          "check_id": "ec71e08710e746bbbe6e7268f032377e",
+          "artifact_id": "38aa89590d3b453bb2c47420aa8e7fe0",
+          "action": "direct_check",
+          "status": "completed",
+          "outcome": "tests_passed",
+          "record": {
+            "path": "state.json",
+            "collection": "checks",
+            "match": {
+              "id": "ec71e08710e746bbbe6e7268f032377e"
+            }
+          }
+        }
+      ],
+      "record": {
+        "path": "state.json",
+        "collection": "question_candidates",
+        "match": {
+          "id": "90fabf4609b545a2a911e245ce254742"
+        }
+      }
+    },
+    {
+      "id": "c73e1a943eeb4f7dbd009677b41d7c36",
+      "status": "paused",
+      "parent_candidate_id": null,
+      "fork_reason": "",
+      "obligation_id": "claim-install-snapshot-alignment",
+      "question_preview": "After a successful InstallSnapshot at index N, does the receiver discard the log entries it cannot reconcile with the snapshot - so that its effective last entry never comes from a branch the snapshot did not confirm - or does it retain and…",
+      "audit_spec_version": 12,
+      "result_claim_ids": [
+        "claim-install-snapshot-alignment"
+      ],
+      "open_issue_ids": [],
+      "executions": [
+        {
+          "check_id": "3d53c8e244184b0490a87411aabe15f4",
+          "artifact_id": "495d49f163e24e3f951df60c6779ec27",
+          "action": "direct_check",
+          "status": "completed",
+          "outcome": "tests_passed",
+          "record": {
+            "path": "state.json",
+            "collection": "checks",
+            "match": {
+              "id": "3d53c8e244184b0490a87411aabe15f4"
+            }
+          }
+        },
+        {
+          "check_id": "b9d811ad439049be9c19247ec7db97b2",
+          "artifact_id": "5a560c551ebc4cdc8fea586eb3dcd785",
+          "action": "direct_check",
+          "status": "completed",
+          "outcome": "tests_passed",
+          "record": {
+            "path": "state.json",
+            "collection": "checks",
+            "match": {
+              "id": "b9d811ad439049be9c19247ec7db97b2"
+            }
+          }
+        }
+      ],
+      "record": {
+        "path": "state.json",
+        "collection": "question_candidates",
+        "match": {
+          "id": "c73e1a943eeb4f7dbd009677b41d7c36"
+        }
+      }
+    },
+    {
+      "id": "27488dfef77c44868f3cc91ed9880724",
+      "question": {
+        "audit_spec_version": 18,
+        "disposition": "ready_for_check",
+        "preferred_check": "direct_test",
+        "question": "Does every client-facing future the library hands to a caller have a way to complete after the node shuts down - either because a raft loop responded it or because it carries the node's shutdown channel - or can a request that was accepted into a buffered channel be dropped by shutdown with no response and no shutdown escape, leaving the caller blocked in Error() forever?",
+        "importance": "The library documents Future.Error as returning generic raft errors such as ErrLeadershipLost or ErrRaftShutdown, and callers are told to check it. A request that the library accepted and then dropped on shutdown leaves the caller with no error path at all: with BatchApplyCh the apply channel is buffered, so Apply can return a future for a request the loops never see, and Shutdown closes the node without draining that buffer. The consequence is a permanently blocked caller (a hang in application code, for example a goroutine holding a lock) rather than a consensus-safety violation, which is why it is classified as an implementation-semantics duty on the client contract.",
+        "source_ids": [
+          "S23",
+          "S67",
+          "S68",
+          "S11",
+          "S9"
+        ],
+        "participants": [
+          "application goroutine holding the future",
+          "raft main loop",
+          "Shutdown"
+        ],
+        "objects": [
+          "Raft.Apply/ApplyLog/Barrier",
+          "logFuture",
+          "deferError.Error",
+          "Raft.Shutdown"
+        ],
+        "contexts": [
+          "BatchApplyCh enabled so the apply channel is buffered",
+          "shutdown before the loops consume the queued request"
+        ],
+        "event_paths": [
+          "Apply -> applyCh buffer -> Shutdown -> no loop dequeues the request -> future unresponded and with no shutdown escape",
+          "Apply -> applyCh -> leaderLoop dispatch -> commit -> processLogs responds the future"
+        ],
+        "activity_classes": [
+          "A1",
+          "A7"
+        ],
+        "behavior_ids": [
+          "b-client-future"
+        ],
+        "fact_ids": [
+          "f-client-completion-escape"
+        ],
+        "supporting_behavior_ids": {
+          "b-leader-loop-commit-consume": "The A1 path that normally responds an accepted operation, and the place whose deferred cleanup responds only what it has already taken on, which is why a buffered request can be left out.",
+          "b-commit-index-advance": "Supplies the advancement lifecycle the client's completion belongs to: the future is answered when the entry commits."
+        },
+        "obligation_relation_kind": "establishment",
+        "counterevidence": [
+          "Shutdown is usually the end of the process, so a blocked caller may not matter; the library may consider completion guarantees unnecessary once Close has been requested.",
+          "With the default BatchApplyCh=false the apply channel is unbuffered, so a send only succeeds when a loop is receiving it, which narrows the window to the moment of shutdown.",
+          "The docs for Apply mention an enqueue timeout rather than a completion guarantee, so the duty may be weaker than the question states."
+        ],
+        "unknowns": [
+          "Whether other future types (VerifyLeader's verifyFuture, configurationChangeFuture, userSnapshotFuture) have the same gap.",
+          "Whether a caller can observe the difference in a supported way rather than by inspecting the future's internals.",
+          "Whether the maintainers intend Error to be blocking-until-shutdown only for futures the library explicitly wires."
+        ],
+        "priority": 2,
+        "trigger_rationale": "Reading the client facing future types after the earlier findings showed that the library wires a shutdown escape into some futures (restoreFuture in restoreUserSnapshot and installSnapshot, configurationsFuture in takeSnapshot) but not into the logFuture created by Apply, ApplyLog and Barrier, while the deferError.Error implementation returns ErrRaftShutdown only through that field. A local construction run of the buffered case observed responded_after_shutdown=false and shutdown_escape=false after Shutdown, so the gap is an observed condition rather than a guess; the next action is to fix the observation as a check."
+      },
+      "status": "escalated",
+      "parent_candidate_id": null,
+      "fork_reason": "",
+      "stop_reason": "Fifth candidate, grounded on the accepted map. The library wires a shutdown escape into some futures but not into the logFuture returned by Apply/ApplyLog/Barrier, and Error returns ErrRaftShutdown only through that field; with the documented BatchApplyCh option a request can be accepted into the buffer and then dropped by Shutdown, which a local construction run confirmed leaves the future with neither a response nor an escape. The claim fixes the completion duty without asserting the violation; whether other future types share the gap, whether the maintainers intend the asymmetry, and whether the default unbuffered channel makes it moot are recorded as counterevidence and unknowns. The map gains the shutdown branch on b-client-future and the Fact f-client-completion-escape; no accepted object's meaning, identity or edges change.",
+      "resume_conditions": [],
+      "obligation_id": "claim-client-future-shutdown-escape",
+      "result_claim_ids": [
+        "claim-client-future-shutdown-escape"
+      ],
+      "open_issue_ids": [],
+      "executions": [
+        {
+          "check_id": "e69bc2007c144a7fb7e950e3827d2cb4",
+          "artifact_id": "54e71939c4644eacbd929a505b3aac2a",
+          "action": "direct_check",
+          "status": "completed",
+          "outcome": "tests_passed",
+          "record": {
+            "path": "state.json",
+            "collection": "checks",
+            "match": {
+              "id": "e69bc2007c144a7fb7e950e3827d2cb4"
+            }
+          }
+        },
+        {
+          "check_id": "e6a53d74753d4e2b880be03c0fe20b0d",
+          "artifact_id": "46a5695874f2465da28c9cfcd03b2071",
+          "action": "direct_check",
+          "status": "completed",
+          "outcome": "tests_passed",
+          "record": {
+            "path": "state.json",
+            "collection": "checks",
+            "match": {
+              "id": "e6a53d74753d4e2b880be03c0fe20b0d"
+            }
+          }
+        }
+      ],
+      "record": {
+        "path": "state.json",
+        "collection": "question_candidates",
+        "match": {
+          "id": "27488dfef77c44868f3cc91ed9880724"
+        }
+      }
+    }
+  ],
+  "units": [
+    {
+      "id": "unit-claim-config-store-delivery",
+      "candidate_id": "831856452d6b4e1985b8de082764a214",
+      "obligation_ids": [
+        "claim-config-store-delivery"
+      ],
+      "status": "checked",
+      "version": 1,
+      "progress": [
+        {
+          "claim_id": "claim-config-store-delivery",
+          "artifact_id": "d37a13c51a594f278bc23ed2af078007",
+          "check_id": "a898e05630e6440d97b856d7527274bd",
+          "record_status": "assessed",
+          "comparison_observed": true
+        }
+      ],
+      "source_explanation": null,
+      "record": {
+        "path": "state.json",
+        "collection": "units",
+        "match": {
+          "id": "unit-claim-config-store-delivery",
+          "version": 1
+        }
+      }
+    },
+    {
+      "id": "unit-claim-heartbeat-header-gate",
+      "candidate_id": "3bf994e1d1c54186b73ed96e82d39802",
+      "obligation_ids": [
+        "claim-heartbeat-header-gate"
+      ],
+      "status": "checked",
+      "version": 1,
+      "progress": [
+        {
+          "claim_id": "claim-heartbeat-header-gate",
+          "artifact_id": "a7ab7f884023425182fec9595c00ba14",
+          "check_id": "1987811182294bfbb372a36548be8d8b",
+          "record_status": "assessed",
+          "comparison_observed": true
+        },
+        {
+          "claim_id": "claim-heartbeat-header-gate",
+          "artifact_id": "f8caf123581f4c9abfa7d55569cfcfbe",
+          "check_id": "7628b537f51c4a868e8ebb80cf019fc2",
+          "record_status": "assessed",
+          "comparison_observed": true
+        }
+      ],
+      "source_explanation": null,
+      "record": {
+        "path": "state.json",
+        "collection": "units",
+        "match": {
+          "id": "unit-claim-heartbeat-header-gate",
+          "version": 1
+        }
+      }
+    },
+    {
+      "id": "unit-claim-timeout-now-attribution",
+      "candidate_id": "90fabf4609b545a2a911e245ce254742",
+      "obligation_ids": [
+        "claim-timeout-now-attribution"
+      ],
+      "status": "checked",
+      "version": 1,
+      "progress": [
+        {
+          "claim_id": "claim-timeout-now-attribution",
+          "artifact_id": "7815ca48454b4d919a20810718683b41",
+          "check_id": "554a0abcf056483ba255f00545e30713",
+          "record_status": "assessed",
+          "comparison_observed": true
+        },
+        {
+          "claim_id": "claim-timeout-now-attribution",
+          "artifact_id": "38aa89590d3b453bb2c47420aa8e7fe0",
+          "check_id": "ec71e08710e746bbbe6e7268f032377e",
+          "record_status": "assessed",
+          "comparison_observed": true
+        }
+      ],
+      "source_explanation": null,
+      "record": {
+        "path": "state.json",
+        "collection": "units",
+        "match": {
+          "id": "unit-claim-timeout-now-attribution",
+          "version": 1
+        }
+      }
+    },
+    {
+      "id": "unit-claim-install-snapshot-alignment",
+      "candidate_id": "c73e1a943eeb4f7dbd009677b41d7c36",
+      "obligation_ids": [
+        "claim-install-snapshot-alignment"
+      ],
+      "status": "checked",
+      "version": 1,
+      "progress": [
+        {
+          "claim_id": "claim-install-snapshot-alignment",
+          "artifact_id": "495d49f163e24e3f951df60c6779ec27",
+          "check_id": "3d53c8e244184b0490a87411aabe15f4",
+          "record_status": "assessed",
+          "comparison_observed": true
+        },
+        {
+          "claim_id": "claim-install-snapshot-alignment",
+          "artifact_id": "5a560c551ebc4cdc8fea586eb3dcd785",
+          "check_id": "b9d811ad439049be9c19247ec7db97b2",
+          "record_status": "assessed",
+          "comparison_observed": true
+        }
+      ],
+      "source_explanation": null,
+      "record": {
+        "path": "state.json",
+        "collection": "units",
+        "match": {
+          "id": "unit-claim-install-snapshot-alignment",
+          "version": 1
+        }
+      }
+    },
+    {
+      "id": "unit-claim-client-future-shutdown-escape",
+      "candidate_id": "27488dfef77c44868f3cc91ed9880724",
+      "obligation_ids": [
+        "claim-client-future-shutdown-escape"
+      ],
+      "binding_ids": [
+        "binding-client-future-shutdown-escape"
+      ],
+      "relation_ids": [],
+      "scope": {
+        "description": "A Raft node with a buffered apply channel (BatchApplyCh) that accepts an Apply/ApplyLog/Barrier request and is then shut down before a loop dequeues it. The obligation concerns the caller's future completing, not the fate of the log entry.",
+        "assumptions": [
+          "The request was accepted, i.e. the send into the apply channel succeeded.",
+          "Shutdown closes the node without draining the apply channel."
+        ],
+        "excluded": [
+          "The step-down path, where the loops do respond queued requests with ErrNotLeader.",
+          "Durability or ordering of the dropped request."
+        ],
+        "parameters": {}
+      },
+      "rationale": "Fifth candidate, grounded on the accepted map. The library wires a shutdown escape into some futures but not into the logFuture returned by Apply/ApplyLog/Barrier, and Error returns ErrRaftShutdown only through that field; with the documented BatchApplyCh option a request can be accepted into the buffer and then dropped by Shutdown, which a local construction run confirmed leaves the future with neither a response nor an escape. The claim fixes the completion duty without asserting the violation; whether other future types share the gap, whether the maintainers intend the asymmetry, and whether the default unbuffered channel makes it moot are recorded as counterevidence and unknowns. The map gains the shutdown branch on b-client-future and the Fact f-client-completion-escape; no accepted object's meaning, identity or edges change.",
+      "status": "checked",
+      "previous_id": null,
+      "version": 1,
+      "boundary_changes": [],
+      "obligation_checks": {
+        "claim-client-future-shutdown-escape": [
+          "e69bc2007c144a7fb7e950e3827d2cb4",
+          "e6a53d74753d4e2b880be03c0fe20b0d"
+        ]
+      },
+      "remaining_obligation_ids": [],
+      "recheck_reasons": [],
+      "coverage_limitations": [],
+      "progress": [
+        {
+          "claim_id": "claim-client-future-shutdown-escape",
+          "artifact_id": "54e71939c4644eacbd929a505b3aac2a",
+          "check_id": "e69bc2007c144a7fb7e950e3827d2cb4",
+          "record_status": "assessed",
+          "comparison_observed": true
+        },
+        {
+          "claim_id": "claim-client-future-shutdown-escape",
+          "artifact_id": "46a5695874f2465da28c9cfcd03b2071",
+          "check_id": "e6a53d74753d4e2b880be03c0fe20b0d",
+          "record_status": "assessed",
+          "comparison_observed": true
+        }
+      ],
+      "source_explanation": null,
+      "record": {
+        "path": "state.json",
+        "collection": "units",
+        "match": {
+          "id": "unit-claim-client-future-shutdown-escape",
+          "version": 1
+        }
+      }
+    }
+  ],
+  "claims": [
+    {
+      "id": "claim-config-store-delivery",
+      "concern": "implementation_semantics",
+      "version": 1,
+      "description_preview": "For every FSM that implements ConfigurationStore, the library must invoke StoreConfiguration(index, configuration) for each committed configuration log entry that it delivers to the FSM, so that a persistent FSM can reconstruct configuratio…",
+      "record": {
+        "path": "state.json",
+        "collection": "claims",
+        "match": {
+          "id": "claim-config-store-delivery",
+          "version": 1
+        }
+      }
+    },
+    {
+      "id": "claim-heartbeat-header-gate",
+      "concern": "implementation_semantics",
+      "version": 1,
+      "description_preview": "Every AppendEntries RPC a server processes, including a pure heartbeat handled by the transport fast path, is subject to the same RPC-header compatibility check that the normal RPC path applies before appendEntries, so a peer outside the su…",
+      "record": {
+        "path": "state.json",
+        "collection": "claims",
+        "match": {
+          "id": "claim-heartbeat-header-gate",
+          "version": 1
+        }
+      }
+    },
+    {
+      "id": "claim-timeout-now-attribution",
+      "concern": "implementation_semantics",
+      "version": 1,
+      "description_preview": "A TimeoutNow request is honoured only when its sender is attributed to the receiver's authority context, at minimum a voter of the receiver's latest configuration, so that a peer outside that configuration cannot clear the receiver's known …",
+      "record": {
+        "path": "state.json",
+        "collection": "claims",
+        "match": {
+          "id": "claim-timeout-now-attribution",
+          "version": 1
+        }
+      }
+    },
+    {
+      "id": "claim-install-snapshot-alignment",
+      "concern": "implementation_semantics",
+      "version": 1,
+      "description_preview": "On a successful InstallSnapshot at index N, a receiver that no longer holds a log entry at N matching the snapshot's last included term must discard the log entries above N, so that its effective last entry and its later vote comparisons an…",
+      "record": {
+        "path": "state.json",
+        "collection": "claims",
+        "match": {
+          "id": "claim-install-snapshot-alignment",
+          "version": 1
+        }
+      }
+    },
+    {
+      "id": "claim-client-future-shutdown-escape",
+      "kind": "obligation",
+      "concern": "implementation_semantics",
+      "description": "Every client-facing future the library returns to a caller can complete: a request the library accepted is either responded by a raft loop, or its future carries the node's shutdown channel so that Error() returns ErrRaftShutdown when the node shuts down before the request is handled.",
+      "scope": {
+        "description": "A Raft node with a buffered apply channel (BatchApplyCh) that accepts an Apply/ApplyLog/Barrier request and is then shut down before a loop dequeues it. The obligation concerns the caller's future completing, not the fate of the log entry.",
+        "assumptions": [
+          "The request was accepted, i.e. the send into the apply channel succeeded.",
+          "Shutdown closes the node without draining the apply channel."
+        ],
+        "excluded": [
+          "The step-down path, where the loops do respond queued requests with ErrNotLeader.",
+          "Durability or ordering of the dropped request."
+        ],
+        "parameters": {}
+      },
+      "source": "Candidate derived from attributed implementation responsibilities",
+      "source_ids": [
+        "S23",
+        "S67",
+        "S68",
+        "S11"
+      ],
+      "pending": [
+        "Establish whether other future types share the gap.",
+        "Confirm with a fixed check that an accepted-then-dropped request has neither a response nor an escape."
+      ],
+      "assessment": "unassessed",
+      "candidate": true,
+      "grounding": {
+        "source_ids": [
+          "S23",
+          "S67",
+          "S68",
+          "S11"
+        ],
+        "expectation_ids": [],
+        "binding_ids": [
+          "binding-client-future-shutdown-escape"
+        ],
+        "derivation": "S67 shows Error returning from either the response channel or ShutdownCh, and that ShutdownCh is a field the creator must set; S23 shows Apply/ApplyLog/Barrier creating a logFuture and only calling init; S68 shows Shutdown closing the node without draining the apply channel; S11 shows the loops responding only the requests they have taken on. A local construction run observed both the response channel empty and no escape after shutdown.",
+        "applicability": "Applicable when BatchApplyCh is enabled so a request can be accepted before any loop dequeues it; with the default unbuffered channel the window is limited to the moment of shutdown.",
+        "unresolved": [
+          "Whether other future types share the gap.",
+          "Whether the maintainers intend this asymmetry."
+        ],
+        "conflicts": [
+          "The Future.Error documentation promises ErrRaftShutdown among the errors a caller may see, while the futures returned by Apply/Barrier have no mechanism to produce it when they are dropped by shutdown."
+        ],
+        "alternatives": [
+          "If completion after Shutdown is deliberately not guaranteed, the correct disposition is a documented caveat on Apply rather than wiring an escape."
+        ]
+      },
+      "version": 1,
+      "record": {
+        "path": "state.json",
+        "collection": "claims",
+        "match": {
+          "id": "claim-client-future-shutdown-escape",
+          "version": 1
+        }
+      }
+    }
+  ],
+  "artifacts": [
+    {
+      "id": "d37a13c51a594f278bc23ed2af078007",
+      "version": 2,
+      "plan_path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-09_12-07-35-hashicorp_raft-real-run/direct-checks/c592aa3595304e6da012632e74662aca/plan.json",
+      "harness_path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-09_12-07-35-hashicorp_raft-real-run/direct-checks/c592aa3595304e6da012632e74662aca/assurance_generated_test.go",
+      "unit_id": "unit-claim-config-store-delivery",
+      "claim_id": "claim-config-store-delivery",
+      "graph_versions": {
+        "claim-config-store-delivery": 1,
+        "binding-config-store-delivery": 1,
+        "unit-claim-config-store-delivery": 1
+      },
+      "previous_id": "3052d8d823d14854a617fe006f2a30a5",
+      "record": {
+        "path": "state.json",
+        "collection": "direct_checks",
+        "match": {
+          "id": "d37a13c51a594f278bc23ed2af078007"
+        }
+      },
+      "basis": [
+        {
+          "path": "state.json",
+          "collection": "claims",
+          "match": {
+            "id": "claim-config-store-delivery",
+            "version": 1
+          }
+        },
+        {
+          "path": "state.json",
+          "collection": "bindings",
+          "match": {
+            "id": "binding-config-store-delivery",
+            "version": 1
+          }
+        },
+        {
+          "path": "state.json",
+          "collection": "units",
+          "match": {
+            "id": "unit-claim-config-store-delivery",
+            "version": 1
+          }
+        }
+      ],
+      "previous_record": {
+        "path": "state.json",
+        "collection": "direct_checks",
+        "match": {
+          "id": "3052d8d823d14854a617fe006f2a30a5"
+        }
+      }
+    },
+    {
+      "id": "a7ab7f884023425182fec9595c00ba14",
+      "version": 1,
+      "plan_path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-09_12-07-35-hashicorp_raft-real-run/direct-checks/1d0e6b56cf6648628baa736358192b4b/plan.json",
+      "harness_path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-09_12-07-35-hashicorp_raft-real-run/direct-checks/1d0e6b56cf6648628baa736358192b4b/assurance_generated_test.go",
+      "unit_id": "unit-claim-heartbeat-header-gate",
+      "claim_id": "claim-heartbeat-header-gate",
+      "graph_versions": {
+        "claim-heartbeat-header-gate": 1,
+        "binding-heartbeat-header-gate": 1,
+        "unit-claim-heartbeat-header-gate": 1
+      },
+      "previous_id": null,
+      "record": {
+        "path": "state.json",
+        "collection": "direct_checks",
+        "match": {
+          "id": "a7ab7f884023425182fec9595c00ba14"
+        }
+      },
+      "basis": [
+        {
+          "path": "state.json",
+          "collection": "claims",
+          "match": {
+            "id": "claim-heartbeat-header-gate",
+            "version": 1
+          }
+        },
+        {
+          "path": "state.json",
+          "collection": "bindings",
+          "match": {
+            "id": "binding-heartbeat-header-gate",
+            "version": 1
+          }
+        },
+        {
+          "path": "state.json",
+          "collection": "units",
+          "match": {
+            "id": "unit-claim-heartbeat-header-gate",
+            "version": 1
+          }
+        }
+      ]
+    },
+    {
+      "id": "7815ca48454b4d919a20810718683b41",
+      "version": 1,
+      "plan_path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-09_12-07-35-hashicorp_raft-real-run/direct-checks/effe7bdd5700409db6058fed4b0139ce/plan.json",
+      "harness_path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-09_12-07-35-hashicorp_raft-real-run/direct-checks/effe7bdd5700409db6058fed4b0139ce/assurance_generated_test.go",
+      "unit_id": "unit-claim-timeout-now-attribution",
+      "claim_id": "claim-timeout-now-attribution",
+      "graph_versions": {
+        "claim-timeout-now-attribution": 1,
+        "binding-timeout-now-attribution": 1,
+        "unit-claim-timeout-now-attribution": 1
+      },
+      "previous_id": null,
+      "record": {
+        "path": "state.json",
+        "collection": "direct_checks",
+        "match": {
+          "id": "7815ca48454b4d919a20810718683b41"
+        }
+      },
+      "basis": [
+        {
+          "path": "state.json",
+          "collection": "claims",
+          "match": {
+            "id": "claim-timeout-now-attribution",
+            "version": 1
+          }
+        },
+        {
+          "path": "state.json",
+          "collection": "bindings",
+          "match": {
+            "id": "binding-timeout-now-attribution",
+            "version": 1
+          }
+        },
+        {
+          "path": "state.json",
+          "collection": "units",
+          "match": {
+            "id": "unit-claim-timeout-now-attribution",
+            "version": 1
+          }
+        }
+      ]
+    },
+    {
+      "id": "495d49f163e24e3f951df60c6779ec27",
+      "version": 1,
+      "plan_path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-09_12-07-35-hashicorp_raft-real-run/direct-checks/03494cb7b7a54ebf9d7f80aa108c8a90/plan.json",
+      "harness_path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-09_12-07-35-hashicorp_raft-real-run/direct-checks/03494cb7b7a54ebf9d7f80aa108c8a90/assurance_generated_test.go",
+      "unit_id": "unit-claim-install-snapshot-alignment",
+      "claim_id": "claim-install-snapshot-alignment",
+      "graph_versions": {
+        "claim-install-snapshot-alignment": 1,
+        "binding-install-snapshot-align": 1,
+        "unit-claim-install-snapshot-alignment": 1
+      },
+      "previous_id": null,
+      "record": {
+        "path": "state.json",
+        "collection": "direct_checks",
+        "match": {
+          "id": "495d49f163e24e3f951df60c6779ec27"
+        }
+      },
+      "basis": [
+        {
+          "path": "state.json",
+          "collection": "claims",
+          "match": {
+            "id": "claim-install-snapshot-alignment",
+            "version": 1
+          }
+        },
+        {
+          "path": "state.json",
+          "collection": "bindings",
+          "match": {
+            "id": "binding-install-snapshot-align",
+            "version": 1
+          }
+        },
+        {
+          "path": "state.json",
+          "collection": "units",
+          "match": {
+            "id": "unit-claim-install-snapshot-alignment",
+            "version": 1
+          }
+        }
+      ]
+    },
+    {
+      "id": "38aa89590d3b453bb2c47420aa8e7fe0",
+      "version": 1,
+      "plan_path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-09_12-07-35-hashicorp_raft-real-run/direct-checks/7cad426588d34a9c85ac8e8e6da007e9/plan.json",
+      "harness_path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-09_12-07-35-hashicorp_raft-real-run/direct-checks/7cad426588d34a9c85ac8e8e6da007e9/assurance_generated_test.go",
+      "unit_id": "unit-claim-timeout-now-attribution",
+      "claim_id": "claim-timeout-now-attribution",
+      "graph_versions": {
+        "claim-timeout-now-attribution": 1,
+        "binding-timeout-now-attribution": 1,
+        "unit-claim-timeout-now-attribution": 1
+      },
+      "previous_id": null,
+      "record": {
+        "path": "state.json",
+        "collection": "direct_checks",
+        "match": {
+          "id": "38aa89590d3b453bb2c47420aa8e7fe0"
+        }
+      },
+      "basis": [
+        {
+          "path": "state.json",
+          "collection": "claims",
+          "match": {
+            "id": "claim-timeout-now-attribution",
+            "version": 1
+          }
+        },
+        {
+          "path": "state.json",
+          "collection": "bindings",
+          "match": {
+            "id": "binding-timeout-now-attribution",
+            "version": 1
+          }
+        },
+        {
+          "path": "state.json",
+          "collection": "units",
+          "match": {
+            "id": "unit-claim-timeout-now-attribution",
+            "version": 1
+          }
+        }
+      ]
+    },
+    {
+      "id": "f8caf123581f4c9abfa7d55569cfcfbe",
+      "version": 1,
+      "plan_path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-09_12-07-35-hashicorp_raft-real-run/direct-checks/c42cdaca88874c7896f30d73bd43a9df/plan.json",
+      "harness_path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-09_12-07-35-hashicorp_raft-real-run/direct-checks/c42cdaca88874c7896f30d73bd43a9df/assurance_generated_test.go",
+      "unit_id": "unit-claim-heartbeat-header-gate",
+      "claim_id": "claim-heartbeat-header-gate",
+      "graph_versions": {
+        "claim-heartbeat-header-gate": 1,
+        "binding-heartbeat-header-gate": 1,
+        "unit-claim-heartbeat-header-gate": 1
+      },
+      "previous_id": null,
+      "record": {
+        "path": "state.json",
+        "collection": "direct_checks",
+        "match": {
+          "id": "f8caf123581f4c9abfa7d55569cfcfbe"
+        }
+      },
+      "basis": [
+        {
+          "path": "state.json",
+          "collection": "claims",
+          "match": {
+            "id": "claim-heartbeat-header-gate",
+            "version": 1
+          }
+        },
+        {
+          "path": "state.json",
+          "collection": "bindings",
+          "match": {
+            "id": "binding-heartbeat-header-gate",
+            "version": 1
+          }
+        },
+        {
+          "path": "state.json",
+          "collection": "units",
+          "match": {
+            "id": "unit-claim-heartbeat-header-gate",
+            "version": 1
+          }
+        }
+      ]
+    },
+    {
+      "id": "5a560c551ebc4cdc8fea586eb3dcd785",
+      "version": 1,
+      "plan_path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-09_12-07-35-hashicorp_raft-real-run/direct-checks/9bc15166fa1a40bbb7005377f756410f/plan.json",
+      "harness_path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-09_12-07-35-hashicorp_raft-real-run/direct-checks/9bc15166fa1a40bbb7005377f756410f/assurance_generated_test.go",
+      "unit_id": "unit-claim-install-snapshot-alignment",
+      "claim_id": "claim-install-snapshot-alignment",
+      "graph_versions": {
+        "claim-install-snapshot-alignment": 1,
+        "binding-install-snapshot-align": 1,
+        "unit-claim-install-snapshot-alignment": 1
+      },
+      "previous_id": null,
+      "record": {
+        "path": "state.json",
+        "collection": "direct_checks",
+        "match": {
+          "id": "5a560c551ebc4cdc8fea586eb3dcd785"
+        }
+      },
+      "basis": [
+        {
+          "path": "state.json",
+          "collection": "claims",
+          "match": {
+            "id": "claim-install-snapshot-alignment",
+            "version": 1
+          }
+        },
+        {
+          "path": "state.json",
+          "collection": "bindings",
+          "match": {
+            "id": "binding-install-snapshot-align",
+            "version": 1
+          }
+        },
+        {
+          "path": "state.json",
+          "collection": "units",
+          "match": {
+            "id": "unit-claim-install-snapshot-alignment",
+            "version": 1
+          }
+        }
+      ]
+    },
+    {
+      "id": "54e71939c4644eacbd929a505b3aac2a",
+      "version": 1,
+      "plan_path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-09_12-07-35-hashicorp_raft-real-run/direct-checks/9fe6856c9b18495fb2b88b0c441987a2/plan.json",
+      "harness_path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-09_12-07-35-hashicorp_raft-real-run/direct-checks/9fe6856c9b18495fb2b88b0c441987a2/assurance_generated_test.go",
+      "unit_id": "unit-claim-client-future-shutdown-escape",
+      "claim_id": "claim-client-future-shutdown-escape",
+      "graph_versions": {
+        "claim-client-future-shutdown-escape": 1,
+        "binding-client-future-shutdown-escape": 1,
+        "unit-claim-client-future-shutdown-escape": 1
+      },
+      "previous_id": null,
+      "record": {
+        "path": "state.json",
+        "collection": "direct_checks",
+        "match": {
+          "id": "54e71939c4644eacbd929a505b3aac2a"
+        }
+      },
+      "basis": [
+        {
+          "path": "state.json",
+          "collection": "claims",
+          "match": {
+            "id": "claim-client-future-shutdown-escape",
+            "version": 1
+          }
+        },
+        {
+          "path": "state.json",
+          "collection": "bindings",
+          "match": {
+            "id": "binding-client-future-shutdown-escape",
+            "version": 1
+          }
+        },
+        {
+          "path": "state.json",
+          "collection": "units",
+          "match": {
+            "id": "unit-claim-client-future-shutdown-escape",
+            "version": 1
+          }
+        }
+      ]
+    },
+    {
+      "id": "46a5695874f2465da28c9cfcd03b2071",
+      "version": 1,
+      "plan_path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-09_12-07-35-hashicorp_raft-real-run/direct-checks/21ae861bcc4f4065a0ecd182f2ab3e25/plan.json",
+      "harness_path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-09_12-07-35-hashicorp_raft-real-run/direct-checks/21ae861bcc4f4065a0ecd182f2ab3e25/assurance_generated_test.go",
+      "unit_id": "unit-claim-client-future-shutdown-escape",
+      "claim_id": "claim-client-future-shutdown-escape",
+      "graph_versions": {
+        "claim-client-future-shutdown-escape": 1,
+        "binding-client-future-shutdown-escape": 1,
+        "unit-claim-client-future-shutdown-escape": 1
+      },
+      "previous_id": null,
+      "record": {
+        "path": "state.json",
+        "collection": "direct_checks",
+        "match": {
+          "id": "46a5695874f2465da28c9cfcd03b2071"
+        }
+      },
+      "basis": [
+        {
+          "path": "state.json",
+          "collection": "claims",
+          "match": {
+            "id": "claim-client-future-shutdown-escape",
+            "version": 1
+          }
+        },
+        {
+          "path": "state.json",
+          "collection": "bindings",
+          "match": {
+            "id": "binding-client-future-shutdown-escape",
+            "version": 1
+          }
+        },
+        {
+          "path": "state.json",
+          "collection": "units",
+          "match": {
+            "id": "unit-claim-client-future-shutdown-escape",
+            "version": 1
+          }
+        }
+      ]
+    }
+  ],
+  "assessments": [
+    {
+      "claim_id": "claim-config-store-delivery",
+      "direct_check_id": "d37a13c51a594f278bc23ed2af078007",
+      "experiment_check_id": "a898e05630e6440d97b856d7527274bd",
+      "confirmed": true,
+      "outcome": "violated",
+      "blockers": [],
+      "bounded_complete": true,
+      "reviewed_complete": true,
+      "correspondence": "no_issue_found",
+      "review_ids": [
+        "38f9e2f2865c4e8081e9cb304fb5fda5"
+      ],
+      "open_issue_ids": [],
+      "comparison_observed": true,
+      "record": {
+        "path": "state.json",
+        "collection": "monitor_results",
+        "match": {
+          "experiment_check_id": "a898e05630e6440d97b856d7527274bd",
+          "claim_id": "claim-config-store-delivery"
+        }
+      }
+    },
+    {
+      "claim_id": "claim-heartbeat-header-gate",
+      "direct_check_id": "a7ab7f884023425182fec9595c00ba14",
+      "experiment_check_id": "1987811182294bfbb372a36548be8d8b",
+      "confirmed": true,
+      "outcome": "violated",
+      "blockers": [],
+      "bounded_complete": true,
+      "reviewed_complete": true,
+      "correspondence": "no_issue_found",
+      "review_ids": [
+        "5e0eff56bb2449b9b2be3b1e10e3ee9b"
+      ],
+      "open_issue_ids": [],
+      "comparison_observed": true,
+      "record": {
+        "path": "state.json",
+        "collection": "monitor_results",
+        "match": {
+          "experiment_check_id": "1987811182294bfbb372a36548be8d8b",
+          "claim_id": "claim-heartbeat-header-gate"
+        }
+      }
+    },
+    {
+      "claim_id": "claim-timeout-now-attribution",
+      "direct_check_id": "7815ca48454b4d919a20810718683b41",
+      "experiment_check_id": "554a0abcf056483ba255f00545e30713",
+      "confirmed": true,
+      "outcome": "violated",
+      "blockers": [],
+      "bounded_complete": true,
+      "reviewed_complete": true,
+      "correspondence": "no_issue_found",
+      "review_ids": [
+        "c036cee963c94fa19ccd67961f37d508"
+      ],
+      "open_issue_ids": [],
+      "comparison_observed": true,
+      "record": {
+        "path": "state.json",
+        "collection": "monitor_results",
+        "match": {
+          "experiment_check_id": "554a0abcf056483ba255f00545e30713",
+          "claim_id": "claim-timeout-now-attribution"
+        }
+      }
+    },
+    {
+      "claim_id": "claim-install-snapshot-alignment",
+      "direct_check_id": "495d49f163e24e3f951df60c6779ec27",
+      "experiment_check_id": "3d53c8e244184b0490a87411aabe15f4",
+      "confirmed": true,
+      "outcome": "violated",
+      "blockers": [],
+      "bounded_complete": true,
+      "reviewed_complete": true,
+      "correspondence": "no_issue_found",
+      "review_ids": [
+        "f267757bfd6c4b71b38c23cd38ca9172"
+      ],
+      "open_issue_ids": [],
+      "comparison_observed": true,
+      "record": {
+        "path": "state.json",
+        "collection": "monitor_results",
+        "match": {
+          "experiment_check_id": "3d53c8e244184b0490a87411aabe15f4",
+          "claim_id": "claim-install-snapshot-alignment"
+        }
+      }
+    },
+    {
+      "claim_id": "claim-timeout-now-attribution",
+      "direct_check_id": "38aa89590d3b453bb2c47420aa8e7fe0",
+      "experiment_check_id": "ec71e08710e746bbbe6e7268f032377e",
+      "confirmed": false,
+      "outcome": "holds",
+      "blockers": [],
+      "bounded_complete": true,
+      "reviewed_complete": true,
+      "correspondence": "no_issue_found",
+      "review_ids": [
+        "4fc740a1c85043c6ad23b8f74b293002"
+      ],
+      "open_issue_ids": [],
+      "comparison_observed": true,
+      "record": {
+        "path": "state.json",
+        "collection": "monitor_results",
+        "match": {
+          "experiment_check_id": "ec71e08710e746bbbe6e7268f032377e",
+          "claim_id": "claim-timeout-now-attribution"
+        }
+      }
+    },
+    {
+      "claim_id": "claim-heartbeat-header-gate",
+      "direct_check_id": "f8caf123581f4c9abfa7d55569cfcfbe",
+      "experiment_check_id": "7628b537f51c4a868e8ebb80cf019fc2",
+      "confirmed": false,
+      "outcome": "holds",
+      "blockers": [],
+      "bounded_complete": true,
+      "reviewed_complete": true,
+      "correspondence": "no_issue_found",
+      "review_ids": [
+        "5df2ee59acd4458383abb3b36e384018"
+      ],
+      "open_issue_ids": [],
+      "comparison_observed": true,
+      "record": {
+        "path": "state.json",
+        "collection": "monitor_results",
+        "match": {
+          "experiment_check_id": "7628b537f51c4a868e8ebb80cf019fc2",
+          "claim_id": "claim-heartbeat-header-gate"
+        }
+      }
+    },
+    {
+      "claim_id": "claim-install-snapshot-alignment",
+      "direct_check_id": "5a560c551ebc4cdc8fea586eb3dcd785",
+      "experiment_check_id": "b9d811ad439049be9c19247ec7db97b2",
+      "confirmed": true,
+      "outcome": "violated",
+      "blockers": [],
+      "bounded_complete": true,
+      "reviewed_complete": true,
+      "correspondence": "no_issue_found",
+      "review_ids": [
+        "372b5298e53142d487a251bc840786bb"
+      ],
+      "open_issue_ids": [],
+      "comparison_observed": true,
+      "record": {
+        "path": "state.json",
+        "collection": "monitor_results",
+        "match": {
+          "experiment_check_id": "b9d811ad439049be9c19247ec7db97b2",
+          "claim_id": "claim-install-snapshot-alignment"
+        }
+      }
+    },
+    {
+      "claim_id": "claim-client-future-shutdown-escape",
+      "direct_check_id": "54e71939c4644eacbd929a505b3aac2a",
+      "experiment_check_id": "e69bc2007c144a7fb7e950e3827d2cb4",
+      "confirmed": true,
+      "outcome": "violated",
+      "blockers": [],
+      "bounded_complete": true,
+      "reviewed_complete": true,
+      "correspondence": "no_issue_found",
+      "review_ids": [
+        "63723709ca0f481d818bbfbecff62ff1"
+      ],
+      "open_issue_ids": [],
+      "comparison_observed": true,
+      "record": {
+        "path": "state.json",
+        "collection": "monitor_results",
+        "match": {
+          "experiment_check_id": "e69bc2007c144a7fb7e950e3827d2cb4",
+          "claim_id": "claim-client-future-shutdown-escape"
+        }
+      }
+    },
+    {
+      "claim_id": "claim-client-future-shutdown-escape",
+      "direct_check_id": "46a5695874f2465da28c9cfcd03b2071",
+      "experiment_check_id": "e6a53d74753d4e2b880be03c0fe20b0d",
+      "confirmed": true,
+      "outcome": "violated",
+      "blockers": [],
+      "bounded_complete": true,
+      "reviewed_complete": true,
+      "correspondence": "no_issue_found",
+      "review_ids": [
+        "a9a153b0c10c4b40a85359d26f50cd31"
+      ],
+      "open_issue_ids": [],
+      "comparison_observed": true,
+      "record": {
+        "path": "state.json",
+        "collection": "monitor_results",
+        "match": {
+          "experiment_check_id": "e6a53d74753d4e2b880be03c0fe20b0d",
+          "claim_id": "claim-client-future-shutdown-escape"
+        }
+      }
+    }
+  ],
+  "frontier": {
+    "relationships": [
+      {
+        "fact_id": "f-durable-term-vote",
+        "source_ids": [
+          "S14",
+          "S6",
+          "S5"
+        ],
+        "unknowns": [],
+        "producers": [
+          "b-vote-grant",
+          "b-term-authority",
+          "b-heartbeat-fast-path"
+        ],
+        "consumers": [
+          "b-vote-grant"
+        ],
+        "invalidators": [
+          "b-term-authority"
+        ],
+        "reinterpreters": [
+          "b-vote-grant"
+        ],
+        "unreferenced_behavior_ids": [
+          "b-term-authority",
+          "b-vote-grant"
+        ],
+        "coverage": "Described relationships; selected checks settle only their explicit scope",
+        "candidate_ids": [
+          "3bf994e1d1c54186b73ed96e82d39802"
+        ]
+      },
+      {
+        "fact_id": "f-leader-commit-index",
+        "source_ids": [
+          "S9",
+          "S11",
+          "S8"
+        ],
+        "unknowns": [],
+        "producers": [
+          "b-commit-index-advance",
+          "b-leader-loop-commit-consume"
+        ],
+        "consumers": [
+          "b-leader-loop-commit-consume",
+          "b-client-future"
+        ],
+        "invalidators": [],
+        "reinterpreters": [],
+        "unreferenced_behavior_ids": [
+          "b-client-future",
+          "b-commit-index-advance",
+          "b-leader-loop-commit-consume"
+        ],
+        "coverage": "Described relationships; selected checks settle only their explicit scope",
+        "candidate_ids": []
+      },
+      {
+        "fact_id": "f-matching-index",
+        "source_ids": [
+          "S9",
+          "S18",
+          "S8"
+        ],
+        "unknowns": [],
+        "producers": [
+          "b-append-entries-sync",
+          "b-commit-index-advance",
+          "b-replication-recovery"
+        ],
+        "consumers": [
+          "b-commit-index-advance",
+          "b-leadership-transfer"
+        ],
+        "invalidators": [
+          "b-append-entries-sync"
+        ],
+        "reinterpreters": [],
+        "unreferenced_behavior_ids": [
+          "b-append-entries-sync",
+          "b-commit-index-advance",
+          "b-leadership-transfer",
+          "b-replication-recovery"
+        ],
+        "coverage": "Described relationships; selected checks settle only their explicit scope",
+        "candidate_ids": []
+      },
+      {
+        "fact_id": "f-latest-configuration",
+        "source_ids": [
+          "S21",
+          "S12",
+          "S24",
+          "S16",
+          "S15"
+        ],
+        "unknowns": [],
+        "producers": [
+          "b-append-entries-sync",
+          "b-config-change",
+          "b-recover-from-disk"
+        ],
+        "consumers": [
+          "b-vote-grant",
+          "b-prevote-grant",
+          "b-append-entries-sync",
+          "b-config-change",
+          "b-leader-lease",
+          "b-fsm-apply-committed"
+        ],
+        "invalidators": [
+          "b-append-entries-sync"
+        ],
+        "reinterpreters": [
+          "b-config-change",
+          "b-recover-from-disk"
+        ],
+        "unreferenced_behavior_ids": [
+          "b-append-entries-sync",
+          "b-config-change",
+          "b-fsm-apply-committed",
+          "b-leader-lease",
+          "b-prevote-grant",
+          "b-recover-from-disk",
+          "b-vote-grant"
+        ],
+        "coverage": "Described relationships; selected checks settle only their explicit scope",
+        "candidate_ids": []
+      },
+      {
+        "fact_id": "f-campaign-tally",
+        "source_ids": [
+          "S3",
+          "S4",
+          "S5"
+        ],
+        "unknowns": [
+          "No distinct consumer Behavior is mapped in this partial map; the tally is consumed inline by the runCandidate select loop."
+        ],
+        "producers": [
+          "b-prevote-campaign",
+          "b-vote-campaign"
+        ],
+        "consumers": [
+          "b-prevote-campaign",
+          "b-vote-campaign"
+        ],
+        "invalidators": [],
+        "reinterpreters": [],
+        "unreferenced_behavior_ids": [
+          "b-prevote-campaign",
+          "b-vote-campaign"
+        ],
+        "coverage": "Described relationships; selected checks settle only their explicit scope",
+        "candidate_ids": []
+      },
+      {
+        "fact_id": "f-fsm-configuration-state",
+        "source_ids": [
+          "S34",
+          "S35",
+          "S36",
+          "S37",
+          "S38"
+        ],
+        "unknowns": [
+          "Whether implementing both BatchingFSM and ConfigurationStore is a supported combination, and therefore which written contract governs configuration persistence for batching FSMs, remains unresolved; the absence of the StoreConfiguration call path for such a FSM is observed, not inferred."
+        ],
+        "producers": [
+          "b-fsm-apply-committed"
+        ],
+        "consumers": [],
+        "invalidators": [],
+        "reinterpreters": [],
+        "unreferenced_behavior_ids": [],
+        "coverage": "Described relationships; selected checks settle only their explicit scope",
+        "candidate_ids": [
+          "831856452d6b4e1985b8de082764a214"
+        ]
+      },
+      {
+        "fact_id": "f-leader-transfer-privilege",
+        "source_ids": [
+          "S48",
+          "S49",
+          "S51",
+          "S6"
+        ],
+        "unknowns": [
+          "The privilege is granted for any in-window TimeoutNow request, including one whose sender the receiver's configuration does not contain (observed, execution 554a0abc); whether that reachability is real and whether the design intends to trust leader discipline remain open."
+        ],
+        "producers": [
+          "b-timeout-now"
+        ],
+        "consumers": [
+          "b-vote-campaign"
+        ],
+        "invalidators": [],
+        "reinterpreters": [
+          "b-vote-campaign"
+        ],
+        "unreferenced_behavior_ids": [
+          "b-vote-campaign"
+        ],
+        "coverage": "Described relationships; selected checks settle only their explicit scope",
+        "candidate_ids": [
+          "90fabf4609b545a2a911e245ce254742"
+        ]
+      },
+      {
+        "fact_id": "f-stable-log-position",
+        "source_ids": [
+          "S54",
+          "S20",
+          "S16"
+        ],
+        "unknowns": [
+          "none recorded: the max-of-two accessors explain the empty-log-with-newer-snapshot case that would otherwise look like index reuse"
+        ],
+        "producers": [
+          "b-stable-position-reconstruction"
+        ],
+        "consumers": [],
+        "invalidators": [],
+        "reinterpreters": [],
+        "unreferenced_behavior_ids": [
+          "b-stable-position-reconstruction"
+        ],
+        "coverage": "Described relationships; selected checks settle only their explicit scope",
+        "candidate_ids": []
+      },
+      {
+        "fact_id": "f-log-snapshot-agreement",
+        "source_ids": [
+          "S57",
+          "S58",
+          "S54",
+          "S8"
+        ],
+        "unknowns": [
+          "The receiver keeps an unconfirmed tail after an accepted install and can then reject the very AppendEntries that would have truncated it (observed, executions 3d53c8e2 and b9d811ad). Reachability with the default configuration is only partly characterised from source: installSnapshot's compaction is skipped entirely when the receiver's log end is at or below TrailingLogs, and otherwise removes entries only up to min(snapshot index, log end - TrailingLogs), so the anchor is deleted while a tail survives only when the snapshot index sits at least TrailingLogs below the receiver's log end. Whether a real leader drives a follower into that shape, and how long the rejection lasts before the leader's nextIndex walk or another snapshot changes it, remain unresolved."
+        ],
+        "producers": [
+          "b-install-snapshot-align"
+        ],
+        "consumers": [],
+        "invalidators": [],
+        "reinterpreters": [],
+        "unreferenced_behavior_ids": [],
+        "coverage": "Described relationships; selected checks settle only their explicit scope",
+        "candidate_ids": [
+          "c73e1a943eeb4f7dbd009677b41d7c36"
+        ]
+      },
+      {
+        "fact_id": "f-client-completion-escape",
+        "source_ids": [
+          "S23",
+          "S67",
+          "S68",
+          "S11"
+        ],
+        "unknowns": [
+          "The absence of a completion path is confirmed for Apply with a buffered apply channel (execution e69bc2007). Reading shows verifyCh is buffered with capacity 64, so VerifyLeader can likewise accept a future that shutdown then drops, while configurationChangeCh, bootstrapCh and userSnapshotCh are unbuffered and leadershipTransferCh holds one, narrowing their window; whether each of those futures shares the gap is unexecuted. Whether the maintainers intend completion after Shutdown not to be guaranteed is also open."
+        ],
+        "producers": [
+          "b-client-future"
+        ],
+        "consumers": [],
+        "invalidators": [],
+        "reinterpreters": [],
+        "unreferenced_behavior_ids": [],
+        "coverage": "Described relationships; selected checks settle only their explicit scope",
+        "candidate_ids": [
+          "27488dfef77c44868f3cc91ed9880724"
+        ]
+      }
+    ],
+    "paused_candidate_ids": [],
+    "behavior_unknowns": [
+      {
+        "behavior_id": "b-prevote-campaign",
+        "activity": "A1",
+        "unknowns": [
+          "whether treating a non-pre-vote peer as granted can itself delay a legitimate election was not modelled"
+        ],
+        "source_ids": [
+          "S4",
+          "S3"
+        ],
+        "protections": []
+      },
+      {
+        "behavior_id": "b-vote-grant",
+        "activity": "A1",
+        "unknowns": [
+          "interaction of the 'has a leader' rejection with an equal-term competing leader was not fully traced"
+        ],
+        "source_ids": [
+          "S6",
+          "S21"
+        ],
+        "protections": []
+      },
+      {
+        "behavior_id": "b-fsm-apply-committed",
+        "activity": "A5",
+        "unknowns": [
+          "Whether a FSM implementing both BatchingFSM and ConfigurationStore is a supported configuration, i.e. which interface is expected to own configuration persistence, is not stated by either doc comment; the delivery gap itself is now an observed violation of the ConfigurationStore contract (confirmed in execution a898e056)."
+        ],
+        "source_ids": [
+          "S35",
+          "S36",
+          "S37",
+          "S38"
+        ],
+        "protections": []
+      },
+      {
+        "behavior_id": "b-heartbeat-fast-path",
+        "activity": "A1",
+        "unknowns": [
+          "Whether a peer outside the supported protocol-version window can deliver a pure heartbeat in a legal deployment, and whether the missing guard is deliberate design, are unresolved; that the fast path does not apply the guard is now an observed violation of claim-heartbeat-header-gate, not a hypothesis."
+        ],
+        "source_ids": [
+          "S40",
+          "S41",
+          "S42",
+          "S43",
+          "S16",
+          "S44",
+          "S45"
+        ],
+        "protections": []
+      },
+      {
+        "behavior_id": "b-timeout-now",
+        "activity": "A2",
+        "unknowns": [
+          "Whether a peer outside the receiver's configuration can reach this handler in a real deployment (the observation uses a fabricated identifier), and whether leaving it unguarded is deliberate design, remain unresolved; that the handler grants the privilege to such a sender is now an observed violation of claim-timeout-now-attribution."
+        ],
+        "source_ids": [
+          "S48",
+          "S49",
+          "S50",
+          "S51"
+        ],
+        "protections": []
+      },
+      {
+        "behavior_id": "b-stable-position-reconstruction",
+        "activity": "A6",
+        "unknowns": [
+          "whether any accessor or caller bypasses these two and reads the raw log index instead was not exhaustively searched"
+        ],
+        "source_ids": [
+          "S54",
+          "S20",
+          "S16"
+        ],
+        "protections": []
+      },
+      {
+        "behavior_id": "b-install-snapshot-align",
+        "activity": "A3",
+        "unknowns": [
+          "Whether a real leader drives a follower into this state (the check seeded the tail), how long the retained tail persists before the next AppendEntries truncates it, and whether any vote or election can depend on that window, remain unresolved; that the install-time alignment step is absent is now an observed violation of claim-install-snapshot-alignment."
+        ],
+        "source_ids": [
+          "S57",
+          "S58",
+          "S54",
+          "S8"
+        ],
+        "protections": []
+      }
+    ],
+    "surfaces": [
+      {
+        "entry_point": "installSnapshot",
+        "disposition": "deferred",
+        "behavior_ids": [],
+        "reason": "Body (raft.go:1814+) was only skimmed; snapshot receive path and its configuration handling are unread.",
+        "source_ids": [
+          "S26"
+        ],
+        "high_consequence": true
+      },
+      {
+        "entry_point": "sendLatestSnapshot / sendSnapshot",
+        "disposition": "deferred",
+        "behavior_ids": [],
+        "reason": "Leader-side snapshot shipping (replication.go:299-386) was read after this Surface was saved: it lists snapshots, opens the newest, sends InstallSnapshot with the snapshot's configuration and index, records a match at meta.Index on success and handles a newer term via handleStaleTerm. What remains unread is the snapshot store implementations' ordering/persistence guarantees and the follower-side stream handling beyond the response, so the Surface stays deferred rather than claiming coverage.",
+        "source_ids": [
+          "S27"
+        ],
+        "high_consequence": true
+      },
+      {
+        "entry_point": "runFSM / fsmMutateCh",
+        "disposition": "deferred",
+        "behavior_ids": [],
+        "reason": "FSM application goroutine (fsm.go:86-130) was located but not read.",
+        "source_ids": [
+          "S28"
+        ],
+        "high_consequence": false
+      },
+      {
+        "entry_point": "runSnapshots / snapshot.go",
+        "disposition": "deferred",
+        "behavior_ids": [],
+        "reason": "Snapshot lifecycle (snapshot.go:72-120) was located but not read.",
+        "source_ids": [
+          "S29"
+        ],
+        "high_consequence": false
+      },
+      {
+        "entry_point": "RecoverCluster",
+        "disposition": "deferred",
+        "behavior_ids": [],
+        "reason": "Manual recovery path (api.go:313-360) not read beyond its doc comment.",
+        "source_ids": [
+          "S30"
+        ],
+        "high_consequence": false
+      },
+      {
+        "entry_point": "net_transport.go / tcp_transport.go",
+        "disposition": "infrastructure",
+        "behavior_ids": [],
+        "reason": "Wire framing and connection handling (net_transport.go:81-100) are transport infrastructure, not Raft responsibility.",
+        "source_ids": [
+          "S31"
+        ],
+        "high_consequence": false
+      },
+      {
+        "entry_point": "observer.go",
+        "disposition": "externalized",
+        "behavior_ids": [],
+        "reason": "Read (observer.go:58-140). The observer carries no protocol responsibility: Raft only emits Observations from existing protocol paths, and the delivery policy is the caller's, since the channel and the blocking flag are injected through NewObserver and the blocking behaviour is documented on both the constructor and the emit path. Closed as externalized rather than mapped, because the library's duty ends at attempting the send and counting drops.",
+        "source_ids": [
+          "S66"
+        ],
+        "high_consequence": false
+      },
+      {
+        "entry_point": "config.go / ValidateConfig",
+        "disposition": "deferred",
+        "behavior_ids": [],
+        "reason": "Config validation and reload paths (config.go:333-360) not read.",
+        "source_ids": [
+          "S33"
+        ],
+        "high_consequence": false
+      },
+      {
+        "entry_point": "runFSM/applyBatch (ConfigurationStore delivery for batching FSMs)",
+        "disposition": "deferred",
+        "behavior_ids": [],
+        "reason": "Sourced discrepancy: ConfigurationStore documents StoreConfiguration is invoked for each committed configuration entry (configuration.go:44-52), but the only call site is in applySingle (fsm.go:118), which the batching dispatch never reaches (fsm.go:127-186). Investigated as Candidate claim-config-store-delivery.",
+        "source_ids": [
+          "S34",
+          "S35",
+          "S36",
+          "S37",
+          "S38"
+        ],
+        "high_consequence": true
+      },
+      {
+        "entry_point": "processHeartbeat / net_transport heartbeat fast path",
+        "disposition": "mapped",
+        "behavior_ids": [
+          "b-heartbeat-fast-path"
+        ],
+        "reason": "Sourced discrepancy in the appendEntries entry paths: processRPC calls checkRPCHeader before dispatching AppendEntries (raft.go:1390-1413), but the heartbeat fast path processHeartbeat calls appendEntries directly with no read of checkRPCHeader (raft.go:1415-1436), and net_transport routes any pure AppendEntries heartbeat (Term != 0, leader addr present, no entries, no prev-log fields, LeaderCommitIndex 0) to that handler (net_transport.go:660-686, 724-733). An AppendEntries whose RPCHeader.ProtocolVersion is outside the supported window that checkRPCHeader rejects on the normal path would therefore still be accepted on the fast path, where appendEntries can step the receiver down, persist a newer term, set the sender as known leader and refresh lastContact. Whether the window outside the fast path's route is reachable with a legal peer and what consequence it has is not established.",
+        "source_ids": [
+          "S40",
+          "S41",
+          "S42",
+          "S43"
+        ],
+        "high_consequence": true
+      },
+      {
+        "entry_point": "ReloadConfig notification scope",
+        "disposition": "deferred",
+        "behavior_ids": [],
+        "reason": "Read while looking for a new lead (api.go:713-741, config.go:267-...): ReloadConfig stores the new configuration and notifies leaderNotifyCh/followerNotifyCh only when HeartbeatTimeout decreases, so a decreased LeaderLeaseTimeout is not signalled and the leader's current lease timer keeps the old value until it fires. Whether that delay has a consequence worth investigating was not established, and the other reloadable fields are read per iteration by their loops. Low consequence; recorded rather than escalated.",
+        "source_ids": [
+          "S52",
+          "S53"
+        ],
+        "high_consequence": false
+      },
+      {
+        "entry_point": "installSnapshot log-tail alignment",
+        "disposition": "mapped",
+        "behavior_ids": [
+          "b-install-snapshot-align"
+        ],
+        "reason": "Sourced asymmetry found while reading the snapshot receive path: after a successful InstallSnapshot the handler updates lastApplied and lastSnapshot and then compacts (raft.go:1928-1953), but it never calls setLastLog, and its only setLastLog callers are NewRaft, liveBootstrap, restoreUserSnapshot, dispatchLogs and appendEntries. Its compaction removes entries only up to the installed snapshot index (snapshot.go:213-259, maxLog = min(snapIdx, lastLogIdx-trailing)), so any entries the follower already holds beyond that index survive. For a follower whose log is longer than the installed snapshot (a divergent branch), getLastEntry therefore keeps returning that tail's index/term until the next matching AppendEntries truncates it, even though the FSM state and committed configuration now come from the snapshot. Whether such a longer divergent branch is reachable and whether the window has a consequence (vote comparisons use getLastEntry) is not established.",
+        "source_ids": [
+          "S55",
+          "S56",
+          "S8"
+        ],
+        "high_consequence": true
+      }
+    ],
+    "core_regions": [
+      {
+        "activity": "A1",
+        "entries": [
+          {
+            "class_id": "A1",
+            "applicability": "applicable",
+            "purpose": "Qualified support for decision formation and legal advancement: elect a leader and extend/commit the replicated log.",
+            "realization_summary": "A candidate runs a pre-vote campaign (preElectSelf) that does not change its term and, on winning it, a real campaign (electSelf) that increments and persists the term and asks voters for a vote. Followers decide the vote in requestVote/requestPreVote with leader-stickiness, log up-to-date and one-vote-per-term guards. The elected leader dispatches a no-op for its term, replicates to each peer (followerReplication), and advances the commit index through the commitment struct once a quorum's matchIndex reaches at least the first entry of the leader's own term.",
+            "entry_points": [
+              "runCandidate",
+              "preElectSelf",
+              "electSelf",
+              "requestVote",
+              "requestPreVote",
+              "appendEntries",
+              "commitment.match",
+              "leaderLoop"
+            ],
+            "behavior_ids": [
+              "b-prevote-campaign",
+              "b-vote-campaign",
+              "b-vote-grant",
+              "b-prevote-grant",
+              "b-append-entries-sync",
+              "b-commit-index-advance",
+              "b-leader-loop-commit-consume",
+              "b-leader-lease",
+              "b-heartbeat-fast-path"
+            ],
+            "variants": [
+              "pre-vote disabled falls back to electSelf directly",
+              "leadership-transfer candidate skips pre-vote"
+            ],
+            "unknowns": [
+              "Behaviour of the pipeline replication fast path under partial responses was only skimmed."
+            ],
+            "source_ids": [
+              "S3",
+              "S4",
+              "S5",
+              "S6",
+              "S7",
+              "S8",
+              "S9",
+              "S11",
+              "S17"
+            ]
+          }
+        ],
+        "coverage": "Partial understanding; neither candidate labels nor object counts establish exhaustion"
+      },
+      {
+        "activity": "A2",
+        "entries": [
+          {
+            "class_id": "A2",
+            "applicability": "applicable",
+            "purpose": "Context validity and acquisition, transfer or loss of authority: term ownership, state transitions, and leadership transfer.",
+            "realization_summary": "Authority is the persisted current term plus the per-term vote. setCurrentTerm persists the term before exposing it; setState clears the known leader on every transition. A newer term observed in a vote request or AppendEntries forces a step-down and term update. leadershipTransfer pre-replicates to the target then sends TimeoutNow; the target sets candidateFromLeadershipTransfer and runs an election without pre-vote, and the flag is reset after each candidate run.",
+            "entry_points": [
+              "setCurrentTerm",
+              "setState",
+              "requestVote",
+              "appendEntries",
+              "leadershipTransfer",
+              "timeoutNow",
+              "runCandidate"
+            ],
+            "behavior_ids": [
+              "b-term-authority",
+              "b-leadership-transfer",
+              "b-timeout-now"
+            ],
+            "variants": [
+              "candidateFromLeadershipTransfer bypasses both pre-vote and appendEntries step-down for equal terms"
+            ],
+            "unknowns": [
+              "Authority effects of leadership transfer when the target never wins were not fully traced."
+            ],
+            "source_ids": [
+              "S14",
+              "S6",
+              "S8",
+              "S22",
+              "S3"
+            ]
+          }
+        ],
+        "coverage": "Partial understanding; neither candidate labels nor object counts establish exhaustion"
+      }
+    ]
+  },
+  "capacity": {
+    "remaining": {
+      "agent_calls": 75,
+      "experiments": 25,
+      "audit_units": 7,
+      "semantic_reviews": 14,
+      "revisions": 11
+    },
+    "remaining_seconds": 1216.2098258660026,
+    "new_obligation": true,
+    "direct_execution": true,
+    "source_investigation": true,
+    "exhausted": []
+  },
+  "conclusions": [
+    {
+      "claim_id": "claim-config-store-delivery",
+      "candidate_id": "831856452d6b4e1985b8de082764a214",
+      "concern": "implementation_semantics",
+      "disposition": "confirmed_in_scope",
+      "check_ids": [
+        "a898e05630e6440d97b856d7527274bd"
+      ],
+      "comparison_observed": true,
+      "blockers": []
+    },
+    {
+      "claim_id": "claim-heartbeat-header-gate",
+      "candidate_id": "3bf994e1d1c54186b73ed96e82d39802",
+      "concern": "implementation_semantics",
+      "disposition": "confirmed_in_scope",
+      "check_ids": [
+        "1987811182294bfbb372a36548be8d8b",
+        "7628b537f51c4a868e8ebb80cf019fc2"
+      ],
+      "comparison_observed": true,
+      "blockers": []
+    },
+    {
+      "claim_id": "claim-timeout-now-attribution",
+      "candidate_id": "90fabf4609b545a2a911e245ce254742",
+      "concern": "implementation_semantics",
+      "disposition": "confirmed_in_scope",
+      "check_ids": [
+        "554a0abcf056483ba255f00545e30713",
+        "ec71e08710e746bbbe6e7268f032377e"
+      ],
+      "comparison_observed": true,
+      "blockers": []
+    },
+    {
+      "claim_id": "claim-install-snapshot-alignment",
+      "candidate_id": "c73e1a943eeb4f7dbd009677b41d7c36",
+      "concern": "implementation_semantics",
+      "disposition": "confirmed_in_scope",
+      "check_ids": [
+        "3d53c8e244184b0490a87411aabe15f4",
+        "b9d811ad439049be9c19247ec7db97b2"
+      ],
+      "comparison_observed": true,
+      "blockers": []
+    },
+    {
+      "claim_id": "claim-client-future-shutdown-escape",
+      "candidate_id": "27488dfef77c44868f3cc91ed9880724",
+      "concern": "implementation_semantics",
+      "disposition": "confirmed_in_scope",
+      "check_ids": [
+        "e69bc2007c144a7fb7e950e3827d2cb4",
+        "e6a53d74753d4e2b880be03c0fe20b0d"
+      ],
+      "comparison_observed": true,
+      "blockers": []
+    }
+  ],
+  "costs": {
+    "agent_calls": 45,
+    "agent_seconds": 2218.2881650000004,
+    "rejected_calls": 1,
+    "rejected_call_seconds": 172.150832,
+    "formal_executions": 11,
+    "formal_execution_seconds": 141.204227,
+    "target_action_cost": {
+      "known_seconds": 145.90797354400092,
+      "unrecorded_check_ids": [],
+      "process_unrecorded_check_ids": []
+    },
+    "elapsed_seconds": 2383.7901741339974,
+    "interpretation": "formal_execution_seconds is controlled target process time (checks and explorations); target_action_cost includes preparation only where recorded. Parent actions and child steps are not added together. Rejected calls may contain useful investigation; wall time is not token cost"
+  },
+  "map_handoffs": [
+    {
+      "operation_id": "80175045278242a0a258766c5b0fcfa3",
+      "ref_ids": [
+        "b-fsm-apply-committed",
+        "f-fsm-configuration-state"
+      ],
+      "submission": "submissions/80175045278242a0a258766c5b0fcfa3/accepted.json"
+    },
+    {
+      "operation_id": "14aa3adf385a43e8b332cf7ecd36405c",
+      "ref_ids": [
+        "b-append-entries-sync",
+        "f-durable-term-vote"
+      ],
+      "submission": "submissions/14aa3adf385a43e8b332cf7ecd36405c/accepted.json"
+    },
+    {
+      "operation_id": "e0aba13d5ce743538af1b92465ebc588",
+      "ref_ids": [
+        "b-heartbeat-fast-path",
+        "f-durable-term-vote"
+      ],
+      "submission": "submissions/e0aba13d5ce743538af1b92465ebc588/accepted.json"
+    },
+    {
+      "operation_id": "0a08129a8e41457eb986dc99612f6030",
+      "ref_ids": [
+        "b-heartbeat-fast-path",
+        "f-durable-term-vote"
+      ],
+      "submission": "submissions/0a08129a8e41457eb986dc99612f6030/accepted.json"
+    },
+    {
+      "operation_id": "73e87b0def0f4aaea8bf94dc658ddb2c",
+      "ref_ids": [
+        "b-timeout-now",
+        "f-leader-transfer-privilege"
+      ],
+      "submission": "submissions/73e87b0def0f4aaea8bf94dc658ddb2c/accepted.json"
+    },
+    {
+      "operation_id": "c3a3eb7e17fa4f9eb6c850a413f4e3ab",
+      "ref_ids": [
+        "b-recover-from-disk",
+        "f-latest-configuration"
+      ],
+      "submission": "submissions/c3a3eb7e17fa4f9eb6c850a413f4e3ab/accepted.json"
+    },
+    {
+      "operation_id": "70dc2989d458407ab58c40fc69c542a4",
+      "ref_ids": [
+        "b-stable-position-reconstruction",
+        "f-stable-log-position"
+      ],
+      "submission": "submissions/70dc2989d458407ab58c40fc69c542a4/accepted.json"
+    },
+    {
+      "operation_id": "059d7d80cb3f441daf4d2d9c16ee20c8",
+      "ref_ids": [
+        "b-install-snapshot-align",
+        "f-log-snapshot-agreement"
+      ],
+      "submission": "submissions/059d7d80cb3f441daf4d2d9c16ee20c8/accepted.json"
+    },
+    {
+      "operation_id": "b1175421d69c47379dec966efed21c11",
+      "ref_ids": [
+        "b-append-entries-sync",
+        "b-heartbeat-fast-path"
+      ],
+      "submission": "submissions/b1175421d69c47379dec966efed21c11/accepted.json"
+    },
+    {
+      "operation_id": "f4315370470f47da9be4f6ee5a279b62",
+      "ref_ids": [
+        "b-install-snapshot-align",
+        "f-log-snapshot-agreement"
+      ],
+      "submission": "submissions/f4315370470f47da9be4f6ee5a279b62/accepted.json"
+    },
+    {
+      "operation_id": "7a1185fc025c43cf87a81a58998f38b2",
+      "ref_ids": [
+        "b-fsm-apply-committed",
+        "b-heartbeat-fast-path",
+        "b-install-snapshot-align",
+        "b-timeout-now"
+      ],
+      "submission": "submissions/7a1185fc025c43cf87a81a58998f38b2/accepted.json"
+    },
+    {
+      "operation_id": "bded47505ce744ddb0ffbf039c280e1f",
+      "ref_ids": [
+        "b-heartbeat-fast-path",
+        "b-timeout-now"
+      ],
+      "submission": "submissions/bded47505ce744ddb0ffbf039c280e1f/accepted.json"
+    },
+    {
+      "operation_id": "c3cd75e12991463895bff16014a03870",
+      "ref_ids": [
+        "b-replication-recovery"
+      ],
+      "submission": "submissions/c3cd75e12991463895bff16014a03870/accepted.json"
+    },
+    {
+      "operation_id": "441bda4cbd724c2594dc441a914f0cf0",
+      "ref_ids": [
+        "b-client-future"
+      ],
+      "submission": "submissions/441bda4cbd724c2594dc441a914f0cf0/accepted.json"
+    },
+    {
+      "operation_id": "7efcd413317c4d9caef6e258b717f30d",
+      "ref_ids": [
+        "b-install-snapshot-align",
+        "f-log-snapshot-agreement"
+      ],
+      "submission": "submissions/7efcd413317c4d9caef6e258b717f30d/accepted.json"
+    },
+    {
+      "operation_id": "9fc379e5daf847fbbe4e45b7d88adea9",
+      "ref_ids": [
+        "b-client-future",
+        "f-client-completion-escape"
+      ],
+      "submission": "submissions/9fc379e5daf847fbbe4e45b7d88adea9/accepted.json"
+    }
+  ],
+  "handoffs": [
+    {
+      "operation_id": "80175045278242a0a258766c5b0fcfa3",
+      "action": "research",
+      "candidate_ids": [],
+      "answered_preview": "For a FSM implementing both BatchingFSM and ConfigurationStore, the library does not invoke ConfigurationStore.StoreConfiguration for a committed LogConfiguration entry. The revised direct check d37a13c5 executed its fixed bytes (execution …",
+      "ref_ids": [
+        "a898e05630e6440d97b856d7527274bd",
+        "d37a13c51a594f278bc23ed2af078007",
+        "b-fsm-apply-committed",
+        "f-fsm-configuration-state",
+        "S34",
+        "S35",
+        "S37",
+        "S38"
+      ],
+      "record": {
+        "path": "state.json",
+        "collection": "selections",
+        "match": {
+          "operation_id": "80175045278242a0a258766c5b0fcfa3"
+        }
+      }
+    },
+    {
+      "operation_id": "14aa3adf385a43e8b332cf7ecd36405c",
+      "action": "research",
+      "candidate_ids": [],
+      "answered_preview": "New sourced lead on a core path, not an obligation: the appendEntries handler has two entry paths with different guards. raft.go:1390-1413 routes normal RPCs through checkRPCHeader (which enforces the supported protocol-version window) befo…",
+      "ref_ids": [
+        "b-append-entries-sync",
+        "f-durable-term-vote",
+        "S8",
+        "S14"
+      ],
+      "record": {
+        "path": "state.json",
+        "collection": "selections",
+        "match": {
+          "operation_id": "14aa3adf385a43e8b332cf7ecd36405c"
+        }
+      }
+    },
+    {
+      "operation_id": "e66e3c692a314321855af0ea7cacb9b9",
+      "action": "obligation",
+      "candidate_ids": [
+        "3bf994e1d1c54186b73ed96e82d39802"
+      ],
+      "answered_preview": "Second obligation, grounded on the accepted map. The heartbeat fast path is the only entry into appendEntries that skips checkRPCHeader, and the network transport routes every pure AppendEntries heartbeat to it, so the same request shape is…",
+      "ref_ids": [],
+      "record": {
+        "path": "state.json",
+        "collection": "selections",
+        "match": {
+          "operation_id": "e66e3c692a314321855af0ea7cacb9b9"
+        }
+      }
+    },
+    {
+      "operation_id": "e0aba13d5ce743538af1b92465ebc588",
+      "action": "research",
+      "candidate_ids": [],
+      "answered_preview": "Premise investigation for the heartbeat-fast-path obligation (claim-heartbeat-header-gate), resolving the construction question of whether a direct handler invocation is the production path. It is: integ_test.go:561-583 installs a custom he…",
+      "ref_ids": [
+        "b-heartbeat-fast-path",
+        "f-durable-term-vote",
+        "S40",
+        "S43"
+      ],
+      "record": {
+        "path": "state.json",
+        "collection": "selections",
+        "match": {
+          "operation_id": "e0aba13d5ce743538af1b92465ebc588"
+        }
+      }
+    },
+    {
+      "operation_id": "0a08129a8e41457eb986dc99612f6030",
+      "action": "research",
+      "candidate_ids": [],
+      "answered_preview": "The second obligation is settled in scope. Direct check a7ab7f88 executed its fixed bytes (execution 1987811182294bfbb372a36548be8d8b) with prerequisites matched, comparison_complete and witness_complete true, and outcome violated: one decl…",
+      "ref_ids": [
+        "1987811182294bfbb372a36548be8d8b",
+        "a7ab7f884023425182fec9595c00ba14",
+        "b-heartbeat-fast-path",
+        "f-durable-term-vote",
+        "S40",
+        "S43"
+      ],
+      "record": {
+        "path": "state.json",
+        "collection": "selections",
+        "match": {
+          "operation_id": "0a08129a8e41457eb986dc99612f6030"
+        }
+      }
+    },
+    {
+      "operation_id": "75cb0e649dc041a9897548dc10ba1ec6",
+      "action": "obligation",
+      "candidate_ids": [
+        "90fabf4609b545a2a911e245ce254742"
+      ],
+      "answered_preview": "Third candidate, grounded on the accepted map. The TimeoutNow receive handler is the only route that grants the vote-while-a-leader-exists privilege, and it validates nothing beyond the RPC-header version window - it cannot even check curre…",
+      "ref_ids": [],
+      "record": {
+        "path": "state.json",
+        "collection": "selections",
+        "match": {
+          "operation_id": "75cb0e649dc041a9897548dc10ba1ec6"
+        }
+      }
+    },
+    {
+      "operation_id": "73e87b0def0f4aaea8bf94dc658ddb2c",
+      "action": "research",
+      "candidate_ids": [],
+      "answered_preview": "The third obligation is settled in scope. Direct check 7815ca48 executed its fixed bytes (execution 554a0abcf056483ba255f00545e30713) with the declarative prerequisite matched, comparison_complete and witness_complete true, and the implicat…",
+      "ref_ids": [
+        "554a0abcf056483ba255f00545e30713",
+        "7815ca48454b4d919a20810718683b41",
+        "b-timeout-now",
+        "f-leader-transfer-privilege",
+        "S49",
+        "S50"
+      ],
+      "record": {
+        "path": "state.json",
+        "collection": "selections",
+        "match": {
+          "operation_id": "73e87b0def0f4aaea8bf94dc658ddb2c"
+        }
+      }
+    },
+    {
+      "operation_id": "c3a3eb7e17fa4f9eb6c850a413f4e3ab",
+      "action": "research",
+      "candidate_ids": [],
+      "answered_preview": "A suspected defect was investigated and explained rather than escalated. A node whose log is empty but which holds a newer snapshot - the state RecoverCluster deliberately produces by truncating the whole log, and also reachable with Traili…",
+      "ref_ids": [
+        "b-recover-from-disk",
+        "f-latest-configuration",
+        "S54",
+        "S20"
+      ],
+      "record": {
+        "path": "state.json",
+        "collection": "selections",
+        "match": {
+          "operation_id": "c3a3eb7e17fa4f9eb6c850a413f4e3ab"
+        }
+      }
+    },
+    {
+      "operation_id": "70dc2989d458407ab58c40fc69c542a4",
+      "action": "research",
+      "candidate_ids": [],
+      "answered_preview": "New sourced lead on the snapshot receive path, prompted by the log/snapshot position mechanism just recorded. installSnapshot ends by setting lastApplied and lastSnapshot and then either removing all old logs (monotonic stores) or compactin…",
+      "ref_ids": [
+        "b-stable-position-reconstruction",
+        "f-stable-log-position",
+        "S8",
+        "S54"
+      ],
+      "record": {
+        "path": "state.json",
+        "collection": "selections",
+        "match": {
+          "operation_id": "70dc2989d458407ab58c40fc69c542a4"
+        }
+      }
+    },
+    {
+      "operation_id": "1019b638881546d280dc346289306ac3",
+      "action": "obligation",
+      "candidate_ids": [
+        "c73e1a943eeb4f7dbd009677b41d7c36"
+      ],
+      "answered_preview": "Fourth candidate, grounded on the accepted map. The snapshot receive path adopts the installed snapshot's index and term but never aligns the log with it: it does not set the last log, and its compaction stops at the snapshot index, while t…",
+      "ref_ids": [],
+      "record": {
+        "path": "state.json",
+        "collection": "selections",
+        "match": {
+          "operation_id": "1019b638881546d280dc346289306ac3"
+        }
+      }
+    },
+    {
+      "operation_id": "059d7d80cb3f441daf4d2d9c16ee20c8",
+      "action": "research",
+      "candidate_ids": [],
+      "answered_preview": "The fourth obligation is settled in scope. Direct check 495d49f1 executed its fixed bytes (execution 3d53c8e244184b0490a87411aabe15f4) with the declarative prerequisite longer-tail matched, comparison_complete and witness_complete true, and…",
+      "ref_ids": [
+        "3d53c8e244184b0490a87411aabe15f4",
+        "495d49f163e24e3f951df60c6779ec27",
+        "b-install-snapshot-align",
+        "f-log-snapshot-agreement",
+        "S57",
+        "S58"
+      ],
+      "record": {
+        "path": "state.json",
+        "collection": "selections",
+        "match": {
+          "operation_id": "059d7d80cb3f441daf4d2d9c16ee20c8"
+        }
+      }
+    },
+    {
+      "operation_id": "b1175421d69c47379dec966efed21c11",
+      "action": "research",
+      "candidate_ids": [],
+      "answered_preview": "Two further entry-path suspicions were checked against source and closed rather than escalated. (1) The protocol-version gate looks as if it could underflow at the minimum: checkRPCHeader rejects when header.ProtocolVersion < r.config().Pro…",
+      "ref_ids": [
+        "S42",
+        "b-append-entries-sync",
+        "b-heartbeat-fast-path"
+      ],
+      "record": {
+        "path": "state.json",
+        "collection": "selections",
+        "match": {
+          "operation_id": "b1175421d69c47379dec966efed21c11"
+        }
+      }
+    },
+    {
+      "operation_id": "f4315370470f47da9be4f6ee5a279b62",
+      "action": "research",
+      "candidate_ids": [],
+      "answered_preview": "A third suspicion from the snapshot area was checked and closed. FileSnapshotStore.List builds its result with `for _, meta := range snapshots { snapMeta = append(snapMeta, &meta.SnapshotMeta) }` (file_snapshot.go:226-242) over the pointers…",
+      "ref_ids": [
+        "b-install-snapshot-align",
+        "f-log-snapshot-agreement",
+        "S26",
+        "S57"
+      ],
+      "record": {
+        "path": "state.json",
+        "collection": "selections",
+        "match": {
+          "operation_id": "f4315370470f47da9be4f6ee5a279b62"
+        }
+      }
+    },
+    {
+      "operation_id": "7a1185fc025c43cf87a81a58998f38b2",
+      "action": "research",
+      "candidate_ids": [],
+      "answered_preview": "The overview now navigates to the run's confirmed results instead of leaving them only in claim records. Four implementation-level duties on the mapped paths were confirmed in scope with complete witnesses: batching FSMs never receive Confi…",
+      "ref_ids": [
+        "b-fsm-apply-committed",
+        "b-heartbeat-fast-path",
+        "b-timeout-now",
+        "b-install-snapshot-align",
+        "S34",
+        "S40"
+      ],
+      "record": {
+        "path": "state.json",
+        "collection": "selections",
+        "match": {
+          "operation_id": "7a1185fc025c43cf87a81a58998f38b2"
+        }
+      }
+    },
+    {
+      "operation_id": "bded47505ce744ddb0ffbf039c280e1f",
+      "action": "research",
+      "candidate_ids": [],
+      "answered_preview": "Both confirmed findings whose importance rested on an unmeasured consequence now carry measured consequence evidence, recorded on the behaviors that own the mechanisms. For the heartbeat fast path (second scenario f8caf123, execution 7628b5…",
+      "ref_ids": [
+        "f8caf123581f4c9abfa7d55569cfcfbe",
+        "38aa89590d3b453bb2c47420aa8e7fe0",
+        "b-heartbeat-fast-path",
+        "b-timeout-now",
+        "S40",
+        "S48"
+      ],
+      "record": {
+        "path": "state.json",
+        "collection": "selections",
+        "match": {
+          "operation_id": "bded47505ce744ddb0ffbf039c280e1f"
+        }
+      }
+    },
+    {
+      "operation_id": "c3cd75e12991463895bff16014a03870",
+      "action": "research",
+      "candidate_ids": [],
+      "answered_preview": "A further sourced discrepancy was found in the transport configuration surface and recorded as a lead rather than escalated. NetworkTransportConfig documents that 'For InstallSnapshot, we multiply the timeout by (SnapshotSize / TimeoutScale…",
+      "ref_ids": [
+        "b-replication-recovery",
+        "S27",
+        "S45",
+        "S64"
+      ],
+      "record": {
+        "path": "state.json",
+        "collection": "selections",
+        "match": {
+          "operation_id": "c3cd75e12991463895bff16014a03870"
+        }
+      }
+    },
+    {
+      "operation_id": "441bda4cbd724c2594dc441a914f0cf0",
+      "action": "research",
+      "candidate_ids": [],
+      "answered_preview": "The last wholly unread file with a public surface was read and closed. observer.go carries no protocol responsibility: Raft.emits Observations only from paths that already produced the state, the emit path takes a read lock and never blocks…",
+      "ref_ids": [
+        "b-client-future",
+        "S23",
+        "S27",
+        "S64"
+      ],
+      "record": {
+        "path": "state.json",
+        "collection": "selections",
+        "match": {
+          "operation_id": "441bda4cbd724c2594dc441a914f0cf0"
+        }
+      }
+    },
+    {
+      "operation_id": "7efcd413317c4d9caef6e258b717f30d",
+      "action": "research",
+      "candidate_ids": [],
+      "answered_preview": "The snapshot alignment finding now has two violated scenarios and a measured operational consequence. The first (execution 3d53c8e2) showed the install retains and reports an unconfirmed tail; the second (execution b9d811ad) showed the shar…",
+      "ref_ids": [
+        "5a560c551ebc4cdc8fea586eb3dcd785",
+        "b9d811ad439049be9c19247ec7db97b2",
+        "b-install-snapshot-align",
+        "f-log-snapshot-agreement",
+        "S57",
+        "S8"
+      ],
+      "record": {
+        "path": "state.json",
+        "collection": "selections",
+        "match": {
+          "operation_id": "7efcd413317c4d9caef6e258b717f30d"
+        }
+      }
+    },
+    {
+      "operation_id": "7e46b38a0d934557b9d772fb6cb499d7",
+      "action": "obligation",
+      "candidate_ids": [
+        "27488dfef77c44868f3cc91ed9880724"
+      ],
+      "answered_preview": "Fifth candidate, grounded on the accepted map. The library wires a shutdown escape into some futures but not into the logFuture returned by Apply/ApplyLog/Barrier, and Error returns ErrRaftShutdown only through that field; with the document…",
+      "ref_ids": [],
+      "record": {
+        "path": "state.json",
+        "collection": "selections",
+        "match": {
+          "operation_id": "7e46b38a0d934557b9d772fb6cb499d7"
+        }
+      }
+    },
+    {
+      "operation_id": "9fc379e5daf847fbbe4e45b7d88adea9",
+      "action": "research",
+      "candidate_ids": [],
+      "answered_preview": "The fifth obligation is settled in scope. Direct check 54e71939 executed its fixed bytes (execution e69bc2007c144a7fb7e950e3827d2cb4) with the declarative prerequisite accepted matched, comparison_complete and witness_complete true, and the…",
+      "ref_ids": [
+        "54e71939c4644eacbd929a505b3aac2a",
+        "e69bc2007c144a7fb7e950e3827d2cb4",
+        "b-client-future",
+        "f-client-completion-escape",
+        "S23",
+        "S68"
+      ],
+      "record": {
+        "path": "state.json",
+        "collection": "selections",
+        "match": {
+          "operation_id": "9fc379e5daf847fbbe4e45b7d88adea9"
+        }
+      },
+      "feedback": {
+        "ref_ids": [
+          "54e71939c4644eacbd929a505b3aac2a",
+          "e69bc2007c144a7fb7e950e3827d2cb4",
+          "b-client-future",
+          "f-client-completion-escape",
+          "S23",
+          "S68"
+        ],
+        "answered": "The fifth obligation is settled in scope. Direct check 54e71939 executed its fixed bytes (execution e69bc2007c144a7fb7e950e3827d2cb4) with the declarative prerequisite accepted matched, comparison_complete and witness_complete true, and the assertion violated: the future returned for an accepted Apply reported responded_after_shutdown false and shutdown_escape false, so caller_can_complete was false, while the same call on a served node completed. The blocking review issue was the Future.Error documentation promising ErrRaftShutdown among the errors a caller may see; it was resolved as an independent scope boundary (how the documentation should be read when completion after Shutdown is not intended), not by weakening the claim.",
+        "remaining": [
+          "Whether the other future types share the gap is now characterised from source but not executed: verifyCh is buffered with capacity 64, so VerifyLeader can accept a future that shutdown then drops, while configurationChangeCh, bootstrapCh and userSnapshotCh are unbuffered and leadershipTransferCh holds one.",
+          "The check establishes the absence of a completion path from the future's state; it does not measure a hang's duration, and the running-node window between an accepted buffered send and shutdown was replaced by skipStartup.",
+          "The other four findings keep their open premises: reachability of an out-of-window heartbeat sender and of an unconfigured TimeoutNow sender, whether batching FSMs are exempt from ConfigurationStore, and real-leader reachability plus the trailing-log-guard question for the snapshot tail.",
+          "Leads with no obligation: ReloadConfig notification scope, the processHeartbeat concurrency contract, and the transport TimeoutScale configuration discrepancy."
+        ],
+        "understanding": "updated",
+        "rationale": "The fifth finding belongs on the client-contract behavior and the Fact that owns the completion escape, with the other futures' exposure recorded as a sourced but unexecuted extension rather than as a new claim. The core overview, all five claims and every accepted result are unchanged.",
+        "question_updates": {}
+      }
+    }
+  ],
+  "pending_work": [],
+  "current": {
+    "phase": "failed",
+    "operation_id": "55ec57dc93554b238efcba19469e7e9b",
+    "status": "cancelled",
+    "reason": "User cancelled action",
+    "session_unavailable": false
+  },
+  "latest_decision": {
+    "operation_id": "94b0fae95873496aa1c984cbd4e3cac3",
+    "action": "review",
+    "record": {
+      "path": "state.json",
+      "collection": "selections",
+      "match": {
+        "operation_id": "94b0fae95873496aa1c984cbd4e3cac3"
+      }
+    }
+  },
+  "stop": {
+    "operation_id": "55ec57dc93554b238efcba19469e7e9b",
+    "action": "stop",
+    "scope": "run",
+    "reason": "user_stop",
+    "origin": "controller",
+    "rationale": "Agent stopped: User cancelled action",
+    "pending_work": [],
+    "remaining_seconds": 1216.2098624670016,
+    "remaining_agent_calls": 75
+  },
+  "stop_reason": "Agent stopped: User cancelled action",
+  "explorations": [
+    {
+      "operation_id": "bcaa06c272bf4890bff151ccfd995340",
+      "submission": "submissions/bcaa06c272bf4890bff151ccfd995340/accepted.json",
+      "question": "When a FSM implements both BatchingFSM and ConfigurationStore and a LogConfiguration entry is committed, does the library call ConfigurationStore.StoreConfiguration, or does the entry only reach BatchingFSM.ApplyBatch so that StoreConfigura…",
+      "rationale": "Construction-guided execution for the accepted unit unit-claim-config-store-delivery. Source reading says the only StoreConfiguration call site is inside applySingle (fsm.go:118), and runFSM reaches applySingle only when the FSM does not im…",
+      "ref_ids": [],
+      "source_ids": [
+        "S34",
+        "S35",
+        "S39",
+        "S37",
+        "S38"
+      ],
+      "inputs": [
+        "submissions/bcaa06c272bf4890bff151ccfd995340/inputs/harness_configstore_test.go"
+      ],
+      "executions": [
+        {
+          "check_id": "a55fcacbd6224839904320183312312e",
+          "status": "completed",
+          "exit_code": 0,
+          "started_at": "2026-10-09T04:15:12.353594+00:00",
+          "ended_at": "2026-10-09T04:15:26.773778+00:00",
+          "record": "logs/a55fcacbd6224839904320183312312e/check.json",
+          "execution_package": ".",
+          "harness_filename": "assurance_generated_test.go",
+          "stdout": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-09_12-07-35-hashicorp_raft-real-run/logs/a55fcacbd6224839904320183312312e/stdout.log",
+          "stderr": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-09_12-07-35-hashicorp_raft-real-run/logs/a55fcacbd6224839904320183312312e/stderr.log",
+          "artifacts": [
+            "/home/nitro/Desktop/consensus-assurance/runs/2026-10-09_12-07-35-hashicorp_raft-real-run/experiments/2eae3aa90fe849aeb67f558a090da902/workspace-delta/manifest.json",
+            "/home/nitro/Desktop/consensus-assurance/runs/2026-10-09_12-07-35-hashicorp_raft-real-run/experiments/2eae3aa90fe849aeb67f558a090da902/workspace-outcome/manifest.json",
+            "/home/nitro/Desktop/consensus-assurance/runs/2026-10-09_12-07-35-hashicorp_raft-real-run/experiments/2eae3aa90fe849aeb67f558a090da902/workspace/assurance_generated_test.go"
+          ]
+        }
+      ],
+      "feedback": [],
+      "without_followup": [
+        "a55fcacbd6224839904320183312312e"
+      ]
+    }
+  ],
+  "review_issues": [],
+  "run_id": "42242dc7d73846e1bc5011601bf11a3c",
+  "snapshot_id": "53d1cd38f3dc495aabd327d66d1a8dcb",
+  "elapsed_seconds": 2383.7901741339974,
+  "source_path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-09_12-07-35-hashicorp_raft-real-run/agent-source",
+  "draft_path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-09_12-07-35-hashicorp_raft-real-run/draft",
+  "state_path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-09_12-07-35-hashicorp_raft-real-run/state.json",
+  "product_schemas": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-09_12-07-35-hashicorp_raft-real-run/product-schemas.json",
+  "submission_schema": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-09_12-07-35-hashicorp_raft-real-run/submission.schema.json",
+  "method_path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-09_12-07-35-hashicorp_raft-real-run/audit-method.md",
+  "build_inputs": [],
+  "directed_question": null,
+  "tools": {
+    "agent": "codex-cli 0.155.0-alpha.16",
+    "implementation": "go version go1.25.8 linux/amd64"
+  },
+  "implementation": {
+    "name": "go_module",
+    "harness_kind": "go_test",
+    "default_execution_package": ".",
+    "harness_filename": "assurance_generated_test.go",
+    "instructions": "Use TestAssurance-prefixed Go tests in the selected local package; derive its declaration from actual source, including valid external test packages. The controller runs Go directly. Emit CA_EVENT JSON using fmt.Println or t.Log. Dependencies are offline; inspect actual source before using internal APIs.",
+    "support_path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-09_12-07-35-hashicorp_raft-real-run/target-support"
+  },
+  "validation": {
+    "command": [
+      "/home/nitro/Desktop/consensus-assurance/.venv/bin/python",
+      "-I",
+      "-B",
+      "-c",
+      "import sys; sys.path.insert(0, '/home/nitro/Desktop/consensus-assurance/src'); from consensus_assurance.cli import main; raise SystemExit(main())",
+      "validate",
+      "--run",
+      "/home/nitro/Desktop/consensus-assurance/runs/2026-10-09_12-07-35-hashicorp_raft-real-run",
+      "--submission"
+    ],
+    "read_only_paths": [
+      "/home/nitro/Desktop/consensus-assurance/src",
+      "/home/nitro/Desktop/consensus-assurance/.venv/lib/python3.10/site-packages",
+      "/home/nitro/Desktop/consensus-assurance/.venv/bin",
+      "/home/nitro/Desktop/consensus-assurance/.venv/pyvenv.cfg"
+    ]
+  },
+  "rejected_drafts": [
+    "/home/nitro/Desktop/consensus-assurance/runs/2026-10-09_12-07-35-hashicorp_raft-real-run/submissions/bf761efec87e45629f7ce654be7a485a/diagnostics.json"
+  ],
+  "records": {
+    "path": "state.json",
+    "keys": {
+      "materials": "id",
+      "checks": "id",
+      "semantic_reviews": "id",
+      "selections": "operation_id"
+    },
+    "paths_relative_to": "research.json directory"
+  },
+  "review_contracts": [
+    {
+      "target_id": "d37a13c51a594f278bc23ed2af078007",
+      "object_type": "direct_check",
+      "version": 2,
+      "required_aspects": [
+        "checker_correspondence"
+      ],
+      "optional_aspects": [
+        "applicability",
+        "decomposition"
+      ]
+    },
+    {
+      "target_id": "a7ab7f884023425182fec9595c00ba14",
+      "object_type": "direct_check",
+      "version": 1,
+      "required_aspects": [
+        "checker_correspondence"
+      ],
+      "optional_aspects": [
+        "applicability",
+        "decomposition"
+      ]
+    },
+    {
+      "target_id": "7815ca48454b4d919a20810718683b41",
+      "object_type": "direct_check",
+      "version": 1,
+      "required_aspects": [
+        "checker_correspondence"
+      ],
+      "optional_aspects": [
+        "applicability",
+        "decomposition"
+      ]
+    },
+    {
+      "target_id": "495d49f163e24e3f951df60c6779ec27",
+      "object_type": "direct_check",
+      "version": 1,
+      "required_aspects": [
+        "checker_correspondence"
+      ],
+      "optional_aspects": [
+        "applicability",
+        "decomposition"
+      ]
+    },
+    {
+      "target_id": "38aa89590d3b453bb2c47420aa8e7fe0",
+      "object_type": "direct_check",
+      "version": 1,
+      "required_aspects": [
+        "checker_correspondence"
+      ],
+      "optional_aspects": [
+        "applicability",
+        "decomposition"
+      ]
+    },
+    {
+      "target_id": "f8caf123581f4c9abfa7d55569cfcfbe",
+      "object_type": "direct_check",
+      "version": 1,
+      "required_aspects": [
+        "checker_correspondence"
+      ],
+      "optional_aspects": [
+        "applicability",
+        "decomposition"
+      ]
+    },
+    {
+      "target_id": "5a560c551ebc4cdc8fea586eb3dcd785",
+      "object_type": "direct_check",
+      "version": 1,
+      "required_aspects": [
+        "checker_correspondence"
+      ],
+      "optional_aspects": [
+        "applicability",
+        "decomposition"
+      ]
+    },
+    {
+      "target_id": "54e71939c4644eacbd929a505b3aac2a",
+      "object_type": "direct_check",
+      "version": 1,
+      "required_aspects": [
+        "checker_correspondence"
+      ],
+      "optional_aspects": [
+        "applicability",
+        "decomposition"
+      ]
+    },
+    {
+      "target_id": "46a5695874f2465da28c9cfcd03b2071",
+      "object_type": "direct_check",
+      "version": 1,
+      "required_aspects": [
+        "checker_correspondence"
+      ],
+      "optional_aspects": [
+        "applicability",
+        "decomposition"
+      ]
+    }
+  ],
+  "review_questions": {
+    "direct_check": {
+      "checker_correspondence": "Explain which part of the current question the obligation and actual observations answer, under which premises. Distinguish the original cause hypothesis and wider consequences from the checked proposition. Review fixed inputs, source bindings, oracle, correlated observations, legality and contrary evidence together; no separate object approvals are required. Matching IDs alone are not correspondence.",
+      "applicability": "Why does the implementation owe this responsibility in the selected scope?",
+      "decomposition": "Explain necessity, sufficiency, alternatives, producer/consumer dependencies and remaining guarantees."
+    }
+  }
+}

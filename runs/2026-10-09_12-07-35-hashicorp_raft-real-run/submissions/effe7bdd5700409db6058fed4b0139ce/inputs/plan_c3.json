@@ -1,0 +1,73 @@
+{
+  "description": "For a TimeoutNow request whose sender is not a voter of the receiver's latest configuration, require that the receiver does not abandon its known leader, enter candidate state and raise the transfer privilege (which skips pre-vote and makes other voters grant votes despite having a leader).",
+  "claim_id": "claim-timeout-now-attribution",
+  "binding_ids": ["binding-timeout-now-attribution"],
+  "harness": {
+    "kind": "go_test",
+    "description": "TestAssuranceTimeoutNowSenderAttribution builds Raft nodes with background goroutines disabled and a bootstrapped two-voter configuration, gives each a known leader, and drives the production dispatch seam processRPC with constructed TimeoutNow requests: one from a sender that is not a voter of the configuration, one control from a configured voter, and one control from a sender outside the RPC-header version window. CA_EVENT lines report the declared sender scope, the unattributed result (leader before/after, state, privilege before/after, whether the transfer privilege was granted), and the two controls.",
+    "semantic_changes": [
+      "Nodes are constructed with conf.skipStartup = true so no background goroutines run; the handler is driven through processRPC, which is the production dispatch for this RPC, with a response channel as the transport would supply.",
+      "Each node is bootstrapped with a two-voter configuration and then given a known leader through the same setLeader/setState accessors appendEntries uses, to represent the inter-heartbeat state in which such an RPC arrives. This is scenario setup, not protocol logic.",
+      "The sender is a fabricated identifier absent from the configuration; the harness does not simulate a full removed-node deployment, which is disclosed as an uncertainty.",
+      "No target code is modified."
+    ],
+    "prerequisites": [
+      {
+        "alias": "unattributed-sender",
+        "event": "sender_scope_declared",
+        "conditions": [
+          {"field": "sender_is_configured_voter", "value": false},
+          {"field": "configuration_nonempty", "value": true}
+        ]
+      }
+    ],
+    "legality": {
+      "source_ids": ["S48", "S49", "S50", "S51", "S6", "S21"],
+      "binding_ids": ["binding-timeout-now-attribution"],
+      "derivation": "S49 shows timeoutNow performing its three effects with no validation; S48 shows the request carries only an RPCHeader so no term is available; S50 shows processRPC is the production dispatch and applies the version window first; S51 shows the privilege's effect (pre-vote skipped, LeadershipTransfer set) and the authors' note that it 'could be abused otherwise'; S6 and S21 show that requestVote and requestPreVote, unlike this handler, reject senders outside the configuration.",
+      "applicability": "Applies when the receiver's latest configuration is non-empty and the sender is not one of its voters, which the harness declares and the receiver's bootstrapped configuration makes checkable.",
+      "unresolved": [
+        "Whether a real removed or stale node reaches this handler in a deployment; the harness fabricates the identifier rather than removing a running node.",
+        "Whether an honoured request can unseat a healthy leader rather than only perturbing terms."
+      ],
+      "conflicts": [
+        "The API documentation presents leadership transfer as safe in mixed clusters, while the receive handler grants the privileged election path without the membership check the vote RPCs apply."
+      ],
+      "alternatives": [
+        "If only a genuine leader ever sends TimeoutNow and the transport is trusted, the correct disposition is a documented assumption rather than a violation."
+      ]
+    }
+  },
+  "monitors": [
+    {
+      "id": "m-timeout-now-attribution",
+      "checker_id": "c-timeout-now-attribution",
+      "event": "timeout_now_result",
+      "binding_ids": ["binding-timeout-now-attribution"],
+      "grounding": {
+        "source_ids": ["S48", "S49", "S50", "S51"],
+        "binding_ids": ["binding-timeout-now-attribution"],
+        "derivation": "The obligation requires attribution of the sender to the receiver's authority context before the handler's effects are taken. The event reports whether the privilege was granted for a request whose sender the receiver's configuration does not contain.",
+        "applicability": "Only evaluated for an in-window request whose declared sender scope is absent from the receiver's latest configuration."
+      },
+      "applicability_conditions": [{"field": "rpc_header_in_window", "value": true}],
+      "admission_alias": "unattributed-sender"
+    }
+  ],
+  "observable_properties": [
+    {
+      "checker_id": "c-timeout-now-attribution",
+      "kind": "event_implication",
+      "trigger": {"field": "event", "value": "timeout_now_result"},
+      "antecedent": {"field": "sender_is_configured_voter", "value": false},
+      "assertion": {"field": "transfer_privilege_granted", "value": false},
+      "identity_fields": ["op_id"],
+      "description": "If the TimeoutNow sender is not a voter of the receiver's latest configuration, the receiver must not grant the transfer privilege (abandon its leader and enter candidate state with the pre-vote-bypassing vote privilege)."
+    }
+  ],
+  "uncertainties": [
+    "Whether a non-member sender is reachable in a legal deployment; the harness fabricates the identifier.",
+    "Whether the design intends to trust leader discipline on this path, which would make the correct disposition a documented assumption.",
+    "The downstream consequence for a healthy leader is not measured: the harness stops at the privilege being granted."
+  ]
+}

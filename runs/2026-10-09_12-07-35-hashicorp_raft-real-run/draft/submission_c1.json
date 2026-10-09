@@ -1,0 +1,113 @@
+{
+  "action": "obligation",
+  "rationale": "First Candidate, grounded on the accepted map. Reading the previously unmapped FSM/apply path (fsm.go) surfaced a sourced discrepancy: ConfigurationStore documents that StoreConfiguration is invoked once a configuration log entry is committed (configuration.go:38-52), but the only call site is inside applySingle, and runFSM calls applySingle only when the FSM does NOT implement BatchingFSM (fsm.go:127-186). Separately, BatchingFSM.ApplyBatch documents that LogConfiguration entries 'will be sent' to the batching FSM (fsm.go:51-69). A FSM that implements both interfaces therefore never receives StoreConfiguration, and the configuration fact is established for it only by whatever its own ApplyBatch chooses to do. The library's own test helper (testing_batch.go:13-33) implements ApplyBatch under the batchtest build flag and simply returns nil for non-LogCommand entries, which is consistent with the discrepancy rather than with the ConfigurationStore contract. This product therefore fixes the responsibility, the attribution and a bounded discriminator; construction of the formal check is deferred to the next turn. The map is extended with the behavior and fact that support this question (b-fsm-apply-committed, f-fsm-configuration-state); no previously accepted object is modified or removed.",
+  "map_path": "map.json",
+  "sources": [
+    {"id": "S34", "file": "configuration.go", "start_line": 38, "end_line": 52, "kind": "interface_statement"},
+    {"id": "S35", "file": "fsm.go", "start_line": 51, "end_line": 69, "kind": "interface_statement"},
+    {"id": "S36", "file": "fsm.go", "start_line": 92, "end_line": 125, "kind": "code_observation"},
+    {"id": "S37", "file": "fsm.go", "start_line": 127, "end_line": 186, "kind": "code_observation"},
+    {"id": "S38", "file": "testing_batch.go", "start_line": 13, "end_line": 33, "kind": "code_observation"},
+    {"id": "S39", "file": "fsm.go", "start_line": 86, "end_line": 125, "kind": "code_observation"}
+  ],
+  "question": {
+    "question": "When a FSM implements both BatchingFSM and ConfigurationStore, does the library invoke StoreConfiguration(index, configuration) for a committed LogConfiguration entry, as the ConfigurationStore contract states, or does the batching dispatch in runFSM make that invocation unreachable?",
+    "importance": "ConfigurationStore exists so a persistent FSM can treat its own state as a complete snapshot and recover without an external snapshot (configuration.go:44-52). If the invocation is unreachable for batching FSMs, an application that implements both interfaces silently loses the only library-provided delivery of committed configuration changes, which matters for recovery and for the FSM's own view of cluster membership. This is an implementation/contract gap, not a consensus-safety violation; it is classified implementation_semantics.",
+    "trigger_rationale": "The map's A5/A6 surfaces for runFSM were unread; reading them showed that the batching path selects applyBatch instead of applySingle, and StoreConfiguration has exactly one call site (fsm.go:118) inside applySingle. The two interface doc comments cannot both hold for a FSM implementing both interfaces, which is a concrete sourced discrepancy rather than a generic untested case.",
+    "disposition": "ready_for_check",
+    "preferred_check": "direct_test",
+    "priority": 2,
+    "obligation_relation_kind": "establishment",
+    "activity_classes": ["A1", "A5", "A6"],
+    "fact_ids": ["f-fsm-configuration-state"],
+    "behavior_ids": ["b-fsm-apply-committed"],
+    "supporting_behavior_ids": {
+      "b-append-entries-sync": "A1 relationship: the configuration fact consumed during AppendEntries processing is the same configuration whose FSM-side persistence this question investigates; the FSM record is an alternative establishment path for the context that determines voter eligibility and therefore qualified support for advancement.",
+      "b-recover-from-disk": "Explains why the missing delivery matters: the FSM configuration record is the recovery substitute for an external snapshot.",
+      "b-config-change": "Establishes which LogConfiguration entries are committed and therefore owed to the FSM."
+    },
+    "objects": [
+      "Raft.runFSM / applySingle / applyBatch",
+      "ConfigurationStore.StoreConfiguration",
+      "BatchingFSM.ApplyBatch",
+      "a FSM implementing both interfaces"
+    ],
+    "contexts": [
+      "committed LogConfiguration entry applied after a membership change",
+      "batched commit delivery when the FSM implements BatchingFSM"
+    ],
+    "participants": ["leader or follower main thread", "FSM goroutine", "application FSM"],
+    "event_paths": [
+      "AddVoter/RemoveServer -> appendConfigurationEntry -> dispatchLogs -> commit -> processLogs -> fsmMutateCh -> applyBatch",
+      "AddVoter/RemoveServer -> appendConfigurationEntry -> dispatchLogs -> commit -> processLogs -> fsmMutateCh -> applySingle -> StoreConfiguration"
+    ],
+    "source_ids": ["S34", "S35", "S36", "S37", "S38", "S8", "S21", "S24"],
+    "counterevidence": [
+      "The early return at fsm.go:111-115 is explicitly commented as 'Return early to avoid incrementing the index and term for an unimplemented operation', showing the author considered the non-ConfigurationStore case deliberately.",
+      "BatchingFSM.ApplyBatch's own doc says LogConfiguration entries will be sent to the batching FSM, which is consistent with the batching FSM being expected to persist configuration itself; this may mean ConfigurationStore is intended to be a non-batching-only interface and the interface comment is merely imprecise.",
+      "No existing test in the snapshot combines BatchingFSM with ConfigurationStore, so the current behaviour is not contradicted by a failing retained expectation."
+    ],
+    "unknowns": [
+      "Whether a FSM implementing both BatchingFSM and ConfigurationStore is a supported/legal configuration, or whether the two interfaces are contractually exclusive.",
+      "Whether the intended delivery point for batching FSMs is ApplyBatch alone, making the ConfigurationStore comment inaccurate rather than the dispatch incomplete.",
+      "Whether any library-owned or documented FSM (e.g. middleware examples) implements both interfaces and depends on StoreConfiguration."
+    ]
+  },
+  "obligation": {
+    "id": "claim-config-store-delivery",
+    "kind": "obligation",
+    "concern": "implementation_semantics",
+    "description": "For every FSM that implements ConfigurationStore, the library must invoke StoreConfiguration(index, configuration) for each committed configuration log entry that it delivers to the FSM, so that a persistent FSM can reconstruct configuration without an external snapshot.",
+    "source_ids": ["S34", "S36", "S37"],
+    "scope": {
+      "description": "A single Raft node whose FSM implements ConfigurationStore, processing a committed LogConfiguration entry. The obligation concerns delivery of the configuration entry to the FSM, not the correctness of the configuration value itself.",
+      "assumptions": [
+        "The entry has been committed (reached the FSM via processLogs).",
+        "The FSM implements ConfigurationStore as documented in configuration.go:44-52."
+      ],
+      "excluded": [
+        "Whether ApplyBatch is the intended delivery point for batching FSMs is a separate contract question; this claim only asserts the ConfigurationStore contract.",
+        "Consensus safety of the configuration entry's commitment rule is out of scope."
+      ]
+    },
+    "pending": [
+      "Confirm from source whether the batching dispatch is intended to replace ConfigurationStore delivery.",
+      "Construct a direct test with a FSM implementing both interfaces and observe whether StoreConfiguration is called for a committed configuration entry."
+    ],
+    "grounding": {
+      "source_ids": ["S34", "S35", "S36", "S37", "S38"],
+      "expectation_ids": [],
+      "binding_ids": ["binding-config-store-delivery"],
+      "derivation": "configuration.go:44-52 states that StoreConfiguration 'is invoked once a log entry containing a configuration change is committed'. fsm.go:90 type-asserts ConfigurationStore and fsm.go:118 is the only call site, inside applySingle. fsm.go:127-186 shows applyBatch returns early to applySingle only when batching is NOT enabled, so with BatchingFSM the single call site is unreachable. fsm.go:51-69 separately documents that LogConfiguration entries are sent to ApplyBatch.",
+      "applicability": "Applicable to a FSM implementing both BatchingFSM and ConfigurationStore; the non-batching case calls StoreConfiguration as documented.",
+      "unresolved": [
+        "Whether implementing both interfaces is a supported configuration.",
+        "Whether the intended normative reading is that ConfigurationStore applies only to non-batching FSMs."
+      ],
+      "conflicts": [
+        "ConfigurationStore's 'is invoked once a log entry containing a configuration change is committed' cannot hold together with ApplyBatch being the only delivery for batching FSMs."
+      ],
+      "alternatives": [
+        "The configuration is delivered to batching FSMs solely through ApplyBatch and ConfigurationStore is documented imprecisely; under that reading there is no violation, only a documentation gap."
+      ]
+    }
+  },
+  "bindings": [
+    {
+      "id": "binding-config-store-delivery",
+      "material_id": "S39",
+      "symbol": "runFSM",
+      "start_line": 86,
+      "end_line": 125,
+      "description": "applySingle is the only code path that calls ConfigurationStore.StoreConfiguration (fsm.go:118), and it returns early for LogConfiguration when the FSM does not implement ConfigurationStore.",
+      "pending": ["Confirm this path is only reached when BatchingFSM is not implemented."],
+      "associations": [
+        {
+          "claim_id": "claim-config-store-delivery",
+          "source_ids": ["S34", "S35", "S36", "S37", "S38"],
+          "rationale": "Anchors the documented ConfigurationStore contract (S34) to the sole StoreConfiguration call site inside applySingle (S36, fsm.go:118), and shows that the batching dispatch selects applyBatch and never applySingle (S35, S37), so the only call site is unreachable for a FSM implementing BatchingFSM; testing_batch.go's MockFSM ApplyBatch returns nil for non-LogCommand entries (S38), consistent with the gap."
+        }
+      ]
+    }
+  ]
+}

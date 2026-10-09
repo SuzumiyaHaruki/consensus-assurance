@@ -1,0 +1,128 @@
+{
+  "description": "Second scenario for the same requirement, measuring the downstream consequence of the heartbeat fast path skipping the RPC-header gate: once an out-of-window pure heartbeat has been acted on, the receiver treats the foreign sender as its known leader and rejects an otherwise acceptable vote request from a configured candidate, whereas the same request is granted when no such heartbeat was seen.",
+  "claim_id": "claim-heartbeat-header-gate",
+  "binding_ids": [
+    "binding-heartbeat-header-gate"
+  ],
+  "harness": {
+    "execution_package": ".",
+    "files": {},
+    "kind": "go_test",
+    "source": "package raft\n\nimport (\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"io\"\n\t\"testing\"\n)\n\ntype hbvFSM struct{}\n\nfunc (f *hbvFSM) Apply(l *Log) interface{}       { return nil }\nfunc (f *hbvFSM) Snapshot() (FSMSnapshot, error) { return &hbvSnapshot{}, nil }\nfunc (f *hbvFSM) Restore(r io.ReadCloser) error  { r.Close(); return nil }\n\ntype hbvSnapshot struct{}\n\nfunc (s *hbvSnapshot) Persist(sink SnapshotSink) error { return sink.Close() }\nfunc (s *hbvSnapshot) Release()                        {}\n\nfunc hbvEmit(t *testing.T, ev map[string]interface{}) {\n\tt.Helper()\n\tb, err := json.Marshal(ev)\n\tif err != nil {\n\t\tt.Fatalf(\"marshal event: %v\", err)\n\t}\n\tfmt.Println(\"CA_EVENT \" + string(b))\n}\n\nfunc hbvNode(t *testing.T, localID ServerID, voters []ServerID) *Raft {\n\tt.Helper()\n\tconf := inmemConfig(t)\n\tconf.ProtocolVersion = ProtocolVersionMax\n\tconf.skipStartup = true\n\tconf.LocalID = localID\n\t_, trans := NewInmemTransport(ServerAddress(localID))\n\tlogs, stable, snaps := NewInmemStore(), NewInmemStore(), NewInmemSnapshotStore()\n\tconfiguration := Configuration{}\n\tfor _, v := range voters {\n\t\tconfiguration.Servers = append(configuration.Servers, Server{\n\t\t\tSuffrage: Voter, ID: v, Address: ServerAddress(v),\n\t\t})\n\t}\n\tif err := BootstrapCluster(conf, logs, stable, snaps, trans, configuration); err != nil {\n\t\tt.Fatalf(\"BootstrapCluster(%s): %v\", localID, err)\n\t}\n\tr, err := NewRaft(conf, &hbvFSM{}, logs, stable, snaps, trans)\n\tif err != nil {\n\t\tt.Fatalf(\"NewRaft(%s): %v\", localID, err)\n\t}\n\tr.setState(Follower)\n\treturn r\n}\n\n// hbvGhostHeartbeat delivers a pure heartbeat with an out-of-window protocol\n// version through the fast-path handler, as net_transport would after\n// classifying it.\nfunc hbvGhostHeartbeat(t *testing.T, r *Raft, ghost ServerID, term uint64) {\n\tt.Helper()\n\tencoded := r.trans.EncodePeer(ghost, ServerAddress(ghost))\n\treq := &AppendEntriesRequest{\n\t\tRPCHeader: RPCHeader{ProtocolVersion: ProtocolVersion(0), ID: []byte(ghost), Addr: encoded},\n\t\tTerm:      term,\n\t\tLeader:    encoded,\n\t}\n\tch := make(chan RPCResponse, 1)\n\tr.processHeartbeat(RPC{Command: req, RespChan: ch})\n\t<-ch\n}\n\nfunc hbvAskVote(r *Raft, candidate ServerID, lastIdx, lastTerm uint64) (bool, string) {\n\tch := make(chan RPCResponse, 1)\n\tencoded := r.trans.EncodePeer(candidate, ServerAddress(candidate))\n\treq := &RequestVoteRequest{\n\t\tRPCHeader:    RPCHeader{ProtocolVersion: ProtocolVersionMax, ID: []byte(candidate), Addr: encoded},\n\t\tTerm:         r.getCurrentTerm() + 1,\n\t\tCandidate:    encoded,\n\t\tLastLogIndex: lastIdx,\n\t\tLastLogTerm:  lastTerm,\n\t}\n\tr.processRPC(RPC{Command: req, RespChan: ch})\n\tres := <-ch\n\tif res.Error != nil {\n\t\treturn false, fmt.Sprintf(\"%v\", res.Error)\n\t}\n\tresp, ok := res.Response.(*RequestVoteResponse)\n\tif !ok || resp == nil {\n\t\treturn false, \"unexpected response type\"\n\t}\n\treturn resp.Granted, \"\"\n}\n\n// TestAssuranceGhostHeartbeatSuppressesVote observes whether an out-of-window\n// heartbeat that reaches the fast path leaves the receiver unwilling to vote for\n// a legitimate candidate.\nfunc TestAssuranceGhostHeartbeatSuppressesVote(t *testing.T) {\n\tconst receiver = ServerID(\"node1\")\n\tconst candidate = ServerID(\"node2\")\n\tconst ghost = ServerID(\"ghost\")\n\tvoters := []ServerID{receiver, candidate, \"node3\"}\n\n\thbvEmit(t, map[string]interface{}{\n\t\t\"event\":                         \"ghost_scenario_declared\",\n\t\t\"op_id\":                         \"hbv-1\",\n\t\t\"ghost_heartbeat_out_of_window\": true,\n\t\t\"candidate\":                     string(candidate),\n\t\t\"candidate_is_configured_voter\": true,\n\t})\n\n\ttested := hbvNode(t, receiver, voters)\n\tlastIdx, lastTerm := tested.getLastEntry()\n\thbvGhostHeartbeat(t, tested, ghost, tested.getCurrentTerm()+1)\n\tleaderAddr, leaderID := tested.LeaderWithID()\n\tgranted, errStr := hbvAskVote(tested, candidate, lastIdx, lastTerm)\n\thbvEmit(t, map[string]interface{}{\n\t\t\"event\":                   \"vote_after_ghost_heartbeat\",\n\t\t\"op_id\":                   \"hbv-1\",\n\t\t\"ghost_leader_adopted\":    leaderAddr != \"\",\n\t\t\"known_leader_id\":         string(leaderID),\n\t\t\"legitimate_vote_granted\": granted,\n\t\t\"error\":                   errStr,\n\t\t\"candidate\":               string(candidate),\n\t})\n\n\t// Control: the same vote request on a receiver that never saw the ghost.\n\tcontrol := hbvNode(t, receiver, voters)\n\tcIdx, cTerm := control.getLastEntry()\n\tcGranted, cErr := hbvAskVote(control, candidate, cIdx, cTerm)\n\tcAddr, cID := control.LeaderWithID()\n\thbvEmit(t, map[string]interface{}{\n\t\t\"event\":                   \"control_vote_without_ghost\",\n\t\t\"op_id\":                   \"hbv-2\",\n\t\t\"ghost_leader_adopted\":    false,\n\t\t\"known_leader_id\":         string(cID),\n\t\t\"known_leader_addr\":       string(cAddr),\n\t\t\"legitimate_vote_granted\": cGranted,\n\t\t\"error\":                   cErr,\n\t\t\"candidate\":               string(candidate),\n\t})\n}\n",
+    "description": "TestAssuranceGhostHeartbeatSuppressesVote builds voter nodes with background goroutines disabled and a bootstrapped three-voter configuration. On the tested node it delivers a pure heartbeat with an out-of-window protocol version through the fast-path handler, then drives a RequestVote from a configured candidate through processRPC and records whether the receiver adopted the ghost as leader and whether the legitimate vote was granted; a second node that never saw the heartbeat answers the same request as a control. CA_EVENT lines report the declaration and both results.",
+    "semantic_changes": [
+      "The out-of-window heartbeat is delivered by calling processHeartbeat, the body of the handler installed by SetHeartbeatHandler (the library's own integration test calls r.processHeartbeat(rpc) from a custom heartbeat handler), because net_transport's fast path is TCP-only and the sandbox has network access disabled; the transport's heartbeat classification is a sourced premise.",
+      "Nodes are built with conf.skipStartup so no background goroutines run, and the vote is driven through processRPC, the production dispatch.",
+      "The vote request is constructed from the receiver's own last entry so the log-up-to-date condition is not what decides the outcome. No target code is modified."
+    ],
+    "prerequisites": [
+      {
+        "alias": "ghost-scenario",
+        "event": "ghost_scenario_declared",
+        "conditions": [
+          {
+            "field": "ghost_heartbeat_out_of_window",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          },
+          {
+            "field": "candidate_is_configured_voter",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          }
+        ]
+      }
+    ],
+    "legality": {
+      "source_ids": [
+        "S40",
+        "S41",
+        "S42",
+        "S43",
+        "S44",
+        "S45",
+        "S6",
+        "S21",
+        "S14"
+      ],
+      "expectation_ids": [],
+      "binding_ids": [
+        "binding-heartbeat-header-gate"
+      ],
+      "derivation": "S42 defines the header window; S41 shows the normal path applying it; S40 and S43 show the fast path reaching appendEntries without it; S44 justifies invoking that handler directly as the production seam; S45 shows InmemTransport does not implement the fast path, so it must be reached deliberately; S14 is the term persistence the handler performs; S6 shows that a known leader causes a vote to be rejected unless the transfer flag is set, and S21 supplies the membership helpers that would otherwise allow the candidate. The chain from the skipped gate to the suppressed vote is therefore sourced end to end.",
+      "applicability": "Applies to a receiver that has acted on an out-of-window heartbeat from a sender outside its configuration and then receives a vote request from a configured candidate whose log is not older.",
+      "unresolved": [
+        "Whether a peer outside the supported window can deliver such a heartbeat in a legal deployment remains the requirement's open premise; this scenario assumes it can and measures the consequence.",
+        "No timing is exercised, so the scenario shows the receiver's state-dependent decision rather than how long the suppression lasts."
+      ],
+      "conflicts": [],
+      "alternatives": [
+        "If the deployment never mixes protocol windows, the suppressed-vote consequence cannot arise, and the correct disposition would be a documented assumption about transport peers."
+      ]
+    }
+  },
+  "monitors": [
+    {
+      "id": "m-ghost-heartbeat-vote",
+      "checker_id": "c-ghost-heartbeat-vote",
+      "event": "vote_after_ghost_heartbeat",
+      "binding_ids": [
+        "binding-heartbeat-header-gate"
+      ],
+      "grounding": {
+        "source_ids": [
+          "S40",
+          "S41",
+          "S42",
+          "S6"
+        ],
+        "expectation_ids": [],
+        "binding_ids": [
+          "binding-heartbeat-header-gate"
+        ],
+        "derivation": "S40/S42 locate the guard the fast path skips and S6 locates the vote rule that depends on a known leader, so the event's two fields together express the consequence of the skipped gate on the formation path.",
+        "applicability": "Only evaluated when the receiver actually adopted the out-of-window sender as its known leader.",
+        "unresolved": [],
+        "conflicts": [],
+        "alternatives": []
+      },
+      "applicability_conditions": [],
+      "admission_alias": "ghost-scenario"
+    }
+  ],
+  "observable_properties": [
+    {
+      "checker_id": "c-ghost-heartbeat-vote",
+      "kind": "event_implication",
+      "trigger": {
+        "field": "event",
+        "op": "eq",
+        "value": "vote_after_ghost_heartbeat",
+        "reference": null
+      },
+      "assertion": {
+        "field": "legitimate_vote_granted",
+        "op": "eq",
+        "value": false,
+        "reference": null
+      },
+      "antecedent": {
+        "field": "ghost_leader_adopted",
+        "op": "eq",
+        "value": true,
+        "reference": null
+      },
+      "identity_fields": [
+        "op_id"
+      ],
+      "description": "When an out-of-window heartbeat has made the receiver adopt a foreign sender as its known leader, an otherwise acceptable vote request from a configured candidate is rejected."
+    }
+  ],
+  "uncertainties": [
+    "Reachability of a peer outside the supported protocol window in a legal deployment; the scenario assumes it.",
+    "The duration of the suppression is not measured, only the state-dependent decision.",
+    "No live cluster, term interaction or election is exercised."
+  ]
+}
