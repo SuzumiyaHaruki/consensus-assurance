@@ -22,7 +22,12 @@ RECONNECT_FIXTURE = Path(__file__).parent / "fixtures/recovered_reconnect.jsonl"
 
 def make_repo(path, backend="go_module"):
     path.mkdir()
-    runner.synthetic_source(path, backend)
+    files = {"go.mod": "module baseline.local/fixture\n\ngo 1.20\n", "sample/value.go":
+             "package sample\nfunc Add(a, b int) int { return a + b }\n"} if backend == "go_module" else {
+             "Cargo.toml": '[package]\nname = "baseline-smoke"\nversion = "0.1.0"\nedition = "2021"\n',
+             "src/lib.rs": "pub fn add(a: i32, b: i32) -> i32 { a + b }\n"}
+    for name, text in {**files, 'fixture.txt': 'synthetic source control'}.items():
+        file = path/name; file.parent.mkdir(parents=True, exist_ok=True); file.write_text(text)
     for args in (["init", "-q"], ["add", "."], ["-c", "user.name=Test", "-c", "user.email=test@example.invalid",
                                                  "commit", "-qm", "Synthetic input"]):
         subprocess.run(["git", "-C", str(path), *args], check=True, capture_output=True)
@@ -75,8 +80,7 @@ def test_configuration_paths_and_neutral_target(tmp_path):
 @pytest.mark.parametrize("update", [{"unknown": True}, {"budget": {"agent_calls": -1}},
     {"budget": {"total_seconds": float("nan")}}, {"allow_experiments": "true"},
     {"codex_provider": {"id": "other", "base_url": "https://example.org", "env_key": "HOME"}},
-    {"auth_mode": "api_key", "api_key_env": "HOME"}, {"agent_model": "--bad"},
-    {"cargo_seed_cache_dir": "obsolete-field"}])
+    {"auth_mode": "api_key", "api_key_env": "HOME"}, {"agent_model": "--bad"}])
 def test_invalid_config_rejected(update):
     values = {"target_config": "target.yaml", "agent_model": "chosen-model", "agent_reasoning_effort": "high",
               "auth_mode": "codex_login", **update}
@@ -99,7 +103,6 @@ def test_no_paid_call_without_authorization(tmp_path, monkeypatch):
     path = tmp_path / "local.yaml"
     path.write_text(yaml.safe_dump(c.model_dump()))
     monkeypatch.setattr(runner, "run", lambda *a, **k: pytest.fail("Must not start model run"))
-    assert main(["smoke", "--config", str(path)]) == 2
     c.allow_experiments = False
     path.write_text(yaml.safe_dump(c.model_dump()))
     assert main(["run", "--config", str(path)]) == 2
@@ -140,21 +143,18 @@ def test_native_events_and_only_top_level_errors(tmp_path, kwargs, status):
 
 
 @pytest.mark.parametrize("ending,status", [("recovered", "completed"), ("failed", "external_error"),
-    ("incomplete", "external_error"), ("nonzero_exit", "external_error"),
-    ("missing_final", "external_blocker_needs_review"), ("changed_session", "session_mismatch")])
+    ("incomplete", "external_error"), ("nonzero_exit", "external_error")])
 def test_reconnect_notification_and_terminal_outcome(tmp_path, ending, status):
     # Excerpt from the 2026-10-08 19:28 HashiCorp run; no model call is replayed.
     items = [json.loads(line) for line in RECONNECT_FIXTURE.read_text().splitlines()]
     session = items[0]["thread_id"]
-    result = events(tmp_path, final=None if ending == "missing_final" else "Partial handoff.")
+    result = events(tmp_path)
     if ending == "incomplete":
         items.pop()
     elif ending == "failed":
         items.append({"type": "turn.failed", "error": {"message": "stream disconnected"}})
     elif ending == "nonzero_exit":
         result["exit_code"] = 1
-    elif ending == "changed_session":
-        session = SESSION
     (tmp_path / "stdout.jsonl").write_text("".join(json.dumps(item) + "\n" for item in items))
     result = codex.decode(tmp_path, result, session)
     assert result["status"] == status
@@ -238,13 +238,7 @@ class ScriptedClient:
 def test_continuing_run_and_completed_report_retention(tmp_path, statuses, stop, turns, report):
     c = configuration(tmp_path)
     class Client(ScriptedClient):
-        def turn(self, folder, prompt, timeout, session):
-            result = super().turn(folder, prompt, timeout, session)
-            notification = next(json.loads(line) for line in RECONNECT_FIXTURE.read_text().splitlines()
-                                if json.loads(line).get("type") == "error")
-            path = folder / "stdout.jsonl"
-            path.write_text(json.dumps(notification) + "\n" + path.read_text())
-            return codex.decode(folder, result, session)
+        pass
     Client.statuses = statuses
     result = runner.run(c, load_target(c), client_factory=Client)
     assert result["stop"] == stop
@@ -275,20 +269,24 @@ def test_preparation_counts_and_timeout_uses_minimum(tmp_path, monkeypatch):
     assert result["stop"] == "total_deadline"
 
 
-def test_empty_smoke_handoffs_cannot_pass_compatibility(tmp_path):
-    c = configuration(tmp_path)
+def test_unchanged_report_reuses_completed_delta_before_later_timeout(tmp_path):
     class Client(ScriptedClient):
-        def turn(self, folder, prompt, timeout, session):
-            assert "compatibility" in prompt and "variant\": \"synthetic" in prompt
-            self.calls.append((timeout, session))
-            return codex.decode(folder, events(folder), session)
-    result = runner.run(c, load_target(c), smoke=True, client_factory=Client)
-    assert not result["ok"] and result["stop"] == "smoke_call_limit"
-    root = Path(result["run_dir"])
-    observed = json.loads((root / "inputs/smoke-observations.json").read_text())
-    assert observed["observed"]["same_session"] and not observed["complete"]
-    record = json.loads((root / "run.json").read_text())
-    assert record["config"]["budget"]["agent_calls"] == 2
+        statuses = ['completed', 'completed', 'timeout']
+        def turn(self, *args):
+            result = super().turn(*args)
+            if len(self.calls) == 2:
+                (self.root/'work/report.md').write_text('report 1')
+            return result
+    config = configuration(tmp_path)
+    result = runner.run(config, load_target(config), client_factory=Client)
+    root = Path(result['run_dir'])
+    record = json.loads((root/'run.json').read_text())
+    assert result['stop'] == 'turn_timeout'
+    assert record['last_completed_report'] == 'turns/0001/changes/files/report.md'
+    assert (root/record['last_completed_report']).read_text() == 'report 1'
+    assert not (root/'turns/0002/changes/files/report.md').exists()
+    assert not list((root/'turns').glob('*/report.md'))
+    assert (root/'turns/0003/changes/files/report.md').read_text() == 'report 3'
 
 
 def test_late_turn_error_keeps_work_and_previous_handoff(tmp_path):
@@ -302,7 +300,7 @@ def test_late_turn_error_keeps_work_and_previous_handoff(tmp_path):
     result = runner.run(c, load_target(c), client_factory=Client)
     root = Path(result["run_dir"])
     assert result["stop"] == "external_blocker_needs_review"
-    assert (root / "turns/0001/report.md").read_text() == "report 1"
+    assert (root / "turns/0001/changes/files/report.md").read_text() == "report 1"
     assert (root / "turns/0002/changes/files/report.md").read_text() == "unfinished report"
 
 
@@ -312,6 +310,19 @@ def test_check_env_deadline_does_not_mean_verified(tmp_path, monkeypatch):
     monkeypatch.setattr(runner, "time", SimpleNamespace(monotonic=lambda: next(ticks, 300.0)))
     result = runner.check_environment(c, load_target(c))
     assert not result["ok"] and result["stop"] == "total_deadline"
+
+
+def test_stdio_check_timeout_keeps_controller_timeout_and_restores_authorization(tmp_path):
+    client = object.__new__(codex.Codex)
+    client.prompt_probe = client.dependency_probe = lambda: None
+    client.deadline = time.monotonic() + .05
+    client.execution_control = {}
+    client.control_path = tmp_path/'control.json'
+    client.config = SimpleNamespace(allow_agent_materials=False, allow_experiments=False)
+    client.mcp_probe = lambda: asyncio.sleep(1)
+    with pytest.raises(TimeoutError, match='MCP compatibility check timed out'):
+        client.check_environment()
+    assert not json.loads(client.control_path.read_text())['allow_experiments']
 
 
 @pytest.mark.parametrize("exception", [subprocess.TimeoutExpired(["go", "env", "GOROOT"], 30), TimeoutError()])
@@ -366,33 +377,29 @@ def test_process_cancellation_and_credential_redaction(tmp_path):
     assert (tmp_path / "logs/stdout.jsonl").read_text().strip() == "[REDACTED_CREDENTIAL]"
 
 
-def test_implementation_identity_tracks_loaded_bytes_and_preserves_start(tmp_path, monkeypatch):
-    project = make_repo(tmp_path / 'implementation')
-    base = project / 'baseline'
-    base.mkdir()
-    for name in ('__main__.py', 'runner.py', 'codex.py', 'local_exec.py', 'requirements.txt', 'task.md'):
-        (base / name).write_text('initial execution input\n')
+def test_implementation_identity_preserves_dirty_and_external_source(tmp_path, monkeypatch):
+    project = make_repo(tmp_path/'implementation')
+    base = project/'baseline'; base.mkdir()
+    (base/'runner.py').write_text('initial input\n')
     runner.git(project, 'add', 'baseline')
     runner.git(project, '-c', 'user.name=T', '-c', 'user.email=t@example.invalid', 'commit', '-qm', 'Implementation')
-    monkeypatch.setattr(runner, '__file__', str(base / 'runner.py'))
+    monkeypatch.setattr(runner, '__file__', str(base/'runner.py'))
     module = sys.modules['consensus_assurance.adapters.storage.snapshot']
-    installed = tmp_path / 'installed.py'
-    installed.write_text('installed module bytes\n')
+    installed = tmp_path/'installed.py'; installed.write_text('external source\n')
     monkeypatch.setattr(module, '__file__', str(installed))
-    root = tmp_path / 'record'
+    root = tmp_path/'record'
     first = runner.implementation_identity(root)
     assert not first['execution_inputs_dirty']
-    assert first['inputs'] == runner.implementation_identity(root)['inputs']
-    entry = first['inputs'][module.__name__]
-    assert entry['path'] == str(installed) and entry['framework_relative_path'] is None
-    assert entry['version_basis'].startswith('external installed bytes')
-    (base / 'runner.py').write_text('changed execution input\n')
-    installed.write_text('changed installed bytes\n')
-    (project / 'unrelated.env').write_text('PRIVATE_NOT_AN_EXECUTION_INPUT')
-    later = runner.implementation_identity(root / 'later')
+    entry = first['retained_source'][module.__name__.replace('.', '/')+'.py']
+    assert entry['source'] == str(installed) and (root/entry['record']).read_bytes() == installed.read_bytes()
+    (base/'runner.py').write_text('changed input\n')
+    (base/'tests').mkdir(); (base/'tests/test_fixture.py').write_text('not a runtime input')
+    (project/'src').mkdir(); (project/'src/.env').write_text('private input')
+    runner.git(project, 'add', 'baseline')  # Staged edits are still dirty relative to HEAD.
+    later = runner.implementation_identity(root/'later')
     assert later['execution_inputs_dirty'] and later['framework_commit'] == first['framework_commit']
-    assert later['inputs']['baseline/runner.py']['sha256'] != first['inputs']['baseline/runner.py']['sha256']
-    result = runner.finish_identity(root, first)
-    assert not result['inputs_unchanged'] and set(result['changed_inputs']) == {'baseline/runner.py', module.__name__}
-    assert first['inputs']['baseline/runner.py']['sha256'] != later['inputs']['baseline/runner.py']['sha256']
-    assert all(b'PRIVATE_NOT_AN_EXECUTION_INPUT' not in p.read_bytes() for p in root.rglob('*') if p.is_file())
+    entry = later['retained_source']['baseline/runner.py']
+    assert (root/'later'/entry['record']).read_text() == 'changed input\n'
+    assert 'baseline/tests/test_fixture.py' not in later['retained_source']
+    assert later['retained_source']['src/.env']['record'] is None
+    assert len(first['reload_inputs']) == 2

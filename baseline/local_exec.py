@@ -4,10 +4,10 @@ import importlib.metadata
 import json
 import os
 import signal
+import shutil
 import sys
 import sysconfig
 import time
-from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
@@ -18,7 +18,6 @@ from mcp.server.lowlevel import Server
 from mcp.server.stdio import stdio_server
 from pydantic import BaseModel, ConfigDict, Field
 
-from consensus_assurance.adapters.runners.experiment import isolated_command
 from consensus_assurance.adapters.storage.files import write_json
 
 
@@ -79,6 +78,28 @@ def validate_directory(work, relative):
     if not resolved.is_relative_to(work) or not resolved.is_dir():
         raise ValueError('cwd escapes this run working copy or is not a directory')
     return resolved
+
+
+def isolated_command(command, workspace, directory, tool_roots=(), read_only_roots=()):
+    """Allowlisted filesystem for caller-selected commands; roots are trusted inputs."""
+    executable = shutil.which('bwrap')
+    if not executable:
+        raise FileNotFoundError('Bubblewrap is required; no host execution fallback')
+    args = [executable, '--die-with-parent', '--new-session', '--unshare-net', '--unshare-pid',
+            '--unshare-ipc', '--unshare-uts', '--cap-drop', 'ALL']
+    for name in ('/usr/bin', '/usr/lib', '/usr/lib64', '/usr/libexec', '/usr/include', '/usr/share', '/etc/alternatives'):
+        if Path(name).is_dir():args += ['--ro-bind', name, name]
+    for name in ('/bin', '/sbin', '/lib', '/lib64'):
+        path = Path(name)
+        if path.is_symlink():args += ['--symlink', os.readlink(path), name]
+        elif path.is_dir():args += ['--ro-bind', name, name]
+    if Path('/etc/ld.so.cache').is_file():args += ['--ro-bind', '/etc/ld.so.cache', '/etc/ld.so.cache']
+    for path in (*tool_roots, *read_only_roots):
+        args += ['--ro-bind', str(path), str(path)]
+    args += ['--tmpfs', '/tmp', '--tmpfs', '/run', '--dir', '/var', '--symlink', '/run', '/var/run',
+             '--dev', '/dev', '--proc', '/proc', '--bind', str(workspace), str(workspace),
+             '--chdir', str(directory), '--', *command]
+    return args
 
 
 async def execute(control, arguments, request_id):
@@ -199,40 +220,6 @@ def reconcile(records, turn, reason):
         if record['turn'] == turn and record['status'] == 'running':
             record.update(status='interrupted', reason=reason, observed_at=timestamp())
             write_json(path, record)
-
-
-@asynccontextmanager
-async def app_server(command, cwd, environment, folder, timeout):
-    """Bounded local Codex protocol session with raw responses retained."""
-    folder.mkdir(parents=True, exist_ok=True)
-    child = None
-    with (folder/'stderr.log').open('wb') as err, (folder/'stdout.jsonl').open('wb') as out:
-        try:
-            child = await asyncio.create_subprocess_exec(*command, cwd=cwd, env=environment,
-                stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=err, start_new_session=True)
-            number = 0
-            async def request(method, params):
-                nonlocal number
-                number += 1
-                child.stdin.write((json.dumps({'id':number, 'method':method, 'params':params})+'\n').encode())
-                await child.stdin.drain()
-                while True:
-                    line = await child.stdout.readline()
-                    if not line:raise ValueError('Codex app server ended before a response')
-                    out.write(line); out.flush()
-                    response = json.loads(line)
-                    if response.get('id') == number:
-                        if 'error' in response:raise ValueError(str(response['error']))
-                        return response['result']
-            with anyio.fail_after(timeout):
-                await request('initialize', {'clientInfo': {'name':'baseline-local-probe', 'version':'1'},
-                    'capabilities': {'experimentalApi': True}})
-                yield request
-        finally:
-            if child:
-                try:os.killpg(child.pid, signal.SIGKILL)
-                except ProcessLookupError:pass
-                await asyncio.wait_for(child.communicate(), 3)
 
 
 if __name__ == '__main__':

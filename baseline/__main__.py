@@ -124,22 +124,17 @@ def validate_selection(config):
 def main(argv=None):
     parser = argparse.ArgumentParser(description="普通 Codex 审计基线；默认不调用模型")
     sub = parser.add_subparsers(dest="command", required=True)
-    for name in ("check-env", "smoke", "run"):
+    for name in ("check-env", "run"):
         command = sub.add_parser(name)
         command.add_argument("--config", required=True)
-        if name == "smoke":
-            command.add_argument("--allow-paid", action="store_true")
     args = parser.parse_args(argv)
     try:
         config = load_config(args.config)
         target = validate_selection(config)
-        if args.command == "smoke" and not args.allow_paid:
-            raise ValueError("smoke requires explicit --allow-paid; no model request sent")
         if args.command != "check-env" and not (config.allow_agent_materials and config.allow_experiments):
             raise ValueError("Set allow_agent_materials and allow_experiments explicitly before model use")
         from .runner import check_environment, run
-        result = check_environment(config, target) if args.command == "check-env" else run(
-            config, target, smoke=args.command == "smoke")
+        result = check_environment(config, target) if args.command == "check-env" else run(config, target)
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0 if result["ok"] else 1
     except ValidationError as exc:

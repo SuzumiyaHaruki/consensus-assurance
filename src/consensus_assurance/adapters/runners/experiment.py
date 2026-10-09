@@ -34,7 +34,8 @@ def sandbox_command(command, workspace, mode, read_only_roots=(), view_path=None
         raise FileNotFoundError("bubblewrap is required by execution_isolation=bwrap")
     args = [executable, "--die-with-parent", "--new-session", "--unshare-net", "--unshare-pid", "--ro-bind", "/", "/",
             "--tmpfs", "/home", "--tmpfs", "/root", "--tmpfs", "/tmp", "--dev", "/dev", "--proc", "/proc"]
-    # Only the experiment workspace is writable; raw run logs and source repositories are hidden.
+    # The host root is read-only; /home, /root and /tmp are hidden.
+    # The workspace is writable, but unrelated unmasked host paths remain readable.
     visible = str(view_path or workspace)
     args += ["--bind", str(workspace), visible]
     for cache in read_only_roots:
@@ -45,28 +46,6 @@ def sandbox_command(command, workspace, mode, read_only_roots=(), view_path=None
         tool_root = exe.parent.parent
         args += ["--ro-bind", str(tool_root), str(tool_root)]
     args += ["--chdir", visible, "--", str(exe), *command[1:]]
-    return args
-
-
-def isolated_command(command, workspace, directory, tool_roots=(), read_only_roots=()):
-    """Allowlisted filesystem for caller-selected commands; roots are trusted inputs."""
-    executable = shutil.which('bwrap')
-    if not executable:
-        raise FileNotFoundError('Bubblewrap is required; no host execution fallback')
-    args = [executable, '--die-with-parent', '--new-session', '--unshare-net', '--unshare-pid',
-            '--unshare-ipc', '--unshare-uts', '--cap-drop', 'ALL']
-    for name in ('/usr/bin', '/usr/lib', '/usr/lib64', '/usr/libexec', '/usr/include', '/usr/share', '/etc/alternatives'):
-        if Path(name).is_dir():args += ['--ro-bind', name, name]
-    for name in ('/bin', '/sbin', '/lib', '/lib64'):
-        path = Path(name)
-        if path.is_symlink():args += ['--symlink', os.readlink(path), name]
-        elif path.is_dir():args += ['--ro-bind', name, name]
-    if Path('/etc/ld.so.cache').is_file():args += ['--ro-bind', '/etc/ld.so.cache', '/etc/ld.so.cache']
-    for path in (*tool_roots, *read_only_roots):
-        args += ['--ro-bind', str(path), str(path)]
-    args += ['--tmpfs', '/tmp', '--tmpfs', '/run', '--dir', '/var', '--symlink', '/run', '/var/run',
-             '--dev', '/dev', '--proc', '/proc', '--bind', str(workspace), str(workspace),
-             '--chdir', str(directory), '--', *command]
     return args
 
 

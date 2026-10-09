@@ -1,6 +1,9 @@
 """Native text turns, isolated configuration, and verified local permissions."""
 import json
 import asyncio
+
+from mcp import ClientSession, StdioServerParameters
+from mcp.client.stdio import stdio_client
 import os
 import re
 import shutil
@@ -12,7 +15,7 @@ from pathlib import Path
 from uuid import UUID
 
 from consensus_assurance.adapters.agents.backend import (
-    classify_failure, codex_diagnostic, common_settings, DISABLED_FEATURES, toml, codex_options as options,
+    classify_failure, codex_diagnostic, common_settings, DISABLED_FEATURES, codex_options as options,
 )
 from consensus_assurance.adapters.runners.go_module import GoModuleBackend
 from consensus_assurance.adapters.storage.files import write_json, digest
@@ -61,7 +64,7 @@ def process(command, cwd, folder, timeout, *, env, stdin="", secrets=()):
     return result
 
 
-def decode(folder, result, session_id=None):
+def read_events(folder):
     events, invalid = [], 0
     for line in (folder / "stdout.jsonl").read_text(errors="replace").splitlines():
         try:
@@ -71,6 +74,11 @@ def decode(folder, result, session_id=None):
             events.append(value)
         except ValueError:
             invalid += 1
+    return events, invalid
+
+
+def decode(folder, result, session_id=None):
+    events, invalid = read_events(folder)
     identities = [e.get("thread_id") for e in events if e.get("type") == "thread.started"]
     identity = identities[-1] if identities else session_id
     completed = [e for e in events if e.get("type") == "turn.completed"]
@@ -279,8 +287,6 @@ class Codex:
                 raise ValueError("Catalog does not support the requested reasoning effort")
             if self.config.agent_reasoning_effort is None and (supported or models[0].get("default_reasoning_level")):
                 raise ValueError("null cannot omit reasoning with this catalog's defaults; select an explicit effort")
-            (self.root / "inputs/models.json").write_bytes(raw)
-            self.settings["model_catalog_json"] = str(self.root / "inputs/models.json")
         elif provider or self.config.agent_reasoning_effort is None:
             raise ValueError("Custom models and omitted reasoning require an explicitly verified model catalog")
         else:
@@ -292,14 +298,19 @@ class Codex:
             if len(selected) != 1 or self.config.agent_reasoning_effort not in {
                     x["effort"] for x in selected[0].get("supported_reasoning_levels", [])}:
                 raise ValueError("Native model or effort is not advertised by this installed CLI catalog")
-            (self.root / "inputs/models.json").write_bytes(raw)
-            self.settings["model_catalog_json"] = str(self.root / "inputs/models.json")
+        (self.root / "inputs/models.json").write_bytes(raw)
+        self.settings["model_catalog_json"] = str(self.root / "inputs/models.json")
         self.permission_probe()
-        asyncio.run(self.mcp_probe())
         write_json(self.root/'inputs/local-exec.json', local_exec.identity(self.mcp_settings, self.execution_control))
         self.execution_control['allow_experiments'] = self.config.allow_agent_materials and self.config.allow_experiments
         write_json(self.control_path, self.execution_control)
-        self.prompt_probe()
+        # The selected CLI materializes bundled skills only on prompt initialization.
+        result, _ = self.local(["debug", "prompt-input", *options(self.settings),
+                               "Local configuration initialization only."], "prompt-bootstrap")
+        if result["status"] != "completed" or result["exit_code"]:
+            raise ValueError("Cannot initialize bundled skill suppression")
+        self.settings["skills.config"] = [{"path": str(path), "enabled": False}
+                                          for path in sorted(self.client_home.glob("skills/**/SKILL.md"))]
         versions = {}
         commands = {"platform": ["uname", "-sm"], "go": ["go", "version"],
                     "go_environment": ["go", "env", "GOOS", "GOARCH", "GOVERSION", "GOROOT", "GOMODCACHE", "GOCACHE", "GOFLAGS", "GOWORK"]} if tool == "go" else {
@@ -317,26 +328,27 @@ class Codex:
                 "native_retries": {"request_max_retries": 4, "stream_max_retries": 5} if provider else
                     {"policy": "bundled provider defaults, tied to recorded CLI version; reserved provider cannot be overridden"},
                 "unbounded_connection_retries": False, "outer_retries": 0,
-                "tool_evidence": {"local_registration_and_tcp": "verified",
-                                  "model_request_tool_surface": "not_inspected_by_check_env",
+                "tool_evidence": {"local_registration_and_tcp": "not_checked_in_ordinary_run",
+                                  "model_request_tool_surface": "not_inspected",
                                   "real_model_tool_use": "not_evaluated"},
                 "reasoning": self.config.agent_reasoning_effort, "permission_probe": "verified"}
 
     async def mcp_probe(self):
-        async with local_exec.app_server([*self.prefix(offline=True), 'app-server', '--strict-config',
-                *options(self.settings)], self.work, self.environment, self.root/'inputs/mcp-probe', self.limit()) as request:
-            thread = (await request('thread/start', {'cwd': str(self.work)}))['thread']['id']
-            inventory = await request('mcpServerStatus/list', {'threadId': thread})
-            if ([server['name'] for server in inventory['data']] != ['baseline_local'] or
-                    inventory['data'][0]['tools'] != {'isolated_exec': local_exec.tool().model_dump(mode='json', exclude_none=True)}):
-                raise ValueError('Codex MCP inventory differs from the authorized tool')
-            result = await request('mcpServer/tool/call', {'threadId': thread, 'server': 'baseline_local',
-                'tool': 'isolated_exec', 'arguments': {'argv': ['python3', '-c',
-                    "import socket; s=socket.socket();s.bind(('127.0.0.1',0));s.listen();c=socket.create_connection(s.getsockname());a,_=s.accept();c.sendall(b'ping');assert a.recv(4)==b'ping';a.sendall(b'pong');assert c.recv(4)==b'pong';print('ISOLATED_TCP_VERIFIED')"], 'timeout_seconds': 10.0}})
-            write_json(self.root/'inputs/local-exec-probe.json', {'inventory': inventory, 'call': result})
-            observed = result.get('structuredContent', {})
-            if observed.get('status') != 'completed' or observed.get('exit_code') != 0 or 'ISOLATED_TCP_VERIFIED' not in observed.get('stdout', {}).get('preview', ''):
-                raise ValueError('Isolated execution MCP probe failed; no model request sent')
+        settings = self.mcp_settings
+        server = StdioServerParameters(command=settings['command'], args=settings['args'], cwd=settings['cwd'], env={})
+        with (self.root/'inputs/local-exec-probe.stderr').open('w') as errors:
+            async with stdio_client(server, errlog=errors) as streams, ClientSession(*streams) as session:
+                await session.initialize()
+                inventory = await session.list_tools()
+                if inventory.tools != [local_exec.tool()]:
+                    raise ValueError('MCP inventory differs from the configured tool')
+                result = await session.call_tool('isolated_exec', {'argv': ['python3', '-c',
+                    "import socket; s=socket.socket();s.bind(('127.0.0.1',0));s.listen();c=socket.create_connection(s.getsockname());a,_=s.accept();c.sendall(b'ping');assert a.recv(4)==b'ping';a.sendall(b'pong');assert c.recv(4)==b'pong';print('ISOLATED_TCP_VERIFIED')"], 'timeout_seconds': 10.0})
+                write_json(self.root/'inputs/local-exec-probe.json', {'inventory': inventory.model_dump(mode='json'),
+                                                                    'call': result.model_dump(mode='json')})
+                observed = result.structuredContent or {}
+                if result.isError or observed.get('status') != 'completed' or observed.get('exit_code') != 0 or 'ISOLATED_TCP_VERIFIED' not in observed.get('stdout', {}).get('preview', ''):
+                    raise ValueError('Isolated execution MCP probe failed; no model request sent')
 
     def permission_probe(self):
         canary = self.home / "credential-canary"
@@ -377,13 +389,7 @@ print('PERMISSIONS_VERIFIED')
             raise ValueError("Permission probe failed; no source may be sent to a model; inspect inputs/permission-probe")
 
     def prompt_probe(self):
-        # This native debug command renders locally. The outer namespace has no network.
-        args = ["debug", "prompt-input", *options(self.settings), "Local configuration inspection only."]
-        result, _ = self.local(args, "prompt-bootstrap")
-        if result["status"] != "completed" or result["exit_code"]:
-            raise ValueError("Cannot inspect native prompt inputs without a model call")
-        self.settings["skills.config"] = [{"path": str(path), "enabled": False}
-                                          for path in sorted(self.client_home.glob("skills/**/SKILL.md"))]
+        # Explicit compatibility diagnostics, never a model turn.
         result, text = self.local(["debug", "prompt-input", *options(self.settings),
                                    "Local configuration inspection only."], "prompt-input")
         if result["status"] != "completed" or result["exit_code"]:
@@ -405,21 +411,30 @@ print('PERMISSIONS_VERIFIED')
         if result["status"] != "completed" or result["exit_code"]:
             raise ValueError("Offline dependency resolution failed; inspect inputs/dependency-probe")
 
+    def check_environment(self):
+        self.prompt_probe()
+        self.dependency_probe()
+        self.execution_control.update(allow_experiments=True, turn_deadline=time.monotonic()+self.limit())
+        write_json(self.control_path, self.execution_control)
+        try:
+            asyncio.run(asyncio.wait_for(self.mcp_probe(), self.limit()))
+        except (asyncio.TimeoutError, TimeoutError) as exc:
+            raise TimeoutError('MCP compatibility check timed out') from exc
+        except Exception as exc:
+            raise ValueError('MCP compatibility check failed; inspect inputs/local-exec-probe.stderr: ' + repr(exc)) from exc
+        finally:
+            self.execution_control['allow_experiments'] = self.config.allow_agent_materials and self.config.allow_experiments
+            write_json(self.control_path, self.execution_control)
+
     def turn(self, folder, prompt, timeout, session_id):
         # An agent-written project configuration must never become a new client configuration.
         if any((self.work / name).exists() for name in (".codex", ".agents")):
             raise ValueError("Unauthorized project configuration appeared in the working copy")
         if not (self.config.allow_agent_materials and self.config.allow_experiments):
             raise ValueError('Model transmission and local execution must both be authorized')
-        saved = json.loads((self.root/'inputs/local-exec.json').read_text())
-        if (saved != local_exec.identity(self.mcp_settings, self.execution_control)
-                or self.settings.get('mcp_servers') != {'baseline_local': self.mcp_settings}
-                or self.execution_control['run_deadline'] != self.deadline):
-            raise ValueError('Isolated execution policy changed; start a new run')
         implementation = json.loads((self.root/'inputs/implementation.json').read_text())
-        for label in ('baseline/local_exec.py', 'consensus_assurance.adapters.runners.experiment'):
-            entry = implementation['inputs'][label]
-            if digest(Path(entry['path']).read_bytes()) != entry['sha256']:
+        for path, expected in implementation['reload_inputs'].items():
+            if digest(Path(path).read_bytes()) != expected:
                 raise ValueError('Isolated execution implementation changed; start a new run')
         self.execution_control.update(turn=folder.name, turn_deadline=min(self.deadline, time.monotonic()+timeout),
                                       allow_experiments=True)
