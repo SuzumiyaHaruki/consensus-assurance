@@ -1,6 +1,6 @@
 from typing import Literal
 from pydantic import Field
-from .types import AssociatedCode, Record, Scope, Grounding, AuditQuestion, Concern
+from .types import AssociatedCode, BindingAssociation, Record, Scope, Grounding, AuditQuestion, Concern
 
 
 class ClaimDraft(Record):
@@ -16,6 +16,7 @@ class ClaimDraft(Record):
 
 
 class BindingDraft(AssociatedCode):
+    associations: list[BindingAssociation] = Field(default_factory=list, description="In a combined obligation, omitted associations are derived from its claim")
     id: str
     material_id: str
     symbol: str = Field(description="Source symbol tied to a verified declaration, interface member or explicitly declared call-site anchor. The behavior range may be a narrow internal snippet. Do not substitute arbitrary words from the excerpt.")
@@ -109,23 +110,8 @@ class GraphPatch(Record):
     relations: list[RelationDraft] = Field(default_factory=list,max_length=30)
     units: list[UnitDraft] = Field(default_factory=list,max_length=5)
     expected_versions: dict[str, int] = {}
-    rationale: str
+    rationale: str = ""
     gaps: list[str] = []
-
-
-class EncodingRevision(Record):
-    old_direct_check_id: str | None = None
-    issue_id: str | None = None
-    input_changes: list[str] = []
-    source_ids: list[str] = Field(min_length=1)
-    rationale: str
-
-
-class JudgmentChange(Record):
-    target_id: str
-    field: Literal["description", "concern", "scope", "grounding", "source", "target", "kind", "group", "rationale", "pending", "source_ids", "claim_id", "material_id", "symbol", "start_line", "end_line",  "obligation_ids", "binding_ids", "relation_ids", "audit_question", "associations", "anchor"]
-    old_value_json: str
-    new_value_json: str
 
 
 class ConditionDisposition(Record):
@@ -134,21 +120,6 @@ class ConditionDisposition(Record):
     applies_to: Literal['old_judgment','current_judgment','independent_scope']
     rationale: str = Field(min_length=1, description="Explain the responsibility and range to which this condition applies, preserving counterevidence")
     source_ids: list[str] = Field(min_length=1)
-
-
-class Feedback(Record):
-    condition_dispositions: list[ConditionDisposition] = []
-    kind: Literal["F2", "F3", "unresolved"]
-    rationale: str
-    evidence_ids: list[str]
-    target_ids: list[str]
-    relation_ids: list[str]
-    new_basis: str = Field(description="For F2, why the old semantic judgment is invalid and what new material establishes")
-    patch: GraphPatch | None = None
-    changes: list[JudgmentChange] = []
-    old_judgment: str = ""
-    new_judgment: str = ""
-    grounding: Grounding = Grounding()
 
 
 class IssueResolution(Record):
@@ -165,8 +136,8 @@ class IssueResolution(Record):
 class DirectCheckPlan(Record):
     """Concrete investigation of an accepted requirement; execution determines the observed result."""
     description: str = Field(description="This check’s discriminator, prefix, controls and observations; reference the accepted claim rather than restating it")
-    claim_id: str
-    binding_ids: list[str] = Field(min_length=1)
+    claim_id: str = Field(default="", description="Omission selects the accepted Unit obligation")
+    binding_ids: list[str] = Field(default_factory=list, description="Omission selects the Unit bindings")
     harness: Harness
     monitors: list[EventMonitor] = Field(min_length=1)
     observable_properties: list[ObservableProperty] = Field(min_length=1, description="Direct route supports event_assertion and event_implication. Correlate prerequisite fields by alias; observe prerequisites and results from the same legal history. Unsupported general temporal properties must remain an explicit limitation.")

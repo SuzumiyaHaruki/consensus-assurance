@@ -1,6 +1,6 @@
 """Descriptive implementation understanding, independent of correctness evidence."""
 from pathlib import Path
-from consensus_assurance.core.types import ConsensusAuditSpec, ACTIVITY_ROLES
+from consensus_assurance.core.types import ConsensusAuditSpec
 from consensus_assurance.core.diagnostics import Diagnostic, DiagnosticError
 from consensus_assurance.adapters.storage.files import write_json
 
@@ -48,7 +48,7 @@ def validate(state, spec, changes=None, unavailable=()):
         for id in related:
             other=behaviors.get(id) or facts.get(id)
             if other:sources.update(other.source_ids)
-        issues.append(Diagnostic(code='audit_spec_semantics',category='semantic',object_ids=ids,paths=[audit_object_path(spec,ids[0]) or '/'],material_ids=sorted(sources&known),details={'old':audit_object_index(old).get(ids[0]),'proposed':obj.model_dump(mode='json')},message=message,allowed=['read','semantic_revision']))
+        issues.append(Diagnostic(code='audit_spec_semantics',category='semantic',object_ids=ids,paths=[audit_object_path(spec,ids[0]) or '/'],material_ids=sorted(sources&known),details={'old':audit_object_index(old).get(ids[0]),'proposed':obj.model_dump(mode='json')},message=message,allowed=['read','research']))
     if spec.version!=(old.version if old else 1):
         issue(spec.target_profile,f'Map base version conflict: expected {old.version if old else 1}, got {spec.version}; the controller assigns the accepted version')
     ids=[audit_object_key(o) for o in objects]+['core_overview']
@@ -81,35 +81,15 @@ def validate(state, spec, changes=None, unavailable=()):
     if overview:
         def overview_issue(path,message):
             issues.append(Diagnostic(code='core_overview',category='semantic',paths=['/core_overview/'+path],
-                message=message,allowed=['read','semantic_revision']))
-        if not overview.rationale.strip():overview_issue('rationale','Explain why the initial backbone is usable, incomplete or blocked')
-        if overview.status!='usable' and not overview.core_gaps:
-            overview_issue('core_gaps','Name the missing backbone or unavailable source/boundary')
-        if overview.status=='usable' and overview.core_gaps:
-            overview_issue('status','A declared core break cannot be a usable initial overview; details may remain open')
+                message=message,allowed=['read','research']))
         for name in ('formation','context','connection'):
             path=getattr(overview,name)
             for field,known_refs in [('behavior_ids',behaviors),('fact_ids',facts),('source_ids',known)]:
                 missing=set(getattr(path,field))-set(known_refs)
                 if missing:overview_issue(name+'/'+field,'Unknown overview references: '+', '.join(sorted(missing)))
-            if overview.status!='usable':continue
-            if not path.explanation.strip() or not path.behavior_ids or not path.fact_ids or not path.source_ids:
-                overview_issue(name,'A usable path needs explanation and Behavior, Fact and source references')
-            selected=[behaviors[b] for b in path.behavior_ids if b in behaviors]
-            roles={b.primary_activity for b in selected}|{k for b in selected for k,v in b.cross_activity_effects.items() if v.strip()}
-            required={'formation':{'A1'},'context':{'A2'},'connection':{'A1','A2'}}[name]
-            if not required<=roles:overview_issue(name+'/behavior_ids','Explain the actual core responsibilities: '+', '.join(sorted(required-roles)))
-            objects=selected+[facts[f] for f in path.fact_ids if f in facts]
-            if any(not set(path.source_ids)&set(o.source_ids) for o in objects):
-                overview_issue(name+'/source_ids','Cite the referenced Behavior and Fact sources; labels alone do not explain a path')
     if issues:raise SpecIssue(issues)
     if changes is not None and not unavailable:understanding_changes(state,spec,changes)
     return spec
-
-
-def require_overview(state, spec):
-    if not (state.config.get('directed_question') or '').strip() and (not spec or not spec.core_overview or spec.core_overview.status!='usable'):
-        raise ValueError('Initial core understanding is incomplete: retain partial research and recover both core paths and their connection before focused Candidates or formal checks')
 
 
 def accept(engine,spec):
@@ -124,31 +104,18 @@ def object_content(obj):
     return {k:v for k,v in (obj or {}).items() if k not in {'behavior_ids','established_by','consumed_by'}} if obj and ('class_id' in obj or 'meaning' in obj) else obj or {}
 
 
-def validate_question(spec,question,focus=()):
-    if not question or not question.activity_classes or not question.behavior_ids or len(question.fact_ids)!=1 or not question.obligation_relation_kind:
-        raise ValueError('A bounded question needs one principal fact, lifecycle, behaviors and activity context')
-    errors=[]
-    for field,collection in zip(REFS,('behaviors','facts')):
-        if not set(getattr(question,field))<={x.id for x in getattr(spec,collection)}:errors.append('Question references absent '+field+': '+', '.join(sorted(set(getattr(question,field))-{x.id for x in getattr(spec,collection)})))
-    if not set(question.activity_classes)<={a.class_id for a in spec.activities}:errors.append('Question references absent Activity: '+', '.join(sorted(set(question.activity_classes)-{a.class_id for a in spec.activities})))
-    fact=next((f for f in spec.facts if f.id==question.fact_ids[0]),None)
-    linked=set(fact.established_by+fact.consumed_by+fact.invalidators+fact.reinterpreters) if fact else set()
-    if fact and not set(question.behavior_ids)<=linked:errors.append('Question Behavior must establish, consume, invalidate or reinterpret its principal Fact')
-    support=question.supporting_behavior_ids
-    if set(support)&set(question.behavior_ids) or not set(support)<={b.id for b in spec.behaviors} or any(not v.strip() for v in support.values()):
-        errors.append('Causal support needs distinct existing Behavior IDs and their prehistory/context/consequence role')
-    behaviors=[b for b in spec.behaviors if b.id in question.behavior_ids or b.id in support]
-    responsibilities={b.primary_activity for b in behaviors}|{k for b in behaviors for k,v in b.cross_activity_effects.items() if v.strip()}
-    if not set(question.activity_classes)<=responsibilities:errors.append('Activity labels need actual Behavior responsibility or attributed cross_activity_effects')
-    if not any(ACTIVITY_ROLES[a]['role']=='core' for a in question.activity_classes):
-        errors.append('Explain an A1 or A2 relationship through the selected sourced Behavior and necessary support; a supporting label alone is not a core question')
-    if focus and not set(focus)&set(question.activity_classes)&responsibilities:errors.append('Explain the selected Fact lifecycle connection to the configured Activity focus')
-    if not question.contexts or not question.event_paths or not question.importance.strip() or not question.trigger_rationale.strip():
-        errors.append('Question needs actual contexts, event paths, consequence and selection reasoning')
-    if (fact and not set(question.source_ids)&set(fact.source_ids)) or any(not set(question.source_ids)&set(b.source_ids) for b in behaviors):
-        errors.append('Question must cite its principal Fact and selected Behavior sources')
-
-    if errors:raise ValueError("; ".join(errors))
+def validate_question(spec, question, focus=()):
+    if question is None or not question.question.strip() or not question.source_ids:
+        raise ValueError('A question needs a concrete uncertainty and captured source references')
+    for field, collection in ((*zip(REFS, ('behaviors', 'facts')), ('supporting_behavior_ids', 'behaviors'))):
+        known = {obj.id for obj in getattr(spec, collection)} if spec else set()
+        if not set(getattr(question, field)) <= known:
+            raise ValueError('Question references absent ' + field)
+    activities = {a.class_id for a in spec.activities} if spec else set()
+    if not set(question.activity_classes) <= activities:
+        raise ValueError('Question references absent Activity')
+    if any(not role.strip() for role in question.supporting_behavior_ids.values()):
+        raise ValueError('Explain the referenced supporting Behavior relationship')
 
 
 def map_delta(before, after):
@@ -170,12 +137,10 @@ def understanding_changes(state, spec, changes):
     candidates={c.id:c for c in state.question_candidates}
     related={}
     for id,c in candidates.items():
-        q=c.question
-        used=set(q.behavior_ids+q.fact_ids+list(q.supporting_behavior_ids))
-        related[id]={key for key,d in delta.items() if key in used or
-            any(set(obj.get('produces_fact_ids',[])+obj.get('consumes_fact_ids',[]))&set(q.fact_ids)
-                for obj in d.values())}
-    required={key for key,d in delta.items() if d['before']} | set().union(*related.values(),set())
+        questions=[c.question]+[u.audit_question for u in state.units if u.candidate_id==id and u.audit_question]
+        used={ref for q in questions for ref in q.behavior_ids+q.fact_ids+list(q.supporting_behavior_ids)}
+        related[id] = set(delta) & used
+    required = {key for keys in related.values() for key in keys if delta[key]['before']}
     missing=required-changes.keys() if old else set()
     unknown=changes.keys()-audit_object_index(old).keys()-audit_object_index(spec).keys()
     if missing or unknown:
@@ -185,25 +150,18 @@ def understanding_changes(state, spec, changes):
     for key,d in delta.items():
         if d['before'] and d['after'] and ('meaning' in d['before'])!=('meaning' in d['after']):
             raise ValueError('Map object identity cannot change between Behavior and Fact: '+key)
-    structural={'identity','validity_context','primary_activity','execution_owner','protocol_context',
-        'produces_fact_ids','consumes_fact_ids','invalidators','reinterpreters'}
     effects={id:[] for id in candidates}
     for key,change in changes.items():
         if not set(change.source_ids)<=known:raise ValueError('Map change needs acquired source evidence: '+key)
         if not set(change.challenges)<=candidates.keys() or any(not reason.strip() for reason in change.challenges.values()):
             raise ValueError('Map challenges need saved Candidate IDs and specific reasons: '+key)
         d=delta[key]
-        fields={k for k in d['before'].keys()|d['after'].keys() if d['before'].get(k)!=d['after'].get(k)}
-        if change.impact=='clarification' and (not d['after'] or fields&structural):
-            raise ValueError('Object removal or changed identity/context/edges is not descriptive clarification: '+key)
         for id in candidates:
             challenged=change.challenges.get(id)
             if key not in related[id] and not challenged:continue
-            preserved=change.preserves or (change.rationale if change.impact=='clarification' else '')
+            preserved=change.preserves
             if not challenged and not preserved.strip():
-                raise ValueError('Explain preserved propositions once in preserves, or name concrete challenges: '+key+' / '+id)
-            if not challenged and change.impact=='meaning' and key in candidates[id].question.fact_ids:
-                raise ValueError('A corrected principal Fact needs a specific challenge; descriptive wording uses clarification: '+key)
+                raise ValueError('Explain how the referenced premise preserves or challenges the saved interpretation: '+key+' / '+id)
             effects[id].append({'object_id':key,'status':'challenged' if challenged else 'preserved',
                 'reason':challenged or preserved,'source_ids':change.source_ids})
     return delta,effects
@@ -212,7 +170,10 @@ def understanding_changes(state, spec, changes):
 def require_basis(state,question,spec=None,focus=(),candidate_id=None):
     """Resolve historical IDs in their recorded map, with attributed intervening edits."""
     spec=spec or load(state)
-    if spec is None:raise ValueError('Save the referenced Behavior/Fact map first')
+    if question and not any((question.behavior_ids, question.fact_ids, question.activity_classes, question.supporting_behavior_ids, question.audit_spec_version)):
+        validate_question(spec, question, focus)
+        return
+    if spec is None:raise ValueError('Save a map only when referencing its objects')
     version=question.audit_spec_version if question else None
     if version is None:raise ValueError('Question needs its accepted audit_spec_version')
     if version==spec.version:
@@ -245,7 +206,7 @@ def record_challenges(state, before, effects, operation_id):
         if not challenged:continue
         candidate=next(c for c in before.question_candidates if c.id==id)
         state.review_issues.append(ReviewIssue(review_id=operation_id,target_id=id,
-            target_version=candidate.question.audit_spec_version,aspect='applicability',
+            target_version=candidate.version,aspect='applicability',
             source_ids=sorted({source for item in challenged for source in item['source_ids']}),
             explanation='; '.join(item['object_id']+': '+item['reason'] for item in challenged),
             disposition='investigation',reason='New implementation knowledge challenges the retained proposition; original observations remain unchanged'))
@@ -253,7 +214,6 @@ def record_challenges(state, before, effects, operation_id):
 
 def validate_units(state,spec=None,focus=()):
     candidates={c.id:c for c in state.question_candidates}
-    if sum(c.status=='active' for c in candidates.values())>1:raise ValueError('Only one active Candidate is allowed')
     owners=[u.candidate_id for u in state.units if u.status!='revised']
     if len(owners)!=len(set(owners)):raise ValueError('A Candidate has one current Unit; use independent direct scenarios or an explicit scoped successor')
     for unit in state.units:
@@ -261,8 +221,6 @@ def validate_units(state,spec=None,focus=()):
         c=candidates.get(unit.candidate_id)
         if c is None or c.obligation_id not in unit.obligation_ids:raise ValueError('Executable Unit needs its accepted Candidate and obligation: '+unit.id)
         require_basis(state,unit.audit_question,spec,focus,unit.candidate_id)
-        if any(getattr(unit.audit_question,k)!=getattr(c.question,k) for k in QUESTION_BASIS):
-            raise ValueError('Unit and Candidate need an explicit shared question reconnection: '+unit.id)
 
 
 def audit_progress(state):

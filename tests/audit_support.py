@@ -93,8 +93,7 @@ def feedback(state, **overrides):
     refs=[s['operation_id'] for s in state.get('selections',[]) if s['action'] in {'pause','explained'}]
     refs += [r['id'] for r in state['semantic_reviews']]
     return dict(ref_ids=list(dict.fromkeys(refs+['code','doc'])),answered='The local return discriminator is bounded by this invocation',
-        remaining=['External consumer invocation ordering is not supplied'],understanding='unchanged',
-        rationale='The source map already expresses the bounded call; no structural generalization from a test',**overrides)
+        remaining=['External consumer invocation ordering is not supplied'],rationale='The source map already expresses the bounded call; no structural generalization from a test',**overrides)
 
 
 def check_step(broken=False, revise=False):
@@ -118,7 +117,7 @@ def review_step(status='no_issue_found',aspect='checker_correspondence'):
             rationale='Actual source, legality, result and independent bound agree within this local call')
         if status in {'disputed','revision_needed'}:item['counterevidence']=['The current assumption needs a distinct source check']
         if status=='revision_needed':item['challenged_components']=['oracle']
-        return dict(action='review',artifact_id=artifact['id'],review_items=[item],rationale='Review the saved execution'),{}
+        return dict(action='research',review=dict(artifact_id=artifact['id'],review_items=[item]),rationale='Review the saved execution'),{}
     return step
 
 
@@ -132,7 +131,7 @@ def engine_for(tmp_path, steps):
     (repo/'README.md').write_text('For 0 <= value <= limit and positive limit, the returned value stays in [0, limit].\n')
     cfg=Config(agent_backend='mock',execution_backend='python',execution_isolation='workspace',
         directed_question='Check the bounded local return contract of the synthetic target',
-        budget=Budget(agent_calls=len(steps),experiments=4,revisions=4,semantic_reviews=4,total_seconds=90))
+        budget=Budget(agent_calls=len(steps),experiments=4,total_seconds=90))
     e=Engine(cfg,tmp_path/'run',PythonBackend(),ScriptedAgent(steps),'')
     return e,repo
 
@@ -275,7 +274,7 @@ def read(instance):
     spec['surfaces']=[dict(entry_point='read',disposition='deferred',source_ids=['code'],
         reason='Caller timing and completion contract need investigation; preserve this early lead')]
     def path(text,bs,fs):return dict(explanation=text,behavior_ids=bs,fact_ids=fs,source_ids=['code'])
-    spec['core_overview']=dict(status='usable',rationale='The finite in-memory paths and their connection are explained; caller policy remains open',
+    spec['core_overview']=dict(rationale='The finite in-memory paths and their connection are explained; caller policy remains open',
         formation=path('support rejects stale or ineligible input, records one value per member, requires all eligible members to agree, preserves the first decision; read exposes it',['call','init','read'],['result','context']),
         context=path('create leaves context unset; change accepts a distinct non-null context, resets support, preserves decision and rejects redundant change',['init','change'],['context']),
         connection=path('support requires the current context; change invalidates pending support while the established decision survives and constrains later return',['call','change'],['result','context']),

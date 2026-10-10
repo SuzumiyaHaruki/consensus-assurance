@@ -280,17 +280,11 @@ def interruption_lines(check, archive):
 
 
 def milestone_lines(state, research, archive, checks, titles):
-    """Keep readiness and actual executions regardless of product action labels."""
+    """Keep sourced learning and actual executions with their original locators."""
     selected = {}
-    changes = [s for s in state.selections if s.get('map_updated')]
-    for s in changes:
-        version = s['accepted_versions']['audit_spec']
-        if (archive.read(f'audit-spec/v{version}.json').get('core_overview') or {}).get('status') == 'usable':
-            selected[s['operation_id']] = ('双主线概览已就绪', archive.link(f'audit-spec/v{version}.json','当时地图'))
-            break
-    growth = [s for s in state.selections if not s.get('duplicate_of') and (s.get('map_delta') or s.get('feedback',{}).get('understanding') == 'updated'
-        or s.get('accepted_versions',{}).get('artifacts') or s.get('released_candidate_ids'))]
-    for s in growth[-3:]+[s for s in state.selections if s['action'] in {'review','revise_check','pause','explained','continue','obligation'} and 'accepted_versions' in s]:
+    growth = [s for s in state.selections if not s.get('duplicate_of') and
+        (s.get('map_delta') or s.get('feedback') or s.get('accepted_versions',{}).get('artifacts'))]
+    for s in growth[-3:]+[s for s in state.selections if s['action'] in {'research','revise_check','pause','explained','continue','obligation'} and 'accepted_versions' in s]:
         review=next((r for r in state.semantic_reviews if r.check_id==s['operation_id']),None)
         title = next((i.report_title for i in review.items if i.aspect=='checker_correspondence' and i.report_title),None) if review else None
         detail='；'+'、'.join(f'v{review.target_versions.get(i.target_id,"?")} {i.aspect}: {i.status}' for i in review.items) if review else ''
@@ -334,7 +328,7 @@ def render_report(state, root):
     link = archive.link
     map_link = ('尚无受理地图' if state.audit_spec_version == 0 and not state.audit_spec_path else
         link(research['audit_spec_path'],f'地图 v{state.audit_spec_version}：概览、Behavior／Fact 与来源'))
-    if research['audit_spec_path'] and research['understanding_status'] != 'usable':map_link += '（已受理部分理解）'
+    if research['audit_spec_path']:map_link += '（可选的共享理解，不代表完整覆盖）'
     checks = {c.id:c for c in state.checks}
     artifacts = {a['id']:a for a in research['artifacts']}
     results = sorted(research['conclusions'],key=lambda r:(list(DISPOSITIONS).index(r['disposition']),
@@ -401,7 +395,7 @@ def render_report(state, root):
         f'{capacity["remaining"]["experiments"]} 次控制器目标执行。资源余量不表示获准恢复或重试。', '',
         '| 资源 | 配置 | 已用 | 剩余 |', '| --- | ---: | ---: | ---: |',
         f'| 总时间（秒） | {config["budget"]["total_seconds"]} | {state.elapsed_seconds:.2f} | {capacity["remaining_seconds"]:.2f} |']
-    for key,label in [('agent_calls','Agent 调用'),('experiments','控制器目标执行'),('audit_units','新 Unit'),('semantic_reviews','语义复核'),('revisions','修订')]:
+    for key,label in [('agent_calls','Agent 调用'),('experiments','控制器目标执行')]:
         enabled = config.get('allow_experiments',False) and config.get('execution_backend','none') != 'none' if key == 'experiments' else True
         details.append(f'| {label} | {config["budget"].get(key,0)} | {state.usage.get(key,0)} | '+(str(capacity['remaining'][key]) if enabled else '未启用')+' |')
     cost=research['costs'];action_cost=cost['target_action_cost']
@@ -532,7 +526,7 @@ def render_report(state, root):
     if research['core_overview']:
         for key,label in [('formation','共识形成与推进'),('context','上下文／权威转换'),('connection','两条主线的连接')]:
             lines.append('- '+label+'（原文导航摘录）：'+excerpt(research['core_overview'][key]['explanation'],220))
-    if research['understanding_status'] != 'usable':lines.append('双主线初始理解尚未完成；定向问题之外不能据片段宣称整体就绪。')
+    if not research['core_overview']:lines.append('尚未登记双主线概览；局部调查可以先行，现有结果不代表整体覆盖。')
     titles = {r['experiment_check_id']:(item.report_title if item else None) or assessment_progress(r)
         for r in research['assessments'] for item in [result_item(r,artifacts[r['direct_check_id']],reviews,checks)]}
     titles.update({x['check_id']:e['rationale'] or e['question'] or '探索原稿缺失' for e in exploration_records for x in e['executions']})

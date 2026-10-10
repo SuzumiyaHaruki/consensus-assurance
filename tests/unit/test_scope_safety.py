@@ -1,54 +1,15 @@
 """Scope refinement preserves semantics, full graph checks and historical applicability."""
 import pytest
 from regression_support import dependency
-from consensus_assurance.workflow.scope_updates import from_patch,apply_scope_update,validate_scope_update,ScopeAssessment
+from consensus_assurance.workflow.graph import apply_patch
 from consensus_assurance.core.types import AuditQuestion
-
-
-@pytest.mark.parametrize('field',['assumptions','excluded','obligation','other_unit'])
-def test_scope_cannot_smuggle_semantics_or_other_writes(dependency_prepared,field):
-    state,patch,_=dependency(dependency_prepared);unit=state.units[0]
-    if field in {'assumptions','excluded'}:getattr(patch.units[0].scope,field).append('All inputs satisfy the obligation')
-    elif field=='obligation':
-        from consensus_assurance.core.proposals import ClaimDraft
-        c=state.claims[1];d=ClaimDraft(**{k:v for k,v in c.model_dump().items() if k in ClaimDraft.model_fields});d.description='A weaker responsibility';patch.claims.append(d)
-    elif field=='other_unit':patch.units[0].obligation_ids.append('input_obligation')
-    before=state.model_dump()
-    with pytest.raises(ValueError):apply_scope_update(state,from_patch(state,unit,patch))
-    assert state.model_dump()==before
-
-
-def test_question_refinement_requires_sourced_assessment(dependency_prepared):
-    state,patch,sources=dependency(dependency_prepared);unit=state.units[0]
-    from consensus_assurance.workflow.graph import apply_patch
-    before=state.model_dump()
-    with pytest.raises(ValueError):apply_patch(state,patch)
-    assert state.model_dump()==before
-    q=AuditQuestion(question='Does the result stay inside the legal bound?',importance='A consumer relies on the bound',trigger_rationale='An actual consumer input exercises the bound',source_ids=[state.materials[0].id])
-    unit.audit_question=q;patch.units[0].audit_question=q.model_copy(deep=True);patch.units[0].audit_question.event_paths=['Provider normalization precedes counter execution']
-    update=from_patch(state,unit,patch)
-    assert validate_scope_update(state,update)==['audit_question']
-    with pytest.raises(ValueError):apply_scope_update(state,update)
-    update.assessment=ScopeAssessment(decision='refinement',source_ids=sources,addressed_fields=['audit_question'],preserved_question=q.question,rationale='The actually read provider refines the input production event without changing the original bounded result',remaining_unknowns=['No production history proof'])
-    new=apply_scope_update(state,update)
-    assert new.audit_question.question==q.question and new.scope==unit.scope
-    assert 'fresh_provider' in new.binding_ids and new.obligation_ids==unit.obligation_ids
 
 
 def test_new_binding_still_requires_real_symbol_and_association(dependency_prepared):
     state,patch,_=dependency(dependency_prepared);patch.bindings[0].symbol='imaginary'
     before=state.model_dump()
-    with pytest.raises(ValueError):apply_scope_update(state,from_patch(state,state.units[0],patch))
+    with pytest.raises(ValueError):apply_patch(state,patch,semantic=True)
     assert state.model_dump()==before
-
-
-def test_shared_binding_does_not_select_all_associated_obligations(dependency_prepared):
-    from consensus_assurance.workflow.graph import expand_unit
-    _, state, _ = dependency_prepared;b=next(b for b in state.bindings if b.id=='input_binding')
-    b.associations.append(b.associations[0].model_copy(update={'claim_id':'step_obligation'}))
-    unit=state.units[0];new=expand_unit(state,unit,['input_dependency'])
-    assert new.obligation_ids==unit.obligation_ids
-    assert 'input_binding' in new.binding_ids and not new.obligation_checks
 
 
 @pytest.mark.parametrize('return_type',['interface{}','struct{ Value int }'])

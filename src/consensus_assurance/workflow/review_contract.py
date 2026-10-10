@@ -9,7 +9,7 @@ POLICY={
  'binding': {'decomposition':'Check the source anchor and behavior range, the semantic association to responsibilities, and the selected unit use. Location alone does not establish an obligation.'},
  'relation': {'decomposition':'Check the direction, kind, conditions and actual endpoint responsibilities; explain the implementing handoff and alternatives.'},
  'unit': {'decomposition':'Check that the audit question, selected obligations, direct/support code uses and boundary assumptions form a coherent executable scope.'},
- 'direct_check': {'checker_correspondence':'Under the evidence-review experiments criteria, what establishes the premises of this written obligation and the validity of its measured result? Which unresolved conditions cannot affect that judgment? Cite fixed inputs, sources and observations; preserve necessary gaps through existing issue/revision paths. Separate the checked proposition from its cause hypothesis and wider consequences.'}}
+ 'direct_check': {'checker_correspondence':'What sourced responsibility applies, how were its necessary state and identities produced in one permitted history, and what actual endpoint answers this claim? Before no_issue_found, establish those premises from fixed inputs, real producers/callers and observations, or an applicable local interface contract. An unresolved condition is independent scope only if it cannot affect applicability, required-history legality or observation validity; otherwise retain the measurement and its issue. See evidence-review.'}}
 
 OPTIONAL={'binding':{'applicability':'Evaluate whether the code mapping applies to the current implementation configuration.'},'unit':{'applicability':'Evaluate whether the unit scope is applicable under the supplied execution conditions.'}}
 OPTIONAL['direct_check'] = dict(POLICY['obligation'])
@@ -34,7 +34,7 @@ def target_contract(state,obj):
     objects=review_objects(state)
     kind=category(obj)
     source_ranges=[{'file':file,'content_digest':version,'ranges':spans} for (file,version),spans in sorted(ranges([m for m in state.materials if m.id in materials]).items())]
-    return {'source_ranges':source_ranges,'target_id':obj.id,'object_type':kind,'version':obj.question.audit_spec_version if kind=='candidate' else obj.version,'required_aspects':list(POLICY[kind]),
+    return {'source_ranges':source_ranges,'target_id':obj.id,'object_type':kind,'version':obj.version,'required_aspects':list(POLICY[kind]),
         'questions':POLICY[kind],'optional_questions':OPTIONAL.get(kind,{}),
         'required_material_ids':sorted(materials),'dependency_versions':{id:objects[id].version for id in sorted(ids) if hasattr(objects[id],'version')}}
 

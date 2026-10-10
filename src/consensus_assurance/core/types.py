@@ -116,13 +116,12 @@ class CoreOverview(Record):
     connection: CorePath = Field(default_factory=CorePath)
     open_details: list[str] = []
     core_gaps: list[str] = []
-    status: Literal["incomplete", "usable", "blocked"] = "incomplete"
-    rationale: str
+    rationale: str = ""
 
 
 class ConsensusAuditSpec(Record):
     version: int = 1
-    target_profile: TargetProfile
+    target_profile: TargetProfile = Field(default_factory=lambda: TargetProfile(system_boundary=""))
     activities: list[Activity] = Field(default_factory=list, max_length=7)
     behaviors: list[Behavior] = []
     facts: list[Fact] = []
@@ -159,7 +158,7 @@ class AuditQuestion(Record):
     disposition: Literal["explained_by_existing_mechanism", "concrete_suspicion", "needs_specific_evidence", "ready_for_check"] | None = None
     preferred_check: Literal["source_review", "direct_test", "controlled_schedule"] | None = None
     question: str
-    importance: str
+    importance: str = ""
     source_ids: list[str] = []
     participants: list[str] = []
     objects: list[str] = []
@@ -169,23 +168,22 @@ class AuditQuestion(Record):
     behavior_ids: list[str] = []
     fact_ids: list[str] = []
     supporting_behavior_ids: dict[str, str] = Field(default_factory=dict,
-        description="Behavior ID to sourced prehistory, context or consequence support; not a direct principal Fact edge")
+        description="Optional Behavior ID to sourced prehistory, context or consequence support")
     obligation_relation_kind: Lifecycle | None = None
     counterevidence: list[str] = []
     unknowns: list[str] = Field(default_factory=list, description="Specific unresolved premises or discriminators of this question; not generic caution or a checklist of untested cases")
-    priority: int = Field(default=0, ge=0, le=3, description="System consequence and audit significance, justified in importance; not proof")
-    trigger_rationale: str
+    trigger_rationale: str = ""
 
 
 class QuestionCandidate(Record):
     """Investigation identity and history; forming an obligation does not confirm a defect."""
+    version: int = 1
     id: str = Field(default_factory=uid)
     question: AuditQuestion
     history: list[AuditQuestion] = []
     check_ids: list[str] = []
     status: Literal["active", "explained", "escalated", "blocked", "paused", "closed"] = "active"
     parent_candidate_id: str | None = None
-    fork_reason: str = ""
     stop_reason: str = ""
     resume_conditions: list[str] = []
     obligation_id: str | None = None
@@ -206,7 +204,7 @@ class SemanticCheck(Record):
     source_ids: list[str] = Field(min_length=1)
     rationale: str
     execution_attribution: ExecutionAttribution | None = Field(default=None,
-        description="Only direct checker_correspondence: cite completed violating witnesses and a subsequent independent failure. Source IDs and rationale must justify completion and causal independence; see evidence-review experiments guidance")
+        description="Only direct checker_correspondence: cite completed violating witnesses and a subsequent independent failure. Source IDs and rationale must justify completion and causal independence; see evidence-review guidance")
     report_title: str | None = Field(default=None, description="Optional short Chinese reading title for this target; presentation only, never a verdict")
     report_answer: str | None = Field(default=None, description="Optional Chinese observed-answer summary preserving applicability; numbers and status come from retained assessment")
     counterevidence: list[str] = []
@@ -516,15 +514,11 @@ class AuditUnit(Record):
 
 class Revision(Record):
     id: str = Field(default_factory=uid)
-    kind: Literal["F2", "F3", "F4", "encoding"]
     rationale: str
     evidence_ids: list[str]
     target_ids: list[str]
-    relation_ids: list[str] = []
     before: dict
     after: dict
-    return_step: Literal["understand", "build", "select", "experiment"]
-    status: Literal["applied", "unresolved"] = "applied"
 
 
 class Analysis(Record):
@@ -535,7 +529,6 @@ class Analysis(Record):
     question_candidates: list[QuestionCandidate] = []
     direct_checks: list[DirectCheckArtifact] = []
     active_direct_check_id: str | None = None
-    scope_updates: dict[str, dict] = {}
     framework_revision: str | None = None
     id: str = Field(default_factory=uid)
     mode: Literal["real", "mock"]

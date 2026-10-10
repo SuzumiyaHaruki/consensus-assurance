@@ -36,8 +36,6 @@ def diagnose_graph(state,proposal,audit_spec=None,locations=None):
         duplicate={id for id in all_ids if all_ids.count(id)>1}
         paths=[f'/{name}/{i}/id' for name in collections for i,o in enumerate(getattr(proposal,name)) if o.id in duplicate]
         emit('duplicate_identity','association',sorted(duplicate),paths,[],'Duplicate graph identifiers',['association']);return issues
-    if len(all_ids)>state.config.get('budget',{}).get('graph_objects',1000):
-        emit('graph_capacity','format',all_ids,['/'+name for name in collections],[],'Configured graph object budget exceeded',['representation'])
     claims={c.id:c for c in proposal.claims};bindings={b.id:b for b in proposal.bindings}
     for i,c in enumerate(proposal.claims):
         if not set(c.source_ids)<=set(materials):emit('missing_material','material',[c.id],[f'/claims/{i}/source_ids'],c.source_ids,'Claim references unread material',['read'])
@@ -82,28 +80,28 @@ def diagnose_graph(state,proposal,audit_spec=None,locations=None):
             missing=set(getattr(u,field))-known
             if missing:emit('unit_reference','association',[u.id,*sorted(missing)],[f'/units/{i}/{field}'],sources,'Audit unit references missing '+field+': '+', '.join(sorted(missing)),['association','read'])
         if len(u.obligation_ids)!=1:
-            emit('unit_primary','semantic',[u.id],[f'/units/{i}/obligation_ids'],sources,'One primary obligation is required',['semantic_revision'])
+            emit('unit_primary','semantic',[u.id],[f'/units/{i}/obligation_ids'],sources,'One primary obligation is required',['revise_check'])
         reached,used=dependency_reach(u,proposal.relations)
         if set(u.relation_ids)<=relations.keys() and used!=set(u.relation_ids):
             emit('unit_dependency','association',[u.id],[f'/units/{i}/relation_ids'],sources,'Selected dependencies must form directed paths from the checked obligation',['association','read'])
         for b in [bindings[id] for id in u.binding_ids if id in bindings]:
             if not relevant_use(u,b,proposal.relations):
-                emit('unit_dependency','association',[u.id,b.id,*sorted(claim_ids(b))],[f'/units/{i}/relation_ids',f'/units/{i}/binding_ids'],sources,'Selected code has no direct association or selected directed dependency path',['association','read','semantic_revision'])
+                emit('unit_dependency','association',[u.id,b.id,*sorted(claim_ids(b))],[f'/units/{i}/relation_ids',f'/units/{i}/binding_ids'],sources,'Selected code has no direct association or selected directed dependency path',['association','read','revise_check'])
                 issues[-1].details={'contract':graph_contract()['dependency']}
         q=u.audit_question
-        if q and (not q.question.strip() or not q.importance.strip() or not q.source_ids or not set(q.source_ids)<=set(materials)):
-            emit('audit_question','semantic',[u.id],[f'/units/{i}/audit_question'],sources,'Audit question requires actual materials and significance',['read','semantic_revision'])
+        if q and (not q.question.strip() or not q.source_ids or not set(q.source_ids)<=set(materials)):
+            emit('audit_question','semantic',[u.id],[f'/units/{i}/audit_question'],sources,'Audit question requires a concrete uncertainty and actual materials',['read','revise_check'])
         if q and (q.disposition is not None or state.analysis_mode!='regression'):
             from .direct_checks import validate_question as validate_route
             try:validate_route(q)
-            except ValueError as exc:emit('audit_question','semantic',[u.id],[f'/units/{i}/audit_question'],sources,str(exc),['read','semantic_revision'])
+            except ValueError as exc:emit('audit_question','semantic',[u.id],[f'/units/{i}/audit_question'],sources,str(exc),['read','revise_check'])
         if q and (q.behavior_ids or q.fact_ids):
             try:
                 if not spec:raise ValueError('A generated question requires accepted implementation understanding')
                 from .audit_spec import require_basis
                 require_basis(state,q,spec,candidate_id=u.candidate_id)
             except ValueError as exc:
-                emit('audit_question','semantic',[u.id],[f'/units/{i}/audit_question'],sources,str(exc),['read','semantic_revision'])
+                emit('audit_question','semantic',[u.id],[f'/units/{i}/audit_question'],sources,str(exc),['read','revise_check'])
     return issues
 
 

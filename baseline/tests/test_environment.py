@@ -586,7 +586,13 @@ def test_pairing_uses_configured_assembly_and_actual_exec_resume(environment, mo
     from consensus_assurance.adapters.runners.experiment import run_experiment
     from consensus_assurance.adapters.runners.process import output
     client = environment
-    config = load_config('baseline/configs/hashicorp.deepseek-pair.full.yaml')
+    import yaml
+    from consensus_assurance.core.config import Budget
+    config_path='baseline/configs/hashicorp.deepseek-pair.full.yaml'
+    with pytest.raises(ValueError,match='v60'):load_config(config_path)
+    # Keep the historical pairing template untouched; select current real resource fields locally.
+    raw=yaml.safe_load(Path(config_path).read_text())
+    config = load_config(config_path, overrides={'budget':{k:v for k,v in raw['budget'].items() if k in Budget.model_fields}})
     assert (config.agent_model, config.agent_reasoning_effort) == (client.config.agent_model, client.config.agent_reasoning_effort)
     config.target.expected_module = None  # Only synthetic code is used for boundary acceptance.
     root = client.root.parent/'paired-full'; root.mkdir()

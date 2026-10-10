@@ -3,15 +3,12 @@ import json
 import shutil
 import pytest
 from consensus_assurance.core.config import Config
-from consensus_assurance.core.proposals import JudgmentChange
 
-from consensus_assurance.workflow.feedback import apply_feedback
 from consensus_assurance.workflow.transactions import commit_graph
 from consensus_assurance.workflow.engine import Engine
 from consensus_assurance.workflow.budget import BudgetTracker
 from consensus_assurance.registry import assemble
 from consensus_assurance.adapters.storage.files import Store
-from regression_support import revision_for
 
 
 def engine_for(tmp_path,state):
@@ -20,19 +17,6 @@ def engine_for(tmp_path,state):
     engine.state=state;engine.budget=BudgetTracker(cfg.budget,state)
     shutil.copytree(state.snapshot.repo,engine.root/'source')
     return engine
-
-
-def test_grounding_only_F2_changes_scope_without_rewriting_claim(prepared):
-    _, state, _ = prepared;claim=state.claims[1];description=claim.description
-    feedback=revision_for(state,[claim.id]);draft=feedback.patch.claims[0]
-    draft.description=description;old=claim.grounding.model_dump(mode='json')
-    draft.grounding.applicability+='; selected serial configuration only'
-    feedback.grounding=draft.grounding.model_copy(update={"unresolved":[],"conflicts":[]})
-    feedback.changes=[JudgmentChange(target_id=claim.id,field='grounding',old_value_json=json.dumps(old),new_value_json=json.dumps(draft.grounding.model_dump(mode='json')))]
-    apply_feedback(state,state.units[0],feedback)
-    current=next(c for c in state.claims if c.id==claim.id)
-    assert current.version==2 and current.description==description
-    assert 'serial configuration' in current.grounding.applicability
 
 
 @pytest.mark.parametrize('interrupt',[False,True])
@@ -80,34 +64,18 @@ def test_condition_reference_diagnostics_are_specific_and_do_not_erase_judgment(
     assert classify_conditions(state,[r['text'] for r in records],[item],[id],records=records)==[item]
 
 
-@pytest.mark.parametrize('applies_to',['old_judgment','current_judgment','independent_scope'])
-def test_F2_attributes_exact_conflict_without_erasing_it(prepared,applies_to):
-    _, s, _ = prepared;id=s.claims[1].id;f=revision_for(s,[id]);f.grounding.conflicts=['The previous statement also constrained object replacement']
-    f.condition_dispositions=[ConditionDisposition(condition=f.grounding.conflicts[0],applies_to=applies_to,source_ids=f.evidence_ids,rationale='The source distinguishes update within one object from replacement; this is attributed to the stated judgment, not a claim about all histories')]
-    apply_feedback(s,s.units[0],f)
-    assert s.revisions[-1].status==('unresolved' if applies_to=='current_judgment' else 'applied')
-    assert s.revisions[-1].after['grounding']['conflicts']==f.grounding.conflicts
-    assert s.claims[1].version==(1 if applies_to=='current_judgment' else 2)
-
-
-def test_F2_cannot_rename_unaddressed_condition(prepared):
-    _, s, _ = prepared;f=revision_for(s,[s.claims[1].id]);f.grounding.unresolved=['Actual input truth unverified']
-    f.condition_dispositions=[ConditionDisposition(condition='Different harmless text',applies_to='old_judgment',source_ids=f.evidence_ids,rationale='Not the actual original question')]
-    before=s.model_dump()
-    with pytest.raises(ValueError):apply_feedback(s,s.units[0],f)
-    assert s.model_dump()==before
-
-
 def test_review_target_inheritance_and_contract_diagnostics(tmp_path,prepared):
-    from consensus_assurance.core.submissions import ReviewSubmission,AuditSubmission
+    from consensus_assurance.core.submissions import ResultReview,AuditSubmission
     from consensus_assurance.core.types import SemanticCheck
     from consensus_assurance.workflow.direct_checks import save_plan
     from consensus_assurance.workflow.review_contract import validate_contract,target_contract
     from regression_support import setup
     engine,unit,plan=setup(tmp_path,prepared);artifact=save_plan(engine,unit,plan,'contract')
-    raw=dict(action='review',artifact_id=artifact.id,rationale='Controlled review contract',review_items=[dict(
-        aspect='checker_correspondence',status='no_issue_found',source_ids=target_contract(engine.state,artifact)['required_material_ids'],rationale='The selected fixed local oracle agrees with its cited scope')])
-    product=ReviewSubmission.model_validate(raw)
+    raw=dict(action='research', review=dict(artifact_id=artifact.id,
+            review_items=[dict(
+        aspect='checker_correspondence',status='no_issue_found',source_ids=target_contract(engine.state,artifact)['required_material_ids'],rationale='The selected fixed local oracle agrees with its cited scope')]),
+            rationale='Controlled review contract')
+    product=ResultReview.model_validate(raw['review'])
     assert product.review_items[0].target_id==artifact.id
     validate_contract(engine.state,artifact.id,product.review_items)
     for fields,code in (({'target_id':plan.claim_id},'review_unknown_target'),
@@ -117,6 +85,5 @@ def test_review_target_inheritance_and_contract_diagnostics(tmp_path,prepared):
         item=product.review_items[0].model_copy(update=fields)
         with pytest.raises(DiagnosticError) as caught:validate_contract(engine.state,artifact.id,[item])
         assert code in {d.code for d in caught.value.diagnostics}
-    with pytest.raises(ValueError):ReviewSubmission.model_validate({**raw,'review_items':raw['review_items']*31})
-    with pytest.raises(ValueError):SemanticCheck.model_validate(raw['review_items'][0])
+    with pytest.raises(ValueError):SemanticCheck.model_validate(raw['review']['review_items'][0])
     assert 'target_id' not in AuditSubmission.model_json_schema()['$defs']['ArtifactReviewItem']['required']

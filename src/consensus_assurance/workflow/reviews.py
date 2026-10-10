@@ -78,7 +78,7 @@ def retain_conflicts(state, artifact, plan):
     bases.extend((artifact,'monitor/'+m.id,m.grounding) for m in plan.monitors)
     for owner,field,basis in bases:
         sources=list(dict.fromkeys(basis.source_ids+basis.expectation_ids))
-        for record in condition_records(basis.conflicts,owner.id+'/'+field,sources,owner.id,owner.version):
+        for record in condition_records(list(dict.fromkeys(basis.conflicts + basis.unresolved)),owner.id+'/'+field,sources,owner.id,owner.version):
             inherited=any((owner is not artifact or i.id in pending) and i.target_id in (ancestors if owner is artifact else {owner.id}) and
                 (owner is artifact or i.target_version==owner.version) and any(c['text']==record['text'] and
                 c['id'].startswith(i.target_id+'/'+field+'/condition/') for c in i.conditions) for i in state.review_issues)
@@ -89,20 +89,21 @@ def retain_conflicts(state, artifact, plan):
                 conditions=[record],disposition='investigation'))
 
 
-def validate_driver_repair(state, prior, old, plan, issue_ids, changed_inputs):
-    """Authorize an attributed draft answer; only subsequent review can discharge it."""
-    issues={i.id:i for i in open_issues(state,prior) if i.target_id in lineage(state,prior) and
-        (i.aspect=='applicability' or set(i.challenged_components)&{'driver','configuration','initialization'})}
-    basis=plan.harness.legality
-    if not issue_ids or len(set(issue_ids))!=len(issue_ids) or not set(issue_ids)<=issues.keys():
-        raise ValueError('Driver premise repair must name exact open applicability or input issues on its lineage')
-    if not changed_inputs or not basis.derivation.strip() or not basis.source_ids or basis.binding_ids!=old.harness.legality.binding_ids:
-        raise ValueError('Driver premise repair needs changed inputs and sourced legality with preserved bindings')
-    removed=set(old.harness.legality.conflicts)-set(basis.conflicts)
-    answered={c['text'] for id in issue_ids for c in issues[id].conditions
-        if c['id'].startswith(issues[id].target_id+'/harness/condition/')}
-    if not removed<=answered:
-        raise ValueError('Removed counterevidence needs its exact harness condition issue; no anonymous conflict removal')
+def direct_changes(before, after):
+    """Compare retained execution inputs when answering a specific repair issue."""
+    inputs=any(getattr(before.harness,k)!=getattr(after.harness,k) for k in ('source','files','execution_package'))
+    properties=lambda plan:[p.model_dump(exclude={'description'}) for p in plan.observable_properties]
+    predicates=lambda plan:[(m.checker_id,m.applicability_conditions) for m in plan.monitors]
+    observations=lambda plan:[(m.checker_id,m.event,m.admission_alias,m.binding_ids) for m in plan.monitors]
+    oracle=properties(before)!=properties(after) or predicates(before)!=predicates(after)
+    def contract(plan):
+        harness=plan.harness.model_dump(exclude={'source','files','execution_package','description','semantic_changes','legality'})
+        harness['prerequisites']=sorted(harness['prerequisites'],key=lambda r:r['alias'])
+        monitors=[m.model_dump(exclude={'event','admission_alias','applicability_conditions'}) for m in plan.monitors]
+        return plan.claim_id,plan.binding_ids,plan.uncertainties,harness,monitors
+    return {'inputs':inputs,'oracle':oracle,'observation':observations(before)!=observations(after),
+        'contract':contract(before)!=contract(after),
+        'legality':before.harness.legality.model_dump(exclude={'derivation'})!=after.harness.legality.model_dump(exclude={'derivation'})}
 
 
 def repair_changes(old, artifact, version=None):
@@ -112,7 +113,6 @@ def repair_changes(old, artifact, version=None):
         return {c:changed if c in {'expectation','scope'} else False for c in
             ('configuration','initialization','driver','observation','oracle','expectation','scope')}
     from .direct_checks import load_plan
-    from .encoding import direct_changes
     before, after = load_plan(old.plan_path), load_plan(artifact.plan_path)
     changes=direct_changes(before,after)
     inputs,predicate,observation=changes['inputs'],changes['oracle'],changes['observation']
@@ -163,7 +163,7 @@ def accept_review(state, submission, operation_id):
     def error(index, issue, message, **details):
         errors.append(Diagnostic(code='issue_resolution', category='format',
             object_ids=[issue.id] if issue else [], paths=[f'/resolutions/{index}'],
-            message=message, details=details, allowed=['read','representation','semantic_revision']))
+            message=message, details=details, allowed=['read','research','revise_check']))
     evidence = {x.id for name in ('checks','direct_checks','evidence','findings','semantic_reviews')
         for x in getattr(state,name)}
     for index, resolution in enumerate(submission.resolutions):
@@ -208,7 +208,7 @@ def accept_review(state, submission, operation_id):
                     original_artifact=old.id, answering_artifact=artifact.id)
     if errors:raise DiagnosticError(errors)
     review = SemanticReview(task_id='review:' + operation_id, check_id=operation_id,
-        target_versions={artifact.id:artifact.question.audit_spec_version if candidate else artifact.version}, material_ids=sources, items=submission.review_items,
+        target_versions={artifact.id:artifact.version}, material_ids=sources, items=submission.review_items,
         origin='mock' if state.mode == 'mock' else 'agent', unit_id=getattr(artifact,'unit_id',None) or None,
         unit_version=next((u.version for u in state.units if u.id == getattr(artifact,'unit_id',None)), None),
         resolves_issue_ids=[r.issue_id for r in submission.resolutions])
@@ -232,7 +232,7 @@ def accept_review(state, submission, operation_id):
             existing.challenged_components=item.challenged_components if item.status=='revision_needed' else []
             continue
         state.review_issues.append(ReviewIssue(review_id=review.id, target_id=artifact.id,
-            target_version=artifact.question.audit_spec_version if candidate else artifact.version, aspect=item.aspect,
+            target_version=artifact.version, aspect=item.aspect,
             source_ids=item.source_ids, explanation=item.rationale, reason=item.rationale,
             disposition='reading' if item.status == 'needs_reading' else 'investigation',
             challenged_components=item.challenged_components if item.status=='revision_needed' else []))

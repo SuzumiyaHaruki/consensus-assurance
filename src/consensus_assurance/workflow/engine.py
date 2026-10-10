@@ -64,28 +64,22 @@ class Engine:
         from .audit import execute
         return execute(self)
 
-    def resume(self, action_timeout=None, repair_attempts=None, agent_turn_timeout=None):
-        if repair_attempts is not None and (not isinstance(repair_attempts,int) or repair_attempts<0):raise ValueError("Repair attempt limit must be a nonnegative integer")
+    def resume(self, action_timeout=None, agent_turn_timeout=None):
         if action_timeout is not None and (not math.isfinite(action_timeout) or action_timeout <= 0):
             raise ValueError("Action timeout must be a finite positive number")
         if agent_turn_timeout is not None and (not math.isfinite(agent_turn_timeout) or agent_turn_timeout <= 0):
             raise ValueError("Agent turn timeout must be a finite positive number")
+        raw = json.loads((self.root / "state.json").read_text())
+        if raw.get("framework_revision") != FRAMEWORK_REVISION:
+            raise ValueError("Historical run uses an incompatible method; use its original Git revision or start a fresh run")
         self.state = self.store.load()
         self.budget = BudgetTracker(self.config.budget, self.state)
         self.runner.deadline = time.monotonic() + self.budget.remaining()
-        if self.state.framework_revision!=FRAMEWORK_REVISION:
-            self.state.stop_reason="Framework revision differs or was not recorded; preserve this historical run and use an explicit offline migration/subrun"
-            return self.state
         self.validate_agent_inputs()
         if self.config.model_dump(mode="json") != self.state.config:
             self.state.stop_reason="Configuration changed; start a new run"
             self.checkpoint("resume_configuration_changed")
             return self.state
-        if repair_attempts is not None and repair_attempts!=self.config.budget.repair_attempts:
-            old=self.config.budget.repair_attempts
-            data=self.config.model_dump(mode="json");data['budget']['repair_attempts']=repair_attempts
-            self.config=Config.model_validate(data);self.state.config=self.config.model_dump(mode='json');self.budget.limits=self.config.budget
-            self.checkpoint(f"repair_attempt_limit_changed:{old}:{repair_attempts}; usage and failures preserved")
         if action_timeout is not None and action_timeout != self.config.budget.action_timeout:
             old_timeout = self.config.budget.action_timeout
             data = self.config.model_dump(mode="json")

@@ -8,11 +8,10 @@ from pydantic import ValidationError
 from consensus_assurance.adapters.storage.files import digest, write_json
 from consensus_assurance.adapters.runners.experiment import extract_events, install_harness
 from consensus_assurance.core.submissions import (AuditSubmission, CandidateSubmission,
-    CheckSubmission, ResearchSubmission, SemanticSubmission, ReviewSubmission, ExploreSubmission)
-from consensus_assurance.core.proposals import (DirectCheckPlan, Feedback,
-    Harness, GraphPatch, UnitDraft)
+    CheckSubmission, ResearchSubmission, ExploreSubmission)
+from consensus_assurance.core.proposals import (DirectCheckPlan, Harness, GraphPatch, UnitDraft)
 from consensus_assurance.core.types import (Material, QuestionCandidate, Revision, ConsensusAuditSpec,
-    CheckRun, ExecutionStatus)
+    CheckRun, ExecutionStatus, AuditQuestion, BindingAssociation)
 from .budget import BudgetExhausted
 from .direct_checks import (assess, execute as execute_direct_check, execute_harness, load_plan, save_plan,
     validate_plan, validate_question, refresh_assessments)
@@ -77,12 +76,10 @@ class Inputs:
 def submission_files(submission):
     """Only explicit product fields declare dependencies; file contents declare no more."""
     mapped = submission.candidate if isinstance(submission,CheckSubmission) and submission.candidate else submission
-    paths = [getattr(mapped,'map_path',None)]
+    paths = [submission.map_path, mapped.map_path]
     if isinstance(submission,(CheckSubmission,ExploreSubmission)):
         paths += [submission.harness_path,*submission.files.values()]
         if isinstance(submission,CheckSubmission):paths.append(submission.plan_path)
-    elif isinstance(submission,ResearchSubmission):paths += [submission.graph_path,submission.scope_path]
-    elif isinstance(submission,SemanticSubmission):paths.append(submission.feedback_path)
     return dict.fromkeys(path for path in paths if path)
 
 
@@ -125,10 +122,13 @@ def prepare_harness(engine, harness):
     return filename
 
 
-def plan_from_files(inputs, submission):
+def plan_from_files(inputs, submission, unit):
     raw = inputs.json(submission.plan_path)
     harness_files(inputs, submission, raw["harness"])
-    return DirectCheckPlan.model_validate(raw)
+    plan = DirectCheckPlan.model_validate(raw)
+    plan.claim_id = plan.claim_id or unit.obligation_ids[0]
+    plan.binding_ids = plan.binding_ids or list(unit.binding_ids)
+    return plan
 
 
 def require_unit(state, id):
@@ -138,101 +138,74 @@ def require_unit(state, id):
     return unit
 
 
+def resolve_question(state, submission):
+    current = next((c for c in state.question_candidates if c.id == submission.candidate_id), None)
+    if submission.candidate_id and current is None:
+        raise ValueError('Candidate ID must name a saved investigation')
+    changes = submission.question
+    if isinstance(changes, AuditQuestion):changes = changes.model_dump(exclude_unset=True)
+    value = current.question.model_dump() if current else {}
+    value.update(changes or {})
+    submission.question = AuditQuestion.model_validate(value)
+
+
 def candidate(engine, submission, operation_id, spec=None):
     state = engine.state
     current = next((c for c in state.question_candidates if c.id == submission.candidate_id), None)
     parent = next((c for c in state.question_candidates if c.id == submission.parent_candidate_id), None)
-    if submission.candidate_id and current is None or submission.parent_candidate_id and parent is None:
-        raise ValueError("Candidate ID must name a saved investigation")
-    selected = {c.id for c in (current, parent) if c}
-    released=[]
-    for other in state.question_candidates:
-        if other.status in {"active","escalated"} and other.id not in selected:
-            other.status, other.stop_reason = 'paused', submission.rationale
-            other.resume_conditions = []
-            released.append(other.id)
-    if released:
-        state.selections[-1]['released_candidate_ids']=released
-        if any(u.id==state.active_unit_id and u.candidate_id in released for u in state.units):
-            state.active_unit_id=state.active_direct_check_id=None
+    if submission.parent_candidate_id and parent is None:
+        raise ValueError('Parent ID must name a saved investigation')
     q = submission.question
     validate_question(q)
     known = {m.id for m in state.materials}
-    if not q.source_ids or not set(q.source_ids) <= known or not any(
+    if not set(q.source_ids) <= known or not any(
             m.id in q.source_ids and m.file in state.snapshot.files for m in state.materials):
-        raise ValueError("Question needs actual authorized source citations")
-    from .audit_spec import require_basis, require_overview, QUESTION_BASIS
-    if current is None:require_overview(state,spec)
-    require_basis(state,q,spec,engine.config.activity_focus,current.id if current else None)
+        raise ValueError('Question needs actual authorized source citations')
+    from .audit_spec import require_basis
+    require_basis(state, q, spec, candidate_id=current.id if current else None)
     if parent and q == parent.question:
-        raise ValueError("A fork needs a distinct sourced question")
-    if submission.action == "explained" and (not q.counterevidence or q.disposition != "explained_by_existing_mechanism"):
-        raise ValueError("Explained disposition needs scoped sourced counterevidence")
+        raise ValueError('A child needs a distinct sourced question')
+    if submission.action == 'explained' and (not q.counterevidence or q.disposition != 'explained_by_existing_mechanism'):
+        raise ValueError('Explained disposition needs scoped sourced counterevidence')
     if current:
         from .research import source_refs
-        answered = submission.feedback and source_refs(state,submission.feedback.ref_ids)
-        update = submission.feedback.question_updates.get(current.id) if submission.feedback else None
-        changed_answer = any(getattr(q,k)!=getattr(current.question,k) for k in ('unknowns','counterevidence','disposition')) or bool(update and update.unknowns!=current.question.unknowns)
-        progress=bool(answered and (changed_answer or q.question!=current.question.question) or any(getattr(q,k)!=getattr(current.question,k)
-            for k in ('fact_ids','behavior_ids','obligation_relation_kind','contexts','event_paths')))
-        if submission.action == "continue" and current.status == "active" and not progress:
-            raise ValueError("Candidate continuation made no observable research change; wording alone is not progress")
-        if current.obligation_id and any(getattr(q,k)!=getattr(current.question,k) for k in QUESTION_BASIS):
-            raise ValueError("An accepted obligation's question needs an attributed semantic revision")
         if ((not set(current.question.counterevidence) <= set(q.counterevidence) or
                 not set(current.question.unknowns) <= set(q.unknowns)) and
-                not answered):
-            raise ValueError("Use feedback.answered with retained source ownership to explain changed counterevidence or unknowns")
-        if current.question!=q:current.history.append(current.question.model_copy(deep=True))
+                not (submission.feedback and source_refs(state, submission.feedback.ref_ids))):
+            raise ValueError('Use sourced feedback to explain changed counterevidence or unknowns')
+        if current.question != q:
+            current.history.append(current.question.model_copy(deep=True))
+            current.version += 1
         current.question = q
-        current.resume_conditions = []
     else:
-        if parent and parent.status in {"active", "escalated"}:
-            from .research import release
-            release(state, {parent.id}, submission.rationale,
-                ['Revisit the parent discriminator after child results; see the saved result_implications'])
-        current = QuestionCandidate(question=q, parent_candidate_id=parent.id if parent else None,
-            fork_reason=json.dumps(submission.result_implications) if parent else "")
+        current = QuestionCandidate(question=q, parent_candidate_id=parent.id if parent else None)
         state.question_candidates.append(current)
     current.check_ids.append(operation_id)
-    current.status = {"continue":"active", "pause":"paused", "explained":"explained", "obligation":"escalated"}[submission.action]
+    current.status = {'continue':'active', 'pause':'paused', 'explained':'explained', 'obligation':'escalated'}[submission.action]
     current.stop_reason = submission.rationale
     current.resume_conditions = submission.resume_conditions
-    if submission.action in {'pause','explained'} and any(u.id==state.active_unit_id and u.candidate_id==current.id for u in state.units):
-        state.active_unit_id=state.active_direct_check_id=None
-    if submission.action == "obligation":
-        from .research import capacity
-        if not capacity(state)['new_obligation']:
-            raise ValueError('No remaining authorized capacity to check a new obligation; continue source research or compare another available direction')
-        if q.disposition != "ready_for_check":
-            raise ValueError("Obligation requires a ready_for_check question")
+    unit = next((u for u in state.units if u.candidate_id == current.id and u.status != 'revised'), None)
+    state.active_unit_id = unit.id if unit and submission.action not in {'pause','explained'} else None
+    state.active_direct_check_id = None
+    if submission.action == 'obligation':
+        if current.obligation_id:
+            raise ValueError('Use revise_check to change an accepted obligation and execute its successor')
         from .graph import apply_patch
         claim = submission.obligation
-        unit = UnitDraft(id="unit-" + claim.id, candidate_id=current.id, obligation_ids=[claim.id],
-            binding_ids=[b.id for b in submission.bindings], relation_ids=[], scope=claim.scope,
+        for binding in submission.bindings:
+            if not binding.associations:
+                binding.associations = [BindingAssociation(claim_id=claim.id,
+                    source_ids=[binding.material_id], rationale=binding.description)]
+        unit = UnitDraft(id='unit-' + claim.id, candidate_id=current.id, obligation_ids=[claim.id],
+            binding_ids=[b.id for b in submission.bindings], scope=claim.scope,
             rationale=submission.rationale, audit_question=q)
         if claim.id in {c.id for c in state.claims}:
-            raise ValueError("Existing obligation requires semantic_revision")
-        apply_patch(state, GraphPatch(claims=[claim], bindings=submission.bindings, units=[unit], rationale=submission.rationale), audit_spec=spec)
-        engine.budget.take("audit_units")
+            raise ValueError('New obligation ID already exists; use its current Unit for revisions')
+        apply_patch(state, GraphPatch(claims=[claim], bindings=submission.bindings, units=[unit],
+            rationale=submission.rationale), audit_spec=spec)
         current.obligation_id = claim.id
         state.active_unit_id = unit.id
     return current
-
-
-def validate_check_revision(state, prior, plan, submission):
-    old = load_plan(prior.plan_path)
-    if submission.encoding_revision:
-        from .encoding import validate_direct_encoding
-        validate_direct_encoding(state, prior, old, plan, submission.encoding_revision)
-    else:
-        from .encoding import direct_changes
-        from .reviews import validate_driver_repair
-        changed = direct_changes(old, plan)
-        if changed['contract'] or changed['oracle'] or changed['observation']:
-            raise ValueError("Ordinary repair preserves the claim, oracle, prerequisites and legality; use attributed encoding/F2/F3")
-        if changed['legality'] or submission.repair_issue_ids:
-            validate_driver_repair(state, prior, old, plan, submission.repair_issue_ids, changed['inputs'])
 
 
 def accept(engine, submission, inputs, operation_id):
@@ -243,13 +216,16 @@ def accept(engine, submission, inputs, operation_id):
 def prepare_submission(engine, submission, inputs, operation_id):
     """Validate on a transaction's state copy; defer every artifact/map write."""
     from .research import global_stop
-    if isinstance(submission,CheckSubmission) and submission.candidate:
-        outer,inner=submission.feedback,submission.candidate.feedback
-        if outer and inner and outer!=inner:raise ValueError('Combined submission has conflicting research feedback')
-        if submission.repair_of and submission.candidate.repair_of and submission.repair_of!=submission.candidate.repair_of:
-            raise ValueError('Combined submission has conflicting repair_of operations')
-        submission=submission.model_copy(update={'feedback':outer or inner,'repair_of':submission.repair_of or submission.candidate.repair_of,
-            'candidate':submission.candidate.model_copy(update={'feedback':outer or inner})})
+    if isinstance(submission, CheckSubmission) and submission.candidate:
+        inner = submission.candidate
+        merged = {}
+        for key in ('feedback', 'review', 'map_path', 'map_changes', 'repair_of'):
+            outer_value, inner_value = getattr(submission, key), getattr(inner, key)
+            if outer_value and inner_value and outer_value != inner_value:
+                raise ValueError('Combined submission has conflicting ' + key)
+            merged[key] = outer_value or inner_value
+        submission = submission.model_copy(update={**merged,
+            'candidate':inner.model_copy(update=merged)})
     state = engine.state
     research_before = state.model_copy(update={name:[o.model_copy(deep=True) for o in getattr(state,name)]
         for name in ('question_candidates','claims','bindings','relations','units','direct_checks','semantic_reviews','review_issues')})
@@ -277,6 +253,8 @@ def prepare_submission(engine, submission, inputs, operation_id):
             spec.version=state.audit_spec_version+1
     elif changes:raise ValueError('Map change declarations require a complete map file')
     def question_version(q, candidate_id=None):
+        if not any((q.behavior_ids, q.fact_ids, q.activity_classes, q.supporting_behavior_ids)):
+            return
         prior=next((c.question for c in research_before.question_candidates if c.id==candidate_id),None)
         if prior:
             if q.audit_spec_version is not None:return
@@ -289,25 +267,8 @@ def prepare_submission(engine, submission, inputs, operation_id):
             q.audit_spec_version=spec.version
         elif q.audit_spec_version is None and spec:
             q.audit_spec_version=spec.version
-    def patch_versions(patch, declarations=None):
-        from consensus_assurance.core.proposals import JudgmentChange
-        for draft in patch.units:
-            if not draft.audit_question:continue
-            original=draft.audit_question.model_dump(mode='json')
-            question_version(draft.audit_question)
-            if declarations is None or original==draft.audit_question.model_dump(mode='json'):continue
-            declared=next((d for d in declarations if d.target_id==draft.id and d.field=='audit_question'),None)
-            if declared and json.loads(declared.new_value_json)!=original:raise ValueError('Declared question differs from its submitted patch')
-            if declared is None:
-                old=next((u for u in state.units if u.id==draft.id),None)
-                if old is None:continue
-                basis=old.audit_question.model_dump(mode='json')
-                if dict(original,audit_spec_version=basis['audit_spec_version'])!=basis:
-                    raise ValueError('Question semantic changes require their own declaration; only version metadata is controller-derived')
-                declared=JudgmentChange(target_id=draft.id,field='audit_question',old_value_json=old.audit_question.model_dump_json(),new_value_json='null')
-                declarations.append(declared)
-            declared.new_value_json=draft.audit_question.model_dump_json()
     if isinstance(mapped,CandidateSubmission):
+        resolve_question(state, mapped)
         collect_validation(lambda:question_version(mapped.question,mapped.candidate_id))
         collect_validation(lambda:validate_question(mapped.question))
         if spec and mapped.question.audit_spec_version==spec.version:
@@ -328,93 +289,62 @@ def prepare_submission(engine, submission, inputs, operation_id):
         decision.update(map_delta=delta,map_effects=effects)
         audit_spec.record_challenges(state,research_before,effects,operation_id)
     def validate_objects():
-        for id,q in getattr(mapped,'reconnect_questions',{}).items():
-            question_version(q)
-            prior=next((c for c in research_before.question_candidates if c.id==id),None)
-            c=next((c for c in state.question_candidates if c.id==id),None)
-            if not proposed or not audit_spec.map_delta(audit_spec.load(research_before),proposed) or not prior or not c:
-                raise ValueError('Question reconnection needs a changed map and a saved Candidate')
-            validate_question(q)
-            audit_spec.require_basis(state,q,spec,engine.config.activity_focus,c.id)
-            if not q.source_ids or not set(q.source_ids)<={m.id for m in state.materials}:raise ValueError('Reconnected question needs actual acquired sources')
-            from .research import source_refs
-            if (not set(prior.question.counterevidence)<=set(q.counterevidence) or not set(prior.question.unknowns)<=set(q.unknowns)) and not (submission.feedback and source_refs(state,submission.feedback.ref_ids)):
-                raise ValueError('Reconnection answers require sourced feedback, preserving earlier questions in history')
-            if c.question!=q:
-                c.history.append(c.question.model_copy(deep=True));c.question=q
-        audit_spec.validate_units(state,spec,engine.config.activity_focus)
-        if len(state.claims)+len(state.bindings)+len(state.relations)+len(state.units)>engine.config.budget.graph_objects:
-            raise ValueError('Accepted graph object budget exceeded')
+        audit_spec.validate_units(state, spec)
+    if submission.review:
+        from .reviews import accept_review
+        accept_review(state, submission.review, operation_id)
     current = {"phase":"accepted", "operation_id":operation_id, "action":submission.action}
     persist_artifact = lambda: None
     if isinstance(submission, CandidateSubmission):
         candidate(engine, submission, operation_id, spec)
     elif isinstance(submission, CheckSubmission):
-        if submission.candidate:audit_spec.require_overview(state,spec)
-        require_capacity(engine,'experiments')
-        if submission.previous_check_id:require_capacity(engine,'revisions')
-        if submission.candidate:
-            candidate(engine, submission.candidate, operation_id, spec)
-        unit = require_unit(state, submission.unit_id or 'unit-' + submission.candidate.obligation.id)
+        require_capacity(engine, 'experiments')
         if not engine.config.allow_experiments:
-            raise ValueError("Formal execution is not authorized")
-        plan = plan_from_files(inputs, submission)
-        validate_plan(state, unit, plan, engine.implementation)
-        filename = prepare_harness(engine, plan.harness)
+            raise ValueError('Formal execution is not authorized')
+        if submission.candidate:candidate(engine, submission.candidate, operation_id, spec)
+        unit = require_unit(state, submission.unit_id or 'unit-' + submission.candidate.obligation.id)
         prior = next((a for a in state.direct_checks if a.id == submission.previous_check_id), None)
         if submission.previous_check_id:
             if prior is None or prior.unit_id != unit.id:
-                raise ValueError("Previous check must belong to the same selected unit")
-            validate_check_revision(state, prior, plan, submission)
-            engine.budget.take("revisions")
+                raise ValueError('Previous check must belong to the same selected Unit')
+            if any(a.previous_id == prior.id for a in state.direct_checks):
+                raise ValueError('Previous check already has a successor; revise the current artifact')
+        changed = []
+        if submission.revision:
+            from .graph import apply_patch
+            from .mutations import write_set
+            from .direct_checks import semantic_ids
+            patch = submission.revision
+            writes = write_set(state, patch)
+            if not {id for id, field in writes} <= semantic_ids(state, unit):
+                raise ValueError('Revision changes an unrelated investigation; submit its own successor')
+            changed = [{'object_id':id, 'field':field} for id, field in writes]
+            for draft in patch.units:
+                if draft.candidate_id != unit.candidate_id or draft.id != unit.id:
+                    raise ValueError('Revision retains its investigation identity; use a linked Candidate for a different question')
+                if draft.audit_question:question_version(draft.audit_question, unit.candidate_id)
+            patch.rationale = submission.rationale
+            apply_patch(state, patch, semantic=True, audit_spec=spec)
+            unit = require_unit(state, unit.id)
+            reconnect_candidate(state, unit)
+        plan = plan_from_files(inputs, submission, unit)
+        validate_plan(state, unit, plan, engine.implementation)
+        filename = prepare_harness(engine, plan.harness)
         validate_objects()
         def persist_artifact():
             artifact = save_plan(engine, unit, plan, operation_id, prior, filename=filename)
             if prior:
-                state.revisions.append(Revision(kind="encoding" if submission.encoding_revision else "F4",
-                    rationale=submission.rationale, target_ids=[prior.id],
+                old = load_plan(prior.plan_path).model_dump(mode='json')
+                new = plan.model_dump(mode='json')
+                state.revisions.append(Revision(rationale=submission.rationale, target_ids=[prior.id],
                     evidence_ids=[c.id for c in state.checks if c.direct_check_id == prior.id],
-                    before={"direct_check_id":prior.id}, after={"direct_check_id":artifact.id,
-                    "encoding_revision":submission.encoding_revision.model_dump(mode="json") if submission.encoding_revision else None}, return_step="experiment"))
-            current["direct_check_id"] = artifact.id
+                    before={'direct_check_id':prior.id, 'graph_versions':prior.graph_versions},
+                    after={'direct_check_id':artifact.id, 'graph_versions':artifact.graph_versions,
+                        'changed_plan_fields':[key for key in old if old[key] != new[key]], 'graph_changes':changed}))
+            current['direct_check_id'] = artifact.id
             state.active_unit_id, state.active_direct_check_id = unit.id, artifact.id
     elif isinstance(submission, ResearchSubmission):
-        if submission.graph_path:
-            from .graph import apply_patch
-            patch = GraphPatch.model_validate(inputs.json(submission.graph_path))
-            from .research import capacity
-            if patch.units and not capacity(state)['new_obligation']:
-                raise ValueError('No remaining capacity for a new checkable Unit; retain sourced map research without a placeholder obligation')
-            if patch.units:audit_spec.require_overview(state,spec)
-            patch_versions(patch)
-            apply_patch(state, patch, audit_spec=spec)
-            for unit in patch.units:
-                engine.budget.take("audit_units")
-        if submission.scope_path:
-            from .scope_updates import ScopeUpdate, apply_scope_update
-            update = ScopeUpdate.model_validate(inputs.json(submission.scope_path))
-            patch_versions(update.patch, update.changes)
-            engine.budget.take("revisions")
-            new = apply_scope_update(state, update, audit_spec=spec)
-            state.scope_updates[update.id] = {"status":"accepted", "proposal":update.model_dump(mode="json"), "new_unit_id":new.id}
-            reconnect_candidate(state,new)
-    elif isinstance(submission, SemanticSubmission):
-        from .feedback import _apply_feedback
-        unit = require_unit(state, submission.unit_id)
-        feedback = Feedback.model_validate(inputs.json(submission.feedback_path))
-        if feedback.kind not in {"F2", "F3"}:
-            raise ValueError("Semantic submission needs complete attributed F2/F3; use Codex reads first")
-        if feedback.patch:patch_versions(feedback.patch, feedback.changes)
-        engine.budget.take("revisions")
-        _apply_feedback(state, unit, feedback, audit_spec=spec)
-        revised_ids={u.id for u in feedback.patch.units} if feedback.patch else {unit.id}
-        for new in state.units:
-            if new.status!='revised' and (new.id in revised_ids or new.previous_id==unit.id):reconnect_candidate(state,new)
-    elif isinstance(submission, ReviewSubmission):
-        from .reviews import accept_review
-        require_capacity(engine,'semantic_reviews')
-        engine.budget.take("semantic_reviews")
-        accept_review(state, submission, operation_id)
+        pass
     elif isinstance(submission, ExploreSubmission):
         require_capacity(engine,'experiments')
         if not engine.config.allow_experiments or engine.implementation is None:
@@ -433,13 +363,15 @@ def prepare_submission(engine, submission, inputs, operation_id):
         for id,update in submission.feedback.question_updates.items():
             c=next(c for c in state.question_candidates if c.id==id)
             if update.resume_conditions and c.status!='paused':raise ValueError('Feedback resume_conditions require a paused Candidate')
-            if c.question.unknowns!=update.unknowns:c.history.append(c.question.model_copy(deep=True))
+            if c.question.unknowns!=update.unknowns:
+                c.history.append(c.question.model_copy(deep=True))
+                c.version += 1
             c.question.unknowns=list(update.unknowns)
             c.resume_conditions=list(update.resume_conditions)
             for unit in state.units:
                 if unit.candidate_id==id and unit.status!='revised':unit.audit_question.unknowns=list(update.unknowns)
     # Forced/resource exits are always possible, even with incomplete historical understanding.
-    if submission.action not in {'stop','explore','review'}:validate_objects()
+    if submission.action != 'stop':validate_objects()
     def finish():
         persist_artifact()
         refresh_assessments(state, {a.id for a in state.direct_checks}, before=research_before)
@@ -508,10 +440,11 @@ def validate_submission(state, root, name, implementation):
 
 
 def reconnect_candidate(state,unit):
-    """Only an explicit accepted Unit patch may revise an escalated question."""
+    """Retain the earlier question when a check revision changes its accepted basis."""
     c=next((c for c in state.question_candidates if c.id==unit.candidate_id),None)
     if c and unit.audit_question and c.question!=unit.audit_question:
         c.history.append(c.question.model_copy(deep=True))
+        c.version += 1
         c.question=unit.audit_question.model_copy(deep=True)
 
 
@@ -524,10 +457,12 @@ def method_text(kind='audit'):
 
 
 def prompt(engine, method):
+    from .research import operation_summary
     return (method + "\nRead this run's research index at " + str(engine.root / "research.json") +
         ". Submit using " + str(engine.root / "submission.schema.json") +
         "; return its path relative to the draft directory and a summary.\n" +
-        ("Attributed protocol knowledge (data):\n" + engine.knowledge if method else ""))
+        ("Attributed protocol knowledge (data):\n" + engine.knowledge if method else "") +
+        "\nLast operation (controller records):\n" + json.dumps(operation_summary(engine.state)))
 
 
 def sync_progress(engine):
@@ -692,9 +627,8 @@ def accept_received(engine):
         errors = submission_errors(submission_diagnostics(exc),archive,result)
         write_json(archive / 'diagnostics.json', errors)
         from .research import reject_local
-        released=reject_local(state,operation_id,errors,raw if isinstance(raw,dict) else {})
-        state.current_submission = {'phase':'rejected', 'operation_id':operation_id, 'rejected':errors,
-            'local_handoff':released}
+        reject_local(state,operation_id,errors,raw if isinstance(raw,dict) else {})
+        state.current_submission = {'phase':'rejected', 'operation_id':operation_id, 'rejected':errors}
         engine.checkpoint('submission_rejected')
         return False
 
@@ -809,7 +743,6 @@ def execute(engine):
 
 
 def write_schemas(root):
-    from .scope_updates import ScopeUpdate
-    products = [DirectCheckPlan, ConsensusAuditSpec, GraphPatch, ScopeUpdate, Feedback]
+    products = [DirectCheckPlan, ConsensusAuditSpec, GraphPatch]
     schemas = {kind.__name__:kind.model_json_schema() for kind in products}
     write_json(root / "product-schemas.json", schemas)

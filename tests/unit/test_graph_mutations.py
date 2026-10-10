@@ -1,34 +1,10 @@
 """Repository-type reproductions of the four audited boundary failures."""
 import pytest
-from regression_support import revision_for
 from consensus_assurance.core.proposals import ClaimDraft, GraphPatch
 
 
 from consensus_assurance.core.proposals import RelationDraft, BindingDraft, UnitDraft
-from consensus_assurance.workflow.feedback import apply_feedback
 from consensus_assurance.workflow.graph import apply_patch
-
-
-@pytest.mark.parametrize('extra',['claim','relation','unit','binding'])
-def test_actual_write_set_rejects_every_unreviewed_object(dependency_prepared,extra):
-    _, state, _ = dependency_prepared;a,b=state.claims[1:3]
-    f=revision_for(state,[a.id])
-    if extra=='claim':f.patch.claims.append(ClaimDraft(**{k:v for k,v in b.model_dump().items() if k in ClaimDraft.model_fields}).model_copy(update={'description':'Weakened unrelated B'}))
-    if extra=='relation':
-        old=state.relations[0];f.patch.relations=[RelationDraft(**{k:v for k,v in old.model_dump().items() if k in RelationDraft.model_fields}).model_copy(update={'kind':'conditional_on'})]
-    if extra=='unit':
-        old=state.units[0]
-        f.patch.units=[UnitDraft(**{k:v for k,v in old.model_dump().items() if k in UnitDraft.model_fields}).model_copy(update={'obligation_ids':[b.id]})]
-    if extra=='binding':
-        old=state.bindings[0];m=next(m for m in state.materials if m.file==old.file and m.start_line<=old.start_line<=old.end_line<=m.end_line)
-        f.patch.bindings=[BindingDraft(id=old.id,associations=[dict(claim_id=b.id,source_ids=[m.id],rationale='Selected fixture operation')],material_id=m.id,symbol=old.symbol,start_line=old.start_line,end_line=old.end_line,description=old.description,pending=old.pending)]
-    for name in ('claims','relations','bindings','units'):
-        for obj in getattr(f.patch,name):f.patch.expected_versions[obj.id]=1
-    from regression_support import declared_changes
-    declared_changes(state,f)
-    before=state.model_dump()
-    with pytest.raises(ValueError,match='write set'):apply_feedback(state,state.units[0],f)
-    assert state.model_dump()==before
 
 
 def test_cross_type_collision_and_incomplete_changes_are_atomic(prepared):
@@ -37,8 +13,6 @@ def test_cross_type_collision_and_incomplete_changes_are_atomic(prepared):
     candidate.id=state.bindings[0].id
     before=state.model_dump()
     with pytest.raises(ValueError,match='types'):apply_patch(state,GraphPatch(claims=[candidate],expected_versions={candidate.id:1},rationale='Collision'),semantic=True)
-    f=revision_for(state,[state.claims[1].id]);f.changes=[]
-    with pytest.raises(ValueError,match='changes must'):apply_feedback(state,state.units[0],f)
     assert state.model_dump()==before
 
 
@@ -82,7 +56,7 @@ def test_patch_keeps_object_versions_and_unrelated_claims(prepared):
     changed=GraphDraft.model_validate(responses['graph']).claims[1]
     changed.description='Refined responsibility under the same documented configuration'
     patch=GraphPatch(claims=[changed],expected_versions={changed.id:1},rationale='New interpretation')
-    with pytest.raises(ValueError,match='F2'): apply_patch(state,patch)
+    with pytest.raises(ValueError,match='revise_check'): apply_patch(state,patch)
     apply_patch(state,patch,semantic=True)
     assert state.claims[1].version==2 and state.claims[0].version==1
     assert state.graph_history[-1]['record']['description']==current.description

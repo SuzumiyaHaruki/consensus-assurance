@@ -95,20 +95,33 @@ def test_controller_interrupt_does_not_require_a_valid_draft(tmp_path,event):
     else:assert not state.audit_spec_path
 
 
-def test_controller_version_normalization_cannot_declare_semantic_changes(tmp_path):
-    def undeclared(state):
-        from consensus_assurance.core.proposals import UnitDraft
-        unit=state['units'][0]
-        draft=UnitDraft(**{k:v for k,v in unit.items() if k in UnitDraft.model_fields})
-        draft.audit_question.contexts=['A different invocation contract']
-        spec=json.loads(Path(state['audit_spec_path']).read_text())
-        spec['surfaces'].append(dict(entry_point='background',disposition='deferred',reason='Not inspected',source_ids=['code']))
-        fb=dict(kind='F2',rationale='Proposed scoped contract change',evidence_ids=['code','doc'],target_ids=[unit['id']],relation_ids=[],
-            new_basis='Acquired source interpretation',old_judgment='Original context',new_judgment='Different context',
-            grounding=products()[0]['obligation']['grounding'],changes=[],
-            patch=dict(units=[draft.model_dump(mode='json')],expected_versions={unit['id']:unit['version']},rationale='Undeclared context change'))
-        return dict(action='semantic_revision',unit_id=unit['id'],map_path='map.json',feedback_path='feedback.json',
-            rationale='Metadata normalization cannot grant semantic write authority'),{'map.json':json.dumps(spec),'feedback.json':json.dumps(fb)}
-    e,repo=engine_for(tmp_path,[first,undeclared,stop]);state=e.start(repo)
-    assert len(diagnostics(e))==1 and 'own declaration' in str(diagnostics(e))
-    assert state.audit_spec_version==1 and state.units[0].audit_question.contexts==products()[0]['question']['contexts']
+def test_claim_revision_keeps_old_evidence_and_executes_new_basis(tmp_path):
+    from consensus_assurance.core.proposals import ClaimDraft
+    saved={}
+    def revise(state):
+        old=state['direct_checks'][0]
+        saved['artifact']=old
+        saved['output']=Path(next(c['stdout'] for c in state['checks'] if c.get('direct_check_id')==old['id'])).read_bytes()
+        claim=ClaimDraft(**{k:v for k,v in state['claims'][0].items() if k in ClaimDraft.model_fields})
+        claim.description='The legal return must equal zero'
+        sub,files=check_step(revise=True)(state)
+        sub['revision']=dict(claims=[claim.model_dump(mode='json')],expected_versions={claim.id:1})
+        sub['rationale']='Replace range comparison with the stronger zero-return proposition; this needs a new execution'
+        plan=json.loads(files['plan.json'])
+        plan['observable_properties'][0]['assertion']={'field':'state.value','value':0}
+        files['plan.json']=json.dumps(plan)
+        files['check.py']=files['check.py'].replace("'in_range':0 <= value <= 3", "'in_range':0 <= value <= 3,'value':value")
+        return sub,files
+    e,repo=engine_for(tmp_path,[first,check_step(),review_step(),revise,review_step(),stop])
+    state=e.start(repo)
+    assert not diagnostics(e),diagnostics(e)
+    old,new=state.direct_checks
+    assert old.model_dump(mode='json')==saved['artifact'] and new.previous_id==old.id
+    assert new.graph_versions['bounded']==2 and old.graph_versions['bounded']==1
+    checks=[c for c in state.checks if c.action=='direct_check']
+    assert len(checks)==2 and checks[0].id!=checks[1].id
+    assert Path(checks[0].stdout).read_bytes()==saved['output']
+    assert state.revisions[0].after['graph_changes']==[{'object_id':'bounded','field':'description'}]
+    assert any(h['id']=='bounded' and h['version']==1 for h in state.graph_history)
+    assert state.semantic_reviews[0].target_versions=={old.id:1}
+    assert state.usage['experiments']==2

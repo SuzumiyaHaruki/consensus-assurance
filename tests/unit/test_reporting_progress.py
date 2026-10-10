@@ -197,9 +197,9 @@ def test_mixed_report_reads_fixed_results_and_moves_without_side_effects(tmp_pat
     from consensus_assurance.registry import EXECUTION_BACKENDS
     def review_second(state):
         sub,files=review_step()(state)
-        sub['review_items'][0]['report_answer']='当前版本的驱动前提已核对。'
+        sub['review']['review_items'][0]['report_answer']='当前版本的驱动前提已核对。'
         issue=next(i for i in state['review_issues'] if i['target_id']==state['direct_checks'][-2]['id'])
-        sub['resolutions']=[dict(issue_id=issue['id'],source_ids=['code','doc'],
+        sub['review']['resolutions']=[dict(issue_id=issue['id'],source_ids=['code','doc'],
             evidence_ids=[state['direct_checks'][-1]['id']],rationale='The revised driver checks admission before invoking the unchanged local comparison',
             residual_issue_ids=[],scope_limitations=[])]
         return sub,files
@@ -211,7 +211,7 @@ def test_mixed_report_reads_fixed_results_and_moves_without_side_effects(tmp_pat
         return sub,files
     def review(state):
         sub,files=review_step()(state)
-        sub['review_items'][0].update(report_title='边界返回责任',report_answer='本次完整观察返回 4，上限为 3。')
+        sub['review']['review_items'][0].update(report_title='边界返回责任',report_answer='本次完整观察返回 4，上限为 3。')
         return sub,files
     def encoded_check(**options):
         def step(state):
@@ -241,14 +241,14 @@ def test_mixed_report_reads_fixed_results_and_moves_without_side_effects(tmp_pat
     def challenge_second(state):
         sub,files=review_step('revision_needed')(state)
         sub['rationale']='Review the caller admission condition before revision'
-        sub['review_items'][0].update(report_answer='旧版本前提仍有争议。',challenged_components=['driver'],
+        sub['review']['review_items'][0].update(report_answer='旧版本前提仍有争议。',challenged_components=['driver'],
             rationale='The caller admission condition is observed but not enforced before invocation',
             counterevidence=['The driver must check admission before making the call'])
         return sub,files
     def repair_second(state):
         sub,files=second(state);sub.pop('candidate')
         sub.update(action='revise_check',unit_id=state['units'][1]['id'],previous_check_id=state['direct_checks'][-1]['id'],
-            repair_issue_ids=[state['review_issues'][-1]['id']],rationale='Enforce the sourced caller admission without changing the oracle')
+            rationale='Enforce the sourced caller admission without changing the oracle')
         plan=json.loads(files['plan.json'])
         plan['harness']['legality']['derivation']='The driver checks the documented legal input before invoking the same return comparison'
         files['plan.json']=json.dumps(plan)
@@ -265,7 +265,7 @@ def test_mixed_report_reads_fixed_results_and_moves_without_side_effects(tmp_pat
         if not initial:
             candidate=state['question_candidates'][-1]['id']
             sub.update(candidate_id=candidate,feedback=dict(ref_ids=[candidate,'code'],answered=explanation,
-                remaining=[],understanding='updated',rationale='Retain the scoped answer without a property judgment'))
+                remaining=[],rationale='Retain the scoped answer without a property judgment'))
         return sub,{}
     def explore(state):
         setup="ready.append('initialized')\n" if any(c['action']=='exploration' for c in state['checks']) else ''
@@ -278,20 +278,20 @@ def test_mixed_report_reads_fixed_results_and_moves_without_side_effects(tmp_pat
             executions=[c['id'] for c in state['checks'] if c['action']=='exploration']
             return dict(action='research',rationale='Retain the conditional output and missing responsibility',feedback=dict(
                 ref_ids=[executions[i] for i in positions]+['code','surface:external repeat policy'],answered=answer,
-                remaining=['Acquire the caller repeat contract'],understanding='updated',rationale='No obligation is inferred from unequal returns')),{}
+                remaining=['Acquire the caller repeat contract'],rationale='No obligation is inferred from unequal returns')),{}
         return step
     first_answer='The first execution exited normally, but initialization did not occur; no prerequisite was reached.'
     repaired_answer='Only the second execution initialized the input and reached the comparison; this remains an exploration.'
     joint_answer='The first execution missed initialization; the second reached it and returned 3 and 4. The external caller contract remains open.'
     def independent_issue(state):
         candidate=state['question_candidates'][-1]['id']
-        return dict(action='review',artifact_id=candidate,rationale='Retain an independent source applicability dispute',
+        return dict(action='research', review=dict(artifact_id=candidate,
             review_items=[dict(target_id=candidate,aspect='applicability',status='disputed',source_ids=['code'],
-                rationale='The external caller may have another boundary',counterevidence=['External caller responsibility remains unacquired'])]),{}
+                rationale='The external caller may have another boundary',counterevidence=['External caller responsibility remains unacquired'])]),
+            rationale='Retain an independent source applicability dispute'),{}
     def fact_feedback(state):
         return dict(action='research',rationale='Retain a separate Fact explanation',feedback=dict(ref_ids=['result','call'],
-            answered='The result Fact describes local delivery only',remaining=[],understanding='unchanged',
-            rationale='Shared Fact and Behavior references do not associate this feedback with an execution')),{}
+            answered='The result Fact describes local delivery only',remaining=[],rationale='Shared Fact and Behavior references do not associate this feedback with an execution')),{}
     def contract_question(state):
         sub,_=first(state);sub.pop('map_path')
         sub.update(action='continue',obligation=None,bindings=[])
@@ -313,8 +313,6 @@ def test_mixed_report_reads_fixed_results_and_moves_without_side_effects(tmp_pat
     e,repo=engine_for(tmp_path,steps);e.agent.mock=False;e.config.execution_isolation='bwrap'
     (repo/'target.py').write_text('def step(value, limit):\n    return value + 1 if value <= limit else 0\n')
     e.config.budget.experiments=8
-    e.config.budget.semantic_reviews=5
-    e.config.budget.audit_units=3
     state=e.start(repo)
     assert not list((e.root/'submissions').glob('*/diagnostics.json')),state.stop_reason
     assert [r['disposition'] for r in view(state)['conclusions']]==['confirmed_in_scope','bounded_no_violation']
@@ -441,7 +439,7 @@ def test_mixed_report_reads_fixed_results_and_moves_without_side_effects(tmp_pat
             assert (f'](#{anchor})' in section)==(i in positions)
     assert old_check.id in text and '修订前 v1' in text and current.plan_path.split('/direct-checks/')[1] in text
     timeline=text.split('## 研究过程与认识增长')[1].split('## 当前未决事项')[0]
-    assert '受理 review：边界返回责任' in timeline and 'Retain the conditional output and missing responsibility' in timeline
+    assert '受理 research：边界返回责任' in timeline and 'Retain the conditional output and missing responsibility' in timeline
     disputed=state.direct_checks[2];disputed_check=next(c for c in state.checks if c.direct_check_id==disputed.id)
     history=next(line for line in timeline.splitlines() if f'logs/{disputed_check.id}/check.json' in line)
     assert disputed_check.exit_code==0 and '目标进程执行成功' in history and '保存的机械比较：有限检查未见违反' in history
@@ -549,7 +547,7 @@ def test_mixed_report_reads_fixed_results_and_moves_without_side_effects(tmp_pat
     missing=render_report(state,moved).read_text()
     assert '部分归档事件缺失' in missing and '**已确认违反**' in missing
     assert '| state.encoded |' not in missing
-    assert '已受理部分理解' in render_report(state,moved).read_text()
+    assert '可选的共享理解' in render_report(state,moved).read_text()
     (moved/f'audit-spec/v{state.audit_spec_version}.json').unlink()
     map_missing=render_report(state,moved).read_text()
     assert '来源（归档字节缺失）' in map_missing and '尚无受理地图' not in map_missing

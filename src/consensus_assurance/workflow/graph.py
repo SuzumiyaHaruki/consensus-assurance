@@ -27,27 +27,6 @@ def apply_graph(state, proposal, audit_spec=None):
     state.gaps.extend(proposal.conflicts+proposal.unexplored+proposal.gaps)
 
 
-def expand_unit(state, unit, relation_ids):
-    from .scope_updates import from_patch,apply_scope_update
-    from consensus_assurance.core.proposals import GraphPatch,UnitDraft
-    edges = sorted([e for e in state.relations if e.id in relation_ids and e.kind in {'boundary','depends_all','conditional_on'}],key=lambda e:e.id)
-    if len(edges)!=len(set(relation_ids)) or not edges:raise ValueError('F3 requires specific dependency relations')
-    reachable=set(unit.obligation_ids+unit.binding_ids);used=set()
-    while True:
-        fresh=[e for e in edges if e.source in reachable and e.id not in used]
-        if not fresh:break
-        for edge in fresh:reachable.add(edge.target);used.add(edge.id)
-    if used!={e.id for e in edges}:raise ValueError('F3 dependency must originate in the current scope; reversed or unrelated edges remain excluded')
-    added=sorted(b.id for b in state.bindings if b.id in reachable or claim_ids(b)&reachable)
-    draft=UnitDraft(**{k:v for k,v in unit.model_dump().items() if k in UnitDraft.model_fields})
-    draft.binding_ids=list(dict.fromkeys(unit.binding_ids+added));draft.relation_ids=list(dict.fromkeys(unit.relation_ids+sorted(used)))
-    if draft.binding_ids==unit.binding_ids:raise ValueError('F3 must add a concrete binding; use an explicit scope proposal to refine existing event granularity')
-    draft.rationale=unit.rationale+'; inspect the selected producer dependencies'
-    patch=GraphPatch(units=[draft],expected_versions={unit.id:unit.version},rationale='Included producer bindings through selected directed dependencies')
-    update=from_patch(state,unit,patch)
-    return apply_scope_update(state,update)
-
-
 def _apply_patch(state, patch, semantic=False, audit_spec=None):
     """Prepare graph records before replacing objects on the caller's trial state."""
     from consensus_assurance.core.proposals import GraphDraft, ClaimDraft, BindingDraft, RelationDraft, UnitDraft
@@ -56,7 +35,7 @@ def _apply_patch(state, patch, semantic=False, audit_spec=None):
         selected=[(name,i,o) for name in ('claims','bindings','relations','units') for i,o in enumerate(getattr(patch,name)) if o.id in ids]
         paths=[f'/{name}/{i}' for name,i,o in selected] or ['/expected_versions']
         sources=list(dict.fromkeys(x for _,_,o in selected for x in getattr(o,'source_ids',[])))
-        raise DiagnosticError([Diagnostic(code='patch_authority',category='semantic',object_ids=list(ids),paths=paths,material_ids=sources,message=message,allowed=['semantic_revision'])])
+        raise DiagnosticError([Diagnostic(code='patch_authority',category='semantic',object_ids=list(ids),paths=paths,material_ids=sources,message=message,allowed=['revise_check'])])
     writes=write_set(state,patch)
     current = {x.id: x for x in [*state.claims, *state.bindings, *state.relations, *state.units]}
     for key, version in patch.expected_versions.items():
@@ -65,25 +44,11 @@ def _apply_patch(state, patch, semantic=False, audit_spec=None):
     replacements = [*patch.claims, *patch.bindings, *patch.relations, *patch.units]
     if len({obj.id for obj in replacements}) != len(replacements):
         reject("Duplicate patch object identifiers",[o.id for o in replacements])
-    for obj in patch.relations:
-        if obj.id in current and not semantic:
-            old = current[obj.id]
-            if any(getattr(obj,key) != getattr(old,key) for key in ("source","target","kind","group","rationale","grounding")) or not set(old.pending)<=set(obj.pending):
-                reject("Changing relationship semantics requires F2",[obj.id])
-    for obj in patch.units:
-        if obj.id in current and not semantic:
-            old=current[obj.id]
-            if obj.scope!=old.scope or not set(old.obligation_ids)<=set(obj.obligation_ids):
-                reject("Ordinary patches cannot remove unit obligations or change scope; use attributed semantic revision or F3 expansion",[obj.id])
     for obj in replacements:
         if obj.id in current and obj.id not in patch.expected_versions:
-            reject("Replacing an object requires its expected version",[obj.id])
-        if obj.id in current and hasattr(obj, "kind") and obj.kind in {"obligation", "assumption"} and not semantic:
-            old = current[obj.id]
-            if obj.kind != old.kind or obj.description != old.description or obj.scope != old.scope or obj.grounding != old.grounding or not set(old.pending)<=set(obj.pending):
-                reject("Changing claim semantics requires F2; dependency additions do not",[obj.id])
+            reject('Replacing an object requires its expected version', [obj.id])
     if not semantic and writes:
-        reject("Changing existing graph semantics requires scoped F2; add candidates or use F3 for new scope",[id for id,field in writes])
+        reject('Changing accepted inputs requires revise_check and a fresh execution', [id for id, field in writes])
     def merge(old, changes, convert):
         values = {x.id: convert(x) for x in old}
         values.update({x.id:x for x in changes})

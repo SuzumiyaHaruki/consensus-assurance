@@ -59,7 +59,7 @@ def create_run_directory(config, command):
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="共识义务驱动的局部实现审计；默认自主发现目标")
+    parser = argparse.ArgumentParser(description="以源码调查与执行证据约束结论的共识审计；默认自主发现目标")
     sub = parser.add_subparsers(dest="command", required=True)
     for name in ("doctor", "run", "inspect", "plan", "estimate"):
         p = sub.add_parser(name)
@@ -72,7 +72,6 @@ def main(argv=None):
         p.add_argument("--runs-dir", default="runs")
         if name == "report":p.add_argument("--export-views",action="store_true",help="按需导出地图、材料、图、进度和计划的根目录派生副本")
         if name == "resume":
-            p.add_argument("--repair-attempts",type=int,help="显式调整任务总修复上限；不重置已用次数或单问题失败记录")
             p.add_argument("--action-timeout", type=float, help="调整后续单动作超时（秒）；保留总预算和已用次数")
             p.add_argument("--agent-turn-timeout", type=float, help="调整后续单次Codex 调查最长时长（秒）；不改变正式执行超时或总预算")
     p = sub.add_parser('validate', help='只读检查当前草稿；不受理、不执行、不获取运行锁')
@@ -128,12 +127,9 @@ def main(argv=None):
                     "后端":{"Agent":config.agent_backend,"目标执行":config.execution_backend},
                     "授权":{"发送材料":config.allow_agent_materials,"执行目标":config.allow_experiments},
                     "预算":b.model_dump(mode="json"),
-                    "零额度":[k for k in ('agent_calls','experiments','audit_units','semantic_reviews','revisions') if getattr(b,k)==0],
+                    "零额度":[k for k in ('agent_calls','experiments') if getattr(b,k)==0],
                     "计数口径":{"agent_calls":"CLI turn；会话内工具不另算调用，总时间不重复叠加内部工具耗时",
-                        "experiments":"控制器探索、失败重试与正式检查共用；不含 Agent 回合内本地试跑，不等于独立问题数",
-                        "audit_units":"新义务入场；new_obligation 不保证能走完整条执行／复核链",
-                        "semantic_reviews":"对应性及语义复核；零额度时新执行不能以 PASS 代替复核",
-                        "revisions":"修订额度独立计数；不按执行次数推算剩余"},
+                        "experiments":"控制器探索、失败重试与正式检查共用；不含 Agent 回合内本地试跑，不等于独立问题数"},
                     "限制说明":"上限不自动扩容或兑换；单项额度耗尽不自动终止有预算的源码调查。缺失 token 用量保持未知，不预测发现数。"},ensure_ascii=False,indent=2))
                 return 0
             root = create_run_directory(config, args.command)
@@ -158,7 +154,7 @@ def main(argv=None):
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             try:
                 if args.command == "resume":
-                    state = engine.resume(action_timeout=args.action_timeout,repair_attempts=args.repair_attempts,
+                    state = engine.resume(action_timeout=args.action_timeout,
                         agent_turn_timeout=args.agent_turn_timeout)
                     if state.framework_revision!=FRAMEWORK_REVISION:
                         print(state.stop_reason);return 2

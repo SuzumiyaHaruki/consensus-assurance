@@ -39,27 +39,3 @@ def write_set(state,patch):
                 if canonical(old_data.get(field))!=canonical(value):
                     writes[(new.id,field)]=(old_data.get(field),value)
     return writes
-
-
-def validate_changes(state, feedback, allowed_ids=None):
-    writes=write_set(state,feedback.patch)
-    changed={id for id,field in writes}
-    allowed=set(feedback.target_ids if allowed_ids is None else allowed_ids)
-    if not changed or not changed<=allowed or not changed<=set(feedback.target_ids):
-        raise ValueError('Actual semantic write set exceeds the explicitly reviewed targets')
-    declared=[(c.target_id,c.field) for c in feedback.changes]
-    if len(set(declared))!=len(declared) or set(declared)!=set(writes):
-        raise ValueError('changes must exactly describe the full semantic write set; historical partial descriptions are read-only')
-    for change in feedback.changes:
-        before,after=writes[(change.target_id,change.field)]
-        if canonical(json.loads(change.old_value_json))!=canonical(before) or canonical(json.loads(change.new_value_json))!=canonical(after):
-            raise ValueError('F2 declared values differ from the actual field changes')
-    return writes
-
-
-SCOPE_FIELDS={'binding_ids','relation_ids','audit_question','rationale'}
-
-def classify_writes(writes,unit_id=None):
-    if not writes:return 'candidate_additions'
-    if unit_id and all(id==unit_id and field in SCOPE_FIELDS for id,field in writes):return 'scope_candidate'
-    return 'semantic_revision'

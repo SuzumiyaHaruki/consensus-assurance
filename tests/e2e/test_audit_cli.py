@@ -74,13 +74,15 @@ def test_cli_audit_fixture_execution_and_report(tmp_path,capsys,monkeypatch):
     assert saved_cancel['run_stop']['origin']=='controller' and saved_cancel['run_stop']['reason']=='user_stop'
     assert saved_cancel['usage']['agent_calls']==1 and '实际取消' in (cancelled/'report.md').read_text()
     old=tmp_path/'historical';old.mkdir()
-    historical={'framework_revision':'native-products-v27','native_current':{'phase':'executed'},'native_session_id':'old-session'}
+    historical={'framework_revision':'audit-products-v59','native_current':{'phase':'executed'},'native_session_id':'old-session'}
     (old/'state.json').write_text(json.dumps(historical))
     (old/'report.md').write_text('历史结果：执行失败，未确认。')
     before={p.name:p.read_bytes() for p in old.iterdir()}
     assert main(['report','--run',str(old)])==0
     assert '历史结果：执行失败' in capsys.readouterr().out
     assert main(['resume','--run',str(old)])==2
+    historical_engine=Engine(Config(),old,None,None,'')
+    with pytest.raises(ValueError,match='original Git revision'):historical_engine.resume()
     assert {p.name:p.read_bytes() for p in old.iterdir()}==before
 
 
@@ -116,16 +118,16 @@ def test_estimate_reports_explicit_long_limits_without_tools(tmp_path,capsys,mon
     assert main(['estimate','--config',str(example),'--repo',str(tmp_path)])==0
     result=json.loads(capsys.readouterr().out)
     assert result['预算']['total_seconds']==4800 and result['预算']['experiments']==16
-    assert result['预算']['semantic_reviews']==10 and result['预算']['audit_units']==6
+    assert set(result['预算'])=={'total_seconds','agent_turn_timeout','action_timeout','agent_calls','experiments'}
     assert '模型检查' not in result['后端'] and result['后端']['目标执行']=='go_module'
     assert result['授权']=={'发送材料':False,'执行目标':False}
     assert '粗略计划下限' not in result and '计划可能受限' not in result
     assert '失败重试' in result['计数口径']['experiments']
-    config=cli.load_config(example);config.budget.experiments=0;config.budget.semantic_reviews=0
+    config=cli.load_config(example);config.budget.experiments=0
     path=tmp_path/'zero.yaml';path.write_text(config.model_dump_json())
     assert main(['estimate','--config',str(path),'--repo',str(tmp_path)])==0
     result=json.loads(capsys.readouterr().out)
-    assert result['零额度']==['experiments','semantic_reviews'] and '源码调查' in result['限制说明']
+    assert result['零额度']==['experiments'] and '源码调查' in result['限制说明']
 
 
 @pytest.fixture

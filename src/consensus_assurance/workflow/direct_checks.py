@@ -17,14 +17,8 @@ def load_plan(path):
 
 
 def validate_question(question):
-    if question is None or question.disposition is None:
-        raise ValueError('New autonomous units need a typed question disposition')
-    if question.disposition=='ready_for_check' and question.preferred_check is None:
-        raise ValueError('Ready question needs preferred_check')
-    if question.disposition=='needs_specific_evidence' and not question.unknowns:
-        raise ValueError('Evidence question needs a named discriminator in question unknowns')
-    if question.preferred_check in {'direct_test','controlled_schedule'} and (not question.event_paths or not question.trigger_rationale.strip()):
-        raise ValueError('Executable question needs legal event paths, observations and oracle rationale')
+    if question is None or not question.question.strip() or not question.source_ids:
+        raise ValueError('A question needs a concrete uncertainty and captured source references')
 
 
 def validate_plan(state,unit,plan,implementation):

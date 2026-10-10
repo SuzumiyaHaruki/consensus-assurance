@@ -31,7 +31,7 @@ def test_necessary_support_oracle_does_not_require_sufficient_completion(eligibl
 
 def test_unattributed_failures_and_exact_completed_witness(tmp_path,prepared):
     from copy import deepcopy
-    from consensus_assurance.core.submissions import ReviewSubmission
+    from consensus_assurance.core.submissions import ResultReview, ResearchSubmission
     from consensus_assurance.workflow import direct_checks
     from consensus_assurance.workflow.audit import accept, Inputs
     from consensus_assurance.workflow.transactions import commit_graph
@@ -54,7 +54,8 @@ def test_unattributed_failures_and_exact_completed_witness(tmp_path,prepared):
     item.execution_attribution=ExecutionAttribution(check_id=c.id,witness_indices={'Range':[1]},failure_stream='stderr',
         failure_lines=(len(raw[1].splitlines()),len(raw[1].splitlines())),harness_lines=(len(p.harness.source.splitlines()),)*2)
     item.rationale='The synchronous source return and independent range comparison completed before a separate raise with no shared target state; no persistence, sampling or reply step depends on that raise.'
-    submission=ReviewSubmission(action='review',artifact_id=a.id,rationale='Controlled framework review; not an Agent discovery',review_items=[item.model_dump(mode="json")])
+    submission=ResultReview(artifact_id=a.id,
+            review_items=[item.model_dump(mode="json")])
     # Invalid references use the real acceptance function on private states, with no partial review.
     for field,value in [('check_id',normal_check.id),('check_id','invented'),('witness_indices',{'Other':[1]}),
             ('witness_indices',{'Range':[0]}),('witness_indices',{'Range':[999]}),('witness_indices',{}),
@@ -65,7 +66,7 @@ def test_unattributed_failures_and_exact_completed_witness(tmp_path,prepared):
         with pytest.raises(ValueError):accept_review(state,bad,'invalid')
         assert state.model_dump(mode='json')==saved
     commit_graph(e,'exact-failure-review',submission.model_dump(mode='json'),
-        lambda proxy:accept(proxy,submission,Inputs(e.root/'draft'),'exact-failure-review'))
+        lambda proxy:accept(proxy,ResearchSubmission(action='research',rationale='Review saved execution',review=submission),Inputs(e.root/'draft'),'exact-failure-review'))
     result=next(r for r in e.state.monitor_results if r['experiment_check_id']==c.id)
     assert result['confirmed'] and result['bounded_complete'] and result['reviewed_complete']
     assert result['properties'][0]['confirmed_witness_indices']==[1]
@@ -180,27 +181,23 @@ def test_issue_follows_explicit_lineage_or_requirement_not_checker_name(tmp_path
     assert any('Open review issue' in x and 'wrong return boundary' in x for x in result['blockers'])==(relationship!='independent')
 
 
-def test_direct_encoding_observation_change_must_be_declared(tmp_path,prepared):
-    from consensus_assurance.workflow.encoding import validate_direct_encoding
-    e,u,old_plan=setup(tmp_path,prepared);old=save_plan(e,u,old_plan,'observation-old');execute(e,old)
-    issue=ReviewIssue(review_id='review',target_id=old.id,target_version=old.version,aspect='checker_correspondence',
-        source_ids=u.audit_question.source_ids,explanation='The old observation field is not independent',disposition='blocked',reason='Correct observed input',challenged_components=['observation'])
-    e.state.review_issues.append(issue);e.state.active_direct_check_id=old.id
-    fixed=old_plan.model_copy(deep=True)
-    fixed.harness.source=fixed.harness.source.replace('in_range=0 <= returned <= limit','range_observed=0 <= returned <= limit')
-    fixed.harness.semantic_changes.append('Emit the independently computed range observation')
-    fixed.observable_properties[0].assertion=Comparison(field='state.range_observed',value=True)
-    revision=EncodingRevision(old_direct_check_id=old.id,issue_id=issue.id,source_ids=issue.source_ids,rationale='Use the separately observed result')
-    with pytest.raises(ValueError,match='declared'):
-        validate_direct_encoding(e.state,old,old_plan,fixed,revision)
-    revision.input_changes=['Add an independent range observation to the result event']
-    validate_direct_encoding(e.state,old,old_plan,fixed,revision)
+@pytest.mark.parametrize('owner',['claim','harness','monitor'])
+def test_registered_necessary_gap_survives_no_issue_review(tmp_path,prepared,owner):
+    e,u,p=setup(tmp_path,prepared,True)
+    basis={'claim':next(c for c in e.state.claims if c.id==p.claim_id).grounding,'harness':p.harness.legality,'monitor':p.monitors[0].grounding}[owner]
+    basis.unresolved=['The necessary input producer history remains unobserved']
+    artifact=save_plan(e,u,p,'registered-gap')
+    review(e.state,u,artifact)
+    check=execute(e,artifact)
+    result=assess(e.state,u,artifact,p,check,extract_events(check))
+    assert result['outcome']=='violated' and not result['confirmed'] and not result['reviewed_complete']
+    assert any('producer history' in gap for gap in result['blockers'])
+    assert e.state.review_issues and not any(i.resolved_by for i in e.state.review_issues)
 
 
 def test_out_of_scope_checker_removal_keeps_responsibility_and_issue_lineage(tmp_path):
     from audit_support import engine_for,first,check_step,review_step,stop,diagnostics
-    from consensus_assurance.core.submissions import CheckSubmission,ReviewSubmission
-    from consensus_assurance.workflow.audit import validate_check_revision
+    from consensus_assurance.core.submissions import CheckSubmission,ResultReview
     from consensus_assurance.workflow.direct_checks import load_plan,compute_assessment
     from consensus_assurance.workflow.reviews import open_issues,accept_review
     saved={}
@@ -215,12 +212,12 @@ def test_out_of_scope_checker_removal_keeps_responsibility_and_issue_lineage(tmp
         return sub,files
     def challenge(state,precise=False):
         sub,_=review_step('revision_needed')(state)
-        sub['review_items'][0].update(rationale='The obligation requires a bounded return, not a zero return',
+        sub['review']['review_items'][0].update(rationale='The obligation requires a bounded return, not a zero return',
             counterevidence=['Zero asserts an additional property outside the accepted responsibility'],
             challenged_components=['scope'])
         if precise:
             sub['sources']=[dict(id='boundary',file='README.md',start_line=2,end_line=2,kind='interface_statement')]
-            sub['review_items'][0].update(rationale='The explicit contract retains Bounded; only the extra Zero checker misstates the oracle',
+            sub['review']['review_items'][0].update(rationale='The explicit contract retains Bounded; only the extra Zero checker misstates the oracle',
                 challenged_components=['oracle'],source_ids=['code','doc','boundary'],out_of_scope_checker_ids=['Zero'])
         return sub,{}
     def corrected(state,linked=True):
@@ -232,42 +229,17 @@ def test_out_of_scope_checker_removal_keeps_responsibility_and_issue_lineage(tmp
             saved['old']=e.state.model_copy(deep=True)
             return sub,files
         old=e.state.direct_checks[0];sub['previous_check_id']=old.id
-        issue=state['review_issues'][-1]
-        sub['encoding_revision']=dict(old_direct_check_id=old.id,issue_id=issue['id'],source_ids=['code','doc','boundary'],
-            rationale='Remove only the extra zero predicate; preserve the bounded responsibility and actual observations')
-        original=load_plan(old.plan_path)
-        repaired=original.model_copy(deep=True);repaired.observable_properties=repaired.observable_properties[:1];repaired.monitors=repaired.monitors[:1]
-        product=CheckSubmission.model_validate(sub)
-        validate_check_revision(e.state,old,repaired,product)
         from consensus_assurance.workflow.review_contract import validate_contract
         item=e.state.semantic_reviews[-1].items[0]
         for update in ({'out_of_scope_checker_ids':['missing']},{'out_of_scope_checker_ids':['Zero','Zero']},
                 {'out_of_scope_checker_ids':['Zero','Bounded']},{'status':'no_issue_found'},
                 {'challenged_components':['driver']},{'aspect':'applicability'}):
             with pytest.raises(ValueError):validate_contract(e.state,old.id,[item.model_copy(update=update)])
-        for fault in ('required','all','new_checker','predicate','identity','prerequisite','endpoint','harness','legality',
-                'undeclared_issue','ordinary','wrong_previous','renaming','semantic_version'):
-            private=e.state.model_copy(deep=True);bad=repaired.model_copy(deep=True);request=product.model_copy(deep=True)
-            if fault=='required':bad.observable_properties=original.observable_properties[1:];bad.monitors=original.monitors[1:]
-            elif fault=='all':bad=bad.model_copy(update={'observable_properties':[],'monitors':[]})
-            elif fault=='new_checker':bad.observable_properties[0].checker_id='New'
-            elif fault=='predicate':bad.observable_properties[0].assertion.value=False
-            elif fault=='identity':bad.observable_properties[0].identity_fields=['context']
-            elif fault=='prerequisite':bad.harness.prerequisites=[]
-            elif fault=='endpoint':bad.monitors[0].event='another-return'
-            elif fault=='harness':bad.harness.source+='\nprint("unrelated output")\n'
-            elif fault=='legality':bad.harness.legality.applicability='Any input without the original admission'
-            elif fault=='undeclared_issue':request.encoding_revision.issue_id=state['review_issues'][0]['id']
-            elif fault=='ordinary':request.encoding_revision=None
-            elif fault=='wrong_previous':request.encoding_revision.old_direct_check_id=state['direct_checks'][-1]['id']
-            elif fault=='renaming':bad=original.model_copy(update={'description':'Only a renamed scenario'})
-            else:private.claims[0].version+=1
-            with pytest.raises(ValueError):validate_check_revision(private,old,bad,request)
         return sub,files
     def resolve(state):
         sub,_=review_step()(state)
-        sub['review_items'][0]['source_ids']=['code','doc','boundary']
-        sub['resolutions']=[dict(issue_id=i['id'],source_ids=['code','doc','boundary'],
+        sub['review']['review_items'][0]['source_ids']=['code','doc','boundary']
+        sub['review']['resolutions']=[dict(issue_id=i['id'],source_ids=['code','doc','boundary'],
             rationale='The inherited correction removes only Zero; a fresh execution still observes the bounded return violation',
             residual_issue_ids=[],scope_limitations=['External consumers remain outside this local obligation']) for i in state['review_issues']]
         return sub,{}
@@ -284,7 +256,7 @@ def test_out_of_scope_checker_removal_keeps_responsibility_and_issue_lineage(tmp
     assert current['reviewed_complete'] and current['outcome']=='violated'
     assert len(open_issues(state,old))==2 and not open_issues(state,new)
     assert not open_issues(state,new.model_copy(update={'id':'descendant','previous_id':new.id}))
-    assert state.usage['experiments']==3 and state.usage['revisions']==1
+    assert state.usage['experiments']==3 and len(state.revisions)==1
     before=saved['old']
     assert state.claims==before.claims and state.units[0].version==before.units[0].version
     assert old==before.direct_checks[0]
@@ -303,7 +275,7 @@ def test_out_of_scope_checker_removal_keeps_responsibility_and_issue_lineage(tmp
     assert [i.id for i in open_issues(private,new)]==[separate.id]
     # Saved ancestor outputs do not authorize review of an unexecuted successor.
     private=state.model_copy(deep=True);private.checks=[c for c in private.checks if c.direct_check_id!=new.id]
-    request=ReviewSubmission.model_validate(resolve(state.model_dump(mode='json'))[0])
+    request=ResultReview.model_validate(resolve(state.model_dump(mode='json'))[0]['review'])
     with pytest.raises(ValueError,match='actual completed execution'):accept_review(private,request,'no-execution')
     # Rewording scope on a fresh execution cannot repair an explicitly named extra checker.
     private=state.model_copy(deep=True);private.semantic_reviews.pop()
@@ -325,13 +297,13 @@ def test_changed_interpretation_updates_current_direct_result(tmp_path,prepared,
     else:
         from consensus_assurance.workflow.audit import accept, Inputs
         from consensus_assurance.workflow.transactions import commit_graph
-        from consensus_assurance.core.submissions import ReviewSubmission
-        submission=ReviewSubmission(action='review',artifact_id=artifact.id,rationale='New sourced interpretation',
+        from consensus_assurance.core.submissions import ResultReview, ResearchSubmission
+        submission=ResultReview(artifact_id=artifact.id,
             review_items=[dict(target_id=artifact.id,aspect='checker_correspondence',status='disputed',
                 source_ids=u.audit_question.source_ids,rationale='Review the recovered input boundary',
                 counterevidence=['The caller boundary remains outside the observed local operation'])])
         commit_graph(e,'knowledge-update',submission.model_dump(mode='json'),
-            lambda proxy:accept(proxy,submission,Inputs(e.root/'draft'),'knowledge-update'))
+            lambda proxy:accept(proxy,ResearchSubmission(action='research',rationale='Review saved execution',review=submission),Inputs(e.root/'draft'),'knowledge-update'))
     current=next(r for r in e.state.monitor_results if r.get('direct_check_id')==artifact.id)
     assert current['outcome']=='violated' and not current['confirmed']
     assert any(('semantic inputs changed' if change=='semantic_input' else 'Open review issue') in reason for reason in current['blockers'])

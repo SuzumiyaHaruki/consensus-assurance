@@ -1,11 +1,4 @@
 """Small product and source constructors for bounded local regressions."""
-def declared_changes(state, feedback):
-    """Construct explicit changes in controlled fixtures; production never fills missing declarations."""
-    import json
-    from consensus_assurance.workflow.mutations import write_set
-    from consensus_assurance.core.proposals import JudgmentChange
-    feedback.changes=[JudgmentChange(target_id=id,field=field,old_value_json=json.dumps(before),new_value_json=json.dumps(after)) for (id,field),(before,after) in write_set(state,feedback.patch).items()]
-    return feedback
 
 
 def toy_responses(repo):
@@ -56,20 +49,6 @@ def add_reads(state,repo,requests):
     return [m.id for m in additions]
 
 
-def revision_for(state, ids):
-    import json
-    from consensus_assurance.core.proposals import ClaimDraft, GraphPatch, Feedback, JudgmentChange
-    drafts=[];changes=[]
-    for id in ids:
-        old=next(c for c in state.claims if c.id==id)
-        new=ClaimDraft(**{k:v for k,v in old.model_dump().items() if k in ClaimDraft.model_fields})
-        new.description=old.description+' with a weaker requirement'
-        drafts.append(new)
-        changes.append(JudgmentChange(target_id=id,field='description',old_value_json=json.dumps(old.description),new_value_json=json.dumps(new.description)))
-    basis=drafts[0].grounding.model_copy(deep=True);basis.unresolved=[];basis.conflicts=[]
-    return Feedback(kind='F2',rationale='Candidate correction',evidence_ids=basis.expectation_ids or basis.source_ids,target_ids=[ids[0]],relation_ids=[],new_basis='Actual materials support the requested correction',patch=GraphPatch(claims=drafts,expected_versions={i:1 for i in ids},rationale='Correction'),changes=changes,old_judgment=state.claims[1].description,new_judgment=drafts[0].description,grounding=basis)
-
-
 def dependency(dependency_prepared):
     from consensus_assurance.core.proposals import GraphPatch, BindingDraft, RelationDraft, UnitDraft
     from consensus_assurance.adapters.storage.snapshot import capture
@@ -87,7 +66,7 @@ def dependency(dependency_prepared):
 
 def setup(tmp_path,prepared,broken=False):
     import shutil
-    from consensus_assurance.core.types import Grounding, AuditQuestion
+    from consensus_assurance.core.types import Grounding, AuditQuestion, QuestionCandidate
     from consensus_assurance.core.proposals import ObservableProperty, Comparison, EventMonitor, DirectCheckPlan, Harness, EventRequirement
     from consensus_assurance.core.config import Config
     from consensus_assurance.registry import assemble
@@ -111,6 +90,8 @@ def setup(tmp_path,prepared,broken=False):
         claim.pending=[];claim.grounding=basis.model_copy(deep=True)
     unit.audit_question=AuditQuestion(question='Does one legal boundary call preserve the range?',importance='Bounded service result',source_ids=basis.source_ids+basis.expectation_ids,
         disposition='ready_for_check',preferred_check='direct_test',event_paths=['legal input -> actual call -> correlated observed return'],trigger_rationale='Observe actual return and independent range predicate')
+    candidate=QuestionCandidate(question=unit.audit_question.model_copy(deep=True),obligation_id=unit.obligation_ids[0])
+    unit.candidate_id=candidate.id;state.question_candidates=[candidate]
     cfg=Config(execution_backend='python',allow_experiments=True,allow_agent_materials=True,execution_isolation='workspace')
     state.config=cfg.model_dump(mode='json')
     e=Engine(cfg,tmp_path/'direct',*assemble(cfg));e.state=state;e.budget=BudgetTracker(cfg.budget,state)

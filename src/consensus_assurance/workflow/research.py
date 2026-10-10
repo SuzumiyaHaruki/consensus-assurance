@@ -84,12 +84,11 @@ def source_refs(state, refs, include_executions=False):
 
 def capacity(state):
     limits = state.config.get('budget',{})
-    names = ('agent_calls','experiments','audit_units','semantic_reviews','revisions')
+    names = ('agent_calls','experiments')
     remaining = {name:max(0,limits.get(name,0)-state.usage.get(name,0)) for name in names}
     seconds=max(0,limits.get('total_seconds',0)-state.elapsed_seconds)
     execution = state.config.get('allow_experiments',False) and state.config.get('execution_backend','none')!='none' and remaining['experiments'] > 0
     return {'remaining':remaining, 'remaining_seconds':seconds,
-        'new_obligation':bool(seconds and remaining['audit_units'] and execution),
         'direct_execution':bool(seconds and execution),
         'source_investigation':bool(seconds and remaining['agent_calls']),
         'exhausted':[name for name,value in remaining.items() if not value]}
@@ -243,21 +242,17 @@ def view(state, compact=False):
     focus_claims={id for u in state.units if u.id in focus_units for id in u.obligation_ids}
     def project(obj,fields):return obj.model_dump(mode='json',include=fields if compact else None)
     overview=spec.core_overview if spec else None
-    ready=bool(overview and overview.status=='usable')
     directed=bool((state.config.get('directed_question') or '').strip())
     drafts={s['draft_id']:s for s in state.selections if s.get('draft_id')}
     result = {'audit_spec_path':state.audit_spec_path, 'audit_spec_version':state.audit_spec_version,
         'activity_roles':ACTIVITY_ROLES, 'activity_focus':state.config.get('activity_focus',[]),
-        'understanding_status':overview.status if overview else 'incomplete' if spec else 'unregistered',
         'core_overview':overview.model_dump(mode='json') if overview else None,
         'understanding_changes':[{'operation_id':s['operation_id'],'version':s['accepted_versions']['audit_spec'],
             'delta':s.get('map_delta',{}),'explanations':s.get('map_changes',{}),'effects':s.get('map_effects',{})}
             for s in state.selections if s.get('map_updated')],
-        'next_objective':{'action':'investigate_and_refocus' if ready or directed else 'recover_core_understanding',
-            'boundary':'user_directed' if directed else 'both_core_paths',
-            'reason':'Use results to update understanding and compare the remaining frontier' if ready or directed else
-                'Save partial maps and leads; explain formation, context transitions and their connection before focused investigation',
-            'core_gaps':overview.core_gaps if overview else ['Initial two-line explanation is not yet recorded']},
+        'next_objective':{'action':'investigate_and_refocus',
+            'boundary':'user_directed' if directed else 'open_audit',
+            'reason':'Refine broad understanding and local source relationships together; choose the missing fact that changes the current answer'},
         'drafts':[s for s in drafts.values() if s['draft_status']!='accepted'],
         'candidates':[],
         'units':[{**(project(u,set(type(u).model_fields)-{'audit_question'} if u.id in focus_units else
@@ -270,7 +265,7 @@ def view(state, compact=False):
             'plan_path','harness_path','graph_versions','previous_id'}) for a in artifacts], 'assessments':records,
         'frontier':frontier(state,spec,results), 'capacity':capacity(state), 'conclusions':results, 'costs':costs(state),
         'map_handoffs':feedback_links(state,audit_object_index(spec)),
-        'handoffs':[s for s in state.selections if s.get('feedback') or s.get('released_candidate_ids') or s['action'] in {'pause','explained'} or s['action']=='stop' and s.get('scope')!='run'],
+        'handoffs':[s for s in state.selections if s.get('feedback') or s['action'] in {'pause','explained'} or s['action']=='stop' and s.get('scope')!='run'],
         'pending_work':pending_work(state), 'current':{k:v for k,v in state.current_submission.items() if k!='harness'},
         'latest_decision':state.selections[-1] if state.selections else None,
         'stop':state.run_stop, 'stop_reason':state.stop_reason}
@@ -413,7 +408,7 @@ def release(state, ids, reason, resume_conditions, closed=False):
 def reject_local(state, operation_id, errors, raw):
     """Track one draft through existing operations, including before acceptance."""
     if any(s['operation_id']==operation_id for s in state.selections):
-        return next(s.get('draft_status')=='paused' for s in state.selections if s['operation_id']==operation_id)
+        return
     target=raw.get('candidate') if isinstance(raw.get('candidate'),dict) else raw
     repair_of=raw.get('repair_of') or target.get('repair_of')
     previous=next((s for s in state.selections if s['operation_id']==repair_of and s['action']=='rejected'),None)
@@ -423,18 +418,12 @@ def reject_local(state, operation_id, errors, raw):
     ids={c.id for c in state.question_candidates if c.id==target.get('candidate_id')}
     ids.update(u.candidate_id for u in state.units if raw.get('unit_id') in {u.id,u.candidate_id})
     if raw.get('action')=='stop':ids.clear()
-    diagnostics=sorted(errors['errors'])
-    repeats=previous.get('repeats',1)+1 if previous and previous.get('diagnostics')==diagnostics else 1
-    paused=repeats>=max(1,state.config.get('budget',{}).get('repair_attempts',4))
-    state.selections.append({'operation_id':operation_id,'action':'rejected','rationale':'; '.join(diagnostics),
-        'candidate_ids':sorted(ids),'draft_id':previous['draft_id'] if previous else operation_id,
-        'repair_of':previous['operation_id'] if previous else None,'diagnostics':diagnostics,'repeats':repeats,
-        'draft_status':'paused' if paused else 'active','raw_path':errors['raw_path'],
-        'submitted_path':errors.get('submitted_path')})
-    if paused:
-        release(state,ids,'Repeated identical draft diagnostics; compare other sourced directions',
-            ['Repair the archived draft diagnostics with new information before resuming'])
-    return paused
+    diagnostics = sorted(errors['errors'])
+    state.selections.append({'operation_id':operation_id, 'action':'rejected', 'rationale':'; '.join(diagnostics),
+        'candidate_ids':sorted(ids), 'draft_id':previous['draft_id'] if previous else operation_id,
+        'repair_of':previous['operation_id'] if previous else None, 'diagnostics':diagnostics,
+        'draft_status':'rejected', 'raw_path':errors['raw_path'], 'submitted_path':errors.get('submitted_path')})
+
 
 
 def stop_record(engine, reason):
@@ -476,9 +465,8 @@ def record_decision(engine, submission, operation_id, map_changed=False):
     record = {'operation_id':operation_id,'action':submission.action,'rationale':submission.rationale,
         'feedback':feedback.model_dump(mode='json') if feedback else {}, 'map_updated':map_changed}
     from consensus_assurance.core.submissions import ResearchSubmission, AuditSubmission
-    if (isinstance(submission,ResearchSubmission) and feedback and not any((submission.map_path, submission.graph_path,
-            submission.scope_path, submission.map_changes, submission.reconnect_questions, submission.sources,
-            feedback.question_updates, submission.repair_of)) and state.selections):
+    if (isinstance(submission,ResearchSubmission) and not map_changed and not any((submission.review,
+            submission.sources, feedback and feedback.question_updates, submission.repair_of)) and state.selections):
         previous=state.selections[-1]
         versions=previous.get('accepted_versions',{})
         prior_turn=next((n for n,c in enumerate(state.checks) if c.id==previous['operation_id']),None)
@@ -489,7 +477,8 @@ def record_decision(engine, submission, operation_id, map_changed=False):
             from .audit import Inputs
             try:prior=AuditSubmission.model_validate(Inputs(engine.root).json(f'submissions/{previous["operation_id"]}/accepted.json'))
             except (OSError,ValueError):prior=None
-            if submission==prior:record['duplicate_of']=previous.get('duplicate_of',previous['operation_id'])
+            if submission==prior:
+                if not map_changed:record['duplicate_of']=previous.get('duplicate_of',previous['operation_id'])
     if submission.repair_of:
         prior=next((s for s in state.selections if s['operation_id']==submission.repair_of and s['action']=='rejected'),None)
         if prior is None:raise ValueError('repair_of must name a retained rejected operation')
@@ -507,7 +496,7 @@ def record_decision(engine, submission, operation_id, map_changed=False):
             unfinished={u.candidate_id for u in state.units if work &
                 {u.id,*u.obligation_ids,*u.binding_ids,*u.relation_ids,
                     *(a.id for a in state.direct_checks if a.unit_id==u.id)}}
-            ids={c.id for c in state.question_candidates if set(c.question.activity_classes)&set(focus) and
+            ids |= {c.id for c in state.question_candidates if set(c.question.activity_classes)&set(focus) and
                 (c.status in {'active','blocked'} or c.status=='escalated' and c.id in work|unfinished)}
         related.update(u.id for u in state.units if u.candidate_id in ids)
         related.update(i.id for i in state.review_issues if any(a.id==i.target_id and
@@ -530,3 +519,32 @@ def record_decision(engine, submission, operation_id, map_changed=False):
     state.selections.append(record)
     if isinstance(submission,StopSubmission) and global_stop(record):state.run_stop=record
     return record
+
+
+def operation_summary(state):
+    """Deliver actual last-operation feedback without resending the research graph."""
+    current = state.current_submission
+    if not current:return {'state':'new', 'next':'Read authorized source; a local question needs no map'}
+    operation = current.get('operation_id')
+    summary = {key:current[key] for key in ('phase','action','operation_id','direct_check_id') if key in current}
+    summary['record'] = 'submissions/' + operation if operation else 'state.json'
+    summary['blockers'] = [preview(x) for x in current.get('rejected',{}).get('errors',[])[:3]]
+    if current.get('execution_gap'):summary['blockers'].append(preview(current['execution_gap']))
+    actions = [*state.action_history, *([state.pending_action] if state.pending_action else [])]
+    ids = {a.id for a in actions if a.logical_input.get('operation_id') == operation}
+    checks = [c for c in state.checks if c.action in {'exploration','direct_check'} and
+        (c.pending_action_id in ids or c.direct_check_id and c.direct_check_id == current.get('direct_check_id'))]
+    summary['executions'] = [{'check_id':c.id,'status':c.status.value,'exit_code':c.exit_code,
+        'record':f'logs/{c.id}/check.json','stdout':c.stdout,'stderr':c.stderr} for c in checks]
+    results = [r for r in state.monitor_results if r.get('experiment_check_id') in {c.id for c in checks}]
+    summary['results'] = [{'check_id':r['experiment_check_id'], 'outcome':r['outcome'],
+        'confirmed':r['confirmed'], 'blockers':[preview(x) for x in r['blockers'][:3]],
+        'missing_observations':[preview(d['reason']) for p in r.get('properties',[]) for d in p.get('diagnostics',[])[:1]]}
+        for r in results]
+    if state.selections and state.selections[-1]['operation_id'] == operation:
+        decision = state.selections[-1]
+        summary['duplicate_of'] = decision.get('duplicate_of')
+        if decision.get('feedback'):
+            summary['answer'] = preview(decision['feedback']['answered'])
+            summary['remaining'] = [preview(x) for x in decision['feedback']['remaining'][:3]]
+    return summary

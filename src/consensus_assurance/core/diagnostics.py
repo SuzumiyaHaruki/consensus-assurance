@@ -13,7 +13,7 @@ class Diagnostic(Record):
     paths: list[str] = []
     material_ids: list[str] = []
     message: str
-    allowed: list[Literal['representation','association','read','semantic_revision','stop']] = []
+    allowed: list[Literal['representation','association','read','research','revise_check','stop']] = []
 
 
 class DiagnosticError(ValueError):

@@ -7,7 +7,7 @@ def graph_contract():
         'dependency':{'kinds':list(DEPENDENCY_KINDS),'direction':'checked obligation -> producer obligation or binding',
             'direct':'A selected binding associated with the checked obligation needs no relation.',
             'support':'Other selected bindings need a selected directed path from the checked obligation. Keep producer guarantees unresolved in relation grounding/pending or binding pending; selecting support does not check its obligation.'},
-        'repair':'Preserve attribution, applicability and unresolved conditions; source-backed semantic changes require F2.'}
+        'repair':'Preserve attribution, applicability and unresolved conditions; changed accepted inputs require revise_check and fresh execution.'}
 
 
 def claim_ids(binding):return {a.claim_id for a in binding.associations}

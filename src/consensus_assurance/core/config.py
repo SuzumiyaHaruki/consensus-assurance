@@ -9,17 +9,19 @@ from .types import ActivityClass, Record
 class Budget(Record):
     '''Configuration for budget constraints in the system.'''
     agent_calls: int = Field(default=8, ge=0)
-    revisions: int = Field(default=3, ge=0)
-    repair_attempts: int = Field(default=4, ge=0)
     action_timeout: float = Field(default=120, gt=0)
     agent_turn_timeout: float = Field(default=900, gt=0)
     total_seconds: float = Field(default=900, gt=0)
 
     experiments: int = Field(default=4, ge=0)
-    audit_units: int = Field(default=2, ge=0)
-
-    semantic_reviews: int = Field(default=4, ge=0)
-    graph_objects: int = Field(default=1000, ge=1)
+    @model_validator(mode="before")
+    @classmethod
+    def reject_product_quotas(cls, value):
+        retired = {'revisions', 'repair_attempts', 'audit_units', 'semantic_reviews', 'graph_objects'}
+        if isinstance(value, dict) and retired & value.keys():
+            raise ValueError('v60 removed research-product quotas: ' + ', '.join(sorted(retired & value.keys())) +
+                '; generate a fresh config retaining agent_calls, experiments and time limits')
+        return value
 
 
 class TargetConfig(Record):
