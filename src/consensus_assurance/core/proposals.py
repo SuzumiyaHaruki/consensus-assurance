@@ -1,5 +1,5 @@
 from typing import Literal
-from pydantic import Field
+from pydantic import Field, StrictInt
 from .types import AssociatedCode, BindingAssociation, Record, Scope, Grounding, AuditQuestion, Concern
 
 
@@ -114,23 +114,12 @@ class GraphPatch(Record):
     gaps: list[str] = []
 
 
-class ConditionDisposition(Record):
-    condition_id: str | None = Field(default=None, description="Stable ID from the supplied condition records; preferred for new output")
-    condition: str = Field(default="", description="Legacy exact-text reference; do not paraphrase it to bypass unresolved conditions")
-    applies_to: Literal['old_judgment','current_judgment','independent_scope']
-    rationale: str = Field(min_length=1, description="Explain the responsibility and range to which this condition applies, preserving counterevidence")
-    source_ids: list[str] = Field(min_length=1)
-
-
 class IssueResolution(Record):
-    condition_dispositions: list[ConditionDisposition] = []
     issue_id: str
     source_ids: list[str] = Field(min_length=1)
-    evidence_ids: list[str] = Field(default_factory=list,
-        description="Accepted execution, artifact, evidence or review IDs answering this issue; Material IDs belong in source_ids")
-    rationale: str = Field(description="Why actual evidence answers this specific issue; describing current behavior alone is insufficient")
-    residual_issue_ids: list[str] = Field(description="Other independent open issues that remain; never the resolved issue or its unresolved children")
-    scope_limitations: list[str] = Field(description="Independent boundaries retained by the related review item")
+    executions: dict[str, list[StrictInt]] = Field(default_factory=dict,
+        description="Target CheckRun IDs to decisive parsed event indices (zero-based). Fixed artifact and inputs resolve through the CheckRun. Empty for a source-only correction; never cite Agent turns or review IDs as observations.")
+    rationale: str = Field(min_length=1, description="Answer this exact issue: how the cited execution establishes its premise, or why the sourced objection does not apply. For a separate producer probe, explain its declared relationship and joint-history compatibility. A narrower endpoint alone does not discharge a necessary premise.")
 
 
 class DirectCheckPlan(Record):

@@ -21,7 +21,7 @@ export PATH="$HOME/.local/bin:$PATH"
 
 Candidate／family／focus 的局部停止保留未决工作并继续Codex 会话；开放运行持续推进到控制器时间／调用边界或真实中断；没有下一项完整检查不能结束整轮。用户预先指定的有限定向任务处置完毕后可结束。`research.json` 给出已映射关系的未知、问题交接及剩余能力。只保留总时间、模型调用和目标执行等实际资源限制；增加总时长不会自动增加调用或执行次数。
 
-新运行支持源码调查、条件探索和真实实现的直接检查／受控调度；内置 TLA/TLC 产品、搜索及校准链已退出，不再要求 Java 或 JAR。直接测试不等价于模型空间穷举。当前方法为 `audit-products-v60`。旧运行及原始报告保持只读；恢复旧方法必须使用其原 Git 版本。含已退役产品配额的本地配置需从当前模板重新生成。
+新运行支持源码调查、条件探索和真实实现的直接检查／受控调度；内置 TLA/TLC 产品、搜索及校准链已退出，不再要求 Java 或 JAR。直接测试不等价于模型空间穷举。当前方法为 `audit-products-v61`。旧运行及原始报告保持只读；恢复旧方法必须使用其原 Git 版本。含已退役产品配额的本地配置需从当前模板重新生成。
 
 ## 目标配置
 
@@ -34,4 +34,4 @@ configs/targets 保留 etcd Raft、HashiCorp Raft、Dragonboat、OmniPaxos、Swi
 - [环境要求](docs/环境要求.md)：安装、运行、目标接入、隔离与测试。
 - [运行索引](runs/README.md)：用户指定归档及其实际结果。
 
-本轮方法替换、迁移边界、行数与本地验收记录，以及 Astra low／DeepSeek high 一小时命令见 [v60 实施说明](docs/development/v60.md)。
+本轮可达性与复核修改、行数和本地验收记录，以及 Astra low／DeepSeek high 30 分钟配置与命令见 [v61 实施说明](docs/development/v61.md)。

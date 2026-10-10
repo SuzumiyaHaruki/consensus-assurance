@@ -349,7 +349,7 @@ def render_report(state, root):
     failures = [c for c in formal+explorations if c.status != ExecutionStatus.COMPLETED or c.exit_code not in (0,None)]
     explained = [c for c in research['candidates'] if c['status'] == 'explained' and not c['results'] and
         not any(u['candidate_id']==c['id'] for u in research['units'])]
-    ongoing = [c for c in research['candidates'] if c['status'] not in {'explained','closed'} and
+    ongoing = [c for c in research['candidates'] if c['question']['unknowns'] or c['resume_conditions'] or c['status'] not in {'explained','closed'} and
         (not c['results'] or c['resume_conditions'] or any(u['candidate_id']==c['id'] and
             any(p['record_status']!='assessed' for p in u['progress']) for u in research['units']))]
     candidate_links = {c['id']:f'[候选 {n}](#candidate-{c["id"]})' for n,c in enumerate(ongoing,1)}
@@ -549,7 +549,7 @@ def render_report(state, root):
     if unexplained:lines += ['',f'{len(unexplained)} 次探索尚无精确引用该执行的后续受理交接；前提与观察是否达到仍需核对：'+
         '；'.join(execution_links[id] for id in unexplained)]
     for c in ongoing:
-        lines += ['', f'<a id="candidate-{c["id"]}"></a>', '', ('暂停调查：' if c['status']=='paused' else '研究中问题：')+c['question']['question'],
+        lines += ['', f'<a id="candidate-{c["id"]}"></a>', '', ('暂停调查：' if c['status']=='paused' else '处置后仍有未知：' if c['status'] in {'explained','closed'} else '研究中问题：')+c['question']['question'],
             link('state.json','候选原文与历史')]
         if c['question']['unknowns']:lines.append('保存的语义未知：'+'；'.join(c['question']['unknowns']))
         if c['resume_conditions']:lines.append('恢复条件：'+'；'.join(c['resume_conditions']))

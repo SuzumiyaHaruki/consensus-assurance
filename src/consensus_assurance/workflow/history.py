@@ -9,5 +9,5 @@ def load_analysis(path):
     value = json.loads(Path(path).read_text())
     revision = value.get("framework_revision")
     if revision is not None and revision != manifest()["version"]:
-        raise ValueError("Historical framework revision is read-only; use its saved report or an explicit offline child import")
+        raise ValueError("Historical framework revision is read-only; use its saved report or original Git revision")
     return Analysis.model_validate(value)

@@ -200,8 +200,7 @@ def test_mixed_report_reads_fixed_results_and_moves_without_side_effects(tmp_pat
         sub['review']['review_items'][0]['report_answer']='当前版本的驱动前提已核对。'
         issue=next(i for i in state['review_issues'] if i['target_id']==state['direct_checks'][-2]['id'])
         sub['review']['resolutions']=[dict(issue_id=issue['id'],source_ids=['code','doc'],
-            evidence_ids=[state['direct_checks'][-1]['id']],rationale='The revised driver checks admission before invoking the unchanged local comparison',
-            residual_issue_ids=[],scope_limitations=[])]
+            executions={next(c['id'] for c in state['checks'] if c['direct_check_id']==state['direct_checks'][-1]['id']):[0,1]},rationale='The revised driver checks admission before invoking the unchanged local comparison')]
         return sub,files
     def initial(state):
         sub,files=first(state);spec=json.loads(files['map.json'])
@@ -241,7 +240,7 @@ def test_mixed_report_reads_fixed_results_and_moves_without_side_effects(tmp_pat
     def challenge_second(state):
         sub,files=review_step('revision_needed')(state)
         sub['rationale']='Review the caller admission condition before revision'
-        sub['review']['review_items'][0].update(report_answer='旧版本前提仍有争议。',challenged_components=['driver'],
+        sub['review']['review_items'][0].update(report_answer='旧版本前提仍有争议。',
             rationale='The caller admission condition is observed but not enforced before invocation',
             counterevidence=['The driver must check admission before making the call'])
         return sub,files

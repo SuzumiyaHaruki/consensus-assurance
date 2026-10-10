@@ -70,7 +70,6 @@ def open_issues(state, artifact=None):
 
 def retain_conflicts(state, artifact, plan):
     """Retain exact input conflicts in the existing issue/resolution chain."""
-    from .repair_policy import condition_records
     claim=next(c for c in state.claims if c.id==plan.claim_id)
     ancestors=lineage(state,artifact)
     pending={i.id for i in open_issues(state,artifact)}
@@ -78,7 +77,9 @@ def retain_conflicts(state, artifact, plan):
     bases.extend((artifact,'monitor/'+m.id,m.grounding) for m in plan.monitors)
     for owner,field,basis in bases:
         sources=list(dict.fromkeys(basis.source_ids+basis.expectation_ids))
-        for record in condition_records(list(dict.fromkeys(basis.conflicts + basis.unresolved)),owner.id+'/'+field,sources,owner.id,owner.version):
+        for n,text in enumerate(dict.fromkeys(basis.conflicts + basis.unresolved),1):
+            record={'id':owner.id+'/'+field+'/condition/'+str(n),'text':text,
+                'target_id':owner.id,'version':owner.version,'source_ids':sources}
             inherited=any((owner is not artifact or i.id in pending) and i.target_id in (ancestors if owner is artifact else {owner.id}) and
                 (owner is artifact or i.target_version==owner.version) and any(c['text']==record['text'] and
                 c['id'].startswith(i.target_id+'/'+field+'/condition/') for c in i.conditions) for i in state.review_issues)
@@ -89,38 +90,56 @@ def retain_conflicts(state, artifact, plan):
                 conditions=[record],disposition='investigation'))
 
 
-def direct_changes(before, after):
-    """Compare retained execution inputs when answering a specific repair issue."""
-    inputs=any(getattr(before.harness,k)!=getattr(after.harness,k) for k in ('source','files','execution_package'))
-    properties=lambda plan:[p.model_dump(exclude={'description'}) for p in plan.observable_properties]
-    predicates=lambda plan:[(m.checker_id,m.applicability_conditions) for m in plan.monitors]
-    observations=lambda plan:[(m.checker_id,m.event,m.admission_alias,m.binding_ids) for m in plan.monitors]
-    oracle=properties(before)!=properties(after) or predicates(before)!=predicates(after)
-    def contract(plan):
-        harness=plan.harness.model_dump(exclude={'source','files','execution_package','description','semantic_changes','legality'})
-        harness['prerequisites']=sorted(harness['prerequisites'],key=lambda r:r['alias'])
-        monitors=[m.model_dump(exclude={'event','admission_alias','applicability_conditions'}) for m in plan.monitors]
-        return plan.claim_id,plan.binding_ids,plan.uncertainties,harness,monitors
-    return {'inputs':inputs,'oracle':oracle,'observation':observations(before)!=observations(after),
-        'contract':contract(before)!=contract(after),
-        'legality':before.harness.legality.model_dump(exclude={'derivation'})!=after.harness.legality.model_dump(exclude={'derivation'})}
-
-
-def repair_changes(old, artifact, version=None):
-    """Compare the challenged component, never infer it from the review column."""
-    if not hasattr(old,'plan_path'):
-        changed=artifact.graph_versions.get(old.id)!=version
-        return {c:changed if c in {'expectation','scope'} else False for c in
-            ('configuration','initialization','driver','observation','oracle','expectation','scope')}
-    from .direct_checks import load_plan
-    before, after = load_plan(old.plan_path), load_plan(artifact.plan_path)
-    changes=direct_changes(before,after)
-    inputs,predicate,observation=changes['inputs'],changes['oracle'],changes['observation']
-    semantic = old.graph_versions != artifact.graph_versions
-    return {'configuration':inputs, 'initialization':inputs, 'driver':inputs,
-        'observation':inputs or predicate or observation, 'oracle':predicate,
-        'expectation':semantic, 'scope':semantic or old.scope != artifact.scope or
-            {p.checker_id for p in after.observable_properties} < {p.checker_id for p in before.observable_properties}}
+def resolution_executions(state, artifact, resolution, items):
+    """Check retained associations and observations; causal sufficiency remains a review judgment."""
+    from consensus_assurance.adapters.runners.experiment import extract_events
+    from .direct_checks import load_plan, compute_assessment, validate_execution_attribution
+    objects = review_objects(state)
+    versions = {id:o.version for id,o in objects.items()}
+    related = {artifact.id, getattr(artifact, 'unit_id', None), getattr(artifact, 'claim_id', None)}
+    related.update(u.candidate_id for u in state.units if u.id in related)
+    related.update(u.id for u in state.units if u.candidate_id == artifact.id)
+    for id, indices in resolution.executions.items():
+        check = next((c for c in state.checks if c.id == id), None)
+        if check is None or check.action not in {'direct_check','exploration'}:
+            raise ValueError('Resolution executions require actual target CheckRun IDs: ' + id)
+        if check.snapshot_id != state.snapshot.id or check.status.value != 'completed':
+            raise ValueError('Resolution execution has a different snapshot or is incomplete: ' + id)
+        owner = next((a for a in state.direct_checks if a.id == check.direct_check_id), None)
+        linked = any('accepted_versions' in s and {id} <= set(s.get('feedback',{}).get('ref_ids',[])) and
+            related & set(s['feedback']['ref_ids']) for s in state.selections)
+        dependency = owner and owner.claim_id != getattr(artifact, 'claim_id', None) and owner.claim_id in getattr(artifact, 'graph_versions', {}) and (
+            owner.graph_versions.get(owner.claim_id) == artifact.graph_versions[owner.claim_id])
+        if owner != artifact and not (linked or dependency or hasattr(artifact, 'question') and owner and owner.unit_id in related):
+            raise ValueError('Resolution execution needs the answering artifact or an explicit dependency/handoff association: ' + id)
+        events = extract_events(check)
+        if (not indices or len(set(indices)) != len(indices) or
+                any(type(i) is not int or not 0 <= i < len(events) for i in indices) or
+                any(e.get('event') == 'invalid_observation' for e in events)):
+            raise ValueError('Resolution needs valid decisive parsed observation indices: ' + id)
+        if check.parameters.get('changed_target_files') or check.parameters.get('lock_unchanged') is False:
+            raise ValueError('Resolution execution changed protected inputs: ' + id)
+        if check.action == 'direct_check':
+            if (owner is None or owner.snapshot_id != check.snapshot_id or
+                    any(versions.get(k) != v for k,v in owner.graph_versions.items())):
+                raise ValueError('Resolution execution has missing or stale fixed artifact inputs: ' + id)
+            plan = load_plan(owner.plan_path)
+            unit = next(u for u in state.units if u.id == owner.unit_id)
+            observed = compute_assessment(state, unit, owner, plan, check, events)
+            if observed['prerequisites']['status'] != 'matched':
+                raise ValueError('Resolution execution has unmatched prerequisites: ' + id)
+        else:
+            actions = [*state.action_history, *([state.pending_action] if state.pending_action else [])]
+            operation = next((a.logical_input.get('operation_id') for a in actions if a.id == check.pending_action_id), None)
+            if not any(s['operation_id'] == operation and s['action'] == 'explore' and 'accepted_versions' in s for s in state.selections):
+                raise ValueError('Resolution exploration lacks accepted fixed inputs: ' + id)
+        if check.exit_code != 0 or check.outcome == 'not_applicable':
+            opinions = items if owner == artifact else [i for r in state.semantic_reviews
+                if owner and r.target_versions.get(owner.id) == owner.version for i in r.items]
+            item = next((i for i in reversed(opinions) if i.execution_attribution and i.execution_attribution.check_id == id), None)
+            if not owner or not item:
+                raise ValueError('Resolution execution requires successful completion or valid narrow failure attribution: ' + id)
+            validate_execution_attribution(state, owner, plan, check, observed['properties'], item)
 
 
 def accept_review(state, submission, operation_id):
@@ -158,14 +177,16 @@ def accept_review(state, submission, operation_id):
         if observed['parsing_errors'] or observed['prerequisites']['status']!='matched':
             raise ValueError('Execution attribution requires complete parsing and matched prerequisites')
     pending = {i.id:i for i in open_issues(state,artifact)}
+    if submission.resolutions and hasattr(artifact, 'graph_versions') and (
+            artifact.snapshot_id != state.snapshot.id or any(a.previous_id == artifact.id for a in state.direct_checks) or
+            any(objects.get(id) is None or objects[id].version != v for id,v in artifact.graph_versions.items())):
+        raise ValueError('Resolve issues against the current artifact and semantic inputs')
     if len({r.issue_id for r in submission.resolutions}) != len(submission.resolutions):
         raise ValueError('Duplicate issue resolution')
     def error(index, issue, message, **details):
         errors.append(Diagnostic(code='issue_resolution', category='format',
             object_ids=[issue.id] if issue else [], paths=[f'/resolutions/{index}'],
             message=message, details=details, allowed=['read','research','revise_check']))
-    evidence = {x.id for name in ('checks','direct_checks','evidence','findings','semantic_reviews')
-        for x in getattr(state,name)}
     for index, resolution in enumerate(submission.resolutions):
         issue = pending.get(resolution.issue_id)
         if not issue:
@@ -174,38 +195,12 @@ def accept_review(state, submission, operation_id):
             continue
         unknown = set(resolution.source_ids)-set(sources)
         if unknown:error(index, issue, 'source_ids accepts acquired Material IDs', unknown_material_ids=sorted(unknown))
-        unknown_evidence = set(resolution.evidence_ids)-evidence
-        if unknown_evidence:error(index, issue, 'evidence_ids accepts retained execution, artifact, evidence or review IDs', unknown_evidence_ids=sorted(unknown_evidence))
+        try:resolution_executions(state, artifact, resolution, submission.review_items)
+        except ValueError as exc:error(index, issue, str(exc))
         if not resolution.rationale.strip():error(index, issue, 'Explain how the answer addresses this issue', original_question=issue.explanation)
-        if issue.conditions:
-            from .repair_policy import classify_conditions
-            dispositions = classify_conditions(state, [c['text'] for c in issue.conditions],
-                resolution.condition_dispositions, resolution.source_ids, records=issue.conditions)
-            if any(d.applies_to == 'current_judgment' for d in dispositions):
-                raise ValueError('Current unresolved conditions cannot discharge their issue')
         item = next((i for i in submission.review_items if i.aspect == issue.aspect and i.status == 'no_issue_found'), None)
         if not item or item.counterevidence or not includes(state,resolution.source_ids,item.source_ids):
             error(index, issue, 'Resolution needs matching substantive review with its answer sources and no current counterevidence', aspect=issue.aspect, answer_source_ids=resolution.source_ids)
-        others = {i.id for i in open_issues(state) if i.id != issue.id and i.parent_issue_id != issue.id}
-        if not set(resolution.residual_issue_ids) <= others or issue.explanation in resolution.scope_limitations:
-            raise ValueError('The original dispute cannot be renamed as a residual scope boundary')
-        components = issue.challenged_components
-        if components:
-            old = objects[issue.target_id]
-            executed = any(c.action == 'direct_check' and c.exit_code == 0 for c in checks)
-            changes = repair_changes(old,artifact,issue.target_version)
-            unchanged = [c for c in components if not changes[c]]
-            challenged=issue_review_item(state,issue)
-            if challenged and challenged.out_of_scope_checker_ids:
-                from .direct_checks import load_plan
-                if set(challenged.out_of_scope_checker_ids)&{p.checker_id for p in load_plan(artifact.plan_path).observable_properties}:
-                    unchanged.append('out_of_scope_checkers')
-            sourced_answer = (artifact.id==old.id and
-                not includes(state,resolution.source_ids,issue.source_ids))
-            if not sourced_answer and (artifact.id == old.id or unchanged or not executed):
-                error(index, issue, 'Repair needs a new artifact, the challenged component change and matching fresh execution',
-                    challenged_components=components, unchanged_components=unchanged, fresh_execution=executed,
-                    original_artifact=old.id, answering_artifact=artifact.id)
     if errors:raise DiagnosticError(errors)
     review = SemanticReview(task_id='review:' + operation_id, check_id=operation_id,
         target_versions={artifact.id:artifact.version}, material_ids=sources, items=submission.review_items,
@@ -217,7 +212,7 @@ def accept_review(state, submission, operation_id):
         issue = next(i for i in state.review_issues if i.id == resolution.issue_id)
         issue.resolved_by = review.id
         issue.resolution_basis = resolution.model_dump(mode='json')
-        issue.resolution_checks = [c.id for c in checks]
+        issue.resolution_checks = list(resolution.executions)
     for item in submission.review_items:
         if item.status == 'no_issue_found':
             continue
@@ -229,11 +224,9 @@ def accept_review(state, submission, operation_id):
         if existing:
             existing.prior_review_ids.append(existing.review_id)
             existing.review_id=review.id
-            existing.challenged_components=item.challenged_components if item.status=='revision_needed' else []
             continue
         state.review_issues.append(ReviewIssue(review_id=review.id, target_id=artifact.id,
             target_version=artifact.version, aspect=item.aspect,
             source_ids=item.source_ids, explanation=item.rationale, reason=item.rationale,
-            disposition='reading' if item.status == 'needs_reading' else 'investigation',
-            challenged_components=item.challenged_components if item.status=='revision_needed' else []))
+            disposition='reading' if item.status == 'needs_reading' else 'investigation'))
     return review

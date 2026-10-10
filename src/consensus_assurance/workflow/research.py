@@ -276,7 +276,8 @@ def view(state, compact=False):
             if c.id not in result['frontier']['paused_candidate_ids']:exclude.add('resume_conditions')
         candidate=c.model_dump(mode='json',exclude=exclude)
         if 'question' in exclude:
-            candidate.update(question_preview=preview(c.question.question),audit_spec_version=c.question.audit_spec_version)
+            candidate.update(question_preview=preview(c.question.question),unknowns=c.question.unknowns,
+                audit_spec_version=c.question.audit_spec_version)
         candidate['result_claim_ids' if compact else 'results']=[r['claim_id'] if compact else
             {k:r[k] for k in ('claim_id','description','disposition')} for r in results if r['candidate_id']==c.id]
         candidate['open_issue_ids']=[i.id for i in issues if i.target_id==c.id]
@@ -522,7 +523,7 @@ def record_decision(engine, submission, operation_id, map_changed=False):
 
 
 def operation_summary(state):
-    """Deliver actual last-operation feedback without resending the research graph."""
+    """Keep the actual result and current gaps across review-only and research handoffs."""
     current = state.current_submission
     if not current:return {'state':'new', 'next':'Read authorized source; a local question needs no map'}
     operation = current.get('operation_id')
@@ -532,17 +533,30 @@ def operation_summary(state):
     if current.get('execution_gap'):summary['blockers'].append(preview(current['execution_gap']))
     actions = [*state.action_history, *([state.pending_action] if state.pending_action else [])]
     ids = {a.id for a in actions if a.logical_input.get('operation_id') == operation}
+    decision = next((s for s in reversed(state.selections) if s['operation_id'] == operation), {})
+    refs = set(decision.get('feedback',{}).get('ref_ids',[]))
+    refs.update(id for r in state.semantic_reviews if r.task_id == 'review:' + str(operation) for id in r.target_versions)
+    refs.update([current.get('direct_check_id'), state.active_direct_check_id])
     checks = [c for c in state.checks if c.action in {'exploration','direct_check'} and
-        (c.pending_action_id in ids or c.direct_check_id and c.direct_check_id == current.get('direct_check_id'))]
+        (c.pending_action_id in ids or c.id in refs or c.direct_check_id and c.direct_check_id in refs)][-3:]
+    if not checks:checks = [c for c in state.checks if c.action in {'exploration','direct_check'}][-1:]
     summary['executions'] = [{'check_id':c.id,'status':c.status.value,'exit_code':c.exit_code,
         'record':f'logs/{c.id}/check.json','stdout':c.stdout,'stderr':c.stderr} for c in checks]
     results = [r for r in state.monitor_results if r.get('experiment_check_id') in {c.id for c in checks}]
     summary['results'] = [{'check_id':r['experiment_check_id'], 'outcome':r['outcome'],
-        'confirmed':r['confirmed'], 'blockers':[preview(x) for x in r['blockers'][:3]],
+        'confirmed':r['confirmed'], 'reviewed_complete':r['reviewed_complete'], 'correspondence':r['correspondence'],
+        'record':{'path':'state.json','collection':'monitor_results','match':{'experiment_check_id':r['experiment_check_id']}},
+        'blockers':[preview(x) for x in r['blockers'][:3]],
         'missing_observations':[preview(d['reason']) for p in r.get('properties',[]) for d in p.get('diagnostics',[])[:1]]}
         for r in results]
-    if state.selections and state.selections[-1]['operation_id'] == operation:
-        decision = state.selections[-1]
+    gaps = [{'id':i.id,'kind':'review_issue','reasons':[i.explanation]} for i in open_issues(state)]
+    gaps.extend({'id':c.id,'kind':'candidate','reasons':c.resume_conditions or c.question.unknowns}
+        for c in state.question_candidates if c.resume_conditions or c.question.unknowns)
+    summary['current_gaps'] = [{'id':w['id'], 'kind':w['kind'], 'reasons':[preview(x) for x in w['reasons'][:2]],
+        'record':{'path':'state.json','collection':'review_issues' if w['kind']=='review_issue' else 'question_candidates',
+            'match':{'id':w['id']}}} for w in gaps[:3]]
+    summary['open_work_index'] = 'research.json'
+    if decision:
         summary['duplicate_of'] = decision.get('duplicate_of')
         if decision.get('feedback'):
             summary['answer'] = preview(decision['feedback']['answered'])

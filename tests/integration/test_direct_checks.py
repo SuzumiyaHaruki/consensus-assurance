@@ -184,20 +184,91 @@ def test_issue_follows_explicit_lineage_or_requirement_not_checker_name(tmp_path
 @pytest.mark.parametrize('owner',['claim','harness','monitor'])
 def test_registered_necessary_gap_survives_no_issue_review(tmp_path,prepared,owner):
     e,u,p=setup(tmp_path,prepared,True)
+    p.monitors[0].grounding=p.monitors[0].grounding.model_copy(deep=True)
     basis={'claim':next(c for c in e.state.claims if c.id==p.claim_id).grounding,'harness':p.harness.legality,'monitor':p.monitors[0].grounding}[owner]
     basis.unresolved=['The necessary input producer history remains unobserved']
+    basis.conflicts=list(basis.unresolved)
+    p.uncertainties=['Larger deployments are outside this local contract']
     artifact=save_plan(e,u,p,'registered-gap')
     review(e.state,u,artifact)
     check=execute(e,artifact)
     result=assess(e.state,u,artifact,p,check,extract_events(check))
     assert result['outcome']=='violated' and not result['confirmed'] and not result['reviewed_complete']
     assert any('producer history' in gap for gap in result['blockers'])
-    assert e.state.review_issues and not any(i.resolved_by for i in e.state.review_issues)
+    assert len(e.state.review_issues)==1 and not e.state.review_issues[0].resolved_by
+    condition=e.state.review_issues[0].conditions[0]
+    assert condition['target_id']==(p.claim_id if owner=='claim' else artifact.id) and condition['version']==1
+    assert p.uncertainties[0] in result['boundaries']
+    if owner=='claim':
+        p.monitors[0].grounding.unresolved=list(basis.unresolved)
+        successor=save_plan(e,u,p,'different-owner',previous=artifact)
+        assert {i.target_id for i in e.state.review_issues}=={p.claim_id,successor.id}
+
+
+def test_identity_repair_and_resolution_references_without_oracle_edits(tmp_path):
+    from audit_support import engine_for, first, products, check_step, review_step, stop
+    from consensus_assurance.core.submissions import ResultReview
+    from consensus_assurance.workflow.reviews import resolution_executions
+    from consensus_assurance.workflow.research import operation_summary
+    def missing_identity(state):
+        sub,files=check_step()(state)
+        files['check.py']=files['check.py'].replace("'event':'returned','operation':'one'", "'event':'returned'")
+        return sub,files
+    def challenge(state):
+        sub,files=review_step('revision_needed')(state)
+        sub['review']['review_items'][0].update(rationale='Observation and oracle were questioned; the returned operation identity is missing.',
+            counterevidence=['The return cannot be associated with the admitted operation'])
+        return sub,files
+    def probe(state):
+        return dict(action='explore',question='Observe an independent stateless call',harness_path='check.py',
+            files={'helper.py':'helper.py'},rationale='Separate supporting observation'),{
+            'check.py':products()[2], 'helper.py':'def legal(value, limit): return 0 <= value <= limit\n'}
+    def handoff(state):
+        probe_id=next(c['id'] for c in state['checks'] if c['action']=='exploration')
+        return dict(action='research',rationale='Relate the separate observation explicitly',feedback=dict(
+            ref_ids=[probe_id,state['direct_checks'][-1]['id'],'code','doc'],answered='Both calls use the same stateless contract.',
+            remaining=['Caller integration remains unobserved'],rationale='Independent calls share no mutable history; neither substitutes for the other endpoint.')),{}
+    def resolve(state):
+        summary=operation_summary(e.state)
+        assert summary['executions'] and summary['current_gaps'][0]['id']==state['review_issues'][0]['id']
+        sub,files=review_step()(state)
+        artifact=e.state.direct_checks[-1]
+        check=next(c for c in e.state.checks if c.direct_check_id==artifact.id)
+        probe_check=next(c for c in e.state.checks if c.action=='exploration')
+        sub['review']['resolutions']=[dict(issue_id=state['review_issues'][0]['id'],source_ids=['code','doc'],
+            executions={check.id:[0,1],probe_check.id:[0,1]},
+            rationale='v2 observes the actual admitted and returned identity; the comparison was already correct. The explicitly linked stateless probe agrees without supplying v2 history.')]
+        request=ResultReview.model_validate(sub['review']);answer=request.resolutions[0]
+        def verify(private, value=answer):resolution_executions(private,artifact,value,request.review_items)
+        verify(e.state)
+        for wrong in (artifact.id,e.state.checks[0].id,e.state.semantic_reviews[0].id):
+            with pytest.raises(ValueError,match='actual target CheckRun'):
+                verify(e.state,answer.model_copy(update={'executions':{wrong:[0]}}))
+        for change in ({'snapshot_id':'other'},{'status':ExecutionStatus.TIMEOUT},{'exit_code':1},{'direct_check_id':e.state.direct_checks[0].id}):
+            private=e.state.model_copy(deep=True)
+            private.checks=[c.model_copy(update=change) if c.id==check.id else c for c in private.checks]
+            with pytest.raises(ValueError):verify(private)
+        with pytest.raises(ValueError,match='observation indices'):
+            verify(e.state,answer.model_copy(update={'executions':{check.id:[99]}}))
+        private=e.state.model_copy(deep=True);private.selections=private.selections[:-1]
+        with pytest.raises(ValueError,match='association'):verify(private)
+        return sub,files
+    e,repo=engine_for(tmp_path,[first,missing_identity,challenge,check_step(revise=True),probe,handoff,resolve,stop])
+    e.agent.mock=False;e.config.execution_isolation='bwrap'
+    (repo/'target.py').write_text('def step(value, limit):\n    return value + 1\n')
+    state=e.start(repo)
+    assert not list((e.root/'submissions').glob('*/diagnostics.json')),state.stop_reason
+    old,new=state.direct_checks
+    plans=[json.loads(Path(a.plan_path).read_text()) for a in (old,new)]
+    assert plans[0]['observable_properties']==plans[1]['observable_properties']
+    assert not state.monitor_results[0]['confirmed'] and state.monitor_results[1]['confirmed']
+    assert len(state.revisions)==1 and state.review_issues[0].resolved_by
+    assert set(state.review_issues[0].resolution_checks)==set(state.review_issues[0].resolution_basis['executions'])
 
 
 def test_out_of_scope_checker_removal_keeps_responsibility_and_issue_lineage(tmp_path):
     from audit_support import engine_for,first,check_step,review_step,stop,diagnostics
-    from consensus_assurance.core.submissions import CheckSubmission,ResultReview
+    from consensus_assurance.core.submissions import ResultReview
     from consensus_assurance.workflow.direct_checks import load_plan,compute_assessment
     from consensus_assurance.workflow.reviews import open_issues,accept_review
     saved={}
@@ -210,80 +281,46 @@ def test_out_of_scope_checker_removal_keeps_responsibility_and_issue_lineage(tmp
         files['check.py']=files['check.py'].replace("'in_range':0 <= value <= 3", "'in_range':0 <= value <= 3,'value':value")
         saved['files']=files
         return sub,files
-    def challenge(state,precise=False):
+    def challenge(state):
         sub,_=review_step('revision_needed')(state)
         sub['review']['review_items'][0].update(rationale='The obligation requires a bounded return, not a zero return',
-            counterevidence=['Zero asserts an additional property outside the accepted responsibility'],
-            challenged_components=['scope'])
-        if precise:
-            sub['sources']=[dict(id='boundary',file='README.md',start_line=2,end_line=2,kind='interface_statement')]
-            sub['review']['review_items'][0].update(rationale='The explicit contract retains Bounded; only the extra Zero checker misstates the oracle',
-                challenged_components=['oracle'],source_ids=['code','doc','boundary'],out_of_scope_checker_ids=['Zero'])
+            counterevidence=['Zero asserts an additional property outside the accepted responsibility'])
         return sub,{}
-    def corrected(state,linked=True):
-        sub,_=check_step(revise=linked)(state)
+    def corrected(state):
+        sub,_=check_step(revise=True)(state)
         files=dict(saved['files']);plan=json.loads(files['plan.json'])
         plan['observable_properties']=plan['observable_properties'][:1];plan['monitors']=plan['monitors'][:1]
         files['plan.json']=json.dumps(plan)
-        if not linked:
-            saved['old']=e.state.model_copy(deep=True)
-            return sub,files
-        old=e.state.direct_checks[0];sub['previous_check_id']=old.id
-        from consensus_assurance.workflow.review_contract import validate_contract
-        item=e.state.semantic_reviews[-1].items[0]
-        for update in ({'out_of_scope_checker_ids':['missing']},{'out_of_scope_checker_ids':['Zero','Zero']},
-                {'out_of_scope_checker_ids':['Zero','Bounded']},{'status':'no_issue_found'},
-                {'challenged_components':['driver']},{'aspect':'applicability'}):
-            with pytest.raises(ValueError):validate_contract(e.state,old.id,[item.model_copy(update=update)])
+        saved['assessment']=state['monitor_results'][0]
         return sub,files
     def resolve(state):
         sub,_=review_step()(state)
-        sub['review']['review_items'][0]['source_ids']=['code','doc','boundary']
-        sub['review']['resolutions']=[dict(issue_id=i['id'],source_ids=['code','doc','boundary'],
+        sub['review']['review_items'][0]['source_ids']=['code','doc']
+        sub['review']['resolutions']=[dict(issue_id=i['id'],source_ids=['code','doc'],
             rationale='The inherited correction removes only Zero; a fresh execution still observes the bounded return violation',
-            residual_issue_ids=[],scope_limitations=['External consumers remain outside this local obligation']) for i in state['review_issues']]
+            executions={next(c['id'] for c in state['checks'] if c['direct_check_id']==sub['review']['artifact_id']):[0,1]}) for i in state['review_issues']]
         return sub,{}
-    e,repo=engine_for(tmp_path,[first,extra,challenge,lambda state:challenge(state,True),
-        lambda state:corrected(state,False),resolve,corrected,resolve,stop])
+    e,repo=engine_for(tmp_path,[first,extra,challenge,corrected,resolve,stop])
     (repo/'target.py').write_text('def step(value, limit):\n    return value + 1\n')
-    with (repo/'README.md').open('a') as stream:stream.write('Only the range is required; returning zero is not a separate responsibility.\n')
     state=e.start(repo)
-    errors=diagnostics(e)
-    assert len(errors)==1 and all('lineage' in d['message'] for d in errors[0]['diagnostics']),errors
-    old,independent,new=state.direct_checks
-    assert new.previous_id==old.id and independent.previous_id is None
+    assert not diagnostics(e),state.stop_reason
+    old,new=state.direct_checks
+    assert new.previous_id==old.id
     current=next(r for r in state.monitor_results if r['direct_check_id']==new.id)
     assert current['reviewed_complete'] and current['outcome']=='violated'
-    assert len(open_issues(state,old))==2 and not open_issues(state,new)
-    assert not open_issues(state,new.model_copy(update={'id':'descendant','previous_id':new.id}))
-    assert state.usage['experiments']==3 and len(state.revisions)==1
-    before=saved['old']
-    assert state.claims==before.claims and state.units[0].version==before.units[0].version
-    assert old==before.direct_checks[0]
-    assert next(r for r in state.monitor_results if r['direct_check_id']==old.id)==before.monitor_results[0]
-    assert [e for e in state.evidence if e.direct_check_id==old.id]==before.evidence
+    assert len(open_issues(state,old))==1 and not open_issues(state,new)
+    assert state.usage['experiments']==2 and len(state.revisions)==1
+    assert state.monitor_results[0]==saved['assessment']
     assert load_plan(old.plan_path).harness==load_plan(new.plan_path).harness
     assert len(load_plan(old.plan_path).observable_properties)==2
     old_check=next(c for c in state.checks if c.direct_check_id==old.id)
     assert '"value": 4' in Path(old_check.stdout).read_text()
     borrowed=compute_assessment(state,state.units[0],new,load_plan(new.plan_path),old_check,extract_events(old_check))
     assert not borrowed['reviewed_complete'] and not borrowed['confirmed']
-    # Resolving this correction does not erase an independent issue on the same lineage.
-    private=state.model_copy(deep=True)
-    separate=state.review_issues[0].model_copy(update={'id':'independent-issue','resolved_by':None})
-    private.review_issues.append(separate)
-    assert [i.id for i in open_issues(private,new)]==[separate.id]
     # Saved ancestor outputs do not authorize review of an unexecuted successor.
     private=state.model_copy(deep=True);private.checks=[c for c in private.checks if c.direct_check_id!=new.id]
     request=ResultReview.model_validate(resolve(state.model_dump(mode='json'))[0]['review'])
     with pytest.raises(ValueError,match='actual completed execution'):accept_review(private,request,'no-execution')
-    # Rewording scope on a fresh execution cannot repair an explicitly named extra checker.
-    private=state.model_copy(deep=True);private.semantic_reviews.pop()
-    private.direct_checks[-1].plan_path=old.plan_path
-    private.direct_checks[-1].scope.description='Reworded local scope'
-    private.review_issues[-1].challenged_components=['scope']
-    with pytest.raises(ValueError) as caught:accept_review(private,request,'scope-text-only')
-    assert any('out_of_scope_checkers' in d.details.get('unchanged_components',[]) for d in caught.value.diagnostics)
 
 
 @pytest.mark.parametrize('change',['semantic_input','knowledge_challenge'])

@@ -116,7 +116,6 @@ def review_step(status='no_issue_found',aspect='checker_correspondence'):
         item=dict(target_id=artifact['id'],aspect=aspect,status=status,source_ids=['code','doc'],
             rationale='Actual source, legality, result and independent bound agree within this local call')
         if status in {'disputed','revision_needed'}:item['counterevidence']=['The current assumption needs a distinct source check']
-        if status=='revision_needed':item['challenged_components']=['oracle']
         return dict(action='research',review=dict(artifact_id=artifact['id'],review_items=[item]),rationale='Review the saved execution'),{}
     return step
 

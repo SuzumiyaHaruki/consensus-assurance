@@ -74,7 +74,8 @@ def test_cli_audit_fixture_execution_and_report(tmp_path,capsys,monkeypatch):
     assert saved_cancel['run_stop']['origin']=='controller' and saved_cancel['run_stop']['reason']=='user_stop'
     assert saved_cancel['usage']['agent_calls']==1 and '实际取消' in (cancelled/'report.md').read_text()
     old=tmp_path/'historical';old.mkdir()
-    historical={'framework_revision':'audit-products-v59','native_current':{'phase':'executed'},'native_session_id':'old-session'}
+    historical={'framework_revision':'audit-products-v60','current_submission':{'phase':'executed'},
+        'agent_session_id':'old-session','review_issues':[{'challenged_components':['oracle']}]}
     (old/'state.json').write_text(json.dumps(historical))
     (old/'report.md').write_text('历史结果：执行失败，未确认。')
     before={p.name:p.read_bytes() for p in old.iterdir()}

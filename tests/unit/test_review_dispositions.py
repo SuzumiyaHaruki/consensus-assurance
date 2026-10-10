@@ -44,24 +44,7 @@ def test_semantic_transaction_failure_and_recovery_are_atomic(tmp_path,prepared,
     assert 'change' in Store(engine.root).load().applied_operations
 
 
-from consensus_assurance.core.proposals import ConditionDisposition
 from consensus_assurance.core.diagnostics import DiagnosticError
-from consensus_assurance.workflow.repair_policy import classify_conditions, condition_records
-
-
-@pytest.mark.parametrize('shape,code',[('missing','condition_missing'),('extra','condition_extra'),('duplicate','condition_duplicate')])
-def test_condition_reference_diagnostics_are_specific_and_do_not_erase_judgment(prepared,shape,code):
-    _, state, _ = prepared;id=state.materials[0].id
-    records=condition_records(['Storage durability has not been inspected'],'issue-version-1',[id],'o',1)
-    item=ConditionDisposition(condition_id=records[0]['id'],applies_to='independent_scope',rationale='This caller-location question does not establish storage behavior',source_ids=[id])
-    dispositions=[] if shape=='missing' else [item,item] if shape=='duplicate' else [item,item.model_copy(update={'condition_id':'wrong'})]
-    before=state.model_dump()
-    with pytest.raises(DiagnosticError) as caught:
-        classify_conditions(state,[r['text'] for r in records],dispositions,[id],records=records,object_ids=['o'])
-    d=caught.value.diagnostics[0]
-    assert d.code==code and d.details[shape] and d.allowed==['representation']
-    assert state.model_dump()==before
-    assert classify_conditions(state,[r['text'] for r in records],[item],[id],records=records)==[item]
 
 
 def test_review_target_inheritance_and_contract_diagnostics(tmp_path,prepared):
@@ -80,10 +63,16 @@ def test_review_target_inheritance_and_contract_diagnostics(tmp_path,prepared):
     validate_contract(engine.state,artifact.id,product.review_items)
     for fields,code in (({'target_id':plan.claim_id},'review_unknown_target'),
         ({'counterevidence':['The endpoint is disputed']},'review_contradictory_judgment'),
-        ({'status':'revision_needed','counterevidence':['Wrong oracle']},'review_missing_component'),
         ({'source_ids':['unacquired']},'review_unknown_source')):
         item=product.review_items[0].model_copy(update=fields)
         with pytest.raises(DiagnosticError) as caught:validate_contract(engine.state,artifact.id,[item])
         assert code in {d.code for d in caught.value.diagnostics}
     with pytest.raises(ValueError):SemanticCheck.model_validate(raw['review']['review_items'][0])
     assert 'target_id' not in AuditSubmission.model_json_schema()['$defs']['ArtifactReviewItem']['required']
+
+    schema=AuditSubmission.model_json_schema()
+    assert not {'challenged_components','out_of_scope_checker_ids'} & schema['$defs']['ArtifactReviewItem']['properties'].keys()
+    assert 'ConditionDisposition' not in schema['$defs']
+    assert set(schema['$defs']['IssueResolution']['properties'])=={'issue_id','source_ids','executions','rationale'}
+    negative=product.review_items[0].model_copy(update={'status':'revision_needed','counterevidence':['Missing independent identity']})
+    validate_contract(engine.state,artifact.id,[negative])

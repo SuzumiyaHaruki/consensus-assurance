@@ -202,7 +202,7 @@ def test_one_audit_runtime_and_methods_match_product_interface(tmp_path):
     assert (e.root/'audit-method.md').read_text()==text
     resource_root=Path('src/consensus_assurance/resources')
     assert text=='\n'.join((resource_root/p).read_text() for p in paths)
-    assert state.framework_revision=='audit-products-v60'
+    assert state.framework_revision=='audit-products-v61'
     assert paths==['system.md','skills/consensus-analysis/SKILL.md','skills/evidence-review/SKILL.md','tasks/audit.md']
 
 

@@ -49,7 +49,7 @@ def test_local_check_review_learning_and_reselection_need_no_map(tmp_path):
     e.agent.investigate = capture
     state = e.start(repo)
     assert not diagnostics(e), diagnostics(e)
-    assert state.framework_revision == 'audit-products-v60' and state.audit_spec_version == 1
+    assert state.framework_revision == 'audit-products-v61' and state.audit_spec_version == 1
     assert not state.question_candidates[0].question.fact_ids
     assert state.question_candidates[0].status=='escalated' and state.question_candidates[-1].status=='paused'
     assert state.question_candidates[-1].history and state.units[0].status == 'checked'
@@ -202,6 +202,10 @@ def test_question_converges_before_obligation_and_results_do_not_propagate(tmp_p
         return dict(action='check',candidate=sub,plan_path='plan.json',harness_path='check.py',files={'helper.py':'helper.py'},
             rationale='Accept the aligned question, map and first actual check together'),files
     def independent(state):
+        from consensus_assurance.workflow.research import operation_summary
+        summary=operation_summary(e.state)
+        assert summary['executions'] and summary['results'][0]['confirmed']
+        assert summary['current_gaps']
         sub,_=question_step(state);sub.pop('map_path');sub['question'].pop('audit_spec_version')
         sub['question'].update(question='Does caller interference uniquely account for this return?',unknowns=['Cause has not been isolated'])
         sub['feedback']=feedback(state)
@@ -214,6 +218,11 @@ def test_question_converges_before_obligation_and_results_do_not_propagate(tmp_p
             disposition='explained_by_existing_mechanism',counterevidence=['The function reads only its parameters'],unknowns=[])
         return sub,{}
     def update_current_question(state):
+        from consensus_assurance.workflow.research import operation_summary
+        summary=operation_summary(e.state)
+        parent=state['question_candidates'][1]['id']
+        assert any(g['id']==parent and 'Cause has not been isolated' in g['reasons'] for g in summary['current_gaps'])
+        assert summary['executions'][0]['check_id']==state['monitor_results'][0]['experiment_check_id']
         c=state['question_candidates'][0]
         q=dict(c['question']);q['question']='Does the caller always consume a bounded value?'
         q['audit_spec_version']=state['audit_spec_version']
@@ -709,7 +718,7 @@ def test_knowledge_growth_preserves_execution_and_supplies_the_next_check(tmp_pa
             review_items=[dict(target_id=c['id'],aspect='applicability',status='no_issue_found',
             source_ids=['code','doc'],rationale=answer)],
             resolutions=[dict(issue_id=issue['id'],source_ids=['code','doc'],
-                evidence_ids=[state['direct_checks'][1]['id']],rationale=answer,residual_issue_ids=[],scope_limitations=['Schedules with an intervening clear remain unchecked'])]),
+                executions={next(c['id'] for c in state['checks'] if c['direct_check_id']==state['direct_checks'][1]['id']):[0,1]},rationale=answer)]),
             rationale='Resolve the specific interpretation against the fixed execution, without changing its requirement'),{}
     def third(state):
         if variant=='interference':
@@ -876,7 +885,7 @@ def test_new_knowledge_challenges_and_reviews_a_retained_source_explanation(tmp_
         return dict(action='research', review=dict(artifact_id=c['id'],
             review_items=[dict(target_id=c['id'],aspect='applicability',status='no_issue_found',
             source_ids=['code','doc'],rationale=answer)],
-            resolutions=[dict(issue_id=issue['id'],source_ids=['code','doc'],rationale=answer,residual_issue_ids=[],scope_limitations=[])]),
+            resolutions=[dict(issue_id=issue['id'],source_ids=['code','doc'],rationale=answer)]),
             rationale='Answer the specific knowledge challenge'),{}
     def invalid_review(state):
         sub,files=resolve(state);sub['review']['review_items'][0]['source_ids']=['missing']

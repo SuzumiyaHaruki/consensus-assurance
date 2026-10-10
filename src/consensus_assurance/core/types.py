@@ -30,7 +30,6 @@ ACTIVITY_ROLES = {
 }
 Lifecycle = Literal["establishment", "preservation", "consumption", "recovery"]
 Concern = Literal["consensus_safety", "bounded_liveness", "implementation_semantics"]
-RepairComponent = Literal["configuration", "initialization", "driver", "observation", "oracle", "expectation", "scope"]
 
 
 class TargetProfile(Record):
@@ -209,10 +208,6 @@ class SemanticCheck(Record):
     report_answer: str | None = Field(default=None, description="Optional Chinese observed-answer summary preserving applicability; numbers and status come from retained assessment")
     counterevidence: list[str] = []
     limitations: list[str] = []
-    challenged_components: list[RepairComponent] = Field(default_factory=list,
-        description="Components requiring repair, distinct from the review aspect; revision_needed must name them")
-    out_of_scope_checker_ids: list[str] = Field(default_factory=list,
-        description="Exact extra checker IDs challenged as outside this obligation, not a change to the obligation. Only direct checker_correspondence revision_needed with a scope/oracle challenge; retained checkers must still express the responsibility")
 
 
 class SemanticReview(Record):
@@ -232,8 +227,6 @@ class ReviewIssue(Record):
     conditions: list[dict[str, Any]] = []
     resolution_basis: dict = {}
     prior_review_ids: list[str] = []
-    parent_issue_id: str | None = None
-    challenged_components: list[RepairComponent] = []
     id: str = Field(default_factory=uid)
     review_id: str
     target_id: str

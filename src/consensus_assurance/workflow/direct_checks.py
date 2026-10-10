@@ -132,7 +132,7 @@ def validate_execution_attribution(state,artifact,plan,check,results,item):
     """Validate exact retained references, not the review's causal independence argument."""
     attribution=item.execution_attribution
     if (not attribution or item.aspect!='checker_correspondence' or item.status!='no_issue_found' or
-            item.counterevidence or item.challenged_components or item.target_id!=artifact.id):
+            item.counterevidence or item.target_id!=artifact.id):
         raise ValueError('Execution attribution requires unchallenged direct checker correspondence')
     if (check is None or attribution.check_id!=check.id or not any(c==check for c in state.checks) or
             artifact not in state.direct_checks or check.action!='direct_check' or check.direct_check_id!=artifact.id or
