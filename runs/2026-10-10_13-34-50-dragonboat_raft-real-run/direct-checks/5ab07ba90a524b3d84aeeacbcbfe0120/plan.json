@@ -1,0 +1,243 @@
+{
+  "description": "Three-node bootstrap and actual election; follower 2 request is queued after its heartbeat sends are lost, then follower 3 request obtains real quorum acknowledgment. Compare each follower ReadyToRead context against its actual leader-admitted context, correlated by scenario and originating node rather than by the compared context. Continue three fault-free heartbeat ticks, with no deadline claim. Successor explicitly samples the completed bootstrap/election prefix for each future requesting origin and associates admission with prefix.origin; the compared contexts and claim are unchanged. This revision compares both actual numeric SystemCtx fields separately instead of a formatted context string; both checks together preserve the full original-context obligation.",
+  "claim_id": "forwarded_read_context_obligation",
+  "binding_ids": [
+    "forwarded_read_confirmation"
+  ],
+  "harness": {
+    "execution_package": "./internal/raft",
+    "files": {},
+    "kind": "go_test",
+    "source": "package raft\n\nimport (\n    \"encoding/json\"\n    \"fmt\"\n    \"testing\"\n\n    \"github.com/lni/dragonboat/v3/config\"\n    pb \"github.com/lni/dragonboat/v3/raftpb\"\n)\n\n// This driver persists each update before delivering its messages. It uses\n// real bootstrap, ticks, elections, forwarding and heartbeat responses.\n// Application entries have no user state machine in this protocol-level probe.\nfunc TestAssuranceForwardedReadBatchIdentity(t *testing.T) {\n    emit := func(v map[string]interface{}) {\n        v[\"scenario\"] = \"forwarded_batch\"\n        b, err := json.Marshal(v)\n        if err != nil { t.Fatal(err) }\n        fmt.Println(\"CA_EVENT \" + string(b))\n    }\n    peers := map[uint64]*Peer{}\n    stores := map[uint64]*TestLogDB{}\n    applied := map[uint64]uint64{}\n    ready := map[uint64][]pb.ReadyToRead{}\n    addresses := []PeerAddress{{NodeID:1, Address:\"n1\"}, {NodeID:2, Address:\"n2\"}, {NodeID:3, Address:\"n3\"}}\n    for id := uint64(1); id <= 3; id++ {\n        stores[id] = NewTestLogDB().(*TestLogDB)\n        peers[id] = Launch(config.Config{NodeID:id, ClusterID:1, ElectionRTT:10, HeartbeatRTT:1, CheckQuorum:true}, stores[id], nil, addresses, true, true)\n    }\n    take := func(id uint64) []pb.Message {\n        p := peers[id]\n        ud := p.GetUpdate(true, applied[id])\n        if err := stores[id].Append(ud.EntriesToSave); err != nil { t.Fatal(err) }\n        if !pb.IsEmptyState(ud.State) { stores[id].SetState(ud.State) }\n        msgs := append([]pb.Message(nil), ud.Messages...)\n        ready[id] = append(ready[id], ud.ReadyToReads...)\n        for _, rr := range ud.ReadyToReads {\n            emit(map[string]interface{}{\"event\":\"ready_result\", \"origin\":id, \"ctx\":fmt.Sprintf(\"%d/%d\", rr.SystemCtx.Low, rr.SystemCtx.High), \"ctx_low\":rr.SystemCtx.Low, \"ctx_high\":rr.SystemCtx.High, \"index\":rr.Index})\n        }\n        p.Commit(ud)\n        for _, e := range ud.CommittedEntries {\n            if e.Type == pb.ConfigChangeEntry {\n                var cc pb.ConfigChange\n                if err := cc.Unmarshal(e.Cmd); err != nil { t.Fatal(err) }\n                p.ApplyConfigChange(cc)\n            }\n            applied[id] = e.Index\n        }\n        p.NotifyRaftLastApplied(applied[id])\n        return msgs\n    }\n    var dropped int\n    first := pb.SystemCtx{Low:101, High:30}\n    second := pb.SystemCtx{Low:202, High:30}\n    pump := func(queue []pb.Message, dropFirst bool) {\n        for steps := 0; len(queue) > 0; steps++ {\n            if steps >= 1000 { t.Fatal(\"message drain exceeded bound\") }\n            m := queue[0]\n            queue = queue[1:]\n            if dropFirst && m.Type == pb.Heartbeat && m.Hint == first.Low && m.HintHigh == first.High {\n                dropped++\n                emit(map[string]interface{}{\"event\":\"dropped_heartbeat\", \"from\":m.From, \"to\":m.To, \"low\":m.Hint, \"high\":m.HintHigh})\n                continue\n            }\n            if m.Type == pb.ReadIndex || m.Type == pb.ReadIndexResp || (m.Type == pb.HeartbeatResp && m.Hint != 0) {\n                emit(map[string]interface{}{\"event\":\"delivered\", \"type\":m.Type.String(), \"from\":m.From, \"to\":m.To, \"term\":m.Term, \"low\":m.Hint, \"high\":m.HintHigh, \"index\":m.LogIndex})\n            }\n            peers[m.To].Handle(m)\n            if m.Type == pb.ReadIndex {\n                // Observe the actual admitted object before any response delivery.\n                ctx := pb.SystemCtx{Low:m.Hint, High:m.HintHigh}\n                if rs, ok := peers[m.To].raft.readIndex.pending[ctx]; ok {\n                    emit(map[string]interface{}{\"event\":\"admitted\", \"origin\":rs.from, \"ctx\":fmt.Sprintf(\"%d/%d\",rs.ctx.Low,rs.ctx.High), \"ctx_low\":rs.ctx.Low, \"ctx_high\":rs.ctx.High, \"index\":rs.index, \"leader\":m.To})\n                }\n            }\n            queue = append(queue, take(m.To)...)\n        }\n    }\n    for id := uint64(1); id <= 3; id++ { pump(take(id), false) }\n    // Only node 1's clock is advanced until it campaigns. All resulting votes\n    // and replication messages are delivered through Peer.Handle.\n    for i := 0; i < 30 && !peers[1].raft.isLeader(); i++ {\n        peers[1].Tick()\n        pump(take(1), false)\n    }\n    if !peers[1].raft.isLeader() || !peers[1].raft.hasCommittedEntryAtCurrentTerm() { t.Fatal(\"leader prefix incomplete\") }\n    for id := uint64(1); id <= 3; id++ {\n        if peers[id].raft.leaderID != 1 || applied[id] < 4 { t.Fatalf(\"prefix incomplete on %d\", id) }\n    }\n    for origin := uint64(2); origin <= 3; origin++ {\n        emit(map[string]interface{}{\"event\":\"prefix\", \"origin\":origin, \"leader_ready\":peers[1].raft.isLeader() && peers[1].raft.hasCommittedEntryAtCurrentTerm(), \"term\":peers[1].raft.term, \"commit\":peers[1].raft.log.committed, \"follower_leader\":peers[origin].raft.leaderID, \"follower_applied\":applied[origin]})\n    }\n    emit(map[string]interface{}{\"event\":\"invoke\", \"operation\":\"first\", \"origin\":2, \"low\":first.Low, \"high\":first.High})\n    peers[2].ReadIndex(first)\n    pump(take(2), true)\n    status, ok := peers[1].raft.readIndex.pending[first]\n    if !ok || status.from != 2 || dropped != 2 { t.Fatal(\"first request was not admitted with both heartbeats lost\") }\n    emit(map[string]interface{}{\"event\":\"first_pending\", \"origin\":status.from, \"low\":status.ctx.Low, \"high\":status.ctx.High, \"index\":status.index})\n    emit(map[string]interface{}{\"event\":\"invoke\", \"operation\":\"second\", \"origin\":3, \"low\":second.Low, \"high\":second.High})\n    peers[3].ReadIndex(second)\n    pump(take(3), false)\n    // Deliver subsequent periodic heartbeats without faults. This is a finite\n    // observation of protocol-owned continuation, not a permanent-stall proof.\n    for i := 0; i < 3; i++ { peers[1].Tick(); pump(take(1), false) }\n    for id := uint64(1); id <= 3; id++ {\n        emit(map[string]interface{}{\"event\":\"endpoint\", \"node\":id, \"ready\":ready[id], \"pending\":len(peers[id].raft.readIndex.pending), \"applied\":applied[id], \"term\":peers[id].raft.term, \"leader\":peers[id].raft.leaderID})\n    }\n}\n",
+    "description": "Synchronous peer driver with TestLogDB storage, actual Launch/tick/read/Handle/GetUpdate/Commit calls, and two lost heartbeat sends.",
+    "semantic_changes": [
+      "No target logic changes.",
+      "In-memory storage and synchronous transport substitute for disk and networking; no crash or persistence failure is claimed.",
+      "Contexts are supplied directly to Peer.ReadIndex; NodeHost client workers are not instantiated.",
+      "Application of non-configuration entries is represented by sequential applied-index notification; no application value claim."
+    ],
+    "prerequisites": [
+      {
+        "alias": "prefix",
+        "event": "prefix",
+        "conditions": [
+          {
+            "field": "leader_ready",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          },
+          {
+            "field": "follower_leader",
+            "op": "eq",
+            "value": 1,
+            "reference": null
+          },
+          {
+            "field": "follower_applied",
+            "op": "eq",
+            "value": 4,
+            "reference": null
+          }
+        ]
+      },
+      {
+        "alias": "admission",
+        "event": "admitted",
+        "conditions": [
+          {
+            "field": "scenario",
+            "op": "eq",
+            "value": null,
+            "reference": "prefix.scenario"
+          },
+          {
+            "field": "leader",
+            "op": "eq",
+            "value": 1,
+            "reference": null
+          },
+          {
+            "field": "origin",
+            "op": "eq",
+            "value": null,
+            "reference": "prefix.origin"
+          }
+        ]
+      }
+    ],
+    "legality": {
+      "source_ids": [
+        "peer_bootstrap",
+        "peer_bootstrap_entries",
+        "test_log_storage",
+        "peer_admission",
+        "term_admission",
+        "commit_quorum",
+        "election_config_guard",
+        "loss_permitted",
+        "peer_read_api",
+        "read_node_producer",
+        "read_client_matching"
+      ],
+      "expectation_ids": [
+        "peer_read_api",
+        "loss_permitted"
+      ],
+      "binding_ids": [
+        "forwarded_read_confirmation"
+      ],
+      "derivation": "Launch builds initial membership and entries; TestLogDB stores every update before outbound delivery; committed bootstrap entries are applied and NotifyRaftLastApplied advances the real election guard. Node 1 ticks trigger its real election and current-term no-op replication. Requests enter Peer.ReadIndex and traverse Peer.Handle. Only the first two heartbeat sends are lost; all delivered messages retain FIFO order. Contexts are legal supplied Peer inputs with nonzero Low and caller-compatible High, not fabricated votes or confirmation state. The single-threaded driver drains each update synchronously and observes readiness before Commit clears it.",
+      "applicability": "Distinct nonzero read contexts, one operation per follower origin, stable term and membership, current-term entry committed before reads.",
+      "unresolved": [],
+      "conflicts": [],
+      "alternatives": []
+    }
+  },
+  "monitors": [
+    {
+      "id": "ready_context_low_monitor",
+      "checker_id": "ready_context_low_preserved",
+      "event": "ready_result",
+      "binding_ids": [
+        "forwarded_read_confirmation"
+      ],
+      "grounding": {
+        "source_ids": [
+          "read_batch",
+          "read_confirmation",
+          "read_forward_consume",
+          "peer_read_api",
+          "read_client_matching",
+          "read_node_producer",
+          "read_node_consumer"
+        ],
+        "expectation_ids": [
+          "batch_context_expectation",
+          "follower_context_expectation",
+          "read_client_matching"
+        ],
+        "binding_ids": [
+          "forwarded_read_confirmation"
+        ],
+        "derivation": "The queue retains the originating node and original SystemCtx for each confirmed read. The batch-confirmation test explicitly preserves each context while allowing its index to advance. Follower consumption passes response context through, and pendingReadIndex.addReady uses exact SystemCtx equality to find the originating batch. Therefore a forwarded completion must preserve the admitted request context; a later heartbeat context is not an alias for earlier requests.",
+        "applicability": "Distinct nonzero read contexts, one operation per follower origin, stable term and membership, current-term entry committed before reads.",
+        "unresolved": [],
+        "conflicts": [],
+        "alternatives": []
+      },
+      "applicability_conditions": [
+        {
+          "field": "scenario",
+          "op": "eq",
+          "value": null,
+          "reference": "admission.scenario"
+        },
+        {
+          "field": "origin",
+          "op": "eq",
+          "value": null,
+          "reference": "admission.origin"
+        }
+      ],
+      "admission_alias": "admission"
+    },
+    {
+      "id": "ready_context_high_monitor",
+      "checker_id": "ready_context_high_preserved",
+      "event": "ready_result",
+      "binding_ids": [
+        "forwarded_read_confirmation"
+      ],
+      "grounding": {
+        "source_ids": [
+          "read_batch",
+          "read_confirmation",
+          "read_forward_consume",
+          "peer_read_api",
+          "read_client_matching",
+          "read_node_producer",
+          "read_node_consumer"
+        ],
+        "expectation_ids": [
+          "batch_context_expectation",
+          "follower_context_expectation",
+          "read_client_matching"
+        ],
+        "binding_ids": [
+          "forwarded_read_confirmation"
+        ],
+        "derivation": "The queue retains the originating node and original SystemCtx for each confirmed read. The batch-confirmation test explicitly preserves each context while allowing its index to advance. Follower consumption passes response context through, and pendingReadIndex.addReady uses exact SystemCtx equality to find the originating batch. Therefore a forwarded completion must preserve the admitted request context; a later heartbeat context is not an alias for earlier requests.",
+        "applicability": "Distinct nonzero read contexts, one operation per follower origin, stable term and membership, current-term entry committed before reads.",
+        "unresolved": [],
+        "conflicts": [],
+        "alternatives": []
+      },
+      "applicability_conditions": [
+        {
+          "field": "scenario",
+          "op": "eq",
+          "value": null,
+          "reference": "admission.scenario"
+        },
+        {
+          "field": "origin",
+          "op": "eq",
+          "value": null,
+          "reference": "admission.origin"
+        }
+      ],
+      "admission_alias": "admission"
+    }
+  ],
+  "observable_properties": [
+    {
+      "checker_id": "ready_context_low_preserved",
+      "kind": "event_assertion",
+      "trigger": {
+        "field": "event",
+        "op": "eq",
+        "value": "ready_result",
+        "reference": null
+      },
+      "assertion": {
+        "field": "ctx_low",
+        "op": "eq",
+        "value": null,
+        "reference": "admission.ctx_low"
+      },
+      "antecedent": null,
+      "identity_fields": [
+        "scenario",
+        "origin"
+      ],
+      "description": "The actual ReadyToRead SystemCtx.Low must equal the same field of the admitted request, correlated by scenario and origin."
+    },
+    {
+      "checker_id": "ready_context_high_preserved",
+      "kind": "event_assertion",
+      "trigger": {
+        "field": "event",
+        "op": "eq",
+        "value": "ready_result",
+        "reference": null
+      },
+      "assertion": {
+        "field": "ctx_high",
+        "op": "eq",
+        "value": null,
+        "reference": "admission.ctx_high"
+      },
+      "antecedent": null,
+      "identity_fields": [
+        "scenario",
+        "origin"
+      ],
+      "description": "The actual ReadyToRead SystemCtx.High must equal the same field of the admitted request, correlated by scenario and origin."
+    }
+  ],
+  "uncertainties": [
+    "The result is local completion-identity semantics, not a stale-read safety violation or a client deadline claim.",
+    "Three subsequent heartbeat ticks are a measured continuation only, not a permanent-stalling bound."
+  ]
+}

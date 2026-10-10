@@ -1,0 +1,112 @@
+{
+  "description": "A real Raft instance is initialized without background loops, given a conflicting log suffix, and handed an AppendEntries request whose conflicting entry triggers suffix deletion. The next StoreLogs is forced to fail. The check observes whether the cached last log remains consistent with the durable log store.",
+  "harness": {
+    "kind": "go_test",
+    "source": "",
+    "files": {},
+    "description": "Use real NewRaft initialization, a real appendEntries handler call, and an injected StoreLogs failure after conflicting suffix deletion to compare cached and durable last-log state.",
+    "semantic_changes": [
+      "Uses the real BootstrapCluster, NewRaft, appendEntries, DeleteRange, and StoreLogs paths.",
+      "Submits one controlled AppendEntries request directly to the handler and injects a permitted StoreLogs failure after suffix deletion.",
+      "Suppresses background loops with the existing skipStartup path so the handler observation is deterministic; this is a controlled conditional probe, not a distributed deployment prefix."
+    ],
+    "prerequisites": [
+      {
+        "alias": "append_setup",
+        "event": "append_setup",
+        "conditions": []
+      }
+    ],
+    "legality": {
+      "source_ids": [
+        "src-appendentries-conflict-full",
+        "src-lastlog-cache",
+        "src-lastlog-accessors"
+      ],
+      "expectation_ids": [],
+      "binding_ids": [
+        "bind-appendentries-conflict",
+        "bind-getlastlog",
+        "bind-getlastindex"
+      ],
+      "derivation": "appendEntries deletes a conflicting suffix before attempting StoreLogs. Its own comment states that r.getLastLog may be left in the wrong state when StoreLogs then fails. The cached last log is accessed through getLastLog and the durable boundary through the LogStore's LastIndex; a return with different values leaves the node advertising a log it no longer stores.",
+      "applicability": "A follower has a conflicting suffix, appendEntries deletes that suffix, and the following StoreLogs returns an error under the permitted storage-failure model.",
+      "unresolved": [
+        "The check supplies the conflicting request directly to the handler and does not exercise a full multi-node deployment."
+      ],
+      "conflicts": [
+        "A process restart would reload the durable LastIndex, but the handler returns without restart and the cached value remains stale."
+      ],
+      "alternatives": [
+        "A history in which StoreLogs succeeds does not exercise this branch."
+      ]
+    }
+  },
+  "monitors": [
+    {
+      "id": "monitor-append-failure",
+      "checker_id": "append_failure_keeps_cached_last_log_consistent",
+      "event": "append_failure",
+      "binding_ids": [
+        "bind-appendentries-conflict",
+        "bind-getlastlog",
+        "bind-getlastindex"
+      ],
+      "grounding": {
+        "source_ids": [
+        "src-appendentries-conflict-full",
+          "src-lastlog-cache",
+          "src-lastlog-accessors"
+        ],
+        "expectation_ids": [],
+        "binding_ids": [
+          "bind-appendentries-conflict",
+          "bind-getlastlog",
+          "bind-getlastindex"
+        ],
+        "derivation": "The result event independently reports the injected StoreLogs failure, the cached last-log values, the durable LastIndex, and whether they match.",
+        "applicability": "Applies when conflicting suffix deletion is followed by a failed StoreLogs call.",
+        "unresolved": [],
+        "conflicts": [],
+        "alternatives": []
+      },
+      "applicability_conditions": [
+        {
+          "field": "operation",
+          "op": "eq",
+          "value": "AppendEntriesStoreFailure"
+        }
+      ],
+      "admission_alias": "append_setup"
+    }
+  ],
+  "observable_properties": [
+    {
+      "checker_id": "append_failure_keeps_cached_last_log_consistent",
+      "kind": "event_implication",
+      "trigger": {
+        "field": "event",
+        "op": "eq",
+        "value": "append_failure"
+      },
+      "antecedent": {
+        "field": "store_logs_failed",
+        "op": "eq",
+        "value": true
+      },
+      "assertion": {
+        "field": "cached_matches_store",
+        "op": "eq",
+        "value": true
+      },
+      "identity_fields": [
+        "node_id"
+      ],
+      "description": "If conflicting suffix deletion is followed by a failed StoreLogs, the cached last log must remain consistent with the durable log store before the handler returns."
+    }
+  ],
+  "uncertainties": [
+    "The check is a controlled handler-level probe with background loops suppressed.",
+    "A process restart or a later successful repair path is outside the observed endpoint."
+  ]
+}

@@ -1,0 +1,144 @@
+{
+  "action": "check",
+  "rationale": "Execute a real single-node Raft cluster whose FSM implements FSM, BatchingFSM, and ConfigurationStore in one value, then observe whether the committed bootstrap LogConfiguration entry is routed to ApplyBatch while StoreConfiguration is skipped.",
+  "plan_path": "check-plan-batch-config.json",
+  "harness_path": "assurance_batch_config_generated_test.go",
+  "sources": [],
+  "candidate": {
+    "action": "obligation",
+    "rationale": "The ConfigurationStore interface promises StoreConfiguration once a configuration log entry is committed. The runFSM batch branch detects ConfigurationStore but sends LogConfiguration only to ApplyBatch, so a valid combined FSM can miss the promised callback.",
+    "question": {
+      "question": "When an FSM implements both BatchingFSM and ConfigurationStore, is StoreConfiguration invoked for a committed configuration log entry, or is the entry only routed to ApplyBatch?",
+      "importance": "ConfigurationStore exists so a durable FSM can persist configuration changes and recover membership without an external snapshot; silently skipping the callback breaks that recovery contract for a valid FSM combination.",
+      "source_ids": [
+        "src-configstore-contract",
+        "src-batchingfsm-contract",
+        "src-runfsm"
+      ],
+      "disposition": "concrete_suspicion",
+      "preferred_check": "direct_test",
+      "objects": [
+        "ConfigurationStore callback",
+        "BatchingFSM ApplyBatch path",
+        "committed LogConfiguration entry"
+      ],
+      "contexts": [
+        "one FSM value implements both optional interfaces and a committed configuration entry is applied"
+      ],
+      "event_paths": [
+        "runFSM -> batchingEnabled branch -> ApplyBatch -> no StoreConfiguration invocation"
+      ],
+      "counterevidence": [
+        "The batch branch routes LogConfiguration to ApplyBatch, which may let an application observe the entry there, but that does not satisfy the separate ConfigurationStore callback contract."
+      ],
+      "unknowns": [
+        "Whether an affected application also reconstructs configuration through ApplyBatch or an external snapshot."
+      ],
+      "trigger_rationale": "The interface contract and the branch structure directly determine whether StoreConfiguration is invoked for the committed configuration entry."
+    },
+    "sources": [
+      {
+        "id": "src-configstore-contract",
+        "file": "configuration.go",
+        "start_line": 38,
+        "end_line": 52,
+        "kind": "interface_statement"
+      },
+      {
+        "id": "src-batchingfsm-contract",
+        "file": "fsm.go",
+        "start_line": 51,
+        "end_line": 69,
+        "kind": "interface_statement"
+      },
+      {
+        "id": "src-runfsm",
+        "file": "fsm.go",
+        "start_line": 83,
+        "end_line": 186,
+        "kind": "code_observation"
+      }
+    ],
+    "obligation": {
+      "id": "claim-configstore-batch-callback",
+      "kind": "obligation",
+      "concern": "implementation_semantics",
+      "description": "For any FSM that implements ConfigurationStore, once a configuration log entry is committed and applied, StoreConfiguration must be invoked for that committed entry with its index and configuration value, including when the same FSM value also implements BatchingFSM.",
+      "source_ids": [
+        "src-configstore-contract",
+        "src-batchingfsm-contract",
+        "src-runfsm"
+      ],
+      "scope": {
+        "description": "One FSM value implements both ConfigurationStore and BatchingFSM, and a committed LogConfiguration entry is applied through Raft's FSM batch path.",
+        "assumptions": [
+          "The configuration entry is committed before the observation.",
+          "The combined FSM's ApplyBatch returns one response per received log entry."
+        ],
+        "excluded": [
+          "FSMs that do not implement ConfigurationStore.",
+          "Non-configuration log entries.",
+          "Application-level configuration recovery outside the Raft callback contract."
+        ],
+        "parameters": {
+          "entry_type": "LogConfiguration",
+          "batch_path": true
+        }
+      },
+      "pending": [],
+      "grounding": {
+        "source_ids": [
+          "src-configstore-contract",
+          "src-batchingfsm-contract",
+          "src-runfsm"
+        ],
+        "expectation_ids": [],
+        "binding_ids": [
+          "bind-configstore-contract",
+          "bind-batchingfsm-contract",
+          "bind-runfsm"
+        ],
+        "derivation": "ConfigurationStore states that StoreConfiguration is invoked once a log entry containing a configuration change is committed. BatchingFSM states that ApplyBatch receives committed log entries and that LogConfiguration is presently among the types sent. runFSM detects whether the same FSM implements both interfaces, but its batch branch sends LogConfiguration to ApplyBatch and never calls the detected configStore. That branch therefore does not perform the callback contract for a combined FSM.",
+        "applicability": "The same FSM value implements ConfigurationStore and BatchingFSM, and a committed LogConfiguration entry is applied through runFSM's batching branch.",
+        "unresolved": [
+          "The observation covers the bootstrap configuration entry in one single-node cluster, not every configuration-change command or durable FSM implementation."
+        ],
+        "conflicts": [
+          "The batch branch's ApplyBatch delivery is an additional delivery path; it does not remove the separate StoreConfiguration obligation."
+        ],
+        "alternatives": [
+          "An FSM that does not implement ConfigurationStore is outside this obligation."
+        ]
+      }
+    },
+    "bindings": [
+      {
+        "id": "bind-configstore-contract",
+        "material_id": "src-configstore-contract",
+        "symbol": "ConfigurationStore",
+        "start_line": 44,
+        "end_line": 52,
+        "description": "ConfigurationStore promises StoreConfiguration once a log entry containing a configuration change is committed.",
+        "pending": []
+      },
+      {
+        "id": "bind-batchingfsm-contract",
+        "material_id": "src-batchingfsm-contract",
+        "symbol": "BatchingFSM",
+        "start_line": 54,
+        "end_line": 69,
+        "description": "BatchingFSM routes committed batches through ApplyBatch and says LogConfiguration is presently among the sent types.",
+        "pending": []
+      },
+      {
+        "id": "bind-runfsm",
+        "material_id": "src-runfsm",
+        "symbol": "runFSM",
+        "start_line": 86,
+        "end_line": 186,
+        "description": "runFSM detects ConfigurationStore but, in the batching branch, sends LogConfiguration to ApplyBatch without invoking StoreConfiguration.",
+        "pending": []
+      }
+    ]
+  }
+}

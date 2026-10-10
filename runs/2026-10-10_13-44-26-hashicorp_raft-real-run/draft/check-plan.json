@@ -1,0 +1,143 @@
+{
+  "description": "A four-node real Raft cluster is reduced to three voters and one non-voter. The two non-leader voters are partitioned; the non-voter remains reachable. The check invokes the real VerifyLeader API on the leader and observes whether its completion is confirmed without a successful voter quorum.",
+  "harness": {
+    "kind": "go_test",
+    "source": "",
+    "files": {},
+    "description": "Construct a real in-memory Raft cluster, commit a voter-to-non-voter configuration change, partition the two non-leader voters, and observe the leader's VerifyLeader result together with successful AppendEntries confirmations by suffrage.",
+    "semantic_changes": [
+      "Uses the real BootstrapCluster, NewRaft, DemoteVoter, transport Disconnect and VerifyLeader paths.",
+      "Wraps the captured in-memory transport only to observe successful AppendEntries confirmations per target address.",
+      "Declines the optional AppendEntriesPipeline fast path so every confirmation is observable through the documented fallback path; no Raft protocol logic is replaced.",
+      "The observation window resets immediately before VerifyLeader and counts only confirmations after that point."
+    ],
+    "prerequisites": [
+      {
+        "alias": "verify_setup",
+        "event": "verify_setup",
+        "conditions": []
+      }
+    ],
+    "legality": {
+      "source_ids": [
+        "src-api-verifyleader",
+        "src-suffrage",
+        "src-verifyleader",
+        "src-vote",
+        "src-notifyall",
+        "src-heartbeat",
+        "src-startstop",
+        "src-quorum",
+        "src-lease"
+      ],
+      "expectation_ids": [],
+      "binding_ids": [
+        "bind-api-verifyleader",
+        "bind-suffrage",
+        "bind-verifyleader",
+        "bind-vote",
+        "bind-notifyall",
+        "bind-heartbeat",
+        "bind-startstop",
+        "bind-quorum",
+        "bind-lease"
+      ],
+      "derivation": "VerifyLeader is documented as a guard against returning stale data after leadership is lost. The configuration contract says a Voter is counted in elections and commitment while a Nonvoter is not. The implementation computes VerifyLeader's quorum from Voter entries only, but registers the request on every replication state; successful heartbeats to any configured peer call notifyAll, whose true branch increments the same vote counter used against that voter-sized quorum.",
+      "applicability": "A leader has a committed configuration with at least one Voter, at least one Nonvoter, a reachable transport path to the Nonvoter, and fewer than the voter quorum of successful voter AppendEntries confirmations after the VerifyLeader request is registered.",
+      "unresolved": [
+        "The check observes one configuration shape and one transport timing; it does not establish behavior for every possible configuration size or transport implementation."
+      ],
+      "conflicts": [
+        "checkLeaderLease counts only Voter entries and can step the leader down later, but it is a separate timer-driven check and does not mediate this VerifyLeader completion."
+      ],
+      "alternatives": [
+        "A caller that does not use VerifyLeader as a read or authority guard is outside this obligation."
+      ]
+    }
+  },
+  "monitors": [
+    {
+      "id": "monitor-nonvoter-verify",
+      "checker_id": "nonvoter_cannot_complete_verify_quorum",
+      "event": "verify_outcome",
+      "binding_ids": [
+        "bind-api-verifyleader",
+        "bind-suffrage",
+        "bind-verifyleader",
+        "bind-vote",
+        "bind-notifyall",
+        "bind-heartbeat",
+        "bind-startstop",
+        "bind-quorum",
+        "bind-lease"
+      ],
+      "grounding": {
+        "source_ids": [
+          "src-api-verifyleader",
+          "src-suffrage",
+          "src-verifyleader",
+          "src-vote",
+          "src-notifyall",
+          "src-heartbeat",
+          "src-startstop",
+          "src-quorum",
+          "src-lease"
+        ],
+        "expectation_ids": [],
+        "binding_ids": [
+          "bind-api-verifyleader",
+          "bind-suffrage",
+          "bind-verifyleader",
+          "bind-vote",
+          "bind-notifyall",
+          "bind-heartbeat",
+          "bind-startstop",
+          "bind-quorum",
+          "bind-lease"
+        ],
+        "derivation": "The observed result event carries the leader identity, the operation name, the leader's voter count, the observed successful voter confirmations, and whether the voter quorum was met. The property compares that independently observed voter-quorum condition with the VerifyLeader outcome.",
+        "applicability": "Applies to VerifyLeader outcomes on a leader whose latest committed configuration contains both voters and at least one non-voter.",
+        "unresolved": [],
+        "conflicts": [],
+        "alternatives": []
+      },
+      "applicability_conditions": [
+        {
+          "field": "operation",
+          "op": "eq",
+          "value": "VerifyLeader"
+        }
+      ],
+      "admission_alias": "verify_setup"
+    }
+  ],
+  "observable_properties": [
+    {
+      "checker_id": "nonvoter_cannot_complete_verify_quorum",
+      "kind": "event_implication",
+      "trigger": {
+        "field": "event",
+        "op": "eq",
+        "value": "verify_outcome"
+      },
+      "antecedent": {
+        "field": "voter_quorum_met",
+        "op": "eq",
+        "value": false
+      },
+      "assertion": {
+        "field": "result",
+        "op": "ne",
+        "value": "confirmed"
+      },
+      "identity_fields": [
+        "leader_id"
+      ],
+      "description": "When a leader has not observed successful voter-quorum confirmation, VerifyLeader must not report confirmed; a non-voter confirmation cannot supply the missing voter quorum."
+    }
+  ],
+  "uncertainties": [
+    "The harness disables the optional pipeline observation path; the bounded result covers the documented non-pipelined fallback and the VerifyLeader vote aggregation.",
+    "The check does not establish how long a caller may act on a false confirmation before the separate leader-lease check steps down."
+  ]
+}

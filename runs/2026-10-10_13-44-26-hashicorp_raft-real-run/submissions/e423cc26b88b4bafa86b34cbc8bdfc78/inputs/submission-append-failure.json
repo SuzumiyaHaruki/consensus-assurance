@@ -1,0 +1,137 @@
+{
+  "action": "check",
+  "rationale": "Execute a controlled handler-level check that deletes a conflicting suffix and then fails StoreLogs, observing whether the cached last log still matches the durable log store before appendEntries returns.",
+  "plan_path": "check-plan-append-failure.json",
+  "harness_path": "assurance_append_failure_generated_test.go",
+  "sources": [
+    {
+      "id": "src-lastlog-cache",
+      "file": "state.go",
+      "start_line": 97,
+      "end_line": 110,
+      "kind": "code_observation"
+    },
+    {
+      "id": "src-appendentries-conflict-full",
+      "file": "raft.go",
+      "start_line": 1440,
+      "end_line": 1559,
+      "kind": "code_observation"
+    }
+  ],
+  "candidate": {
+    "action": "obligation",
+    "rationale": "The appendEntries storage-failure branch explicitly notes that r.getLastLog may be left wrong after suffix deletion. The cached last log is then used by subsequent append processing, so returning with a stale value can prevent repair.",
+    "question": {
+      "question": "After appendEntries deletes a conflicting log suffix and StoreLogs then fails, can the follower's cached last log diverge from its durable log store and prevent later repair?",
+      "importance": "The cached last log drives later append matching and election-facing log identity; a divergence after a permitted failed write can leave the follower advertising logs it no longer stores.",
+      "source_ids": [
+        "src-appendentries-conflict-full",
+        "src-lastlog-cache",
+        "src-lastlog-accessors"
+      ],
+      "disposition": "concrete_suspicion",
+      "preferred_check": "direct_test",
+      "objects": [
+        "cached last log",
+        "durable LogStore LastIndex",
+        "appendEntries conflict deletion"
+      ],
+      "contexts": [
+        "conflicting suffix deletion followed by a permitted StoreLogs failure"
+      ],
+      "event_paths": [
+        "appendEntries -> DeleteRange -> StoreLogs failure -> return -> getLastLog compared with LogStore.LastIndex"
+      ],
+      "counterevidence": [
+        "A process restart would reload the durable LastIndex, but the observed endpoint is the handler return without restart."
+      ],
+      "unknowns": [
+        "Whether a later successful repair path can restore the cached value without restart."
+      ],
+      "trigger_rationale": "The source branch and its explicit TODO identify the exact state-consistency endpoint to observe."
+    },
+    "obligation": {
+      "id": "claim-append-failure-cached-lastlog",
+      "kind": "obligation",
+      "concern": "consensus_safety",
+      "description": "If appendEntries deletes a conflicting log suffix and the subsequent StoreLogs fails, the follower's cached last log must remain equal to the durable LogStore's last index or be restored before the handler returns.",
+      "source_ids": [
+        "src-appendentries-conflict-full",
+        "src-lastlog-cache",
+        "src-lastlog-accessors"
+      ],
+      "scope": {
+        "description": "A follower with a conflicting suffix applies an AppendEntries request, deletes the suffix, and then receives a permitted StoreLogs failure before any restart or successful repair.",
+        "assumptions": [
+          "The request contains an entry conflicting with the stored suffix.",
+          "StoreLogs returns an error after DeleteRange has succeeded."
+        ],
+        "excluded": [
+          "Process restart and recovery from durable state.",
+          "Successful StoreLogs histories.",
+          "Byzantine or corrupted log stores."
+        ],
+        "parameters": {
+          "initial_last_index": 3,
+          "conflict_index": 2,
+          "failure_point": "StoreLogs"
+        }
+      },
+      "pending": [],
+      "grounding": {
+        "source_ids": [
+          "src-appendentries-conflict-full",
+          "src-lastlog-cache",
+          "src-lastlog-accessors"
+        ],
+        "expectation_ids": [],
+        "binding_ids": [
+          "bind-appendentries-conflict",
+          "bind-getlastlog",
+          "bind-getlastindex"
+        ],
+        "derivation": "appendEntries deletes the conflicting suffix and then calls StoreLogs. On StoreLogs error it returns without restoring or advancing the cached last log, while the code comment acknowledges that r.getLastLog may be left in the wrong state. getLastLog supplies that cached value and the LogStore LastIndex supplies the durable value, so equality is the required consistency relation at the handler endpoint.",
+        "applicability": "The follower has a conflicting suffix, DeleteRange succeeds, and the immediately following StoreLogs fails.",
+        "unresolved": [
+          "The probe supplies the conflicting request directly and suppresses background loops; it does not establish a full multi-node history."
+        ],
+        "conflicts": [
+          "Restart reloads the durable LastIndex, but the handler return without restart is the scoped endpoint."
+        ],
+        "alternatives": [
+          "A successful StoreLogs call does not exercise the failure branch."
+        ]
+      }
+    },
+    "bindings": [
+      {
+        "id": "bind-appendentries-conflict",
+        "material_id": "src-appendentries-conflict-full",
+        "symbol": "appendEntries",
+        "start_line": 1440,
+        "end_line": 1559,
+        "description": "Deletes a conflicting suffix, then returns on StoreLogs failure without restoring cached last-log state.",
+        "pending": []
+      },
+      {
+        "id": "bind-getlastlog",
+        "material_id": "src-lastlog-cache",
+        "symbol": "getLastLog",
+        "start_line": 97,
+        "end_line": 103,
+        "description": "Reads the cached last log index and term used by subsequent append processing.",
+        "pending": []
+      },
+      {
+        "id": "bind-getlastindex",
+        "material_id": "src-lastlog-accessors",
+        "symbol": "getLastIndex",
+        "start_line": 159,
+        "end_line": 163,
+        "description": "Reads the maximum of cached log and snapshot state, showing the stable-index contract around the cached log value.",
+        "pending": []
+      }
+    ]
+  }
+}
