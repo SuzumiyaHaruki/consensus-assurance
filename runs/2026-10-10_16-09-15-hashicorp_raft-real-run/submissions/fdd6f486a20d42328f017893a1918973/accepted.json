@@ -1,0 +1,232 @@
+{
+  "rationale": "Sourced contract violation in the membership/authority transition path. configurations.latest is documented as the latest configuration in the log/snapshot (configuration.go:254-265) and is the sole authority input for the leader's quorum: quorumSize() (raft.go:1086-1094) counts voters from r.configurations.latest, and commitment.setConfiguration (commitment.go:53-64) rebuilds the match-index voter set from the new configuration. appendConfigurationEntry (raft.go:1203-1240) must therefore only install a configuration that exists in the log, but it calls dispatchLogs first and then unconditionally runs setLatestConfiguration / commitment.setConfiguration / startStopReplication. dispatchLogs (raft.go:1244-1283) assigns applyLog.log.Index before StoreLogs and returns after responding the error, so future.Index() is still nonzero when the write failed. A retained clean-copy execution (exploration 19c98425e4d9482cadcf9bfa3e4f7a85) supplied one transient LogStore.StoreLogs failure on a single-voter cluster that had committed index 3 and observed: AddVoter returned the store error; the assigned index 4 is absent from durable storage (durable last index 3, raft last index 3); the published configuration lists a phantom second voter; and the node then never regains leadership over 142 samples (state Candidate, quorum 2, reachable voters 1), i.e. progress stops until restart. This claim is the sourced requirement, not the experiment; the harness and events are retained with the exploration.",
+  "sources": [
+    {
+      "id": "src2-append-config",
+      "file": "raft.go",
+      "start_line": 1203,
+      "end_line": 1240,
+      "kind": "code_observation"
+    },
+    {
+      "id": "src2-dispatch-logs",
+      "file": "raft.go",
+      "start_line": 1244,
+      "end_line": 1283,
+      "kind": "code_observation"
+    },
+    {
+      "id": "src2-quorum-size",
+      "file": "raft.go",
+      "start_line": 1086,
+      "end_line": 1094,
+      "kind": "code_observation"
+    },
+    {
+      "id": "src2-commitment-setcfg",
+      "file": "commitment.go",
+      "start_line": 53,
+      "end_line": 64,
+      "kind": "code_observation"
+    },
+    {
+      "id": "src2-configurations-doc",
+      "file": "configuration.go",
+      "start_line": 254,
+      "end_line": 265,
+      "kind": "document_statement"
+    },
+    {
+      "id": "src2-follower-gate",
+      "file": "raft.go",
+      "start_line": 205,
+      "end_line": 240,
+      "kind": "code_observation"
+    }
+  ],
+  "feedback": null,
+  "review": null,
+  "map_path": null,
+  "map_changes": {},
+  "repair_of": "6374186cdb5b4d49b1371f38c0b5ec70",
+  "action": "obligation",
+  "candidate_id": null,
+  "parent_candidate_id": null,
+  "question": {
+    "audit_spec_version": null,
+    "disposition": "concrete_suspicion",
+    "preferred_check": "controlled_schedule",
+    "question": "Does a membership change whose durable log write fails still become the node's live configuration and quorum, and can the node form consensus afterwards?",
+    "importance": "Decides whether a transient durable-log failure during AddVoter/RemoveServer/DemoteVoter can leave the authority context (quorum and election eligibility) inconsistent with the durable log.",
+    "source_ids": [
+      "src2-append-config",
+      "src2-dispatch-logs",
+      "src2-quorum-size",
+      "src2-commitment-setcfg",
+      "src2-configurations-doc",
+      "src2-follower-gate"
+    ],
+    "participants": [
+      "leader",
+      "LogStore",
+      "follower"
+    ],
+    "objects": [
+      "Configuration",
+      "configurations.latest",
+      "commitment.matchIndexes"
+    ],
+    "contexts": [
+      "leader term",
+      "uncommitted configuration change"
+    ],
+    "event_paths": [],
+    "activity_classes": [],
+    "behavior_ids": [],
+    "fact_ids": [],
+    "supporting_behavior_ids": {},
+    "obligation_relation_kind": null,
+    "counterevidence": [],
+    "unknowns": [
+      "Whether the same latest-vs-log divergence is reachable without any LogStore error",
+      "The exact recovery path and whether only a restart repairs the authority context",
+      "Which StoreLogs failure timings (before vs after partial write) leave the log truncation cache stale"
+    ],
+    "trigger_rationale": ""
+  },
+  "resume_conditions": [],
+  "obligation": {
+    "id": "claim-config-publish-requires-durable-append",
+    "kind": "obligation",
+    "concern": "consensus_safety",
+    "description": "For a leader handling a membership change, the resulting configuration must not be installed as configurations.latest, and must not change the quorum derived from latest (commitment.setConfiguration match indexes, quorumSize, leader-lease and election voter sets), unless the corresponding configuration entry has been durably appended to the Raft log.",
+    "source_ids": [
+      "src2-append-config",
+      "src2-dispatch-logs",
+      "src2-quorum-size",
+      "src2-commitment-setcfg",
+      "src2-configurations-doc",
+      "src2-follower-gate"
+    ],
+    "scope": {
+      "description": "A leader that is processing a configurationChangeFuture and whose LogStore.StoreLogs returns an error for that entry.",
+      "assumptions": [
+        "A LogStore.StoreLogs error is an admitted input: dispatchLogs itself handles it by responding the error and setting state to Follower, so a transient store error is a handled, not fatal, condition.",
+        "The configuration entry index is assigned by dispatchLogs before StoreLogs is attempted."
+      ],
+      "excluded": [
+        "Corruption semantics beyond StoreLogs returning a non-nil error",
+        "Protocol versions below 2 where the entry type is LogRemovePeerDeprecated"
+      ],
+      "parameters": {}
+    },
+    "pending": [
+      "Map the exact set of store failure points that leave r.configurations.latest inconsistent with the durable log",
+      "Establish the bounded recovery: verify that a restart (which re-scans the durable log) restores a consistent authority context"
+    ],
+    "grounding": {
+      "source_ids": [
+        "src2-append-config",
+        "src2-dispatch-logs",
+        "src2-quorum-size",
+        "src2-commitment-setcfg",
+        "src2-configurations-doc",
+        "src2-follower-gate"
+      ],
+      "expectation_ids": [],
+      "binding_ids": [
+        "bind-append-config",
+        "bind-dispatch-logs",
+        "bind-quorum-size",
+        "bind-commitment-setcfg"
+      ],
+      "derivation": "configuration.go:254-265 documents configurations.latest as the latest configuration in the log/snapshot, so any latest value must correspond to a stored entry. raft.go:1203-1240 installs the new configuration after dispatchLogs returns without checking whether the entry was stored; raft.go:1244-1283 shows the error path responds and returns after the index was already assigned. raft.go:1086-1094 and commitment.go:53-64 show latest drives the quorum; raft.go:158-260 shows latest gates election start.",
+      "applicability": "Applies whenever a configurationChangeFuture is processed by a leader and the entry's durable write fails.",
+      "unresolved": [
+        "Whether a production LogStore (e.g. BoltDB) can surface a transient StoreLogs error while the process continues"
+      ],
+      "conflicts": [],
+      "alternatives": [
+        "The node is expected to be discarded on any store error, in which case the divergence has no operational consequence"
+      ]
+    }
+  },
+  "bindings": [
+    {
+      "associations": [
+        {
+          "claim_id": "claim-config-publish-requires-durable-append",
+          "source_ids": [
+            "src2-append-config"
+          ],
+          "rationale": "Leader handler that dispatches the configuration entry and then installs the new configuration as latest regardless of whether the durable write succeeded."
+        }
+      ],
+      "anchor": null,
+      "id": "bind-append-config",
+      "material_id": "src2-append-config",
+      "symbol": "appendConfigurationEntry",
+      "start_line": 1203,
+      "end_line": 1240,
+      "description": "Leader handler that dispatches the configuration entry and then installs the new configuration as latest regardless of whether the durable write succeeded.",
+      "pending": []
+    },
+    {
+      "associations": [
+        {
+          "claim_id": "claim-config-publish-requires-durable-append",
+          "source_ids": [
+            "src2-dispatch-logs"
+          ],
+          "rationale": "Assigns each log index before StoreLogs, and on StoreLogs error responds the error and sets state to Follower without rolling back the assigned index."
+        }
+      ],
+      "anchor": null,
+      "id": "bind-dispatch-logs",
+      "material_id": "src2-dispatch-logs",
+      "symbol": "dispatchLogs",
+      "start_line": 1244,
+      "end_line": 1283,
+      "description": "Assigns each log index before StoreLogs, and on StoreLogs error responds the error and sets state to Follower without rolling back the assigned index.",
+      "pending": []
+    },
+    {
+      "associations": [
+        {
+          "claim_id": "claim-config-publish-requires-durable-append",
+          "source_ids": [
+            "src2-quorum-size"
+          ],
+          "rationale": "Derives the required voter count from r.configurations.latest, so an unpublished latest changes the node's own quorum."
+        }
+      ],
+      "anchor": null,
+      "id": "bind-quorum-size",
+      "material_id": "src2-quorum-size",
+      "symbol": "quorumSize",
+      "start_line": 1086,
+      "end_line": 1094,
+      "description": "Derives the required voter count from r.configurations.latest, so an unpublished latest changes the node's own quorum.",
+      "pending": []
+    },
+    {
+      "associations": [
+        {
+          "claim_id": "claim-config-publish-requires-durable-append",
+          "source_ids": [
+            "src2-commitment-setcfg"
+          ],
+          "rationale": "Rebuilds the commitment match-index voter set from the supplied configuration, adopting the new quorum before it is committed."
+        }
+      ],
+      "anchor": null,
+      "id": "bind-commitment-setcfg",
+      "material_id": "src2-commitment-setcfg",
+      "symbol": "setConfiguration",
+      "start_line": 53,
+      "end_line": 64,
+      "description": "Rebuilds the commitment match-index voter set from the supplied configuration, adopting the new quorum before it is committed.",
+      "pending": []
+    }
+  ]
+}

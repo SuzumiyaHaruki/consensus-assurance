@@ -1,0 +1,112 @@
+{
+  "description": "Direct check for claim-config-publish-requires-durable-append. A single-voter leader is driven through a real AddVoter whose LogStore.StoreLogs call is made to fail once at the real storage boundary. The check observes the one membership-change operation and asks whether the configuration that became configurations.latest has its entry in the durable log.",
+  "claim_id": "claim-config-publish-requires-durable-append",
+  "binding_ids": [
+    "bind-append-config",
+    "bind-dispatch-logs",
+    "bind-quorum-size",
+    "bind-commitment-setcfg"
+  ],
+  "harness": {
+    "execution_package": ".",
+    "files": {},
+    "kind": "go_test",
+    "source": "// Copyright (c) HashiCorp, Inc.\n// SPDX-License-Identifier: MPL-2.0\n\npackage raft\n\nimport (\n\t\"encoding/json\"\n\t\"errors\"\n\t\"fmt\"\n\t\"sync/atomic\"\n\t\"testing\"\n\t\"time\"\n)\n\n// assuranceFailStore is an in-memory LogStore/StableStore whose StoreLogs can be\n// made to fail on demand. It models a transient durable-write failure at the\n// real LogStore boundary; every other operation behaves like InmemStore.\ntype assuranceFailStore struct {\n\t*InmemStore\n\tfailStoreLogs atomic.Bool\n}\n\nfunc (f *assuranceFailStore) StoreLogs(logs []*Log) error {\n\tif f.failStoreLogs.Load() {\n\t\treturn errors.New(\"injected LogStore.StoreLogs failure\")\n\t}\n\treturn f.InmemStore.StoreLogs(logs)\n}\n\nfunc assuranceEmit(t *testing.T, ev map[string]interface{}) {\n\tt.Helper()\n\tbuf, err := json.Marshal(ev)\n\tif err != nil {\n\t\tt.Fatalf(\"marshal event: %v\", err)\n\t}\n\tfmt.Println(\"CA_EVENT \" + string(buf))\n}\n\nfunc assuranceServers(c Configuration) []string {\n\tout := make([]string, 0, len(c.Servers))\n\tfor _, s := range c.Servers {\n\t\tout = append(out, fmt.Sprintf(\"%s/%s/%s\", s.ID, s.Address, s.Suffrage))\n\t}\n\treturn out\n}\n\n// assuranceSingleNode builds one bootstrapped voter with the supplied store.\nfunc assuranceSingleNode(t *testing.T, store *assuranceFailStore, trans *InmemTransport, fsm FSM) *Raft {\n\tt.Helper()\n\tconf := inmemConfig(t)\n\tconf.LocalID = ServerID(trans.LocalAddr())\n\tsnap := NewInmemSnapshotStore()\n\tboot := Configuration{Servers: []Server{{Suffrage: Voter, ID: conf.LocalID, Address: trans.LocalAddr()}}}\n\tif err := BootstrapCluster(conf, store, store, snap, trans, boot); err != nil {\n\t\tt.Fatalf(\"bootstrap: %v\", err)\n\t}\n\tr, err := NewRaft(conf, fsm, store, store, snap, trans)\n\tif err != nil {\n\t\tt.Fatalf(\"new raft: %v\", err)\n\t}\n\treturn r\n}\n\nfunc assuranceWaitLeader(r *Raft, d time.Duration) bool {\n\tdeadline := time.Now().Add(d)\n\tfor r.State() != Leader && time.Now().Before(deadline) {\n\t\ttime.Sleep(10 * time.Millisecond)\n\t}\n\treturn r.State() == Leader\n}\n\n// TestAssuranceConfigPublishedWithoutPersist asks whether a membership change\n// whose durable log write fails is still published into the node's live\n// configuration, and what that does to its own progress.\nfunc TestAssuranceConfigPublishedWithoutPersist(t *testing.T) {\n\t_, trans := NewInmemTransport(\"\")\n\tstore := &assuranceFailStore{InmemStore: NewInmemStore()}\n\tr := assuranceSingleNode(t, store, trans, &MockFSM{})\n\tdefer r.Shutdown()\n\n\tif !assuranceWaitLeader(r, 3*time.Second) {\n\t\tt.Fatalf(\"never became leader, state=%v\", r.State())\n\t}\n\tif err := r.Apply([]byte(\"baseline\"), 2*time.Second).Error(); err != nil {\n\t\tt.Fatalf(\"baseline apply: %v\", err)\n\t}\n\n\tbefore := r.GetConfiguration()\n\t_ = before.Error()\n\tdurableBefore, _ := store.LastIndex()\n\tnode := string(r.localID)\n\tassuranceEmit(t, map[string]interface{}{\n\t\t\"event\": \"assurance_leader_established\",\n\t\t\"node\":  node,\n\t\t\"term\":  r.getCurrentTerm(),\n\t})\n\tassuranceEmit(t, map[string]interface{}{\n\t\t\"event\":     \"assurance_config_change_attempt\",\n\t\t\"node\":      node,\n\t\t\"attempted\": true,\n\t})\n\n\t// Fail exactly the durable write that carries the membership change.\n\tstore.failStoreLogs.Store(true)\n\taddErr := r.AddVoter(ServerID(\"phantom\"), ServerAddress(\"phantom-addr\"), 0, 2*time.Second).Error()\n\tstore.failStoreLogs.Store(false)\n\n\tafter := r.GetConfiguration()\n\t_ = after.Error()\n\tdurableAfter, _ := store.LastIndex()\n\n\tvar stored Log\n\tassignedIdx := durableBefore + 1\n\tgetErr := store.GetLog(assignedIdx, &stored)\n\tentryDurable := getErr == nil\n\n\t// Decisive monitor event: was the published configuration durable?\n\tassuranceEmit(t, map[string]interface{}{\n\t\t\"event\":                     \"assurance_config_published\",\n\t\t\"node\":                      node,\n\t\t\"published_ahead_of_durable\": true,\n\t\t\"entry_durable\":             entryDurable,\n\t\t\"published_voters\":          len(after.Configuration().Servers),\n\t\t\"durable_last_index\":        durableAfter,\n\t})\n\n\tassuranceEmit(t, map[string]interface{}{\n\t\t\"event\":                       \"config_publish_after_failed_durable_write\",\n\t\t\"add_voter_error\":             fmt.Sprint(addErr),\n\t\t\"config_index_before\":         before.Index(),\n\t\t\"config_servers_before\":       assuranceServers(before.Configuration()),\n\t\t\"durable_last_index_before\":   durableBefore,\n\t\t\"config_index_after\":          after.Index(),\n\t\t\"config_servers_after\":        assuranceServers(after.Configuration()),\n\t\t\"durable_last_index_after\":    durableAfter,\n\t\t\"assigned_config_index\":       assignedIdx,\n\t\t\"getlog_at_assigned_idx_err\":  fmt.Sprint(getErr),\n\t\t\"raft_last_index\":             r.LastIndex(),\n\t\t\"published_ahead_of_durable\":  len(after.Configuration().Servers) > len(before.Configuration().Servers),\n\t\t\"published_config_index_api\":  after.Index(),\n\t})\n\n\t// Watch whether this single-voter cluster can still make progress.\n\teverLeader := false\n\tleaderSamples, samples := 0, 0\n\twatchUntil := time.Now().Add(1500 * time.Millisecond)\n\tfor time.Now().Before(watchUntil) {\n\t\tsamples++\n\t\tif r.State() == Leader {\n\t\t\teverLeader = true\n\t\t\tleaderSamples++\n\t\t}\n\t\ttime.Sleep(10 * time.Millisecond)\n\t}\n\n\tlive := r.GetConfiguration()\n\t_ = live.Error()\n\tvoters := 0\n\tfor _, s := range live.Configuration().Servers {\n\t\tif s.Suffrage == Voter {\n\t\t\tvoters++\n\t\t}\n\t}\n\tassuranceEmit(t, map[string]interface{}{\n\t\t\"event\":                        \"progress_after_failed_durable_write\",\n\t\t\"state\":                        r.State().String(),\n\t\t\"ever_leader_in_window\":        everLeader,\n\t\t\"leader_samples\":               leaderSamples,\n\t\t\"samples\":                      samples,\n\t\t\"voters_in_live_configuration\": voters,\n\t\t\"quorum_size_live\":             voters/2 + 1,\n\t\t\"reachable_voters\":             1,\n\t\t\"commit_index\":                 r.CommitIndex(),\n\t\t\"last_index\":                   r.LastIndex(),\n\t})\n}\n\n// TestAssuranceRestartRepairsAuthorityContext closes the recovery question: after\n// the failed membership change, does a restart from the same durable store\n// restore a consistent authority context?\nfunc TestAssuranceRestartRepairsAuthorityContext(t *testing.T) {\n\taddr := NewInmemAddr()\n\t_, trans := NewInmemTransport(addr)\n\tstore := &assuranceFailStore{InmemStore: NewInmemStore()}\n\tsnap := NewInmemSnapshotStore()\n\tconf := inmemConfig(t)\n\tconf.LocalID = ServerID(addr)\n\tboot := Configuration{Servers: []Server{{Suffrage: Voter, ID: conf.LocalID, Address: addr}}}\n\tif err := BootstrapCluster(conf, store, store, snap, trans, boot); err != nil {\n\t\tt.Fatalf(\"bootstrap: %v\", err)\n\t}\n\tr, err := NewRaft(conf, &MockFSM{}, store, store, snap, trans)\n\tif err != nil {\n\t\tt.Fatalf(\"new raft: %v\", err)\n\t}\n\tif !assuranceWaitLeader(r, 3*time.Second) {\n\t\tt.Fatalf(\"never became leader, state=%v\", r.State())\n\t}\n\n\tstore.failStoreLogs.Store(true)\n\taddErr := r.AddVoter(ServerID(\"phantom\"), ServerAddress(\"phantom-addr\"), 0, 2*time.Second).Error()\n\tstore.failStoreLogs.Store(false)\n\n\tpreRestart := r.GetConfiguration()\n\t_ = preRestart.Error()\n\tpreState := r.State().String()\n\tdurable, _ := store.LastIndex()\n\tif err := r.Shutdown().Error(); err != nil {\n\t\tt.Fatalf(\"shutdown: %v\", err)\n\t}\n\n\t// Restart from the same durable store: the phantom entry was never stored.\n\t_, trans2 := NewInmemTransport(addr)\n\tr2, err := NewRaft(conf, &MockFSM{}, store, store, snap, trans2)\n\tif err != nil {\n\t\tt.Fatalf(\"restart raft: %v\", err)\n\t}\n\tdefer r2.Shutdown()\n\tbecameLeader := assuranceWaitLeader(r2, 3*time.Second)\n\tpost := r2.GetConfiguration()\n\t_ = post.Error()\n\tassuranceEmit(t, map[string]interface{}{\n\t\t\"event\":                    \"restart_after_failed_durable_write\",\n\t\t\"add_voter_error\":          fmt.Sprint(addErr),\n\t\t\"durable_last_index\":       durable,\n\t\t\"state_before_restart\":     preState,\n\t\t\"servers_before_restart\":   assuranceServers(preRestart.Configuration()),\n\t\t\"became_leader_after\":      becameLeader,\n\t\t\"servers_after_restart\":    assuranceServers(post.Configuration()),\n\t\t\"voters_after_restart\":     len(post.Configuration().Servers),\n\t\t\"commit_index_after\":       r2.CommitIndex(),\n\t})\n}\n\n// TestAssuranceConfigPersistControl is the success-path control: when the same\n// membership change persists, the entry is in the log store, so the published\n// configuration has a durable counterpart.\nfunc TestAssuranceConfigPersistControl(t *testing.T) {\n\t_, trans := NewInmemTransport(\"\")\n\tstore := &assuranceFailStore{InmemStore: NewInmemStore()}\n\tr := assuranceSingleNode(t, store, trans, &MockFSM{})\n\tdefer r.Shutdown()\n\n\tif !assuranceWaitLeader(r, 3*time.Second) {\n\t\tt.Fatalf(\"never became leader, state=%v\", r.State())\n\t}\n\tif err := r.Apply([]byte(\"baseline\"), 2*time.Second).Error(); err != nil {\n\t\tt.Fatalf(\"baseline apply: %v\", err)\n\t}\n\tdurableBefore, _ := store.LastIndex()\n\tbefore := r.GetConfiguration()\n\t_ = before.Error()\n\n\taddErr := r.AddVoter(ServerID(\"phantom\"), ServerAddress(\"phantom-addr\"), 0, 2*time.Second).Error()\n\tassignedIdx := durableBefore + 1\n\tvar stored Log\n\tgetErr := store.GetLog(assignedIdx, &stored)\n\tafter := r.GetConfiguration()\n\t_ = after.Error()\n\tdurableAfter, _ := store.LastIndex()\n\n\tassuranceEmit(t, map[string]interface{}{\n\t\t\"event\":                      \"config_persist_success_control\",\n\t\t\"add_voter_error\":            fmt.Sprint(addErr),\n\t\t\"assigned_config_index\":      assignedIdx,\n\t\t\"getlog_at_assigned_idx_err\": fmt.Sprint(getErr),\n\t\t\"durable_last_index_after\":   durableAfter,\n\t\t\"config_servers_before\":      assuranceServers(before.Configuration()),\n\t\t\"config_servers_after\":       assuranceServers(after.Configuration()),\n\t})\n}\n",
+    "description": "In-package Go test (assurance_generated_test.go) that bootstraps one voter with an InmemStore whose StoreLogs can be failed on demand, waits for leadership, emits the leader-established and change-attempt prerequisites, performs AddVoter with a single injected StoreLogs failure, then emits assurance_config_published carrying whether the published configuration's assigned log index is present in the store.",
+    "semantic_changes": [
+      "One transient LogStore.StoreLogs failure is injected at the real LogStore boundary; no target source is modified",
+      "The harness is an added _test.go file in the captured package; observation is emitted as CA_EVENT JSON"
+    ],
+    "prerequisites": [
+      {
+        "alias": "adm",
+        "event": "assurance_leader_established",
+        "conditions": []
+      },
+      {
+        "alias": "act",
+        "event": "assurance_config_change_attempt",
+        "conditions": []
+      }
+    ],
+    "legality": {
+      "source_ids": [
+        "src2-append-config",
+        "src2-dispatch-logs"
+      ],
+      "expectation_ids": [],
+      "binding_ids": [
+        "bind-append-config",
+        "bind-dispatch-logs"
+      ],
+      "derivation": "appendConfigurationEntry (bind-append-config) dispatches the configuration entry and then installs the new configuration; dispatchLogs (bind-dispatch-logs) assigns the log index before StoreLogs and returns on error, so the leader can attempt a change whose entry never becomes durable.",
+      "applicability": "A leader holding a configurationChangeFuture while its LogStore.StoreLogs returns an error for that entry. The failure is supplied by the harness, not produced by real producers.",
+      "unresolved": [
+        "Only one failure timing (whole StoreLogs call fails) is exercised in this direct check; the general set of failure points is covered by the wider investigation"
+      ],
+      "conflicts": [],
+      "alternatives": [
+        "A deployment that discards the process on any store error would not run long enough to observe the divergence"
+      ]
+    }
+  },
+  "monitors": [
+    {
+      "id": "mon-config-publish-durable",
+      "checker_id": "checker-config-publish-durable",
+      "event": "assurance_config_published",
+      "binding_ids": [
+        "bind-append-config",
+        "bind-dispatch-logs"
+      ],
+      "grounding": {
+        "source_ids": [
+          "src2-append-config",
+          "src2-dispatch-logs",
+          "src2-configurations-doc"
+        ],
+        "expectation_ids": [],
+        "binding_ids": [
+          "bind-append-config",
+          "bind-dispatch-logs"
+        ],
+        "derivation": "configurations.latest is documented as the latest configuration in the log/snapshot (src2-configurations-doc), and appendConfigurationEntry publishes the new configuration after dispatchLogs returns (bind-append-config, bind-dispatch-logs). The monitor therefore asks whether the configuration published for this operation has a durable log entry.",
+        "applicability": "The admitted membership-change operation is performed by a leader; the result event reports whether the entry assigned to that operation is present in the LogStore.",
+        "unresolved": [
+          "Whether a production LogStore can return a transient StoreLogs error while the process continues"
+        ],
+        "conflicts": [],
+        "alternatives": []
+      },
+      "applicability_conditions": [],
+      "admission_alias": "adm"
+    }
+  ],
+  "observable_properties": [
+    {
+      "checker_id": "checker-config-publish-durable",
+      "kind": "event_assertion",
+      "trigger": {
+        "field": "published_ahead_of_durable",
+        "op": "eq",
+        "value": true,
+        "reference": null
+      },
+      "assertion": {
+        "field": "entry_durable",
+        "op": "eq",
+        "value": true,
+        "reference": null
+      },
+      "antecedent": null,
+      "identity_fields": [
+        "node"
+      ],
+      "description": "For a membership change whose configuration was published as the node's latest configuration, the configuration entry must be present in the durable log."
+    }
+  ],
+  "uncertainties": [
+    "A single failing StoreLogs timing is observed; other store failure points are outside this direct check",
+    "The admitted operation runs in a single-voter cluster, so downstream effects on a multi-voter quorum are not exercised here"
+  ]
+}

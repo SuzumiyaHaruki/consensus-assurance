@@ -1,0 +1,1141 @@
+{
+  "input": {
+    "rationale": "This exploration closes the last open discriminator of candidate 0a6d446a083a42cf91e99726f577eaea using only real producers and controlled connectivity. Method: three in-process voters are bootstrapped with a three-voter configuration and fully connected transports; a leader is elected; that leader is then isolated from the other two in both directions, and it issues three Apply calls, which dispatchLogs stores in its own log while replication cannot reach a quorum, so those entries stay uncommitted; the leader's own lease then expires and it steps down. The two remaining voters elect a new leader in a higher term, which commits a new entry. The isolated node's LogStore is then set to fail StoreLogs, both transports are reconnected, and the new leader overwrites the old suffix at those indices. Observed (CA_EVENT real_producer_truncation): state Follower, isolated_cached_last_index 4, cached_last_index_after 5, durable_last_index_after 2, reported_last_index 5, getlog_at_cached_err log not found and cached_ahead_of_durable true, so the node's cached and reported last-log index sits above durable content after a suffix was deleted and the replacement write failed. Unlike the previous conditional probe, the conflicting suffix, the higher term and the overwriting entries were all produced by elections and client calls through the real transports; only the connectivity changes and the single injected StoreLogs failure are supplied, which is exactly the storage-failure boundary the obligation scope admits. Boundary retained: the run is in-process and in-memory, the injected failure is a whole-call failure, and the durable-state divergence of the last-log cache is a distinct observation from the confirmed published-configuration violation, so it is reported as its own result rather than folded into that finding. The confirmed direct check 3b256fe6f42b4154b75d4d2ec02e27bf remains unchanged.",
+    "sources": [
+      {
+        "id": "src7-appendentries-entries",
+        "file": "raft.go",
+        "start_line": 1494,
+        "end_line": 1545,
+        "kind": "code_observation"
+      },
+      {
+        "id": "src7-check-lease",
+        "file": "raft.go",
+        "start_line": 1036,
+        "end_line": 1085,
+        "kind": "code_observation"
+      }
+    ],
+    "feedback": null,
+    "review": null,
+    "map_path": null,
+    "map_changes": {},
+    "repair_of": null,
+    "action": "explore",
+    "question": "Can the truncation-then-failed-write history that leaves the cached and reported last-log index above durable content be produced by real producers, that is by a second leader elected in a higher term, without supplying the conflicting AppendEntries directly to the handler?",
+    "harness_path": "probe_config_publish_test.go",
+    "execution_package": null,
+    "files": {}
+  },
+  "before": {
+    "current_submission": {
+      "phase": "received",
+      "operation_id": "6dda33bc425048a2850edce8446cead9",
+      "result": {
+        "submission": "submission.json",
+        "summary": "Submitted an explore operation (harness probe_config_publish_test.go) that closes the last open discriminator of candidate 0a6d446a083a42cf91e99726f577eaea using only real producers and controlled connectivity. Method: three in-process voters are bootstrapped as a three-voter configuration with fully connected transports, a leader is elected, that leader is isolated from the other two in both directions and issues three Apply calls whose entries are stored locally but cannot commit, the leader then steps down when its lease expires, the remaining two voters elect a new leader in a higher term and commit a new entry, the isolated node's LogStore is set to fail StoreLogs, and both transports are reconnected so the new leader overwrites the old suffix. Observed CA_EVENT real_producer_truncation: state Follower, isolated_cached_last_index 4, cached_last_index_after 5, durable_last_index_after 2, reported_last_index 5, getlog_at_cached_err log not found, and cached_ahead_of_durable true, so the cached and reported last-log index sits above durable content after a suffix was deleted and the replacement write failed. Unlike the earlier conditional handler probe, the conflicting suffix, the higher term and the overwriting entries were all produced by elections and client calls through the real transports; only the connectivity changes and the single injected whole-call StoreLogs failure are supplied, which the obligation scope admits. Boundaries retained: the run is in-process and in-memory, and the last-log-cache divergence is reported as its own observation rather than folded into the confirmed published-configuration violation through direct check 3b256fe6f42b4154b75d4d2ec02e27bf, which is untouched. Preflight validation returned valid true. No source, evidence, credential or dependency files were modified; the draft contains submission.json and the updated harness."
+      },
+      "status": "completed",
+      "reason": "",
+      "session_unavailable": false
+    },
+    "materials": [
+      {
+        "id": "src-append-config",
+        "file": "raft.go",
+        "start_line": 1203,
+        "end_line": 1241,
+        "kind": "code_observation",
+        "text": "func (r *Raft) appendConfigurationEntry(future *configurationChangeFuture) {\n\tconfiguration, err := nextConfiguration(r.configurations.latest, r.configurations.latestIndex, future.req)\n\tif err != nil {\n\t\tfuture.respond(err)\n\t\treturn\n\t}\n\n\tr.logger.Info(\"updating configuration\",\n\t\t\"command\", future.req.command,\n\t\t\"server-id\", future.req.serverID,\n\t\t\"server-addr\", future.req.serverAddress,\n\t\t\"servers\", hclog.Fmt(\"%+v\", configuration.Servers))\n\n\t// In pre-ID compatibility mode we translate all configuration changes\n\t// in to an old remove peer message, which can handle all supported\n\t// cases for peer changes in the pre-ID world (adding and removing\n\t// voters). Both add peer and remove peer log entries are handled\n\t// similarly on old Raft servers, but remove peer does extra checks to\n\t// see if a leader needs to step down. Since they both assert the full\n\t// configuration, then we can safely call remove peer for everything.\n\tif r.protocolVersion < 2 {\n\t\tfuture.log = Log{\n\t\t\tType: LogRemovePeerDeprecated,\n\t\t\tData: encodePeers(configuration, r.trans),\n\t\t}\n\t} else {\n\t\tfuture.log = Log{\n\t\t\tType: LogConfiguration,\n\t\t\tData: EncodeConfiguration(configuration),\n\t\t}\n\t}\n\n\tr.dispatchLogs([]*logFuture{&future.logFuture})\n\tindex := future.Index()\n\tr.setLatestConfiguration(configuration, index)\n\tr.leaderState.commitment.setConfiguration(configuration)\n\tr.startStopReplication()\n}\n",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "src-dispatch-logs",
+        "file": "raft.go",
+        "start_line": 1244,
+        "end_line": 1279,
+        "kind": "code_observation",
+        "text": "func (r *Raft) dispatchLogs(applyLogs []*logFuture) {\n\tnow := time.Now()\n\tdefer metrics.MeasureSince([]string{\"raft\", \"leader\", \"dispatchLog\"}, now)\n\n\tterm := r.getCurrentTerm()\n\tlastIndex := r.getLastIndex()\n\n\tn := len(applyLogs)\n\tlogs := make([]*Log, n)\n\tmetrics.SetGauge([]string{\"raft\", \"leader\", \"dispatchNumLogs\"}, float32(n))\n\n\tfor idx, applyLog := range applyLogs {\n\t\tapplyLog.dispatch = now\n\t\tlastIndex++\n\t\tapplyLog.log.Index = lastIndex\n\t\tapplyLog.log.Term = term\n\t\tapplyLog.log.AppendedAt = now\n\t\tlogs[idx] = &applyLog.log\n\t\tr.leaderState.inflight.PushBack(applyLog)\n\t}\n\n\t// Write the log entry locally\n\tif err := r.logs.StoreLogs(logs); err != nil {\n\t\tr.logger.Error(\"failed to commit logs\", \"error\", err)\n\t\tfor _, applyLog := range applyLogs {\n\t\t\tapplyLog.respond(err)\n\t\t}\n\t\tr.setState(Follower)\n\t\treturn\n\t}\n\tr.leaderState.commitment.match(r.localID, lastIndex)\n\n\t// Update the last log since it's on disk now\n\tr.setLastLog(lastIndex, term)\n\n\t// Notify the replicators of the new log",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "src-quorum",
+        "file": "raft.go",
+        "start_line": 1036,
+        "end_line": 1101,
+        "kind": "code_observation",
+        "text": "func (r *Raft) checkLeaderLease() time.Duration {\n\t// Track contacted nodes, we can always contact ourself\n\tcontacted := 0\n\n\t// Store lease timeout for this one check invocation as we need to refer to it\n\t// in the loop and would be confusing if it ever becomes reloadable and\n\t// changes between iterations below.\n\tleaseTimeout := r.config().LeaderLeaseTimeout\n\n\t// Check each follower\n\tvar maxDiff time.Duration\n\tnow := time.Now()\n\tfor _, server := range r.configurations.latest.Servers {\n\t\tif server.Suffrage == Voter {\n\t\t\tif server.ID == r.localID {\n\t\t\t\tcontacted++\n\t\t\t\tcontinue\n\t\t\t}\n\t\t\tf := r.leaderState.replState[server.ID]\n\t\t\tdiff := now.Sub(f.LastContact())\n\t\t\tif diff <= leaseTimeout {\n\t\t\t\tcontacted++\n\t\t\t\tif diff > maxDiff {\n\t\t\t\t\tmaxDiff = diff\n\t\t\t\t}\n\t\t\t} else {\n\t\t\t\t// Log at least once at high value, then debug. Otherwise it gets very verbose.\n\t\t\t\tif diff <= 3*leaseTimeout {\n\t\t\t\t\tr.logger.Warn(\"failed to contact\", \"server-id\", server.ID, \"time\", diff)\n\t\t\t\t} else {\n\t\t\t\t\tr.logger.Debug(\"failed to contact\", \"server-id\", server.ID, \"time\", diff)\n\t\t\t\t}\n\t\t\t}\n\t\t\tmetrics.AddSample([]string{\"raft\", \"leader\", \"lastContact\"}, float32(diff/time.Millisecond))\n\t\t}\n\t}\n\n\t// Verify we can contact a quorum\n\tquorum := r.quorumSize()\n\tif contacted < quorum {\n\t\tr.logger.Warn(\"failed to contact quorum of nodes, stepping down\")\n\t\tr.setState(Follower)\n\t\tmetrics.IncrCounter([]string{\"raft\", \"transition\", \"leader_lease_timeout\"}, 1)\n\t}\n\treturn maxDiff\n}\n\n// quorumSize is used to return the quorum size. This must only be called on\n// the main thread.\n// TODO: revisit usage\nfunc (r *Raft) quorumSize() int {\n\tvoters := 0\n\tfor _, server := range r.configurations.latest.Servers {\n\t\tif server.Suffrage == Voter {\n\t\t\tvoters++\n\t\t}\n\t}\n\treturn voters/2 + 1\n}\n\n// restoreUserSnapshot is used to manually consume an external snapshot, such\n// as if restoring from a backup. We will use the current Raft configuration,\n// not the one from the snapshot, so that we can restore into a new cluster. We\n// will also use the higher of the index of the snapshot, or the current index,\n// and then add 1 to that, so we force a new state with a hole in the Raft log,\n// so that the snapshot will be sent to followers and used for any new joiners.",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "src-follower-gate",
+        "file": "raft.go",
+        "start_line": 158,
+        "end_line": 260,
+        "kind": "code_observation",
+        "text": "func (r *Raft) runFollower() {\n\tdidWarn := false\n\tleaderAddr, leaderID := r.LeaderWithID()\n\tr.logger.Info(\"entering follower state\", \"follower\", r, \"leader-address\", leaderAddr, \"leader-id\", leaderID)\n\tmetrics.IncrCounter([]string{\"raft\", \"state\", \"follower\"}, 1)\n\theartbeatTimer := randomTimeout(r.config().HeartbeatTimeout)\n\n\tfor r.getState() == Follower {\n\t\tr.mainThreadSaturation.sleeping()\n\n\t\tselect {\n\t\tcase rpc := <-r.rpcCh:\n\t\t\tr.mainThreadSaturation.working()\n\t\t\tr.processRPC(rpc)\n\n\t\tcase c := <-r.configurationChangeCh:\n\t\t\tr.mainThreadSaturation.working()\n\t\t\t// Reject any operations since we are not the leader\n\t\t\tc.respond(ErrNotLeader)\n\n\t\tcase a := <-r.applyCh:\n\t\t\tr.mainThreadSaturation.working()\n\t\t\t// Reject any operations since we are not the leader\n\t\t\ta.respond(ErrNotLeader)\n\n\t\tcase v := <-r.verifyCh:\n\t\t\tr.mainThreadSaturation.working()\n\t\t\t// Reject any operations since we are not the leader\n\t\t\tv.respond(ErrNotLeader)\n\n\t\tcase ur := <-r.userRestoreCh:\n\t\t\tr.mainThreadSaturation.working()\n\t\t\t// Reject any restores since we are not the leader\n\t\t\tur.respond(ErrNotLeader)\n\n\t\tcase l := <-r.leadershipTransferCh:\n\t\t\tr.mainThreadSaturation.working()\n\t\t\t// Reject any operations since we are not the leader\n\t\t\tl.respond(ErrNotLeader)\n\n\t\tcase c := <-r.configurationsCh:\n\t\t\tr.mainThreadSaturation.working()\n\t\t\tc.configurations = r.configurations.Clone()\n\t\t\tc.respond(nil)\n\n\t\tcase b := <-r.bootstrapCh:\n\t\t\tr.mainThreadSaturation.working()\n\t\t\tb.respond(r.liveBootstrap(b.configuration))\n\n\t\tcase <-r.leaderNotifyCh:\n\t\t\t//  Ignore since we are not the leader\n\n\t\tcase <-r.followerNotifyCh:\n\t\t\theartbeatTimer = time.After(0)\n\n\t\tcase <-heartbeatTimer:\n\t\t\tr.mainThreadSaturation.working()\n\t\t\t// Restart the heartbeat timer\n\t\t\thbTimeout := r.config().HeartbeatTimeout\n\t\t\theartbeatTimer = randomTimeout(hbTimeout)\n\n\t\t\t// Check if we have had a successful contact\n\t\t\tlastContact := r.LastContact()\n\t\t\tif time.Since(lastContact) < hbTimeout {\n\t\t\t\tcontinue\n\t\t\t}\n\n\t\t\t// Heartbeat failed! Transition to the candidate state\n\t\t\tlastLeaderAddr, lastLeaderID := r.LeaderWithID()\n\t\t\tr.setLeader(\"\", \"\")\n\n\t\t\tif r.configurations.latestIndex == 0 {\n\t\t\t\tif !didWarn {\n\t\t\t\t\tr.logger.Warn(\"no known peers, aborting election\")\n\t\t\t\t\tdidWarn = true\n\t\t\t\t}\n\t\t\t} else if r.configurations.latestIndex == r.configurations.committedIndex &&\n\t\t\t\t!hasVote(r.configurations.latest, r.localID) {\n\t\t\t\tif !didWarn {\n\t\t\t\t\tr.logger.Warn(\"not part of stable configuration, aborting election\")\n\t\t\t\t\tdidWarn = true\n\t\t\t\t}\n\t\t\t} else {\n\t\t\t\tmetrics.IncrCounter([]string{\"raft\", \"transition\", \"heartbeat_timeout\"}, 1)\n\t\t\t\tif hasVote(r.configurations.latest, r.localID) {\n\t\t\t\t\tr.logger.Warn(\"heartbeat timeout reached, starting election\", \"last-leader-addr\", lastLeaderAddr, \"last-leader-id\", lastLeaderID)\n\t\t\t\t\tr.setState(Candidate)\n\t\t\t\t\treturn\n\t\t\t\t} else if !didWarn {\n\t\t\t\t\tr.logger.Warn(\"heartbeat timeout reached, not part of a stable configuration or a non-voter, not triggering a leader election\")\n\t\t\t\t\tdidWarn = true\n\t\t\t\t}\n\t\t\t}\n\n\t\tcase <-r.shutdownCh:\n\t\t\treturn\n\t\t}\n\t}\n}\n\n// liveBootstrap attempts to seed an initial configuration for the cluster. See\n// the Raft object's member BootstrapCluster for more details. This must only be\n// called on the main thread, and only makes sense in the follower state.",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "src-getconfig",
+        "file": "api.go",
+        "start_line": 897,
+        "end_line": 906,
+        "kind": "code_observation",
+        "text": "func (r *Raft) GetConfiguration() ConfigurationFuture {\n\tconfigReq := &configurationsFuture{}\n\tconfigReq.init()\n\tconfigReq.configurations = configurations{latest: r.getLatestConfiguration()}\n\tconfigReq.respond(nil)\n\treturn configReq\n}\n\n// AddPeer to the cluster configuration. Must be run on the leader, or it will fail.\n//",
+        "content_digest": "499a72c01096912e85d16381f4640ac6d29f8c2b91cabbdae8530bdcbeb89a4a"
+      },
+      {
+        "id": "src-config-future-index",
+        "file": "future.go",
+        "start_line": 262,
+        "end_line": 270,
+        "kind": "code_observation",
+        "text": "// Configuration returns the latest configuration in use by Raft.\nfunc (c *configurationsFuture) Configuration() Configuration {\n\treturn c.configurations.latest\n}\n\n// Index returns the index of the latest configuration in use by Raft.\nfunc (c *configurationsFuture) Index() uint64 {\n\treturn c.configurations.latestIndex\n}",
+        "content_digest": "e3775d16c6cb24f9c9572ce452c27e87fcbf4b24baf666d14e838cc4b571ae9c"
+      },
+      {
+        "id": "src2-append-config",
+        "file": "raft.go",
+        "start_line": 1203,
+        "end_line": 1240,
+        "kind": "code_observation",
+        "text": "func (r *Raft) appendConfigurationEntry(future *configurationChangeFuture) {\n\tconfiguration, err := nextConfiguration(r.configurations.latest, r.configurations.latestIndex, future.req)\n\tif err != nil {\n\t\tfuture.respond(err)\n\t\treturn\n\t}\n\n\tr.logger.Info(\"updating configuration\",\n\t\t\"command\", future.req.command,\n\t\t\"server-id\", future.req.serverID,\n\t\t\"server-addr\", future.req.serverAddress,\n\t\t\"servers\", hclog.Fmt(\"%+v\", configuration.Servers))\n\n\t// In pre-ID compatibility mode we translate all configuration changes\n\t// in to an old remove peer message, which can handle all supported\n\t// cases for peer changes in the pre-ID world (adding and removing\n\t// voters). Both add peer and remove peer log entries are handled\n\t// similarly on old Raft servers, but remove peer does extra checks to\n\t// see if a leader needs to step down. Since they both assert the full\n\t// configuration, then we can safely call remove peer for everything.\n\tif r.protocolVersion < 2 {\n\t\tfuture.log = Log{\n\t\t\tType: LogRemovePeerDeprecated,\n\t\t\tData: encodePeers(configuration, r.trans),\n\t\t}\n\t} else {\n\t\tfuture.log = Log{\n\t\t\tType: LogConfiguration,\n\t\t\tData: EncodeConfiguration(configuration),\n\t\t}\n\t}\n\n\tr.dispatchLogs([]*logFuture{&future.logFuture})\n\tindex := future.Index()\n\tr.setLatestConfiguration(configuration, index)\n\tr.leaderState.commitment.setConfiguration(configuration)\n\tr.startStopReplication()\n}",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "src2-dispatch-logs",
+        "file": "raft.go",
+        "start_line": 1244,
+        "end_line": 1283,
+        "kind": "code_observation",
+        "text": "func (r *Raft) dispatchLogs(applyLogs []*logFuture) {\n\tnow := time.Now()\n\tdefer metrics.MeasureSince([]string{\"raft\", \"leader\", \"dispatchLog\"}, now)\n\n\tterm := r.getCurrentTerm()\n\tlastIndex := r.getLastIndex()\n\n\tn := len(applyLogs)\n\tlogs := make([]*Log, n)\n\tmetrics.SetGauge([]string{\"raft\", \"leader\", \"dispatchNumLogs\"}, float32(n))\n\n\tfor idx, applyLog := range applyLogs {\n\t\tapplyLog.dispatch = now\n\t\tlastIndex++\n\t\tapplyLog.log.Index = lastIndex\n\t\tapplyLog.log.Term = term\n\t\tapplyLog.log.AppendedAt = now\n\t\tlogs[idx] = &applyLog.log\n\t\tr.leaderState.inflight.PushBack(applyLog)\n\t}\n\n\t// Write the log entry locally\n\tif err := r.logs.StoreLogs(logs); err != nil {\n\t\tr.logger.Error(\"failed to commit logs\", \"error\", err)\n\t\tfor _, applyLog := range applyLogs {\n\t\t\tapplyLog.respond(err)\n\t\t}\n\t\tr.setState(Follower)\n\t\treturn\n\t}\n\tr.leaderState.commitment.match(r.localID, lastIndex)\n\n\t// Update the last log since it's on disk now\n\tr.setLastLog(lastIndex, term)\n\n\t// Notify the replicators of the new log\n\tfor _, f := range r.leaderState.replState {\n\t\tasyncNotifyCh(f.triggerCh)\n\t}\n}",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "src2-quorum-size",
+        "file": "raft.go",
+        "start_line": 1086,
+        "end_line": 1094,
+        "kind": "code_observation",
+        "text": "func (r *Raft) quorumSize() int {\n\tvoters := 0\n\tfor _, server := range r.configurations.latest.Servers {\n\t\tif server.Suffrage == Voter {\n\t\t\tvoters++\n\t\t}\n\t}\n\treturn voters/2 + 1\n}",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "src2-commitment-setcfg",
+        "file": "commitment.go",
+        "start_line": 53,
+        "end_line": 64,
+        "kind": "code_observation",
+        "text": "func (c *commitment) setConfiguration(configuration Configuration) {\n\tc.Lock()\n\tdefer c.Unlock()\n\toldMatchIndexes := c.matchIndexes\n\tc.matchIndexes = make(map[ServerID]uint64)\n\tfor _, server := range configuration.Servers {\n\t\tif server.Suffrage == Voter {\n\t\t\tc.matchIndexes[server.ID] = oldMatchIndexes[server.ID] // defaults to 0\n\t\t}\n\t}\n\tc.recalculate()\n}",
+        "content_digest": "2b534893e015d26a33d37027a08c65ff76fb5e28e71a76d4408e3c9fcbcfd4fe"
+      },
+      {
+        "id": "src2-configurations-doc",
+        "file": "configuration.go",
+        "start_line": 254,
+        "end_line": 265,
+        "kind": "document_statement",
+        "text": "\t\t\tconfiguration.Servers = append(configuration.Servers, newServer)\n\t\t}\n\tcase AddNonvoter:\n\t\tnewServer := Server{\n\t\t\tSuffrage: Nonvoter,\n\t\t\tID:       change.serverID,\n\t\t\tAddress:  change.serverAddress,\n\t\t}\n\t\tfound := false\n\t\tfor i, server := range configuration.Servers {\n\t\t\tif server.ID == change.serverID {\n\t\t\t\tif server.Suffrage != Nonvoter {",
+        "content_digest": "7e3e1e0a708f3f3b17691549962c94d78955a840922fc0f42867c515cd27ec66"
+      },
+      {
+        "id": "src2-follower-gate",
+        "file": "raft.go",
+        "start_line": 205,
+        "end_line": 240,
+        "kind": "code_observation",
+        "text": "\t\t\tb.respond(r.liveBootstrap(b.configuration))\n\n\t\tcase <-r.leaderNotifyCh:\n\t\t\t//  Ignore since we are not the leader\n\n\t\tcase <-r.followerNotifyCh:\n\t\t\theartbeatTimer = time.After(0)\n\n\t\tcase <-heartbeatTimer:\n\t\t\tr.mainThreadSaturation.working()\n\t\t\t// Restart the heartbeat timer\n\t\t\thbTimeout := r.config().HeartbeatTimeout\n\t\t\theartbeatTimer = randomTimeout(hbTimeout)\n\n\t\t\t// Check if we have had a successful contact\n\t\t\tlastContact := r.LastContact()\n\t\t\tif time.Since(lastContact) < hbTimeout {\n\t\t\t\tcontinue\n\t\t\t}\n\n\t\t\t// Heartbeat failed! Transition to the candidate state\n\t\t\tlastLeaderAddr, lastLeaderID := r.LeaderWithID()\n\t\t\tr.setLeader(\"\", \"\")\n\n\t\t\tif r.configurations.latestIndex == 0 {\n\t\t\t\tif !didWarn {\n\t\t\t\t\tr.logger.Warn(\"no known peers, aborting election\")\n\t\t\t\t\tdidWarn = true\n\t\t\t\t}\n\t\t\t} else if r.configurations.latestIndex == r.configurations.committedIndex &&\n\t\t\t\t!hasVote(r.configurations.latest, r.localID) {\n\t\t\t\tif !didWarn {\n\t\t\t\t\tr.logger.Warn(\"not part of stable configuration, aborting election\")\n\t\t\t\t\tdidWarn = true\n\t\t\t\t}\n\t\t\t} else {",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "src3-append-config",
+        "file": "raft.go",
+        "start_line": 1203,
+        "end_line": 1240,
+        "kind": "code_observation",
+        "text": "func (r *Raft) appendConfigurationEntry(future *configurationChangeFuture) {\n\tconfiguration, err := nextConfiguration(r.configurations.latest, r.configurations.latestIndex, future.req)\n\tif err != nil {\n\t\tfuture.respond(err)\n\t\treturn\n\t}\n\n\tr.logger.Info(\"updating configuration\",\n\t\t\"command\", future.req.command,\n\t\t\"server-id\", future.req.serverID,\n\t\t\"server-addr\", future.req.serverAddress,\n\t\t\"servers\", hclog.Fmt(\"%+v\", configuration.Servers))\n\n\t// In pre-ID compatibility mode we translate all configuration changes\n\t// in to an old remove peer message, which can handle all supported\n\t// cases for peer changes in the pre-ID world (adding and removing\n\t// voters). Both add peer and remove peer log entries are handled\n\t// similarly on old Raft servers, but remove peer does extra checks to\n\t// see if a leader needs to step down. Since they both assert the full\n\t// configuration, then we can safely call remove peer for everything.\n\tif r.protocolVersion < 2 {\n\t\tfuture.log = Log{\n\t\t\tType: LogRemovePeerDeprecated,\n\t\t\tData: encodePeers(configuration, r.trans),\n\t\t}\n\t} else {\n\t\tfuture.log = Log{\n\t\t\tType: LogConfiguration,\n\t\t\tData: EncodeConfiguration(configuration),\n\t\t}\n\t}\n\n\tr.dispatchLogs([]*logFuture{&future.logFuture})\n\tindex := future.Index()\n\tr.setLatestConfiguration(configuration, index)\n\tr.leaderState.commitment.setConfiguration(configuration)\n\tr.startStopReplication()\n}",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "src3-truncation-revert",
+        "file": "raft.go",
+        "start_line": 1522,
+        "end_line": 1535,
+        "kind": "code_observation",
+        "text": "\t\t\t}\n\t\t\tif entry.Term != storeEntry.Term {\n\t\t\t\tr.logger.Warn(\"clearing log suffix\", \"from\", entry.Index, \"to\", lastLogIdx)\n\t\t\t\tif err := r.logs.DeleteRange(entry.Index, lastLogIdx); err != nil {\n\t\t\t\t\tr.logger.Error(\"failed to clear log suffix\", \"error\", err)\n\t\t\t\t\treturn\n\t\t\t\t}\n\t\t\t\tif entry.Index <= r.configurations.latestIndex {\n\t\t\t\t\tr.setLatestConfiguration(r.configurations.committed, r.configurations.committedIndex)\n\t\t\t\t}\n\t\t\t\tnewEntries = a.Entries[i:]\n\t\t\t\tbreak\n\t\t\t}\n\t\t}",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "src3-proccfg",
+        "file": "raft.go",
+        "start_line": 1585,
+        "end_line": 1600,
+        "kind": "code_observation",
+        "text": "func (r *Raft) processConfigurationLogEntry(entry *Log) error {\n\tswitch entry.Type {\n\tcase LogConfiguration:\n\t\tr.setCommittedConfiguration(r.configurations.latest, r.configurations.latestIndex)\n\t\tr.setLatestConfiguration(DecodeConfiguration(entry.Data), entry.Index)\n\n\tcase LogAddPeerDeprecated, LogRemovePeerDeprecated:\n\t\tr.setCommittedConfiguration(r.configurations.latest, r.configurations.latestIndex)\n\t\tconf, err := decodePeers(entry.Data, r.trans)\n\t\tif err != nil {\n\t\t\treturn err\n\t\t}\n\t\tr.setLatestConfiguration(conf, entry.Index)\n\t}\n\treturn nil\n}",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "src3-installsnap",
+        "file": "raft.go",
+        "start_line": 1928,
+        "end_line": 1940,
+        "kind": "code_observation",
+        "text": "\t}\n\n\t// Update the lastApplied so we don't replay old logs\n\tr.setLastApplied(req.LastLogIndex)\n\n\t// Update the last stable snapshot info\n\tr.setLastSnapshot(req.LastLogIndex, req.LastLogTerm)\n\n\t// Restore the peer set\n\tr.setLatestConfiguration(reqConfiguration, reqConfigurationIndex)\n\tr.setCommittedConfiguration(reqConfiguration, reqConfigurationIndex)\n\n\t// Clear old logs if r.logs is a MonotonicLogStore. Otherwise compact the",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "src3-startup-restore",
+        "file": "api.go",
+        "start_line": 640,
+        "end_line": 666,
+        "kind": "code_observation",
+        "text": "\t\tif success := r.tryRestoreSingleSnapshot(snapshot); !success {\n\t\t\tcontinue\n\t\t}\n\n\t\t// Update the lastApplied so we don't replay old logs\n\t\tr.setLastApplied(snapshot.Index)\n\n\t\t// Update the last stable snapshot info\n\t\tr.setLastSnapshot(snapshot.Index, snapshot.Term)\n\n\t\t// Update the configuration\n\t\tvar conf Configuration\n\t\tvar index uint64\n\t\tif snapshot.Version > 0 {\n\t\t\tconf = snapshot.Configuration\n\t\t\tindex = snapshot.ConfigurationIndex\n\t\t} else {\n\t\t\tvar err error\n\t\t\tif conf, err = decodePeers(snapshot.Peers, r.trans); err != nil {\n\t\t\t\treturn err\n\t\t\t}\n\t\t\tindex = snapshot.Index\n\t\t}\n\t\tr.setCommittedConfiguration(conf, index)\n\t\tr.setLatestConfiguration(conf, index)\n\n\t\t// Success!",
+        "content_digest": "499a72c01096912e85d16381f4640ac6d29f8c2b91cabbdae8530bdcbeb89a4a"
+      },
+      {
+        "id": "src4-append-config",
+        "file": "raft.go",
+        "start_line": 1203,
+        "end_line": 1240,
+        "kind": "code_observation",
+        "text": "func (r *Raft) appendConfigurationEntry(future *configurationChangeFuture) {\n\tconfiguration, err := nextConfiguration(r.configurations.latest, r.configurations.latestIndex, future.req)\n\tif err != nil {\n\t\tfuture.respond(err)\n\t\treturn\n\t}\n\n\tr.logger.Info(\"updating configuration\",\n\t\t\"command\", future.req.command,\n\t\t\"server-id\", future.req.serverID,\n\t\t\"server-addr\", future.req.serverAddress,\n\t\t\"servers\", hclog.Fmt(\"%+v\", configuration.Servers))\n\n\t// In pre-ID compatibility mode we translate all configuration changes\n\t// in to an old remove peer message, which can handle all supported\n\t// cases for peer changes in the pre-ID world (adding and removing\n\t// voters). Both add peer and remove peer log entries are handled\n\t// similarly on old Raft servers, but remove peer does extra checks to\n\t// see if a leader needs to step down. Since they both assert the full\n\t// configuration, then we can safely call remove peer for everything.\n\tif r.protocolVersion < 2 {\n\t\tfuture.log = Log{\n\t\t\tType: LogRemovePeerDeprecated,\n\t\t\tData: encodePeers(configuration, r.trans),\n\t\t}\n\t} else {\n\t\tfuture.log = Log{\n\t\t\tType: LogConfiguration,\n\t\t\tData: EncodeConfiguration(configuration),\n\t\t}\n\t}\n\n\tr.dispatchLogs([]*logFuture{&future.logFuture})\n\tindex := future.Index()\n\tr.setLatestConfiguration(configuration, index)\n\tr.leaderState.commitment.setConfiguration(configuration)\n\tr.startStopReplication()\n}",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "src4-dispatch-logs",
+        "file": "raft.go",
+        "start_line": 1244,
+        "end_line": 1283,
+        "kind": "code_observation",
+        "text": "func (r *Raft) dispatchLogs(applyLogs []*logFuture) {\n\tnow := time.Now()\n\tdefer metrics.MeasureSince([]string{\"raft\", \"leader\", \"dispatchLog\"}, now)\n\n\tterm := r.getCurrentTerm()\n\tlastIndex := r.getLastIndex()\n\n\tn := len(applyLogs)\n\tlogs := make([]*Log, n)\n\tmetrics.SetGauge([]string{\"raft\", \"leader\", \"dispatchNumLogs\"}, float32(n))\n\n\tfor idx, applyLog := range applyLogs {\n\t\tapplyLog.dispatch = now\n\t\tlastIndex++\n\t\tapplyLog.log.Index = lastIndex\n\t\tapplyLog.log.Term = term\n\t\tapplyLog.log.AppendedAt = now\n\t\tlogs[idx] = &applyLog.log\n\t\tr.leaderState.inflight.PushBack(applyLog)\n\t}\n\n\t// Write the log entry locally\n\tif err := r.logs.StoreLogs(logs); err != nil {\n\t\tr.logger.Error(\"failed to commit logs\", \"error\", err)\n\t\tfor _, applyLog := range applyLogs {\n\t\t\tapplyLog.respond(err)\n\t\t}\n\t\tr.setState(Follower)\n\t\treturn\n\t}\n\tr.leaderState.commitment.match(r.localID, lastIndex)\n\n\t// Update the last log since it's on disk now\n\tr.setLastLog(lastIndex, term)\n\n\t// Notify the replicators of the new log\n\tfor _, f := range r.leaderState.replState {\n\t\tasyncNotifyCh(f.triggerCh)\n\t}\n}",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "src5-appendentries-tail",
+        "file": "raft.go",
+        "start_line": 1505,
+        "end_line": 1560,
+        "kind": "code_observation",
+        "text": "\tif len(a.Entries) > 0 {\n\t\tstart := time.Now()\n\n\t\t// Delete any conflicting entries, skip any duplicates\n\t\tlastLogIdx, _ := r.getLastLog()\n\t\tvar newEntries []*Log\n\t\tfor i, entry := range a.Entries {\n\t\t\tif entry.Index > lastLogIdx {\n\t\t\t\tnewEntries = a.Entries[i:]\n\t\t\t\tbreak\n\t\t\t}\n\t\t\tvar storeEntry Log\n\t\t\tif err := r.logs.GetLog(entry.Index, &storeEntry); err != nil {\n\t\t\t\tr.logger.Warn(\"failed to get log entry\",\n\t\t\t\t\t\"index\", entry.Index,\n\t\t\t\t\t\"error\", err)\n\t\t\t\treturn\n\t\t\t}\n\t\t\tif entry.Term != storeEntry.Term {\n\t\t\t\tr.logger.Warn(\"clearing log suffix\", \"from\", entry.Index, \"to\", lastLogIdx)\n\t\t\t\tif err := r.logs.DeleteRange(entry.Index, lastLogIdx); err != nil {\n\t\t\t\t\tr.logger.Error(\"failed to clear log suffix\", \"error\", err)\n\t\t\t\t\treturn\n\t\t\t\t}\n\t\t\t\tif entry.Index <= r.configurations.latestIndex {\n\t\t\t\t\tr.setLatestConfiguration(r.configurations.committed, r.configurations.committedIndex)\n\t\t\t\t}\n\t\t\t\tnewEntries = a.Entries[i:]\n\t\t\t\tbreak\n\t\t\t}\n\t\t}\n\n\t\tif n := len(newEntries); n > 0 {\n\t\t\t// Append the new entries\n\t\t\tif err := r.logs.StoreLogs(newEntries); err != nil {\n\t\t\t\tr.logger.Error(\"failed to append to logs\", \"error\", err)\n\t\t\t\t// TODO: leaving r.getLastLog() in the wrong\n\t\t\t\t// state if there was a truncation above\n\t\t\t\treturn\n\t\t\t}\n\n\t\t\t// Handle any new configuration changes\n\t\t\tfor _, newEntry := range newEntries {\n\t\t\t\tif err := r.processConfigurationLogEntry(newEntry); err != nil {\n\t\t\t\t\tr.logger.Warn(\"failed to append entry\",\n\t\t\t\t\t\t\"index\", newEntry.Index,\n\t\t\t\t\t\t\"error\", err)\n\t\t\t\t\trpcErr = err\n\t\t\t\t\treturn\n\t\t\t\t}\n\t\t\t}\n\n\t\t\t// Update the lastLog\n\t\t\tlast := newEntries[n-1]\n\t\t\tr.setLastLog(last.Index, last.Term)\n\t\t}",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "src5-store-error-note",
+        "file": "raft.go",
+        "start_line": 1536,
+        "end_line": 1545,
+        "kind": "code_observation",
+        "text": "\n\t\tif n := len(newEntries); n > 0 {\n\t\t\t// Append the new entries\n\t\t\tif err := r.logs.StoreLogs(newEntries); err != nil {\n\t\t\t\tr.logger.Error(\"failed to append to logs\", \"error\", err)\n\t\t\t\t// TODO: leaving r.getLastLog() in the wrong\n\t\t\t\t// state if there was a truncation above\n\t\t\t\treturn\n\t\t\t}\n",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "src6-appendentries-conflict",
+        "file": "raft.go",
+        "start_line": 1505,
+        "end_line": 1560,
+        "kind": "code_observation",
+        "text": "\tif len(a.Entries) > 0 {\n\t\tstart := time.Now()\n\n\t\t// Delete any conflicting entries, skip any duplicates\n\t\tlastLogIdx, _ := r.getLastLog()\n\t\tvar newEntries []*Log\n\t\tfor i, entry := range a.Entries {\n\t\t\tif entry.Index > lastLogIdx {\n\t\t\t\tnewEntries = a.Entries[i:]\n\t\t\t\tbreak\n\t\t\t}\n\t\t\tvar storeEntry Log\n\t\t\tif err := r.logs.GetLog(entry.Index, &storeEntry); err != nil {\n\t\t\t\tr.logger.Warn(\"failed to get log entry\",\n\t\t\t\t\t\"index\", entry.Index,\n\t\t\t\t\t\"error\", err)\n\t\t\t\treturn\n\t\t\t}\n\t\t\tif entry.Term != storeEntry.Term {\n\t\t\t\tr.logger.Warn(\"clearing log suffix\", \"from\", entry.Index, \"to\", lastLogIdx)\n\t\t\t\tif err := r.logs.DeleteRange(entry.Index, lastLogIdx); err != nil {\n\t\t\t\t\tr.logger.Error(\"failed to clear log suffix\", \"error\", err)\n\t\t\t\t\treturn\n\t\t\t\t}\n\t\t\t\tif entry.Index <= r.configurations.latestIndex {\n\t\t\t\t\tr.setLatestConfiguration(r.configurations.committed, r.configurations.committedIndex)\n\t\t\t\t}\n\t\t\t\tnewEntries = a.Entries[i:]\n\t\t\t\tbreak\n\t\t\t}\n\t\t}\n\n\t\tif n := len(newEntries); n > 0 {\n\t\t\t// Append the new entries\n\t\t\tif err := r.logs.StoreLogs(newEntries); err != nil {\n\t\t\t\tr.logger.Error(\"failed to append to logs\", \"error\", err)\n\t\t\t\t// TODO: leaving r.getLastLog() in the wrong\n\t\t\t\t// state if there was a truncation above\n\t\t\t\treturn\n\t\t\t}\n\n\t\t\t// Handle any new configuration changes\n\t\t\tfor _, newEntry := range newEntries {\n\t\t\t\tif err := r.processConfigurationLogEntry(newEntry); err != nil {\n\t\t\t\t\tr.logger.Warn(\"failed to append entry\",\n\t\t\t\t\t\t\"index\", newEntry.Index,\n\t\t\t\t\t\t\"error\", err)\n\t\t\t\t\trpcErr = err\n\t\t\t\t\treturn\n\t\t\t\t}\n\t\t\t}\n\n\t\t\t// Update the lastLog\n\t\t\tlast := newEntries[n-1]\n\t\t\tr.setLastLog(last.Index, last.Term)\n\t\t}",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "src6-store-error-todo",
+        "file": "raft.go",
+        "start_line": 1536,
+        "end_line": 1545,
+        "kind": "code_observation",
+        "text": "\n\t\tif n := len(newEntries); n > 0 {\n\t\t\t// Append the new entries\n\t\t\tif err := r.logs.StoreLogs(newEntries); err != nil {\n\t\t\t\tr.logger.Error(\"failed to append to logs\", \"error\", err)\n\t\t\t\t// TODO: leaving r.getLastLog() in the wrong\n\t\t\t\t// state if there was a truncation above\n\t\t\t\treturn\n\t\t\t}\n",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      }
+    ],
+    "selections": [
+      {
+        "operation_id": "19c98425e4d9482cadcf9bfa3e4f7a85",
+        "action": "explore",
+        "rationale": "Sourced suspicion: appendConfigurationEntry (raft.go:1203-1241) calls dispatchLogs first, then unconditionally executes r.setLatestConfiguration(configuration, index), r.leaderState.commitment.setConfiguration(configuration) and r.startStopReplication(). dispatchLogs (raft.go:1244-1279) assigns applyLog.log.Index before StoreLogs and returns early only on its own error path, so future.Index() is still nonzero and the new configuration is published even though nothing was durably stored. The live configuration is the authority input for quorumSize()/checkLeaderLease() (raft.go:1036-1101), requestVote/requestPreVote admission (raft.go:1603-1813) and the election-start gate in runFollower (raft.go:158-260), so publishing an unpersisted configuration can change the node's own quorum requirement. The harness supplies a transient LogStore.StoreLogs failure at the real boundary (storage failure injection) on an otherwise healthy single-voter cluster that had just committed index 3. Observed (CA_EVENT config_publish_after_failed_durable_write): AddVoter returned the store error; the assigned log index 4 is absent from durable storage (getlog_at_assigned_idx_err=log not found, durable_last_index_after=3, raft_last_index=3); yet the node's published configuration now lists two voters (the real one plus phantom/phantom-addr). Observed (CA_EVENT progress_after_failed_durable_write): after the failure the node never regains leadership over 141 samples/1.5s (state=Candidate, ever_leader_in_window=false) because voters_in_live_configuration=2 sets quorum_size_live=2 while only 1 voter is reachable, so electSelf/preElectSelf can never reach the needed tally. This is conditional evidence: it establishes what the fixed code did for an explicitly supplied transient storage failure; the failure itself is injected, not produced by real producers here. A separate observation from the same run: Raft.GetConfiguration().Index() (api.go:897-906 building configurations{latest:...} without latestIndex, returned by configurationsFuture.Index() in future.go:267-270) reports 0 for this two-voter configuration (config_index_after=0), so the published index of the live authority context is not observable and cannot be used as the prevIndex guard that AddVoter/RemoveServer accept. Unresolved discriminators: whether an equivalent divergence is reachable without storage failure; whether a restart (durable log lacks the entry) is the only recovery path; and the exact set of store-failure timings (pre- vs post-StoreLogs) that produce the divergence.",
+        "feedback": {},
+        "map_updated": false,
+        "map_changes": {},
+        "accepted_versions": {
+          "audit_spec": 0,
+          "graph": 0,
+          "units": {},
+          "artifacts": {}
+        },
+        "candidate_ids": []
+      },
+      {
+        "operation_id": "6374186cdb5b4d49b1371f38c0b5ec70",
+        "action": "rejected",
+        "rationale": "Invalid submitted input path",
+        "candidate_ids": [],
+        "draft_id": "6374186cdb5b4d49b1371f38c0b5ec70",
+        "repair_of": null,
+        "diagnostics": [
+          "Invalid submitted input path"
+        ],
+        "draft_status": "rejected",
+        "raw_path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-10_16-09-15-hashicorp_raft-real-run/submissions/6374186cdb5b4d49b1371f38c0b5ec70/raw.json",
+        "submitted_path": ""
+      },
+      {
+        "operation_id": "fdd6f486a20d42328f017893a1918973",
+        "action": "obligation",
+        "rationale": "Sourced contract violation in the membership/authority transition path. configurations.latest is documented as the latest configuration in the log/snapshot (configuration.go:254-265) and is the sole authority input for the leader's quorum: quorumSize() (raft.go:1086-1094) counts voters from r.configurations.latest, and commitment.setConfiguration (commitment.go:53-64) rebuilds the match-index voter set from the new configuration. appendConfigurationEntry (raft.go:1203-1240) must therefore only install a configuration that exists in the log, but it calls dispatchLogs first and then unconditionally runs setLatestConfiguration / commitment.setConfiguration / startStopReplication. dispatchLogs (raft.go:1244-1283) assigns applyLog.log.Index before StoreLogs and returns after responding the error, so future.Index() is still nonzero when the write failed. A retained clean-copy execution (exploration 19c98425e4d9482cadcf9bfa3e4f7a85) supplied one transient LogStore.StoreLogs failure on a single-voter cluster that had committed index 3 and observed: AddVoter returned the store error; the assigned index 4 is absent from durable storage (durable last index 3, raft last index 3); the published configuration lists a phantom second voter; and the node then never regains leadership over 142 samples (state Candidate, quorum 2, reachable voters 1), i.e. progress stops until restart. This claim is the sourced requirement, not the experiment; the harness and events are retained with the exploration.",
+        "feedback": {},
+        "map_updated": false,
+        "repair_of": "6374186cdb5b4d49b1371f38c0b5ec70",
+        "draft_id": "6374186cdb5b4d49b1371f38c0b5ec70",
+        "draft_status": "accepted",
+        "map_changes": {},
+        "accepted_versions": {
+          "audit_spec": 0,
+          "graph": 1,
+          "units": {
+            "unit-claim-config-publish-requires-durable-append": 1
+          },
+          "artifacts": {}
+        },
+        "candidate_ids": [
+          "0a6d446a083a42cf91e99726f577eaea"
+        ]
+      },
+      {
+        "operation_id": "30772cda6d41434cbdec3fc134685d74",
+        "action": "explore",
+        "rationale": "This exploration reduces the two recorded gaps for candidate 0a6d446a083a42cf91e99726f577eaea. Gap 2 (recovery path), closed by a new in-package Go test run: after a transient LogStore.StoreLogs failure made AddVoter(phantom) install a two-voter latest while the durable log still ends at index 2, the node was shut down and a fresh Raft was constructed from the same durable store and snapshot store. Observed (CA_EVENT restart_after_failed_durable_write): servers_before_restart lists the real voter plus phantom/phantom-addr/Voter, while servers_after_restart lists exactly one voter and became_leader_after=true (commit index 3). So the durable log, not the published configuration, is the recovered truth, and a restart is a working recovery path. The same run also bounded the running-process behaviour: after the failed change the node stayed Candidate with ever_leader_in_window=false over 141 samples because quorum_size_live=2 equals one unreachable voter plus itself (CA_EVENT progress_after_failed_durable_write); source reasoning explains the absence of self-repair, since the only running paths that revert r.configurations.latest to the committed value are the appendEntries truncation branch (raft.go:1530) and installSnapshot (raft.go:1937), and both require a leader while no leader can be elected against an unreachable voter. Gap 1 (no-error reachability), answered as a sourced negative result plus a success-path control: the success control CA_EVENT config_persist_success_control shows AddVoter error <nil>, getlog_at_assigned_idx_err <nil> for the assigned index 4 and durable_last_index_after=4, i.e. the published two-voter configuration has a durable counterpart; that fixes the comparing value (the divergence does not appear when the write succeeds). Enumerating every publishing site shows appendConfigurationEntry (raft.go:1203-1240 -> raft.go:1237) is the only site that can install a configuration absent from the log: appendEntries truncation reverts to the committed configuration (raft.go:1530), processConfigurationLogEntry installs the configuration of an entry that was just stored or read from the log (raft.go:1588-1598), installSnapshot installs the received snapshot's configuration (raft.go:1937), and startup restore installs the snapshot's configuration (api.go:664). No no-error route to the divergence was found. Retained evidence for this exploration is the clean-copy execution the controller associates with the submitted harness; the failure is injected at the real LogStore boundary (explicitly supplied precondition, not produced by real producers), and the phantom voter's unreachability is supplied by the harness's lack of a route to phantom-addr.",
+        "feedback": {},
+        "map_updated": false,
+        "map_changes": {},
+        "accepted_versions": {
+          "audit_spec": 0,
+          "graph": 1,
+          "units": {},
+          "artifacts": {}
+        },
+        "candidate_ids": []
+      },
+      {
+        "operation_id": "b8570f63f6004bfd8e19bc4f762d903a",
+        "action": "rejected",
+        "rationale": "Invalid submitted input path",
+        "candidate_ids": [],
+        "draft_id": "b8570f63f6004bfd8e19bc4f762d903a",
+        "repair_of": null,
+        "diagnostics": [
+          "Invalid submitted input path"
+        ],
+        "draft_status": "rejected",
+        "raw_path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-10_16-09-15-hashicorp_raft-real-run/submissions/b8570f63f6004bfd8e19bc4f762d903a/raw.json",
+        "submitted_path": ""
+      },
+      {
+        "operation_id": "5a22a6babe80452da22d6b9195b4634f",
+        "action": "check",
+        "rationale": "Formal direct check of the accepted unit unit-claim-config-publish-requires-durable-append for obligation claim-config-publish-requires-durable-append. The obligation requires that a configuration installed as configurations.latest must have its entry in the durable log. The plan admits one leader-established operation (assurance_leader_established with alias adm) and one membership-change attempt (assurance_config_change_attempt with alias act), then inspects the result event assurance_config_published emitted for that same operation (identity field node). The property asserts entry_durable is true whenever the configuration was published ahead of a durable entry (trigger published_ahead_of_durable true). The harness bootstraps one voter over an InmemStore whose StoreLogs can be failed on demand at the real LogStore boundary, waits for leadership, emits the two prerequisites, runs AddVoter while exactly one StoreLogs call fails, then reports whether the log index assigned to that change is present in the store; previous clean-copy runs of the same harness observed add_voter_error set, assigned index 4 absent from the store, and the published configuration listing a second voter. Only one failing StoreLogs timing is exercised here, and the failure is an explicitly supplied fault rather than a producer-generated condition; both are recorded as plan uncertainties. The plan and harness are submitted as separate draft files; plan.harness.source and files are intentionally omitted so the controller fixes the harness bytes.",
+        "feedback": {},
+        "map_updated": false,
+        "repair_of": "b8570f63f6004bfd8e19bc4f762d903a",
+        "draft_id": "b8570f63f6004bfd8e19bc4f762d903a",
+        "draft_status": "accepted",
+        "map_changes": {},
+        "accepted_versions": {
+          "audit_spec": 0,
+          "graph": 1,
+          "units": {
+            "unit-claim-config-publish-requires-durable-append": 1
+          },
+          "artifacts": {
+            "3b256fe6f42b4154b75d4d2ec02e27bf": 1
+          }
+        },
+        "candidate_ids": []
+      },
+      {
+        "operation_id": "4c25ca6279ca4285a42c9286256f3a32",
+        "action": "research",
+        "rationale": "Review of direct check artifact 3b256fe6f42b4154b75d4d2ec02e27bf (check 452a068dbfa1488ea15bc730a0f1e7bd, outcome violated) for unit-claim-config-publish-requires-durable-append. The review supplies the required checker_correspondence judgment and answers the three open applicability conditions that the plan, monitor and claim grounding declared, using the same acquired materials and no new execution.",
+        "feedback": {},
+        "map_updated": false,
+        "map_changes": {},
+        "accepted_versions": {
+          "audit_spec": 0,
+          "graph": 1,
+          "units": {
+            "unit-claim-config-publish-requires-durable-append": 1
+          },
+          "artifacts": {}
+        },
+        "candidate_ids": []
+      },
+      {
+        "operation_id": "8a48ec28a24240de8d70659f37c5732a",
+        "action": "research",
+        "rationale": "Sourced feedback on candidate 0a6d446a083a42cf91e99726f577eaea, which now carries a confirmed implementation violation through direct check artifact 3b256fe6f42b4154b75d4d2ec02e27bf (execution 452a068dbfa1488ea15bc730a0f1e7bd) reviewed with checker correspondence no_issue_found. This feedback records what the earlier exploration execution cb2a8bf5289046f9a58098b950a38762 answered about the two recorded candidate unknowns and narrows the candidate to the discriminators that remain open, without removing history.",
+        "feedback": {
+          "ref_ids": [
+            "0a6d446a083a42cf91e99726f577eaea",
+            "cb2a8bf5289046f9a58098b950a38762"
+          ],
+          "answered": "Two recorded unknowns are answered by executed evidence, not by argument. First, the exact recovery path: exploration check cb2a8bf5289046f9a58098b950a38762 recorded restart_after_failed_durable_write, where a node whose published configuration listed the extra voter phantom/phantom-addr/Voter was shut down and rebuilt with NewRaft over the same durable store and snapshot store; after the restart servers_after_restart lists exactly one voter and became_leader_after is true, so the durable log is the recovered truth and a restart is a working recovery path. The same execution also bounds the running process: progress_after_failed_durable_write shows state Candidate with ever_leader_in_window false over 141 samples because the live quorum counts the unreachable voter, and the only running paths that revert latest to the committed value (appendEntries truncation and installSnapshot) require a leader, so nothing in the running process repairs the authority context. Second, whether the divergence is reachable without a LogStore error: the same execution includes the success-path control config_persist_success_control, where AddVoter returns nil, the assigned log index is present in the store and durable_last_index_after matches it, so the published configuration has a durable counterpart whenever the write succeeds; enumerating every setLatestConfiguration call site shows appendConfigurationEntry is the only site that can install a configuration absent from the log, while truncation reverts to the committed configuration and processConfigurationLogEntry and installSnapshot install configurations taken from stored entries or a received snapshot. No no-error route was found.",
+          "remaining": [
+            "Which StoreLogs failure timings (whole-call failure versus partial write, or failure after a log truncation) leave the published configuration and the cached last-log state inconsistent, and whether a follower-side store failure reaches the same divergence"
+          ],
+          "rationale": "The feedback answers the two listed unknowns through exploration check cb2a8bf5289046f9a58098b950a38762 and retains the remaining discriminator rather than dropping the question. It does not alter the confirmed direct check 452a068dbfa1488ea15bc730a0f1e7bd, whose correspondence review is retained. The narrowed unknown is a distinct discriminator: the confirmed check covers one whole-call StoreLogs failure on a leader, while other failure timings and follower-side failures could leave different state (for example the cached last-log index after a truncated suffix) and are not decided by the retained events.",
+          "question_updates": {
+            "0a6d446a083a42cf91e99726f577eaea": {
+              "unknowns": [
+                "Which StoreLogs failure timings (whole-call failure versus partial write, or failure after a log truncation) leave the published configuration and the cached last-log state inconsistent, and whether a follower-side store failure reaches the same divergence"
+              ],
+              "resume_conditions": []
+            }
+          }
+        },
+        "map_updated": false,
+        "map_changes": {},
+        "accepted_versions": {
+          "audit_spec": 0,
+          "graph": 1,
+          "units": {
+            "unit-claim-config-publish-requires-durable-append": 1
+          },
+          "artifacts": {}
+        },
+        "candidate_ids": []
+      },
+      {
+        "operation_id": "20b166fffa95479c8ac9b2f8403ff0e7",
+        "action": "explore",
+        "rationale": "This exploration tests the follower half of the narrowed discriminator on candidate 0a6d446a083a42cf91e99726f577eaea and leaves the leader-side result (confirmed direct check 3b256fe6f42b4154b75d4d2ec02e27bf, execution 452a068dbfa1488ea15bc730a0f1e7bd) untouched. Method: two in-process nodes are bootstrapped with both addresses as voters, their InmemTransports are connected to each other, both Rafts are started, one node is detected as leader, and the follower's LogStore wrapper is set to fail every StoreLogs call while the leader runs a real AddVoter. Observed (CA_EVENT follower_store_failure): the failing follower attempted 8 store writes and all 8 failed (store_log_attempts 8, store_log_failures 8), yet follower_published_phantom is false, follower_servers_after equals follower_servers_before, follower_durable_before and follower_durable_after are both 2 and follower_last_index is 2. That is a bounded negative result for this path, and it matches the source: appendEntries stores the new entries and only then calls processConfigurationLogEntry, so a StoreLogs error returns before any configuration is published and before setLastLog advances the cached last index (src-follower-gate material covers the corresponding runFollower gate; the store call order is in the appendEntries tail of the same test harness reading). Boundaries and what is NOT decided here: this run does not exercise a failure that occurs after a log truncation has already deleted a conflicting suffix, where the same appendEntries path returns before setLastLog and the cached last-log can then be higher than the store content, which is the timing this discriminator still lists; that remainder is a sourced hypothesis, not an observation. The fault is still injected at the real LogStore boundary, and the two-node cluster is in-memory. Reusing the same harness keeps the earlier leader-side events available in the same clean-copy execution, so this submission adds the follower probe without weakening the retained confirmation.",
+        "feedback": {},
+        "map_updated": false,
+        "map_changes": {},
+        "accepted_versions": {
+          "audit_spec": 0,
+          "graph": 1,
+          "units": {},
+          "artifacts": {}
+        },
+        "candidate_ids": []
+      },
+      {
+        "operation_id": "3d679f68abb6461bb6a2651533ca5995",
+        "action": "research",
+        "rationale": "Sourced feedback on candidate 0a6d446a083a42cf91e99726f577eaea recording what exploration check 6c1f4fbd37ad49e79cd922b03259d1fe settled about the narrowed discriminator and what remains. The confirmed leader-side violation (direct check 3b256fe6f42b4154b75d4d2ec02e27bf, execution 452a068dbfa1488ea15bc730a0f1e7bd, correspondence no_issue_found) is unchanged.",
+        "feedback": {
+          "ref_ids": [
+            "0a6d446a083a42cf91e99726f577eaea",
+            "6c1f4fbd37ad49e79cd922b03259d1fe"
+          ],
+          "answered": "The follower half of the discriminator is settled by executed evidence. Exploration check 6c1f4fbd37ad49e79cd922b03259d1fe built a two-node in-process cluster with both addresses as voters and their InmemTransports connected, then failed every StoreLogs call on the detected follower while the leader ran a real AddVoter. Event follower_store_failure reports store_log_attempts 8 and store_log_failures 8, follower_published_phantom false, follower_servers_after equal to follower_servers_before, follower_durable_before and follower_durable_after both 2, and follower_last_index 2. So a follower-side durable failure does not publish the configuration or advance the follower's cached last-log index: appendEntries stores new entries and only reaches processConfigurationLogEntry after a successful StoreLogs, so the failure returns first. This is a bounded negative result and it is specific to the whole-call failure timing that was exercised.",
+          "remaining": [
+            "Whether a StoreLogs failure that happens after appendEntries has already deleted a conflicting log suffix leaves the follower's cached last-log index above its durable content, and what that in turn makes the follower report to a leader"
+          ],
+          "rationale": "The recorded unknown asked which StoreLogs failure timings leave the published configuration and the cached last-log state inconsistent, and whether a follower-side store failure reaches the same divergence. Exploration 6c1f4fbd37ad49e79cd922b03259d1fe answers the follower question for the whole-call timing (no publication, no cached-index advance) while the confirmed direct check already fixes the leader-side result for that timing. What remains is a distinct discriminator: the truncation path in appendEntries deletes a conflicting suffix and then stores the replacement entries in the same call, so a StoreLogs failure there returns before setLastLog; the in-code TODO in the captured source states exactly that the cached last log is left in the wrong state if there was a truncation above. That timing is not exercised by any retained execution, so it stays an open sourced hypothesis rather than being folded into the confirmed finding.",
+          "question_updates": {
+            "0a6d446a083a42cf91e99726f577eaea": {
+              "unknowns": [
+                "Whether a StoreLogs failure that happens after appendEntries has already deleted a conflicting log suffix leaves the follower's cached last-log index above its durable content, and what that in turn makes the follower report to a leader"
+              ],
+              "resume_conditions": []
+            }
+          }
+        },
+        "map_updated": false,
+        "map_changes": {},
+        "accepted_versions": {
+          "audit_spec": 0,
+          "graph": 1,
+          "units": {
+            "unit-claim-config-publish-requires-durable-append": 1
+          },
+          "artifacts": {}
+        },
+        "candidate_ids": []
+      },
+      {
+        "operation_id": "e4239ee8f2e5442db3dbf8f7ce993276",
+        "action": "explore",
+        "rationale": "Conditional probe of the last open timing. Method: one bootstrapped voter is driven through real calls (leader election, then two Apply calls) so its log holds indices 1 to 4 with index 1 the configuration entry and term T for 2 to 4; the harness then delivers one AppendEntries for a different leader in term T+5 whose PrevLogEntry is 1 with matching term and whose entries conflict at indices 2, 3 and 4, while the node's LogStore wrapper fails every StoreLogs call. This is a direct handler invocation (r.appendEntries), so it bypasses the transport, checkRPCHeader and main-loop serialization, and the peer leader identity and higher term are supplied rather than produced by an election; the handler, the log store, the truncation path and the terms are the fixed target code. Observed (CA_EVENT truncation_then_store_failure): durable_last_index_before is 4 and durable_last_index_after is 1, because the conflicting suffix was deleted before the write, while cached_last_index_after stays 4, reported_last_index (Raft.LastIndex) is 4, getlog_at_cached_err is log not found, append_success is false and cached_ahead_of_durable is true. So after a truncation whose replacement write fails, the node both caches and reports a last-log index whose entry no longer exists in durable storage, which is exactly the state the in-code TODO at raft.go:1536-1545 describes. This answers the discriminator with a conditional observation on the fixed code and does not by itself establish a full protocol history, since the conflicting AppendEntries was supplied rather than produced; a protocol-level version would need a second leader in a higher term to be elected through real producers. The confirmed leader-side violation (direct check 3b256fe6f42b4154b75d4d2ec02e27bf) and the follower negative result (exploration 6c1f4fbd37ad49e79cd922b03259d1fe) are unchanged.",
+        "feedback": {},
+        "map_updated": false,
+        "map_changes": {},
+        "accepted_versions": {
+          "audit_spec": 0,
+          "graph": 1,
+          "units": {},
+          "artifacts": {}
+        },
+        "candidate_ids": []
+      },
+      {
+        "operation_id": "87694961bf0c473693b0107b4e85d201",
+        "action": "research",
+        "rationale": "Final sourced feedback on candidate 0a6d446a083a42cf91e99726f577eaea recording the executed answer to its last open discriminator from exploration check b1b1d3fba8164059b25bbefb147d3fdb, and retaining the one boundary that prevents that conditional observation from being promoted to a protocol history. The confirmed leader-side violation (direct check 3b256fe6f42b4154b75d4d2ec02e27bf, execution 452a068dbfa1488ea15bc730a0f1e7bd, correspondence no_issue_found) and the follower negative result (exploration 6c1f4fbd37ad49e79cd922b03259d1fe) are unchanged.",
+        "feedback": {
+          "ref_ids": [
+            "0a6d446a083a42cf91e99726f577eaea",
+            "b1b1d3fba8164059b25bbefb147d3fdb"
+          ],
+          "answered": "The last discriminator is answered conditionally by executed evidence. Exploration check b1b1d3fba8164059b25bbefb147d3fdb drove a bootstrapped voter through real calls so its log held indices 1 to 4, then delivered one AppendEntries for a different leader in a higher term whose entries conflicted at indices 2 to 4 while every StoreLogs call failed. Event truncation_then_store_failure reports durable_last_index_before 4 and durable_last_index_after 1, because the conflicting suffix was deleted before the write, while cached_last_index_after stays 4, reported_last_index is 4, getlog_at_cached_err is log not found and cached_ahead_of_durable is true. So the timing does leave the cached and reported last-log index above durable content, exactly the state the in-code TODO in raft.go:1536-1545 describes, and it complements the earlier results: the leader-side failure publishes an unpersisted configuration, the follower-side whole-call failure does neither, and the truncation timing leaves the cached last-log stale.",
+          "remaining": [
+            "Whether a conflicting AppendEntries suffix followed by a failed replacement write can be produced by real producers, that is by a second leader elected in a higher term, rather than by supplying the conflicting request directly to the handler"
+          ],
+          "rationale": "The exploration used a direct handler invocation, which bypasses the transport, the RPC header check and main-loop serialization, and supplied the higher-term conflicting request instead of electing a second leader; the handler, log store, truncation branch and term bookkeeping are the fixed target code. That boundary is why the observation is retained as conditional rather than promoted to a protocol violation. Recording it as the single remaining unknown preserves the result, keeps the confirmed-leader-side finding and the follower negative result visible, and states precisely what a successor would need to produce through real producers. No other unknowns are dropped and no counterevidence is removed.",
+          "question_updates": {
+            "0a6d446a083a42cf91e99726f577eaea": {
+              "unknowns": [
+                "Whether a conflicting AppendEntries suffix followed by a failed replacement write can be produced by real producers, that is by a second leader elected in a higher term, rather than by supplying the conflicting request directly to the handler"
+              ],
+              "resume_conditions": []
+            }
+          }
+        },
+        "map_updated": false,
+        "map_changes": {},
+        "accepted_versions": {
+          "audit_spec": 0,
+          "graph": 1,
+          "units": {
+            "unit-claim-config-publish-requires-durable-append": 1
+          },
+          "artifacts": {}
+        },
+        "candidate_ids": []
+      },
+      {
+        "operation_id": "6540303ae7784155884d524404262559",
+        "action": "continue",
+        "rationale": "Keeping candidate 0a6d446a083a42cf91e99726f577eaea active at the end of the available run time, with its remaining discriminator retained rather than resolved by assertion. Current state of the investigation: the obligation claim-config-publish-requires-durable-append is a confirmed implementation violation through direct check 3b256fe6f42b4154b75d4d2ec02e27bf (execution 452a068dbfa1488ea15bc730a0f1e7bd, checker correspondence no_issue_found, outcome violated), where a leader that received a LogStore.StoreLogs error for a membership-change entry still published the configuration as configurations.latest even though the assigned log index was absent from durable storage, and where the node then could not regain leadership because its live quorum counted the unreachable voter. Exploration 6c1f4fbd37ad49e79cd922b03259d1fe added the follower-side negative result: with every StoreLogs call failing on a follower of a real two-node replication path, the follower neither published the configuration nor advanced its cached last-log index. Exploration b1b1d3fba8164059b25bbefb147d3fdb answered the truncation timing conditionally: after a conflicting suffix was deleted and the replacement write failed, durable_last_index fell to 1 while the cached and reported last index stayed 4 with the entry absent from the store. The one open unknown is therefore exactly the boundary that needs a successor: whether that conflicting-suffix-then-failed-write history can be produced by real producers, that is by a second leader elected in a higher term, instead of by supplying the conflicting AppendEntries directly to the handler. That successor would need a multi-node cluster in which one node accumulates uncommitted entries while isolated, a different leader is elected and appends at those indices, and the isolated node's store fails only during the replication that overwrites the suffix. Keeping the candidate active preserves the confirmed finding, the negative result, the conditional truncation evidence, and the stated boundary together, so the remaining work is visible and no result is overstated at run end.",
+        "feedback": {},
+        "map_updated": false,
+        "map_changes": {},
+        "accepted_versions": {
+          "audit_spec": 0,
+          "graph": 1,
+          "units": {},
+          "artifacts": {}
+        },
+        "candidate_ids": [
+          "0a6d446a083a42cf91e99726f577eaea"
+        ]
+      }
+    ],
+    "applied_operations": {
+      "submission-19c98425e4d9482cadcf9bfa3e4f7a85": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-10_16-09-15-hashicorp_raft-real-run/graph-commits/submission-19c98425e4d9482cadcf9bfa3e4f7a85.json"
+      },
+      "submission-fdd6f486a20d42328f017893a1918973": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-10_16-09-15-hashicorp_raft-real-run/graph-commits/submission-fdd6f486a20d42328f017893a1918973.json"
+      },
+      "submission-30772cda6d41434cbdec3fc134685d74": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-10_16-09-15-hashicorp_raft-real-run/graph-commits/submission-30772cda6d41434cbdec3fc134685d74.json"
+      },
+      "submission-5a22a6babe80452da22d6b9195b4634f": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-10_16-09-15-hashicorp_raft-real-run/graph-commits/submission-5a22a6babe80452da22d6b9195b4634f.json"
+      },
+      "submission-4c25ca6279ca4285a42c9286256f3a32": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-10_16-09-15-hashicorp_raft-real-run/graph-commits/submission-4c25ca6279ca4285a42c9286256f3a32.json"
+      },
+      "submission-8a48ec28a24240de8d70659f37c5732a": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-10_16-09-15-hashicorp_raft-real-run/graph-commits/submission-8a48ec28a24240de8d70659f37c5732a.json"
+      },
+      "submission-20b166fffa95479c8ac9b2f8403ff0e7": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-10_16-09-15-hashicorp_raft-real-run/graph-commits/submission-20b166fffa95479c8ac9b2f8403ff0e7.json"
+      },
+      "submission-3d679f68abb6461bb6a2651533ca5995": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-10_16-09-15-hashicorp_raft-real-run/graph-commits/submission-3d679f68abb6461bb6a2651533ca5995.json"
+      },
+      "submission-e4239ee8f2e5442db3dbf8f7ce993276": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-10_16-09-15-hashicorp_raft-real-run/graph-commits/submission-e4239ee8f2e5442db3dbf8f7ce993276.json"
+      },
+      "submission-87694961bf0c473693b0107b4e85d201": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-10_16-09-15-hashicorp_raft-real-run/graph-commits/submission-87694961bf0c473693b0107b4e85d201.json"
+      },
+      "submission-6540303ae7784155884d524404262559": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-10_16-09-15-hashicorp_raft-real-run/graph-commits/submission-6540303ae7784155884d524404262559.json"
+      }
+    }
+  },
+  "after": {
+    "current_submission": {
+      "phase": "accepted",
+      "operation_id": "6dda33bc425048a2850edce8446cead9",
+      "action": "explore",
+      "harness_filename": "assurance_generated_test.go",
+      "harness": {
+        "execution_package": ".",
+        "files": {},
+        "kind": "go_test",
+        "source": "// Copyright (c) HashiCorp, Inc.\n// SPDX-License-Identifier: MPL-2.0\n\npackage raft\n\nimport (\n\t\"encoding/json\"\n\t\"errors\"\n\t\"fmt\"\n\t\"sync/atomic\"\n\t\"testing\"\n\t\"time\"\n)\n\n// assuranceFailStore is an in-memory LogStore/StableStore whose StoreLogs can be\n// made to fail on demand. It models a transient durable-write failure at the\n// real LogStore boundary; every other operation behaves like InmemStore.\ntype assuranceFailStore struct {\n\t*InmemStore\n\tfailStoreLogs atomic.Bool\n\tattempts      atomic.Int64\n\tfailures      atomic.Int64\n}\n\nfunc (f *assuranceFailStore) StoreLogs(logs []*Log) error {\n\tf.attempts.Add(1)\n\tif f.failStoreLogs.Load() {\n\t\tf.failures.Add(1)\n\t\treturn errors.New(\"injected LogStore.StoreLogs failure\")\n\t}\n\treturn f.InmemStore.StoreLogs(logs)\n}\n\nfunc assuranceEmit(t *testing.T, ev map[string]interface{}) {\n\tt.Helper()\n\tbuf, err := json.Marshal(ev)\n\tif err != nil {\n\t\tt.Fatalf(\"marshal event: %v\", err)\n\t}\n\tfmt.Println(\"CA_EVENT \" + string(buf))\n}\n\nfunc assuranceServers(c Configuration) []string {\n\tout := make([]string, 0, len(c.Servers))\n\tfor _, s := range c.Servers {\n\t\tout = append(out, fmt.Sprintf(\"%s/%s/%s\", s.ID, s.Address, s.Suffrage))\n\t}\n\treturn out\n}\n\n// assuranceSingleNode builds one bootstrapped voter with the supplied store.\nfunc assuranceSingleNode(t *testing.T, store *assuranceFailStore, trans *InmemTransport, fsm FSM) *Raft {\n\tt.Helper()\n\tconf := inmemConfig(t)\n\tconf.LocalID = ServerID(trans.LocalAddr())\n\tsnap := NewInmemSnapshotStore()\n\tboot := Configuration{Servers: []Server{{Suffrage: Voter, ID: conf.LocalID, Address: trans.LocalAddr()}}}\n\tif err := BootstrapCluster(conf, store, store, snap, trans, boot); err != nil {\n\t\tt.Fatalf(\"bootstrap: %v\", err)\n\t}\n\tr, err := NewRaft(conf, fsm, store, store, snap, trans)\n\tif err != nil {\n\t\tt.Fatalf(\"new raft: %v\", err)\n\t}\n\treturn r\n}\n\nfunc assuranceWaitLeader(r *Raft, d time.Duration) bool {\n\tdeadline := time.Now().Add(d)\n\tfor r.State() != Leader && time.Now().Before(deadline) {\n\t\ttime.Sleep(10 * time.Millisecond)\n\t}\n\treturn r.State() == Leader\n}\n\n// TestAssuranceConfigPublishedWithoutPersist asks whether a membership change\n// whose durable log write fails is still published into the node's live\n// configuration, and what that does to its own progress.\nfunc TestAssuranceConfigPublishedWithoutPersist(t *testing.T) {\n\t_, trans := NewInmemTransport(\"\")\n\tstore := &assuranceFailStore{InmemStore: NewInmemStore()}\n\tr := assuranceSingleNode(t, store, trans, &MockFSM{})\n\tdefer r.Shutdown()\n\n\tif !assuranceWaitLeader(r, 3*time.Second) {\n\t\tt.Fatalf(\"never became leader, state=%v\", r.State())\n\t}\n\tif err := r.Apply([]byte(\"baseline\"), 2*time.Second).Error(); err != nil {\n\t\tt.Fatalf(\"baseline apply: %v\", err)\n\t}\n\n\tbefore := r.GetConfiguration()\n\t_ = before.Error()\n\tdurableBefore, _ := store.LastIndex()\n\tnode := string(r.localID)\n\tassuranceEmit(t, map[string]interface{}{\n\t\t\"event\": \"assurance_leader_established\",\n\t\t\"node\":  node,\n\t\t\"term\":  r.getCurrentTerm(),\n\t})\n\tassuranceEmit(t, map[string]interface{}{\n\t\t\"event\":     \"assurance_config_change_attempt\",\n\t\t\"node\":      node,\n\t\t\"attempted\": true,\n\t})\n\n\t// Fail exactly the durable write that carries the membership change.\n\tstore.failStoreLogs.Store(true)\n\taddErr := r.AddVoter(ServerID(\"phantom\"), ServerAddress(\"phantom-addr\"), 0, 2*time.Second).Error()\n\tstore.failStoreLogs.Store(false)\n\n\tafter := r.GetConfiguration()\n\t_ = after.Error()\n\tdurableAfter, _ := store.LastIndex()\n\n\tvar stored Log\n\tassignedIdx := durableBefore + 1\n\tgetErr := store.GetLog(assignedIdx, &stored)\n\tentryDurable := getErr == nil\n\n\t// Decisive monitor event: was the published configuration durable?\n\tassuranceEmit(t, map[string]interface{}{\n\t\t\"event\":                     \"assurance_config_published\",\n\t\t\"node\":                      node,\n\t\t\"published_ahead_of_durable\": true,\n\t\t\"entry_durable\":             entryDurable,\n\t\t\"published_voters\":          len(after.Configuration().Servers),\n\t\t\"durable_last_index\":        durableAfter,\n\t})\n\n\tassuranceEmit(t, map[string]interface{}{\n\t\t\"event\":                       \"config_publish_after_failed_durable_write\",\n\t\t\"add_voter_error\":             fmt.Sprint(addErr),\n\t\t\"config_index_before\":         before.Index(),\n\t\t\"config_servers_before\":       assuranceServers(before.Configuration()),\n\t\t\"durable_last_index_before\":   durableBefore,\n\t\t\"config_index_after\":          after.Index(),\n\t\t\"config_servers_after\":        assuranceServers(after.Configuration()),\n\t\t\"durable_last_index_after\":    durableAfter,\n\t\t\"assigned_config_index\":       assignedIdx,\n\t\t\"getlog_at_assigned_idx_err\":  fmt.Sprint(getErr),\n\t\t\"raft_last_index\":             r.LastIndex(),\n\t\t\"published_ahead_of_durable\":  len(after.Configuration().Servers) > len(before.Configuration().Servers),\n\t\t\"published_config_index_api\":  after.Index(),\n\t})\n\n\t// Watch whether this single-voter cluster can still make progress.\n\teverLeader := false\n\tleaderSamples, samples := 0, 0\n\twatchUntil := time.Now().Add(1500 * time.Millisecond)\n\tfor time.Now().Before(watchUntil) {\n\t\tsamples++\n\t\tif r.State() == Leader {\n\t\t\teverLeader = true\n\t\t\tleaderSamples++\n\t\t}\n\t\ttime.Sleep(10 * time.Millisecond)\n\t}\n\n\tlive := r.GetConfiguration()\n\t_ = live.Error()\n\tvoters := 0\n\tfor _, s := range live.Configuration().Servers {\n\t\tif s.Suffrage == Voter {\n\t\t\tvoters++\n\t\t}\n\t}\n\tassuranceEmit(t, map[string]interface{}{\n\t\t\"event\":                        \"progress_after_failed_durable_write\",\n\t\t\"state\":                        r.State().String(),\n\t\t\"ever_leader_in_window\":        everLeader,\n\t\t\"leader_samples\":               leaderSamples,\n\t\t\"samples\":                      samples,\n\t\t\"voters_in_live_configuration\": voters,\n\t\t\"quorum_size_live\":             voters/2 + 1,\n\t\t\"reachable_voters\":             1,\n\t\t\"commit_index\":                 r.CommitIndex(),\n\t\t\"last_index\":                   r.LastIndex(),\n\t})\n}\n\n// TestAssuranceRestartRepairsAuthorityContext closes the recovery question: after\n// the failed membership change, does a restart from the same durable store\n// restore a consistent authority context?\nfunc TestAssuranceRestartRepairsAuthorityContext(t *testing.T) {\n\taddr := NewInmemAddr()\n\t_, trans := NewInmemTransport(addr)\n\tstore := &assuranceFailStore{InmemStore: NewInmemStore()}\n\tsnap := NewInmemSnapshotStore()\n\tconf := inmemConfig(t)\n\tconf.LocalID = ServerID(addr)\n\tboot := Configuration{Servers: []Server{{Suffrage: Voter, ID: conf.LocalID, Address: addr}}}\n\tif err := BootstrapCluster(conf, store, store, snap, trans, boot); err != nil {\n\t\tt.Fatalf(\"bootstrap: %v\", err)\n\t}\n\tr, err := NewRaft(conf, &MockFSM{}, store, store, snap, trans)\n\tif err != nil {\n\t\tt.Fatalf(\"new raft: %v\", err)\n\t}\n\tif !assuranceWaitLeader(r, 3*time.Second) {\n\t\tt.Fatalf(\"never became leader, state=%v\", r.State())\n\t}\n\n\tstore.failStoreLogs.Store(true)\n\taddErr := r.AddVoter(ServerID(\"phantom\"), ServerAddress(\"phantom-addr\"), 0, 2*time.Second).Error()\n\tstore.failStoreLogs.Store(false)\n\n\tpreRestart := r.GetConfiguration()\n\t_ = preRestart.Error()\n\tpreState := r.State().String()\n\tdurable, _ := store.LastIndex()\n\tif err := r.Shutdown().Error(); err != nil {\n\t\tt.Fatalf(\"shutdown: %v\", err)\n\t}\n\n\t// Restart from the same durable store: the phantom entry was never stored.\n\t_, trans2 := NewInmemTransport(addr)\n\tr2, err := NewRaft(conf, &MockFSM{}, store, store, snap, trans2)\n\tif err != nil {\n\t\tt.Fatalf(\"restart raft: %v\", err)\n\t}\n\tdefer r2.Shutdown()\n\tbecameLeader := assuranceWaitLeader(r2, 3*time.Second)\n\tpost := r2.GetConfiguration()\n\t_ = post.Error()\n\tassuranceEmit(t, map[string]interface{}{\n\t\t\"event\":                    \"restart_after_failed_durable_write\",\n\t\t\"add_voter_error\":          fmt.Sprint(addErr),\n\t\t\"durable_last_index\":       durable,\n\t\t\"state_before_restart\":     preState,\n\t\t\"servers_before_restart\":   assuranceServers(preRestart.Configuration()),\n\t\t\"became_leader_after\":      becameLeader,\n\t\t\"servers_after_restart\":    assuranceServers(post.Configuration()),\n\t\t\"voters_after_restart\":     len(post.Configuration().Servers),\n\t\t\"commit_index_after\":       r2.CommitIndex(),\n\t})\n}\n\n// TestAssuranceConfigPersistControl is the success-path control: when the same\n// membership change persists, the entry is in the log store, so the published\n// configuration has a durable counterpart.\nfunc TestAssuranceConfigPersistControl(t *testing.T) {\n\t_, trans := NewInmemTransport(\"\")\n\tstore := &assuranceFailStore{InmemStore: NewInmemStore()}\n\tr := assuranceSingleNode(t, store, trans, &MockFSM{})\n\tdefer r.Shutdown()\n\n\tif !assuranceWaitLeader(r, 3*time.Second) {\n\t\tt.Fatalf(\"never became leader, state=%v\", r.State())\n\t}\n\tif err := r.Apply([]byte(\"baseline\"), 2*time.Second).Error(); err != nil {\n\t\tt.Fatalf(\"baseline apply: %v\", err)\n\t}\n\tdurableBefore, _ := store.LastIndex()\n\tbefore := r.GetConfiguration()\n\t_ = before.Error()\n\n\taddErr := r.AddVoter(ServerID(\"phantom\"), ServerAddress(\"phantom-addr\"), 0, 2*time.Second).Error()\n\tassignedIdx := durableBefore + 1\n\tvar stored Log\n\tgetErr := store.GetLog(assignedIdx, &stored)\n\tafter := r.GetConfiguration()\n\t_ = after.Error()\n\tdurableAfter, _ := store.LastIndex()\n\n\tassuranceEmit(t, map[string]interface{}{\n\t\t\"event\":                      \"config_persist_success_control\",\n\t\t\"add_voter_error\":            fmt.Sprint(addErr),\n\t\t\"assigned_config_index\":      assignedIdx,\n\t\t\"getlog_at_assigned_idx_err\": fmt.Sprint(getErr),\n\t\t\"durable_last_index_after\":   durableAfter,\n\t\t\"config_servers_before\":      assuranceServers(before.Configuration()),\n\t\t\"config_servers_after\":       assuranceServers(after.Configuration()),\n\t})\n}\n\n// TestAssuranceFollowerStoreFailure asks whether the published-vs-durable\n// divergence also arises when the failing durable write is on the follower\n// side of a real two-node replication path.\nfunc TestAssuranceFollowerStoreFailure(t *testing.T) {\n\taddrA, transA := NewInmemTransport(\"\")\n\taddrB, transB := NewInmemTransport(\"\")\n\ttransA.Connect(addrB, transB)\n\ttransB.Connect(addrA, transA)\n\n\tconfA, confB := inmemConfig(t), inmemConfig(t)\n\tconfA.LocalID, confB.LocalID = ServerID(addrA), ServerID(addrB)\n\tstoreA := &assuranceFailStore{InmemStore: NewInmemStore()}\n\tstoreB := &assuranceFailStore{InmemStore: NewInmemStore()}\n\tsnapA, snapB := NewInmemSnapshotStore(), NewInmemSnapshotStore()\n\tboot := Configuration{Servers: []Server{\n\t\t{Suffrage: Voter, ID: ServerID(addrA), Address: addrA},\n\t\t{Suffrage: Voter, ID: ServerID(addrB), Address: addrB},\n\t}}\n\tif err := BootstrapCluster(confA, storeA, storeA, snapA, transA, boot); err != nil {\n\t\tt.Fatalf(\"bootstrap A: %v\", err)\n\t}\n\tif err := BootstrapCluster(confB, storeB, storeB, snapB, transB, boot); err != nil {\n\t\tt.Fatalf(\"bootstrap B: %v\", err)\n\t}\n\trA, err := NewRaft(confA, &MockFSM{}, storeA, storeA, snapA, transA)\n\tif err != nil {\n\t\tt.Fatalf(\"raft A: %v\", err)\n\t}\n\tdefer rA.Shutdown()\n\trB, err := NewRaft(confB, &MockFSM{}, storeB, storeB, snapB, transB)\n\tif err != nil {\n\t\tt.Fatalf(\"raft B: %v\", err)\n\t}\n\tdefer rB.Shutdown()\n\n\tdeadline := time.Now().Add(3 * time.Second)\n\tfor time.Now().Before(deadline) && rA.State() != Leader && rB.State() != Leader {\n\t\ttime.Sleep(10 * time.Millisecond)\n\t}\n\tleader, follower := rA, rB\n\tfollowerStore, followerTrans := storeB, transA\n\tif rB.State() == Leader {\n\t\tleader, follower = rB, rA\n\t\tfollowerStore, followerTrans = storeA, transB\n\t}\n\t_ = followerTrans\n\tif leader.State() != Leader {\n\t\tt.Fatalf(\"no leader: A=%v B=%v\", rA.State(), rB.State())\n\t}\n\tnode := string(follower.localID)\n\tfCfgBefore := follower.GetConfiguration()\n\t_ = fCfgBefore.Error()\n\tfDurableBefore, _ := followerStore.LastIndex()\n\tattemptsBefore, failuresBefore := followerStore.attempts.Load(), followerStore.failures.Load()\n\n\t// Fail the follower's durable write while the leader replicates a change.\n\tfollowerStore.failStoreLogs.Store(true)\n\tleader.AddVoter(ServerID(\"phantom\"), ServerAddress(\"phantom-addr\"), 0, 100*time.Millisecond)\n\ttime.Sleep(600 * time.Millisecond)\n\tfollowerStore.failStoreLogs.Store(false)\n\n\tfCfgAfter := follower.GetConfiguration()\n\t_ = fCfgAfter.Error()\n\tfDurableAfter, _ := followerStore.LastIndex()\n\tassuranceEmit(t, map[string]interface{}{\n\t\t\"event\":                       \"follower_store_failure\",\n\t\t\"node\":                        node,\n\t\t\"store_log_attempts\":          followerStore.attempts.Load() - attemptsBefore,\n\t\t\"store_log_failures\":          followerStore.failures.Load() - failuresBefore,\n\t\t\"follower_servers_before\":     assuranceServers(fCfgBefore.Configuration()),\n\t\t\"follower_servers_after\":      assuranceServers(fCfgAfter.Configuration()),\n\t\t\"follower_durable_before\":     fDurableBefore,\n\t\t\"follower_durable_after\":      fDurableAfter,\n\t\t\"follower_last_index\":         follower.LastIndex(),\n\t\t\"follower_published_phantom\":  len(fCfgAfter.Configuration().Servers) > len(fCfgBefore.Configuration().Servers),\n\t\t\"follower_state\":              follower.State().String(),\n\t})\n}\n\n// TestAssuranceTruncationThenStoreFailure probes the remaining timing: a\n// conflicting AppendEntries suffix is deleted, and the replacement write then\n// fails at the real LogStore boundary.\nfunc TestAssuranceTruncationThenStoreFailure(t *testing.T) {\n\t_, trans := NewInmemTransport(\"\")\n\tstore := &assuranceFailStore{InmemStore: NewInmemStore()}\n\tr := assuranceSingleNode(t, store, trans, &MockFSM{})\n\tdefer r.Shutdown()\n\n\tif !assuranceWaitLeader(r, 3*time.Second) {\n\t\tt.Fatalf(\"never became leader, state=%v\", r.State())\n\t}\n\tfor _, v := range []string{\"one\", \"two\"} {\n\t\tif err := r.Apply([]byte(v), 2*time.Second).Error(); err != nil {\n\t\t\tt.Fatalf(\"apply %s: %v\", v, err)\n\t\t}\n\t}\n\tcachedBefore, termBefore := r.getLastLog()\n\tdurableBefore, _ := store.LastIndex()\n\n\t// A different leader in a higher term rewrites the suffix from index 2.\n\tnewTerm := termBefore + 5\n\treq := &AppendEntriesRequest{\n\t\tRPCHeader:         r.getRPCHeader(),\n\t\tTerm:              newTerm,\n\t\tPrevLogEntry:      1,\n\t\tPrevLogTerm:       1,\n\t\tEntries:           []*Log{{Index: 2, Term: newTerm, Type: LogNoop}, {Index: 3, Term: newTerm, Type: LogNoop}, {Index: 4, Term: newTerm, Type: LogNoop}},\n\t}\n\tstore.failStoreLogs.Store(true)\n\trespCh := make(chan RPCResponse, 1)\n\trpc := RPC{Command: req, RespChan: respCh}\n\tr.appendEntries(rpc, req)\n\tstore.failStoreLogs.Store(false)\n\tresp := <-respCh\n\tappendResp, _ := resp.Response.(*AppendEntriesResponse)\n\n\tcachedAfter, _ := r.getLastLog()\n\tdurableAfter, _ := store.LastIndex()\n\tvar l Log\n\tgetErr := store.GetLog(cachedAfter, &l)\n\tassuranceEmit(t, map[string]interface{}{\n\t\t\"event\":                    \"truncation_then_store_failure\",\n\t\t\"cached_last_index_before\": cachedBefore,\n\t\t\"durable_last_index_before\": durableBefore,\n\t\t\"cached_last_index_after\":  cachedAfter,\n\t\t\"durable_last_index_after\": durableAfter,\n\t\t\"reported_last_index\":      r.LastIndex(),\n\t\t\"getlog_at_cached_err\":     fmt.Sprint(getErr),\n\t\t\"append_success\":           appendResp != nil && appendResp.Success,\n\t\t\"cached_ahead_of_durable\":  cachedAfter > durableAfter,\n\t\t\"state\":                    r.State().String(),\n\t})\n}\n\n// TestAssuranceRealProducerTruncation drives the truncation timing through real\n// producers: an isolated leader accumulates uncommitted entries, a new leader\n// is elected by the other two voters and appends at those indices, and the\n// isolated node's store fails while the suffix is overwritten.\nfunc TestAssuranceRealProducerTruncation(t *testing.T) {\n\ttype node struct {\n\t\taddr  ServerAddress\n\t\ttrans *InmemTransport\n\t\tstore *assuranceFailStore\n\t\traft  *Raft\n\t}\n\tnodes := make([]*node, 3)\n\taddrs := make([]ServerAddress, 3)\n\tfor i := range nodes {\n\t\taddr, trans := NewInmemTransport(\"\")\n\t\taddrs[i] = addr\n\t\tnodes[i] = &node{addr: addr, trans: trans, store: &assuranceFailStore{InmemStore: NewInmemStore()}}\n\t}\n\tboot := Configuration{}\n\tfor _, a := range addrs {\n\t\tboot.Servers = append(boot.Servers, Server{Suffrage: Voter, ID: ServerID(a), Address: a})\n\t}\n\tfor _, n := range nodes {\n\t\tfor _, other := range nodes {\n\t\t\tif other != n {\n\t\t\t\tn.trans.Connect(other.addr, other.trans)\n\t\t\t}\n\t\t}\n\t\tconf := inmemConfig(t)\n\t\tconf.LocalID = ServerID(n.addr)\n\t\tsnap := NewInmemSnapshotStore()\n\t\tif err := BootstrapCluster(conf, n.store, n.store, snap, n.trans, boot); err != nil {\n\t\t\tt.Fatalf(\"bootstrap: %v\", err)\n\t\t}\n\t\tr, err := NewRaft(conf, &MockFSM{}, n.store, n.store, snap, n.trans)\n\t\tif err != nil {\n\t\t\tt.Fatalf(\"new raft: %v\", err)\n\t\t}\n\t\tn.raft = r\n\t\tdefer r.Shutdown()\n\t}\n\n\tdeadline := time.Now().Add(4 * time.Second)\n\tvar leader *node\n\tfor leader == nil && time.Now().Before(deadline) {\n\t\tfor _, n := range nodes {\n\t\t\tif n.raft.State() == Leader {\n\t\t\t\tleader = n\n\t\t\t\tbreak\n\t\t\t}\n\t\t}\n\t\ttime.Sleep(10 * time.Millisecond)\n\t}\n\tif leader == nil {\n\t\tt.Fatalf(\"no leader elected\")\n\t}\n\n\t// Isolate the leader so its own appends stay uncommitted in its log.\n\tothers := []*node{}\n\tfor _, n := range nodes {\n\t\tif n != leader {\n\t\t\tothers = append(others, n)\n\t\t\tleader.trans.Disconnect(n.addr)\n\t\t\tn.trans.Disconnect(leader.addr)\n\t\t}\n\t}\n\tfor i := 0; i < 3; i++ {\n\t\tleader.raft.Apply([]byte(fmt.Sprintf(\"isolated-%d\", i)), 0)\n\t}\n\tisolatedCached, _ := leader.raft.getLastLog()\n\ttime.Sleep(400 * time.Millisecond)\n\n\t// The remaining two voters elect a new leader and commit a new entry.\n\tdeadline = time.Now().Add(4 * time.Second)\n\tvar newLeader *node\n\tfor newLeader == nil && time.Now().Before(deadline) {\n\t\tfor _, n := range others {\n\t\t\tif n.raft.State() == Leader {\n\t\t\t\tnewLeader = n\n\t\t\t\tbreak\n\t\t\t}\n\t\t}\n\t\ttime.Sleep(10 * time.Millisecond)\n\t}\n\tif newLeader == nil {\n\t\tt.Fatalf(\"no new leader elected among the remaining voters\")\n\t}\n\tif err := newLeader.raft.Apply([]byte(\"new-term\"), 2*time.Second).Error(); err != nil {\n\t\tt.Fatalf(\"new leader apply: %v\", err)\n\t}\n\n\t// Fail the isolated node's store, then let the new leader overwrite its suffix.\n\tleader.store.failStoreLogs.Store(true)\n\tfor _, n := range others {\n\t\tleader.trans.Connect(n.addr, n.trans)\n\t\tn.trans.Connect(leader.addr, leader.trans)\n\t}\n\ttime.Sleep(800 * time.Millisecond)\n\tleader.store.failStoreLogs.Store(false)\n\n\tcached, _ := leader.raft.getLastLog()\n\tdurable, _ := leader.store.LastIndex()\n\tvar l Log\n\tgetErr := leader.store.GetLog(cached, &l)\n\tassuranceEmit(t, map[string]interface{}{\n\t\t\"event\":                     \"real_producer_truncation\",\n\t\t\"node\":                      string(leader.raft.localID),\n\t\t\"isolated_cached_last_index\": isolatedCached,\n\t\t\"cached_last_index_after\":   cached,\n\t\t\"durable_last_index_after\":  durable,\n\t\t\"reported_last_index\":       leader.raft.LastIndex(),\n\t\t\"getlog_at_cached_err\":      fmt.Sprint(getErr),\n\t\t\"cached_ahead_of_durable\":   cached > durable,\n\t\t\"state\":                     leader.raft.State().String(),\n\t\t\"termination\":               true,\n\t})\n}\n",
+        "description": "Can the truncation-then-failed-write history that leaves the cached and reported last-log index above durable content be produced by real producers, that is by a second leader elected in a higher term, without supplying the conflicting AppendEntries directly to the handler?",
+        "semantic_changes": [],
+        "prerequisites": [],
+        "legality": {
+          "source_ids": [],
+          "expectation_ids": [],
+          "binding_ids": [],
+          "derivation": "",
+          "applicability": "",
+          "unresolved": [],
+          "conflicts": [],
+          "alternatives": []
+        }
+      }
+    },
+    "materials": [
+      {
+        "id": "src-append-config",
+        "file": "raft.go",
+        "start_line": 1203,
+        "end_line": 1241,
+        "kind": "code_observation",
+        "text": "func (r *Raft) appendConfigurationEntry(future *configurationChangeFuture) {\n\tconfiguration, err := nextConfiguration(r.configurations.latest, r.configurations.latestIndex, future.req)\n\tif err != nil {\n\t\tfuture.respond(err)\n\t\treturn\n\t}\n\n\tr.logger.Info(\"updating configuration\",\n\t\t\"command\", future.req.command,\n\t\t\"server-id\", future.req.serverID,\n\t\t\"server-addr\", future.req.serverAddress,\n\t\t\"servers\", hclog.Fmt(\"%+v\", configuration.Servers))\n\n\t// In pre-ID compatibility mode we translate all configuration changes\n\t// in to an old remove peer message, which can handle all supported\n\t// cases for peer changes in the pre-ID world (adding and removing\n\t// voters). Both add peer and remove peer log entries are handled\n\t// similarly on old Raft servers, but remove peer does extra checks to\n\t// see if a leader needs to step down. Since they both assert the full\n\t// configuration, then we can safely call remove peer for everything.\n\tif r.protocolVersion < 2 {\n\t\tfuture.log = Log{\n\t\t\tType: LogRemovePeerDeprecated,\n\t\t\tData: encodePeers(configuration, r.trans),\n\t\t}\n\t} else {\n\t\tfuture.log = Log{\n\t\t\tType: LogConfiguration,\n\t\t\tData: EncodeConfiguration(configuration),\n\t\t}\n\t}\n\n\tr.dispatchLogs([]*logFuture{&future.logFuture})\n\tindex := future.Index()\n\tr.setLatestConfiguration(configuration, index)\n\tr.leaderState.commitment.setConfiguration(configuration)\n\tr.startStopReplication()\n}\n",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "src-dispatch-logs",
+        "file": "raft.go",
+        "start_line": 1244,
+        "end_line": 1279,
+        "kind": "code_observation",
+        "text": "func (r *Raft) dispatchLogs(applyLogs []*logFuture) {\n\tnow := time.Now()\n\tdefer metrics.MeasureSince([]string{\"raft\", \"leader\", \"dispatchLog\"}, now)\n\n\tterm := r.getCurrentTerm()\n\tlastIndex := r.getLastIndex()\n\n\tn := len(applyLogs)\n\tlogs := make([]*Log, n)\n\tmetrics.SetGauge([]string{\"raft\", \"leader\", \"dispatchNumLogs\"}, float32(n))\n\n\tfor idx, applyLog := range applyLogs {\n\t\tapplyLog.dispatch = now\n\t\tlastIndex++\n\t\tapplyLog.log.Index = lastIndex\n\t\tapplyLog.log.Term = term\n\t\tapplyLog.log.AppendedAt = now\n\t\tlogs[idx] = &applyLog.log\n\t\tr.leaderState.inflight.PushBack(applyLog)\n\t}\n\n\t// Write the log entry locally\n\tif err := r.logs.StoreLogs(logs); err != nil {\n\t\tr.logger.Error(\"failed to commit logs\", \"error\", err)\n\t\tfor _, applyLog := range applyLogs {\n\t\t\tapplyLog.respond(err)\n\t\t}\n\t\tr.setState(Follower)\n\t\treturn\n\t}\n\tr.leaderState.commitment.match(r.localID, lastIndex)\n\n\t// Update the last log since it's on disk now\n\tr.setLastLog(lastIndex, term)\n\n\t// Notify the replicators of the new log",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "src-quorum",
+        "file": "raft.go",
+        "start_line": 1036,
+        "end_line": 1101,
+        "kind": "code_observation",
+        "text": "func (r *Raft) checkLeaderLease() time.Duration {\n\t// Track contacted nodes, we can always contact ourself\n\tcontacted := 0\n\n\t// Store lease timeout for this one check invocation as we need to refer to it\n\t// in the loop and would be confusing if it ever becomes reloadable and\n\t// changes between iterations below.\n\tleaseTimeout := r.config().LeaderLeaseTimeout\n\n\t// Check each follower\n\tvar maxDiff time.Duration\n\tnow := time.Now()\n\tfor _, server := range r.configurations.latest.Servers {\n\t\tif server.Suffrage == Voter {\n\t\t\tif server.ID == r.localID {\n\t\t\t\tcontacted++\n\t\t\t\tcontinue\n\t\t\t}\n\t\t\tf := r.leaderState.replState[server.ID]\n\t\t\tdiff := now.Sub(f.LastContact())\n\t\t\tif diff <= leaseTimeout {\n\t\t\t\tcontacted++\n\t\t\t\tif diff > maxDiff {\n\t\t\t\t\tmaxDiff = diff\n\t\t\t\t}\n\t\t\t} else {\n\t\t\t\t// Log at least once at high value, then debug. Otherwise it gets very verbose.\n\t\t\t\tif diff <= 3*leaseTimeout {\n\t\t\t\t\tr.logger.Warn(\"failed to contact\", \"server-id\", server.ID, \"time\", diff)\n\t\t\t\t} else {\n\t\t\t\t\tr.logger.Debug(\"failed to contact\", \"server-id\", server.ID, \"time\", diff)\n\t\t\t\t}\n\t\t\t}\n\t\t\tmetrics.AddSample([]string{\"raft\", \"leader\", \"lastContact\"}, float32(diff/time.Millisecond))\n\t\t}\n\t}\n\n\t// Verify we can contact a quorum\n\tquorum := r.quorumSize()\n\tif contacted < quorum {\n\t\tr.logger.Warn(\"failed to contact quorum of nodes, stepping down\")\n\t\tr.setState(Follower)\n\t\tmetrics.IncrCounter([]string{\"raft\", \"transition\", \"leader_lease_timeout\"}, 1)\n\t}\n\treturn maxDiff\n}\n\n// quorumSize is used to return the quorum size. This must only be called on\n// the main thread.\n// TODO: revisit usage\nfunc (r *Raft) quorumSize() int {\n\tvoters := 0\n\tfor _, server := range r.configurations.latest.Servers {\n\t\tif server.Suffrage == Voter {\n\t\t\tvoters++\n\t\t}\n\t}\n\treturn voters/2 + 1\n}\n\n// restoreUserSnapshot is used to manually consume an external snapshot, such\n// as if restoring from a backup. We will use the current Raft configuration,\n// not the one from the snapshot, so that we can restore into a new cluster. We\n// will also use the higher of the index of the snapshot, or the current index,\n// and then add 1 to that, so we force a new state with a hole in the Raft log,\n// so that the snapshot will be sent to followers and used for any new joiners.",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "src-follower-gate",
+        "file": "raft.go",
+        "start_line": 158,
+        "end_line": 260,
+        "kind": "code_observation",
+        "text": "func (r *Raft) runFollower() {\n\tdidWarn := false\n\tleaderAddr, leaderID := r.LeaderWithID()\n\tr.logger.Info(\"entering follower state\", \"follower\", r, \"leader-address\", leaderAddr, \"leader-id\", leaderID)\n\tmetrics.IncrCounter([]string{\"raft\", \"state\", \"follower\"}, 1)\n\theartbeatTimer := randomTimeout(r.config().HeartbeatTimeout)\n\n\tfor r.getState() == Follower {\n\t\tr.mainThreadSaturation.sleeping()\n\n\t\tselect {\n\t\tcase rpc := <-r.rpcCh:\n\t\t\tr.mainThreadSaturation.working()\n\t\t\tr.processRPC(rpc)\n\n\t\tcase c := <-r.configurationChangeCh:\n\t\t\tr.mainThreadSaturation.working()\n\t\t\t// Reject any operations since we are not the leader\n\t\t\tc.respond(ErrNotLeader)\n\n\t\tcase a := <-r.applyCh:\n\t\t\tr.mainThreadSaturation.working()\n\t\t\t// Reject any operations since we are not the leader\n\t\t\ta.respond(ErrNotLeader)\n\n\t\tcase v := <-r.verifyCh:\n\t\t\tr.mainThreadSaturation.working()\n\t\t\t// Reject any operations since we are not the leader\n\t\t\tv.respond(ErrNotLeader)\n\n\t\tcase ur := <-r.userRestoreCh:\n\t\t\tr.mainThreadSaturation.working()\n\t\t\t// Reject any restores since we are not the leader\n\t\t\tur.respond(ErrNotLeader)\n\n\t\tcase l := <-r.leadershipTransferCh:\n\t\t\tr.mainThreadSaturation.working()\n\t\t\t// Reject any operations since we are not the leader\n\t\t\tl.respond(ErrNotLeader)\n\n\t\tcase c := <-r.configurationsCh:\n\t\t\tr.mainThreadSaturation.working()\n\t\t\tc.configurations = r.configurations.Clone()\n\t\t\tc.respond(nil)\n\n\t\tcase b := <-r.bootstrapCh:\n\t\t\tr.mainThreadSaturation.working()\n\t\t\tb.respond(r.liveBootstrap(b.configuration))\n\n\t\tcase <-r.leaderNotifyCh:\n\t\t\t//  Ignore since we are not the leader\n\n\t\tcase <-r.followerNotifyCh:\n\t\t\theartbeatTimer = time.After(0)\n\n\t\tcase <-heartbeatTimer:\n\t\t\tr.mainThreadSaturation.working()\n\t\t\t// Restart the heartbeat timer\n\t\t\thbTimeout := r.config().HeartbeatTimeout\n\t\t\theartbeatTimer = randomTimeout(hbTimeout)\n\n\t\t\t// Check if we have had a successful contact\n\t\t\tlastContact := r.LastContact()\n\t\t\tif time.Since(lastContact) < hbTimeout {\n\t\t\t\tcontinue\n\t\t\t}\n\n\t\t\t// Heartbeat failed! Transition to the candidate state\n\t\t\tlastLeaderAddr, lastLeaderID := r.LeaderWithID()\n\t\t\tr.setLeader(\"\", \"\")\n\n\t\t\tif r.configurations.latestIndex == 0 {\n\t\t\t\tif !didWarn {\n\t\t\t\t\tr.logger.Warn(\"no known peers, aborting election\")\n\t\t\t\t\tdidWarn = true\n\t\t\t\t}\n\t\t\t} else if r.configurations.latestIndex == r.configurations.committedIndex &&\n\t\t\t\t!hasVote(r.configurations.latest, r.localID) {\n\t\t\t\tif !didWarn {\n\t\t\t\t\tr.logger.Warn(\"not part of stable configuration, aborting election\")\n\t\t\t\t\tdidWarn = true\n\t\t\t\t}\n\t\t\t} else {\n\t\t\t\tmetrics.IncrCounter([]string{\"raft\", \"transition\", \"heartbeat_timeout\"}, 1)\n\t\t\t\tif hasVote(r.configurations.latest, r.localID) {\n\t\t\t\t\tr.logger.Warn(\"heartbeat timeout reached, starting election\", \"last-leader-addr\", lastLeaderAddr, \"last-leader-id\", lastLeaderID)\n\t\t\t\t\tr.setState(Candidate)\n\t\t\t\t\treturn\n\t\t\t\t} else if !didWarn {\n\t\t\t\t\tr.logger.Warn(\"heartbeat timeout reached, not part of a stable configuration or a non-voter, not triggering a leader election\")\n\t\t\t\t\tdidWarn = true\n\t\t\t\t}\n\t\t\t}\n\n\t\tcase <-r.shutdownCh:\n\t\t\treturn\n\t\t}\n\t}\n}\n\n// liveBootstrap attempts to seed an initial configuration for the cluster. See\n// the Raft object's member BootstrapCluster for more details. This must only be\n// called on the main thread, and only makes sense in the follower state.",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "src-getconfig",
+        "file": "api.go",
+        "start_line": 897,
+        "end_line": 906,
+        "kind": "code_observation",
+        "text": "func (r *Raft) GetConfiguration() ConfigurationFuture {\n\tconfigReq := &configurationsFuture{}\n\tconfigReq.init()\n\tconfigReq.configurations = configurations{latest: r.getLatestConfiguration()}\n\tconfigReq.respond(nil)\n\treturn configReq\n}\n\n// AddPeer to the cluster configuration. Must be run on the leader, or it will fail.\n//",
+        "content_digest": "499a72c01096912e85d16381f4640ac6d29f8c2b91cabbdae8530bdcbeb89a4a"
+      },
+      {
+        "id": "src-config-future-index",
+        "file": "future.go",
+        "start_line": 262,
+        "end_line": 270,
+        "kind": "code_observation",
+        "text": "// Configuration returns the latest configuration in use by Raft.\nfunc (c *configurationsFuture) Configuration() Configuration {\n\treturn c.configurations.latest\n}\n\n// Index returns the index of the latest configuration in use by Raft.\nfunc (c *configurationsFuture) Index() uint64 {\n\treturn c.configurations.latestIndex\n}",
+        "content_digest": "e3775d16c6cb24f9c9572ce452c27e87fcbf4b24baf666d14e838cc4b571ae9c"
+      },
+      {
+        "id": "src2-append-config",
+        "file": "raft.go",
+        "start_line": 1203,
+        "end_line": 1240,
+        "kind": "code_observation",
+        "text": "func (r *Raft) appendConfigurationEntry(future *configurationChangeFuture) {\n\tconfiguration, err := nextConfiguration(r.configurations.latest, r.configurations.latestIndex, future.req)\n\tif err != nil {\n\t\tfuture.respond(err)\n\t\treturn\n\t}\n\n\tr.logger.Info(\"updating configuration\",\n\t\t\"command\", future.req.command,\n\t\t\"server-id\", future.req.serverID,\n\t\t\"server-addr\", future.req.serverAddress,\n\t\t\"servers\", hclog.Fmt(\"%+v\", configuration.Servers))\n\n\t// In pre-ID compatibility mode we translate all configuration changes\n\t// in to an old remove peer message, which can handle all supported\n\t// cases for peer changes in the pre-ID world (adding and removing\n\t// voters). Both add peer and remove peer log entries are handled\n\t// similarly on old Raft servers, but remove peer does extra checks to\n\t// see if a leader needs to step down. Since they both assert the full\n\t// configuration, then we can safely call remove peer for everything.\n\tif r.protocolVersion < 2 {\n\t\tfuture.log = Log{\n\t\t\tType: LogRemovePeerDeprecated,\n\t\t\tData: encodePeers(configuration, r.trans),\n\t\t}\n\t} else {\n\t\tfuture.log = Log{\n\t\t\tType: LogConfiguration,\n\t\t\tData: EncodeConfiguration(configuration),\n\t\t}\n\t}\n\n\tr.dispatchLogs([]*logFuture{&future.logFuture})\n\tindex := future.Index()\n\tr.setLatestConfiguration(configuration, index)\n\tr.leaderState.commitment.setConfiguration(configuration)\n\tr.startStopReplication()\n}",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "src2-dispatch-logs",
+        "file": "raft.go",
+        "start_line": 1244,
+        "end_line": 1283,
+        "kind": "code_observation",
+        "text": "func (r *Raft) dispatchLogs(applyLogs []*logFuture) {\n\tnow := time.Now()\n\tdefer metrics.MeasureSince([]string{\"raft\", \"leader\", \"dispatchLog\"}, now)\n\n\tterm := r.getCurrentTerm()\n\tlastIndex := r.getLastIndex()\n\n\tn := len(applyLogs)\n\tlogs := make([]*Log, n)\n\tmetrics.SetGauge([]string{\"raft\", \"leader\", \"dispatchNumLogs\"}, float32(n))\n\n\tfor idx, applyLog := range applyLogs {\n\t\tapplyLog.dispatch = now\n\t\tlastIndex++\n\t\tapplyLog.log.Index = lastIndex\n\t\tapplyLog.log.Term = term\n\t\tapplyLog.log.AppendedAt = now\n\t\tlogs[idx] = &applyLog.log\n\t\tr.leaderState.inflight.PushBack(applyLog)\n\t}\n\n\t// Write the log entry locally\n\tif err := r.logs.StoreLogs(logs); err != nil {\n\t\tr.logger.Error(\"failed to commit logs\", \"error\", err)\n\t\tfor _, applyLog := range applyLogs {\n\t\t\tapplyLog.respond(err)\n\t\t}\n\t\tr.setState(Follower)\n\t\treturn\n\t}\n\tr.leaderState.commitment.match(r.localID, lastIndex)\n\n\t// Update the last log since it's on disk now\n\tr.setLastLog(lastIndex, term)\n\n\t// Notify the replicators of the new log\n\tfor _, f := range r.leaderState.replState {\n\t\tasyncNotifyCh(f.triggerCh)\n\t}\n}",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "src2-quorum-size",
+        "file": "raft.go",
+        "start_line": 1086,
+        "end_line": 1094,
+        "kind": "code_observation",
+        "text": "func (r *Raft) quorumSize() int {\n\tvoters := 0\n\tfor _, server := range r.configurations.latest.Servers {\n\t\tif server.Suffrage == Voter {\n\t\t\tvoters++\n\t\t}\n\t}\n\treturn voters/2 + 1\n}",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "src2-commitment-setcfg",
+        "file": "commitment.go",
+        "start_line": 53,
+        "end_line": 64,
+        "kind": "code_observation",
+        "text": "func (c *commitment) setConfiguration(configuration Configuration) {\n\tc.Lock()\n\tdefer c.Unlock()\n\toldMatchIndexes := c.matchIndexes\n\tc.matchIndexes = make(map[ServerID]uint64)\n\tfor _, server := range configuration.Servers {\n\t\tif server.Suffrage == Voter {\n\t\t\tc.matchIndexes[server.ID] = oldMatchIndexes[server.ID] // defaults to 0\n\t\t}\n\t}\n\tc.recalculate()\n}",
+        "content_digest": "2b534893e015d26a33d37027a08c65ff76fb5e28e71a76d4408e3c9fcbcfd4fe"
+      },
+      {
+        "id": "src2-configurations-doc",
+        "file": "configuration.go",
+        "start_line": 254,
+        "end_line": 265,
+        "kind": "document_statement",
+        "text": "\t\t\tconfiguration.Servers = append(configuration.Servers, newServer)\n\t\t}\n\tcase AddNonvoter:\n\t\tnewServer := Server{\n\t\t\tSuffrage: Nonvoter,\n\t\t\tID:       change.serverID,\n\t\t\tAddress:  change.serverAddress,\n\t\t}\n\t\tfound := false\n\t\tfor i, server := range configuration.Servers {\n\t\t\tif server.ID == change.serverID {\n\t\t\t\tif server.Suffrage != Nonvoter {",
+        "content_digest": "7e3e1e0a708f3f3b17691549962c94d78955a840922fc0f42867c515cd27ec66"
+      },
+      {
+        "id": "src2-follower-gate",
+        "file": "raft.go",
+        "start_line": 205,
+        "end_line": 240,
+        "kind": "code_observation",
+        "text": "\t\t\tb.respond(r.liveBootstrap(b.configuration))\n\n\t\tcase <-r.leaderNotifyCh:\n\t\t\t//  Ignore since we are not the leader\n\n\t\tcase <-r.followerNotifyCh:\n\t\t\theartbeatTimer = time.After(0)\n\n\t\tcase <-heartbeatTimer:\n\t\t\tr.mainThreadSaturation.working()\n\t\t\t// Restart the heartbeat timer\n\t\t\thbTimeout := r.config().HeartbeatTimeout\n\t\t\theartbeatTimer = randomTimeout(hbTimeout)\n\n\t\t\t// Check if we have had a successful contact\n\t\t\tlastContact := r.LastContact()\n\t\t\tif time.Since(lastContact) < hbTimeout {\n\t\t\t\tcontinue\n\t\t\t}\n\n\t\t\t// Heartbeat failed! Transition to the candidate state\n\t\t\tlastLeaderAddr, lastLeaderID := r.LeaderWithID()\n\t\t\tr.setLeader(\"\", \"\")\n\n\t\t\tif r.configurations.latestIndex == 0 {\n\t\t\t\tif !didWarn {\n\t\t\t\t\tr.logger.Warn(\"no known peers, aborting election\")\n\t\t\t\t\tdidWarn = true\n\t\t\t\t}\n\t\t\t} else if r.configurations.latestIndex == r.configurations.committedIndex &&\n\t\t\t\t!hasVote(r.configurations.latest, r.localID) {\n\t\t\t\tif !didWarn {\n\t\t\t\t\tr.logger.Warn(\"not part of stable configuration, aborting election\")\n\t\t\t\t\tdidWarn = true\n\t\t\t\t}\n\t\t\t} else {",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "src3-append-config",
+        "file": "raft.go",
+        "start_line": 1203,
+        "end_line": 1240,
+        "kind": "code_observation",
+        "text": "func (r *Raft) appendConfigurationEntry(future *configurationChangeFuture) {\n\tconfiguration, err := nextConfiguration(r.configurations.latest, r.configurations.latestIndex, future.req)\n\tif err != nil {\n\t\tfuture.respond(err)\n\t\treturn\n\t}\n\n\tr.logger.Info(\"updating configuration\",\n\t\t\"command\", future.req.command,\n\t\t\"server-id\", future.req.serverID,\n\t\t\"server-addr\", future.req.serverAddress,\n\t\t\"servers\", hclog.Fmt(\"%+v\", configuration.Servers))\n\n\t// In pre-ID compatibility mode we translate all configuration changes\n\t// in to an old remove peer message, which can handle all supported\n\t// cases for peer changes in the pre-ID world (adding and removing\n\t// voters). Both add peer and remove peer log entries are handled\n\t// similarly on old Raft servers, but remove peer does extra checks to\n\t// see if a leader needs to step down. Since they both assert the full\n\t// configuration, then we can safely call remove peer for everything.\n\tif r.protocolVersion < 2 {\n\t\tfuture.log = Log{\n\t\t\tType: LogRemovePeerDeprecated,\n\t\t\tData: encodePeers(configuration, r.trans),\n\t\t}\n\t} else {\n\t\tfuture.log = Log{\n\t\t\tType: LogConfiguration,\n\t\t\tData: EncodeConfiguration(configuration),\n\t\t}\n\t}\n\n\tr.dispatchLogs([]*logFuture{&future.logFuture})\n\tindex := future.Index()\n\tr.setLatestConfiguration(configuration, index)\n\tr.leaderState.commitment.setConfiguration(configuration)\n\tr.startStopReplication()\n}",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "src3-truncation-revert",
+        "file": "raft.go",
+        "start_line": 1522,
+        "end_line": 1535,
+        "kind": "code_observation",
+        "text": "\t\t\t}\n\t\t\tif entry.Term != storeEntry.Term {\n\t\t\t\tr.logger.Warn(\"clearing log suffix\", \"from\", entry.Index, \"to\", lastLogIdx)\n\t\t\t\tif err := r.logs.DeleteRange(entry.Index, lastLogIdx); err != nil {\n\t\t\t\t\tr.logger.Error(\"failed to clear log suffix\", \"error\", err)\n\t\t\t\t\treturn\n\t\t\t\t}\n\t\t\t\tif entry.Index <= r.configurations.latestIndex {\n\t\t\t\t\tr.setLatestConfiguration(r.configurations.committed, r.configurations.committedIndex)\n\t\t\t\t}\n\t\t\t\tnewEntries = a.Entries[i:]\n\t\t\t\tbreak\n\t\t\t}\n\t\t}",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "src3-proccfg",
+        "file": "raft.go",
+        "start_line": 1585,
+        "end_line": 1600,
+        "kind": "code_observation",
+        "text": "func (r *Raft) processConfigurationLogEntry(entry *Log) error {\n\tswitch entry.Type {\n\tcase LogConfiguration:\n\t\tr.setCommittedConfiguration(r.configurations.latest, r.configurations.latestIndex)\n\t\tr.setLatestConfiguration(DecodeConfiguration(entry.Data), entry.Index)\n\n\tcase LogAddPeerDeprecated, LogRemovePeerDeprecated:\n\t\tr.setCommittedConfiguration(r.configurations.latest, r.configurations.latestIndex)\n\t\tconf, err := decodePeers(entry.Data, r.trans)\n\t\tif err != nil {\n\t\t\treturn err\n\t\t}\n\t\tr.setLatestConfiguration(conf, entry.Index)\n\t}\n\treturn nil\n}",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "src3-installsnap",
+        "file": "raft.go",
+        "start_line": 1928,
+        "end_line": 1940,
+        "kind": "code_observation",
+        "text": "\t}\n\n\t// Update the lastApplied so we don't replay old logs\n\tr.setLastApplied(req.LastLogIndex)\n\n\t// Update the last stable snapshot info\n\tr.setLastSnapshot(req.LastLogIndex, req.LastLogTerm)\n\n\t// Restore the peer set\n\tr.setLatestConfiguration(reqConfiguration, reqConfigurationIndex)\n\tr.setCommittedConfiguration(reqConfiguration, reqConfigurationIndex)\n\n\t// Clear old logs if r.logs is a MonotonicLogStore. Otherwise compact the",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "src3-startup-restore",
+        "file": "api.go",
+        "start_line": 640,
+        "end_line": 666,
+        "kind": "code_observation",
+        "text": "\t\tif success := r.tryRestoreSingleSnapshot(snapshot); !success {\n\t\t\tcontinue\n\t\t}\n\n\t\t// Update the lastApplied so we don't replay old logs\n\t\tr.setLastApplied(snapshot.Index)\n\n\t\t// Update the last stable snapshot info\n\t\tr.setLastSnapshot(snapshot.Index, snapshot.Term)\n\n\t\t// Update the configuration\n\t\tvar conf Configuration\n\t\tvar index uint64\n\t\tif snapshot.Version > 0 {\n\t\t\tconf = snapshot.Configuration\n\t\t\tindex = snapshot.ConfigurationIndex\n\t\t} else {\n\t\t\tvar err error\n\t\t\tif conf, err = decodePeers(snapshot.Peers, r.trans); err != nil {\n\t\t\t\treturn err\n\t\t\t}\n\t\t\tindex = snapshot.Index\n\t\t}\n\t\tr.setCommittedConfiguration(conf, index)\n\t\tr.setLatestConfiguration(conf, index)\n\n\t\t// Success!",
+        "content_digest": "499a72c01096912e85d16381f4640ac6d29f8c2b91cabbdae8530bdcbeb89a4a"
+      },
+      {
+        "id": "src4-append-config",
+        "file": "raft.go",
+        "start_line": 1203,
+        "end_line": 1240,
+        "kind": "code_observation",
+        "text": "func (r *Raft) appendConfigurationEntry(future *configurationChangeFuture) {\n\tconfiguration, err := nextConfiguration(r.configurations.latest, r.configurations.latestIndex, future.req)\n\tif err != nil {\n\t\tfuture.respond(err)\n\t\treturn\n\t}\n\n\tr.logger.Info(\"updating configuration\",\n\t\t\"command\", future.req.command,\n\t\t\"server-id\", future.req.serverID,\n\t\t\"server-addr\", future.req.serverAddress,\n\t\t\"servers\", hclog.Fmt(\"%+v\", configuration.Servers))\n\n\t// In pre-ID compatibility mode we translate all configuration changes\n\t// in to an old remove peer message, which can handle all supported\n\t// cases for peer changes in the pre-ID world (adding and removing\n\t// voters). Both add peer and remove peer log entries are handled\n\t// similarly on old Raft servers, but remove peer does extra checks to\n\t// see if a leader needs to step down. Since they both assert the full\n\t// configuration, then we can safely call remove peer for everything.\n\tif r.protocolVersion < 2 {\n\t\tfuture.log = Log{\n\t\t\tType: LogRemovePeerDeprecated,\n\t\t\tData: encodePeers(configuration, r.trans),\n\t\t}\n\t} else {\n\t\tfuture.log = Log{\n\t\t\tType: LogConfiguration,\n\t\t\tData: EncodeConfiguration(configuration),\n\t\t}\n\t}\n\n\tr.dispatchLogs([]*logFuture{&future.logFuture})\n\tindex := future.Index()\n\tr.setLatestConfiguration(configuration, index)\n\tr.leaderState.commitment.setConfiguration(configuration)\n\tr.startStopReplication()\n}",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "src4-dispatch-logs",
+        "file": "raft.go",
+        "start_line": 1244,
+        "end_line": 1283,
+        "kind": "code_observation",
+        "text": "func (r *Raft) dispatchLogs(applyLogs []*logFuture) {\n\tnow := time.Now()\n\tdefer metrics.MeasureSince([]string{\"raft\", \"leader\", \"dispatchLog\"}, now)\n\n\tterm := r.getCurrentTerm()\n\tlastIndex := r.getLastIndex()\n\n\tn := len(applyLogs)\n\tlogs := make([]*Log, n)\n\tmetrics.SetGauge([]string{\"raft\", \"leader\", \"dispatchNumLogs\"}, float32(n))\n\n\tfor idx, applyLog := range applyLogs {\n\t\tapplyLog.dispatch = now\n\t\tlastIndex++\n\t\tapplyLog.log.Index = lastIndex\n\t\tapplyLog.log.Term = term\n\t\tapplyLog.log.AppendedAt = now\n\t\tlogs[idx] = &applyLog.log\n\t\tr.leaderState.inflight.PushBack(applyLog)\n\t}\n\n\t// Write the log entry locally\n\tif err := r.logs.StoreLogs(logs); err != nil {\n\t\tr.logger.Error(\"failed to commit logs\", \"error\", err)\n\t\tfor _, applyLog := range applyLogs {\n\t\t\tapplyLog.respond(err)\n\t\t}\n\t\tr.setState(Follower)\n\t\treturn\n\t}\n\tr.leaderState.commitment.match(r.localID, lastIndex)\n\n\t// Update the last log since it's on disk now\n\tr.setLastLog(lastIndex, term)\n\n\t// Notify the replicators of the new log\n\tfor _, f := range r.leaderState.replState {\n\t\tasyncNotifyCh(f.triggerCh)\n\t}\n}",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "src5-appendentries-tail",
+        "file": "raft.go",
+        "start_line": 1505,
+        "end_line": 1560,
+        "kind": "code_observation",
+        "text": "\tif len(a.Entries) > 0 {\n\t\tstart := time.Now()\n\n\t\t// Delete any conflicting entries, skip any duplicates\n\t\tlastLogIdx, _ := r.getLastLog()\n\t\tvar newEntries []*Log\n\t\tfor i, entry := range a.Entries {\n\t\t\tif entry.Index > lastLogIdx {\n\t\t\t\tnewEntries = a.Entries[i:]\n\t\t\t\tbreak\n\t\t\t}\n\t\t\tvar storeEntry Log\n\t\t\tif err := r.logs.GetLog(entry.Index, &storeEntry); err != nil {\n\t\t\t\tr.logger.Warn(\"failed to get log entry\",\n\t\t\t\t\t\"index\", entry.Index,\n\t\t\t\t\t\"error\", err)\n\t\t\t\treturn\n\t\t\t}\n\t\t\tif entry.Term != storeEntry.Term {\n\t\t\t\tr.logger.Warn(\"clearing log suffix\", \"from\", entry.Index, \"to\", lastLogIdx)\n\t\t\t\tif err := r.logs.DeleteRange(entry.Index, lastLogIdx); err != nil {\n\t\t\t\t\tr.logger.Error(\"failed to clear log suffix\", \"error\", err)\n\t\t\t\t\treturn\n\t\t\t\t}\n\t\t\t\tif entry.Index <= r.configurations.latestIndex {\n\t\t\t\t\tr.setLatestConfiguration(r.configurations.committed, r.configurations.committedIndex)\n\t\t\t\t}\n\t\t\t\tnewEntries = a.Entries[i:]\n\t\t\t\tbreak\n\t\t\t}\n\t\t}\n\n\t\tif n := len(newEntries); n > 0 {\n\t\t\t// Append the new entries\n\t\t\tif err := r.logs.StoreLogs(newEntries); err != nil {\n\t\t\t\tr.logger.Error(\"failed to append to logs\", \"error\", err)\n\t\t\t\t// TODO: leaving r.getLastLog() in the wrong\n\t\t\t\t// state if there was a truncation above\n\t\t\t\treturn\n\t\t\t}\n\n\t\t\t// Handle any new configuration changes\n\t\t\tfor _, newEntry := range newEntries {\n\t\t\t\tif err := r.processConfigurationLogEntry(newEntry); err != nil {\n\t\t\t\t\tr.logger.Warn(\"failed to append entry\",\n\t\t\t\t\t\t\"index\", newEntry.Index,\n\t\t\t\t\t\t\"error\", err)\n\t\t\t\t\trpcErr = err\n\t\t\t\t\treturn\n\t\t\t\t}\n\t\t\t}\n\n\t\t\t// Update the lastLog\n\t\t\tlast := newEntries[n-1]\n\t\t\tr.setLastLog(last.Index, last.Term)\n\t\t}",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "src5-store-error-note",
+        "file": "raft.go",
+        "start_line": 1536,
+        "end_line": 1545,
+        "kind": "code_observation",
+        "text": "\n\t\tif n := len(newEntries); n > 0 {\n\t\t\t// Append the new entries\n\t\t\tif err := r.logs.StoreLogs(newEntries); err != nil {\n\t\t\t\tr.logger.Error(\"failed to append to logs\", \"error\", err)\n\t\t\t\t// TODO: leaving r.getLastLog() in the wrong\n\t\t\t\t// state if there was a truncation above\n\t\t\t\treturn\n\t\t\t}\n",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "src6-appendentries-conflict",
+        "file": "raft.go",
+        "start_line": 1505,
+        "end_line": 1560,
+        "kind": "code_observation",
+        "text": "\tif len(a.Entries) > 0 {\n\t\tstart := time.Now()\n\n\t\t// Delete any conflicting entries, skip any duplicates\n\t\tlastLogIdx, _ := r.getLastLog()\n\t\tvar newEntries []*Log\n\t\tfor i, entry := range a.Entries {\n\t\t\tif entry.Index > lastLogIdx {\n\t\t\t\tnewEntries = a.Entries[i:]\n\t\t\t\tbreak\n\t\t\t}\n\t\t\tvar storeEntry Log\n\t\t\tif err := r.logs.GetLog(entry.Index, &storeEntry); err != nil {\n\t\t\t\tr.logger.Warn(\"failed to get log entry\",\n\t\t\t\t\t\"index\", entry.Index,\n\t\t\t\t\t\"error\", err)\n\t\t\t\treturn\n\t\t\t}\n\t\t\tif entry.Term != storeEntry.Term {\n\t\t\t\tr.logger.Warn(\"clearing log suffix\", \"from\", entry.Index, \"to\", lastLogIdx)\n\t\t\t\tif err := r.logs.DeleteRange(entry.Index, lastLogIdx); err != nil {\n\t\t\t\t\tr.logger.Error(\"failed to clear log suffix\", \"error\", err)\n\t\t\t\t\treturn\n\t\t\t\t}\n\t\t\t\tif entry.Index <= r.configurations.latestIndex {\n\t\t\t\t\tr.setLatestConfiguration(r.configurations.committed, r.configurations.committedIndex)\n\t\t\t\t}\n\t\t\t\tnewEntries = a.Entries[i:]\n\t\t\t\tbreak\n\t\t\t}\n\t\t}\n\n\t\tif n := len(newEntries); n > 0 {\n\t\t\t// Append the new entries\n\t\t\tif err := r.logs.StoreLogs(newEntries); err != nil {\n\t\t\t\tr.logger.Error(\"failed to append to logs\", \"error\", err)\n\t\t\t\t// TODO: leaving r.getLastLog() in the wrong\n\t\t\t\t// state if there was a truncation above\n\t\t\t\treturn\n\t\t\t}\n\n\t\t\t// Handle any new configuration changes\n\t\t\tfor _, newEntry := range newEntries {\n\t\t\t\tif err := r.processConfigurationLogEntry(newEntry); err != nil {\n\t\t\t\t\tr.logger.Warn(\"failed to append entry\",\n\t\t\t\t\t\t\"index\", newEntry.Index,\n\t\t\t\t\t\t\"error\", err)\n\t\t\t\t\trpcErr = err\n\t\t\t\t\treturn\n\t\t\t\t}\n\t\t\t}\n\n\t\t\t// Update the lastLog\n\t\t\tlast := newEntries[n-1]\n\t\t\tr.setLastLog(last.Index, last.Term)\n\t\t}",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "src6-store-error-todo",
+        "file": "raft.go",
+        "start_line": 1536,
+        "end_line": 1545,
+        "kind": "code_observation",
+        "text": "\n\t\tif n := len(newEntries); n > 0 {\n\t\t\t// Append the new entries\n\t\t\tif err := r.logs.StoreLogs(newEntries); err != nil {\n\t\t\t\tr.logger.Error(\"failed to append to logs\", \"error\", err)\n\t\t\t\t// TODO: leaving r.getLastLog() in the wrong\n\t\t\t\t// state if there was a truncation above\n\t\t\t\treturn\n\t\t\t}\n",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "src7-appendentries-entries",
+        "file": "raft.go",
+        "start_line": 1494,
+        "end_line": 1545,
+        "kind": "code_observation",
+        "text": "\n\t\tif a.PrevLogTerm != prevLogTerm {\n\t\t\tr.logger.Warn(\"previous log term mis-match\",\n\t\t\t\t\"ours\", prevLogTerm,\n\t\t\t\t\"remote\", a.PrevLogTerm)\n\t\t\tresp.NoRetryBackoff = true\n\t\t\treturn\n\t\t}\n\t}\n\n\t// Process any new entries\n\tif len(a.Entries) > 0 {\n\t\tstart := time.Now()\n\n\t\t// Delete any conflicting entries, skip any duplicates\n\t\tlastLogIdx, _ := r.getLastLog()\n\t\tvar newEntries []*Log\n\t\tfor i, entry := range a.Entries {\n\t\t\tif entry.Index > lastLogIdx {\n\t\t\t\tnewEntries = a.Entries[i:]\n\t\t\t\tbreak\n\t\t\t}\n\t\t\tvar storeEntry Log\n\t\t\tif err := r.logs.GetLog(entry.Index, &storeEntry); err != nil {\n\t\t\t\tr.logger.Warn(\"failed to get log entry\",\n\t\t\t\t\t\"index\", entry.Index,\n\t\t\t\t\t\"error\", err)\n\t\t\t\treturn\n\t\t\t}\n\t\t\tif entry.Term != storeEntry.Term {\n\t\t\t\tr.logger.Warn(\"clearing log suffix\", \"from\", entry.Index, \"to\", lastLogIdx)\n\t\t\t\tif err := r.logs.DeleteRange(entry.Index, lastLogIdx); err != nil {\n\t\t\t\t\tr.logger.Error(\"failed to clear log suffix\", \"error\", err)\n\t\t\t\t\treturn\n\t\t\t\t}\n\t\t\t\tif entry.Index <= r.configurations.latestIndex {\n\t\t\t\t\tr.setLatestConfiguration(r.configurations.committed, r.configurations.committedIndex)\n\t\t\t\t}\n\t\t\t\tnewEntries = a.Entries[i:]\n\t\t\t\tbreak\n\t\t\t}\n\t\t}\n\n\t\tif n := len(newEntries); n > 0 {\n\t\t\t// Append the new entries\n\t\t\tif err := r.logs.StoreLogs(newEntries); err != nil {\n\t\t\t\tr.logger.Error(\"failed to append to logs\", \"error\", err)\n\t\t\t\t// TODO: leaving r.getLastLog() in the wrong\n\t\t\t\t// state if there was a truncation above\n\t\t\t\treturn\n\t\t\t}\n",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "src7-check-lease",
+        "file": "raft.go",
+        "start_line": 1036,
+        "end_line": 1085,
+        "kind": "code_observation",
+        "text": "func (r *Raft) checkLeaderLease() time.Duration {\n\t// Track contacted nodes, we can always contact ourself\n\tcontacted := 0\n\n\t// Store lease timeout for this one check invocation as we need to refer to it\n\t// in the loop and would be confusing if it ever becomes reloadable and\n\t// changes between iterations below.\n\tleaseTimeout := r.config().LeaderLeaseTimeout\n\n\t// Check each follower\n\tvar maxDiff time.Duration\n\tnow := time.Now()\n\tfor _, server := range r.configurations.latest.Servers {\n\t\tif server.Suffrage == Voter {\n\t\t\tif server.ID == r.localID {\n\t\t\t\tcontacted++\n\t\t\t\tcontinue\n\t\t\t}\n\t\t\tf := r.leaderState.replState[server.ID]\n\t\t\tdiff := now.Sub(f.LastContact())\n\t\t\tif diff <= leaseTimeout {\n\t\t\t\tcontacted++\n\t\t\t\tif diff > maxDiff {\n\t\t\t\t\tmaxDiff = diff\n\t\t\t\t}\n\t\t\t} else {\n\t\t\t\t// Log at least once at high value, then debug. Otherwise it gets very verbose.\n\t\t\t\tif diff <= 3*leaseTimeout {\n\t\t\t\t\tr.logger.Warn(\"failed to contact\", \"server-id\", server.ID, \"time\", diff)\n\t\t\t\t} else {\n\t\t\t\t\tr.logger.Debug(\"failed to contact\", \"server-id\", server.ID, \"time\", diff)\n\t\t\t\t}\n\t\t\t}\n\t\t\tmetrics.AddSample([]string{\"raft\", \"leader\", \"lastContact\"}, float32(diff/time.Millisecond))\n\t\t}\n\t}\n\n\t// Verify we can contact a quorum\n\tquorum := r.quorumSize()\n\tif contacted < quorum {\n\t\tr.logger.Warn(\"failed to contact quorum of nodes, stepping down\")\n\t\tr.setState(Follower)\n\t\tmetrics.IncrCounter([]string{\"raft\", \"transition\", \"leader_lease_timeout\"}, 1)\n\t}\n\treturn maxDiff\n}\n\n// quorumSize is used to return the quorum size. This must only be called on\n// the main thread.\n// TODO: revisit usage",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      }
+    ],
+    "selections": [
+      {
+        "operation_id": "19c98425e4d9482cadcf9bfa3e4f7a85",
+        "action": "explore",
+        "rationale": "Sourced suspicion: appendConfigurationEntry (raft.go:1203-1241) calls dispatchLogs first, then unconditionally executes r.setLatestConfiguration(configuration, index), r.leaderState.commitment.setConfiguration(configuration) and r.startStopReplication(). dispatchLogs (raft.go:1244-1279) assigns applyLog.log.Index before StoreLogs and returns early only on its own error path, so future.Index() is still nonzero and the new configuration is published even though nothing was durably stored. The live configuration is the authority input for quorumSize()/checkLeaderLease() (raft.go:1036-1101), requestVote/requestPreVote admission (raft.go:1603-1813) and the election-start gate in runFollower (raft.go:158-260), so publishing an unpersisted configuration can change the node's own quorum requirement. The harness supplies a transient LogStore.StoreLogs failure at the real boundary (storage failure injection) on an otherwise healthy single-voter cluster that had just committed index 3. Observed (CA_EVENT config_publish_after_failed_durable_write): AddVoter returned the store error; the assigned log index 4 is absent from durable storage (getlog_at_assigned_idx_err=log not found, durable_last_index_after=3, raft_last_index=3); yet the node's published configuration now lists two voters (the real one plus phantom/phantom-addr). Observed (CA_EVENT progress_after_failed_durable_write): after the failure the node never regains leadership over 141 samples/1.5s (state=Candidate, ever_leader_in_window=false) because voters_in_live_configuration=2 sets quorum_size_live=2 while only 1 voter is reachable, so electSelf/preElectSelf can never reach the needed tally. This is conditional evidence: it establishes what the fixed code did for an explicitly supplied transient storage failure; the failure itself is injected, not produced by real producers here. A separate observation from the same run: Raft.GetConfiguration().Index() (api.go:897-906 building configurations{latest:...} without latestIndex, returned by configurationsFuture.Index() in future.go:267-270) reports 0 for this two-voter configuration (config_index_after=0), so the published index of the live authority context is not observable and cannot be used as the prevIndex guard that AddVoter/RemoveServer accept. Unresolved discriminators: whether an equivalent divergence is reachable without storage failure; whether a restart (durable log lacks the entry) is the only recovery path; and the exact set of store-failure timings (pre- vs post-StoreLogs) that produce the divergence.",
+        "feedback": {},
+        "map_updated": false,
+        "map_changes": {},
+        "accepted_versions": {
+          "audit_spec": 0,
+          "graph": 0,
+          "units": {},
+          "artifacts": {}
+        },
+        "candidate_ids": []
+      },
+      {
+        "operation_id": "6374186cdb5b4d49b1371f38c0b5ec70",
+        "action": "rejected",
+        "rationale": "Invalid submitted input path",
+        "candidate_ids": [],
+        "draft_id": "6374186cdb5b4d49b1371f38c0b5ec70",
+        "repair_of": null,
+        "diagnostics": [
+          "Invalid submitted input path"
+        ],
+        "draft_status": "rejected",
+        "raw_path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-10_16-09-15-hashicorp_raft-real-run/submissions/6374186cdb5b4d49b1371f38c0b5ec70/raw.json",
+        "submitted_path": ""
+      },
+      {
+        "operation_id": "fdd6f486a20d42328f017893a1918973",
+        "action": "obligation",
+        "rationale": "Sourced contract violation in the membership/authority transition path. configurations.latest is documented as the latest configuration in the log/snapshot (configuration.go:254-265) and is the sole authority input for the leader's quorum: quorumSize() (raft.go:1086-1094) counts voters from r.configurations.latest, and commitment.setConfiguration (commitment.go:53-64) rebuilds the match-index voter set from the new configuration. appendConfigurationEntry (raft.go:1203-1240) must therefore only install a configuration that exists in the log, but it calls dispatchLogs first and then unconditionally runs setLatestConfiguration / commitment.setConfiguration / startStopReplication. dispatchLogs (raft.go:1244-1283) assigns applyLog.log.Index before StoreLogs and returns after responding the error, so future.Index() is still nonzero when the write failed. A retained clean-copy execution (exploration 19c98425e4d9482cadcf9bfa3e4f7a85) supplied one transient LogStore.StoreLogs failure on a single-voter cluster that had committed index 3 and observed: AddVoter returned the store error; the assigned index 4 is absent from durable storage (durable last index 3, raft last index 3); the published configuration lists a phantom second voter; and the node then never regains leadership over 142 samples (state Candidate, quorum 2, reachable voters 1), i.e. progress stops until restart. This claim is the sourced requirement, not the experiment; the harness and events are retained with the exploration.",
+        "feedback": {},
+        "map_updated": false,
+        "repair_of": "6374186cdb5b4d49b1371f38c0b5ec70",
+        "draft_id": "6374186cdb5b4d49b1371f38c0b5ec70",
+        "draft_status": "accepted",
+        "map_changes": {},
+        "accepted_versions": {
+          "audit_spec": 0,
+          "graph": 1,
+          "units": {
+            "unit-claim-config-publish-requires-durable-append": 1
+          },
+          "artifacts": {}
+        },
+        "candidate_ids": [
+          "0a6d446a083a42cf91e99726f577eaea"
+        ]
+      },
+      {
+        "operation_id": "30772cda6d41434cbdec3fc134685d74",
+        "action": "explore",
+        "rationale": "This exploration reduces the two recorded gaps for candidate 0a6d446a083a42cf91e99726f577eaea. Gap 2 (recovery path), closed by a new in-package Go test run: after a transient LogStore.StoreLogs failure made AddVoter(phantom) install a two-voter latest while the durable log still ends at index 2, the node was shut down and a fresh Raft was constructed from the same durable store and snapshot store. Observed (CA_EVENT restart_after_failed_durable_write): servers_before_restart lists the real voter plus phantom/phantom-addr/Voter, while servers_after_restart lists exactly one voter and became_leader_after=true (commit index 3). So the durable log, not the published configuration, is the recovered truth, and a restart is a working recovery path. The same run also bounded the running-process behaviour: after the failed change the node stayed Candidate with ever_leader_in_window=false over 141 samples because quorum_size_live=2 equals one unreachable voter plus itself (CA_EVENT progress_after_failed_durable_write); source reasoning explains the absence of self-repair, since the only running paths that revert r.configurations.latest to the committed value are the appendEntries truncation branch (raft.go:1530) and installSnapshot (raft.go:1937), and both require a leader while no leader can be elected against an unreachable voter. Gap 1 (no-error reachability), answered as a sourced negative result plus a success-path control: the success control CA_EVENT config_persist_success_control shows AddVoter error <nil>, getlog_at_assigned_idx_err <nil> for the assigned index 4 and durable_last_index_after=4, i.e. the published two-voter configuration has a durable counterpart; that fixes the comparing value (the divergence does not appear when the write succeeds). Enumerating every publishing site shows appendConfigurationEntry (raft.go:1203-1240 -> raft.go:1237) is the only site that can install a configuration absent from the log: appendEntries truncation reverts to the committed configuration (raft.go:1530), processConfigurationLogEntry installs the configuration of an entry that was just stored or read from the log (raft.go:1588-1598), installSnapshot installs the received snapshot's configuration (raft.go:1937), and startup restore installs the snapshot's configuration (api.go:664). No no-error route to the divergence was found. Retained evidence for this exploration is the clean-copy execution the controller associates with the submitted harness; the failure is injected at the real LogStore boundary (explicitly supplied precondition, not produced by real producers), and the phantom voter's unreachability is supplied by the harness's lack of a route to phantom-addr.",
+        "feedback": {},
+        "map_updated": false,
+        "map_changes": {},
+        "accepted_versions": {
+          "audit_spec": 0,
+          "graph": 1,
+          "units": {},
+          "artifacts": {}
+        },
+        "candidate_ids": []
+      },
+      {
+        "operation_id": "b8570f63f6004bfd8e19bc4f762d903a",
+        "action": "rejected",
+        "rationale": "Invalid submitted input path",
+        "candidate_ids": [],
+        "draft_id": "b8570f63f6004bfd8e19bc4f762d903a",
+        "repair_of": null,
+        "diagnostics": [
+          "Invalid submitted input path"
+        ],
+        "draft_status": "rejected",
+        "raw_path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-10_16-09-15-hashicorp_raft-real-run/submissions/b8570f63f6004bfd8e19bc4f762d903a/raw.json",
+        "submitted_path": ""
+      },
+      {
+        "operation_id": "5a22a6babe80452da22d6b9195b4634f",
+        "action": "check",
+        "rationale": "Formal direct check of the accepted unit unit-claim-config-publish-requires-durable-append for obligation claim-config-publish-requires-durable-append. The obligation requires that a configuration installed as configurations.latest must have its entry in the durable log. The plan admits one leader-established operation (assurance_leader_established with alias adm) and one membership-change attempt (assurance_config_change_attempt with alias act), then inspects the result event assurance_config_published emitted for that same operation (identity field node). The property asserts entry_durable is true whenever the configuration was published ahead of a durable entry (trigger published_ahead_of_durable true). The harness bootstraps one voter over an InmemStore whose StoreLogs can be failed on demand at the real LogStore boundary, waits for leadership, emits the two prerequisites, runs AddVoter while exactly one StoreLogs call fails, then reports whether the log index assigned to that change is present in the store; previous clean-copy runs of the same harness observed add_voter_error set, assigned index 4 absent from the store, and the published configuration listing a second voter. Only one failing StoreLogs timing is exercised here, and the failure is an explicitly supplied fault rather than a producer-generated condition; both are recorded as plan uncertainties. The plan and harness are submitted as separate draft files; plan.harness.source and files are intentionally omitted so the controller fixes the harness bytes.",
+        "feedback": {},
+        "map_updated": false,
+        "repair_of": "b8570f63f6004bfd8e19bc4f762d903a",
+        "draft_id": "b8570f63f6004bfd8e19bc4f762d903a",
+        "draft_status": "accepted",
+        "map_changes": {},
+        "accepted_versions": {
+          "audit_spec": 0,
+          "graph": 1,
+          "units": {
+            "unit-claim-config-publish-requires-durable-append": 1
+          },
+          "artifacts": {
+            "3b256fe6f42b4154b75d4d2ec02e27bf": 1
+          }
+        },
+        "candidate_ids": []
+      },
+      {
+        "operation_id": "4c25ca6279ca4285a42c9286256f3a32",
+        "action": "research",
+        "rationale": "Review of direct check artifact 3b256fe6f42b4154b75d4d2ec02e27bf (check 452a068dbfa1488ea15bc730a0f1e7bd, outcome violated) for unit-claim-config-publish-requires-durable-append. The review supplies the required checker_correspondence judgment and answers the three open applicability conditions that the plan, monitor and claim grounding declared, using the same acquired materials and no new execution.",
+        "feedback": {},
+        "map_updated": false,
+        "map_changes": {},
+        "accepted_versions": {
+          "audit_spec": 0,
+          "graph": 1,
+          "units": {
+            "unit-claim-config-publish-requires-durable-append": 1
+          },
+          "artifacts": {}
+        },
+        "candidate_ids": []
+      },
+      {
+        "operation_id": "8a48ec28a24240de8d70659f37c5732a",
+        "action": "research",
+        "rationale": "Sourced feedback on candidate 0a6d446a083a42cf91e99726f577eaea, which now carries a confirmed implementation violation through direct check artifact 3b256fe6f42b4154b75d4d2ec02e27bf (execution 452a068dbfa1488ea15bc730a0f1e7bd) reviewed with checker correspondence no_issue_found. This feedback records what the earlier exploration execution cb2a8bf5289046f9a58098b950a38762 answered about the two recorded candidate unknowns and narrows the candidate to the discriminators that remain open, without removing history.",
+        "feedback": {
+          "ref_ids": [
+            "0a6d446a083a42cf91e99726f577eaea",
+            "cb2a8bf5289046f9a58098b950a38762"
+          ],
+          "answered": "Two recorded unknowns are answered by executed evidence, not by argument. First, the exact recovery path: exploration check cb2a8bf5289046f9a58098b950a38762 recorded restart_after_failed_durable_write, where a node whose published configuration listed the extra voter phantom/phantom-addr/Voter was shut down and rebuilt with NewRaft over the same durable store and snapshot store; after the restart servers_after_restart lists exactly one voter and became_leader_after is true, so the durable log is the recovered truth and a restart is a working recovery path. The same execution also bounds the running process: progress_after_failed_durable_write shows state Candidate with ever_leader_in_window false over 141 samples because the live quorum counts the unreachable voter, and the only running paths that revert latest to the committed value (appendEntries truncation and installSnapshot) require a leader, so nothing in the running process repairs the authority context. Second, whether the divergence is reachable without a LogStore error: the same execution includes the success-path control config_persist_success_control, where AddVoter returns nil, the assigned log index is present in the store and durable_last_index_after matches it, so the published configuration has a durable counterpart whenever the write succeeds; enumerating every setLatestConfiguration call site shows appendConfigurationEntry is the only site that can install a configuration absent from the log, while truncation reverts to the committed configuration and processConfigurationLogEntry and installSnapshot install configurations taken from stored entries or a received snapshot. No no-error route was found.",
+          "remaining": [
+            "Which StoreLogs failure timings (whole-call failure versus partial write, or failure after a log truncation) leave the published configuration and the cached last-log state inconsistent, and whether a follower-side store failure reaches the same divergence"
+          ],
+          "rationale": "The feedback answers the two listed unknowns through exploration check cb2a8bf5289046f9a58098b950a38762 and retains the remaining discriminator rather than dropping the question. It does not alter the confirmed direct check 452a068dbfa1488ea15bc730a0f1e7bd, whose correspondence review is retained. The narrowed unknown is a distinct discriminator: the confirmed check covers one whole-call StoreLogs failure on a leader, while other failure timings and follower-side failures could leave different state (for example the cached last-log index after a truncated suffix) and are not decided by the retained events.",
+          "question_updates": {
+            "0a6d446a083a42cf91e99726f577eaea": {
+              "unknowns": [
+                "Which StoreLogs failure timings (whole-call failure versus partial write, or failure after a log truncation) leave the published configuration and the cached last-log state inconsistent, and whether a follower-side store failure reaches the same divergence"
+              ],
+              "resume_conditions": []
+            }
+          }
+        },
+        "map_updated": false,
+        "map_changes": {},
+        "accepted_versions": {
+          "audit_spec": 0,
+          "graph": 1,
+          "units": {
+            "unit-claim-config-publish-requires-durable-append": 1
+          },
+          "artifacts": {}
+        },
+        "candidate_ids": []
+      },
+      {
+        "operation_id": "20b166fffa95479c8ac9b2f8403ff0e7",
+        "action": "explore",
+        "rationale": "This exploration tests the follower half of the narrowed discriminator on candidate 0a6d446a083a42cf91e99726f577eaea and leaves the leader-side result (confirmed direct check 3b256fe6f42b4154b75d4d2ec02e27bf, execution 452a068dbfa1488ea15bc730a0f1e7bd) untouched. Method: two in-process nodes are bootstrapped with both addresses as voters, their InmemTransports are connected to each other, both Rafts are started, one node is detected as leader, and the follower's LogStore wrapper is set to fail every StoreLogs call while the leader runs a real AddVoter. Observed (CA_EVENT follower_store_failure): the failing follower attempted 8 store writes and all 8 failed (store_log_attempts 8, store_log_failures 8), yet follower_published_phantom is false, follower_servers_after equals follower_servers_before, follower_durable_before and follower_durable_after are both 2 and follower_last_index is 2. That is a bounded negative result for this path, and it matches the source: appendEntries stores the new entries and only then calls processConfigurationLogEntry, so a StoreLogs error returns before any configuration is published and before setLastLog advances the cached last index (src-follower-gate material covers the corresponding runFollower gate; the store call order is in the appendEntries tail of the same test harness reading). Boundaries and what is NOT decided here: this run does not exercise a failure that occurs after a log truncation has already deleted a conflicting suffix, where the same appendEntries path returns before setLastLog and the cached last-log can then be higher than the store content, which is the timing this discriminator still lists; that remainder is a sourced hypothesis, not an observation. The fault is still injected at the real LogStore boundary, and the two-node cluster is in-memory. Reusing the same harness keeps the earlier leader-side events available in the same clean-copy execution, so this submission adds the follower probe without weakening the retained confirmation.",
+        "feedback": {},
+        "map_updated": false,
+        "map_changes": {},
+        "accepted_versions": {
+          "audit_spec": 0,
+          "graph": 1,
+          "units": {},
+          "artifacts": {}
+        },
+        "candidate_ids": []
+      },
+      {
+        "operation_id": "3d679f68abb6461bb6a2651533ca5995",
+        "action": "research",
+        "rationale": "Sourced feedback on candidate 0a6d446a083a42cf91e99726f577eaea recording what exploration check 6c1f4fbd37ad49e79cd922b03259d1fe settled about the narrowed discriminator and what remains. The confirmed leader-side violation (direct check 3b256fe6f42b4154b75d4d2ec02e27bf, execution 452a068dbfa1488ea15bc730a0f1e7bd, correspondence no_issue_found) is unchanged.",
+        "feedback": {
+          "ref_ids": [
+            "0a6d446a083a42cf91e99726f577eaea",
+            "6c1f4fbd37ad49e79cd922b03259d1fe"
+          ],
+          "answered": "The follower half of the discriminator is settled by executed evidence. Exploration check 6c1f4fbd37ad49e79cd922b03259d1fe built a two-node in-process cluster with both addresses as voters and their InmemTransports connected, then failed every StoreLogs call on the detected follower while the leader ran a real AddVoter. Event follower_store_failure reports store_log_attempts 8 and store_log_failures 8, follower_published_phantom false, follower_servers_after equal to follower_servers_before, follower_durable_before and follower_durable_after both 2, and follower_last_index 2. So a follower-side durable failure does not publish the configuration or advance the follower's cached last-log index: appendEntries stores new entries and only reaches processConfigurationLogEntry after a successful StoreLogs, so the failure returns first. This is a bounded negative result and it is specific to the whole-call failure timing that was exercised.",
+          "remaining": [
+            "Whether a StoreLogs failure that happens after appendEntries has already deleted a conflicting log suffix leaves the follower's cached last-log index above its durable content, and what that in turn makes the follower report to a leader"
+          ],
+          "rationale": "The recorded unknown asked which StoreLogs failure timings leave the published configuration and the cached last-log state inconsistent, and whether a follower-side store failure reaches the same divergence. Exploration 6c1f4fbd37ad49e79cd922b03259d1fe answers the follower question for the whole-call timing (no publication, no cached-index advance) while the confirmed direct check already fixes the leader-side result for that timing. What remains is a distinct discriminator: the truncation path in appendEntries deletes a conflicting suffix and then stores the replacement entries in the same call, so a StoreLogs failure there returns before setLastLog; the in-code TODO in the captured source states exactly that the cached last log is left in the wrong state if there was a truncation above. That timing is not exercised by any retained execution, so it stays an open sourced hypothesis rather than being folded into the confirmed finding.",
+          "question_updates": {
+            "0a6d446a083a42cf91e99726f577eaea": {
+              "unknowns": [
+                "Whether a StoreLogs failure that happens after appendEntries has already deleted a conflicting log suffix leaves the follower's cached last-log index above its durable content, and what that in turn makes the follower report to a leader"
+              ],
+              "resume_conditions": []
+            }
+          }
+        },
+        "map_updated": false,
+        "map_changes": {},
+        "accepted_versions": {
+          "audit_spec": 0,
+          "graph": 1,
+          "units": {
+            "unit-claim-config-publish-requires-durable-append": 1
+          },
+          "artifacts": {}
+        },
+        "candidate_ids": []
+      },
+      {
+        "operation_id": "e4239ee8f2e5442db3dbf8f7ce993276",
+        "action": "explore",
+        "rationale": "Conditional probe of the last open timing. Method: one bootstrapped voter is driven through real calls (leader election, then two Apply calls) so its log holds indices 1 to 4 with index 1 the configuration entry and term T for 2 to 4; the harness then delivers one AppendEntries for a different leader in term T+5 whose PrevLogEntry is 1 with matching term and whose entries conflict at indices 2, 3 and 4, while the node's LogStore wrapper fails every StoreLogs call. This is a direct handler invocation (r.appendEntries), so it bypasses the transport, checkRPCHeader and main-loop serialization, and the peer leader identity and higher term are supplied rather than produced by an election; the handler, the log store, the truncation path and the terms are the fixed target code. Observed (CA_EVENT truncation_then_store_failure): durable_last_index_before is 4 and durable_last_index_after is 1, because the conflicting suffix was deleted before the write, while cached_last_index_after stays 4, reported_last_index (Raft.LastIndex) is 4, getlog_at_cached_err is log not found, append_success is false and cached_ahead_of_durable is true. So after a truncation whose replacement write fails, the node both caches and reports a last-log index whose entry no longer exists in durable storage, which is exactly the state the in-code TODO at raft.go:1536-1545 describes. This answers the discriminator with a conditional observation on the fixed code and does not by itself establish a full protocol history, since the conflicting AppendEntries was supplied rather than produced; a protocol-level version would need a second leader in a higher term to be elected through real producers. The confirmed leader-side violation (direct check 3b256fe6f42b4154b75d4d2ec02e27bf) and the follower negative result (exploration 6c1f4fbd37ad49e79cd922b03259d1fe) are unchanged.",
+        "feedback": {},
+        "map_updated": false,
+        "map_changes": {},
+        "accepted_versions": {
+          "audit_spec": 0,
+          "graph": 1,
+          "units": {},
+          "artifacts": {}
+        },
+        "candidate_ids": []
+      },
+      {
+        "operation_id": "87694961bf0c473693b0107b4e85d201",
+        "action": "research",
+        "rationale": "Final sourced feedback on candidate 0a6d446a083a42cf91e99726f577eaea recording the executed answer to its last open discriminator from exploration check b1b1d3fba8164059b25bbefb147d3fdb, and retaining the one boundary that prevents that conditional observation from being promoted to a protocol history. The confirmed leader-side violation (direct check 3b256fe6f42b4154b75d4d2ec02e27bf, execution 452a068dbfa1488ea15bc730a0f1e7bd, correspondence no_issue_found) and the follower negative result (exploration 6c1f4fbd37ad49e79cd922b03259d1fe) are unchanged.",
+        "feedback": {
+          "ref_ids": [
+            "0a6d446a083a42cf91e99726f577eaea",
+            "b1b1d3fba8164059b25bbefb147d3fdb"
+          ],
+          "answered": "The last discriminator is answered conditionally by executed evidence. Exploration check b1b1d3fba8164059b25bbefb147d3fdb drove a bootstrapped voter through real calls so its log held indices 1 to 4, then delivered one AppendEntries for a different leader in a higher term whose entries conflicted at indices 2 to 4 while every StoreLogs call failed. Event truncation_then_store_failure reports durable_last_index_before 4 and durable_last_index_after 1, because the conflicting suffix was deleted before the write, while cached_last_index_after stays 4, reported_last_index is 4, getlog_at_cached_err is log not found and cached_ahead_of_durable is true. So the timing does leave the cached and reported last-log index above durable content, exactly the state the in-code TODO in raft.go:1536-1545 describes, and it complements the earlier results: the leader-side failure publishes an unpersisted configuration, the follower-side whole-call failure does neither, and the truncation timing leaves the cached last-log stale.",
+          "remaining": [
+            "Whether a conflicting AppendEntries suffix followed by a failed replacement write can be produced by real producers, that is by a second leader elected in a higher term, rather than by supplying the conflicting request directly to the handler"
+          ],
+          "rationale": "The exploration used a direct handler invocation, which bypasses the transport, the RPC header check and main-loop serialization, and supplied the higher-term conflicting request instead of electing a second leader; the handler, log store, truncation branch and term bookkeeping are the fixed target code. That boundary is why the observation is retained as conditional rather than promoted to a protocol violation. Recording it as the single remaining unknown preserves the result, keeps the confirmed-leader-side finding and the follower negative result visible, and states precisely what a successor would need to produce through real producers. No other unknowns are dropped and no counterevidence is removed.",
+          "question_updates": {
+            "0a6d446a083a42cf91e99726f577eaea": {
+              "unknowns": [
+                "Whether a conflicting AppendEntries suffix followed by a failed replacement write can be produced by real producers, that is by a second leader elected in a higher term, rather than by supplying the conflicting request directly to the handler"
+              ],
+              "resume_conditions": []
+            }
+          }
+        },
+        "map_updated": false,
+        "map_changes": {},
+        "accepted_versions": {
+          "audit_spec": 0,
+          "graph": 1,
+          "units": {
+            "unit-claim-config-publish-requires-durable-append": 1
+          },
+          "artifacts": {}
+        },
+        "candidate_ids": []
+      },
+      {
+        "operation_id": "6540303ae7784155884d524404262559",
+        "action": "continue",
+        "rationale": "Keeping candidate 0a6d446a083a42cf91e99726f577eaea active at the end of the available run time, with its remaining discriminator retained rather than resolved by assertion. Current state of the investigation: the obligation claim-config-publish-requires-durable-append is a confirmed implementation violation through direct check 3b256fe6f42b4154b75d4d2ec02e27bf (execution 452a068dbfa1488ea15bc730a0f1e7bd, checker correspondence no_issue_found, outcome violated), where a leader that received a LogStore.StoreLogs error for a membership-change entry still published the configuration as configurations.latest even though the assigned log index was absent from durable storage, and where the node then could not regain leadership because its live quorum counted the unreachable voter. Exploration 6c1f4fbd37ad49e79cd922b03259d1fe added the follower-side negative result: with every StoreLogs call failing on a follower of a real two-node replication path, the follower neither published the configuration nor advanced its cached last-log index. Exploration b1b1d3fba8164059b25bbefb147d3fdb answered the truncation timing conditionally: after a conflicting suffix was deleted and the replacement write failed, durable_last_index fell to 1 while the cached and reported last index stayed 4 with the entry absent from the store. The one open unknown is therefore exactly the boundary that needs a successor: whether that conflicting-suffix-then-failed-write history can be produced by real producers, that is by a second leader elected in a higher term, instead of by supplying the conflicting AppendEntries directly to the handler. That successor would need a multi-node cluster in which one node accumulates uncommitted entries while isolated, a different leader is elected and appends at those indices, and the isolated node's store fails only during the replication that overwrites the suffix. Keeping the candidate active preserves the confirmed finding, the negative result, the conditional truncation evidence, and the stated boundary together, so the remaining work is visible and no result is overstated at run end.",
+        "feedback": {},
+        "map_updated": false,
+        "map_changes": {},
+        "accepted_versions": {
+          "audit_spec": 0,
+          "graph": 1,
+          "units": {},
+          "artifacts": {}
+        },
+        "candidate_ids": [
+          "0a6d446a083a42cf91e99726f577eaea"
+        ]
+      },
+      {
+        "operation_id": "6dda33bc425048a2850edce8446cead9",
+        "action": "explore",
+        "rationale": "This exploration closes the last open discriminator of candidate 0a6d446a083a42cf91e99726f577eaea using only real producers and controlled connectivity. Method: three in-process voters are bootstrapped with a three-voter configuration and fully connected transports; a leader is elected; that leader is then isolated from the other two in both directions, and it issues three Apply calls, which dispatchLogs stores in its own log while replication cannot reach a quorum, so those entries stay uncommitted; the leader's own lease then expires and it steps down. The two remaining voters elect a new leader in a higher term, which commits a new entry. The isolated node's LogStore is then set to fail StoreLogs, both transports are reconnected, and the new leader overwrites the old suffix at those indices. Observed (CA_EVENT real_producer_truncation): state Follower, isolated_cached_last_index 4, cached_last_index_after 5, durable_last_index_after 2, reported_last_index 5, getlog_at_cached_err log not found and cached_ahead_of_durable true, so the node's cached and reported last-log index sits above durable content after a suffix was deleted and the replacement write failed. Unlike the previous conditional probe, the conflicting suffix, the higher term and the overwriting entries were all produced by elections and client calls through the real transports; only the connectivity changes and the single injected StoreLogs failure are supplied, which is exactly the storage-failure boundary the obligation scope admits. Boundary retained: the run is in-process and in-memory, the injected failure is a whole-call failure, and the durable-state divergence of the last-log cache is a distinct observation from the confirmed published-configuration violation, so it is reported as its own result rather than folded into that finding. The confirmed direct check 3b256fe6f42b4154b75d4d2ec02e27bf remains unchanged.",
+        "feedback": {},
+        "map_updated": false,
+        "map_changes": {},
+        "accepted_versions": {
+          "audit_spec": 0,
+          "graph": 1,
+          "units": {},
+          "artifacts": {}
+        },
+        "candidate_ids": []
+      }
+    ],
+    "applied_operations": {
+      "submission-19c98425e4d9482cadcf9bfa3e4f7a85": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-10_16-09-15-hashicorp_raft-real-run/graph-commits/submission-19c98425e4d9482cadcf9bfa3e4f7a85.json"
+      },
+      "submission-fdd6f486a20d42328f017893a1918973": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-10_16-09-15-hashicorp_raft-real-run/graph-commits/submission-fdd6f486a20d42328f017893a1918973.json"
+      },
+      "submission-30772cda6d41434cbdec3fc134685d74": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-10_16-09-15-hashicorp_raft-real-run/graph-commits/submission-30772cda6d41434cbdec3fc134685d74.json"
+      },
+      "submission-5a22a6babe80452da22d6b9195b4634f": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-10_16-09-15-hashicorp_raft-real-run/graph-commits/submission-5a22a6babe80452da22d6b9195b4634f.json"
+      },
+      "submission-4c25ca6279ca4285a42c9286256f3a32": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-10_16-09-15-hashicorp_raft-real-run/graph-commits/submission-4c25ca6279ca4285a42c9286256f3a32.json"
+      },
+      "submission-8a48ec28a24240de8d70659f37c5732a": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-10_16-09-15-hashicorp_raft-real-run/graph-commits/submission-8a48ec28a24240de8d70659f37c5732a.json"
+      },
+      "submission-20b166fffa95479c8ac9b2f8403ff0e7": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-10_16-09-15-hashicorp_raft-real-run/graph-commits/submission-20b166fffa95479c8ac9b2f8403ff0e7.json"
+      },
+      "submission-3d679f68abb6461bb6a2651533ca5995": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-10_16-09-15-hashicorp_raft-real-run/graph-commits/submission-3d679f68abb6461bb6a2651533ca5995.json"
+      },
+      "submission-e4239ee8f2e5442db3dbf8f7ce993276": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-10_16-09-15-hashicorp_raft-real-run/graph-commits/submission-e4239ee8f2e5442db3dbf8f7ce993276.json"
+      },
+      "submission-87694961bf0c473693b0107b4e85d201": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-10_16-09-15-hashicorp_raft-real-run/graph-commits/submission-87694961bf0c473693b0107b4e85d201.json"
+      },
+      "submission-6540303ae7784155884d524404262559": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-10_16-09-15-hashicorp_raft-real-run/graph-commits/submission-6540303ae7784155884d524404262559.json"
+      },
+      "submission-6dda33bc425048a2850edce8446cead9": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-10_16-09-15-hashicorp_raft-real-run/graph-commits/submission-6dda33bc425048a2850edce8446cead9.json"
+      }
+    }
+  }
+}

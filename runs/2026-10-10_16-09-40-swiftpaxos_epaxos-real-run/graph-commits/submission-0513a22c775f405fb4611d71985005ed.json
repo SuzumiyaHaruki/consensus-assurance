@@ -1,0 +1,228 @@
+{
+  "input": {
+    "rationale": "Source shows handlePrepare exports inst.vbal and handlePrepareReply selects values by VBallot, but PrepareReply Marshal/Unmarshal omit that field. The probe produces instance contents through handlePropose, serialized PreAccept, handlePreAccept, startRecoveryForInstance and serialized Prepare before decoding the actual reply bytes. Empty bounded replica containers reproduce relevant initialization but bypass constructors, startup, dispatch, timers and execution workers; recovery is explicitly invoked rather than timer-triggered. This is a local producer/transport exploration, not a claim of quorum formation, application, safety failure or infinite stall. A later cluster consequence requires a compatible schedule and actual decision/application endpoint; recovery also relabels its local self reply with the new ballot, which may independently affect selection and must not be attributed to codec loss.",
+    "sources": [
+      {
+        "id": "reply_codec",
+        "file": "epaxos/defs.go",
+        "start_line": 153,
+        "end_line": 252,
+        "kind": "code_observation"
+      },
+      {
+        "id": "reply_fields",
+        "file": "epaxos/defs.go",
+        "start_line": 20,
+        "end_line": 30,
+        "kind": "code_observation"
+      },
+      {
+        "id": "proposal_producer",
+        "file": "epaxos/epaxos.go",
+        "start_line": 724,
+        "end_line": 845,
+        "kind": "code_observation"
+      },
+      {
+        "id": "recovery_producer_consumer",
+        "file": "epaxos/epaxos.go",
+        "start_line": 1127,
+        "end_line": 1314,
+        "kind": "code_observation"
+      },
+      {
+        "id": "initialization",
+        "file": "epaxos/epaxos.go",
+        "start_line": 134,
+        "end_line": 196,
+        "kind": "code_observation"
+      },
+      {
+        "id": "ballot_send",
+        "file": "epaxos/epaxos.go",
+        "start_line": 435,
+        "end_line": 526,
+        "kind": "code_observation"
+      },
+      {
+        "id": "transport_send",
+        "file": "replica/replica.go",
+        "start_line": 215,
+        "end_line": 227,
+        "kind": "code_observation"
+      },
+      {
+        "id": "transport_receive",
+        "file": "replica/replica.go",
+        "start_line": 451,
+        "end_line": 462,
+        "kind": "code_observation"
+      },
+      {
+        "id": "base_initialization",
+        "file": "replica/replica.go",
+        "start_line": 66,
+        "end_line": 125,
+        "kind": "code_observation"
+      }
+    ],
+    "feedback": null,
+    "review": null,
+    "map_path": null,
+    "map_changes": {},
+    "repair_of": null,
+    "action": "explore",
+    "question": "Does an actual PrepareReply produced after a nonzero initial-ballot PreAccept preserve its accepted-value ballot through SendMsg and the receiver codec?",
+    "harness_path": "probe_test.go",
+    "execution_package": null,
+    "files": {}
+  },
+  "before": {
+    "current_submission": {
+      "phase": "received",
+      "operation_id": "0513a22c775f405fb4611d71985005ed",
+      "result": {
+        "submission": "submission.json",
+        "summary": "Prepared a validated exploration draft for apparent PrepareReply value-ballot loss during serialization, using actual producer handlers. Retained execution is pending; no protocol safety or liveness violation is claimed."
+      },
+      "status": "completed",
+      "reason": "",
+      "session_unavailable": false
+    },
+    "materials": [],
+    "selections": [],
+    "applied_operations": {}
+  },
+  "after": {
+    "current_submission": {
+      "phase": "accepted",
+      "operation_id": "0513a22c775f405fb4611d71985005ed",
+      "action": "explore",
+      "harness_filename": "epaxos/assurance_generated_test.go",
+      "harness": {
+        "execution_package": "./epaxos",
+        "files": {},
+        "kind": "go_test",
+        "source": "package epaxos\n\nimport (\n    \"bufio\"\n    \"bytes\"\n    \"encoding/json\"\n    \"fmt\"\n    \"reflect\"\n    \"testing\"\n\n    \"github.com/imdea-software/swiftpaxos/dlog\"\n    \"github.com/imdea-software/swiftpaxos/replica\"\n    \"github.com/imdea-software/swiftpaxos/replica/defs\"\n    fastrpc \"github.com/imdea-software/swiftpaxos/rpc\"\n    \"github.com/imdea-software/swiftpaxos/state\"\n)\n\n// This probe uses constructor-equivalent empty protocol containers of bounded\n// size. It bypasses network startup, the event loop, timers and execution workers.\n// All instance contents after initialization are produced by actual handlers.\nfunc assuranceEmptyReplica(id int32) (*Replica, []*bytes.Buffer) {\n    const n = 3\n    base := &replica.Replica{\n        Logger: dlog.New(\"\", false), N: n, F: 1, Id: id, Thrifty: true,\n        PeerWriters: make([]*bufio.Writer, n), Alive: []bool{true,true,true},\n        PreferredPeerOrder: []int32{(id+1)%n, (id+2)%n, id},\n        Stats: &defs.Stats{M: make(map[string]int)},\n        ProposeChan: make(chan *defs.GPropose, 1),\n    }\n    r := &Replica{Replica: base, InstanceSpace: make([][]*Instance,n),\n        crtInstance: []int32{-1,-1,-1}, CommittedUpTo: []int32{-1,-1,-1},\n        ExecedUpTo: []int32{-1,-1,-1}, conflicts: make([]map[state.Key]*InstPair,n),\n        maxSeqPerKey: make(map[state.Key]int32), maxRecvBallot: -1,\n        latestCPInstance: -1, prepareRPC: 10, prepareReplyRPC: 11,\n        preAcceptRPC: 12, preAcceptReplyRPC: 13,\n    }\n    wires := make([]*bytes.Buffer,n)\n    for i:=0;i<n;i++ {\n        r.InstanceSpace[i] = make([]*Instance,4)\n        r.conflicts[i] = make(map[state.Key]*InstPair)\n        wires[i] = new(bytes.Buffer)\n        base.PeerWriters[i] = bufio.NewWriter(wires[i])\n    }\n    return r,wires\n}\n\nfunc assuranceDecode(t *testing.T, wire *bytes.Buffer, code byte, dst fastrpc.Serializable) {\n    t.Helper()\n    got,err:=wire.ReadByte()\n    if err!=nil || got!=code { t.Fatalf(\"RPC code got %d, err %v; want %d\",got,err,code) }\n    if err:=dst.Unmarshal(wire);err!=nil { t.Fatal(err) }\n    if wire.Len()!=0 { t.Fatalf(\"unexpected trailing bytes: %d\",wire.Len()) }\n}\n\nfunc TestAssurancePrepareReplyProducerTransport(t *testing.T) {\n    owner, ow := assuranceEmptyReplica(1)\n    acceptor, aw := assuranceEmptyReplica(2)\n    recoverer, rw := assuranceEmptyReplica(0)\n    proposal := &defs.GPropose{Propose: &defs.Propose{CommandId: 71,ClientId: 9,\n        Command: state.Command{Op: state.PUT,K: 17,V: state.Value(\"payload\")}}}\n    owner.handlePropose(proposal)\n    pa := new(PreAccept)\n    assuranceDecode(t,ow[2],owner.preAcceptRPC,pa)\n    acceptor.handlePreAccept(pa)\n    // Keep the actual PreAcceptReply pending; no quorum or commit is asserted.\n    before := acceptor.InstanceSpace[1][0]\n    acceptedValueBallot := before.vbal\n    if acceptedValueBallot!=1 || before.Status!=PREACCEPTED_EQ { t.Fatal(\"preaccept prefix not reached\") }\n    recoverer.startRecoveryForInstance(1,0)\n    prep := new(Prepare)\n    assuranceDecode(t,rw[2],recoverer.prepareRPC,prep)\n    acceptor.handlePrepare(prep)\n    // This is the actual handlePrepare -> replyPrepare -> SendMsg byte stream.\n    reply := new(PrepareReply).New().(*PrepareReply)\n    assuranceDecode(t,aw[0],acceptor.prepareReplyRPC,reply)\n    inst := acceptor.InstanceSpace[1][0]\n    identityOK := reply.AcceptorId==2 && reply.Replica==1 && reply.Instance==0\n    otherFieldsOK := reply.Ballot==inst.bal && reply.Status==inst.Status && reply.Seq==inst.Seq &&\n        reflect.DeepEqual(reply.Command,inst.Cmds) && reflect.DeepEqual(reply.Deps,inst.Deps)\n    event := map[string]any{\n        \"kind\":\"prepare_reply_transport\", \"operation_id\":\"client9-command71-instance1.0\",\n        \"preaccept_ballot\":pa.Ballot,\"prepare_ballot\":prep.Ballot,\n        \"producer_vballot_before_prepare\":acceptedValueBallot,\"producer_vballot_after_prepare\":inst.vbal,\n        \"decoded_vballot\":reply.VBallot,\"identity_preserved\":identityOK,\n        \"other_fields_preserved\":otherFieldsOK,\"value_ballot_preserved\":reply.VBallot==inst.vbal,\n        \"producer_status\":inst.Status,\"decoded_status\":reply.Status,\n    }\n    data,err:=json.Marshal(event);if err!=nil { t.Fatal(err) }\n    fmt.Println(\"CA_EVENT \"+string(data))\n    if !identityOK || !otherFieldsOK { t.Fatal(\"probe correlation or other fields failed\") }\n    // This exploration reports the measured comparison without a formal verdict.\n}\n",
+        "description": "Does an actual PrepareReply produced after a nonzero initial-ballot PreAccept preserve its accepted-value ballot through SendMsg and the receiver codec?",
+        "semantic_changes": [],
+        "prerequisites": [],
+        "legality": {
+          "source_ids": [],
+          "expectation_ids": [],
+          "binding_ids": [],
+          "derivation": "",
+          "applicability": "",
+          "unresolved": [],
+          "conflicts": [],
+          "alternatives": []
+        }
+      }
+    },
+    "materials": [
+      {
+        "id": "reply_codec",
+        "file": "epaxos/defs.go",
+        "start_line": 153,
+        "end_line": 252,
+        "kind": "code_observation",
+        "text": "func (t *PrepareReply) Marshal(wire io.Writer) {\n\tvar b [18]byte\n\tvar bs []byte\n\tbs = b[:17]\n\ttmp32 := t.AcceptorId\n\tbs[0] = byte(tmp32)\n\tbs[1] = byte(tmp32 >> 8)\n\tbs[2] = byte(tmp32 >> 16)\n\tbs[3] = byte(tmp32 >> 24)\n\ttmp32 = t.Replica\n\tbs[4] = byte(tmp32)\n\tbs[5] = byte(tmp32 >> 8)\n\tbs[6] = byte(tmp32 >> 16)\n\tbs[7] = byte(tmp32 >> 24)\n\ttmp32 = t.Instance\n\tbs[8] = byte(tmp32)\n\tbs[9] = byte(tmp32 >> 8)\n\tbs[10] = byte(tmp32 >> 16)\n\tbs[11] = byte(tmp32 >> 24)\n\ttmp32 = t.Ballot\n\tbs[12] = byte(tmp32)\n\tbs[13] = byte(tmp32 >> 8)\n\tbs[14] = byte(tmp32 >> 16)\n\tbs[15] = byte(tmp32 >> 24)\n\tbs[16] = byte(t.Status)\n\twire.Write(bs)\n\tbs = b[:]\n\talen1 := int64(len(t.Command))\n\tif wlen := binary.PutVarint(bs, alen1); wlen >= 0 {\n\t\twire.Write(b[0:wlen])\n\t}\n\tfor i := int64(0); i < alen1; i++ {\n\t\tt.Command[i].Marshal(wire)\n\t}\n\tbs = b[:4]\n\ttmp32 = t.Seq\n\tbs[0] = byte(tmp32)\n\tbs[1] = byte(tmp32 >> 8)\n\tbs[2] = byte(tmp32 >> 16)\n\tbs[3] = byte(tmp32 >> 24)\n\twire.Write(bs)\n\tbs = b[:]\n\talen2 := int64(len(t.Deps))\n\tif wlen := binary.PutVarint(bs, alen2); wlen >= 0 {\n\t\twire.Write(b[0:wlen])\n\t}\n\tfor i := int64(0); i < alen2; i++ {\n\t\tbs = b[:4]\n\t\ttmp32 = t.Deps[i]\n\t\tbs[0] = byte(tmp32)\n\t\tbs[1] = byte(tmp32 >> 8)\n\t\tbs[2] = byte(tmp32 >> 16)\n\t\tbs[3] = byte(tmp32 >> 24)\n\t\twire.Write(bs)\n\t}\n}\n\nfunc (t *PrepareReply) Unmarshal(rr io.Reader) error {\n\tvar wire byteReader\n\tvar ok bool\n\tif wire, ok = rr.(byteReader); !ok {\n\t\twire = bufio.NewReader(rr)\n\t}\n\tvar b [17]byte\n\tvar bs []byte\n\tbs = b[:17]\n\tif _, err := io.ReadAtLeast(wire, bs, 17); err != nil {\n\t\treturn err\n\t}\n\tt.AcceptorId = int32((uint32(bs[0]) | (uint32(bs[1]) << 8) | (uint32(bs[2]) << 16) | (uint32(bs[3]) << 24)))\n\tt.Replica = int32((uint32(bs[4]) | (uint32(bs[5]) << 8) | (uint32(bs[6]) << 16) | (uint32(bs[7]) << 24)))\n\tt.Instance = int32((uint32(bs[8]) | (uint32(bs[9]) << 8) | (uint32(bs[10]) << 16) | (uint32(bs[11]) << 24)))\n\tt.Ballot = int32((uint32(bs[12]) | (uint32(bs[13]) << 8) | (uint32(bs[14]) << 16) | (uint32(bs[15]) << 24)))\n\tt.Status = int8(bs[16])\n\talen1, err := binary.ReadVarint(wire)\n\tif err != nil {\n\t\treturn err\n\t}\n\tt.Command = make([]state.Command, alen1)\n\tfor i := int64(0); i < alen1; i++ {\n\t\tt.Command[i].Unmarshal(wire)\n\t}\n\tbs = b[:4]\n\tif _, err := io.ReadAtLeast(wire, bs, 4); err != nil {\n\t\treturn err\n\t}\n\tt.Seq = int32((uint32(bs[0]) | (uint32(bs[1]) << 8) | (uint32(bs[2]) << 16) | (uint32(bs[3]) << 24)))\n\talen2, err := binary.ReadVarint(wire)\n\tif err != nil {\n\t\treturn err\n\t}\n\tt.Deps = make([]int32, alen2)\n\tfor i := int64(0); i < alen2; i++ {\n\t\tif _, err := io.ReadAtLeast(wire, bs, 4); err != nil {\n\t\t\treturn err\n\t\t}\n\t\tt.Deps[i] = int32((uint32(bs[0]) | (uint32(bs[1]) << 8) | (uint32(bs[2]) << 16) | (uint32(bs[3]) << 24)))\n\t}\n\treturn nil\n}",
+        "content_digest": "b700aebe3189db692d63ad081450d4b790ecb6846675d6b84dd2c925fe31dceb"
+      },
+      {
+        "id": "reply_fields",
+        "file": "epaxos/defs.go",
+        "start_line": 20,
+        "end_line": 30,
+        "kind": "code_observation",
+        "text": "type PrepareReply struct {\n\tAcceptorId int32\n\tReplica    int32\n\tInstance   int32\n\tBallot     int32\n\tVBallot    int32\n\tStatus     int8\n\tCommand    []state.Command\n\tSeq        int32\n\tDeps       []int32\n}",
+        "content_digest": "b700aebe3189db692d63ad081450d4b790ecb6846675d6b84dd2c925fe31dceb"
+      },
+      {
+        "id": "proposal_producer",
+        "file": "epaxos/epaxos.go",
+        "start_line": 724,
+        "end_line": 845,
+        "kind": "code_observation",
+        "text": "func (r *Replica) handlePropose(propose *defs.GPropose) {\n\t//TODO!! Handle client retries\n\n\tbatchSize := len(r.ProposeChan) + 1\n\tr.M.Lock()\n\tr.Stats.M[\"totalBatching\"]++\n\tr.Stats.M[\"totalBatchingSize\"] += batchSize\n\tr.M.Unlock()\n\n\tr.crtInstance[r.Id]++\n\n\tcmds := make([]state.Command, batchSize)\n\tproposals := make([]*defs.GPropose, batchSize)\n\tcmds[0] = propose.Command\n\tproposals[0] = propose\n\tfor i := 1; i < batchSize; i++ {\n\t\tprop := <-r.ProposeChan\n\t\tcmds[i] = prop.Command\n\t\tproposals[i] = prop\n\t}\n\n\tr.startPhase1(cmds, r.Id, r.crtInstance[r.Id], r.Id, proposals)\n\n\tcpcounter += len(cmds)\n\n}\n\nfunc (r *Replica) startPhase1(cmds []state.Command, replica int32, instance int32, ballot int32, proposals []*defs.GPropose) {\n\t// init command attributes\n\tseq := int32(0)\n\tdeps := make([]int32, r.N)\n\tfor q := 0; q < r.N; q++ {\n\t\tdeps[q] = -1\n\t}\n\tseq, deps, _ = r.updateAttributes(cmds, seq, deps, replica, instance)\n\tcomDeps := make([]int32, r.N)\n\tfor i := 0; i < r.N; i++ {\n\t\tcomDeps[i] = -1\n\t}\n\n\tinst := r.newInstance(replica, instance, cmds, ballot, ballot, PREACCEPTED, seq, deps)\n\tinst.lb = r.newLeaderBookkeeping(proposals, deps, comDeps, deps, ballot, cmds, PREACCEPTED, -1)\n\tr.InstanceSpace[replica][instance] = inst\n\n\tr.updateConflicts(cmds, replica, instance, seq)\n\n\tif seq >= r.maxSeq {\n\t\tr.maxSeq = seq\n\t}\n\n\tr.recordInstanceMetadata(r.InstanceSpace[r.Id][instance])\n\tr.recordCommands(cmds)\n\tr.sync()\n\n\tr.bcastPreAccept(replica, instance)\n}\n\nfunc (r *Replica) handlePreAccept(preAccept *PreAccept) {\n\tinst := r.InstanceSpace[preAccept.Replica][preAccept.Instance]\n\n\tif preAccept.Seq >= r.maxSeq {\n\t\tr.maxSeq = preAccept.Seq + 1\n\t}\n\n\tif preAccept.Ballot > r.maxRecvBallot {\n\t\tr.maxRecvBallot = preAccept.Ballot\n\t}\n\n\tif preAccept.Instance > r.crtInstance[preAccept.Replica] {\n\t\tr.crtInstance[preAccept.Replica] = preAccept.Instance\n\t}\n\n\tif inst == nil {\n\t\tinst = r.newInstanceDefault(preAccept.Replica, preAccept.Instance)\n\t\tr.InstanceSpace[preAccept.Replica][preAccept.Instance] = inst\n\t}\n\n\tif inst != nil && preAccept.Ballot < inst.bal {\n\t\treturn\n\t}\n\n\tinst.bal = preAccept.Ballot\n\n\tif inst.Status >= ACCEPTED {\n\t\tif inst.Cmds == nil {\n\t\t\tr.InstanceSpace[preAccept.LeaderId][preAccept.Instance].Cmds = preAccept.Command\n\t\t\tr.updateConflicts(preAccept.Command, preAccept.Replica, preAccept.Instance, preAccept.Seq)\n\t\t\tr.recordCommands(preAccept.Command)\n\t\t\tr.sync()\n\t\t}\n\n\t} else {\n\t\tseq, deps, changed := r.updateAttributes(preAccept.Command, preAccept.Seq, preAccept.Deps, preAccept.Replica, preAccept.Instance)\n\t\tstatus := PREACCEPTED_EQ\n\t\tif changed {\n\t\t\tstatus = PREACCEPTED\n\t\t}\n\t\tinst.Cmds = preAccept.Command\n\t\tinst.Seq = seq\n\t\tinst.Deps = deps\n\t\tinst.bal = preAccept.Ballot\n\t\tinst.vbal = preAccept.Ballot\n\t\tinst.Status = status\n\n\t\tr.updateConflicts(preAccept.Command, preAccept.Replica, preAccept.Instance, preAccept.Seq)\n\t\tr.recordInstanceMetadata(r.InstanceSpace[preAccept.Replica][preAccept.Instance])\n\t\tr.recordCommands(preAccept.Command)\n\t\tr.sync()\n\n\t}\n\n\treply := &PreAcceptReply{\n\t\tpreAccept.Replica,\n\t\tpreAccept.Instance,\n\t\tinst.bal,\n\t\tinst.vbal,\n\t\tinst.Seq,\n\t\tinst.Deps,\n\t\tr.CommittedUpTo,\n\t\tinst.Status}\n\tr.replyPreAccept(preAccept.LeaderId, reply)\n}",
+        "content_digest": "9a50f418cb729388df24817712b2172b4a77fc6eb3f5b9fdfb8189e422b623cf"
+      },
+      {
+        "id": "recovery_producer_consumer",
+        "file": "epaxos/epaxos.go",
+        "start_line": 1127,
+        "end_line": 1314,
+        "kind": "code_observation",
+        "text": "func (r *Replica) startRecoveryForInstance(replica int32, instance int32) {\n\tinst := r.InstanceSpace[replica][instance]\n\tif inst == nil {\n\t\tinst = r.newInstanceDefault(replica, instance)\n\t\tr.InstanceSpace[replica][instance] = inst\n\t} else if inst.Status >= COMMITTED && inst.Cmds != nil {\n\t\tr.Printf(\"No need to recover %d.%d\", replica, instance)\n\t\treturn\n\t}\n\n\t// no TLA guidance here (some difference with the original implementation)\n\tvar proposals []*defs.GPropose = nil\n\tif inst.lb != nil {\n\t\tproposals = inst.lb.clientProposals\n\t}\n\tinst.lb = r.newLeaderBookkeepingDefault()\n\tlb := inst.lb\n\tlb.clientProposals = proposals\n\tlb.ballot = inst.vbal\n\tlb.seq = inst.Seq\n\tlb.cmds = inst.Cmds\n\tlb.deps = inst.Deps\n\tlb.status = inst.Status\n\tr.makeBallot(replica, instance)\n\n\tinst.bal = lb.lastTriedBallot\n\tinst.vbal = lb.lastTriedBallot\n\tpreply := &PrepareReply{\n\t\tr.Id,\n\t\treplica,\n\t\tinstance,\n\t\tinst.bal,\n\t\tinst.vbal,\n\t\tinst.Status,\n\t\tinst.Cmds,\n\t\tinst.Seq,\n\t\tinst.Deps}\n\n\tlb.prepareReplies = append(lb.prepareReplies, preply)\n\tlb.leaderResponded = r.Id == replica\n\n\tr.bcastPrepare(replica, instance)\n}\n\nfunc (r *Replica) handlePrepare(prepare *Prepare) {\n\tinst := r.InstanceSpace[prepare.Replica][prepare.Instance]\n\tvar preply *PrepareReply\n\n\tif prepare.Ballot > r.maxRecvBallot {\n\t\tr.maxRecvBallot = prepare.Ballot\n\t}\n\n\tif inst == nil {\n\t\tr.InstanceSpace[prepare.Replica][prepare.Instance] = r.newInstanceDefault(prepare.Replica, prepare.Instance)\n\t\tinst = r.InstanceSpace[prepare.Replica][prepare.Instance]\n\t}\n\n\tif prepare.Ballot < inst.bal {\n\t\tr.Printf(\"Joined higher ballot %d < %d\", prepare.Ballot, inst.bal)\n\t} else if inst.bal < prepare.Ballot {\n\t\tr.Printf(\"Joining ballot %d \", prepare.Ballot)\n\t\tinst.bal = prepare.Ballot\n\t}\n\n\tpreply = &PrepareReply{\n\t\tr.Id,\n\t\tprepare.Replica,\n\t\tprepare.Instance,\n\t\tinst.bal,\n\t\tinst.vbal,\n\t\tinst.Status,\n\t\tinst.Cmds,\n\t\tinst.Seq,\n\t\tinst.Deps}\n\tr.replyPrepare(prepare.LeaderId, preply)\n}\n\nfunc (r *Replica) handlePrepareReply(preply *PrepareReply) {\n\tinst := r.InstanceSpace[preply.Replica][preply.Instance]\n\tlb := inst.lb\n\n\tif preply.Ballot > r.maxRecvBallot {\n\t\tr.maxRecvBallot = preply.Ballot\n\t}\n\n\tif inst == nil || lb == nil || !lb.preparing {\n\t\treturn\n\t}\n\n\tif preply.Ballot != lb.lastTriedBallot {\n\t\tlb.nacks++\n\t\treturn\n\t}\n\n\tlb.prepareReplies = append(lb.prepareReplies, preply)\n\tif len(lb.prepareReplies) < r.Replica.SlowQuorumSize() {\n\t\treturn\n\t}\n\n\tlb.preparing = false\n\n\t// Deal with each sub-cases in order of the (corrected) TLA specification\n\t// only replies from the highest ballot are taken into account\n\t// 1 -> committed/executed\n\t// 2 -> accepted\n\t// 3 -> pre-accepted > f (not including the leader) and allEqual\n\t// 4 -> pre-accepted >= f/2 (not including the leader) and allEqual\n\t// 5 -> pre-accepted > 0 and (disagreeing or leader replied or pre-accepted < f/2)\n\t// 6 -> none of the above\n\tpreAcceptCount := 0\n\tsubCase := 0\n\tallEqual := true\n\tfor _, element := range lb.prepareReplies {\n\t\tif element.VBallot >= lb.ballot {\n\t\t\tlb.ballot = element.VBallot\n\t\t\tlb.cmds = element.Command\n\t\t\tlb.seq = element.Seq\n\t\t\tlb.deps = element.Deps\n\t\t\tlb.status = element.Status\n\t\t}\n\t\tif element.AcceptorId == element.Replica {\n\t\t\tlb.leaderResponded = true\n\t\t}\n\t\tif element.Status == PREACCEPTED_EQ || element.Status == PREACCEPTED {\n\t\t\tpreAcceptCount++\n\t\t}\n\t}\n\n\tif lb.status >= COMMITTED { // 1\n\t\tsubCase = 1\n\t} else if lb.status == ACCEPTED { // 2\n\t\tsubCase = 2\n\t} else if lb.status == PREACCEPTED || lb.status == PREACCEPTED_EQ {\n\t\tfor _, element := range lb.prepareReplies {\n\t\t\tif element.VBallot == lb.ballot && element.Status >= PREACCEPTED {\n\t\t\t\t_, _, equal := r.mergeAttributes(lb.seq, lb.deps, element.Seq, element.Deps)\n\t\t\t\tif !equal {\n\t\t\t\t\tallEqual = false\n\t\t\t\t\tbreak\n\t\t\t\t}\n\t\t\t}\n\t\t}\n\t\tif preAcceptCount >= r.Replica.SlowQuorumSize()-1 && !lb.leaderResponded && allEqual {\n\t\t\tsubCase = 3\n\t\t} else if preAcceptCount >= r.Replica.SlowQuorumSize()-1 && !lb.leaderResponded && allEqual {\n\t\t\tsubCase = 4\n\t\t} else if preAcceptCount > 0 && (lb.leaderResponded || !allEqual || preAcceptCount < r.Replica.SlowQuorumSize()-1) {\n\t\t\tsubCase = 5\n\t\t} else {\n\t\t\tpanic(\"Cannot occur\")\n\t\t}\n\t} else if lb.status == NONE {\n\t\tsubCase = 6\n\t} else {\n\t\tpanic(\"Status unknown\")\n\t}\n\n\t// if subCase != 5 {\n\t// \tdlog.Printf(\"In %d.%d, sub-case %d\\n\", preply.Replica, preply.Instance, subCase)\n\t// } else {\n\t// \tdlog.Printf(\"In %d.%d, sub-case %d with (leaderResponded=%t, allEqual=%t, enough=%t)\\n\",\n\t// \t\tpreply.Replica, preply.Instance, subCase, lb.leaderResponded, allEqual, preAcceptCount < r.Replica.SlowQuorumSize()-1)\n\t// }\n\n\tinst.Cmds = lb.cmds\n\tinst.bal = lb.lastTriedBallot\n\tinst.vbal = lb.lastTriedBallot\n\tinst.Seq = lb.seq\n\tinst.Deps = lb.deps\n\tinst.Status = lb.status\n\n\tif subCase == 1 {\n\t\t// nothing to do\n\t} else if subCase == 2 || subCase == 3 {\n\t\tinst.Status = ACCEPTED\n\t\tlb.status = ACCEPTED\n\t\tr.bcastAccept(preply.Replica, preply.Instance)\n\t} else if subCase == 4 {\n\t\tlb.tryingToPreAccept = true\n\t\tr.bcastTryPreAccept(preply.Replica, preply.Instance)\n\t} else { // subCase 5 and 6\n\t\tcmd := state.NOOP()\n\t\tif inst.lb.cmds != nil {\n\t\t\tcmd = inst.lb.cmds\n\t\t}\n\t\tr.startPhase1(cmd, preply.Replica, preply.Instance, lb.lastTriedBallot, lb.clientProposals)\n\t}\n}",
+        "content_digest": "9a50f418cb729388df24817712b2172b4a77fc6eb3f5b9fdfb8189e422b623cf"
+      },
+      {
+        "id": "initialization",
+        "file": "epaxos/epaxos.go",
+        "start_line": 134,
+        "end_line": 196,
+        "kind": "code_observation",
+        "text": "func New(alias string, id int, peerAddrList []string, exec, beacon, durable bool, batchWait int, transconf bool, failures int, conf *config.Config, logger *dlog.Logger) *Replica {\n\tr := &Replica{\n\t\treplica.New(alias, id, failures, peerAddrList, true, exec, false, conf, logger),\n\t\tmake(chan fastrpc.Serializable, defs.CHAN_BUFFER_SIZE),\n\t\tmake(chan fastrpc.Serializable, defs.CHAN_BUFFER_SIZE),\n\t\tmake(chan fastrpc.Serializable, defs.CHAN_BUFFER_SIZE),\n\t\tmake(chan fastrpc.Serializable, defs.CHAN_BUFFER_SIZE),\n\t\tmake(chan fastrpc.Serializable, defs.CHAN_BUFFER_SIZE),\n\t\tmake(chan fastrpc.Serializable, defs.CHAN_BUFFER_SIZE*3),\n\t\tmake(chan fastrpc.Serializable, defs.CHAN_BUFFER_SIZE*3),\n\t\tmake(chan fastrpc.Serializable, defs.CHAN_BUFFER_SIZE*2),\n\t\tmake(chan fastrpc.Serializable, defs.CHAN_BUFFER_SIZE),\n\t\tmake(chan fastrpc.Serializable, defs.CHAN_BUFFER_SIZE),\n\t\t0, 0, 0, 0, 0, 0, 0, 0, 0,\n\t\tmake([][]*Instance, len(peerAddrList)),\n\t\tmake([]int32, len(peerAddrList)),\n\t\tmake([]int32, len(peerAddrList)),\n\t\tmake([]int32, len(peerAddrList)),\n\t\tnil,\n\t\tmake([]map[state.Key]*InstPair, len(peerAddrList)),\n\t\tmake(map[state.Key]int32),\n\t\t0,\n\t\t0,\n\t\t-1,\n\t\tnew(sync.Mutex),\n\t\tmake(chan *instanceId, defs.CHAN_BUFFER_SIZE),\n\t\tfalse,\n\t\t-1,\n\t\tbatchWait,\n\t\ttransconf,\n\t}\n\n\tr.Beacon = beacon\n\tr.Durable = durable\n\n\tfor i := 0; i < r.N; i++ {\n\t\tr.InstanceSpace[i] = make([]*Instance, MAX_INSTANCE) // FIXME\n\t\tr.crtInstance[i] = -1\n\t\tr.ExecedUpTo[i] = -1\n\t\tr.CommittedUpTo[i] = -1\n\t\tr.conflicts[i] = make(map[state.Key]*InstPair, HT_INIT_SIZE)\n\t}\n\n\tr.exec = &Exec{r}\n\n\tcpMarker = make([]state.Command, 0)\n\n\t//register RPCs\n\tr.prepareRPC = r.RPC.Register(new(Prepare), r.prepareChan)\n\tr.prepareReplyRPC = r.RPC.Register(new(PrepareReply), r.prepareReplyChan)\n\tr.preAcceptRPC = r.RPC.Register(new(PreAccept), r.preAcceptChan)\n\tr.preAcceptReplyRPC = r.RPC.Register(new(PreAcceptReply), r.preAcceptReplyChan)\n\tr.acceptRPC = r.RPC.Register(new(Accept), r.acceptChan)\n\tr.acceptReplyRPC = r.RPC.Register(new(AcceptReply), r.acceptReplyChan)\n\tr.commitRPC = r.RPC.Register(new(Commit), r.commitChan)\n\tr.tryPreAcceptRPC = r.RPC.Register(new(TryPreAccept), r.tryPreAcceptChan)\n\tr.tryPreAcceptReplyRPC = r.RPC.Register(new(TryPreAcceptReply), r.tryPreAcceptReplyChan)\n\n\tr.Stats.M[\"weird\"], r.Stats.M[\"conflicted\"], r.Stats.M[\"slow\"], r.Stats.M[\"fast\"], r.Stats.M[\"totalCommitTime\"], r.Stats.M[\"totalBatching\"], r.Stats.M[\"totalBatchingSize\"] = 0, 0, 0, 0, 0, 0, 0\n\n\tgo r.run()\n\n\treturn r",
+        "content_digest": "9a50f418cb729388df24817712b2172b4a77fc6eb3f5b9fdfb8189e422b623cf"
+      },
+      {
+        "id": "ballot_send",
+        "file": "epaxos/epaxos.go",
+        "start_line": 435,
+        "end_line": 526,
+        "kind": "code_observation",
+        "text": "func isInitialBallot(ballot int32, replica int32, instance int32) bool {\n\treturn ballot == replica\n}\n\nfunc (r *Replica) makeBallot(replica int32, instance int32) {\n\tlb := r.InstanceSpace[replica][instance].lb\n\tn := r.Id\n\tif r.Id != replica {\n\t\tn += int32(r.N)\n\t}\n\tif r.IsLeader {\n\t\tfor n < r.maxRecvBallot {\n\t\t\tn += int32(r.N)\n\t\t}\n\t}\n\tlb.lastTriedBallot = n\n}\n\nfunc (r *Replica) replyPrepare(replicaId int32, reply *PrepareReply) {\n\tr.SendMsg(replicaId, r.prepareReplyRPC, reply)\n}\n\nfunc (r *Replica) replyPreAccept(replicaId int32, reply *PreAcceptReply) {\n\tr.SendMsg(replicaId, r.preAcceptReplyRPC, reply)\n}\n\nfunc (r *Replica) replyAccept(replicaId int32, reply *AcceptReply) {\n\tr.SendMsg(replicaId, r.acceptReplyRPC, reply)\n}\n\nfunc (r *Replica) replyTryPreAccept(replicaId int32, reply *TryPreAcceptReply) {\n\tr.SendMsg(replicaId, r.tryPreAcceptReplyRPC, reply)\n}\n\nfunc (r *Replica) bcastPrepare(replica int32, instance int32) {\n\tdefer func() {\n\t\tif err := recover(); err != nil {\n\t\t\tr.Println(\"Prepare bcast failed:\", err)\n\t\t}\n\t}()\n\tlb := r.InstanceSpace[replica][instance].lb\n\targs := &Prepare{r.Id, replica, instance, lb.lastTriedBallot}\n\n\tn := r.N - 1\n\tq := r.Id\n\tfor sent := 0; sent < n; {\n\t\tq = (q + 1) % int32(r.N)\n\t\tif q == r.Id {\n\t\t\tbreak\n\t\t}\n\t\tif !r.Alive[q] {\n\t\t\tcontinue\n\t\t}\n\t\tr.SendMsg(q, r.prepareRPC, args)\n\t\tsent++\n\t}\n\n}\n\nfunc (r *Replica) bcastPreAccept(replica int32, instance int32) {\n\tdefer func() {\n\t\tif err := recover(); err != nil {\n\t\t\tr.Println(\"PreAccept bcast failed:\", err)\n\t\t}\n\t}()\n\tlb := r.InstanceSpace[replica][instance].lb\n\tpa := new(PreAccept)\n\tpa.LeaderId = r.Id\n\tpa.Replica = replica\n\tpa.Instance = instance\n\tpa.Ballot = lb.lastTriedBallot\n\tpa.Command = lb.cmds\n\tpa.Seq = lb.seq\n\tpa.Deps = lb.deps\n\n\tn := r.N - 1\n\tif r.Thrifty {\n\t\tn = r.Replica.FastQuorumSize() - 1\n\t}\n\n\tsent := 0\n\tfor q := 0; q < r.N-1; q++ {\n\t\tif !r.Alive[r.PreferredPeerOrder[q]] {\n\t\t\tcontinue\n\t\t}\n\t\tr.SendMsg(r.PreferredPeerOrder[q], r.preAcceptRPC, pa)\n\t\tsent++\n\t\tif sent >= n {\n\t\t\tbreak\n\t\t}\n\t}\n}",
+        "content_digest": "9a50f418cb729388df24817712b2172b4a77fc6eb3f5b9fdfb8189e422b623cf"
+      },
+      {
+        "id": "transport_send",
+        "file": "replica/replica.go",
+        "start_line": 215,
+        "end_line": 227,
+        "kind": "code_observation",
+        "text": "func (r *Replica) SendMsg(peerId int32, code uint8, msg fastrpc.Serializable) {\n\tr.M.Lock()\n\tdefer r.M.Unlock()\n\n\tw := r.PeerWriters[peerId]\n\tif w == nil {\n\t\tr.Printf(\"Connection to %d lost!\", peerId)\n\t\treturn\n\t}\n\tw.WriteByte(code)\n\tmsg.Marshal(w)\n\tw.Flush()\n}",
+        "content_digest": "ea28e2b94198a705e6dd9892a6154ce9b8cb424ec3dedeed8f8bd2488341e766"
+      },
+      {
+        "id": "transport_receive",
+        "file": "replica/replica.go",
+        "start_line": 451,
+        "end_line": 462,
+        "kind": "code_observation",
+        "text": "\n\t\tdefault:\n\t\t\tp, exists := r.RPC.Get(msgType)\n\t\t\tif exists {\n\t\t\t\tobj := p.Obj.New()\n\t\t\t\tif err = obj.Unmarshal(reader); err != nil {\n\t\t\t\t\tbreak\n\t\t\t\t}\n\t\t\t\tgo func(obj fastrpc.Serializable) {\n\t\t\t\t\ttime.Sleep(r.Dt.WaitDurationID(rid))\n\t\t\t\t\tp.Chan <- obj\n\t\t\t\t}(obj)",
+        "content_digest": "ea28e2b94198a705e6dd9892a6154ce9b8cb424ec3dedeed8f8bd2488341e766"
+      },
+      {
+        "id": "base_initialization",
+        "file": "replica/replica.go",
+        "start_line": 66,
+        "end_line": 125,
+        "kind": "code_observation",
+        "text": "\t\tLogger: l,\n\n\t\tN:     n,\n\t\tF:     f,\n\t\tId:    int32(id),\n\t\tAlias: alias,\n\n\t\tPeerAddrList:       addrs,\n\t\tPeers:              make([]net.Conn, n),\n\t\tPeerReaders:        make([]*bufio.Reader, n),\n\t\tPeerWriters:        make([]*bufio.Writer, n),\n\t\tClientWriters:      make(map[int32]*bufio.Writer),\n\t\tConfig:             config,\n\t\tAlive:              make([]bool, n),\n\t\tPreferredPeerOrder: make([]int32, n),\n\n\t\tState:       state.InitState(),\n\t\tRPC:         fastrpc.NewTableId(defs.RPC_TABLE),\n\t\tStableStore: nil,\n\t\tStats:       &defs.Stats{make(map[string]int)},\n\t\tShutdown:    false,\n\t\tListener:    nil,\n\t\tProposeChan: make(chan *defs.GPropose, defs.CHAN_BUFFER_SIZE),\n\t\tBeaconChan:  make(chan *defs.GBeacon, defs.CHAN_BUFFER_SIZE),\n\n\t\tThrifty: thrifty,\n\t\tExec:    exec,\n\t\tLRead:   lread,\n\t\tDreply:  true,\n\t\tBeacon:  false,\n\t\tDurable: false,\n\n\t\tEwma:      make([]float64, n),\n\t\tLatencies: make([]int64, n),\n\n\t\tDt: defs.NewLatencyTable(defs.LatencyConf, defs.IP(), addrs),\n\t}\n\n\tfor i := 0; i < r.N; i++ {\n\t\tr.PreferredPeerOrder[i] = int32((int(r.Id) + 1 + i) % r.N)\n\t\tr.Ewma[i] = 0.0\n\t\tr.Latencies[i] = 0\n\t}\n\n\treturn r\n}\n\nfunc (r *Replica) Ping(args *defs.PingArgs, reply *defs.PingReply) error {\n\treturn nil\n}\n\nfunc (r *Replica) BeTheLeader(args *defs.BeTheLeaderArgs, reply *defs.BeTheLeaderReply) error {\n\treturn nil\n}\n\nfunc (r *Replica) FastQuorumSize() int {\n\treturn r.F + (r.F+1)/2\n}\n\nfunc (r *Replica) SlowQuorumSize() int {",
+        "content_digest": "ea28e2b94198a705e6dd9892a6154ce9b8cb424ec3dedeed8f8bd2488341e766"
+      }
+    ],
+    "selections": [
+      {
+        "operation_id": "0513a22c775f405fb4611d71985005ed",
+        "action": "explore",
+        "rationale": "Source shows handlePrepare exports inst.vbal and handlePrepareReply selects values by VBallot, but PrepareReply Marshal/Unmarshal omit that field. The probe produces instance contents through handlePropose, serialized PreAccept, handlePreAccept, startRecoveryForInstance and serialized Prepare before decoding the actual reply bytes. Empty bounded replica containers reproduce relevant initialization but bypass constructors, startup, dispatch, timers and execution workers; recovery is explicitly invoked rather than timer-triggered. This is a local producer/transport exploration, not a claim of quorum formation, application, safety failure or infinite stall. A later cluster consequence requires a compatible schedule and actual decision/application endpoint; recovery also relabels its local self reply with the new ballot, which may independently affect selection and must not be attributed to codec loss.",
+        "feedback": {},
+        "map_updated": false,
+        "map_changes": {},
+        "accepted_versions": {
+          "audit_spec": 0,
+          "graph": 0,
+          "units": {},
+          "artifacts": {}
+        },
+        "candidate_ids": []
+      }
+    ],
+    "applied_operations": {
+      "submission-0513a22c775f405fb4611d71985005ed": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-10_16-09-40-swiftpaxos_epaxos-real-run/graph-commits/submission-0513a22c775f405fb4611d71985005ed.json"
+      }
+    }
+  }
+}

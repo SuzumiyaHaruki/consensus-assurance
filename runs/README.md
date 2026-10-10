@@ -2,18 +2,24 @@
 
 当前 `runs/` 按开始时间追踪最近六次实验：五个实现各一次 Astra 实验，以及一次 DeepSeek HashiCorp 实验。`baseline/runs/` 原有五次实验的追踪保持不变。其余本地运行不因追踪切换而删除；旧归档可从 Git 历史查看。
 
-各次使用独立会话。完整组使用方法 v60，各次预算均为 30 分钟、最多 80 次模型调用和 40 次目标执行。具体输入版本、执行条件与额度消耗以原始配置、状态及日志为准。
+各次使用独立会话。完整组使用方法 v61，代码基线为 `dc4acbe6394948f9bfbea2183a840e808dc7d77e`，各次预算均为 30 分钟、最多 80 次模型调用和 40 次目标执行。具体输入版本、执行条件与额度消耗以原始配置、状态及日志为准。
 
 | 完整组实验 | 模型／推理档位 | 开始时间（2026-10-10） | 预算／实际时间 | 停止原因 |
 | --- | --- | --- | --- | --- |
-| [etcd](2026-10-10_13-27-45-etcd_raft-real-run/report.md) | `gpt-6-astra` / `low` | 13:27:45 | 30／3.37 分钟 | 模型服务返回网安风险拒绝；`tool_gap` |
-| [HashiCorp](2026-10-10_13-31-08-hashicorp_raft-real-run/report.md) | `gpt-6-astra` / `low` | 13:31:08 | 30／3.70 分钟 | 模型服务返回网安风险拒绝；`tool_gap` |
-| [Dragonboat](2026-10-10_13-34-50-dragonboat_raft-real-run/report.md) | `gpt-6-astra` / `low` | 13:34:50 | 30／17.68 分钟 | 模型服务返回网安风险拒绝；`tool_gap` |
-| [HashiCorp](2026-10-10_13-44-26-hashicorp_raft-real-run/report.md) | `deepseek-flash` / `high` | 13:44:26 | 30／30.00 分钟 | 总预算耗尽时 Agent 调用超时；`resource_limit`，剩余时间为 0 |
-| [OmniPaxos](2026-10-10_13-52-31-omnipaxos-real-run/report.md) | `gpt-6-astra` / `low` | 13:52:31 | 30／5.94 分钟 | 模型服务返回网安风险拒绝；`tool_gap` |
-| [EPaxos](2026-10-10_13-58-28-swiftpaxos_epaxos-real-run/report.md) | `gpt-6-astra` / `low` | 13:58:28 | 30／3.69 分钟 | 模型服务返回网安风险拒绝；`tool_gap` |
+| [etcd](2026-10-10_15-52-43-etcd_raft-real-run/report.md) | `gpt-6-astra` / `low` | 15:52:43 | 30／4.25 分钟 | 模型服务返回网安风险拒绝；`tool_gap` |
+| [HashiCorp](2026-10-10_15-56-58-hashicorp_raft-real-run/report.md) | `gpt-6-astra` / `low` | 15:56:58 | 30／4.61 分钟 | 模型服务返回网安风险拒绝；`tool_gap` |
+| [Dragonboat](2026-10-10_16-01-36-dragonboat_raft-real-run/report.md) | `gpt-6-astra` / `low` | 16:01:36 | 30／5.83 分钟 | 模型服务返回网安风险拒绝；`tool_gap` |
+| [OmniPaxos](2026-10-10_16-07-26-omnipaxos-real-run/report.md) | `gpt-6-astra` / `low` | 16:07:26 | 30／2.23 分钟 | 模型服务返回网安风险拒绝；`tool_gap` |
+| [HashiCorp](2026-10-10_16-09-15-hashicorp_raft-real-run/report.md) | `deepseek-flash` / `high` | 16:09:15 | 30／30.00 分钟 | 总预算耗尽时 Agent 调用超时；`resource_limit`，剩余时间为 0 |
+| [EPaxos](2026-10-10_16-09-40-swiftpaxos_epaxos-real-run/report.md) | `gpt-6-astra` / `low` | 16:09:40 | 30／9.72 分钟 | 模型服务返回网安风险拒绝；`tool_gap` |
 
-Dragonboat 记录 7 次模型调用、4 次目标执行；DeepSeek HashiCorp 记录 18 次模型调用、3 次目标执行。其余四次各记录 1 次模型调用。预算是上限，不表示完成了相应数量的检查。
+DeepSeek HashiCorp 记录 26 次模型调用、7 次目标执行（1 次正式检查、6 次探索）；EPaxos 记录 3 次模型调用、2 次目标执行（1 次正式检查、1 次探索）。其余四次各记录 1 次模型调用、0 次控制器目标执行。预算是上限，不表示完成了相应数量的检查。
+
+交接时需保留以下结论边界：
+
+- DeepSeek HashiCorp 原报告登记 1 项已确认的有界义务违反：配置日志写入失败后，仍发布了未持久化的新配置。该记录不自动证明集群共识失效；`GetConfiguration` 返回索引的问题已受理义务，但尚无固定检查。
+- EPaxos 原报告记录 `PrepareReply` 生产值经编码、解码后未保留 accepted-value ballot 的观察；对应性复核未完成，仍为待调查线索，不能提升为已确认缺陷。
+- 其余四次在首回合被服务中断，无已受理候选或正式性质判定。五次 Astra 拦截均保留原始日志，不从拒绝信息推断具体触发文本。
 
 以下 baseline 归档保留原记录；与本次完整组的版本、模型或预算不同，不构成同条件配对。
 

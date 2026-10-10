@@ -1,0 +1,116 @@
+{
+  "description": "Repeat the producer/transport prefix from exploration with an input admission event before handlePrepare, then compare the decoded VBallot to that same operation input. This is the local preservation claim, not a cluster endpoint.",
+  "claim_id": "prepare_reply_value_ballot_preservation",
+  "binding_ids": [
+    "prepare_reply_marshal",
+    "prepare_reply_unmarshal"
+  ],
+  "harness": {
+    "execution_package": "./epaxos",
+    "files": {},
+    "kind": "go_test",
+    "source": "package epaxos\n\nimport (\n    \"bufio\"\n    \"bytes\"\n    \"encoding/json\"\n    \"fmt\"\n    \"reflect\"\n    \"testing\"\n\n    \"github.com/imdea-software/swiftpaxos/dlog\"\n    \"github.com/imdea-software/swiftpaxos/replica\"\n    \"github.com/imdea-software/swiftpaxos/replica/defs\"\n    fastrpc \"github.com/imdea-software/swiftpaxos/rpc\"\n    \"github.com/imdea-software/swiftpaxos/state\"\n)\n\n// This probe uses constructor-equivalent empty protocol containers of bounded\n// size. It bypasses network startup, the event loop, timers and execution workers.\n// All instance contents after initialization are produced by actual handlers.\nfunc assuranceEmptyReplica(id int32) (*Replica, []*bytes.Buffer) {\n    const n = 3\n    base := &replica.Replica{\n        Logger: dlog.New(\"\", false), N: n, F: 1, Id: id, Thrifty: true,\n        PeerWriters: make([]*bufio.Writer, n), Alive: []bool{true,true,true},\n        PreferredPeerOrder: []int32{(id+1)%n, (id+2)%n, id},\n        Stats: &defs.Stats{M: make(map[string]int)},\n        ProposeChan: make(chan *defs.GPropose, 1),\n    }\n    r := &Replica{Replica: base, InstanceSpace: make([][]*Instance,n),\n        crtInstance: []int32{-1,-1,-1}, CommittedUpTo: []int32{-1,-1,-1},\n        ExecedUpTo: []int32{-1,-1,-1}, conflicts: make([]map[state.Key]*InstPair,n),\n        maxSeqPerKey: make(map[state.Key]int32), maxRecvBallot: -1,\n        latestCPInstance: -1, prepareRPC: 10, prepareReplyRPC: 11,\n        preAcceptRPC: 12, preAcceptReplyRPC: 13,\n    }\n    wires := make([]*bytes.Buffer,n)\n    for i:=0;i<n;i++ {\n        r.InstanceSpace[i] = make([]*Instance,4)\n        r.conflicts[i] = make(map[state.Key]*InstPair)\n        wires[i] = new(bytes.Buffer)\n        base.PeerWriters[i] = bufio.NewWriter(wires[i])\n    }\n    return r,wires\n}\n\nfunc assuranceDecode(t *testing.T, wire *bytes.Buffer, code byte, dst fastrpc.Serializable) {\n    t.Helper()\n    got,err:=wire.ReadByte()\n    if err!=nil || got!=code { t.Fatalf(\"RPC code got %d, err %v; want %d\",got,err,code) }\n    if err:=dst.Unmarshal(wire);err!=nil { t.Fatal(err) }\n    if wire.Len()!=0 { t.Fatalf(\"unexpected trailing bytes: %d\",wire.Len()) }\n}\n\nfunc TestAssurancePrepareReplyProducerTransport(t *testing.T) {\n    owner, ow := assuranceEmptyReplica(1)\n    acceptor, aw := assuranceEmptyReplica(2)\n    recoverer, rw := assuranceEmptyReplica(0)\n    proposal := &defs.GPropose{Propose: &defs.Propose{CommandId: 71,ClientId: 9,\n        Command: state.Command{Op: state.PUT,K: 17,V: state.Value(\"payload\")}}}\n    owner.handlePropose(proposal)\n    pa := new(PreAccept)\n    assuranceDecode(t,ow[2],owner.preAcceptRPC,pa)\n    acceptor.handlePreAccept(pa)\n    // Keep the actual PreAcceptReply pending; no quorum or commit is asserted.\n    before := acceptor.InstanceSpace[1][0]\n    acceptedValueBallot := before.vbal\n    if acceptedValueBallot!=1 || before.Status!=PREACCEPTED_EQ { t.Fatal(\"preaccept prefix not reached\") }\n    recoverer.startRecoveryForInstance(1,0)\n    prep := new(Prepare)\n    assuranceDecode(t,rw[2],recoverer.prepareRPC,prep)\n    admission := map[string]any{\n        \"event\":\"prepare_reply_admitted\", \"acceptor\":acceptor.Id,\n        \"replica\":prep.Replica,\"instance\":prep.Instance,\n        \"vballot\":before.vbal,\"status\":before.Status,\"prepare_ballot\":prep.Ballot,\n    }\n    admittedData,err:=json.Marshal(admission);if err!=nil { t.Fatal(err) }\n    fmt.Println(\"CA_EVENT \"+string(admittedData))\n    acceptor.handlePrepare(prep)\n    // This is the actual handlePrepare -> replyPrepare -> SendMsg byte stream.\n    reply := new(PrepareReply).New().(*PrepareReply)\n    assuranceDecode(t,aw[0],acceptor.prepareReplyRPC,reply)\n    inst := acceptor.InstanceSpace[1][0]\n    identityOK := reply.AcceptorId==2 && reply.Replica==1 && reply.Instance==0\n    otherFieldsOK := reply.Ballot==inst.bal && reply.Status==inst.Status && reply.Seq==inst.Seq &&\n        reflect.DeepEqual(reply.Command,inst.Cmds) && reflect.DeepEqual(reply.Deps,inst.Deps)\n    event := map[string]any{\n        \"event\":\"prepare_reply_transport\", \"acceptor\":reply.AcceptorId,\n        \"replica\":reply.Replica,\"instance\":reply.Instance,\n        \"preaccept_ballot\":pa.Ballot,\"prepare_ballot\":prep.Ballot,\n        \"producer_vballot_before_prepare\":acceptedValueBallot,\"producer_vballot_after_prepare\":inst.vbal,\n        \"decoded_vballot\":reply.VBallot,\"identity_preserved\":identityOK,\n        \"other_fields_preserved\":otherFieldsOK,\"value_ballot_preserved\":reply.VBallot==inst.vbal,\n        \"producer_status\":inst.Status,\"decoded_status\":reply.Status,\n    }\n    data,err:=json.Marshal(event);if err!=nil { t.Fatal(err) }\n    fmt.Println(\"CA_EVENT \"+string(data))\n    if !identityOK || !otherFieldsOK { t.Fatal(\"probe correlation or other fields failed\") }\n    // The external checker compares this decoded value against the prior admission.\n}\n",
+    "description": "Three bounded empty replicas; propose at owner 1, deliver its real PreAccept to acceptor 2, initiate recovery at replica 0, deliver its real Prepare to acceptor 2, decode the actual SendMsg reply.",
+    "semantic_changes": [
+      "Replace constructor startup and TCP sockets with constructor-equivalent empty protocol containers and separate per-link byte buffers.",
+      "Call private handlers synchronously; no event loop, timer, execution worker or crash is modeled.",
+      "Reduce instance arrays to four entries; only instance 1.0 is touched. No produced instance field or message is edited.",
+      "Hold the PreAcceptReply and unused Prepare bytes without delivering them."
+    ],
+    "prerequisites": [
+      {
+        "alias": "admitted",
+        "event": "prepare_reply_admitted",
+        "conditions": [
+          {
+            "field": "status",
+            "op": "eq",
+            "value": 2,
+            "reference": null
+          }
+        ]
+      }
+    ],
+    "legality": {
+      "source_ids": [
+        "initialization",
+        "base_initialization",
+        "proposal_producer",
+        "recovery_producer_consumer",
+        "ballot_send",
+        "transport_send",
+        "transport_receive"
+      ],
+      "expectation_ids": [],
+      "binding_ids": [
+        "prepare_reply_marshal",
+        "prepare_reply_unmarshal"
+      ],
+      "derivation": "Empty rows, counters -1, empty conflict maps, N=3 F=1, thriftiness and cyclic peer preference match initialization. handlePropose produces ballot 1 and actual bytes; handlePreAccept creates the stored value. startRecoveryForInstance produces Prepare ballot 3; handlePrepare consumes it. The probe omits worker/network startup and invokes recovery directly, so it establishes the admitted local producer input rather than end-to-end recovery reachability.",
+      "applicability": "Single synchronous test owns all replica objects and buffers. Before the producer call, the input event samples the actual instance value ballot and identity; after its synchronous SendMsg flush, a fresh object decodes the complete untouched byte stream.",
+      "unresolved": [],
+      "conflicts": [],
+      "alternatives": []
+    }
+  },
+  "monitors": [
+    {
+      "id": "value_ballot_transport_monitor",
+      "checker_id": "value_ballot_transport",
+      "event": "prepare_reply_transport",
+      "binding_ids": [
+        "prepare_reply_marshal",
+        "prepare_reply_unmarshal"
+      ],
+      "grounding": {
+        "source_ids": [
+          "reply_codec",
+          "transport_send",
+          "transport_receive",
+          "recovery_producer_consumer"
+        ],
+        "expectation_ids": [],
+        "binding_ids": [
+          "prepare_reply_marshal",
+          "prepare_reply_unmarshal"
+        ],
+        "derivation": "Read decoded_vballot from the actual fresh decoded reply; compare to the earlier admitted.vballot. Correlation fields are the actual acceptor ID, replica and instance, never the ballot.",
+        "applicability": "The result occurs only after successful full decoding of the corresponding synchronous producer output. Go assertions check framing, independent identity and other payload fields without filtering the value-ballot comparison.",
+        "unresolved": [],
+        "conflicts": [],
+        "alternatives": []
+      },
+      "applicability_conditions": [],
+      "admission_alias": "admitted"
+    }
+  ],
+  "observable_properties": [
+    {
+      "checker_id": "value_ballot_transport",
+      "kind": "event_assertion",
+      "trigger": {
+        "field": "event",
+        "op": "eq",
+        "value": "prepare_reply_transport",
+        "reference": null
+      },
+      "assertion": {
+        "field": "decoded_vballot",
+        "op": "eq",
+        "value": null,
+        "reference": "admitted.vballot"
+      },
+      "antecedent": null,
+      "identity_fields": [
+        "acceptor",
+        "replica",
+        "instance"
+      ],
+      "description": "The decoded accepted-value ballot equals the value sampled for the same admitted producer operation."
+    }
+  ],
+  "uncertainties": [
+    "No decision or application endpoint is observed; loss of this field is not alone proof of a consensus safety violation.",
+    "The constructor/event-loop/timer bypass is explicit; local codec applicability is grounded independently in the producer/receiver contract."
+  ]
+}
