@@ -1,0 +1,102 @@
+{
+  "id": "20b0c1cfbc3a40a4b120ae1fe3c26b15-experiment",
+  "investigation_id": "20b0c1cfbc3a40a4b120ae1fe3c26b15-question-0",
+  "version": 1,
+  "basis": {
+    "harness": {
+      "kind": "go_test",
+      "source": "// Copyright 2025 The etcd Authors\n//\n// Licensed under the Apache License, Version 2.0 (the \"License\");\n// you may not use this file except in compliance with the License.\n// You may obtain a copy of the License at\n//\n//     http://www.apache.org/licenses/LICENSE-2.0\n//\n// Unless required by applicable law or agreed to in writing, software\n// distributed under the License is distributed on an \"AS IS\" BASIS,\n// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n// See the License for the specific language governing permissions and\n// limitations under the License.\n\npackage raft\n\nimport (\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"testing\"\n\n\tpb \"go.etcd.io/raft/v3/raftpb\"\n)\n\n// Generated audit harness. It never changes production logic. It drives the\n// read-index producer of a real leader whose first entry in its term has not\n// been committed yet, which is the path that queues read requests.\n\nfunc assuranceEmit(t *testing.T, event map[string]any) {\n\tt.Helper()\n\traw, err := json.Marshal(event)\n\tif err != nil {\n\t\tt.Fatalf(\"marshal CA_EVENT: %v\", err)\n\t}\n\tfmt.Println(\"CA_EVENT \" + string(raw))\n}\n\nfunc assurancePump(t *testing.T, nodes map[uint64]*raft, pending []pb.Message, budget int) []pb.Message {\n\tt.Helper()\n\tfor len(pending) > 0 && budget > 0 {\n\t\tbudget--\n\t\tm := pending[0]\n\t\tpending = pending[1:]\n\t\ttarget, ok := nodes[m.To]\n\t\tif !ok {\n\t\t\tt.Fatalf(\"message %s addressed to unknown node %d\", m.Type, m.To)\n\t\t}\n\t\tif err := target.Step(m); err != nil {\n\t\t\tt.Fatalf(\"node %d step %s: %v\", m.To, m.Type, err)\n\t\t}\n\t\tpending = append(pending, target.readMessages()...)\n\t}\n\treturn pending\n}\n\nfunc TestAssuranceReadIndexQueuedUntilTermCommit(t *testing.T) {\n\tr1 := newTestRaft(1, 10, 1, newTestMemoryStorage(withPeers(1, 2, 3)))\n\tr2 := newTestRaft(2, 10, 1, newTestMemoryStorage(withPeers(1, 2, 3)))\n\tr3 := newTestRaft(3, 10, 1, newTestMemoryStorage(withPeers(1, 2, 3)))\n\tnodes := map[uint64]*raft{1: r1, 2: r2, 3: r3}\n\n\t// Become leader without letting any follower acknowledge the new entry, so\n\t// the leader has no committed entry in its term yet. This is the state the\n\t// library reaches right after an election before the empty entry commits.\n\tr1.becomeCandidate()\n\tr1.becomeLeader()\n\tr1.bcastAppend()\n\tfirstEntry := r1.readMessages() // MsgApp carrying the empty entry, plus self-ack processing\n\tcommittedInTerm := r1.committedEntryInCurrentTerm()\n\n\tctx := []byte(\"assurance-queued-read\")\n\t_ = r1.Step(pb.Message{From: 1, To: 1, Type: pb.MsgReadIndex, Entries: []pb.Entry{{Data: ctx}}})\n\tqueuedMsgs := r1.readMessages()\n\tassuranceEmit(t, map[string]any{\n\t\t\"event\":                     \"read_index_queued\",\n\t\t\"request_id\":                \"queued\",\n\t\t\"scenario\":                  \"queued_before_term_commit\",\n\t\t\"committed_in_term\":         committedInTerm,\n\t\t\"committed\":                 r1.raftLog.committed,\n\t\t\"queued_after\":              len(r1.pendingReadIndexMessages),\n\t\t\"heartbeats_emitted\":        len(queuedMsgs),\n\t\t\"read_states_after\":         len(r1.readStates),\n\t\t\"leader_state\":              r1.state.String(),\n\t\t\"term\":                      r1.Term,\n\t})\n\n\t// The application delivers the replicated entry; the followers acknowledge\n\t// it and the resulting commit is the leader's first commit in its term.\n\tpending := assurancePump(t, nodes, firstEntry, 100)\n\tassuranceEmit(t, map[string]any{\n\t\t\"event\":                  \"read_index_released\",\n\t\t\"request_id\":             \"queued\",\n\t\t\"scenario\":               \"queued_before_term_commit\",\n\t\t\"committed\":              r1.raftLog.committed,\n\t\t\"committed_in_term\":      r1.committedEntryInCurrentTerm(),\n\t\t\"queued_after\":           len(r1.pendingReadIndexMessages),\n\t\t\"read_states_after\":      len(r1.readStates),\n\t\t\"delivered\":              len(r1.readStates) == 1,\n\t\t\"read_state_index\":       readStateIndex(r1),\n\t\t\"undelivered_messages\":   len(pending),\n\t\t\"leader_state\":           r1.state.String(),\n\t\t\"term\":                   r1.Term,\n\t})\n\n\t// Contrast: once the leader has committed an entry in its term, a further\n\t// read request is answered immediately without queueing.\n\tbefore := len(r1.readStates)\n\t_ = r1.Step(pb.Message{From: 1, To: 1, Type: pb.MsgReadIndex, Entries: []pb.Entry{{Data: []byte(\"assurance-immediate-read\")}}})\n\timmediateMsgs := r1.readMessages()\n\tacks := []pb.Message{}\n\tfor _, m := range immediateMsgs {\n\t\ttarget, ok := nodes[m.To]\n\t\tif !ok {\n\t\t\tt.Fatalf(\"immediate heartbeat to unknown node %d\", m.To)\n\t\t}\n\t\t_ = target.Step(m)\n\t\tacks = append(acks, target.readMessages()...)\n\t}\n\tfor _, a := range acks {\n\t\t_ = r1.Step(a)\n\t}\n\tr1.readMessages()\n\tassuranceEmit(t, map[string]any{\n\t\t\"event\":             \"read_index_immediate\",\n\t\t\"request_id\":        \"immediate\",\n\t\t\"scenario\":          \"after_term_commit\",\n\t\t\"queued_after\":      len(r1.pendingReadIndexMessages),\n\t\t\"read_states_added\": len(r1.readStates) - before,\n\t\t\"heartbeats\":        len(immediateMsgs),\n\t\t\"acks_from_voters\":  len(acks),\n\t\t\"delivered\":         len(r1.readStates) > before,\n\t\t\"committed\":         r1.raftLog.committed,\n\t\t\"leader_state\":      r1.state.String(),\n\t})\n\n\tif committedInTerm {\n\t\tt.Fatalf(\"harness precondition failed: leader already committed in term %d\", r1.Term)\n\t}\n\tif len(r1.readStates) < 2 {\n\t\tt.Fatalf(\"expected both read requests to be delivered, got %d read states\", len(r1.readStates))\n\t}\n}\n\nfunc readStateIndex(r *raft) uint64 {\n\tif len(r.readStates) == 0 {\n\t\treturn 0\n\t}\n\treturn r.readStates[len(r.readStates)-1].Index\n}\n",
+      "files": {},
+      "execution_package": ".",
+      "description": "",
+      "semantic_changes": [],
+      "prerequisites": [
+        {
+          "alias": "queued_request",
+          "event": "read_index_queued",
+          "conditions": [
+            {
+              "field": "scenario",
+              "op": "eq",
+              "value": "queued_before_term_commit",
+              "reference": null
+            }
+          ]
+        }
+      ]
+    },
+    "source_ids": [
+      "leader_msg_read_index",
+      "release_pending_read_index",
+      "send_read_index_response",
+      "heartbeat_resp_completion",
+      "advance"
+    ],
+    "anchors": [],
+    "scope": {
+      "description": "One probe on a freshly built three-voter cluster whose node 1 is made leader without any follower acknowledgment, so it has no committed entry in its term. The probe submits a local ReadIndex, observes the queue, then delivers the replication messages and the followers' acknowledgments to drive the first commit, and finally submits a second ReadIndex after that commit as the contrast path.",
+      "assumptions": [
+        "The leader is made to win directly (becomeCandidate + becomeLeader) so that the pre-commit state is observable; this is the same state the library reaches momentarily after a real election.",
+        "Read requests are submitted locally by the leader, which steps a MsgReadIndex exactly as Node.ReadIndex does.",
+        "All messages are delivered in process with no loss, and the followers are ordinary fresh raft instances configured with the same voter set.",
+        "The default ReadOnlySafe option is used, so an answer requires the leader's own acknowledgment plus a quorum of voter acknowledgments produced by the real followers."
+      ],
+      "excluded": [
+        "ReadOnlyLeaseBased and forwarded read requests from followers",
+        "Snapshots, restarts, membership changes, leadership changes and network faults",
+        "Any application-level interpretation of the delivered read state"
+      ],
+      "parameters": {}
+    },
+    "prefix": "Harness (draft file assurance_generated_test.go, package raft, execution package '.'; no captured file is replaced). The test builds three real raft instances with newTestRaft(1|2|3, 10, 1, newTestMemoryStorage(withPeers(1,2,3))), calls r1.becomeCandidate() and r1.becomeLeader() so that node 1 leads with an uncommitted entry in its term, and takes r1.bcastAppend()'s messages while recording committedEntryInCurrentTerm() (expected false). It then steps a local MsgReadIndex carrying the rctx into the leader and emits read_index_queued with committed_in_term, committed, queued_after, heartbeats_emitted, read_states_after and the leader state, which shows whether the request was queued with no heartbeat broadcast. Next it delivers the leader's MsgApp to nodes 2 and 3 through a bounded queue, steps the MsgAppResp acknowledgments they produce back into the leader, and emits read_index_released with the new committed index, committed_in_term, queued_after, read_states_after, delivered, read_state_index, undelivered_messages and leader state. Finally it submits a second local MsgReadIndex, delivers the two heartbeats it produces to the real followers, steps their acknowledgments back, and emits read_index_immediate with queued_after, read_states_added, heartbeats, acks_from_voters, delivered, committed and leader state. The test asserts the precondition (no committed entry in term before the queued request) and that both requests are delivered, so a change in either path fails the harness instead of reshaping the evidence.",
+    "requirement": null,
+    "responsibility": "The leader-side ReadIndex producer owns eventually answering a read request that it accepted for later processing: a request that the leader deferred because it had no committed entry in its term must be released by the commit that makes the read index available, not left waiting for an unrelated later proposal.",
+    "comparisons": [
+      {
+        "event": "read_index_released",
+        "identity_fields": [
+          "request_id"
+        ],
+        "admission_alias": "queued_request",
+        "assertion": {
+          "field": "delivered",
+          "op": "eq",
+          "value": true,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [
+          {
+            "field": "scenario",
+            "op": "eq",
+            "value": "queued_before_term_commit",
+            "reference": null
+          }
+        ],
+        "description": "A ReadIndex request deferred before the leader's first commit in its term is delivered once that commit happens."
+      }
+    ],
+    "knowledge": []
+  },
+  "snapshot_id": "a23faff7cd3e43b9af4254953ad0f9e7",
+  "configuration": {
+    "backend": "go_module",
+    "target": {
+      "expected_module": "go.etcd.io/raft/v3",
+      "variant": "etcd_raft",
+      "analysis_roots": [],
+      "execution_package": ".",
+      "harness_path": "assurance_generated_test.go"
+    },
+    "isolation": "bwrap",
+    "tools": {
+      "agent": "codex-cli 0.155.0-alpha.16",
+      "implementation": "go version go1.26.7 linux/amd64"
+    }
+  },
+  "harness_filename": "assurance_generated_test.go",
+  "operation_id": "20b0c1cfbc3a40a4b120ae1fe3c26b15",
+  "previous_id": null,
+  "difference": {},
+  "revision_reason": ""
+}

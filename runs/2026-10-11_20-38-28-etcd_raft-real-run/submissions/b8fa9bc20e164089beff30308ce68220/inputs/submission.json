@@ -1,0 +1,138 @@
+{
+  "rationale": "New line at the client-contract layer, opened while looking for the Node API path of a removed member. Source trace: node.run's confc case applies the configuration and, when the node was a member before and is neither in the new voters nor in VotersOutgoing, sets the proposal channel to nil with the comment 'If the node was removed, block incoming proposals' plus a note that resetting it on leadership change 'isn't very sound and likely has bugs' (node.go:405-433). Node.Propose reaches that channel through stepWithWaitOption, whose select can only complete on the channel, on ctx.Done or on n.done (node.go:513-537), so with a caller context that does not expire the call blocks and never reports that the proposal cannot be admitted, even though the raft layer itself signals a drop in the comparable removed-leader case (raft.go:1290-1295). The experiment drives one voter through the Node API while two other voters are bare raft instances, so the member control and the post-removal witness use the same call and the same call timeout.",
+  "sources": [
+    {
+      "id": "node_block_proposals_on_removal",
+      "file": "node.go",
+      "start_line": 405,
+      "end_line": 433,
+      "kind": "code_observation"
+    },
+    {
+      "id": "node_propose_wait",
+      "file": "node.go",
+      "start_line": 513,
+      "end_line": 537,
+      "kind": "code_observation"
+    }
+  ],
+  "investigations": [
+    {
+      "ref": "@node_propose_after_removal",
+      "question": "After a node applies a configuration that removes it, does a proposal made through the Node API report that the proposal cannot be admitted, or does the call block until the caller's context expires without any signal that the node is no longer a member?",
+      "source_ids": [
+        "node_block_proposals_on_removal",
+        "node_propose_wait",
+        "leader_propose_drop"
+      ],
+      "hypothesis": "node.run sets the proposal channel to nil when the node applies a removal of itself, and Node.Propose's wait path selects only on that channel, the caller's context and the node's done channel, so the call blocks and returns the caller's context error (or ErrStopped) rather than any statement about admissibility, even though the raft layer's own proposal path returns a drop error when the removed node is the leader.",
+      "discriminator": "Drive a three-voter cluster with node 3 behind the Node API, make it a follower of a bare leader, propose through node 3's Node while it is still a member with a short-lived context (expected: returns promptly with no error), then remove node 3 on the leader, apply the committed entry on node 3, and repeat the same Node.Propose call with the same timeout, recording the returned error text and the elapsed time. If the second call returns a raft error before the deadline, the hypothesis is refuted.",
+      "disposition": "active",
+      "limitations": [
+        "The probe uses a short-lived caller context; with a non-expiring context the call would block until the node stops, which the harness does not measure directly.",
+        "The removal is applied only on the subject node through the Node API while the other two voters are bare raft instances driven by the harness.",
+        "The embedding service's own proposal timeouts, retries and membership tracking are outside the captured package."
+      ]
+    }
+  ],
+  "knowledge": [
+    {
+      "ref": "@behavior_node_block_proposals_on_removal",
+      "kind": "behavior",
+      "statement": "When a node applies a configuration in which it was a member before and is absent from the new voters (and from VotersOutgoing), node.run disables its proposal channel by setting propc to nil; Node.Propose/ProposeConfChange reach that channel through stepWithWaitOption, whose select can complete only on the channel send, on ctx.Done or on n.done. A proposal issued after such an application therefore blocks and returns only the caller's context error or ErrStopped, and the raft step path that would otherwise run (a follower forwarding the MsgProp to its leader) is never invoked, so the library's own drop signal (raft.go:1290-1295 for the removed-leader case) is not produced on this path.",
+      "conditions": "The node is driven through the Node API with an asynchronous run loop, it applied a committed configuration that removed it while it was in the previous configuration, its proposal channel was therefore disabled, and the caller supplies a context with a deadline (a non-expiring context blocks until the node stops).",
+      "source_ids": [
+        "node_block_proposals_on_removal",
+        "node_propose_wait",
+        "leader_propose_drop"
+      ]
+    }
+  ],
+  "experiment": {
+    "investigation_id": "@node_propose_after_removal",
+    "harness_path": "assurance_generated_test.go",
+    "execution_package": ".",
+    "source_ids": [
+      "node_block_proposals_on_removal",
+      "node_propose_wait",
+      "leader_propose_drop"
+    ],
+    "scope": {
+      "description": "One probe on a three-voter cluster in which node 1 is a bare raft leader, node 2 a bare raft follower and node 3 is driven through the Node API. The probe first proposes through node 3's Node while it is still a member, then removes node 3 on the leader, lets node 3's application apply the committed entry, and repeats the same proposal with the same caller timeout.",
+      "assumptions": [
+        "The harness plays the application loop for node 3 (handing Ready structs back with Advance) and the transport for all messages, delivering peer messages to node 3 through Node.Step so that raft state is only touched by the owning goroutine for the Node-driven node.",
+        "Node 1 is made leader directly by becomeCandidate/becomeLeader and then broadcasts its entry, which is the same leader state a completed election produces.",
+        "The subject's proposal is made through Node.Propose, the same call an embedding service uses, with a context that expires after the recorded timeout.",
+        "The derived field blocked_until_deadline is computed as (returned error == context.DeadlineExceeded) and (elapsed >= timeout/2); both operands are reported.",
+        "Delivery is fault-free and in-process; no restart, snapshot or leadership change occurs."
+      ],
+      "excluded": [
+        "A non-expiring caller context, which the harness does not measure directly",
+        "ReadOnlyLeaseBased, snapshots, restarts and joint configurations",
+        "The embedding service's propagation and retry policy for proposals"
+      ]
+    },
+    "prefix": "Harness (draft file assurance_generated_test.go, package raft, execution package '.'; no captured file is replaced). The test builds three storages for voters {1,2,3}: bare raft instances for nodes 1 and 2 and a RawNode wrapped in newNode for node 3, whose run loop is started and stopped by the test. A delivery pump sends each message to the instance it addresses, feeding node 3's messages through Node.Step so only the run loop touches that raft instance; a drive loop hands node 3's Readys back with storage.Append and Node.Advance, applies any committed conf-change entry through Node.ApplyConfChange, and moves the Ready's messages into the delivery queue. The probe makes node 1 leader (becomeCandidate, becomeLeader, bcastAppend), drives until both bare followers committed the leadership entry, and emits node_setup with probe_id 'member', leader, term, committed, node3_in_config and the call timeout. It then calls Node.Propose on node 3 with a 200 ms context and emits node_propose for probe_id 'member' with the error text, elapsed milliseconds, the timeout, the derived blocked_until_deadline and node3_in_config. Next it proposes a ConfChangeV2 removing node 3 on the bare leader, drives until node 3's configuration no longer contains node 3, and emits self_removal_applied with probe_id 'removed', node3_in_config, voters, node3_lead, node3_state and committed. Finally it repeats the same Node.Propose call with the same timeout and emits node_propose for probe_id 'removed'. The test asserts that the member control returns without error and that the post-removal call blocks until the deadline, so a change in either behaviour fails the harness instead of reshaping the evidence.",
+    "responsibility": "The Node API owns telling a caller whether a proposal can be admitted. When the library itself has learned that the node is no longer a member, a proposal call that cannot be processed must be reported as not admissible rather than blocking until the caller's context expires, leaving the caller to infer the reason from a deadline error.",
+    "prerequisites": [
+      {
+        "alias": "member_setup",
+        "event": "node_setup",
+        "conditions": [
+          {
+            "field": "node3_in_config",
+            "value": true
+          }
+        ]
+      },
+      {
+        "alias": "removed_setup",
+        "event": "self_removal_applied",
+        "conditions": [
+          {
+            "field": "node3_in_config",
+            "value": false
+          }
+        ]
+      }
+    ],
+    "comparisons": [
+      {
+        "description": "After the node applied its own removal, a proposal through the Node API is reported as not admissible instead of blocking until the caller's deadline.",
+        "event": "node_propose",
+        "identity_fields": [
+          "probe_id"
+        ],
+        "admission_alias": "removed_setup",
+        "applicability_conditions": [
+          {
+            "field": "scenario",
+            "value": "removed"
+          }
+        ],
+        "assertion": {
+          "field": "blocked_until_deadline",
+          "value": false
+        }
+      },
+      {
+        "description": "Control: while the node is still a member, the same proposal call returns promptly without error.",
+        "event": "node_propose",
+        "identity_fields": [
+          "probe_id"
+        ],
+        "admission_alias": "member_setup",
+        "applicability_conditions": [
+          {
+            "field": "scenario",
+            "value": "member"
+          }
+        ],
+        "assertion": {
+          "field": "blocked_until_deadline",
+          "value": false
+        }
+      }
+    ]
+  }
+}

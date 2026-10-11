@@ -1,0 +1,675 @@
+{
+  "input": {
+    "rationale": "Trace the ReadIndex producer on a leader to decide whether a caller that retries a lost linearizable-read request can always complete it. Source reading shows that readOnly.addRequest (read_only.go:56-63) discards any MsgReadIndex whose Entries[0].Data equals an rctx that is already pending, that sendMsgReadIndexResponse (raft.go:2142-2157) still re-broadcasts a heartbeat for that discarded message, and that completion (raft.go:1596-1606 / 2068-2084) answers only the request message stored for the first admission. The in-tree Node.ReadIndex contract (node.go:218-229) tells callers that a lost ReadIndex request is theirs to retry and that reusing an rctx is supported ('Starting with release-3.7, this restriction is lifted, and it is ok to retry the same rctx'), while rawnode.go:560-563 shows the retry path reports no error even when the message is dropped. The attached experiment drives the real producer on a 3-voter in-process cluster: two different voters forward ReadIndex messages carrying the same rctx while the first is pending, then the leader receives a quorum acknowledgment and eight further heartbeat rounds with quorum acks while remaining leader. It measures whether a read index answer is produced for each admitted request, with controls that keep the shape identical and vary only rctx equality and requester identity. This is a bounded-liveness question; the draft does not claim an unbounded guarantee, and the snapshot's own documentation of the 3.6 restriction is retained as counterevidence for human review.",
+    "sources": [
+      {
+        "id": "add_request",
+        "file": "read_only.go",
+        "start_line": 56,
+        "end_line": 63,
+        "kind": "code_observation"
+      },
+      {
+        "id": "advance",
+        "file": "read_only.go",
+        "start_line": 81,
+        "end_line": 112,
+        "kind": "code_observation"
+      },
+      {
+        "id": "leader_msg_read_index",
+        "file": "raft.go",
+        "start_line": 1346,
+        "end_line": 1363,
+        "kind": "code_observation"
+      },
+      {
+        "id": "heartbeat_resp_completion",
+        "file": "raft.go",
+        "start_line": 1596,
+        "end_line": 1606,
+        "kind": "code_observation"
+      },
+      {
+        "id": "response_to_req",
+        "file": "raft.go",
+        "start_line": 2068,
+        "end_line": 2084,
+        "kind": "code_observation"
+      },
+      {
+        "id": "send_read_index_response",
+        "file": "raft.go",
+        "start_line": 2142,
+        "end_line": 2157,
+        "kind": "code_observation"
+      },
+      {
+        "id": "node_read_index_contract",
+        "file": "node.go",
+        "start_line": 218,
+        "end_line": 229,
+        "kind": "document_statement"
+      },
+      {
+        "id": "rawnode_read_index_api",
+        "file": "rawnode.go",
+        "start_line": 556,
+        "end_line": 563,
+        "kind": "code_observation"
+      },
+      {
+        "id": "test_frees_read_only_mem",
+        "file": "raft_test.go",
+        "start_line": 1192,
+        "end_line": 1222,
+        "kind": "test_expectation"
+      },
+      {
+        "id": "test_readindex_to_old_leader",
+        "file": "node_test.go",
+        "start_line": 196,
+        "end_line": 241,
+        "kind": "test_expectation"
+      }
+    ],
+    "investigations": [
+      {
+        "id": null,
+        "ref": "@readindex_duplicate_rctx",
+        "question": "On a stable leader using ReadOnlySafe, can a ReadIndex request that carries an rctx equal to one that is still pending complete, or is that request silently discarded so that its requester receives no read index answer while the cluster keeps making progress?",
+        "source_ids": [
+          "add_request",
+          "advance",
+          "leader_msg_read_index",
+          "heartbeat_resp_completion",
+          "response_to_req",
+          "send_read_index_response",
+          "node_read_index_contract",
+          "rawnode_read_index_api",
+          "test_frees_read_only_mem",
+          "test_readindex_to_old_leader"
+        ],
+        "hypothesis": "The leader keys pending read requests by the rctx string only, so a second admission carrying an equal rctx is dropped without recording its own request message; when the single status completes, the answer is addressed to the first admission's requester and no answer is ever produced for the second requester, even though the leader stays leader and keeps satisfying quorum heartbeat acknowledgments.",
+        "discriminator": "Drive two real voters to forward ReadIndex messages with equal rctx to the leader before any quorum acknowledgment, then deliver the quorum ack and eight further heartbeat rounds with acks from both followers; count read index answers per requester while confirming the leader stays in StateLeader. Controls: the identical shape with distinct rctxes (both requesters must be answered) and a single requester retrying its own rctx (that requester must be answered), which separate a duplicate-rctx admission loss from a broken harness or a generally stalled leader.",
+        "disposition": "active",
+        "parent_id": null,
+        "knowledge": null,
+        "counterevidence": [
+          "node.go:218-229 states that callers must not reuse an rctx and that the reuse restriction is only lifted starting with release-3.7, so the silent drop may be the documented behaviour of this release-3.6 revision rather than an implementation error; this draft reports the mechanism and the observed starvation, and leaves that classification to human review.",
+          "The same-requester retry case is answered: when one requester retries its own rctx while the status is pending, the single response is addressed to that requester, so the observed starvation requires a requester whose equal-rctx message is discarded because another requester was admitted first.",
+          "Existing test coverage (raft_test.go:1192-1222) exercises one unique rctx and only checks that the queue and pending map drain; node_test.go:196-241 forwards two equal rctxes from different nodes but asserts only that the messages are forwarded and never checks for read index answers."
+        ],
+        "limitations": [
+          "Only ReadOnlySafe is exercised; ReadOnlyLeaseBased and the pendingReadIndexMessages path (a leader that has not yet committed an entry in its term) are out of scope for this experiment.",
+          "The observation window is eight leader heartbeat rounds with quorum acknowledgments in one process; it establishes repeated nonprogress under normal opportunities rather than an unbounded guarantee.",
+          "The requester-side application contract (matching ReadStates by RequestCtx) is read from node.go / rawnode.go rather than executed."
+        ],
+        "resume_conditions": null
+      }
+    ],
+    "knowledge": [
+      {
+        "id": null,
+        "ref": "@dropped_equal_rctx",
+        "kind": "behavior",
+        "statement": "In StateLeader with the ReadOnlySafe option, when a MsgReadIndex arrives whose Entries[0].Data equals the rctx of a request that is already recorded in readOnly.pendingReadIndex, readOnly.addRequest returns early without storing the new request message, and sendMsgReadIndexResponse still attaches a heartbeat with that rctx (bcastHeartbeatWithCtx) and re-acknowledges the local node; the readIndexQueue and pendingReadIndex therefore keep exactly one status for the two admissions, and no second request message is retained.",
+        "conditions": "Node is in StateLeader, ReadOnlyOption is ReadOnlySafe (the default), the leader has committed an entry in its current term so stepLeader calls sendMsgReadIndexResponse directly, the earlier request with the equal rctx is still pending (not yet advanced), and no reset/become* has occurred between the two admissions.",
+        "source_ids": [
+          "add_request",
+          "send_read_index_response",
+          "leader_msg_read_index"
+        ],
+        "executions": {},
+        "changed_premise": "",
+        "affected_uses": []
+      },
+      {
+        "id": null,
+        "ref": "@completion_targets_first_requester",
+        "kind": "behavior",
+        "statement": "On the acknowledging heartbeat, stepLeader asks readOnly.advance for the statuses up to the acknowledged ctx and then answers each returned status through responseToReadIndexReq(rs.req, rs.index): a status whose stored request came from a remote peer produces one MsgReadIndexResp addressed to that stored request's From, and a status whose stored request came from the leader itself appends one local ReadState. Only the request message of the first admission with a given rctx is stored, so admissions that were discarded by addRequest produce no read index answer of either kind.",
+        "conditions": "ReadOnlySafe with a quorum of heartbeat acknowledgments carrying the ctx, leader state unchanged between admission and acknowledgment, and the discarded admission having used the same rctx bytes as the stored one.",
+        "source_ids": [
+          "heartbeat_resp_completion",
+          "response_to_req",
+          "advance"
+        ],
+        "executions": {},
+        "changed_premise": "",
+        "affected_uses": []
+      }
+    ],
+    "gaps": [],
+    "interpretations": [],
+    "experiment": {
+      "investigation_id": "@readindex_duplicate_rctx",
+      "harness_path": "assurance_generated_test.go",
+      "files": {},
+      "execution_package": ".",
+      "source_ids": [
+        "add_request",
+        "advance",
+        "leader_msg_read_index",
+        "heartbeat_resp_completion",
+        "response_to_req",
+        "send_read_index_response",
+        "node_read_index_contract",
+        "rawnode_read_index_api"
+      ],
+      "anchors": [],
+      "scope": {
+        "description": "In-process three-voter cluster (nodes 1, 2, 3 of the captured raft package, one process, three real state machines), ReadOnlySafe, fault-free delivery, no proposal, no election after node 1 becomes leader, no snapshot and no membership change. The requested question is only whether each admitted ReadIndex request receives a read index answer.",
+        "assumptions": [
+          "ReadOnlyOption is the default ReadOnlySafe for newTestRaft.",
+          "Delivery is reliable and ordered as the harness steps messages explicitly; no network loss or reordering is injected.",
+          "Node 1 has committed an entry in its term before the read requests arrive, so stepLeader serves MsgReadIndex immediately instead of appending to pendingReadIndexMessages.",
+          "The two requester nodes chose byte-equal rctx values; only the requester identity and the rctx equality differ from the control scenario.",
+          "The leader remains leader during the observation window (verified in the emitted events)."
+        ],
+        "excluded": [
+          "ReadOnlyLeaseBased and lease-based reads",
+          "MsgReadIndex arriving before the leader has committed an entry in its term (pendingReadIndexMessages path)",
+          "leadership transfer, conf change, joint configuration, snapshot restore and restart",
+          "msg application / state machine reads beyond the raft ReadState and MsgReadIndexResp contract"
+        ],
+        "parameters": {}
+      },
+      "prefix": "Initialization and producers in the draft harness (draft file assurance_generated_test.go, package raft, execution package '.'; no captured file is replaced). assuranceCluster builds three real raft instances with newTestRaft(1|2|3, 10, 1, newTestMemoryStorage(withPeers(1,2,3))), wires them with newNetwork and elects node 1 by nt.send(MsgHup); it asserts r1.state == StateLeader and r1.committedEntryInCurrentTerm() before clearing all message queues. assuranceForward uses the real caller path: Step a local MsgReadIndex{From:id,To:id,Type:MsgReadIndex,Entries:[{Data:rctx}]} into follower f and take the single forwarded MsgReadIndex (stepFollower sets m.To = f.lead without attaching a term), then Step that message into the leader. Scenario duplicate_ctx: follower 2 forwards rctx 'assurance-dup-rctx' and the leader steps it; follower 3 then forwards the same rctx and the leader steps it while the first status is still pending; a third identical retry from follower 3 is also stepped. The leader then receives MsgHeartbeatResp{From:2,Context:rctx} (quorum of voters {1,2,3} is reached by the leader's own ack plus node 2) plus eight further rounds of MsgHeartbeatResp from nodes 3 and 2 followed by leader.tickHeartbeat(); every emitted message is inspected for MsgReadIndexResp and counted per destination. Scenario distinct_ctx repeats exactly the same sequence with two different rctx values, and scenario same_requester_retry repeats it with a single follower retrying its own rctx. Events record, per admission, the pending/queue sizes after the admission; per retry, the queue change and emitted heartbeats; per round, the leader state, pending/queue sizes and cumulative responses per requester; and per request, the final responded flag, response count, awaited rounds and the requester's ReadState count.",
+      "semantic_changes": [],
+      "requirement": null,
+      "responsibility": "The leader-side ReadIndex producer owns producing a read index answer (one local ReadState for a local request, or one MsgReadIndexResp to the requesting peer) for every ReadIndex request it admits; the documented caller contract states that lost ReadIndex requests are the caller's to retry and that reusing an rctx is supported from release-3.7 on.",
+      "prerequisites": [
+        {
+          "alias": "dup_request",
+          "event": "read_index_request",
+          "conditions": [
+            {
+              "field": "scenario",
+              "op": "eq",
+              "value": "duplicate_ctx",
+              "reference": null
+            }
+          ]
+        },
+        {
+          "alias": "control_request",
+          "event": "read_index_request",
+          "conditions": [
+            {
+              "field": "scenario",
+              "op": "eq",
+              "value": "distinct_ctx",
+              "reference": null
+            }
+          ]
+        },
+        {
+          "alias": "retry_request",
+          "event": "read_index_request",
+          "conditions": [
+            {
+              "field": "scenario",
+              "op": "eq",
+              "value": "same_requester_retry",
+              "reference": null
+            }
+          ]
+        }
+      ],
+      "comparisons": [
+        {
+          "event": "read_index_delivery",
+          "identity_fields": [
+            "request_id"
+          ],
+          "admission_alias": "dup_request",
+          "assertion": {
+            "field": "responded",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          },
+          "antecedent": null,
+          "applicability_conditions": [
+            {
+              "field": "scenario",
+              "op": "eq",
+              "value": "duplicate_ctx",
+              "reference": null
+            }
+          ],
+          "description": "Admitted ReadIndex requests that carry an rctx equal to another requester's pending rctx each receive a read index answer."
+        },
+        {
+          "event": "read_index_delivery",
+          "identity_fields": [
+            "request_id"
+          ],
+          "admission_alias": "control_request",
+          "assertion": {
+            "field": "responded",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          },
+          "antecedent": null,
+          "applicability_conditions": [
+            {
+              "field": "scenario",
+              "op": "eq",
+              "value": "distinct_ctx",
+              "reference": null
+            }
+          ],
+          "description": "Control: with identical timing and distinct rctxes, each admitted ReadIndex request receives a read index answer."
+        },
+        {
+          "event": "read_index_delivery",
+          "identity_fields": [
+            "request_id"
+          ],
+          "admission_alias": "retry_request",
+          "assertion": {
+            "field": "responded",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          },
+          "antecedent": null,
+          "applicability_conditions": [
+            {
+              "field": "scenario",
+              "op": "eq",
+              "value": "same_requester_retry",
+              "reference": null
+            }
+          ],
+          "description": "Control: a single requester retrying its own pending rctx still receives a read index answer for that rctx."
+        }
+      ],
+      "knowledge": [],
+      "previous_id": null,
+      "revision_reason": ""
+    },
+    "stop": null
+  },
+  "before": {
+    "investigations": [],
+    "knowledge": [],
+    "experiments": [],
+    "materials": [],
+    "current_submission": {
+      "phase": "received",
+      "operation_id": "708eebc14c4040feb495e11d064001d0",
+      "result": {
+        "submission": "submission.json",
+        "summary": "Draft update submitted from the run's draft directory: submission.json (validated read-only: valid, no diagnostics) plus the harness file assurance_generated_test.go. It registers one investigation into the leader-side ReadIndex producer under ReadOnlySafe, two sourced Behavior entries, and one experiment that drives a real 3-voter in-process cluster through the actual producer paths. Sourced mechanism: read_only.go:56-63 discards a MsgReadIndex whose rctx equals an already-pending one, raft.go:2142-2157 still re-broadcasts a heartbeat for it, and completion answers only the stored (first) request message (raft.go:1596-1606, 2068-2084); node.go:218-229 documents that lost ReadIndex requests are the caller's to retry and asserts reuse is supported from release-3.7, while rawnode.go:560-563 shows a dropped retry reports no error. The experiment compares, in one run, three scenarios with identical shape: equal rctx from two different voters, distinct rctxes (control), and one requester retrying its own rctx (control). Locally the harness passes and shows the duplicate-rctx second requester receiving zero responses and zero ReadStates over eight heartbeat rounds while the leader stays leader and the first requester is answered. No interpretation is claimed yet because the formal conclusion must cite the controller's retained execution receipt; the snapshot's own release-3.6 restriction is kept as counterevidence for human review."
+      },
+      "status": "completed",
+      "reason": "",
+      "session_unavailable": false
+    },
+    "applied_operations": {}
+  },
+  "after": {
+    "investigations": [
+      {
+        "id": "708eebc14c4040feb495e11d064001d0-question-0",
+        "version": 1,
+        "question": "On a stable leader using ReadOnlySafe, can a ReadIndex request that carries an rctx equal to one that is still pending complete, or is that request silently discarded so that its requester receives no read index answer while the cluster keeps making progress?",
+        "source_ids": [
+          "add_request",
+          "advance",
+          "leader_msg_read_index",
+          "heartbeat_resp_completion",
+          "response_to_req",
+          "send_read_index_response",
+          "node_read_index_contract",
+          "rawnode_read_index_api",
+          "test_frees_read_only_mem",
+          "test_readindex_to_old_leader"
+        ],
+        "hypothesis": "The leader keys pending read requests by the rctx string only, so a second admission carrying an equal rctx is dropped without recording its own request message; when the single status completes, the answer is addressed to the first admission's requester and no answer is ever produced for the second requester, even though the leader stays leader and keeps satisfying quorum heartbeat acknowledgments.",
+        "discriminator": "Drive two real voters to forward ReadIndex messages with equal rctx to the leader before any quorum acknowledgment, then deliver the quorum ack and eight further heartbeat rounds with acks from both followers; count read index answers per requester while confirming the leader stays in StateLeader. Controls: the identical shape with distinct rctxes (both requesters must be answered) and a single requester retrying its own rctx (that requester must be answered), which separate a duplicate-rctx admission loss from a broken harness or a generally stalled leader.",
+        "disposition": "active",
+        "parent_id": null,
+        "knowledge": [],
+        "counterevidence": [
+          "node.go:218-229 states that callers must not reuse an rctx and that the reuse restriction is only lifted starting with release-3.7, so the silent drop may be the documented behaviour of this release-3.6 revision rather than an implementation error; this draft reports the mechanism and the observed starvation, and leaves that classification to human review.",
+          "The same-requester retry case is answered: when one requester retries its own rctx while the status is pending, the single response is addressed to that requester, so the observed starvation requires a requester whose equal-rctx message is discarded because another requester was admitted first.",
+          "Existing test coverage (raft_test.go:1192-1222) exercises one unique rctx and only checks that the queue and pending map drain; node_test.go:196-241 forwards two equal rctxes from different nodes but asserts only that the messages are forwarded and never checks for read index answers."
+        ],
+        "limitations": [
+          "Only ReadOnlySafe is exercised; ReadOnlyLeaseBased and the pendingReadIndexMessages path (a leader that has not yet committed an entry in its term) are out of scope for this experiment.",
+          "The observation window is eight leader heartbeat rounds with quorum acknowledgments in one process; it establishes repeated nonprogress under normal opportunities rather than an unbounded guarantee.",
+          "The requester-side application contract (matching ReadStates by RequestCtx) is read from node.go / rawnode.go rather than executed."
+        ],
+        "resume_conditions": [],
+        "gaps": [],
+        "history": [],
+        "operation_id": "708eebc14c4040feb495e11d064001d0"
+      }
+    ],
+    "knowledge": [
+      {
+        "id": "708eebc14c4040feb495e11d064001d0-knowledge-0",
+        "revision": 1,
+        "kind": "behavior",
+        "statement": "In StateLeader with the ReadOnlySafe option, when a MsgReadIndex arrives whose Entries[0].Data equals the rctx of a request that is already recorded in readOnly.pendingReadIndex, readOnly.addRequest returns early without storing the new request message, and sendMsgReadIndexResponse still attaches a heartbeat with that rctx (bcastHeartbeatWithCtx) and re-acknowledges the local node; the readIndexQueue and pendingReadIndex therefore keep exactly one status for the two admissions, and no second request message is retained.",
+        "conditions": "Node is in StateLeader, ReadOnlyOption is ReadOnlySafe (the default), the leader has committed an entry in its current term so stepLeader calls sendMsgReadIndexResponse directly, the earlier request with the equal rctx is still pending (not yet advanced), and no reset/become* has occurred between the two admissions.",
+        "source_ids": [
+          "add_request",
+          "send_read_index_response",
+          "leader_msg_read_index"
+        ],
+        "executions": {},
+        "history": [],
+        "operation_id": "708eebc14c4040feb495e11d064001d0"
+      },
+      {
+        "id": "708eebc14c4040feb495e11d064001d0-knowledge-1",
+        "revision": 1,
+        "kind": "behavior",
+        "statement": "On the acknowledging heartbeat, stepLeader asks readOnly.advance for the statuses up to the acknowledged ctx and then answers each returned status through responseToReadIndexReq(rs.req, rs.index): a status whose stored request came from a remote peer produces one MsgReadIndexResp addressed to that stored request's From, and a status whose stored request came from the leader itself appends one local ReadState. Only the request message of the first admission with a given rctx is stored, so admissions that were discarded by addRequest produce no read index answer of either kind.",
+        "conditions": "ReadOnlySafe with a quorum of heartbeat acknowledgments carrying the ctx, leader state unchanged between admission and acknowledgment, and the discarded admission having used the same rctx bytes as the stored one.",
+        "source_ids": [
+          "heartbeat_resp_completion",
+          "response_to_req",
+          "advance"
+        ],
+        "executions": {},
+        "history": [],
+        "operation_id": "708eebc14c4040feb495e11d064001d0"
+      }
+    ],
+    "experiments": [
+      {
+        "id": "708eebc14c4040feb495e11d064001d0-experiment",
+        "investigation_id": "708eebc14c4040feb495e11d064001d0-question-0",
+        "version": 1,
+        "basis": {
+          "harness": {
+            "kind": "go_test",
+            "source": "// Copyright 2025 The etcd Authors\n//\n// Licensed under the Apache License, Version 2.0 (the \"License\");\n// you may not use this file except in compliance with the License.\n// You may obtain a copy of the License at\n//\n//     http://www.apache.org/licenses/LICENSE-2.0\n//\n// Unless required by applicable law or agreed to in writing, software\n// distributed under the License is distributed on an \"AS IS\" BASIS,\n// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n// See the License for the specific language governing permissions and\n// limitations under the License.\n\npackage raft\n\nimport (\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"testing\"\n\n\tpb \"go.etcd.io/raft/v3/raftpb\"\n)\n\n// This file is generated by the audit harness. It never changes production\n// logic; it drives the real state machine through its normal entry points\n// (Step / ReadIndex forwarding) and reports observations as CA_EVENT lines.\n\nfunc assuranceEmit(t *testing.T, event map[string]any) {\n\tt.Helper()\n\traw, err := json.Marshal(event)\n\tif err != nil {\n\t\tt.Fatalf(\"marshal CA_EVENT: %v\", err)\n\t}\n\tfmt.Println(\"CA_EVENT \" + string(raw))\n}\n\n// assuranceCluster builds three real raft instances for the voter set\n// {1,2,3}, wires them through the standard test network and elects node 1 as\n// leader with a committed entry in its term, which is the precondition for\n// the leader to answer MsgReadIndex immediately (see stepLeader /\n// committedEntryInCurrentTerm).\nfunc assuranceCluster(t *testing.T) (leader, follower2, follower3 *raft) {\n\tt.Helper()\n\tr1 := newTestRaft(1, 10, 1, newTestMemoryStorage(withPeers(1, 2, 3)))\n\tr2 := newTestRaft(2, 10, 1, newTestMemoryStorage(withPeers(1, 2, 3)))\n\tr3 := newTestRaft(3, 10, 1, newTestMemoryStorage(withPeers(1, 2, 3)))\n\tnt := newNetwork(r1, r2, r3)\n\tnt.send(pb.Message{From: 1, To: 1, Type: pb.MsgHup})\n\tif r1.state != StateLeader {\n\t\tt.Fatalf(\"node 1 is %v, want %v\", r1.state, StateLeader)\n\t}\n\tif !r1.committedEntryInCurrentTerm() {\n\t\tt.Fatalf(\"leader 1 has no committed entry in term %d, read index would be queued instead of served\", r1.Term)\n\t}\n\tassuranceEmit(t, map[string]any{\n\t\t\"event\":                   \"leader_elected\",\n\t\t\"leader\":                  \"1\",\n\t\t\"term\":                    r1.Term,\n\t\t\"committed\":               r1.raftLog.committed,\n\t\t\"committed_in_term\":       r1.committedEntryInCurrentTerm(),\n\t\t\"read_only_option\":        \"ReadOnlySafe\",\n\t\t\"leader_state\":            r1.state.String(),\n\t\t\"voters\":                  r1.trk.ConfState().Voters,\n\t\t\"follower2_lead\":          r2.lead,\n\t\t\"follower3_lead\":          r3.lead,\n\t})\n\t// Start every scenario from a quiescent message queue.\n\tfor _, r := range []*raft{r1, r2, r3} {\n\t\tr.readMessages()\n\t}\n\treturn r1, r2, r3\n}\n\n// assuranceForward makes follower r issue a real local ReadIndex for ctx and\n// returns the MsgReadIndex that r forwards to its leader (this is exactly what\n// RawNode.ReadIndex/Node.ReadIndex do: Step a local MsgReadIndex, which\n// stepFollower forwards to r.lead without a term).\nfunc assuranceForward(t *testing.T, r *raft, ctx []byte) pb.Message {\n\tt.Helper()\n\tif err := r.Step(pb.Message{\n\t\tFrom:    r.id,\n\t\tTo:      r.id,\n\t\tType:    pb.MsgReadIndex,\n\t\tEntries: []pb.Entry{{Data: ctx}},\n\t}); err != nil {\n\t\tt.Fatalf(\"node %d step MsgReadIndex: %v\", r.id, err)\n\t}\n\tmsgs := r.readMessages()\n\tif len(msgs) != 1 {\n\t\tt.Fatalf(\"node %d forwarded %d messages, want exactly 1\", r.id, len(msgs))\n\t}\n\tm := msgs[0]\n\tif m.Type != pb.MsgReadIndex || m.To != r.lead || len(m.Entries) != 1 || string(m.Entries[0].Data) != string(ctx) {\n\t\tt.Fatalf(\"node %d forwarded %+v, want MsgReadIndex to %d carrying %q\", r.id, m, r.lead, ctx)\n\t}\n\treturn m\n}\n\n// assurancePump delivers messages to the node each one addresses, using the\n// real Step path of every state machine, and counts the read index responses\n// that reach a requester. It returns the messages left undelivered when the\n// per-round budget runs out.\nfunc assurancePump(t *testing.T, nodes map[uint64]*raft, pending []pb.Message, responses map[uint64]int, budget int) []pb.Message {\n\tt.Helper()\n\tfor len(pending) > 0 && budget > 0 {\n\t\tbudget--\n\t\tm := pending[0]\n\t\tpending = pending[1:]\n\t\ttarget, ok := nodes[m.To]\n\t\tif !ok {\n\t\t\tt.Fatalf(\"message %s addressed to unknown node %d\", m.Type, m.To)\n\t\t}\n\t\tif m.Type == pb.MsgReadIndexResp {\n\t\t\tresponses[m.To]++\n\t\t}\n\t\tif err := target.Step(m); err != nil {\n\t\t\tt.Fatalf(\"node %d step %s: %v\", m.To, m.Type, err)\n\t\t}\n\t\tpending = append(pending, target.readMessages()...)\n\t}\n\treturn pending\n}\n\nfunc assuranceCountReadStates(nodes map[uint64]*raft) map[string]int {\n\tout := map[string]int{}\n\tfor id, r := range nodes {\n\t\tout[fmt.Sprintf(\"%d\", id)] = len(r.readStates)\n\t}\n\treturn out\n}\n\nfunc TestAssuranceReadIndexRepeatedRctx(t *testing.T) {\n\t// admit forwards one ReadIndex from follower f, delivers the leader's\n\t// heartbeat broadcast to the addressed followers (so that a real\n\t// MsgHeartbeatResp carrying the rctx is produced by their state machines)\n\t// and holds those acknowledgments back. It returns the leader's outgoing\n\t// messages for inspection.\n\tadmit := func(lead *raft, nodes map[uint64]*raft, f *raft, ctx []byte, held *[]pb.Message) []pb.Message {\n\t\tt.Helper()\n\t\tlead.Step(assuranceForward(t, f, ctx))\n\t\tmsgs := lead.readMessages()\n\t\tfor _, m := range msgs {\n\t\t\ttarget, ok := nodes[m.To]\n\t\t\tif !ok {\n\t\t\t\tt.Fatalf(\"leader sent %s to unknown node %d\", m.Type, m.To)\n\t\t\t}\n\t\t\tif err := target.Step(m); err != nil {\n\t\t\t\tt.Fatalf(\"node %d step %s: %v\", m.To, m.Type, err)\n\t\t\t}\n\t\t\t*held = append(*held, target.readMessages()...)\n\t\t}\n\t\treturn msgs\n\t}\n\trequestEvent := func(scenario, requestID, requester string, ctx []byte, lead *raft) {\n\t\tassuranceEmit(t, map[string]any{\n\t\t\t\"event\":         \"read_index_request\",\n\t\t\t\"request_id\":    requestID,\n\t\t\t\"requester\":     requester,\n\t\t\t\"rctx\":          string(ctx),\n\t\t\t\"scenario\":      scenario,\n\t\t\t\"pending_after\": len(lead.readOnly.pendingReadIndex),\n\t\t\t\"queue_after\":   len(lead.readOnly.readIndexQueue),\n\t\t\t\"leader_state\":  lead.state.String(),\n\t\t})\n\t}\n\n\t// Scenario \"duplicate_ctx\": two different voters each issue one ReadIndex\n\t// carrying the *same* rctx, with no quorum acknowledgment in between.\n\tdupCtx := []byte(\"assurance-dup-rctx\")\n\tleader, f2, f3 := assuranceCluster(t)\n\tnodes := map[uint64]*raft{1: leader, 2: f2, 3: f3}\n\tresponses := map[uint64]int{}\n\tvar held []pb.Message\n\n\t// Requester 2 reaches the leader first and is admitted.\n\tadmit(leader, nodes, f2, dupCtx, &held)\n\trequestEvent(\"duplicate_ctx\", \"duplicate/2\", \"2\", dupCtx, leader)\n\n\t// Requester 3 reaches the same leader with an equal rctx while requester\n\t// 2's status is still pending.\n\tadmit(leader, nodes, f3, dupCtx, &held)\n\trequestEvent(\"duplicate_ctx\", \"duplicate/3\", \"3\", dupCtx, leader)\n\n\t// Retrying the same rctx is likewise accepted by the leader without\n\t// creating a new pending status.\n\tqueueBefore := len(leader.readOnly.readIndexQueue)\n\tretryMsgs := admit(leader, nodes, f3, dupCtx, &held)\n\tassuranceEmit(t, map[string]any{\n\t\t\"event\":              \"read_index_retry\",\n\t\t\"request_id\":         \"duplicate/3\",\n\t\t\"requester\":          \"3\",\n\t\t\"rctx\":               string(dupCtx),\n\t\t\"scenario\":           \"duplicate_ctx\",\n\t\t\"queue_before\":       queueBefore,\n\t\t\"queue_after\":        len(leader.readOnly.readIndexQueue),\n\t\t\"pending_after\":      len(leader.readOnly.pendingReadIndex),\n\t\t\"heartbeats_emitted\": len(retryMsgs),\n\t\t\"leader_state\":       leader.state.String(),\n\t})\n\n\t// Observation window: the held acknowledgments and the leader's own\n\t// periodic heartbeats keep flowing. Every message is processed by the\n\t// state machine it addresses, which is the leader's normal opportunity to\n\t// complete pending read requests.\n\tconst rounds = 8\n\tpending := held\n\tfor i := 0; i < rounds; i++ {\n\t\tleader.tickHeartbeat()\n\t\tpending = append(pending, leader.readMessages()...)\n\t\tpending = assurancePump(t, nodes, pending, responses, 200)\n\t\tassuranceEmit(t, map[string]any{\n\t\t\t\"event\":          \"read_index_round\",\n\t\t\t\"scenario\":       \"duplicate_ctx\",\n\t\t\t\"round\":          i,\n\t\t\t\"leader_state\":   leader.state.String(),\n\t\t\t\"term\":           leader.Term,\n\t\t\t\"pending\":        len(leader.readOnly.pendingReadIndex),\n\t\t\t\"queue\":          len(leader.readOnly.readIndexQueue),\n\t\t\t\"responses_to_2\": responses[2],\n\t\t\t\"responses_to_3\": responses[3],\n\t\t\t\"read_states\":    assuranceCountReadStates(nodes),\n\t\t\t\"undelivered\":    len(pending),\n\t\t})\n\t}\n\n\tassuranceEmit(t, map[string]any{\n\t\t\"event\":         \"read_index_delivery\",\n\t\t\"request_id\":    \"duplicate/2\",\n\t\t\"requester\":     \"2\",\n\t\t\"rctx\":          string(dupCtx),\n\t\t\"scenario\":      \"duplicate_ctx\",\n\t\t\"responded\":     responses[2] > 0,\n\t\t\"responses\":     responses[2],\n\t\t\"rounds_waited\": rounds,\n\t\t\"leader_state\":  leader.state.String(),\n\t})\n\tassuranceEmit(t, map[string]any{\n\t\t\"event\":                 \"read_index_delivery\",\n\t\t\"request_id\":            \"duplicate/3\",\n\t\t\"requester\":             \"3\",\n\t\t\"rctx\":                  string(dupCtx),\n\t\t\"scenario\":              \"duplicate_ctx\",\n\t\t\"responded\":             responses[3] > 0,\n\t\t\"responses\":             responses[3],\n\t\t\"rounds_waited\":         rounds,\n\t\t\"leader_state\":          leader.state.String(),\n\t\t\"requester_read_states\": len(f3.readStates),\n\t})\n\tif responses[2] == 0 {\n\t\tt.Fatalf(\"harness check: first requester got no read index response\")\n\t}\n\tif responses[3] != 0 || len(f3.readStates) != 0 {\n\t\tt.Fatalf(\"expected the second requester to be starved, got %d responses and %d read states\",\n\t\t\tresponses[3], len(f3.readStates))\n\t}\n\n\t// Scenario \"distinct_ctx\" (control): the same two requesters, same order,\n\t// same timing, but distinct rctxes.\n\tleaderC, c2, c3 := assuranceCluster(t)\n\tcnodes := map[uint64]*raft{1: leaderC, 2: c2, 3: c3}\n\tcresponses := map[uint64]int{}\n\tvar cheld []pb.Message\n\tctx2 := []byte(\"assurance-ctl-rctx-2\")\n\tctx3 := []byte(\"assurance-ctl-rctx-3\")\n\tadmit(leaderC, cnodes, c2, ctx2, &cheld)\n\trequestEvent(\"distinct_ctx\", \"control/2\", \"2\", ctx2, leaderC)\n\tadmit(leaderC, cnodes, c3, ctx3, &cheld)\n\trequestEvent(\"distinct_ctx\", \"control/3\", \"3\", ctx3, leaderC)\n\tcpending := cheld\n\tfor i := 0; i < rounds; i++ {\n\t\tleaderC.tickHeartbeat()\n\t\tcpending = append(cpending, leaderC.readMessages()...)\n\t\tcpending = assurancePump(t, cnodes, cpending, cresponses, 200)\n\t}\n\tassuranceEmit(t, map[string]any{\n\t\t\"event\":        \"read_index_delivery\",\n\t\t\"request_id\":   \"control/2\",\n\t\t\"requester\":    \"2\",\n\t\t\"rctx\":         string(ctx2),\n\t\t\"scenario\":     \"distinct_ctx\",\n\t\t\"responded\":    cresponses[2] > 0,\n\t\t\"responses\":    cresponses[2],\n\t\t\"leader_state\": leaderC.state.String(),\n\t})\n\tassuranceEmit(t, map[string]any{\n\t\t\"event\":        \"read_index_delivery\",\n\t\t\"request_id\":   \"control/3\",\n\t\t\"requester\":    \"3\",\n\t\t\"rctx\":         string(ctx3),\n\t\t\"scenario\":     \"distinct_ctx\",\n\t\t\"responded\":    cresponses[3] > 0,\n\t\t\"responses\":    cresponses[3],\n\t\t\"leader_state\": leaderC.state.String(),\n\t})\n\tif cresponses[2] == 0 || cresponses[3] == 0 {\n\t\tt.Fatalf(\"control failure: distinct rctxes answered %v\", cresponses)\n\t}\n\n\t// Scenario \"same_requester_retry\": one requester retries its own rctx while\n\t// the first status is pending. The retry is equally deduplicated, but the\n\t// single response is addressed to that same requester.\n\tleaderS, s2, s3 := assuranceCluster(t)\n\tsnodes := map[uint64]*raft{1: leaderS, 2: s2, 3: s3}\n\tsresponses := map[uint64]int{}\n\tvar sheld []pb.Message\n\townCtx := []byte(\"assurance-own-rctx\")\n\tadmit(leaderS, snodes, s2, ownCtx, &sheld)\n\trequestEvent(\"same_requester_retry\", \"retry/2\", \"2\", ownCtx, leaderS)\n\tadmit(leaderS, snodes, s2, ownCtx, &sheld)\n\tspending := sheld\n\tfor i := 0; i < rounds; i++ {\n\t\tleaderS.tickHeartbeat()\n\t\tspending = append(spending, leaderS.readMessages()...)\n\t\tspending = assurancePump(t, snodes, spending, sresponses, 200)\n\t}\n\tassuranceEmit(t, map[string]any{\n\t\t\"event\":        \"read_index_delivery\",\n\t\t\"request_id\":   \"retry/2\",\n\t\t\"requester\":    \"2\",\n\t\t\"rctx\":         string(ownCtx),\n\t\t\"scenario\":     \"same_requester_retry\",\n\t\t\"responded\":    sresponses[2] > 0,\n\t\t\"responses\":    sresponses[2],\n\t\t\"leader_state\": leaderS.state.String(),\n\t})\n\tif sresponses[2] == 0 {\n\t\tt.Fatalf(\"harness check: retrying requester was not answered\")\n\t}\n}\n",
+            "files": {},
+            "execution_package": ".",
+            "description": "",
+            "semantic_changes": [],
+            "prerequisites": [
+              {
+                "alias": "dup_request",
+                "event": "read_index_request",
+                "conditions": [
+                  {
+                    "field": "scenario",
+                    "op": "eq",
+                    "value": "duplicate_ctx",
+                    "reference": null
+                  }
+                ]
+              },
+              {
+                "alias": "control_request",
+                "event": "read_index_request",
+                "conditions": [
+                  {
+                    "field": "scenario",
+                    "op": "eq",
+                    "value": "distinct_ctx",
+                    "reference": null
+                  }
+                ]
+              },
+              {
+                "alias": "retry_request",
+                "event": "read_index_request",
+                "conditions": [
+                  {
+                    "field": "scenario",
+                    "op": "eq",
+                    "value": "same_requester_retry",
+                    "reference": null
+                  }
+                ]
+              }
+            ]
+          },
+          "source_ids": [
+            "add_request",
+            "advance",
+            "leader_msg_read_index",
+            "heartbeat_resp_completion",
+            "response_to_req",
+            "send_read_index_response",
+            "node_read_index_contract",
+            "rawnode_read_index_api"
+          ],
+          "anchors": [],
+          "scope": {
+            "description": "In-process three-voter cluster (nodes 1, 2, 3 of the captured raft package, one process, three real state machines), ReadOnlySafe, fault-free delivery, no proposal, no election after node 1 becomes leader, no snapshot and no membership change. The requested question is only whether each admitted ReadIndex request receives a read index answer.",
+            "assumptions": [
+              "ReadOnlyOption is the default ReadOnlySafe for newTestRaft.",
+              "Delivery is reliable and ordered as the harness steps messages explicitly; no network loss or reordering is injected.",
+              "Node 1 has committed an entry in its term before the read requests arrive, so stepLeader serves MsgReadIndex immediately instead of appending to pendingReadIndexMessages.",
+              "The two requester nodes chose byte-equal rctx values; only the requester identity and the rctx equality differ from the control scenario.",
+              "The leader remains leader during the observation window (verified in the emitted events)."
+            ],
+            "excluded": [
+              "ReadOnlyLeaseBased and lease-based reads",
+              "MsgReadIndex arriving before the leader has committed an entry in its term (pendingReadIndexMessages path)",
+              "leadership transfer, conf change, joint configuration, snapshot restore and restart",
+              "msg application / state machine reads beyond the raft ReadState and MsgReadIndexResp contract"
+            ],
+            "parameters": {}
+          },
+          "prefix": "Initialization and producers in the draft harness (draft file assurance_generated_test.go, package raft, execution package '.'; no captured file is replaced). assuranceCluster builds three real raft instances with newTestRaft(1|2|3, 10, 1, newTestMemoryStorage(withPeers(1,2,3))), wires them with newNetwork and elects node 1 by nt.send(MsgHup); it asserts r1.state == StateLeader and r1.committedEntryInCurrentTerm() before clearing all message queues. assuranceForward uses the real caller path: Step a local MsgReadIndex{From:id,To:id,Type:MsgReadIndex,Entries:[{Data:rctx}]} into follower f and take the single forwarded MsgReadIndex (stepFollower sets m.To = f.lead without attaching a term), then Step that message into the leader. Scenario duplicate_ctx: follower 2 forwards rctx 'assurance-dup-rctx' and the leader steps it; follower 3 then forwards the same rctx and the leader steps it while the first status is still pending; a third identical retry from follower 3 is also stepped. The leader then receives MsgHeartbeatResp{From:2,Context:rctx} (quorum of voters {1,2,3} is reached by the leader's own ack plus node 2) plus eight further rounds of MsgHeartbeatResp from nodes 3 and 2 followed by leader.tickHeartbeat(); every emitted message is inspected for MsgReadIndexResp and counted per destination. Scenario distinct_ctx repeats exactly the same sequence with two different rctx values, and scenario same_requester_retry repeats it with a single follower retrying its own rctx. Events record, per admission, the pending/queue sizes after the admission; per retry, the queue change and emitted heartbeats; per round, the leader state, pending/queue sizes and cumulative responses per requester; and per request, the final responded flag, response count, awaited rounds and the requester's ReadState count.",
+          "requirement": null,
+          "responsibility": "The leader-side ReadIndex producer owns producing a read index answer (one local ReadState for a local request, or one MsgReadIndexResp to the requesting peer) for every ReadIndex request it admits; the documented caller contract states that lost ReadIndex requests are the caller's to retry and that reusing an rctx is supported from release-3.7 on.",
+          "comparisons": [
+            {
+              "event": "read_index_delivery",
+              "identity_fields": [
+                "request_id"
+              ],
+              "admission_alias": "dup_request",
+              "assertion": {
+                "field": "responded",
+                "op": "eq",
+                "value": true,
+                "reference": null
+              },
+              "antecedent": null,
+              "applicability_conditions": [
+                {
+                  "field": "scenario",
+                  "op": "eq",
+                  "value": "duplicate_ctx",
+                  "reference": null
+                }
+              ],
+              "description": "Admitted ReadIndex requests that carry an rctx equal to another requester's pending rctx each receive a read index answer."
+            },
+            {
+              "event": "read_index_delivery",
+              "identity_fields": [
+                "request_id"
+              ],
+              "admission_alias": "control_request",
+              "assertion": {
+                "field": "responded",
+                "op": "eq",
+                "value": true,
+                "reference": null
+              },
+              "antecedent": null,
+              "applicability_conditions": [
+                {
+                  "field": "scenario",
+                  "op": "eq",
+                  "value": "distinct_ctx",
+                  "reference": null
+                }
+              ],
+              "description": "Control: with identical timing and distinct rctxes, each admitted ReadIndex request receives a read index answer."
+            },
+            {
+              "event": "read_index_delivery",
+              "identity_fields": [
+                "request_id"
+              ],
+              "admission_alias": "retry_request",
+              "assertion": {
+                "field": "responded",
+                "op": "eq",
+                "value": true,
+                "reference": null
+              },
+              "antecedent": null,
+              "applicability_conditions": [
+                {
+                  "field": "scenario",
+                  "op": "eq",
+                  "value": "same_requester_retry",
+                  "reference": null
+                }
+              ],
+              "description": "Control: a single requester retrying its own pending rctx still receives a read index answer for that rctx."
+            }
+          ],
+          "knowledge": []
+        },
+        "snapshot_id": "a23faff7cd3e43b9af4254953ad0f9e7",
+        "configuration": {
+          "backend": "go_module",
+          "target": {
+            "expected_module": "go.etcd.io/raft/v3",
+            "variant": "etcd_raft",
+            "analysis_roots": [],
+            "execution_package": ".",
+            "harness_path": "assurance_generated_test.go"
+          },
+          "isolation": "bwrap",
+          "tools": {
+            "agent": "codex-cli 0.155.0-alpha.16",
+            "implementation": "go version go1.26.7 linux/amd64"
+          }
+        },
+        "harness_filename": "assurance_generated_test.go",
+        "operation_id": "708eebc14c4040feb495e11d064001d0",
+        "previous_id": null,
+        "difference": {},
+        "revision_reason": ""
+      }
+    ],
+    "materials": [
+      {
+        "id": "add_request",
+        "file": "read_only.go",
+        "start_line": 56,
+        "end_line": 63,
+        "kind": "code_observation",
+        "text": "func (ro *readOnly) addRequest(index uint64, m pb.Message) {\n\ts := string(m.Entries[0].Data)\n\tif _, ok := ro.pendingReadIndex[s]; ok {\n\t\treturn\n\t}\n\tro.pendingReadIndex[s] = &readIndexStatus{index: index, req: m, acks: make(map[uint64]bool)}\n\tro.readIndexQueue = append(ro.readIndexQueue, s)\n}",
+        "content_digest": "298b7d3edf32eecfc96172ced95506e9f3ac0964ec39068c32c572d95f782dc5"
+      },
+      {
+        "id": "advance",
+        "file": "read_only.go",
+        "start_line": 81,
+        "end_line": 112,
+        "kind": "code_observation",
+        "text": "func (ro *readOnly) advance(m pb.Message) []*readIndexStatus {\n\tvar (\n\t\ti     int\n\t\tfound bool\n\t)\n\n\tctx := string(m.Context)\n\tvar rss []*readIndexStatus\n\n\tfor _, okctx := range ro.readIndexQueue {\n\t\ti++\n\t\trs, ok := ro.pendingReadIndex[okctx]\n\t\tif !ok {\n\t\t\tpanic(\"cannot find corresponding read state from pending map\")\n\t\t}\n\t\trss = append(rss, rs)\n\t\tif okctx == ctx {\n\t\t\tfound = true\n\t\t\tbreak\n\t\t}\n\t}\n\n\tif found {\n\t\tro.readIndexQueue = ro.readIndexQueue[i:]\n\t\tfor _, rs := range rss {\n\t\t\tdelete(ro.pendingReadIndex, string(rs.req.Entries[0].Data))\n\t\t}\n\t\treturn rss\n\t}\n\n\treturn nil\n}",
+        "content_digest": "298b7d3edf32eecfc96172ced95506e9f3ac0964ec39068c32c572d95f782dc5"
+      },
+      {
+        "id": "leader_msg_read_index",
+        "file": "raft.go",
+        "start_line": 1346,
+        "end_line": 1363,
+        "kind": "code_observation",
+        "text": "\tcase pb.MsgReadIndex:\n\t\t// only one voting member (the leader) in the cluster\n\t\tif r.trk.IsSingleton() {\n\t\t\tif resp := r.responseToReadIndexReq(m, r.raftLog.committed); resp.To != None {\n\t\t\t\tr.send(resp)\n\t\t\t}\n\t\t\treturn nil\n\t\t}\n\n\t\t// Postpone read only request when this leader has not committed\n\t\t// any log entry at its term.\n\t\tif !r.committedEntryInCurrentTerm() {\n\t\t\tr.pendingReadIndexMessages = append(r.pendingReadIndexMessages, m)\n\t\t\treturn nil\n\t\t}\n\n\t\tsendMsgReadIndexResponse(r, m)\n",
+        "content_digest": "4283c10e12c6da14964c6d6784a69851af1312245aa83925ec0e9426a07ed7bb"
+      },
+      {
+        "id": "heartbeat_resp_completion",
+        "file": "raft.go",
+        "start_line": 1596,
+        "end_line": 1606,
+        "kind": "code_observation",
+        "text": "\t\tif r.trk.Voters.VoteResult(r.readOnly.recvAck(m.From, m.Context)) != quorum.VoteWon {\n\t\t\treturn nil\n\t\t}\n\n\t\trss := r.readOnly.advance(m)\n\t\tfor _, rs := range rss {\n\t\t\tif resp := r.responseToReadIndexReq(rs.req, rs.index); resp.To != None {\n\t\t\t\tr.send(resp)\n\t\t\t}\n\t\t}\n\tcase pb.MsgSnapStatus:",
+        "content_digest": "4283c10e12c6da14964c6d6784a69851af1312245aa83925ec0e9426a07ed7bb"
+      },
+      {
+        "id": "response_to_req",
+        "file": "raft.go",
+        "start_line": 2068,
+        "end_line": 2084,
+        "kind": "code_observation",
+        "text": "// responseToReadIndexReq constructs a response for `req`. If `req` comes from the peer\n// itself, a blank value will be returned.\nfunc (r *raft) responseToReadIndexReq(req pb.Message, readIndex uint64) pb.Message {\n\tif req.From == None || req.From == r.id {\n\t\tr.readStates = append(r.readStates, ReadState{\n\t\t\tIndex:      readIndex,\n\t\t\tRequestCtx: req.Entries[0].Data,\n\t\t})\n\t\treturn pb.Message{}\n\t}\n\treturn pb.Message{\n\t\tType:    pb.MsgReadIndexResp,\n\t\tTo:      req.From,\n\t\tIndex:   readIndex,\n\t\tEntries: req.Entries,\n\t}\n}",
+        "content_digest": "4283c10e12c6da14964c6d6784a69851af1312245aa83925ec0e9426a07ed7bb"
+      },
+      {
+        "id": "send_read_index_response",
+        "file": "raft.go",
+        "start_line": 2142,
+        "end_line": 2157,
+        "kind": "code_observation",
+        "text": "func sendMsgReadIndexResponse(r *raft, m pb.Message) {\n\t// thinking: use an internally defined context instead of the user given context.\n\t// We can express this in terms of the term and index instead of a user-supplied value.\n\t// This would allow multiple reads to piggyback on the same message.\n\tswitch r.readOnly.option {\n\t// If more than the local vote is needed, go through a full broadcast.\n\tcase ReadOnlySafe:\n\t\tr.readOnly.addRequest(r.raftLog.committed, m)\n\t\t// The local node automatically acks the request.\n\t\tr.readOnly.recvAck(r.id, m.Entries[0].Data)\n\t\tr.bcastHeartbeatWithCtx(m.Entries[0].Data)\n\tcase ReadOnlyLeaseBased:\n\t\tif resp := r.responseToReadIndexReq(m, r.raftLog.committed); resp.To != None {\n\t\t\tr.send(resp)\n\t\t}\n\t}",
+        "content_digest": "4283c10e12c6da14964c6d6784a69851af1312245aa83925ec0e9426a07ed7bb"
+      },
+      {
+        "id": "node_read_index_contract",
+        "file": "node.go",
+        "start_line": 218,
+        "end_line": 229,
+        "kind": "document_statement",
+        "text": "\t// ReadIndex request a read state. The read state will be set in the ready.\n\t// Read state has a read index. Once the application advances further than the read\n\t// index, any linearizable read requests issued before the read request can be\n\t// processed safely. The read state will have the same rctx attached.\n\t// Note that request can be lost without notice, therefore it is user's job\n\t// to retry ReadIndex.\n\t//\n\t// Retries must always use new rctxes, and never reuse an rctx already\n\t// passed into ReadIndex. Starting with release-3.7, this restriction is\n\t// lifted, and it is ok to retry the same rctx. Refer to\n\t// https://github.com/etcd-io/raft/issues/392 for more details.\n\tReadIndex(ctx context.Context, rctx []byte) error",
+        "content_digest": "0cd9eb2027a8794b9b4212822ca59e7c4f38416a4d1b580e4c730538c59f85fb"
+      },
+      {
+        "id": "rawnode_read_index_api",
+        "file": "rawnode.go",
+        "start_line": 556,
+        "end_line": 563,
+        "kind": "code_observation",
+        "text": "// ReadIndex requests a read state. The read state will be set in ready.\n// Read State has a read index. Once the application advances further than the read\n// index, any linearizable read requests issued before the read request can be\n// processed safely. The read state will have the same rctx attached.\n// See (Node).ReadIndex for more details.\nfunc (rn *RawNode) ReadIndex(rctx []byte) {\n\t_ = rn.raft.Step(pb.Message{Type: pb.MsgReadIndex, Entries: []pb.Entry{{Data: rctx}}})\n}",
+        "content_digest": "353943bf23d55dc9225beebf06f530e678518ed13323d25cb728bf401580b4c0"
+      },
+      {
+        "id": "test_frees_read_only_mem",
+        "file": "raft_test.go",
+        "start_line": 1192,
+        "end_line": 1222,
+        "kind": "test_expectation",
+        "text": "// TestRaftFreesReadOnlyMem ensures raft will free read request from\n// readOnly readIndexQueue and pendingReadIndex map.\n// related issue: https://github.com/etcd-io/etcd/issues/7571\nfunc TestRaftFreesReadOnlyMem(t *testing.T) {\n\tsm := newTestRaft(1, 5, 1, newTestMemoryStorage(withPeers(1, 2)))\n\tsm.becomeCandidate()\n\tsm.becomeLeader()\n\tsm.raftLog.commitTo(sm.raftLog.lastIndex())\n\n\tctx := []byte(\"ctx\")\n\n\t// leader starts linearizable read request.\n\t// more info: raft dissertation 6.4, step 2.\n\tsm.Step(pb.Message{From: 2, Type: pb.MsgReadIndex, Entries: []pb.Entry{{Data: ctx}}})\n\tmsgs := sm.readMessages()\n\trequire.Len(t, msgs, 1)\n\trequire.Equal(t, pb.MsgHeartbeat, msgs[0].Type)\n\trequire.Equal(t, ctx, msgs[0].Context)\n\trequire.Len(t, sm.readOnly.readIndexQueue, 1)\n\trequire.Len(t, sm.readOnly.pendingReadIndex, 1)\n\t_, ok := sm.readOnly.pendingReadIndex[string(ctx)]\n\trequire.True(t, ok)\n\n\t// heartbeat responses from majority of followers (1 in this case)\n\t// acknowledge the authority of the leader.\n\t// more info: raft dissertation 6.4, step 3.\n\tsm.Step(pb.Message{From: 2, Type: pb.MsgHeartbeatResp, Context: ctx})\n\trequire.Empty(t, sm.readOnly.readIndexQueue)\n\trequire.Empty(t, sm.readOnly.pendingReadIndex)\n\t_, ok = sm.readOnly.pendingReadIndex[string(ctx)]\n\trequire.False(t, ok)",
+        "content_digest": "2f540fe5097104275e8f932a47cefc2b9e910b552b27c8b714238b05b2a2747a"
+      },
+      {
+        "id": "test_readindex_to_old_leader",
+        "file": "node_test.go",
+        "start_line": 196,
+        "end_line": 241,
+        "kind": "test_expectation",
+        "text": "func TestNodeReadIndexToOldLeader(t *testing.T) {\n\tr1 := newTestRaft(1, 10, 1, newTestMemoryStorage(withPeers(1, 2, 3)))\n\tr2 := newTestRaft(2, 10, 1, newTestMemoryStorage(withPeers(1, 2, 3)))\n\tr3 := newTestRaft(3, 10, 1, newTestMemoryStorage(withPeers(1, 2, 3)))\n\n\tnt := newNetwork(r1, r2, r3)\n\n\t// elect r1 as leader\n\tnt.send(raftpb.Message{From: 1, To: 1, Type: raftpb.MsgHup})\n\n\tvar testEntries = []raftpb.Entry{{Data: []byte(\"testdata\")}}\n\n\t// send readindex request to r2(follower)\n\tr2.Step(raftpb.Message{From: 2, To: 2, Type: raftpb.MsgReadIndex, Entries: testEntries})\n\n\t// verify r2(follower) forwards this message to r1(leader) with term not set\n\trequire.Len(t, r2.msgs, 1)\n\treadIndxMsg1 := raftpb.Message{From: 2, To: 1, Type: raftpb.MsgReadIndex, Entries: testEntries}\n\trequire.Equal(t, readIndxMsg1, r2.msgs[0])\n\n\t// send readindex request to r3(follower)\n\tr3.Step(raftpb.Message{From: 3, To: 3, Type: raftpb.MsgReadIndex, Entries: testEntries})\n\n\t// verify r3(follower) forwards this message to r1(leader) with term not set as well.\n\trequire.Len(t, r3.msgs, 1)\n\treadIndxMsg2 := raftpb.Message{From: 3, To: 1, Type: raftpb.MsgReadIndex, Entries: testEntries}\n\trequire.Equal(t, readIndxMsg2, r3.msgs[0])\n\n\t// now elect r3 as leader\n\tnt.send(raftpb.Message{From: 3, To: 3, Type: raftpb.MsgHup})\n\n\t// let r1 steps the two messages previously we got from r2, r3\n\tr1.Step(readIndxMsg1)\n\tr1.Step(readIndxMsg2)\n\n\t// verify r1(follower) forwards these messages again to r3(new leader)\n\trequire.Len(t, r1.msgs, 2)\n\treadIndxMsg3 := raftpb.Message{From: 2, To: 3, Type: raftpb.MsgReadIndex, Entries: testEntries}\n\trequire.Equal(t, readIndxMsg3, r1.msgs[0])\n\treadIndxMsg3 = raftpb.Message{From: 3, To: 3, Type: raftpb.MsgReadIndex, Entries: testEntries}\n\trequire.Equal(t, readIndxMsg3, r1.msgs[1])\n}\n\n// TestNodeProposeConfig ensures that node.ProposeConfChange sends the given configuration proposal\n// to the underlying raft.\nfunc TestNodeProposeConfig(t *testing.T) {",
+        "content_digest": "f4a4c8d4e79249db761831c25d5da82dd7ff5e7a995753f91634473a6c8314ca"
+      }
+    ],
+    "current_submission": {
+      "phase": "accepted",
+      "operation_id": "708eebc14c4040feb495e11d064001d0",
+      "action": "update",
+      "no_change": false,
+      "references": {
+        "@dropped_equal_rctx": "708eebc14c4040feb495e11d064001d0-knowledge-0",
+        "@completion_targets_first_requester": "708eebc14c4040feb495e11d064001d0-knowledge-1",
+        "@readindex_duplicate_rctx": "708eebc14c4040feb495e11d064001d0-question-0"
+      },
+      "experiment_id": "708eebc14c4040feb495e11d064001d0-experiment"
+    },
+    "applied_operations": {
+      "submission-708eebc14c4040feb495e11d064001d0": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-11_20-38-28-etcd_raft-real-run/semantic-commits/submission-708eebc14c4040feb495e11d064001d0.json"
+      }
+    }
+  }
+}

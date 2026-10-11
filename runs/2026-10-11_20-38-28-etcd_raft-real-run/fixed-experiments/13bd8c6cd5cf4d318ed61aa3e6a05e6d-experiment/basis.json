@@ -1,0 +1,172 @@
+{
+  "id": "13bd8c6cd5cf4d318ed61aa3e6a05e6d-experiment",
+  "investigation_id": "13bd8c6cd5cf4d318ed61aa3e6a05e6d-question-0",
+  "version": 1,
+  "basis": {
+    "harness": {
+      "kind": "go_test",
+      "source": "// Copyright 2025 The etcd Authors\n//\n// Licensed under the Apache License, Version 2.0 (the \"License\");\n// you may not use this file except in compliance with the License.\n// You may obtain a copy of the License at\n//\n//     http://www.apache.org/licenses/LICENSE-2.0\n//\n// Unless required by applicable law or agreed to in writing, software\n// distributed under the License is distributed on an \"AS IS\" BASIS,\n// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n// See the License for the specific language governing permissions and\n// limitations under the License.\n\npackage raft\n\nimport (\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"testing\"\n\n\tpb \"go.etcd.io/raft/v3/raftpb\"\n)\n\n// Generated audit harness. It never changes production logic. It feeds\n// proposals carrying conf-change entries through the real proposal path,\n// directly into the leader and through a follower's forwarding hop, and\n// recovers any panic so that the outcome can be reported verbatim.\n\nfunc assuranceEmit(t *testing.T, event map[string]any) {\n\tt.Helper()\n\traw, err := json.Marshal(event)\n\tif err != nil {\n\t\tt.Fatalf(\"marshal CA_EVENT: %v\", err)\n\t}\n\tfmt.Println(\"CA_EVENT \" + string(raw))\n}\n\ntype assuranceStepOutcome struct {\n\tpanicked  bool\n\trecovered string\n\tmsgs      []pb.Message\n}\n\nfunc assuranceStepRecover(r *raft, m pb.Message) (res assuranceStepOutcome) {\n\tdefer func() {\n\t\tif v := recover(); v != nil {\n\t\t\tres.panicked = true\n\t\t\tres.recovered = fmt.Sprint(v)\n\t\t}\n\t}()\n\t_ = r.Step(m)\n\tres.msgs = r.readMessages()\n\treturn res\n}\n\nfunc TestAssuranceMalformedConfChangeProposal(t *testing.T) {\n\tcluster := func() (leader, follower *raft) {\n\t\tr1 := newTestRaft(1, 10, 1, newTestMemoryStorage(withPeers(1, 2, 3)))\n\t\tr2 := newTestRaft(2, 10, 1, newTestMemoryStorage(withPeers(1, 2, 3)))\n\t\tr3 := newTestRaft(3, 10, 1, newTestMemoryStorage(withPeers(1, 2, 3)))\n\t\tnt := newNetwork(r1, r2, r3)\n\t\tnt.send(pb.Message{From: 1, To: 1, Type: pb.MsgHup})\n\t\tif r1.state != StateLeader {\n\t\t\tt.Fatalf(\"node 1 is %v, want %v\", r1.state, StateLeader)\n\t\t}\n\t\tr1.appliedTo(r1.raftLog.committed, 0)\n\t\tfor _, r := range []*raft{r1, r2, r3} {\n\t\t\tr.readMessages()\n\t\t}\n\t\treturn r1, r2\n\t}\n\n\tprobe := func(probeID, scenario string, payload []byte, viaFollower bool) {\n\t\tleader, follower := cluster()\n\t\tlastBefore := leader.raftLog.lastIndex()\n\t\tassuranceEmit(t, map[string]any{\n\t\t\t\"event\":        \"conf_proposal_setup\",\n\t\t\t\"probe_id\":     probeID,\n\t\t\t\"scenario\":     scenario,\n\t\t\t\"via_follower\": viaFollower,\n\t\t\t\"data_len\":     len(payload),\n\t\t\t\"leader\":       \"1\",\n\t\t\t\"term\":         leader.Term,\n\t\t\t\"leader_state\": leader.state.String(),\n\t\t\t\"committed\":    leader.raftLog.committed,\n\t\t\t\"applied\":      leader.raftLog.applied,\n\t\t})\n\n\t\tfollowerPanicked, followerRecovered, followerMsgs := false, \"\", []pb.Message{}\n\t\tforwardedTo := uint64(0)\n\t\ttarget := leader\n\t\tif viaFollower {\n\t\t\tres := assuranceStepRecover(follower, pb.Message{From: 2, To: 2, Type: pb.MsgProp,\n\t\t\t\tEntries: []pb.Entry{{Type: pb.EntryConfChangeV2, Data: payload}}})\n\t\t\tfollowerPanicked, followerRecovered, followerMsgs = res.panicked, res.recovered, res.msgs\n\t\t\tif len(res.msgs) > 0 {\n\t\t\t\tforwardedTo = res.msgs[0].To\n\t\t\t\tres = assuranceStepRecover(leader, res.msgs[0])\n\t\t\t}\n\t\t\tassuranceEmit(t, map[string]any{\n\t\t\t\t\"event\":              \"conf_proposal_outcome\",\n\t\t\t\t\"probe_id\":           probeID,\n\t\t\t\t\"scenario\":           scenario,\n\t\t\t\t\"via_follower\":       true,\n\t\t\t\t\"follower_panicked\":  followerPanicked,\n\t\t\t\t\"follower_recovered\": followerRecovered,\n\t\t\t\t\"follower_messages\":  len(followerMsgs),\n\t\t\t\t\"forwarded_to\":       forwardedTo,\n\t\t\t\t\"leader_panicked\":    res.panicked,\n\t\t\t\t\"recovered\":          res.recovered,\n\t\t\t\t\"last_index_before\":  lastBefore,\n\t\t\t\t\"last_index_after\":   leader.raftLog.lastIndex(),\n\t\t\t\t\"leader_state\":       leader.state.String(),\n\t\t\t})\n\t\t\tif followerPanicked || len(followerMsgs) != 1 {\n\t\t\t\tt.Fatalf(\"harness: forwarding hop panicked=%v messages=%d\", followerPanicked, len(followerMsgs))\n\t\t\t}\n\t\t\treturn\n\t\t}\n\n\t\tres := assuranceStepRecover(target, pb.Message{From: 1, To: 1, Type: pb.MsgProp,\n\t\t\tEntries: []pb.Entry{{Type: pb.EntryConfChangeV2, Data: payload}}})\n\t\tassuranceEmit(t, map[string]any{\n\t\t\t\"event\":             \"conf_proposal_outcome\",\n\t\t\t\"probe_id\":          probeID,\n\t\t\t\"scenario\":          scenario,\n\t\t\t\"via_follower\":      false,\n\t\t\t\"follower_panicked\": false,\n\t\t\t\"follower_messages\": 0,\n\t\t\t\"forwarded_to\":      0,\n\t\t\t\"leader_panicked\":   res.panicked,\n\t\t\t\"recovered\":         res.recovered,\n\t\t\t\"last_index_before\": lastBefore,\n\t\t\t\"last_index_after\":  leader.raftLog.lastIndex(),\n\t\t\t\"leader_state\":      leader.state.String(),\n\t\t})\n\t}\n\n\t// A proposal whose conf-change payload cannot be unmarshalled, delivered\n\t// directly to the leader.\n\tprobe(\"malformed/direct\", \"malformed_direct\", []byte{0xff, 0xff, 0xff, 0xff}, false)\n\t// The same shape relayed by a follower that forwards proposals.\n\tprobe(\"malformed/via-follower\", \"malformed_via_follower\", []byte{0xff, 0xff, 0xff, 0xff}, true)\n\t// Control: a well-formed conf change of the same entry type.\n\tvalidCC := pb.ConfChangeV2{Changes: []pb.ConfChangeSingle{{Type: pb.ConfChangeAddNode, NodeID: 4}}}\n\tvalid, err := validCC.Marshal()\n\tif err != nil {\n\t\tt.Fatalf(\"marshal valid conf change: %v\", err)\n\t}\n\tprobe(\"valid/direct\", \"valid_direct\", valid, false)\n}\n",
+      "files": {},
+      "execution_package": ".",
+      "description": "",
+      "semantic_changes": [],
+      "prerequisites": [
+        {
+          "alias": "malformed_direct_setup",
+          "event": "conf_proposal_setup",
+          "conditions": [
+            {
+              "field": "scenario",
+              "op": "eq",
+              "value": "malformed_direct",
+              "reference": null
+            }
+          ]
+        },
+        {
+          "alias": "forwarded_setup",
+          "event": "conf_proposal_setup",
+          "conditions": [
+            {
+              "field": "scenario",
+              "op": "eq",
+              "value": "malformed_via_follower",
+              "reference": null
+            }
+          ]
+        },
+        {
+          "alias": "valid_setup",
+          "event": "conf_proposal_setup",
+          "conditions": [
+            {
+              "field": "scenario",
+              "op": "eq",
+              "value": "valid_direct",
+              "reference": null
+            }
+          ]
+        }
+      ]
+    },
+    "source_ids": [
+      "proposal_conf_entry_unmarshal",
+      "follower_proposal_forwarding",
+      "send_local_message_terms"
+    ],
+    "anchors": [],
+    "scope": {
+      "description": "Three probes on freshly elected three-voter clusters, each stepping one MsgProp carrying an EntryConfChangeV2 into a real state machine with any panic recovered: a malformed payload directly into the leader, the same malformed payload into follower 2 (whose forwarded message is then stepped into the leader), and a well-formed payload directly into the leader as the control.",
+      "assumptions": [
+        "The cluster is built with newNetwork and elected by nt.send(MsgHup), so the leader has a committed entry in its term and the follower knows its leader.",
+        "The malformed payload is the byte sequence {0xff,0xff,0xff,0xff}, which the library's protobuf decoding rejects.",
+        "Proposals are delivered as pb.Message{Type: MsgProp, Entries: [{Type: EntryConfChangeV2, Data: payload}]}, which is the shape a caller or a forwarding follower produces.",
+        "The follower's relayed message is stepped into the leader by the harness, which is the same message the transport would deliver.",
+        "Panics are recovered by the harness only; in production the same panic escapes (*raft).Step and aborts the caller's raft loop."
+      ],
+      "excluded": [
+        "The transport, admission control and any authentication between peers",
+        "The legacy EntryConfChange entry type",
+        "Snapshots, membership changes, restarts and joint configurations",
+        "Any state-machine effect of the proposal, since the malformed payload never reaches the log"
+      ],
+      "parameters": {}
+    },
+    "prefix": "Harness (draft file assurance_generated_test.go, package raft, execution package '.'; no captured file is replaced). assuranceCluster-equivalent setup: three real raft instances with newTestRaft(1|2|3, 10, 1, newTestMemoryStorage(withPeers(1,2,3))) wired with newNetwork and elected by nt.send(MsgHup); the harness asserts node 1 is StateLeader, advances its applied index to its committed index and clears the queues. For each probe it emits conf_proposal_setup with probe_id, scenario, via_follower, data_len, leader, term, leader state, committed and applied; it then steps the proposal with assuranceStepRecover, which recovers any panic and reports the verbatim value plus the messages the node produced. For the malformed-direct probe the proposal is stepped into the leader; for the malformed-via-follower probe it is stepped into follower 2 (whose single forwarded MsgProp to node 1 is recorded and then stepped into the leader, with the leader's own panic recovered); for the valid control a marshalled ConfChangeV2 adding node 4 is stepped into the leader. Each probe emits conf_proposal_outcome with probe_id, scenario, via_follower, follower_panicked, follower_recovered, follower_messages, forwarded_to, leader_panicked, recovered, last_index_before, last_index_after and leader state. The harness asserts that the forwarding hop neither panics nor changes the number of forwarded messages, so a failure at the relay cannot be mistaken for the leader's outcome.",
+    "requirement": null,
+    "responsibility": "The proposal path owns deciding whether a proposal can be turned into log state and reporting a failure to its caller; a payload it cannot decode must be rejected as a proposal rather than converted into an abort of the node that processes it, and a node that relays a proposal owns at least not to propagate a shape it knows the leader will abort on.",
+    "comparisons": [
+      {
+        "event": "conf_proposal_outcome",
+        "identity_fields": [
+          "probe_id"
+        ],
+        "admission_alias": "malformed_direct_setup",
+        "assertion": {
+          "field": "leader_panicked",
+          "op": "eq",
+          "value": false,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [
+          {
+            "field": "scenario",
+            "op": "eq",
+            "value": "malformed_direct",
+            "reference": null
+          }
+        ],
+        "description": "Stepping a proposal with an undecodable conf-change payload directly into a leader does not abort the node."
+      },
+      {
+        "event": "conf_proposal_outcome",
+        "identity_fields": [
+          "probe_id"
+        ],
+        "admission_alias": "forwarded_setup",
+        "assertion": {
+          "field": "leader_panicked",
+          "op": "eq",
+          "value": false,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [
+          {
+            "field": "scenario",
+            "op": "eq",
+            "value": "malformed_via_follower",
+            "reference": null
+          }
+        ],
+        "description": "Relaying the same malformed proposal through a follower does not let it abort the leader that decodes it."
+      },
+      {
+        "event": "conf_proposal_outcome",
+        "identity_fields": [
+          "probe_id"
+        ],
+        "admission_alias": "valid_setup",
+        "assertion": {
+          "field": "leader_panicked",
+          "op": "eq",
+          "value": false,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [
+          {
+            "field": "scenario",
+            "op": "eq",
+            "value": "valid_direct",
+            "reference": null
+          }
+        ],
+        "description": "Control: a well-formed conf change of the same entry type is appended without aborting the leader."
+      }
+    ],
+    "knowledge": []
+  },
+  "snapshot_id": "a23faff7cd3e43b9af4254953ad0f9e7",
+  "configuration": {
+    "backend": "go_module",
+    "target": {
+      "expected_module": "go.etcd.io/raft/v3",
+      "variant": "etcd_raft",
+      "analysis_roots": [],
+      "execution_package": ".",
+      "harness_path": "assurance_generated_test.go"
+    },
+    "isolation": "bwrap",
+    "tools": {
+      "agent": "codex-cli 0.155.0-alpha.16",
+      "implementation": "go version go1.26.7 linux/amd64"
+    }
+  },
+  "harness_filename": "assurance_generated_test.go",
+  "operation_id": "13bd8c6cd5cf4d318ed61aa3e6a05e6d",
+  "previous_id": null,
+  "difference": {},
+  "revision_reason": ""
+}

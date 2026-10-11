@@ -1,0 +1,171 @@
+{
+  "id": "252c693faf004ee5a79ecb81394a92ab-experiment",
+  "investigation_id": "252c693faf004ee5a79ecb81394a92ab-question-0",
+  "version": 1,
+  "basis": {
+    "harness": {
+      "kind": "go_test",
+      "source": "// Copyright 2025 The etcd Authors\n//\n// Licensed under the Apache License, Version 2.0 (the \"License\");\n// you may not use this file except in compliance with the License.\n// You may obtain a copy of the License at\n//\n//     http://www.apache.org/licenses/LICENSE-2.0\n//\n// Unless required by applicable law or agreed to in writing, software\n// distributed under the License is distributed on an \"AS IS\" BASIS,\n// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n// See the License for the specific language governing permissions and\n// limitations under the License.\n\npackage raft\n\nimport (\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"testing\"\n\n\tpb \"go.etcd.io/raft/v3/raftpb\"\n)\n\n// Generated audit harness. It never changes production logic. It feeds\n// MsgReadIndexResp messages of three shapes into a real follower and reports\n// whether each shape was accepted, so that the read-index response path's\n// validation can be compared with the request path's lack of it.\n\nfunc assuranceEmit(t *testing.T, event map[string]any) {\n\tt.Helper()\n\traw, err := json.Marshal(event)\n\tif err != nil {\n\t\tt.Fatalf(\"marshal CA_EVENT: %v\", err)\n\t}\n\tfmt.Println(\"CA_EVENT \" + string(raw))\n}\n\nfunc TestAssuranceReadIndexRespValidation(t *testing.T) {\n\tr1 := newTestRaft(1, 10, 1, newTestMemoryStorage(withPeers(1, 2, 3)))\n\tr2 := newTestRaft(2, 10, 1, newTestMemoryStorage(withPeers(1, 2, 3)))\n\tr3 := newTestRaft(3, 10, 1, newTestMemoryStorage(withPeers(1, 2, 3)))\n\tnt := newNetwork(r1, r2, r3)\n\tnt.send(pb.Message{From: 1, To: 1, Type: pb.MsgHup})\n\tif r1.state != StateLeader {\n\t\tt.Fatalf(\"node 1 is %v, want %v\", r1.state, StateLeader)\n\t}\n\tr1.readMessages()\n\tr2.readMessages()\n\tr3.readMessages()\n\n\tprobe := func(probeID, scenario string, entries []pb.Entry) {\n\t\tassuranceEmit(t, map[string]any{\n\t\t\t\"event\":        \"read_index_resp_setup\",\n\t\t\t\"probe_id\":     probeID,\n\t\t\t\"scenario\":     scenario,\n\t\t\t\"node\":         \"2\",\n\t\t\t\"node_state\":   r2.state.String(),\n\t\t\t\"term\":         r2.Term,\n\t\t\t\"lead\":         r2.lead,\n\t\t\t\"entries_sent\": len(entries),\n\t\t\t\"read_index\":   7,\n\t\t})\n\t\tbefore := len(r2.readStates)\n\t\tpanicked, recovered := false, \"\"\n\t\tfunc() {\n\t\t\tdefer func() {\n\t\t\t\tif v := recover(); v != nil {\n\t\t\t\t\tpanicked = true\n\t\t\t\t\trecovered = fmt.Sprint(v)\n\t\t\t\t}\n\t\t\t}()\n\t\t\t_ = r2.Step(pb.Message{From: 1, To: 2, Type: pb.MsgReadIndexResp,\n\t\t\t\tTerm: r2.Term, Index: 7, Entries: entries})\n\t\t}()\n\t\tr2.readMessages()\n\t\tadded := len(r2.readStates) - before\n\t\trequestCtx := \"\"\n\t\tif added > 0 {\n\t\t\trequestCtx = string(r2.readStates[len(r2.readStates)-1].RequestCtx)\n\t\t}\n\t\tassuranceEmit(t, map[string]any{\n\t\t\t\"event\":              \"read_index_resp_outcome\",\n\t\t\t\"probe_id\":           probeID,\n\t\t\t\"scenario\":           scenario,\n\t\t\t\"entries_sent\":       len(entries),\n\t\t\t\"panicked\":           panicked,\n\t\t\t\"recovered\":          recovered,\n\t\t\t\"read_states_added\":  added,\n\t\t\t\"read_state_index\":   readStateIndex(r2),\n\t\t\t\"read_state_request_ctx\": requestCtx,\n\t\t\t\"node_state\":         r2.state.String(),\n\t\t\t\"term\":               r2.Term,\n\t\t})\n\t}\n\n\t// A response with no entries carries no request context to match.\n\tprobe(\"resp/zero-entries\", \"response_zero_entries\", nil)\n\t// A response with two entries is malformed for this message type.\n\tprobe(\"resp/two-entries\", \"response_two_entries\", []pb.Entry{{Data: []byte(\"a\")}, {Data: []byte(\"b\")}})\n\t// The well-formed response carries exactly one entry.\n\tprobe(\"resp/one-entry\", \"response_one_entry\", []pb.Entry{{Data: []byte(\"assurance-rctx\")}})\n\n\tif r2.readStates[len(r2.readStates)-1].RequestCtx == nil {\n\t\tt.Fatalf(\"harness: the accepted response did not carry its request context\")\n\t}\n}\n\nfunc readStateIndex(r *raft) uint64 {\n\tif len(r.readStates) == 0 {\n\t\treturn 0\n\t}\n\treturn r.readStates[len(r.readStates)-1].Index\n}\n",
+      "files": {},
+      "execution_package": ".",
+      "description": "",
+      "semantic_changes": [],
+      "prerequisites": [
+        {
+          "alias": "zero_setup",
+          "event": "read_index_resp_setup",
+          "conditions": [
+            {
+              "field": "scenario",
+              "op": "eq",
+              "value": "response_zero_entries",
+              "reference": null
+            }
+          ]
+        },
+        {
+          "alias": "two_setup",
+          "event": "read_index_resp_setup",
+          "conditions": [
+            {
+              "field": "scenario",
+              "op": "eq",
+              "value": "response_two_entries",
+              "reference": null
+            }
+          ]
+        },
+        {
+          "alias": "one_setup",
+          "event": "read_index_resp_setup",
+          "conditions": [
+            {
+              "field": "scenario",
+              "op": "eq",
+              "value": "response_one_entry",
+              "reference": null
+            }
+          ]
+        }
+      ]
+    },
+    "source_ids": [
+      "read_index_resp_validation",
+      "leader_msg_read_index",
+      "send_read_index_response",
+      "add_request"
+    ],
+    "anchors": [],
+    "scope": {
+      "description": "Three probes on one freshly elected three-voter cluster: MsgReadIndexResp messages carrying zero, two and one entries are stepped into follower 2 at its own term, each with the panic recovered and the resulting read states recorded.",
+      "assumptions": [
+        "The cluster is built with newTestRaft for {1,2,3} and elected with nt.send(MsgHup), so follower 2 is in the leader's term and knows its leader.",
+        "Each response is delivered as pb.Message{From: 1, To: 2, Type: MsgReadIndexResp, Term: follower term, Index: 7, Entries: ...}, which is the shape the leader's response producer emits.",
+        "Panics are recovered by the harness only; the recovered value is reported verbatim.",
+        "A read state is considered accepted when the follower's readStates slice grows, and its index and request context are reported."
+      ],
+      "excluded": [
+        "The transport and the Node layer's response filtering",
+        "Any correlation between an accepted response and a request the node issued",
+        "Snapshots, membership changes, restarts and leadership changes"
+      ],
+      "parameters": {}
+    },
+    "prefix": "Harness (draft file assurance_generated_test.go, package raft, execution package '.'; no captured file is replaced). The test builds three real raft instances with newTestRaft(1|2|3, 10, 1, newTestMemoryStorage(withPeers(1,2,3))) and elects node 1 with newNetwork and nt.send(MsgHup); it asserts that node 1 is StateLeader and clears all queues. For each probe it emits read_index_resp_setup with probe_id, scenario, node, node state, term, lead, the number of entries to be sent and the read index (7), then steps the message into follower 2 inside a recover wrapper and records whether the node panicked and with which text. Afterwards it processes the follower's own queues, computes how many read states were added relative to the count before the step, reads the index and request context of the newest read state, and emits read_index_resp_outcome with probe_id, scenario, entries_sent, panicked, recovered, read_states_added, read_state_index, read_state_request_ctx, node state and term. Probes: 'resp/zero-entries' (no entries), 'resp/two-entries' (two entries) and 'resp/one-entry' (one entry, the control). The test asserts that the accepted response carried a non-nil request context, so a silently empty acceptance cannot be mistaken for validation.",
+    "requirement": null,
+    "responsibility": "The read-index response path owns rejecting a peer-delivered message whose shape cannot be interpreted as a read state for the local node, so that a malformed response neither produces a bogus read state nor aborts the node.",
+    "comparisons": [
+      {
+        "event": "read_index_resp_outcome",
+        "identity_fields": [
+          "probe_id"
+        ],
+        "admission_alias": "zero_setup",
+        "assertion": {
+          "field": "read_states_added",
+          "op": "eq",
+          "value": 0,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [
+          {
+            "field": "scenario",
+            "op": "eq",
+            "value": "response_zero_entries",
+            "reference": null
+          }
+        ],
+        "description": "A MsgReadIndexResp with no entries adds no read state and does not abort the follower."
+      },
+      {
+        "event": "read_index_resp_outcome",
+        "identity_fields": [
+          "probe_id"
+        ],
+        "admission_alias": "two_setup",
+        "assertion": {
+          "field": "read_states_added",
+          "op": "eq",
+          "value": 0,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [
+          {
+            "field": "scenario",
+            "op": "eq",
+            "value": "response_two_entries",
+            "reference": null
+          }
+        ],
+        "description": "A MsgReadIndexResp with two entries adds no read state and does not abort the follower."
+      },
+      {
+        "event": "read_index_resp_outcome",
+        "identity_fields": [
+          "probe_id"
+        ],
+        "admission_alias": "one_setup",
+        "assertion": {
+          "field": "read_states_added",
+          "op": "eq",
+          "value": 1,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [
+          {
+            "field": "scenario",
+            "op": "eq",
+            "value": "response_one_entry",
+            "reference": null
+          }
+        ],
+        "description": "Control: a MsgReadIndexResp with exactly one entry is accepted as one read state carrying the request context."
+      }
+    ],
+    "knowledge": []
+  },
+  "snapshot_id": "a23faff7cd3e43b9af4254953ad0f9e7",
+  "configuration": {
+    "backend": "go_module",
+    "target": {
+      "expected_module": "go.etcd.io/raft/v3",
+      "variant": "etcd_raft",
+      "analysis_roots": [],
+      "execution_package": ".",
+      "harness_path": "assurance_generated_test.go"
+    },
+    "isolation": "bwrap",
+    "tools": {
+      "agent": "codex-cli 0.155.0-alpha.16",
+      "implementation": "go version go1.26.7 linux/amd64"
+    }
+  },
+  "harness_filename": "assurance_generated_test.go",
+  "operation_id": "252c693faf004ee5a79ecb81394a92ab",
+  "previous_id": null,
+  "difference": {},
+  "revision_reason": ""
+}

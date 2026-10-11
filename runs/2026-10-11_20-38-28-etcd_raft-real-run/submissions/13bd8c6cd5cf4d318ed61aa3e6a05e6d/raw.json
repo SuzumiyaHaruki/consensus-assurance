@@ -1,0 +1,168 @@
+{
+  "rationale": "Another input path for the proposal side, opened while reviewing how proposals reach a leader: stepLeader unmarshals a proposal's conf-change payload and panics on a decode error (raft.go:1305-1313), while stepFollower forwards a MsgProp to its leader without inspecting the entry payload at all (raft.go:1714-1724) and the forwarded message carries no term (raft.go:536-541), so a malformed conf-change proposal reaches the leader's unmarshal either directly or through a member that believes it is relaying a normal client proposal. One control and two probes measure exactly that, with the panic recovered in the harness so the outcome is reported verbatim.",
+  "sources": [
+    {
+      "id": "proposal_conf_entry_unmarshal",
+      "file": "raft.go",
+      "start_line": 1305,
+      "end_line": 1313,
+      "kind": "code_observation"
+    },
+    {
+      "id": "follower_proposal_forwarding",
+      "file": "raft.go",
+      "start_line": 1714,
+      "end_line": 1724,
+      "kind": "code_observation"
+    }
+  ],
+  "investigations": [
+    {
+      "ref": "@malformed_confchange_proposal",
+      "question": "Does a proposal whose conf-change entry cannot be decoded abort the node that processes it, and does a follower's proposal-forwarding hop validate the payload before relaying it to the leader?",
+      "source_ids": [
+        "proposal_conf_entry_unmarshal",
+        "follower_proposal_forwarding",
+        "send_local_message_terms"
+      ],
+      "hypothesis": "stepLeader decodes the conf-change payload of a proposal and panics on failure, stepFollower forwards a proposal without examining its entries and without attaching a term, so a proposal carrying an undecodable conf-change payload aborts whichever node decodes it, and relaying it through a follower only moves the abort to the leader without any rejection at the relay.",
+      "discriminator": "On a freshly elected three-voter cluster, step a MsgProp carrying an EntryConfChangeV2 whose Data cannot be decoded (a) directly into the leader and (b) into a follower that forwards proposals, recording for each: whether the stepping node panicked and with which recovered text, how many messages the follower produced and to whom, the leader's panic and recovered text for the forwarded case, and the last index before and after. Use a well-formed conf change of the same entry type as the control, which must be appended without aborting. If the malformed proposal is rejected with an error instead of aborting, or if the follower refuses to relay it, the hypothesis is refuted.",
+      "disposition": "active",
+      "limitations": [
+        "The malformed payload is constructed by the harness as bytes that fail protobuf decoding; it represents a corrupt, truncated or otherwise invalid payload rather than any particular producer.",
+        "The probes step messages directly into the state machines; the transport and any application-level validation between peers are outside the captured package.",
+        "Only the EntryConfChangeV2 variant is probed directly and through forwarding; the legacy EntryConfChange variant shares the same unmarshal-and-panic shape but was not executed.",
+        "Whether reachability through a real peer is within the trusted message contract is a question for human review."
+      ]
+    }
+  ],
+  "knowledge": [
+    {
+      "ref": "@behavior_proposal_payload_decode_abort",
+      "kind": "behavior",
+      "statement": "In stepLeader, a MsgProp whose entry type is EntryConfChange or EntryConfChangeV2 is unmarshalled into the corresponding conf-change struct and any decode error panics the node processing the proposal (raft.go:1305-1313); nothing earlier on the path inspects the payload, because stepFollower relays a proposal by only rewriting m.To and sending it, without attaching a term or decoding the entries (raft.go:1714-1724 with raft.go:536-541). A proposal carrying an undecodable conf-change payload therefore aborts whichever node decodes it, and the follower that relays it neither rejects nor detects the problem.",
+      "conditions": "The receiver is a leader in the middle of handling MsgProp (for example a freshly elected leader in a three-voter configuration), the proposal is delivered either directly or through a follower that forwards proposals to its leader, and the entry type is a conf-change type with a payload that fails the library's protobuf decode.",
+      "source_ids": [
+        "proposal_conf_entry_unmarshal",
+        "follower_proposal_forwarding",
+        "send_local_message_terms"
+      ]
+    }
+  ],
+  "experiment": {
+    "investigation_id": "@malformed_confchange_proposal",
+    "harness_path": "assurance_generated_test.go",
+    "execution_package": ".",
+    "source_ids": [
+      "proposal_conf_entry_unmarshal",
+      "follower_proposal_forwarding",
+      "send_local_message_terms"
+    ],
+    "scope": {
+      "description": "Three probes on freshly elected three-voter clusters, each stepping one MsgProp carrying an EntryConfChangeV2 into a real state machine with any panic recovered: a malformed payload directly into the leader, the same malformed payload into follower 2 (whose forwarded message is then stepped into the leader), and a well-formed payload directly into the leader as the control.",
+      "assumptions": [
+        "The cluster is built with newNetwork and elected by nt.send(MsgHup), so the leader has a committed entry in its term and the follower knows its leader.",
+        "The malformed payload is the byte sequence {0xff,0xff,0xff,0xff}, which the library's protobuf decoding rejects.",
+        "Proposals are delivered as pb.Message{Type: MsgProp, Entries: [{Type: EntryConfChangeV2, Data: payload}]}, which is the shape a caller or a forwarding follower produces.",
+        "The follower's relayed message is stepped into the leader by the harness, which is the same message the transport would deliver.",
+        "Panics are recovered by the harness only; in production the same panic escapes (*raft).Step and aborts the caller's raft loop."
+      ],
+      "excluded": [
+        "The transport, admission control and any authentication between peers",
+        "The legacy EntryConfChange entry type",
+        "Snapshots, membership changes, restarts and joint configurations",
+        "Any state-machine effect of the proposal, since the malformed payload never reaches the log"
+      ]
+    },
+    "prefix": "Harness (draft file assurance_generated_test.go, package raft, execution package '.'; no captured file is replaced). assuranceCluster-equivalent setup: three real raft instances with newTestRaft(1|2|3, 10, 1, newTestMemoryStorage(withPeers(1,2,3))) wired with newNetwork and elected by nt.send(MsgHup); the harness asserts node 1 is StateLeader, advances its applied index to its committed index and clears the queues. For each probe it emits conf_proposal_setup with probe_id, scenario, via_follower, data_len, leader, term, leader state, committed and applied; it then steps the proposal with assuranceStepRecover, which recovers any panic and reports the verbatim value plus the messages the node produced. For the malformed-direct probe the proposal is stepped into the leader; for the malformed-via-follower probe it is stepped into follower 2 (whose single forwarded MsgProp to node 1 is recorded and then stepped into the leader, with the leader's own panic recovered); for the valid control a marshalled ConfChangeV2 adding node 4 is stepped into the leader. Each probe emits conf_proposal_outcome with probe_id, scenario, via_follower, follower_panicked, follower_recovered, follower_messages, forwarded_to, leader_panicked, recovered, last_index_before, last_index_after and leader state. The harness asserts that the forwarding hop neither panics nor changes the number of forwarded messages, so a failure at the relay cannot be mistaken for the leader's outcome.",
+    "responsibility": "The proposal path owns deciding whether a proposal can be turned into log state and reporting a failure to its caller; a payload it cannot decode must be rejected as a proposal rather than converted into an abort of the node that processes it, and a node that relays a proposal owns at least not to propagate a shape it knows the leader will abort on.",
+    "prerequisites": [
+      {
+        "alias": "malformed_direct_setup",
+        "event": "conf_proposal_setup",
+        "conditions": [
+          {
+            "field": "scenario",
+            "value": "malformed_direct"
+          }
+        ]
+      },
+      {
+        "alias": "forwarded_setup",
+        "event": "conf_proposal_setup",
+        "conditions": [
+          {
+            "field": "scenario",
+            "value": "malformed_via_follower"
+          }
+        ]
+      },
+      {
+        "alias": "valid_setup",
+        "event": "conf_proposal_setup",
+        "conditions": [
+          {
+            "field": "scenario",
+            "value": "valid_direct"
+          }
+        ]
+      }
+    ],
+    "comparisons": [
+      {
+        "description": "Stepping a proposal with an undecodable conf-change payload directly into a leader does not abort the node.",
+        "event": "conf_proposal_outcome",
+        "identity_fields": [
+          "probe_id"
+        ],
+        "admission_alias": "malformed_direct_setup",
+        "applicability_conditions": [
+          {
+            "field": "scenario",
+            "value": "malformed_direct"
+          }
+        ],
+        "assertion": {
+          "field": "leader_panicked",
+          "value": false
+        }
+      },
+      {
+        "description": "Relaying the same malformed proposal through a follower does not let it abort the leader that decodes it.",
+        "event": "conf_proposal_outcome",
+        "identity_fields": [
+          "probe_id"
+        ],
+        "admission_alias": "forwarded_setup",
+        "applicability_conditions": [
+          {
+            "field": "scenario",
+            "value": "malformed_via_follower"
+          }
+        ],
+        "assertion": {
+          "field": "leader_panicked",
+          "value": false
+        }
+      },
+      {
+        "description": "Control: a well-formed conf change of the same entry type is appended without aborting the leader.",
+        "event": "conf_proposal_outcome",
+        "identity_fields": [
+          "probe_id"
+        ],
+        "admission_alias": "valid_setup",
+        "applicability_conditions": [
+          {
+            "field": "scenario",
+            "value": "valid_direct"
+          }
+        ],
+        "assertion": {
+          "field": "leader_panicked",
+          "value": false
+        }
+      }
+    ]
+  }
+}

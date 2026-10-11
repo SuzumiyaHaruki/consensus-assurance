@@ -1,0 +1,183 @@
+{
+  "rationale": "New child of the conf-change line: while probing the Node API of a removed member I stepped a proposable change that removes the last voter and saw the application path abort. Source trace: the changer refuses such a change with an error (confchange/confchange.go:170-172 inside apply, exercised by confchange/testdata/simple_safety.txt), the leader's propose-time validation (raft.go:1318-1335) does not check the resulting voter set, and raft.applyConfChange turns any changer error into a panic with a TODO to return it to the caller (raft.go:1961-1964). The experiment proposes such a change through the real MsgProp path on a single-voter leader, confirms it commits, then applies it through the documented application path and recovers the panic, with an add-voter change of the same shape as the control.",
+  "sources": [
+    {
+      "id": "removed_all_voters_guard",
+      "file": "confchange/confchange.go",
+      "start_line": 170,
+      "end_line": 172,
+      "kind": "code_observation"
+    },
+    {
+      "id": "apply_conf_change_panic",
+      "file": "raft.go",
+      "start_line": 1961,
+      "end_line": 1964,
+      "kind": "code_observation"
+    },
+    {
+      "id": "simple_safety_expectation",
+      "file": "confchange/testdata/simple_safety.txt",
+      "start_line": 1,
+      "end_line": 8,
+      "kind": "test_expectation"
+    }
+  ],
+  "investigations": [
+    {
+      "id": null,
+      "ref": "@confchange_remove_last_voter",
+      "question": "Can a client proposal that removes the last voter be accepted and committed by a single-voter cluster, and does applying the committed entry abort the applying node, or is the change rejected before it reaches the log?",
+      "source_ids": [
+        "removed_all_voters_guard",
+        "apply_conf_change_panic",
+        "simple_safety_expectation",
+        "conf_change_validation"
+      ],
+      "hypothesis": "The changer reports 'removed all voters' only when the configuration is computed at apply time, the leader's propose-time validation checks pending/joint state but not the resulting voter set, and raft.applyConfChange panics on any changer error, so a legal proposal can be accepted, committed, and then abort the applying node when the application applies it.",
+      "discriminator": "On a single-voter leader, propose a ConfChangeV2 removing that voter through the real MsgProp path and record the returned error, whether the entry committed, and what happens when the documented application path applies it (panic recovered and reported verbatim); repeat with an add-voter change of the same shape as the control, which must apply without aborting. If the proposal is rejected before being appended, or if applying it returns an error instead of aborting, the hypothesis is refuted.",
+      "disposition": "active",
+      "parent_id": "b87d04b254e44ceaadb200304929056a-question-0",
+      "knowledge": null,
+      "counterevidence": null,
+      "limitations": [
+        "The probe uses a single-voter cluster, which is the minimal configuration in which a proposable change removes the last voter; multi-voter removals that leave at least one voter are the control shape.",
+        "The harness recovers the panic itself; the process-level consequence and any restart behaviour are inferred from the panic rather than observed.",
+        "The probe applies the committed entry directly through applyConfChange, which is what an application does with a committed conf-change entry, but no real server loop is involved.",
+        "Whether an embedding service is expected to pre-validate the resulting voter set is a contract question outside the captured package."
+      ],
+      "resume_conditions": null
+    }
+  ],
+  "knowledge": [
+    {
+      "id": null,
+      "ref": "@behavior_remove_last_voter_abort",
+      "kind": "behavior",
+      "statement": "The confchange changer computes the resulting configuration and returns the error 'removed all voters' when the incoming voter set becomes empty (confchange/confchange.go:170-172), which the captured datadriven test treats as an expected changer-level rejection. The leader's propose-time validation does not compute the resulting voter set, so a proposal that removes the last voter passes (raft.go:1318-1335) and is appended like any other conf change; when the application later applies the committed entry, raft.applyConfChange converts the changer's error into a panic carrying that error text (raft.go:1961-1964, with the TODO to return the error to the caller), so the abort happens on the application's apply path rather than at proposal time.",
+      "conditions": "The proposal is a simple ConfChangeV2 (or ConfChange) that leaves no voter in the incoming configuration, made on a leader whose propose-time validation passes because no other conf change is pending and the configuration is not joint; the application then applies the committed entry through ApplyConfChange.",
+      "source_ids": [
+        "removed_all_voters_guard",
+        "apply_conf_change_panic",
+        "simple_safety_expectation",
+        "conf_change_validation"
+      ],
+      "executions": {},
+      "changed_premise": "",
+      "affected_uses": []
+    }
+  ],
+  "gaps": [],
+  "interpretations": [],
+  "experiment": {
+    "investigation_id": "@confchange_remove_last_voter",
+    "harness_path": "assurance_generated_test.go",
+    "files": {},
+    "execution_package": ".",
+    "source_ids": [
+      "removed_all_voters_guard",
+      "apply_conf_change_panic",
+      "simple_safety_expectation",
+      "conf_change_validation"
+    ],
+    "anchors": [],
+    "scope": {
+      "description": "Two probes on freshly built single-voter clusters whose node 1 is made leader with everything committed applied. Each probe proposes a ConfChangeV2 through the real MsgProp path, checks that the entry committed, then applies it through the documented application path with the panic recovered, and records the voters before and after.",
+      "assumptions": [
+        "The leader is made to win directly (becomeCandidate + becomeLeader) so the single-voter cluster is ready without a network round trip.",
+        "Proposals are stepped as pb.Message{Type: MsgProp, Entries: [{Type: EntryConfChangeV2, Data: marshalled ConfChangeV2}]}, which is the shape Node.ProposeConfChange delivers.",
+        "In a single-voter cluster the leader's own acknowledgment is the quorum, so the entry commits once it is appended and its self-acknowledgment is processed.",
+        "The application path for a committed conf-change entry is ApplyConfChange, which the harness calls with the same ConfChangeV2 and recovers any panic verbatim.",
+        "No restart, snapshot, joint configuration or peer traffic is involved."
+      ],
+      "excluded": [
+        "Multi-voter clusters and joint configurations",
+        "The embedding application's own validation or operator interfaces",
+        "Process-level effects of the recovered panic and any restart behaviour"
+      ],
+      "parameters": {}
+    },
+    "prefix": "Harness (draft file assurance_generated_test.go, package raft, execution package '.'; no captured file is replaced). Each probe builds a real raft instance with newTestRaft(1, 10, 1, newTestMemoryStorage(withPeers(voters...))), calls becomeCandidate and becomeLeader so the single-voter cluster is ready, advances the applied index and clears the queues. It emits conf_change_setup with probe_id, scenario, voters_before, pendingConfIndex, applied, committed, node state and term; marshals the ConfChangeV2, steps it as a MsgProp into the leader and records the returned error; takes the appended index, processes the leader's own acknowledgment through readMessages so the entry commits (the self-ack of a single-voter leader is the quorum), and records whether the committed index covers the proposed index. It then calls applyConfChange with the same ConfChangeV2 inside a recover, recording panicked, the verbatim recovered value, the voters afterwards and the node state, and emits conf_change_apply. Probes: 'remove-last-voter' (ConfChangeV2 removing node 1 from a {1} cluster) and 'add-voter-control' (ConfChangeV2 adding node 2 to a {1} cluster), which must not abort. The test asserts that both proposals committed so that a failure to commit cannot be mistaken for the measured outcome.",
+    "semantic_changes": [],
+    "requirement": null,
+    "responsibility": "The proposal and apply paths own keeping the configuration serviceable: a change whose application cannot produce a usable configuration must be rejected before it is committed or reported to the application, not converted into an abort of the node that applies it.",
+    "prerequisites": [
+      {
+        "alias": "probe_setup",
+        "event": "conf_change_setup",
+        "conditions": [
+          {
+            "field": "scenario",
+            "op": "eq",
+            "value": "remove_last_voter",
+            "reference": null
+          }
+        ]
+      },
+      {
+        "alias": "control_setup",
+        "event": "conf_change_setup",
+        "conditions": [
+          {
+            "field": "scenario",
+            "op": "eq",
+            "value": "add_voter_control",
+            "reference": null
+          }
+        ]
+      }
+    ],
+    "comparisons": [
+      {
+        "event": "conf_change_apply",
+        "identity_fields": [
+          "probe_id"
+        ],
+        "admission_alias": "probe_setup",
+        "assertion": {
+          "field": "panicked",
+          "op": "eq",
+          "value": false,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [
+          {
+            "field": "scenario",
+            "op": "eq",
+            "value": "remove_last_voter",
+            "reference": null
+          }
+        ],
+        "description": "Applying a committed conf change that removes the last voter does not abort the applying node."
+      },
+      {
+        "event": "conf_change_apply",
+        "identity_fields": [
+          "probe_id"
+        ],
+        "admission_alias": "control_setup",
+        "assertion": {
+          "field": "panicked",
+          "op": "eq",
+          "value": false,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [
+          {
+            "field": "scenario",
+            "op": "eq",
+            "value": "add_voter_control",
+            "reference": null
+          }
+        ],
+        "description": "Control: applying a committed add-voter change of the same shape does not abort the applying node."
+      }
+    ],
+    "knowledge": [],
+    "previous_id": null,
+    "revision_reason": ""
+  },
+  "stop": null
+}

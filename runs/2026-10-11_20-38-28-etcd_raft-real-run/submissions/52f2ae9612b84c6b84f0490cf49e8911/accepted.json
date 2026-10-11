@@ -1,0 +1,83 @@
+{
+  "rationale": "The successor experiment 34e68e30368140d492185254dcedf04b-experiment has been executed and retained, so this update records the non-expiring-context witness that the previous interpretation had listed as unmeasured: with context.Background the proposal on the node that applied its own removal did not return inside the 300 ms observation window and ended only when the node was stopped, returning ErrStopped. The conclusion is stated as a defect against the declared predicate, the escape through stopping the node and the deliberate nature of the block are recorded as counterevidence, and the window-based observation is bounded explicitly in the limitations.",
+  "sources": [],
+  "investigations": [],
+  "knowledge": [
+    {
+      "id": null,
+      "ref": "@observed_node_propose_blocked_without_deadline",
+      "kind": "fact",
+      "statement": "In the retained execution of the successor experiment (three-voter cluster {1,2,3}; node 1 a bare raft leader at term 1 with committed 1, node 2 a bare follower, node 3 driven through the Node API as a follower; fault-free in-process delivery), Node.Propose on node 3 while it was a member returned no error in 0 ms (parsed index 1: error_text '<nil>', elapsed_ms 0, blocked_until_deadline false, node3_in_config true). After node 3 applied a ConfChangeV2 that removed it (index 2: node3_in_config false, voters [1,2], committed 3), a proposal with a 200 ms deadline blocked for the whole deadline and returned 'context deadline exceeded' (index 3: elapsed_ms 200, blocked_until_deadline true). A proposal issued with context.Background from a separate goroutine did not return during the fixed 300 ms observation window (index 4: returned_within_window false, error_text '<nil>', node3_in_config false), and it returned only after the node was stopped, with the error text 'raft: stopped' (index 5: returned_after_stop true).",
+      "conditions": "One executed in-process experiment with the fixed harness bytes of experiment 34e68e30368140d492185254dcedf04b-experiment (receipt 133c591601724c759fe07b2e80b55649, exit 0, changed_target_files [], no parsing errors); the subject node was driven through the Node API with its own Ready/Advance loop, the other voters were bare raft instances, the removal was proposed on the leader and applied on the subject node, no restart, snapshot or leadership change occurred, and the witness call was observed for 300 ms before the node was stopped. One observed instance under these conditions, not a universal guarantee.",
+      "source_ids": [
+        "node_block_proposals_on_removal",
+        "node_propose_wait",
+        "leader_propose_drop"
+      ],
+      "executions": {
+        "133c591601724c759fe07b2e80b55649": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5
+        ]
+      },
+      "changed_premise": "",
+      "affected_uses": []
+    }
+  ],
+  "gaps": [],
+  "interpretations": [
+    {
+      "investigation_id": "b8fa9bc20e164089beff30308ce68220-question-0",
+      "experiment_id": "34e68e30368140d492185254dcedf04b-experiment",
+      "source_ids": [
+        "node_block_proposals_on_removal",
+        "node_propose_wait",
+        "leader_propose_drop"
+      ],
+      "executions": {
+        "133c591601724c759fe07b2e80b55649": [
+          1,
+          2,
+          3,
+          4,
+          5
+        ]
+      },
+      "conclusion": "violated",
+      "rationale": "Receipt 133c591601724c759fe07b2e80b55649 is a completed execution of this investigation's successor experiment on the changed basis (status completed, exit 0, outcome tests_passed, unchanged target files, no parsing errors, 6 parsed events). Comparison 0 declares that a proposal issued with a non-expiring caller context on a node that applied its own removal returns inside the fixed observation window; it is violated with a complete valid witness at parsed index 4, correlated to its own admission at index 2 (self_removal_applied for probe_id 'removed': node3_in_config false, voters [1,2], node3_lead 1, node3_state StateFollower, committed 3). The measured operands at index 4 are returned_within_window false, error_text '<nil>' (no value was produced by the call), observation_ms 300 and node3_in_config false, and the follow-up event at index 5 shows the call ending only when the node was stopped, with returned_after_stop true and the error text 'raft: stopped'. Comparison 1, the deadline-context control, holds at index 1 (member setup at index 0: leader 1, term 1, committed 1, node3_in_config true, 200 ms timeout): the same call returned no error in 0 ms while the node was a member, so the blocking depends on the applied removal and not on the harness. The mechanism is the sourced one: node.run disables the proposal channel when the node applies a configuration that no longer contains it (node.go:405-433), and stepWithWaitOption's select can complete only on that channel, on ctx.Done or on n.done (node.go:513-537), which the execution confirms end to end - the deadline case ended on ctx.Done, the non-expiring case ended only on n.done after Stop, and the raft layer's own drop signal on the proposal path (raft.go:1290-1295, for the removed-leader case) was never produced. Engineering significance: for a service that keeps the removed member running, the caller receives no admissibility signal at all and the proposal call remains blocked for the lifetime of the node; the observation window bounds what was measured, while the source shows there is no fourth completion path. The predecessor interpretation on the deadline-context basis remains recorded and was not revised.",
+      "answers": {},
+      "knowledge": [
+        {
+          "entry_id": "b8fa9bc20e164089beff30308ce68220-knowledge-0",
+          "revision": 1,
+          "assertion": "The disabled proposal channel leaves only the caller context or the node's done channel as completion paths, which the execution shows as ctx.Done at index 3 and n.done at index 5."
+        }
+      ],
+      "counterevidence": [
+        "The block is deliberate in the captured source, which states that it blocks incoming proposals when the node was removed, so the behaviour can be read as the intended mechanism rather than an implementation error.",
+        "The call is not unbounded in every scenario: stopping the node releases it with ErrStopped (index 5: 'raft: stopped'), so a service that removes and stops the member does receive a signal, and the finding concerns a removed member that keeps running.",
+        "The deadline-context case returns the caller's own context error (index 3), so a caller that always bounds its proposals is only misled about the reason, not blocked.",
+        "The control at index 1 shows the same call works normally while the node is a member, excluding harness, transport and timeout artefacts.",
+        "The witness uses a 300 ms observation window, so the claim about longer or unbounded blocking rests on the window plus the sourced completion set rather than on an unbounded measurement.",
+        "The source's own note that resetting the channel on leadership change 'isn't very sound and likely has bugs' points at related unsoundness in the same mechanism without being itself the observation."
+      ],
+      "limitations": [
+        "One executed instance with a fixed 300 ms window in one process and fault-free delivery; longer windows and other schedules were not measured.",
+        "Only removal of a follower node was exercised; removal of the leader (a different branch) is covered by the earlier removed-leader finding, and joint configurations and learner demotion were not probed.",
+        "The subject node's removal was applied through its own Node API while the other voters were bare raft instances driven by the harness.",
+        "Whether an embedding service is expected to bound its proposals, or to stop removed members promptly, is a contract question outside the captured package, so severity and defect classification remain with human review.",
+        "The node was stopped by the harness as the escape route; no other external cancellation path was explored."
+      ],
+      "joint_history": "",
+      "failure_attribution": null,
+      "report_title": "被移除节点上无超时调用 Node.Propose 会一直阻塞：只有停止节点（ErrStopped）才结束",
+      "report_answer": "在 successor 实验（同一场景，新增不设超时的调用）中：node 3 仍为成员时同一 Node.Propose 调用 0ms 返回且 error 为 nil（对照）；它应用移除自身的配置后（voters [1,2]、node3_in_config=false），带 200ms 超时的调用阻塞满超时并只返回 'context deadline exceeded'，而使用 context.Background 的调用在 300ms 观测窗口内完全没有返回（returned_within_window=false），仅在该节点被 Stop 后才以 'raft: stopped' 结束（returned_after_stop=true）。源码显示 node.run 在节点应用自身移除后把提案通道置空（node.go:405-433），而 Node.Propose 的等待路径只有该通道、调用方 context、节点 done 三条完成路径（node.go:513-537），raft 层在同类情形下的 drop 信号（raft.go:1290-1295）在这条路径上不会出现。因此对“移除后仍继续运行”的成员，调用方得不到任何不可受理的信号；是否构成缺陷需人工结合调用方与运维契约复核。"
+    }
+  ],
+  "experiment": null,
+  "stop": null
+}
