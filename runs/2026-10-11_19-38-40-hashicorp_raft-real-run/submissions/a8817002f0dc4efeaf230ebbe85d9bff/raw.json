@@ -1,0 +1,102 @@
+{
+  "rationale": "New A1 direction on leadership stability: the lease check that makes a leader step down when it cannot reach a quorum, and the configuration validation that is supposed to keep that monitor sane. The check measures the elapsed time since the last response from each follower; the leader's own contact cadence is a tenth of the heartbeat timeout plus the commit-timeout re-replication, and the validation bounds the lease only against the full heartbeat timeout and a five-millisecond floor. A legal configuration can therefore run the lease far shorter than the interval at which the leader speaks to its followers, which turns a monitor for 'cannot contact' into a source of continuous steps down. Recorded with the requirement anchor and the impact stated.",
+  "sources": [
+    {
+      "id": "src_config_lease_doc",
+      "file": "config.go",
+      "start_line": 201,
+      "end_line": 205,
+      "kind": "document_statement"
+    },
+    {
+      "id": "src_validateconfig_lease_bounds",
+      "file": "config.go",
+      "start_line": 366,
+      "end_line": 374,
+      "kind": "code_observation"
+    },
+    {
+      "id": "src_checkleaderlease_window",
+      "file": "raft.go",
+      "start_line": 1036,
+      "end_line": 1080,
+      "kind": "code_observation"
+    },
+    {
+      "id": "src_heartbeat_cadence",
+      "file": "replication.go",
+      "start_line": 398,
+      "end_line": 405,
+      "kind": "code_observation"
+    },
+    {
+      "id": "src_commit_timeout_replication",
+      "file": "replication.go",
+      "start_line": 163,
+      "end_line": 172,
+      "kind": "code_observation"
+    }
+  ],
+  "investigations": [
+    {
+      "ref": "@q_lease_vs_contact_cadence",
+      "question": "What relationship must the leader-lease timeout have with the leader's own peer-contact cadence, and does the configuration validation enforce it?",
+      "source_ids": [
+        "src_config_lease_doc",
+        "src_validateconfig_lease_bounds",
+        "src_checkleaderlease_window",
+        "src_heartbeat_cadence",
+        "src_commit_timeout_replication"
+      ],
+      "hypothesis": "The lease check declares a follower contacted when the elapsed time since its last response is at most the lease timeout, and the leader's periodic contact with a follower comes from a heartbeat at one tenth of the heartbeat timeout and a commit-timeout re-replication; the validation bounds the lease only to at least five milliseconds and at most the full heartbeat timeout, so a configuration with a small lease and a large heartbeat is accepted even though the lease is then shorter than the interval at which the leader is actually able to speak to that follower. Under such a configuration the check reports 'failed to contact quorum of nodes' and steps down while contact is in fact happening, and leadership cannot be retained.",
+      "discriminator": "Refuted if the leader contacts followers at least as often as the lease window for every validated configuration, if some other mechanism refreshes the per-follower contact record on that cadence, or if validation rejects a lease shorter than the contact cadence. An executed witness would be a three-node cluster configured with a heartbeat timeout of a second and a lease of five milliseconds, observing repeated leadership steps down and no sustained leader.",
+      "disposition": "active",
+      "limitations": [
+        "Source-only (this run's experiment capacity is exhausted); the churn was not exercised.",
+        "The contact cadence also depends on the commit timeout and on round-trip latency, so the exact threshold below which a lease mis-fires is deployment-dependent; the claim is that validation admits leases below any such threshold.",
+        "Nothing here concerns the default configuration, whose lease is half the heartbeat timeout and is therefore well above the cadence."
+      ]
+    }
+  ],
+  "knowledge": [
+    {
+      "ref": "@k_lease_validation_misses_lower_bound",
+      "kind": "fact",
+      "statement": "The leader's periodic contact with each follower is driven by two timers: the replication heartbeat loop waits a random duration up to one tenth of the heartbeat timeout before each heartbeat, and the replication loop additionally re-replicates on a random duration up to the commit timeout. A follower counts as contacted for the lease check when the elapsed time since its last response is at most the leader-lease timeout, and the leader steps down when fewer than a quorum are contacted. Configuration validation requires the lease to be at least five milliseconds and at most the heartbeat timeout, and requires the election timeout to be at least the heartbeat timeout; it imposes no lower bound relating the lease to the contact cadence. A configuration such as a one-second heartbeat timeout with a five-millisecond lease is therefore accepted, and in it the check will usually find every follower un-contacted even though responses are arriving on the heartbeat and commit-timeout cadence, so the leader logs that it failed to contact a quorum and steps down - repeatedly, since nothing about the configuration changes after a re-election.",
+      "conditions": "The mismatch needs a lease shorter than the typical interval between a leader's contacts with its followers, which the validation permits; the document's description of the field frames the condition as being unable to contact a quorum, which a lease below the contact cadence does not represent.",
+      "source_ids": [
+        "src_config_lease_doc",
+        "src_validateconfig_lease_bounds",
+        "src_checkleaderlease_window",
+        "src_heartbeat_cadence",
+        "src_commit_timeout_replication"
+      ]
+    }
+  ],
+  "interpretations": [
+    {
+      "investigation_id": "@q_lease_vs_contact_cadence",
+      "source_ids": [
+        "src_config_lease_doc",
+        "src_validateconfig_lease_bounds",
+        "src_checkleaderlease_window",
+        "src_heartbeat_cadence",
+        "src_commit_timeout_replication"
+      ],
+      "conclusion": "explained",
+      "rationale": "The requirement is stated by the field's own documentation: the lease controls how long the leader may go 'without being able to contact a quorum of nodes', and the leader steps down when that interval passes without contact (config.go:201-205). The implementation measures contact as the elapsed time since a follower's last response compared with the lease (raft.go:1036-1080), while a leader's ability to speak to its followers is bounded from above by its own timers: a heartbeat every random interval up to one tenth of the heartbeat timeout (replication.go:398-405) and a commit-timeout re-replication (replication.go:163-172). The relation that makes the monitor meaningful is therefore a lower bound on the lease relative to that cadence, and it is exactly the relation that validation does not enforce: validation rejects a lease below five milliseconds and above the heartbeat timeout, and requires the election timeout to be at least the heartbeat timeout (config.go:366-374). A configuration combining a long heartbeat timeout with a minimal lease is legal, and in it the check will find the followers un-contacted at most checks even though responses are arriving normally, so the leader logs a contact failure and steps down; a fresh election reproduces the same configuration, so the outcome is leadership churn and no sustained progress - a bounded, deterministic mechanism rather than a rare race, gated only by a configuration the library accepts. The honest framing is a validation gap with a documented-purpose mismatch rather than a defect of the default: the default lease is half the heartbeat timeout, far above the cadence, and the impact requires an operator to choose a lease much smaller than their heartbeat timeout. Severity is nevertheless high when it occurs, because the cluster cannot keep a leader, which is why it is recorded rather than dismissed as tuning.",
+      "counterevidence": [
+        "The default and any lease near the heartbeat timeout are far above the contact cadence, so the mismatch cannot appear without an unusual choice; the validation's upper bound and floor were presumably chosen with that in mind.",
+        "Contact is recorded on any response, including a rejected one, so the effective cadence is at least as often as the commit-timeout re-replication, which shortens the window in which a small lease could still work (for example with a very small commit timeout).",
+        "A caller can detect the situation from the log line the check emits and from the leadership-transition metric, so it is diagnosable even though it is accepted at validation time.",
+        "No execution: the churn was reasoned from the timers, the comparison and the validation, not observed."
+      ],
+      "limitations": [
+        "Source-only; the threshold at which a lease starts mis-firing is deployment-dependent (round-trip latency, commit timeout, follower responsiveness) and was not measured.",
+        "Only the lease check and its validation were examined; the interaction with the read-index use of the lease, if any, was not re-derived.",
+        "The finding is about configuration acceptance, not about the default configuration's correctness."
+      ],
+      "report_title": "配置校验缺口：合法的短 leader lease 会让领导者因“无法联系 quorum”而反复下台",
+      "report_answer": "本次记录一个配置校验缺口（仅源码，未执行，实验额度已用尽）。需求来自字段自身的文档：LeaderLeaseTimeout 控制“在不接触 quorum 的情况下还能当 leader 多久”，超过该间隔即下台（config.go:201-205）。实现把“接触”量化为“距该跟随者最近一次响应的时间 ≤ lease”（raft.go:1036-1080），而 leader 能联系到跟随者的**周期上界**由其自身定时器决定：心跳循环等待至多 HeartbeatTimeout/10 后发一次心跳（replication.go:398-405），复制循环另按 CommitTimeout 重新复制（replication.go:163-172）。因此使该监控有意义的关系是 lease 相对接触节奏的**下界**，而这正是校验没有施加的约束：校验只要求 lease ≥5ms、≤HeartbeatTimeout，并要求 ElectionTimeout ≥ HeartbeatTimeout（config.go:366-374）。于是“心跳超时 1 秒 + lease 5 毫秒”这类配置合法，却会让检查在响应正常到达的情况下判定无人被联系，领导者记录“failed to contact quorum of nodes”并下台；重新选举会重现同样配置，形成领导权反复更替、无法持续推进的结果——这是由被库接受的配置触发的确定性机制，而非罕见竞态。诚实的定位是“校验缺口 + 与文档意图不一致”，而非默认配置缺陷：默认 lease 为心跳超时的一半，远高于接触节奏；危害只在运维选择远小于心跳超时的 lease 时出现，但一旦出现后果严重（集群无法保有 leader），故予以记录。反证保留：任何响应（含被拒绝）都会刷新接触记录，使有效节奏至少与 CommitTimeout 重新复制一样快；该情形可从日志行与转换指标被诊断出来；以及未执行测量。"    }
+  ]
+}

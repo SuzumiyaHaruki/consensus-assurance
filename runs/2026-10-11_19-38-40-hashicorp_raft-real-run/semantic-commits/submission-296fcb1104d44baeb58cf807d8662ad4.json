@@ -1,0 +1,1790 @@
+{
+  "input": {
+    "rationale": "New A1 (decision formation/progress) lead, independent of the recorded A2 findings: what reconciles a follower's advertised/local log position with a snapshot it has just installed, and can the leader's back-off leave the pair repeating the same snapshot? Source trace of installSnapshot's tail against its sibling path restoreUserSnapshot, then through getLastEntry/getLastIndex, the receiver's prev-log check, the leader's back-off, and the snapshot branch of setPreviousLog. The cycle is source-established with stated conditions; no execution was requested because this run's experiment capacity is exhausted.",
+    "sources": [
+      {
+        "id": "src_install_snapshot_tail",
+        "file": "raft.go",
+        "start_line": 1930,
+        "end_line": 1952,
+        "kind": "code_observation"
+      },
+      {
+        "id": "src_restore_user_snapshot_setlastlog",
+        "file": "raft.go",
+        "start_line": 1180,
+        "end_line": 1187,
+        "kind": "code_observation"
+      },
+      {
+        "id": "src_appendentries_prev_check",
+        "file": "raft.go",
+        "start_line": 1475,
+        "end_line": 1502,
+        "kind": "code_observation"
+      },
+      {
+        "id": "src_resp_lastlog_operand",
+        "file": "raft.go",
+        "start_line": 1443,
+        "end_line": 1449,
+        "kind": "code_observation"
+      },
+      {
+        "id": "src_replicate_backoff_clamp",
+        "file": "replication.go",
+        "start_line": 249,
+        "end_line": 261,
+        "kind": "code_observation"
+      },
+      {
+        "id": "src_snapshot_success_nextindex",
+        "file": "replication.go",
+        "start_line": 360,
+        "end_line": 376,
+        "kind": "code_observation"
+      },
+      {
+        "id": "src_set_previous_log_snapshot_branch",
+        "file": "replication.go",
+        "start_line": 588,
+        "end_line": 599,
+        "kind": "code_observation"
+      },
+      {
+        "id": "src_getlast_snapshot_preference",
+        "file": "state.go",
+        "start_line": 152,
+        "end_line": 174,
+        "kind": "code_observation"
+      },
+      {
+        "id": "src_compactlogs_trailing_early_return",
+        "file": "snapshot.go",
+        "start_line": 214,
+        "end_line": 240,
+        "kind": "code_observation"
+      }
+    ],
+    "investigations": [
+      {
+        "id": null,
+        "ref": "@q_snapshot_install_lastlog_reconcile",
+        "question": "After a follower installs a snapshot whose index is below the follower's own cached last log index, which code reconciles the follower's cached/advertised last log position and its local log entries with the installed snapshot, and can the leader's back-off then repeat the same snapshot indefinitely?",
+        "source_ids": [
+          "src_install_snapshot_tail",
+          "src_restore_user_snapshot_setlastlog",
+          "src_appendentries_prev_check",
+          "src_resp_lastlog_operand",
+          "src_replicate_backoff_clamp",
+          "src_snapshot_success_nextindex",
+          "src_set_previous_log_snapshot_branch",
+          "src_getlast_snapshot_preference",
+          "src_compactlogs_trailing_early_return"
+        ],
+        "hypothesis": "installSnapshot never revises the cached last log index/term, while its sibling path restoreUserSnapshot explicitly does; since getLastEntry/getLastIndex prefer the snapshot only when the cached log index is below the snapshot index, a follower whose cached last index is above the installed snapshot keeps advertising and comparing against its own divergent log. With a divergence at or below the snapshot index (the condition that caused the snapshot) and a leader whose log no longer contains entries below its snapshot index, the pair repeats: InstallSnapshot(snapshotIndex) succeeds and sets nextIndex = snapshotIndex+1; the next AppendEntries carries PrevLogEntry = snapshotIndex and is rejected with NoRetryBackoff and LastLog = the follower's higher stale index; the leader clamps nextIndex back to snapshotIndex; the request for snapshotIndex-1 cannot be built from the leader's compacted log, so the same snapshot is sent again.",
+        "discriminator": "Refuted if the follower's cached last log is lowered on install (or if the advertised/resp.LastLog is not the stale value), if the receiver can accept PrevLogEntry = snapshotIndex from the snapshot metadata alone, if the leader can always build a request for snapshotIndex-1 (log not compacted there), or if the cycle is broken by any other terminating condition such as a successful truncation. An executed witness would be a leader with a compacted prefix whose first index is snapshotIndex+1 and a follower whose log diverges at or below snapshotIndex while its cached last index is above it, then observing repeated InstallSnapshot requests instead of ForwardProgress.",
+        "disposition": "active",
+        "parent_id": null,
+        "knowledge": null,
+        "counterevidence": null,
+        "limitations": [
+          "Source-derived reachability argument with explicit conditions; no receipt, because this run had no experiment capacity left.",
+          "The reachability of 'cached last index above the installed snapshot index' is argued from a divergent-suffix history (a node that kept uncommitted entries from an earlier leader and whose index outran the leader's snapshot point); no execution confirms that history end to end.",
+          "Only the leader-to-follower snapshot path is examined; the user-initiated restore path is the sibling that does perform the update."
+        ],
+        "resume_conditions": null
+      }
+    ],
+    "knowledge": [
+      {
+        "id": null,
+        "ref": "@k_install_snapshot_leaves_cached_lastlog",
+        "kind": "behavior",
+        "statement": "On a successful InstallSnapshot the follower updates lastApplied to the snapshot index, sets the last snapshot index/term, replaces the latest and committed configurations from the request, and then either removes old logs (MonotonicLogStore) or calls compactLogs(snapshotIndex) before responding Success. It does not call setLastLog at any point, so the cached last log index/term retain their pre-snapshot values. The sibling path restoreUserSnapshot does call setLastLog(lastIndex, term) at the same stage of its own flow.",
+        "conditions": "Executed on the follower's main thread when an InstallSnapshot RPC passes the version and term checks; the effect on the advertised position follows from getLastIndex/getLastEntry, which return the cached log position whenever it is greater than or equal to the snapshot position.",
+        "source_ids": [
+          "src_install_snapshot_tail",
+          "src_restore_user_snapshot_setlastlog",
+          "src_getlast_snapshot_preference"
+        ],
+        "executions": {},
+        "changed_premise": "",
+        "affected_uses": []
+      },
+      {
+        "id": null,
+        "ref": "@k_snapshot_install_can_repeat",
+        "kind": "fact",
+        "statement": "If the follower's cached last log index is above the installed snapshot index and its log diverges from the leader at or below that snapshot index, installation does not resolve the divergence and the leader-follower pair settles into a repeating cycle rather than making progress. The receiver's prev-log check compares the request's PrevLogEntry (the snapshot index, sent via setPreviousLog's snapshot branch) against getLastEntry, which returns the follower's own higher cached position, so the equality shortcut does not apply and the term is taken from the follower's local log (or the lookup fails after compaction), producing a rejection with NoRetryBackoff and LastLog set to that higher cached index. The leader then clamps nextIndex to at most nextIndex-1 (the follower's higher LastLog does not raise that bound) and cannot build a request for snapshotIndex-1 because its own log starts above that index, so it transmits the same snapshot again; the install succeeds again, nextIndex is set to snapshotIndex+1, and the cycle repeats with the leader's match index for that peer pinned at the snapshot index.",
+        "conditions": "Requires (a) the follower's cached last log index to exceed the leader's latest snapshot index, (b) a genuine divergence at or below that snapshot index, and (c) the leader's log to no longer contain the entry below its snapshot index so the request for snapshotIndex-1 cannot be built. If (a) is absent, getLastEntry and getLastIndex prefer the snapshot and the receiver accepts PrevLogEntry = snapshot index directly; if (c) is absent the leader can keep walking down and eventually truncate the follower's divergent suffix.",
+        "source_ids": [
+          "src_appendentries_prev_check",
+          "src_resp_lastlog_operand",
+          "src_replicate_backoff_clamp",
+          "src_snapshot_success_nextindex",
+          "src_set_previous_log_snapshot_branch",
+          "src_compactlogs_trailing_early_return"
+        ],
+        "executions": {},
+        "changed_premise": "",
+        "affected_uses": []
+      }
+    ],
+    "gaps": [],
+    "interpretations": [
+      {
+        "investigation_id": "@q_snapshot_install_lastlog_reconcile",
+        "experiment_id": null,
+        "source_ids": [
+          "src_install_snapshot_tail",
+          "src_restore_user_snapshot_setlastlog",
+          "src_appendentries_prev_check",
+          "src_resp_lastlog_operand",
+          "src_replicate_backoff_clamp",
+          "src_snapshot_success_nextindex",
+          "src_set_previous_log_snapshot_branch",
+          "src_getlast_snapshot_preference",
+          "src_compactlogs_trailing_early_return"
+        ],
+        "executions": {},
+        "conclusion": "explained",
+        "rationale": "The applicable responsibility is that installing a snapshot must make the follower's durable position agree with the state it just accepted; otherwise the leader's log-matching rules keep negotiating against a history the follower no longer holds. In this snapshot the responsibility is discharged only halfway. installSnapshot sets lastApplied, lastSnapshot and the configurations and then discards or compacts logs up to the snapshot index (raft.go:1930-1952), but it never sets the cached last log, whereas restoreUserSnapshot in the same file states the intent explicitly ('We set the last log so it looks like we've stored the empty index we burned') and calls setLastLog (raft.go:1180-1187). That difference matters because getLastIndex/getLastEntry return the cached log position whenever it is greater than or equal to the snapshot position (state.go:152-174): with the cached index above the installed snapshot, the follower both advertises that higher index in every AppendEntriesResponse (raft.go:1443-1449) and takes its prev-log term from its own log rather than from the snapshot metadata (raft.go:1475-1502). The paired consequence is a stable two-state cycle when the divergence that caused the snapshot lies at or below the snapshot index and the leader's log has been compacted there: AppendEntries(PrevLogEntry = snapshotIndex) is rejected with NoRetryBackoff and LastLog = the follower's higher index; the leader's back-off keeps only the min(s.nextIndex-1, resp.LastLog+1) term, so nextIndex falls to the snapshot index (replication.go:249-261); the next attempt needs the entry below the snapshot index, which the leader can no longer produce, so SEND_SNAP transmits the same snapshot (replication.go:588-599 for the snapshot-branch prev entry and 360-376 for the post-success nextIndex = snapshotIndex+1). Each turn of the cycle re-transfers the whole snapshot to that peer and re-runs the FSM restore, so the peer's match index never advances past the snapshot index: nonprogress bounded by a concrete, source-supported mechanism rather than by a bare timeout. Both cycle states are local and deterministic, so the local question is answered from the retained source: nothing on the install path reconciles the cached last log, and every enclosing protection in the loop (the back-off clamp, the snapshot branch, the compacted prefix) keeps the cycle in place instead of breaking it. The contrasting sibling path shows the missing update is not architecturally impossible, only absent here.",
+        "answers": {},
+        "knowledge": [],
+        "counterevidence": [
+          "When the follower's cached last index is below the installed snapshot index - the ordinary case, and the one exercised by existing snapshot tests - getLastEntry and getLastIndex already prefer the snapshot, so the receiver accepts PrevLogEntry = snapshot index and makes progress; the defect is confined to the index-ahead case.",
+          "If the leader's log still contains the entry below its snapshot index, the back-off eventually walks below the divergence point, the follower truncates its suffix, and the pair recovers; the cycle needs the leader's prefix to be compacted at or above that point.",
+          "The state machine's state is still restored correctly and lastApplied is advanced, so the harm is progress and repeated work (snapshot transfer plus FSM restore) rather than a divergence between the follower's FSM and the committed state.",
+          "No receipt accompanies this account; a reader should treat the reachability of an index-ahead, diverging follower as argued rather than observed."
+        ],
+        "limitations": [
+          "Conditions are stated explicitly: follower cached last index above the leader's snapshot index, divergence at or below that index, and a leader whose log no longer holds the entry below its snapshot index. Outside them the recorded harm does not follow.",
+          "The reasoning is static; the number of cycles, their cost and whether a given store's compaction policy trims the follower's divergent suffix were not measured.",
+          "The reachability of the required follower history (an index-ahead divergent suffix from a superseded leader) is argued from the retained code paths, not reproduced."
+        ],
+        "joint_history": "",
+        "failure_attribution": null,
+        "report_title": "快照安装在“日志已超出快照索引”的跟随者上无法消解分歧，导致重复安装同一快照",
+        "report_answer": "本次为源码推导（本运行实验额度已用尽）。installSnapshot 在成功时更新 lastApplied、lastSnapshot 与配置，并按存储类型删除/压缩日志，但从不更新缓存中的 lastLog 索引与 term；同一文件中的兄弟路径 restoreUserSnapshot 则明确调用 setLastLog（并注释说明了意图）。由于 getLastIndex/getLastEntry 只在缓存日志索引低于快照索引时才优先返回快照位置，当跟随者的缓存最后索引高于刚安装的快照索引时，它会在每个 AppendEntriesResponse 中继续公布这个更高的索引，并在 prev-log 检查中用自己（已分歧）的日志取 term。若导致快照的分歧点位于该快照索引或其之下，而 leader 的日志又已压缩到快照索引之上，双方会稳定地循环：leader 以 PrevLogEntry=快照索引 发送 → 跟随者以 NoRetryBackoff 与更高的 LastLog 拒绝 → leader 退避把 nextIndex 降到快照索引 → 无法构造 snapshotIndex-1 的请求 → 再次发送同一快照 → 安装成功把 nextIndex 置为 snapshotIndex+1 → 重复。每次循环都重传整份快照并重跑 FSM restore，而该 peer 的 match index 始终止于快照索引，属有明确机制的持续无进展。适用条件与反例（缓存索引低于快照索引的常规情形、leader 仍保有快照索引以下日志的情形）已在记录中列明。"
+      }
+    ],
+    "experiment": null,
+    "stop": null
+  },
+  "before": {
+    "investigations": [
+      {
+        "id": "b692e1e41ba940c78dc240498acfbdc1-question-0",
+        "version": 1,
+        "question": "Which applicable condition restricts the authority to induce a leadership transition (TimeoutNow) to the current leader and to the context in which that leadership still holds?",
+        "source_ids": [
+          "src_timeoutnow_handler",
+          "src_timeoutnow_cmd",
+          "src_check_header",
+          "src_vote_membership_guard",
+          "src_prevote_membership_guard",
+          "src_electSelf_transfer_flag",
+          "src_vote_leader_bypass"
+        ],
+        "hypothesis": "timeoutNow is the only consensus RPC that performs an authority transition (leader cleared, node set to Candidate, candidateFromLeadershipTransfer set so the next RequestVote carries LeadershipTransfer=true and voters skip the known-leader rejection) while carrying no term and applying no membership or leadership guard; the enclosing checkRPCHeader only bounds the protocol version. Therefore a TimeoutNow that no longer reflects a live transfer authority, or one sent by a non-member whose protocol version is in range, is indistinguishable from an authorized one and forces an authority transition.",
+        "discriminator": "Refuted if an enclosing protection (membership/eligibility check on the sender, a term carried by TimeoutNowRequest and compared against the receiver's current term, or a known-leader requirement) exists on the path from RPC admission to timeoutNow, or if the induced candidate cannot win because voters still apply the known-leader rejection when LeadershipTransfer is set. An executed witness would be a 3-node cluster where a single TimeoutNow from a party that is not the current-term leader causes the term to rise and the legitimate leader to leave the Leader state; a control is that the same non-member sender is rejected by requestVote/requestPreVote.",
+        "disposition": "active",
+        "parent_id": null,
+        "knowledge": [],
+        "counterevidence": [],
+        "limitations": [
+          "Judgment is source-established (guard absence is decidable from the function bodies); no executed witness was retained in this run.",
+          "The RPC layer has no authentication by design; the non-member consequence assumes only transport reachability, while the stale-message consequence assumes only that a former leader's TimeoutNow can be delivered/processed after leadership moved on."
+        ],
+        "resume_conditions": [],
+        "gaps": [],
+        "history": [],
+        "operation_id": "b692e1e41ba940c78dc240498acfbdc1"
+      },
+      {
+        "id": "5d4108432b0d4ae38661ad457982e991-question-0",
+        "version": 1,
+        "question": "When the caller names a leadership-transfer target that is in the configuration but cannot vote (Nonvoter/Staging), which applicable condition keeps the transfer from taking leadership away from the current leader, and which observable event justifies the returned future succeeding?",
+        "source_ids": [
+          "src_transfer_api_doc",
+          "src_initiate_transfer_guard",
+          "src_pickServer_voter_filter",
+          "src_transfer_catchup_then_timeoutnow",
+          "src_replstate_for_every_peer",
+          "src_vote_nonvoter_term_stepdown",
+          "src_electSelf_bumps_term",
+          "src_transfer_success_on_leftLeaderLoop"
+        ],
+        "hypothesis": "The explicit-target API performs no suffrage/eligibility check on the named server, while the automatic path selects only voters; therefore LeadershipTransferToServer(nonVoterID, addr) on a reachable, caught-up non-voter passes the catch-up loop, sends TimeoutNow, makes that non-voter campaign at currentTerm+1 (electSelf persists the higher term and asks only voters), and every voter - the incumbent leader included - sets the higher term and steps down before rejecting the vote as non-voter. The named target can never win, the cluster loses its leader and must hold another election, and the caller's future is nevertheless resolved as success because the leader-side goroutine treats leaving the leader loop as the success event.",
+        "discriminator": "Refuted if any condition on the path rejects a non-voter target before TimeoutNow is sent (a suffrage/eligibility check in initiateLeadershipTransfer or leadershipTransfer, absence of a replication state for non-voters, or a catch-up loop that cannot terminate), or if a voter that receives the induced RequestVote does not adopt the higher term (so leadership survives), or if the future is resolved with an error in this scenario. An executed witness would be a 3-node voter cluster plus one AddNonvoter member, where LeadershipTransferToServer(nonvoter) leaves the cluster without a leader at the old term and the returned future reports no error while the non-voter never becomes leader.",
+        "disposition": "active",
+        "parent_id": null,
+        "knowledge": [
+          {
+            "entry_id": "b692e1e41ba940c78dc240498acfbdc1-knowledge-0",
+            "revision": 1,
+            "assertion": "timeoutNow unconditionally clears the known leader, sets Candidate and sets candidateFromLeadershipTransfer, reading nothing from the request."
+          },
+          {
+            "entry_id": "b692e1e41ba940c78dc240498acfbdc1-knowledge-2",
+            "revision": 1,
+            "assertion": "The sender-side expectation is that TimeoutNow comes from the current leader, while TimeoutNow itself applies no eligibility guard."
+          }
+        ],
+        "counterevidence": [],
+        "limitations": [
+          "Established by source reading; no receipt exists in this run (experiment capacity already consumed), so the end-to-end sequence is argued from the handler rules rather than observed.",
+          "Reachability requires a caller that names a non-voting member; the library neither documents a voter-only requirement nor rejects such a target, and the target must be reachable and caught up, otherwise the pre-existing timeout path reports an error.",
+          "The term bump and the loss of leadership at term+1 are the sourced consequences; which surviving voter wins the subsequent election is schedule-dependent and not claimed."
+        ],
+        "resume_conditions": [],
+        "gaps": [],
+        "history": [],
+        "operation_id": "5d4108432b0d4ae38661ad457982e991"
+      },
+      {
+        "id": "32fbb0ae6f38453f96e52ddb17c102e3-question-0",
+        "version": 1,
+        "question": "After a voter has skipped the known-leader rejection because a RequestVote carries LeadershipTransfer=true, which remaining receive-side condition can still refuse the vote, and which producers are able to set that mark at all?",
+        "source_ids": [
+          "src_vote_grant_rules",
+          "src_candidate_vote_tally"
+        ],
+        "hypothesis": "The bypass only removes the leader-presence veto; the receiver still applies the duplicate-vote rule for that term, the log up-to-dateness rule, and (for the candidate ID) the membership and suffrage rules, and then persists and grants. In a healthy cluster nothing has voted at the induced candidate's fresh term and a healthy follower's log is not behind, so the induced candidate reaches the grant threshold; the mark itself has a single producer (timeoutNow) and is cleared unconditionally when candidacy ends, so LeadershipTransfer=true can only ride on one candidacy that follows a TimeoutNow.",
+        "discriminator": "Refuted if some other receive-side condition withholds the vote in the healthy case (for example an unconditional persistence failure, or a leader-presence veto that survives the mark), or if some other code path stores candidateFromLeadershipTransfer=true, or if the mark outlives candidacy. A refusal that requires an already-recorded same-term vote for a different candidate, a strictly longer receiver log, or a non-voting candidate refutes only a stronger universal claim, not this one.",
+        "disposition": "active",
+        "parent_id": null,
+        "knowledge": [
+          {
+            "entry_id": "b692e1e41ba940c78dc240498acfbdc1-knowledge-0",
+            "revision": 1,
+            "assertion": "timeoutNow unconditionally clears the known leader, sets Candidate and sets candidateFromLeadershipTransfer, reading nothing from the request."
+          },
+          {
+            "entry_id": "5d4108432b0d4ae38661ad457982e991-knowledge-1",
+            "revision": 1,
+            "assertion": "A candidacy induced by timeoutNow stamps LeadershipTransfer=true, which disables the known-leader rejection on the voting side."
+          }
+        ],
+        "counterevidence": [],
+        "limitations": [
+          "Source-established conditions, no receipt; the tally and grant arithmetic is read from runCandidate and requestVote rather than observed.",
+          "The claim is about one induced candidacy in a cluster whose voters are otherwise healthy and have not yet voted in the candidate's term; it is not a claim about partitioned or already-campaigned clusters."
+        ],
+        "resume_conditions": [],
+        "gaps": [],
+        "history": [],
+        "operation_id": "32fbb0ae6f38453f96e52ddb17c102e3"
+      },
+      {
+        "id": "32fbb0ae6f38453f96e52ddb17c102e3-question-1",
+        "version": 1,
+        "question": "Is the mixed-version pre-vote fallback reachable, i.e. can the error a pre-vote-incapable peer produces for an unknown RPC type ever contain the substring that preElectSelf treats as a granted pre-vote?",
+        "source_ids": [
+          "src_prevote_fallback_match",
+          "src_unknown_rpc_type_error",
+          "src_unexpected_command_constant"
+        ],
+        "hypothesis": "preElectSelf counts a peer's pre-vote as granted when the transport error contains the constant rpcUnexpectedCommandError, but that constant is the text of the local processRPC default branch, while a peer that cannot handle the pre-vote RPC fails earlier, in NetworkTransport.handleCommand, whose unknown-type error text is 'unknown rpc type %d'. If a pre-vote-incapable peer reports the latter (or a transport-level failure that carries no such text), the fallback never fires and a candidate whose only reachable peers are pre-vote-incapable has its pre-vote refused rather than granted - the opposite of the stated rolling-upgrade intent.",
+        "discriminator": "Settled by reading the counterpart (pre-1.7) transport's unknown-rpc-type error text together with this snapshot's response encoding, or by observing one pre-vote response round trip in a mixed-version cluster. Refuted if that error text contains 'unexpected command', or if the receive-side error is not carried back to the sender at all, in which case a differently-phrased conclusion applies.",
+        "disposition": "paused",
+        "parent_id": null,
+        "knowledge": [],
+        "counterevidence": [],
+        "limitations": [
+          "The sender in this scenario is the captured version; the receiver is a version not present in the authorized material, so the error text seen by the sender cannot be established here.",
+          "Only the string-match fallback is questioned; nothing in this record claims the pre-vote feature is broken within clusters where every peer speaks the captured version."
+        ],
+        "resume_conditions": [
+          "Authorized access to the counterpart transport version's unknown-rpc-type path, or a retained mixed-version cluster observation of one pre-vote exchange; neither exists in this snapshot, and this run's experiment capacity is exhausted."
+        ],
+        "gaps": [],
+        "history": [],
+        "operation_id": "32fbb0ae6f38453f96e52ddb17c102e3"
+      },
+      {
+        "id": "58efcbe400a04d91a7159521dca86757-question-0",
+        "version": 1,
+        "question": "Which leadership-transfer target conditions do the retained tests fix as required behaviour, and does any retained expectation settle the eligibility of a named non-voting target or any receive-side condition on TimeoutNow?",
+        "source_ids": [
+          "src_leadertransfer_doc",
+          "src_test_transfer_invalid_id",
+          "src_test_transfer_invalid_address",
+          "src_test_transfer_behind_voter",
+          "src_test_transfer_ignores_nonvoters"
+        ],
+        "hypothesis": "The retained suite fixes four target outcomes for the explicit API (unknown ID, unreachable address, caught-up voter succeeds, behind voter succeeds) and one outcome for the automatic path (a cluster whose only other member was demoted yields 'cannot find peer'). An explicit non-voting target, and every receive-side property of the TimeoutNow handler, are unasserted; therefore the recorded findings are not contradicted by an existing expectation, and the implicit requirement 'leadership transfer ignores non-voters' is encoded in the test name and realized only by pickServer.",
+        "discriminator": "Refuted if any retained test names a non-voting server as the argument of LeadershipTransferToServer, or asserts a receive-side condition of TimeoutNow (term, sender membership, sender leadership, or a known-leader requirement). Test names and comments are treated as evidence of intent only, not as proof of enforcement; the enforcement question is settled by the handler bodies already recorded.",
+        "disposition": "active",
+        "parent_id": null,
+        "knowledge": [],
+        "counterevidence": [],
+        "limitations": [
+          "Expectations are source assertions about intended behaviour, not executions, and a passing suite does not establish what an uncovered path does.",
+          "Only the retained snapshot's tests were searched; test files outside the captured tree are out of scope."
+        ],
+        "resume_conditions": [],
+        "gaps": [],
+        "history": [],
+        "operation_id": "58efcbe400a04d91a7159521dca86757"
+      }
+    ],
+    "knowledge": [
+      {
+        "id": "b692e1e41ba940c78dc240498acfbdc1-knowledge-0",
+        "revision": 1,
+        "kind": "behavior",
+        "statement": "On receiving a TimeoutNow RPC, timeoutNow unconditionally clears the known leader (setLeader(\"\",\"\")), sets the local state to Candidate, stores candidateFromLeadershipTransfer=true, and responds with a successful TimeoutNowResponse. The handler reads nothing from the request: no sender identity/membership check, no term comparison, and no check that the local node currently knows a leader or that the sender is that leader.",
+        "conditions": "Conditional execution per RPC: processRPC admits the command after checkRPCHeader, which only rejects protocol versions outside [ProtocolVersionMin, ProtocolVersionMax] and more than one version behind the local ProtocolVersion; any sender that satisfies that header reaches timeoutNow. TimeoutNowRequest contains only RPCHeader (no Term field).",
+        "source_ids": [
+          "src_timeoutnow_handler",
+          "src_timeoutnow_cmd",
+          "src_check_header"
+        ],
+        "executions": {},
+        "history": [],
+        "operation_id": "b692e1e41ba940c78dc240498acfbdc1"
+      },
+      {
+        "id": "b692e1e41ba940c78dc240498acfbdc1-knowledge-1",
+        "revision": 1,
+        "kind": "fact",
+        "statement": "A node put into candidacy by timeoutNow stamps LeadershipTransfer=true on the RequestVote it sends, because candidateFromLeadershipTransfer is read in electSelf and runCandidate skips pre-vote while that flag is set. On the voting side, requestVote rejects a candidate only while 'we have a leader and the candidate is not that leader AND !req.LeadershipTransfer', so with LeadershipTransfer=true a healthy, up-to-date voter grants the vote even though it currently knows a leader. The up-to-date voter can therefore win the induced election and the incumbent leader (which applies the same bypass and steps down on the higher term) loses leadership.",
+        "conditions": "Requires the induced candidate's log to be at least as up to date as the voters' (true for a healthy follower) and the induced candidate to be a Voter in the receiver's latest configuration (the membership guard still applies to the candidate ID).",
+        "source_ids": [
+          "src_runCandidate_prevote_skip",
+          "src_electSelf_transfer_flag",
+          "src_vote_leader_bypass",
+          "src_timeoutnow_handler"
+        ],
+        "executions": {},
+        "history": [],
+        "operation_id": "b692e1e41ba940c78dc240498acfbdc1"
+      },
+      {
+        "id": "b692e1e41ba940c78dc240498acfbdc1-knowledge-2",
+        "revision": 1,
+        "kind": "fact",
+        "statement": "The sibling consensus RPC handlers do apply an eligibility guard that timeoutNow lacks: requestVote returns without granting when the candidate ID is absent from the latest configuration, and requestPreVote returns without granting likewise. The legitimate sender of TimeoutNow is the current leader (leadershipTransfer sends it after bringing the target up to date), so the transfer authority is expected to be the leader's, yet no handler-side condition encodes that expectation.",
+        "conditions": "Guards are evaluated only when len(r.configurations.latest.Servers) > 0 (a bootstrapping cluster with an empty configuration list deliberately grants); the comparison is drawn at the level of 'which conditions the handler applies', not of byte-identical code.",
+        "source_ids": [
+          "src_vote_membership_guard",
+          "src_prevote_membership_guard",
+          "src_leadertransfer_send"
+        ],
+        "executions": {},
+        "history": [],
+        "operation_id": "b692e1e41ba940c78dc240498acfbdc1"
+      },
+      {
+        "id": "5d4108432b0d4ae38661ad457982e991-knowledge-0",
+        "revision": 1,
+        "kind": "behavior",
+        "statement": "LeadershipTransferToServer(id, address) forwards the named target to initiateLeadershipTransfer with no check other than 'cannot transfer leadership to itself'; the named target is used as-is and the only per-target validation anywhere in the transfer path is asynchronous, in leadershipTransfer's catch-up loop (it waits for that peer's nextIndex to pass the leader's last index). By contrast the automatic LeadershipTransfer() path chooses its target with pickServer, which skips every server whose Suffrage is not Voter (and skips peers without replication state).",
+        "conditions": "Applies when the caller passes an explicit id/address (LeadershipTransferToServer); the named server must exist in r.leaderState.replState, which startStopReplication creates for every server in the latest configuration except the local one - non-voters included, because it skips only server.ID == r.localID.",
+        "source_ids": [
+          "src_transfer_api_doc",
+          "src_initiate_transfer_guard",
+          "src_pickServer_voter_filter",
+          "src_replstate_for_every_peer"
+        ],
+        "executions": {},
+        "history": [],
+        "operation_id": "5d4108432b0d4ae38661ad457982e991"
+      },
+      {
+        "id": "5d4108432b0d4ae38661ad457982e991-knowledge-1",
+        "revision": 1,
+        "kind": "fact",
+        "statement": "A transfer to a caught-up non-voting target cannot place that target in power and does not preserve the incumbent leader. timeoutNow puts the non-voter into candidacy (see the previously recorded handler behavior), runCandidate then skips pre-vote because candidateFromLeadershipTransfer is set and calls electSelf, which persists currentTerm+1 and asks only the voters; each voter receiving that RequestVote first adopts the newer term and transitions to Follower and only then rejects the vote because the candidate has no vote, so the election cannot be won at that term and the cluster is left without a leader until a further election. The leader-side goroutine nonetheless resolves the caller's future with no error, because the branch that responds nil is the one that fires when the leader leaves its leader loop ('lost leadership during transfer (expected)').",
+        "conditions": "Requires the non-voting target to be reachable and caught up so the catch-up loop terminates; the incumbent leader must still be a voter in the latest configuration (the normal case) and must receive the induced RequestVote, which it does because electSelf asks every Voter in the candidate's latest configuration.",
+        "source_ids": [
+          "src_transfer_catchup_then_timeoutnow",
+          "src_electSelf_bumps_term",
+          "src_vote_nonvoter_term_stepdown",
+          "src_transfer_success_on_leftLeaderLoop"
+        ],
+        "executions": {},
+        "history": [],
+        "operation_id": "5d4108432b0d4ae38661ad457982e991"
+      },
+      {
+        "id": "32fbb0ae6f38453f96e52ddb17c102e3-knowledge-0",
+        "revision": 1,
+        "kind": "behavior",
+        "statement": "For a RequestVote that reaches the vote-rule section of requestVote (i.e. after the membership check, the leader-presence check, the older-term check and the newer-term adoption), the receiver decides in this order: it reads the persisted last vote and, if that vote is for this same term, returns immediately - granting only when the stored candidate bytes equal the current candidate's bytes, and otherwise returning with Granted=false; it then refuses when its own last entry term is greater than the candidate's, or when the terms are equal and its own last index is greater; otherwise it persists a vote for the candidate and sets Granted=true. So the LeadershipTransfer mark only removes the leader-presence veto, not the duplicate-vote rule, the log up-to-dateness rule, the membership rule, or the non-voter rule that precede it.",
+        "conditions": "Applies to a request that has already passed the earlier vetoes in requestVote; the duplicate-vote branch returns without granting whenever lastVoteTerm equals the request term and the stored candidate differs, and the persist step can also fail (which returns without granting).",
+        "source_ids": [
+          "src_vote_grant_rules"
+        ],
+        "executions": {},
+        "history": [],
+        "operation_id": "32fbb0ae6f38453f96e52ddb17c102e3"
+      },
+      {
+        "id": "32fbb0ae6f38453f96e52ddb17c102e3-knowledge-1",
+        "revision": 1,
+        "kind": "fact",
+        "statement": "In the retained snapshot candidateFromLeadershipTransfer is stored true only inside timeoutNow, and it is stored false only by the deferred reset in runCandidate, so the privilege that disables the known-leader rejection exists for exactly one candidacy and only on a node that has just received a TimeoutNow; a node that campaigns on its own (heartbeat timeout, pre-vote success path, or election restart) sends RequestVote with the mark false because runCandidate both skips pre-vote only while the flag is set and resets it on every exit.",
+        "conditions": "Read from the captured snapshot's assignment sites; the conclusion is about which producers set the mark, not about whether the flag's read/write ordering is race-free.",
+        "source_ids": [
+          "src_candidate_vote_tally"
+        ],
+        "executions": {},
+        "history": [],
+        "operation_id": "32fbb0ae6f38453f96e52ddb17c102e3"
+      },
+      {
+        "id": "58efcbe400a04d91a7159521dca86757-knowledge-0",
+        "revision": 1,
+        "kind": "fact",
+        "statement": "The retained transfer tests fix these requirements: LeadershipTransferToServer with an ID absent from the leader's replication state must fail with 'cannot find replication state' (raft_test.go:2502-2515); with a reachable ID but an address the transport cannot use must fail with 'failed to make TimeoutNow RPC' (raft_test.go:2518-2532); with a voting follower as the target the call must succeed and that follower must become leader, both while writes continue (raft_test.go:2433-2486) and in a seven-node cluster (raft_test.go:2488-2500); with a behind but caught-up-able voting follower the same must hold after 1000 commits (raft_test.go:2534-2553); and, for the automatic path, a two-node cluster whose only other voter was demoted must fail with 'cannot find peer' (raft_test.go:2636-2654). No retained test passes a non-voting server as the explicit target, and no retained test asserts anything about the receiver of a TimeoutNow.",
+        "conditions": "Read as test expectations in the captured snapshot (they are assertions of required behaviour, not observations); the named tests are the only ones in the snapshot whose bodies call LeadershipTransfer/LeadershipTransferToServer or reference TimeoutNow, checked by searching the retained test files.",
+        "source_ids": [
+          "src_leadertransfer_doc",
+          "src_test_transfer_invalid_id",
+          "src_test_transfer_invalid_address",
+          "src_test_transfer_behind_voter",
+          "src_test_transfer_with_writes",
+          "src_test_transfer_ignores_nonvoters"
+        ],
+        "executions": {},
+        "history": [],
+        "operation_id": "58efcbe400a04d91a7159521dca86757"
+      }
+    ],
+    "interpretations": [
+      {
+        "id": "b692e1e41ba940c78dc240498acfbdc1-interpretation-0",
+        "investigation_id": "b692e1e41ba940c78dc240498acfbdc1-question-0",
+        "experiment_id": null,
+        "source_ids": [
+          "src_timeoutnow_handler",
+          "src_timeoutnow_cmd",
+          "src_check_header",
+          "src_vote_membership_guard",
+          "src_prevote_membership_guard",
+          "src_vote_leader_bypass",
+          "src_runCandidate_prevote_skip",
+          "src_electSelf_transfer_flag",
+          "src_leadertransfer_send"
+        ],
+        "executions": {},
+        "conclusion": "explained",
+        "rationale": "The applicable responsibility is that a leadership transfer must be authorized by the leadership it transfers away from. In this implementation that responsibility is carried only by the sender's intent: timeoutNow (raft.go:2209-2214) has no guard at all, and TimeoutNowRequest (commands.go:204-208) has no Term field, so the receiver cannot decide freshness or eligibility even in principle. Two sourced consequences follow. (1) Freshness/authority loss: leadershipTransfer (raft.go:1024-1029) sends TimeoutNow while it still holds leadership, but leadership can move on before the message is processed (the transfer goroutine waits afterwards for leftLeaderLoop, and the RPC may be delayed or the target blocked in installSnapshot/RPC processing); the receiver still becomes a Candidate at currentTerm+1, which for a healthy voter wins because requestVote's known-leader rejection is disabled by req.LeadershipTransfer (raft.go:1650-1656) while candidateFromLeadershipTransfer makes electSelf stamp that flag (raft.go:296, 1993). The new term then forces the actual leader to step down via its own requestVote/appendEntries handling, so a message that no longer represents any live authority deposes the legitimate leader. (2) Eligibility: requestVote and requestPreVote reject non-members (raft.go:1639-1649, 1755-1761), whereas timeoutNow is admitted for any sender that passes checkRPCHeader's protocol-version bounds (raft.go:43-67) - the eligibility guard is simply absent on the one path that can trigger an election and set the vote-bypass flag. The code itself flags the sensitivity of this privilege in runCandidate's comment that the transfer flag 'could be abused otherwise'; here the abuse is not prevented but the privilege is reachable by any protocol-compatible sender and carries no context to expire stale grants. No enclosing protection refutes the hypothesis: no membership check, no term, no known-leader requirement, and no sender-leadership check exist between RPC admission and the transition.",
+        "answers": {},
+        "knowledge": [],
+        "counterevidence": [
+          "runCandidate resets candidateFromLeadershipTransfer=false on every exit (raft.go:307), so the vote-bypass privilege does not persist beyond one candidacy; the defect is that reaching that candidacy needs no authority rather than that the privilege is permanent.",
+          "leaderLoop refuses to start a second transfer while one is in progress and refuses configuration changes/user restores during it, showing that the library does constrain legitimate transfer usage; those constraints are on the sender, not on the receiver's admission of TimeoutNow."
+        ],
+        "limitations": [
+          "Mechanism and guard absence are source-established; the end-to-end election outcome (term rise plus the incumbent leaving Leader) is argued from requestVote's grant rules, not observed under execution - this run's experiment capacity was already consumed, so no receipt exists.",
+          "Raft does not authenticate RPCs; the non-member variant therefore depends on the deployment's transport protection, and is reported as an eligibility-guard asymmetry rather than as a cryptographic forgery result.",
+          "Considered and not claimed: normal leader-initiated transfers, pre-vote behaviour for members, and the Candidate-skipped step-down at raft.go:1462 are unchanged here - the finding is restricted to the missing condition on TimeoutNow itself."
+        ],
+        "joint_history": "",
+        "failure_attribution": null,
+        "report_title": "TimeoutNow 缺少授权/时效校验，可强制触发领导权转移",
+        "report_answer": "在捕获的 hashicorp/raft 快照中，TimeoutNow 处理函数无条件清除已知 leader、把本节点置为 Candidate 并设置 candidateFromLeadershipTransfer，且 TimeoutNowRequest 不携带 term，也没有发送方成员资格或“发送方是当前 leader”的校验；只有协议版本被检查。与之对照，requestVote/requestPreVote 会对非成员直接拒绝。由于该标志会让 electSelf 带上 LeadershipTransfer=true、并让投票方跳过“已有 leader”的拒绝条件，一次不再代表任何现存领导权的 TimeoutNow（或来自协议版本合法的非成员）即可驱动一次可成功当选的领导权转移，使合法 leader 下台。该结论由源码确立；本次未保留执行见证（实验额度已用尽），因此建议后续用 3 节点集群 + 非成员传输发送 TimeoutNow 的对照实验确认。",
+        "operation_id": "b692e1e41ba940c78dc240498acfbdc1"
+      },
+      {
+        "id": "5d4108432b0d4ae38661ad457982e991-interpretation-0",
+        "investigation_id": "5d4108432b0d4ae38661ad457982e991-question-0",
+        "experiment_id": null,
+        "source_ids": [
+          "src_transfer_api_doc",
+          "src_initiate_transfer_guard",
+          "src_pickServer_voter_filter",
+          "src_transfer_catchup_then_timeoutnow",
+          "src_replstate_for_every_peer",
+          "src_vote_nonvoter_term_stepdown",
+          "src_electSelf_bumps_term",
+          "src_transfer_success_on_leftLeaderLoop"
+        ],
+        "executions": {},
+        "conclusion": "explained",
+        "rationale": "The requirement is stated by the captured API contract itself: LeadershipTransfer/LeadershipTransferToServer say a transfer is safe to use in mixed-version clusters and that 'If a follower cannot be promoted, it will fail gracefully' (api.go:1259-1260, 1274-1275). A non-voting member is exactly a follower that cannot be promoted, so that branch is the contract under test. The applicable responsibility is split across three places, and only one of them checks suffrage. (1) Target selection: the automatic path uses pickServer, which skips non-voters (raft.go:2166-2169), but the explicit path passes the caller's ID through initiateLeadershipTransfer after checking only self-transfer (raft.go:2187-2206). (2) The transfer itself: leadershipTransfer waits for that peer's nextIndex to pass the leader's last index and then sends TimeoutNow (raft.go:1010-1029); the wait can terminate for a non-voter because startStopReplication creates replication state for every configured peer except the local one (raft.go:587-611), so there is no suffrage gate on this path either. (3) The receiving side performs the transition without consulting suffrage (raft.go:2209-2214, previously recorded), and the induced candidacy is a real election attempt: electSelf persists currentTerm+1 (raft.go:1980-1983) and targets only voters (raft.go:2015-2017). On the voters, requestVote handles the newer term before the non-voter rejection: the newer-term branch transitions the receiver to Follower and adopts the term (raft.go:1662-1671), and the comment at raft.go:1673-1677 documents that this ordering is deliberate ('step down and update term, but reject the vote request'). So a single explicit transfer request to a non-voter removes the incumbent leader even though no vote is granted, and because the target can never reach quorum the expected leadership change never happens. The caller-visible outcome contradicts the contract in a second way: the future is not an error. The leader-side goroutine registers 'lost leadership during transfer (expected)' on leftLeaderLoop and responds nil there (raft.go:734-739), and after a successful TimeoutNow it waits in the same nil-responding branch (raft.go:748-756); the success evidence is therefore 'this leader left the leader loop', which the non-voter scenario satisfies even though no transfer occurred. Both halves are decidable from the retained source, so the local question is answered without needing an execution: the missing condition is a suffrage/eligibility check on the explicit target, and the mis-associated success event is the leader-loop exit rather than the target acquiring leadership.",
+        "answers": {},
+        "knowledge": [],
+        "counterevidence": [
+          "For a non-voter that is unreachable or badly behind, the existing timeout branch fires first ('leadership transfer timeout', raft.go:729-733) and the caller does get an error, so the failure is limited to targets whose catch-up loop terminates.",
+          "The receiving-side non-voter check in requestVote (raft.go:1678-1683) is itself a protective mechanism introduced for a different scenario (a voter demoted to non-voter cannot win while the cluster has a leader); it does not protect against this path because the term adoption happens earlier in the same handler.",
+          "The leader's own lease/verify machinery and the subsequent normal election eventually restore a leader, so this is not a permanent outage - the sourced harm is a forced leadership loss plus a success report for an operation that did not happen."
+        ],
+        "limitations": [
+          "Source-established only; this run had no remaining experiment capacity, so no receipt accompanies the claim and the exact timing of the follow-up election is not measured.",
+          "The defect is caller-reachable (a caller must name a non-voting member) rather than spontaneously reachable; a caller that restricts itself to voters, or a cluster without non-voters, never hits it.",
+          "Not claimed: that a transfer to a reachable voter is broken, that the non-voter's later pre-vote campaigns inflate the term indefinitely (runCandidate resets candidateFromLeadershipTransfer on exit, so subsequent campaigns use pre-vote), or that the extra election is unbounded - the sourced claim is one lost leadership plus a false success signal."
+        ],
+        "joint_history": "",
+        "failure_attribution": null,
+        "report_title": "LeadershipTransferToServer 可指向非投票成员：领导者被迫下台但 Future 仍报告成功",
+        "report_answer": "在捕获快照中，显式指定目标的 LeadershipTransferToServer 只检查“不能转给自己”，不像自动路径那样用 pickServer 过滤非投票者；而 leadershipTransfer 的追赶循环对任何配置内节点（startStopReplication 为除本机外的所有节点建立复制状态，包含非投票者）都能结束，随后发送 TimeoutNow。收到 TimeoutNow 的非投票者会无条件成为 Candidate（candidateFromLeadershipTransfer 置位、跳过 pre-vote），electSelf 持久化 currentTerm+1 并只向投票者拉票；每个投票者（含现任 leader）在 requestVote 中先因更高任期切换到 Follower 并更新任期，之后才以“候选者非投票者”为由拒绝投票。结果：目标永远无法当选，集群失去 leader 并被迫重选；而调用方拿到的 Future 却按 leftLeaderLoop 分支返回成功（“lost leadership during transfer (expected)”），与 API 文档承诺的“若 follower 无法被提升则优雅失败”相反。该结论完全由源码确立；本运行实验额度已用尽，未保留执行见证，后续可用“3 投票者 + 1 AddNonvoter 成员”的对照实验验证。",
+        "operation_id": "5d4108432b0d4ae38661ad457982e991"
+      },
+      {
+        "id": "32fbb0ae6f38453f96e52ddb17c102e3-interpretation-0",
+        "investigation_id": "32fbb0ae6f38453f96e52ddb17c102e3-question-0",
+        "experiment_id": null,
+        "source_ids": [
+          "src_vote_grant_rules",
+          "src_candidate_vote_tally"
+        ],
+        "executions": {},
+        "conclusion": "explained",
+        "rationale": "The predicate under test is 'a RequestVote marked LeadershipTransfer=true is granted by a voter that currently knows a leader, in a healthy cluster, and the mark is only produced by a TimeoutNow'. Both halves are decided by the retained handlers. (a) Grant path: after the leader-presence veto is skipped, the receiver's remaining vetoes are the duplicate-vote rule (raft.go:1697-1705), which fires only when it has already voted in that same term for someone else - impossible for the fresh term an induced candidate proposes, because the receivers still sit at the incumbent term and only the candidate itself has persisted a vote there; the log rules (raft.go:1707-1723), which a healthy, caught-up follower satisfies by construction since it replicated the leader's entries; and the earlier membership/non-voter checks, which a voting member passes. It then persists and grants (raft.go:1725-1732). The candidate side counts exactly that: runCandidate increments grantedVotes per Granted response and becomes Leader at voteGranted >= votesNeeded, where votesNeeded is the configuration's majority including the candidate's own persisted self-vote (raft.go:363-385 with the tally seeded in electSelf) - so one granted voter is sufficient for a three-voter cluster. (b) Producer uniqueness: the mark is stored true only in timeoutNow and cleared on every runCandidate exit, so no self-started campaign and no second candidacy carries it. Together these make the induced, up-to-date voting node winnable, which is the premise the first recorded finding needs, and they equally explain the second finding's asymmetry: when the TimeoutNow target is a non-voter the same mark is set, but the induced candidate fails the membership/suffrage veto on every voter, so the term adoption happens without any grant - leadership is lost and nothing is transferred.",
+        "answers": {},
+        "knowledge": [
+          {
+            "entry_id": "b692e1e41ba940c78dc240498acfbdc1-knowledge-0",
+            "revision": 1,
+            "assertion": "The receiving handler performs the transition without consulting the request."
+          },
+          {
+            "entry_id": "5d4108432b0d4ae38661ad457982e991-knowledge-1",
+            "revision": 1,
+            "assertion": "The induced candidacy cannot win when the target is a non-voter, while the term adoption still removes the incumbent leader."
+          }
+        ],
+        "counterevidence": [
+          "The duplicate-vote rule is a real competing explanation that can refuse the induced candidate: if a voter (or the candidate's rivals) already persisted a vote in the candidate's term - for example because another node campaigned in that same term first - requestVote returns early with Granted=false at raft.go:1697-1705. The predicate therefore excludes clusters where the induced term has already seen a vote; this narrows the claim rather than refuting it.",
+          "Persist failures on the receiver make the grant path return without granting (raft.go:1725-1729); that is a fault condition outside the stated healthy-cluster scope.",
+          "A voter whose own log is strictly ahead denies the vote (raft.go:1707-1723), so the induced candidate must be genuinely caught up; for a healthy follower of the same leader this holds, but it is an applicability condition and not a free assumption."
+        ],
+        "limitations": [
+          "No execution or receipt: both the grant conditions and the single-producer claim are read from the retained source, and the run had no experiment capacity left.",
+          "The tally arithmetic assumes the induced candidate is a voter with the majority threshold of its own latest configuration; configurations where the candidate's latest config differs from the voters' are not covered.",
+          "This verification does not re-open the earlier findings' conclusions or their saved records; it only raises confidence in the link they rely on and states where that link would break."
+        ],
+        "joint_history": "",
+        "failure_attribution": null,
+        "report_title": "核验领导权转移的关键前提：跳过“已有 leader”拒绝后，投票仍会授予",
+        "report_answer": "本次仅做源码核验（本运行实验额度已用尽）。LeadershipTransfer=true 只取消 requestVote 中“已知 leader 即拒绝”这一项否决；接收方仍按顺序执行：同任期重复投票规则（只有同一候选人才会返回 Granted=true，否则直接返回不授予）、日志新旧比较、以及更早的成员资格/非投票者检查，全部通过后才持久化投票并授予。在健康集群中，被 TimeoutNow 推到候选的节点提出的任期是全新的、投票者尚未投票，且其日志与 leader 同步，因此能够拿到授予；候选侧 runCandidate 按票数达到多数即当选。同时 candidateFromLeadershipTransfer 只在 timeoutNow 中被置位、并在 runCandidate 退出时无条件复位，因此该“特权标记”只可能出现在紧随 TimeoutNow 的那一次候选上。该核验同时解释了第二个发现的非对称性：目标为非投票者时标记同样会被设置，但每个投票者都会在成员/投票权检查处拒绝授予，于是任期被推进、leader 下台，而领导权并未转移。",
+        "operation_id": "32fbb0ae6f38453f96e52ddb17c102e3"
+      },
+      {
+        "id": "58efcbe400a04d91a7159521dca86757-interpretation-0",
+        "investigation_id": "58efcbe400a04d91a7159521dca86757-question-0",
+        "experiment_id": null,
+        "source_ids": [
+          "src_leadertransfer_doc",
+          "src_test_transfer_invalid_id",
+          "src_test_transfer_invalid_address",
+          "src_test_transfer_behind_voter",
+          "src_test_transfer_ignores_nonvoters"
+        ],
+        "executions": {},
+        "conclusion": "explained",
+        "rationale": "The check is whether an enclosing protection in the retained material already encodes the conditions the two recorded findings say are missing. It does not. The documented failure contract ('If a follower cannot be promoted, it will fail gracefully', api.go:1251-1260) is exercised only for a target the leader has no replication state for and for a target whose address the transport cannot reach - both of which fail before any transfer authority is exercised, because initiateLeadershipTransfer rejects only self-transfer and leadershipTransfer then fails to find or reach the peer. The one test whose name states the intent that non-voters are not transfer targets (TestRaft_LeadershipTransferIgnoresNonvoters, raft_test.go:2636-2654) demotes the only other member of a two-node cluster and calls the automatic LeadershipTransfer(), so it pins pickServer's voter filter and never reaches LeadershipTransferToServer; the explicit path remains unasserted. Finally, searching the retained test files finds no test body that asserts any receive-side property of TimeoutNow: the only TimeoutNow string in the suite is the expected error text of an unreachable target. So neither recorded finding is refuted by an existing expectation, and the absence is itself informative: the eligibility rule the suite names is enforced in exactly one of the two selection paths, and the handler that performs the transition has no test at all. The findings stay as recorded; what changes is their support - the requirement side is stronger (intent is named by the suite) and the protective side is weaker (no test, no guard).",
+        "answers": {},
+        "knowledge": [],
+        "counterevidence": [
+          "A test name is not enforcement: TestRaft_LeadershipTransferIgnoresNonvoters could be read as being about the automatic path only, and the passing suite does not show that the explicit non-voter path is harmless.",
+          "The invalid-ID and invalid-address tests do show that a caller normally observes an error when a transfer cannot be attempted, which is why the non-voter case is a gap in the contract rather than a general failure of the error path.",
+          "The behind-voter test (raft_test.go:2534-2553) shows the catch-up loop and a successful transfer to a lagging voter are intended to work, so no part of the earlier findings needs to be widened to voters."
+        ],
+        "limitations": [
+          "This record is about what the retained tests fix, not about observed behaviour of the uncovered paths; it neither strengthens nor weakens the mechanism claims beyond removing a would-be refutation.",
+          "No execution was performed (this run's experiment capacity is exhausted); the tests were read, not run.",
+          "The search covered the snapshot's test files only, which is the authorized material."
+        ],
+        "joint_history": "",
+        "failure_attribution": null,
+        "report_title": "证据覆盖核查：转移目标资格只在自动路径被固定，接收侧 TimeoutNow 无任何测试",
+        "report_answer": "对保留测试的对抗性核查显示：显式目标的转移只在“ID 无复制状态”和“地址不可达”两种情形下被测试固定为必须失败；对已追上进度的投票者、以及落后但仍为投票者的目标，测试要求成功；唯一表达“领导权转移忽略非投票者”这一意图的 TestRaft_LeadershipTransferIgnoresNonvoters 只调用自动路径 LeadershipTransfer()，因此它固定的是 pickServer 的过滤，并未覆盖显式传入非投票目标的 LeadershipTransferToServer；同时整个保留测试集中没有任何用例断言 TimeoutNow 接收侧的条件（全库仅有一处以 TimeoutNow 作为期望错误文本）。因此两条已记录发现都没有被既有期望反驳：需求侧更明确（测试名表达了“非投票者不参与转移”的意图），保护侧更薄弱（显式路径无校验、接收侧无测试）。注意测试名与注释仅作为意图证据，不作为执行或强制性的证明。",
+        "operation_id": "58efcbe400a04d91a7159521dca86757"
+      }
+    ],
+    "materials": [
+      {
+        "id": "src_timeoutnow_handler",
+        "file": "raft.go",
+        "start_line": 2209,
+        "end_line": 2214,
+        "kind": "code_observation",
+        "text": "func (r *Raft) timeoutNow(rpc RPC, req *TimeoutNowRequest) {\n\tr.setLeader(\"\", \"\")\n\tr.setState(Candidate)\n\tr.candidateFromLeadershipTransfer.Store(true)\n\trpc.Respond(&TimeoutNowResponse{}, nil)\n}",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "src_timeoutnow_cmd",
+        "file": "commands.go",
+        "start_line": 204,
+        "end_line": 208,
+        "kind": "interface_statement",
+        "text": "// TimeoutNowRequest is the command used by a leader to signal another server to\n// start an election.\ntype TimeoutNowRequest struct {\n\tRPCHeader\n}",
+        "content_digest": "44cf24bfd7cdde1123e73c7bc8c51fed84a2d0448f30da29b09b7bdc10e834c3"
+      },
+      {
+        "id": "src_check_header",
+        "file": "raft.go",
+        "start_line": 43,
+        "end_line": 67,
+        "kind": "code_observation",
+        "text": "// checkRPCHeader houses logic about whether this instance of Raft can process\n// the given RPC message.\nfunc (r *Raft) checkRPCHeader(rpc RPC) error {\n\t// Get the header off the RPC message.\n\twh, ok := rpc.Command.(WithRPCHeader)\n\tif !ok {\n\t\treturn fmt.Errorf(\"RPC does not have a header\")\n\t}\n\theader := wh.GetRPCHeader()\n\n\t// First check is to just make sure the code can understand the\n\t// protocol at all.\n\tif header.ProtocolVersion < ProtocolVersionMin ||\n\t\theader.ProtocolVersion > ProtocolVersionMax {\n\t\treturn ErrUnsupportedProtocol\n\t}\n\n\t// Second check is whether we should support this message, given the\n\t// current protocol we are configured to run. This will drop support\n\t// for protocol version 0 starting at protocol version 2, which is\n\t// currently what we want, and in general support one version back. We\n\t// may need to revisit this policy depending on how future protocol\n\t// changes evolve.\n\tif header.ProtocolVersion < r.config().ProtocolVersion-1 {\n\t\treturn ErrUnsupportedProtocol",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "src_vote_membership_guard",
+        "file": "raft.go",
+        "start_line": 1639,
+        "end_line": 1649,
+        "kind": "code_observation",
+        "text": "\t// We assume that the peer is part of the configuration and skip this check\n\tif len(req.ID) > 0 {\n\t\tcandidateID := ServerID(req.ID)\n\t\t// if the Servers list is empty that mean the cluster is very likely trying to bootstrap,\n\t\t// Grant the vote\n\t\tif len(r.configurations.latest.Servers) > 0 && !inConfiguration(r.configurations.latest, candidateID) {\n\t\t\tr.logger.Warn(\"rejecting vote request since node is not in configuration\",\n\t\t\t\t\"from\", candidate)\n\t\t\treturn\n\t\t}\n\t}",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "src_vote_leader_bypass",
+        "file": "raft.go",
+        "start_line": 1650,
+        "end_line": 1656,
+        "kind": "code_observation",
+        "text": "\tif leaderAddr, leaderID := r.LeaderWithID(); leaderAddr != \"\" && leaderAddr != candidate && !req.LeadershipTransfer {\n\t\tr.logger.Warn(\"rejecting vote request since we have a leader\",\n\t\t\t\"from\", candidate,\n\t\t\t\"leader\", leaderAddr,\n\t\t\t\"leader-id\", string(leaderID))\n\t\treturn\n\t}",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "src_prevote_membership_guard",
+        "file": "raft.go",
+        "start_line": 1755,
+        "end_line": 1761,
+        "kind": "code_observation",
+        "text": "\t// if the Servers list is empty that mean the cluster is very likely trying to bootstrap,\n\t// Grant the vote\n\tif len(r.configurations.latest.Servers) > 0 && !inConfiguration(r.configurations.latest, candidateID) {\n\t\tr.logger.Warn(\"rejecting pre-vote request since node is not in configuration\",\n\t\t\t\"from\", candidate)\n\t\treturn\n\t}",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "src_runCandidate_prevote_skip",
+        "file": "raft.go",
+        "start_line": 291,
+        "end_line": 307,
+        "kind": "code_observation",
+        "text": "\tvar voteCh <-chan *voteResult\n\tvar prevoteCh <-chan *preVoteResult\n\n\t// check if pre-vote is active and that this is not a leader transfer.\n\t// Leader transfer do not perform prevote by design\n\tif !r.preVoteDisabled && !r.candidateFromLeadershipTransfer.Load() {\n\t\tprevoteCh = r.preElectSelf()\n\t} else {\n\t\tvoteCh = r.electSelf()\n\t}\n\n\t// Make sure the leadership transfer flag is reset after each run. Having this\n\t// flag will set the field LeadershipTransfer in a RequestVoteRequest to true,\n\t// which will make other servers vote even though they have a leader already.\n\t// It is important to reset that flag, because this privilege could be abused\n\t// otherwise.\n\tdefer func() { r.candidateFromLeadershipTransfer.Store(false) }()",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "src_electSelf_transfer_flag",
+        "file": "raft.go",
+        "start_line": 1986,
+        "end_line": 1994,
+        "kind": "code_observation",
+        "text": "\treq := &RequestVoteRequest{\n\t\tRPCHeader: r.getRPCHeader(),\n\t\tTerm:      newTerm,\n\t\t// this is needed for retro compatibility, before RPCHeader.Addr was added\n\t\tCandidate:          r.trans.EncodePeer(r.localID, r.localAddr),\n\t\tLastLogIndex:       lastIdx,\n\t\tLastLogTerm:        lastTerm,\n\t\tLeadershipTransfer: r.candidateFromLeadershipTransfer.Load(),\n\t}",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "src_leadertransfer_send",
+        "file": "raft.go",
+        "start_line": 1024,
+        "end_line": 1029,
+        "kind": "code_observation",
+        "text": "\t// Step 3: send TimeoutNow message to target server.\n\terr := r.trans.TimeoutNow(id, address, &TimeoutNowRequest{RPCHeader: r.getRPCHeader()}, &TimeoutNowResponse{})\n\tif err != nil {\n\t\terr = fmt.Errorf(\"failed to make TimeoutNow RPC to %v: %v\", id, err)\n\t}\n\tdoneCh <- err",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "src_appendentries_sameterm",
+        "file": "raft.go",
+        "start_line": 1460,
+        "end_line": 1466,
+        "kind": "code_observation",
+        "text": "\t// Increase the term if we see a newer one, also transition to follower\n\t// if we ever get an appendEntries call\n\tif a.Term > r.getCurrentTerm() || (r.getState() != Follower && !r.candidateFromLeadershipTransfer.Load()) {\n\t\t// Ensure transition to follower\n\t\tr.setState(Follower)\n\t\tr.setCurrentTerm(a.Term)\n\t\tresp.Term = a.Term",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "src_transfer_api_doc",
+        "file": "api.go",
+        "start_line": 1269,
+        "end_line": 1282,
+        "kind": "document_statement",
+        "text": "// LeadershipTransferToServer does the same as LeadershipTransfer but takes a\n// server in the arguments in case a leadership should be transitioned to a\n// specific server in the cluster.  Note that raft protocol version 3 is not\n// sufficient to use LeadershipTransfer. A recent version of that library has\n// to be used that includes this feature. Using transfer leadership is safe\n// however in a cluster where not every node has the latest version. If a\n// follower cannot be promoted, it will fail gracefully.\nfunc (r *Raft) LeadershipTransferToServer(id ServerID, address ServerAddress) Future {\n\tif r.protocolVersion < 3 {\n\t\treturn errorFuture{ErrUnsupportedProtocol}\n\t}\n\n\treturn r.initiateLeadershipTransfer(&id, &address)\n}",
+        "content_digest": "499a72c01096912e85d16381f4640ac6d29f8c2b91cabbdae8530bdcbeb89a4a"
+      },
+      {
+        "id": "src_initiate_transfer_guard",
+        "file": "raft.go",
+        "start_line": 2187,
+        "end_line": 2206,
+        "kind": "code_observation",
+        "text": "func (r *Raft) initiateLeadershipTransfer(id *ServerID, address *ServerAddress) LeadershipTransferFuture {\n\tfuture := &leadershipTransferFuture{ID: id, Address: address}\n\tfuture.init()\n\n\tif id != nil && *id == r.localID {\n\t\terr := fmt.Errorf(\"cannot transfer leadership to itself\")\n\t\tr.logger.Info(err.Error())\n\t\tfuture.respond(err)\n\t\treturn future\n\t}\n\n\tselect {\n\tcase r.leadershipTransferCh <- future:\n\t\treturn future\n\tcase <-r.shutdownCh:\n\t\treturn errorFuture{ErrRaftShutdown}\n\tdefault:\n\t\treturn errorFuture{ErrEnqueueTimeout}\n\t}\n}",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "src_pickServer_voter_filter",
+        "file": "raft.go",
+        "start_line": 2161,
+        "end_line": 2182,
+        "kind": "code_observation",
+        "text": "// pickServer returns the follower that is most up to date and participating in quorum.\n// Because it accesses leaderstate, it should only be called from the leaderloop.\nfunc (r *Raft) pickServer() *Server {\n\tvar pick *Server\n\tvar current uint64\n\tfor _, server := range r.configurations.latest.Servers {\n\t\tif server.ID == r.localID || server.Suffrage != Voter {\n\t\t\tcontinue\n\t\t}\n\t\tstate, ok := r.leaderState.replState[server.ID]\n\t\tif !ok {\n\t\t\tcontinue\n\t\t}\n\t\tnextIdx := atomic.LoadUint64(&state.nextIndex)\n\t\tif nextIdx > current {\n\t\t\tcurrent = nextIdx\n\t\t\ttmp := server\n\t\t\tpick = &tmp\n\t\t}\n\t}\n\treturn pick\n}",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "src_transfer_catchup_then_timeoutnow",
+        "file": "raft.go",
+        "start_line": 989,
+        "end_line": 1030,
+        "kind": "code_observation",
+        "text": "// leadershipTransfer is doing the heavy lifting for the leadership transfer.\nfunc (r *Raft) leadershipTransfer(id ServerID, address ServerAddress, repl *followerReplication, stopCh chan struct{}, doneCh chan error) {\n\t// make sure we are not already stopped\n\tselect {\n\tcase <-stopCh:\n\t\tdoneCh <- nil\n\t\treturn\n\tdefault:\n\t}\n\n\tfor atomic.LoadUint64(&repl.nextIndex) <= r.getLastIndex() {\n\t\terr := &deferError{}\n\t\terr.init()\n\t\trepl.triggerDeferErrorCh <- err\n\t\tselect {\n\t\tcase err := <-err.errCh:\n\t\t\tif err != nil {\n\t\t\t\tdoneCh <- err\n\t\t\t\treturn\n\t\t\t}\n\t\tcase <-stopCh:\n\t\t\tdoneCh <- nil\n\t\t\treturn\n\t\t}\n\t}\n\n\t// Step ?: the thesis describes in chap 6.4.1: Using clocks to reduce\n\t// messaging for read-only queries. If this is implemented, the lease\n\t// has to be reset as well, in case leadership is transferred. This\n\t// implementation also has a lease, but it serves another purpose and\n\t// doesn't need to be reset. The lease mechanism in our raft lib, is\n\t// setup in a similar way to the one in the thesis, but in practice\n\t// it's a timer that just tells the leader how often to check\n\t// heartbeats are still coming in.\n\n\t// Step 3: send TimeoutNow message to target server.\n\terr := r.trans.TimeoutNow(id, address, &TimeoutNowRequest{RPCHeader: r.getRPCHeader()}, &TimeoutNowResponse{})\n\tif err != nil {\n\t\terr = fmt.Errorf(\"failed to make TimeoutNow RPC to %v: %v\", id, err)\n\t}\n\tdoneCh <- err\n}",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "src_replstate_for_every_peer",
+        "file": "raft.go",
+        "start_line": 583,
+        "end_line": 611,
+        "kind": "code_observation",
+        "text": "\tinConfig := make(map[ServerID]bool, len(r.configurations.latest.Servers))\n\tlastIdx := r.getLastIndex()\n\n\t// Start replication goroutines that need starting\n\tfor _, server := range r.configurations.latest.Servers {\n\t\tif server.ID == r.localID {\n\t\t\tcontinue\n\t\t}\n\n\t\tinConfig[server.ID] = true\n\n\t\ts, ok := r.leaderState.replState[server.ID]\n\t\tif !ok {\n\t\t\tr.logger.Info(\"added peer, starting replication\", \"peer\", server.ID)\n\t\t\ts = &followerReplication{\n\t\t\t\tpeer:                server,\n\t\t\t\tcommitment:          r.leaderState.commitment,\n\t\t\t\tstopCh:              make(chan uint64, 1),\n\t\t\t\ttriggerCh:           make(chan struct{}, 1),\n\t\t\t\ttriggerDeferErrorCh: make(chan *deferError, 1),\n\t\t\t\tcurrentTerm:         r.getCurrentTerm(),\n\t\t\t\tnextIndex:           lastIdx + 1,\n\t\t\t\tlastContact:         time.Now(),\n\t\t\t\tnotify:              make(map[*verifyFuture]struct{}),\n\t\t\t\tnotifyCh:            make(chan struct{}, 1),\n\t\t\t\tstepDown:            r.leaderState.stepDown,\n\t\t\t}\n\n\t\t\tr.leaderState.replState[server.ID] = s",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "src_vote_nonvoter_term_stepdown",
+        "file": "raft.go",
+        "start_line": 1660,
+        "end_line": 1684,
+        "kind": "code_observation",
+        "text": "\t\treturn\n\t}\n\n\t// Increase the term if we see a newer one\n\tif req.Term > r.getCurrentTerm() {\n\t\t// Ensure transition to follower\n\t\tr.logger.Debug(\"lost leadership because received a requestVote with a newer term\")\n\t\tr.setState(Follower)\n\t\tr.setCurrentTerm(req.Term)\n\n\t\tresp.Term = req.Term\n\t}\n\n\t// if we get a request for vote from a nonVoter  and the request term is higher,\n\t// step down and update term, but reject the vote request\n\t// This could happen when a node, previously voter, is converted to non-voter\n\t// The reason we need to step in is to permit to the cluster to make progress in such a scenario\n\t// More details about that in https://github.com/hashicorp/raft/pull/526\n\tif len(req.ID) > 0 {\n\t\tcandidateID := ServerID(req.ID)\n\t\tif len(r.configurations.latest.Servers) > 0 && !hasVote(r.configurations.latest, candidateID) {\n\t\t\tr.logger.Warn(\"rejecting vote request since node is not a voter\", \"from\", candidate)\n\t\t\treturn\n\t\t}\n\t}",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "src_electSelf_bumps_term",
+        "file": "raft.go",
+        "start_line": 1976,
+        "end_line": 1984,
+        "kind": "code_observation",
+        "text": "func (r *Raft) electSelf() <-chan *voteResult {\n\t// Create a response channel\n\trespCh := make(chan *voteResult, len(r.configurations.latest.Servers))\n\n\t// Increment the term\n\tnewTerm := r.getCurrentTerm() + 1\n\n\tr.setCurrentTerm(newTerm)\n\t// Construct the request",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "src_transfer_success_on_leftLeaderLoop",
+        "file": "raft.go",
+        "start_line": 734,
+        "end_line": 756,
+        "kind": "code_observation",
+        "text": "\t\t\t\tcase <-leftLeaderLoop:\n\t\t\t\t\tclose(stopCh)\n\t\t\t\t\terr := fmt.Errorf(\"lost leadership during transfer (expected)\")\n\t\t\t\t\tr.logger.Debug(err.Error())\n\t\t\t\t\tfuture.respond(nil)\n\t\t\t\t\t<-doneCh\n\t\t\t\tcase err := <-doneCh:\n\t\t\t\t\tif err != nil {\n\t\t\t\t\t\tr.logger.Debug(err.Error())\n\t\t\t\t\t\tfuture.respond(err)\n\t\t\t\t\t} else {\n\t\t\t\t\t\t// Wait for up to ElectionTimeout before flagging the\n\t\t\t\t\t\t// leadership transfer as done and unblocking applies in\n\t\t\t\t\t\t// the leaderLoop.\n\t\t\t\t\t\tselect {\n\t\t\t\t\t\tcase <-time.After(r.config().ElectionTimeout):\n\t\t\t\t\t\t\terr := fmt.Errorf(\"leadership transfer timeout\")\n\t\t\t\t\t\t\tr.logger.Debug(err.Error())\n\t\t\t\t\t\t\tfuture.respond(err)\n\t\t\t\t\t\tcase <-leftLeaderLoop:\n\t\t\t\t\t\t\tr.logger.Debug(\"lost leadership during transfer (expected)\")\n\t\t\t\t\t\t\tfuture.respond(nil)\n\t\t\t\t\t\t}",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "src_vote_grant_rules",
+        "file": "raft.go",
+        "start_line": 1685,
+        "end_line": 1733,
+        "kind": "code_observation",
+        "text": "\t// Check if we have voted yet\n\tlastVoteTerm, err := r.stable.GetUint64(keyLastVoteTerm)\n\tif err != nil && err.Error() != \"not found\" {\n\t\tr.logger.Error(\"failed to get last vote term\", \"error\", err)\n\t\treturn\n\t}\n\tlastVoteCandBytes, err := r.stable.Get(keyLastVoteCand)\n\tif err != nil && err.Error() != \"not found\" {\n\t\tr.logger.Error(\"failed to get last vote candidate\", \"error\", err)\n\t\treturn\n\t}\n\n\t// Check if we've voted in this election before\n\tif lastVoteTerm == req.Term && lastVoteCandBytes != nil {\n\t\tr.logger.Info(\"duplicate requestVote for same term\", \"term\", req.Term)\n\t\tif bytes.Equal(lastVoteCandBytes, candidateBytes) {\n\t\t\tr.logger.Warn(\"duplicate requestVote from\", \"candidate\", candidate)\n\t\t\tresp.Granted = true\n\t\t}\n\t\treturn\n\t}\n\n\t// Reject if their term is older\n\tlastIdx, lastTerm := r.getLastEntry()\n\tif lastTerm > req.LastLogTerm {\n\t\tr.logger.Warn(\"rejecting vote request since our last term is greater\",\n\t\t\t\"candidate\", candidate,\n\t\t\t\"last-term\", lastTerm,\n\t\t\t\"last-candidate-term\", req.LastLogTerm)\n\t\treturn\n\t}\n\n\tif lastTerm == req.LastLogTerm && lastIdx > req.LastLogIndex {\n\t\tr.logger.Warn(\"rejecting vote request since our last index is greater\",\n\t\t\t\"candidate\", candidate,\n\t\t\t\"last-index\", lastIdx,\n\t\t\t\"last-candidate-index\", req.LastLogIndex)\n\t\treturn\n\t}\n\n\t// Persist a vote for safety\n\tif err := r.persistVote(req.Term, candidateBytes); err != nil {\n\t\tr.logger.Error(\"failed to persist vote\", \"error\", err)\n\t\treturn\n\t}\n\n\tresp.Granted = true\n\tr.setLastContact()\n}",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "src_candidate_vote_tally",
+        "file": "raft.go",
+        "start_line": 363,
+        "end_line": 385,
+        "kind": "code_observation",
+        "text": "\t\tcase vote := <-voteCh:\n\t\t\tr.mainThreadSaturation.working()\n\t\t\t// Check if the term is greater than ours, bail\n\t\t\tif vote.Term > r.getCurrentTerm() {\n\t\t\t\tr.logger.Debug(\"newer term discovered, fallback to follower\", \"term\", vote.Term)\n\t\t\t\tr.setState(Follower)\n\t\t\t\tr.setCurrentTerm(vote.Term)\n\t\t\t\treturn\n\t\t\t}\n\n\t\t\t// Check if the vote is granted\n\t\t\tif vote.Granted {\n\t\t\t\tgrantedVotes++\n\t\t\t\tr.logger.Debug(\"vote granted\", \"from\", vote.voterID, \"term\", vote.Term, \"tally\", grantedVotes)\n\t\t\t}\n\n\t\t\t// Check if we've become the leader\n\t\t\tif grantedVotes >= votesNeeded {\n\t\t\t\tr.logger.Info(\"election won\", \"term\", vote.Term, \"tally\", grantedVotes)\n\t\t\t\tr.setState(Leader)\n\t\t\t\tr.setLeader(r.localAddr, r.localID)\n\t\t\t\treturn\n\t\t\t}",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "src_prevote_fallback_match",
+        "file": "raft.go",
+        "start_line": 2082,
+        "end_line": 2088,
+        "kind": "code_observation",
+        "text": "\t\t\t// If the target server do not support Pre-vote RPC we count this as a granted vote to allow\n\t\t\t// the cluster to progress.\n\t\t\tif err != nil && strings.Contains(err.Error(), rpcUnexpectedCommandError) {\n\t\t\t\tr.logger.Error(\"target does not support pre-vote RPC, treating as granted\",\n\t\t\t\t\t\"target\", peer,\n\t\t\t\t\t\"error\", err,\n\t\t\t\t\t\"term\", req.Term)",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "src_unknown_rpc_type_error",
+        "file": "net_transport.go",
+        "start_line": 716,
+        "end_line": 717,
+        "kind": "code_observation",
+        "text": "\tdefault:\n\t\treturn fmt.Errorf(\"unknown rpc type %d\", rpcType)",
+        "content_digest": "523d3ae139061c4cb2efa2c340e98e902db0c9637f3f7aed19735486a97f53bf"
+      },
+      {
+        "id": "src_unexpected_command_constant",
+        "file": "raft.go",
+        "start_line": 21,
+        "end_line": 24,
+        "kind": "code_observation",
+        "text": "\tminCheckInterval          = 10 * time.Millisecond\n\toldestLogGaugeInterval    = 10 * time.Second\n\trpcUnexpectedCommandError = \"unexpected command\"\n)",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "src_leadertransfer_doc",
+        "file": "api.go",
+        "start_line": 1251,
+        "end_line": 1260,
+        "kind": "document_statement",
+        "text": "// stop accepting client requests, make sure the target server is up to date\n// and starts the transfer with a TimeoutNow message. This message has the same\n// effect as if the election timeout on the target server fires. Since\n// it is unlikely that another server is starting an election, it is very\n// likely that the target server is able to win the election.  Note that raft\n// protocol version 3 is not sufficient to use LeadershipTransfer. A recent\n// version of that library has to be used that includes this feature.  Using\n// transfer leadership is safe however in a cluster where not every node has\n// the latest version. If a follower cannot be promoted, it will fail\n// gracefully.",
+        "content_digest": "499a72c01096912e85d16381f4640ac6d29f8c2b91cabbdae8530bdcbeb89a4a"
+      },
+      {
+        "id": "src_test_transfer_invalid_id",
+        "file": "raft_test.go",
+        "start_line": 2502,
+        "end_line": 2515,
+        "kind": "test_expectation",
+        "text": "func TestRaft_LeadershipTransferToInvalidID(t *testing.T) {\n\tc := MakeCluster(3, t, nil)\n\tdefer c.Close()\n\n\tfuture := c.Leader().LeadershipTransferToServer(ServerID(\"abc\"), ServerAddress(\"localhost\"))\n\tif future.Error() == nil {\n\t\tt.Fatal(\"leadership transfer should err\")\n\t}\n\n\texpected := \"cannot find replication state\"\n\tactual := future.Error().Error()\n\tif !strings.Contains(actual, expected) {\n\t\tt.Errorf(\"leadership transfer should err with: %s\", expected)\n\t}",
+        "content_digest": "51962412636d46873abcb6dba5a4603504d480f2f7c8b2b2cc1f561b652b6f6c"
+      },
+      {
+        "id": "src_test_transfer_invalid_address",
+        "file": "raft_test.go",
+        "start_line": 2518,
+        "end_line": 2532,
+        "kind": "test_expectation",
+        "text": "func TestRaft_LeadershipTransferToInvalidAddress(t *testing.T) {\n\tc := MakeCluster(3, t, nil)\n\tdefer c.Close()\n\n\tfollower := c.GetInState(Follower)[0]\n\tfuture := c.Leader().LeadershipTransferToServer(follower.localID, ServerAddress(\"localhost\"))\n\tif future.Error() == nil {\n\t\tt.Fatal(\"leadership transfer should err\")\n\t}\n\texpected := \"failed to make TimeoutNow RPC\"\n\tactual := future.Error().Error()\n\tif !strings.Contains(actual, expected) {\n\t\tt.Errorf(\"leadership transfer should err with: %s\", expected)\n\t}\n}",
+        "content_digest": "51962412636d46873abcb6dba5a4603504d480f2f7c8b2b2cc1f561b652b6f6c"
+      },
+      {
+        "id": "src_test_transfer_behind_voter",
+        "file": "raft_test.go",
+        "start_line": 2534,
+        "end_line": 2553,
+        "kind": "test_expectation",
+        "text": "func TestRaft_LeadershipTransferToBehindServer(t *testing.T) {\n\tc := MakeCluster(3, t, nil)\n\tdefer c.Close()\n\n\tl := c.Leader()\n\tbehind := c.GetInState(Follower)[0]\n\n\t// Commit a lot of things\n\tfor i := 0; i < 1000; i++ {\n\t\tl.Apply([]byte(fmt.Sprintf(\"test%d\", i)), 0)\n\t}\n\n\tfuture := l.LeadershipTransferToServer(behind.localID, behind.localAddr)\n\tif future.Error() != nil {\n\t\tt.Fatalf(\"This is not supposed to error: %v\", future.Error())\n\t}\n\tif c.Leader().localID != behind.localID {\n\t\tt.Fatal(\"Behind server did not get leadership\")\n\t}\n}",
+        "content_digest": "51962412636d46873abcb6dba5a4603504d480f2f7c8b2b2cc1f561b652b6f6c"
+      },
+      {
+        "id": "src_test_transfer_with_writes",
+        "file": "raft_test.go",
+        "start_line": 2433,
+        "end_line": 2486,
+        "kind": "test_expectation",
+        "text": "func TestRaft_LeadershipTransferWithWrites(t *testing.T) {\n\tconf := inmemConfig(t)\n\tconf.Logger = hclog.New(&hclog.LoggerOptions{Level: hclog.Trace})\n\tc := MakeCluster(7, t, conf)\n\tdefer c.Close()\n\n\tdoneCh := make(chan struct{})\n\tvar writerErr error\n\tvar wg sync.WaitGroup\n\tvar writes int\n\twg.Add(1)\n\tleader := c.Leader()\n\tgo func() {\n\t\tdefer wg.Done()\n\t\tfor {\n\t\t\tselect {\n\t\t\tcase <-doneCh:\n\t\t\t\treturn\n\t\t\tdefault:\n\t\t\t\tfuture := leader.Apply([]byte(\"test\"), 0)\n\t\t\t\tswitch err := future.Error(); {\n\t\t\t\tcase errors.Is(err, ErrRaftShutdown):\n\t\t\t\t\treturn\n\t\t\t\tcase errors.Is(err, ErrNotLeader):\n\t\t\t\t\tleader = c.Leader()\n\t\t\t\tcase errors.Is(err, ErrLeadershipTransferInProgress):\n\t\t\t\t\tcontinue\n\t\t\t\tcase errors.Is(err, ErrLeadershipLost):\n\t\t\t\t\tcontinue\n\t\t\t\tcase err == nil:\n\t\t\t\t\twrites++\n\t\t\t\tdefault:\n\t\t\t\t\twriterErr = err\n\t\t\t\t}\n\t\t\t\ttime.Sleep(time.Millisecond)\n\t\t\t}\n\t\t}\n\t}()\n\n\tfollower := c.Followers()[0]\n\tfuture := c.Leader().LeadershipTransferToServer(follower.localID, follower.localAddr)\n\tif future.Error() != nil {\n\t\tt.Fatalf(\"Didn't expect error: %v\", future.Error())\n\t}\n\tif follower.localID != c.Leader().localID {\n\t\tt.Error(\"Leadership should have been transitioned to specified server.\")\n\t}\n\tclose(doneCh)\n\twg.Wait()\n\tif writerErr != nil {\n\t\tt.Fatal(writerErr)\n\t}\n\tt.Logf(\"writes: %d\", writes)\n}",
+        "content_digest": "51962412636d46873abcb6dba5a4603504d480f2f7c8b2b2cc1f561b652b6f6c"
+      },
+      {
+        "id": "src_test_transfer_ignores_nonvoters",
+        "file": "raft_test.go",
+        "start_line": 2636,
+        "end_line": 2654,
+        "kind": "test_expectation",
+        "text": "func TestRaft_LeadershipTransferIgnoresNonvoters(t *testing.T) {\n\tc := MakeCluster(2, t, nil)\n\tdefer c.Close()\n\n\tfollower := c.Followers()[0]\n\n\tdemoteFuture := c.Leader().DemoteVoter(follower.localID, 0, 0)\n\tif demoteFuture.Error() != nil {\n\t\tt.Fatalf(\"demote voter err'd: %v\", demoteFuture.Error())\n\t}\n\n\tfuture := c.Leader().LeadershipTransfer()\n\tif future.Error() == nil {\n\t\tt.Fatal(\"leadership transfer should err\")\n\t}\n\n\texpected := \"cannot find peer\"\n\tactual := future.Error().Error()\n\tif !strings.Contains(actual, expected) {",
+        "content_digest": "51962412636d46873abcb6dba5a4603504d480f2f7c8b2b2cc1f561b652b6f6c"
+      }
+    ],
+    "current_submission": {
+      "phase": "received",
+      "operation_id": "296fcb1104d44baeb58cf807d8662ad4",
+      "result": {
+        "submission": "update5.json",
+        "summary": "Validated (validate --run <run> --submission update5.json → valid=true). New A1 (progress) direction, source-only since this run's experiment capacity is exhausted. installSnapshot's success path updates lastApplied, lastSnapshot and the configurations, then removes/compacts logs (raft.go:1930-1952) but never calls setLastLog — while the sibling path restoreUserSnapshot explicitly does, with a comment stating the intent (raft.go:1180-1187). Because getLastIndex/getLastEntry return the cached log position whenever it is >= the snapshot position (state.go:152-174), a follower whose cached last index is above the installed snapshot keeps advertising that higher index in every response (raft.go:1443-1449) and takes its prev-log term from its own divergent log instead of the snapshot metadata (raft.go:1475-1502). Where the divergence that triggered the snapshot lies at or below the snapshot index and the leader's log is compacted there, the pair settles into a stable two-state cycle: AppendEntries(PrevLogEntry = snapshotIndex) is rejected with NoRetryBackoff and LastLog = the stale higher index; the back-off clamp only offers min(nextIndex-1, resp.LastLog+1) so nextIndex falls to the snapshot index (replication.go:249-261); the request for snapshotIndex-1 cannot be built from the leader's compacted log; SEND_SNAP re-sends the same snapshot, whose success resets nextIndex to snapshotIndex+1 (replication.go:360-376, 588-599) — repeating full snapshot transfers plus FSM restores with the peer's match index pinned at the snapshot index. Recorded as one Behavior (the asymmetry with restoreUserSnapshot), one Fact (the cycle with its three required conditions), and an 'explained' interpretation listing the refutations (snapshot preferred when the cached index is lower; leader able to walk below the divergence; other terminating conditions) and the competition (correct FSM state, so the harm is repeated nonprogress/work rather than divergence). Two earlier suspicions were discarded after checking: installSnapshot's missing setLastLog is harmless in the ordinary index-behind case, and the commitment median index is correct for even voter counts."
+      },
+      "status": "completed",
+      "reason": "",
+      "session_unavailable": false
+    },
+    "applied_operations": {
+      "submission-b692e1e41ba940c78dc240498acfbdc1": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-11_19-38-40-hashicorp_raft-real-run/semantic-commits/submission-b692e1e41ba940c78dc240498acfbdc1.json"
+      },
+      "submission-5d4108432b0d4ae38661ad457982e991": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-11_19-38-40-hashicorp_raft-real-run/semantic-commits/submission-5d4108432b0d4ae38661ad457982e991.json"
+      },
+      "submission-32fbb0ae6f38453f96e52ddb17c102e3": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-11_19-38-40-hashicorp_raft-real-run/semantic-commits/submission-32fbb0ae6f38453f96e52ddb17c102e3.json"
+      },
+      "submission-58efcbe400a04d91a7159521dca86757": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-11_19-38-40-hashicorp_raft-real-run/semantic-commits/submission-58efcbe400a04d91a7159521dca86757.json"
+      }
+    }
+  },
+  "after": {
+    "investigations": [
+      {
+        "id": "b692e1e41ba940c78dc240498acfbdc1-question-0",
+        "version": 1,
+        "question": "Which applicable condition restricts the authority to induce a leadership transition (TimeoutNow) to the current leader and to the context in which that leadership still holds?",
+        "source_ids": [
+          "src_timeoutnow_handler",
+          "src_timeoutnow_cmd",
+          "src_check_header",
+          "src_vote_membership_guard",
+          "src_prevote_membership_guard",
+          "src_electSelf_transfer_flag",
+          "src_vote_leader_bypass"
+        ],
+        "hypothesis": "timeoutNow is the only consensus RPC that performs an authority transition (leader cleared, node set to Candidate, candidateFromLeadershipTransfer set so the next RequestVote carries LeadershipTransfer=true and voters skip the known-leader rejection) while carrying no term and applying no membership or leadership guard; the enclosing checkRPCHeader only bounds the protocol version. Therefore a TimeoutNow that no longer reflects a live transfer authority, or one sent by a non-member whose protocol version is in range, is indistinguishable from an authorized one and forces an authority transition.",
+        "discriminator": "Refuted if an enclosing protection (membership/eligibility check on the sender, a term carried by TimeoutNowRequest and compared against the receiver's current term, or a known-leader requirement) exists on the path from RPC admission to timeoutNow, or if the induced candidate cannot win because voters still apply the known-leader rejection when LeadershipTransfer is set. An executed witness would be a 3-node cluster where a single TimeoutNow from a party that is not the current-term leader causes the term to rise and the legitimate leader to leave the Leader state; a control is that the same non-member sender is rejected by requestVote/requestPreVote.",
+        "disposition": "active",
+        "parent_id": null,
+        "knowledge": [],
+        "counterevidence": [],
+        "limitations": [
+          "Judgment is source-established (guard absence is decidable from the function bodies); no executed witness was retained in this run.",
+          "The RPC layer has no authentication by design; the non-member consequence assumes only transport reachability, while the stale-message consequence assumes only that a former leader's TimeoutNow can be delivered/processed after leadership moved on."
+        ],
+        "resume_conditions": [],
+        "gaps": [],
+        "history": [],
+        "operation_id": "b692e1e41ba940c78dc240498acfbdc1"
+      },
+      {
+        "id": "5d4108432b0d4ae38661ad457982e991-question-0",
+        "version": 1,
+        "question": "When the caller names a leadership-transfer target that is in the configuration but cannot vote (Nonvoter/Staging), which applicable condition keeps the transfer from taking leadership away from the current leader, and which observable event justifies the returned future succeeding?",
+        "source_ids": [
+          "src_transfer_api_doc",
+          "src_initiate_transfer_guard",
+          "src_pickServer_voter_filter",
+          "src_transfer_catchup_then_timeoutnow",
+          "src_replstate_for_every_peer",
+          "src_vote_nonvoter_term_stepdown",
+          "src_electSelf_bumps_term",
+          "src_transfer_success_on_leftLeaderLoop"
+        ],
+        "hypothesis": "The explicit-target API performs no suffrage/eligibility check on the named server, while the automatic path selects only voters; therefore LeadershipTransferToServer(nonVoterID, addr) on a reachable, caught-up non-voter passes the catch-up loop, sends TimeoutNow, makes that non-voter campaign at currentTerm+1 (electSelf persists the higher term and asks only voters), and every voter - the incumbent leader included - sets the higher term and steps down before rejecting the vote as non-voter. The named target can never win, the cluster loses its leader and must hold another election, and the caller's future is nevertheless resolved as success because the leader-side goroutine treats leaving the leader loop as the success event.",
+        "discriminator": "Refuted if any condition on the path rejects a non-voter target before TimeoutNow is sent (a suffrage/eligibility check in initiateLeadershipTransfer or leadershipTransfer, absence of a replication state for non-voters, or a catch-up loop that cannot terminate), or if a voter that receives the induced RequestVote does not adopt the higher term (so leadership survives), or if the future is resolved with an error in this scenario. An executed witness would be a 3-node voter cluster plus one AddNonvoter member, where LeadershipTransferToServer(nonvoter) leaves the cluster without a leader at the old term and the returned future reports no error while the non-voter never becomes leader.",
+        "disposition": "active",
+        "parent_id": null,
+        "knowledge": [
+          {
+            "entry_id": "b692e1e41ba940c78dc240498acfbdc1-knowledge-0",
+            "revision": 1,
+            "assertion": "timeoutNow unconditionally clears the known leader, sets Candidate and sets candidateFromLeadershipTransfer, reading nothing from the request."
+          },
+          {
+            "entry_id": "b692e1e41ba940c78dc240498acfbdc1-knowledge-2",
+            "revision": 1,
+            "assertion": "The sender-side expectation is that TimeoutNow comes from the current leader, while TimeoutNow itself applies no eligibility guard."
+          }
+        ],
+        "counterevidence": [],
+        "limitations": [
+          "Established by source reading; no receipt exists in this run (experiment capacity already consumed), so the end-to-end sequence is argued from the handler rules rather than observed.",
+          "Reachability requires a caller that names a non-voting member; the library neither documents a voter-only requirement nor rejects such a target, and the target must be reachable and caught up, otherwise the pre-existing timeout path reports an error.",
+          "The term bump and the loss of leadership at term+1 are the sourced consequences; which surviving voter wins the subsequent election is schedule-dependent and not claimed."
+        ],
+        "resume_conditions": [],
+        "gaps": [],
+        "history": [],
+        "operation_id": "5d4108432b0d4ae38661ad457982e991"
+      },
+      {
+        "id": "32fbb0ae6f38453f96e52ddb17c102e3-question-0",
+        "version": 1,
+        "question": "After a voter has skipped the known-leader rejection because a RequestVote carries LeadershipTransfer=true, which remaining receive-side condition can still refuse the vote, and which producers are able to set that mark at all?",
+        "source_ids": [
+          "src_vote_grant_rules",
+          "src_candidate_vote_tally"
+        ],
+        "hypothesis": "The bypass only removes the leader-presence veto; the receiver still applies the duplicate-vote rule for that term, the log up-to-dateness rule, and (for the candidate ID) the membership and suffrage rules, and then persists and grants. In a healthy cluster nothing has voted at the induced candidate's fresh term and a healthy follower's log is not behind, so the induced candidate reaches the grant threshold; the mark itself has a single producer (timeoutNow) and is cleared unconditionally when candidacy ends, so LeadershipTransfer=true can only ride on one candidacy that follows a TimeoutNow.",
+        "discriminator": "Refuted if some other receive-side condition withholds the vote in the healthy case (for example an unconditional persistence failure, or a leader-presence veto that survives the mark), or if some other code path stores candidateFromLeadershipTransfer=true, or if the mark outlives candidacy. A refusal that requires an already-recorded same-term vote for a different candidate, a strictly longer receiver log, or a non-voting candidate refutes only a stronger universal claim, not this one.",
+        "disposition": "active",
+        "parent_id": null,
+        "knowledge": [
+          {
+            "entry_id": "b692e1e41ba940c78dc240498acfbdc1-knowledge-0",
+            "revision": 1,
+            "assertion": "timeoutNow unconditionally clears the known leader, sets Candidate and sets candidateFromLeadershipTransfer, reading nothing from the request."
+          },
+          {
+            "entry_id": "5d4108432b0d4ae38661ad457982e991-knowledge-1",
+            "revision": 1,
+            "assertion": "A candidacy induced by timeoutNow stamps LeadershipTransfer=true, which disables the known-leader rejection on the voting side."
+          }
+        ],
+        "counterevidence": [],
+        "limitations": [
+          "Source-established conditions, no receipt; the tally and grant arithmetic is read from runCandidate and requestVote rather than observed.",
+          "The claim is about one induced candidacy in a cluster whose voters are otherwise healthy and have not yet voted in the candidate's term; it is not a claim about partitioned or already-campaigned clusters."
+        ],
+        "resume_conditions": [],
+        "gaps": [],
+        "history": [],
+        "operation_id": "32fbb0ae6f38453f96e52ddb17c102e3"
+      },
+      {
+        "id": "32fbb0ae6f38453f96e52ddb17c102e3-question-1",
+        "version": 1,
+        "question": "Is the mixed-version pre-vote fallback reachable, i.e. can the error a pre-vote-incapable peer produces for an unknown RPC type ever contain the substring that preElectSelf treats as a granted pre-vote?",
+        "source_ids": [
+          "src_prevote_fallback_match",
+          "src_unknown_rpc_type_error",
+          "src_unexpected_command_constant"
+        ],
+        "hypothesis": "preElectSelf counts a peer's pre-vote as granted when the transport error contains the constant rpcUnexpectedCommandError, but that constant is the text of the local processRPC default branch, while a peer that cannot handle the pre-vote RPC fails earlier, in NetworkTransport.handleCommand, whose unknown-type error text is 'unknown rpc type %d'. If a pre-vote-incapable peer reports the latter (or a transport-level failure that carries no such text), the fallback never fires and a candidate whose only reachable peers are pre-vote-incapable has its pre-vote refused rather than granted - the opposite of the stated rolling-upgrade intent.",
+        "discriminator": "Settled by reading the counterpart (pre-1.7) transport's unknown-rpc-type error text together with this snapshot's response encoding, or by observing one pre-vote response round trip in a mixed-version cluster. Refuted if that error text contains 'unexpected command', or if the receive-side error is not carried back to the sender at all, in which case a differently-phrased conclusion applies.",
+        "disposition": "paused",
+        "parent_id": null,
+        "knowledge": [],
+        "counterevidence": [],
+        "limitations": [
+          "The sender in this scenario is the captured version; the receiver is a version not present in the authorized material, so the error text seen by the sender cannot be established here.",
+          "Only the string-match fallback is questioned; nothing in this record claims the pre-vote feature is broken within clusters where every peer speaks the captured version."
+        ],
+        "resume_conditions": [
+          "Authorized access to the counterpart transport version's unknown-rpc-type path, or a retained mixed-version cluster observation of one pre-vote exchange; neither exists in this snapshot, and this run's experiment capacity is exhausted."
+        ],
+        "gaps": [],
+        "history": [],
+        "operation_id": "32fbb0ae6f38453f96e52ddb17c102e3"
+      },
+      {
+        "id": "58efcbe400a04d91a7159521dca86757-question-0",
+        "version": 1,
+        "question": "Which leadership-transfer target conditions do the retained tests fix as required behaviour, and does any retained expectation settle the eligibility of a named non-voting target or any receive-side condition on TimeoutNow?",
+        "source_ids": [
+          "src_leadertransfer_doc",
+          "src_test_transfer_invalid_id",
+          "src_test_transfer_invalid_address",
+          "src_test_transfer_behind_voter",
+          "src_test_transfer_ignores_nonvoters"
+        ],
+        "hypothesis": "The retained suite fixes four target outcomes for the explicit API (unknown ID, unreachable address, caught-up voter succeeds, behind voter succeeds) and one outcome for the automatic path (a cluster whose only other member was demoted yields 'cannot find peer'). An explicit non-voting target, and every receive-side property of the TimeoutNow handler, are unasserted; therefore the recorded findings are not contradicted by an existing expectation, and the implicit requirement 'leadership transfer ignores non-voters' is encoded in the test name and realized only by pickServer.",
+        "discriminator": "Refuted if any retained test names a non-voting server as the argument of LeadershipTransferToServer, or asserts a receive-side condition of TimeoutNow (term, sender membership, sender leadership, or a known-leader requirement). Test names and comments are treated as evidence of intent only, not as proof of enforcement; the enforcement question is settled by the handler bodies already recorded.",
+        "disposition": "active",
+        "parent_id": null,
+        "knowledge": [],
+        "counterevidence": [],
+        "limitations": [
+          "Expectations are source assertions about intended behaviour, not executions, and a passing suite does not establish what an uncovered path does.",
+          "Only the retained snapshot's tests were searched; test files outside the captured tree are out of scope."
+        ],
+        "resume_conditions": [],
+        "gaps": [],
+        "history": [],
+        "operation_id": "58efcbe400a04d91a7159521dca86757"
+      },
+      {
+        "id": "296fcb1104d44baeb58cf807d8662ad4-question-0",
+        "version": 1,
+        "question": "After a follower installs a snapshot whose index is below the follower's own cached last log index, which code reconciles the follower's cached/advertised last log position and its local log entries with the installed snapshot, and can the leader's back-off then repeat the same snapshot indefinitely?",
+        "source_ids": [
+          "src_install_snapshot_tail",
+          "src_restore_user_snapshot_setlastlog",
+          "src_appendentries_prev_check",
+          "src_resp_lastlog_operand",
+          "src_replicate_backoff_clamp",
+          "src_snapshot_success_nextindex",
+          "src_set_previous_log_snapshot_branch",
+          "src_getlast_snapshot_preference",
+          "src_compactlogs_trailing_early_return"
+        ],
+        "hypothesis": "installSnapshot never revises the cached last log index/term, while its sibling path restoreUserSnapshot explicitly does; since getLastEntry/getLastIndex prefer the snapshot only when the cached log index is below the snapshot index, a follower whose cached last index is above the installed snapshot keeps advertising and comparing against its own divergent log. With a divergence at or below the snapshot index (the condition that caused the snapshot) and a leader whose log no longer contains entries below its snapshot index, the pair repeats: InstallSnapshot(snapshotIndex) succeeds and sets nextIndex = snapshotIndex+1; the next AppendEntries carries PrevLogEntry = snapshotIndex and is rejected with NoRetryBackoff and LastLog = the follower's higher stale index; the leader clamps nextIndex back to snapshotIndex; the request for snapshotIndex-1 cannot be built from the leader's compacted log, so the same snapshot is sent again.",
+        "discriminator": "Refuted if the follower's cached last log is lowered on install (or if the advertised/resp.LastLog is not the stale value), if the receiver can accept PrevLogEntry = snapshotIndex from the snapshot metadata alone, if the leader can always build a request for snapshotIndex-1 (log not compacted there), or if the cycle is broken by any other terminating condition such as a successful truncation. An executed witness would be a leader with a compacted prefix whose first index is snapshotIndex+1 and a follower whose log diverges at or below snapshotIndex while its cached last index is above it, then observing repeated InstallSnapshot requests instead of ForwardProgress.",
+        "disposition": "active",
+        "parent_id": null,
+        "knowledge": [],
+        "counterevidence": [],
+        "limitations": [
+          "Source-derived reachability argument with explicit conditions; no receipt, because this run had no experiment capacity left.",
+          "The reachability of 'cached last index above the installed snapshot index' is argued from a divergent-suffix history (a node that kept uncommitted entries from an earlier leader and whose index outran the leader's snapshot point); no execution confirms that history end to end.",
+          "Only the leader-to-follower snapshot path is examined; the user-initiated restore path is the sibling that does perform the update."
+        ],
+        "resume_conditions": [],
+        "gaps": [],
+        "history": [],
+        "operation_id": "296fcb1104d44baeb58cf807d8662ad4"
+      }
+    ],
+    "knowledge": [
+      {
+        "id": "b692e1e41ba940c78dc240498acfbdc1-knowledge-0",
+        "revision": 1,
+        "kind": "behavior",
+        "statement": "On receiving a TimeoutNow RPC, timeoutNow unconditionally clears the known leader (setLeader(\"\",\"\")), sets the local state to Candidate, stores candidateFromLeadershipTransfer=true, and responds with a successful TimeoutNowResponse. The handler reads nothing from the request: no sender identity/membership check, no term comparison, and no check that the local node currently knows a leader or that the sender is that leader.",
+        "conditions": "Conditional execution per RPC: processRPC admits the command after checkRPCHeader, which only rejects protocol versions outside [ProtocolVersionMin, ProtocolVersionMax] and more than one version behind the local ProtocolVersion; any sender that satisfies that header reaches timeoutNow. TimeoutNowRequest contains only RPCHeader (no Term field).",
+        "source_ids": [
+          "src_timeoutnow_handler",
+          "src_timeoutnow_cmd",
+          "src_check_header"
+        ],
+        "executions": {},
+        "history": [],
+        "operation_id": "b692e1e41ba940c78dc240498acfbdc1"
+      },
+      {
+        "id": "b692e1e41ba940c78dc240498acfbdc1-knowledge-1",
+        "revision": 1,
+        "kind": "fact",
+        "statement": "A node put into candidacy by timeoutNow stamps LeadershipTransfer=true on the RequestVote it sends, because candidateFromLeadershipTransfer is read in electSelf and runCandidate skips pre-vote while that flag is set. On the voting side, requestVote rejects a candidate only while 'we have a leader and the candidate is not that leader AND !req.LeadershipTransfer', so with LeadershipTransfer=true a healthy, up-to-date voter grants the vote even though it currently knows a leader. The up-to-date voter can therefore win the induced election and the incumbent leader (which applies the same bypass and steps down on the higher term) loses leadership.",
+        "conditions": "Requires the induced candidate's log to be at least as up to date as the voters' (true for a healthy follower) and the induced candidate to be a Voter in the receiver's latest configuration (the membership guard still applies to the candidate ID).",
+        "source_ids": [
+          "src_runCandidate_prevote_skip",
+          "src_electSelf_transfer_flag",
+          "src_vote_leader_bypass",
+          "src_timeoutnow_handler"
+        ],
+        "executions": {},
+        "history": [],
+        "operation_id": "b692e1e41ba940c78dc240498acfbdc1"
+      },
+      {
+        "id": "b692e1e41ba940c78dc240498acfbdc1-knowledge-2",
+        "revision": 1,
+        "kind": "fact",
+        "statement": "The sibling consensus RPC handlers do apply an eligibility guard that timeoutNow lacks: requestVote returns without granting when the candidate ID is absent from the latest configuration, and requestPreVote returns without granting likewise. The legitimate sender of TimeoutNow is the current leader (leadershipTransfer sends it after bringing the target up to date), so the transfer authority is expected to be the leader's, yet no handler-side condition encodes that expectation.",
+        "conditions": "Guards are evaluated only when len(r.configurations.latest.Servers) > 0 (a bootstrapping cluster with an empty configuration list deliberately grants); the comparison is drawn at the level of 'which conditions the handler applies', not of byte-identical code.",
+        "source_ids": [
+          "src_vote_membership_guard",
+          "src_prevote_membership_guard",
+          "src_leadertransfer_send"
+        ],
+        "executions": {},
+        "history": [],
+        "operation_id": "b692e1e41ba940c78dc240498acfbdc1"
+      },
+      {
+        "id": "5d4108432b0d4ae38661ad457982e991-knowledge-0",
+        "revision": 1,
+        "kind": "behavior",
+        "statement": "LeadershipTransferToServer(id, address) forwards the named target to initiateLeadershipTransfer with no check other than 'cannot transfer leadership to itself'; the named target is used as-is and the only per-target validation anywhere in the transfer path is asynchronous, in leadershipTransfer's catch-up loop (it waits for that peer's nextIndex to pass the leader's last index). By contrast the automatic LeadershipTransfer() path chooses its target with pickServer, which skips every server whose Suffrage is not Voter (and skips peers without replication state).",
+        "conditions": "Applies when the caller passes an explicit id/address (LeadershipTransferToServer); the named server must exist in r.leaderState.replState, which startStopReplication creates for every server in the latest configuration except the local one - non-voters included, because it skips only server.ID == r.localID.",
+        "source_ids": [
+          "src_transfer_api_doc",
+          "src_initiate_transfer_guard",
+          "src_pickServer_voter_filter",
+          "src_replstate_for_every_peer"
+        ],
+        "executions": {},
+        "history": [],
+        "operation_id": "5d4108432b0d4ae38661ad457982e991"
+      },
+      {
+        "id": "5d4108432b0d4ae38661ad457982e991-knowledge-1",
+        "revision": 1,
+        "kind": "fact",
+        "statement": "A transfer to a caught-up non-voting target cannot place that target in power and does not preserve the incumbent leader. timeoutNow puts the non-voter into candidacy (see the previously recorded handler behavior), runCandidate then skips pre-vote because candidateFromLeadershipTransfer is set and calls electSelf, which persists currentTerm+1 and asks only the voters; each voter receiving that RequestVote first adopts the newer term and transitions to Follower and only then rejects the vote because the candidate has no vote, so the election cannot be won at that term and the cluster is left without a leader until a further election. The leader-side goroutine nonetheless resolves the caller's future with no error, because the branch that responds nil is the one that fires when the leader leaves its leader loop ('lost leadership during transfer (expected)').",
+        "conditions": "Requires the non-voting target to be reachable and caught up so the catch-up loop terminates; the incumbent leader must still be a voter in the latest configuration (the normal case) and must receive the induced RequestVote, which it does because electSelf asks every Voter in the candidate's latest configuration.",
+        "source_ids": [
+          "src_transfer_catchup_then_timeoutnow",
+          "src_electSelf_bumps_term",
+          "src_vote_nonvoter_term_stepdown",
+          "src_transfer_success_on_leftLeaderLoop"
+        ],
+        "executions": {},
+        "history": [],
+        "operation_id": "5d4108432b0d4ae38661ad457982e991"
+      },
+      {
+        "id": "32fbb0ae6f38453f96e52ddb17c102e3-knowledge-0",
+        "revision": 1,
+        "kind": "behavior",
+        "statement": "For a RequestVote that reaches the vote-rule section of requestVote (i.e. after the membership check, the leader-presence check, the older-term check and the newer-term adoption), the receiver decides in this order: it reads the persisted last vote and, if that vote is for this same term, returns immediately - granting only when the stored candidate bytes equal the current candidate's bytes, and otherwise returning with Granted=false; it then refuses when its own last entry term is greater than the candidate's, or when the terms are equal and its own last index is greater; otherwise it persists a vote for the candidate and sets Granted=true. So the LeadershipTransfer mark only removes the leader-presence veto, not the duplicate-vote rule, the log up-to-dateness rule, the membership rule, or the non-voter rule that precede it.",
+        "conditions": "Applies to a request that has already passed the earlier vetoes in requestVote; the duplicate-vote branch returns without granting whenever lastVoteTerm equals the request term and the stored candidate differs, and the persist step can also fail (which returns without granting).",
+        "source_ids": [
+          "src_vote_grant_rules"
+        ],
+        "executions": {},
+        "history": [],
+        "operation_id": "32fbb0ae6f38453f96e52ddb17c102e3"
+      },
+      {
+        "id": "32fbb0ae6f38453f96e52ddb17c102e3-knowledge-1",
+        "revision": 1,
+        "kind": "fact",
+        "statement": "In the retained snapshot candidateFromLeadershipTransfer is stored true only inside timeoutNow, and it is stored false only by the deferred reset in runCandidate, so the privilege that disables the known-leader rejection exists for exactly one candidacy and only on a node that has just received a TimeoutNow; a node that campaigns on its own (heartbeat timeout, pre-vote success path, or election restart) sends RequestVote with the mark false because runCandidate both skips pre-vote only while the flag is set and resets it on every exit.",
+        "conditions": "Read from the captured snapshot's assignment sites; the conclusion is about which producers set the mark, not about whether the flag's read/write ordering is race-free.",
+        "source_ids": [
+          "src_candidate_vote_tally"
+        ],
+        "executions": {},
+        "history": [],
+        "operation_id": "32fbb0ae6f38453f96e52ddb17c102e3"
+      },
+      {
+        "id": "58efcbe400a04d91a7159521dca86757-knowledge-0",
+        "revision": 1,
+        "kind": "fact",
+        "statement": "The retained transfer tests fix these requirements: LeadershipTransferToServer with an ID absent from the leader's replication state must fail with 'cannot find replication state' (raft_test.go:2502-2515); with a reachable ID but an address the transport cannot use must fail with 'failed to make TimeoutNow RPC' (raft_test.go:2518-2532); with a voting follower as the target the call must succeed and that follower must become leader, both while writes continue (raft_test.go:2433-2486) and in a seven-node cluster (raft_test.go:2488-2500); with a behind but caught-up-able voting follower the same must hold after 1000 commits (raft_test.go:2534-2553); and, for the automatic path, a two-node cluster whose only other voter was demoted must fail with 'cannot find peer' (raft_test.go:2636-2654). No retained test passes a non-voting server as the explicit target, and no retained test asserts anything about the receiver of a TimeoutNow.",
+        "conditions": "Read as test expectations in the captured snapshot (they are assertions of required behaviour, not observations); the named tests are the only ones in the snapshot whose bodies call LeadershipTransfer/LeadershipTransferToServer or reference TimeoutNow, checked by searching the retained test files.",
+        "source_ids": [
+          "src_leadertransfer_doc",
+          "src_test_transfer_invalid_id",
+          "src_test_transfer_invalid_address",
+          "src_test_transfer_behind_voter",
+          "src_test_transfer_with_writes",
+          "src_test_transfer_ignores_nonvoters"
+        ],
+        "executions": {},
+        "history": [],
+        "operation_id": "58efcbe400a04d91a7159521dca86757"
+      },
+      {
+        "id": "296fcb1104d44baeb58cf807d8662ad4-knowledge-0",
+        "revision": 1,
+        "kind": "behavior",
+        "statement": "On a successful InstallSnapshot the follower updates lastApplied to the snapshot index, sets the last snapshot index/term, replaces the latest and committed configurations from the request, and then either removes old logs (MonotonicLogStore) or calls compactLogs(snapshotIndex) before responding Success. It does not call setLastLog at any point, so the cached last log index/term retain their pre-snapshot values. The sibling path restoreUserSnapshot does call setLastLog(lastIndex, term) at the same stage of its own flow.",
+        "conditions": "Executed on the follower's main thread when an InstallSnapshot RPC passes the version and term checks; the effect on the advertised position follows from getLastIndex/getLastEntry, which return the cached log position whenever it is greater than or equal to the snapshot position.",
+        "source_ids": [
+          "src_install_snapshot_tail",
+          "src_restore_user_snapshot_setlastlog",
+          "src_getlast_snapshot_preference"
+        ],
+        "executions": {},
+        "history": [],
+        "operation_id": "296fcb1104d44baeb58cf807d8662ad4"
+      },
+      {
+        "id": "296fcb1104d44baeb58cf807d8662ad4-knowledge-1",
+        "revision": 1,
+        "kind": "fact",
+        "statement": "If the follower's cached last log index is above the installed snapshot index and its log diverges from the leader at or below that snapshot index, installation does not resolve the divergence and the leader-follower pair settles into a repeating cycle rather than making progress. The receiver's prev-log check compares the request's PrevLogEntry (the snapshot index, sent via setPreviousLog's snapshot branch) against getLastEntry, which returns the follower's own higher cached position, so the equality shortcut does not apply and the term is taken from the follower's local log (or the lookup fails after compaction), producing a rejection with NoRetryBackoff and LastLog set to that higher cached index. The leader then clamps nextIndex to at most nextIndex-1 (the follower's higher LastLog does not raise that bound) and cannot build a request for snapshotIndex-1 because its own log starts above that index, so it transmits the same snapshot again; the install succeeds again, nextIndex is set to snapshotIndex+1, and the cycle repeats with the leader's match index for that peer pinned at the snapshot index.",
+        "conditions": "Requires (a) the follower's cached last log index to exceed the leader's latest snapshot index, (b) a genuine divergence at or below that snapshot index, and (c) the leader's log to no longer contain the entry below its snapshot index so the request for snapshotIndex-1 cannot be built. If (a) is absent, getLastEntry and getLastIndex prefer the snapshot and the receiver accepts PrevLogEntry = snapshot index directly; if (c) is absent the leader can keep walking down and eventually truncate the follower's divergent suffix.",
+        "source_ids": [
+          "src_appendentries_prev_check",
+          "src_resp_lastlog_operand",
+          "src_replicate_backoff_clamp",
+          "src_snapshot_success_nextindex",
+          "src_set_previous_log_snapshot_branch",
+          "src_compactlogs_trailing_early_return"
+        ],
+        "executions": {},
+        "history": [],
+        "operation_id": "296fcb1104d44baeb58cf807d8662ad4"
+      }
+    ],
+    "interpretations": [
+      {
+        "id": "b692e1e41ba940c78dc240498acfbdc1-interpretation-0",
+        "investigation_id": "b692e1e41ba940c78dc240498acfbdc1-question-0",
+        "experiment_id": null,
+        "source_ids": [
+          "src_timeoutnow_handler",
+          "src_timeoutnow_cmd",
+          "src_check_header",
+          "src_vote_membership_guard",
+          "src_prevote_membership_guard",
+          "src_vote_leader_bypass",
+          "src_runCandidate_prevote_skip",
+          "src_electSelf_transfer_flag",
+          "src_leadertransfer_send"
+        ],
+        "executions": {},
+        "conclusion": "explained",
+        "rationale": "The applicable responsibility is that a leadership transfer must be authorized by the leadership it transfers away from. In this implementation that responsibility is carried only by the sender's intent: timeoutNow (raft.go:2209-2214) has no guard at all, and TimeoutNowRequest (commands.go:204-208) has no Term field, so the receiver cannot decide freshness or eligibility even in principle. Two sourced consequences follow. (1) Freshness/authority loss: leadershipTransfer (raft.go:1024-1029) sends TimeoutNow while it still holds leadership, but leadership can move on before the message is processed (the transfer goroutine waits afterwards for leftLeaderLoop, and the RPC may be delayed or the target blocked in installSnapshot/RPC processing); the receiver still becomes a Candidate at currentTerm+1, which for a healthy voter wins because requestVote's known-leader rejection is disabled by req.LeadershipTransfer (raft.go:1650-1656) while candidateFromLeadershipTransfer makes electSelf stamp that flag (raft.go:296, 1993). The new term then forces the actual leader to step down via its own requestVote/appendEntries handling, so a message that no longer represents any live authority deposes the legitimate leader. (2) Eligibility: requestVote and requestPreVote reject non-members (raft.go:1639-1649, 1755-1761), whereas timeoutNow is admitted for any sender that passes checkRPCHeader's protocol-version bounds (raft.go:43-67) - the eligibility guard is simply absent on the one path that can trigger an election and set the vote-bypass flag. The code itself flags the sensitivity of this privilege in runCandidate's comment that the transfer flag 'could be abused otherwise'; here the abuse is not prevented but the privilege is reachable by any protocol-compatible sender and carries no context to expire stale grants. No enclosing protection refutes the hypothesis: no membership check, no term, no known-leader requirement, and no sender-leadership check exist between RPC admission and the transition.",
+        "answers": {},
+        "knowledge": [],
+        "counterevidence": [
+          "runCandidate resets candidateFromLeadershipTransfer=false on every exit (raft.go:307), so the vote-bypass privilege does not persist beyond one candidacy; the defect is that reaching that candidacy needs no authority rather than that the privilege is permanent.",
+          "leaderLoop refuses to start a second transfer while one is in progress and refuses configuration changes/user restores during it, showing that the library does constrain legitimate transfer usage; those constraints are on the sender, not on the receiver's admission of TimeoutNow."
+        ],
+        "limitations": [
+          "Mechanism and guard absence are source-established; the end-to-end election outcome (term rise plus the incumbent leaving Leader) is argued from requestVote's grant rules, not observed under execution - this run's experiment capacity was already consumed, so no receipt exists.",
+          "Raft does not authenticate RPCs; the non-member variant therefore depends on the deployment's transport protection, and is reported as an eligibility-guard asymmetry rather than as a cryptographic forgery result.",
+          "Considered and not claimed: normal leader-initiated transfers, pre-vote behaviour for members, and the Candidate-skipped step-down at raft.go:1462 are unchanged here - the finding is restricted to the missing condition on TimeoutNow itself."
+        ],
+        "joint_history": "",
+        "failure_attribution": null,
+        "report_title": "TimeoutNow 缺少授权/时效校验，可强制触发领导权转移",
+        "report_answer": "在捕获的 hashicorp/raft 快照中，TimeoutNow 处理函数无条件清除已知 leader、把本节点置为 Candidate 并设置 candidateFromLeadershipTransfer，且 TimeoutNowRequest 不携带 term，也没有发送方成员资格或“发送方是当前 leader”的校验；只有协议版本被检查。与之对照，requestVote/requestPreVote 会对非成员直接拒绝。由于该标志会让 electSelf 带上 LeadershipTransfer=true、并让投票方跳过“已有 leader”的拒绝条件，一次不再代表任何现存领导权的 TimeoutNow（或来自协议版本合法的非成员）即可驱动一次可成功当选的领导权转移，使合法 leader 下台。该结论由源码确立；本次未保留执行见证（实验额度已用尽），因此建议后续用 3 节点集群 + 非成员传输发送 TimeoutNow 的对照实验确认。",
+        "operation_id": "b692e1e41ba940c78dc240498acfbdc1"
+      },
+      {
+        "id": "5d4108432b0d4ae38661ad457982e991-interpretation-0",
+        "investigation_id": "5d4108432b0d4ae38661ad457982e991-question-0",
+        "experiment_id": null,
+        "source_ids": [
+          "src_transfer_api_doc",
+          "src_initiate_transfer_guard",
+          "src_pickServer_voter_filter",
+          "src_transfer_catchup_then_timeoutnow",
+          "src_replstate_for_every_peer",
+          "src_vote_nonvoter_term_stepdown",
+          "src_electSelf_bumps_term",
+          "src_transfer_success_on_leftLeaderLoop"
+        ],
+        "executions": {},
+        "conclusion": "explained",
+        "rationale": "The requirement is stated by the captured API contract itself: LeadershipTransfer/LeadershipTransferToServer say a transfer is safe to use in mixed-version clusters and that 'If a follower cannot be promoted, it will fail gracefully' (api.go:1259-1260, 1274-1275). A non-voting member is exactly a follower that cannot be promoted, so that branch is the contract under test. The applicable responsibility is split across three places, and only one of them checks suffrage. (1) Target selection: the automatic path uses pickServer, which skips non-voters (raft.go:2166-2169), but the explicit path passes the caller's ID through initiateLeadershipTransfer after checking only self-transfer (raft.go:2187-2206). (2) The transfer itself: leadershipTransfer waits for that peer's nextIndex to pass the leader's last index and then sends TimeoutNow (raft.go:1010-1029); the wait can terminate for a non-voter because startStopReplication creates replication state for every configured peer except the local one (raft.go:587-611), so there is no suffrage gate on this path either. (3) The receiving side performs the transition without consulting suffrage (raft.go:2209-2214, previously recorded), and the induced candidacy is a real election attempt: electSelf persists currentTerm+1 (raft.go:1980-1983) and targets only voters (raft.go:2015-2017). On the voters, requestVote handles the newer term before the non-voter rejection: the newer-term branch transitions the receiver to Follower and adopts the term (raft.go:1662-1671), and the comment at raft.go:1673-1677 documents that this ordering is deliberate ('step down and update term, but reject the vote request'). So a single explicit transfer request to a non-voter removes the incumbent leader even though no vote is granted, and because the target can never reach quorum the expected leadership change never happens. The caller-visible outcome contradicts the contract in a second way: the future is not an error. The leader-side goroutine registers 'lost leadership during transfer (expected)' on leftLeaderLoop and responds nil there (raft.go:734-739), and after a successful TimeoutNow it waits in the same nil-responding branch (raft.go:748-756); the success evidence is therefore 'this leader left the leader loop', which the non-voter scenario satisfies even though no transfer occurred. Both halves are decidable from the retained source, so the local question is answered without needing an execution: the missing condition is a suffrage/eligibility check on the explicit target, and the mis-associated success event is the leader-loop exit rather than the target acquiring leadership.",
+        "answers": {},
+        "knowledge": [],
+        "counterevidence": [
+          "For a non-voter that is unreachable or badly behind, the existing timeout branch fires first ('leadership transfer timeout', raft.go:729-733) and the caller does get an error, so the failure is limited to targets whose catch-up loop terminates.",
+          "The receiving-side non-voter check in requestVote (raft.go:1678-1683) is itself a protective mechanism introduced for a different scenario (a voter demoted to non-voter cannot win while the cluster has a leader); it does not protect against this path because the term adoption happens earlier in the same handler.",
+          "The leader's own lease/verify machinery and the subsequent normal election eventually restore a leader, so this is not a permanent outage - the sourced harm is a forced leadership loss plus a success report for an operation that did not happen."
+        ],
+        "limitations": [
+          "Source-established only; this run had no remaining experiment capacity, so no receipt accompanies the claim and the exact timing of the follow-up election is not measured.",
+          "The defect is caller-reachable (a caller must name a non-voting member) rather than spontaneously reachable; a caller that restricts itself to voters, or a cluster without non-voters, never hits it.",
+          "Not claimed: that a transfer to a reachable voter is broken, that the non-voter's later pre-vote campaigns inflate the term indefinitely (runCandidate resets candidateFromLeadershipTransfer on exit, so subsequent campaigns use pre-vote), or that the extra election is unbounded - the sourced claim is one lost leadership plus a false success signal."
+        ],
+        "joint_history": "",
+        "failure_attribution": null,
+        "report_title": "LeadershipTransferToServer 可指向非投票成员：领导者被迫下台但 Future 仍报告成功",
+        "report_answer": "在捕获快照中，显式指定目标的 LeadershipTransferToServer 只检查“不能转给自己”，不像自动路径那样用 pickServer 过滤非投票者；而 leadershipTransfer 的追赶循环对任何配置内节点（startStopReplication 为除本机外的所有节点建立复制状态，包含非投票者）都能结束，随后发送 TimeoutNow。收到 TimeoutNow 的非投票者会无条件成为 Candidate（candidateFromLeadershipTransfer 置位、跳过 pre-vote），electSelf 持久化 currentTerm+1 并只向投票者拉票；每个投票者（含现任 leader）在 requestVote 中先因更高任期切换到 Follower 并更新任期，之后才以“候选者非投票者”为由拒绝投票。结果：目标永远无法当选，集群失去 leader 并被迫重选；而调用方拿到的 Future 却按 leftLeaderLoop 分支返回成功（“lost leadership during transfer (expected)”），与 API 文档承诺的“若 follower 无法被提升则优雅失败”相反。该结论完全由源码确立；本运行实验额度已用尽，未保留执行见证，后续可用“3 投票者 + 1 AddNonvoter 成员”的对照实验验证。",
+        "operation_id": "5d4108432b0d4ae38661ad457982e991"
+      },
+      {
+        "id": "32fbb0ae6f38453f96e52ddb17c102e3-interpretation-0",
+        "investigation_id": "32fbb0ae6f38453f96e52ddb17c102e3-question-0",
+        "experiment_id": null,
+        "source_ids": [
+          "src_vote_grant_rules",
+          "src_candidate_vote_tally"
+        ],
+        "executions": {},
+        "conclusion": "explained",
+        "rationale": "The predicate under test is 'a RequestVote marked LeadershipTransfer=true is granted by a voter that currently knows a leader, in a healthy cluster, and the mark is only produced by a TimeoutNow'. Both halves are decided by the retained handlers. (a) Grant path: after the leader-presence veto is skipped, the receiver's remaining vetoes are the duplicate-vote rule (raft.go:1697-1705), which fires only when it has already voted in that same term for someone else - impossible for the fresh term an induced candidate proposes, because the receivers still sit at the incumbent term and only the candidate itself has persisted a vote there; the log rules (raft.go:1707-1723), which a healthy, caught-up follower satisfies by construction since it replicated the leader's entries; and the earlier membership/non-voter checks, which a voting member passes. It then persists and grants (raft.go:1725-1732). The candidate side counts exactly that: runCandidate increments grantedVotes per Granted response and becomes Leader at voteGranted >= votesNeeded, where votesNeeded is the configuration's majority including the candidate's own persisted self-vote (raft.go:363-385 with the tally seeded in electSelf) - so one granted voter is sufficient for a three-voter cluster. (b) Producer uniqueness: the mark is stored true only in timeoutNow and cleared on every runCandidate exit, so no self-started campaign and no second candidacy carries it. Together these make the induced, up-to-date voting node winnable, which is the premise the first recorded finding needs, and they equally explain the second finding's asymmetry: when the TimeoutNow target is a non-voter the same mark is set, but the induced candidate fails the membership/suffrage veto on every voter, so the term adoption happens without any grant - leadership is lost and nothing is transferred.",
+        "answers": {},
+        "knowledge": [
+          {
+            "entry_id": "b692e1e41ba940c78dc240498acfbdc1-knowledge-0",
+            "revision": 1,
+            "assertion": "The receiving handler performs the transition without consulting the request."
+          },
+          {
+            "entry_id": "5d4108432b0d4ae38661ad457982e991-knowledge-1",
+            "revision": 1,
+            "assertion": "The induced candidacy cannot win when the target is a non-voter, while the term adoption still removes the incumbent leader."
+          }
+        ],
+        "counterevidence": [
+          "The duplicate-vote rule is a real competing explanation that can refuse the induced candidate: if a voter (or the candidate's rivals) already persisted a vote in the candidate's term - for example because another node campaigned in that same term first - requestVote returns early with Granted=false at raft.go:1697-1705. The predicate therefore excludes clusters where the induced term has already seen a vote; this narrows the claim rather than refuting it.",
+          "Persist failures on the receiver make the grant path return without granting (raft.go:1725-1729); that is a fault condition outside the stated healthy-cluster scope.",
+          "A voter whose own log is strictly ahead denies the vote (raft.go:1707-1723), so the induced candidate must be genuinely caught up; for a healthy follower of the same leader this holds, but it is an applicability condition and not a free assumption."
+        ],
+        "limitations": [
+          "No execution or receipt: both the grant conditions and the single-producer claim are read from the retained source, and the run had no experiment capacity left.",
+          "The tally arithmetic assumes the induced candidate is a voter with the majority threshold of its own latest configuration; configurations where the candidate's latest config differs from the voters' are not covered.",
+          "This verification does not re-open the earlier findings' conclusions or their saved records; it only raises confidence in the link they rely on and states where that link would break."
+        ],
+        "joint_history": "",
+        "failure_attribution": null,
+        "report_title": "核验领导权转移的关键前提：跳过“已有 leader”拒绝后，投票仍会授予",
+        "report_answer": "本次仅做源码核验（本运行实验额度已用尽）。LeadershipTransfer=true 只取消 requestVote 中“已知 leader 即拒绝”这一项否决；接收方仍按顺序执行：同任期重复投票规则（只有同一候选人才会返回 Granted=true，否则直接返回不授予）、日志新旧比较、以及更早的成员资格/非投票者检查，全部通过后才持久化投票并授予。在健康集群中，被 TimeoutNow 推到候选的节点提出的任期是全新的、投票者尚未投票，且其日志与 leader 同步，因此能够拿到授予；候选侧 runCandidate 按票数达到多数即当选。同时 candidateFromLeadershipTransfer 只在 timeoutNow 中被置位、并在 runCandidate 退出时无条件复位，因此该“特权标记”只可能出现在紧随 TimeoutNow 的那一次候选上。该核验同时解释了第二个发现的非对称性：目标为非投票者时标记同样会被设置，但每个投票者都会在成员/投票权检查处拒绝授予，于是任期被推进、leader 下台，而领导权并未转移。",
+        "operation_id": "32fbb0ae6f38453f96e52ddb17c102e3"
+      },
+      {
+        "id": "58efcbe400a04d91a7159521dca86757-interpretation-0",
+        "investigation_id": "58efcbe400a04d91a7159521dca86757-question-0",
+        "experiment_id": null,
+        "source_ids": [
+          "src_leadertransfer_doc",
+          "src_test_transfer_invalid_id",
+          "src_test_transfer_invalid_address",
+          "src_test_transfer_behind_voter",
+          "src_test_transfer_ignores_nonvoters"
+        ],
+        "executions": {},
+        "conclusion": "explained",
+        "rationale": "The check is whether an enclosing protection in the retained material already encodes the conditions the two recorded findings say are missing. It does not. The documented failure contract ('If a follower cannot be promoted, it will fail gracefully', api.go:1251-1260) is exercised only for a target the leader has no replication state for and for a target whose address the transport cannot reach - both of which fail before any transfer authority is exercised, because initiateLeadershipTransfer rejects only self-transfer and leadershipTransfer then fails to find or reach the peer. The one test whose name states the intent that non-voters are not transfer targets (TestRaft_LeadershipTransferIgnoresNonvoters, raft_test.go:2636-2654) demotes the only other member of a two-node cluster and calls the automatic LeadershipTransfer(), so it pins pickServer's voter filter and never reaches LeadershipTransferToServer; the explicit path remains unasserted. Finally, searching the retained test files finds no test body that asserts any receive-side property of TimeoutNow: the only TimeoutNow string in the suite is the expected error text of an unreachable target. So neither recorded finding is refuted by an existing expectation, and the absence is itself informative: the eligibility rule the suite names is enforced in exactly one of the two selection paths, and the handler that performs the transition has no test at all. The findings stay as recorded; what changes is their support - the requirement side is stronger (intent is named by the suite) and the protective side is weaker (no test, no guard).",
+        "answers": {},
+        "knowledge": [],
+        "counterevidence": [
+          "A test name is not enforcement: TestRaft_LeadershipTransferIgnoresNonvoters could be read as being about the automatic path only, and the passing suite does not show that the explicit non-voter path is harmless.",
+          "The invalid-ID and invalid-address tests do show that a caller normally observes an error when a transfer cannot be attempted, which is why the non-voter case is a gap in the contract rather than a general failure of the error path.",
+          "The behind-voter test (raft_test.go:2534-2553) shows the catch-up loop and a successful transfer to a lagging voter are intended to work, so no part of the earlier findings needs to be widened to voters."
+        ],
+        "limitations": [
+          "This record is about what the retained tests fix, not about observed behaviour of the uncovered paths; it neither strengthens nor weakens the mechanism claims beyond removing a would-be refutation.",
+          "No execution was performed (this run's experiment capacity is exhausted); the tests were read, not run.",
+          "The search covered the snapshot's test files only, which is the authorized material."
+        ],
+        "joint_history": "",
+        "failure_attribution": null,
+        "report_title": "证据覆盖核查：转移目标资格只在自动路径被固定，接收侧 TimeoutNow 无任何测试",
+        "report_answer": "对保留测试的对抗性核查显示：显式目标的转移只在“ID 无复制状态”和“地址不可达”两种情形下被测试固定为必须失败；对已追上进度的投票者、以及落后但仍为投票者的目标，测试要求成功；唯一表达“领导权转移忽略非投票者”这一意图的 TestRaft_LeadershipTransferIgnoresNonvoters 只调用自动路径 LeadershipTransfer()，因此它固定的是 pickServer 的过滤，并未覆盖显式传入非投票目标的 LeadershipTransferToServer；同时整个保留测试集中没有任何用例断言 TimeoutNow 接收侧的条件（全库仅有一处以 TimeoutNow 作为期望错误文本）。因此两条已记录发现都没有被既有期望反驳：需求侧更明确（测试名表达了“非投票者不参与转移”的意图），保护侧更薄弱（显式路径无校验、接收侧无测试）。注意测试名与注释仅作为意图证据，不作为执行或强制性的证明。",
+        "operation_id": "58efcbe400a04d91a7159521dca86757"
+      },
+      {
+        "id": "296fcb1104d44baeb58cf807d8662ad4-interpretation-0",
+        "investigation_id": "296fcb1104d44baeb58cf807d8662ad4-question-0",
+        "experiment_id": null,
+        "source_ids": [
+          "src_install_snapshot_tail",
+          "src_restore_user_snapshot_setlastlog",
+          "src_appendentries_prev_check",
+          "src_resp_lastlog_operand",
+          "src_replicate_backoff_clamp",
+          "src_snapshot_success_nextindex",
+          "src_set_previous_log_snapshot_branch",
+          "src_getlast_snapshot_preference",
+          "src_compactlogs_trailing_early_return"
+        ],
+        "executions": {},
+        "conclusion": "explained",
+        "rationale": "The applicable responsibility is that installing a snapshot must make the follower's durable position agree with the state it just accepted; otherwise the leader's log-matching rules keep negotiating against a history the follower no longer holds. In this snapshot the responsibility is discharged only halfway. installSnapshot sets lastApplied, lastSnapshot and the configurations and then discards or compacts logs up to the snapshot index (raft.go:1930-1952), but it never sets the cached last log, whereas restoreUserSnapshot in the same file states the intent explicitly ('We set the last log so it looks like we've stored the empty index we burned') and calls setLastLog (raft.go:1180-1187). That difference matters because getLastIndex/getLastEntry return the cached log position whenever it is greater than or equal to the snapshot position (state.go:152-174): with the cached index above the installed snapshot, the follower both advertises that higher index in every AppendEntriesResponse (raft.go:1443-1449) and takes its prev-log term from its own log rather than from the snapshot metadata (raft.go:1475-1502). The paired consequence is a stable two-state cycle when the divergence that caused the snapshot lies at or below the snapshot index and the leader's log has been compacted there: AppendEntries(PrevLogEntry = snapshotIndex) is rejected with NoRetryBackoff and LastLog = the follower's higher index; the leader's back-off keeps only the min(s.nextIndex-1, resp.LastLog+1) term, so nextIndex falls to the snapshot index (replication.go:249-261); the next attempt needs the entry below the snapshot index, which the leader can no longer produce, so SEND_SNAP transmits the same snapshot (replication.go:588-599 for the snapshot-branch prev entry and 360-376 for the post-success nextIndex = snapshotIndex+1). Each turn of the cycle re-transfers the whole snapshot to that peer and re-runs the FSM restore, so the peer's match index never advances past the snapshot index: nonprogress bounded by a concrete, source-supported mechanism rather than by a bare timeout. Both cycle states are local and deterministic, so the local question is answered from the retained source: nothing on the install path reconciles the cached last log, and every enclosing protection in the loop (the back-off clamp, the snapshot branch, the compacted prefix) keeps the cycle in place instead of breaking it. The contrasting sibling path shows the missing update is not architecturally impossible, only absent here.",
+        "answers": {},
+        "knowledge": [],
+        "counterevidence": [
+          "When the follower's cached last index is below the installed snapshot index - the ordinary case, and the one exercised by existing snapshot tests - getLastEntry and getLastIndex already prefer the snapshot, so the receiver accepts PrevLogEntry = snapshot index and makes progress; the defect is confined to the index-ahead case.",
+          "If the leader's log still contains the entry below its snapshot index, the back-off eventually walks below the divergence point, the follower truncates its suffix, and the pair recovers; the cycle needs the leader's prefix to be compacted at or above that point.",
+          "The state machine's state is still restored correctly and lastApplied is advanced, so the harm is progress and repeated work (snapshot transfer plus FSM restore) rather than a divergence between the follower's FSM and the committed state.",
+          "No receipt accompanies this account; a reader should treat the reachability of an index-ahead, diverging follower as argued rather than observed."
+        ],
+        "limitations": [
+          "Conditions are stated explicitly: follower cached last index above the leader's snapshot index, divergence at or below that index, and a leader whose log no longer holds the entry below its snapshot index. Outside them the recorded harm does not follow.",
+          "The reasoning is static; the number of cycles, their cost and whether a given store's compaction policy trims the follower's divergent suffix were not measured.",
+          "The reachability of the required follower history (an index-ahead divergent suffix from a superseded leader) is argued from the retained code paths, not reproduced."
+        ],
+        "joint_history": "",
+        "failure_attribution": null,
+        "report_title": "快照安装在“日志已超出快照索引”的跟随者上无法消解分歧，导致重复安装同一快照",
+        "report_answer": "本次为源码推导（本运行实验额度已用尽）。installSnapshot 在成功时更新 lastApplied、lastSnapshot 与配置，并按存储类型删除/压缩日志，但从不更新缓存中的 lastLog 索引与 term；同一文件中的兄弟路径 restoreUserSnapshot 则明确调用 setLastLog（并注释说明了意图）。由于 getLastIndex/getLastEntry 只在缓存日志索引低于快照索引时才优先返回快照位置，当跟随者的缓存最后索引高于刚安装的快照索引时，它会在每个 AppendEntriesResponse 中继续公布这个更高的索引，并在 prev-log 检查中用自己（已分歧）的日志取 term。若导致快照的分歧点位于该快照索引或其之下，而 leader 的日志又已压缩到快照索引之上，双方会稳定地循环：leader 以 PrevLogEntry=快照索引 发送 → 跟随者以 NoRetryBackoff 与更高的 LastLog 拒绝 → leader 退避把 nextIndex 降到快照索引 → 无法构造 snapshotIndex-1 的请求 → 再次发送同一快照 → 安装成功把 nextIndex 置为 snapshotIndex+1 → 重复。每次循环都重传整份快照并重跑 FSM restore，而该 peer 的 match index 始终止于快照索引，属有明确机制的持续无进展。适用条件与反例（缓存索引低于快照索引的常规情形、leader 仍保有快照索引以下日志的情形）已在记录中列明。",
+        "operation_id": "296fcb1104d44baeb58cf807d8662ad4"
+      }
+    ],
+    "materials": [
+      {
+        "id": "src_timeoutnow_handler",
+        "file": "raft.go",
+        "start_line": 2209,
+        "end_line": 2214,
+        "kind": "code_observation",
+        "text": "func (r *Raft) timeoutNow(rpc RPC, req *TimeoutNowRequest) {\n\tr.setLeader(\"\", \"\")\n\tr.setState(Candidate)\n\tr.candidateFromLeadershipTransfer.Store(true)\n\trpc.Respond(&TimeoutNowResponse{}, nil)\n}",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "src_timeoutnow_cmd",
+        "file": "commands.go",
+        "start_line": 204,
+        "end_line": 208,
+        "kind": "interface_statement",
+        "text": "// TimeoutNowRequest is the command used by a leader to signal another server to\n// start an election.\ntype TimeoutNowRequest struct {\n\tRPCHeader\n}",
+        "content_digest": "44cf24bfd7cdde1123e73c7bc8c51fed84a2d0448f30da29b09b7bdc10e834c3"
+      },
+      {
+        "id": "src_check_header",
+        "file": "raft.go",
+        "start_line": 43,
+        "end_line": 67,
+        "kind": "code_observation",
+        "text": "// checkRPCHeader houses logic about whether this instance of Raft can process\n// the given RPC message.\nfunc (r *Raft) checkRPCHeader(rpc RPC) error {\n\t// Get the header off the RPC message.\n\twh, ok := rpc.Command.(WithRPCHeader)\n\tif !ok {\n\t\treturn fmt.Errorf(\"RPC does not have a header\")\n\t}\n\theader := wh.GetRPCHeader()\n\n\t// First check is to just make sure the code can understand the\n\t// protocol at all.\n\tif header.ProtocolVersion < ProtocolVersionMin ||\n\t\theader.ProtocolVersion > ProtocolVersionMax {\n\t\treturn ErrUnsupportedProtocol\n\t}\n\n\t// Second check is whether we should support this message, given the\n\t// current protocol we are configured to run. This will drop support\n\t// for protocol version 0 starting at protocol version 2, which is\n\t// currently what we want, and in general support one version back. We\n\t// may need to revisit this policy depending on how future protocol\n\t// changes evolve.\n\tif header.ProtocolVersion < r.config().ProtocolVersion-1 {\n\t\treturn ErrUnsupportedProtocol",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "src_vote_membership_guard",
+        "file": "raft.go",
+        "start_line": 1639,
+        "end_line": 1649,
+        "kind": "code_observation",
+        "text": "\t// We assume that the peer is part of the configuration and skip this check\n\tif len(req.ID) > 0 {\n\t\tcandidateID := ServerID(req.ID)\n\t\t// if the Servers list is empty that mean the cluster is very likely trying to bootstrap,\n\t\t// Grant the vote\n\t\tif len(r.configurations.latest.Servers) > 0 && !inConfiguration(r.configurations.latest, candidateID) {\n\t\t\tr.logger.Warn(\"rejecting vote request since node is not in configuration\",\n\t\t\t\t\"from\", candidate)\n\t\t\treturn\n\t\t}\n\t}",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "src_vote_leader_bypass",
+        "file": "raft.go",
+        "start_line": 1650,
+        "end_line": 1656,
+        "kind": "code_observation",
+        "text": "\tif leaderAddr, leaderID := r.LeaderWithID(); leaderAddr != \"\" && leaderAddr != candidate && !req.LeadershipTransfer {\n\t\tr.logger.Warn(\"rejecting vote request since we have a leader\",\n\t\t\t\"from\", candidate,\n\t\t\t\"leader\", leaderAddr,\n\t\t\t\"leader-id\", string(leaderID))\n\t\treturn\n\t}",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "src_prevote_membership_guard",
+        "file": "raft.go",
+        "start_line": 1755,
+        "end_line": 1761,
+        "kind": "code_observation",
+        "text": "\t// if the Servers list is empty that mean the cluster is very likely trying to bootstrap,\n\t// Grant the vote\n\tif len(r.configurations.latest.Servers) > 0 && !inConfiguration(r.configurations.latest, candidateID) {\n\t\tr.logger.Warn(\"rejecting pre-vote request since node is not in configuration\",\n\t\t\t\"from\", candidate)\n\t\treturn\n\t}",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "src_runCandidate_prevote_skip",
+        "file": "raft.go",
+        "start_line": 291,
+        "end_line": 307,
+        "kind": "code_observation",
+        "text": "\tvar voteCh <-chan *voteResult\n\tvar prevoteCh <-chan *preVoteResult\n\n\t// check if pre-vote is active and that this is not a leader transfer.\n\t// Leader transfer do not perform prevote by design\n\tif !r.preVoteDisabled && !r.candidateFromLeadershipTransfer.Load() {\n\t\tprevoteCh = r.preElectSelf()\n\t} else {\n\t\tvoteCh = r.electSelf()\n\t}\n\n\t// Make sure the leadership transfer flag is reset after each run. Having this\n\t// flag will set the field LeadershipTransfer in a RequestVoteRequest to true,\n\t// which will make other servers vote even though they have a leader already.\n\t// It is important to reset that flag, because this privilege could be abused\n\t// otherwise.\n\tdefer func() { r.candidateFromLeadershipTransfer.Store(false) }()",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "src_electSelf_transfer_flag",
+        "file": "raft.go",
+        "start_line": 1986,
+        "end_line": 1994,
+        "kind": "code_observation",
+        "text": "\treq := &RequestVoteRequest{\n\t\tRPCHeader: r.getRPCHeader(),\n\t\tTerm:      newTerm,\n\t\t// this is needed for retro compatibility, before RPCHeader.Addr was added\n\t\tCandidate:          r.trans.EncodePeer(r.localID, r.localAddr),\n\t\tLastLogIndex:       lastIdx,\n\t\tLastLogTerm:        lastTerm,\n\t\tLeadershipTransfer: r.candidateFromLeadershipTransfer.Load(),\n\t}",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "src_leadertransfer_send",
+        "file": "raft.go",
+        "start_line": 1024,
+        "end_line": 1029,
+        "kind": "code_observation",
+        "text": "\t// Step 3: send TimeoutNow message to target server.\n\terr := r.trans.TimeoutNow(id, address, &TimeoutNowRequest{RPCHeader: r.getRPCHeader()}, &TimeoutNowResponse{})\n\tif err != nil {\n\t\terr = fmt.Errorf(\"failed to make TimeoutNow RPC to %v: %v\", id, err)\n\t}\n\tdoneCh <- err",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "src_appendentries_sameterm",
+        "file": "raft.go",
+        "start_line": 1460,
+        "end_line": 1466,
+        "kind": "code_observation",
+        "text": "\t// Increase the term if we see a newer one, also transition to follower\n\t// if we ever get an appendEntries call\n\tif a.Term > r.getCurrentTerm() || (r.getState() != Follower && !r.candidateFromLeadershipTransfer.Load()) {\n\t\t// Ensure transition to follower\n\t\tr.setState(Follower)\n\t\tr.setCurrentTerm(a.Term)\n\t\tresp.Term = a.Term",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "src_transfer_api_doc",
+        "file": "api.go",
+        "start_line": 1269,
+        "end_line": 1282,
+        "kind": "document_statement",
+        "text": "// LeadershipTransferToServer does the same as LeadershipTransfer but takes a\n// server in the arguments in case a leadership should be transitioned to a\n// specific server in the cluster.  Note that raft protocol version 3 is not\n// sufficient to use LeadershipTransfer. A recent version of that library has\n// to be used that includes this feature. Using transfer leadership is safe\n// however in a cluster where not every node has the latest version. If a\n// follower cannot be promoted, it will fail gracefully.\nfunc (r *Raft) LeadershipTransferToServer(id ServerID, address ServerAddress) Future {\n\tif r.protocolVersion < 3 {\n\t\treturn errorFuture{ErrUnsupportedProtocol}\n\t}\n\n\treturn r.initiateLeadershipTransfer(&id, &address)\n}",
+        "content_digest": "499a72c01096912e85d16381f4640ac6d29f8c2b91cabbdae8530bdcbeb89a4a"
+      },
+      {
+        "id": "src_initiate_transfer_guard",
+        "file": "raft.go",
+        "start_line": 2187,
+        "end_line": 2206,
+        "kind": "code_observation",
+        "text": "func (r *Raft) initiateLeadershipTransfer(id *ServerID, address *ServerAddress) LeadershipTransferFuture {\n\tfuture := &leadershipTransferFuture{ID: id, Address: address}\n\tfuture.init()\n\n\tif id != nil && *id == r.localID {\n\t\terr := fmt.Errorf(\"cannot transfer leadership to itself\")\n\t\tr.logger.Info(err.Error())\n\t\tfuture.respond(err)\n\t\treturn future\n\t}\n\n\tselect {\n\tcase r.leadershipTransferCh <- future:\n\t\treturn future\n\tcase <-r.shutdownCh:\n\t\treturn errorFuture{ErrRaftShutdown}\n\tdefault:\n\t\treturn errorFuture{ErrEnqueueTimeout}\n\t}\n}",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "src_pickServer_voter_filter",
+        "file": "raft.go",
+        "start_line": 2161,
+        "end_line": 2182,
+        "kind": "code_observation",
+        "text": "// pickServer returns the follower that is most up to date and participating in quorum.\n// Because it accesses leaderstate, it should only be called from the leaderloop.\nfunc (r *Raft) pickServer() *Server {\n\tvar pick *Server\n\tvar current uint64\n\tfor _, server := range r.configurations.latest.Servers {\n\t\tif server.ID == r.localID || server.Suffrage != Voter {\n\t\t\tcontinue\n\t\t}\n\t\tstate, ok := r.leaderState.replState[server.ID]\n\t\tif !ok {\n\t\t\tcontinue\n\t\t}\n\t\tnextIdx := atomic.LoadUint64(&state.nextIndex)\n\t\tif nextIdx > current {\n\t\t\tcurrent = nextIdx\n\t\t\ttmp := server\n\t\t\tpick = &tmp\n\t\t}\n\t}\n\treturn pick\n}",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "src_transfer_catchup_then_timeoutnow",
+        "file": "raft.go",
+        "start_line": 989,
+        "end_line": 1030,
+        "kind": "code_observation",
+        "text": "// leadershipTransfer is doing the heavy lifting for the leadership transfer.\nfunc (r *Raft) leadershipTransfer(id ServerID, address ServerAddress, repl *followerReplication, stopCh chan struct{}, doneCh chan error) {\n\t// make sure we are not already stopped\n\tselect {\n\tcase <-stopCh:\n\t\tdoneCh <- nil\n\t\treturn\n\tdefault:\n\t}\n\n\tfor atomic.LoadUint64(&repl.nextIndex) <= r.getLastIndex() {\n\t\terr := &deferError{}\n\t\terr.init()\n\t\trepl.triggerDeferErrorCh <- err\n\t\tselect {\n\t\tcase err := <-err.errCh:\n\t\t\tif err != nil {\n\t\t\t\tdoneCh <- err\n\t\t\t\treturn\n\t\t\t}\n\t\tcase <-stopCh:\n\t\t\tdoneCh <- nil\n\t\t\treturn\n\t\t}\n\t}\n\n\t// Step ?: the thesis describes in chap 6.4.1: Using clocks to reduce\n\t// messaging for read-only queries. If this is implemented, the lease\n\t// has to be reset as well, in case leadership is transferred. This\n\t// implementation also has a lease, but it serves another purpose and\n\t// doesn't need to be reset. The lease mechanism in our raft lib, is\n\t// setup in a similar way to the one in the thesis, but in practice\n\t// it's a timer that just tells the leader how often to check\n\t// heartbeats are still coming in.\n\n\t// Step 3: send TimeoutNow message to target server.\n\terr := r.trans.TimeoutNow(id, address, &TimeoutNowRequest{RPCHeader: r.getRPCHeader()}, &TimeoutNowResponse{})\n\tif err != nil {\n\t\terr = fmt.Errorf(\"failed to make TimeoutNow RPC to %v: %v\", id, err)\n\t}\n\tdoneCh <- err\n}",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "src_replstate_for_every_peer",
+        "file": "raft.go",
+        "start_line": 583,
+        "end_line": 611,
+        "kind": "code_observation",
+        "text": "\tinConfig := make(map[ServerID]bool, len(r.configurations.latest.Servers))\n\tlastIdx := r.getLastIndex()\n\n\t// Start replication goroutines that need starting\n\tfor _, server := range r.configurations.latest.Servers {\n\t\tif server.ID == r.localID {\n\t\t\tcontinue\n\t\t}\n\n\t\tinConfig[server.ID] = true\n\n\t\ts, ok := r.leaderState.replState[server.ID]\n\t\tif !ok {\n\t\t\tr.logger.Info(\"added peer, starting replication\", \"peer\", server.ID)\n\t\t\ts = &followerReplication{\n\t\t\t\tpeer:                server,\n\t\t\t\tcommitment:          r.leaderState.commitment,\n\t\t\t\tstopCh:              make(chan uint64, 1),\n\t\t\t\ttriggerCh:           make(chan struct{}, 1),\n\t\t\t\ttriggerDeferErrorCh: make(chan *deferError, 1),\n\t\t\t\tcurrentTerm:         r.getCurrentTerm(),\n\t\t\t\tnextIndex:           lastIdx + 1,\n\t\t\t\tlastContact:         time.Now(),\n\t\t\t\tnotify:              make(map[*verifyFuture]struct{}),\n\t\t\t\tnotifyCh:            make(chan struct{}, 1),\n\t\t\t\tstepDown:            r.leaderState.stepDown,\n\t\t\t}\n\n\t\t\tr.leaderState.replState[server.ID] = s",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "src_vote_nonvoter_term_stepdown",
+        "file": "raft.go",
+        "start_line": 1660,
+        "end_line": 1684,
+        "kind": "code_observation",
+        "text": "\t\treturn\n\t}\n\n\t// Increase the term if we see a newer one\n\tif req.Term > r.getCurrentTerm() {\n\t\t// Ensure transition to follower\n\t\tr.logger.Debug(\"lost leadership because received a requestVote with a newer term\")\n\t\tr.setState(Follower)\n\t\tr.setCurrentTerm(req.Term)\n\n\t\tresp.Term = req.Term\n\t}\n\n\t// if we get a request for vote from a nonVoter  and the request term is higher,\n\t// step down and update term, but reject the vote request\n\t// This could happen when a node, previously voter, is converted to non-voter\n\t// The reason we need to step in is to permit to the cluster to make progress in such a scenario\n\t// More details about that in https://github.com/hashicorp/raft/pull/526\n\tif len(req.ID) > 0 {\n\t\tcandidateID := ServerID(req.ID)\n\t\tif len(r.configurations.latest.Servers) > 0 && !hasVote(r.configurations.latest, candidateID) {\n\t\t\tr.logger.Warn(\"rejecting vote request since node is not a voter\", \"from\", candidate)\n\t\t\treturn\n\t\t}\n\t}",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "src_electSelf_bumps_term",
+        "file": "raft.go",
+        "start_line": 1976,
+        "end_line": 1984,
+        "kind": "code_observation",
+        "text": "func (r *Raft) electSelf() <-chan *voteResult {\n\t// Create a response channel\n\trespCh := make(chan *voteResult, len(r.configurations.latest.Servers))\n\n\t// Increment the term\n\tnewTerm := r.getCurrentTerm() + 1\n\n\tr.setCurrentTerm(newTerm)\n\t// Construct the request",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "src_transfer_success_on_leftLeaderLoop",
+        "file": "raft.go",
+        "start_line": 734,
+        "end_line": 756,
+        "kind": "code_observation",
+        "text": "\t\t\t\tcase <-leftLeaderLoop:\n\t\t\t\t\tclose(stopCh)\n\t\t\t\t\terr := fmt.Errorf(\"lost leadership during transfer (expected)\")\n\t\t\t\t\tr.logger.Debug(err.Error())\n\t\t\t\t\tfuture.respond(nil)\n\t\t\t\t\t<-doneCh\n\t\t\t\tcase err := <-doneCh:\n\t\t\t\t\tif err != nil {\n\t\t\t\t\t\tr.logger.Debug(err.Error())\n\t\t\t\t\t\tfuture.respond(err)\n\t\t\t\t\t} else {\n\t\t\t\t\t\t// Wait for up to ElectionTimeout before flagging the\n\t\t\t\t\t\t// leadership transfer as done and unblocking applies in\n\t\t\t\t\t\t// the leaderLoop.\n\t\t\t\t\t\tselect {\n\t\t\t\t\t\tcase <-time.After(r.config().ElectionTimeout):\n\t\t\t\t\t\t\terr := fmt.Errorf(\"leadership transfer timeout\")\n\t\t\t\t\t\t\tr.logger.Debug(err.Error())\n\t\t\t\t\t\t\tfuture.respond(err)\n\t\t\t\t\t\tcase <-leftLeaderLoop:\n\t\t\t\t\t\t\tr.logger.Debug(\"lost leadership during transfer (expected)\")\n\t\t\t\t\t\t\tfuture.respond(nil)\n\t\t\t\t\t\t}",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "src_vote_grant_rules",
+        "file": "raft.go",
+        "start_line": 1685,
+        "end_line": 1733,
+        "kind": "code_observation",
+        "text": "\t// Check if we have voted yet\n\tlastVoteTerm, err := r.stable.GetUint64(keyLastVoteTerm)\n\tif err != nil && err.Error() != \"not found\" {\n\t\tr.logger.Error(\"failed to get last vote term\", \"error\", err)\n\t\treturn\n\t}\n\tlastVoteCandBytes, err := r.stable.Get(keyLastVoteCand)\n\tif err != nil && err.Error() != \"not found\" {\n\t\tr.logger.Error(\"failed to get last vote candidate\", \"error\", err)\n\t\treturn\n\t}\n\n\t// Check if we've voted in this election before\n\tif lastVoteTerm == req.Term && lastVoteCandBytes != nil {\n\t\tr.logger.Info(\"duplicate requestVote for same term\", \"term\", req.Term)\n\t\tif bytes.Equal(lastVoteCandBytes, candidateBytes) {\n\t\t\tr.logger.Warn(\"duplicate requestVote from\", \"candidate\", candidate)\n\t\t\tresp.Granted = true\n\t\t}\n\t\treturn\n\t}\n\n\t// Reject if their term is older\n\tlastIdx, lastTerm := r.getLastEntry()\n\tif lastTerm > req.LastLogTerm {\n\t\tr.logger.Warn(\"rejecting vote request since our last term is greater\",\n\t\t\t\"candidate\", candidate,\n\t\t\t\"last-term\", lastTerm,\n\t\t\t\"last-candidate-term\", req.LastLogTerm)\n\t\treturn\n\t}\n\n\tif lastTerm == req.LastLogTerm && lastIdx > req.LastLogIndex {\n\t\tr.logger.Warn(\"rejecting vote request since our last index is greater\",\n\t\t\t\"candidate\", candidate,\n\t\t\t\"last-index\", lastIdx,\n\t\t\t\"last-candidate-index\", req.LastLogIndex)\n\t\treturn\n\t}\n\n\t// Persist a vote for safety\n\tif err := r.persistVote(req.Term, candidateBytes); err != nil {\n\t\tr.logger.Error(\"failed to persist vote\", \"error\", err)\n\t\treturn\n\t}\n\n\tresp.Granted = true\n\tr.setLastContact()\n}",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "src_candidate_vote_tally",
+        "file": "raft.go",
+        "start_line": 363,
+        "end_line": 385,
+        "kind": "code_observation",
+        "text": "\t\tcase vote := <-voteCh:\n\t\t\tr.mainThreadSaturation.working()\n\t\t\t// Check if the term is greater than ours, bail\n\t\t\tif vote.Term > r.getCurrentTerm() {\n\t\t\t\tr.logger.Debug(\"newer term discovered, fallback to follower\", \"term\", vote.Term)\n\t\t\t\tr.setState(Follower)\n\t\t\t\tr.setCurrentTerm(vote.Term)\n\t\t\t\treturn\n\t\t\t}\n\n\t\t\t// Check if the vote is granted\n\t\t\tif vote.Granted {\n\t\t\t\tgrantedVotes++\n\t\t\t\tr.logger.Debug(\"vote granted\", \"from\", vote.voterID, \"term\", vote.Term, \"tally\", grantedVotes)\n\t\t\t}\n\n\t\t\t// Check if we've become the leader\n\t\t\tif grantedVotes >= votesNeeded {\n\t\t\t\tr.logger.Info(\"election won\", \"term\", vote.Term, \"tally\", grantedVotes)\n\t\t\t\tr.setState(Leader)\n\t\t\t\tr.setLeader(r.localAddr, r.localID)\n\t\t\t\treturn\n\t\t\t}",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "src_prevote_fallback_match",
+        "file": "raft.go",
+        "start_line": 2082,
+        "end_line": 2088,
+        "kind": "code_observation",
+        "text": "\t\t\t// If the target server do not support Pre-vote RPC we count this as a granted vote to allow\n\t\t\t// the cluster to progress.\n\t\t\tif err != nil && strings.Contains(err.Error(), rpcUnexpectedCommandError) {\n\t\t\t\tr.logger.Error(\"target does not support pre-vote RPC, treating as granted\",\n\t\t\t\t\t\"target\", peer,\n\t\t\t\t\t\"error\", err,\n\t\t\t\t\t\"term\", req.Term)",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "src_unknown_rpc_type_error",
+        "file": "net_transport.go",
+        "start_line": 716,
+        "end_line": 717,
+        "kind": "code_observation",
+        "text": "\tdefault:\n\t\treturn fmt.Errorf(\"unknown rpc type %d\", rpcType)",
+        "content_digest": "523d3ae139061c4cb2efa2c340e98e902db0c9637f3f7aed19735486a97f53bf"
+      },
+      {
+        "id": "src_unexpected_command_constant",
+        "file": "raft.go",
+        "start_line": 21,
+        "end_line": 24,
+        "kind": "code_observation",
+        "text": "\tminCheckInterval          = 10 * time.Millisecond\n\toldestLogGaugeInterval    = 10 * time.Second\n\trpcUnexpectedCommandError = \"unexpected command\"\n)",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "src_leadertransfer_doc",
+        "file": "api.go",
+        "start_line": 1251,
+        "end_line": 1260,
+        "kind": "document_statement",
+        "text": "// stop accepting client requests, make sure the target server is up to date\n// and starts the transfer with a TimeoutNow message. This message has the same\n// effect as if the election timeout on the target server fires. Since\n// it is unlikely that another server is starting an election, it is very\n// likely that the target server is able to win the election.  Note that raft\n// protocol version 3 is not sufficient to use LeadershipTransfer. A recent\n// version of that library has to be used that includes this feature.  Using\n// transfer leadership is safe however in a cluster where not every node has\n// the latest version. If a follower cannot be promoted, it will fail\n// gracefully.",
+        "content_digest": "499a72c01096912e85d16381f4640ac6d29f8c2b91cabbdae8530bdcbeb89a4a"
+      },
+      {
+        "id": "src_test_transfer_invalid_id",
+        "file": "raft_test.go",
+        "start_line": 2502,
+        "end_line": 2515,
+        "kind": "test_expectation",
+        "text": "func TestRaft_LeadershipTransferToInvalidID(t *testing.T) {\n\tc := MakeCluster(3, t, nil)\n\tdefer c.Close()\n\n\tfuture := c.Leader().LeadershipTransferToServer(ServerID(\"abc\"), ServerAddress(\"localhost\"))\n\tif future.Error() == nil {\n\t\tt.Fatal(\"leadership transfer should err\")\n\t}\n\n\texpected := \"cannot find replication state\"\n\tactual := future.Error().Error()\n\tif !strings.Contains(actual, expected) {\n\t\tt.Errorf(\"leadership transfer should err with: %s\", expected)\n\t}",
+        "content_digest": "51962412636d46873abcb6dba5a4603504d480f2f7c8b2b2cc1f561b652b6f6c"
+      },
+      {
+        "id": "src_test_transfer_invalid_address",
+        "file": "raft_test.go",
+        "start_line": 2518,
+        "end_line": 2532,
+        "kind": "test_expectation",
+        "text": "func TestRaft_LeadershipTransferToInvalidAddress(t *testing.T) {\n\tc := MakeCluster(3, t, nil)\n\tdefer c.Close()\n\n\tfollower := c.GetInState(Follower)[0]\n\tfuture := c.Leader().LeadershipTransferToServer(follower.localID, ServerAddress(\"localhost\"))\n\tif future.Error() == nil {\n\t\tt.Fatal(\"leadership transfer should err\")\n\t}\n\texpected := \"failed to make TimeoutNow RPC\"\n\tactual := future.Error().Error()\n\tif !strings.Contains(actual, expected) {\n\t\tt.Errorf(\"leadership transfer should err with: %s\", expected)\n\t}\n}",
+        "content_digest": "51962412636d46873abcb6dba5a4603504d480f2f7c8b2b2cc1f561b652b6f6c"
+      },
+      {
+        "id": "src_test_transfer_behind_voter",
+        "file": "raft_test.go",
+        "start_line": 2534,
+        "end_line": 2553,
+        "kind": "test_expectation",
+        "text": "func TestRaft_LeadershipTransferToBehindServer(t *testing.T) {\n\tc := MakeCluster(3, t, nil)\n\tdefer c.Close()\n\n\tl := c.Leader()\n\tbehind := c.GetInState(Follower)[0]\n\n\t// Commit a lot of things\n\tfor i := 0; i < 1000; i++ {\n\t\tl.Apply([]byte(fmt.Sprintf(\"test%d\", i)), 0)\n\t}\n\n\tfuture := l.LeadershipTransferToServer(behind.localID, behind.localAddr)\n\tif future.Error() != nil {\n\t\tt.Fatalf(\"This is not supposed to error: %v\", future.Error())\n\t}\n\tif c.Leader().localID != behind.localID {\n\t\tt.Fatal(\"Behind server did not get leadership\")\n\t}\n}",
+        "content_digest": "51962412636d46873abcb6dba5a4603504d480f2f7c8b2b2cc1f561b652b6f6c"
+      },
+      {
+        "id": "src_test_transfer_with_writes",
+        "file": "raft_test.go",
+        "start_line": 2433,
+        "end_line": 2486,
+        "kind": "test_expectation",
+        "text": "func TestRaft_LeadershipTransferWithWrites(t *testing.T) {\n\tconf := inmemConfig(t)\n\tconf.Logger = hclog.New(&hclog.LoggerOptions{Level: hclog.Trace})\n\tc := MakeCluster(7, t, conf)\n\tdefer c.Close()\n\n\tdoneCh := make(chan struct{})\n\tvar writerErr error\n\tvar wg sync.WaitGroup\n\tvar writes int\n\twg.Add(1)\n\tleader := c.Leader()\n\tgo func() {\n\t\tdefer wg.Done()\n\t\tfor {\n\t\t\tselect {\n\t\t\tcase <-doneCh:\n\t\t\t\treturn\n\t\t\tdefault:\n\t\t\t\tfuture := leader.Apply([]byte(\"test\"), 0)\n\t\t\t\tswitch err := future.Error(); {\n\t\t\t\tcase errors.Is(err, ErrRaftShutdown):\n\t\t\t\t\treturn\n\t\t\t\tcase errors.Is(err, ErrNotLeader):\n\t\t\t\t\tleader = c.Leader()\n\t\t\t\tcase errors.Is(err, ErrLeadershipTransferInProgress):\n\t\t\t\t\tcontinue\n\t\t\t\tcase errors.Is(err, ErrLeadershipLost):\n\t\t\t\t\tcontinue\n\t\t\t\tcase err == nil:\n\t\t\t\t\twrites++\n\t\t\t\tdefault:\n\t\t\t\t\twriterErr = err\n\t\t\t\t}\n\t\t\t\ttime.Sleep(time.Millisecond)\n\t\t\t}\n\t\t}\n\t}()\n\n\tfollower := c.Followers()[0]\n\tfuture := c.Leader().LeadershipTransferToServer(follower.localID, follower.localAddr)\n\tif future.Error() != nil {\n\t\tt.Fatalf(\"Didn't expect error: %v\", future.Error())\n\t}\n\tif follower.localID != c.Leader().localID {\n\t\tt.Error(\"Leadership should have been transitioned to specified server.\")\n\t}\n\tclose(doneCh)\n\twg.Wait()\n\tif writerErr != nil {\n\t\tt.Fatal(writerErr)\n\t}\n\tt.Logf(\"writes: %d\", writes)\n}",
+        "content_digest": "51962412636d46873abcb6dba5a4603504d480f2f7c8b2b2cc1f561b652b6f6c"
+      },
+      {
+        "id": "src_test_transfer_ignores_nonvoters",
+        "file": "raft_test.go",
+        "start_line": 2636,
+        "end_line": 2654,
+        "kind": "test_expectation",
+        "text": "func TestRaft_LeadershipTransferIgnoresNonvoters(t *testing.T) {\n\tc := MakeCluster(2, t, nil)\n\tdefer c.Close()\n\n\tfollower := c.Followers()[0]\n\n\tdemoteFuture := c.Leader().DemoteVoter(follower.localID, 0, 0)\n\tif demoteFuture.Error() != nil {\n\t\tt.Fatalf(\"demote voter err'd: %v\", demoteFuture.Error())\n\t}\n\n\tfuture := c.Leader().LeadershipTransfer()\n\tif future.Error() == nil {\n\t\tt.Fatal(\"leadership transfer should err\")\n\t}\n\n\texpected := \"cannot find peer\"\n\tactual := future.Error().Error()\n\tif !strings.Contains(actual, expected) {",
+        "content_digest": "51962412636d46873abcb6dba5a4603504d480f2f7c8b2b2cc1f561b652b6f6c"
+      },
+      {
+        "id": "src_install_snapshot_tail",
+        "file": "raft.go",
+        "start_line": 1930,
+        "end_line": 1952,
+        "kind": "code_observation",
+        "text": "\t// Update the lastApplied so we don't replay old logs\n\tr.setLastApplied(req.LastLogIndex)\n\n\t// Update the last stable snapshot info\n\tr.setLastSnapshot(req.LastLogIndex, req.LastLogTerm)\n\n\t// Restore the peer set\n\tr.setLatestConfiguration(reqConfiguration, reqConfigurationIndex)\n\tr.setCommittedConfiguration(reqConfiguration, reqConfigurationIndex)\n\n\t// Clear old logs if r.logs is a MonotonicLogStore. Otherwise compact the\n\t// logs. In both cases, log any errors and continue.\n\tif mlogs, ok := r.logs.(MonotonicLogStore); ok && mlogs.IsMonotonic() {\n\t\tif err := r.removeOldLogs(); err != nil {\n\t\t\tr.logger.Error(\"failed to reset logs\", \"error\", err)\n\t\t}\n\t} else if err := r.compactLogs(req.LastLogIndex); err != nil {\n\t\tr.logger.Error(\"failed to compact logs\", \"error\", err)\n\t}\n\n\tr.logger.Info(\"Installed remote snapshot\")\n\tresp.Success = true\n\tr.setLastContact()",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "src_restore_user_snapshot_setlastlog",
+        "file": "raft.go",
+        "start_line": 1180,
+        "end_line": 1187,
+        "kind": "code_observation",
+        "text": "\t// We set the last log so it looks like we've stored the empty\n\t// index we burned. The last applied is set because we made the\n\t// FSM take the snapshot state, and we store the last snapshot\n\t// in the stable store since we created a snapshot as part of\n\t// this process.\n\tr.setLastLog(lastIndex, term)\n\tr.setLastApplied(lastIndex)\n\tr.setLastSnapshot(lastIndex, term)",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "src_appendentries_prev_check",
+        "file": "raft.go",
+        "start_line": 1475,
+        "end_line": 1502,
+        "kind": "code_observation",
+        "text": "\t// Verify the last log entry\n\tif a.PrevLogEntry > 0 {\n\t\tlastIdx, lastTerm := r.getLastEntry()\n\n\t\tvar prevLogTerm uint64\n\t\tif a.PrevLogEntry == lastIdx {\n\t\t\tprevLogTerm = lastTerm\n\t\t} else {\n\t\t\tvar prevLog Log\n\t\t\tif err := r.logs.GetLog(a.PrevLogEntry, &prevLog); err != nil {\n\t\t\t\tr.logger.Warn(\"failed to get previous log\",\n\t\t\t\t\t\"previous-index\", a.PrevLogEntry,\n\t\t\t\t\t\"last-index\", lastIdx,\n\t\t\t\t\t\"error\", err)\n\t\t\t\tresp.NoRetryBackoff = true\n\t\t\t\treturn\n\t\t\t}\n\t\t\tprevLogTerm = prevLog.Term\n\t\t}\n\n\t\tif a.PrevLogTerm != prevLogTerm {\n\t\t\tr.logger.Warn(\"previous log term mis-match\",\n\t\t\t\t\"ours\", prevLogTerm,\n\t\t\t\t\"remote\", a.PrevLogTerm)\n\t\t\tresp.NoRetryBackoff = true\n\t\t\treturn\n\t\t}\n\t}",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "src_resp_lastlog_operand",
+        "file": "raft.go",
+        "start_line": 1443,
+        "end_line": 1449,
+        "kind": "code_observation",
+        "text": "\tresp := &AppendEntriesResponse{\n\t\tRPCHeader:      r.getRPCHeader(),\n\t\tTerm:           r.getCurrentTerm(),\n\t\tLastLog:        r.getLastIndex(),\n\t\tSuccess:        false,\n\t\tNoRetryBackoff: false,\n\t}",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "src_replicate_backoff_clamp",
+        "file": "replication.go",
+        "start_line": 249,
+        "end_line": 261,
+        "kind": "code_observation",
+        "text": "\t\t// Update our replication state\n\t\tupdateLastAppended(s, &req)\n\n\t\t// Clear any failures, allow pipelining\n\t\ts.failures = 0\n\t\ts.allowPipeline = true\n\t} else {\n\t\tatomic.StoreUint64(&s.nextIndex, max(min(s.nextIndex-1, resp.LastLog+1), 1))\n\t\tif resp.NoRetryBackoff {\n\t\t\ts.failures = 0\n\t\t} else {\n\t\t\ts.failures++\n\t\t}",
+        "content_digest": "24106024107950339bd30fc4e24a0b4a0a97a1c0e01aa7b31bedf4a2ad30b054"
+      },
+      {
+        "id": "src_snapshot_success_nextindex",
+        "file": "replication.go",
+        "start_line": 360,
+        "end_line": 376,
+        "kind": "code_observation",
+        "text": "\t\tr.handleStaleTerm(s)\n\t\treturn true, nil\n\t}\n\n\t// Update the last contact\n\ts.setLastContact()\n\n\t// Check for success\n\tif resp.Success {\n\t\t// Update the indexes\n\t\tatomic.StoreUint64(&s.nextIndex, meta.Index+1)\n\t\ts.commitment.match(peer.ID, meta.Index)\n\n\t\t// Clear any failures\n\t\ts.failures = 0\n\n\t\t// Notify we are still leader",
+        "content_digest": "24106024107950339bd30fc4e24a0b4a0a97a1c0e01aa7b31bedf4a2ad30b054"
+      },
+      {
+        "id": "src_set_previous_log_snapshot_branch",
+        "file": "replication.go",
+        "start_line": 588,
+        "end_line": 599,
+        "kind": "code_observation",
+        "text": "\t// Guard for the first index, since there is no 0 log entry\n\t// Guard against the previous index being a snapshot as well\n\tlastSnapIdx, lastSnapTerm := r.getLastSnapshot()\n\tif nextIndex == 1 {\n\t\treq.PrevLogEntry = 0\n\t\treq.PrevLogTerm = 0\n\n\t} else if (nextIndex - 1) == lastSnapIdx {\n\t\treq.PrevLogEntry = lastSnapIdx\n\t\treq.PrevLogTerm = lastSnapTerm\n\n\t} else {",
+        "content_digest": "24106024107950339bd30fc4e24a0b4a0a97a1c0e01aa7b31bedf4a2ad30b054"
+      },
+      {
+        "id": "src_getlast_snapshot_preference",
+        "file": "state.go",
+        "start_line": 152,
+        "end_line": 174,
+        "kind": "code_observation",
+        "text": "\nfunc (r *raftState) waitShutdown() {\n\tr.routinesGroup.Wait()\n}\n\n// getLastIndex returns the last index in stable storage.\n// Either from the last log or from the last snapshot.\nfunc (r *raftState) getLastIndex() uint64 {\n\tr.lastLock.Lock()\n\tdefer r.lastLock.Unlock()\n\treturn max(r.lastLogIndex, r.lastSnapshotIndex)\n}\n\n// getLastEntry returns the last index and term in stable storage.\n// Either from the last log or from the last snapshot.\nfunc (r *raftState) getLastEntry() (uint64, uint64) {\n\tr.lastLock.Lock()\n\tdefer r.lastLock.Unlock()\n\tif r.lastLogIndex >= r.lastSnapshotIndex {\n\t\treturn r.lastLogIndex, r.lastLogTerm\n\t}\n\treturn r.lastSnapshotIndex, r.lastSnapshotTerm\n}",
+        "content_digest": "9e73b5bcd67350db80c272c0d0f3f6c17afb24fb6e62b28e891c13e96107e189"
+      },
+      {
+        "id": "src_compactlogs_trailing_early_return",
+        "file": "snapshot.go",
+        "start_line": 214,
+        "end_line": 240,
+        "kind": "code_observation",
+        "text": "// the lastLogIdx, and the trailingLogs and trims the logs that\n// are no longer needed.\nfunc (r *Raft) compactLogsWithTrailing(snapIdx uint64, lastLogIdx uint64, trailingLogs uint64) error {\n\t// Determine log ranges to compact\n\tminLog, err := r.logs.FirstIndex()\n\tif err != nil {\n\t\treturn fmt.Errorf(\"failed to get first log index: %v\", err)\n\t}\n\n\t// Check if we have enough logs to truncate\n\t// Use a consistent value for trailingLogs for the duration of this method\n\t// call to avoid surprising behaviour.\n\tif lastLogIdx <= trailingLogs {\n\t\treturn nil\n\t}\n\n\t// Truncate up to the end of the snapshot, or `TrailingLogs`\n\t// back from the head, which ever is further back. This ensures\n\t// at least `TrailingLogs` entries, but does not allow logs\n\t// after the snapshot to be removed.\n\tmaxLog := min(snapIdx, lastLogIdx-trailingLogs)\n\n\tif minLog > maxLog {\n\t\tr.logger.Info(\"no logs to truncate\")\n\t\treturn nil\n\t}\n",
+        "content_digest": "45d46961871682958b155bd719bf025ff7e3a31ec948e21c8f6b9447d026cb3d"
+      }
+    ],
+    "current_submission": {
+      "phase": "accepted",
+      "operation_id": "296fcb1104d44baeb58cf807d8662ad4",
+      "action": "update",
+      "no_change": false,
+      "references": {
+        "@k_install_snapshot_leaves_cached_lastlog": "296fcb1104d44baeb58cf807d8662ad4-knowledge-0",
+        "@k_snapshot_install_can_repeat": "296fcb1104d44baeb58cf807d8662ad4-knowledge-1",
+        "@q_snapshot_install_lastlog_reconcile": "296fcb1104d44baeb58cf807d8662ad4-question-0"
+      }
+    },
+    "applied_operations": {
+      "submission-b692e1e41ba940c78dc240498acfbdc1": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-11_19-38-40-hashicorp_raft-real-run/semantic-commits/submission-b692e1e41ba940c78dc240498acfbdc1.json"
+      },
+      "submission-5d4108432b0d4ae38661ad457982e991": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-11_19-38-40-hashicorp_raft-real-run/semantic-commits/submission-5d4108432b0d4ae38661ad457982e991.json"
+      },
+      "submission-32fbb0ae6f38453f96e52ddb17c102e3": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-11_19-38-40-hashicorp_raft-real-run/semantic-commits/submission-32fbb0ae6f38453f96e52ddb17c102e3.json"
+      },
+      "submission-58efcbe400a04d91a7159521dca86757": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-11_19-38-40-hashicorp_raft-real-run/semantic-commits/submission-58efcbe400a04d91a7159521dca86757.json"
+      },
+      "submission-296fcb1104d44baeb58cf807d8662ad4": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-11_19-38-40-hashicorp_raft-real-run/semantic-commits/submission-296fcb1104d44baeb58cf807d8662ad4.json"
+      }
+    }
+  }
+}

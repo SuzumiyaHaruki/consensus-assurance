@@ -1,0 +1,173 @@
+{
+  "rationale": "Second, independent A2 direction: the explicit-target side of leadership transfer. A1/A2 orientation says an authority transition should be justifyable by the event that actually confers the authority; here the caller-facing API promises a graceful failure when the named server cannot be promoted (api.go:1269-1276), while the automatic path and the explicit path disagree about who is a legal target. Source trace of LeadershipTransferToServer -> leadershipTransfer -> timeoutNow -> requestVote, read together with the leader-side goroutine that decides what the caller's future means, shows that a reachable, caught-up non-voting target is accepted as a transfer target and the resulting term bump removes the incumbent leader even though the named target can never win, and that the future is then resolved as success. No execution was requested: this run's experiment capacity is exhausted, so the product is a source-grounded behavior/fact chain plus an explicit discriminator.",
+  "sources": [
+    {
+      "id": "src_transfer_api_doc",
+      "file": "api.go",
+      "start_line": 1269,
+      "end_line": 1282,
+      "kind": "document_statement"
+    },
+    {
+      "id": "src_initiate_transfer_guard",
+      "file": "raft.go",
+      "start_line": 2187,
+      "end_line": 2206,
+      "kind": "code_observation"
+    },
+    {
+      "id": "src_pickServer_voter_filter",
+      "file": "raft.go",
+      "start_line": 2161,
+      "end_line": 2182,
+      "kind": "code_observation"
+    },
+    {
+      "id": "src_transfer_catchup_then_timeoutnow",
+      "file": "raft.go",
+      "start_line": 989,
+      "end_line": 1030,
+      "kind": "code_observation"
+    },
+    {
+      "id": "src_replstate_for_every_peer",
+      "file": "raft.go",
+      "start_line": 583,
+      "end_line": 611,
+      "kind": "code_observation"
+    },
+    {
+      "id": "src_vote_nonvoter_term_stepdown",
+      "file": "raft.go",
+      "start_line": 1660,
+      "end_line": 1684,
+      "kind": "code_observation"
+    },
+    {
+      "id": "src_electSelf_bumps_term",
+      "file": "raft.go",
+      "start_line": 1976,
+      "end_line": 1984,
+      "kind": "code_observation"
+    },
+    {
+      "id": "src_transfer_success_on_leftLeaderLoop",
+      "file": "raft.go",
+      "start_line": 734,
+      "end_line": 756,
+      "kind": "code_observation"
+    }
+  ],
+  "investigations": [
+    {
+      "id": null,
+      "ref": "@q_transfer_target_suffrage",
+      "question": "When the caller names a leadership-transfer target that is in the configuration but cannot vote (Nonvoter/Staging), which applicable condition keeps the transfer from taking leadership away from the current leader, and which observable event justifies the returned future succeeding?",
+      "source_ids": [
+        "src_transfer_api_doc",
+        "src_initiate_transfer_guard",
+        "src_pickServer_voter_filter",
+        "src_transfer_catchup_then_timeoutnow",
+        "src_replstate_for_every_peer",
+        "src_vote_nonvoter_term_stepdown",
+        "src_electSelf_bumps_term",
+        "src_transfer_success_on_leftLeaderLoop"
+      ],
+      "hypothesis": "The explicit-target API performs no suffrage/eligibility check on the named server, while the automatic path selects only voters; therefore LeadershipTransferToServer(nonVoterID, addr) on a reachable, caught-up non-voter passes the catch-up loop, sends TimeoutNow, makes that non-voter campaign at currentTerm+1 (electSelf persists the higher term and asks only voters), and every voter - the incumbent leader included - sets the higher term and steps down before rejecting the vote as non-voter. The named target can never win, the cluster loses its leader and must hold another election, and the caller's future is nevertheless resolved as success because the leader-side goroutine treats leaving the leader loop as the success event.",
+      "discriminator": "Refuted if any condition on the path rejects a non-voter target before TimeoutNow is sent (a suffrage/eligibility check in initiateLeadershipTransfer or leadershipTransfer, absence of a replication state for non-voters, or a catch-up loop that cannot terminate), or if a voter that receives the induced RequestVote does not adopt the higher term (so leadership survives), or if the future is resolved with an error in this scenario. An executed witness would be a 3-node voter cluster plus one AddNonvoter member, where LeadershipTransferToServer(nonvoter) leaves the cluster without a leader at the old term and the returned future reports no error while the non-voter never becomes leader.",
+      "disposition": "active",
+      "parent_id": null,
+      "knowledge": [
+        {
+          "entry_id": "b692e1e41ba940c78dc240498acfbdc1-knowledge-0",
+          "revision": 1,
+          "assertion": "timeoutNow unconditionally clears the known leader, sets Candidate and sets candidateFromLeadershipTransfer, reading nothing from the request."
+        },
+        {
+          "entry_id": "b692e1e41ba940c78dc240498acfbdc1-knowledge-2",
+          "revision": 1,
+          "assertion": "The sender-side expectation is that TimeoutNow comes from the current leader, while TimeoutNow itself applies no eligibility guard."
+        }
+      ],
+      "counterevidence": null,
+      "limitations": [
+        "Established by source reading; no receipt exists in this run (experiment capacity already consumed), so the end-to-end sequence is argued from the handler rules rather than observed.",
+        "Reachability requires a caller that names a non-voting member; the library neither documents a voter-only requirement nor rejects such a target, and the target must be reachable and caught up, otherwise the pre-existing timeout path reports an error.",
+        "The term bump and the loss of leadership at term+1 are the sourced consequences; which surviving voter wins the subsequent election is schedule-dependent and not claimed."
+      ],
+      "resume_conditions": null
+    }
+  ],
+  "knowledge": [
+    {
+      "id": null,
+      "ref": "@k_explicit_transfer_target_unvalidated",
+      "kind": "behavior",
+      "statement": "LeadershipTransferToServer(id, address) forwards the named target to initiateLeadershipTransfer with no check other than 'cannot transfer leadership to itself'; the named target is used as-is and the only per-target validation anywhere in the transfer path is asynchronous, in leadershipTransfer's catch-up loop (it waits for that peer's nextIndex to pass the leader's last index). By contrast the automatic LeadershipTransfer() path chooses its target with pickServer, which skips every server whose Suffrage is not Voter (and skips peers without replication state).",
+      "conditions": "Applies when the caller passes an explicit id/address (LeadershipTransferToServer); the named server must exist in r.leaderState.replState, which startStopReplication creates for every server in the latest configuration except the local one - non-voters included, because it skips only server.ID == r.localID.",
+      "source_ids": [
+        "src_transfer_api_doc",
+        "src_initiate_transfer_guard",
+        "src_pickServer_voter_filter",
+        "src_replstate_for_every_peer"
+      ],
+      "executions": {},
+      "changed_premise": "",
+      "affected_uses": []
+    },
+    {
+      "id": null,
+      "ref": "@k_nonvoter_target_costs_leadership",
+      "kind": "fact",
+      "statement": "A transfer to a caught-up non-voting target cannot place that target in power and does not preserve the incumbent leader. timeoutNow puts the non-voter into candidacy (see the previously recorded handler behavior), runCandidate then skips pre-vote because candidateFromLeadershipTransfer is set and calls electSelf, which persists currentTerm+1 and asks only the voters; each voter receiving that RequestVote first adopts the newer term and transitions to Follower and only then rejects the vote because the candidate has no vote, so the election cannot be won at that term and the cluster is left without a leader until a further election. The leader-side goroutine nonetheless resolves the caller's future with no error, because the branch that responds nil is the one that fires when the leader leaves its leader loop ('lost leadership during transfer (expected)').",
+      "conditions": "Requires the non-voting target to be reachable and caught up so the catch-up loop terminates; the incumbent leader must still be a voter in the latest configuration (the normal case) and must receive the induced RequestVote, which it does because electSelf asks every Voter in the candidate's latest configuration.",
+      "source_ids": [
+        "src_transfer_catchup_then_timeoutnow",
+        "src_electSelf_bumps_term",
+        "src_vote_nonvoter_term_stepdown",
+        "src_transfer_success_on_leftLeaderLoop"
+      ],
+      "executions": {},
+      "changed_premise": "",
+      "affected_uses": []
+    }
+  ],
+  "gaps": [],
+  "interpretations": [
+    {
+      "investigation_id": "@q_transfer_target_suffrage",
+      "experiment_id": null,
+      "source_ids": [
+        "src_transfer_api_doc",
+        "src_initiate_transfer_guard",
+        "src_pickServer_voter_filter",
+        "src_transfer_catchup_then_timeoutnow",
+        "src_replstate_for_every_peer",
+        "src_vote_nonvoter_term_stepdown",
+        "src_electSelf_bumps_term",
+        "src_transfer_success_on_leftLeaderLoop"
+      ],
+      "executions": {},
+      "conclusion": "explained",
+      "rationale": "The requirement is stated by the captured API contract itself: LeadershipTransfer/LeadershipTransferToServer say a transfer is safe to use in mixed-version clusters and that 'If a follower cannot be promoted, it will fail gracefully' (api.go:1259-1260, 1274-1275). A non-voting member is exactly a follower that cannot be promoted, so that branch is the contract under test. The applicable responsibility is split across three places, and only one of them checks suffrage. (1) Target selection: the automatic path uses pickServer, which skips non-voters (raft.go:2166-2169), but the explicit path passes the caller's ID through initiateLeadershipTransfer after checking only self-transfer (raft.go:2187-2206). (2) The transfer itself: leadershipTransfer waits for that peer's nextIndex to pass the leader's last index and then sends TimeoutNow (raft.go:1010-1029); the wait can terminate for a non-voter because startStopReplication creates replication state for every configured peer except the local one (raft.go:587-611), so there is no suffrage gate on this path either. (3) The receiving side performs the transition without consulting suffrage (raft.go:2209-2214, previously recorded), and the induced candidacy is a real election attempt: electSelf persists currentTerm+1 (raft.go:1980-1983) and targets only voters (raft.go:2015-2017). On the voters, requestVote handles the newer term before the non-voter rejection: the newer-term branch transitions the receiver to Follower and adopts the term (raft.go:1662-1671), and the comment at raft.go:1673-1677 documents that this ordering is deliberate ('step down and update term, but reject the vote request'). So a single explicit transfer request to a non-voter removes the incumbent leader even though no vote is granted, and because the target can never reach quorum the expected leadership change never happens. The caller-visible outcome contradicts the contract in a second way: the future is not an error. The leader-side goroutine registers 'lost leadership during transfer (expected)' on leftLeaderLoop and responds nil there (raft.go:734-739), and after a successful TimeoutNow it waits in the same nil-responding branch (raft.go:748-756); the success evidence is therefore 'this leader left the leader loop', which the non-voter scenario satisfies even though no transfer occurred. Both halves are decidable from the retained source, so the local question is answered without needing an execution: the missing condition is a suffrage/eligibility check on the explicit target, and the mis-associated success event is the leader-loop exit rather than the target acquiring leadership.",
+      "answers": {},
+      "knowledge": [],
+      "counterevidence": [
+        "For a non-voter that is unreachable or badly behind, the existing timeout branch fires first ('leadership transfer timeout', raft.go:729-733) and the caller does get an error, so the failure is limited to targets whose catch-up loop terminates.",
+        "The receiving-side non-voter check in requestVote (raft.go:1678-1683) is itself a protective mechanism introduced for a different scenario (a voter demoted to non-voter cannot win while the cluster has a leader); it does not protect against this path because the term adoption happens earlier in the same handler.",
+        "The leader's own lease/verify machinery and the subsequent normal election eventually restore a leader, so this is not a permanent outage - the sourced harm is a forced leadership loss plus a success report for an operation that did not happen."
+      ],
+      "limitations": [
+        "Source-established only; this run had no remaining experiment capacity, so no receipt accompanies the claim and the exact timing of the follow-up election is not measured.",
+        "The defect is caller-reachable (a caller must name a non-voting member) rather than spontaneously reachable; a caller that restricts itself to voters, or a cluster without non-voters, never hits it.",
+        "Not claimed: that a transfer to a reachable voter is broken, that the non-voter's later pre-vote campaigns inflate the term indefinitely (runCandidate resets candidateFromLeadershipTransfer on exit, so subsequent campaigns use pre-vote), or that the extra election is unbounded - the sourced claim is one lost leadership plus a false success signal."
+      ],
+      "joint_history": "",
+      "failure_attribution": null,
+      "report_title": "LeadershipTransferToServer 可指向非投票成员：领导者被迫下台但 Future 仍报告成功",
+      "report_answer": "在捕获快照中，显式指定目标的 LeadershipTransferToServer 只检查“不能转给自己”，不像自动路径那样用 pickServer 过滤非投票者；而 leadershipTransfer 的追赶循环对任何配置内节点（startStopReplication 为除本机外的所有节点建立复制状态，包含非投票者）都能结束，随后发送 TimeoutNow。收到 TimeoutNow 的非投票者会无条件成为 Candidate（candidateFromLeadershipTransfer 置位、跳过 pre-vote），electSelf 持久化 currentTerm+1 并只向投票者拉票；每个投票者（含现任 leader）在 requestVote 中先因更高任期切换到 Follower 并更新任期，之后才以“候选者非投票者”为由拒绝投票。结果：目标永远无法当选，集群失去 leader 并被迫重选；而调用方拿到的 Future 却按 leftLeaderLoop 分支返回成功（“lost leadership during transfer (expected)”），与 API 文档承诺的“若 follower 无法被提升则优雅失败”相反。该结论完全由源码确立；本运行实验额度已用尽，未保留执行见证，后续可用“3 投票者 + 1 AddNonvoter 成员”的对照实验验证。"
+    }
+  ],
+  "experiment": null,
+  "stop": null
+}

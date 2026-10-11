@@ -1,0 +1,70 @@
+{
+  "rationale": "Last coverage question for the snapshot-install cycle finding: could the retained randomized scenarios bear on it at all? Reading how the fuzzy harness configures Raft answers decisively - the snapshot threshold is set far above anything the scenarios generate and the interval an hour, with a single Bolt store for logs and stable state - so snapshots are effectively never taken, the leader's log is never compacted, and the snapshot-send and snapshot-install paths are never reached by the suite that would otherwise be the strongest falsification device. Source-only; this run's experiment capacity is exhausted.",
+  "sources": [
+    {
+      "id": "src_fuzzy_node_config",
+      "file": "fuzzy/node.go",
+      "start_line": 42,
+      "end_line": 53,
+      "kind": "test_expectation"
+    },
+    {
+      "id": "src_fuzzy_node_newraft",
+      "file": "fuzzy/node.go",
+      "start_line": 62,
+      "end_line": 68,
+      "kind": "test_expectation"
+    }
+  ],
+  "investigations": [
+    {
+      "ref": "@q_snapshot_path_fuzzy_coverage",
+      "question": "Do the retained randomized scenarios ever take a snapshot or reach the snapshot-send/install paths, so that their verifications could bear on the recorded snapshot-install cycle?",
+      "source_ids": [
+        "src_fuzzy_node_config",
+        "src_fuzzy_node_newraft"
+      ],
+      "hypothesis": "No. The fuzzy harness starts from the default configuration and then sets the snapshot threshold to a value far above the entry counts the scenarios generate and the snapshot interval to an hour, so no snapshot is created during a scenario run; with no snapshot the leader never compacts its log, so a node behind the head is always recovered by log transfer and the transport never sends an InstallSnapshot. The suite's verifications (single leader per term, log equality, FSM equality) therefore exercise consensus without the snapshot path.",
+      "discriminator": "Refuted if any fuzzy scenario takes a snapshot explicitly, lowers the threshold or interval, or restarts a node such that a snapshot is restored, or if the harness's partition scenarios force an install through log compaction rather than through an explicit snapshot. Reading the harness configuration and the scenarios settles it.",
+      "disposition": "explained",
+      "limitations": [
+        "Coverage of the retained scenarios only; other harnesses outside the snapshot are out of scope.",
+        "This does not bear on the correctness of the snapshot path, only on whether the retained randomized evidence constrains it."
+      ]
+    }
+  ],
+  "knowledge": [
+    {
+      "ref": "@k_fuzzy_scenarios_never_snapshot",
+      "kind": "fact",
+      "statement": "The retained randomized harness creates each node with the default Raft configuration, then overrides two fields before constructing the node: the snapshot threshold is set to 1409600 entries and the snapshot interval to one hour. Each node uses a single Bolt store for both the log and the stable state and a file snapshot store with a retention of five. Because no scenario generates anywhere near that many entries, and because only a taken snapshot triggers log compaction, the leader's log is never trimmed during a scenario run, a lagging node is always caught up by log transfer, and the code paths that send or install a snapshot are never entered. Scenarios do restart nodes and do partition and heal them, but those operations restore state from the same snapshot store, which is empty.",
+      "conditions": "Read from the harness's node construction in the captured tree; the verification helpers the scenarios call (leader-per-term verifier, log and FSM equality) therefore constrain consensus behaviour without the snapshot path.",
+      "source_ids": [
+        "src_fuzzy_node_config",
+        "src_fuzzy_node_newraft"
+      ]
+    }
+  ],
+  "interpretations": [
+    {
+      "investigation_id": "@q_snapshot_path_fuzzy_coverage",
+      "source_ids": [
+        "src_fuzzy_node_config",
+        "src_fuzzy_node_newraft"
+      ],
+      "conclusion": "explained",
+      "rationale": "The recorded snapshot-install cycle is exercised only when a leader has compacted its log and a node needs an install, and the question here is whether the retained randomized suite ever reaches that state. It does not, and the reason is configuration rather than chance: the harness takes the default configuration and overrides the snapshot threshold to 1409600 and the interval to an hour (fuzzy/node.go:42-53), then builds every node from a single Bolt store used for both logs and stable state plus a file snapshot store (fuzzy/node.go:62-68). Since no scenario generates that volume of entries and compaction happens only after a snapshot is taken, the leader's log stays complete for the whole run, so a node returning from a partition is always repaired by log transfer, and neither the snapshot-send path nor the install-snapshot handler is entered. This closes the last external falsification route for the snapshot-cycle finding: the unit tests that do take snapshots cover only the index-behind premise (recorded earlier), and the randomized suite, which does stress partitions, membership changes and restarts, runs with snapshots effectively disabled. It is a coverage result, not evidence about the cycle's reachability or harm, and it cuts both ways: the suite's passing cannot be read as reassurance about snapshot handling, and it also cannot be read as a refutation of the recorded account.",
+      "counterevidence": [
+        "The suite does restart nodes and partition them, which exercises recovery of state from the stores; that is meaningful coverage of restart and partition recovery, just not of snapshot creation, sending or installing.",
+        "The harness uses a monotonic Bolt store, so had compaction occurred the install path would have been reached; the absence is purely due to the thresholds, which means a future harness change to those two fields would change what the suite constrains.",
+        "Scenarios could still reach the install path through an explicitly low snapshot threshold set by a test-local configuration; none of the retained scenarios does so.",
+        "No execution: the harness was read, not run."
+      ],
+      "limitations": [
+        "Coverage claim about the retained scenarios only; it neither supports nor refutes the recorded mechanism.",
+        "Only the captured harness files were read; other harnesses were not examined."
+      ],
+      "report_title": "覆盖度收口：模糊测试把快照阈值/间隔调到几乎不会触发，因此从未覆盖快照发送/安装路径",
+      "report_answer": "本次补上快照循环发现最后一条外部证伪路径的覆盖问题（仅源码，未执行）。fuzzy 测试框架用默认配置创建节点后，把 SnapshotThreshold 设为 1409600 条、SnapshotInterval 设为一小时（fuzzy/node.go:42-53），并为每个节点使用同一个 Bolt 存储作为日志与稳定状态、外加文件快照存储（fuzzy/node.go:62-68）。由于任何场景都不会产生如此数量的条目，而只有“真正拍过快照”才会触发日志压缩，因此运行期间 leader 的日志始终完整：从分区恢复的节点总是通过日志补齐，快照发送与安装路径根本不会被进入。这关闭了快照循环发现最后一条外部证伪途径：会拍快照的单元测试只覆盖“索引低于快照索引”的情形（此前已记录），而真正施压分区/成员变更/重启的随机套件几乎是禁用了快照。该结果只是覆盖度结论——它既不能被读作对快照处理的安心证据，也不能被读作对已记录机制的否定；同时反证保留：套件确实覆盖了重启与分区恢复，且若这两个配置字段被改动，套件能约束的范围就会改变。"    }
+  ]
+}

@@ -1,0 +1,82 @@
+{
+  "rationale": "New direction on persistence and recovery: how a node's own vote is recorded, and what the receiver trusts when it sees a repeated vote request. The record is written as two independent single-key stable-store operations, and the duplicate branch answers from the durable record alone, without re-checking the candidate's log. Reading those two pieces together raises a question that the retained material does not settle, so the mechanism is recorded as a Fact and the consequence is left unresolved with an explicit discriminator rather than asserted.",
+  "sources": [
+    {
+      "id": "src_persistVote_two_writes",
+      "file": "raft.go",
+      "start_line": 2130,
+      "end_line": 2138,
+      "kind": "code_observation"
+    },
+    {
+      "id": "src_stable_store_single_key_api",
+      "file": "stable.go",
+      "start_line": 5,
+      "end_line": 18,
+      "kind": "interface_statement"
+    },
+    {
+      "id": "src_vote_duplicate_branch",
+      "file": "raft.go",
+      "start_line": 1697,
+      "end_line": 1705,
+      "kind": "code_observation"
+    }
+  ],
+  "investigations": [
+    {
+      "ref": "@q_vote_record_atomicity",
+      "question": "What does a receiver conclude from its durable vote record when the term and the candidate were written as two separate stable-store operations, and can that conclusion grant a vote it should have denied?",
+      "source_ids": [
+        "src_persistVote_two_writes",
+        "src_stable_store_single_key_api",
+        "src_vote_duplicate_branch"
+      ],
+      "hypothesis": "The vote record is two independent writes (term, then candidate) over an interface that offers only single-key operations, so a crash between them leaves a newer term paired with the previous term's candidate. The duplicate branch then grants on identity bytes alone when the stored term equals the request term, without the log up-to-dateness comparison that a first-time grant performs; the branch is therefore reachable for a term in which the node never actually granted anything, and its grant carries less evidence than the code path it replaces.",
+      "discriminator": "Settled by (a) reading whether any supported StableStore or the surrounding code makes the term and candidate writes atomic, and (b) a crash-injection probe that interrupts the process between the two writes, restarts it, and observes the answer to a vote request at the newer term from the previous candidate while the node's own log has advanced past that candidate's. Refuted if the two writes are atomic in every supported store, if the duplicate branch is unreachable with a candidate from an older term, or if the grant carries the log comparison in a path not read here.",
+      "disposition": "active",
+      "limitations": [
+        "Source-only; no crash-injection or store inspection was performed (this run's experiment capacity is exhausted).",
+        "The interface shows only single-key operations; whether a particular deployment's store offers batching that this code could use was not examined beyond the captured tree.",
+        "The consequence needs a specific vote split as well as the crash window, so this record does not claim a reachable loss of a committed entry."
+      ]
+    }
+  ],
+  "knowledge": [
+    {
+      "ref": "@k_vote_record_two_writes_and_duplicate_grant",
+      "kind": "fact",
+      "statement": "A vote is recorded as two independent stable-store writes in sequence - the vote term first, then the candidate's encoded identity - and the StableStore interface exposes only per-key Set/Get operations, so nothing in the captured code makes the pair atomic. When a RequestVote arrives, the receiver reads both keys and, if the stored term equals the request term and a candidate identity is present, returns immediately: it grants only when the stored identity equals the requester's encoded identity, and otherwise returns without granting, in either case without performing the log up-to-dateness comparison that the ordinary grant path performs before persisting and granting. The stored identity is whatever was persisted by the most recent vote, which may belong to an earlier term than the stored term if the process stopped between the two writes.",
+      "conditions": "Applies to a receiver whose durable term equals the request term - either because it truly voted in that term, or because the candidate write did not complete while the term write did. The comparison is over encoded candidate bytes (the address/identifier as the transport encodes it), not over the candidate's log.",
+      "source_ids": [
+        "src_persistVote_two_writes",
+        "src_stable_store_single_key_api",
+        "src_vote_duplicate_branch"
+      ]
+    }
+  ],
+  "interpretations": [
+    {
+      "investigation_id": "@q_vote_record_atomicity",
+      "source_ids": [
+        "src_persistVote_two_writes",
+        "src_stable_store_single_key_api",
+        "src_vote_duplicate_branch"
+      ],
+      "conclusion": "unresolved",
+      "rationale": "The mechanism is established: persistVote performs two separate writes with the term ahead of the candidate (raft.go:2130-2138), the StableStore interface offers only single-key Set/SetUint64/Get/GetUint64 (stable.go:5-18), and the duplicate branch answers from those two keys alone, granting on identity equality and otherwise returning without a grant, in both cases skipping the log comparison that the first-time grant path performs (raft.go:1697-1705). What is not established is the engineering consequence, and the retained material does not decide it for two reasons. First, the state after a crash between the writes - a newer term paired with an older term's candidate identity - makes the duplicate branch reachable for a term in which the node granted nothing, and the grant then certifies only identity, not log freshness; but the resulting harm depends on how the cluster's quorums divide, and a vote that skips the freshness check for one voter does not by itself carry an entry: any quorum intersects the nodes that stored a committed entry, and those voters still apply the log comparison unless they too are in the anomalous state. Second, whether the window is real in a deployment depends on the store: the interface permits batching or atomic transactions even though the captured code uses two key writes, and no supported store implementation is in the captured tree. I therefore record the mechanism and the two conditions under which it could matter (a crash inside the write pair, and a candidate identity that recurs at the later term with the node's log advanced past it) and leave the judgement unresolved rather than claiming a reachable violation.",
+      "counterevidence": [
+        "The order chosen (term before candidate) keeps the invariant 'at most one grant per term' intact: after the crash the node answers at most one candidate at that term, and any other candidate at the same term is refused, so no double vote is produced by the window.",
+        "For the anomaly to matter, the node's own log must have advanced past the requester's since the earlier vote; otherwise the skipped comparison would have succeeded anyway, and the grant carries the same evidence it would have carried.",
+        "A claimed loss of a committed entry would still have to defeat the intersection between any quorum and the set of nodes holding that entry, which the retained material does not show.",
+        "No execution: the window, the store's real write behaviour and the resulting vote split were not observed."
+      ],
+      "limitations": [
+        "This is deliberately unresolved: the record fixes the mechanism and the discriminator, not a severity judgement.",
+        "Only the captured tree was searched for atomicity support; store implementations outside it were not examined.",
+        "No receipt exists, and this run had no experiment capacity left for a crash-injection probe."
+      ],
+      "report_title": "未决：投票记录由两次独立写入组成，重复投票分支只按身份字节授予且不做日志比较",
+      "report_answer": "本次记录一个未决的持久化/恢复问题（仅源码，未执行；实验额度已用尽）。机制：persistVote 先写入投票任期、再写入候选人身份，是两次独立的 stable store 写入（raft.go:2130-2138），而 StableStore 接口只提供逐键 Set/Get（stable.go:5-18），捕获代码中没有任何使这对写入原子化的机制。接收 RequestVote 时，若持久化任期等于请求任期且存在候选人身份，重复投票分支仅按“身份编码字节是否相等”决定授予或拒绝，并在两种情况下都跳过首次授予路径中的日志新旧比较（raft.go:1697-1705）。因此若进程恰在两次写入之间停止，重启后会出现“较新任期 + 较早期任期的候选人身份”，使该分支在一个节点实际从未授予过的任期上被触发，且该授权不携带日志新鲜度证据。未决之处：一是其后果取决于仲裁集合如何划分——任何仲裁都与持有已提交条目的节点相交，而这些投票者仍会执行日志比较（除非它们也处于异常状态）；二是窗口是否在真实部署中存在取决于存储实现，而捕获树中没有任何受支持的 StableStore 实现。记录同时保留反证：该写入顺序保持了“同任期至多一次授予”；只有当该节点日志在两次投票之间已超过请求方时，被跳过的比较才本来会导致拒绝；以及未观察到任何执行。"    }
+  ]
+}

@@ -1,0 +1,84 @@
+{
+  "rationale": "Narrowing the transfer-readiness finding against its own weakest link. The readiness loop can pass on an uncorroborated cursor, but the harm I sketched needs the TimeoutNow to actually reach the target, so an unreachable target must fail earlier - and the retained material says exactly that: one test asserts an error for a target the transport cannot reach, and the code has a dedicated error path from the TimeoutNow call back to the caller's future. Recording that bound as a refinement rather than leaving the earlier record as it stood.",
+  "sources": [
+    {
+      "id": "src_test_transfer_invalid_address",
+      "file": "raft_test.go",
+      "start_line": 2518,
+      "end_line": 2532,
+      "kind": "test_expectation"
+    },
+    {
+      "id": "src_transfer_timeoutnow_error_path",
+      "file": "raft.go",
+      "start_line": 1024,
+      "end_line": 1030,
+      "kind": "code_observation"
+    },
+    {
+      "id": "src_leaderloop_transfer_error_branch",
+      "file": "raft.go",
+      "start_line": 740,
+      "end_line": 744,
+      "kind": "code_observation"
+    }
+  ],
+  "investigations": [],
+  "knowledge": [
+    {
+      "id": null,
+      "ref": "@k_unreachable_target_fails_before_the_false_success",
+      "kind": "fact",
+      "statement": "An unreachable transfer target does not reach the false-success branch: the transfer reports the failure of the TimeoutNow RPC itself. The transfer routine turns a transport error from the TimeoutNow call into a wrapped error and hands it to the done channel, and the leader-side goroutine forwards a non-nil done-channel error to the caller's future instead of the nil response used when the leader merely leaves its loop. A retained test pins the caller-visible consequence for an address the transport cannot use: the transfer must return an error mentioning the failed TimeoutNow RPC. Consequently the readiness record's harm requires the target to be reachable at the moment TimeoutNow is sent while its replication cursor is still uncorroborated, which is the interval between the peer becoming reachable and its first AppendEntries response being processed.",
+      "conditions": "The error path is taken when the transport call itself fails; a target that is reachable but rejects or ignores the TimeoutNow is a different case (the caller then sees the transfer-timeout error or the leadership-loss success branch, as recorded earlier).",
+      "source_ids": [
+        "src_transfer_timeoutnow_error_path",
+        "src_leaderloop_transfer_error_branch",
+        "src_test_transfer_invalid_address"
+      ],
+      "executions": {},
+      "changed_premise": "",
+      "affected_uses": []
+    }
+  ],
+  "gaps": [],
+  "interpretations": [
+    {
+      "investigation_id": "162b6ef916694a80b964ee328b61dd44-question-0",
+      "experiment_id": null,
+      "source_ids": [
+        "src_transfer_timeoutnow_error_path",
+        "src_leaderloop_transfer_error_branch",
+        "src_test_transfer_invalid_address"
+      ],
+      "executions": {},
+      "conclusion": "conditional",
+      "rationale": "The earlier record established that the transfer's only per-target condition before TimeoutNow is a loop over a cursor that is seeded optimistically and survives transport errors, so the condition does not prove the target is current. This successor asks what that buys an attacker of the outcome - or, more precisely, how narrow the harm is - and the retained material answers with a protective path: if the target is still unreachable, the TimeoutNow call fails, the failure is wrapped and reported (raft.go:1024-1030), and the leader-side goroutine forwards that error to the caller rather than responding with the nil that means 'leadership was lost during transfer' (raft.go:740-744). The retained test for an address the transport cannot use fixes that expectation from the caller's side, requiring an error that names the failed TimeoutNow RPC. So the readiness gap cannot by itself produce the misleading-success outcome; that outcome needs the target to be reachable exactly when TimeoutNow is sent while its cursor is still uncorroborated, i.e. inside the interval between the peer becoming reachable and its first AppendEntries response being processed, during which the leader's own replication loop is also probing it with the same frequency. The finding therefore stands as an evidence gap in the readiness test with a narrow window, and the earlier records' conditional framing is kept; what changes is that the harm now has a stated ceiling rather than an open one.",
+      "answers": {},
+      "knowledge": [
+        {
+          "entry_id": "162b6ef916694a80b964ee328b61dd44-knowledge-0",
+          "revision": 1,
+          "assertion": "The cursor is seeded optimistically and is not corrected by transport errors."
+        }
+      ],
+      "counterevidence": [
+        "A target that is reachable but unable or unwilling to act on TimeoutNow still produces a caller-visible error through the transfer-timeout branch, so the false-success path is reserved for the case where the leader genuinely loses leadership.",
+        "The retained invalid-address test exercises the unreachable case only through a bogus address; it does not construct a target that becomes reachable between the readiness check and the TimeoutNow, so it bounds the harm without covering the residual window.",
+        "If the residual window is hit, the outcome is a leadership change to some other node with a success report - not lost committed data, since the behind target cannot win the induced election thanks to the voters' log comparison.",
+        "No execution: the window's duration was reasoned from the replication cadence and the error path, not measured."
+      ],
+      "limitations": [
+        "This is a successor opinion for the same question; the earlier interpretation and its counterevidence remain recorded.",
+        "The residual window is not quantified; a measurement would need the target's return timing and the leader's replication probe interval, which were not exercised.",
+        "Only the transfer path's caller-visible error handling was re-read for this record."
+      ],
+      "joint_history": "",
+      "failure_attribution": null,
+      "report_title": "收窄：不可达目标会先报错，转移就绪缺口只剩极窄窗口",
+      "report_answer": "本次对“转移就绪依据”发现做了收窄（仅源码，未执行）。关键保护路径：若目标仍不可达，TimeoutNow 调用本身失败，该错误会被包装并上报（raft.go:1024-1030），leader 侧 goroutine 会把 done 通道上的非 nil 错误转交给调用方，而不是使用表示“转移期间失去领导权”的 nil 成功响应（raft.go:740-744）；保留测试也对不可用地址固定了这一期望——调用方必须收到提示 TimeoutNow RPC 失败的报错。因此“就绪游标未获证实”本身不足以产生误导性的成功：要落到该分支，必须先决条件是目标在发送 TimeoutNow 那一刻已可达、而其复制游标仍未获证实，即窗口仅为“对端恢复可达至其首个 AppendEntries 响应被处理之间”，且 leader 自身复制循环在同一频率上持续探测。故该发现仍作为“就绪测试的证据缺口”保留，危害上限已明确：即便命中窗口，后果也只是领导权转移到其他节点并返回成功，而非已提交数据丢失（落后的目标无法当选，因为投票者仍执行日志比较）。前一轮解释与反证均保留。"
+    }
+  ],
+  "experiment": null,
+  "stop": null
+}

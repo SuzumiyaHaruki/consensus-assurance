@@ -1,0 +1,71 @@
+{
+  "rationale": "Closing the source-decidable half of the recorded vote-record question and sharpening its mechanism. Part (a) of the discriminator was 'whether any supported store or the surrounding code makes the pair atomic': searching the captured tree shows the two keys are written only by persistVote, as two single-key operations, with no batching anywhere, so within the captured code the pair is never atomic and the remaining unknown is store-level behaviour plus severity. Reading the two writes against the duplicate branch also shows the order is load-bearing: because the candidate is written second, the crash artifact is a newer term with the earlier candidate, which the branch answers with a grant that skips the log comparison; the opposite order would instead produce a refusal for a legitimately re-requesting candidate. The earlier opinion is preserved and a successor interpretation narrows the question from 'whether the window exists' to 'what the window's grant is worth'.",
+  "sources": [
+    {
+      "id": "src_vote_keys_definition",
+      "file": "raft.go",
+      "start_line": 27,
+      "end_line": 29,
+      "kind": "code_observation"
+    },
+    {
+      "id": "src_persistVote_two_writes",
+      "file": "raft.go",
+      "start_line": 2130,
+      "end_line": 2138,
+      "kind": "code_observation"
+    },
+    {
+      "id": "src_vote_duplicate_branch",
+      "file": "raft.go",
+      "start_line": 1697,
+      "end_line": 1705,
+      "kind": "code_observation"
+    }
+  ],
+  "knowledge": [
+    {
+      "ref": "@k_vote_record_write_order_is_load_bearing",
+      "kind": "fact",
+      "statement": "The vote record uses two named stable-store keys (the vote term and the encoded candidate identity), and within the captured tree the only writer is persistVote, which performs two single-key operations with the term first and the candidate second; no batching or transaction is used, and no other code path writes either key. The write order decides which artifact a crash inside the pair can leave, and the duplicate branch turns that artifact into opposite verdicts: with the term written and the candidate not, the record reads as 'this term, the previous term's candidate', so that candidate's later request at the term is answered by the identity comparison and granted without the log up-to-dateness check; with the reverse order the artifact would read as 'the previous term, this term's candidate', which the branch answers by refusing any other identity at the previous term - a lost re-vote rather than an unchecked grant. The committed order therefore produces the permission-shaped artifact rather than the refusal-shaped one.",
+      "conditions": "Requires a process stop between the two writes and a later vote request at the stored term from exactly the identity stored in the candidate key; the branch's verdict depends only on encoded identity equality, and the term key alone gates whether the branch is taken.",
+      "source_ids": [
+        "src_vote_keys_definition",
+        "src_persistVote_two_writes",
+        "src_vote_duplicate_branch"
+      ]
+    }
+  ],
+  "interpretations": [
+    {
+      "investigation_id": "e4268f4f179d446bbd43667074a659a0-question-0",
+      "source_ids": [
+        "src_vote_keys_definition",
+        "src_persistVote_two_writes",
+        "src_vote_duplicate_branch"
+      ],
+      "conclusion": "conditional",
+      "rationale": "The preceding record left the question unresolved on two grounds: whether the write pair can be atomic, and what the resulting grant is worth. The first ground is now settled within the captured material. The vote keys are named in one place and are written only by persistVote, which issues two single-key operations over an interface that offers no batch primitive, and no other code path writes either key, so in this codebase the pair is never atomic; the only remaining variability is store-level behaviour outside the captured tree. The second ground is sharpened rather than settled: the artifact depends on the write order, and the order used here - term then candidate - makes the artifact 'newer term with the earlier candidate identity', which the duplicate branch answers by the identity comparison, granting that candidate at the newer term without the log comparison. The opposite order would instead produce a denial for a candidate that genuinely re-requested at the earlier term, so the committed order is the one that can hand out a permission the first-time path would not have. What remains conditional is the harm: the grant removes the freshness evidence for one voter, and whether that changes a cluster's outcome depends on the vote split and on the intersection between any quorum and the nodes holding the committed entries. The finding is therefore recorded as 'a grant that skips the freshness check is producible under a stop between the two writes', not as 'a committed entry is lost'.",
+      "knowledge": [
+        {
+          "entry_id": "e4268f4f179d446bbd43667074a659a0-knowledge-0",
+          "revision": 1,
+          "assertion": "The vote record is two independent writes and the duplicate branch grants on identity bytes without the log comparison."
+        }
+      ],
+      "counterevidence": [
+        "The crash must interrupt a write pair that the node reaches only after all vote checks have already passed for that term, so the stuck record names a candidate the node was in the act of granting to at that term; the anomaly is that a later request at the same term from the earlier term's identity is answered as if a vote had been completed.",
+        "The record still admits at most one grant per term, so the window cannot produce a double vote at the same term.",
+        "Without the log having advanced past the requester since the earlier vote, the skipped comparison would have succeeded anyway and the grant would carry the same evidence.",
+        "Store-level behaviour remains unexamined: the interface permits atomic or batched implementations that the captured code does not use, and no supported store implementation is in the tree.",
+        "No execution or receipt: the window was reasoned from the write order and the branch, not observed."
+      ],
+      "limitations": [
+        "This is a successor opinion for the same question; the earlier unresolved interpretation stays recorded alongside it.",
+        "The severity judgement - whether a quorum can be formed from voters that either lack the entry or answer from the anomalous record - was not carried further and is not claimed.",
+        "Search for other writers of the two keys covered the captured tree only."
+      ],
+      "report_title": "细化：投票记录写入顺序决定了崩溃残留是“未做日志比较的授权”",
+      "report_answer": "本次把上一轮未决问题中可由源码判定的部分收口（仅源码，未执行）。一是原子性：投票任期与候选人身份分别由 persistVote 以两次逐键写入完成，捕获代码中没有任何批量/事务写入，也没有其他代码路径写这两个键，因此在本代码库内这对写入从不是原子的，剩余不确定性只在存储实现层面。二是写入顺序的分量：因为先写任期、后写候选人，进程在两者之间停止时残留的是“较新任期 + 较早期任期的候选人身份”，重复投票分支会据此按身份字节相等授予该候选人在该任期的选票，且不做日志新旧比较；反之若先写候选人，残留将是“较旧任期 + 本次候选人”，分支会对该任期上其他身份的请求直接拒绝——那是少投一次的活性瑕疵而不是未经比较的授权。因此当前顺序产生的是“许可型”残留。仍属条件性的部分是危害：该授权只为一名投票者去掉了新鲜度证据，是否改变集群结果取决于投票划分，以及任何仲裁集合与持有已提交条目节点集合的交集，故记录为“在一次写入中断条件下可以产生跳过新鲜度检查的授权”，而非“已提交条目丢失”。上一轮结论与反证均保留。"    }
+  ]
+}

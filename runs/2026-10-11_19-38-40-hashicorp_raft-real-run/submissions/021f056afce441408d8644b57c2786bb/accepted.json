@@ -1,0 +1,96 @@
+{
+  "rationale": "Sharpening the snapshot-install coverage record by reading what its convergence assertion actually compares. It compares the sequence of command payloads each FSM applied plus the configuration history each FSM saw; it does not compare the Raft log, applied or commit indexes, or replication bookkeeping. That means the assertion is sensitive to a follower that stops making progress (a length mismatch fails the test after the longstop timeout) but blind to the specific state the recorded cycle involves - and no retained scenario constructs the cycle's premise, so that sensitivity was never aimed at it.",
+  "sources": [
+    {
+      "id": "src_cluster_ensuresame",
+      "file": "testing.go",
+      "start_line": 614,
+      "end_line": 677,
+      "kind": "test_expectation"
+    },
+    {
+      "id": "src_mockfsm_applied_log",
+      "file": "testing.go",
+      "start_line": 76,
+      "end_line": 107,
+      "kind": "test_expectation"
+    }
+  ],
+  "investigations": [
+    {
+      "id": null,
+      "ref": "@q_ensuresame_scope",
+      "question": "What does the retained convergence assertion compare, and what would it therefore have detected about a follower that keeps reinstalling a snapshot instead of making progress?",
+      "source_ids": [
+        "src_cluster_ensuresame",
+        "src_mockfsm_applied_log"
+      ],
+      "hypothesis": "The assertion compares, between every node, the ordered slice of command payloads their FSM applied and the sequence of configurations their FSM recorded, retrying until a longstop timeout and then failing with a length or content mismatch. It compares no Raft-level state: not the log store, not applied/commit indexes, not replication cursors. So it would detect a stalled follower as a payload-length mismatch, but it would not detect a follower whose applied payloads happen to match while its log or cursor state does not.",
+      "discriminator": "Refuted if the assertion also compares logs, indexes or cursors, or if the FSM it uses records something other than the applied payloads. Reading the helper and the FSM implementation settles it.",
+      "disposition": "explained",
+      "parent_id": null,
+      "knowledge": null,
+      "counterevidence": null,
+      "limitations": [
+        "Coverage of the assertion only; it says nothing about whether the recorded cycle occurs.",
+        "The helper's sensitivity to a stall depends on the longstop timeout being long enough for the mismatch to appear within a test run."
+      ],
+      "resume_conditions": null
+    }
+  ],
+  "knowledge": [
+    {
+      "id": null,
+      "ref": "@k_ensuresame_compares_applied_payloads_only",
+      "kind": "fact",
+      "statement": "The retained cluster convergence assertion compares, across all nodes, two things: the ordered slice of command payloads each FSM applied, and the sequence of configurations each FSM recorded. It checks lengths and then byte-compares each entry, retrying on mismatch until a longstop deadline before failing the test. The FSM used records exactly those applied payloads (its Apply appends the entry's data under a lock) and replaces them wholesale on Restore from a snapshot stream. The assertion therefore observes applied progress and FSM-visible configuration history only: it reads no Raft log, no applied or commit index, no match or next index, and no node configuration object.",
+      "conditions": "Read as harness behaviour in the captured snapshot; the retry loop means a transient difference is tolerated until the deadline, so the assertion detects persistent divergence rather than momentary lag.",
+      "source_ids": [
+        "src_cluster_ensuresame",
+        "src_mockfsm_applied_log"
+      ],
+      "executions": {},
+      "changed_premise": "",
+      "affected_uses": []
+    }
+  ],
+  "gaps": [],
+  "interpretations": [
+    {
+      "investigation_id": "4cf31a0956264d7db7657595b46e92b4-question-0",
+      "experiment_id": null,
+      "source_ids": [
+        "src_cluster_ensuresame",
+        "src_mockfsm_applied_log"
+      ],
+      "executions": {},
+      "conclusion": "explained",
+      "rationale": "The earlier record for this question said the two snapshot tests assert convergence, and that the follower in their premise is strictly behind the snapshot index, which is the case the snapshot-preference logic already handles. Reading the assertion itself refines what 'convergence' means here and how strong the retained negative is. The helper compares the ordered payloads each FSM applied and the configurations each FSM recorded, with a retry window before failure (testing.go:614-677), and the FSM it inspects holds exactly the applied payloads, replaced wholesale when a snapshot is restored (testing.go:76-107). Two consequences follow. First, the assertion is sensitive to a follower that stops making progress: a node stuck in a snapshot loop would stop applying the leader's later commands, so the payload lengths would differ and the test would fail once the retry window expired - meaning the retained suite is not simply blind to stalls of this shape. Second, the assertion is nevertheless blind to the state the recorded cycle concerns: it never reads the log store, the applied or commit indexes, the replication cursor or the node configuration, so a follower whose applied payloads match while its log and cursor state do not would pass. Because no retained scenario constructs the cycle's premise (the node tests cover only the index-behind case and the randomized harness effectively disables snapshots, both recorded earlier), that sensitivity was never aimed at the cycle; the honest summary is that the retained evidence would likely catch a stalled follower if a test set the premise up, and that no retained test does.",
+      "answers": {},
+      "knowledge": [
+        {
+          "entry_id": "4cf31a0956264d7db7657595b46e92b4-knowledge-0",
+          "revision": 1,
+          "assertion": "The retained snapshot tests fix only the index-behind premise and assert convergence after reconnect."
+        }
+      ],
+      "counterevidence": [
+        "The assertion's sensitivity to payload-length divergence is real protective value: a follower that falls behind and stays behind fails the test, so the snapshot tests are not vacuous about progress.",
+        "Some retained tests do compare node configurations through a separate helper, so the absence of Raft-state comparison in this assertion does not mean the suite never inspects configuration.",
+        "This record does not change the mechanism findings; it narrows how much reassurance the retained suite's passing can be taken to provide.",
+        "No execution: the helper and FSM were read, not run."
+      ],
+      "limitations": [
+        "A successor opinion for the same question; the earlier interpretation and its counterevidence remain recorded.",
+        "The sensitivity claim assumes the retry window is long enough for a stalled follower to be observed, which was not measured.",
+        "Only this assertion was read; other helpers in the harness were not re-examined here."
+      ],
+      "joint_history": "",
+      "failure_attribution": null,
+      "report_title": "细化覆盖结论：收敛断言只比较“已应用命令载荷”，对停滞敏感但不看日志与复制状态",
+      "report_answer": "本次细化快照安装的覆盖结论（仅源码阅读，未执行）。该断言的比较对象是：各 FSM 按顺序应用的命令载荷序列，以及各 FSM 记录到的配置序列；长度不同或字节不同时在 longstop 期限内重试，超时则判失败（testing.go:614-677）；所使用的 FSM 恰好只在 Apply 时追加条目载荷、在 Restore 时整体替换（testing.go:76-107）。由此得到两点：其一，断言对“停止推进的跟随者”是敏感的——陷入快照循环的节点不会再应用 leader 后续命令，载荷长度会出现差异并在重试窗口结束后失败，因此保留套件并非对这类停滞完全无感；其二，断言并不读取日志存储、已应用/提交索引、复制游标或节点配置，因此“已应用载荷一致而日志与游标状态不一致”的跟随者可以通过。又因为保留场景从未构造该循环的前提（单元测试只覆盖“落后于快照索引”的情形，随机套件几乎禁用了快照，均已有记录），这项敏感性从未被对准该循环。诚实的总结是：若有人把前提搭起来，保留证据很可能能发现停滞的跟随者；但没有任何保留测试这么做。"
+    }
+  ],
+  "experiment": null,
+  "stop": null
+}

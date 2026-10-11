@@ -1,0 +1,90 @@
+{
+  "rationale": "Independent direction after three passes on the election-threshold question: the production transport's heartbeat fast path, because it deliberately runs a consensus handler on a connection goroutine while the main thread may be blocked, and the code comments impose a safety requirement on that arrangement. Reading the admission condition and the handler's guards settles whether the requirement holds, and records a source-explained protective mechanism rather than a defect.",
+  "sources": [
+    {
+      "id": "src_net_heartbeat_fastpath_condition",
+      "file": "net_transport.go",
+      "start_line": 664,
+      "end_line": 687,
+      "kind": "code_observation"
+    },
+    {
+      "id": "src_net_heartbeat_fastpath_dispatch",
+      "file": "net_transport.go",
+      "start_line": 724,
+      "end_line": 733,
+      "kind": "code_observation"
+    },
+    {
+      "id": "src_api_heartbeat_concurrency_requirement",
+      "file": "api.go",
+      "start_line": 613,
+      "end_line": 616,
+      "kind": "code_observation"
+    },
+    {
+      "id": "src_appendentries_commit_guard",
+      "file": "raft.go",
+      "start_line": 1565,
+      "end_line": 1572,
+      "kind": "code_observation"
+    }
+  ],
+  "investigations": [
+    {
+      "ref": "@q_heartbeat_fastpath_safety",
+      "question": "Can the transport's heartbeat fast path, which runs a consensus handler on a connection goroutine, touch commit, log or configuration state that the main loop owns?",
+      "source_ids": [
+        "src_net_heartbeat_fastpath_condition",
+        "src_net_heartbeat_fastpath_dispatch",
+        "src_api_heartbeat_concurrency_requirement",
+        "src_appendentries_commit_guard"
+      ],
+      "hypothesis": "The fast path is admitted only for a request whose previous-log fields, entry list and leader commit index are all zero, and for those inputs the handler reduces to thread-safe mutations (atomic state/term, mutex-protected leader and last-contact fields), leaving commit advancement, log application and configuration reads on the main thread - so the arrangement the registration comment requires is satisfied and the guard is the admission test itself.",
+      "discriminator": "Refuted by any request shape that reaches the fast path while carrying entries or a non-zero leader commit index, by any main-thread-owned read or write performed before those guards, or by the fast path being taken for the commit-index-only re-replication the replication loop sends on its CommitTimeout. A race-detector run over a large-cluster snapshot catch-up would be the executed form.",
+      "disposition": "active",
+      "limitations": [
+        "Source-only (this run's experiment capacity is exhausted); no race detector was run.",
+        "Covers the NetworkTransport path only; the in-memory test transport stores the handler without using it in its RPC path."
+      ]
+    }
+  ],
+  "knowledge": [
+    {
+      "ref": "@k_heartbeat_fastpath_admission_scope",
+      "kind": "fact",
+      "statement": "The heartbeat fast path is admitted only for an AppendEntries request whose term is non-zero, whose leader address is present, and whose PrevLogEntry, PrevLogTerm, Entries and LeaderCommitIndex are all zero; only then does the transport invoke the registered handler directly on the connection goroutine instead of handing the RPC to the consumer channel. For exactly those inputs appendEntries performs the term branch, records the sender as leader and refreshes last contact, because the previous-log check is guarded by PrevLogEntry > 0, the entry processing loop by a non-empty entry list, and the commit-index block by LeaderCommitIndex > 0 with a strictly greater value; the fields it does touch are protected by an atomic state/term, the leader mutex and the last-contact mutex. A commit-index-only AppendEntries (the re-replication the replication loop sends on its CommitTimeout) therefore does not qualify and stays on the main thread, so the fast path never updates commit state, never applies logs and never reads the configuration from a non-main goroutine.",
+      "conditions": "Applies to the default NetworkTransport, which is where a registered heartbeat handler is fast-pathed; the in-memory test transport stores the handler but routes RPCs through the same consumer channel as everything else. The requirement that makes this safe is stated at the registration site as a comment on the caller.",
+      "source_ids": [
+        "src_net_heartbeat_fastpath_condition",
+        "src_net_heartbeat_fastpath_dispatch",
+        "src_api_heartbeat_concurrency_requirement",
+        "src_appendentries_commit_guard"
+      ]
+    }
+  ],
+  "interpretations": [
+    {
+      "investigation_id": "@q_heartbeat_fastpath_safety",
+      "source_ids": [
+        "src_net_heartbeat_fastpath_condition",
+        "src_net_heartbeat_fastpath_dispatch",
+        "src_api_heartbeat_concurrency_requirement",
+        "src_appendentries_commit_guard"
+      ],
+      "conclusion": "explained",
+      "rationale": "The question was whether running a consensus handler off the main thread can touch state that the main loop owns. The admission condition answers it: the transport classifies a request as a heartbeat only when the term is set, the leader address is present, and the previous-log fields, the entry list and the leader commit index are all zero (net_transport.go:664-687), and only such a request is handed to the registered handler on the connection goroutine (net_transport.go:724-733). With those zeros, appendEntries cannot reach the previous-log comparison, the entry loop, or the commit-index block - the latter guarded by LeaderCommitIndex > 0 (raft.go:1565-1572) - so it cannot advance the commit index, apply logs, or read the configuration, and it leaves the FSM channel, the log store and the inflight bookkeeping to the main thread. What it does do is thread-safe by construction: state and term are atomics, and the leader and last-contact fields are mutex-protected. The registration site states the requirement explicitly ('It MUST be safe for this to be called concurrently with a blocking RPC', api.go:613-616), and the restriction in the admission condition is what satisfies it. Negative result: no defect recorded here, and the protective mechanism is the zero-field admission test rather than anything inside the handler.",
+      "counterevidence": [
+        "The safety argument rests entirely on the admission condition: relaxing it to admit requests with entries or a non-zero commit index would put commit advancement, log application and configuration reads on a connection goroutine concurrently with the main loop, which is the arrangement the comment forbids.",
+        "The handler still mutates state and term and records a leader from that goroutine, so the guarantee is 'no main-loop-owned commit/FSM/log state is touched', not 'the handler is read-only'.",
+        "This record covers the NetworkTransport path only; the in-memory transport stores the handler but does not use it in its RPC path, so nothing here transfers to test transports as a concurrency statement.",
+        "No execution: the reasoning is from the admission test and the handler's guards, not from a race detector run."
+      ],
+      "limitations": [
+        "Source-only reading of one transport; other transport implementations in the wild may fast-path different message shapes, which would need their own admission argument.",
+        "The record is a protective-mechanism finding, not a defect; it constrains the admission condition's future change rather than reporting current misbehaviour."
+      ],
+      "report_title": "保护机制记录：心跳快路径的准入条件限制了它在非主线程上能触碰的状态",
+      "report_answer": "本次记录一个源码层面的保护机制（非缺陷；仅源码，实验额度已用尽）。NetworkTransport 只有在 AppendEntries 请求满足“term 非零、leader 地址存在、PrevLogEntry/PrevLogTerm/Entries/LeaderCommitIndex 全为零”时，才把它当作心跳并直接在连接 goroutine 上调用已注册的 heartbeat 处理函数（net_transport.go:664-687、724-733）。在这些字段为零的前提下，appendEntries 无法进入 prev-log 比较、条目循环与提交索引分支（后者由 LeaderCommitIndex > 0 把关，raft.go:1565-1572），因此不会在主线程之外推进提交、应用日志或读取配置；它确实触碰的 state/term 为原子字段，leader 与 lastContact 由互斥量保护。注册处的注释明确要求该处理必须可与阻塞中的 RPC 并发（api.go:613-616），而满足这一要求的关键正是上述准入条件。因此本项为负面结果：未记录缺陷，且保护来自准入测试本身——若放宽该条件以接纳带条目或带提交索引的请求，就会把提交推进/日志应用/配置读取放到连接 goroutine 上并发执行，正是注释所禁止的情形。"    }
+  ]
+}

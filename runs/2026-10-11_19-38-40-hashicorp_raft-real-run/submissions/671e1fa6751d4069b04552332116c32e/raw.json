@@ -1,0 +1,80 @@
+{
+  "rationale": "Checking a protective note in the configuration-change admission path: the helper that opens the configuration-change channel carries a warning that a transition of its conditions from outside the leader loop would need the loop to be kicked. Reading where each input to that condition can change for a leader - the latest and committed configuration indexes and the raft commit index - shows both inputs move only from inside the leader loop along the leader's own paths, plus one path that coincides with stepping down, so the warned-about missed wakeup does not arise from current code. Recorded as a source-explained negative with the caveat stated.",
+  "sources": [
+    {
+      "id": "src_configchange_ch_if_stable",
+      "file": "raft.go",
+      "start_line": 647,
+      "end_line": 663,
+      "kind": "code_observation"
+    },
+    {
+      "id": "src_leaderloop_commit_handler",
+      "file": "raft.go",
+      "start_line": 786,
+      "end_line": 800,
+      "kind": "code_observation"
+    },
+    {
+      "id": "src_append_config_entry_updates",
+      "file": "raft.go",
+      "start_line": 1235,
+      "end_line": 1240,
+      "kind": "code_observation"
+    }
+  ],
+  "investigations": [
+    {
+      "ref": "@q_configchange_channel_wakeup",
+      "question": "Can the configuration-change admission condition flip from closed to open without the leader loop being woken, so that an accepted change request is never dispatched?",
+      "source_ids": [
+        "src_configchange_ch_if_stable",
+        "src_leaderloop_commit_handler",
+        "src_append_config_entry_updates"
+      ],
+      "hypothesis": "No, not through the leader's own paths. The condition reads the latest and committed configuration indexes and the current commit index; while the node is leader, appendConfigurationEntry writes the latest index from inside the loop, and the commit handler inside the same loop writes both the commit index and the committed configuration index. Commitment bookkeeping is advanced by replication goroutines but only feeds a notification channel that the loop consumes, so no input changes while the loop is not looking. The one receive-side path that can change the latest configuration index for a same-term node (appendEntries appending a configuration entry) is either irrelevant to a leader because it also transitions the node to follower, or applies to a transfer candidacy, which is not in the leader loop.",
+      "discriminator": "Refuted if any path can raise either the commit index or the latest configuration index of a running leader outside the leader loop, or if the helper is consulted only once per iteration in a way that skips re-evaluation after the commit handler runs. An executed witness would be an accepted configuration change whose future stays pending while the conditions are actually satisfied.",
+      "disposition": "explained",
+      "limitations": [
+        "Source-only (this run's experiment capacity is exhausted).",
+        "The claim is about the leader's own paths and the receive-side paths that exist in the captured code; a future change that adds another writer of those fields would invalidate it, which is what the note itself warns about."
+      ]
+    }
+  ],
+  "knowledge": [
+    {
+      "ref": "@k_config_change_admission_wakeup_is_internal",
+      "kind": "fact",
+      "statement": "The configuration-change admission helper returns the request channel only when the latest configuration index equals the committed configuration index and the raft commit index has reached the current leader term's start index; otherwise it returns nil so the select cannot receive. For a running leader, both inputs change only from inside the leader loop: appending a configuration entry sets the latest configuration and its index from within the loop, and the commit-notification handler updates the commit index and, when the latest configuration's index has been reached, the committed configuration index. Replication goroutines advance the commitment object's internal match indexes but surface that only through the commit channel the loop consumes. The helper carries a note that a transition of these conditions from outside the loop would need the loop to be kicked; in the captured code no such external writer exists for a leader, and the one receive-side writer of the latest configuration index changes a leader's state to follower in the same handler, so the note describes a constraint on future changes rather than an open hazard.",
+      "conditions": "Read from the admission helper, the commit-notification handler and the configuration-append path; assumes the leader is not shutting down and that its replication goroutines cannot write the raft commit index or the configuration fields directly (they notify instead).",
+      "source_ids": [
+        "src_configchange_ch_if_stable",
+        "src_leaderloop_commit_handler",
+        "src_append_config_entry_updates"
+      ]
+    }
+  ],
+  "interpretations": [
+    {
+      "investigation_id": "@q_configchange_channel_wakeup",
+      "source_ids": [
+        "src_configchange_ch_if_stable",
+        "src_leaderloop_commit_handler",
+        "src_append_config_entry_updates"
+      ],
+      "conclusion": "explained",
+      "rationale": "This was a liveness question about the admission path for membership changes: the helper returns nil unless the latest configuration is committed and the leader has committed an entry in its term, and its own note says that a transition of those conditions from outside the loop would require the loop to be kicked. Reading the writers settles it. The latest configuration index is written by the configuration-append path, which runs inside the leader loop (raft.go:1235-1240), and the commit index and committed configuration index are written by the commit-notification handler in the same loop (raft.go:786-800); the commitment object's internal match indexes are advanced by replication goroutines but only notify. Since the loop re-evaluates the select after each of those handlers, the condition is re-read immediately after any input changes, so an accepted change request cannot be left waiting on a condition that has already become true. The remaining receive-side writer of the latest configuration index - a same-term appendEntries carrying a configuration entry - either drives the node out of the leader state in the same handler (the step-down condition) or applies to a transfer candidacy, which is not in the leader loop at all. This is a negative result: the warned-about hazard is a constraint on future changes to these fields, and the current code respects it.",
+      "counterevidence": [
+        "The helper's note is a real maintenance constraint: adding any new writer of the commit index or of the configuration fields outside the loop would reintroduce the missed-wakeup hazard the note describes.",
+        "The condition also depends on the leader-term start index, which is fixed at leader setup and cannot change during a term, so the only live inputs are the two indexes discussed.",
+        "A leader that received a same-term appendEntries with a configuration entry would already be leaving the leader state, so the change is not a counterexample to the wakeup property even though it does write the field.",
+        "No execution: the analysis is structural, and no accepted request was observed to remain pending."
+      ],
+      "limitations": [
+        "Source-only reading of one admission path; nothing is claimed about the wider leader loop's progress beyond this condition.",
+        "The negative is valid for the captured code and would need re-derivation if another writer of the relevant fields were added."
+      ],
+      "report_title": "负面结论：配置变更准入条件的唤醒完全发生在 leader 循环内部",
+      "report_answer": "本次记录一个负面结论（仅源码，未执行，本运行实验额度已用尽）。疑问来自配置变更准入辅助函数的注释：若其条件在 leader 循环之外变为真，就需要显式唤醒循环，否则已接受的变更请求可能一直得不到派发。核对各输入的写入方后可知，对运行中的 leader 而言两个输入都只在循环内部变化：追加配置条目时由循环内写入 latest 配置及其索引（raft.go:1235-1240），提交通知处理里写入提交索引并在达到该配置索引时写入已提交配置（raft.go:786-800）；复制 goroutine 只推进 commitment 内部匹配索引并通过通道通知循环。循环在每次处理完这些分支后都会重新求值 select，故条件一旦为真即被重新读取，不会出现“条件已满足但请求仍挂起”。唯一在接收侧写入 latest 配置索引的路径（同任期的 appendEntries 携带配置条目）会在同一处理函数中把节点带离 leader 状态，或只适用于不在 leader 循环中的转移候选。故该注释是对未来改动者的维护约束，而非当前代码的未决风险；反证亦保留：任何新增的循环外写入者都会重新引入该风险。"    }
+  ]
+}

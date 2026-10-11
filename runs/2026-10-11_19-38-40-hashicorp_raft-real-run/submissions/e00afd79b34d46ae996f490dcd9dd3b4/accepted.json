@@ -1,0 +1,111 @@
+{
+  "rationale": "New direction on the reload path, which borders on the theme's context transitions: two reloadable fields are consumed by the same loops but the wake condition names only one of them. The candidate loop contains a branch whose evident purpose is to adopt a changed election timeout, and the only notifier for that branch fires when the heartbeat timeout decreases; reading the two together shows a reload that changes the election timeout alone cannot reach the branch. Recorded with severity graded honestly: bounded and without safety impact, but an implementation mismatch between the refresh and what wakes it.",
+  "sources": [
+    {
+      "id": "src_reloadconfig_notify_condition",
+      "file": "api.go",
+      "start_line": 733,
+      "end_line": 739,
+      "kind": "code_observation"
+    },
+    {
+      "id": "src_candidate_electiontimeout_refresh",
+      "file": "raft.go",
+      "start_line": 423,
+      "end_line": 427,
+      "kind": "code_observation"
+    },
+    {
+      "id": "src_follower_notify_rearms_timer",
+      "file": "raft.go",
+      "start_line": 208,
+      "end_line": 212,
+      "kind": "code_observation"
+    },
+    {
+      "id": "src_config_electiontimeout_doc",
+      "file": "config.go",
+      "start_line": 285,
+      "end_line": 292,
+      "kind": "document_statement"
+    }
+  ],
+  "investigations": [
+    {
+      "id": null,
+      "ref": "@q_electiontimeout_reload_wakeup",
+      "question": "When a reload changes the election timeout, which running state adopts the new value, and what wakes it to do so?",
+      "source_ids": [
+        "src_reloadconfig_notify_condition",
+        "src_candidate_electiontimeout_refresh",
+        "src_follower_notify_rearms_timer",
+        "src_config_electiontimeout_doc"
+      ],
+      "hypothesis": "The candidate loop has a branch that compares its current election timeout with the configured value and re-arms the timer when they differ, and that branch is woken by the follower notification channel, which the reload path signals only when the heartbeat timeout decreased. A reload that changes the election timeout without decreasing the heartbeat timeout therefore cannot reach the branch, so a running candidacy keeps the timer it started with, while the follower state does re-arm promptly through its own notification case.",
+      "discriminator": "Refuted if the follower notification channel has another producer, if the candidate re-reads the election timeout on some other trigger (for example its own timer or a configuration read), or if the reload path's condition also covers a changed election timeout. An executed witness would be a candidate with a long configured election timeout, a reload that lowers only the election timeout, and observation of when the candidacy restarts.",
+      "disposition": "explained",
+      "parent_id": null,
+      "knowledge": null,
+      "counterevidence": null,
+      "limitations": [
+        "Source-only (this run's experiment capacity is exhausted); no reload was exercised against a running candidate.",
+        "The reloadable-configuration documentation for this field states what it means, not when a change takes effect, so this is an implementation mismatch with the refresh branch's evident purpose rather than a violated written promise; the impact is bounded because the next candidacy reads the configured value at entry.",
+        "Only the two notification consumers and the reload notifier were traced."
+      ],
+      "resume_conditions": null
+    }
+  ],
+  "knowledge": [
+    {
+      "id": null,
+      "ref": "@k_electiontimeout_reload_wake_mismatch",
+      "kind": "behavior",
+      "statement": "ReloadConfig stores the new configuration and then notifies the leader and follower channels only when the heartbeat timeout decreased, with comments stating that a leader's replication loops must discover a shorter heartbeat timeout and a follower must update its current timer. The follower state consumes that notification by re-arming its heartbeat timer immediately. The candidate state consumes the same notification differently: it compares its captured election timeout with the configured one and, only if they differ, replaces it and re-arms its election timer. Because the notification is gated on the heartbeat timeout, a reload that changes the election timeout alone - including a decrease - never reaches the candidate's comparison branch, so a candidacy in progress keeps the timer it started with even though the configured value has changed; the new value is read when the next candidacy begins. The election timeout is one of the fields documented as reloadable.",
+      "conditions": "Applies while a node is in the candidate state; the follower state is unaffected because it re-arms from the configured value on every iteration and on the notification, and the leader state's use of the notification concerns the heartbeat cadence rather than the election timeout.",
+      "source_ids": [
+        "src_reloadconfig_notify_condition",
+        "src_candidate_electiontimeout_refresh",
+        "src_follower_notify_rearms_timer",
+        "src_config_electiontimeout_doc"
+      ],
+      "executions": {},
+      "changed_premise": "",
+      "affected_uses": []
+    }
+  ],
+  "gaps": [],
+  "interpretations": [
+    {
+      "investigation_id": "@q_electiontimeout_reload_wakeup",
+      "experiment_id": null,
+      "source_ids": [
+        "src_reloadconfig_notify_condition",
+        "src_candidate_electiontimeout_refresh",
+        "src_follower_notify_rearms_timer",
+        "src_config_electiontimeout_doc"
+      ],
+      "executions": {},
+      "conclusion": "explained",
+      "rationale": "The question is which running state adopts a reloaded election timeout and what wakes it. The reload stores the new values and then, conditioned on a decreased heartbeat timeout, notifies the leader and follower channels (api.go:733-739). The follower consumes that notification by re-arming its timer immediately (raft.go:208-212), so heartbeat-driven followership picks up its change at once. The candidate consumes the same notification through a branch whose whole purpose is to adopt a changed election timeout: it compares the captured value with the configured one and, if they differ, replaces it and re-arms the election timer (raft.go:423-427). That branch is therefore unreachable for a reload that changes only the election timeout, because the notification that would wake it is gated on a different field; a candidacy in progress keeps its original timer, and only the next candidacy reads the new value at entry. The mismatch is between the refresh and the wake condition rather than a violated written promise: the reloadable-configuration documentation states what the election timeout means but not when a change takes effect, unlike the trailing-logs entry, which names the point at which the new value applies. Severity is correspondingly moderate: no safety consequence, since the timer only bounds when another election attempt starts and the new value applies to that attempt; the practical effect is that an operator shortening the election timeout during an election storm does not see it take effect in the attempt already in progress. It is recorded because the two sides of the mechanism name different fields, which is the kind of stale-condition gap that survives a review focused on either side alone.",
+      "answers": {},
+      "knowledge": [],
+      "counterevidence": [
+        "The follower path is prompt, and any reload that decreases the heartbeat timeout also wakes the candidate branch, so the gap requires an election-timeout-only change.",
+        "The bounded delay is one election attempt at the old timeout, and the candidate reads the configured value when the attempt ends, so the divergence cannot persist beyond that.",
+        "The field's reload documentation makes no promise about immediate effect, so this is not a breach of a stated duty; the strongest honest reading is that the refresh branch exists for a case its only wake source cannot deliver.",
+        "No execution: the reload was not exercised, and the number of affected election attempts was not measured."
+      ],
+      "limitations": [
+        "Source-only; no runtime observation of a reload against a candidate.",
+        "The record covers the two notification consumers and the notifier; other users of the configuration object were not re-examined.",
+        "The severity judgement is explicitly low: bounded delay, no safety impact."
+      ],
+      "joint_history": "",
+      "failure_attribution": null,
+      "report_title": "重载路径错配：候选者刷新 ElectionTimeout 的分支只由 HeartbeatTimeout 下降唤醒",
+      "report_answer": "本次记录一条新的实现错配（仅源码，未执行，实验额度已用尽）。ReloadConfig 在写入新配置后，仅当 HeartbeatTimeout 降低时才通知 leader/follower 通道（api.go:733-739，注释也写明是让 leader 的复制循环发现更短的心跳超时、以及让 follower 更新当前定时器）。follower 状态收到该通知后立即重新定时（raft.go:208-212），因此心跳驱动的跟随者能立刻生效；而候选者状态对同一通知的处理是：比较已捕获的 electionTimeout 与当前配置值，不同则替换并重设定时器（raft.go:423-427）——该分支的用途正是采纳变化后的 ElectionTimeout，但它只能被“HeartbeatTimeout 下降”唤醒。结果：只修改（即使降低）ElectionTimeout 的重载无法到达该分支，进行中的候选保持启动时的定时器，只有下一次候选在入口处读取新值。该错配不是违背书面承诺：可重载字段的文档只说明 ElectionTimeout 的含义，未承诺生效时点（而 TrailingLogs 的文档明确写了生效时点）。严重性中低：无安全影响，仅影响“选举再次发起”的等待上限，且下一次候选即采用新值；实际影响是运维在选举风暴中调低选举超时，对已经在进行的这次尝试不生效。记录它的理由是两个机制分别指向不同字段，这正是只审查单侧代码时容易漏掉的陈旧条件缺口。"
+    }
+  ],
+  "experiment": null,
+  "stop": null
+}

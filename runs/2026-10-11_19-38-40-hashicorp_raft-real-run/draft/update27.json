@@ -1,0 +1,92 @@
+{
+  "rationale": "Closing a gap left open by the VerifyLeader record: that record noted the heartbeat path submits acknowledgements to pending verifications but never compares the response term, which raised the question of how a leader learns that a peer has moved to a higher term at all. Reading the other response paths shows the discovery is covered by the replication loop's periodic probe, whose response is term-checked, so the heartbeat omission is a latency question bounded by that probe rather than an unhandled case. Recorded as a source-explained negative with the bound stated.",
+  "sources": [
+    {
+      "id": "src_heartbeat_success_branch",
+      "file": "replication.go",
+      "start_line": 407,
+      "end_line": 432,
+      "kind": "code_observation"
+    },
+    {
+      "id": "src_replicateTo_term_check",
+      "file": "replication.go",
+      "start_line": 238,
+      "end_line": 244,
+      "kind": "code_observation"
+    },
+    {
+      "id": "src_handle_stale_term",
+      "file": "replication.go",
+      "start_line": 646,
+      "end_line": 650,
+      "kind": "code_observation"
+    },
+    {
+      "id": "src_commit_timeout_probe_again",
+      "file": "replication.go",
+      "start_line": 163,
+      "end_line": 172,
+      "kind": "code_observation"
+    }
+  ],
+  "investigations": [
+    {
+      "ref": "@q_stale_term_discovery_paths",
+      "question": "How does a leader learn that a peer has moved to a higher term, given that the heartbeat path does not compare the response term?",
+      "source_ids": [
+        "src_heartbeat_success_branch",
+        "src_replicateTo_term_check",
+        "src_handle_stale_term",
+        "src_commit_timeout_probe_again"
+      ],
+      "hypothesis": "Discovery does not depend on the heartbeat path. The replication loop re-probes every peer with an AppendEntries on a commit-timeout cadence and checks the response term there, stopping that peer's replication and signalling the leader to step down when a higher term appears; the pipelined response path checks the same thing. The heartbeat's success branch only refreshes the contact time and submits acknowledgements to pending verifications, so a higher term it observes is surfaced only when a verification happens to be pending.",
+      "discriminator": "Refuted if the periodic probe can be skipped for a peer (for example a peer whose replication loop is idle or stopped), if the heartbeat response term is compared somewhere not read here, or if the commit-timeout trigger does not send a request every interval. An executed witness would be a peer with a higher term reachable only by heartbeats, observing when the leader steps down.",
+      "disposition": "explained",
+      "limitations": [
+        "Source-only (this run's experiment capacity is exhausted); no such peer was constructed.",
+        "The bound on discovery latency is the commit-timeout interval, which the configuration validation only floors at a millisecond, so an operator can choose a large value; that is a tuning consideration noted here rather than a separate finding.",
+        "Replication is stopped for a peer once a higher term is seen, so rediscovery after a step-down relies on the new term's leader setup rather than on the old leader's loop."
+      ]
+    }
+  ],
+  "knowledge": [
+    {
+      "ref": "@k_term_discovery_is_probe_driven",
+      "kind": "fact",
+      "statement": "A leader discovers that a peer has moved to a higher term through response paths that compare terms, not through the heartbeat fast path. The replication loop's commit-timeout trigger sends an AppendEntries to every peer it manages regardless of whether there are entries to send, and the response handling there compares the peer's term with the leader's and, when it is higher, stops replication to that peer and signals the leader to step down; the pipelined decode path performs the same comparison. The heartbeat loop, by contrast, only refreshes the last-contact time on success and submits the response's success bit to any pending leadership verification, without inspecting the term, so a higher term observed by a heartbeat is surfaced only when a verification happens to be waiting. The consequence is that stale-term detection is driven by the periodic probe rather than by the fast path, and its latency is bounded by the commit-timeout interval (and by any replication triggered by new entries) rather than by the heartbeat cadence.",
+      "conditions": "Applies while the leader's replication loop for that peer is running, which is the case for every configured peer other than the local server; the commit-timeout trigger fires every random interval up to the configured commit timeout.",
+      "source_ids": [
+        "src_heartbeat_success_branch",
+        "src_replicateTo_term_check",
+        "src_handle_stale_term",
+        "src_commit_timeout_probe_again"
+      ]
+    }
+  ],
+  "interpretations": [
+    {
+      "investigation_id": "@q_stale_term_discovery_paths",
+      "source_ids": [
+        "src_heartbeat_success_branch",
+        "src_replicateTo_term_check",
+        "src_handle_stale_term",
+        "src_commit_timeout_probe_again"
+      ],
+      "conclusion": "explained",
+      "rationale": "The question arose from the previous record's observation that the heartbeat success branch never compares the response term: it only refreshes the follower's contact time and hands the response's success bit to pending verifications (replication.go:407-432). That looks like a missing term check, so the follow-up is whether a leader could fail to learn that a peer has moved on. It cannot, because a second, independent path covers it: the replication loop's commit-timeout trigger sends an AppendEntries to each peer on every interval (replication.go:163-172), the response handling there compares the peer's term and, on a higher term, stops replication for that peer and signals a step down (replication.go:238-244, 646-650), and the pipelined decode path performs the same comparison. The heartbeat's contribution is narrower than the probe's: it keeps the contact record fresh for the lease and it lets a pending verification conclude, which is also how a verification learns that another leader exists (the success bit is false when the peer's term is higher, and that is submitted as a negative vote). So the omission is real but not an unhandled case: it means the fast path does not shorten term-discovery latency, which is instead bounded by the commit-timeout probe. Recorded as a protective-mechanism negative, with the tuning caveat that the commit timeout is only floored at a millisecond by validation, so a large value lengthens that bound; that is noted as a consideration rather than as a separate finding, since the probe still fires and the step-down still follows.",
+      "counterevidence": [
+        "The bound depends on the commit-timeout probe firing for that peer; if a peer's replication state has been stopped (for example a removed peer) no probe is owed, and the peer is no longer part of the configuration the leader must track.",
+        "The heartbeat path is not useless for discovery: with a verification pending it produces a negative vote that steps the leader down, which is exactly the mechanism VerifyLeader relies on.",
+        "A large commit timeout lengthens the worst case, so this negative is about coverage rather than about promptness.",
+        "No execution: the paths were read, not exercised with a higher-term peer."
+      ],
+      "limitations": [
+        "Source-only; no measurement of discovery latency was made.",
+        "Only the three response paths (heartbeat, standard replication, pipeline decode) were compared; other transports in the wild may add paths of their own.",
+        "This does not change the VerifyLeader record; it bounds one of the questions that record raised."
+      ],
+      "report_title": "负面结论：过期任期的发现由复制循环的周期性探测保证，而非心跳快路径",
+      "report_answer": "本次记录一个负面结论（仅源码，未执行，实验额度已用尽）。问题源自上一条记录：心跳成功分支从不比较响应中的任期，只刷新接触时间并把成功位交给待完成的校验（replication.go:407-432），看上去像是漏检。但 leader 并不会因此发现不了对端任期已升高：复制循环的 CommitTimeout 触发会**每间隔向每个对端各发一次 AppendEntries**（replication.go:163-172），其响应处理会比较任期，一旦更高就停止对该对端的复制并通知 leader 下台（replication.go:238-244、646-650）；流水线解码路径同样比较任期。心跳路径的贡献更窄：维持 lease 所需的接触记录，以及让待完成的校验得出结论（当对端任期更高时成功位为 false，会作为否决票提交——这正是 VerifyLeader 检测到新 leader 的方式）。因此该省略是真实的，但并非未处理的分支：它意味着快路径不会缩短任期发现的延迟，而该延迟的上界由 CommitTimeout 探测决定。作为保护机制记录，并保留一个调优提示：校验只要求 CommitTimeout ≥1ms，取值过大将拉长该上界——这只是注意事项，不另立发现，因为探测仍会发生、下台仍会执行。反证保留：若某对端的复制已停止（如已被移除）则不再欠探测，而它也不再是 leader 需要跟踪的成员；心跳路径在有待完成校验时确实参与发现；以及未执行测量。"    }
+  ]
+}

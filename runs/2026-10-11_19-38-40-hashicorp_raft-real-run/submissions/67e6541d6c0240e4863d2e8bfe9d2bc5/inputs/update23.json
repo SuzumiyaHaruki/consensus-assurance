@@ -1,0 +1,113 @@
+{
+  "rationale": "New direction on completion handling, which the theme's 'how completions become justified' names directly. A client's Apply or VerifyLeader future is resolved by the main loop; checking what happens to requests that the loop has accepted but not yet processed when the instance shuts down shows a completion that is never delivered, reachable through a documented configuration option, with an existing escape hatch that user-facing futures do not arm. Recorded with the harm ceiling and the protections that do exist.",
+  "sources": [
+    {
+      "id": "src_applych_buffering",
+      "file": "api.go",
+      "start_line": 540,
+      "end_line": 544,
+      "kind": "code_observation"
+    },
+    {
+      "id": "src_verifych_buffer",
+      "file": "api.go",
+      "start_line": 566,
+      "end_line": 570,
+      "kind": "code_observation"
+    },
+    {
+      "id": "src_run_returns_without_draining",
+      "file": "raft.go",
+      "start_line": 138,
+      "end_line": 146,
+      "kind": "code_observation"
+    },
+    {
+      "id": "src_leader_defer_resolves_inflight",
+      "file": "raft.go",
+      "start_line": 512,
+      "end_line": 520,
+      "kind": "code_observation"
+    },
+    {
+      "id": "src_future_shutdown_escape",
+      "file": "future.go",
+      "start_line": 103,
+      "end_line": 119,
+      "kind": "interface_statement"
+    },
+    {
+      "id": "src_config_batch_apply_ch_doc",
+      "file": "config.go",
+      "start_line": 169,
+      "end_line": 174,
+      "kind": "document_statement"
+    }
+  ],
+  "investigations": [
+    {
+      "ref": "@q_queued_future_completion_on_shutdown",
+      "question": "When the instance is shut down while client requests have been queued but not yet processed, what resolves those requests' futures?",
+      "source_ids": [
+        "src_applych_buffering",
+        "src_verifych_buffer",
+        "src_run_returns_without_draining",
+        "src_leader_defer_resolves_inflight",
+        "src_future_shutdown_escape",
+        "src_config_batch_apply_ch_doc"
+      ],
+      "hypothesis": "Nothing does. The main loop returns on shutdown without draining any request channel, so requests sitting in a buffered channel are never answered; the leader's cleanup only covers requests already moved to its inflight list; and the future type provides a shutdown escape only if the request carried a shutdown channel, which the user-facing request paths never set. With the documented option that buffers the apply channel, an apply or barrier future can therefore remain unresolved forever, and a verify future can do the same through its buffered channel.",
+      "discriminator": "Refuted if shutdown drains or rejects queued requests, if inflight cleanup reaches channel-queued requests, or if the user-facing enqueue paths arm the futures' shutdown channel. An executed witness would be: enqueue more applies than the loop can process with the buffering option enabled, shut the instance down, and observe futures whose Error() never returns.",
+      "disposition": "explained",
+      "limitations": [
+        "Source-only (this run's experiment capacity is exhausted); no shutdown race was exercised.",
+        "The window depends on the option that buffers the apply channel and on timing: with the default unbuffered channel a request that was accepted has been received by the loop, which then either dispatches it (inflight cleanup covers it) or rejects it.",
+        "The record is about completion of client futures, not about durability or ordering of the entries involved."
+      ]
+    }
+  ],
+  "knowledge": [
+    {
+      "ref": "@k_queued_futures_have_no_shutdown_completion",
+      "kind": "fact",
+      "statement": "Requests that a client has successfully enqueued but that the main loop has not yet processed have no shutdown completion path. The main loop's shutdown case clears the known leader and returns; it does not drain or reject the apply or verify channels. The leader's step-down cleanup responds to requests on its inflight list and to registered verification futures, which covers requests already dispatched or registered but not requests still sitting in a channel. The future type can return a shutdown error from its waiter only through a shutdown channel field, and the captured code sets that field only on the internal restore and configuration futures used inside the loops, never on the futures handed to callers by the apply, barrier, verify, snapshot, restore, bootstrap or transfer entry points. Two request channels are buffered: the apply channel when the configuration option that buffers it is enabled (capacity equal to the maximum append entries), and the verification channel (capacity 64); with buffering, a request can be accepted while the loop is not reading it, so it can be left in the buffer when the loop exits and its caller waits forever. The unbuffered channels - configuration changes, user snapshot, user restore and bootstrap - cannot accept a request the loop has not received, so they are answered even during shutdown handling.",
+      "conditions": "Requires the instance to be shut down between a request being accepted into a buffered channel and the loop consuming it; the apply-channel case additionally requires the buffering option to be enabled, while the verification channel is buffered unconditionally.",
+      "source_ids": [
+        "src_applych_buffering",
+        "src_verifych_buffer",
+        "src_run_returns_without_draining",
+        "src_leader_defer_resolves_inflight",
+        "src_future_shutdown_escape",
+        "src_config_batch_apply_ch_doc"
+      ]
+    }
+  ],
+  "interpretations": [
+    {
+      "investigation_id": "@q_queued_future_completion_on_shutdown",
+      "source_ids": [
+        "src_applych_buffering",
+        "src_verifych_buffer",
+        "src_run_returns_without_draining",
+        "src_leader_defer_resolves_inflight",
+        "src_future_shutdown_escape",
+        "src_config_batch_apply_ch_doc"
+      ],
+      "conclusion": "explained",
+      "rationale": "The responsibility at stake is that a request the library has accepted must eventually be answered, because the caller's only way to learn the outcome is the future it was handed. The library has the machinery for that: the future type's waiter selects on an optional shutdown channel and returns the raft-shutdown error if it fires (future.go:103-119), and the leader's step-down cleanup resolves everything already inflight or registered (raft.go:512-520). The gap is that neither covers requests accepted into a channel and not yet consumed: the main loop's shutdown case returns without draining (raft.go:138-146), and the user-facing entry points never arm the futures' shutdown channel - the only assignments in the captured code are for the internal restore futures and the configuration future used by the snapshot routine. Two channels can hold an accepted request when the loop is not reading: the verification channel with capacity 64, and the apply channel when the option that buffers it is enabled with capacity equal to the maximum append entries (api.go:540-544, 566-570; the option and its purpose are documented in the configuration, config.go:169-174). So a caller that applies commands with that option enabled, or verifies leadership while the loop is busy, and then shuts the instance down, can be left with a future whose Error() never returns; nothing in the captured code would ever respond to it. The ceiling on the harm is what keeps this proportionate: the ambiguity is about the outcome of the accepted request, not about stored data; the leader cleanup still resolves anything actually dispatched; the default configuration leaves the apply channel unbuffered, so the common case is covered; and the shutdown operation is documented as not graceful. It remains a real completion gap for a documented configuration, and for the verification channel it is reachable without any option at all.",
+      "counterevidence": [
+        "The documentation for shutdown says it is not a graceful operation, which tempers the expectation, though it does not say that an accepted request may never be answered.",
+        "The verification channel's buffering exists to keep the shutdown-relevant path fast, and in practice its entries are consumed almost immediately by the leader loop; the window is a race, not a steady state.",
+        "Requests that do get dispatched are covered by the leader's cleanup, so the finding is confined to the queued-but-unconsumed case.",
+        "A caller that owns the process can avoid the hang by using Shutdown's future first or by not blocking on futures during teardown; that is a mitigation, not a resolution, since the caller cannot drain the library's channels.",
+        "No execution: the race was reasoned from the channel capacities, the loop's shutdown branch and the future's escape field, not observed."
+      ],
+      "limitations": [
+        "Source-only, with no measurement of how often the race occurs in practice.",
+        "Only the request channels listed were checked for draining; other internal channels are out of scope.",
+        "The severity judgement is bounded to a client-side wait; no claim is made about entries being lost or reordered."
+      ],
+      "report_title": "完成性缺口：已入队但未处理的 Apply/Verify 请求在关闭后永远不会被应答",
+      "report_answer": "本次记录一个完成性缺口（仅源码，未执行，实验额度已用尽）。职责是：库一旦接受了请求，就必须最终给出应答，因为调用方只能通过拿到的 future 得知结果。库中确有相应机制——future 的等待逻辑可选地监听 shutdown 通道并返回关闭错误（future.go:103-119），leader 的降级清理会应答已计入 inflight 或已登记的请求（raft.go:512-520）。缺口在于：两者都不覆盖“已被通道接受但尚未被主循环消费”的请求——主循环的关闭分支直接返回而不排空通道（raft.go:138-146），而面向用户的入口从未为 future 绑定 shutdown 通道（捕获代码中仅内部 restore future 与快照例程使用的配置 future 绑定了该字段）。两个通道可能持有此类请求：容量 64 的 verify 通道，以及开启“缓冲 apply 通道”选项后容量为 MaxAppendEntries 的 apply 通道（api.go:540-544、566-570；该选项及其用途在配置文档中说明，config.go:169-174）。因此调用方若在开启该选项的情况下提交命令、或在循环繁忙时做 VerifyLeader，随后关闭实例，就可能拿到一个 Error() 永不返回的 future，且没有任何代码会去应答它。危害上限：不确定的是该请求的结果，而非已存储数据；已派发的请求仍由 leader 清理应答；默认配置下 apply 通道无缓冲，常见情形被覆盖；关闭本身也被文档描述为“非优雅”。但这对一个受文档支持的配置而言仍是真实的完成性缺口，而 verify 通道的该问题无需任何选项即可发生。反证一并保留：关闭文档的“非优雅”表述、verify 通道几乎总被立即消费（属竞态而非稳态）、以及调用方可先等待 Shutdown 的 future 作为缓解（但不能替库排空通道）。"    }
+  ]
+}
