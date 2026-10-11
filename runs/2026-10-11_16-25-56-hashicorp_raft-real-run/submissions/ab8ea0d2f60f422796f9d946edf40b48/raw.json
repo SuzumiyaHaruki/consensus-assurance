@@ -1,0 +1,187 @@
+{
+  "rationale": "New A1/A2 direction with a bounded-liveness endpoint: what a client sees when VerifyLeader is issued by a leader that has just been cut off from its quorum. The probe measures the healthy case as a control and the isolated case against a client-side wait limit, with the leader lease set to the heartbeat timeout so the bounded completion path is the lease check. The requested execution turns the local operands into a retained comparison.",
+  "sources": [
+    {
+      "id": "s_check_leader_lease",
+      "file": "raft.go",
+      "start_line": 1036,
+      "end_line": 1081,
+      "kind": "code_observation"
+    },
+    {
+      "id": "s_verify_leader_api",
+      "file": "api.go",
+      "start_line": 883,
+      "end_line": 893,
+      "kind": "code_observation"
+    },
+    {
+      "id": "s_lease_config_validation",
+      "file": "config.go",
+      "start_line": 333,
+      "end_line": 376,
+      "kind": "code_observation"
+    }
+  ],
+  "investigations": [
+    {
+      "ref": "@verify-leader-under-partition",
+      "question": "When a leader that cannot reach a quorum issues VerifyLeader, does the request complete within a bound that the source supports, and does it fail rather than silently succeed, without the caller having to supply its own timeout?",
+      "source_ids": [
+        "s_verify_leader_api",
+        "s_check_leader_lease",
+        "s_leader_cleanup_verify",
+        "s_verify_future_vote",
+        "s_lease_config_validation"
+      ],
+      "hypothesis": "VerifyLeader counts the leader's own vote and then waits for peer replies; with the peers unreachable no reply arrives, so the request can only complete when the leader leaves the leader loop. The lease check is that path: the leader loop samples last contact periodically and steps down when fewer than quorumSize peers were contacted within LeaderLeaseTimeout, and the step-down cleanup responds ErrLeadershipLost to every pending verification. The request should therefore complete in the order of LeaderLeaseTimeout and report an error, while a healthy leader completes immediately.",
+      "discriminator": "On a healthy three-node cluster call VerifyLeader on the leader (control: immediate success), then isolate the leader from both followers and call VerifyLeader again, measuring completion, elapsed time, the returned error and the leader's state against a client-side wait limit several times the lease. A defect needs the request to remain unanswered past the limit or to report success while the leader cannot contact a quorum; prompt failure with the leader stepping down refutes the concern for this configuration.",
+      "disposition": "active",
+      "limitations": [
+        "Native local run of the requested harness (not retained evidence): healthy verification returned nil in 0ms; after isolating the leader the request completed in 304ms with lease 300ms, reported 'leadership lost while committing log' and the node was Follower.",
+        "The configuration requires LeaderLeaseTimeout <= HeartbeatTimeout, so the probe sets heartbeat, election and lease to 300ms; other lease/heartbeat ratios were not exercised.",
+        "The probe isolates the leader rather than crashing it, so the followers elect their own leader while the isolated node is stepping down; that concurrent election is not part of the measured endpoint."
+      ]
+    }
+  ],
+  "knowledge": [
+    {
+      "kind": "behavior",
+      "statement": "A leader that cannot contact a quorum stops being leader through the lease check rather than through the verification itself: the leader loop samples per-peer last contact and steps down when fewer than quorumSize voters were contacted within LeaderLeaseTimeout, after which the step-down cleanup responds ErrLeadershipLost to every future still in the leader's notify set. VerifyLeader therefore completes with an error in the order of the lease when its peers are silent, and configuration validation requires LeaderLeaseTimeout to be at least 5ms and no larger than HeartbeatTimeout.",
+      "conditions": "Applies to Raft.VerifyLeader on a leader whose peers are unreachable in the captured revision; the request itself only counts replies and a false reply steps the leader down immediately, while silence is resolved by the lease check and the step-down cleanup.",
+      "source_ids": [
+        "s_verify_leader_api",
+        "s_check_leader_lease",
+        "s_leader_cleanup_verify",
+        "s_lease_config_validation"
+      ]
+    }
+  ],
+  "experiment": {
+    "investigation_id": "@verify-leader-under-partition",
+    "harness_path": "assurance_verify_partition.go",
+    "files": {},
+    "execution_package": ".",
+    "source_ids": [
+      "s_verify_leader_api",
+      "s_check_leader_lease",
+      "s_leader_cleanup_verify",
+      "s_verify_future_vote",
+      "s_lease_config_validation"
+    ],
+    "anchors": [
+      {
+        "material_id": "s_verify_leader_api",
+        "symbol": "Raft.VerifyLeader",
+        "start_line": 883,
+        "end_line": 893
+      },
+      {
+        "material_id": "s_check_leader_lease",
+        "symbol": "Raft.checkLeaderLease",
+        "start_line": 1036,
+        "end_line": 1081
+      },
+      {
+        "material_id": "s_lease_config_validation",
+        "symbol": "ValidateConfig",
+        "start_line": 333,
+        "end_line": 376
+      }
+    ],
+    "requirement": "VerifyLeader issued by a leader that cannot contact a quorum completes within a bound set by the leader lease and reports an error instead of hanging or claiming success, while the same call on a healthy leader succeeds immediately.",
+    "responsibility": "Verification completion for a stranded leader: the leader loop's lease check that ends leadership, the step-down cleanup that answers pending verifications, and the verification path that counts only peer replies.",
+    "scope": {
+      "description": "One fault-free execution of a normally bootstrapped three-node in-memory cluster with heartbeat, election and leader-lease timeouts all set to 300ms: a control VerifyLeader on the healthy leader, then isolation of the leader from both followers and a second VerifyLeader measured against a 6s client-side wait limit.",
+      "assumptions": [
+        "MakeCluster(3) performs real bootstrap, election and heartbeats through the in-memory transport, and c.Partition isolates the leader while leaving the other two connected to each other.",
+        "LeaderLeaseTimeout must not exceed HeartbeatTimeout, so all three timeouts are set to 300ms and the expected completion bound is a small multiple of that value.",
+        "The client-side wait limit of 6s is generous relative to the 300ms lease, so remaining unanswered past it would be a hang rather than an expected bound.",
+        "The leader is still in the Leader state when the isolated call is issued, so the measured path is the lease check and the step-down cleanup rather than a non-leader rejection."
+      ],
+      "excluded": [
+        "Configurations with other lease, heartbeat or election ratios (for example a lease far below the heartbeat timeout).",
+        "Crash and restart scenarios, and any network transport behaviour.",
+        "The followers' own election while the leader is isolated."
+      ],
+      "parameters": {
+        "cluster_size": 3,
+        "heartbeat_timeout_ms": 300,
+        "election_timeout_ms": 300,
+        "leader_lease_timeout_ms": 300,
+        "client_wait_limit_ms": 6000
+      }
+    },
+    "prefix": "Built with captured test facilities and real producers only: MakeCluster(3, conf) with HeartbeatTimeout, ElectionTimeout and LeaderLeaseTimeout all 300ms bootstraps the cluster and c.Leader() returns the leader; the harness emits verify_control_start with the node identity, its state and the lease, calls VerifyLeader and emits verify_healthy with the error, elapsed time and state. It then isolates the leader from its peers with c.Partition, emits verify_probe_start with the node identity, state, lease and connected-peer count, issues VerifyLeader again, waits on the returned future from a separate goroutine against a 6s limit, and emits verify_partitioned with completion, elapsed time, error text, state and the wait limit. No storage is pre-filled and no production code is modified.",
+    "prerequisites": [
+      {
+        "alias": "control_start",
+        "event": "verify_control_start",
+        "conditions": [
+          {
+            "field": "leader_state",
+            "op": "eq",
+            "value": "Leader"
+          }
+        ]
+      },
+      {
+        "alias": "probe_start",
+        "event": "verify_probe_start",
+        "conditions": [
+          {
+            "field": "leader_state",
+            "op": "eq",
+            "value": "Leader"
+          },
+          {
+            "field": "peers_connected",
+            "op": "eq",
+            "value": 0
+          }
+        ]
+      }
+    ],
+    "comparisons": [
+      {
+        "event": "verify_healthy",
+        "identity_fields": [
+          "node"
+        ],
+        "admission_alias": "control_start",
+        "assertion": {
+          "field": "error_empty",
+          "op": "eq",
+          "value": true
+        },
+        "description": "Control: on a healthy cluster the leader's verification succeeds, so the probe measures a working path before the isolation."
+      },
+      {
+        "event": "verify_partitioned",
+        "identity_fields": [
+          "node"
+        ],
+        "admission_alias": "probe_start",
+        "assertion": {
+          "field": "completed",
+          "op": "eq",
+          "value": true
+        },
+        "description": "Bounded completion: the isolated leader's verification returns within the client wait limit instead of hanging on peers that cannot answer."
+      },
+      {
+        "event": "verify_partitioned",
+        "identity_fields": [
+          "node"
+        ],
+        "admission_alias": "probe_start",
+        "assertion": {
+          "field": "error_empty",
+          "op": "eq",
+          "value": false
+        },
+        "description": "Correctness of the endpoint: the stranded verification fails rather than reporting success, because leadership ended."
+      }
+    ]
+  }
+}

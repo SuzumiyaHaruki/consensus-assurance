@@ -1,0 +1,168 @@
+{
+  "rationale": "The mode-scoped probe executed and both comparisons are now decided, so the install-snapshot rewind question can be closed locally with a measured interpretation: in three isolation/compaction/reconnect rounds the node that entered the install path kept a monotone applied index, and the two nodes that did not enter it did the same in the same window. The protection requirement held, no defect is claimed, and the boundary the probe cannot reach (a configuration where the leader's latest snapshot index is below a follower's applied index) is retained explicitly rather than glossed over.",
+  "investigations": [
+    {
+      "id": "3aab71eb943140cfa801c33349322eb2-question-0",
+      "disposition": "explained",
+      "resume_conditions": [],
+      "limitations": [
+        "Answered for the driven scenario, not in general: the probe never constructs a leader whose latest snapshot index is below a follower's applied index, so unreachability of a rewinding install is not established.",
+        "Three probe executions were needed because of two comparison-wiring defects of mine (an admission without node identity, then one admission alias serving nodes that cannot produce the other result event); receipts 2ee538f299f344b098cc111a3b2cdd43 and 1ac934864b0f42fd9bb658662fd71274 therefore retain operands without a decided comparison, and only receipt 60a9c1c1920e4c7d9cd3b6c031613b69 carries complete comparisons.",
+        "All three executions show the same operand pattern: no applied-index decrease anywhere, and the recovered node's snapshot index equal to its applied index rather than below it.",
+        "Monotonic log store implementations, which take the removeOldLogs branch, were not exercised."
+      ]
+    },
+    {
+      "ref": "@pipeline-next-index-progress",
+      "question": "Can pipelined replication leave the leader's per-follower nextIndex ahead of what the follower has acknowledged, or stall progress, given that the pipeline advances its own send cursor before any response arrives?",
+      "source_ids": [
+        "s_pipeline_replicate",
+        "s_pipeline_send",
+        "s_pipeline_decode",
+        "s_update_last_appended",
+        "s_set_previous_log"
+      ],
+      "hypothesis": "pipelineSend advances a pipeline-local next index to last entry index + 1 immediately after handing the request to the pipeline, while the per-follower nextIndex and the commitment map are only updated from decoded responses in pipelineDecode via updateLastAppended. If the local cursor were also the acknowledged cursor, a dropped or rejected request could leave the leader believing the follower had entries it never stored, and a terminal failure could stall replication.",
+      "discriminator": "Trace where the two cursors are updated and what happens on the first unsuccessful pipeline response or a setup error: a defect needs the acknowledged nextIndex (or commitment) to advance without a successful response, or replication to stop without falling back. If the local cursor is private to pipelineSend, s.nextIndex and commitment move only on successful decoded responses, the pipeline aborts on the first NACK and standard replication resumes from the acknowledged index, and setup errors route to the snapshot path, then the concern is refuted for this path.",
+      "disposition": "explained",
+      "limitations": [
+        "Source-only: no execution was requested, so this is a reading of cursor ownership and fallback rather than an observed pipeline failure.",
+        "The transport contract (InmemTransport and NetworkTransport pipelines deliver responses in order and close on error) was assumed, not exercised.",
+        "Behaviour of concurrent stop, removal and shutdown paths while a pipeline is in flight was not traced."
+      ]
+    }
+  ],
+  "knowledge": [
+    {
+      "kind": "fact",
+      "statement": "Across three executions of the same isolation/compaction/reconnect probe on a 3-node in-memory cluster, the node that entered the InstallSnapshot path never reported an applied index below its own maximum: its applied index advanced 27 -> 112 -> 197 -> 257 across rounds with decrease_count 0 and applied_at_end equal to max_applied_seen, while its snapshot index (257) stayed above its surviving log store last index (197) and the two nodes that never entered the install path were monotone as well (snapshot index 257, log store last index 257, decrease_count 0).",
+      "conditions": "Observed with MakeCluster(3), SnapshotInterval 30ms, SnapshotThreshold 10, TrailingLogs 5, in-memory log/snapshot stores, protocol 3, in three rounds of 25 warm commands, isolating one follower, 60 further commands through the remaining quorum, reconnecting, and polling all nodes every 2ms for 1.2s. The probe does not construct a leader snapshot index below a follower's applied index, so this is an observed bounded result and not a guarantee for other configurations.",
+      "source_ids": [
+        "s_install_snapshot_full",
+        "s_process_logs",
+        "s_get_last_index",
+        "s_replicate_to_backoff"
+      ],
+      "executions": {
+        "2ee538f299f344b098cc111a3b2cdd43": [
+          4,
+          5,
+          6
+        ],
+        "1ac934864b0f42fd9bb658662fd71274": [
+          7,
+          8,
+          9
+        ],
+        "60a9c1c1920e4c7d9cd3b6c031613b69": [
+          9,
+          10,
+          12
+        ]
+      }
+    },
+    {
+      "kind": "behavior",
+      "statement": "Pipelined replication keeps two separate cursors: pipelineSend advances a private send cursor to the last pipelined entry index + 1 as soon as the request is handed to the pipeline, while the per-follower nextIndex and the commitment map advance only from successful decoded responses (updateLastAppended stores nextIndex = last entry index + 1 and matches commitment, then notifies the verify futures as leader). The decoder aborts the pipeline on the first unsuccessful response, on a newer term (notifyAll(false) plus a step-down notification) and pipelineSend returns shouldStop when setup fails such as a compacted prefix, after which the caller falls back to standard replication or the snapshot path. setPreviousLog additionally special-cases nextIndex-1 equal to the last snapshot index so a snapshot-backed prefix is accepted as the previous log entry.",
+      "conditions": "Applies to the leader-side pipeline path in the captured revision for peers that support AppendEntriesPipeline, including the fallback to replicateTo after the pipeline aborts.",
+      "source_ids": [
+        "s_pipeline_replicate",
+        "s_pipeline_send",
+        "s_pipeline_decode",
+        "s_update_last_appended",
+        "s_set_previous_log"
+      ]
+    }
+  ],
+  "interpretations": [
+    {
+      "investigation_id": "3aab71eb943140cfa801c33349322eb2-question-0",
+      "experiment_id": "b21611696f4444f69963dfa6e9cc0a77-experiment",
+      "source_ids": [
+        "s_install_snapshot_full",
+        "s_install_snapshot_term_only",
+        "s_install_snapshot_apply",
+        "s_process_logs",
+        "s_get_last_index",
+        "s_replicate_to_backoff"
+      ],
+      "executions": {
+        "60a9c1c1920e4c7d9cd3b6c031613b69": [
+          9,
+          10,
+          12
+        ]
+      },
+      "conclusion": "holds",
+      "rationale": "The protection held in the executed scenario: no delivered InstallSnapshot moved a receiver's applied index backwards. Receipt 60a9c1c1920e4c7d9cd3b6c031613b69 (completed, exit 0, tests_passed) parsed thirteen events. Index 0 probe_start fixes the scenario constants (3 nodes, SnapshotInterval 30ms, SnapshotThreshold 10, TrailingLogs 5) with leader server-33f90177...; indices 1-3 probe_node_start carry each node's identity and starting state (applied 2, snapshot index 0). The three rounds are visible at indices 4, 6 and 7 for the isolated follower server-9053e19f... (applied 27 -> 112 -> 197). Index 5 recovery_mode_entered records the moment that node first showed the install signature (applied 87, snapshot index 87, log store last index 27). Index 10 recovered_node_probe_end reports install_signature_seen true with install_signature_ticks 1223, snapshot index 257 above log store last index 197, applied_at_end 257 equal to max_applied_seen, observed_applied_decrease false and decrease_count 0 with the decrease operands left at zero - comparison_index 0 holds with the recovery_mode admission matched at index 5. Indices 8 and 11 steady_mode_confirmed and indices 9 and 12 steady_node_probe_end cover the other two nodes: install_signature_seen false, snapshot index 257, log store last index 257, applied_at_end 257 equal to max_applied_seen, observed_applied_decrease false - comparison_index 1 holds with steady_mode admissions at indices 8 and 11. So the node that went through the real InstallSnapshot handler stayed monotone while the installs were happening, which is exactly what a rewinding request would have broken, and the same-execution comparison rules out polling or snapshotting in general as the source of the monotone state. Source-wise this is consistent with the two behaviours already recorded: the receiver checks only the term (raft.go:1825-1845) while the sender clamps nextIndex towards the follower's snapshot-aware reported last index (replication.max(min(nextIndex-1, response.LastLog+1), 1)), so in these rounds every delivered request carried the leader's current snapshot index rather than an older one; the observed snapshot index 257 equals the node's applied index 257, and its log store last index 197 is simply the surviving older tail. No defect is claimed. What remains open and is recorded as a boundary rather than a result: the probe does not construct the configuration in which the leader's latest snapshot index sits below a follower's applied index, so it cannot establish that a rewinding install is unreachable in general.",
+      "counterevidence": [
+        "Two earlier executions of the same probe produced the same operand pattern but unknown comparisons because of my admission wiring, so their operands are retained as corroboration rather than as independent verdicts.",
+        "A rewinding install would require the leader to send a snapshot index below the follower's applied index; the probe drives repeated installs and none of them had that shape, which weakens but does not eliminate the concern."
+      ],
+      "limitations": [
+        "Bounded scenario: one cluster shape, three rounds, 30ms snapshot interval and 5 trailing logs; other configurations were not exercised.",
+        "The measurement is polling from the test goroutine every 2ms; it observes values rather than proving that an interleaving was impossible.",
+        "Monotonic log stores, which remove old logs more aggressively, were not exercised.",
+        "The question of general unreachability is left open on purpose; this interpretation closes the local question, not the global one."
+      ],
+      "report_title": "\u5feb\u7167\u5b89\u88c5\u672a\u56de\u9000\u5df2\u5e94\u7528\u72b6\u6001\uff08\u542b\u540c\u6267\u884c\u5bf9\u7167\uff09",
+      "report_answer": "\u672c\u573a\u666f\u4e0b\u7684\u4fdd\u62a4\u6210\u7acb\uff1a\u56fa\u5b9a\u8f93\u5165\u6267\u884c\uff08receipt 60a9c1c1920e4c7d9cd3b6c031613b69\uff0cexit 0\uff09\u4e2d\uff0c\u4e09\u8f6e\u9694\u79bb/\u538b\u7f29/\u91cd\u8fde\u4f7f server-9053e19f \u8fdb\u5165 InstallSnapshot \u8def\u5f84\uff08index 5 recovery_mode_entered\uff0capplied 87\u3001snapshot 87\u3001log store 197 \u4e4b\u524d\u7684 27\uff09\uff0c\u8be5\u8282\u70b9\u6700\u7ec8 applied_at_end 257 \u7b49\u4e8e max_applied_seen\u3001decrease_count 0\u3001observed_applied_decrease false\uff0c\u5feb\u7167\u7d22\u5f15 257 \u9ad8\u4e8e\u6b8b\u7559\u65e5\u5fd7\u7d22\u5f15 197\uff1b\u540c\u4e00\u7a97\u53e3\u5185\u53e6\u5916\u4e24\u4e2a\u672a\u8fdb\u5165\u5b89\u88c5\u8def\u5f84\u7684\u8282\u70b9\u540c\u6837\u5355\u8c03\uff08\u7d22\u5f15 9\u300112\uff0capplied 257\u3001snapshot 257\u3001\u65e5\u5fd7 257\uff09\u3002\u4e24\u6761\u6bd4\u8f83\u5747\u6210\u7acb\uff0c\u8bf4\u660e\u672c\u573a\u666f\u6ca1\u6709\u51fa\u73b0\u201c\u5feb\u7167\u7d22\u5f15\u4f4e\u4e8e\u63a5\u6536\u65b9\u5df2\u5e94\u7528\u7d22\u5f15\u201d\u7684\u56de\u9000\u5b89\u88c5\uff1b\u6e90\u7801\u4fa7\u4e0e\u5df2\u8bb0\u5f55\u884c\u4e3a\u4e00\u81f4\uff1a\u63a5\u6536\u7aef\u53ea\u6821\u9a8c term\uff08raft.go:1825-1845\uff09\uff0c\u53d1\u9001\u7aef\u628a nextIndex \u5411\u8ddf\u968f\u8005\u4e0a\u62a5\u7684\u3001\u542b\u5feb\u7167\u7d22\u5f15\u7684 LastLog \u6536\u655b\u3002\u672a\u4e3b\u5f20\u7f3a\u9677\uff1a\u63a2\u9488\u672a\u6784\u9020\u201cleader \u6700\u65b0\u5feb\u7167\u7d22\u5f15\u4f4e\u4e8e\u8ddf\u968f\u8005\u5df2\u5e94\u7528\u7d22\u5f15\u201d\u7684\u914d\u7f6e\uff0c\u56e0\u6b64\u4e00\u822c\u4e0d\u53ef\u8fbe\u6027\u4ecd\u672a\u8bc1\u660e\u3002"
+    },
+    {
+      "investigation_id": "@pipeline-next-index-progress",
+      "source_ids": [
+        "s_pipeline_replicate",
+        "s_pipeline_send",
+        "s_pipeline_decode",
+        "s_update_last_appended",
+        "s_set_previous_log"
+      ],
+      "conclusion": "explained",
+      "rationale": "The optimistic advance is confined to the pipeline and does not become acknowledged state. pipelineSend builds each request from the current local cursor (setupAppendEntries) and, only after the request is accepted by the pipeline, stores last.Index+1 into that private cursor (replication.go:512-532); the per-follower s.nextIndex and the commitment map are updated exclusively from successful decoded responses through updateLastAppended, which also notifies any waiting verify futures that the leader is still leader (replication.go:534-567, 655-665). Any unsuccessful response stops the decoder, which makes pipelineReplicate return and the replicate loop fall back to standard replication from the last acknowledged nextIndex, so a rejected batch cannot be treated as stored; a newer term additionally notifies the followers' votes as false and signals step-down, and a setup failure in pipelineSend returns shouldStop without sending, which sends the loop back through the standard path where a missing prefix becomes the snapshot path (replication.go:446-510, 224-296). setPreviousLog's snapshot case (replication.go:587-612) covers the boundary where the previous entry is exactly the snapshot index rather than a stored log. No defect is claimed from this reading: the cursor separation plus the abort-and-fall-back rule is an enclosing protection for the concern.",
+      "counterevidence": [
+        "The local cursor is only used to build the next pipelined request; nothing else reads it, so an in-flight NACK cannot promote unacknowledged entries into s.nextIndex or into commitment."
+      ],
+      "limitations": [
+        "Source-only; no pipeline failure, out-of-order close or stop-while-in-flight execution was requested.",
+        "Assumes the transport pipeline delivers responses in order and reports errors through the same path, which was read but not exercised."
+      ]
+    }
+  ],
+  "sources": [
+    {
+      "id": "s_pipeline_replicate",
+      "file": "replication.go",
+      "start_line": 446,
+      "end_line": 510,
+      "kind": "code_observation"
+    },
+    {
+      "id": "s_pipeline_send",
+      "file": "replication.go",
+      "start_line": 512,
+      "end_line": 532,
+      "kind": "code_observation"
+    },
+    {
+      "id": "s_pipeline_decode",
+      "file": "replication.go",
+      "start_line": 534,
+      "end_line": 567,
+      "kind": "code_observation"
+    },
+    {
+      "id": "s_set_previous_log",
+      "file": "replication.go",
+      "start_line": 587,
+      "end_line": 612,
+      "kind": "code_observation"
+    },
+    {
+      "id": "s_update_last_appended",
+      "file": "replication.go",
+      "start_line": 655,
+      "end_line": 665,
+      "kind": "code_observation"
+    }
+  ]
+}

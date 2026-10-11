@@ -1,0 +1,155 @@
+{
+  "id": "83e05a1268184d598ceffcdfe382b2d6-experiment",
+  "investigation_id": "83e05a1268184d598ceffcdfe382b2d6-question-0",
+  "version": 1,
+  "basis": {
+    "harness": {
+      "kind": "go_test",
+      "source": "package raft\n\nimport (\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"testing\"\n\t\"time\"\n)\n\nfunc caState(t *testing.T, ev map[string]interface{}) {\n\tb, err := json.Marshal(ev)\n\tif err != nil {\n\t\tt.Fatalf(\"marshal: %v\", err)\n\t}\n\tfmt.Println(\"CA_EVENT \" + string(b))\n}\n\n// TestAssuranceReloadConfigValidation checks that a reload whose merged\n// configuration violates the validated invariants is rejected without changing\n// the running configuration, and that a valid reload is accepted and visible.\nfunc TestAssuranceReloadConfigValidation(t *testing.T) {\n\tc := MakeCluster(1, t, nil)\n\tdefer c.Close()\n\n\tr := c.rafts[0]\n\tbefore := r.ReloadableConfig()\n\tleaseBefore := r.config().LeaderLeaseTimeout\n\n\tcaState(t, map[string]interface{}{\n\t\t\"event\":                  \"reload_probe_start\",\n\t\t\"node\":                   string(r.localID),\n\t\t\"heartbeat_ms_before\":    before.HeartbeatTimeout.Milliseconds(),\n\t\t\"election_ms_before\":     before.ElectionTimeout.Milliseconds(),\n\t\t\"leader_lease_ms_before\": leaseBefore.Milliseconds(),\n\t})\n\n\t// Invalid: lowering the heartbeat below the (non-reloadable) leader lease.\n\tinvalid := before\n\tinvalid.HeartbeatTimeout = 10 * time.Millisecond\n\tinvalid.ElectionTimeout = 10 * time.Millisecond\n\tinvalidErr := r.ReloadConfig(invalid)\n\tafterInvalid := r.ReloadableConfig()\n\tcaState(t, map[string]interface{}{\n\t\t\"event\":               \"reload_invalid\",\n\t\t\"node\":                string(r.localID),\n\t\t\"error_text\":          errStringReload(invalidErr),\n\t\t\"error_empty\":         invalidErr == nil,\n\t\t\"config_unchanged\":    afterInvalid == before,\n\t\t\"heartbeat_ms_after\":  afterInvalid.HeartbeatTimeout.Milliseconds(),\n\t\t\"heartbeat_ms_before\": before.HeartbeatTimeout.Milliseconds(),\n\t})\n\n\t// Valid: raising heartbeat and election together keeps the lease invariant.\n\tvalid := before\n\tvalid.HeartbeatTimeout = 100 * time.Millisecond\n\tvalid.ElectionTimeout = 100 * time.Millisecond\n\tvalidErr := r.ReloadConfig(valid)\n\tafterValid := r.ReloadableConfig()\n\tcaState(t, map[string]interface{}{\n\t\t\"event\":              \"reload_valid\",\n\t\t\"node\":               string(r.localID),\n\t\t\"error_text\":         errStringReload(validErr),\n\t\t\"error_empty\":        validErr == nil,\n\t\t\"heartbeat_ms_after\": afterValid.HeartbeatTimeout.Milliseconds(),\n\t\t\"election_ms_after\":  afterValid.ElectionTimeout.Milliseconds(),\n\t\t\"lease_ms_after\":     r.config().LeaderLeaseTimeout.Milliseconds(),\n\t\t\"heartbeat_applied\":  afterValid.HeartbeatTimeout == 100*time.Millisecond,\n\t})\n}\n\nfunc errStringReload(err error) string {\n\tif err == nil {\n\t\treturn \"\"\n\t}\n\treturn err.Error()\n}\n",
+      "files": {},
+      "execution_package": ".",
+      "description": "",
+      "semantic_changes": [],
+      "prerequisites": [
+        {
+          "alias": "reload_start",
+          "event": "reload_probe_start",
+          "conditions": [
+            {
+              "field": "leader_lease_ms_before",
+              "op": "ne",
+              "value": 0,
+              "reference": null
+            }
+          ]
+        }
+      ]
+    },
+    "source_ids": [
+      "s_reload_config",
+      "s_reloadable_config",
+      "s_lease_config_validation"
+    ],
+    "anchors": [
+      {
+        "material_id": "s_reload_config",
+        "symbol": "Raft.ReloadConfig",
+        "start_line": 717,
+        "end_line": 741,
+        "anchor": {
+          "source_ids": [
+            "s_reload_config"
+          ],
+          "boundary_complete": true,
+          "kind": "declaration",
+          "material_id": "s_reload_config",
+          "start_line": 717,
+          "end_line": 717,
+          "symbol": "Raft.ReloadConfig"
+        }
+      }
+    ],
+    "scope": {
+      "description": "One fault-free execution on a normally bootstrapped single-node in-memory cluster: read the reloadable configuration, attempt an invalid reload that lowers the heartbeat and election timeouts below the non-reloadable leader lease, then attempt a valid reload that raises both.",
+      "assumptions": [
+        "MakeCluster(1) with the captured in-memory configuration leaves heartbeat, election and leader lease at 50ms, so lowering heartbeat and election to 10ms violates the validated lease-versus-heartbeat invariant while raising them to 100ms keeps it.",
+        "ReloadableConfig reports the reloadable fields currently in force, which is the configuration the probe compares against.",
+        "A single node is sufficient because the reload path does not depend on cluster membership or leadership."
+      ],
+      "excluded": [
+        "Timing behaviour of replication and heartbeat loops after a successful reload.",
+        "Other reloadable fields and other invalid combinations.",
+        "Multi-node behaviour, network transport and restarts."
+      ],
+      "parameters": {
+        "heartbeat_ms_before": 50,
+        "election_ms_before": 50,
+        "leader_lease_ms_before": 50,
+        "invalid_heartbeat_ms": 10,
+        "valid_heartbeat_ms": 100
+      }
+    },
+    "prefix": "Built with captured test facilities and real producers only: MakeCluster(1) bootstraps a node; the harness emits reload_probe_start with the node identity and the heartbeat, election and leader-lease values in force, then calls ReloadConfig with the reloadable fields set to 10ms for heartbeat and election while the non-reloadable lease stays at 50ms and emits reload_invalid with the returned error, whether the reported configuration is unchanged and the heartbeat value reported afterwards. It then calls ReloadConfig with heartbeat and election raised to 100ms and emits reload_valid with the returned error, the reported heartbeat and election, the lease still in force and whether the new heartbeat was applied. No storage is pre-filled and no production code is modified.",
+    "requirement": "A reload whose merged configuration violates the validated invariants is rejected with the running configuration unchanged, and a valid reload is accepted and visible through ReloadableConfig.",
+    "responsibility": "Admission of runtime configuration changes in Raft.ReloadConfig: merging the reloadable fields, validating the merged configuration and storing it only on success.",
+    "comparisons": [
+      {
+        "event": "reload_invalid",
+        "identity_fields": [
+          "node"
+        ],
+        "admission_alias": "reload_start",
+        "assertion": {
+          "field": "error_empty",
+          "op": "eq",
+          "value": false,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [],
+        "description": "An invalid merged configuration is rejected: the lease-versus-heartbeat invariant the constructor enforces is also enforced for a running node."
+      },
+      {
+        "event": "reload_invalid",
+        "identity_fields": [
+          "node"
+        ],
+        "admission_alias": "reload_start",
+        "assertion": {
+          "field": "config_unchanged",
+          "op": "eq",
+          "value": true,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [],
+        "description": "The rejected reload leaves the running configuration untouched, so a failed reload cannot half-apply."
+      },
+      {
+        "event": "reload_valid",
+        "identity_fields": [
+          "node"
+        ],
+        "admission_alias": "reload_start",
+        "assertion": {
+          "field": "heartbeat_applied",
+          "op": "eq",
+          "value": true,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [
+          {
+            "field": "error_empty",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          }
+        ],
+        "description": "Control: a valid reload is accepted and visible through ReloadableConfig, so the rejection above is about the invalid values rather than a broken reload path."
+      }
+    ],
+    "knowledge": []
+  },
+  "snapshot_id": "a4c51d74d8ce4f16817600a3ec9e373c",
+  "configuration": {
+    "backend": "go_module",
+    "target": {
+      "expected_module": "github.com/hashicorp/raft",
+      "variant": "hashicorp_raft",
+      "analysis_roots": [],
+      "execution_package": ".",
+      "harness_path": "assurance_generated_test.go"
+    },
+    "isolation": "bwrap",
+    "tools": {
+      "agent": "codex-cli 0.155.0-alpha.16",
+      "implementation": "go version go1.23.5 linux/amd64"
+    }
+  },
+  "harness_filename": "assurance_generated_test.go",
+  "operation_id": "83e05a1268184d598ceffcdfe382b2d6",
+  "previous_id": null,
+  "difference": {},
+  "revision_reason": ""
+}

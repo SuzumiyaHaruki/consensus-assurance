@@ -1,0 +1,78 @@
+{
+  "rationale": "Final item for the run's remaining budget: the observation delivery contract, which closes the last piece of client-facing lifecycle semantics not yet recorded. Observations are best-effort by default - a non-blocking observer silently drops when its channel is full and counts the drop - while a blocking observer applies backpressure to whichever goroutine emits the observation, which is a materially different failure mode for a consumer of the same API.",
+  "sources": [
+    {
+      "id": "s_observation_types",
+      "file": "observer.go",
+      "start_line": 11,
+      "end_line": 45,
+      "kind": "interface_statement"
+    },
+    {
+      "id": "s_observer_registration",
+      "file": "observer.go",
+      "start_line": 104,
+      "end_line": 118,
+      "kind": "code_observation"
+    },
+    {
+      "id": "s_observe_delivery",
+      "file": "observer.go",
+      "start_line": 120,
+      "end_line": 149,
+      "kind": "code_observation"
+    }
+  ],
+  "investigations": [
+    {
+      "ref": "@observation-delivery-contract",
+      "question": "What does an observer receive, and what happens to an observation when the observer cannot keep up?",
+      "source_ids": [
+        "s_observation_types",
+        "s_observer_registration",
+        "s_observe_delivery"
+      ],
+      "hypothesis": "Delivery is best-effort by default: for a non-blocking observer the library attempts a channel send and counts a dropped observation when the channel is full, without blocking the emitting goroutine, while a blocking observer performs a plain send and therefore applies backpressure to the caller. A filter can suppress delivery per observer, and registration and deregistration take a write lock while delivery takes the read lock, so a slow blocking observer holds a read lock for the duration of its send.",
+      "discriminator": "Compare the delivery paths for blocking and non-blocking observers and the counters each maintains, and check which locks are held while sending. A defect would need the library to promise lossless delivery, to block an internal goroutine for a non-blocking observer, or to hold a lock across a send in a way that prevents registration; the documented best-effort path with explicit drop counting refutes the first two, and the read lock during a blocking send is the boundary worth stating.",
+      "disposition": "explained",
+      "limitations": [
+        "Source-only: no execution was requested in this turn; no observer was registered, dropped or blocked while observing.",
+        "The set of events that produce observations was read but not enumerated exhaustively; the observation data types listed in the interface were not traced to every producer.",
+        "The consequence of a blocking observer on a specific emitting goroutine (main loop, replication, FSM thread) was not measured."
+      ]
+    }
+  ],
+  "knowledge": [
+    {
+      "kind": "behavior",
+      "statement": "An observation carries the emitting Raft instance and an event payload that is one of the documented types (a vote request, a Raft state, a peer change, a leader change and the heartbeat-failure/resume observations). Delivery is per observer and best-effort by default: a non-blocking observer gets a non-blocking send and the library counts the observation as dropped when its channel is full, while a blocking observer performs a plain send that applies backpressure to the emitting goroutine. Each observer can have a filter that suppresses delivery, and both counters are maintained per observer. Registration and deregistration take the observers write lock while delivery iterates under the read lock, so a blocking observer blocks the emitting goroutine but only prevents registrations, not other observers from being visited.",
+      "conditions": "Applies to Raft.RegisterObserver/DeregisterObserver and to every observe call site in the captured revision; losslessness is not promised for the default non-blocking observer, and the blocking mode is opt-in per observer.",
+      "source_ids": [
+        "s_observation_types",
+        "s_observer_registration",
+        "s_observe_delivery"
+      ]
+    }
+  ],
+  "interpretations": [
+    {
+      "investigation_id": "@observation-delivery-contract",
+      "source_ids": [
+        "s_observation_types",
+        "s_observer_registration",
+        "s_observe_delivery"
+      ],
+      "conclusion": "explained",
+      "rationale": "The contrast between the two delivery modes is deliberate and visible in a few lines. observe builds one observation per registered observer, applies that observer's filter, skips observers with no channel, and then either sends unconditionally when the observer asked for blocking behaviour or attempts a non-blocking send and increments a dropped counter when the channel is full (observer.go:120-151). The counters are per observer and updated atomically, so a consumer can detect loss rather than infer it. Ordering of registration is guarded separately: RegisterObserver and DeregisterObserver take the observers write lock (observer.go:104-118) while delivery holds only the read lock, so a blocking observer does not prevent another observer from being visited, but a blocking observer does hold the read lock for the duration of its send and therefore blocks registration or deregistration until it returns. Consequences worth stating for a consumer: with the default non-blocking mode, losing observations under load is expected and the drop counter is the signal; with the opt-in blocking mode, the observer can stall whichever internal goroutine emitted the observation - main loop, replication or the FSM thread, depending on the event - and the observation stream must not be treated as a durable log. No defect is claimed: the interface documents that observations are sent when an event occurs and the implementation's drop counting makes the best-effort semantics observable.",
+      "counterevidence": [
+        "A blocking observer cannot cause an internal deadlock by itself: delivery holds only a read lock, so it cannot block another observer's delivery, and the counters let a consumer distinguish loss from silence.",
+        "Nothing in the interface promises lossless delivery, so the drop path is a documented-by-design consequence of the non-blocking default rather than an unstated violation."
+      ],
+      "limitations": [
+        "Source-only; no observer was registered or saturated in this run.",
+        "The blast radius of a blocking observer was reasoned per emitting goroutine but not measured.",
+        "The full list of event producers was not enumerated; the observation payload types in the interface are the extent of what was read."
+      ]
+    }
+  ]
+}

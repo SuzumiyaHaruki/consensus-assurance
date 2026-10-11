@@ -1,0 +1,960 @@
+{
+  "input": {
+    "rationale": "A1/A2 orientation over the captured snapshot: the leadership-transfer order (TimeoutNow) is the one consensus message that changes authority on the receiver, so I traced what the producer establishes, what the message carries and what the receiver checks. Every other RPC handler binds its effect to the sender's term (appendEntries, installSnapshot, requestVote); timeoutNow binds to nothing, and the message struct has no term field at all. A bounded fault-free probe in a normally bootstrapped 3-node in-memory cluster is requested to observe the receiver-side consequence, with a stale-term RequestVote from the same non-member sender as the discriminating control. A second, unresolved local observation about configuration state lagging the committed log is recorded without a mechanism claim.",
+    "sources": [
+      {
+        "id": "s_timeoutnow_handler",
+        "file": "raft.go",
+        "start_line": 2209,
+        "end_line": 2214,
+        "kind": "code_observation"
+      },
+      {
+        "id": "s_timeoutnow_msg",
+        "file": "commands.go",
+        "start_line": 206,
+        "end_line": 213,
+        "kind": "code_observation"
+      },
+      {
+        "id": "s_prevote_gate",
+        "file": "raft.go",
+        "start_line": 285,
+        "end_line": 308,
+        "kind": "code_observation"
+      },
+      {
+        "id": "s_vote_known_leader",
+        "file": "raft.go",
+        "start_line": 1603,
+        "end_line": 1656,
+        "kind": "code_observation"
+      },
+      {
+        "id": "s_vote_term_guard",
+        "file": "raft.go",
+        "start_line": 1658,
+        "end_line": 1670,
+        "kind": "code_observation"
+      },
+      {
+        "id": "s_append_term_guard",
+        "file": "raft.go",
+        "start_line": 1453,
+        "end_line": 1463,
+        "kind": "code_observation"
+      },
+      {
+        "id": "s_snapshot_term_guard",
+        "file": "raft.go",
+        "start_line": 1833,
+        "end_line": 1841,
+        "kind": "code_observation"
+      },
+      {
+        "id": "s_sender_precondition",
+        "file": "raft.go",
+        "start_line": 1003,
+        "end_line": 1032,
+        "kind": "code_observation"
+      },
+      {
+        "id": "s_get_configuration",
+        "file": "api.go",
+        "start_line": 897,
+        "end_line": 903,
+        "kind": "code_observation"
+      },
+      {
+        "id": "s_ensure_same_peers",
+        "file": "testing.go",
+        "start_line": 692,
+        "end_line": 712,
+        "kind": "test_expectation"
+      }
+    ],
+    "investigations": [
+      {
+        "id": null,
+        "ref": "@timeoutnow-authority",
+        "question": "In the captured snapshot, is a leadership-transfer order (TimeoutNow) bound at the receiver to the current leader's authority, or can a delivered order that carries no term and whose claimed sender is not the current leader (and not a configuration member) drive a stable follower out of Follower and depose the serving leader?",
+        "source_ids": [
+          "s_timeoutnow_handler",
+          "s_timeoutnow_msg",
+          "s_prevote_gate",
+          "s_vote_known_leader",
+          "s_sender_precondition"
+        ],
+        "hypothesis": "Raft.timeoutNow is the only RPC handler that changes authority without consulting any term: it does setLeader(\"\",\"\"), setState(Candidate) and candidateFromLeadershipTransfer.Store(true) and responds, ignoring RPCHeader.ID/Addr and the configuration. TimeoutNowRequest embeds only RPCHeader, so no term/freshness value exists to check, while the producer only sends it after it has caught the target up (nextIndex beyond the leader's last index) - a precondition the receiver cannot verify. The Candidate run skips pre-vote (raft.go:294-298) and voters skip the known-leader rejection for LeadershipTransfer candidates (raft.go:1645-1656), so the order withdraws both disruption guards at once.",
+        "discriminator": "In one fault-free, normally bootstrapped 3-node in-memory cluster with a stable leader at a known term, deliver a single TimeoutNow to a follower using a transport RPC header whose ID is not a configuration member (and which necessarily carries no term), then observe the target's state/term and the previous leader's state/term for a bounded interval. Control: the same non-member sender with a RequestVoteRequest that does carry a term, but an older one, must leave the target unchanged. If the TimeoutNow leaves the target in Follower at the same term and the leader in place, the hypothesis is refuted; if the target leaves Follower at a higher term while the leader steps down, the receiver-side authority gap is observed.",
+        "disposition": "active",
+        "parent_id": null,
+        "knowledge": null,
+        "counterevidence": null,
+        "limitations": [
+          "The probe uses the in-memory transport inside one process; the sender identity is the RPC header ID, and the network transport does not authenticate peers at the Raft layer, so the spoofed-identity route overlaps with transport-level trust. The freshness part of the question does not depend on spoofing: a replayed or delayed order from a legitimate former leader is indistinguishable because the message carries no term.",
+          "The probe observes disruption/authority behaviour only. It does not claim a state-machine safety violation (log matching and vote uniqueness are still enforced by the term/vote rules), and it does not establish how long the deposed leader's clients are without a leader.",
+          "No claim is made about clusters where no leader is currently known; the probe starts from a stable leader to make the authority transition observable."
+        ],
+        "resume_conditions": null
+      },
+      {
+        "id": null,
+        "ref": "@configuration-latest-lag",
+        "question": "Can a server in the captured snapshot hold a configurations.latest (and hence GetConfiguration) that is older than its own committed log, and how is that state produced?",
+        "source_ids": [
+          "s_get_configuration",
+          "s_ensure_same_peers"
+        ],
+        "hypothesis": "GetConfiguration returns the atomically published latest configuration (api.go:897-903), a value written only by setLatestConfiguration. In the captured package's own TestRaft_ProtocolVersion_Upgrade_2_3, an old follower was observed reporting the 2-server bootstrap configuration for at least the full 5s EnsureSamePeers window while the newly added server reported the 3-server configuration, i.e. the membership read diverged from the replicated configuration entry. A candidate production path is the rollback in appendEntries (raft.go:1526-1532, setLatestConfiguration(committed, committedIndex)) combined with the duplicate-skip loop that never re-runs processConfigurationLogEntry for an entry already present.",
+        "discriminator": "Replay the captured upgrade scenario with instrumentation that reads configurations.latest/latestIndex, the atomic latestConfiguration, the log store contents and commitIndex on every node immediately after the AddVoter future returns and then every 250ms; a persistent latest index below the appended configuration entry index (with the entry present in the log store and applied to the FSM) would confirm the divergence, while convergence within a few hundred ms on every run would show the earlier observation was lag rather than a stale read.",
+        "disposition": "active",
+        "parent_id": null,
+        "knowledge": null,
+        "counterevidence": null,
+        "limitations": [
+          "Local exploration only: the captured TestRaft_ProtocolVersion_Upgrade_2_3 failed with 'peer mismatch' in 2 of 3 isolated local runs, but two instrumented re-implementations of the same scenario converged within 250ms on every run, so the mechanism is unresolved rather than established. No knowledge entry is claimed here.",
+          "The frozen evidence for any claim must come from the controller's own execution of a fixed harness, which has not been requested for this question."
+        ],
+        "resume_conditions": null
+      }
+    ],
+    "knowledge": [
+      {
+        "id": null,
+        "ref": null,
+        "kind": "behavior",
+        "statement": "Raft.timeoutNow performs an unconditional authority transition on the receiver: it clears the known leader, sets the state to Candidate, stores candidateFromLeadershipTransfer=true and responds with an empty TimeoutNowResponse. It never inspects the RPC header identity, the current configuration, or any term, and observes no election or heartbeat precondition before transitioning.",
+        "conditions": "Applies to every TimeoutNowRequest that passes checkRPCHeader, delivered to a server in any run state; the request carries only RPCHeader (ProtocolVersion, ID, Addr) and therefore cannot be evaluated for freshness.",
+        "source_ids": [
+          "s_timeoutnow_handler",
+          "s_timeoutnow_msg"
+        ],
+        "executions": {},
+        "changed_premise": "",
+        "affected_uses": []
+      },
+      {
+        "id": null,
+        "ref": null,
+        "kind": "behavior",
+        "statement": "While candidateFromLeadershipTransfer is set, runCandidate does not pre-vote: it calls electSelf directly, which increments the current term and sends RequestVote with LeadershipTransfer=true. The flag is cleared by a deferred store(false) when the candidate run ends.",
+        "conditions": "Set only by timeoutNow in the captured source; applies to a node that then enters/continues the candidate state.",
+        "source_ids": [
+          "s_prevote_gate"
+        ],
+        "executions": {},
+        "changed_premise": "",
+        "affected_uses": []
+      },
+      {
+        "id": null,
+        "ref": null,
+        "kind": "behavior",
+        "statement": "requestVote rejects a vote request that arrives while a different leader is known, but skips that rejection when req.LeadershipTransfer is true; the older-term rejection and the log-suffix comparison still run before a vote is granted.",
+        "conditions": "Applies to RequestVoteRequest handling on any server that has a recorded leader whose address differs from the candidate and whose protocol version carries the LeadershipTransfer flag.",
+        "source_ids": [
+          "s_vote_known_leader",
+          "s_vote_term_guard"
+        ],
+        "executions": {},
+        "changed_premise": "",
+        "affected_uses": []
+      },
+      {
+        "id": null,
+        "ref": null,
+        "kind": "behavior",
+        "statement": "The other authority-bearing RPC handlers guard their state change with the sender's term: appendEntries returns early when a.Term is below the current term and only adopts/updates term and state when the request term is greater (or the receiver is not a follower), and installSnapshot ignores a snapshot whose request term is older than the current term.",
+        "conditions": "Applies to AppendEntriesRequest and InstallSnapshotRequest processing; this is the control contrast for the TimeoutNow handler, which has no term to compare.",
+        "source_ids": [
+          "s_append_term_guard",
+          "s_snapshot_term_guard"
+        ],
+        "executions": {},
+        "changed_premise": "",
+        "affected_uses": []
+      },
+      {
+        "id": null,
+        "ref": null,
+        "kind": "behavior",
+        "statement": "The leader-side leadershipTransfer routine only issues the TimeoutNow RPC after it has driven the target's replication nextIndex past the leader's last log index, i.e. the producer establishes a caught-up target before transferring.",
+        "conditions": "Applies to the sender path invoked from leaderLoop; it is not verified by, nor visible to, the receiving timeoutNow handler.",
+        "source_ids": [
+          "s_sender_precondition"
+        ],
+        "executions": {},
+        "changed_premise": "",
+        "affected_uses": []
+      },
+      {
+        "id": null,
+        "ref": null,
+        "kind": "behavior",
+        "statement": "GetConfiguration does not read main-thread membership state: it returns a configurationsFuture whose configurations field is filled from the atomically published latestConfiguration, which is written only by setLatestConfiguration (and cleared/initialised elsewhere), so the value a client sees is whatever that atomic last held.",
+        "conditions": "Applies to any caller of GetConfiguration on any server, including followers, independent of the main-thread run loop.",
+        "source_ids": [
+          "s_get_configuration"
+        ],
+        "executions": {},
+        "changed_premise": "",
+        "affected_uses": []
+      }
+    ],
+    "gaps": [
+      {
+        "investigation_id": "@timeoutnow-authority",
+        "question": "Does one received TimeoutNow, whose RPC header claims a sender that is not the serving leader and not a configuration member and which carries no term, actually move a stable follower out of Follower at a higher term and cause the serving leader to step down in a fault-free 3-node cluster, while a stale-term RequestVote from the same claimed sender leaves the target unchanged?",
+        "experiment_id": null
+      },
+      {
+        "investigation_id": "@configuration-latest-lag",
+        "question": "Under instrumented replay of the captured upgrade scenario, does any node hold configurations.latest/latestIndex below its own appended configuration entry index for longer than the 5s EnsureSamePeers window, and if so which source path (appendEntries rollback, duplicate-skip in appendEntries, snapshot install, or restart replay) produced it?",
+        "experiment_id": null
+      }
+    ],
+    "interpretations": [],
+    "experiment": {
+      "investigation_id": "@timeoutnow-authority",
+      "harness_path": "assurance_timeoutnow.go",
+      "files": {},
+      "execution_package": ".",
+      "source_ids": [
+        "s_timeoutnow_handler",
+        "s_timeoutnow_msg",
+        "s_prevote_gate",
+        "s_vote_known_leader",
+        "s_sender_precondition"
+      ],
+      "anchors": [
+        {
+          "material_id": "s_timeoutnow_handler",
+          "symbol": "Raft.timeoutNow",
+          "start_line": 2209,
+          "end_line": 2214,
+          "anchor": null
+        },
+        {
+          "material_id": "s_timeoutnow_msg",
+          "symbol": "TimeoutNowRequest",
+          "start_line": 206,
+          "end_line": 208,
+          "anchor": null
+        },
+        {
+          "material_id": "s_prevote_gate",
+          "symbol": "Raft.runCandidate",
+          "start_line": 285,
+          "end_line": 308,
+          "anchor": null
+        },
+        {
+          "material_id": "s_vote_known_leader",
+          "symbol": "Raft.requestVote",
+          "start_line": 1603,
+          "end_line": 1656,
+          "anchor": null
+        }
+      ],
+      "scope": {
+        "description": "One fault-free execution of a normally bootstrapped 3-node in-memory cluster; one control RPC (stale-term RequestVote from a non-member claimed sender) followed by one TimeoutNow from the same claimed sender to a follower, with bounded observation of target and leader state/term.",
+        "assumptions": [
+          "MakeCluster(3) performs real bootstrap: initial configuration entry, leader election and log replication through the in-memory transport.",
+          "Both RPCs are delivered over the in-memory transport with no packet loss, reordering or delay, so any observed transition is caused by the delivered request itself.",
+          "The sender identity in the RPC header ('ghost-not-in-config') is deliberately not a configuration member; the probe does not rely on the sender being reachable or registered.",
+          "The cluster is healthy before the probe: a leader is serving at a known term, which the harness records as steady_state."
+        ],
+        "excluded": [
+          "Network-transport authentication, TLS and peer-identity properties outside the Raft layer.",
+          "State-machine safety (log matching, single vote per term) and any claim that the newly elected leader violates it.",
+          "Behaviour after the observation interval, further elections, and client-visible unavailability."
+        ],
+        "parameters": {
+          "cluster_size": 3,
+          "observation_interval_seconds": 2,
+          "control_request_term": "target term at steady state minus 1",
+          "claimed_sender_id": "ghost-not-in-config"
+        }
+      },
+      "prefix": "The harness builds the prefix itself with the captured test facilities: MakeCluster(3, t, nil) bootstraps a three-voter configuration through the in-memory transport, waits for a stable leader (c.Leader()), and records the leader id/address/term and the chosen follower's state/term as CA_EVENT steady_state. It then selects the follower's transport peer as sender and emits CA_EVENT control_stale_request_vote after delivering a RequestVoteRequest with Term = targetTerm-1 and RPCHeader.ID = 'ghost-not-in-config'. Only then does it deliver the single TimeoutNowRequest with the same RPC header (no term field exists) and emit CA_EVENT after_timeout_now after a bounded 2s observation of the target and the previous leader. No state is injected and no storage is pre-filled.",
+      "semantic_changes": [],
+      "requirement": "A delivered leadership-transfer order is processed as authority to depose the known leader even though the message carries no term and its claimed sender is not the serving leader or a configuration member; the receiver performs no term, identity or membership check before clearing the leader and starting an election.",
+      "responsibility": "Receiver-side admission of a leadership-transfer order in Raft.timeoutNow, and the two guards that the order disables: the candidate pre-vote gate and the known-leader vote rejection.",
+      "prerequisites": [
+        {
+          "alias": "control_admission",
+          "event": "control_vote_sent",
+          "conditions": [
+            {
+              "field": "claimed_sender_id",
+              "op": "eq",
+              "value": "ghost-not-in-config",
+              "reference": null
+            },
+            {
+              "field": "target_state",
+              "op": "eq",
+              "value": "Follower",
+              "reference": null
+            }
+          ]
+        },
+        {
+          "alias": "probe_admission",
+          "event": "authority_probe_sent",
+          "conditions": [
+            {
+              "field": "claimed_sender_id",
+              "op": "eq",
+              "value": "ghost-not-in-config",
+              "reference": null
+            },
+            {
+              "field": "target_state",
+              "op": "eq",
+              "value": "Follower",
+              "reference": null
+            },
+            {
+              "field": "leader_state",
+              "op": "eq",
+              "value": "Leader",
+              "reference": null
+            }
+          ]
+        }
+      ],
+      "comparisons": [
+        {
+          "event": "control_stale_request_vote",
+          "identity_fields": [
+            "claimed_sender_id"
+          ],
+          "admission_alias": "control_admission",
+          "assertion": {
+            "field": "target_moved",
+            "op": "eq",
+            "value": false,
+            "reference": null
+          },
+          "antecedent": null,
+          "applicability_conditions": [
+            {
+              "field": "granted",
+              "op": "eq",
+              "value": false,
+              "reference": null
+            }
+          ],
+          "description": "Control: a request that carries a stale term from the same non-member claimed sender is refused and leaves the target in Follower at its original term."
+        },
+        {
+          "event": "after_timeout_now",
+          "identity_fields": [
+            "target_id"
+          ],
+          "admission_alias": "probe_admission",
+          "assertion": {
+            "field": "target_moved",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          },
+          "antecedent": null,
+          "applicability_conditions": [
+            {
+              "field": "target_state_before",
+              "op": "eq",
+              "value": "Follower",
+              "reference": null
+            },
+            {
+              "field": "leader_state_before",
+              "op": "eq",
+              "value": "Leader",
+              "reference": null
+            },
+            {
+              "field": "rpc_error",
+              "op": "eq",
+              "value": "",
+              "reference": null
+            }
+          ],
+          "description": "Probe: the delivered order moves the follower out of Follower and raises its term, although the order carries no term and its claimed sender is not the leader or a member."
+        },
+        {
+          "event": "after_timeout_now",
+          "identity_fields": [
+            "leader_id"
+          ],
+          "admission_alias": "probe_admission",
+          "assertion": {
+            "field": "leader_deposed",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          },
+          "antecedent": null,
+          "applicability_conditions": [
+            {
+              "field": "leader_state_before",
+              "op": "eq",
+              "value": "Leader",
+              "reference": null
+            }
+          ],
+          "description": "Probe consequence: the previously serving leader is no longer Leader and reports a higher term within the bounded observation interval."
+        }
+      ],
+      "knowledge": [],
+      "previous_id": null,
+      "revision_reason": ""
+    },
+    "stop": null
+  },
+  "before": {
+    "investigations": [],
+    "knowledge": [],
+    "experiments": [],
+    "materials": [],
+    "current_submission": {
+      "phase": "received",
+      "operation_id": "ce1a7dcb68b449448fdee06b3eb7737e",
+      "result": {
+        "submission": "update.json",
+        "summary": "Investigated the receiver side of the leadership-transfer order (TimeoutNow) as an authority transition, and recorded one unresolved configuration-state question.\n\nSourced defect candidate (A2, authority transition): `Raft.timeoutNow` (raft.go:2209-2214) is the one authority-bearing RPC handler that binds to nothing. It clears the known leader, sets state Candidate and sets candidateFromLeadershipTransfer=true, ignoring the RPC header identity and the configuration, while `TimeoutNowRequest` (commands.go:206-208) carries only RPCHeader and therefore no term at all. The producer only sends it after catching the target up (raft.go:1003-1032), a precondition the receiver cannot verify, and the order simultaneously disables both disruption guards: runCandidate skips pre-vote (raft.go:285-308) and voters skip the known-leader rejection (raft.go:1603-1656). Contrast: appendEntries and installSnapshot both reject/ignore a sender term below the receiver's current term (raft.go:1453-1463, 1833-1841).\n\nLocal native feedback (not formal evidence): the requested harness (draft/assurance_timeoutnow.go) in a normally bootstrapped, fault-free 3-node in-memory cluster shows the steady state (leader at term 2, target Follower at term 2), a control stale-term RequestVote from a claimed sender 'ghost-not-in-config' leaving the target unmoved, and then one TimeoutNow from the same non-member claimed sender driving the target from Follower(term 2) to Leader(term 3) and deposing the serving leader (Follower, term 3) within 2s. This is an authority/disruption defect; no state-machine safety violation is claimed, and the spoofed-identity route overlaps with transport-level trust, so the experiment asks for the controller's fixed-input execution and comparison. `validate --submission update.json` returns valid:true.\n\nSecond, unresolved question (no mechanism claim, no knowledge entry): running the captured TestRaft_ProtocolVersion_Upgrade_2_3 locally failed 2 of 3 isolated runs with 'peer mismatch', where an old follower reported the 2-server bootstrap configuration for the whole 5s EnsureSamePeers window while the added server reported 3 servers; GetConfiguration returns an atomically published latestConfiguration (api.go:897-903), and a candidate production path is the appendEntries truncation rollback (raft.go:1526-1532) plus duplicate-skip. Instrumented re-implementations of the same scenario converged within 250ms on every run, so the mechanism is recorded as a registered gap rather than a finding."
+      },
+      "status": "completed",
+      "reason": "",
+      "session_unavailable": false
+    },
+    "applied_operations": {}
+  },
+  "after": {
+    "investigations": [
+      {
+        "id": "ce1a7dcb68b449448fdee06b3eb7737e-question-0",
+        "version": 1,
+        "question": "In the captured snapshot, is a leadership-transfer order (TimeoutNow) bound at the receiver to the current leader's authority, or can a delivered order that carries no term and whose claimed sender is not the current leader (and not a configuration member) drive a stable follower out of Follower and depose the serving leader?",
+        "source_ids": [
+          "s_timeoutnow_handler",
+          "s_timeoutnow_msg",
+          "s_prevote_gate",
+          "s_vote_known_leader",
+          "s_sender_precondition"
+        ],
+        "hypothesis": "Raft.timeoutNow is the only RPC handler that changes authority without consulting any term: it does setLeader(\"\",\"\"), setState(Candidate) and candidateFromLeadershipTransfer.Store(true) and responds, ignoring RPCHeader.ID/Addr and the configuration. TimeoutNowRequest embeds only RPCHeader, so no term/freshness value exists to check, while the producer only sends it after it has caught the target up (nextIndex beyond the leader's last index) - a precondition the receiver cannot verify. The Candidate run skips pre-vote (raft.go:294-298) and voters skip the known-leader rejection for LeadershipTransfer candidates (raft.go:1645-1656), so the order withdraws both disruption guards at once.",
+        "discriminator": "In one fault-free, normally bootstrapped 3-node in-memory cluster with a stable leader at a known term, deliver a single TimeoutNow to a follower using a transport RPC header whose ID is not a configuration member (and which necessarily carries no term), then observe the target's state/term and the previous leader's state/term for a bounded interval. Control: the same non-member sender with a RequestVoteRequest that does carry a term, but an older one, must leave the target unchanged. If the TimeoutNow leaves the target in Follower at the same term and the leader in place, the hypothesis is refuted; if the target leaves Follower at a higher term while the leader steps down, the receiver-side authority gap is observed.",
+        "disposition": "active",
+        "parent_id": null,
+        "knowledge": [],
+        "counterevidence": [],
+        "limitations": [
+          "The probe uses the in-memory transport inside one process; the sender identity is the RPC header ID, and the network transport does not authenticate peers at the Raft layer, so the spoofed-identity route overlaps with transport-level trust. The freshness part of the question does not depend on spoofing: a replayed or delayed order from a legitimate former leader is indistinguishable because the message carries no term.",
+          "The probe observes disruption/authority behaviour only. It does not claim a state-machine safety violation (log matching and vote uniqueness are still enforced by the term/vote rules), and it does not establish how long the deposed leader's clients are without a leader.",
+          "No claim is made about clusters where no leader is currently known; the probe starts from a stable leader to make the authority transition observable."
+        ],
+        "resume_conditions": [],
+        "gaps": [
+          {
+            "id": "ce1a7dcb68b449448fdee06b3eb7737e-gap-0",
+            "question": "Does one received TimeoutNow, whose RPC header claims a sender that is not the serving leader and not a configuration member and which carries no term, actually move a stable follower out of Follower at a higher term and cause the serving leader to step down in a fault-free 3-node cluster, while a stale-term RequestVote from the same claimed sender leaves the target unchanged?",
+            "experiment_id": null,
+            "operation_id": "ce1a7dcb68b449448fdee06b3eb7737e"
+          }
+        ],
+        "history": [],
+        "operation_id": "ce1a7dcb68b449448fdee06b3eb7737e"
+      },
+      {
+        "id": "ce1a7dcb68b449448fdee06b3eb7737e-question-1",
+        "version": 1,
+        "question": "Can a server in the captured snapshot hold a configurations.latest (and hence GetConfiguration) that is older than its own committed log, and how is that state produced?",
+        "source_ids": [
+          "s_get_configuration",
+          "s_ensure_same_peers"
+        ],
+        "hypothesis": "GetConfiguration returns the atomically published latest configuration (api.go:897-903), a value written only by setLatestConfiguration. In the captured package's own TestRaft_ProtocolVersion_Upgrade_2_3, an old follower was observed reporting the 2-server bootstrap configuration for at least the full 5s EnsureSamePeers window while the newly added server reported the 3-server configuration, i.e. the membership read diverged from the replicated configuration entry. A candidate production path is the rollback in appendEntries (raft.go:1526-1532, setLatestConfiguration(committed, committedIndex)) combined with the duplicate-skip loop that never re-runs processConfigurationLogEntry for an entry already present.",
+        "discriminator": "Replay the captured upgrade scenario with instrumentation that reads configurations.latest/latestIndex, the atomic latestConfiguration, the log store contents and commitIndex on every node immediately after the AddVoter future returns and then every 250ms; a persistent latest index below the appended configuration entry index (with the entry present in the log store and applied to the FSM) would confirm the divergence, while convergence within a few hundred ms on every run would show the earlier observation was lag rather than a stale read.",
+        "disposition": "active",
+        "parent_id": null,
+        "knowledge": [],
+        "counterevidence": [],
+        "limitations": [
+          "Local exploration only: the captured TestRaft_ProtocolVersion_Upgrade_2_3 failed with 'peer mismatch' in 2 of 3 isolated local runs, but two instrumented re-implementations of the same scenario converged within 250ms on every run, so the mechanism is unresolved rather than established. No knowledge entry is claimed here.",
+          "The frozen evidence for any claim must come from the controller's own execution of a fixed harness, which has not been requested for this question."
+        ],
+        "resume_conditions": [],
+        "gaps": [
+          {
+            "id": "ce1a7dcb68b449448fdee06b3eb7737e-gap-1",
+            "question": "Under instrumented replay of the captured upgrade scenario, does any node hold configurations.latest/latestIndex below its own appended configuration entry index for longer than the 5s EnsureSamePeers window, and if so which source path (appendEntries rollback, duplicate-skip in appendEntries, snapshot install, or restart replay) produced it?",
+            "experiment_id": null,
+            "operation_id": "ce1a7dcb68b449448fdee06b3eb7737e"
+          }
+        ],
+        "history": [],
+        "operation_id": "ce1a7dcb68b449448fdee06b3eb7737e"
+      }
+    ],
+    "knowledge": [
+      {
+        "id": "ce1a7dcb68b449448fdee06b3eb7737e-knowledge-0",
+        "revision": 1,
+        "kind": "behavior",
+        "statement": "Raft.timeoutNow performs an unconditional authority transition on the receiver: it clears the known leader, sets the state to Candidate, stores candidateFromLeadershipTransfer=true and responds with an empty TimeoutNowResponse. It never inspects the RPC header identity, the current configuration, or any term, and observes no election or heartbeat precondition before transitioning.",
+        "conditions": "Applies to every TimeoutNowRequest that passes checkRPCHeader, delivered to a server in any run state; the request carries only RPCHeader (ProtocolVersion, ID, Addr) and therefore cannot be evaluated for freshness.",
+        "source_ids": [
+          "s_timeoutnow_handler",
+          "s_timeoutnow_msg"
+        ],
+        "executions": {},
+        "history": [],
+        "operation_id": "ce1a7dcb68b449448fdee06b3eb7737e"
+      },
+      {
+        "id": "ce1a7dcb68b449448fdee06b3eb7737e-knowledge-1",
+        "revision": 1,
+        "kind": "behavior",
+        "statement": "While candidateFromLeadershipTransfer is set, runCandidate does not pre-vote: it calls electSelf directly, which increments the current term and sends RequestVote with LeadershipTransfer=true. The flag is cleared by a deferred store(false) when the candidate run ends.",
+        "conditions": "Set only by timeoutNow in the captured source; applies to a node that then enters/continues the candidate state.",
+        "source_ids": [
+          "s_prevote_gate"
+        ],
+        "executions": {},
+        "history": [],
+        "operation_id": "ce1a7dcb68b449448fdee06b3eb7737e"
+      },
+      {
+        "id": "ce1a7dcb68b449448fdee06b3eb7737e-knowledge-2",
+        "revision": 1,
+        "kind": "behavior",
+        "statement": "requestVote rejects a vote request that arrives while a different leader is known, but skips that rejection when req.LeadershipTransfer is true; the older-term rejection and the log-suffix comparison still run before a vote is granted.",
+        "conditions": "Applies to RequestVoteRequest handling on any server that has a recorded leader whose address differs from the candidate and whose protocol version carries the LeadershipTransfer flag.",
+        "source_ids": [
+          "s_vote_known_leader",
+          "s_vote_term_guard"
+        ],
+        "executions": {},
+        "history": [],
+        "operation_id": "ce1a7dcb68b449448fdee06b3eb7737e"
+      },
+      {
+        "id": "ce1a7dcb68b449448fdee06b3eb7737e-knowledge-3",
+        "revision": 1,
+        "kind": "behavior",
+        "statement": "The other authority-bearing RPC handlers guard their state change with the sender's term: appendEntries returns early when a.Term is below the current term and only adopts/updates term and state when the request term is greater (or the receiver is not a follower), and installSnapshot ignores a snapshot whose request term is older than the current term.",
+        "conditions": "Applies to AppendEntriesRequest and InstallSnapshotRequest processing; this is the control contrast for the TimeoutNow handler, which has no term to compare.",
+        "source_ids": [
+          "s_append_term_guard",
+          "s_snapshot_term_guard"
+        ],
+        "executions": {},
+        "history": [],
+        "operation_id": "ce1a7dcb68b449448fdee06b3eb7737e"
+      },
+      {
+        "id": "ce1a7dcb68b449448fdee06b3eb7737e-knowledge-4",
+        "revision": 1,
+        "kind": "behavior",
+        "statement": "The leader-side leadershipTransfer routine only issues the TimeoutNow RPC after it has driven the target's replication nextIndex past the leader's last log index, i.e. the producer establishes a caught-up target before transferring.",
+        "conditions": "Applies to the sender path invoked from leaderLoop; it is not verified by, nor visible to, the receiving timeoutNow handler.",
+        "source_ids": [
+          "s_sender_precondition"
+        ],
+        "executions": {},
+        "history": [],
+        "operation_id": "ce1a7dcb68b449448fdee06b3eb7737e"
+      },
+      {
+        "id": "ce1a7dcb68b449448fdee06b3eb7737e-knowledge-5",
+        "revision": 1,
+        "kind": "behavior",
+        "statement": "GetConfiguration does not read main-thread membership state: it returns a configurationsFuture whose configurations field is filled from the atomically published latestConfiguration, which is written only by setLatestConfiguration (and cleared/initialised elsewhere), so the value a client sees is whatever that atomic last held.",
+        "conditions": "Applies to any caller of GetConfiguration on any server, including followers, independent of the main-thread run loop.",
+        "source_ids": [
+          "s_get_configuration"
+        ],
+        "executions": {},
+        "history": [],
+        "operation_id": "ce1a7dcb68b449448fdee06b3eb7737e"
+      }
+    ],
+    "experiments": [
+      {
+        "id": "ce1a7dcb68b449448fdee06b3eb7737e-experiment",
+        "investigation_id": "ce1a7dcb68b449448fdee06b3eb7737e-question-0",
+        "version": 1,
+        "basis": {
+          "harness": {
+            "kind": "go_test",
+            "source": "package raft\n\nimport (\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"testing\"\n\t\"time\"\n)\n\nfunc caEvent(t *testing.T, ev map[string]interface{}) {\n\tb, err := json.Marshal(ev)\n\tif err != nil {\n\t\tt.Fatalf(\"marshal: %v\", err)\n\t}\n\tfmt.Println(\"CA_EVENT \" + string(b))\n}\n\n// TestAssuranceTimeoutNowNonLeaderAuthority observes the receiving side of a\n// leadership-transfer order (TimeoutNow) in a fault-free, normally bootstrapped\n// in-memory cluster. The RPC header is filled with a sender identity that is not\n// the current leader and not part of the configuration; TimeoutNowRequest has no\n// term field at all, so no freshness value can be supplied or checked.\nfunc TestAssuranceTimeoutNowNonLeaderAuthority(t *testing.T) {\n\tc := MakeCluster(3, t, nil)\n\tdefer c.Close()\n\n\tleader := c.Leader()\n\tif leader == nil {\n\t\tt.Fatalf(\"no leader elected\")\n\t}\n\tleaderID, leaderAddr := leader.LeaderWithID()\n\tleaderTermBefore := leader.getCurrentTerm()\n\n\tvar target *Raft\n\tfor _, r := range c.rafts {\n\t\tif r != leader {\n\t\t\ttarget = r\n\t\t\tbreak\n\t\t}\n\t}\n\tif target == nil {\n\t\tt.Fatalf(\"no follower available\")\n\t}\n\n\ttargetStateBefore := target.getState()\n\ttargetTermBefore := target.getCurrentTerm()\n\n\tcaEvent(t, map[string]interface{}{\n\t\t\"event\":             \"steady_state\",\n\t\t\"leader_id\":         string(leaderID),\n\t\t\"leader_addr\":       string(leaderAddr),\n\t\t\"leader_state\":      leader.getState().String(),\n\t\t\"leader_term\":       leaderTermBefore,\n\t\t\"target_id\":         string(target.localID),\n\t\t\"target_state\":      targetStateBefore.String(),\n\t\t\"target_term\":       targetTermBefore,\n\t\t\"target_protocol\":   int64(target.protocolVersion),\n\t\t\"cluster_size\":      len(c.rafts),\n\t\t\"claimed_sender_id\": \"ghost-not-in-config\",\n\t})\n\n\tsender := c.trans[(c.IndexOf(target)+1)%len(c.trans)]\n\tghostHeader := RPCHeader{\n\t\tProtocolVersion: target.protocolVersion,\n\t\tID:              []byte(\"ghost-not-in-config\"),\n\t\tAddr:            []byte(\"ghost-not-in-config\"),\n\t}\n\n\t// Control: the same non-member sender, with a request that does carry a term,\n\t// but an older one. A stale request must not move the target.\n\tvoteReq := &RequestVoteRequest{\n\t\tRPCHeader:    ghostHeader,\n\t\tTerm:         targetTermBefore - 1,\n\t\tLastLogIndex: 0,\n\t\tLastLogTerm:  0,\n\t}\n\tvoteResp := &RequestVoteResponse{}\n\tcaEvent(t, map[string]interface{}{\n\t\t\"event\":             \"control_vote_sent\",\n\t\t\"claimed_sender_id\": \"ghost-not-in-config\",\n\t\t\"target_id\":         string(target.localID),\n\t\t\"request_term\":      targetTermBefore - 1,\n\t\t\"target_state\":      targetStateBefore.String(),\n\t\t\"target_term\":       targetTermBefore,\n\t})\n\tvoteErr := sender.RequestVote(target.localID, target.localAddr, voteReq, voteResp)\n\tcaEvent(t, map[string]interface{}{\n\t\t\"event\":              \"control_stale_request_vote\",\n\t\t\"claimed_sender_id\":  \"ghost-not-in-config\",\n\t\t\"request_term\":       targetTermBefore - 1,\n\t\t\"rpc_error\":          errString(voteErr),\n\t\t\"granted\":            voteResp.Granted,\n\t\t\"target_state_after\": target.getState().String(),\n\t\t\"target_term_after\":  target.getCurrentTerm(),\n\t\t\"target_moved\":       target.getState() != targetStateBefore || target.getCurrentTerm() != targetTermBefore,\n\t})\n\n\t// Authority probe: leadership-transfer order from the same non-member sender.\n\tnowReq := &TimeoutNowRequest{RPCHeader: ghostHeader}\n\tnowResp := &TimeoutNowResponse{}\n\tcaEvent(t, map[string]interface{}{\n\t\t\"event\":             \"authority_probe_sent\",\n\t\t\"claimed_sender_id\": \"ghost-not-in-config\",\n\t\t\"target_id\":         string(target.localID),\n\t\t\"leader_id\":         string(leaderID),\n\t\t\"target_state\":      targetStateBefore.String(),\n\t\t\"target_term\":       targetTermBefore,\n\t\t\"leader_state\":      leader.getState().String(),\n\t\t\"leader_term\":       leader.getCurrentTerm(),\n\t})\n\tnowErr := sender.TimeoutNow(target.localID, target.localAddr, nowReq, nowResp)\n\n\ttargetMoved := false\n\tleaderDeposed := false\n\tdeadline := time.Now().Add(2 * time.Second)\n\tfor time.Now().Before(deadline) {\n\t\tif target.getState() != targetStateBefore || target.getCurrentTerm() != targetTermBefore {\n\t\t\ttargetMoved = true\n\t\t}\n\t\tif leader.getState() != Leader || leader.getCurrentTerm() != leaderTermBefore {\n\t\t\tleaderDeposed = true\n\t\t}\n\t\tif targetMoved && leaderDeposed {\n\t\t\tbreak\n\t\t}\n\t\ttime.Sleep(20 * time.Millisecond)\n\t}\n\n\tcaEvent(t, map[string]interface{}{\n\t\t\"event\":                  \"after_timeout_now\",\n\t\t\"claimed_sender_id\":      \"ghost-not-in-config\",\n\t\t\"rpc_error\":              errString(nowErr),\n\t\t\"target_id\":              string(target.localID),\n\t\t\"target_state_before\":    targetStateBefore.String(),\n\t\t\"target_term_before\":     targetTermBefore,\n\t\t\"target_state_after\":     target.getState().String(),\n\t\t\"target_term_after\":      target.getCurrentTerm(),\n\t\t\"target_moved\":           targetMoved,\n\t\t\"leader_id\":              string(leaderID),\n\t\t\"leader_state_before\":    \"Leader\",\n\t\t\"leader_term_before\":     leaderTermBefore,\n\t\t\"leader_state_after\":     leader.getState().String(),\n\t\t\"leader_term_after\":      leader.getCurrentTerm(),\n\t\t\"leader_deposed\":         leaderDeposed,\n\t\t\"observation_interval_s\": 2,\n\t})\n}\n\nfunc errString(err error) string {\n\tif err == nil {\n\t\treturn \"\"\n\t}\n\treturn err.Error()\n}\n",
+            "files": {},
+            "execution_package": ".",
+            "description": "",
+            "semantic_changes": [],
+            "prerequisites": [
+              {
+                "alias": "control_admission",
+                "event": "control_vote_sent",
+                "conditions": [
+                  {
+                    "field": "claimed_sender_id",
+                    "op": "eq",
+                    "value": "ghost-not-in-config",
+                    "reference": null
+                  },
+                  {
+                    "field": "target_state",
+                    "op": "eq",
+                    "value": "Follower",
+                    "reference": null
+                  }
+                ]
+              },
+              {
+                "alias": "probe_admission",
+                "event": "authority_probe_sent",
+                "conditions": [
+                  {
+                    "field": "claimed_sender_id",
+                    "op": "eq",
+                    "value": "ghost-not-in-config",
+                    "reference": null
+                  },
+                  {
+                    "field": "target_state",
+                    "op": "eq",
+                    "value": "Follower",
+                    "reference": null
+                  },
+                  {
+                    "field": "leader_state",
+                    "op": "eq",
+                    "value": "Leader",
+                    "reference": null
+                  }
+                ]
+              }
+            ]
+          },
+          "source_ids": [
+            "s_timeoutnow_handler",
+            "s_timeoutnow_msg",
+            "s_prevote_gate",
+            "s_vote_known_leader",
+            "s_sender_precondition"
+          ],
+          "anchors": [
+            {
+              "material_id": "s_timeoutnow_handler",
+              "symbol": "Raft.timeoutNow",
+              "start_line": 2209,
+              "end_line": 2214,
+              "anchor": {
+                "source_ids": [
+                  "s_timeoutnow_handler"
+                ],
+                "boundary_complete": true,
+                "kind": "declaration",
+                "material_id": "s_timeoutnow_handler",
+                "start_line": 2209,
+                "end_line": 2209,
+                "symbol": "Raft.timeoutNow"
+              }
+            },
+            {
+              "material_id": "s_timeoutnow_msg",
+              "symbol": "TimeoutNowRequest",
+              "start_line": 206,
+              "end_line": 208,
+              "anchor": {
+                "source_ids": [
+                  "s_timeoutnow_msg"
+                ],
+                "boundary_complete": true,
+                "kind": "declaration",
+                "material_id": "s_timeoutnow_msg",
+                "start_line": 206,
+                "end_line": 206,
+                "symbol": "TimeoutNowRequest"
+              }
+            },
+            {
+              "material_id": "s_prevote_gate",
+              "symbol": "Raft.runCandidate",
+              "start_line": 285,
+              "end_line": 308,
+              "anchor": {
+                "source_ids": [
+                  "s_prevote_gate"
+                ],
+                "boundary_complete": false,
+                "kind": "declaration",
+                "material_id": "s_prevote_gate",
+                "start_line": 285,
+                "end_line": 285,
+                "symbol": "Raft.runCandidate"
+              }
+            },
+            {
+              "material_id": "s_vote_known_leader",
+              "symbol": "Raft.requestVote",
+              "start_line": 1603,
+              "end_line": 1656,
+              "anchor": {
+                "source_ids": [
+                  "s_vote_known_leader"
+                ],
+                "boundary_complete": false,
+                "kind": "declaration",
+                "material_id": "s_vote_known_leader",
+                "start_line": 1603,
+                "end_line": 1603,
+                "symbol": "Raft.requestVote"
+              }
+            }
+          ],
+          "scope": {
+            "description": "One fault-free execution of a normally bootstrapped 3-node in-memory cluster; one control RPC (stale-term RequestVote from a non-member claimed sender) followed by one TimeoutNow from the same claimed sender to a follower, with bounded observation of target and leader state/term.",
+            "assumptions": [
+              "MakeCluster(3) performs real bootstrap: initial configuration entry, leader election and log replication through the in-memory transport.",
+              "Both RPCs are delivered over the in-memory transport with no packet loss, reordering or delay, so any observed transition is caused by the delivered request itself.",
+              "The sender identity in the RPC header ('ghost-not-in-config') is deliberately not a configuration member; the probe does not rely on the sender being reachable or registered.",
+              "The cluster is healthy before the probe: a leader is serving at a known term, which the harness records as steady_state."
+            ],
+            "excluded": [
+              "Network-transport authentication, TLS and peer-identity properties outside the Raft layer.",
+              "State-machine safety (log matching, single vote per term) and any claim that the newly elected leader violates it.",
+              "Behaviour after the observation interval, further elections, and client-visible unavailability."
+            ],
+            "parameters": {
+              "cluster_size": 3,
+              "observation_interval_seconds": 2,
+              "control_request_term": "target term at steady state minus 1",
+              "claimed_sender_id": "ghost-not-in-config"
+            }
+          },
+          "prefix": "The harness builds the prefix itself with the captured test facilities: MakeCluster(3, t, nil) bootstraps a three-voter configuration through the in-memory transport, waits for a stable leader (c.Leader()), and records the leader id/address/term and the chosen follower's state/term as CA_EVENT steady_state. It then selects the follower's transport peer as sender and emits CA_EVENT control_stale_request_vote after delivering a RequestVoteRequest with Term = targetTerm-1 and RPCHeader.ID = 'ghost-not-in-config'. Only then does it deliver the single TimeoutNowRequest with the same RPC header (no term field exists) and emit CA_EVENT after_timeout_now after a bounded 2s observation of the target and the previous leader. No state is injected and no storage is pre-filled.",
+          "requirement": "A delivered leadership-transfer order is processed as authority to depose the known leader even though the message carries no term and its claimed sender is not the serving leader or a configuration member; the receiver performs no term, identity or membership check before clearing the leader and starting an election.",
+          "responsibility": "Receiver-side admission of a leadership-transfer order in Raft.timeoutNow, and the two guards that the order disables: the candidate pre-vote gate and the known-leader vote rejection.",
+          "comparisons": [
+            {
+              "event": "control_stale_request_vote",
+              "identity_fields": [
+                "claimed_sender_id"
+              ],
+              "admission_alias": "control_admission",
+              "assertion": {
+                "field": "target_moved",
+                "op": "eq",
+                "value": false,
+                "reference": null
+              },
+              "antecedent": null,
+              "applicability_conditions": [
+                {
+                  "field": "granted",
+                  "op": "eq",
+                  "value": false,
+                  "reference": null
+                }
+              ],
+              "description": "Control: a request that carries a stale term from the same non-member claimed sender is refused and leaves the target in Follower at its original term."
+            },
+            {
+              "event": "after_timeout_now",
+              "identity_fields": [
+                "target_id"
+              ],
+              "admission_alias": "probe_admission",
+              "assertion": {
+                "field": "target_moved",
+                "op": "eq",
+                "value": true,
+                "reference": null
+              },
+              "antecedent": null,
+              "applicability_conditions": [
+                {
+                  "field": "target_state_before",
+                  "op": "eq",
+                  "value": "Follower",
+                  "reference": null
+                },
+                {
+                  "field": "leader_state_before",
+                  "op": "eq",
+                  "value": "Leader",
+                  "reference": null
+                },
+                {
+                  "field": "rpc_error",
+                  "op": "eq",
+                  "value": "",
+                  "reference": null
+                }
+              ],
+              "description": "Probe: the delivered order moves the follower out of Follower and raises its term, although the order carries no term and its claimed sender is not the leader or a member."
+            },
+            {
+              "event": "after_timeout_now",
+              "identity_fields": [
+                "leader_id"
+              ],
+              "admission_alias": "probe_admission",
+              "assertion": {
+                "field": "leader_deposed",
+                "op": "eq",
+                "value": true,
+                "reference": null
+              },
+              "antecedent": null,
+              "applicability_conditions": [
+                {
+                  "field": "leader_state_before",
+                  "op": "eq",
+                  "value": "Leader",
+                  "reference": null
+                }
+              ],
+              "description": "Probe consequence: the previously serving leader is no longer Leader and reports a higher term within the bounded observation interval."
+            }
+          ],
+          "knowledge": []
+        },
+        "snapshot_id": "a4c51d74d8ce4f16817600a3ec9e373c",
+        "configuration": {
+          "backend": "go_module",
+          "target": {
+            "expected_module": "github.com/hashicorp/raft",
+            "variant": "hashicorp_raft",
+            "analysis_roots": [],
+            "execution_package": ".",
+            "harness_path": "assurance_generated_test.go"
+          },
+          "isolation": "bwrap",
+          "tools": {
+            "agent": "codex-cli 0.155.0-alpha.16",
+            "implementation": "go version go1.23.5 linux/amd64"
+          }
+        },
+        "harness_filename": "assurance_generated_test.go",
+        "operation_id": "ce1a7dcb68b449448fdee06b3eb7737e",
+        "previous_id": null,
+        "difference": {},
+        "revision_reason": ""
+      }
+    ],
+    "materials": [
+      {
+        "id": "s_timeoutnow_handler",
+        "file": "raft.go",
+        "start_line": 2209,
+        "end_line": 2214,
+        "kind": "code_observation",
+        "text": "func (r *Raft) timeoutNow(rpc RPC, req *TimeoutNowRequest) {\n\tr.setLeader(\"\", \"\")\n\tr.setState(Candidate)\n\tr.candidateFromLeadershipTransfer.Store(true)\n\trpc.Respond(&TimeoutNowResponse{}, nil)\n}",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "s_timeoutnow_msg",
+        "file": "commands.go",
+        "start_line": 206,
+        "end_line": 213,
+        "kind": "code_observation",
+        "text": "type TimeoutNowRequest struct {\n\tRPCHeader\n}\n\n// GetRPCHeader - See WithRPCHeader.\nfunc (r *TimeoutNowRequest) GetRPCHeader() RPCHeader {\n\treturn r.RPCHeader\n}",
+        "content_digest": "44cf24bfd7cdde1123e73c7bc8c51fed84a2d0448f30da29b09b7bdc10e834c3"
+      },
+      {
+        "id": "s_prevote_gate",
+        "file": "raft.go",
+        "start_line": 285,
+        "end_line": 308,
+        "kind": "code_observation",
+        "text": "func (r *Raft) runCandidate() {\n\tterm := r.getCurrentTerm() + 1\n\tr.logger.Info(\"entering candidate state\", \"node\", r, \"term\", term)\n\tmetrics.IncrCounter([]string{\"raft\", \"state\", \"candidate\"}, 1)\n\n\t// Start vote for us, and set a timeout\n\tvar voteCh <-chan *voteResult\n\tvar prevoteCh <-chan *preVoteResult\n\n\t// check if pre-vote is active and that this is not a leader transfer.\n\t// Leader transfer do not perform prevote by design\n\tif !r.preVoteDisabled && !r.candidateFromLeadershipTransfer.Load() {\n\t\tprevoteCh = r.preElectSelf()\n\t} else {\n\t\tvoteCh = r.electSelf()\n\t}\n\n\t// Make sure the leadership transfer flag is reset after each run. Having this\n\t// flag will set the field LeadershipTransfer in a RequestVoteRequest to true,\n\t// which will make other servers vote even though they have a leader already.\n\t// It is important to reset that flag, because this privilege could be abused\n\t// otherwise.\n\tdefer func() { r.candidateFromLeadershipTransfer.Store(false) }()\n",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "s_vote_known_leader",
+        "file": "raft.go",
+        "start_line": 1603,
+        "end_line": 1656,
+        "kind": "code_observation",
+        "text": "func (r *Raft) requestVote(rpc RPC, req *RequestVoteRequest) {\n\tdefer metrics.MeasureSince([]string{\"raft\", \"rpc\", \"requestVote\"}, time.Now())\n\tr.observe(*req)\n\n\t// Setup a response\n\tresp := &RequestVoteResponse{\n\t\tRPCHeader: r.getRPCHeader(),\n\t\tTerm:      r.getCurrentTerm(),\n\t\tGranted:   false,\n\t}\n\tvar rpcErr error\n\tdefer func() {\n\t\trpc.Respond(resp, rpcErr)\n\t}()\n\n\t// Version 0 servers will panic unless the peers is present. It's only\n\t// used on them to produce a warning message.\n\tif r.protocolVersion < 2 {\n\t\tresp.Peers = encodePeers(r.configurations.latest, r.trans)\n\t}\n\n\t// Check if we have an existing leader [who's not the candidate] and also\n\t// check the LeadershipTransfer flag is set. Usually votes are rejected if\n\t// there is a known leader. But if the leader initiated a leadership transfer,\n\t// vote!\n\tvar candidate ServerAddress\n\tvar candidateBytes []byte\n\tif len(req.RPCHeader.Addr) > 0 {\n\t\tcandidate = r.trans.DecodePeer(req.RPCHeader.Addr)\n\t\tcandidateBytes = req.RPCHeader.Addr\n\t} else {\n\t\tcandidate = r.trans.DecodePeer(req.Candidate)\n\t\tcandidateBytes = req.Candidate\n\t}\n\n\t// For older raft version ID is not part of the packed message\n\t// We assume that the peer is part of the configuration and skip this check\n\tif len(req.ID) > 0 {\n\t\tcandidateID := ServerID(req.ID)\n\t\t// if the Servers list is empty that mean the cluster is very likely trying to bootstrap,\n\t\t// Grant the vote\n\t\tif len(r.configurations.latest.Servers) > 0 && !inConfiguration(r.configurations.latest, candidateID) {\n\t\t\tr.logger.Warn(\"rejecting vote request since node is not in configuration\",\n\t\t\t\t\"from\", candidate)\n\t\t\treturn\n\t\t}\n\t}\n\tif leaderAddr, leaderID := r.LeaderWithID(); leaderAddr != \"\" && leaderAddr != candidate && !req.LeadershipTransfer {\n\t\tr.logger.Warn(\"rejecting vote request since we have a leader\",\n\t\t\t\"from\", candidate,\n\t\t\t\"leader\", leaderAddr,\n\t\t\t\"leader-id\", string(leaderID))\n\t\treturn\n\t}",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "s_vote_term_guard",
+        "file": "raft.go",
+        "start_line": 1658,
+        "end_line": 1670,
+        "kind": "code_observation",
+        "text": "\t// Ignore an older term\n\tif req.Term < r.getCurrentTerm() {\n\t\treturn\n\t}\n\n\t// Increase the term if we see a newer one\n\tif req.Term > r.getCurrentTerm() {\n\t\t// Ensure transition to follower\n\t\tr.logger.Debug(\"lost leadership because received a requestVote with a newer term\")\n\t\tr.setState(Follower)\n\t\tr.setCurrentTerm(req.Term)\n\n\t\tresp.Term = req.Term",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "s_append_term_guard",
+        "file": "raft.go",
+        "start_line": 1453,
+        "end_line": 1463,
+        "kind": "code_observation",
+        "text": "\t}()\n\n\t// Ignore an older term\n\tif a.Term < r.getCurrentTerm() {\n\t\treturn\n\t}\n\n\t// Increase the term if we see a newer one, also transition to follower\n\t// if we ever get an appendEntries call\n\tif a.Term > r.getCurrentTerm() || (r.getState() != Follower && !r.candidateFromLeadershipTransfer.Load()) {\n\t\t// Ensure transition to follower",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "s_snapshot_term_guard",
+        "file": "raft.go",
+        "start_line": 1833,
+        "end_line": 1841,
+        "kind": "code_observation",
+        "text": "\n\t// Ignore an older term\n\tif req.Term < r.getCurrentTerm() {\n\t\tr.logger.Info(\"ignoring installSnapshot request with older term than current term\",\n\t\t\t\"request-term\", req.Term,\n\t\t\t\"current-term\", r.getCurrentTerm())\n\t\treturn\n\t}\n",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "s_sender_precondition",
+        "file": "raft.go",
+        "start_line": 1003,
+        "end_line": 1032,
+        "kind": "code_observation",
+        "text": "\t\tselect {\n\t\tcase err := <-err.errCh:\n\t\t\tif err != nil {\n\t\t\t\tdoneCh <- err\n\t\t\t\treturn\n\t\t\t}\n\t\tcase <-stopCh:\n\t\t\tdoneCh <- nil\n\t\t\treturn\n\t\t}\n\t}\n\n\t// Step ?: the thesis describes in chap 6.4.1: Using clocks to reduce\n\t// messaging for read-only queries. If this is implemented, the lease\n\t// has to be reset as well, in case leadership is transferred. This\n\t// implementation also has a lease, but it serves another purpose and\n\t// doesn't need to be reset. The lease mechanism in our raft lib, is\n\t// setup in a similar way to the one in the thesis, but in practice\n\t// it's a timer that just tells the leader how often to check\n\t// heartbeats are still coming in.\n\n\t// Step 3: send TimeoutNow message to target server.\n\terr := r.trans.TimeoutNow(id, address, &TimeoutNowRequest{RPCHeader: r.getRPCHeader()}, &TimeoutNowResponse{})\n\tif err != nil {\n\t\terr = fmt.Errorf(\"failed to make TimeoutNow RPC to %v: %v\", id, err)\n\t}\n\tdoneCh <- err\n}\n\n// checkLeaderLease is used to check if we can contact a quorum of nodes",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "s_get_configuration",
+        "file": "api.go",
+        "start_line": 897,
+        "end_line": 903,
+        "kind": "code_observation",
+        "text": "func (r *Raft) GetConfiguration() ConfigurationFuture {\n\tconfigReq := &configurationsFuture{}\n\tconfigReq.init()\n\tconfigReq.configurations = configurations{latest: r.getLatestConfiguration()}\n\tconfigReq.respond(nil)\n\treturn configReq\n}",
+        "content_digest": "499a72c01096912e85d16381f4640ac6d29f8c2b91cabbdae8530bdcbeb89a4a"
+      },
+      {
+        "id": "s_ensure_same_peers",
+        "file": "testing.go",
+        "start_line": 692,
+        "end_line": 712,
+        "kind": "test_expectation",
+        "text": "func (c *cluster) EnsureSamePeers(t *testing.T) {\n\tlimit := time.Now().Add(c.longstopTimeout)\n\tpeerSet := c.getConfiguration(c.rafts[0])\n\nCHECK:\n\tfor i, raft := range c.rafts {\n\t\tif i == 0 {\n\t\t\tcontinue\n\t\t}\n\n\t\totherSet := c.getConfiguration(raft)\n\t\tif !reflect.DeepEqual(peerSet, otherSet) {\n\t\t\tif time.Now().After(limit) {\n\t\t\t\tt.Fatalf(\"peer mismatch: %+v %+v\", peerSet, otherSet)\n\t\t\t} else {\n\t\t\t\tgoto WAIT\n\t\t\t}\n\t\t}\n\t}\n\treturn\n",
+        "content_digest": "426e32dca108d637c6f718a27cb5405b93a507a8f1247249fba90e23eabdfe23"
+      }
+    ],
+    "current_submission": {
+      "phase": "accepted",
+      "operation_id": "ce1a7dcb68b449448fdee06b3eb7737e",
+      "action": "update",
+      "no_change": false,
+      "references": {
+        "@timeoutnow-authority": "ce1a7dcb68b449448fdee06b3eb7737e-question-0",
+        "@configuration-latest-lag": "ce1a7dcb68b449448fdee06b3eb7737e-question-1"
+      },
+      "experiment_id": "ce1a7dcb68b449448fdee06b3eb7737e-experiment"
+    },
+    "applied_operations": {
+      "submission-ce1a7dcb68b449448fdee06b3eb7737e": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-11_16-25-56-hashicorp_raft-real-run/semantic-commits/submission-ce1a7dcb68b449448fdee06b3eb7737e.json"
+      }
+    }
+  }
+}

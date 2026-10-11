@@ -1,0 +1,84 @@
+{
+  "rationale": "Reachability for the legacy-encoding question can be settled from source without an execution: the constructor rebuilds the configuration by replaying log entries regardless of the node's configured protocol version, so a member restarted at protocol 1 keeps any versioned configuration, including non-voters, and at protocol 1 the available membership API is exactly the deprecated peer API whose payload cannot carry them. That makes the loss conditional on a downgrade-style deployment rather than on an untouched cluster, which is recorded as a conditional answer with the deployment requirement stated as the trigger.",
+  "sources": [
+    {
+      "id": "s_new_raft_config_replay",
+      "file": "api.go",
+      "start_line": 593,
+      "end_line": 607,
+      "kind": "code_observation"
+    },
+    {
+      "id": "s_add_peer_protocol_gate",
+      "file": "api.go",
+      "start_line": 905,
+      "end_line": 919,
+      "kind": "code_observation"
+    },
+    {
+      "id": "s_check_rpc_header_version_window",
+      "file": "raft.go",
+      "start_line": 45,
+      "end_line": 70,
+      "kind": "code_observation"
+    }
+  ],
+  "investigations": [
+    {
+      "id": "6962a0dc36854f06b25086c2b0574c7c-question-0",
+      "ref": null,
+      "question": null,
+      "source_ids": null,
+      "hypothesis": null,
+      "discriminator": null,
+      "disposition": "explained",
+      "parent_id": null,
+      "knowledge": null,
+      "counterevidence": null,
+      "limitations": [
+        "Conditional answer: the lossy encoding is real, and its precondition is reachable only through a downgrade-style deployment - a member restarted with a protocol version below 2 while its stores already contain versioned configuration entries that include non-voters - not in a cluster that has only ever run the newer format.",
+        "Whether such a downgrade is a supported operation for the library is a policy question the captured sources do not settle; the code permits the restart and rebuilds the configuration without consulting the node's protocol version.",
+        "No execution was requested, so no entry was appended and decoded; the conclusion rests on the constructor's replay, the encoding branch, the encoder/decoder asymmetry and the protocol gate on the membership API.",
+        "The failure would drop non-voting members from the written configuration, not break quorum, since checkConfiguration still requires at least one voter."
+      ],
+      "resume_conditions": []
+    }
+  ],
+  "knowledge": [],
+  "gaps": [],
+  "interpretations": [
+    {
+      "investigation_id": "6962a0dc36854f06b25086c2b0574c7c-question-0",
+      "experiment_id": null,
+      "source_ids": [
+        "s_encode_peers_legacy",
+        "s_append_config_legacy_branch",
+        "s_decode_peers_legacy",
+        "s_new_raft_config_replay",
+        "s_add_peer_protocol_gate",
+        "s_check_rpc_header_version_window"
+      ],
+      "executions": {},
+      "conclusion": "conditional",
+      "rationale": "The mechanism is established and the precondition is reachable under a named deployment, so the answer is conditional rather than unresolved. Mechanism: with a leader whose protocol version is below 2, appendConfigurationEntry writes a deprecated remove-peer entry whose payload is encodePeers(configuration) (raft.go:1219-1233), encodePeers keeps only servers whose suffrage is Voter and states that other suffrage types are not supported by the format (configuration.go:311-327), and the receiving side decodes deprecated entries with decodePeers, which reconstructs every server as a voter (configuration.go:330-352) - so a non-voter or staging entry in the computed configuration is written back without it, and nothing on that path reports the loss because checkConfiguration only requires at least one voter. Precondition: a below-2 leader must hold such a configuration. The constructor makes that reachable after a downgrade-style restart: NewRaft rebuilds the configuration by replaying the log through processConfigurationLogEntry (api.go:593-607), which decodes each entry by its own type rather than by the node's configured protocol version, so a node restarted with protocol version 1 keeps a configuration containing non-voters that was originally written in the versioned format; its configuration store, not its protocol version, decides who counts for quorum. The membership API available at that version is the deprecated one - AddPeer refuses when the protocol version is above 2 (api.go:905-919), while the versioned AddVoter/AddNonvoter require protocol 2 or above - so an operator on a downgraded node has precisely the API whose payload cannot carry non-voters. Interoperability does not block the scenario either: the RPC header check accepts one version back (raft.go:45-70), so a protocol-1 node can exchange RPCs with protocol-2 peers that still understand the deprecated entry. Therefore, in a cluster where a member is restarted at a protocol version below 2 (a rollback after a versioned configuration has been written) and that member leads a membership change, the appended entry drops every non-voting member, and every peer decodes it that way. Scope and severity: this is a configuration-fidelity defect conditional on that deployment, it does not endanger quorum, and it does not occur in a cluster that never used the versioned format. Whether a rollback below the version that wrote a configuration is a supported operation is left to the reader; the captured code does not prevent it and does not warn about it.",
+      "answers": {},
+      "knowledge": [],
+      "counterevidence": [
+        "A cluster that has only ever run protocol 1 cannot hold non-voter entries, because the deprecated format cannot introduce them, so the defect cannot arise there.",
+        "checkConfiguration still guarantees at least one voter, so the worst case is losing non-voting members, not losing the ability to commit.",
+        "The one-version-back RPC window means the mixed deployment is not obviously excluded by the protocol checks, which is what makes the precondition reachable rather than hypothetical."
+      ],
+      "limitations": [
+        "No execution: the appended entry was not decoded and compared, and no downgraded node was constructed.",
+        "Whether the library supports rollback below the version that wrote versioned configuration entries is a policy question outside the captured sources.",
+        "The conclusion is scoped to a deliberate restart with a lower protocol version on stores that already contain versioned configuration entries."
+      ],
+      "joint_history": "",
+      "failure_attribution": null,
+      "report_title": "降级到 protocol 1 的 leader 会以旧格式写配置条目，非投票成员被静默丢弃",
+      "report_answer": "条件性确认的缺陷：当 leader 的 protocolVersion 低于 2 时，appendConfigurationEntry 使用旧格式（encodePeers）写成员变更（raft.go:1219-1233），而该编码只保留 Voter，注释明确说明其他 suffrage 不受支持（configuration.go:311-327）；接收端 decodePeers 也只会还原为 Voter（configuration.go:330-352），因此配置中的非投票成员会被静默丢弃，checkConfiguration 只要求至少一个 Voter，不会报错。触发条件：低于 2 的 leader 持有含非投票成员的配置。该前置状态可达：NewRaft 通过回放日志重建配置（api.go:593-607），解码只依赖条目类型、不看本节点协议版本，所以把成员以 protocol 1 重启后仍会保留版本化格式写入的非投票成员；而 protocol 1 下可用的成员变更 API 恰是旧格式的 AddPeer（API 在 protocolVersion > 2 时拒绝，api.go:905-919），RPC 头检查允许一个版本回退（raft.go:45-70），protocol 1 与 protocol 2 节点可以互通。影响范围：属于部署性条件（写出版本化配置后回退版本再重启），不会破坏 quorum，也只在曾使用版本化格式的集群中出现；库是否“支持”这种回退未在快照中说明。"
+    }
+  ],
+  "experiment": null,
+  "stop": null
+}

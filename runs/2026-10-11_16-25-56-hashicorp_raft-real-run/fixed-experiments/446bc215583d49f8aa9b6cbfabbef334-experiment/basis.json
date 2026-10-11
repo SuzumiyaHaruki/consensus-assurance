@@ -1,0 +1,122 @@
+{
+  "id": "446bc215583d49f8aa9b6cbfabbef334-experiment",
+  "investigation_id": "ce1a7dcb68b449448fdee06b3eb7737e-question-1",
+  "version": 1,
+  "basis": {
+    "harness": {
+      "kind": "go_test",
+      "source": "package raft\n\nimport (\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"testing\"\n\t\"time\"\n)\n\nfunc caSay(t *testing.T, ev map[string]interface{}) {\n\tb, err := json.Marshal(ev)\n\tif err != nil {\n\t\tt.Fatalf(\"marshal: %v\", err)\n\t}\n\tfmt.Println(\"CA_EVENT \" + string(b))\n}\n\n// TestAssuranceConfigurationContentConvergence repeats the captured upgrade\n// scenario and measures, per node, how long the atomically published\n// configuration content takes to include the joining voter, and whether any\n// node still showed the old membership while holding the configuration entry\n// in its own log store. It deliberately avoids the configuration index\n// accessor, which is known to return a constant zero.\nfunc TestAssuranceConfigurationContentConvergence(t *testing.T) {\n\tconst rounds = 25\n\tconst window = 3 * time.Second\n\n\tfor it := 0; it < rounds; it++ {\n\t\tconf := inmemConfig(t)\n\t\tconf.ProtocolVersion = 2\n\t\tc := MakeCluster(2, t, conf)\n\n\t\tconf3 := inmemConfig(t)\n\t\tconf3.ProtocolVersion = 3\n\t\tjoiner := MakeClusterNoBootstrap(1, t, conf3)\n\t\tc.Merge(joiner)\n\t\tc.FullyConnect()\n\n\t\tleader := c.Leader()\n\t\tif leader == nil {\n\t\t\tt.Fatalf(\"round %d: no leader\", it)\n\t\t}\n\t\tfuture := leader.AddVoter(joiner.rafts[0].localID, joiner.rafts[0].localAddr, 0, time.Second)\n\t\tif err := future.Error(); err != nil {\n\t\t\tt.Fatalf(\"round %d: add voter: %v\", it, err)\n\t\t}\n\t\tentryIndex := future.Index()\n\t\tstart := time.Now()\n\n\t\tcaSay(t, map[string]interface{}{\n\t\t\t\"event\":        \"config_round_probe_start\",\n\t\t\t\"iteration\":    it,\n\t\t\t\"entry_index\":  entryIndex,\n\t\t\t\"cluster_size\": len(c.rafts),\n\t\t})\n\n\t\tfor _, r := range c.rafts {\n\t\t\tlogLast, _ := r.logs.LastIndex()\n\t\t\tcaSay(t, map[string]interface{}{\n\t\t\t\t\"event\":                 \"config_round_start\",\n\t\t\t\t\"iteration\":             it,\n\t\t\t\t\"node\":                  string(r.localID),\n\t\t\t\t\"entry_index\":           entryIndex,\n\t\t\t\t\"content_servers_start\": len(r.getLatestConfiguration().Servers),\n\t\t\t\t\"log_store_last_start\":  logLast,\n\t\t\t})\n\t\t}\n\n\t\tconvergedAt := map[ServerID]time.Duration{}\n\t\tdeadline := start.Add(window)\n\t\tfor time.Now().Before(deadline) {\n\t\t\tall := true\n\t\t\tfor _, r := range c.rafts {\n\t\t\t\t_, done := convergedAt[r.localID]\n\t\t\t\tif !done {\n\t\t\t\t\tif len(r.getLatestConfiguration().Servers) >= 3 {\n\t\t\t\t\t\tconvergedAt[r.localID] = time.Since(start)\n\t\t\t\t\t} else {\n\t\t\t\t\t\tall = false\n\t\t\t\t\t}\n\t\t\t\t}\n\t\t\t}\n\t\t\tif all {\n\t\t\t\tbreak\n\t\t\t}\n\t\t\ttime.Sleep(5 * time.Millisecond)\n\t\t}\n\n\t\tanyLagWithEntry := false\n\t\tvar maxWait int64\n\t\ttype lagObs struct {\n\t\t\tnode    string\n\t\t\tservers int\n\t\t\tpresent bool\n\t\t\tlogLast uint64\n\t\t\tapplied uint64\n\t\t\tcommit  uint64\n\t\t}\n\t\tvar lagging []lagObs\n\t\tfor _, r := range c.rafts {\n\t\t\tvar entry Log\n\t\t\tpresent := r.logs.GetLog(entryIndex, &entry) == nil\n\t\t\tlogLast, _ := r.logs.LastIndex()\n\t\t\tservers := len(r.getLatestConfiguration().Servers)\n\t\t\tlat, ok := convergedAt[r.localID]\n\t\t\tif !ok && present {\n\t\t\t\tanyLagWithEntry = true\n\t\t\t}\n\t\t\tif lat.Milliseconds() > maxWait {\n\t\t\t\tmaxWait = lat.Milliseconds()\n\t\t\t}\n\t\t\tcaSay(t, map[string]interface{}{\n\t\t\t\t\"event\":                \"config_node_result\",\n\t\t\t\t\"iteration\":            it,\n\t\t\t\t\"node\":                 string(r.localID),\n\t\t\t\t\"converged\":            ok,\n\t\t\t\t\"wait_ms\":              lat.Milliseconds(),\n\t\t\t\t\"content_servers\":      servers,\n\t\t\t\t\"entry_present_in_log\": present,\n\t\t\t\t\"log_store_last\":       logLast,\n\t\t\t\t\"applied_index\":        r.getLastApplied(),\n\t\t\t\t\"commit_index\":         r.getCommitIndex(),\n\t\t\t})\n\t\t\tif !ok {\n\t\t\t\tlagging = append(lagging, lagObs{node: string(r.localID), servers: servers, present: present, logLast: logLast, applied: r.getLastApplied(), commit: r.getCommitIndex()})\n\t\t\t}\n\t\t}\n\n\t\tcaSay(t, map[string]interface{}{\n\t\t\t\"event\":              \"config_round_end\",\n\t\t\t\"iteration\":          it,\n\t\t\t\"entry_index\":        entryIndex,\n\t\t\t\"all_converged\":      len(convergedAt) == len(c.rafts),\n\t\t\t\"any_lag_with_entry\": anyLagWithEntry,\n\t\t\t\"max_wait_ms\":        maxWait,\n\t\t\t\"window_ms\":          window.Milliseconds(),\n\t\t\t\"lagging_nodes\":      len(lagging),\n\t\t})\n\t\tc.Close()\n\t}\n}\n",
+      "files": {},
+      "execution_package": ".",
+      "description": "",
+      "semantic_changes": [],
+      "prerequisites": [
+        {
+          "alias": "round",
+          "event": "config_round_probe_start",
+          "conditions": [
+            {
+              "field": "entry_index",
+              "op": "ne",
+              "value": 0,
+              "reference": null
+            },
+            {
+              "field": "cluster_size",
+              "op": "eq",
+              "value": 3,
+              "reference": null
+            }
+          ]
+        }
+      ]
+    },
+    "source_ids": [
+      "s_set_latest_configuration",
+      "s_get_latest_configuration",
+      "s_process_configuration_entry",
+      "s_get_configuration_api"
+    ],
+    "anchors": [],
+    "scope": {
+      "description": "Twenty-five repetitions of the captured upgrade scenario (protocol-2 pair plus a protocol-3 joiner) on in-memory clusters, each round following one AddVoter of the joiner and polling every 5ms for up to 3s for the published configuration content to include the joiner, then recording per node whether the entry is in its log store while its published content is still old.",
+      "assumptions": [
+        "MakeCluster(2, protocol 2) plus a merged MakeClusterNoBootstrap(1, protocol 3) and AddVoter of the joiner reproduce the captured scenario, with the future's index identifying the configuration entry.",
+        "The atomically published configuration content is what GetConfiguration returns and what the captured cluster assertion compares; the configuration index accessor is excluded because it returns a constant zero.",
+        "Five-millisecond polling with a 3s window is dense enough to distinguish prompt propagation from a multi-second stall.",
+        "Every round is a fresh cluster, so rounds do not share state."
+      ],
+      "excluded": [
+        "The configuration index accessor, which is covered by a separate finding.",
+        "Network transport behaviour, crashes and restarts.",
+        "Any claim about the captured test's earlier local failures, which this probe does not reproduce."
+      ],
+      "parameters": {
+        "rounds": 25,
+        "window_ms": 3000,
+        "poll_interval_ms": 5,
+        "protocol_pair": 2,
+        "protocol_joiner": 3
+      }
+    },
+    "prefix": "Built with captured test facilities and real producers only: per round a protocol-2 pair is bootstrapped, a protocol-3 single node is created without bootstrap, merged and fully connected, and the leader adds that node through AddVoter, whose future index identifies the configuration entry. The harness emits one config_round_probe_start per round with the iteration, entry index and cluster size, then one config_round_start per node with the starting published content and log store last index. It polls the atomically published content of every node every 5ms for up to 3s, records when each node first shows the joiner, and finally emits per-node config_node_result events carrying whether the entry is present in that node's log store together with its published content, log store last index, applied index and commit index, plus one config_round_end carrying all_converged, any_lag_with_entry, the maximum wait and the window. No storage is pre-filled and no production code is modified.",
+    "requirement": null,
+    "responsibility": "Propagation of a committed configuration entry into the atomically published configuration content on every node of the captured upgrade scenario, and the duty of the log store to hold the entry that content is derived from.",
+    "comparisons": [
+      {
+        "event": "config_round_end",
+        "identity_fields": [
+          "iteration"
+        ],
+        "admission_alias": "round",
+        "assertion": {
+          "field": "all_converged",
+          "op": "eq",
+          "value": true,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [],
+        "description": "Every node's published configuration includes the joining voter within the 3s window, i.e. the committed configuration entry propagates to every node's visible membership."
+      },
+      {
+        "event": "config_round_end",
+        "identity_fields": [
+          "iteration"
+        ],
+        "admission_alias": "round",
+        "assertion": {
+          "field": "any_lag_with_entry",
+          "op": "eq",
+          "value": false,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [],
+        "description": "No node published the old membership while its own log store already held the configuration entry, which is the 'stale configuration state' signature this question asks about."
+      }
+    ],
+    "knowledge": []
+  },
+  "snapshot_id": "a4c51d74d8ce4f16817600a3ec9e373c",
+  "configuration": {
+    "backend": "go_module",
+    "target": {
+      "expected_module": "github.com/hashicorp/raft",
+      "variant": "hashicorp_raft",
+      "analysis_roots": [],
+      "execution_package": ".",
+      "harness_path": "assurance_generated_test.go"
+    },
+    "isolation": "bwrap",
+    "tools": {
+      "agent": "codex-cli 0.155.0-alpha.16",
+      "implementation": "go version go1.23.5 linux/amd64"
+    }
+  },
+  "harness_filename": "assurance_generated_test.go",
+  "operation_id": "446bc215583d49f8aa9b6cbfabbef334",
+  "previous_id": null,
+  "difference": {},
+  "revision_reason": ""
+}

@@ -1,0 +1,109 @@
+{
+  "rationale": "One focused source item for the remaining budget: what counts as existing state when a caller decides whether a node is new, and whether that detection lines up with what the constructor restores. The helper's three checks match the documented contract and the constructor's restore behaviour, and the one component it does not consult directly - a persisted vote - cannot appear without a current term in the captured write paths, which is recorded as the enclosing argument rather than as an unexamined gap.",
+  "sources": [
+    {
+      "id": "s_has_existing_state",
+      "file": "api.go",
+      "start_line": 460,
+      "end_line": 494,
+      "kind": "code_observation"
+    },
+    {
+      "id": "s_new_raft_restores",
+      "file": "api.go",
+      "start_line": 496,
+      "end_line": 500,
+      "kind": "document_statement"
+    },
+    {
+      "id": "s_has_existing_state_test",
+      "file": "raft_test.go",
+      "start_line": 255,
+      "end_line": 295,
+      "kind": "test_expectation"
+    },
+    {
+      "id": "s_vote_write_order",
+      "file": "raft.go",
+      "start_line": 1983,
+      "end_line": 2026,
+      "kind": "code_observation"
+    }
+  ],
+  "investigations": [
+    {
+      "id": null,
+      "ref": "@existing-state-detection",
+      "question": "What does HasExistingState count as existing state, and can a store be in a condition where the constructor restores state but the helper reports the node as new (or the reverse), so a caller might bootstrap over data it should have recovered?",
+      "source_ids": [
+        "s_has_existing_state",
+        "s_new_raft_restores",
+        "s_has_existing_state_test",
+        "s_vote_write_order"
+      ],
+      "hypothesis": "The helper reports existing state when any of three independent conditions holds: a current term above zero in the stable store, a log store last index above zero, or at least one snapshot. That matches the constructor's documented behaviour of restoring old state, so the only way the two could disagree is a state component the helper never consults - most plausibly the persisted vote - being written without a current term.",
+      "discriminator": "Enumerate the durable components the constructor reads (current term, log store, snapshot store, and the configuration entries inside the log) and compare them with the helper's three checks, then look for a write path that persists a component without any of the three triggers. A defect needs such a write path, for example a vote persisted before the term; if every such write is preceded by a term increase, the helper's term check covers it and the concern is refuted.",
+      "disposition": "explained",
+      "parent_id": null,
+      "knowledge": null,
+      "counterevidence": null,
+      "limitations": [
+        "Source-only: no execution was requested in this turn; the reasoning rests on the helper, the write paths and the captured test expectation.",
+        "The helper treats any last log index above zero as existing state even if the log is otherwise empty, which is a conservative direction (it can report existing state for a store that has been used and cleared) and was not exercised.",
+        "A custom store implementation that reports a non-zero last index or lists snapshots for a fresh node would make the helper conservative; the captured in-memory stores were not executed here."
+      ],
+      "resume_conditions": null
+    }
+  ],
+  "knowledge": [
+    {
+      "id": null,
+      "ref": null,
+      "kind": "behavior",
+      "statement": "HasExistingState reports existing state when the stable store's current term is above zero, or the log store's last index is above zero, or the snapshot store lists at least one snapshot; a 'not found' reading of the term is treated as no term while other term errors are returned, and log and snapshot errors are returned. NewRaft correspondingly restores any old state (snapshots, logs, peers) when constructing the node. The helper does not consult the persisted vote directly, but in the captured write paths a vote is only persisted after the term has been raised durably (setCurrentTerm before persistVote in both the election path and the vote-handling path), so a stored vote implies a non-zero current term and is covered by the first check.",
+      "conditions": "Applies to HasExistingState with any LogStore, StableStore and SnapshotStore, and to NewRaft's restore behaviour in the captured revision; the vote-order argument applies to the two write paths present in this revision.",
+      "source_ids": [
+        "s_has_existing_state",
+        "s_new_raft_restores",
+        "s_vote_write_order",
+        "s_has_existing_state_test"
+      ],
+      "executions": {},
+      "changed_premise": "",
+      "affected_uses": []
+    }
+  ],
+  "gaps": [],
+  "interpretations": [
+    {
+      "investigation_id": "@existing-state-detection",
+      "experiment_id": null,
+      "source_ids": [
+        "s_has_existing_state",
+        "s_new_raft_restores",
+        "s_has_existing_state_test",
+        "s_vote_write_order"
+      ],
+      "executions": {},
+      "conclusion": "explained",
+      "rationale": "Detection and recovery agree in the captured revision. HasExistingState (api.go:460-494) is documented as reporting logs, knowledge of a current term or any snapshot, and the implementation checks exactly those three things in that order: a stable current term above zero returns true, a 'not found' error is ignored while other term errors are propagated, a log last index above zero returns true, and a non-empty snapshot list returns true. NewRaft's documentation (api.go:496-500) states that old state such as snapshots, logs and peers is restored when the node is constructed, so a caller that respects the helper will not bootstrap over data the constructor would recover. The captured test for this contract (raft_test.go:255-295) records the expected direction on both sides: a freshly created node in a merged cluster reports no existing state before it joins, and the same node reports existing state after joining, which matches the helper's use of the stable term and log index. The one durable component the helper does not consult directly is the persisted vote; in both write paths that persist one, the term is raised durably first - the election path raises the term before persisting the vote (raft.go:1983 and 2021), and the vote-handling path adopts a higher term before persisting the vote (raft.go:1668 and 1726) - so a stored vote cannot exist without a non-zero current term, and the first check covers it. The remaining asymmetry is conservative rather than unsafe: a used-but-cleared log store, or a custom store that reports a non-zero last index for a fresh node, makes the helper report existing state, which errs towards recovering rather than bootstrapping. No defect is claimed.",
+      "answers": {},
+      "knowledge": [],
+      "counterevidence": [
+        "The candidate gap - a persisted vote that the helper ignores - is closed by the durable ordering of the two write paths, not merely by the absence of a counterexample.",
+        "The captured test expectation covers both directions (fresh node false, joined node true), so the helper's contract is not only documented but exercised by the package's own tests."
+      ],
+      "limitations": [
+        "Source-only; no execution was requested for this question in this turn.",
+        "The conservative direction (existing state reported for a cleared but previously used store) was not exercised against a real store.",
+        "The vote-order argument covers the write paths present in this revision; it is not a statement about other revisions."
+      ],
+      "joint_history": "",
+      "failure_attribution": null,
+      "report_title": null,
+      "report_answer": null
+    }
+  ],
+  "experiment": null,
+  "stop": null
+}

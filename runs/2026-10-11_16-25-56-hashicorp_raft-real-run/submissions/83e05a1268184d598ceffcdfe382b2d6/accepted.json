@@ -1,0 +1,191 @@
+{
+  "rationale": "New A2 direction on configuration authority over a running node: whether a reload can put a node into a state its own constructor would have rejected. Source reading shows the reload merges five fields onto the current configuration, validates the merged result and stores only on success; the requested experiment decides that on a live node with an invalid reload and a valid one in the same execution.",
+  "sources": [
+    {
+      "id": "s_reload_config",
+      "file": "api.go",
+      "start_line": 713,
+      "end_line": 741,
+      "kind": "code_observation"
+    },
+    {
+      "id": "s_reloadable_config",
+      "file": "config.go",
+      "start_line": 267,
+      "end_line": 313,
+      "kind": "code_observation"
+    }
+  ],
+  "investigations": [
+    {
+      "id": null,
+      "ref": "@reload-config-validation",
+      "question": "Can ReloadConfig on a running node install a configuration that the same library would reject at construction (for example a leader lease longer than the heartbeat timeout), and is the running configuration left untouched when the merged configuration is invalid?",
+      "source_ids": [
+        "s_reload_config",
+        "s_reloadable_config",
+        "s_lease_config_validation"
+      ],
+      "hypothesis": "ReloadConfig copies exactly the reloadable fields onto the current configuration under a reload lock, runs the same validation the constructor uses on the merged result, and stores the new configuration only when validation passes, so an invalid reload returns the validation error and leaves the running configuration and its timers unchanged. A shorter heartbeat additionally wakes the leader and follower loops so replication and heartbeat timers adopt it.",
+      "discriminator": "On a live node read ReloadableConfig, attempt a reload that violates the lease-versus-heartbeat invariant, and compare the returned error and the reported configuration with the values read before; then attempt a valid relaxation and check that it is accepted and visible. A defect needs the invalid reload to be accepted, to change the configuration partially, or the valid one to be silently dropped; rejection with unchanged state and an applied valid reload refutes the concern.",
+      "disposition": "active",
+      "parent_id": null,
+      "knowledge": null,
+      "counterevidence": null,
+      "limitations": [
+        "Native local run of the requested harness (not retained evidence): with heartbeat and election at 50ms and lease 50ms, the invalid reload (heartbeat and election 10ms) failed with 'LeaderLeaseTimeout (50ms) cannot be larger than heartbeat timeout (10ms)' and the reported configuration was unchanged; the valid reload to 100ms was accepted and reported.",
+        "The probe exercises one node and one invariant (lease versus heartbeat); other validated fields and other invalid combinations were not exercised.",
+        "The probe observes the reported configuration and the returned error, not the timing behaviour of the loops after a reload."
+      ],
+      "resume_conditions": null
+    }
+  ],
+  "knowledge": [
+    {
+      "id": null,
+      "ref": null,
+      "kind": "behavior",
+      "statement": "ReloadConfig merges exactly the five reloadable fields (TrailingLogs, SnapshotInterval, SnapshotThreshold, HeartbeatTimeout, ElectionTimeout) onto the current configuration under a reload lock, runs the same validation used at construction on the merged result, and stores it only when validation succeeds; on failure it returns the validation error without storing anything. After a successful reload that lowers the heartbeat timeout it additionally notifies the leader and follower notification channels so replication and heartbeat timers adopt the shorter value, while other reloadable decreases take effect at the next natural timer.",
+      "conditions": "Applies to Raft.ReloadConfig on a running node in the captured revision; fields outside the reloadable set, such as the leader lease, are not reloadable and are taken from the current configuration when the merged result is validated.",
+      "source_ids": [
+        "s_reload_config",
+        "s_reloadable_config",
+        "s_lease_config_validation"
+      ],
+      "executions": {},
+      "changed_premise": "",
+      "affected_uses": []
+    }
+  ],
+  "gaps": [],
+  "interpretations": [],
+  "experiment": {
+    "investigation_id": "@reload-config-validation",
+    "harness_path": "assurance_reload_config.go",
+    "files": {},
+    "execution_package": ".",
+    "source_ids": [
+      "s_reload_config",
+      "s_reloadable_config",
+      "s_lease_config_validation"
+    ],
+    "anchors": [
+      {
+        "material_id": "s_reload_config",
+        "symbol": "Raft.ReloadConfig",
+        "start_line": 717,
+        "end_line": 741,
+        "anchor": {
+          "source_ids": [
+            "s_reload_config"
+          ],
+          "boundary_complete": true,
+          "kind": "declaration",
+          "material_id": "s_reload_config",
+          "start_line": 717,
+          "end_line": 717,
+          "symbol": "Raft.ReloadConfig"
+        }
+      }
+    ],
+    "scope": {
+      "description": "One fault-free execution on a normally bootstrapped single-node in-memory cluster: read the reloadable configuration, attempt an invalid reload that lowers the heartbeat and election timeouts below the non-reloadable leader lease, then attempt a valid reload that raises both.",
+      "assumptions": [
+        "MakeCluster(1) with the captured in-memory configuration leaves heartbeat, election and leader lease at 50ms, so lowering heartbeat and election to 10ms violates the validated lease-versus-heartbeat invariant while raising them to 100ms keeps it.",
+        "ReloadableConfig reports the reloadable fields currently in force, which is the configuration the probe compares against.",
+        "A single node is sufficient because the reload path does not depend on cluster membership or leadership."
+      ],
+      "excluded": [
+        "Timing behaviour of replication and heartbeat loops after a successful reload.",
+        "Other reloadable fields and other invalid combinations.",
+        "Multi-node behaviour, network transport and restarts."
+      ],
+      "parameters": {
+        "heartbeat_ms_before": 50,
+        "election_ms_before": 50,
+        "leader_lease_ms_before": 50,
+        "invalid_heartbeat_ms": 10,
+        "valid_heartbeat_ms": 100
+      }
+    },
+    "prefix": "Built with captured test facilities and real producers only: MakeCluster(1) bootstraps a node; the harness emits reload_probe_start with the node identity and the heartbeat, election and leader-lease values in force, then calls ReloadConfig with the reloadable fields set to 10ms for heartbeat and election while the non-reloadable lease stays at 50ms and emits reload_invalid with the returned error, whether the reported configuration is unchanged and the heartbeat value reported afterwards. It then calls ReloadConfig with heartbeat and election raised to 100ms and emits reload_valid with the returned error, the reported heartbeat and election, the lease still in force and whether the new heartbeat was applied. No storage is pre-filled and no production code is modified.",
+    "semantic_changes": [],
+    "requirement": "A reload whose merged configuration violates the validated invariants is rejected with the running configuration unchanged, and a valid reload is accepted and visible through ReloadableConfig.",
+    "responsibility": "Admission of runtime configuration changes in Raft.ReloadConfig: merging the reloadable fields, validating the merged configuration and storing it only on success.",
+    "prerequisites": [
+      {
+        "alias": "reload_start",
+        "event": "reload_probe_start",
+        "conditions": [
+          {
+            "field": "leader_lease_ms_before",
+            "op": "ne",
+            "value": 0,
+            "reference": null
+          }
+        ]
+      }
+    ],
+    "comparisons": [
+      {
+        "event": "reload_invalid",
+        "identity_fields": [
+          "node"
+        ],
+        "admission_alias": "reload_start",
+        "assertion": {
+          "field": "error_empty",
+          "op": "eq",
+          "value": false,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [],
+        "description": "An invalid merged configuration is rejected: the lease-versus-heartbeat invariant the constructor enforces is also enforced for a running node."
+      },
+      {
+        "event": "reload_invalid",
+        "identity_fields": [
+          "node"
+        ],
+        "admission_alias": "reload_start",
+        "assertion": {
+          "field": "config_unchanged",
+          "op": "eq",
+          "value": true,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [],
+        "description": "The rejected reload leaves the running configuration untouched, so a failed reload cannot half-apply."
+      },
+      {
+        "event": "reload_valid",
+        "identity_fields": [
+          "node"
+        ],
+        "admission_alias": "reload_start",
+        "assertion": {
+          "field": "heartbeat_applied",
+          "op": "eq",
+          "value": true,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [
+          {
+            "field": "error_empty",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          }
+        ],
+        "description": "Control: a valid reload is accepted and visible through ReloadableConfig, so the rejection above is about the invalid values rather than a broken reload path."
+      }
+    ],
+    "knowledge": [],
+    "previous_id": null,
+    "revision_reason": ""
+  },
+  "stop": null
+}

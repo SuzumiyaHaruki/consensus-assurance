@@ -1,0 +1,234 @@
+{
+  "rationale": "New A1 direction after the authority work: the decision-to-application path. I read what actually reaches the FSM thread (prepareLog routing), how the FSM thread tracks the index it has accounted for, and how that index is then used for snapshot metadata. The FSM index deliberately lags committed configuration entries, and takeSnapshot contains that with an explicit representability guard rather than a silent mislabel; the same reading surfaced one unsigned-arithmetic curiosity in shouldSnapshot that I could not settle in this turn, so it is registered as a paused, sourced question with a discriminator and no claim.",
+  "sources": [
+    {
+      "id": "s_fsm_apply_single",
+      "file": "fsm.go",
+      "start_line": 92,
+      "end_line": 125,
+      "kind": "code_observation"
+    },
+    {
+      "id": "s_fsm_snapshot_req",
+      "file": "fsm.go",
+      "start_line": 216,
+      "end_line": 233,
+      "kind": "code_observation"
+    },
+    {
+      "id": "s_prepare_log",
+      "file": "raft.go",
+      "start_line": 1362,
+      "end_line": 1387,
+      "kind": "code_observation"
+    },
+    {
+      "id": "s_process_logs",
+      "file": "raft.go",
+      "start_line": 1292,
+      "end_line": 1358,
+      "kind": "code_observation"
+    },
+    {
+      "id": "s_should_snapshot",
+      "file": "snapshot.go",
+      "start_line": 104,
+      "end_line": 120,
+      "kind": "code_observation"
+    },
+    {
+      "id": "s_take_snapshot",
+      "file": "snapshot.go",
+      "start_line": 125,
+      "end_line": 211,
+      "kind": "code_observation"
+    },
+    {
+      "id": "s_compact_trailing",
+      "file": "snapshot.go",
+      "start_line": 213,
+      "end_line": 240,
+      "kind": "code_observation"
+    },
+    {
+      "id": "s_get_last_index",
+      "file": "state.go",
+      "start_line": 159,
+      "end_line": 163,
+      "kind": "code_observation"
+    },
+    {
+      "id": "s_install_snapshot_tail",
+      "file": "raft.go",
+      "start_line": 1930,
+      "end_line": 1950,
+      "kind": "code_observation"
+    }
+  ],
+  "investigations": [
+    {
+      "id": null,
+      "ref": "@snapshot-fsm-index-guard",
+      "question": "After a configuration entry is committed, can the FSM thread's own applied index lag behind the committed configuration index in a way that makes a snapshot claim an index/configuration combination the FSM does not represent, or that silently mislabels snapshot metadata?",
+      "source_ids": [
+        "s_fsm_apply_single",
+        "s_prepare_log",
+        "s_process_logs",
+        "s_fsm_snapshot_req",
+        "s_take_snapshot",
+        "s_compact_trailing"
+      ],
+      "hypothesis": "The FSM thread tracks the index it has accounted for locally and advances it only for entries that actually reach it; configuration entries are dropped before dispatch in protocol <= 2 and, when they do arrive without a ConfigurationStore, return early without advancing the index. That lag is then contained by takeSnapshot, which refuses to snapshot when the FSM index is below the committed configuration index instead of labelling a snapshot with a configuration the FSM never reached.",
+      "discriminator": "Trace which log types survive prepareLog into the FSM batch, whether the apply handler advances its local index for each of them, and what takeSnapshot does with the FSM-reported index versus the committed configuration index read afterwards. A defect would require either an entry type that reaches the FSM but silently skips the index bookkeeping without a stated reason, or a snapshot that is created with a configuration index beyond the FSM index.",
+      "disposition": "explained",
+      "parent_id": null,
+      "knowledge": null,
+      "counterevidence": null,
+      "limitations": [
+        "Source-only: no execution was requested, so this is a reading of the routing, index and guard code rather than an observed snapshot sequence.",
+        "The behaviour is described for the single-apply path; the batching path tracks the last entry in the batch instead (fsm.go:145-171) and was not differentially exercised."
+      ],
+      "resume_conditions": null
+    },
+    {
+      "id": null,
+      "ref": "@should-snapshot-log-index-underflow",
+      "question": "Can shouldSnapshot's unsigned delta between the log store's last index and the last snapshot index underflow, so that the automatic snapshot condition is permanently true on a node whose log store sits below its snapshot index, and what does such a node then do every SnapshotInterval?",
+      "source_ids": [
+        "s_should_snapshot",
+        "s_take_snapshot",
+        "s_install_snapshot_tail",
+        "s_get_last_index",
+        "s_compact_trailing"
+      ],
+      "hypothesis": "shouldSnapshot computes delta := lastIdx - lastSnap with unsigned integers and no ordering check, where lastIdx is the log store's LastIndex and lastSnap is the snapshot index kept separately. A node that recovered through InstallSnapshot sets its last snapshot index to the snapshot's index, while its log store may keep a lower index: installSnapshot compacts with min(snapIdx, lastLogIdx-trailingLogs), so a node whose log store is below the snapshot index keeps that lower index, and the node's snapshot-aware log index (getLastIndex = max(lastLogIndex, lastSnapshotIndex)) does not feed shouldSnapshot. If a run reaches that state, delta underflows and the node takes a fresh full-state snapshot every SnapshotInterval until its log store grows past the snapshot index.",
+      "discriminator": "Build a cluster whose leader has compacted most of its log, let a fresh or lagging follower recover by InstallSnapshot, and then record, per SnapshotInterval: the follower's log store FirstIndex/LastIndex, its last snapshot index, whether shouldSnapshot returned true, whether takeSnapshot created a new snapshot at the same index and whether a repeat install happened. A confirmed defect needs the log store index below the snapshot index together with repeated snapshot creation on an otherwise idle node; if the log store index is always at or above the snapshot index after install, or if some other producer raises it, the hypothesis is refuted.",
+      "disposition": "paused",
+      "parent_id": null,
+      "knowledge": null,
+      "counterevidence": null,
+      "limitations": [
+        "Purely a source reading: the reachable state is argued from installSnapshot's compaction and last-snapshot bookkeeping, not observed.",
+        "Only the condition is in question. Even if it holds, the visible effect would be repeated snapshot work rather than a stated safety or availability failure, and the snapshot store still reaps old snapshots.",
+        "Whether any other path raises the log store index between install and the next SnapshotInterval was not established."
+      ],
+      "resume_conditions": [
+        "Resume when a harness can drive a real InstallSnapshot recovery (compacted leader log, follower without the prefix) and sample the follower's log store indices and snapshot index around SnapshotInterval.",
+        "Alternatives that would also settle it from source: a producer that raises the follower's log store LastIndex to at least the snapshot index during install, or a caller that normalises the snapshot index before shouldSnapshot runs."
+      ]
+    }
+  ],
+  "knowledge": [
+    {
+      "id": null,
+      "ref": null,
+      "kind": "behavior",
+      "statement": "Only some committed log types reach the FSM thread: prepareLog returns a commit tuple for LogBarrier and LogCommand, and for LogConfiguration only when protocolVersion > 2. LogNoop, LogAddPeerDeprecated, LogRemovePeerDeprecated and LogConfiguration under protocol <= 2 return nil, so they never enter the FSM batch; processLogs still responds to any future attached to them from the main thread and then advances lastApplied.",
+      "conditions": "Applies to processLogs dispatching committed entries to fsmMutateCh on the leader and on followers, for every configuration of the FSM (with or without ConfigurationStore and BatchingFSM).",
+      "source_ids": [
+        "s_prepare_log",
+        "s_process_logs"
+      ],
+      "executions": {},
+      "changed_premise": "",
+      "affected_uses": []
+    },
+    {
+      "id": null,
+      "ref": null,
+      "kind": "behavior",
+      "statement": "The FSM thread's local applied index advances for every entry it receives, except for LogConfiguration when the FSM does not implement ConfigurationStore, where the handler returns early on the stated grounds of not incrementing the index for an unimplemented operation. The index it reports in a snapshot request is that local index, so it can legitimately sit below the committed configuration index.",
+      "conditions": "Applies to the single-apply path in runFSM; the batching path instead takes the index and term of the last entry in the batch whether or not it was sent to ApplyBatch.",
+      "source_ids": [
+        "s_fsm_apply_single",
+        "s_fsm_snapshot_req"
+      ],
+      "executions": {},
+      "changed_premise": "",
+      "affected_uses": []
+    },
+    {
+      "id": null,
+      "ref": null,
+      "kind": "behavior",
+      "statement": "takeSnapshot refuses to create a snapshot when the FSM-reported index is below the committed configuration index, and otherwise records that index/term together with the committed configuration and its index, then compacts only up to min(snapshot index, last log index - TrailingLogs).",
+      "conditions": "Applies to automatic and user-triggered snapshots on any server; the committed configuration is read from the main thread through configurationsCh after the FSM snapshot has been started.",
+      "source_ids": [
+        "s_take_snapshot",
+        "s_compact_trailing"
+      ],
+      "executions": {},
+      "changed_premise": "",
+      "affected_uses": []
+    },
+    {
+      "id": null,
+      "ref": null,
+      "kind": "behavior",
+      "statement": "A server's reported last log index is max(lastLogIndex, lastSnapshotIndex), so installing a snapshot raises the server's last index even though appendEntries and installSnapshot do not rewrite the stored log index; installSnapshot updates lastApplied, the last snapshot index, both configurations and log compaction.",
+      "conditions": "Applies to raftState.getLastIndex as used by election and replication bookkeeping and to the InstallSnapshot handler.",
+      "source_ids": [
+        "s_get_last_index",
+        "s_install_snapshot_tail"
+      ],
+      "executions": {},
+      "changed_premise": "",
+      "affected_uses": []
+    },
+    {
+      "id": null,
+      "ref": null,
+      "kind": "behavior",
+      "statement": "The automatic snapshot condition compares the log store's last index with the snapshot index using an unsigned subtraction and no ordering guard, so a log store index below the snapshot index makes the comparison permanently true.",
+      "conditions": "Applies to shouldSnapshot as invoked by the snapshot goroutine on its random SnapshotInterval; the log store index is the store's own LastIndex, not the snapshot-aware getLastIndex.",
+      "source_ids": [
+        "s_should_snapshot",
+        "s_get_last_index"
+      ],
+      "executions": {},
+      "changed_premise": "",
+      "affected_uses": []
+    }
+  ],
+  "gaps": [
+    {
+      "investigation_id": "@should-snapshot-log-index-underflow",
+      "question": "In an execution where a follower recovers through InstallSnapshot while its log store index stays below the installed snapshot index, does shouldSnapshot return true on every SnapshotInterval and does the node then create a fresh snapshot at the same index, or does some producer raise the log store index or otherwise prevent the repeat?",
+      "experiment_id": null
+    }
+  ],
+  "interpretations": [
+    {
+      "investigation_id": "@snapshot-fsm-index-guard",
+      "experiment_id": null,
+      "source_ids": [
+        "s_fsm_apply_single",
+        "s_prepare_log",
+        "s_process_logs",
+        "s_fsm_snapshot_req",
+        "s_take_snapshot",
+        "s_compact_trailing"
+      ],
+      "executions": {},
+      "conclusion": "explained",
+      "rationale": "The lag is real but contained, and the containment is explicit rather than accidental. Committed entries reach the FSM thread only if prepareLog builds a tuple for them (raft.go:1362-1387): LogBarrier and LogCommand always, LogConfiguration only when protocolVersion > 2, while LogNoop and the deprecated peer entries return nil and are never dispatched; processLogs (raft.go:1292-1358) responds to their futures itself and then advances lastApplied. Inside the FSM thread (fsm.go:92-125) every received entry advances the local lastIndex/lastTerm except a LogConfiguration when the FSM does not implement ConfigurationStore, which returns early with the explicit reason that the index should not advance for an unimplemented operation. The snapshot request reports that local index (fsm.go:216-233), so after a committed configuration change with no later command or barrier the FSM index can sit below the committed configuration index. takeSnapshot (snapshot.go:125-211) reads the committed configuration from the main thread afterwards and refuses to snapshot when snapReq.index < committedIndex, with a comment naming exactly this case, so metadata is never labelled with a configuration the FSM has not reached; compaction is separately bounded by min(snapshot index, last log index - TrailingLogs) (snapshot.go:213-240), so nothing beyond the log's last index is trimmed. The observable boundary is that snapshot creation keeps failing with 'cannot take snapshot now, wait until the configuration entry at N has been applied' until an entry the FSM accounts for arrives - and the library's own client contract supplies one, since both a command and a Barrier traverse this path, so the condition is self-clearing under normal traffic rather than a stuck state. No defect is claimed here; the reading explains why the asymmetry between the log index and the FSM index is safe.",
+      "answers": {},
+      "knowledge": [],
+      "counterevidence": [
+        "The early return would be a silent metadata mislabel if the guard were absent, but snapshot.go:165-176 refuses exactly that case and reports it to the caller, so the weak link identified in the hypothesis is enclosed by a source-visible protection.",
+        "Compaction cannot delete past the log head: maxLog is the minimum of the snapshot index and lastLogIdx-trailingLogs (snapshot.go:213-240)."
+      ],
+      "limitations": [
+        "Source-only: no execution was requested, so this explains the guard rather than observing a snapshot sequence or the error being returned to a client.",
+        "The batching FSM path tracks the last entry of the batch (fsm.go:145-171) rather than the last entry sent to ApplyBatch, which was read but not differentially exercised.",
+        "Nothing here measures how long a cluster would run without a snapshot in the no-traffic case; the claim is only that the condition is bounded by a legal client operation."
+      ],
+      "joint_history": "",
+      "failure_attribution": null,
+      "report_title": null,
+      "report_answer": null
+    }
+  ],
+  "experiment": null,
+  "stop": null
+}

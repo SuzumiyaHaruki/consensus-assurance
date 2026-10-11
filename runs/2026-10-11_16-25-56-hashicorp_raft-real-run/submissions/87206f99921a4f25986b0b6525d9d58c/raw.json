@@ -1,0 +1,178 @@
+{
+  "rationale": "The successor execution completed and now yields both intended comparisons, including the control that the predecessor could not correlate. This turn records the measured interpretation against the successor receipt (with joint history explaining why the two receipts describe the same scenario), answers nothing new, and promotes the observed recovered-node state as a durable fact with its observations so later work can reuse it without re-deriving it from source. With the snapshot question closed, this turn inspects a different A2 surface that the same thread of work keeps touching: what happens to an already-dispatched leadership-verification future (VerifyLeader) when leadership is lost while replication goroutines still hold it. Source reading shows the completion ownership is single-threaded and idempotent, so a future that a replication goroutine re-notifies onto the shared verify channel after the leadership-lost cleanup is answered once by the cleanup and then rejected as ErrNotLeader in the follower/candidate state instead of being double-completed or leaking.",
+  "sources": [
+    {
+      "id": "s_defer_error_respond",
+      "file": "future.go",
+      "start_line": 94,
+      "end_line": 131,
+      "kind": "code_observation"
+    },
+    {
+      "id": "s_verify_future_vote",
+      "file": "future.go",
+      "start_line": 272,
+      "end_line": 293,
+      "kind": "code_observation"
+    },
+    {
+      "id": "s_leader_cleanup_verify",
+      "file": "raft.go",
+      "start_line": 511,
+      "end_line": 526,
+      "kind": "code_observation"
+    },
+    {
+      "id": "s_verify_leader_dispatch",
+      "file": "raft.go",
+      "start_line": 963,
+      "end_line": 987,
+      "kind": "code_observation"
+    },
+    {
+      "id": "s_nonleader_verify_reject",
+      "file": "raft.go",
+      "start_line": 181,
+      "end_line": 186,
+      "kind": "code_observation"
+    }
+  ],
+  "investigations": [
+    {
+      "ref": "@verify-future-after-leadership-loss",
+      "question": "When leadership is lost while a VerifyLeader request is outstanding, can the resulting future be completed twice or left permanently unanswered, given that replication goroutines still hold it and notify it onto the shared verify channel after the leader loop has already responded to the pending set?",
+      "source_ids": [
+        "s_verify_future_vote",
+        "s_defer_error_respond",
+        "s_leader_cleanup_verify",
+        "s_verify_leader_dispatch",
+        "s_nonleader_verify_reject"
+      ],
+      "hypothesis": "A pending verify future lives in two owners at once: the leader loop's notify set (responded with ErrLeadershipLost by the step-down cleanup) and each replication goroutine's notify map (a separate map, cleared by notifyAll at the end of an RPC). A goroutine that notifies after the cleanup therefore pushes the same future back onto the shared verifyCh, where the follower or candidate loop will respond to it a second time.",
+      "discriminator": "Trace who may call respond on a verifyFuture and with what synchronisation, and what happens to a future that a replication goroutine re-notifies after the step-down cleanup: a defect requires two concurrent responders (a data race on the responded flag or a double send on the error channel) or a future that is never completed. If respond is reachable only from the main goroutine holding the run loop, and the second arrival is answered under the same stateless reject rule, the sequence is ordered and idempotent, and the apparent double completion is refuted.",
+      "disposition": "explained",
+      "limitations": [
+        "Source-only: no execution and no race-detector run was requested, so this explains the ownership and ordering rather than observing a concurrent step-down.",
+        "The analysis covers verifyFuture completion paths in the captured revision; it says nothing about other future types or about respond callers added later.",
+        "The timing window in which a replication goroutine notifies after the cleanup was reasoned from the code, not measured."
+      ]
+    }
+  ],
+  "knowledge": [
+    {
+      "kind": "fact",
+      "statement": "A node that recovers through InstallSnapshot while its log store keeps a lower index reports shouldSnapshot() as true indefinitely and keeps creating fresh snapshots at the installed snapshot index while completely idle: in two executions of the same fixed harness the recovered node produced 15 and 13 distinct snapshot IDs at index 202 with applied_delta 0 over a 900ms window (SnapshotInterval 40ms), while the leading node of the same cluster reported shouldSnapshot() false and exactly 1 distinct snapshot ID at index 202.",
+      "conditions": "Observed with MakeCluster(3), SnapshotInterval 40ms, SnapshotThreshold 20, TrailingLogs 5, in-memory log/snapshot stores, protocol 3, after isolating one follower, committing 140 further commands so the leader's log compacts past that follower's next index, reconnecting so the follower recovers by InstallSnapshot (log store last index stays 62, snapshot index 202), then isolating the recovered node for a 900ms window sampled every 40ms. Two executions are instances, not a universal guarantee; MonotonicLogStore implementations, production SnapshotInterval values and long-running persistence were not observed.",
+      "source_ids": [
+        "s_should_snapshot",
+        "s_install_snapshot_full",
+        "s_compact_trailing",
+        "s_run_snapshots"
+      ],
+      "executions": {
+        "dd59f37872d240548eff168eb821901f": [
+          0,
+          1,
+          3
+        ],
+        "c388285f090c4c1c85547bd6ddd9cd98": [
+          0,
+          1,
+          3,
+          4
+        ]
+      }
+    },
+    {
+      "kind": "behavior",
+      "statement": "A verifyFuture can be woken by only one notification (vote is guarded by the notify channel being non-nil and set to nil when it fires), and every respond path is idempotent through the deferError responded flag; vote(true) only notifies once the counted votes reach quorumSize, while vote(false) notifies immediately so the leader loop can step down when any peer reports a new leader.",
+      "conditions": "Applies to VerifyLeader/verifyFuture handling in the captured revision, including the quorumSize==0 dispatch sentinel and the follower/candidate paths that reject arrivals on the shared verify channel with ErrNotLeader.",
+      "source_ids": [
+        "s_verify_future_vote",
+        "s_defer_error_respond",
+        "s_verify_leader_dispatch",
+        "s_nonleader_verify_reject"
+      ]
+    },
+    {
+      "kind": "behavior",
+      "statement": "On stepping down, the leader loop responds ErrLeadershipLost to every future still in its own notify set; replication goroutines keep their notify maps separate and only clear them through notifyAll at the end of a replication RPC, so a late notification can push an already-answered verify future back onto the shared verify channel, where the next non-leader loop answers it again through the idempotent respond path.",
+      "conditions": "Applies to leadership loss (step-down, shutdown, or state change out of Leader) with outstanding VerifyLeader requests; the arrivals are handled by whichever run loop is active when they are read.",
+      "source_ids": [
+        "s_leader_cleanup_verify",
+        "s_verify_future_vote",
+        "s_defer_error_respond",
+        "s_nonleader_verify_reject"
+      ]
+    }
+  ],
+  "interpretations": [
+    {
+      "investigation_id": "e2a8cfd757e74ee4965e45968de09795-question-1",
+      "experiment_id": "1bb3635ce65244c5ac3c439ab505451e-experiment",
+      "source_ids": [
+        "s_should_snapshot",
+        "s_run_snapshots",
+        "s_take_snapshot",
+        "s_install_snapshot_full",
+        "s_get_last_index",
+        "s_compact_trailing"
+      ],
+      "executions": {
+        "c388285f090c4c1c85547bd6ddd9cd98": [
+          3,
+          4
+        ]
+      },
+      "conclusion": "holds",
+      "rationale": "The successor execution reproduces the defect and supplies the control that the predecessor receipt could not correlate. Receipt c388285f090c4c1c85547bd6ddd9cd98 (completed, exit 0, tests_passed) parsed five events. Index 0 recovery_state for node server-b5fbb977...: snapshot index advanced 62 -> 202 across the reconnect while the log store last index stayed 62, with log_store_below_snapshot_index true and snapshot_advanced_over_log_store true - a real InstallSnapshot recovery that left the log store below the installed snapshot index. Index 1 window_start (recovered-node): should_snapshot true, snapshot index 202, last snapshot index 202, log store last index 62, applied index 202. Index 3 recovered_window_end after 22 samples at 40ms with applied_delta 0: distinct_snapshot_ids 13, snapshot_created_without_new_entries true, newest snapshot index still 202 while the newest ID moved from 2-202-1791708350452 to 2-202-1791708351357 - comparison_index 0 holds with victim_start matched at index 1. Index 2 control_window_start and index 4 control_window_end (leader-control, same cluster, same window, applied_delta 0): should_snapshot false, log store last index 202 equal to its snapshot index, distinct_snapshot_ids 1, snapshot_created_without_new_entries false - comparison_index 1 holds with control_start matched at index 2. Taken together the two comparisons isolate the cause to the state of the recovered node rather than to snapshotting in general: identical configuration and window, only the log-store-to-snapshot-index relation differs, and only that node repeats snapshots. The mechanism remains the unsigned delta in shouldSnapshot measured against the log store's own LastIndex (snapshot.go:106-120) for a node whose snapshot index was raised by InstallSnapshot (raft.go:1814-1950) above a log store that compaction left lower (snapshot.go:216-240), sampled every SnapshotInterval by runSnapshots (snapshot.go:72-102); takeSnapshot accepts the repeat because the FSM index equals the installed snapshot index (snapshot.go:125-211). Severity stays resource-shaped: repeated full-state snapshot work and IO on an idle recovered node, with snapshot retention bounding stored copies; no safety or availability failure is claimed.",
+      "joint_history": "The predecessor receipt dd59f37872d240548eff168eb821901f and this successor receipt c388285f090c4c1c85547bd6ddd9cd98 come from the same fixed harness family on the same captured snapshot and differ only in event naming: the successor emits recovered_window_end for the recovered node and control_window_start/control_window_end for the leader, so its control comparison can correlate admission and result on the same node identity (the predecessor reported comparison_index 1 as unknown with 'No corresponding prerequisite events reached: control_window/window_start'). Producers, configuration parameters, command counts, isolation steps, window length and sampling interval are identical, and the recovery operands agree (snapshot index 62 -> 202 with log store last index 62 in both); node IDs and snapshot ID timestamps differ per execution as expected. Both receipts are therefore compatible descriptions of the same scenario, and the successor is the one whose both comparisons are complete.",
+      "knowledge": [
+        {
+          "entry_id": "e2a8cfd757e74ee4965e45968de09795-knowledge-4",
+          "revision": 1,
+          "assertion": "shouldSnapshot compares the log store's own last index with the snapshot index using an unsigned subtraction with no ordering guard."
+        },
+        {
+          "entry_id": "e2a8cfd757e74ee4965e45968de09795-knowledge-2",
+          "revision": 1,
+          "assertion": "takeSnapshot only refuses when the FSM-reported index is below the committed configuration index."
+        }
+      ],
+      "counterevidence": [
+        "The control comparison now holds against the opposite value: the leader in the same cluster and window had shouldSnapshot false, its log store index equal to its snapshot index, and a single snapshot ID at index 202 with applied_delta 0, so the repeated snapshots are not a property of the configuration or of the window.",
+        "The number of distinct snapshot IDs differs between the two executions (15 and 13 over 22 samples at a 40ms interval), which is consistent with scheduling jitter rather than a different mechanism, and is retained here rather than smoothed.",
+        "The recovered node was isolated during the window by construction, so the repeats cannot be attributed to further InstallSnapshot traffic from the leader."
+      ],
+      "limitations": [
+        "Two executions, both short windows (900ms) with a deliberately small SnapshotInterval; production SnapshotInterval behaviour and long-run persistence were not observed.",
+        "Only the in-memory log and snapshot stores with default (non-monotonic) log store behaviour were exercised; MonotonicLogStore takes the removeOldLogs branch instead.",
+        "The measured effect is repeated snapshot creation; its CPU, IO and FSM Snapshot() latency cost, and any interaction with slow snapshot persistence, were not measured.",
+        "No claim is made that the condition is unrecoverable: any traffic that raises the log store index above the snapshot index ends it, and it is not claimed to affect safety."
+      ],
+      "report_title": "\u5feb\u7167\u6062\u590d\u8282\u70b9\u7684\u81ea\u52a8\u5feb\u7167\u6761\u4ef6\u6052\u771f\uff08\u542b\u5bf9\u7167\u786e\u8ba4\uff09",
+      "report_answer": "\u5df2\u786e\u8ba4\u7684\u7f3a\u9677\uff08\u542b\u5bf9\u7167\uff09\uff1a\u7ecf InstallSnapshot \u6062\u590d\u7684\u8282\u70b9\uff0c\u5176\u65e5\u5fd7\u5b58\u50a8 LastIndex \u505c\u7559\u5728\u4f4e\u4e8e\u5df2\u5b89\u88c5\u5feb\u7167\u7d22\u5f15\u7684\u4f4d\u7f6e\uff0cshouldSnapshot\uff08snapshot.go:106-120\uff09\u4ee5\u65e0\u7b26\u53f7\u51cf\u6cd5\u4e14\u65e0\u5927\u5c0f\u4fdd\u62a4\u5730\u6bd4\u8f83\u65e5\u5fd7\u5b58\u50a8\u7d22\u5f15\u4e0e\u5feb\u7167\u7d22\u5f15\uff0c\u4f7f\u6761\u4ef6\u6052\u4e3a\u771f\uff1brunSnapshots\uff08snapshot.go:72-102\uff09\u56e0\u6b64\u6bcf\u4e2a SnapshotInterval \u90fd\u89e6\u53d1\u4e00\u6b21 takeSnapshot\u3002\u540e\u7ee7\u56fa\u5b9a\u8f93\u5165\u6267\u884c\uff08receipt c388285f090c4c1c85547bd6ddd9cd98\uff0cexit 0\uff09\u4e2d\uff1a\u6062\u590d\u8282\u70b9\u5feb\u7167\u7d22\u5f15 62\u2192202 \u800c\u65e5\u5fd7\u5b58\u50a8\u7d22\u5f15\u4fdd\u6301 62\uff1b900ms \u7a97\u53e3\u5185 applied_delta \u4e3a 0\u3001\u5e94\u4ea7\u751f 13 \u4e2a\u4e0d\u540c\u5feb\u7167 ID\u3001\u6700\u65b0\u5feb\u7167\u7d22\u5f15\u59cb\u7ec8\u4e3a 202\uff1b\u540c\u4e00\u7a97\u53e3\u540c\u4e00\u96c6\u7fa4\u7684 leader \u5bf9\u7167 should_snapshot \u4e3a false\u3001\u65e5\u5fd7\u5b58\u50a8\u7d22\u5f15 202 \u7b49\u4e8e\u5feb\u7167\u7d22\u5f15\u3001\u53ea\u6709 1 \u4e2a\u5feb\u7167 ID\u3002\u4e24\u6761\u6bd4\u8f83\u5747\u6210\u7acb\uff0c\u4e0e\u524d\u4e00\u6267\u884c\uff08dd59f37872d240548eff168eb821901f\uff0c15 \u4e2a\u5feb\u7167 ID\uff0c\u5bf9\u7167\u672a\u5173\u8054\uff09\u6784\u6210\u540c\u4e00\u573a\u666f\u7684\u517c\u5bb9\u5386\u53f2\u3002\u540e\u679c\u662f\u7a7a\u95f2\u6062\u590d\u8282\u70b9\u6301\u7eed\u5199\u51fa\u7b49\u4ef7\u5168\u91cf\u5feb\u7167\uff08\u53ef\u907f\u514d\u7684 IO/\u5feb\u7167\u5f00\u9500\uff09\uff0c\u4e0d\u4e3b\u5f20\u5b89\u5168\u6027\u6216\u53ef\u7528\u6027\u88ab\u7834\u574f\u3002"
+    },
+    {
+      "investigation_id": "@verify-future-after-leadership-loss",
+      "source_ids": [
+        "s_verify_future_vote",
+        "s_defer_error_respond",
+        "s_leader_cleanup_verify",
+        "s_verify_leader_dispatch",
+        "s_nonleader_verify_reject"
+      ],
+      "conclusion": "explained",
+      "rationale": "The apparent double completion is refuted by completion ownership and ordering. verifyLeader registers the future in the leader loop's notify set and in each replication goroutine's notify map, and the step-down cleanup responds ErrLeadershipLost to everything still in the leader's own set (raft.go:511-526). The replication maps are separate and are only cleared by notifyAll when an RPC finishes (replication.go:100-111), so a goroutine that finishes its heartbeat after the cleanup can still call vote on the same future; vote sends the future onto the shared verify channel and nils its notify channel under voteLock, so it wakes at most once (future.go:272-293). The critical point is who responds: respond is reachable only from the main run loop for this future type (the leader loop's verify branch, the follower and candidate reject branches, and the step-down cleanup), and all of those execute on the single main goroutine, so the cleanup's respond and any later rejection are sequentially ordered rather than concurrent. The second arrival is therefore a no-op: deferError.respond returns early once responded is set, and if it were reached first it would simply answer ErrNotLeader through the same idempotent path (future.go:94-131, raft.go:181-186). The result is that a VerifyLeader outstanding at leadership loss is answered exactly once - ErrLeadershipLost from the cleanup - and any late wake-up on the shared channel is swallowed by the responded flag instead of double-closing the error channel or blocking a sender. A worthwhile boundary follows from the same reading but is not a defect: because vote records a false reply immediately, the leader steps down and answers ErrNotLeader as soon as a single peer reports a new leader, and because votes are only counted from replies, a partition that silences peers leaves the request unanswered until a reply, shutdown or the caller's own timeout resolves it.",
+      "counterevidence": [
+        "The strong form of the suspicion - two concurrent responders racing on the responded flag - requires a respond caller off the main goroutine, and the captured revision has none for verifyFuture: replication goroutines only call vote/notifyAll, which never respond.",
+        "The shared verify channel is buffered (api.go:568) so the late notification itself cannot block a replication goroutine."
+      ],
+      "limitations": [
+        "Source-only: the ordering argument rests on respond being called exclusively from the main run loop in this revision; a race-detector execution of a concurrent step-down was not requested.",
+        "The unresolved-caller-timeout boundary (a verified request that never gets a peer reply) is described, not measured.",
+        "No behaviour of other future types or later revisions is claimed."
+      ]
+    }
+  ]
+}

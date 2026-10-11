@@ -1,0 +1,67 @@
+{
+  "rationale": "The fixed execution completed with all three comparisons decided in the same direction the local run predicted, so the bounded-liveness question for a stranded leader is closed with a measured interpretation and a promoted fact: completion in the order of the leader lease with an error, a healthy control that succeeds immediately, and the isolated node leaving the leader state.",
+  "investigations": [
+    {
+      "id": "ab8ea0d2f60f422796f9d946edf40b48-question-0",
+      "disposition": "explained",
+      "limitations": [
+        "Answered for the tested configuration only: heartbeat, election and leader-lease timeouts were all 300ms, and the configuration rules require the lease not to exceed the heartbeat timeout, so ratios far from 1:1 were not exercised.",
+        "The probe isolates the leader rather than crashing it, and the followers elect their own leader while the isolated node steps down; that concurrent election is outside the measured endpoint even though it happens in the same execution.",
+        "The measured bound is the lease check plus scheduling (306ms against a 300ms lease in the retained run); no upper bound for heavily loaded hosts is claimed.",
+        "Bounded completion was measured through the returned future with a client-side wait limit; the request was still outstanding at the moment of isolation by construction, which is the scenario of interest."
+      ]
+    }
+  ],
+  "knowledge": [
+    {
+      "kind": "fact",
+      "statement": "In a three-node cluster with heartbeat, election and leader-lease timeouts all 300ms, VerifyLeader on the healthy leader returned nil immediately (0ms) while the node stayed Leader, and after isolating the leader from both followers the same call completed in 306ms with the error 'leadership lost while committing log', leaving the node in state Follower.",
+      "conditions": "Observed in one fault-free execution through the in-memory transport where the leader was partitioned with c.Partition, the client waited up to 6s on the returned future, and the leader was still in the Leader state when the isolated call was issued. The values are an instance under these conditions and not a bound for other timeout ratios or loaded hosts.",
+      "source_ids": [
+        "s_verify_leader_api",
+        "s_check_leader_lease",
+        "s_leader_cleanup_verify"
+      ],
+      "executions": {
+        "32b2614b51cd4e06a91be66d8bed1c4b": [
+          0,
+          1,
+          2,
+          3
+        ]
+      }
+    }
+  ],
+  "interpretations": [
+    {
+      "investigation_id": "ab8ea0d2f60f422796f9d946edf40b48-question-0",
+      "experiment_id": "ab8ea0d2f60f422796f9d946edf40b48-experiment",
+      "source_ids": [
+        "s_verify_leader_api",
+        "s_check_leader_lease",
+        "s_leader_cleanup_verify",
+        "s_verify_future_vote",
+        "s_lease_config_validation"
+      ],
+      "executions": {
+        "32b2614b51cd4e06a91be66d8bed1c4b": [
+          1,
+          3
+        ]
+      },
+      "conclusion": "holds",
+      "rationale": "The protection held: a verification issued by a leader that cannot reach a quorum completed within a bound tied to the leader lease and reported an error instead of hanging or succeeding. Receipt 32b2614b51cd4e06a91be66d8bed1c4b (completed, exit 0, tests_passed) parsed four events. Index 0 verify_control_start records the leader node server-ea62e7ff in state Leader with the 300ms lease; index 1 verify_healthy reports error_empty true, elapsed 0ms and the node still Leader, so comparison 0 holds with the control_start admission matched - a healthy verification succeeds immediately. Index 2 verify_probe_start records the same node still Leader while isolated from its peers (peers_connected 0); index 3 verify_partitioned reports completed true in 306ms, error_empty false with error_text 'leadership lost while committing log', state Follower and the 6s client wait limit, so comparison 1 holds (bounded completion, no hang) and comparison 2 holds (the stranded verification fails rather than claiming success) with the probe_start admission matched in both cases. The source explains the endpoint: VerifyLeader only counts peer replies (api.go:883-893), so with silent peers nobody notifies the future; the leader loop's lease check samples per-peer last contact and steps down when fewer than quorumSize voters were contacted within LeaderLeaseTimeout (raft.go:1036-1081), and the step-down cleanup responds ErrLeadershipLost to every future still in the leader's notify set - which is exactly the error text observed. Configuration validation additionally requires the lease to be at least 5ms and no larger than the heartbeat timeout (config.go:333-376), which is why the probe uses 300ms for all three timeouts and why the measured bound is a small multiple of that value rather than an arbitrary one. Since the observed error came from the cleanup rather than from a peer vote, the run also corroborates the earlier reading that a late replication notification cannot double-complete a verification future: the node had already answered and left the leader state. No defect is claimed; the residual boundary is that only the 1:1 timeout ratio was exercised, that the followers' own election during the isolation is outside the endpoint, and that the bound was measured on an unloaded in-process cluster.",
+      "counterevidence": [
+        "The control in the same execution (index 1) shows verification succeeds normally, so the failure at index 3 is attributable to the isolation and not to a broken verification path.",
+        "The observed error is the leadership-lost path rather than a quorum rejection, which is consistent with the source: silence is resolved by the lease check, not by the request itself."
+      ],
+      "limitations": [
+        "One configuration (lease equal to heartbeat and election timeout) and one execution; other ratios and loaded hosts were not exercised.",
+        "The probe isolates rather than crashes the leader, and the followers elect while the isolated node steps down; that is outside the measured endpoint.",
+        "The measured 306ms against a 300ms lease is a single observation, and no claim is made about the distribution of the completion time."
+      ],
+      "report_title": "被隔离 leader 的 VerifyLeader 在租约量级内完成并报错",
+      "report_answer": "本场景下保护成立（固定输入执行 receipt 32b2614b51cd4e06a91be66d8bed1c4b，exit 0，三条比较全部判定成立）：健康 leader 的 VerifyLeader 立即返回成功（0ms，仍为 Leader，索引 1）；把 leader 与两个 follower 隔离后，同一调用在 306ms（租约 300ms）内完成并返回错误 “leadership lost while committing log”，节点状态变为 Follower（索引 3）。源码机制：VerifyLeader 只统计对端回应（api.go:883-893），无人回应时由 leader loop 的租约检查在 LeaderLeaseTimeout 内联系不到 quorum 时下台（raft.go:1036-1081），随后下台清理对未完成的验证 future 回应 ErrLeadershipLost。配置校验要求租约不高于心跳超时（config.go:333-376），因此探针把三个超时都设为 300ms。未主张缺陷；残余边界为只测了 1:1 的租约/心跳比、隔离期间 follower 自行选举不在测量端点内、以及单次、空载环境下的观测。"
+    }
+  ]
+}

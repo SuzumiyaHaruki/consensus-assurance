@@ -1,0 +1,125 @@
+{
+  "rationale": "New grounded lead from the recovery work rather than a new area: while reading the InstallSnapshot handler for the earlier question I noticed that its only freshness check is on the term, and that it then sets lastApplied and the last snapshot index from the request before compacting by that index. That raises a distinct authority/state question - whether a snapshot that is current in term but older in index than the receiving node's applied state can rewind durable applied state, and whether the sender-side trigger plus log re-application always cover the rewind. I traced what I could in the captured sources, recorded the behaviour, and left the reachability question explicitly unresolved with a discriminator rather than asserting a defect.",
+  "sources": [
+    {
+      "id": "s_install_snapshot_term_only",
+      "file": "raft.go",
+      "start_line": 1825,
+      "end_line": 1845,
+      "kind": "code_observation"
+    },
+    {
+      "id": "s_install_snapshot_apply",
+      "file": "raft.go",
+      "start_line": 1926,
+      "end_line": 1955,
+      "kind": "code_observation"
+    },
+    {
+      "id": "s_process_logs_replay",
+      "file": "raft.go",
+      "start_line": 1292,
+      "end_line": 1348,
+      "kind": "code_observation"
+    },
+    {
+      "id": "s_replicate_to_backoff",
+      "file": "replication.go",
+      "start_line": 224,
+      "end_line": 296,
+      "kind": "code_observation"
+    },
+    {
+      "id": "s_replicate_send_snapshot",
+      "file": "replication.go",
+      "start_line": 296,
+      "end_line": 380,
+      "kind": "code_observation"
+    }
+  ],
+  "investigations": [
+    {
+      "ref": "@install-snapshot-index-rewind",
+      "question": "Can an InstallSnapshot whose term is current but whose snapshot index is older than the receiving node's applied state rewind that node's applied state, and is the rewind always covered by re-application from the surviving log so that no acknowledged applied entry is lost?",
+      "source_ids": [
+        "s_install_snapshot_term_only",
+        "s_install_snapshot_apply",
+        "s_process_logs_replay",
+        "s_replicate_to_backoff",
+        "s_replicate_send_snapshot",
+        "s_get_last_index"
+      ],
+      "hypothesis": "installSnapshot performs no comparison between the request's LastLogIndex and the receiving node's own lastApplied, last snapshot index or log store range: it rejects only an older term, restores the FSM from the requested snapshot, sets lastApplied and the last snapshot index to the request's values (a decrease when the request is older by index), replaces both configurations from the request, and then compacts or removes old logs according to that index. Recovering from such a rewind therefore depends on processLogs replaying entries from lastApplied+1 out of the surviving log; if the node's log no longer covers (request index, previously applied index] - for example because it had already compacted past the older snapshot index - those already-applied entries cannot be re-applied and the rewound state persists.",
+      "discriminator": "Two-sided. Sender side: determine whether a leader can be induced to send a snapshot whose index is below the follower's applied index, given that a snapshot is only opened when the leader cannot produce entries from its nextIndex (below its compacted first index) and that nextIndex only moves on follower responses. Receiver side: instrument a node whose log store first index is above the index of a delivered snapshot and record lastApplied, the FSM-visible applied index and the log first index immediately before and after the install, then whether a later commit advance re-applies the gap. A defect needs a delivered request with snapshot index below the receiver's applied index together with a log that does not cover the gap, so that the applied index is not re-reached; if every delivered request has an index at or above the receiver's applied index, or the surviving log always covers the gap, the concern is refuted.",
+      "disposition": "paused",
+      "resume_conditions": [
+        "Resume when a harness can log, on the receiving node, the InstallSnapshot request's LastLogIndex and Term alongside that node's lastApplied, last snapshot index and log store first/last index, so the rewind question is decided from observations rather than from the send-side argument.",
+        "Resume earlier if source shows an enclosing check on the receiving side (an index comparison that is not present in the captured handler) or an invariant that the log always covers (lastSnapshotIndex, lastApplied], which would refute the concern without execution."
+      ],
+      "limitations": [
+        "Source-only: the handler's lack of an index check is established, but whether a rewinding request is reachable was not established; the send-side argument sketched in the discriminator is a lead, not a proof.",
+        "The earlier observation that a node's reported last log index is max(lastLogIndex, lastSnapshotIndex) and that a follower's applied index never exceeds that reported index narrows the trigger but does not by itself order the leader's snapshot index against the follower's applied index.",
+        "No claim is made that this is reachable or that it is a defect; a state regression would also have to survive the log-replay path before it could be called one."
+      ]
+    }
+  ],
+  "knowledge": [
+    {
+      "kind": "behavior",
+      "statement": "InstallSnapshot validates freshness only by term: an older term is ignored, a newer term transitions the receiver to follower and is adopted, and there is no comparison of the request's LastLogIndex with the receiver's own lastApplied, last snapshot index or log store range. On success the handler restores the FSM from the requested snapshot, sets lastApplied to the request's LastLogIndex, sets the last snapshot index to the request's LastLogIndex/LastLogTerm, replaces both the latest and committed configurations from the request, and then removes all old logs (monotonic stores) or compacts up to the request's index.",
+      "conditions": "Applies to InstallSnapshotRequest handling on any server that reaches the handler, including a server whose own applied index or snapshot index is higher than the request's; the only preceding checks in the handler are the snapshot version bounds and the term.",
+      "source_ids": [
+        "s_install_snapshot_term_only",
+        "s_install_snapshot_apply"
+      ]
+    },
+    {
+      "kind": "behavior",
+      "statement": "Recovery from a restored snapshot index depends on log replay: processLogs rejects an index at or below lastApplied, otherwise it walks from lastApplied+1 to the target index fetching each log from the store and panics when a needed entry is missing, so a restored index below the previously applied index leaves re-application to entries that must still exist in the log.",
+      "conditions": "Applies to commit-application on any server after a restore, including the install path that sets lastApplied from the request; the walk is bounded by the target commit index and sources entries either from the in-flight future map or the log store.",
+      "source_ids": [
+        "s_process_logs_replay"
+      ]
+    },
+    {
+      "kind": "behavior",
+      "statement": "The sender reaches the snapshot path only when it cannot produce entries from its per-peer nextIndex, and nextIndex moves on follower responses: a rejected AppendEntries sets nextIndex to max(min(nextIndex-1, response.LastLog+1), 1), and the snapshot is opened when setupAppendEntries reports the log is not found, i.e. when the needed prefix has been compacted away.",
+      "conditions": "Applies to the leader-side replication loop for each peer; the reported last log index used in the backoff comes from the follower's AppendEntriesResponse.LastLog.",
+      "source_ids": [
+        "s_replicate_to_backoff",
+        "s_replicate_send_snapshot"
+      ]
+    }
+  ],
+  "interpretations": [
+    {
+      "investigation_id": "@install-snapshot-index-rewind",
+      "source_ids": [
+        "s_install_snapshot_term_only",
+        "s_install_snapshot_apply",
+        "s_process_logs_replay",
+        "s_replicate_to_backoff",
+        "s_replicate_send_snapshot",
+        "s_get_last_index"
+      ],
+      "conclusion": "unresolved",
+      "rationale": "What is established from source: the receiver's only freshness check is on the term (raft.go:1825-1845), and on success it restores the FSM and then sets lastApplied, the last snapshot index and both configurations from the request before compacting or removing old logs by the request's index (raft.go:1926-1955). The receiver therefore has no index-based defence of its own: if a request whose index is below the node's current applied index were delivered and accepted, lastApplied and the durable FSM state would move backwards, and the only path back is processLogs walking from lastApplied+1 to the next commit index out of the log store (raft.go:1292-1348), which panics rather than silently skipping when an entry is missing. What is not established: whether such a request is reachable. The send-side trigger is narrow - the leader opens a snapshot only when it cannot produce entries from its per-peer nextIndex, and nextIndex only moves on follower responses, with a rejection clamping it to max(min(nextIndex-1, response.LastLog+1), 1) (replication.go:262-300, 355-400). Since a follower reports LastLog = max(lastLogIndex, lastSnapshotIndex), a follower that has applied beyond the leader's snapshot index also reports a last index at least that high, which makes the decrement path stop at a matching prefix rather than descend past the leader's compacted first index; that argument is plausible but not proven here, and it depends on the follower's log covering its own applied range at the time of the exchange. The concern is therefore recorded as an unresolved boundary with a concrete discriminator instead of a defect: the deciding observation is a delivered InstallSnapshot whose LastLogIndex is below the receiving node's lastApplied while the node's log store first index is above that request index.",
+      "knowledge": [
+        {
+          "entry_id": "87206f99921a4f25986b0b6525d9d58c-knowledge-0",
+          "revision": 1,
+          "assertion": "the recovered-node state observed in the two executions shows a log store index surviving below an installed snapshot index, i.e. install ordering between the two indexes is a real, observed relation rather than an assumption."
+        }
+      ],
+      "counterevidence": [
+        "The sender-side backoff uses the follower's reported LastLog, and the reported value is snapshot-aware (max(lastLogIndex, lastSnapshotIndex)), so the leader's nextIndex is pulled down towards that value rather than below it on a rejection; this is the strongest candidate protection against delivering a rewinding snapshot.",
+        "A rewind would be re-coverable whenever the surviving log still spans (request index, next commit index], which is the normal case after compaction with trailing logs, so a state regression would have to coincide with a log that no longer covers that range."
+      ],
+      "limitations": [
+        "No execution was requested for this question; the reachability argument is source reasoning on a narrow send-side path and is explicitly not a proof.",
+        "The decisive measurement (request LastLogIndex versus receiver lastApplied and log first index, plus whether the applied index is re-reached) was not performed, so the concern is not promoted to a defect.",
+        "Only the in-memory and default non-monotonic log store behaviour is described; monotonic stores take the removeOldLogs branch, which removes more aggressively and was not analysed for this question."
+      ]
+    }
+  ]
+}

@@ -1,0 +1,98 @@
+{
+  "rationale": "Short turn on a client-visible question that kept mattering in earlier work: whether the node's progress accessors (LastIndex, CommitIndex, AppliedIndex) mean the same thing, and which of them bounds what a snapshot may claim. The accessors deliberately differ, one of them is documented as dispatch-time rather than FSM-completion-time, and snapshot metadata is produced from a fourth value owned by the FSM thread. Recording the synthesis stops future work from treating them as interchangeable.",
+  "sources": [
+    {
+      "id": "s_progress_accessors",
+      "file": "api.go",
+      "start_line": 1225,
+      "end_line": 1247,
+      "kind": "document_statement"
+    },
+    {
+      "id": "s_process_logs_dispatch_index",
+      "file": "raft.go",
+      "start_line": 1352,
+      "end_line": 1358,
+      "kind": "code_observation"
+    }
+  ],
+  "investigations": [
+    {
+      "id": null,
+      "ref": "@progress-accessor-meanings",
+      "question": "Do LastIndex, CommitIndex and AppliedIndex expose the same progress, and which value bounds what a snapshot may claim about the state machine?",
+      "source_ids": [
+        "s_progress_accessors",
+        "s_process_logs_dispatch_index",
+        "s_fsm_snapshot_req",
+        "s_take_snapshot",
+        "s_get_last_index"
+      ],
+      "hypothesis": "The three accessors are intentionally different views: LastIndex is stable storage including the snapshot index, CommitIndex is the committed index, and AppliedIndex reflects the last index handed to the FSM thread's apply channel rather than work the FSM has finished - its own documentation says the application's state may lag behind it. Snapshot metadata is a separate value that the FSM thread owns and reports, and takeSnapshot additionally refuses to use it when it is below the committed configuration index.",
+      "discriminator": "Compare each accessor's implementation and documentation with when its backing field is written: a defect would need an accessor whose documentation promises FSM completion while the value is written at dispatch time, or snapshot metadata derived from an accessor rather than from the FSM thread's own index. If the documentation states the dispatch-time caveat and snapshot metadata comes from the FSM thread, the accessors are consistent views and the concern is refuted.",
+      "disposition": "explained",
+      "parent_id": null,
+      "knowledge": null,
+      "counterevidence": null,
+      "limitations": [
+        "Source-only: no execution was requested in this turn, so the different notions are established from the accessors, their write sites and their documentation rather than measured concurrently.",
+        "The turn did not measure how far AppliedIndex can lead the FSM in practice under a slow FSM; only the ordering of writes was established.",
+        "Nothing here changes earlier findings; it consolidates the vocabulary used to interpret them."
+      ],
+      "resume_conditions": null
+    }
+  ],
+  "knowledge": [
+    {
+      "id": null,
+      "ref": null,
+      "kind": "behavior",
+      "statement": "A node exposes three intentionally different progress views: LastIndex is the last index in stable storage including the snapshot index, CommitIndex is the committed index, and AppliedIndex is the last index sent to the FSM thread's apply channel, which the documentation explicitly says does not mean the FSM has consumed and applied it. The value is written when processLogs dispatches a batch to the FSM thread, so application state may lag it. Snapshot metadata is a fourth, FSM-thread-owned value: runFSM reports the index it has accounted for in a snapshot request, and takeSnapshot refuses to snapshot when that index is below the committed configuration index, so no accessor drives snapshot metadata.",
+      "conditions": "Applies to the captured revision's accessors Raft.LastIndex, Raft.CommitIndex and Raft.AppliedIndex and to the snapshot request path; the values may differ at any instant, especially while the FSM thread has queued work.",
+      "source_ids": [
+        "s_progress_accessors",
+        "s_process_logs_dispatch_index",
+        "s_fsm_snapshot_req",
+        "s_take_snapshot",
+        "s_get_last_index"
+      ],
+      "executions": {},
+      "changed_premise": "",
+      "affected_uses": []
+    }
+  ],
+  "gaps": [],
+  "interpretations": [
+    {
+      "investigation_id": "@progress-accessor-meanings",
+      "experiment_id": null,
+      "source_ids": [
+        "s_progress_accessors",
+        "s_process_logs_dispatch_index",
+        "s_fsm_snapshot_req",
+        "s_take_snapshot",
+        "s_get_last_index"
+      ],
+      "executions": {},
+      "conclusion": "explained",
+      "rationale": "The accessors are consistent views rather than conflicting ones, and the mismatch that could mislead a client is documented at the accessor itself. LastIndex delegates to getLastIndex, which returns the maximum of the stored log index and the snapshot index under the last-index lock (state.go:159-163); CommitIndex returns the committed index; AppliedIndex returns the applied index whose documentation (api.go:1238-1244) states that it reflects the last index sent to the FSM over the apply channel and that the application's state may therefore lag behind it. That caveat matches the write site: processLogs advances the applied index after the batch has been queued to the FSM thread (raft.go:1352-1358), so a client that polls AppliedIndex to decide whether its own write is applied can be told the index before the FSM has processed it, exactly as documented; a client that waits on its own Apply or Barrier future instead is answered by the FSM thread. Snapshot metadata does not use any of these accessors: the FSM thread reports the index it has accounted for with the snapshot request (fsm.go:216-233), and takeSnapshot checks that value against the committed configuration index before creating a snapshot (snapshot.go:125-211), so the fourth value is the one that bounds what a snapshot may claim. Consequences for reading earlier work in this run: the applied index reported by a node is a dispatch watermark, the FSM thread's index is the one that produces snapshot indices, and configuration visibility depends on the append path rather than on either watermark. No defect is claimed.",
+      "answers": {},
+      "knowledge": [],
+      "counterevidence": [
+        "The strongest candidate for a defect here - an accessor that claims more than it delivers - is explicitly disclaimed in the accessor's own documentation, so a client cannot be misled by the name alone.",
+        "Snapshot metadata being produced by the FSM thread rather than by an accessor removes the possibility of a snapshot claiming state the FSM has not reached, which was checked separately in an earlier question with its guard."
+      ],
+      "limitations": [
+        "Source-only synthesis; no concurrent measurement of the four values was requested in this turn.",
+        "The distance by which AppliedIndex can lead the FSM under a slow application was not measured.",
+        "This consolidates vocabulary; it supersedes nothing and changes no earlier conclusion."
+      ],
+      "joint_history": "",
+      "failure_attribution": null,
+      "report_title": null,
+      "report_answer": null
+    }
+  ],
+  "experiment": null,
+  "stop": null
+}
