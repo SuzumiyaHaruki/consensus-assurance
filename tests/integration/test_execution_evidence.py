@@ -94,6 +94,76 @@ def test_same_operation_ambiguity_cannot_be_selected_away(tmp_path,failure):
     assert not assessment(engine.state, engine.root, fixed, check)['confirmed']
 
 
+@pytest.mark.parametrize('case,outcome,confirmed',[
+    ('prediction','holds',False), ('duty','violated',True), ('mismatch','holds',False),
+    ('missing','unknown',False), ('malformed','unknown',False), ('unmatched','unknown',False),
+    ('gap','violated',False)])
+def test_report_separates_sampled_predicate_witness_and_model_account(tmp_path,case,outcome,confirmed):
+    if not shutil.which('bwrap'):
+        pytest.skip('bubblewrap is required for original isolated execution')
+    def start(state):
+        sub,files=combined(state)
+        sub['investigations'][0]['question']='Does the capacity branch preserve its input as required by the caller contract?'
+        request=sub['experiment']
+        request['requirement']=('The capacity call returns zero while the normal call increments'
+            if case in {'prediction','mismatch'} else 'The capacity call preserves its input while the normal call increments')
+        request['comparisons']=[dict(event='returned',identity_fields=['operation'],admission_alias='start',
+            applicability_conditions=[dict(field='operation',value=operation)],
+            assertion=dict(field='value',value=expected),description=description)
+            for operation,expected,description in [('case',0 if case in {'prediction','mismatch'} else 3,'Capacity case'),
+                                                  ('control',3,'Independent normal control')]]
+        if case=='gap':sub['gaps']=[dict(investigation_id='@q',question='Does the caller contract apply to the admitted capacity input?')]
+        files['check.py']=f'''import json
+from target import step
+for operation, value in [('case',3),('control',2)]:
+    if not (operation=='case' and {case!r}=='unmatched'):
+        print('CA_EVENT '+json.dumps(dict(event='admitted',operation=operation,value=value)))
+    result=dict(event='returned',operation=operation,value=step(value,3))
+    if operation=='case' and {case!r}=='missing':result.pop('value')
+    print('CA_EVENT '+('{{broken' if operation=='case' and {case!r}=='malformed' else json.dumps(result)))
+'''
+        return sub,files
+    def explain(state):
+        fixed=e.state.experiments[0]
+        check=next(c for c in e.state.checks if c.experiment_id==fixed.id)
+        events=observed(fixed,check,e.root)['events']
+        return opinion(state,conclusion='violated' if case=='mismatch' else 'conditional' if outcome=='unknown' else outcome,
+            executions={check.id:[i for i,v in enumerate(events) if v['event']=='returned']},
+            rationale='The sampled capacity result is undesirable under the sourced preservation contract; the control increments',
+            report_answer='容量输入归零，违反所引用的局部保持值要求；普通输入仍递增。',
+            limitations=['Incomplete samples and unresolved applicability cannot establish this account'])
+    e,repo=engine_for(tmp_path,[start,explain,stop])
+    e.agent.mock=False
+    e.config.execution_isolation='bwrap'
+    (repo/'README.md').write_text('A synchronous capacity call must preserve its input; a call below capacity must increment.\n')
+    state=e.start(repo)
+    fixed=state.experiments[0]
+    check=next(c for c in state.checks if c.experiment_id==fixed.id)
+    result=assessment(state,e.root,fixed,check)
+    control_outcome='unknown' if case=='malformed' else 'holds'
+    assert [r['outcome'] for r in result['comparisons']]==[outcome,control_outcome]
+    assert result['confirmed']==confirmed and result['comparisons'][0]['confirmed']==confirmed
+    assert not result['comparisons'][1]['confirmed']
+    if outcome!='unknown':assert [v['value'] for v in result['events'] if v['event']=='returned']==[0,3]
+    from consensus_assurance.reporting.chinese import render_report
+    before=state.model_dump(mode='json')
+    report=render_report(state,e.root).read_text()
+    assert state.model_dump(mode='json')==before
+    assert assessment(state,e.root,fixed,check)==result
+    case_text,control_text=report.split('比较 0 ·',1)[1].split('比较 1 ·',1)
+    labels={'holds':'所声明比较条件成立','violated':'所声明比较条件不成立','unknown':'比较未判定'}
+    assert labels[outcome] in case_text and f'confirmed={str(confirmed).lower()}' in case_text
+    assert labels[control_outcome] in control_text and 'confirmed=false' in control_text
+    if control_outcome=='holds':assert '未产生反例见证（confirmed=false）' in control_text
+    assert '当前模型归属解释' in report and state.interpretations[0].report_answer in report
+    assert '有限范围未见违反' not in report and '未确认违反' not in report
+    assert ('归属判断与机械结果不一致' in report)==(case=='mismatch')
+    if case=='gap':assert state.investigations[0].gaps[0].question in report and '仍未回答的必要缺口' in report
+    if case in {'missing','malformed','unmatched'}:assert '观测缺口' in report
+    for path in (f'fixed-experiments/{fixed.id}/basis.json',f'logs/{check.id}/check.json',f'logs/{check.id}/observations.json'):
+        assert path in report and (e.root/path).is_file()
+
+
 def test_bounded_retry_cycle_controls_and_historical_failures(tmp_path):
     """Supplied source reasoning plus real receipts, not automatic liveness inference."""
     if not shutil.which('bwrap'):
@@ -194,7 +264,7 @@ for mode, reset, ticks in [('short',True,4),('long',True,6),('control',False,6)]
     assert gap.question in assessment(challenged,e.root,state.experiments[2],next(c for c in state.checks if c.experiment_id==state.experiments[2].id))['blockers']
     from consensus_assurance.reporting.chinese import render_report
     report=render_report(state,e.root).read_text()
-    assert '局部问题已回答' in report and '当前归属解释' in report and '已确认有界违反' in report
+    assert '局部问题已回答' in report and '当前模型归属解释' in report and '固定比较的完整反例见证已确认' in report
 
 
 def test_separate_receipt_requires_association_and_successor_cannot_borrow_it(tmp_path):

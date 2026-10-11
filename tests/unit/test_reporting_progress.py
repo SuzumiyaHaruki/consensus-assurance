@@ -28,14 +28,17 @@ def test_report_uses_actual_observations_and_preserves_opinion_history(tmp_path)
     text=render_report(s,e.root).read_text()
     assert 'Caller history remains unestablished' in text
     assert 'Compare the actual return' in text
-    assert '未确认违反' in text and '"value": 0' in text
+    assert '反例见证未确认' in text and '所声明比较条件不成立' in text
+    check=next(c for c in s.checks if c.experiment_id)
+    observation=f'logs/{check.id}/observations.json'
+    assert observation in text and json.loads((e.root/observation).read_text())['events'][1]['value']==0
     assert s.model_dump(mode='json')==before
     clone=tmp_path/'moved';shutil.copytree(e.root,clone)
     original=e.root.with_name('unavailable');e.root.rename(original)
     from consensus_assurance.adapters.storage.files import Store
     saved=Store(clone).load()
     moved=render_report(saved,clone).read_text()
-    assert '"value": 0' in moved
+    assert observation in moved and json.loads((clone/observation).read_text())['events'][1]['value']==0
     assert str(original) not in moved and str(e.root) not in moved
     import re
     for link in re.findall(r'\]\(([^)]+)\)',moved):assert (clone/link).is_file(),link

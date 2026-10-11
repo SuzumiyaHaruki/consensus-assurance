@@ -280,26 +280,48 @@ def test_only_finite_answered_task_can_complete_early(tmp_path, directed):
         assert state.usage['agent_calls'] == 2
 
 
-def test_unrelated_knowledge_addition_preserves_results_and_probe_needs_no_requirement(tmp_path):
+def test_evidence_enrichment_preserves_used_premise_and_exploratory_results(tmp_path):
     def probe(state):
         sub, files = combined(state)
         for key in ('requirement', 'responsibility', 'comparisons', 'anchors'):
             sub['experiment'].pop(key)
+        if state['experiments']:
+            assert state['experiments'] == before[0] and not state['investigations'][0]['gaps']
+            sub.pop('investigations')
+            sub.pop('sources')
+            sub['experiment'].update(investigation_id=state['investigations'][0]['id'],
+                previous_id=state['experiments'][0]['id'], revision_reason='Sample another legal capacity input',
+                knowledge=[dict(entry_id=state['knowledge'][0]['id'], revision=1)])
+            files['check.py'] = files['check.py'].replace('3', '4')
         return sub, files
 
     before = []
 
     def knowledge(state):
         before.append(state['experiments'])
-        return {'rationale': 'Independent sourced understanding', 'knowledge': [dict(
+        return {'rationale': 'Retain the sourced premise with its actual samples', 'knowledge': [dict(
+            ref='@behavior', id=state['knowledge'][0]['id'] if state['knowledge'] else None,
             kind='behavior', statement='The function returns zero at capacity', conditions='value equals limit',
-            source_ids=['code'])]}, {}
+            source_ids=['code'], executions={c['id']:[1] for c in state['checks'] if c.get('experiment_id')})],
+            'investigations':[dict(id=state['investigations'][0]['id'],
+                knowledge=[dict(entry_id='@behavior',revision=1)])]}, {}
 
-    engine, repo = engine_for(tmp_path, [probe, knowledge, stop])
+    engine, repo = engine_for(tmp_path, [probe, knowledge, probe, knowledge, stop])
     state = engine.start(repo)
-    assert [a.model_dump(mode='json') for a in state.experiments] == before[0]
-    assert state.knowledge and not state.investigations[0].gaps
-    check = next(c for c in state.checks if c.experiment_id)
-    result = assessment(state, engine.root, state.experiments[0], check)
-    assert result['events'][1]['value'] == 0
-    assert result['outcome'] == 'unknown' and not result['confirmed']
+    assert [a.model_dump(mode='json') for a in state.experiments] == before[-1]
+    entry = state.knowledge[0]
+    assert entry.revision == 2 and len(entry.history) == 1 and len(entry.executions) == 2
+    history = entry.history[0]
+    assert (entry.statement, entry.conditions) == (history['statement'], history['conditions'])
+    assert not history['correction'] and not history['affected_uses'] and not state.investigations[0].gaps
+    assert set(history['recorded_uses']) == {state.investigations[0].id, state.experiments[1].id}
+    assert len(history['executions']) == 1 and history['executions'].items() <= entry.executions.items()
+    assert state.investigations[0].knowledge[0].revision == state.experiments[1].basis.knowledge[0].revision == 1
+    for fixed in state.experiments:
+        check = next(c for c in state.checks if c.experiment_id == fixed.id)
+        result = assessment(state, engine.root, fixed, check)
+        assert result['events'][1]['value'] == 0
+        assert result['outcome'] == 'unknown' and not result['confirmed']
+    index = json.loads((engine.root/'research.json').read_text())['reselection']['recent_knowledge'][0]
+    assert index['revision'] == 2 and set(index['executions']) == set(entry.executions)
+    assert index['last_correction']['correction'] == '' and index['last_correction']['recorded_uses'] == history['recorded_uses']
