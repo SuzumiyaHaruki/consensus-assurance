@@ -1,0 +1,172 @@
+{
+  "rationale": "Investigate whether recovery synchronization preserves an already-decided key when a genuine partition leaves a follower behind. Source ordering suggests the delta merge uses the incoming decided index as the local snapshot boundary before the missing entries have been installed. Execute actual producers and a complete-snapshot control before drawing a conclusion.",
+  "sources": [
+    {
+      "id": "sync_receiver",
+      "file": "omnipaxos/src/storage/internal_storage.rs",
+      "start_line": 312,
+      "end_line": 411,
+      "kind": "code_observation"
+    },
+    {
+      "id": "sync_sender",
+      "file": "omnipaxos/src/sequence_paxos/mod.rs",
+      "start_line": 402,
+      "end_line": 437,
+      "kind": "code_observation"
+    },
+    {
+      "id": "sync_leader",
+      "file": "omnipaxos/src/sequence_paxos/leader.rs",
+      "start_line": 142,
+      "end_line": 191,
+      "kind": "code_observation"
+    },
+    {
+      "id": "prepare_recovery",
+      "file": "omnipaxos/src/sequence_paxos/follower.rs",
+      "start_line": 12,
+      "end_line": 81,
+      "kind": "code_observation"
+    },
+    {
+      "id": "snapshot_contract",
+      "file": "omnipaxos/src/storage/mod.rs",
+      "start_line": 83,
+      "end_line": 115,
+      "kind": "interface_statement"
+    },
+    {
+      "id": "storage_read_contract",
+      "file": "omnipaxos/src/storage/mod.rs",
+      "start_line": 161,
+      "end_line": 164,
+      "kind": "interface_statement"
+    },
+    {
+      "id": "snapshot_docs",
+      "file": "docs/omnipaxos/compaction.md",
+      "start_line": 29,
+      "end_line": 65,
+      "kind": "document_statement"
+    },
+    {
+      "id": "memory_reads",
+      "file": "omnipaxos_storage/src/memory_storage.rs",
+      "start_line": 101,
+      "end_line": 122,
+      "kind": "code_observation"
+    },
+    {
+      "id": "reconnect_contract",
+      "file": "omnipaxos/src/omni_paxos.rs",
+      "start_line": 394,
+      "end_line": 398,
+      "kind": "interface_statement"
+    }
+  ],
+  "investigations": [
+    {
+      "ref": "@snapshot_sync",
+      "question": "Does delta snapshot synchronization preserve the receiver's previously decided state when reconnecting a lagging follower?",
+      "source_ids": [
+        "sync_receiver",
+        "sync_sender",
+        "sync_leader",
+        "prepare_recovery",
+        "snapshot_contract",
+        "storage_read_contract",
+        "snapshot_docs",
+        "memory_reads",
+        "reconnect_contract"
+      ],
+      "hypothesis": "sync_log installs the incoming decided index in its cache before create_decided_snapshot. A follower with one decided entry receiving a delta for the next two entries requests its absent full range from MemoryStorage, which returns an empty vector; merging the delta may discard the first decided key.",
+      "discriminator": "Initialize three real instances, decide one unique key everywhere, isolate one follower while two more unique keys decide on the connected majority, and restore its connection. Observe the generated Promise and AcceptSync plus the public decided-state representation. Repeat with the leader locally snapshotted to force a Complete snapshot using the same history and measurement.",
+      "counterevidence": [
+        "Complete snapshot installation does not call create_decided_snapshot and may preserve the state. Existing source snapshot tests compare contents after explicit compaction; they do not by themselves establish this reconnect schedule."
+      ],
+      "limitations": [
+        "No retained target execution exists yet. The initial probe targets the public snapshot-backed log view, not a separately running application FSM."
+      ]
+    }
+  ],
+  "experiment": {
+    "investigation_id": "@snapshot_sync",
+    "harness_path": "draft/snapshot_sync.rs",
+    "source_ids": [
+      "sync_receiver",
+      "sync_sender",
+      "sync_leader",
+      "prepare_recovery",
+      "snapshot_contract",
+      "storage_read_contract",
+      "snapshot_docs",
+      "memory_reads",
+      "reconnect_contract"
+    ],
+    "scope": {
+      "description": "Three-node in-process cluster with real BLE and Sequence Paxos, MemoryStorage, deterministic message draining, unique-key map snapshots, and one temporary network partition.",
+      "assumptions": [
+        "MemoryStorage is used without crashes or write failures.",
+        "Node 1 is disconnected only after all nodes publicly expose the first decided entry.",
+        "The partition and reconnection occur between logical timer ticks; no timeout or permanent liveness claim is made.",
+        "Snapshot merge uses standard map overwrite semantics as documented."
+      ],
+      "excluded": [
+        "Persistence crash windows",
+        "Application worker execution",
+        "Reconfiguration",
+        "Byzantine messages"
+      ],
+      "parameters": {
+        "nodes": [
+          1,
+          2,
+          3
+        ],
+        "configuration_id": 1,
+        "initialization_ticks": 40,
+        "isolated_node": 1,
+        "preferred_leader": 3
+      }
+    },
+    "prefix": "Build all instances from empty MemoryStorage through OmniPaxosConfig; drive 40 real logical ticks with complete delivery; append key 101 at leader 3 and drain until all nodes decide index 1. Partition node 1; append keys 202 and 303 at leader 3 and deliver remaining messages to obtain majority-decided index 3. Restore the transport and call node 1 reconnected(3); deliver all resulting original messages. In the control only, snapshot the leader locally at decided index 3 before restoration. All prefixes run independently from empty state in the same invocation.",
+    "responsibility": "A snapshot represents decided log entries and synchronization must preserve their key/value meaning. SnapshotType::Delta represents changes since an earlier snapshot; the receiver must merge it with the corresponding earlier local prefix, as distinct from reading a range of missing entries.",
+    "prerequisites": [
+      {
+        "alias": "admitted",
+        "event": "admission"
+      }
+    ],
+    "comparisons": [
+      {
+        "event": "endpoint",
+        "identity_fields": [
+          "case",
+          "receiver"
+        ],
+        "admission_alias": "admitted",
+        "assertion": {
+          "field": "actual_state",
+          "op": "eq",
+          "reference": "admitted.expected_state"
+        },
+        "description": "The receiver public decided state must equal the actual leader decided state captured before reconnection for this same independently initialized case."
+      },
+      {
+        "event": "endpoint",
+        "identity_fields": [
+          "case",
+          "receiver"
+        ],
+        "admission_alias": "admitted",
+        "assertion": {
+          "field": "actual_decided",
+          "op": "eq",
+          "reference": "admitted.expected_decided"
+        },
+        "description": "Record whether recovery reached the leader decided boundary; contents are compared separately."
+      }
+    ]
+  }
+}

@@ -1,0 +1,280 @@
+{
+  "input": {
+    "rationale": "Promote the store-type-independence result to durable Fact knowledge tied to the completed execution, since it is the reusable conclusion for anyone fixing or reviewing this defect: the stall is not caused by retained above-snapshot log bytes.",
+    "sources": [],
+    "investigations": [],
+    "knowledge": [
+      {
+        "id": null,
+        "ref": null,
+        "kind": "fact",
+        "statement": "In the retained 3-node in-memory execution (CheckRun ed8023e758ae49bc93676179f4ae489c), the post-snapshot catch-up stall occurred for both log-store monotonicity branches: with a non-monotonic InmemStore the isolated follower stayed at applied index 45 while the leader commit index was 55 (event 3, stalled=true, isolated_caught_up=false), and with MockMonotonicLogStore, whose removeOldLogs deletes the above-snapshot log bytes during installSnapshot, it still stayed at applied index 45 with old_last_after=223 (event 5, stalled=true, isolated_caught_up=false). The control whose log ended at or below the snapshot index reached applied index 55 (event 1, isolated_caught_up=true).",
+        "conditions": "Single process, three real Raft instances over InmemTransport with FileSnapshotStore; ProtocolVersion=3; HeartbeatTimeout=ElectionTimeout=LeaderLeaseTimeout=300ms; TrailingLogs=0; the isolated node's above-snapshot suffix was produced by real uncommitted Apply calls on the old leader before it stepped down; only live catch-up was measured.",
+        "source_ids": [
+          "install_snapshot",
+          "get_last_entry",
+          "append_prev_check",
+          "replicate_to"
+        ],
+        "executions": {
+          "ed8023e758ae49bc93676179f4ae489c": [
+            1,
+            3,
+            5
+          ]
+        },
+        "changed_premise": "",
+        "affected_uses": []
+      }
+    ],
+    "gaps": [],
+    "interpretations": [],
+    "experiment": null,
+    "stop": null
+  },
+  "before": {
+    "knowledge": [
+      {
+        "id": "b02f82dfc4024a638ae4ecbdcb18b1fc-knowledge-0",
+        "revision": 1,
+        "kind": "behavior",
+        "statement": "(*Raft).installSnapshot restores the received snapshot into the FSM, sets lastApplied=req.LastLogIndex, sets lastSnapshot=(req.LastLogIndex,req.LastLogTerm), overwrites the latest and committed configuration, then removes or compacts only logs at or below req.LastLogIndex (removeOldLogs for a MonotonicLogStore, otherwise compactLogs). It never calls setLastLog and never truncates log entries above req.LastLogIndex, so the cached lastLogIndex/lastLogTerm retain any pre-existing suffix.",
+        "conditions": "A follower handles an InstallSnapshotRequest and its persisted log already contains entries at indices greater than req.LastLogIndex, for example an uncommitted suffix written by an earlier leader term.",
+        "source_ids": [
+          "install_snapshot_decl"
+        ],
+        "executions": {},
+        "history": [],
+        "operation_id": "b02f82dfc4024a638ae4ecbdcb18b1fc"
+      },
+      {
+        "id": "b02f82dfc4024a638ae4ecbdcb18b1fc-knowledge-1",
+        "revision": 1,
+        "kind": "behavior",
+        "statement": "(*raftState).getLastEntry returns (lastLogIndex,lastLogTerm) whenever lastLogIndex >= lastSnapshotIndex, and returns (lastSnapshotIndex,lastSnapshotTerm) only when the cached log index is below the snapshot index. After a snapshot install that leaves a longer persisted log, the follower therefore reports the stale tail index and term rather than the snapshot index and term.",
+        "conditions": "lastLogIndex > lastSnapshotIndex on the local raftState, which holds after installSnapshot when the log was not truncated above the snapshot index.",
+        "source_ids": [
+          "get_last_entry"
+        ],
+        "executions": {},
+        "history": [],
+        "operation_id": "b02f82dfc4024a638ae4ecbdcb18b1fc"
+      },
+      {
+        "id": "b02f82dfc4024a638ae4ecbdcb18b1fc-knowledge-2",
+        "revision": 1,
+        "kind": "behavior",
+        "statement": "(*Raft).appendEntries verifies a.PrevLogEntry by comparing it to getLastEntry; if they differ it reads logs.GetLog(a.PrevLogEntry). A missing entry or a differing term sets resp.NoRetryBackoff=true and rejects the request without truncating the local log.",
+        "conditions": "A follower receives an AppendEntriesRequest with a.PrevLogEntry > 0.",
+        "source_ids": [
+          "append_prev_check"
+        ],
+        "executions": {},
+        "history": [],
+        "operation_id": "b02f82dfc4024a638ae4ecbdcb18b1fc"
+      },
+      {
+        "id": "b02f82dfc4024a638ae4ecbdcb18b1fc-knowledge-3",
+        "revision": 1,
+        "kind": "behavior",
+        "statement": "(*Raft).replicateTo advances s.nextIndex to max(min(s.nextIndex-1, resp.LastLog+1), 1) on a rejected AppendEntries, so a follower that reports a higher LastLog than the leader's nextIndex causes nextIndex to decrease by one; when setupAppendEntries returns ErrLogNotFound it goes to SEND_SNAP and sendLatestSnapshot re-sends the newest snapshot and sets nextIndex=meta.Index+1 on success.",
+        "conditions": "The follower keeps rejecting AppendEntries and its reported LastLog stays above the leader's nextIndex.",
+        "source_ids": [
+          "replicate_to",
+          "send_latest_snapshot"
+        ],
+        "executions": {},
+        "history": [],
+        "operation_id": "b02f82dfc4024a638ae4ecbdcb18b1fc"
+      },
+      {
+        "id": "e3d6dc035d0e4e3d8f25950dd3698fdf-knowledge-0",
+        "revision": 1,
+        "kind": "fact",
+        "statement": "In the retained 3-node in-memory execution, when the isolated node reconnected with its persisted log ending above the replacement leader's snapshot index (case: old_last_before=222 vs snapshot_index=45), the node's applied index stayed at the snapshot index 45 across the observation window while the leader's commit index was 55 (stalled=true, isolated_caught_up=false); in the same execution the control with the node's log ending below the snapshot index (old_last_before=25) reached applied index 55 and caught up (stalled=false, isolated_caught_up=true).",
+        "conditions": "Single process, three real Raft instances over InmemTransport with InmemStore and FileSnapshotStore, ProtocolVersion=3, HeartbeatTimeout=ElectionTimeout=LeaderLeaseTimeout=300ms, TrailingLogs=0, replacement leader compacted at or below its snapshot index; the isolated node's above-snapshot suffix was produced by real uncommitted Apply calls on the old leader before it stepped down.",
+        "source_ids": [
+          "install_snapshot",
+          "get_last_entry",
+          "append_prev_check",
+          "replicate_to"
+        ],
+        "executions": {
+          "61befa27ce114c8097c8bdfa597e9ee5": [
+            1,
+            3
+          ]
+        },
+        "history": [],
+        "operation_id": "e3d6dc035d0e4e3d8f25950dd3698fdf"
+      }
+    ],
+    "current_submission": {
+      "phase": "received",
+      "operation_id": "aec582f7b2ee436a9a667699fffce95a",
+      "result": {
+        "submission": "snapshot_suffix_store_independence_knowledge.json",
+        "summary": "Run state is complete: the previous envelope was accepted (phase executed, no_change false), the investigation is `explained`, and there are no remaining necessary gaps — the monotonic gap 1b24d155db77414b9490619c49f7a51f-gap-0 was answered by the completed discriminator (CheckRun ed8023e758ae49bc93676179f4ae489c, exit 0). With about four minutes of total budget left and no open necessary work, this turn adds one durable artifact rather than a new experiment or an empty action: a Fact knowledge entry tying the store-type-independence result to that execution. It records that the post-snapshot catch-up stall occurs for both log-store monotonicity branches — non-monotonic InmemStore (event 3: applied frozen at 45, leader commit 55, stalled=true) and MockMonotonicLogStore whose removeOldLogs deletes the above-snapshot bytes (event 5: applied 45, old_last_after 223, stalled=true) — while the control reached applied 55 (event 1, isolated_caught_up=true). Conditions and scope are explicit (single process, three real Raft instances over InmemTransport with FileSnapshotStore, ProtocolVersion 3, 300ms timeouts, TrailingLogs=0, real uncommitted Apply suffix, live catch-up only). The reusable conclusion for review or repair: the cause is the cached lastLogIndex/lastLogTerm that installSnapshot never resets (no setLastLog, raft.go:1814-1953), read by getLastEntry (state.go:167-174) and rejected at the PrevLogEntry check (raft.go:1475-1502), after which replicateTo (replication.go:222-260) walks nextIndex to ErrLogNotFound and sendLatestSnapshot re-sends the same snapshot — not retained above-snapshot log bytes. Evidence holds no safety claim (progress only) and no restart/recovery coverage. Envelope validates (valid=true). Draft file: `draft/snapshot_suffix_store_independence_knowledge.json`."
+      },
+      "status": "completed",
+      "reason": "",
+      "session_unavailable": false
+    },
+    "applied_operations": {
+      "submission-b02f82dfc4024a638ae4ecbdcb18b1fc": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-11_12-49-23-hashicorp_raft-real-run/semantic-commits/submission-b02f82dfc4024a638ae4ecbdcb18b1fc.json"
+      },
+      "submission-e3d6dc035d0e4e3d8f25950dd3698fdf": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-11_12-49-23-hashicorp_raft-real-run/semantic-commits/submission-e3d6dc035d0e4e3d8f25950dd3698fdf.json"
+      },
+      "submission-582acedf6e86477a92ab474a241721b7": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-11_12-49-23-hashicorp_raft-real-run/semantic-commits/submission-582acedf6e86477a92ab474a241721b7.json"
+      },
+      "submission-5af7bfdd43694974b1a9aa24d559df0f": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-11_12-49-23-hashicorp_raft-real-run/semantic-commits/submission-5af7bfdd43694974b1a9aa24d559df0f.json"
+      },
+      "submission-1b24d155db77414b9490619c49f7a51f": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-11_12-49-23-hashicorp_raft-real-run/semantic-commits/submission-1b24d155db77414b9490619c49f7a51f.json"
+      },
+      "submission-58b739baeea14b0a8ff27e6cfab5c1c3": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-11_12-49-23-hashicorp_raft-real-run/semantic-commits/submission-58b739baeea14b0a8ff27e6cfab5c1c3.json"
+      },
+      "submission-b8ec90938f1346649533b743268e42fc": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-11_12-49-23-hashicorp_raft-real-run/semantic-commits/submission-b8ec90938f1346649533b743268e42fc.json"
+      }
+    }
+  },
+  "after": {
+    "knowledge": [
+      {
+        "id": "b02f82dfc4024a638ae4ecbdcb18b1fc-knowledge-0",
+        "revision": 1,
+        "kind": "behavior",
+        "statement": "(*Raft).installSnapshot restores the received snapshot into the FSM, sets lastApplied=req.LastLogIndex, sets lastSnapshot=(req.LastLogIndex,req.LastLogTerm), overwrites the latest and committed configuration, then removes or compacts only logs at or below req.LastLogIndex (removeOldLogs for a MonotonicLogStore, otherwise compactLogs). It never calls setLastLog and never truncates log entries above req.LastLogIndex, so the cached lastLogIndex/lastLogTerm retain any pre-existing suffix.",
+        "conditions": "A follower handles an InstallSnapshotRequest and its persisted log already contains entries at indices greater than req.LastLogIndex, for example an uncommitted suffix written by an earlier leader term.",
+        "source_ids": [
+          "install_snapshot_decl"
+        ],
+        "executions": {},
+        "history": [],
+        "operation_id": "b02f82dfc4024a638ae4ecbdcb18b1fc"
+      },
+      {
+        "id": "b02f82dfc4024a638ae4ecbdcb18b1fc-knowledge-1",
+        "revision": 1,
+        "kind": "behavior",
+        "statement": "(*raftState).getLastEntry returns (lastLogIndex,lastLogTerm) whenever lastLogIndex >= lastSnapshotIndex, and returns (lastSnapshotIndex,lastSnapshotTerm) only when the cached log index is below the snapshot index. After a snapshot install that leaves a longer persisted log, the follower therefore reports the stale tail index and term rather than the snapshot index and term.",
+        "conditions": "lastLogIndex > lastSnapshotIndex on the local raftState, which holds after installSnapshot when the log was not truncated above the snapshot index.",
+        "source_ids": [
+          "get_last_entry"
+        ],
+        "executions": {},
+        "history": [],
+        "operation_id": "b02f82dfc4024a638ae4ecbdcb18b1fc"
+      },
+      {
+        "id": "b02f82dfc4024a638ae4ecbdcb18b1fc-knowledge-2",
+        "revision": 1,
+        "kind": "behavior",
+        "statement": "(*Raft).appendEntries verifies a.PrevLogEntry by comparing it to getLastEntry; if they differ it reads logs.GetLog(a.PrevLogEntry). A missing entry or a differing term sets resp.NoRetryBackoff=true and rejects the request without truncating the local log.",
+        "conditions": "A follower receives an AppendEntriesRequest with a.PrevLogEntry > 0.",
+        "source_ids": [
+          "append_prev_check"
+        ],
+        "executions": {},
+        "history": [],
+        "operation_id": "b02f82dfc4024a638ae4ecbdcb18b1fc"
+      },
+      {
+        "id": "b02f82dfc4024a638ae4ecbdcb18b1fc-knowledge-3",
+        "revision": 1,
+        "kind": "behavior",
+        "statement": "(*Raft).replicateTo advances s.nextIndex to max(min(s.nextIndex-1, resp.LastLog+1), 1) on a rejected AppendEntries, so a follower that reports a higher LastLog than the leader's nextIndex causes nextIndex to decrease by one; when setupAppendEntries returns ErrLogNotFound it goes to SEND_SNAP and sendLatestSnapshot re-sends the newest snapshot and sets nextIndex=meta.Index+1 on success.",
+        "conditions": "The follower keeps rejecting AppendEntries and its reported LastLog stays above the leader's nextIndex.",
+        "source_ids": [
+          "replicate_to",
+          "send_latest_snapshot"
+        ],
+        "executions": {},
+        "history": [],
+        "operation_id": "b02f82dfc4024a638ae4ecbdcb18b1fc"
+      },
+      {
+        "id": "e3d6dc035d0e4e3d8f25950dd3698fdf-knowledge-0",
+        "revision": 1,
+        "kind": "fact",
+        "statement": "In the retained 3-node in-memory execution, when the isolated node reconnected with its persisted log ending above the replacement leader's snapshot index (case: old_last_before=222 vs snapshot_index=45), the node's applied index stayed at the snapshot index 45 across the observation window while the leader's commit index was 55 (stalled=true, isolated_caught_up=false); in the same execution the control with the node's log ending below the snapshot index (old_last_before=25) reached applied index 55 and caught up (stalled=false, isolated_caught_up=true).",
+        "conditions": "Single process, three real Raft instances over InmemTransport with InmemStore and FileSnapshotStore, ProtocolVersion=3, HeartbeatTimeout=ElectionTimeout=LeaderLeaseTimeout=300ms, TrailingLogs=0, replacement leader compacted at or below its snapshot index; the isolated node's above-snapshot suffix was produced by real uncommitted Apply calls on the old leader before it stepped down.",
+        "source_ids": [
+          "install_snapshot",
+          "get_last_entry",
+          "append_prev_check",
+          "replicate_to"
+        ],
+        "executions": {
+          "61befa27ce114c8097c8bdfa597e9ee5": [
+            1,
+            3
+          ]
+        },
+        "history": [],
+        "operation_id": "e3d6dc035d0e4e3d8f25950dd3698fdf"
+      },
+      {
+        "id": "aec582f7b2ee436a9a667699fffce95a-knowledge-0",
+        "revision": 1,
+        "kind": "fact",
+        "statement": "In the retained 3-node in-memory execution (CheckRun ed8023e758ae49bc93676179f4ae489c), the post-snapshot catch-up stall occurred for both log-store monotonicity branches: with a non-monotonic InmemStore the isolated follower stayed at applied index 45 while the leader commit index was 55 (event 3, stalled=true, isolated_caught_up=false), and with MockMonotonicLogStore, whose removeOldLogs deletes the above-snapshot log bytes during installSnapshot, it still stayed at applied index 45 with old_last_after=223 (event 5, stalled=true, isolated_caught_up=false). The control whose log ended at or below the snapshot index reached applied index 55 (event 1, isolated_caught_up=true).",
+        "conditions": "Single process, three real Raft instances over InmemTransport with FileSnapshotStore; ProtocolVersion=3; HeartbeatTimeout=ElectionTimeout=LeaderLeaseTimeout=300ms; TrailingLogs=0; the isolated node's above-snapshot suffix was produced by real uncommitted Apply calls on the old leader before it stepped down; only live catch-up was measured.",
+        "source_ids": [
+          "install_snapshot",
+          "get_last_entry",
+          "append_prev_check",
+          "replicate_to"
+        ],
+        "executions": {
+          "ed8023e758ae49bc93676179f4ae489c": [
+            1,
+            3,
+            5
+          ]
+        },
+        "history": [],
+        "operation_id": "aec582f7b2ee436a9a667699fffce95a"
+      }
+    ],
+    "current_submission": {
+      "phase": "accepted",
+      "operation_id": "aec582f7b2ee436a9a667699fffce95a",
+      "action": "update",
+      "no_change": false,
+      "references": {}
+    },
+    "applied_operations": {
+      "submission-b02f82dfc4024a638ae4ecbdcb18b1fc": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-11_12-49-23-hashicorp_raft-real-run/semantic-commits/submission-b02f82dfc4024a638ae4ecbdcb18b1fc.json"
+      },
+      "submission-e3d6dc035d0e4e3d8f25950dd3698fdf": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-11_12-49-23-hashicorp_raft-real-run/semantic-commits/submission-e3d6dc035d0e4e3d8f25950dd3698fdf.json"
+      },
+      "submission-582acedf6e86477a92ab474a241721b7": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-11_12-49-23-hashicorp_raft-real-run/semantic-commits/submission-582acedf6e86477a92ab474a241721b7.json"
+      },
+      "submission-5af7bfdd43694974b1a9aa24d559df0f": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-11_12-49-23-hashicorp_raft-real-run/semantic-commits/submission-5af7bfdd43694974b1a9aa24d559df0f.json"
+      },
+      "submission-1b24d155db77414b9490619c49f7a51f": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-11_12-49-23-hashicorp_raft-real-run/semantic-commits/submission-1b24d155db77414b9490619c49f7a51f.json"
+      },
+      "submission-58b739baeea14b0a8ff27e6cfab5c1c3": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-11_12-49-23-hashicorp_raft-real-run/semantic-commits/submission-58b739baeea14b0a8ff27e6cfab5c1c3.json"
+      },
+      "submission-b8ec90938f1346649533b743268e42fc": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-11_12-49-23-hashicorp_raft-real-run/semantic-commits/submission-b8ec90938f1346649533b743268e42fc.json"
+      },
+      "submission-aec582f7b2ee436a9a667699fffce95a": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-11_12-49-23-hashicorp_raft-real-run/semantic-commits/submission-aec582f7b2ee436a9a667699fffce95a.json"
+      }
+    }
+  }
+}

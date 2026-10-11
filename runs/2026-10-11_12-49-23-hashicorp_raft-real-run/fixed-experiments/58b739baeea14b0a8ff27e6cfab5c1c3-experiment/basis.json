@@ -1,0 +1,519 @@
+{
+  "id": "58b739baeea14b0a8ff27e6cfab5c1c3-experiment",
+  "investigation_id": "b02f82dfc4024a638ae4ecbdcb18b1fc-question-0",
+  "version": 4,
+  "basis": {
+    "harness": {
+      "kind": "go_test",
+      "source": "package raft\n\n// Assurance exploration harness against the captured hashicorp/raft snapshot.\n// Not part of the target source; uses exported plus same-package test\n// facilities. This variant adds a MonotonicLogStore scenario, where\n// installSnapshot's removeOldLogs already deletes the above-snapshot bytes, to\n// discriminate retained log bytes from the cached last-log state as the cause.\n\nimport (\n\t\"fmt\"\n\t\"testing\"\n\t\"time\"\n)\n\nfunc assuranceConfMono() *Config {\n\tconf := DefaultConfig()\n\tconf.HeartbeatTimeout = 300 * time.Millisecond\n\tconf.ElectionTimeout = 300 * time.Millisecond\n\tconf.LeaderLeaseTimeout = 300 * time.Millisecond\n\tconf.CommitTimeout = 10 * time.Millisecond\n\t// Delete all logs at or below a completed snapshot so the leader cannot\n\t// serve them from its log store.\n\tconf.TrailingLogs = 0\n\tconf.SnapshotThreshold = 1 << 60\n\tconf.SnapshotInterval = time.Hour\n\treturn conf\n}\n\ntype assuranceResultMono struct {\n\tscenario        string\n\tstaleSuffix     bool // isolated node's last index was above the snapshot index\n\tstoreMonotonic  bool\n\tsnapshotIndex   uint64\n\toldLastBefore   uint64\n\toldLastAfter    uint64\n\toldAppliedAfter uint64\n\toldCommitAfter  uint64\n\tleaderLastAfter uint64\n\tleaderCommit    uint64\n\tstalled         bool\n\tcaughtUp        bool\n}\n\nfunc waitFirstLeaderMono(t *testing.T, c *cluster, d time.Duration) *Raft {\n\tt.Helper()\n\tdeadline := time.Now().Add(d)\n\tfor time.Now().Before(deadline) {\n\t\tleaders := c.GetInState(Leader)\n\t\tif len(leaders) == 1 {\n\t\t\treturn leaders[0]\n\t\t}\n\t\ttime.Sleep(10 * time.Millisecond)\n\t}\n\tt.Fatalf(\"no stable leader\")\n\treturn nil\n}\n\nfunc waitLeaderExcludingMono(t *testing.T, c *cluster, exclude *Raft, d time.Duration) *Raft {\n\tt.Helper()\n\tdeadline := time.Now().Add(d)\n\tfor time.Now().Before(deadline) {\n\t\tfor _, r := range c.rafts {\n\t\t\tif r != exclude && r.State() == Leader {\n\t\t\t\treturn r\n\t\t\t}\n\t\t}\n\t\ttime.Sleep(10 * time.Millisecond)\n\t}\n\tt.Fatalf(\"no leader excluding isolated node\")\n\treturn nil\n}\n\n// runScenarioMono is runScenario with a selectable log store type. With\n// monotonic=true, installSnapshot's removeOldLogs deletes all logs up to the\n// snapshot's last index (including any above-snapshot suffix bytes), so a\n// persistent stall can only come from the cached last-log index/term.\nfunc runScenarioMono(t *testing.T, scenario string, monotonic bool, prefix, tail, extra, post int) assuranceResultMono {\n\tt.Helper()\n\tc := MakeClusterCustom(t, &MakeClusterOpts{\n\t\tPeers:           3,\n\t\tBootstrap:       true,\n\t\tConf:            assuranceConfMono(),\n\t\tMonotonicLogs:   monotonic,\n\t\tLongstopTimeout: 60 * time.Second,\n\t})\n\tdefer c.Close()\n\n\told := waitFirstLeaderMono(t, c, 10*time.Second)\n\tif err := old.Barrier(2 * time.Second).Error(); err != nil {\n\t\tt.Fatalf(\"barrier: %v\", err)\n\t}\n\tfor i := 0; i < prefix; i++ {\n\t\tf := old.Apply([]byte(fmt.Sprintf(\"prefix-%d\", i)), 2*time.Second)\n\t\tif err := f.Error(); err != nil {\n\t\t\tt.Fatalf(\"prefix apply: %v\", err)\n\t\t}\n\t}\n\tc.WaitForReplication(prefix)\n\n\tc.Partition([]ServerAddress{old.localAddr})\n\n\tfor i := 0; i < tail; i++ {\n\t\told.Apply([]byte(fmt.Sprintf(\"tail-%d\", i)), 0)\n\t}\n\toldLastBefore := old.LastIndex()\n\n\tnl := waitLeaderExcludingMono(t, c, old, 10*time.Second)\n\tif err := nl.Barrier(2 * time.Second).Error(); err != nil {\n\t\tt.Fatalf(\"new leader barrier: %v\", err)\n\t}\n\tfor i := 0; i < extra; i++ {\n\t\tf := nl.Apply([]byte(fmt.Sprintf(\"extra-%d\", i)), 2*time.Second)\n\t\tif err := f.Error(); err != nil {\n\t\t\tt.Fatalf(\"extra apply: %v\", err)\n\t\t}\n\t}\n\tif err := nl.Snapshot().Error(); err != nil {\n\t\tt.Fatalf(\"snapshot: %v\", err)\n\t}\n\tsnaps, err := nl.snapshots.List()\n\tif err != nil || len(snaps) == 0 {\n\t\tt.Fatalf(\"no snapshot: %v %v\", snaps, err)\n\t}\n\tsnapIdx := snaps[0].Index\n\n\tfor i := 0; i < post; i++ {\n\t\tf := nl.Apply([]byte(fmt.Sprintf(\"post-%d\", i)), 2*time.Second)\n\t\tif err := f.Error(); err != nil {\n\t\t\tt.Fatalf(\"post apply: %v\", err)\n\t\t}\n\t}\n\tleaderCommit := nl.CommitIndex()\n\n\tif tail > 0 && oldLastBefore <= uint64(prefix) {\n\t\tt.Fatalf(\"isolated node tail was not appended: last=%d prefix=%d\", oldLastBefore, prefix)\n\t}\n\n\tt.Logf(\"[CA] %s monotonic=%t prefix=%d tail=%d extra=%d post=%d snapshotIndex=%d oldLastBefore=%d leaderCommit=%d\",\n\t\tscenario, monotonic, prefix, tail, extra, post, snapIdx, oldLastBefore, leaderCommit)\n\n\tc.FullyConnect()\n\ttime.Sleep(1500 * time.Millisecond)\n\tapplied1 := old.AppliedIndex()\n\ttime.Sleep(3 * time.Second)\n\tapplied2 := old.AppliedIndex()\n\n\tres := assuranceResultMono{\n\t\tscenario:        scenario,\n\t\tstaleSuffix:     oldLastBefore > snapIdx,\n\t\tstoreMonotonic:  monotonic,\n\t\tsnapshotIndex:   snapIdx,\n\t\toldLastBefore:   oldLastBefore,\n\t\toldLastAfter:    old.LastIndex(),\n\t\toldAppliedAfter: applied2,\n\t\toldCommitAfter:  old.CommitIndex(),\n\t\tleaderLastAfter: nl.LastIndex(),\n\t\tleaderCommit:    leaderCommit,\n\t}\n\tres.caughtUp = applied2 >= leaderCommit\n\tres.stalled = !res.caughtUp && applied1 == applied2\n\t// Emit before the deferred c.Close() runs, so a slow helper shutdown cannot\n\t// hide an already completed measurement.\n\temitMono(res)\n\treturn res\n}\n\nfunc emitMono(r assuranceResultMono) {\n\tfmt.Printf(\"CA_EVENT {\\\"event\\\":\\\"scenario_setup\\\",\\\"scenario\\\":%q,\\\"stale_suffix\\\":%t,\\\"store_monotonic\\\":%t,\\\"snapshot_index\\\":%d,\\\"old_last_before\\\":%d}\\n\",\n\t\tr.scenario, r.staleSuffix, r.storeMonotonic, r.snapshotIndex, r.oldLastBefore)\n\tfmt.Printf(\"CA_EVENT {\\\"event\\\":\\\"snapshot_catchup_result\\\",\\\"scenario\\\":%q,\\\"stale_suffix\\\":%t,\\\"store_monotonic\\\":%t,\\\"snapshot_index\\\":%d,\\\"old_last_before\\\":%d,\\\"old_last_after\\\":%d,\\\"old_applied_after\\\":%d,\\\"old_commit_after\\\":%d,\\\"leader_last_after\\\":%d,\\\"leader_commit_index\\\":%d,\\\"stalled\\\":%t,\\\"isolated_caught_up\\\":%t}\\n\",\n\t\tr.scenario, r.staleSuffix, r.storeMonotonic, r.snapshotIndex, r.oldLastBefore, r.oldLastAfter,\n\t\tr.oldAppliedAfter, r.oldCommitAfter, r.leaderLastAfter, r.leaderCommit, r.stalled, r.caughtUp)\n}\n\nfunc TestAssuranceSnapshotStaleSuffixMonotonic(t *testing.T) {\n\t// Control: non-monotonic store, isolated log ends below the snapshot index.\n\trunScenarioMono(t, \"control_catchup\", false, 20, 2, 20, 10)\n\n\t// Non-monotonic store, isolated log extends above the snapshot index.\n\trunScenarioMono(t, \"case_nonmonotonic_stall\", false, 20, 200, 20, 10)\n\n\t// Monotonic store, same stale suffix; removeOldLogs deletes the bytes but\n\t// the cached last-log state is not reset.\n\trunScenarioMono(t, \"case_monotonic_stall\", true, 20, 200, 20, 10)\n}\n",
+      "files": {},
+      "execution_package": ".",
+      "description": "",
+      "semantic_changes": [],
+      "prerequisites": [
+        {
+          "alias": "admission",
+          "event": "scenario_setup",
+          "conditions": []
+        }
+      ]
+    },
+    "source_ids": [
+      "install_snapshot",
+      "get_last_entry",
+      "append_prev_check",
+      "replicate_to"
+    ],
+    "anchors": [
+      {
+        "material_id": "install_snapshot_decl",
+        "symbol": "installSnapshot",
+        "start_line": 1930,
+        "end_line": 1948,
+        "anchor": {
+          "source_ids": [
+            "install_snapshot",
+            "install_snapshot_decl"
+          ],
+          "boundary_complete": true,
+          "kind": "declaration",
+          "material_id": "install_snapshot_decl",
+          "start_line": 1814,
+          "end_line": 1814,
+          "symbol": "installSnapshot"
+        }
+      },
+      {
+        "material_id": "get_last_entry",
+        "symbol": "getLastEntry",
+        "start_line": 167,
+        "end_line": 174,
+        "anchor": {
+          "source_ids": [
+            "get_last_entry"
+          ],
+          "boundary_complete": true,
+          "kind": "declaration",
+          "material_id": "get_last_entry",
+          "start_line": 167,
+          "end_line": 167,
+          "symbol": "getLastEntry"
+        }
+      },
+      {
+        "material_id": "append_entries_decl",
+        "symbol": "appendEntries",
+        "start_line": 1475,
+        "end_line": 1502,
+        "anchor": {
+          "source_ids": [
+            "append_entries_decl",
+            "append_prev_check"
+          ],
+          "boundary_complete": true,
+          "kind": "declaration",
+          "material_id": "append_entries_decl",
+          "start_line": 1440,
+          "end_line": 1440,
+          "symbol": "appendEntries"
+        }
+      },
+      {
+        "material_id": "replicate_to_decl",
+        "symbol": "replicateTo",
+        "start_line": 222,
+        "end_line": 260,
+        "anchor": {
+          "source_ids": [
+            "replicate_to",
+            "replicate_to_decl"
+          ],
+          "boundary_complete": true,
+          "kind": "declaration",
+          "material_id": "replicate_to_decl",
+          "start_line": 202,
+          "end_line": 202,
+          "symbol": "replicateTo"
+        }
+      }
+    ],
+    "scope": {
+      "description": "One process, three real Raft instances over InmemTransport with FileSnapshotStore; each scenario selects InmemStore directly (non-monotonic) or wrapped in MockMonotonicLogStore (monotonic) via MakeClusterCustom with LongstopTimeout=60s. The replacement leader compacts at or below its snapshot index (TrailingLogs=0).",
+      "assumptions": [
+        "Config: ProtocolVersion=3, HeartbeatTimeout=ElectionTimeout=LeaderLeaseTimeout=300ms, CommitTimeout=10ms, TrailingLogs=0, SnapshotThreshold disabled, SnapshotInterval=1h.",
+        "The isolated node's above-snapshot suffix is produced by real uncommitted Apply calls on the old leader before it steps down; no state is injected.",
+        "MockMonotonicLogStore returns IsMonotonic()==true, so installSnapshot takes the removeOldLogs branch."
+      ],
+      "excluded": [
+        "Network and TCP transports; mixed-version rolling upgrades.",
+        "Restart or recovery of the isolated node; only live catch-up is measured.",
+        "Disk-backed stores."
+      ],
+      "parameters": {
+        "prefix": 20,
+        "case_tail": 200,
+        "control_tail": 2,
+        "extra": 20,
+        "post": 10,
+        "settle_ms": 4500,
+        "longstop_timeout_s": 60
+      }
+    },
+    "prefix": "For each of three scenarios: bootstrap a 3-node cluster, commit a 20-command prefix, isolate the current leader, append 2 (control) or 200 (both stall cases) uncommitted tail commands on the isolated node, let the remaining two nodes elect a replacement leader, commit 20 more commands and take a snapshot at index S, commit 10 post entries above S, reconnect, observe for about 4.5s, and emit the scenario's setup and result events before helper cleanup. The two stall scenarios differ only in the isolated node's log store (non-monotonic vs MockMonotonicLogStore).",
+    "requirement": "After a follower installs a snapshot at index S, catch-up must not depend on whether the above-S bytes survive: regardless of the LogStore's monotonicity, a follower whose persisted log ended above S must stop reporting a last log entry above S and accept the leader's AppendEntries with PrevLogEntry=S so it converges to the leader's log. Anchored in state.go:167-174 (getLastEntry) and raft.go:1475-1502 (appendEntries PrevLogEntry check); installSnapshot at raft.go:1814-1953 chooses removeOldLogs for a MonotonicLogStore and compactLogs otherwise, and is the producer responsible for the post-install last-log state.",
+    "responsibility": "Follower snapshot installation establishing a post-install last-log state compatible with the leader's AppendEntries and nextIndex catch-up loop, for both monotonicity branches of the LogStore.",
+    "comparisons": [
+      {
+        "event": "snapshot_catchup_result",
+        "identity_fields": [
+          "scenario",
+          "snapshot_index",
+          "old_last_before"
+        ],
+        "admission_alias": "admission",
+        "assertion": {
+          "field": "isolated_caught_up",
+          "op": "eq",
+          "value": true,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [
+          {
+            "field": "stale_suffix",
+            "op": "eq",
+            "value": false,
+            "reference": null
+          }
+        ],
+        "description": "Control: isolated log at or below the snapshot index reaches the leader commit index."
+      },
+      {
+        "event": "snapshot_catchup_result",
+        "identity_fields": [
+          "scenario",
+          "snapshot_index",
+          "old_last_before"
+        ],
+        "admission_alias": "admission",
+        "assertion": {
+          "field": "stalled",
+          "op": "eq",
+          "value": false,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [
+          {
+            "field": "stale_suffix",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          },
+          {
+            "field": "store_monotonic",
+            "op": "eq",
+            "value": false,
+            "reference": null
+          }
+        ],
+        "description": "Non-monotonic store with a stale above-snapshot suffix must catch up."
+      },
+      {
+        "event": "snapshot_catchup_result",
+        "identity_fields": [
+          "scenario",
+          "snapshot_index",
+          "old_last_before"
+        ],
+        "admission_alias": "admission",
+        "assertion": {
+          "field": "stalled",
+          "op": "eq",
+          "value": false,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [
+          {
+            "field": "stale_suffix",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          },
+          {
+            "field": "store_monotonic",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          }
+        ],
+        "description": "Monotonic store with a stale above-snapshot suffix: removeOldLogs deletes the bytes, yet the cached last-log state must not block catch-up."
+      }
+    ],
+    "knowledge": []
+  },
+  "snapshot_id": "5ac6315a56aa4013be17fbb9fa68818a",
+  "configuration": {
+    "backend": "go_module",
+    "target": {
+      "expected_module": "github.com/hashicorp/raft",
+      "variant": "hashicorp_raft",
+      "analysis_roots": [],
+      "execution_package": ".",
+      "harness_path": "assurance_generated_test.go"
+    },
+    "isolation": "bwrap",
+    "tools": {
+      "agent": "codex-cli 0.155.0-alpha.16",
+      "implementation": "go version go1.23.5 linux/amd64"
+    }
+  },
+  "harness_filename": "assurance_generated_test.go",
+  "operation_id": "58b739baeea14b0a8ff27e6cfab5c1c3",
+  "previous_id": "5af7bfdd43694974b1a9aa24d559df0f-experiment",
+  "difference": {
+    "harness": {
+      "before": {
+        "kind": "go_test",
+        "source": "package raft\n\n// Assurance exploration harness against the captured hashicorp/raft snapshot.\n// Not part of the target source; uses exported plus same-package test\n// facilities. This variant adds a MonotonicLogStore scenario, where\n// installSnapshot's removeOldLogs already deletes the above-snapshot bytes, to\n// discriminate retained log bytes from the cached last-log state as the cause.\n\nimport (\n\t\"fmt\"\n\t\"testing\"\n\t\"time\"\n)\n\nfunc assuranceConfMono() *Config {\n\tconf := DefaultConfig()\n\tconf.HeartbeatTimeout = 300 * time.Millisecond\n\tconf.ElectionTimeout = 300 * time.Millisecond\n\tconf.LeaderLeaseTimeout = 300 * time.Millisecond\n\tconf.CommitTimeout = 10 * time.Millisecond\n\t// Delete all logs at or below a completed snapshot so the leader cannot\n\t// serve them from its log store.\n\tconf.TrailingLogs = 0\n\tconf.SnapshotThreshold = 1 << 60\n\tconf.SnapshotInterval = time.Hour\n\treturn conf\n}\n\ntype assuranceResultMono struct {\n\tscenario        string\n\tstaleSuffix     bool // isolated node's last index was above the snapshot index\n\tstoreMonotonic  bool\n\tsnapshotIndex   uint64\n\toldLastBefore   uint64\n\toldLastAfter    uint64\n\toldAppliedAfter uint64\n\toldCommitAfter  uint64\n\tleaderLastAfter uint64\n\tleaderCommit    uint64\n\tstalled         bool\n\tcaughtUp        bool\n}\n\nfunc waitFirstLeaderMono(t *testing.T, c *cluster, d time.Duration) *Raft {\n\tt.Helper()\n\tdeadline := time.Now().Add(d)\n\tfor time.Now().Before(deadline) {\n\t\tleaders := c.GetInState(Leader)\n\t\tif len(leaders) == 1 {\n\t\t\treturn leaders[0]\n\t\t}\n\t\ttime.Sleep(10 * time.Millisecond)\n\t}\n\tt.Fatalf(\"no stable leader\")\n\treturn nil\n}\n\nfunc waitLeaderExcludingMono(t *testing.T, c *cluster, exclude *Raft, d time.Duration) *Raft {\n\tt.Helper()\n\tdeadline := time.Now().Add(d)\n\tfor time.Now().Before(deadline) {\n\t\tfor _, r := range c.rafts {\n\t\t\tif r != exclude && r.State() == Leader {\n\t\t\t\treturn r\n\t\t\t}\n\t\t}\n\t\ttime.Sleep(10 * time.Millisecond)\n\t}\n\tt.Fatalf(\"no leader excluding isolated node\")\n\treturn nil\n}\n\n// runScenarioMono is runScenario with a selectable log store type. With\n// monotonic=true, installSnapshot's removeOldLogs deletes all logs up to the\n// snapshot's last index (including any above-snapshot suffix bytes), so a\n// persistent stall can only come from the cached last-log index/term.\nfunc runScenarioMono(t *testing.T, scenario string, monotonic bool, prefix, tail, extra, post int) assuranceResultMono {\n\tt.Helper()\n\tc := MakeClusterCustom(t, &MakeClusterOpts{\n\t\tPeers:         3,\n\t\tBootstrap:     true,\n\t\tConf:          assuranceConfMono(),\n\t\tMonotonicLogs: monotonic,\n\t})\n\tdefer c.Close()\n\n\told := waitFirstLeaderMono(t, c, 10*time.Second)\n\tif err := old.Barrier(2 * time.Second).Error(); err != nil {\n\t\tt.Fatalf(\"barrier: %v\", err)\n\t}\n\tfor i := 0; i < prefix; i++ {\n\t\tf := old.Apply([]byte(fmt.Sprintf(\"prefix-%d\", i)), 2*time.Second)\n\t\tif err := f.Error(); err != nil {\n\t\t\tt.Fatalf(\"prefix apply: %v\", err)\n\t\t}\n\t}\n\tc.WaitForReplication(prefix)\n\n\tc.Partition([]ServerAddress{old.localAddr})\n\n\tfor i := 0; i < tail; i++ {\n\t\told.Apply([]byte(fmt.Sprintf(\"tail-%d\", i)), 0)\n\t}\n\toldLastBefore := old.LastIndex()\n\n\tnl := waitLeaderExcludingMono(t, c, old, 10*time.Second)\n\tif err := nl.Barrier(2 * time.Second).Error(); err != nil {\n\t\tt.Fatalf(\"new leader barrier: %v\", err)\n\t}\n\tfor i := 0; i < extra; i++ {\n\t\tf := nl.Apply([]byte(fmt.Sprintf(\"extra-%d\", i)), 2*time.Second)\n\t\tif err := f.Error(); err != nil {\n\t\t\tt.Fatalf(\"extra apply: %v\", err)\n\t\t}\n\t}\n\tif err := nl.Snapshot().Error(); err != nil {\n\t\tt.Fatalf(\"snapshot: %v\", err)\n\t}\n\tsnaps, err := nl.snapshots.List()\n\tif err != nil || len(snaps) == 0 {\n\t\tt.Fatalf(\"no snapshot: %v %v\", snaps, err)\n\t}\n\tsnapIdx := snaps[0].Index\n\n\tfor i := 0; i < post; i++ {\n\t\tf := nl.Apply([]byte(fmt.Sprintf(\"post-%d\", i)), 2*time.Second)\n\t\tif err := f.Error(); err != nil {\n\t\t\tt.Fatalf(\"post apply: %v\", err)\n\t\t}\n\t}\n\tleaderCommit := nl.CommitIndex()\n\n\tif tail > 0 && oldLastBefore <= uint64(prefix) {\n\t\tt.Fatalf(\"isolated node tail was not appended: last=%d prefix=%d\", oldLastBefore, prefix)\n\t}\n\n\tt.Logf(\"[CA] %s monotonic=%t prefix=%d tail=%d extra=%d post=%d snapshotIndex=%d oldLastBefore=%d leaderCommit=%d\",\n\t\tscenario, monotonic, prefix, tail, extra, post, snapIdx, oldLastBefore, leaderCommit)\n\n\tc.FullyConnect()\n\ttime.Sleep(1500 * time.Millisecond)\n\tapplied1 := old.AppliedIndex()\n\ttime.Sleep(3 * time.Second)\n\tapplied2 := old.AppliedIndex()\n\n\tres := assuranceResultMono{\n\t\tscenario:        scenario,\n\t\tstaleSuffix:     oldLastBefore > snapIdx,\n\t\tstoreMonotonic:  monotonic,\n\t\tsnapshotIndex:   snapIdx,\n\t\toldLastBefore:   oldLastBefore,\n\t\toldLastAfter:    old.LastIndex(),\n\t\toldAppliedAfter: applied2,\n\t\toldCommitAfter:  old.CommitIndex(),\n\t\tleaderLastAfter: nl.LastIndex(),\n\t\tleaderCommit:    leaderCommit,\n\t}\n\tres.caughtUp = applied2 >= leaderCommit\n\tres.stalled = !res.caughtUp && applied1 == applied2\n\treturn res\n}\n\nfunc emitMono(r assuranceResultMono) {\n\tfmt.Printf(\"CA_EVENT {\\\"event\\\":\\\"scenario_setup\\\",\\\"scenario\\\":%q,\\\"stale_suffix\\\":%t,\\\"store_monotonic\\\":%t,\\\"snapshot_index\\\":%d,\\\"old_last_before\\\":%d}\\n\",\n\t\tr.scenario, r.staleSuffix, r.storeMonotonic, r.snapshotIndex, r.oldLastBefore)\n\tfmt.Printf(\"CA_EVENT {\\\"event\\\":\\\"snapshot_catchup_result\\\",\\\"scenario\\\":%q,\\\"stale_suffix\\\":%t,\\\"store_monotonic\\\":%t,\\\"snapshot_index\\\":%d,\\\"old_last_before\\\":%d,\\\"old_last_after\\\":%d,\\\"old_applied_after\\\":%d,\\\"old_commit_after\\\":%d,\\\"leader_last_after\\\":%d,\\\"leader_commit_index\\\":%d,\\\"stalled\\\":%t,\\\"isolated_caught_up\\\":%t}\\n\",\n\t\tr.scenario, r.staleSuffix, r.storeMonotonic, r.snapshotIndex, r.oldLastBefore, r.oldLastAfter,\n\t\tr.oldAppliedAfter, r.oldCommitAfter, r.leaderLastAfter, r.leaderCommit, r.stalled, r.caughtUp)\n}\n\nfunc TestAssuranceSnapshotStaleSuffixMonotonic(t *testing.T) {\n\t// Control: non-monotonic store, isolated log ends below the snapshot index.\n\temitMono(runScenarioMono(t, \"control_catchup\", false, 20, 2, 20, 10))\n\n\t// Non-monotonic store, isolated log extends above the snapshot index.\n\temitMono(runScenarioMono(t, \"case_nonmonotonic_stall\", false, 20, 200, 20, 10))\n\n\t// Monotonic store, same stale suffix; removeOldLogs deletes the bytes but\n\t// the cached last-log state is not reset.\n\temitMono(runScenarioMono(t, \"case_monotonic_stall\", true, 20, 200, 20, 10))\n}\n",
+        "files": {},
+        "execution_package": ".",
+        "description": "",
+        "semantic_changes": [],
+        "prerequisites": [
+          {
+            "alias": "admission",
+            "event": "scenario_setup",
+            "conditions": []
+          }
+        ]
+      },
+      "after": {
+        "kind": "go_test",
+        "source": "package raft\n\n// Assurance exploration harness against the captured hashicorp/raft snapshot.\n// Not part of the target source; uses exported plus same-package test\n// facilities. This variant adds a MonotonicLogStore scenario, where\n// installSnapshot's removeOldLogs already deletes the above-snapshot bytes, to\n// discriminate retained log bytes from the cached last-log state as the cause.\n\nimport (\n\t\"fmt\"\n\t\"testing\"\n\t\"time\"\n)\n\nfunc assuranceConfMono() *Config {\n\tconf := DefaultConfig()\n\tconf.HeartbeatTimeout = 300 * time.Millisecond\n\tconf.ElectionTimeout = 300 * time.Millisecond\n\tconf.LeaderLeaseTimeout = 300 * time.Millisecond\n\tconf.CommitTimeout = 10 * time.Millisecond\n\t// Delete all logs at or below a completed snapshot so the leader cannot\n\t// serve them from its log store.\n\tconf.TrailingLogs = 0\n\tconf.SnapshotThreshold = 1 << 60\n\tconf.SnapshotInterval = time.Hour\n\treturn conf\n}\n\ntype assuranceResultMono struct {\n\tscenario        string\n\tstaleSuffix     bool // isolated node's last index was above the snapshot index\n\tstoreMonotonic  bool\n\tsnapshotIndex   uint64\n\toldLastBefore   uint64\n\toldLastAfter    uint64\n\toldAppliedAfter uint64\n\toldCommitAfter  uint64\n\tleaderLastAfter uint64\n\tleaderCommit    uint64\n\tstalled         bool\n\tcaughtUp        bool\n}\n\nfunc waitFirstLeaderMono(t *testing.T, c *cluster, d time.Duration) *Raft {\n\tt.Helper()\n\tdeadline := time.Now().Add(d)\n\tfor time.Now().Before(deadline) {\n\t\tleaders := c.GetInState(Leader)\n\t\tif len(leaders) == 1 {\n\t\t\treturn leaders[0]\n\t\t}\n\t\ttime.Sleep(10 * time.Millisecond)\n\t}\n\tt.Fatalf(\"no stable leader\")\n\treturn nil\n}\n\nfunc waitLeaderExcludingMono(t *testing.T, c *cluster, exclude *Raft, d time.Duration) *Raft {\n\tt.Helper()\n\tdeadline := time.Now().Add(d)\n\tfor time.Now().Before(deadline) {\n\t\tfor _, r := range c.rafts {\n\t\t\tif r != exclude && r.State() == Leader {\n\t\t\t\treturn r\n\t\t\t}\n\t\t}\n\t\ttime.Sleep(10 * time.Millisecond)\n\t}\n\tt.Fatalf(\"no leader excluding isolated node\")\n\treturn nil\n}\n\n// runScenarioMono is runScenario with a selectable log store type. With\n// monotonic=true, installSnapshot's removeOldLogs deletes all logs up to the\n// snapshot's last index (including any above-snapshot suffix bytes), so a\n// persistent stall can only come from the cached last-log index/term.\nfunc runScenarioMono(t *testing.T, scenario string, monotonic bool, prefix, tail, extra, post int) assuranceResultMono {\n\tt.Helper()\n\tc := MakeClusterCustom(t, &MakeClusterOpts{\n\t\tPeers:           3,\n\t\tBootstrap:       true,\n\t\tConf:            assuranceConfMono(),\n\t\tMonotonicLogs:   monotonic,\n\t\tLongstopTimeout: 60 * time.Second,\n\t})\n\tdefer c.Close()\n\n\told := waitFirstLeaderMono(t, c, 10*time.Second)\n\tif err := old.Barrier(2 * time.Second).Error(); err != nil {\n\t\tt.Fatalf(\"barrier: %v\", err)\n\t}\n\tfor i := 0; i < prefix; i++ {\n\t\tf := old.Apply([]byte(fmt.Sprintf(\"prefix-%d\", i)), 2*time.Second)\n\t\tif err := f.Error(); err != nil {\n\t\t\tt.Fatalf(\"prefix apply: %v\", err)\n\t\t}\n\t}\n\tc.WaitForReplication(prefix)\n\n\tc.Partition([]ServerAddress{old.localAddr})\n\n\tfor i := 0; i < tail; i++ {\n\t\told.Apply([]byte(fmt.Sprintf(\"tail-%d\", i)), 0)\n\t}\n\toldLastBefore := old.LastIndex()\n\n\tnl := waitLeaderExcludingMono(t, c, old, 10*time.Second)\n\tif err := nl.Barrier(2 * time.Second).Error(); err != nil {\n\t\tt.Fatalf(\"new leader barrier: %v\", err)\n\t}\n\tfor i := 0; i < extra; i++ {\n\t\tf := nl.Apply([]byte(fmt.Sprintf(\"extra-%d\", i)), 2*time.Second)\n\t\tif err := f.Error(); err != nil {\n\t\t\tt.Fatalf(\"extra apply: %v\", err)\n\t\t}\n\t}\n\tif err := nl.Snapshot().Error(); err != nil {\n\t\tt.Fatalf(\"snapshot: %v\", err)\n\t}\n\tsnaps, err := nl.snapshots.List()\n\tif err != nil || len(snaps) == 0 {\n\t\tt.Fatalf(\"no snapshot: %v %v\", snaps, err)\n\t}\n\tsnapIdx := snaps[0].Index\n\n\tfor i := 0; i < post; i++ {\n\t\tf := nl.Apply([]byte(fmt.Sprintf(\"post-%d\", i)), 2*time.Second)\n\t\tif err := f.Error(); err != nil {\n\t\t\tt.Fatalf(\"post apply: %v\", err)\n\t\t}\n\t}\n\tleaderCommit := nl.CommitIndex()\n\n\tif tail > 0 && oldLastBefore <= uint64(prefix) {\n\t\tt.Fatalf(\"isolated node tail was not appended: last=%d prefix=%d\", oldLastBefore, prefix)\n\t}\n\n\tt.Logf(\"[CA] %s monotonic=%t prefix=%d tail=%d extra=%d post=%d snapshotIndex=%d oldLastBefore=%d leaderCommit=%d\",\n\t\tscenario, monotonic, prefix, tail, extra, post, snapIdx, oldLastBefore, leaderCommit)\n\n\tc.FullyConnect()\n\ttime.Sleep(1500 * time.Millisecond)\n\tapplied1 := old.AppliedIndex()\n\ttime.Sleep(3 * time.Second)\n\tapplied2 := old.AppliedIndex()\n\n\tres := assuranceResultMono{\n\t\tscenario:        scenario,\n\t\tstaleSuffix:     oldLastBefore > snapIdx,\n\t\tstoreMonotonic:  monotonic,\n\t\tsnapshotIndex:   snapIdx,\n\t\toldLastBefore:   oldLastBefore,\n\t\toldLastAfter:    old.LastIndex(),\n\t\toldAppliedAfter: applied2,\n\t\toldCommitAfter:  old.CommitIndex(),\n\t\tleaderLastAfter: nl.LastIndex(),\n\t\tleaderCommit:    leaderCommit,\n\t}\n\tres.caughtUp = applied2 >= leaderCommit\n\tres.stalled = !res.caughtUp && applied1 == applied2\n\t// Emit before the deferred c.Close() runs, so a slow helper shutdown cannot\n\t// hide an already completed measurement.\n\temitMono(res)\n\treturn res\n}\n\nfunc emitMono(r assuranceResultMono) {\n\tfmt.Printf(\"CA_EVENT {\\\"event\\\":\\\"scenario_setup\\\",\\\"scenario\\\":%q,\\\"stale_suffix\\\":%t,\\\"store_monotonic\\\":%t,\\\"snapshot_index\\\":%d,\\\"old_last_before\\\":%d}\\n\",\n\t\tr.scenario, r.staleSuffix, r.storeMonotonic, r.snapshotIndex, r.oldLastBefore)\n\tfmt.Printf(\"CA_EVENT {\\\"event\\\":\\\"snapshot_catchup_result\\\",\\\"scenario\\\":%q,\\\"stale_suffix\\\":%t,\\\"store_monotonic\\\":%t,\\\"snapshot_index\\\":%d,\\\"old_last_before\\\":%d,\\\"old_last_after\\\":%d,\\\"old_applied_after\\\":%d,\\\"old_commit_after\\\":%d,\\\"leader_last_after\\\":%d,\\\"leader_commit_index\\\":%d,\\\"stalled\\\":%t,\\\"isolated_caught_up\\\":%t}\\n\",\n\t\tr.scenario, r.staleSuffix, r.storeMonotonic, r.snapshotIndex, r.oldLastBefore, r.oldLastAfter,\n\t\tr.oldAppliedAfter, r.oldCommitAfter, r.leaderLastAfter, r.leaderCommit, r.stalled, r.caughtUp)\n}\n\nfunc TestAssuranceSnapshotStaleSuffixMonotonic(t *testing.T) {\n\t// Control: non-monotonic store, isolated log ends below the snapshot index.\n\trunScenarioMono(t, \"control_catchup\", false, 20, 2, 20, 10)\n\n\t// Non-monotonic store, isolated log extends above the snapshot index.\n\trunScenarioMono(t, \"case_nonmonotonic_stall\", false, 20, 200, 20, 10)\n\n\t// Monotonic store, same stale suffix; removeOldLogs deletes the bytes but\n\t// the cached last-log state is not reset.\n\trunScenarioMono(t, \"case_monotonic_stall\", true, 20, 200, 20, 10)\n}\n",
+        "files": {},
+        "execution_package": ".",
+        "description": "",
+        "semantic_changes": [],
+        "prerequisites": [
+          {
+            "alias": "admission",
+            "event": "scenario_setup",
+            "conditions": []
+          }
+        ]
+      }
+    },
+    "source_ids": {
+      "before": [
+        "install_snapshot",
+        "get_last_entry",
+        "append_prev_check",
+        "set_previous_log",
+        "replicate_to",
+        "send_latest_snapshot"
+      ],
+      "after": [
+        "install_snapshot",
+        "get_last_entry",
+        "append_prev_check",
+        "replicate_to"
+      ]
+    },
+    "scope": {
+      "before": {
+        "description": "One process, three real Raft instances over InmemTransport with FileSnapshotStore; each scenario selects InmemStore either directly (non-monotonic) or wrapped in MockMonotonicLogStore (monotonic) via MakeClusterCustom. The replacement leader compacts at or below its snapshot index (TrailingLogs=0).",
+        "assumptions": [
+          "Config: ProtocolVersion=3, HeartbeatTimeout=ElectionTimeout=LeaderLeaseTimeout=300ms, CommitTimeout=10ms, TrailingLogs=0, SnapshotThreshold disabled, SnapshotInterval=1h.",
+          "The isolated node's above-snapshot suffix is produced by real uncommitted Apply calls on the old leader before it steps down; no state is injected.",
+          "MockMonotonicLogStore returns IsMonotonic()==true, so installSnapshot takes the removeOldLogs branch."
+        ],
+        "excluded": [
+          "Network and TCP transports; mixed-version rolling upgrades.",
+          "Restart or recovery of the isolated node; only live catch-up is measured.",
+          "Disk-backed stores (the in-memory stores share the same LogStore contract)."
+        ],
+        "parameters": {
+          "prefix": 20,
+          "case_tail": 200,
+          "control_tail": 2,
+          "extra": 20,
+          "post": 10,
+          "settle_ms": 4500
+        }
+      },
+      "after": {
+        "description": "One process, three real Raft instances over InmemTransport with FileSnapshotStore; each scenario selects InmemStore directly (non-monotonic) or wrapped in MockMonotonicLogStore (monotonic) via MakeClusterCustom with LongstopTimeout=60s. The replacement leader compacts at or below its snapshot index (TrailingLogs=0).",
+        "assumptions": [
+          "Config: ProtocolVersion=3, HeartbeatTimeout=ElectionTimeout=LeaderLeaseTimeout=300ms, CommitTimeout=10ms, TrailingLogs=0, SnapshotThreshold disabled, SnapshotInterval=1h.",
+          "The isolated node's above-snapshot suffix is produced by real uncommitted Apply calls on the old leader before it steps down; no state is injected.",
+          "MockMonotonicLogStore returns IsMonotonic()==true, so installSnapshot takes the removeOldLogs branch."
+        ],
+        "excluded": [
+          "Network and TCP transports; mixed-version rolling upgrades.",
+          "Restart or recovery of the isolated node; only live catch-up is measured.",
+          "Disk-backed stores."
+        ],
+        "parameters": {
+          "prefix": 20,
+          "case_tail": 200,
+          "control_tail": 2,
+          "extra": 20,
+          "post": 10,
+          "settle_ms": 4500,
+          "longstop_timeout_s": 60
+        }
+      }
+    },
+    "prefix": {
+      "before": "For each of three scenarios: bootstrap a 3-node cluster, commit a 20-command prefix, isolate the current leader, append 2 (control) or 200 (both stall cases) uncommitted tail commands on the isolated node, let the remaining two nodes elect a replacement leader, commit 20 more commands and take a snapshot at index S, commit 10 post entries above S, reconnect, and observe for about 4.5s. The two stall scenarios differ only in the isolated node's log store (non-monotonic vs MockMonotonicLogStore).",
+      "after": "For each of three scenarios: bootstrap a 3-node cluster, commit a 20-command prefix, isolate the current leader, append 2 (control) or 200 (both stall cases) uncommitted tail commands on the isolated node, let the remaining two nodes elect a replacement leader, commit 20 more commands and take a snapshot at index S, commit 10 post entries above S, reconnect, observe for about 4.5s, and emit the scenario's setup and result events before helper cleanup. The two stall scenarios differ only in the isolated node's log store (non-monotonic vs MockMonotonicLogStore)."
+    },
+    "responsibility": {
+      "before": "Follower snapshot installation establishing a post-install last-log state compatible with the leader's AppendEntries and nextIndex catch-up loop, for both monoticity branches of the LogStore.",
+      "after": "Follower snapshot installation establishing a post-install last-log state compatible with the leader's AppendEntries and nextIndex catch-up loop, for both monotonicity branches of the LogStore."
+    },
+    "comparisons": {
+      "before": [
+        {
+          "event": "snapshot_catchup_result",
+          "identity_fields": [
+            "scenario",
+            "snapshot_index",
+            "old_last_before"
+          ],
+          "admission_alias": "admission",
+          "assertion": {
+            "field": "isolated_caught_up",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          },
+          "antecedent": null,
+          "applicability_conditions": [
+            {
+              "field": "stale_suffix",
+              "op": "eq",
+              "value": false,
+              "reference": null
+            }
+          ],
+          "description": "Control: isolated log at or below the snapshot index reaches the leader commit index."
+        },
+        {
+          "event": "snapshot_catchup_result",
+          "identity_fields": [
+            "scenario",
+            "snapshot_index",
+            "old_last_before"
+          ],
+          "admission_alias": "admission",
+          "assertion": {
+            "field": "stalled",
+            "op": "eq",
+            "value": false,
+            "reference": null
+          },
+          "antecedent": null,
+          "applicability_conditions": [
+            {
+              "field": "stale_suffix",
+              "op": "eq",
+              "value": true,
+              "reference": null
+            },
+            {
+              "field": "store_monotonic",
+              "op": "eq",
+              "value": false,
+              "reference": null
+            }
+          ],
+          "description": "Non-monotonic store with a stale above-snapshot suffix must still catch up; the retained run shows it stalls."
+        },
+        {
+          "event": "snapshot_catchup_result",
+          "identity_fields": [
+            "scenario",
+            "snapshot_index",
+            "old_last_before"
+          ],
+          "admission_alias": "admission",
+          "assertion": {
+            "field": "stalled",
+            "op": "eq",
+            "value": false,
+            "reference": null
+          },
+          "antecedent": null,
+          "applicability_conditions": [
+            {
+              "field": "stale_suffix",
+              "op": "eq",
+              "value": true,
+              "reference": null
+            },
+            {
+              "field": "store_monotonic",
+              "op": "eq",
+              "value": true,
+              "reference": null
+            }
+          ],
+          "description": "Monotonic store with a stale above-snapshot suffix: removeOldLogs deletes the bytes, yet the cached last-log state must not block catch-up; the retained run shows it still stalls."
+        }
+      ],
+      "after": [
+        {
+          "event": "snapshot_catchup_result",
+          "identity_fields": [
+            "scenario",
+            "snapshot_index",
+            "old_last_before"
+          ],
+          "admission_alias": "admission",
+          "assertion": {
+            "field": "isolated_caught_up",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          },
+          "antecedent": null,
+          "applicability_conditions": [
+            {
+              "field": "stale_suffix",
+              "op": "eq",
+              "value": false,
+              "reference": null
+            }
+          ],
+          "description": "Control: isolated log at or below the snapshot index reaches the leader commit index."
+        },
+        {
+          "event": "snapshot_catchup_result",
+          "identity_fields": [
+            "scenario",
+            "snapshot_index",
+            "old_last_before"
+          ],
+          "admission_alias": "admission",
+          "assertion": {
+            "field": "stalled",
+            "op": "eq",
+            "value": false,
+            "reference": null
+          },
+          "antecedent": null,
+          "applicability_conditions": [
+            {
+              "field": "stale_suffix",
+              "op": "eq",
+              "value": true,
+              "reference": null
+            },
+            {
+              "field": "store_monotonic",
+              "op": "eq",
+              "value": false,
+              "reference": null
+            }
+          ],
+          "description": "Non-monotonic store with a stale above-snapshot suffix must catch up."
+        },
+        {
+          "event": "snapshot_catchup_result",
+          "identity_fields": [
+            "scenario",
+            "snapshot_index",
+            "old_last_before"
+          ],
+          "admission_alias": "admission",
+          "assertion": {
+            "field": "stalled",
+            "op": "eq",
+            "value": false,
+            "reference": null
+          },
+          "antecedent": null,
+          "applicability_conditions": [
+            {
+              "field": "stale_suffix",
+              "op": "eq",
+              "value": true,
+              "reference": null
+            },
+            {
+              "field": "store_monotonic",
+              "op": "eq",
+              "value": true,
+              "reference": null
+            }
+          ],
+          "description": "Monotonic store with a stale above-snapshot suffix: removeOldLogs deletes the bytes, yet the cached last-log state must not block catch-up."
+        }
+      ]
+    }
+  },
+  "revision_reason": "Harness-only change to fix the predecessor's independent cleanup failure: MakeClusterOpts.LongstopTimeout is raised from the helper default 5s to 60s, and each scenario's CA_EVENT pair is now printed inside the scenario function before the deferred cluster.Close. No scenario, app, source, requirement or comparison changed."
+}

@@ -1,0 +1,740 @@
+{
+  "input": {
+    "rationale": "The resumed discriminator completed with exit 0, so the registered monotonic gap can be answered from retained execution: all three comparisons evaluated, control holds and both store types are violated. This supersedes the predecessor's unresolved account while preserving it.",
+    "sources": [],
+    "investigations": [
+      {
+        "id": "b02f82dfc4024a638ae4ecbdcb18b1fc-question-0",
+        "ref": null,
+        "question": null,
+        "source_ids": null,
+        "hypothesis": null,
+        "discriminator": null,
+        "disposition": null,
+        "parent_id": null,
+        "knowledge": null,
+        "counterevidence": null,
+        "limitations": [
+          "Single-process in-memory InmemTransport, FileSnapshotStore and InmemStore/MockMonotonicLogStore; network/TCP transports and disk-backed stores were not exercised.",
+          "Only live catch-up was observed; restart/recovery of a node left holding an above-snapshot suffix, and any consequence for committed entries or safety (as opposed to progress), were not tested.",
+          "TrailingLogs=0 forces compaction; with larger TrailingLogs the follower must be correspondingly further behind for the leader to send a snapshot, but the follower-side last-log state that causes the stall is unchanged."
+        ],
+        "resume_conditions": null
+      }
+    ],
+    "knowledge": [],
+    "gaps": [],
+    "interpretations": [
+      {
+        "investigation_id": "b02f82dfc4024a638ae4ecbdcb18b1fc-question-0",
+        "experiment_id": "58b739baeea14b0a8ff27e6cfab5c1c3-experiment",
+        "source_ids": [
+          "install_snapshot",
+          "get_last_entry",
+          "append_prev_check",
+          "replicate_to"
+        ],
+        "executions": {
+          "ed8023e758ae49bc93676179f4ae489c": [
+            1,
+            3,
+            5
+          ]
+        },
+        "conclusion": "violated",
+        "rationale": "CheckRun ed8023e758ae49bc93676179f4ae489c is a completed experiment execution (status completed, exit_code 0, parsing_errors empty, prerequisites matched with alias admission at event index 0). Comparison 0 (applicability stale_suffix=false, assertion isolated_caught_up==true) evaluated event index 1 and holds: the follower whose log ended below the snapshot index reached applied index 55 = leader commit 55 (comparison_complete true). Comparison 1 (applicability stale_suffix=true, store_monotonic=false, assertion stalled==false) evaluated event index 3 and is violated with valid witness index 3: case_nonmonotonic_stall stayed at applied index 45 while leader_commit_index was 55 (old_last_before=223, stalled=true). Comparison 2 (applicability stale_suffix=true, store_monotonic=true, assertion stalled==false) evaluated event index 5 and is violated with valid witness index 5: case_monotonic_stall behaved identically (applied 45 vs leader commit 55, old_last_after=223, stalled=true) even though removeOldLogs deleted the above-snapshot bytes. Together with the source trace (installSnapshot at raft.go:1814-1953 resets lastApplied/lastSnapshot/config and compacts or removes logs at or below req.LastLogIndex but never truncates above it or calls setLastLog; getLastEntry at state.go:167-174 keeps returning the cached above-snapshot index/term; appendEntries at raft.go:1475-1502 rejects the PrevLogEntry check; replicateTo at replication.go:222-260 walks nextIndex down to ErrLogNotFound and sendLatestSnapshot re-sends the same snapshot), this establishes the defect for both LogStore monotonicity branches.",
+        "answers": {
+          "1b24d155db77414b9490619c49f7a51f-gap-0": "Yes. CheckRun ed8023e758ae49bc93676179f4ae489c (completed, exit_code 0, no parsing errors, prerequisites matched) shows the monotonic store stalling exactly like the non-monotonic one. Comparison 2 (applicability stale_suffix=true, store_monotonic=true, assertion stalled==false) is violated with valid witness index 5: scenario case_monotonic_stall reports snapshot_index=45 < old_last_before=223, old_last_after=223, old_applied_after=45 while leader_commit_index=55, stalled=true, isolated_caught_up=false. Because MockMonotonicLogStore makes installSnapshot take the removeOldLogs branch, the above-snapshot bytes are already deleted, so what survives is the cached lastLogIndex/lastLogTerm, which is not reset (no setLastLog call) and is still reported by getLastEntry (state.go:167-174). The stall is therefore caused by the cached last-log state, not by retained log bytes."
+        },
+        "knowledge": [
+          {
+            "entry_id": "b02f82dfc4024a638ae4ecbdcb18b1fc-knowledge-0",
+            "revision": 1,
+            "assertion": "installSnapshot does not truncate log entries above req.LastLogIndex and does not call setLastLog"
+          },
+          {
+            "entry_id": "b02f82dfc4024a638ae4ecbdcb18b1fc-knowledge-1",
+            "revision": 1,
+            "assertion": "getLastEntry reports the cached log index/term whenever it is at or above the snapshot index"
+          },
+          {
+            "entry_id": "b02f82dfc4024a638ae4ecbdcb18b1fc-knowledge-2",
+            "revision": 1,
+            "assertion": "appendEntries rejects on a missing or term-mismatched PrevLogEntry without truncating"
+          },
+          {
+            "entry_id": "b02f82dfc4024a638ae4ecbdcb18b1fc-knowledge-3",
+            "revision": 1,
+            "assertion": "replicateTo lowers nextIndex and falls back to re-sending the newest snapshot on ErrLogNotFound"
+          }
+        ],
+        "counterevidence": [
+          "The monotonic branch confirms rather than refutes the explanation: deleting the above-snapshot bytes (removeOldLogs) did not restore catch-up, which rules out retained bytes as the necessary cause.",
+          "The control comparison still holds, so ordinary snapshot catch-up is unaffected.",
+          "The predecessor run's nonzero exit was an upstream helper shutdown timeout (testing.go:307) and is preserved as counterevidence for that failed attempt; it carried no target-behavior claim."
+        ],
+        "limitations": [
+          "Only progress/liveness is established; no committed entry was observed to be lost or overwritten, so no safety violation is claimed.",
+          "Coverage is limited to the in-memory, single-process, 3-node configuration described in the experiment scope; network transports, disk-backed stores and restarts were not exercised."
+        ],
+        "joint_history": "",
+        "failure_attribution": null,
+        "report_title": "追随者安装快照后仍上报快照索引以上的旧日志导致无法追上：单调与非单调日志存储均受影响",
+        "report_answer": "在保留执行 CheckRun ed8023e758ae49bc93676179f4ae489c（completed，exit 0）中：对照场景比较成立（applied 55 = leader commit 55）；非单调存储对比 violated，witness 为事件 3（applied 冻结 45，leader commit 55，stalled=true）；单调存储（removeOldLogs 已删除快照索引以上的日志字节）对比同样 violated，witness 为事件 5（snapshot_index 45、old_last_before 223、old_last_after 223、applied 45、stalled=true）。因此问题不取决于日志字节是否保留，而在于 installSnapshot 未重置缓存的 lastLogIndex/lastLogTerm（未调用 setLastLog），getLastEntry 继续返回快照索引以上的旧项，AppendEntries 的 PrevLogEntry 校验被拒，leader 逐次下调 nextIndex 直至 ErrLogNotFound 并反复重发同一快照。范围限于单进程内存、3 节点；未测试重启恢复，也不主张已提交日志丢失。"
+      }
+    ],
+    "experiment": null,
+    "stop": null
+  },
+  "before": {
+    "investigations": [
+      {
+        "id": "b02f82dfc4024a638ae4ecbdcb18b1fc-question-0",
+        "version": 3,
+        "question": "When a follower installs a snapshot while its persisted log already ends above the snapshot's LastLogIndex, does the follower's last-log report allow the leader's next AppendEntries (PrevLogEntry = snapshot index) to be accepted, or does the leader loop re-transferring the same snapshot with no follower progress?",
+        "source_ids": [
+          "install_snapshot",
+          "get_last_entry",
+          "append_prev_check",
+          "set_previous_log",
+          "replicate_to",
+          "send_latest_snapshot"
+        ],
+        "hypothesis": "installSnapshot restores the FSM, sets lastApplied/lastSnapshot/configuration and compacts logs at or below req.LastLogIndex, but never truncates log entries above req.LastLogIndex and never calls setLastLog. The cached lastLogIndex/lastLogTerm therefore keep the stale suffix, so getLastEntry reports (staleLast, staleTerm) instead of (snapshotIndex, snapshotTerm) whenever lastLogIndex > lastSnapshotIndex. appendEntries then fails the PrevLogEntry==lastIdx branch and either logs.GetLog errors (entries compacted) or returns the stale term, so it rejects with NoRetryBackoff. The leader lowers nextIndex by one (resp.LastLog+1 is above nextIndex-1, so min picks nextIndex-1), and once nextIndex-1 falls below the leader's compacted first index setupAppendEntries returns ErrLogNotFound and the leader re-sends the identical snapshot.",
+        "discriminator": "Run the same 3-node in-memory scenario twice: with the isolated node's pre-reconnect last log index below the replacement leader's snapshot index (control, no stale suffix) and above it (case, stale suffix). If the explanation holds the control converges after one install, while the case leaves the isolated node stuck at the snapshot index with leader commit index above it and repeated identical snapshot installs. If the case also converges, the stale-suffix explanation is refuted and the harness or predicate must be revisited.",
+        "disposition": "explained",
+        "parent_id": null,
+        "knowledge": [],
+        "counterevidence": [
+          "The control branch (follower log at or below the snapshot index) reaches the leader commit index, so ordinary snapshot catch-up works; the violation is specific to a follower whose persisted log extends above the snapshot index.",
+          "The predecessor experiment's comparisons were unusable (all unknown) because its two mutually exclusive scenario_setup admissions could not both correlate to one result event; that encoding defect is corrected here and is not evidence about the target."
+        ],
+        "limitations": [
+          "MonotonicLogStore coverage is not established: the dedicated discriminator run (experiment 5af7bfdd43694974b1a9aa24d559df0f-experiment, CheckRun b7a3841507c14bbba992965686f5ee54) panicked during harness cleanup before emitting the monotonic scenario's result event.",
+          "All other limitations already recorded remain: single-process in-memory transport, no restart/recovery, and no safety (as opposed to progress) claim."
+        ],
+        "resume_conditions": [],
+        "gaps": [
+          {
+            "id": "1b24d155db77414b9490619c49f7a51f-gap-0",
+            "question": "Does the post-snapshot catch-up stall also occur with a MonotonicLogStore, where installSnapshot's removeOldLogs deletes the above-snapshot log bytes and only the cached lastLogIndex/lastLogTerm remain to be reported by getLastEntry?",
+            "experiment_id": "5af7bfdd43694974b1a9aa24d559df0f-experiment",
+            "operation_id": "1b24d155db77414b9490619c49f7a51f"
+          }
+        ],
+        "history": [
+          {
+            "id": "b02f82dfc4024a638ae4ecbdcb18b1fc-question-0",
+            "version": 1,
+            "question": "When a follower installs a snapshot while its persisted log already ends above the snapshot's LastLogIndex, does the follower's last-log report allow the leader's next AppendEntries (PrevLogEntry = snapshot index) to be accepted, or does the leader loop re-transferring the same snapshot with no follower progress?",
+            "source_ids": [
+              "install_snapshot",
+              "get_last_entry",
+              "append_prev_check",
+              "set_previous_log",
+              "replicate_to",
+              "send_latest_snapshot"
+            ],
+            "hypothesis": "installSnapshot restores the FSM, sets lastApplied/lastSnapshot/configuration and compacts logs at or below req.LastLogIndex, but never truncates log entries above req.LastLogIndex and never calls setLastLog. The cached lastLogIndex/lastLogTerm therefore keep the stale suffix, so getLastEntry reports (staleLast, staleTerm) instead of (snapshotIndex, snapshotTerm) whenever lastLogIndex > lastSnapshotIndex. appendEntries then fails the PrevLogEntry==lastIdx branch and either logs.GetLog errors (entries compacted) or returns the stale term, so it rejects with NoRetryBackoff. The leader lowers nextIndex by one (resp.LastLog+1 is above nextIndex-1, so min picks nextIndex-1), and once nextIndex-1 falls below the leader's compacted first index setupAppendEntries returns ErrLogNotFound and the leader re-sends the identical snapshot.",
+            "discriminator": "Run the same 3-node in-memory scenario twice: with the isolated node's pre-reconnect last log index below the replacement leader's snapshot index (control, no stale suffix) and above it (case, stale suffix). If the explanation holds the control converges after one install, while the case leaves the isolated node stuck at the snapshot index with leader commit index above it and repeated identical snapshot installs. If the case also converges, the stale-suffix explanation is refuted and the harness or predicate must be revisited.",
+            "disposition": "active",
+            "parent_id": null,
+            "knowledge": [],
+            "counterevidence": [],
+            "limitations": [],
+            "resume_conditions": [],
+            "operation_id": "b02f82dfc4024a638ae4ecbdcb18b1fc"
+          },
+          {
+            "id": "b02f82dfc4024a638ae4ecbdcb18b1fc-question-0",
+            "version": 2,
+            "question": "When a follower installs a snapshot while its persisted log already ends above the snapshot's LastLogIndex, does the follower's last-log report allow the leader's next AppendEntries (PrevLogEntry = snapshot index) to be accepted, or does the leader loop re-transferring the same snapshot with no follower progress?",
+            "source_ids": [
+              "install_snapshot",
+              "get_last_entry",
+              "append_prev_check",
+              "set_previous_log",
+              "replicate_to",
+              "send_latest_snapshot"
+            ],
+            "hypothesis": "installSnapshot restores the FSM, sets lastApplied/lastSnapshot/configuration and compacts logs at or below req.LastLogIndex, but never truncates log entries above req.LastLogIndex and never calls setLastLog. The cached lastLogIndex/lastLogTerm therefore keep the stale suffix, so getLastEntry reports (staleLast, staleTerm) instead of (snapshotIndex, snapshotTerm) whenever lastLogIndex > lastSnapshotIndex. appendEntries then fails the PrevLogEntry==lastIdx branch and either logs.GetLog errors (entries compacted) or returns the stale term, so it rejects with NoRetryBackoff. The leader lowers nextIndex by one (resp.LastLog+1 is above nextIndex-1, so min picks nextIndex-1), and once nextIndex-1 falls below the leader's compacted first index setupAppendEntries returns ErrLogNotFound and the leader re-sends the identical snapshot.",
+            "discriminator": "Run the same 3-node in-memory scenario twice: with the isolated node's pre-reconnect last log index below the replacement leader's snapshot index (control, no stale suffix) and above it (case, stale suffix). If the explanation holds the control converges after one install, while the case leaves the isolated node stuck at the snapshot index with leader commit index above it and repeated identical snapshot installs. If the case also converges, the stale-suffix explanation is refuted and the harness or predicate must be revisited.",
+            "disposition": "explained",
+            "parent_id": null,
+            "knowledge": [],
+            "counterevidence": [
+              "The control branch (follower log at or below the snapshot index) reaches the leader commit index, so ordinary snapshot catch-up works; the violation is specific to a follower whose persisted log extends above the snapshot index.",
+              "The predecessor experiment's comparisons were unusable (all unknown) because its two mutually exclusive scenario_setup admissions could not both correlate to one result event; that encoding defect is corrected here and is not evidence about the target."
+            ],
+            "limitations": [
+              "Single-process in-memory InmemTransport, non-monotonic InmemStore and FileSnapshotStore; network/TCP transports and MonotonicLogStore were not exercised.",
+              "Only live catch-up was observed. Restart/recovery of a node left holding an above-snapshot suffix, and any consequence for committed entries or safety (as opposed to progress), were not tested.",
+              "The harness forces compaction with TrailingLogs=0 and disables automatic snapshots so the replacement leader cannot serve the isolated node's match point from its log; a deployment with different TrailingLogs/SnapshotInterval changes the timing but not the follower-side last-log state."
+            ],
+            "resume_conditions": [],
+            "operation_id": "582acedf6e86477a92ab474a241721b7"
+          }
+        ],
+        "operation_id": "1b24d155db77414b9490619c49f7a51f"
+      }
+    ],
+    "interpretations": [
+      {
+        "id": "e3d6dc035d0e4e3d8f25950dd3698fdf-interpretation-0",
+        "investigation_id": "b02f82dfc4024a638ae4ecbdcb18b1fc-question-0",
+        "experiment_id": "b02f82dfc4024a638ae4ecbdcb18b1fc-experiment",
+        "source_ids": [
+          "install_snapshot",
+          "get_last_entry",
+          "append_prev_check",
+          "set_previous_log",
+          "replicate_to",
+          "send_latest_snapshot"
+        ],
+        "executions": {
+          "61befa27ce114c8097c8bdfa597e9ee5": [
+            1,
+            3
+          ]
+        },
+        "conclusion": "violated",
+        "rationale": "Decisive parsed events of the retained execution (CheckRun 61befa27ce114c8097c8bdfa597e9ee5, status completed, exit_code 0, prerequisites matched): event index 3 (case_no_progress result) reports snapshot_index=45 < old_last_before=222, old_applied_after=45, leader_commit_index=55, stalled=true, isolated_caught_up=false; event index 1 (control_catchup result) reports snapshot_index=45 > old_last_before=25, old_applied_after=55, leader_commit_index=55, stalled=false, isolated_caught_up=true. The follower therefore did not converge to the leader's log after installing the snapshot, while the same code path converged when its log did not extend above the snapshot index. This matches the producer/consumer trace: installSnapshot (raft.go:1814-1953) never truncates log entries above req.LastLogIndex and never calls setLastLog, so getLastEntry (state.go:167-174) keeps reporting the stale (lastLogIndex,lastLogTerm); the AppendEntries PrevLogEntry check (raft.go:1475-1502) rejects with NoRetryBackoff, and replicateTo (replication.go:222-260) lowers nextIndex until setupAppendEntries returns ErrLogNotFound, at which point sendLatestSnapshot (replication.go:299-383) re-sends the same snapshot.",
+        "answers": {},
+        "knowledge": [
+          {
+            "entry_id": "b02f82dfc4024a638ae4ecbdcb18b1fc-knowledge-0",
+            "revision": 1,
+            "assertion": "installSnapshot does not truncate log entries above req.LastLogIndex and does not call setLastLog"
+          },
+          {
+            "entry_id": "b02f82dfc4024a638ae4ecbdcb18b1fc-knowledge-1",
+            "revision": 1,
+            "assertion": "getLastEntry reports the cached log index/term whenever it is at or above the snapshot index"
+          },
+          {
+            "entry_id": "b02f82dfc4024a638ae4ecbdcb18b1fc-knowledge-2",
+            "revision": 1,
+            "assertion": "appendEntries rejects on a missing or term-mismatched PrevLogEntry without truncating"
+          },
+          {
+            "entry_id": "b02f82dfc4024a638ae4ecbdcb18b1fc-knowledge-3",
+            "revision": 1,
+            "assertion": "replicateTo lowers nextIndex and falls back to re-sending the newest snapshot on ErrLogNotFound"
+          }
+        ],
+        "counterevidence": [
+          "The three comparisons declared in this experiment's basis evaluated as unknown, not violated: each declared prerequisite had to correlate to every result event, but the two scenario_setup admissions carry mutually exclusive scenario values, so match_prerequisites could not build one chain (observations.json comparisons[0..2] reason 'No corresponding prerequisite events reached'). This is a defect in the comparison admission encoding, not in the cited event facts.",
+          "The control event (index 1) is consistent with the ordinary snapshot install path working when the follower's log ends at or below the snapshot index, so the stall is not a blanket snapshot failure."
+        ],
+        "limitations": [
+          "Single-process in-memory transport and the non-monotonic InmemStore path; network/TCP transports and MonotonicLogStore were not exercised.",
+          "Only live catch-up was observed; restart/recovery of the stalled node and any committed-entry or safety consequence were not tested.",
+          "The declared requirement text conditioned on S >= L (log at or below the snapshot index), which describes the control; the violation is observed in the opposite branch (L > S), where the follower keeps a stale suffix.",
+          "The submitted successor experiment corrects the admission/comparison encoding and needs its own receipt before it can carry an interpretation."
+        ],
+        "joint_history": "",
+        "failure_attribution": null,
+        "report_title": "从快照恢复后保留超出快照索引的旧日志后缀导致追随者无法追上",
+        "report_answer": "追随者安装快照时只压缩快照索引及以下的日志，既不截断索引以上的旧日志、也不更新缓存的最后日志索引/任期；因此当本机日志长于快照索引时，getLastEntry 仍返回旧的 (lastLogIndex,lastLogTerm)，AppendEntries 的 PrevLogEntry 校验被拒绝，leader 逐次下调 nextIndex 直到 ErrLogNotFound 并反复重发同一快照，追随者停在快照索引不再前进（保留执行事件 1 与 3 支持该结论；对照事件显示日志未超出快照索引时可正常追上）。",
+        "operation_id": "e3d6dc035d0e4e3d8f25950dd3698fdf"
+      },
+      {
+        "id": "582acedf6e86477a92ab474a241721b7-interpretation-0",
+        "investigation_id": "b02f82dfc4024a638ae4ecbdcb18b1fc-question-0",
+        "experiment_id": "e3d6dc035d0e4e3d8f25950dd3698fdf-experiment",
+        "source_ids": [
+          "install_snapshot",
+          "get_last_entry",
+          "append_prev_check",
+          "set_previous_log",
+          "replicate_to",
+          "send_latest_snapshot"
+        ],
+        "executions": {
+          "2322bd7884b749f89c3101f04bc82e78": [
+            1,
+            3
+          ]
+        },
+        "conclusion": "violated",
+        "rationale": "CheckRun 2322bd7884b749f89c3101f04bc82e78 is a completed experiment execution (status completed, exit_code 0, parsing_errors empty, prerequisites matched with alias admission at event indices 0 and 2). Comparison 0 (applicability stale_suffix=false, assertion isolated_caught_up==true) evaluated event index 1 and outcome holds (comparison_complete true): the follower whose log ended below the snapshot index reached applied index 55 = leader commit 55. Comparisons 1 and 2 (applicability stale_suffix=true, assertions isolated_caught_up==true and stalled==false) evaluated event index 3 and outcome violated with valid_witness_indices [3], witness_complete true and comparison_complete true: with snapshot_index=45 below old_last_before=222 the follower stayed at applied index 45 while leader_commit_index was 55 and reported stalled=true, isolated_caught_up=false. So the follower does not accept the leader's PrevLogEntry=S check after installing the snapshot and never converges to the leader's log. This is consistent with the traced producer/consumer chain: installSnapshot (raft.go:1814-1953) restricts log removal to at or below req.LastLogIndex and never calls setLastLog, so getLastEntry (state.go:167-174) keeps returning the stale above-snapshot index/term; appendEntries (raft.go:1475-1502) rejects on the missing or term-mismatched PrevLogEntry with NoRetryBackoff; replicateTo (replication.go:222-260) walks nextIndex down to the leader's compacted first index, where setupAppendEntries returns ErrLogNotFound and sendLatestSnapshot (replication.go:299-383) re-sends the same snapshot.",
+        "answers": {},
+        "knowledge": [
+          {
+            "entry_id": "e3d6dc035d0e4e3d8f25950dd3698fdf-knowledge-0",
+            "revision": 1,
+            "assertion": "observed stalled catch-up with an above-snapshot follower log and a converging control below it"
+          },
+          {
+            "entry_id": "b02f82dfc4024a638ae4ecbdcb18b1fc-knowledge-0",
+            "revision": 1,
+            "assertion": "installSnapshot does not truncate log entries above req.LastLogIndex and does not call setLastLog"
+          },
+          {
+            "entry_id": "b02f82dfc4024a638ae4ecbdcb18b1fc-knowledge-1",
+            "revision": 1,
+            "assertion": "getLastEntry reports the cached log index/term whenever it is at or above the snapshot index"
+          },
+          {
+            "entry_id": "b02f82dfc4024a638ae4ecbdcb18b1fc-knowledge-2",
+            "revision": 1,
+            "assertion": "appendEntries rejects on a missing or term-mismatched PrevLogEntry without truncating"
+          },
+          {
+            "entry_id": "b02f82dfc4024a638ae4ecbdcb18b1fc-knowledge-3",
+            "revision": 1,
+            "assertion": "replicateTo lowers nextIndex and falls back to re-sending the newest snapshot on ErrLogNotFound"
+          }
+        ],
+        "counterevidence": [
+          "The control comparison holds in the same execution, so the stall is not a general failure of snapshot installation.",
+          "The stalled follower reports old_last_after=223 (unchanged stale suffix) while old_commit_after=23, i.e. its local log/commit view remains inconsistent with the restored FSM at index 45; this is consistent with the defect but also means the exact number of re-sent snapshots is timing dependent and was not counted in this run."
+        ],
+        "limitations": [
+          "Only progress/liveness is established. The retained events do not show a committed entry lost or overwritten, so no safety violation is claimed.",
+          "Transport, store and restart coverage is limited to the in-memory, non-monotonic single-process configuration described in the experiment scope.",
+          "The successor fixes the predecessor's comparison encoding; the predecessor's raw event indices 1 and 3 remain valid observations and its interpretation is preserved."
+        ],
+        "joint_history": "",
+        "failure_attribution": null,
+        "report_title": "追随者安装快照后仍上报快照索引以上的旧日志，导致 leader 反复重发同一快照且追随者无法追上",
+        "report_answer": "在保留的 3 节点内存执行中（CheckRun 2322bd7884b749f89c3101f04bc82e78）：对照场景（本机日志末索引 25 低于快照索引 45）比较成立，追随者 applied=55 达到 leader commit=55；缺陷场景（本机日志末索引 222 高于快照索引 45）两条比较被判 violated，witness 为事件 3，追随者 applied 冻结在 45、leader commit=55、stalled=true。原因链：installSnapshot 只清理快照索引及以下的日志、不截断以上后缀也不更新 setLastLog，getLastEntry 继续返回旧的 (lastLogIndex,lastLogTerm)，AppendEntries 的 PrevLogEntry 校验被拒，leader 逐次下调 nextIndex 直至 ErrLogNotFound 并重发同一快照。范围限于单进程内存、非单调存储；未测试重启恢复与安全性，不主张已提交日志丢失。",
+        "operation_id": "582acedf6e86477a92ab474a241721b7"
+      },
+      {
+        "id": "1b24d155db77414b9490619c49f7a51f-interpretation-0",
+        "investigation_id": "b02f82dfc4024a638ae4ecbdcb18b1fc-question-0",
+        "experiment_id": "5af7bfdd43694974b1a9aa24d559df0f-experiment",
+        "source_ids": [
+          "install_snapshot",
+          "get_last_entry",
+          "append_prev_check",
+          "replicate_to"
+        ],
+        "executions": {
+          "b7a3841507c14bbba992965686f5ee54": [
+            1,
+            3
+          ]
+        },
+        "conclusion": "unresolved",
+        "rationale": "CheckRun b7a3841507c14bbba992965686f5ee54 has status completed but exit_code 1 (outcome tests_failed), so it cannot support the monotonic conclusion. What did complete, before the failure, are two parsed events on the same operation stream: event 1 (control_catchup) with stale_suffix=false, old_last_after=55, applied 55 = leader commit 55 (comparison 0 outcome holds), and event 3 (case_nonmonotonic_stall) with snapshot_index=45 < old_last_before=223, applied frozen at 45 while leader commit 55, stalled=true, isolated_caught_up=false (comparison 1 outcome violated, valid witness index 3). That re-confirms the already-established non-monotonic defect and is retained here only as partial output. The monotonic scenario ran (its [CA] log line reports snapshot_index=45, oldLastBefore=222, leaderCommit=55) but emitted no CA_EVENT before the test panicked in the harness helper cluster.Close() after its shutdown-timeout timer fired (testing.go:307), i.e. a harness cleanup timeout, not a target assertion. No monotonic endpoint was measured, so the discriminator between retained above-snapshot bytes and the cached last-log state is not decided by this run.",
+        "answers": {},
+        "knowledge": [],
+        "counterevidence": [
+          "Native local runs of the same harness (before submission, not a formal receipt) showed the monotonic scenario stalling identically (old_last_after=223, applied=45, stalled=true). This is why the question is worth resuming, but it is not retained execution evidence and is not used as a conclusion.",
+          "The panic occurred in the test helper's cluster.Close(), so it also does not indicate any target behavior failure."
+        ],
+        "limitations": [
+          "Concrete resume condition: emit the monotonic scenario's result event (or explicitly Shutdown and await each Raft before cluster.Close) so the measurement precedes cleanup, then re-run this exact harness as a fresh successor; a completed receipt with the monotonic comparison then decides the gap.",
+          "Until that receipt exists, the monotonic branch is unestablished and the recorded defect conclusion rests only on the non-monotonic receipt 2322bd7884b749f89c3101f04bc82e78."
+        ],
+        "joint_history": "",
+        "failure_attribution": null,
+        "report_title": null,
+        "report_answer": null,
+        "operation_id": "1b24d155db77414b9490619c49f7a51f"
+      }
+    ],
+    "current_submission": {
+      "phase": "received",
+      "operation_id": "b8ec90938f1346649533b743268e42fc",
+      "result": {
+        "submission": "snapshot_suffix_monotonic_verdict.json",
+        "summary": "The previous final response was rejected only because it carried raw newlines (JSON control characters) in the summary field; the draft itself is intact and validates (valid=true). Re-submitting the same path. Content: interpretation of the completed monotonic discriminator (CheckRun ed8023e758ae49bc93676179f4ae489c, status completed, exit_code 0, prerequisites matched, no parsing errors), conclusion violated. Comparisons: 0 (control, stale_suffix=false) holds on event 1 (applied 55 = leader commit 55); 1 (stale_suffix=true, store_monotonic=false) violated with valid witness 3 (snapshot_index 45 < old_last_before 223, applied frozen 45 while leader commit 55, stalled=true); 2 (stale_suffix=true, store_monotonic=true) violated with valid witness 5 (old_last_after 223, applied 45, stalled=true) even though removeOldLogs deleted the above-snapshot bytes. This answers the registered gap 1b24d155db77414b9490619c49f7a51f-gap-0: yes, the stall also occurs with a MonotonicLogStore, so the cause is the cached lastLogIndex/lastLogTerm that installSnapshot never resets (no setLastLog, raft.go:1814-1953), read by getLastEntry (state.go:167-174) and rejected at the PrevLogEntry check (raft.go:1475-1502), after which replicateTo (replication.go:222-260) walks nextIndex to ErrLogNotFound and sendLatestSnapshot re-sends the same snapshot. Investigation limitations updated (monotonic coverage now established; remaining limits: single-process in-memory, no restart/recovery, progress only with no safety claim, TrailingLogs=0 note). Prior unresolved account and failed-attempt counterevidence are preserved."
+      },
+      "status": "completed",
+      "reason": "",
+      "session_unavailable": false
+    },
+    "applied_operations": {
+      "submission-b02f82dfc4024a638ae4ecbdcb18b1fc": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-11_12-49-23-hashicorp_raft-real-run/semantic-commits/submission-b02f82dfc4024a638ae4ecbdcb18b1fc.json"
+      },
+      "submission-e3d6dc035d0e4e3d8f25950dd3698fdf": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-11_12-49-23-hashicorp_raft-real-run/semantic-commits/submission-e3d6dc035d0e4e3d8f25950dd3698fdf.json"
+      },
+      "submission-582acedf6e86477a92ab474a241721b7": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-11_12-49-23-hashicorp_raft-real-run/semantic-commits/submission-582acedf6e86477a92ab474a241721b7.json"
+      },
+      "submission-5af7bfdd43694974b1a9aa24d559df0f": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-11_12-49-23-hashicorp_raft-real-run/semantic-commits/submission-5af7bfdd43694974b1a9aa24d559df0f.json"
+      },
+      "submission-1b24d155db77414b9490619c49f7a51f": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-11_12-49-23-hashicorp_raft-real-run/semantic-commits/submission-1b24d155db77414b9490619c49f7a51f.json"
+      },
+      "submission-58b739baeea14b0a8ff27e6cfab5c1c3": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-11_12-49-23-hashicorp_raft-real-run/semantic-commits/submission-58b739baeea14b0a8ff27e6cfab5c1c3.json"
+      }
+    }
+  },
+  "after": {
+    "investigations": [
+      {
+        "id": "b02f82dfc4024a638ae4ecbdcb18b1fc-question-0",
+        "version": 4,
+        "question": "When a follower installs a snapshot while its persisted log already ends above the snapshot's LastLogIndex, does the follower's last-log report allow the leader's next AppendEntries (PrevLogEntry = snapshot index) to be accepted, or does the leader loop re-transferring the same snapshot with no follower progress?",
+        "source_ids": [
+          "install_snapshot",
+          "get_last_entry",
+          "append_prev_check",
+          "set_previous_log",
+          "replicate_to",
+          "send_latest_snapshot"
+        ],
+        "hypothesis": "installSnapshot restores the FSM, sets lastApplied/lastSnapshot/configuration and compacts logs at or below req.LastLogIndex, but never truncates log entries above req.LastLogIndex and never calls setLastLog. The cached lastLogIndex/lastLogTerm therefore keep the stale suffix, so getLastEntry reports (staleLast, staleTerm) instead of (snapshotIndex, snapshotTerm) whenever lastLogIndex > lastSnapshotIndex. appendEntries then fails the PrevLogEntry==lastIdx branch and either logs.GetLog errors (entries compacted) or returns the stale term, so it rejects with NoRetryBackoff. The leader lowers nextIndex by one (resp.LastLog+1 is above nextIndex-1, so min picks nextIndex-1), and once nextIndex-1 falls below the leader's compacted first index setupAppendEntries returns ErrLogNotFound and the leader re-sends the identical snapshot.",
+        "discriminator": "Run the same 3-node in-memory scenario twice: with the isolated node's pre-reconnect last log index below the replacement leader's snapshot index (control, no stale suffix) and above it (case, stale suffix). If the explanation holds the control converges after one install, while the case leaves the isolated node stuck at the snapshot index with leader commit index above it and repeated identical snapshot installs. If the case also converges, the stale-suffix explanation is refuted and the harness or predicate must be revisited.",
+        "disposition": "explained",
+        "parent_id": null,
+        "knowledge": [],
+        "counterevidence": [
+          "The control branch (follower log at or below the snapshot index) reaches the leader commit index, so ordinary snapshot catch-up works; the violation is specific to a follower whose persisted log extends above the snapshot index.",
+          "The predecessor experiment's comparisons were unusable (all unknown) because its two mutually exclusive scenario_setup admissions could not both correlate to one result event; that encoding defect is corrected here and is not evidence about the target."
+        ],
+        "limitations": [
+          "Single-process in-memory InmemTransport, FileSnapshotStore and InmemStore/MockMonotonicLogStore; network/TCP transports and disk-backed stores were not exercised.",
+          "Only live catch-up was observed; restart/recovery of a node left holding an above-snapshot suffix, and any consequence for committed entries or safety (as opposed to progress), were not tested.",
+          "TrailingLogs=0 forces compaction; with larger TrailingLogs the follower must be correspondingly further behind for the leader to send a snapshot, but the follower-side last-log state that causes the stall is unchanged."
+        ],
+        "resume_conditions": [],
+        "gaps": [
+          {
+            "id": "1b24d155db77414b9490619c49f7a51f-gap-0",
+            "question": "Does the post-snapshot catch-up stall also occur with a MonotonicLogStore, where installSnapshot's removeOldLogs deletes the above-snapshot log bytes and only the cached lastLogIndex/lastLogTerm remain to be reported by getLastEntry?",
+            "experiment_id": "5af7bfdd43694974b1a9aa24d559df0f-experiment",
+            "operation_id": "1b24d155db77414b9490619c49f7a51f"
+          }
+        ],
+        "history": [
+          {
+            "id": "b02f82dfc4024a638ae4ecbdcb18b1fc-question-0",
+            "version": 1,
+            "question": "When a follower installs a snapshot while its persisted log already ends above the snapshot's LastLogIndex, does the follower's last-log report allow the leader's next AppendEntries (PrevLogEntry = snapshot index) to be accepted, or does the leader loop re-transferring the same snapshot with no follower progress?",
+            "source_ids": [
+              "install_snapshot",
+              "get_last_entry",
+              "append_prev_check",
+              "set_previous_log",
+              "replicate_to",
+              "send_latest_snapshot"
+            ],
+            "hypothesis": "installSnapshot restores the FSM, sets lastApplied/lastSnapshot/configuration and compacts logs at or below req.LastLogIndex, but never truncates log entries above req.LastLogIndex and never calls setLastLog. The cached lastLogIndex/lastLogTerm therefore keep the stale suffix, so getLastEntry reports (staleLast, staleTerm) instead of (snapshotIndex, snapshotTerm) whenever lastLogIndex > lastSnapshotIndex. appendEntries then fails the PrevLogEntry==lastIdx branch and either logs.GetLog errors (entries compacted) or returns the stale term, so it rejects with NoRetryBackoff. The leader lowers nextIndex by one (resp.LastLog+1 is above nextIndex-1, so min picks nextIndex-1), and once nextIndex-1 falls below the leader's compacted first index setupAppendEntries returns ErrLogNotFound and the leader re-sends the identical snapshot.",
+            "discriminator": "Run the same 3-node in-memory scenario twice: with the isolated node's pre-reconnect last log index below the replacement leader's snapshot index (control, no stale suffix) and above it (case, stale suffix). If the explanation holds the control converges after one install, while the case leaves the isolated node stuck at the snapshot index with leader commit index above it and repeated identical snapshot installs. If the case also converges, the stale-suffix explanation is refuted and the harness or predicate must be revisited.",
+            "disposition": "active",
+            "parent_id": null,
+            "knowledge": [],
+            "counterevidence": [],
+            "limitations": [],
+            "resume_conditions": [],
+            "operation_id": "b02f82dfc4024a638ae4ecbdcb18b1fc"
+          },
+          {
+            "id": "b02f82dfc4024a638ae4ecbdcb18b1fc-question-0",
+            "version": 2,
+            "question": "When a follower installs a snapshot while its persisted log already ends above the snapshot's LastLogIndex, does the follower's last-log report allow the leader's next AppendEntries (PrevLogEntry = snapshot index) to be accepted, or does the leader loop re-transferring the same snapshot with no follower progress?",
+            "source_ids": [
+              "install_snapshot",
+              "get_last_entry",
+              "append_prev_check",
+              "set_previous_log",
+              "replicate_to",
+              "send_latest_snapshot"
+            ],
+            "hypothesis": "installSnapshot restores the FSM, sets lastApplied/lastSnapshot/configuration and compacts logs at or below req.LastLogIndex, but never truncates log entries above req.LastLogIndex and never calls setLastLog. The cached lastLogIndex/lastLogTerm therefore keep the stale suffix, so getLastEntry reports (staleLast, staleTerm) instead of (snapshotIndex, snapshotTerm) whenever lastLogIndex > lastSnapshotIndex. appendEntries then fails the PrevLogEntry==lastIdx branch and either logs.GetLog errors (entries compacted) or returns the stale term, so it rejects with NoRetryBackoff. The leader lowers nextIndex by one (resp.LastLog+1 is above nextIndex-1, so min picks nextIndex-1), and once nextIndex-1 falls below the leader's compacted first index setupAppendEntries returns ErrLogNotFound and the leader re-sends the identical snapshot.",
+            "discriminator": "Run the same 3-node in-memory scenario twice: with the isolated node's pre-reconnect last log index below the replacement leader's snapshot index (control, no stale suffix) and above it (case, stale suffix). If the explanation holds the control converges after one install, while the case leaves the isolated node stuck at the snapshot index with leader commit index above it and repeated identical snapshot installs. If the case also converges, the stale-suffix explanation is refuted and the harness or predicate must be revisited.",
+            "disposition": "explained",
+            "parent_id": null,
+            "knowledge": [],
+            "counterevidence": [
+              "The control branch (follower log at or below the snapshot index) reaches the leader commit index, so ordinary snapshot catch-up works; the violation is specific to a follower whose persisted log extends above the snapshot index.",
+              "The predecessor experiment's comparisons were unusable (all unknown) because its two mutually exclusive scenario_setup admissions could not both correlate to one result event; that encoding defect is corrected here and is not evidence about the target."
+            ],
+            "limitations": [
+              "Single-process in-memory InmemTransport, non-monotonic InmemStore and FileSnapshotStore; network/TCP transports and MonotonicLogStore were not exercised.",
+              "Only live catch-up was observed. Restart/recovery of a node left holding an above-snapshot suffix, and any consequence for committed entries or safety (as opposed to progress), were not tested.",
+              "The harness forces compaction with TrailingLogs=0 and disables automatic snapshots so the replacement leader cannot serve the isolated node's match point from its log; a deployment with different TrailingLogs/SnapshotInterval changes the timing but not the follower-side last-log state."
+            ],
+            "resume_conditions": [],
+            "operation_id": "582acedf6e86477a92ab474a241721b7"
+          },
+          {
+            "id": "b02f82dfc4024a638ae4ecbdcb18b1fc-question-0",
+            "version": 3,
+            "question": "When a follower installs a snapshot while its persisted log already ends above the snapshot's LastLogIndex, does the follower's last-log report allow the leader's next AppendEntries (PrevLogEntry = snapshot index) to be accepted, or does the leader loop re-transferring the same snapshot with no follower progress?",
+            "source_ids": [
+              "install_snapshot",
+              "get_last_entry",
+              "append_prev_check",
+              "set_previous_log",
+              "replicate_to",
+              "send_latest_snapshot"
+            ],
+            "hypothesis": "installSnapshot restores the FSM, sets lastApplied/lastSnapshot/configuration and compacts logs at or below req.LastLogIndex, but never truncates log entries above req.LastLogIndex and never calls setLastLog. The cached lastLogIndex/lastLogTerm therefore keep the stale suffix, so getLastEntry reports (staleLast, staleTerm) instead of (snapshotIndex, snapshotTerm) whenever lastLogIndex > lastSnapshotIndex. appendEntries then fails the PrevLogEntry==lastIdx branch and either logs.GetLog errors (entries compacted) or returns the stale term, so it rejects with NoRetryBackoff. The leader lowers nextIndex by one (resp.LastLog+1 is above nextIndex-1, so min picks nextIndex-1), and once nextIndex-1 falls below the leader's compacted first index setupAppendEntries returns ErrLogNotFound and the leader re-sends the identical snapshot.",
+            "discriminator": "Run the same 3-node in-memory scenario twice: with the isolated node's pre-reconnect last log index below the replacement leader's snapshot index (control, no stale suffix) and above it (case, stale suffix). If the explanation holds the control converges after one install, while the case leaves the isolated node stuck at the snapshot index with leader commit index above it and repeated identical snapshot installs. If the case also converges, the stale-suffix explanation is refuted and the harness or predicate must be revisited.",
+            "disposition": "explained",
+            "parent_id": null,
+            "knowledge": [],
+            "counterevidence": [
+              "The control branch (follower log at or below the snapshot index) reaches the leader commit index, so ordinary snapshot catch-up works; the violation is specific to a follower whose persisted log extends above the snapshot index.",
+              "The predecessor experiment's comparisons were unusable (all unknown) because its two mutually exclusive scenario_setup admissions could not both correlate to one result event; that encoding defect is corrected here and is not evidence about the target."
+            ],
+            "limitations": [
+              "MonotonicLogStore coverage is not established: the dedicated discriminator run (experiment 5af7bfdd43694974b1a9aa24d559df0f-experiment, CheckRun b7a3841507c14bbba992965686f5ee54) panicked during harness cleanup before emitting the monotonic scenario's result event.",
+              "All other limitations already recorded remain: single-process in-memory transport, no restart/recovery, and no safety (as opposed to progress) claim."
+            ],
+            "resume_conditions": [],
+            "operation_id": "1b24d155db77414b9490619c49f7a51f"
+          }
+        ],
+        "operation_id": "b8ec90938f1346649533b743268e42fc"
+      }
+    ],
+    "interpretations": [
+      {
+        "id": "e3d6dc035d0e4e3d8f25950dd3698fdf-interpretation-0",
+        "investigation_id": "b02f82dfc4024a638ae4ecbdcb18b1fc-question-0",
+        "experiment_id": "b02f82dfc4024a638ae4ecbdcb18b1fc-experiment",
+        "source_ids": [
+          "install_snapshot",
+          "get_last_entry",
+          "append_prev_check",
+          "set_previous_log",
+          "replicate_to",
+          "send_latest_snapshot"
+        ],
+        "executions": {
+          "61befa27ce114c8097c8bdfa597e9ee5": [
+            1,
+            3
+          ]
+        },
+        "conclusion": "violated",
+        "rationale": "Decisive parsed events of the retained execution (CheckRun 61befa27ce114c8097c8bdfa597e9ee5, status completed, exit_code 0, prerequisites matched): event index 3 (case_no_progress result) reports snapshot_index=45 < old_last_before=222, old_applied_after=45, leader_commit_index=55, stalled=true, isolated_caught_up=false; event index 1 (control_catchup result) reports snapshot_index=45 > old_last_before=25, old_applied_after=55, leader_commit_index=55, stalled=false, isolated_caught_up=true. The follower therefore did not converge to the leader's log after installing the snapshot, while the same code path converged when its log did not extend above the snapshot index. This matches the producer/consumer trace: installSnapshot (raft.go:1814-1953) never truncates log entries above req.LastLogIndex and never calls setLastLog, so getLastEntry (state.go:167-174) keeps reporting the stale (lastLogIndex,lastLogTerm); the AppendEntries PrevLogEntry check (raft.go:1475-1502) rejects with NoRetryBackoff, and replicateTo (replication.go:222-260) lowers nextIndex until setupAppendEntries returns ErrLogNotFound, at which point sendLatestSnapshot (replication.go:299-383) re-sends the same snapshot.",
+        "answers": {},
+        "knowledge": [
+          {
+            "entry_id": "b02f82dfc4024a638ae4ecbdcb18b1fc-knowledge-0",
+            "revision": 1,
+            "assertion": "installSnapshot does not truncate log entries above req.LastLogIndex and does not call setLastLog"
+          },
+          {
+            "entry_id": "b02f82dfc4024a638ae4ecbdcb18b1fc-knowledge-1",
+            "revision": 1,
+            "assertion": "getLastEntry reports the cached log index/term whenever it is at or above the snapshot index"
+          },
+          {
+            "entry_id": "b02f82dfc4024a638ae4ecbdcb18b1fc-knowledge-2",
+            "revision": 1,
+            "assertion": "appendEntries rejects on a missing or term-mismatched PrevLogEntry without truncating"
+          },
+          {
+            "entry_id": "b02f82dfc4024a638ae4ecbdcb18b1fc-knowledge-3",
+            "revision": 1,
+            "assertion": "replicateTo lowers nextIndex and falls back to re-sending the newest snapshot on ErrLogNotFound"
+          }
+        ],
+        "counterevidence": [
+          "The three comparisons declared in this experiment's basis evaluated as unknown, not violated: each declared prerequisite had to correlate to every result event, but the two scenario_setup admissions carry mutually exclusive scenario values, so match_prerequisites could not build one chain (observations.json comparisons[0..2] reason 'No corresponding prerequisite events reached'). This is a defect in the comparison admission encoding, not in the cited event facts.",
+          "The control event (index 1) is consistent with the ordinary snapshot install path working when the follower's log ends at or below the snapshot index, so the stall is not a blanket snapshot failure."
+        ],
+        "limitations": [
+          "Single-process in-memory transport and the non-monotonic InmemStore path; network/TCP transports and MonotonicLogStore were not exercised.",
+          "Only live catch-up was observed; restart/recovery of the stalled node and any committed-entry or safety consequence were not tested.",
+          "The declared requirement text conditioned on S >= L (log at or below the snapshot index), which describes the control; the violation is observed in the opposite branch (L > S), where the follower keeps a stale suffix.",
+          "The submitted successor experiment corrects the admission/comparison encoding and needs its own receipt before it can carry an interpretation."
+        ],
+        "joint_history": "",
+        "failure_attribution": null,
+        "report_title": "从快照恢复后保留超出快照索引的旧日志后缀导致追随者无法追上",
+        "report_answer": "追随者安装快照时只压缩快照索引及以下的日志，既不截断索引以上的旧日志、也不更新缓存的最后日志索引/任期；因此当本机日志长于快照索引时，getLastEntry 仍返回旧的 (lastLogIndex,lastLogTerm)，AppendEntries 的 PrevLogEntry 校验被拒绝，leader 逐次下调 nextIndex 直到 ErrLogNotFound 并反复重发同一快照，追随者停在快照索引不再前进（保留执行事件 1 与 3 支持该结论；对照事件显示日志未超出快照索引时可正常追上）。",
+        "operation_id": "e3d6dc035d0e4e3d8f25950dd3698fdf"
+      },
+      {
+        "id": "582acedf6e86477a92ab474a241721b7-interpretation-0",
+        "investigation_id": "b02f82dfc4024a638ae4ecbdcb18b1fc-question-0",
+        "experiment_id": "e3d6dc035d0e4e3d8f25950dd3698fdf-experiment",
+        "source_ids": [
+          "install_snapshot",
+          "get_last_entry",
+          "append_prev_check",
+          "set_previous_log",
+          "replicate_to",
+          "send_latest_snapshot"
+        ],
+        "executions": {
+          "2322bd7884b749f89c3101f04bc82e78": [
+            1,
+            3
+          ]
+        },
+        "conclusion": "violated",
+        "rationale": "CheckRun 2322bd7884b749f89c3101f04bc82e78 is a completed experiment execution (status completed, exit_code 0, parsing_errors empty, prerequisites matched with alias admission at event indices 0 and 2). Comparison 0 (applicability stale_suffix=false, assertion isolated_caught_up==true) evaluated event index 1 and outcome holds (comparison_complete true): the follower whose log ended below the snapshot index reached applied index 55 = leader commit 55. Comparisons 1 and 2 (applicability stale_suffix=true, assertions isolated_caught_up==true and stalled==false) evaluated event index 3 and outcome violated with valid_witness_indices [3], witness_complete true and comparison_complete true: with snapshot_index=45 below old_last_before=222 the follower stayed at applied index 45 while leader_commit_index was 55 and reported stalled=true, isolated_caught_up=false. So the follower does not accept the leader's PrevLogEntry=S check after installing the snapshot and never converges to the leader's log. This is consistent with the traced producer/consumer chain: installSnapshot (raft.go:1814-1953) restricts log removal to at or below req.LastLogIndex and never calls setLastLog, so getLastEntry (state.go:167-174) keeps returning the stale above-snapshot index/term; appendEntries (raft.go:1475-1502) rejects on the missing or term-mismatched PrevLogEntry with NoRetryBackoff; replicateTo (replication.go:222-260) walks nextIndex down to the leader's compacted first index, where setupAppendEntries returns ErrLogNotFound and sendLatestSnapshot (replication.go:299-383) re-sends the same snapshot.",
+        "answers": {},
+        "knowledge": [
+          {
+            "entry_id": "e3d6dc035d0e4e3d8f25950dd3698fdf-knowledge-0",
+            "revision": 1,
+            "assertion": "observed stalled catch-up with an above-snapshot follower log and a converging control below it"
+          },
+          {
+            "entry_id": "b02f82dfc4024a638ae4ecbdcb18b1fc-knowledge-0",
+            "revision": 1,
+            "assertion": "installSnapshot does not truncate log entries above req.LastLogIndex and does not call setLastLog"
+          },
+          {
+            "entry_id": "b02f82dfc4024a638ae4ecbdcb18b1fc-knowledge-1",
+            "revision": 1,
+            "assertion": "getLastEntry reports the cached log index/term whenever it is at or above the snapshot index"
+          },
+          {
+            "entry_id": "b02f82dfc4024a638ae4ecbdcb18b1fc-knowledge-2",
+            "revision": 1,
+            "assertion": "appendEntries rejects on a missing or term-mismatched PrevLogEntry without truncating"
+          },
+          {
+            "entry_id": "b02f82dfc4024a638ae4ecbdcb18b1fc-knowledge-3",
+            "revision": 1,
+            "assertion": "replicateTo lowers nextIndex and falls back to re-sending the newest snapshot on ErrLogNotFound"
+          }
+        ],
+        "counterevidence": [
+          "The control comparison holds in the same execution, so the stall is not a general failure of snapshot installation.",
+          "The stalled follower reports old_last_after=223 (unchanged stale suffix) while old_commit_after=23, i.e. its local log/commit view remains inconsistent with the restored FSM at index 45; this is consistent with the defect but also means the exact number of re-sent snapshots is timing dependent and was not counted in this run."
+        ],
+        "limitations": [
+          "Only progress/liveness is established. The retained events do not show a committed entry lost or overwritten, so no safety violation is claimed.",
+          "Transport, store and restart coverage is limited to the in-memory, non-monotonic single-process configuration described in the experiment scope.",
+          "The successor fixes the predecessor's comparison encoding; the predecessor's raw event indices 1 and 3 remain valid observations and its interpretation is preserved."
+        ],
+        "joint_history": "",
+        "failure_attribution": null,
+        "report_title": "追随者安装快照后仍上报快照索引以上的旧日志，导致 leader 反复重发同一快照且追随者无法追上",
+        "report_answer": "在保留的 3 节点内存执行中（CheckRun 2322bd7884b749f89c3101f04bc82e78）：对照场景（本机日志末索引 25 低于快照索引 45）比较成立，追随者 applied=55 达到 leader commit=55；缺陷场景（本机日志末索引 222 高于快照索引 45）两条比较被判 violated，witness 为事件 3，追随者 applied 冻结在 45、leader commit=55、stalled=true。原因链：installSnapshot 只清理快照索引及以下的日志、不截断以上后缀也不更新 setLastLog，getLastEntry 继续返回旧的 (lastLogIndex,lastLogTerm)，AppendEntries 的 PrevLogEntry 校验被拒，leader 逐次下调 nextIndex 直至 ErrLogNotFound 并重发同一快照。范围限于单进程内存、非单调存储；未测试重启恢复与安全性，不主张已提交日志丢失。",
+        "operation_id": "582acedf6e86477a92ab474a241721b7"
+      },
+      {
+        "id": "1b24d155db77414b9490619c49f7a51f-interpretation-0",
+        "investigation_id": "b02f82dfc4024a638ae4ecbdcb18b1fc-question-0",
+        "experiment_id": "5af7bfdd43694974b1a9aa24d559df0f-experiment",
+        "source_ids": [
+          "install_snapshot",
+          "get_last_entry",
+          "append_prev_check",
+          "replicate_to"
+        ],
+        "executions": {
+          "b7a3841507c14bbba992965686f5ee54": [
+            1,
+            3
+          ]
+        },
+        "conclusion": "unresolved",
+        "rationale": "CheckRun b7a3841507c14bbba992965686f5ee54 has status completed but exit_code 1 (outcome tests_failed), so it cannot support the monotonic conclusion. What did complete, before the failure, are two parsed events on the same operation stream: event 1 (control_catchup) with stale_suffix=false, old_last_after=55, applied 55 = leader commit 55 (comparison 0 outcome holds), and event 3 (case_nonmonotonic_stall) with snapshot_index=45 < old_last_before=223, applied frozen at 45 while leader commit 55, stalled=true, isolated_caught_up=false (comparison 1 outcome violated, valid witness index 3). That re-confirms the already-established non-monotonic defect and is retained here only as partial output. The monotonic scenario ran (its [CA] log line reports snapshot_index=45, oldLastBefore=222, leaderCommit=55) but emitted no CA_EVENT before the test panicked in the harness helper cluster.Close() after its shutdown-timeout timer fired (testing.go:307), i.e. a harness cleanup timeout, not a target assertion. No monotonic endpoint was measured, so the discriminator between retained above-snapshot bytes and the cached last-log state is not decided by this run.",
+        "answers": {},
+        "knowledge": [],
+        "counterevidence": [
+          "Native local runs of the same harness (before submission, not a formal receipt) showed the monotonic scenario stalling identically (old_last_after=223, applied=45, stalled=true). This is why the question is worth resuming, but it is not retained execution evidence and is not used as a conclusion.",
+          "The panic occurred in the test helper's cluster.Close(), so it also does not indicate any target behavior failure."
+        ],
+        "limitations": [
+          "Concrete resume condition: emit the monotonic scenario's result event (or explicitly Shutdown and await each Raft before cluster.Close) so the measurement precedes cleanup, then re-run this exact harness as a fresh successor; a completed receipt with the monotonic comparison then decides the gap.",
+          "Until that receipt exists, the monotonic branch is unestablished and the recorded defect conclusion rests only on the non-monotonic receipt 2322bd7884b749f89c3101f04bc82e78."
+        ],
+        "joint_history": "",
+        "failure_attribution": null,
+        "report_title": null,
+        "report_answer": null,
+        "operation_id": "1b24d155db77414b9490619c49f7a51f"
+      },
+      {
+        "id": "b8ec90938f1346649533b743268e42fc-interpretation-0",
+        "investigation_id": "b02f82dfc4024a638ae4ecbdcb18b1fc-question-0",
+        "experiment_id": "58b739baeea14b0a8ff27e6cfab5c1c3-experiment",
+        "source_ids": [
+          "install_snapshot",
+          "get_last_entry",
+          "append_prev_check",
+          "replicate_to"
+        ],
+        "executions": {
+          "ed8023e758ae49bc93676179f4ae489c": [
+            1,
+            3,
+            5
+          ]
+        },
+        "conclusion": "violated",
+        "rationale": "CheckRun ed8023e758ae49bc93676179f4ae489c is a completed experiment execution (status completed, exit_code 0, parsing_errors empty, prerequisites matched with alias admission at event index 0). Comparison 0 (applicability stale_suffix=false, assertion isolated_caught_up==true) evaluated event index 1 and holds: the follower whose log ended below the snapshot index reached applied index 55 = leader commit 55 (comparison_complete true). Comparison 1 (applicability stale_suffix=true, store_monotonic=false, assertion stalled==false) evaluated event index 3 and is violated with valid witness index 3: case_nonmonotonic_stall stayed at applied index 45 while leader_commit_index was 55 (old_last_before=223, stalled=true). Comparison 2 (applicability stale_suffix=true, store_monotonic=true, assertion stalled==false) evaluated event index 5 and is violated with valid witness index 5: case_monotonic_stall behaved identically (applied 45 vs leader commit 55, old_last_after=223, stalled=true) even though removeOldLogs deleted the above-snapshot bytes. Together with the source trace (installSnapshot at raft.go:1814-1953 resets lastApplied/lastSnapshot/config and compacts or removes logs at or below req.LastLogIndex but never truncates above it or calls setLastLog; getLastEntry at state.go:167-174 keeps returning the cached above-snapshot index/term; appendEntries at raft.go:1475-1502 rejects the PrevLogEntry check; replicateTo at replication.go:222-260 walks nextIndex down to ErrLogNotFound and sendLatestSnapshot re-sends the same snapshot), this establishes the defect for both LogStore monotonicity branches.",
+        "answers": {
+          "1b24d155db77414b9490619c49f7a51f-gap-0": "Yes. CheckRun ed8023e758ae49bc93676179f4ae489c (completed, exit_code 0, no parsing errors, prerequisites matched) shows the monotonic store stalling exactly like the non-monotonic one. Comparison 2 (applicability stale_suffix=true, store_monotonic=true, assertion stalled==false) is violated with valid witness index 5: scenario case_monotonic_stall reports snapshot_index=45 < old_last_before=223, old_last_after=223, old_applied_after=45 while leader_commit_index=55, stalled=true, isolated_caught_up=false. Because MockMonotonicLogStore makes installSnapshot take the removeOldLogs branch, the above-snapshot bytes are already deleted, so what survives is the cached lastLogIndex/lastLogTerm, which is not reset (no setLastLog call) and is still reported by getLastEntry (state.go:167-174). The stall is therefore caused by the cached last-log state, not by retained log bytes."
+        },
+        "knowledge": [
+          {
+            "entry_id": "b02f82dfc4024a638ae4ecbdcb18b1fc-knowledge-0",
+            "revision": 1,
+            "assertion": "installSnapshot does not truncate log entries above req.LastLogIndex and does not call setLastLog"
+          },
+          {
+            "entry_id": "b02f82dfc4024a638ae4ecbdcb18b1fc-knowledge-1",
+            "revision": 1,
+            "assertion": "getLastEntry reports the cached log index/term whenever it is at or above the snapshot index"
+          },
+          {
+            "entry_id": "b02f82dfc4024a638ae4ecbdcb18b1fc-knowledge-2",
+            "revision": 1,
+            "assertion": "appendEntries rejects on a missing or term-mismatched PrevLogEntry without truncating"
+          },
+          {
+            "entry_id": "b02f82dfc4024a638ae4ecbdcb18b1fc-knowledge-3",
+            "revision": 1,
+            "assertion": "replicateTo lowers nextIndex and falls back to re-sending the newest snapshot on ErrLogNotFound"
+          }
+        ],
+        "counterevidence": [
+          "The monotonic branch confirms rather than refutes the explanation: deleting the above-snapshot bytes (removeOldLogs) did not restore catch-up, which rules out retained bytes as the necessary cause.",
+          "The control comparison still holds, so ordinary snapshot catch-up is unaffected.",
+          "The predecessor run's nonzero exit was an upstream helper shutdown timeout (testing.go:307) and is preserved as counterevidence for that failed attempt; it carried no target-behavior claim."
+        ],
+        "limitations": [
+          "Only progress/liveness is established; no committed entry was observed to be lost or overwritten, so no safety violation is claimed.",
+          "Coverage is limited to the in-memory, single-process, 3-node configuration described in the experiment scope; network transports, disk-backed stores and restarts were not exercised."
+        ],
+        "joint_history": "",
+        "failure_attribution": null,
+        "report_title": "追随者安装快照后仍上报快照索引以上的旧日志导致无法追上：单调与非单调日志存储均受影响",
+        "report_answer": "在保留执行 CheckRun ed8023e758ae49bc93676179f4ae489c（completed，exit 0）中：对照场景比较成立（applied 55 = leader commit 55）；非单调存储对比 violated，witness 为事件 3（applied 冻结 45，leader commit 55，stalled=true）；单调存储（removeOldLogs 已删除快照索引以上的日志字节）对比同样 violated，witness 为事件 5（snapshot_index 45、old_last_before 223、old_last_after 223、applied 45、stalled=true）。因此问题不取决于日志字节是否保留，而在于 installSnapshot 未重置缓存的 lastLogIndex/lastLogTerm（未调用 setLastLog），getLastEntry 继续返回快照索引以上的旧项，AppendEntries 的 PrevLogEntry 校验被拒，leader 逐次下调 nextIndex 直至 ErrLogNotFound 并反复重发同一快照。范围限于单进程内存、3 节点；未测试重启恢复，也不主张已提交日志丢失。",
+        "operation_id": "b8ec90938f1346649533b743268e42fc"
+      }
+    ],
+    "current_submission": {
+      "phase": "accepted",
+      "operation_id": "b8ec90938f1346649533b743268e42fc",
+      "action": "update",
+      "no_change": false,
+      "references": {}
+    },
+    "applied_operations": {
+      "submission-b02f82dfc4024a638ae4ecbdcb18b1fc": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-11_12-49-23-hashicorp_raft-real-run/semantic-commits/submission-b02f82dfc4024a638ae4ecbdcb18b1fc.json"
+      },
+      "submission-e3d6dc035d0e4e3d8f25950dd3698fdf": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-11_12-49-23-hashicorp_raft-real-run/semantic-commits/submission-e3d6dc035d0e4e3d8f25950dd3698fdf.json"
+      },
+      "submission-582acedf6e86477a92ab474a241721b7": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-11_12-49-23-hashicorp_raft-real-run/semantic-commits/submission-582acedf6e86477a92ab474a241721b7.json"
+      },
+      "submission-5af7bfdd43694974b1a9aa24d559df0f": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-11_12-49-23-hashicorp_raft-real-run/semantic-commits/submission-5af7bfdd43694974b1a9aa24d559df0f.json"
+      },
+      "submission-1b24d155db77414b9490619c49f7a51f": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-11_12-49-23-hashicorp_raft-real-run/semantic-commits/submission-1b24d155db77414b9490619c49f7a51f.json"
+      },
+      "submission-58b739baeea14b0a8ff27e6cfab5c1c3": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-11_12-49-23-hashicorp_raft-real-run/semantic-commits/submission-58b739baeea14b0a8ff27e6cfab5c1c3.json"
+      },
+      "submission-b8ec90938f1346649533b743268e42fc": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-11_12-49-23-hashicorp_raft-real-run/semantic-commits/submission-b8ec90938f1346649533b743268e42fc.json"
+      }
+    }
+  }
+}

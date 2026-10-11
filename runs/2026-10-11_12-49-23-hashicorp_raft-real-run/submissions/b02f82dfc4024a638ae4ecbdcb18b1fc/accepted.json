@@ -1,0 +1,383 @@
+{
+  "rationale": "Sourced local question in the captured github.com/hashicorp/raft snapshot. Symbols: (*Raft).installSnapshot (raft.go:1814-1953), (*raftState).getLastEntry (state.go:167-174), (*Raft).appendEntries PrevLogEntry check (raft.go:1475-1502), (*Raft).replicateTo/setPreviousLog/sendLatestSnapshot (replication.go), with the post-restore update block at raft.go:1930-1948. Question: when a follower handles an InstallSnapshotRequest while its own persisted log already extends beyond the snapshot's LastLogIndex (an uncommitted suffix from an earlier term), does the follower converge to the leader's log, or does the leader keep re-transferring the same snapshot? Source trace plus one bounded 3-node in-memory execution isolating the stale-suffix condition against a short-suffix control.",
+  "sources": [
+    {
+      "id": "install_snapshot",
+      "file": "raft.go",
+      "start_line": 1930,
+      "end_line": 1948,
+      "kind": "code_observation"
+    },
+    {
+      "id": "install_snapshot_decl",
+      "file": "raft.go",
+      "start_line": 1814,
+      "end_line": 1954,
+      "kind": "code_observation"
+    },
+    {
+      "id": "get_last_entry",
+      "file": "state.go",
+      "start_line": 165,
+      "end_line": 174,
+      "kind": "code_observation"
+    },
+    {
+      "id": "append_prev_check",
+      "file": "raft.go",
+      "start_line": 1475,
+      "end_line": 1502,
+      "kind": "code_observation"
+    },
+    {
+      "id": "append_entries_decl",
+      "file": "raft.go",
+      "start_line": 1440,
+      "end_line": 1580,
+      "kind": "code_observation"
+    },
+    {
+      "id": "set_previous_log",
+      "file": "replication.go",
+      "start_line": 587,
+      "end_line": 611,
+      "kind": "code_observation"
+    },
+    {
+      "id": "replicate_to",
+      "file": "replication.go",
+      "start_line": 222,
+      "end_line": 260,
+      "kind": "code_observation"
+    },
+    {
+      "id": "replicate_to_decl",
+      "file": "replication.go",
+      "start_line": 202,
+      "end_line": 295,
+      "kind": "code_observation"
+    },
+    {
+      "id": "send_latest_snapshot",
+      "file": "replication.go",
+      "start_line": 299,
+      "end_line": 375,
+      "kind": "code_observation"
+    }
+  ],
+  "investigations": [
+    {
+      "id": null,
+      "ref": "@snapshot_stale_suffix",
+      "question": "When a follower installs a snapshot while its persisted log already ends above the snapshot's LastLogIndex, does the follower's last-log report allow the leader's next AppendEntries (PrevLogEntry = snapshot index) to be accepted, or does the leader loop re-transferring the same snapshot with no follower progress?",
+      "source_ids": [
+        "install_snapshot",
+        "get_last_entry",
+        "append_prev_check",
+        "set_previous_log",
+        "replicate_to",
+        "send_latest_snapshot"
+      ],
+      "hypothesis": "installSnapshot restores the FSM, sets lastApplied/lastSnapshot/configuration and compacts logs at or below req.LastLogIndex, but never truncates log entries above req.LastLogIndex and never calls setLastLog. The cached lastLogIndex/lastLogTerm therefore keep the stale suffix, so getLastEntry reports (staleLast, staleTerm) instead of (snapshotIndex, snapshotTerm) whenever lastLogIndex > lastSnapshotIndex. appendEntries then fails the PrevLogEntry==lastIdx branch and either logs.GetLog errors (entries compacted) or returns the stale term, so it rejects with NoRetryBackoff. The leader lowers nextIndex by one (resp.LastLog+1 is above nextIndex-1, so min picks nextIndex-1), and once nextIndex-1 falls below the leader's compacted first index setupAppendEntries returns ErrLogNotFound and the leader re-sends the identical snapshot.",
+      "discriminator": "Run the same 3-node in-memory scenario twice: with the isolated node's pre-reconnect last log index below the replacement leader's snapshot index (control, no stale suffix) and above it (case, stale suffix). If the explanation holds the control converges after one install, while the case leaves the isolated node stuck at the snapshot index with leader commit index above it and repeated identical snapshot installs. If the case also converges, the stale-suffix explanation is refuted and the harness or predicate must be revisited.",
+      "disposition": null,
+      "parent_id": null,
+      "knowledge": null,
+      "counterevidence": null,
+      "limitations": null,
+      "resume_conditions": null
+    }
+  ],
+  "knowledge": [
+    {
+      "id": null,
+      "ref": null,
+      "kind": "behavior",
+      "statement": "(*Raft).installSnapshot restores the received snapshot into the FSM, sets lastApplied=req.LastLogIndex, sets lastSnapshot=(req.LastLogIndex,req.LastLogTerm), overwrites the latest and committed configuration, then removes or compacts only logs at or below req.LastLogIndex (removeOldLogs for a MonotonicLogStore, otherwise compactLogs). It never calls setLastLog and never truncates log entries above req.LastLogIndex, so the cached lastLogIndex/lastLogTerm retain any pre-existing suffix.",
+      "conditions": "A follower handles an InstallSnapshotRequest and its persisted log already contains entries at indices greater than req.LastLogIndex, for example an uncommitted suffix written by an earlier leader term.",
+      "source_ids": [
+        "install_snapshot_decl"
+      ],
+      "executions": {},
+      "changed_premise": "",
+      "affected_uses": []
+    },
+    {
+      "id": null,
+      "ref": null,
+      "kind": "behavior",
+      "statement": "(*raftState).getLastEntry returns (lastLogIndex,lastLogTerm) whenever lastLogIndex >= lastSnapshotIndex, and returns (lastSnapshotIndex,lastSnapshotTerm) only when the cached log index is below the snapshot index. After a snapshot install that leaves a longer persisted log, the follower therefore reports the stale tail index and term rather than the snapshot index and term.",
+      "conditions": "lastLogIndex > lastSnapshotIndex on the local raftState, which holds after installSnapshot when the log was not truncated above the snapshot index.",
+      "source_ids": [
+        "get_last_entry"
+      ],
+      "executions": {},
+      "changed_premise": "",
+      "affected_uses": []
+    },
+    {
+      "id": null,
+      "ref": null,
+      "kind": "behavior",
+      "statement": "(*Raft).appendEntries verifies a.PrevLogEntry by comparing it to getLastEntry; if they differ it reads logs.GetLog(a.PrevLogEntry). A missing entry or a differing term sets resp.NoRetryBackoff=true and rejects the request without truncating the local log.",
+      "conditions": "A follower receives an AppendEntriesRequest with a.PrevLogEntry > 0.",
+      "source_ids": [
+        "append_prev_check"
+      ],
+      "executions": {},
+      "changed_premise": "",
+      "affected_uses": []
+    },
+    {
+      "id": null,
+      "ref": null,
+      "kind": "behavior",
+      "statement": "(*Raft).replicateTo advances s.nextIndex to max(min(s.nextIndex-1, resp.LastLog+1), 1) on a rejected AppendEntries, so a follower that reports a higher LastLog than the leader's nextIndex causes nextIndex to decrease by one; when setupAppendEntries returns ErrLogNotFound it goes to SEND_SNAP and sendLatestSnapshot re-sends the newest snapshot and sets nextIndex=meta.Index+1 on success.",
+      "conditions": "The follower keeps rejecting AppendEntries and its reported LastLog stays above the leader's nextIndex.",
+      "source_ids": [
+        "replicate_to",
+        "send_latest_snapshot"
+      ],
+      "executions": {},
+      "changed_premise": "",
+      "affected_uses": []
+    }
+  ],
+  "gaps": [],
+  "interpretations": [],
+  "experiment": {
+    "investigation_id": "@snapshot_stale_suffix",
+    "harness_path": "snapshot_suffix_harness.go",
+    "files": {},
+    "execution_package": ".",
+    "source_ids": [
+      "install_snapshot",
+      "get_last_entry",
+      "append_prev_check",
+      "set_previous_log",
+      "replicate_to",
+      "send_latest_snapshot"
+    ],
+    "anchors": [
+      {
+        "material_id": "install_snapshot_decl",
+        "symbol": "installSnapshot",
+        "start_line": 1930,
+        "end_line": 1948,
+        "anchor": {
+          "source_ids": [
+            "install_snapshot",
+            "install_snapshot_decl"
+          ],
+          "boundary_complete": true,
+          "kind": "declaration",
+          "material_id": "install_snapshot_decl",
+          "start_line": 1814,
+          "end_line": 1814,
+          "symbol": "installSnapshot"
+        }
+      },
+      {
+        "material_id": "get_last_entry",
+        "symbol": "getLastEntry",
+        "start_line": 167,
+        "end_line": 174,
+        "anchor": {
+          "source_ids": [
+            "get_last_entry"
+          ],
+          "boundary_complete": true,
+          "kind": "declaration",
+          "material_id": "get_last_entry",
+          "start_line": 167,
+          "end_line": 167,
+          "symbol": "getLastEntry"
+        }
+      },
+      {
+        "material_id": "append_entries_decl",
+        "symbol": "appendEntries",
+        "start_line": 1475,
+        "end_line": 1502,
+        "anchor": {
+          "source_ids": [
+            "append_entries_decl",
+            "append_prev_check"
+          ],
+          "boundary_complete": true,
+          "kind": "declaration",
+          "material_id": "append_entries_decl",
+          "start_line": 1440,
+          "end_line": 1440,
+          "symbol": "appendEntries"
+        }
+      },
+      {
+        "material_id": "set_previous_log",
+        "symbol": "setPreviousLog",
+        "start_line": 595,
+        "end_line": 597,
+        "anchor": {
+          "source_ids": [
+            "set_previous_log"
+          ],
+          "boundary_complete": true,
+          "kind": "declaration",
+          "material_id": "set_previous_log",
+          "start_line": 587,
+          "end_line": 587,
+          "symbol": "setPreviousLog"
+        }
+      },
+      {
+        "material_id": "replicate_to_decl",
+        "symbol": "replicateTo",
+        "start_line": 222,
+        "end_line": 260,
+        "anchor": {
+          "source_ids": [
+            "replicate_to",
+            "replicate_to_decl"
+          ],
+          "boundary_complete": true,
+          "kind": "declaration",
+          "material_id": "replicate_to_decl",
+          "start_line": 202,
+          "end_line": 202,
+          "symbol": "replicateTo"
+        }
+      }
+    ],
+    "scope": {
+      "description": "One process, three real Raft instances over InmemTransport with InmemStore and FileSnapshotStore, built with the upstream MakeCluster test helper. The replacement leader compacts its log at or below its snapshot index (TrailingLogs=0) so it can no longer serve the isolated node's match point from the log store.",
+      "assumptions": [
+        "Config: ProtocolVersion=3, HeartbeatTimeout=ElectionTimeout=LeaderLeaseTimeout=300ms, CommitTimeout=10ms, TrailingLogs=0, SnapshotThreshold disabled, SnapshotInterval=1h.",
+        "The isolated node's uncommitted suffix is produced by real Apply calls on the old leader during its pre-step-down lease window; no state is injected.",
+        "The replacement leader commits post-snapshot entries with the third node so leader_commit_index rises above the snapshot index."
+      ],
+      "excluded": [
+        "Network and TCP transports; mixed-version rolling upgrades.",
+        "Monotonic log stores; the non-monotonic InmemStore path is exercised.",
+        "Any restart or recovery of the isolated node; only live catch-up is measured."
+      ],
+      "parameters": {
+        "prefix": 20,
+        "case_tail": 200,
+        "control_tail": 2,
+        "extra": 20,
+        "post": 10,
+        "settle_ms": 4500
+      }
+    },
+    "prefix": "Bootstrap a 3-node cluster; commit a 20-command prefix to all nodes; isolate the current leader; append 200 (case) or 2 (control) uncommitted tail commands on the isolated node; let the remaining two nodes elect a replacement leader; commit 20 more commands and take a snapshot at index S on the replacement leader; commit 10 post entries above S; reconnect and observe for about 4.5s.",
+    "semantic_changes": [],
+    "requirement": "After a follower installs a snapshot at index S and the follower's durable log ends at index L with S >= L, the follower must report its last log entry as (S, snapshotTerm) so the leader's PrevLogEntry=S consistency check succeeds and later entries commit on the follower. Anchored in state.go:167-174 (getLastEntry) and raft.go:1475-1502 (appendEntries PrevLogEntry check); installSnapshot at raft.go:1814-1953 with the post-restore block at raft.go:1930-1948 is the producer that must establish that condition.",
+    "responsibility": "Follower snapshot installation establishing a post-install last-log state compatible with the leader's AppendEntries and nextIndex catch-up loop.",
+    "prerequisites": [
+      {
+        "alias": "control_admission",
+        "event": "scenario_setup",
+        "conditions": [
+          {
+            "field": "scenario",
+            "op": "eq",
+            "value": "control_catchup",
+            "reference": null
+          },
+          {
+            "field": "stale_suffix",
+            "op": "eq",
+            "value": false,
+            "reference": null
+          }
+        ]
+      },
+      {
+        "alias": "case_admission",
+        "event": "scenario_setup",
+        "conditions": [
+          {
+            "field": "scenario",
+            "op": "eq",
+            "value": "case_no_progress",
+            "reference": null
+          },
+          {
+            "field": "stale_suffix",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          }
+        ]
+      }
+    ],
+    "comparisons": [
+      {
+        "event": "control_catchup",
+        "identity_fields": [
+          "scenario",
+          "snapshot_index"
+        ],
+        "admission_alias": "control_admission",
+        "assertion": {
+          "field": "isolated_caught_up",
+          "op": "eq",
+          "value": true,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [],
+        "description": "Control: isolated node's last index below the snapshot index still catches up to the leader commit index."
+      },
+      {
+        "event": "case_no_progress",
+        "identity_fields": [
+          "scenario",
+          "snapshot_index",
+          "old_last_before"
+        ],
+        "admission_alias": "case_admission",
+        "assertion": {
+          "field": "stalled",
+          "op": "eq",
+          "value": true,
+          "reference": null
+        },
+        "antecedent": {
+          "field": "stale_suffix",
+          "op": "eq",
+          "value": true,
+          "reference": null
+        },
+        "applicability_conditions": [],
+        "description": "Case: with the isolated node's last index above the snapshot index, its applied index does not change across a 3s sample while the leader commit index is above it."
+      },
+      {
+        "event": "case_no_progress",
+        "identity_fields": [
+          "scenario",
+          "old_last_after"
+        ],
+        "admission_alias": "case_admission",
+        "assertion": {
+          "field": "isolated_caught_up",
+          "op": "eq",
+          "value": false,
+          "reference": null
+        },
+        "antecedent": {
+          "field": "stale_suffix",
+          "op": "eq",
+          "value": true,
+          "reference": null
+        },
+        "applicability_conditions": [],
+        "description": "Case: the isolated node is still short of the leader commit index after the observation window."
+      }
+    ],
+    "knowledge": [],
+    "previous_id": null,
+    "revision_reason": ""
+  },
+  "stop": null
+}
