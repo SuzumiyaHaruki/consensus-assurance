@@ -1,99 +1,66 @@
-"""The public CLI uses the same file products as the real Codex transport."""
 import json
+import re
 from pathlib import Path
 import pytest
-from audit_support import first, check_step
-from consensus_assurance.cli import main
+from consensus_assurance.cli import main, create_run_directory, resolve_run
 from consensus_assurance.core.config import Config, Budget
 from consensus_assurance.registry import assemble
 from consensus_assurance.workflow.engine import Engine
 
 
-def test_cli_audit_fixture_execution_and_report(tmp_path,capsys,monkeypatch):
-    repo=tmp_path/'repo';repo.mkdir()
-    (repo/'target.py').write_text('def step(value, limit):\n    return value + 1 if value < limit else 0\n')
-    (repo/'README.md').write_text('Legal local return remains within capacity.\n')
-    submission,files=check_step()({'units':[{'id':'unit-bounded'}]})
-    fixture=tmp_path/'audit.json'
-    candidate,map_files=first({})
-    fixture.write_text(json.dumps([{'submission':candidate,'files':map_files}, {'submission':submission,'files':files}]))
-    config=Config(agent_backend='mock',fixture=str(fixture),execution_backend='python',execution_isolation='workspace',
-        directed_question='Execute the supplied local return check',runs_dir=str(tmp_path/'runs'),budget=Budget(agent_calls=2,total_seconds=60))
-    path=tmp_path/'config.yaml';path.write_text(config.model_dump_json())
-    assert main(['run','--config',str(path),'--repo',str(repo)])==2
-    root=next((tmp_path/'runs').glob('*-mock-run'))
-    state=json.loads((root/'state.json').read_text())
-    assert len(state['direct_checks'])==1 and state['usage']['agent_calls']==2
-    assert state['agent_session_id']=='fixture-session' and len(state['agent_turns'])==2
-    assert state['method_paths'] and state['run_stop']['origin']=='controller'
-    assert (root/'draft').is_dir() and (root/'submissions').is_dir() and (root/'agent-source').is_dir()
-    assert any(c['action']=='direct_check' and c['exit_code']==0 for c in state['checks'])
-    report=(root/'report.md').read_text()
-    assert 'mock' in report and '待调查线索' in report and Path(state['direct_checks'][0]['harness_path']).relative_to(root).as_posix() in report
-    derived=['audit-spec.json','materials.json','graph.json','audit-progress.json','plan.json']
-    assert all(not (root/name).exists() for name in derived)
-    index=json.loads((root/'research.json').read_text());index.update(retained_context='obsolete',remaining_seconds=98,remaining_agent_calls=25)
-    (root/'research.json').write_text(json.dumps(index))
-    assert main(['report','--run',str(root)])==0
-    current=json.loads((root/'research.json').read_text())
-    assert current==index
-    assert current['implementation']['harness_kind']=='python' and current['validation']['command']
-    assert current['capacity']['remaining']['agent_calls']==0
-    assert all(not (root/name).exists() for name in derived)
-    assert main(['report','--run',str(root),'--export-views'])==0
-    assert all((root/name).exists() for name in derived)
-    assert json.loads((root/'research.json').read_text())==index
-    artifact=state['direct_checks'][0]
-    assert json.loads(Path(artifact['plan_path']).read_text())['claim_id']==state['claims'][0]['id']
-    import re
-    from urllib.parse import unquote
-    for target in re.findall(r'\]\(([^)]+)\)',report):
-        assert f'id="{target[1:]}"' in report if target.startswith('#') else (root/unquote(target)).is_file()
-    assert main(['resume','--run',str(root),'--agent-turn-timeout','120'])==2
-    resumed=json.loads((root/'state.json').read_text())
-    assert resumed['config']['budget']['agent_turn_timeout']==120
-    assert resumed['agent_session_id']==state['agent_session_id'] and resumed['agent_turns']==state['agent_turns']
-    assert resumed['usage']==state['usage'] and resumed['direct_checks']==state['direct_checks']
-    saved=(root/'state.json').read_bytes()
-    with pytest.raises(ValueError,match='empty directory'):
-        Engine(config,root,*assemble(config)).start(repo)
-    assert main(['plan','--config',str(path),'--repo',str(repo)])==0
-    fresh=next((tmp_path/'runs').glob('*-mock-plan'))
-    initial=json.loads((fresh/'state.json').read_text())
-    assert initial['id']!=state['id'] and initial['agent_session_id'] is None
-    assert all(not initial[key] for key in ('question_candidates','units','materials','evidence','agent_turns','usage'))
-    assert (root/'state.json').read_bytes()==saved
-    assert not (fresh/'draft').exists()
-    from consensus_assurance.adapters.agents.backend import MockAgent
-    def cancel(*args,**kwargs):raise KeyboardInterrupt('Actual caller cancellation')
-    monkeypatch.setattr(MockAgent,'investigate',cancel)
-    previous=set((tmp_path/'runs').iterdir())
-    assert main(['run','--config',str(path),'--repo',str(repo)])==130
-    cancelled=next(iter(set((tmp_path/'runs').iterdir())-previous))
-    saved_cancel=json.loads((cancelled/'state.json').read_text())
-    assert saved_cancel['run_stop']['origin']=='controller' and saved_cancel['run_stop']['reason']=='user_stop'
-    assert saved_cancel['usage']['agent_calls']==1 and '实际取消' in (cancelled/'report.md').read_text()
-    old=tmp_path/'historical';old.mkdir()
-    historical={'framework_revision':'audit-products-v60','current_submission':{'phase':'executed'},
-        'agent_session_id':'old-session','review_issues':[{'challenged_components':['oracle']}]}
-    (old/'state.json').write_text(json.dumps(historical))
-    (old/'report.md').write_text('历史结果：执行失败，未确认。')
-    before={p.name:p.read_bytes() for p in old.iterdir()}
-    assert main(['report','--run',str(old)])==0
-    assert '历史结果：执行失败' in capsys.readouterr().out
-    assert main(['resume','--run',str(old)])==2
-    historical_engine=Engine(Config(),old,None,None,'')
-    with pytest.raises(ValueError,match='original Git revision'):historical_engine.resume()
-    assert {p.name:p.read_bytes() for p in old.iterdir()}==before
+def test_cli_fixed_execution_and_fresh_run_are_independent(tmp_path, capsys):
+    from audit_support import combined
+    repo = tmp_path / 'source'
+    repo.mkdir()
+    (repo / 'target.py').write_text('def step(value, limit):\n    return value + 1 if value < limit else 0\n')
+    (repo / 'README.md').write_text('Fixture boundary contract.\n')
+    submission, files = combined({})
+    fixture = tmp_path / 'responses.json'
+    fixture.write_text(json.dumps([dict(submission=submission, files=files)]))
+    config = Config(agent_backend='mock', execution_backend='python', fixture=str(fixture),
+                    execution_isolation='workspace', runs_dir=str(tmp_path / 'runs'),
+                    budget=Budget(agent_calls=1, experiments=1, total_seconds=30))
+    path = tmp_path / 'config.json'
+    path.write_text(config.model_dump_json())
+    original = {p.name: p.read_bytes() for p in repo.iterdir()}
+    for _ in range(2):
+        assert main(['run', '--config', str(path), '--repo', str(repo)]) == 2
+    roots = sorted((tmp_path / 'runs').iterdir())
+    states = [json.loads((root / 'state.json').read_text()) for root in roots]
+    assert len(roots) == 2 and states[0]['id'] != states[1]['id']
+    assert states[0]['experiments'][0]['id'] != states[1]['experiments'][0]['id']
+    for root, state in zip(roots, states):
+        assert state['usage'] == {'agent_calls': 1, 'experiments': 1}
+        assert len(state['experiments']) == 1 and state['interpretations'] == []
+        assert main(['report', '--run', str(root), '--export-views']) == 0
+        assert (root / 'knowledge.json').is_file()
+        schema = json.loads((root / 'submission.schema.json').read_text())
+        assert not {'Unit', 'Claim', 'Binding', 'GraphPatch', 'Evidence', 'Finding'} & schema['$defs'].keys()
+    assert {p.name: p.read_bytes() for p in repo.iterdir()} == original
+    capsys.readouterr()
 
+
+def test_historical_method_rejected_before_writes_but_saved_report_readable(tmp_path, capsys, monkeypatch):
+    import consensus_assurance.cli as cli
+    root = tmp_path / 'archive'
+    root.mkdir()
+    (root / 'state.json').write_text(json.dumps({'framework_revision': 'audit-products-v61', 'retired': 'layout'}))
+    (root / 'report.md').write_text('Original saved report\n')
+    before = {p.name: p.read_bytes() for p in root.iterdir()}
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError('Historical commands must not assemble providers or migrate state')
+
+    monkeypatch.setattr(cli, 'assemble', forbidden)
+    assert main(['resume', '--run', str(root)]) == 2
+    assert main(['validate', '--run', str(root), '--submission', 'submission.json']) == 2
+    assert main(['report', '--run', str(root)]) == 0
+    assert 'Original saved report' in capsys.readouterr().out
+    assert {p.name: p.read_bytes() for p in root.iterdir()} == before
 
 def test_missing_target_cli_has_no_download(tmp_path, capsys):
     assert main(["run", "--repo", str(tmp_path / "absent"), "--runs-dir", str(tmp_path / "runs")]) == 2
     assert "does not exist" in capsys.readouterr().err
-
-
-import re
-from consensus_assurance.cli import create_run_directory, resolve_run
 
 
 def test_readable_unique_run_directories(tmp_path):

@@ -10,7 +10,7 @@ from consensus_assurance.registry import assemble
 from consensus_assurance.workflow.audit import add_support
 from consensus_assurance.adapters.runners.process import ProcessRunner
 from consensus_assurance.adapters.runners.experiment import install_harness
-from consensus_assurance.core.proposals import Harness
+from consensus_assurance.core.types import Harness
 
 
 @pytest.mark.parametrize('upstream_lock',[False,True])
@@ -250,7 +250,10 @@ def test_package_boundaries_match_preflight_and_admission_without_execution(tmp_
     # Captured snapshots normally exclude links; both validation paths must still reject a damaged source view.
     for folder in ('source','agent-source'):(engine.root/folder/'internal/escape').symlink_to(tmp_path,target_is_directory=True)
     draft=engine.root/'draft';draft.mkdir()
-    sub=dict(action='explore',question='Check local placement only',harness_path='check.go',rationale='Boundary control',**selection)
+    from audit_support import first
+    sub, _ = first({})
+    sub['experiment'] = dict(investigation_id='@q',harness_path='check.go',source_ids=['code'],
+        scope={'description':'Local placement'},prefix='No execution during preflight',**selection)
     (draft/'submission.json').write_text(json.dumps(sub));(draft/'check.go').write_text('package service\n')
     (draft/'helper.go').write_text('package service\n')
     monkeypatch.setattr(ProcessRunner,'run',lambda *a,**kw:pytest.fail('Validation cannot execute'))
@@ -259,7 +262,7 @@ def test_package_boundaries_match_preflight_and_admission_without_execution(tmp_
     assert not result['valid'] and result['diagnostics']
     assert engine.state.model_dump(mode='json')==saved
     with pytest.raises(ValueError):prepare_submission(engine,AuditSubmission.model_validate(sub),Inputs(draft),'invalid')
-    assert not (engine.root/'experiments').exists() and not engine.state.checks and not engine.state.direct_checks
+    assert not (engine.root/'experiments').exists() and not engine.state.checks and not engine.state.experiments
 
 
 def test_python_rejects_go_override_and_go_default_path_conflict(tmp_path):

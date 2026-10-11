@@ -70,7 +70,7 @@ def main(argv=None):
     for name in ("resume", "report"):
         p = sub.add_parser(name); p.add_argument("--run", required=True)
         p.add_argument("--runs-dir", default="runs")
-        if name == "report":p.add_argument("--export-views",action="store_true",help="按需导出地图、材料、图、进度和计划的根目录派生副本")
+        if name == "report":p.add_argument("--export-views",action="store_true",help="按需导出当前工作、材料和共享知识视图")
         if name == "resume":
             p.add_argument("--action-timeout", type=float, help="调整后续单动作超时（秒）；保留总预算和已用次数")
             p.add_argument("--agent-turn-timeout", type=float, help="调整后续单次Codex 调查最长时长（秒）；不改变正式执行超时或总预算")
@@ -99,22 +99,14 @@ def main(argv=None):
             if raw.get("framework_revision")!=FRAMEWORK_REVISION:
                 if args.command=="report" and (root/"report.md").is_file():
                     print((root/"report.md").read_text());return 0
-                print("历史运行只读；使用原始报告或离线导入，不能恢复到新语义。");return 2
+                print("历史运行只读；使用原始报告或原 Git 版本，不能恢复到新语义。");return 2
             state=Store(root).load()
             if args.command == "report":
                 if args.export_views:
-                    from consensus_assurance.reporting.chinese import Archive
-                    from consensus_assurance.workflow.audit_spec import audit_progress
-                    archive=Archive(state,root)
-                    spec_path=archive.path(f'audit-spec/v{state.audit_spec_version}.json')
-                    spec=archive.read(spec_path)
-                    if spec and spec.get('version')!=state.audit_spec_version:raise ValueError('Saved map version differs from state')
+                    from consensus_assurance.workflow.research import current_view
+                    write_json(root/'research.json',current_view(state,root))
                     write_json(root/'materials.json',[m.model_dump(mode='json') for m in state.materials])
-                    write_json(root/'graph.json',{'version':state.graph_version,
-                        **{name:[x.model_dump(mode='json') for x in getattr(state,name)] for name in ('claims','bindings','relations')}})
-                    if spec:write_json(root/'audit-spec.json',spec)
-                    write_json(root/'audit-progress.json',audit_progress(state.model_copy(update={'audit_spec_path':str(spec_path) if spec_path else None})))
-                    write_json(root/'plan.json',{'units':[u.model_dump(mode='json') for u in state.units],'selections':state.selections})
+                    write_json(root/'knowledge.json',[e.model_dump(mode='json') for e in state.knowledge])
                 print(render_report(state, root)); return 0
             config = Config.model_validate(state.config)
         else:

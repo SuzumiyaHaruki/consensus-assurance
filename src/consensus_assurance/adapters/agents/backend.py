@@ -203,14 +203,14 @@ class CodexAgent:
         filesystem={":root":"deny",":minimal":"read",":slash_tmp":"deny",
             str(Path(os.environ.get("TMPDIR") or "/tmp").resolve()):"deny",
             str(root/"agent-source"):"read",str(directory):"write",
-            str(root/"direct-checks"):"read",str(root/"submissions"):"read",
+            str(root/"fixed-experiments"):"read",str(root/"submissions"):"read",
             str(root/"state.json"):"read",str(root/"research.json"):"read",
-            str(root/"submission.schema.json"):"read",str(root/"product-schemas.json"):"read",
+            str(root/"submission.schema.json"):"read",
             str(root/"audit-method.md"):"read",
             str(root/"target-support"):"read",
             str(root/"build-inputs"):"read",
             str(root/"agent-inputs"):"read",
-            **{str(root/name):"read" for name in ("logs","findings","audit-spec","actions")},
+            **{str(root/name):"read" for name in ("logs","actions")},
             **{str(path):"read" for path in getattr(self,"read_only_roots",[]) if path.is_dir()},
             **{path:"read" for path in tool_paths},
             str(codex_home/"tmp"/"arg0"):"read",str(Path(executable).resolve().parent):"read"}
@@ -256,7 +256,7 @@ class CodexAgent:
         from consensus_assurance.adapters.validation import validation_tool
         tool = validation_tool(runner.root)
         protected = [source, Path(__file__)]
-        for folder in ("logs", "direct-checks"):
+        for folder in ("logs", "fixed-experiments"):
             path = runner.root / folder / "permission-canary"
             path.parent.mkdir(exist_ok=True)
             path.write_text("retained permission canary")
@@ -300,7 +300,7 @@ class CodexAgent:
             return verified, [check]
         finally:
             for path in [private, script, directory / '.write-control',
-                    *(runner.root/folder/'permission-canary' for folder in ('logs','direct-checks'))]:
+                    *(runner.root/folder/'permission-canary' for folder in ('logs','fixed-experiments'))]:
                 path.unlink(missing_ok=True)
 
     def prepare(self, runner, directory, snapshot_id):
@@ -432,7 +432,7 @@ class MockAgent:
 
     def investigate(self, runner, prompt, directory, snapshot_id, timeout, session_id=None):
         if self.cursor >= len(self.responses):
-            return CheckRun(action="agent_turn", status=ExecutionStatus.ERROR,
+            return CheckRun(action="agent_turn", cwd=str(directory), status=ExecutionStatus.ERROR,
                 snapshot_id=snapshot_id, origin=Origin.MOCK, reason="Audit fixture exhausted"), session_id, None
         item = self.responses[self.cursor]
         self.cursor += 1

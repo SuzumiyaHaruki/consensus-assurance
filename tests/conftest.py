@@ -1,63 +1,6 @@
-import shutil
 from pathlib import Path
 import pytest
-from consensus_assurance.core.config import Config
-from consensus_assurance.core.types import Analysis
-from consensus_assurance.core.proposals import GraphDraft
-from consensus_assurance.adapters.storage.snapshot import capture
-from regression_support import add_reads
-from consensus_assurance.workflow.graph import apply_graph
-
 ROOT = Path(__file__).resolve().parents[1]
-
-
-@pytest.fixture
-def prepared(tmp_path):
-    repo = tmp_path / "repo"
-    shutil.copytree(ROOT / "tests/fixtures/toy_protocol", repo)
-    snapshot = capture(repo)
-    from regression_support import toy_responses
-    responses = toy_responses(repo)
-    config = Config(protocol="toy", execution_backend="python", agent_backend="mock")
-    state = Analysis(mode="mock", analysis_mode="regression", config=config.model_dump(mode="json"), snapshot=snapshot)
-    add_reads(state, repo, responses['reads'])
-    apply_graph(state, GraphDraft.model_validate(responses['graph']))
-    return repo, state, responses
-
-
-@pytest.fixture
-def dependency_prepared(prepared):
-    from regression_support import add_dependency
-    add_dependency(prepared[1],prepared[2])
-    return prepared
-
-
-@pytest.fixture
-def full_refresh_equivalence(monkeypatch):
-    """Compare accepted transactions with the existing evaluator, without a second runtime."""
-    from types import SimpleNamespace
-    from consensus_assurance.workflow import audit, direct_checks
-    from consensus_assurance.workflow.research import view
-    compared = []
-    def refresh(state, artifact_ids, **kwargs):
-        direct_checks.refresh_assessments(state, artifact_ids, **kwargs)
-        if not state.monitor_results:return
-        expected = state.model_copy(deep=True)
-        direct_checks.refresh_assessments(expected, artifact_ids)
-        for key in ('monitor_results','checks','evidence','findings'):
-            assert getattr(state,key) == getattr(expected,key), key
-        actual = state.model_copy(deep=True)
-        for copy in (actual,expected):audit.sync_progress(SimpleNamespace(state=copy))
-        assert actual.units == expected.units
-        assert view(actual)['conclusions'] == view(expected)['conclusions']
-        stable = expected.model_dump(mode='json')
-        direct_checks.refresh_assessments(expected, artifact_ids)
-        assert expected.model_dump(mode='json') == stable
-        compared.append(artifact_ids)
-    monkeypatch.setattr(audit, 'refresh_assessments', refresh)
-    yield
-    assert compared, 'The regression must reach an actual measured result'
-
 
 @pytest.fixture
 def go_module(tmp_path):

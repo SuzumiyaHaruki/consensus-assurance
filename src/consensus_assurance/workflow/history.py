@@ -1,13 +1,11 @@
-"""Current structured state; old archives remain raw, read-only historical records."""
+"""Current method only; historical reports are read without loading an engine."""
 import json
-from pathlib import Path
 from consensus_assurance.core.types import Analysis
 from .prompts import manifest
 
 
 def load_analysis(path):
-    value = json.loads(Path(path).read_text())
-    revision = value.get("framework_revision")
-    if revision is not None and revision != manifest()["version"]:
-        raise ValueError("Historical framework revision is read-only; use its saved report or original Git revision")
-    return Analysis.model_validate(value)
+    raw = json.loads(path.read_text())
+    if raw.get("framework_revision") != manifest()["version"]:
+        raise ValueError("Historical run uses an incompatible method; use its original Git revision")
+    return Analysis.model_validate(raw)

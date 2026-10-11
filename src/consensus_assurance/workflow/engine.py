@@ -4,7 +4,7 @@ import shutil
 import time
 from pathlib import Path
 from consensus_assurance.core.config import Config
-from consensus_assurance.core.types import (Analysis, Assessment, CheckRun,
+from consensus_assurance.core.types import (Analysis, CheckRun,
     ExecutionStatus, uid, PendingAction, Record)
 from consensus_assurance.ports.interfaces import AgentBackend, ExecutionBackend
 from consensus_assurance.adapters.runners.process import ProcessRunner, output
@@ -27,16 +27,6 @@ class Engine:
 
     def checkpoint(self, event):
         self.budget.sync()
-        versions={o.id:o.version for o in self.state.claims+self.state.bindings+self.state.relations+self.state.units}
-        stale={a.id for a in self.state.direct_checks if any(versions.get(k)!=v for k,v in a.graph_versions.items())}
-        for evidence in self.state.evidence:
-            if evidence.direct_check_id in stale:
-                evidence.applicability='recheck_required';evidence.assessment=Assessment.STALE;evidence.stale_reason='Direct-check semantic inputs changed'
-        for finding in self.state.findings:
-            if finding.direct_check_id in stale:finding.applicability='recheck_required'
-        if stale:
-            from .direct_checks import refresh_assessments
-            refresh_assessments(self.state,stale,stale_only=True)
         self.store.save(self.state, event)
         from .research import current_view
         write_json(self.root/'research.json',current_view(self.state,self.root,self.implementation))
@@ -178,7 +168,7 @@ class Engine:
     def action(self, kind, resource, callback, inputs=None):
         from .action_identity import stable_input
         if kind=='agent_turn':self.validate_agent_inputs()
-        if kind in {'direct_execute','exploration'} and hasattr(self.implementation,'validate_builds'):
+        if kind in {'experiment_execute'} and hasattr(self.implementation,'validate_builds'):
             self.implementation.validate_builds(self.root,self.state.snapshot.id,self.runner.deadline)
         logical = stable_input(inputs or {})
         pending = self.state.pending_action
@@ -194,7 +184,7 @@ class Engine:
                     self.state.gaps.append("Interrupted operation has no completed receipt; retry in a fresh workspace")
                 self.state.action_history.append(pending.model_copy(deep=True))
             self.budget.take(resource)
-            pending = PendingAction(kind=kind, logical_input=logical, unit_id=self.state.active_unit_id)
+            pending = PendingAction(kind=kind, logical_input=logical)
             self.state.pending_action = pending
         directory = self.root / "actions" / pending.id
         pending.input_path = str(directory / "input.json")
@@ -226,5 +216,5 @@ class Engine:
         self.checkpoint("next_action_" + stage)
 
 
-    def graph_commit_hook(self,key):
+    def semantic_commit_hook(self,key):
         """Interruption seam after semantic manifest, before state checkpoint."""

@@ -27,7 +27,7 @@ def test_experiment_archives_inputs_separately_from_runtime_outputs(tmp_path):
 
 
 import pytest
-from consensus_assurance.core.proposals import Comparison, EventRequirement
+from consensus_assurance.core.types import Comparison, EventRequirement
 from consensus_assurance.workflow.observations import match_prerequisites
 
 
@@ -47,7 +47,7 @@ def test_event_identity_and_context_cannot_be_spliced():
 @pytest.mark.parametrize('variation',['same','context','operation','unrelated_event','future'])
 def test_R6_consequence_requires_correlated_participants(variation):
     from consensus_assurance.core.events import match_prerequisites
-    from consensus_assurance.core.proposals import EventRequirement, Comparison
+    from consensus_assurance.core.types import EventRequirement, Comparison
     requirement=EventRequirement(alias='producer',event='accepted',conditions=[Comparison(field='participant',value='a')])
     events=[{'participant':'a','event':'accepted','operation':'x','context':1},{'participant':'b','event':'returned','operation':'x','context':1}];index=1
     if variation=='context':events[0]['context']=2

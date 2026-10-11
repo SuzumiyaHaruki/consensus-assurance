@@ -1,8 +1,6 @@
 import pytest
-from consensus_assurance.core.types import Material,BindingAssociation
-from consensus_assurance.core.proposals import BindingDraft, GraphDraft
+from consensus_assurance.core.types import Material, SourceAnchor
 from consensus_assurance.workflow.locations import locate
-from consensus_assurance.workflow.graph import apply_graph
 
 
 def material(text,start=1,file='sample.go'):
@@ -10,7 +8,7 @@ def material(text,start=1,file='sample.go'):
 
 
 def binding(m,symbol='accept',start=2,end=2,anchor=None):
-    return BindingDraft(id='code',associations=[dict(claim_id='O',source_ids=[m.id],rationale='Selected fixture operation')],material_id=m.id,symbol=symbol,start_line=start,end_line=end,description='Observed operation body',pending=[],anchor=anchor)
+    return SourceAnchor(material_id=m.id, symbol=symbol, start_line=start, end_line=end, anchor=anchor)
 
 
 def test_declaration_outside_read_material_requires_reading():
@@ -20,18 +18,6 @@ def test_declaration_outside_read_material_requires_reading():
     assert locate(b,{partial.id:partial,complete.id:complete})[0]['material_id']==complete.id
     prefix=material('func accept() {\n  value++\n')
     assert not locate(binding(prefix),{prefix.id:prefix})[0]['boundary_complete']
-
-
-def test_multiple_obligations_share_one_binding_with_sourced_associations(prepared):
-    _, state, responses = prepared;p=GraphDraft.model_validate(responses['graph']);b=p.bindings[0]
-    b.associations.append(BindingAssociation(claim_id=p.claims[-1].id,source_ids=[b.material_id],rationale='The same entry also consumes the producer condition'))
-    apply_graph(state,p)
-    assert len(state.bindings[0].associations)==2
-
-
-def test_new_association_requires_its_own_explanation():
-    from pydantic import ValidationError
-    with pytest.raises(ValidationError):BindingAssociation.model_validate({'claim_id':'O'})
 
 
 def test_qualified_interface_member_requires_actual_owner_and_anchor():

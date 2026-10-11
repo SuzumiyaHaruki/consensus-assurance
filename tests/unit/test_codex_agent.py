@@ -164,8 +164,8 @@ def test_effective_profile_exposes_results_and_retains_root_network_boundary(tmp
     monkeypatch.setattr('shutil.which',lambda name:'/usr/bin/'+name)
     monkeypatch.setenv('TMPDIR',str(tmp_path/'host-tmp'))
     options='\n'.join(CodexAgent().permission_options(tmp_path,tmp_path/'draft'))
-    for path in ('agent-source','submissions','logs','direct-checks','actions','state.json','research.json',
-            'submission.schema.json','product-schemas.json','audit-method.md','target-support','build-inputs','agent-inputs'):
+    for path in ('agent-source','submissions','logs','fixed-experiments','actions','state.json','research.json',
+            'submission.schema.json','audit-method.md','target-support','build-inputs','agent-inputs'):
         assert json.dumps(str(tmp_path/path))+'="read"' in options
     assert 'default_permissions="ca_audit"' in options and 'permissions.ca_audit.filesystem=' in options
     assert json.dumps(str(tmp_path/'source')) not in options
@@ -202,7 +202,7 @@ def test_one_audit_runtime_and_methods_match_product_interface(tmp_path):
     assert (e.root/'audit-method.md').read_text()==text
     resource_root=Path('src/consensus_assurance/resources')
     assert text=='\n'.join((resource_root/p).read_text() for p in paths)
-    assert state.framework_revision=='audit-products-v61'
+    assert state.framework_revision=='audit-products-v62'
     assert paths==['system.md','skills/consensus-analysis/SKILL.md','skills/evidence-review/SKILL.md','tasks/audit.md']
 
 
@@ -234,7 +234,7 @@ def test_incomplete_or_changed_agent_session_is_not_a_success(tmp_path,events,se
 
 def test_helper_preflight_rejects_aliases_collisions_and_target_replacement(tmp_path):
     from consensus_assurance.adapters.runners.experiment import install_harness
-    from consensus_assurance.core.proposals import Harness
+    from consensus_assurance.core.types import Harness
     (tmp_path/'target.py').write_text('original')
     for files in ({'main.py':'replacement'}, {'a/./x.py':'one','a/x.py':'two'},
             {'helper':'file','helper/a.py':'nested'}, {'target.py':'replacement'},

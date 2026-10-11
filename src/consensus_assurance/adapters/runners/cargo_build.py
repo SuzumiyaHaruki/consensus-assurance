@@ -219,14 +219,10 @@ class PreparationFailed(Exception):
 def build_inputs(adapter,root,state,read):
     """Read bounded preparation metadata, never validate tools or materialize a seed."""
     selected=[(adapter.package,adapter.harness_filename)]
-    for artifact in state.direct_checks:
-        harness=read(f'direct-checks/{artifact.operation_id}/plan.json').get('harness',{})
-        if harness.get('kind')=='rust_test':
-            package=harness.get('execution_package') or adapter.package
-            selected.append((package,str(Path(package)/'tests'/Path(artifact.harness_path).name)))
-    current=state.current_submission
-    if current.get('harness',{}).get('kind')=='rust_test':
-        selected.append((current['harness']['execution_package'],current['harness_filename']))
+    for artifact in state.experiments:
+        harness = artifact.basis.harness
+        if harness.kind == 'rust_test':
+            selected.append((harness.execution_package or adapter.package, artifact.harness_filename))
     paths={p.relative_to(root) for p in (root/'build-inputs/targets').glob('**/basis.json')}
     for package,filename in selected:
         command=adapter.experiment_command(package,filename)

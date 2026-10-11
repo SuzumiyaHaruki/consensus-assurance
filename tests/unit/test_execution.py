@@ -8,7 +8,7 @@ from consensus_assurance.core.config import locate_repo
 from consensus_assurance.adapters.agents.backend import classify_failure
 from consensus_assurance.adapters.runners.process import ProcessRunner
 from consensus_assurance.core.events import match_prerequisites
-from consensus_assurance.core.proposals import EventRequirement
+from consensus_assurance.core.types import EventRequirement
 from consensus_assurance.adapters.storage.files import redact
 from consensus_assurance.adapters.storage.snapshot import capture
 

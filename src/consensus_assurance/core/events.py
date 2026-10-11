@@ -1,5 +1,5 @@
 """Bounded event lookup and correlation, independent of workflow and tools."""
-from .proposals import EventRequirement, Comparison
+from .types import EventRequirement, Comparison
 
 MISSING = object()
 

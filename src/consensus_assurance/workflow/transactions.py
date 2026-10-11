@@ -4,15 +4,14 @@ import json
 import re
 from consensus_assurance.core.types import Analysis
 from consensus_assurance.adapters.storage.files import write_json
-from .mutations import adopt
 from .budget import BudgetTracker
 
 EXCLUDED={'checks','tools','elapsed_seconds','created_at'}
 
 
-def commit_graph(engine,key,payload,callback):
+def commit_update(engine,key,payload,callback):
     if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.:-]*',key) or '..' in key:raise ValueError('Invalid semantic operation ID')
-    path=engine.root/'graph-commits'/(key+'.json')
+    path=engine.root/'semantic-commits'/(key+'.json')
     recorded=engine.state.applied_operations.get(key)
     if recorded:
         if json.loads(path.read_text())['input']!=payload:raise ValueError('Operation identity reused with different semantic input')
@@ -30,9 +29,9 @@ def commit_graph(engine,key,payload,callback):
         fields=[k for k in after if k not in EXCLUDED and before[k]!=after[k]]
         operation={'input':payload,'before':{k:before[k] for k in fields},'after':{k:after[k] for k in fields}}
         write_json(path,operation)
-        engine.graph_commit_hook(key)
+        engine.semantic_commit_hook(key)
     current=engine.state.model_dump(mode='json')
     if any(current[k]!=v for k,v in operation['before'].items()):raise ValueError('Semantic operation base changed; cannot replay a prepared mutation')
     trial=Analysis.model_validate({**current,**operation['after']})
-    adopt(engine.state,trial)
+    engine.state.__dict__.update(trial.__dict__)
     engine.checkpoint('semantic_operation_committed')

@@ -1,156 +1,7 @@
-"""Current research projection and attributed decisions; history stays in state."""
-from .audit_spec import load, audit_object_index
-from .reviews import open_issues
-from consensus_assurance.core.types import ACTIVITY_ROLES, CheckRun
-
-
-def source_explanation(state, unit):
-    """Return the accepted answer selecting no execution, without changing execution progress."""
-    from .audit_spec import QUESTION_BASIS
-    candidate = next((c for c in state.question_candidates if c.id==unit.candidate_id), None)
-    if (not candidate or candidate.status not in {'explained','closed'} or not candidate.check_ids or
-            unit.obligation_ids != [candidate.obligation_id] or not unit.audit_question or
-            state.config.get('directed_question') or any(a.unit_id==unit.id for a in state.direct_checks)):
-        return None
-    if state.pending_action and state.pending_action.unit_id==unit.id:return None
-    if any(getattr(candidate.question,k)!=getattr(unit.audit_question,k) for k in QUESTION_BASIS):return None
-    record=next((s for s in reversed(state.selections) if s['operation_id']==candidate.check_ids[-1]), {})
-    versions=record.get('accepted_versions',{})
-    owned={'units':[unit.id], 'claims':unit.obligation_ids, 'bindings':unit.binding_ids, 'relations':unit.relation_ids}
-    if record.get('action')!='explained' or any(versions.get(kind,{}).get(obj.id)!=obj.version
-            for kind,ids in owned.items() for obj in getattr(state,kind) if obj.id in ids):return None
-    targets={candidate.id, *(id for ids in owned.values() for id in ids)}
-    if any(i.target_id in targets for i in open_issues(state)):return None
-    return record['operation_id']
-
-
-def pending_work(state):
-    return ([{'id':u.id, 'candidate_id':u.candidate_id, 'kind':'unit',
-        'remaining':u.remaining_obligation_ids or u.obligation_ids, 'reasons':u.coverage_limitations}
-        for u in state.units if u.status not in {'checked','revised'} and not source_explanation(state,u)]
-        + [{'id':i.id, 'kind':'review_issue', 'reasons':[i.explanation], 'source_ids':i.source_ids}
-            for i in open_issues(state)]
-        + [{'id':c.id, 'kind':'candidate', 'reasons':c.question.unknowns}
-            for c in state.question_candidates if not c.obligation_id and c.status in {'active','blocked'}])
-
-
-def unit_progress(state, unit, artifacts, assessments):
-    """Locate current records; incomplete disposition does not imply missing review."""
-    rows = []
-    for claim in unit.obligation_ids:
-        fixed = [a for a in artifacts if a.unit_id==unit.id and a.claim_id==claim]
-        if not fixed:rows.append({'claim_id':claim, 'record_status':'no_fixed_check'})
-        for artifact in fixed:
-            checks = [c for c in state.checks if c.direct_check_id==artifact.id and c.action=='direct_check']
-            if not checks:rows.append({'claim_id':claim, 'artifact_id':artifact.id, 'record_status':'no_execution'})
-            for check in checks:
-                records = [r for r in assessments if r.get('experiment_check_id')==check.id and r.get('claim_id')==claim]
-                status = ('assessed' if records and all(r.get('reviewed_complete') for r in records) else
-                    'execution_incomplete' if check.status.value!='completed' or check.exit_code not in (0,None) else
-                    'no_assessment' if not records else 'assessment_incomplete')
-                rows.append({'claim_id':claim, 'artifact_id':artifact.id, 'check_id':check.id, 'record_status':status,
-                    'comparison_observed':True if any(comparison_observed(r) for r in records) else
-                        False if records and all(comparison_observed(r) is False for r in records) else None})
-    return rows
-
-
-def source_refs(state, refs, include_executions=False):
-    """Resolve retained ownership; execution observations need not have a graph yet."""
-    links = {m.id:{m.id} for m in state.materials}
-    links.update({c.id:set(c.question.source_ids) for c in state.question_candidates})
-    links.update({u.id:set(u.binding_ids+[u.candidate_id]) for u in state.units})
-    links.update({b.id:{b.material_id} for b in state.bindings})
-    links.update({c.id:set(c.source_ids) for c in state.claims})
-    links.update({a.id:{a.unit_id} for a in state.direct_checks})
-    links.update({e.id:{e.check_id} for e in state.evidence+state.findings})
-    links.update({c.id:{c.direct_check_id} - {None} for c in state.checks})
-    links.update({r.id:{ref for item in r.items for ref in item.source_ids} for r in state.semantic_reviews})
-    links.update({key:set(obj.get('source_ids',[])) for key,obj in audit_object_index(load(state)).items()})
-    links.update({s['operation_id']:set(s.get('candidate_ids',[])+s.get('feedback',{}).get('ref_ids',[]))
-        for s in state.selections})
-    found, seen, todo = set(), set(), list(refs)
-    materials = {m.id for m in state.materials}
-    if include_executions:
-        materials.update(c.id for c in state.checks if c.action in
-            {'exploration','direct_check'})
-    while todo:
-        ref = todo.pop()
-        if ref in seen:continue
-        seen.add(ref)
-        if ref in materials:found.add(ref)
-        else:todo.extend(links.get(ref,()))
-    return found
-
-
-def capacity(state):
-    limits = state.config.get('budget',{})
-    names = ('agent_calls','experiments')
-    remaining = {name:max(0,limits.get(name,0)-state.usage.get(name,0)) for name in names}
-    seconds=max(0,limits.get('total_seconds',0)-state.elapsed_seconds)
-    execution = state.config.get('allow_experiments',False) and state.config.get('execution_backend','none')!='none' and remaining['experiments'] > 0
-    return {'remaining':remaining, 'remaining_seconds':seconds,
-        'direct_execution':bool(seconds and execution),
-        'source_investigation':bool(seconds and remaining['agent_calls']),
-        'exhausted':[name for name,value in remaining.items() if not value]}
-
-
-def frontier(state, spec, results=()):
-    """Project sourced unknowns and actual edges, never synthesize lifecycle products."""
-    candidates = state.question_candidates
-    disputed = {i.target_id for i in open_issues(state)}
-    completed = {c.id for c in candidates if (units := [u for u in state.units if u.candidate_id==c.id and u.status!='revised'])
-        and all(u.status=='checked' and not u.remaining_obligation_ids for u in units)
-        and not ({c.id}|{a.id for a in state.direct_checks if a.unit_id in {u.id for u in units}})&disputed}
-    paused = [c.id for c in candidates if c.status=='paused' and (c.id not in completed or c.resume_conditions)]
-    relationships = []
-    for fact in spec.facts if spec else []:
-        investigations = [c for c in candidates if fact.id in c.question.fact_ids]
-        referenced = {b for c in investigations for b in c.question.behavior_ids}
-        edges = set(fact.established_by+fact.consumed_by+fact.invalidators+fact.reinterpreters)
-        relationships.append({'fact_id':fact.id, 'source_ids':fact.source_ids,
-            'unknowns':fact.unknowns, 'producers':fact.established_by, 'consumers':fact.consumed_by,
-            'invalidators':fact.invalidators, 'reinterpreters':fact.reinterpreters,
-            'unreferenced_behavior_ids':sorted(edges-referenced),
-            'investigations':[{'candidate_id':c.id,'status':c.status,'lifecycle':c.question.obligation_relation_kind,
-                'question':c.question.question,'remaining':c.question.unknowns,'resume_conditions':c.resume_conditions,
-                'source_explanation':next((source_explanation(state,u) for u in state.units if u.candidate_id==c.id and u.status!='revised'),None),
-                'results':[{'claim_id':r['claim_id'],'disposition':r['disposition']} for r in results if r['candidate_id']==c.id]}
-                for c in investigations], 'coverage':'Described relationships; selected checks settle only their explicit scope'})
-    return {'relationships':relationships, 'paused_candidate_ids':paused,
-        'behavior_unknowns':[{'behavior_id':b.id,'activity':b.primary_activity,'unknowns':b.unknowns,
-            'source_ids':b.source_ids,'protections':b.existing_protections} for b in spec.behaviors if b.unknowns] if spec else [],
-        'surfaces':[s.model_dump(mode='json') for s in spec.surfaces] if spec else [],
-        'core_regions':[{'activity':a,'entries':[x.model_dump(mode='json') for x in spec.activities if x.class_id==a] if spec else [],
-            'coverage':'Partial understanding; neither candidate labels nor object counts establish exhaustion'}
-            for a,role in ACTIVITY_ROLES.items() if role['role']=='core']}
-
-
-def comparison_observed(record):
-    """An assessment alone is not an evaluated comparison; missing legacy fields stay unknown."""
-    properties=record.get('properties')
-    if properties is None:return None
-    if any(p.get('evaluated_indices') or p.get('witness_complete') for p in properties):return True
-    return False if all('evaluated_indices' in p for p in properties) else None
-
-
-def conclusions(state, records):
-    """One result per logical obligation, with artifact versions retained as evidence."""
-    result=[]
-    for claim in state.claims:
-        observed=[r for r in records if r.get('claim_id')==claim.id]
-        if not observed:continue
-        confirmed=any(r.get('confirmed') and r.get('outcome')=='violated' for r in observed)
-        checked=all(r.get('reviewed_complete') for r in observed)
-        unit=next((u for u in state.units if u.status!='revised' and claim.id in u.obligation_ids),None)
-        result.append({'claim_id':claim.id,'candidate_id':unit.candidate_id if unit else None,
-            'question':unit.audit_question.question if unit and unit.audit_question else None,
-            'concern':claim.concern,'description':claim.description,
-            'disposition':'confirmed_in_scope' if confirmed else 'bounded_no_violation' if checked and all(r.get('outcome')=='holds' for r in observed) else 'investigation_lead',
-            'scope':claim.scope.model_dump(mode='json'),'check_ids':[r['experiment_check_id'] for r in observed],
-            'comparison_observed':True if any(comparison_observed(r) for r in observed) else
-                False if all(comparison_observed(r) is False for r in observed) else None,
-            'blockers':list(dict.fromkeys(b for r in observed for b in r['blockers']))})
-    return result
+"""Read-only current-work projections over semantic owners and immutable receipts."""
+from consensus_assurance.core.types import FixedExperiment
+from .knowledge import open_gaps, uses_of
+from .experiments import assessment
 
 
 def execution_cost(check):
@@ -164,401 +15,107 @@ def execution_cost(check):
 
 
 def costs(state):
-    rejected={s['operation_id'] for s in state.selections if s['action']=='rejected'}
-    checks=list({c.id:c for c in state.checks}.values())
-    calls=[c for c in checks if c.action=='agent_turn']
-    formal={c.id:execution_cost(c) for c in checks if c.action in {'direct_check','exploration'}}
+    checks = {c.id:c for c in state.checks if c.action == 'experiment'}
+    values = {id:execution_cost(c) for id,c in checks.items()}
     def total(key):
-        known=[c[key] for c in formal.values() if c[key] is not None]
-        return sum(known) if known or not formal else None
-    return {'agent_calls':state.usage.get('agent_calls',0),'agent_seconds':sum(execution_cost(c)['process_seconds'] or 0 for c in calls),
-        'rejected_calls':len(rejected),'rejected_call_seconds':sum(execution_cost(c)['process_seconds'] or 0 for c in calls if c.id in rejected),
-        'formal_executions':len(formal),'formal_execution_seconds':total('process_seconds'),
-        'target_action_cost':{'known_seconds':total('action_seconds'),
-            'unrecorded_check_ids':[id for id,c in formal.items() if c['action_seconds'] is None],
-            'process_unrecorded_check_ids':[id for id,c in formal.items() if c['process_seconds'] is None]},
-        'elapsed_seconds':state.elapsed_seconds,
-        'interpretation':'formal_execution_seconds is controlled target process time (checks and explorations); target_action_cost includes preparation only where recorded. Parent actions and child steps are not added together. Rejected calls may contain useful investigation; wall time is not token cost'}
+        known = [v[key] for v in values.values() if v[key] is not None]
+        return sum(known) if known or not values else None
+    return {'agent_calls':state.usage.get('agent_calls',0), 'target_executions':len(checks),
+            'process_seconds':total('process_seconds'), 'action_seconds':total('action_seconds'),
+            'unrecorded_action_ids':[id for id,v in values.items() if v['action_seconds'] is None],
+            'elapsed_seconds':state.elapsed_seconds}
 
 
-def preview(text):
-    return text if len(text) <= 240 else text[:240] + '…'
-
-
-def feedback_links(state, ref_ids, after=None):
-    """Locate accepted, explicit references; related does not mean answered or resolved."""
-    links, following = [], after is None
-    for selection in state.selections:
-        if following and 'accepted_versions' in selection and not selection.get('duplicate_of'):
-            refs = sorted(set(ref_ids) & set(selection.get('feedback',{}).get('ref_ids',[])))
-            if refs:
-                operation = selection['operation_id']
-                links.append({'operation_id':operation, 'ref_ids':refs,
-                    'submission':f'submissions/{operation}/accepted.json'})
-        if selection['operation_id'] == after:following = True
-    return links
-
-
-def exploration_results(state, read):
-    """Join accepted products, action identities, executions and explicit later feedback."""
-    actions = {a.id:a for a in [*state.action_history, *([state.pending_action] if state.pending_action else [])]}
-    result = []
-    for selection in state.selections:
-        if selection['action'] != 'explore' or 'accepted_versions' not in selection:continue
-        operation = selection['operation_id']
-        submission = f'submissions/{operation}/accepted.json'
-        product = read(submission)
-        owned = {a.id for a in actions.values() if a.kind == 'exploration' and a.logical_input.get('operation_id') == operation}
-        checks = {c.id:c for c in state.checks if c.action == 'exploration' and c.pending_action_id in owned}
-        handoffs = feedback_links(state,checks,after=operation)
-        result.append({'operation_id':operation, 'submission':submission,
-            'question':product.get('question'), 'rationale':product.get('rationale'),
-            'ref_ids':product.get('feedback',{}).get('ref_ids',[]) if product.get('feedback') else [],
-            'source_ids':[s['id'] for s in product.get('sources',[])],
-            'inputs':[f'submissions/{operation}/inputs/{name}' for name in
-                dict.fromkeys([product.get('harness_path'),*product.get('files',{}).values()]) if name],
-            'executions':[{'check_id':c.id,'status':c.status.value,'exit_code':c.exit_code,
-                'started_at':c.started_at,'ended_at':c.ended_at,'record':f'logs/{c.id}/check.json',
-                'execution_package':c.parameters.get('execution_package'),'harness_filename':c.parameters.get('harness_filename'),
-                'stdout':c.stdout,'stderr':c.stderr,'artifacts':c.artifacts} for c in checks.values()],
-            'feedback':handoffs, 'without_followup':[id for id in checks if not any(id in h['ref_ids'] for h in handoffs)]})
-    return result
-
-
-def view(state, compact=False):
-    spec = load(state)
-    current = [u for u in state.units if u.status != 'revised']
-    superseded = {a.previous_id for a in state.direct_checks}
-    artifacts = [a for a in state.direct_checks if a.id not in superseded and
-        a.unit_id in {u.id for u in current}]
-    records = [r for r in state.monitor_results if r.get('direct_check_id') in {a.id for a in artifacts}]
-    results=conclusions(state,records)
-    issues=open_issues(state)
-    disputed={i.target_id for i in issues}
-    focus_units={u.id for u in current if (u.status!='checked' and not source_explanation(state,u)) or u.id==state.active_unit_id}
-    focus_units.update(a.unit_id for a in state.direct_checks if a.id in disputed)
-    focus_candidates={c.id for c in state.question_candidates if c.status=='active' or c.id in disputed}
-    focus_candidates.update(u.candidate_id for u in state.units if u.id in focus_units)
-    focus_claims={id for u in state.units if u.id in focus_units for id in u.obligation_ids}
-    def project(obj,fields):return obj.model_dump(mode='json',include=fields if compact else None)
-    overview=spec.core_overview if spec else None
-    directed=bool((state.config.get('directed_question') or '').strip())
-    drafts={s['draft_id']:s for s in state.selections if s.get('draft_id')}
-    result = {'audit_spec_path':state.audit_spec_path, 'audit_spec_version':state.audit_spec_version,
-        'activity_roles':ACTIVITY_ROLES, 'activity_focus':state.config.get('activity_focus',[]),
-        'core_overview':overview.model_dump(mode='json') if overview else None,
-        'understanding_changes':[{'operation_id':s['operation_id'],'version':s['accepted_versions']['audit_spec'],
-            'delta':s.get('map_delta',{}),'explanations':s.get('map_changes',{}),'effects':s.get('map_effects',{})}
-            for s in state.selections if s.get('map_updated')],
-        'next_objective':{'action':'investigate_and_refocus',
-            'boundary':'user_directed' if directed else 'open_audit',
-            'reason':'Refine broad understanding and local source relationships together; choose the missing fact that changes the current answer'},
-        'drafts':[s for s in drafts.values() if s['draft_status']!='accepted'],
-        'candidates':[],
-        'units':[{**(project(u,set(type(u).model_fields)-{'audit_question'} if u.id in focus_units else
-            {'id','version','candidate_id','obligation_ids','status'}) if compact else u.model_dump(mode='json',exclude={'audit_question'})),
-            'progress':unit_progress(state,u,artifacts,records), 'source_explanation':source_explanation(state,u)} for u in current],
-        'claims':[{**project(c,None if c.id in focus_claims else {'id','version','concern'}),
-            **({'description_preview':preview(c.description)} if compact and c.id not in focus_claims else {})}
-            for c in state.claims if any(c.id in u.obligation_ids for u in current)],
-        'artifacts':[project(a,{'id','version','unit_id','claim_id',
-            'plan_path','harness_path','graph_versions','previous_id'}) for a in artifacts], 'assessments':records,
-        'frontier':frontier(state,spec,results), 'capacity':capacity(state), 'conclusions':results, 'costs':costs(state),
-        'map_handoffs':feedback_links(state,audit_object_index(spec)),
-        'handoffs':[s for s in state.selections if s.get('feedback') or s['action'] in {'pause','explained'} or s['action']=='stop' and s.get('scope')!='run'],
-        'pending_work':pending_work(state), 'current':{k:v for k,v in state.current_submission.items() if k!='harness'},
-        'latest_decision':state.selections[-1] if state.selections else None,
-        'stop':state.run_stop, 'stop_reason':state.stop_reason}
-    for c in state.question_candidates:
-        exclude={'history','check_ids'}
-        if compact and c.id not in focus_candidates:
-            exclude.update({'question','stop_reason'})
-            if c.id not in result['frontier']['paused_candidate_ids']:exclude.add('resume_conditions')
-        candidate=c.model_dump(mode='json',exclude=exclude)
-        if 'question' in exclude:
-            candidate.update(question_preview=preview(c.question.question),unknowns=c.question.unknowns,
-                audit_spec_version=c.question.audit_spec_version)
-        candidate['result_claim_ids' if compact else 'results']=[r['claim_id'] if compact else
-            {k:r[k] for k in ('claim_id','description','disposition')} for r in results if r['candidate_id']==c.id]
-        candidate['open_issue_ids']=[i.id for i in issues if i.target_id==c.id]
-        units={u.id for u in state.units if u.candidate_id==candidate['id']}
-        owned={a.id for a in state.direct_checks if a.unit_id in units}
-        candidate['executions']=[{'check_id':c.id,'artifact_id':c.direct_check_id,
-            'action':c.action,'status':c.status.value,'outcome':c.outcome}
-            for c in state.checks if c.direct_check_id in owned]
-        result['candidates'].append(candidate)
-    return result
+def available(state):
+    budget = state.config['budget']
+    return {'seconds':max(0, budget['total_seconds'] - state.elapsed_seconds),
+            **{k:max(0, budget[k] - state.usage.get(k,0)) for k in ('agent_calls','experiments')}}
 
 
 def current_view(state, root, implementation=None):
-    """Rebuild the work index with exact history locators and trusted runtime context."""
     from consensus_assurance.adapters.validation import validation_tool
     from .audit import Inputs
-    from .review_contract import target_contract
-    result = view(state, compact=True)
     def read(path):
-        try:return Inputs(root).json(path)
-        except (OSError, ValueError):return {}
-    result['explorations'] = exploration_results(state, read)
-    for exploration in result['explorations']:
-        for field in ('question','rationale'):
-            if exploration[field]:exploration[field]=preview(exploration[field])
-    def record(collection, match, **extra):
-        return {'path':'state.json', 'collection':collection, 'match':match, **extra}
-    issues = open_issues(state)
-    for candidate in result['candidates']:
-        candidate['record'] = record('question_candidates', {'id':candidate['id']})
-        for execution in candidate['executions']:
-            execution['record'] = record('checks', {'id':execution['check_id']})
-    for collection in ('units','claims'):
-        for obj in result[collection]:obj['record']=record(collection,{'id':obj['id'],'version':obj['version']})
-    objects = {(name,obj.id):obj for name in ('claims','bindings','relations','units') for obj in getattr(state,name)}
-    for artifact in result['artifacts']:
-        artifact['record'] = record('direct_checks', {'id':artifact['id']})
-        artifact['basis'] = []
-        for id,version in artifact['graph_versions'].items():
-            kind = next((name for name,obj_id in objects if obj_id == id), None)
-            if kind is None:
-                kind = next(h['kind'] for h in state.graph_history if h['id']==id and h['version']==version)
-            obj = objects.get((kind,id))
-            reference = (record(kind, {'id':id,'version':version}) if obj and obj.version==version else
-                record('graph_history', {'kind':kind,'id':id,'version':version}, field='record'))
-            artifact['basis'].append(reference)
-        if artifact.get('previous_id'):
-            artifact['previous_record'] = record(artifact['record']['collection'], {'id':artifact['previous_id']})
-    result['assessments'] = [{**{k:r[k] for k in ('claim_id','direct_check_id','experiment_check_id',
-        'confirmed','outcome','blockers','bounded_complete','reviewed_complete','correspondence','review_ids','open_issue_ids') if k in r},
-        'comparison_observed':comparison_observed(r),
-        'comparison_diagnostics':[{'checker_id':p['checker_id'],'reason':preview(d['reason'])}
-            for p in r.get('properties',[]) for d in p.get('diagnostics',[])[:1]],
-        'record':record('monitor_results', {'experiment_check_id':r['experiment_check_id'], 'claim_id':r['claim_id']})}
-        for r in result['assessments']]
-    for conclusion in result['conclusions']:
-        for key in ('description','question','scope'):conclusion.pop(key, None)
-    for relationship in result['frontier']['relationships']:
-        relationship['candidate_ids'] = [c['candidate_id'] for c in relationship.pop('investigations')]
-    result['understanding_changes'] = [{'operation_id':c['operation_id'],'version':c['version'],
-        'record':record('selections', {'operation_id':c['operation_id']})} for c in result['understanding_changes']]
-    handoffs = result['handoffs']
-    recent = next((s['operation_id'] for s in reversed(handoffs) if s.get('feedback') and not s.get('duplicate_of')), None)
-    result['handoffs'] = [{**{k:s[k] for k in ('operation_id','action','candidate_ids','duplicate_of') if k in s},
-        'answered_preview':preview(s.get('feedback',{}).get('answered',s['rationale'])),
-        'ref_ids':s.get('feedback',{}).get('ref_ids',s.get('ref_ids',[])),
-        'record':record('selections', {'operation_id':s['operation_id']}),
-        **({'feedback':s['feedback']} if s['operation_id']==recent else {})} for s in handoffs]
-    for pending in result['pending_work']:
-        collection = {'unit':'units','candidate':'question_candidates','review_issue':'review_issues'}[pending['kind']]
-        pending['record'] = record(collection, {'id':pending['id']})
-        pending.pop('reasons', None)
-    result['review_issues'] = [i.model_dump(mode='json') for i in issues]
-    result['current'].pop('result', None)
-    if result['latest_decision']:
-        last = result['latest_decision']
-        result['latest_decision'] = {'operation_id':last['operation_id'],'action':last['action'],
-            **({'duplicate_of':last['duplicate_of'],'next_step':'Accepted without new knowledge; investigate another sourced discriminator within remaining capacity'} if last.get('duplicate_of') else {}),
-            'record':record('selections', {'operation_id':last['operation_id']})}
-    targets=[a for a in state.direct_checks if a.id in {x['id'] for x in result['artifacts']}]
-    targets.extend(c for c in state.question_candidates if any(i.target_id==c.id for i in issues))
-    contracts=[target_contract(state,a) for a in targets]
-    build_inputs=implementation.build_inputs(root,state,read) if hasattr(implementation,'build_inputs') else []
-    for item in build_inputs:
-        latest=item['latest_preparation']
-        if latest:
-            latest.update(execution_cost(CheckRun.model_validate(read(latest['record']))))
-    result.update(run_id=state.id,snapshot_id=state.snapshot.id,elapsed_seconds=state.elapsed_seconds,
-        source_path=str(root/'agent-source'),draft_path=str(root/'draft'),state_path=str(root/'state.json'),
-        product_schemas=str(root/'product-schemas.json'),submission_schema=str(root/'submission.schema.json'),
-        method_path=str(root/'audit-method.md'),
-        build_inputs=build_inputs,
-        directed_question=state.config.get('directed_question'),tools=state.tools,
-        implementation={'name':implementation.name,'harness_kind':implementation.harness_kind,
-            'default_execution_package':getattr(implementation,'package',None),
+        try:
+            return Inputs(root).json(path)
+        except (OSError,ValueError):
+            return {}
+    questions = []
+    for q in state.investigations:
+        related = [a.id for a in state.experiments if a.investigation_id == q.id]
+        check = next((c for c in reversed(state.checks) if c.experiment_id in related), None)
+        opinions = [i for i in state.interpretations if i.investigation_id == q.id]
+        questions.append({'id':q.id, 'version':q.version, 'question':q.question, 'hypothesis':q.hypothesis,
+            'discriminator':q.discriminator, 'disposition':q.disposition, 'parent_id':q.parent_id,
+            'source_ids':q.source_ids, 'counterevidence':q.counterevidence,
+            'limitations':q.limitations, 'resume_conditions':q.resume_conditions,
+            'knowledge':[u.model_dump(mode='json') for u in q.knowledge],
+            'open_gaps':[g.model_dump(mode='json') for g in open_gaps(state,q.id)],
+            'latest_execution':{'id':check.id, 'experiment_id':check.experiment_id, 'status':check.status.value,
+                'exit_code':check.exit_code, 'record':f'logs/{check.id}/check.json',
+                'observations':f'logs/{check.id}/observations.json'} if check else None,
+            'latest_interpretation':opinions[-1].model_dump(mode='json') if opinions else None,
+            'record':{'path':'state.json', 'collection':'investigations','id':q.id}})
+    knowledge = [{**e.model_dump(exclude={'history'}), 'uses':uses_of(state,e.id,e.revision),
+                  'last_correction':{k:e.history[-1][k] for k in ('revision','correction','recorded_uses','affected_uses')}
+                      if e.history else None} for e in state.knowledge]
+    results = []
+    for raw in state.experiments:
+        a = FixedExperiment.model_validate(raw)
+        checks = [c for c in state.checks if c.experiment_id == a.id]
+        results.append({'id':a.id, 'investigation_id':a.investigation_id, 'previous_id':a.previous_id,
+            'basis':f'fixed-experiments/{a.id}/basis.json',
+            'results':[{k:v for k,v in assessment(state,root,a,c).items() if k not in {'events','comparisons'}} for c in checks]})
+    return {'run_id':state.id, 'method':state.framework_revision, 'allocation':available(state),
+        'source_path':str(root/'agent-source'), 'draft_path':str(root/'draft'), 'state_path':str(root/'state.json'),
+        'submission_schema':str(root/'submission.schema.json'), 'method_path':str(root/'audit-method.md'),
+        'directed_question':state.config.get('directed_question'), 'activity_focus':state.config.get('activity_focus',[]),
+        'investigations':questions, 'knowledge':knowledge, 'experiments':results,
+        'current':state.current_submission, 'validation':validation_tool(root), 'tools':state.tools,
+        'build_inputs':implementation.build_inputs(root,state,read) if hasattr(implementation,'build_inputs') else [],
+        'implementation':{'name':implementation.name, 'harness_kind':implementation.harness_kind,
             'harness_filename':implementation.harness_filename,
-            'execution_isolation':state.config.get('execution_isolation'),
-            'instructions':implementation.harness_instructions + '\nOrdinary Codex shell networking is disabled. ' + {
-                'bwrap':'Formal execution uses a private network namespace: TCP between processes in the same invocation is available; host and external networking are unavailable.',
-                'workspace':'Formal execution uses workspace mode without network namespace isolation; this mode supplies no private-network boundary.',
-            }.get(state.config.get('execution_isolation'),'Formal execution isolation is not recorded; consult the run configuration.'),
+            'default_execution_package':getattr(implementation,'package',None),
+            'instructions':implementation.harness_instructions,
+            'network':'Agent shell networking is disabled. Isolated target execution may communicate only inside its private network namespace.',
             'support_path':str(root/'target-support')} if implementation else None,
-        validation=validation_tool(root),
-        rejected_drafts=[str(p) for p in sorted((root/'submissions').glob('*/diagnostics.json'))],
-        records={'path':'state.json','keys':{'materials':'id','checks':'id','semantic_reviews':'id',
-            'selections':'operation_id'},'paths_relative_to':'research.json directory'},
-        review_contracts=[{**{k:c[k] for k in ('target_id','object_type','version','required_aspects')},
-            'optional_aspects':list(c['optional_questions'])} for c in contracts],
-        review_questions={c['object_type']:{**c['questions'],**c['optional_questions']} for c in contracts})
-    return result
+        'example':{'rationale':'Investigate a sourced local uncertainty',
+            'sources':[{'id':'source','file':'REPLACE_WITH_CAPTURED_FILE','start_line':1,'end_line':1,'kind':'code_observation'}],
+            'investigations':[{'ref':'@question','question':'Which applicable caller condition establishes this result?',
+                'source_ids':['source'],'discriminator':'Trace the actual producer and the enclosing protection'}]},
+        'costs':costs(state)}
+
+
+def operation_summary(state, root):
+    current = state.current_submission
+    summary = {k:current[k] for k in ('phase','operation_id','experiment_id','no_change','references','execution_gap') if k in current}
+    summary['allocation'] = available(state)
+    summary['open_work_index'] = 'research.json'
+    summary['diagnostics'] = current.get('rejected',{})
+    check = next((c for c in reversed(state.checks) if c.action == 'experiment'),None)
+    if check:
+        summary['latest_actual_execution'] = {'id':check.id,'status':check.status.value,'exit_code':check.exit_code,
+            'record':f'logs/{check.id}/check.json','observations':f'logs/{check.id}/observations.json'}
+    summary['necessary_gaps'] = [{'investigation_id':q.id,'id':g.id,'question':g.question}
+        for q in state.investigations for g in open_gaps(state,q.id)]
+    owners = {i.investigation_id for i in state.interpretations if i.operation_id == current.get('operation_id')}
+    owners.update(q.id for q in state.investigations if q.operation_id == current.get('operation_id'))
+    if not owners and check:
+        owners.update(a.investigation_id for a in state.experiments if a.id == check.experiment_id)
+    summary['questions'] = [{'id':q.id, 'question':q.question, 'discriminator':q.discriminator}
+                            for q in state.investigations if q.id in owners][-3:]
+    summary['changed_knowledge'] = [{'id':e.id, 'revision':e.revision,
+        'changed_premise':e.history[-1]['correction'], 'affected_uses':e.history[-1]['affected_uses']}
+        for e in state.knowledge if e.operation_id == current.get('operation_id') and e.history]
+    if current.get('no_change'):
+        summary['next'] = 'No semantic change; inspect the saved result, answer a necessary gap or choose a useful sourced discriminator'
+    return summary
 
 
 def global_stop(raw):
-    return raw.get('action')=='stop' and raw.get('scope')=='run'
-
-
-def release(state, ids, reason, resume_conditions, closed=False):
-    for c in state.question_candidates:
-        if c.id in ids:
-            c.status='closed' if closed else 'paused'
-            if reason is not None:c.stop_reason=reason
-            if closed or resume_conditions is not None:c.resume_conditions=[] if closed else resume_conditions
-    units={u.id for u in state.units if u.candidate_id in ids}
-    if state.active_unit_id in units:state.active_unit_id=None
-    if any(a.id==state.active_direct_check_id and a.unit_id in units for a in state.direct_checks):
-        state.active_direct_check_id=None
-
-
-def reject_local(state, operation_id, errors, raw):
-    """Track one draft through existing operations, including before acceptance."""
-    if any(s['operation_id']==operation_id for s in state.selections):
-        return
-    target=raw.get('candidate') if isinstance(raw.get('candidate'),dict) else raw
-    repair_of=raw.get('repair_of') or target.get('repair_of')
-    previous=next((s for s in state.selections if s['operation_id']==repair_of and s['action']=='rejected'),None)
-    if previous is None and not raw and state.selections:
-        last=state.selections[-1]
-        if last['action']=='rejected' and last.get('submitted_path')==errors.get('submitted_path'):previous=last
-    ids={c.id for c in state.question_candidates if c.id==target.get('candidate_id')}
-    ids.update(u.candidate_id for u in state.units if raw.get('unit_id') in {u.id,u.candidate_id})
-    if raw.get('action')=='stop':ids.clear()
-    diagnostics = sorted(errors['errors'])
-    state.selections.append({'operation_id':operation_id, 'action':'rejected', 'rationale':'; '.join(diagnostics),
-        'candidate_ids':sorted(ids), 'draft_id':previous['draft_id'] if previous else operation_id,
-        'repair_of':previous['operation_id'] if previous else None, 'diagnostics':diagnostics,
-        'draft_status':'rejected', 'raw_path':errors['raw_path'], 'submitted_path':errors.get('submitted_path')})
-
+    return raw.get('action') == 'stop' and raw.get('scope') == 'run'
 
 
 def stop_record(engine, reason):
-    """Record a controller-observed interruption, never a submitted reason."""
-    state = engine.state
-    state.run_stop = {'operation_id':state.current_submission.get('operation_id',state.id),
-        'action':'stop', 'scope':'run', 'reason':reason, 'origin':'controller', 'rationale':state.stop_reason,
-        'pending_work':pending_work(state), 'remaining_seconds':engine.budget.remaining(),
-        'remaining_agent_calls':engine.config.budget.agent_calls-state.usage.get('agent_calls',0)}
-
-
-def stop_error(state, message, refs=()):
-    from consensus_assurance.core.diagnostics import Diagnostic, DiagnosticError
-    raise DiagnosticError([Diagnostic(code='stop_decision', category='semantic',
-        object_ids=sorted(refs), message=message,
-        details={'capacity':capacity(state), 'reconsider':'research_decision'})])
-
-
-def record_decision(engine, submission, operation_id, map_changed=False):
-    from consensus_assurance.core.submissions import StopSubmission
-    state, spec = engine.state, load(engine.state)
-    if isinstance(submission,StopSubmission):
-        if submission.scope=='run' and not (engine.config.directed_question or '').strip():
-            stop_error(state, 'This open run continues within the authorized budget. Disposition the local question or use research, explore or Candidate work for another concrete learning step; a complete new finding is not required.')
-        if submission.reason=='user_stop' or submission.scope=='run' and submission.reason in {'resource_limit','tool_gap'}:
-            stop_error(state, 'Submitted reasons do not establish controller interruptions; retain a local handoff. Actual cancellation, permissions, service failures and budget limits are controller events.')
-    known = {x.id for name in ('question_candidates','units','claims','bindings','checks','semantic_reviews',
-        'direct_checks','materials','review_issues','evidence','findings') for x in getattr(state,name)}
-    known.update(audit_object_index(spec))
-    known.update(s['operation_id'] for s in state.selections)
-    feedback = submission.feedback
-    if feedback:
-        if not set(feedback.ref_ids)<=known:raise ValueError('Research feedback references unknown objects: '+', '.join(set(feedback.ref_ids)-known))
-        if not source_refs(state,feedback.ref_ids,include_executions=True):
-            raise ValueError('Research feedback needs acquired sources or a retained research execution')
-        candidates={c.id:c for c in state.question_candidates}
-        if not set(feedback.question_updates)<=candidates.keys():raise ValueError('Feedback question_updates must name saved Candidates')
-        if feedback.question_updates and not source_refs(state,feedback.ref_ids):raise ValueError('Question updates need sourced answers through retained references')
-    record = {'operation_id':operation_id,'action':submission.action,'rationale':submission.rationale,
-        'feedback':feedback.model_dump(mode='json') if feedback else {}, 'map_updated':map_changed}
-    from consensus_assurance.core.submissions import ResearchSubmission, AuditSubmission
-    if (isinstance(submission,ResearchSubmission) and not map_changed and not any((submission.review,
-            submission.sources, feedback and feedback.question_updates, submission.repair_of)) and state.selections):
-        previous=state.selections[-1]
-        versions=previous.get('accepted_versions',{})
-        prior_turn=next((n for n,c in enumerate(state.checks) if c.id==previous['operation_id']),None)
-        if (previous['action']=='research' and versions.get('audit_spec')==state.audit_spec_version and
-                versions.get('graph')==state.graph_version and prior_turn is not None and
-                all(c.action in {'agent_turn','agent_probe','implementation_tool_probe','codex_permission_probe'}
-                    for c in state.checks[prior_turn+1:])):
-            from .audit import Inputs
-            try:prior=AuditSubmission.model_validate(Inputs(engine.root).json(f'submissions/{previous["operation_id"]}/accepted.json'))
-            except (OSError,ValueError):prior=None
-            if submission==prior:
-                if not map_changed:record['duplicate_of']=previous.get('duplicate_of',previous['operation_id'])
-    if submission.repair_of:
-        prior=next((s for s in state.selections if s['operation_id']==submission.repair_of and s['action']=='rejected'),None)
-        if prior is None:raise ValueError('repair_of must name a retained rejected operation')
-        record.update(repair_of=submission.repair_of,draft_id=prior['draft_id'],draft_status='accepted')
-    if isinstance(submission,StopSubmission):
-        if not set(submission.ref_ids)<=known or not source_refs(state,submission.ref_ids):
-            raise ValueError('Normal stop needs known research references with acquired source ownership')
-        related = set(submission.ref_ids)
-        if submission.scope in {'candidate','family'} and not any(c.id in submission.ref_ids for c in state.question_candidates):
-            raise ValueError('Local stop must identify its Candidate or family')
-        ids={c.id for c in state.question_candidates if c.id in submission.ref_ids}
-        if submission.scope=='focus':
-            focus=state.config.get('activity_focus',[]) or ['A1','A2']
-            work={w['id'] for w in pending_work(state)} | {i.target_id for i in open_issues(state)}
-            unfinished={u.candidate_id for u in state.units if work &
-                {u.id,*u.obligation_ids,*u.binding_ids,*u.relation_ids,
-                    *(a.id for a in state.direct_checks if a.unit_id==u.id)}}
-            ids |= {c.id for c in state.question_candidates if set(c.question.activity_classes)&set(focus) and
-                (c.status in {'active','blocked'} or c.status=='escalated' and c.id in work|unfinished)}
-        related.update(u.id for u in state.units if u.candidate_id in ids)
-        related.update(i.id for i in state.review_issues if any(a.id==i.target_id and
-            a.unit_id in related for a in state.direct_checks))
-        if submission.scope=='run':
-            disposed={c.id for c in state.question_candidates if c.status in {'explained','closed'} or
-                any(u.candidate_id==c.id and u.status=='checked' for u in state.units)}
-            if submission.reason!='bounded_completed' or not ids & disposed or pending_work(state):
-                stop_error(state, 'A user-directed run may end after its configured finite task is disposed; cite that explained, closed or checked Candidate. Unfinished work requires a local disposition.', related)
-        if submission.reason=='bounded_completed' and (submission.scope=='focus' or
-                any(w['id'] in related for w in pending_work(state))):
-            stop_error(state, 'Selected scope still has unfinished work; local checks do not establish focus exhaustion', related)
-        if submission.scope!='run':
-            if submission.reason!='bounded_completed' and not submission.resume_conditions:
-                raise ValueError('Local pause needs concrete resume_conditions; pending Units and issues remain visible')
-            release(state,ids,None if submission.scope=='focus' else submission.rationale,
-                None if submission.scope=='focus' else submission.resume_conditions,submission.reason=='bounded_completed')
-        record.update(origin='agent',scope=submission.scope,reason=submission.reason,ref_ids=submission.ref_ids,
-            pending_work=pending_work(state),candidate_ids=sorted(ids),resume_conditions=submission.resume_conditions)
-    state.selections.append(record)
-    if isinstance(submission,StopSubmission) and global_stop(record):state.run_stop=record
-    return record
-
-
-def operation_summary(state):
-    """Keep the actual result and current gaps across review-only and research handoffs."""
-    current = state.current_submission
-    if not current:return {'state':'new', 'next':'Read authorized source; a local question needs no map'}
-    operation = current.get('operation_id')
-    summary = {key:current[key] for key in ('phase','action','operation_id','direct_check_id') if key in current}
-    summary['record'] = 'submissions/' + operation if operation else 'state.json'
-    summary['blockers'] = [preview(x) for x in current.get('rejected',{}).get('errors',[])[:3]]
-    if current.get('execution_gap'):summary['blockers'].append(preview(current['execution_gap']))
-    actions = [*state.action_history, *([state.pending_action] if state.pending_action else [])]
-    ids = {a.id for a in actions if a.logical_input.get('operation_id') == operation}
-    decision = next((s for s in reversed(state.selections) if s['operation_id'] == operation), {})
-    refs = set(decision.get('feedback',{}).get('ref_ids',[]))
-    refs.update(id for r in state.semantic_reviews if r.task_id == 'review:' + str(operation) for id in r.target_versions)
-    refs.update([current.get('direct_check_id'), state.active_direct_check_id])
-    checks = [c for c in state.checks if c.action in {'exploration','direct_check'} and
-        (c.pending_action_id in ids or c.id in refs or c.direct_check_id and c.direct_check_id in refs)][-3:]
-    if not checks:checks = [c for c in state.checks if c.action in {'exploration','direct_check'}][-1:]
-    summary['executions'] = [{'check_id':c.id,'status':c.status.value,'exit_code':c.exit_code,
-        'record':f'logs/{c.id}/check.json','stdout':c.stdout,'stderr':c.stderr} for c in checks]
-    results = [r for r in state.monitor_results if r.get('experiment_check_id') in {c.id for c in checks}]
-    summary['results'] = [{'check_id':r['experiment_check_id'], 'outcome':r['outcome'],
-        'confirmed':r['confirmed'], 'reviewed_complete':r['reviewed_complete'], 'correspondence':r['correspondence'],
-        'record':{'path':'state.json','collection':'monitor_results','match':{'experiment_check_id':r['experiment_check_id']}},
-        'blockers':[preview(x) for x in r['blockers'][:3]],
-        'missing_observations':[preview(d['reason']) for p in r.get('properties',[]) for d in p.get('diagnostics',[])[:1]]}
-        for r in results]
-    gaps = [{'id':i.id,'kind':'review_issue','reasons':[i.explanation]} for i in open_issues(state)]
-    gaps.extend({'id':c.id,'kind':'candidate','reasons':c.resume_conditions or c.question.unknowns}
-        for c in state.question_candidates if c.resume_conditions or c.question.unknowns)
-    summary['current_gaps'] = [{'id':w['id'], 'kind':w['kind'], 'reasons':[preview(x) for x in w['reasons'][:2]],
-        'record':{'path':'state.json','collection':'review_issues' if w['kind']=='review_issue' else 'question_candidates',
-            'match':{'id':w['id']}}} for w in gaps[:3]]
-    summary['open_work_index'] = 'research.json'
-    if decision:
-        summary['duplicate_of'] = decision.get('duplicate_of')
-        if decision.get('feedback'):
-            summary['answer'] = preview(decision['feedback']['answered'])
-            summary['remaining'] = [preview(x) for x in decision['feedback']['remaining'][:3]]
-    return summary
+    engine.state.run_stop = {'reason':reason,'origin':'controller','rationale':engine.state.stop_reason,
+                             'remaining':available(engine.state)}
