@@ -44,7 +44,7 @@ def test_historical_method_rejected_before_writes_but_saved_report_readable(tmp_
     import consensus_assurance.cli as cli
     root = tmp_path / 'archive'
     root.mkdir()
-    (root / 'state.json').write_text(json.dumps({'framework_revision': 'audit-products-v61', 'retired': 'layout'}))
+    (root / 'state.json').write_text(json.dumps({'framework_revision': 'audit-products-v62', 'retired': 'layout'}))
     (root / 'report.md').write_text('Original saved report\n')
     before = {p.name: p.read_bytes() for p in root.iterdir()}
 

@@ -77,11 +77,31 @@ def test_admission_and_independent_prerequisite_permutation():
     assert compare_events(events,prop,requirements)['outcome']=='unknown'
     assert compare_events([],prop,requirements)['outcome']=='unknown'
     prop.admission_alias='start'
+    prop.applicability_conditions.append(Comparison(field='context',reference='ready.context'))
     requirements[1].conditions=[Comparison(field='context',reference='start.context')]
     reversed_events=[events[1],events[0],*events[2:]]
     assert compare_events(reversed_events,prop,requirements)['outcome']=='unknown'
     result=compare_events(events[:3]+[events[0]],prop,requirements)
     assert result['outcome']=='unknown' and result['missing_indices']==[3]
+
+
+def test_independent_scenario_chains_keep_required_history_and_completion():
+    requirements = [EventRequirement(alias='boot',event='boot'), *[
+        EventRequirement(alias=mode,event='admit',conditions=[Comparison(field='mode',value=mode),
+            Comparison(field='context',reference='boot.context')]) for mode in ('a','b')]]
+    events = [dict(event=event,operation=mode,mode=mode,context=1,actual=actual)
+        for mode,actual in [('a',0),('b',1)] for event in ('boot','admit','result')]
+    def result(mode, values=events):
+        prop = EventComparison(event='result',identity_fields=['operation','context'],admission_alias=mode,
+            applicability_conditions=[Comparison(field='mode',value=mode)],assertion=Comparison(field='actual',value=1))
+        return compare_events(values,prop,requirements)
+    assert result('a')['witness_complete'] and result('b')['comparison_complete']
+    assert result('b')['outcome']=='holds'
+    for values in (events[1:], events[:1]+events[2:], [events[0],*events]):
+        assert result('a',values)['outcome']=='unknown'
+    incomplete=result('a',events[:2]+events[3:])
+    assert incomplete['missing_indices']==[1] and not incomplete['comparison_complete']
+    assert result('b',events[1:])['comparison_complete']
 
 
 @pytest.mark.parametrize('qualified',[False,True])

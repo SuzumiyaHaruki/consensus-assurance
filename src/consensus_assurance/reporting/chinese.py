@@ -14,7 +14,7 @@ def execution_summary(check):
 
 def render_report(state, root):
     root = Path(root)
-    labels = {'active':'调查中','paused':'暂停','explained':'已有源码解释','closed':'局部问题已处置'}
+    labels = {'active':'调查中','paused':'暂停','explained':'局部问题已回答','closed':'局部问题已处置'}
     conclusions = {'explained':'源码解释','conditional':'条件性结果','violated':'违反判断',
                    'holds':'有限范围未见违反','unresolved':'未解决'}
     rows = ['# 共识审计研究报告', '',
@@ -59,6 +59,9 @@ def render_report(state, root):
                 result = assessment(state, root, a, c)
                 rows.append(f"执行 `{c.id}`：{c.status.value}，退出码 {c.exit_code}；[回执](logs/{c.id}/check.json)、[stdout](logs/{c.id}/stdout.log)、[stderr](logs/{c.id}/stderr.log)。")
                 rows.append('机械比较：' + result['outcome'] + '；当前确认：' + ('已确认有界违反' if result['confirmed'] else '未确认违反'))
+                current = next((i for i in opinions if i.id == result['interpretation_id']), None)
+                if current:
+                    rows.append(f'当前归属解释 `{current.id}`：{conclusions[current.conclusion]}；' + (current.report_answer or current.rationale))
                 if result['events']:
                     rows.extend(['', '实际观察（前 8 条，完整记录见原始输出）：', '', '```json',
                                  json.dumps(result['events'][:8], ensure_ascii=False, indent=2), '```'])

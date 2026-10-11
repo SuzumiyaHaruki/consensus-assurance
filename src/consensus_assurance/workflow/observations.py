@@ -1,6 +1,6 @@
 """Finite, non-evaluating event correlation and fully observed safety monitors."""
 from consensus_assurance.core.types import Comparison
-from consensus_assurance.core.events import MISSING, field, compare, match_prerequisites, event_requirements
+from consensus_assurance.core.events import MISSING, field, compare, match_prerequisites, prerequisite_chain, comparison_requirements
 
 
 def compare_events(events, comparison, requirements, comparison_index=0):
@@ -9,17 +9,13 @@ def compare_events(events, comparison, requirements, comparison_index=0):
     admission = None
     admission_dependencies = []
     admission_error = ''
-    if requirements:
+    selected = []
+    if requirements is not None:
         try:
-            declared = event_requirements(requirements)
-            admission = next((r for r in declared if r.alias == comparison.admission_alias), None)
-            if admission is None or any(r.event==comparison.event for r in declared):
-                admission_error = 'Explicit admission_alias is missing or prerequisites depend on the result'
-            else:
-                wanted={c.reference.partition('.')[0] for c in admission.conditions if c.reference}
-                for req in reversed(declared):
-                    if req.alias in wanted:wanted.update(c.reference.partition('.')[0] for c in req.conditions if c.reference)
-                admission_dependencies=[r for r in declared if r.alias in wanted]
+            selected = comparison_requirements(comparison, requirements)
+            admission = next(r for r in selected if r.alias == comparison.admission_alias)
+            admission_dependencies = prerequisite_chain(selected,
+                [c.reference.partition('.')[0] for c in admission.conditions if c.reference])
         except ValueError as exc:
             admission_error = str(exc)
     def gap(index, reason):
@@ -40,7 +36,7 @@ def compare_events(events, comparison, requirements, comparison_index=0):
             continue
         aliases = {}
         if requirements is not None:
-            linked = match_prerequisites(events, requirements, index, comparison.identity_fields)
+            linked = match_prerequisites(events, selected, index, comparison.identity_fields)
             correlations[str(index)] = linked
             if linked['status'] != 'matched':
                 gap(index, linked['reason'])
@@ -72,6 +68,9 @@ def compare_events(events, comparison, requirements, comparison_index=0):
         return any(field(a,k) is not MISSING and field(b,k) is not MISSING
             and compare(a, Comparison(field=k,reference='other.'+k), {'other':b}) is False
             for k in comparison.identity_fields)
+    for index,value in results:
+        if any(other != value and not independent_operation(index,j) for j,other in results):
+            gap(index, 'Contradictory same-operation result observations')
     if admission and not admission_error:
         for index,event in enumerate(events):
             if event.get('event') != admission.event:continue

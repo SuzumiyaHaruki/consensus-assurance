@@ -45,6 +45,29 @@ def event_requirements(requirements, reference=None):
     return ordered
 
 
+def prerequisite_chain(requirements, aliases):
+    """Select explicitly used aliases and their transitive producer dependencies."""
+    ordered = event_requirements(requirements)
+    wanted = set(aliases)
+    if not wanted <= {r.alias for r in ordered}:
+        raise ValueError('Use a declared admission alias and prerequisite references')
+    for req in reversed(ordered):
+        if req.alias in wanted:
+            wanted.update(c.reference.partition('.')[0] for c in req.conditions if c.reference)
+    return [r for r in ordered if r.alias in wanted]
+
+
+def comparison_requirements(comparison, requirements):
+    conditions = [comparison.assertion, *comparison.applicability_conditions]
+    selected = prerequisite_chain(requirements, [comparison.admission_alias,
+        *(c.reference.partition('.')[0] for c in conditions if c.reference)])
+    for condition in conditions:
+        event_requirements(selected, condition.reference)
+    if any(r.event == comparison.event for r in selected):
+        raise ValueError('Result events cannot establish their own prerequisites')
+    return selected
+
+
 def match_prerequisites(events, requirements, witness_index=None, identity_fields=()):
     '''Match a sequence of events against a set of ordered prerequisites, optionally using a witness event for identity checks.'''
     if not requirements:

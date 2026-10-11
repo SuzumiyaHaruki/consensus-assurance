@@ -108,7 +108,7 @@ def target_receipts(state, root, executions, *, owner_id=None, experiment_id=Non
             raise ValueError('Supporting observations require completed execution and intact parsed events')
         if c.parameters.get('changed_target_files') or c.parameters.get('lock_unchanged') is False:
             raise ValueError('Referenced execution changed protected inputs')
-        if a.basis.harness.prerequisites and measured['prerequisites']['status'] != 'matched':
+        if a.basis.harness.prerequisites and measured['prerequisites'] and measured['prerequisites']['status'] != 'matched':
             raise ValueError('Referenced execution has unmatched prerequisites')
         if c.exit_code != 0 or c.outcome == 'not_applicable':
             if failure is None:

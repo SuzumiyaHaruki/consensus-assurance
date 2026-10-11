@@ -3,7 +3,7 @@ from pathlib import Path
 import time
 from consensus_assurance.core.types import FixedExperiment, FailureAttribution
 from consensus_assurance.core.types import CheckRun, ExecutionStatus, Origin, now
-from consensus_assurance.core.events import event_requirements, match_prerequisites
+from consensus_assurance.core.events import event_requirements, match_prerequisites, comparison_requirements
 from consensus_assurance.adapters.storage.files import write_json
 from consensus_assurance.adapters.storage.snapshot import capture
 from consensus_assurance.adapters.runners.experiment import run_experiment, extract_events, install_harness
@@ -35,14 +35,9 @@ def validate_basis(state, basis, implementation):
         raise ValueError('A requirement needs sourced applicability reasoning and verified code anchors')
     declared = event_requirements(basis.harness.prerequisites)
     for comparison in basis.comparisons:
-        if not any(r.alias == comparison.admission_alias for r in declared):
-            raise ValueError('Comparison requires an explicit prerequisite admission alias')
-        if any(r.event == comparison.event for r in declared):
-            raise ValueError('Result events cannot establish their own prerequisites')
+        comparison_requirements(comparison, declared)
         conditions = comparison.applicability_conditions
         assertion = comparison.assertion
-        for condition in [assertion, *conditions]:
-            event_requirements(declared, condition.reference)
         if assertion.field in comparison.identity_fields:
             raise ValueError('Compared value cannot establish independent operation identity')
         if any(c.field == assertion.field for c in conditions):
@@ -120,7 +115,7 @@ def observed(fixed, check, root=None):
         check = check.model_copy(update={'stdout': str(root / 'logs' / check.id / 'stdout.log')})
     events = extract_events(check)
     return {'events': events,
-            'prerequisites': match_prerequisites(events, fixed.basis.harness.prerequisites),
+            'prerequisites': None if fixed.basis.comparisons else match_prerequisites(events, fixed.basis.harness.prerequisites),
             'comparisons': [compare_events(events, c, fixed.basis.harness.prerequisites, i)
                             for i, c in enumerate(fixed.basis.comparisons)],
             'parsing_errors': [e for e in events if e.get('event') == 'invalid_observation']}
@@ -137,7 +132,7 @@ def validate_failure(state, root, fixed, check, measurement, value):
             check.outcome != 'tests_failed' or check.parameters.get('test_started') is False or
             check.parameters.get('failure_class') == 'build_or_setup' or
             check.parameters.get('changed_target_files') != [] or check.parameters.get('lock_unchanged') is False or
-            measurement['parsing_errors'] or measurement['prerequisites']['status'] != 'matched'):
+            measurement['parsing_errors']):
         raise ValueError('Failure attribution requires a completed original test failure with intact inputs and prerequisites')
     if not a.witness_indices:
         raise ValueError('Failure attribution needs exact violating event indices')
@@ -177,7 +172,7 @@ def assessment(state, root, fixed, check):
         blockers.append('Exploratory basis has no fixed requirement and comparison')
     if opinion is None:
         blockers.append('Execution has no attributed interpretation')
-    elif opinion.conclusion not in {'violated', 'holds'} or opinion.counterevidence:
+    elif opinion.conclusion not in {'violated', 'holds'}:
         blockers.append('Current interpretation remains conditional, disputed or unresolved')
     gaps = open_gaps(state, fixed.investigation_id, fixed.id)
     blockers.extend(g.question for g in gaps)
@@ -197,7 +192,7 @@ def assessment(state, root, fixed, check):
         blockers.append('No selected test completed')
     if value['parsing_errors']:
         blockers.append('Invalid or incomplete observation output')
-    if value['prerequisites']['status'] != 'matched':
+    if value['prerequisites'] and value['prerequisites']['status'] != 'matched':
         blockers.append(value['prerequisites']['reason'])
     attributed = {}
     if check.exit_code != 0:

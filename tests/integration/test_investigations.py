@@ -164,42 +164,79 @@ print('CA_EVENT '+json.dumps(dict(event='result',operation='one',epoch=worker.ep
 
 
 def test_conditional_probe_real_history_knowledge_correction_and_reuse(tmp_path):
-    def initial(state):return research_case(state,supplied=True)
-    def prefix(state):return research_case(state)
+    def initial(state):
+        sub,files=research_case(state,supplied=True)
+        sub['knowledge'][0].update(kind='behavior',statement='Both guard branches grant after report')
+        sub['knowledge'].extend(dict(kind='behavior',statement=statement,conditions='Serialized calls',source_ids=['code'])
+            for statement in ('begin allocates a ticket','finish records a pending ticket','advance clears the pending set'))
+        sub['experiment']['knowledge']=[dict(entry_id='@fact',revision=1)]
+        sub['investigations'][1]['knowledge']=[]
+        return sub,files
+    def prefix(state):
+        sub,files=research_case(state)
+        sub['experiment']['knowledge']=[dict(entry_id=state['knowledge'][0]['id'],revision=1)]
+        return sub,files
+    def branch_control(state):
+        sub,files=research_case(state,protected=True)
+        sub['experiment']['revision_reason']='Observe the legitimate protected guard branch using the same actual producer prefix'
+        sub['interpretations']=opinion(state,knowledge=[dict(entry_id=state['knowledge'][0]['id'],revision=1)],
+            rationale='The reporting branch grants before finish; whether this generalizes to the other branch remains to be checked')[0]['interpretations']
+        return sub,files
     def correct(state):
         q,later=state['investigations']
         fact=state['knowledge'][0]
-        sub,files=opinion(state,answers={q['gaps'][0]['id']:'Fresh execution invokes real begin and report in the same context'},
-            rationale='The actual producer emits notification before completion; the guard consumes the weaker fact')
-        sub['knowledge']=[dict(id=fact['id'],kind='fact',statement='A notification establishes reporting, not completion',
+        check=next(c for c in state['checks'] if c.get('experiment_id')==state['experiments'][-1]['id'])
+        sub,files=opinion(state,conclusion='holds',knowledge=[dict(entry_id=fact['id'],revision=2)],
+            answers={q['gaps'][0]['id']:'Fresh executions invoke real begin and report in the same context'},
+            rationale='The protected branch requires finish; the earlier general statement about both branches was inaccurate')
+        sub['knowledge']=[dict(id=fact['id'],kind='behavior',
+            statement='The reporting branch grants after report; the protected branch requires finish',
             conditions='Current admitted ticket; report may precede finish',source_ids=['code','doc'],
-            changed_premise='Reporting does not establish completion',affected_uses=[q['id'],later['id']])]
+            executions={check['id']:[1]},changed_premise='Grant after report applies only to the reporting branch',
+            affected_uses=[q['id'],state['experiments'][1]['id'],state['interpretations'][0]['id']])]
+        corrected.append(sub['knowledge'][0])
         return sub,files
-    def reuse(state):
-        q=state['investigations'][1]
-        fact=state['knowledge'][0]
-        assert q['gaps'] and fact['revision']==2
+    corrected=[]
+    def duplicate(state):
+        return {'rationale':'Repeat the same effective correction','knowledge':corrected},{}
+    def global_choice(state):
+        assert state['current_submission']['no_change']
+        from consensus_assurance.workflow.research import operation_summary
+        summary=operation_summary(e.state,e.root)
+        assert 'any valuable A1/A2' in summary['next'] and summary['reselection']['target']['repo']==str(repo)
         index=json.loads((e.root/'research.json').read_text())
-        assert set(index['knowledge'][0]['last_correction']['recorded_uses'])=={i['id'] for i in state['investigations']}
-        return {'rationale':'Reuse the corrected conditional fact for transition analysis',
-            'investigations':[dict(id=q['id'],knowledge=[dict(entry_id=fact['id'],revision=2)],
-                discriminator='Check that advance retires reported tickets')],
+        entry=index['reselection']['recent_knowledge'][-1]
+        assert entry['revision']==2 and entry['last_correction']['affected_uses']==corrected[0]['affected_uses']
+        assert entry['statement']==corrected[0]['statement'] and entry['executions']
+        q=state['investigations'][1]
+        assert not q['gaps'] and not q['knowledge']
+        return {'rationale':'Select the independent authority question, not another guard variant',
+            'investigations':[dict(id=q['id'],disposition='explained')],
             'interpretations':[dict(investigation_id=q['id'],source_ids=['code'],conclusion='explained',
-                rationale='advance clears pending and reported sets and changes the ticket context',
-                answers={q['gaps'][0]['id']:'Source clears the weaker reporting fact at transition; it never promised completion'},
-                knowledge=[dict(entry_id=fact['id'],revision=2)])]},{}
-    e,repo=engine_for(tmp_path,[initial,prefix,correct,reuse,stop])
+                rationale='advance changes epoch and clears pending tickets, protecting against old-ticket reuse')]},{}
+    def local_lead(state):
+        return {'rationale':'A separate local completion responsibility becomes worth tracing',
+            'investigations':[dict(question='Can a reported ticket be explicitly finished before authority changes?',
+                source_ids=['code'],knowledge=[dict(entry_id=state['knowledge'][0]['id'],revision=2)],
+                discriminator='Trace the actual finish producer, independent of whether report alone grants')]},{}
+    e,repo=engine_for(tmp_path,[initial,prefix,branch_control,correct,duplicate,global_choice,local_lead,stop])
+    e.config.directed_question=None
     (repo/'target.py').write_text(Path('tests/fixtures/research_protocol.py').read_text())
     (repo/'README.md').write_text('Calls are serialized; report may precede finish; allowed requires completion of a current ticket.\n')
     state=e.start(repo)
-    assert len(state.experiments)==2, state.current_submission
+    assert len(state.experiments)==3, state.current_submission
     assert state.knowledge[0].revision==2 and len(state.knowledge[0].history)==1
-    assert state.investigations[1].knowledge[0].revision==2
+    assert all(k.revision==1 and not k.history for k in state.knowledge[1:])
     assert not open_gaps(state,state.investigations[1].id)
     assert open_gaps(state,state.investigations[0].id)
+    assert state.investigations[2].knowledge[0].revision==2
+    assert all(q.parent_id is None for q in state.investigations)
+    assert state.knowledge[0].history[0]['statement']=='Both guard branches grant after report'
+    assert state.experiments[1].basis.knowledge[0].revision==1 and state.interpretations[0].knowledge[0].revision==1
+    assert len(state.interpretations)==3 and state.agent_session_id=='fixture-session'
     assert state.experiments[0].basis.scope.assumptions
     assert not state.experiments[1].basis.scope.assumptions
-    assert all(assessment(state,e.root,a,next(c for c in state.checks if c.experiment_id==a.id))['outcome']=='violated' for a in state.experiments)
+    assert [assessment(state,e.root,a,next(c for c in state.checks if c.experiment_id==a.id))['outcome'] for a in state.experiments]==['violated','violated','holds']
 
 
 @pytest.mark.parametrize('protected,expected',[(False,'violated'),(True,'holds')])
