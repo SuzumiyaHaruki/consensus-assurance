@@ -131,7 +131,8 @@ for operation, value in [('case',3),('control',2)]:
             executions={check.id:[i for i,v in enumerate(events) if v['event']=='returned']},
             rationale='The sampled capacity result is undesirable under the sourced preservation contract; the control increments',
             report_answer='容量输入归零，违反所引用的局部保持值要求；普通输入仍递增。',
-            limitations=['Incomplete samples and unresolved applicability cannot establish this account'])
+            limitations=['Incomplete samples and unresolved applicability cannot establish this account'],
+            defect_claim='asserted' if case in {'prediction','mismatch'} else None if case=='duty' else 'unresolved')
     e,repo=engine_for(tmp_path,[start,explain,stop])
     e.agent.mock=False
     e.config.execution_isolation='bwrap'
@@ -155,13 +156,76 @@ for operation, value in [('case',3),('control',2)]:
     assert labels[outcome] in case_text and f'confirmed={str(confirmed).lower()}' in case_text
     assert labels[control_outcome] in control_text and 'confirmed=false' in control_text
     if control_outcome=='holds':assert '未产生反例见证（confirmed=false）' in control_text
-    assert '当前模型归属解释' in report and state.interpretations[0].report_answer in report
+    assert '该执行的模型归属解释' in report and state.interpretations[0].report_answer in report
+    claim=state.interpretations[0].defect_claim
+    labels={None:'未提交缺陷判断','asserted':'主张存在缺陷（待人工核验）','unresolved':'尚不能判断'}
+    assert f'当前模型缺陷判断：{labels[claim]}' in report
+    claims,_,other=report.split('## 模型明确主张的缺陷（待人工核验）',1)[1].partition('## 其他研究结果')
+    assert (state.investigations[0].question in claims)==(claim=='asserted')
+    assert (state.investigations[0].question in other)==(claim!='asserted')
+    assert report.count('### ')==1
     assert '有限范围未见违反' not in report and '未确认违反' not in report
     assert ('归属判断与机械结果不一致' in report)==(case=='mismatch')
     if case=='gap':assert state.investigations[0].gaps[0].question in report and '仍未回答的必要缺口' in report
     if case in {'missing','malformed','unmatched'}:assert '观测缺口' in report
     for path in (f'fixed-experiments/{fixed.id}/basis.json',f'logs/{check.id}/check.json',f'logs/{check.id}/observations.json'):
         assert path in report and (e.root/path).is_file()
+
+
+def test_exploratory_receipt_supports_contract_refutation_without_rerun(tmp_path):
+    if not shutil.which('bwrap'):
+        pytest.skip('bubblewrap is required for original isolated execution')
+    from consensus_assurance.reporting.chinese import render_report
+    saved={}
+    def start(state):
+        sub,files=combined(state)
+        sub['experiment'].pop('requirement')
+        sub['experiment']['prefix']='Supply a capacity input to observe the boundary behavior; legality remains to be researched.'
+        return sub,files
+    def allegation(state):
+        return opinion(state,defect_claim='asserted',rationale='The sampled reset appears to lose caller state')
+    def correction(state):
+        fixed=e.state.experiments[0]
+        check=next(c for c in e.state.checks if c.experiment_id)
+        saved['assessment']=assessment(e.state,e.root,fixed,check)
+        saved['fixed'],saved['check']=fixed.model_dump(mode='json'),check.model_dump(mode='json')
+        paths=[f'fixed-experiments/{fixed.id}/basis.json',f'fixed-experiments/{fixed.id}/{fixed.harness_filename}',
+               *[f'logs/{check.id}/{name}' for name in ('check.json','observations.json','stdout.log','stderr.log')]]
+        saved['files']={path:(e.root/path).read_bytes() for path in paths}
+        claims=render_report(e.state,e.root).read_text().split('## 其他研究结果',1)[0]
+        assert e.state.investigations[0].question in claims and '主张存在缺陷（待人工核验）' in claims
+        return opinion(state,experiment_id=None,conclusion='explained',defect_claim='refuted',
+            rationale='The necessary legal-call premise is false; the sampled reset is outside the interface contract',
+            counterevidence=['The captured caller contract requires value < limit; the supplied input equals limit'],
+            limitations=['No claim about other callers or behavior within the permitted input range'])
+    e,repo=engine_for(tmp_path,[start,allegation,correction,stop])
+    e.agent.mock=False
+    e.config.execution_isolation='bwrap'
+    contract='Callers must supply 0 <= value < limit; capacity input is prohibited.\n'
+    (repo/'README.md').write_text(contract)
+    state=e.start(repo)
+    assert state.usage['experiments']==len(state.experiments)==1
+    checks=[c for c in state.checks if c.experiment_id]
+    assert len(checks)==1 and checks[0].model_dump(mode='json')==saved['check']
+    assert state.experiments[0].model_dump(mode='json')==saved['fixed']
+    assert all((e.root/path).read_bytes()==raw for path,raw in saved['files'].items())
+    result=assessment(state,e.root,state.experiments[0],checks[0])
+    assert result==saved['assessment'] and result['events'][1]['value']==0
+    assert result['outcome']=='violated' and not result['confirmed']
+    assert result['blockers']==['Exploratory basis has no fixed requirement']
+    assert [i.defect_claim for i in state.interpretations]==['asserted','refuted']
+    assert all(i.executions=={checks[0].id:[1]} for i in state.interpretations)
+    view=json.loads((e.root/'research.json').read_text())
+    assert view['investigations'][0]['latest_interpretation']['defect_claim']=='refuted'
+    assert view['reselection']['questions'][0]['latest_interpretation']['defect_claim']=='refuted'
+    report=render_report(state,e.root).read_text()
+    claims,_,other=report.split('## 模型明确主张的缺陷（待人工核验）',1)[1].partition('## 其他研究结果')
+    assert state.investigations[0].question not in claims and state.investigations[0].question in other
+    assert '当前模型缺陷判断：当前疑点已否定' in other and report.count('### ')==1
+    assert '历史解释，问题已有后续解释' in other
+    assert all(i.rationale in report for i in state.interpretations)
+    assert state.interpretations[-1].counterevidence[0] in report
+    assert (repo/'README.md').read_text()==contract
 
 
 def test_bounded_retry_cycle_controls_and_historical_failures(tmp_path):
@@ -264,7 +328,7 @@ for mode, reset, ticks in [('short',True,4),('long',True,6),('control',False,6)]
     assert gap.question in assessment(challenged,e.root,state.experiments[2],next(c for c in state.checks if c.experiment_id==state.experiments[2].id))['blockers']
     from consensus_assurance.reporting.chinese import render_report
     report=render_report(state,e.root).read_text()
-    assert '局部问题已回答' in report and '当前模型归属解释' in report and '固定比较的完整反例见证已确认' in report
+    assert '局部问题已回答' in report and '该执行的模型归属解释' in report and '固定比较的完整反例见证已确认' in report
 
 
 def test_separate_receipt_requires_association_and_successor_cannot_borrow_it(tmp_path):

@@ -1,0 +1,183 @@
+{
+  "rationale": "Fresh-session orientation on hashicorp/raft c0dc6a0b (post-1.7.0), A2 context/authority transition: a follower rebuilt from a leader snapshot. Source trace showed that installSnapshot never makes the log's last-entry view agree with the snapshot it just installed; when the follower already holds an entry at that same index from an earlier term, getLastEntry keeps returning the stale entry's term, so the follower rejects the leader's AppendEntries exactly at the snapshot boundary. A driver harness was built and exercised locally (construction feedback, not a retained receipt): the defect case returns success=false while the otherwise identical control returns success=true. This update registers the sourced mechanism, the two Behaviors, the reproducing experiment, and an open question about the leader-side consequence.",
+  "sources": [
+    {
+      "id": "src-installsnap",
+      "file": "raft.go",
+      "start_line": 1814,
+      "end_line": 1953,
+      "kind": "code_observation"
+    },
+    {
+      "id": "src-lastindex",
+      "file": "state.go",
+      "start_line": 157,
+      "end_line": 174,
+      "kind": "code_observation"
+    },
+    {
+      "id": "src-appendentries",
+      "file": "raft.go",
+      "start_line": 1440,
+      "end_line": 1500,
+      "kind": "code_observation"
+    },
+    {
+      "id": "src-compact",
+      "file": "snapshot.go",
+      "start_line": 216,
+      "end_line": 262,
+      "kind": "code_observation"
+    },
+    {
+      "id": "src-replication",
+      "file": "replication.go",
+      "start_line": 220,
+      "end_line": 300,
+      "kind": "code_observation"
+    },
+    {
+      "id": "src-repl-snap",
+      "file": "replication.go",
+      "start_line": 299,
+      "end_line": 375,
+      "kind": "code_observation"
+    }
+  ],
+  "investigations": [
+    {
+      "id": null,
+      "ref": "@q-snapshot-boundary",
+      "question": "After a follower successfully installs an InstallSnapshot whose last included entry is (index L, term T), must the follower accept the leader's next AppendEntries with PrevLogEntry=L and PrevLogTerm=T, and does it still do so when the follower already held a log entry at L from an earlier term?",
+      "source_ids": [
+        "src-installsnap",
+        "src-lastindex",
+        "src-appendentries",
+        "src-compact",
+        "src-replication",
+        "src-repl-snap"
+      ],
+      "hypothesis": "installSnapshot sets lastApplied and lastSnapshot but never calls setLastLog nor invalidates the pre-existing log entry at L. getLastEntry returns (lastLogIndex,lastLogTerm) whenever lastLogIndex >= lastSnapshotIndex, so once the snapshot makes lastSnapshotIndex == L while the stale log entry keeps lastLogIndex == L, the tie is resolved in favour of the stale log term. The follower's PrevLogEntry==L check then compares the leader's snapshot term T against the stale term and answers Success=false with NoRetryBackoff=true. The leader sets nextIndex = max(min(nextIndex-1, resp.LastLog+1), 1), which lands on L; setPreviousLog(L) then needs the leader's own log entry L-1, which is absent once the leader has compacted up to its snapshot index (compactLogsWithTrailing can leave firstIndex > L-1), so replicateTo jumps to SEND_SNAP, re-sends the same snapshot, restores nextIndex=L+1, and the same rejection recurs.",
+      "discriminator": "Drive one node with real RPCs: bootstrap it as a Nonvoter, seed a command at index 2 with an AppendEntries whose Term is 2, install an InstallSnapshot with LastLogIndex=2 and LastLogTerm=3, then send AppendEntries with PrevLogEntry=2/PrevLogTerm=3. The necessary property is met only if the last append succeeds; the suspicion holds if it fails while an otherwise identical control node without the seeded entry succeeds. Refuted if the post-snapshot append succeeds in both cases, or if getLastEntry reports the snapshot term for index 2.",
+      "disposition": null,
+      "parent_id": null,
+      "knowledge": null,
+      "counterevidence": null,
+      "limitations": null,
+      "resume_conditions": null
+    }
+  ],
+  "knowledge": [
+    {
+      "id": null,
+      "ref": "@b-installsnap-state-updates",
+      "kind": "behavior",
+      "statement": "On accepting an InstallSnapshot, installSnapshot sets lastApplied=req.LastLogIndex and lastSnapshot=(req.LastLogIndex,req.LastLogTerm), restores latest and committed configuration from the snapshot payload, then clears the log store (removeOldLogs) for a monotonic store or compacts it (compactLogs(req.LastLogIndex)) otherwise, and finally sets resp.Success=true. It never calls setLastLog and never truncates a pre-existing log suffix at or above req.LastLogIndex, so lastLogIndex keeps its pre-snapshot value and a stale entry at the snapshot index can remain in the store.",
+      "conditions": "Reached only when the RPC header passes checkRPCHeader, the snapshot version is supported, req.Term >= currentTerm, the snapshot bytes are fully received (n == req.Size) and the FSM restore succeeds.",
+      "source_ids": [
+        "src-installsnap",
+        "src-compact"
+      ],
+      "executions": {},
+      "changed_premise": "",
+      "affected_uses": []
+    },
+    {
+      "id": null,
+      "ref": "@b-lastindex-tie",
+      "kind": "behavior",
+      "statement": "raftState.getLastIndex returns max(lastLogIndex,lastSnapshotIndex) and getLastEntry returns (lastLogIndex,lastLogTerm) whenever lastLogIndex >= lastSnapshotIndex, otherwise (lastSnapshotIndex,lastSnapshotTerm). The comparison is on index only, so when the two sources name the same index with different terms the log-derived term wins. appendEntries uses this as the PrevLogEntry==lastIdx fast path and otherwise reads logs.GetLog(PrevLogEntry); a term mismatch or a missing entry yields Success=false with NoRetryBackoff=true.",
+      "conditions": "Holds for any *Raft whose log and snapshot were written by different ingest paths (NewRaft startup restore, installSnapshot, takeSnapshot, liveBootstrap, dispatchLogs, AppendEntries append, restoreUserSnapshot).",
+      "source_ids": [
+        "src-lastindex",
+        "src-appendentries",
+        "src-installsnap"
+      ],
+      "executions": {},
+      "changed_premise": "",
+      "affected_uses": []
+    }
+  ],
+  "gaps": [
+    {
+      "investigation_id": "@q-snapshot-boundary",
+      "question": "Does the leader side actually restore the blocking state in one execution: with a leader whose log has been compacted so that the snapshot index L is at its head, does an unrepairable follower produce repeated InstallSnapshot attempts with no committed progress rather than converging after one snapshot?",
+      "experiment_id": null
+    }
+  ],
+  "interpretations": [
+    {
+      "investigation_id": "@q-snapshot-boundary",
+      "experiment_id": null,
+      "source_ids": [
+        "src-installsnap",
+        "src-lastindex",
+        "src-appendentries",
+        "src-compact",
+        "src-replication",
+        "src-repl-snap"
+      ],
+      "executions": {},
+      "conclusion": "conditional",
+      "defect_claim": "unresolved",
+      "rationale": "Source establishes a necessary property and a mechanism that appears to violate it. Property: after a successful InstallSnapshot for (L,T), a node's state at L is the snapshot's, so the leader's next AppendEntries with PrevLogEntry=L/PrevLogTerm=T must be accepted. Mechanism: installSnapshot (raft.go 1814-1953) sets lastSnapshot=(L,T) but leaves lastLogIndex and any stale log entry at L untouched; getLastEntry (state.go 167-174) prefers the log term whenever lastLogIndex >= lastSnapshotIndex, i.e. precisely the tie produced when the follower already held an entry at L from an earlier term; appendEntries (raft.go 1475-1500) then reports Success=false, NoRetryBackoff=true. Leader side (replication.go 223, 256, 286-300, 370): nextIndex becomes L via max(min(nextIndex-1, resp.LastLog+1),1); setPreviousLog(L) requires the leader's entry L-1; once the leader has compacted past L (compactLogsWithTrailing can set firstIndex > L-1) that lookup returns ErrLogNotFound, which routes to SEND_SNAP and re-installs the same snapshot. Local construction feedback (harness assurance_generated_test.go, both sub-cases, run in a scratch copy) matched the prediction exactly: with the stale same-index entry, state_after_snapshot reported last_log_index=2/last_log_term=2 against last_snapshot_index=2/last_snapshot_term=3 and the follow-up append returned success=false/no_retry_backoff=true; without the seeded entry the same append returned success=true. That run is not a retained receipt, so the defect claim is left unresolved pending the controller's execution of the registered experiment; the leader-side loop of the gap above is likewise still unexecuted.",
+      "answers": {},
+      "knowledge": [],
+      "counterevidence": [
+        "Behind-follower case does not trigger it: when the follower's lastLogIndex is below the snapshot index, getLastEntry returns the snapshot pair and the appended entries are accepted (observed as the harness control: last_log_index=1 < last_snapshot_index=2 -> success=true).",
+        "With the default TrailingLogs the leader normally retains entries below its snapshot index, so setPreviousLog(L) succeeds, the leader backs off one index and appendEntries truncates the conflicting suffix from its stored copy, converging without a snapshot loop; the loop needs the leader to have compacted up to or past L."
+      ],
+      "limitations": [
+        "The retained execution has not yet run in the controller; conclusions rest on source plus non-retained local construction feedback.",
+        "The end-to-end repeated-snapshot cycle (the registered gap) was not executed; only the follower-side boundary rejection was observed, and the leader-side cycle is argued from source.",
+        "Reachability of the precondition through a full replica history was not exercised: the harness seeds the older-term entry at L with a legal AppendEntries from a term-2 leader, but a full multi-node history (old leader's uncommitted entry surviving while a new leader commits its own entry at L and compacts) is not driven."
+      ],
+      "joint_history": "",
+      "failure_attribution": null,
+      "report_title": null,
+      "report_answer": null
+    }
+  ],
+  "experiment": {
+    "investigation_id": "@q-snapshot-boundary",
+    "harness_path": "assurance_generated_test.go",
+    "files": {},
+    "execution_package": null,
+    "source_ids": [
+      "src-installsnap",
+      "src-lastindex",
+      "src-appendentries",
+      "src-compact",
+      "src-replication",
+      "src-repl-snap"
+    ],
+    "anchors": [],
+    "scope": {
+      "description": "Two nodes in one process over InmemTransport: 'server-1' under test (Nonvoter so it never campaigns) and 'server-2' as the RPC producer. A control and a defect case run the same two/three RPC steps and differ only in whether an earlier-term leader first stored a command at the snapshot index.",
+      "assumptions": [
+        "The isolated target executes the root package '.' directly; the harness is an in-package test so it may call unexported handlers and state accessors.",
+        "InmemTransport with two connected transports suffices because the claims concern one follower's response to a leader's RPCs; only the InmemStore (non-monotonic) is exercised.",
+        "BootstrapCluster writes the configuration entry that makes server-1 a Nonvoter, so the node never starts an election and the driven RPCs keep a stable term."
+      ],
+      "excluded": [
+        "No net/tcp transport and no multi-node partition history; the leader-side snapshot loop is out of scope for this harness."
+      ],
+      "parameters": {
+        "seed_term": 2,
+        "snapshot_last_log_index": 2,
+        "snapshot_last_log_term": 3,
+        "store": "InmemStore"
+      }
+    },
+    "prefix": "Bootstrap server-1 as a Nonvoter in a configuration whose only Voter is server-2 (BootstrapCluster then NewRaft, so the node starts its own run/runFSM loops). Defect case step 1: server-2 sends AppendEntries(Term=2, PrevLogEntry=1, PrevLogTerm=1, Entries=[{Index:2,Term:2,Type:LogCommand}], LeaderCommitIndex=1) so the node stores a term-2 entry at index 2. Step 2: server-2 sends InstallSnapshot(SnapshotVersion=1, Term=3, LastLogIndex=2, LastLogTerm=3, Configuration=<server-1 Nonvoter/server-2 Voter>, ConfigurationIndex=1, Size=len(payload), payload=msgpack-encoded empty [][]byte) which the MockFSM restores. Step 3: server-2 sends AppendEntries(Term=3, PrevLogEntry=2, PrevLogTerm=3, Entries=[{Index:3,Term:3,Type:LogCommand}], LeaderCommitIndex=2). The control repeats steps 2-3 only. Each step emits CA_EVENT JSON with the response and the post-snapshot last_log/last_snapshot/getLastEntry values.",
+    "semantic_changes": [],
+    "requirement": null,
+    "responsibility": "installSnapshot and raftState.getLastEntry must leave a single, unchallenged view of the last durable entry: a snapshot supersedes any log entry at the same index.",
+    "prerequisites": [],
+    "comparisons": [],
+    "knowledge": [],
+    "previous_id": null,
+    "revision_reason": ""
+  },
+  "stop": null
+}

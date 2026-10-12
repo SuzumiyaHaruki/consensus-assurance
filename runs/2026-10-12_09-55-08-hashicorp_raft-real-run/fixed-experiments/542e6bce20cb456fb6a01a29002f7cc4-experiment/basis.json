@@ -1,0 +1,68 @@
+{
+  "id": "542e6bce20cb456fb6a01a29002f7cc4-experiment",
+  "investigation_id": "542e6bce20cb456fb6a01a29002f7cc4-question-0",
+  "version": 1,
+  "basis": {
+    "harness": {
+      "kind": "go_test",
+      "source": "package raft\n\nimport (\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"io\"\n\t\"sync\"\n\t\"testing\"\n\t\"time\"\n)\n\nfunc caEvent(m map[string]interface{}) {\n\tb, _ := json.Marshal(m)\n\tfmt.Println(\"CA_EVENT \" + string(b))\n}\n\n// countingTrans counts InstallSnapshot calls the leader makes to its peers.\ntype countingTrans struct {\n\t*InmemTransport\n\tmu    sync.Mutex\n\tsnaps int\n}\n\nfunc (c *countingTrans) InstallSnapshot(id ServerID, target ServerAddress, args *InstallSnapshotRequest, resp *InstallSnapshotResponse, data io.Reader) error {\n\tc.mu.Lock()\n\tc.snaps++\n\tc.mu.Unlock()\n\treturn c.InmemTransport.InstallSnapshot(id, target, args, resp, data)\n}\n\nfunc (c *countingTrans) SnapshotCount() int {\n\tc.mu.Lock()\n\tdefer c.mu.Unlock()\n\treturn c.snaps\n}\n\nfunc waitState(t *testing.T, r *Raft, want RaftState, limit time.Duration) bool {\n\tdeadline := time.Now().Add(limit)\n\tfor time.Now().Before(deadline) {\n\t\tif r.State() == want {\n\t\t\treturn true\n\t\t}\n\t\ttime.Sleep(5 * time.Millisecond)\n\t}\n\treturn false\n}\n\nfunc TestAssurance_SnapshotBoundaryLoop(t *testing.T) {\n\tfor _, stale := range []bool{false, true} {\n\t\tt.Run(fmt.Sprintf(\"stale_index_entry=%v\", stale), func(t *testing.T) {\n\t\t\t// --- Leader A: single-voter cluster, becomes leader on its own.\n\t\t\taddrA, rawA := NewInmemTransport(\"server-A\")\n\t\t\ttransA := &countingTrans{InmemTransport: rawA}\n\t\t\tconfA := inmemConfig(t)\n\t\t\tconfA.LocalID = ServerID(\"server-A\")\n\t\t\tconfA.ProtocolVersion = 3\n\t\t\tconfA.TrailingLogs = 0\n\t\t\tconfA.SnapshotThreshold = 1 << 20\n\t\t\tconfA.SnapshotInterval = time.Hour\n\t\t\tstoreA := NewInmemStore()\n\t\t\tsnapsA := NewInmemSnapshotStore()\n\t\t\tfsmA := &MockFSM{}\n\t\t\tcfgA := Configuration{Servers: []Server{{Suffrage: Voter, ID: ServerID(\"server-A\"), Address: addrA}}}\n\t\t\tif err := BootstrapCluster(confA, storeA, storeA, snapsA, transA, cfgA); err != nil {\n\t\t\t\tt.Fatalf(\"bootstrap A: %v\", err)\n\t\t\t}\n\t\t\tleader, err := NewRaft(confA, fsmA, storeA, storeA, snapsA, transA)\n\t\t\tif err != nil {\n\t\t\t\tt.Fatalf(\"NewRaft A: %v\", err)\n\t\t\t}\n\t\t\tdefer leader.Shutdown()\n\t\t\tif !waitState(t, leader, Leader, 5*time.Second) {\n\t\t\t\tt.Fatalf(\"A never became leader\")\n\t\t\t}\n\t\t\tfor i := 0; i < 6; i++ {\n\t\t\t\tif err := leader.Apply([]byte(fmt.Sprintf(\"cmd-%d\", i)), 2*time.Second).Error(); err != nil {\n\t\t\t\t\tt.Fatalf(\"apply: %v\", err)\n\t\t\t\t}\n\t\t\t}\n\t\t\tsf := leader.Snapshot()\n\t\t\tif err := sf.Error(); err != nil {\n\t\t\t\tt.Fatalf(\"snapshot: %v\", err)\n\t\t\t}\n\t\t\tmeta, rc, err := sf.Open()\n\t\t\tif err != nil {\n\t\t\t\tt.Fatalf(\"snapshot open: %v\", err)\n\t\t\t}\n\t\t\tsnapIdx := meta.Index\n\t\t\trc.Close()\n\t\t\tfirstA, _ := storeA.FirstIndex()\n\t\t\tcaEvent(map[string]interface{}{\"event\": \"leader_snapshot\", \"snapshot_index\": snapIdx, \"leader_first_index\": firstA,\n\t\t\t\t\"leader_last_index\": leader.LastIndex(), \"leader_commit_index\": leader.CommitIndex()})\n\n\t\t\t// --- Follower B: Nonvoter in A's configuration so it never campaigns.\n\t\t\taddrB, rawB := NewInmemTransport(\"server-B\")\n\t\t\tconfB := inmemConfig(t)\n\t\t\tconfB.LocalID = ServerID(\"server-B\")\n\t\t\tconfB.ProtocolVersion = 3\n\t\t\tconfB.SnapshotThreshold = 1 << 20\n\t\t\tconfB.SnapshotInterval = time.Hour\n\t\t\tstoreB := NewInmemStore()\n\t\t\tsnapsB := NewInmemSnapshotStore()\n\t\t\tfsmB := &MockFSM{}\n\t\t\tcfgB := Configuration{Servers: []Server{\n\t\t\t\t{Suffrage: Voter, ID: ServerID(\"server-A\"), Address: addrA},\n\t\t\t\t{Suffrage: Nonvoter, ID: ServerID(\"server-B\"), Address: addrB},\n\t\t\t}}\n\t\t\tif err := BootstrapCluster(confB, storeB, storeB, snapsB, rawB, cfgB); err != nil {\n\t\t\t\tt.Fatalf(\"bootstrap B: %v\", err)\n\t\t\t}\n\t\t\tfollower, err := NewRaft(confB, fsmB, storeB, storeB, snapsB, rawB)\n\t\t\tif err != nil {\n\t\t\t\tt.Fatalf(\"NewRaft B: %v\", err)\n\t\t\t}\n\t\t\tdefer follower.Shutdown()\n\t\t\ttime.Sleep(50 * time.Millisecond)\n\n\t\t\t// Seed B with earlier-term (term 1) entries up to snapIdx (defect)\n\t\t\t// or snapIdx-1 (control), delivered as a legal AppendEntries.\n\t\t\ttarget := snapIdx\n\t\t\tif !stale {\n\t\t\t\ttarget = snapIdx - 1\n\t\t\t}\n\t\t\taddrD, rawD := NewInmemTransport(\"dummy\")\n\t\t\trawD.Connect(addrB, rawB)\n\t\t\trawB.Connect(addrD, rawD)\n\t\t\tvar entries []*Log\n\t\t\tfor i := uint64(2); i <= target; i++ {\n\t\t\t\tentries = append(entries, &Log{Index: i, Term: 1, Type: LogCommand, Data: []byte(\"old\")})\n\t\t\t}\n\t\t\tencA := rawD.EncodePeer(\"server-A\", addrA)\n\t\t\tseed := &AppendEntriesRequest{\n\t\t\t\tRPCHeader:         RPCHeader{ProtocolVersion: 3, ID: []byte(\"server-A\"), Addr: encA},\n\t\t\t\tTerm:              1,\n\t\t\t\tLeader:            encA,\n\t\t\t\tPrevLogEntry:      1,\n\t\t\t\tPrevLogTerm:       1,\n\t\t\t\tEntries:           entries,\n\t\t\t\tLeaderCommitIndex: 1,\n\t\t\t}\n\t\t\tvar seedResp AppendEntriesResponse\n\t\t\tif err := rawD.AppendEntries(ServerID(\"server-B\"), addrB, seed, &seedResp); err != nil {\n\t\t\t\tt.Fatalf(\"seed: %v\", err)\n\t\t\t}\n\t\t\tif !seedResp.Success {\n\t\t\t\tt.Fatalf(\"seed rejected: %+v\", seedResp)\n\t\t\t}\n\t\t\ttime.Sleep(50 * time.Millisecond)\n\n\t\t\t// --- Connect A and B, then add B as a voter of A.\n\t\t\trawA.Connect(addrB, rawB)\n\t\t\trawB.Connect(addrA, rawA)\n\t\t\t_ = leader.AddVoter(ServerID(\"server-B\"), addrB, 0, time.Second)\n\n\t\t\ttime.Sleep(300 * time.Millisecond)\n\t\t\tearly := transA.SnapshotCount()\n\t\t\ttime.Sleep(1200 * time.Millisecond)\n\t\t\tlate := transA.SnapshotCount()\n\t\t\tcaEvent(map[string]interface{}{\n\t\t\t\t\"event\": \"loop_observe\", \"stale_index_entry\": stale,\n\t\t\t\t\"snapshot_index\": snapIdx, \"install_snapshot_calls_early\": early, \"install_snapshot_calls_late\": late,\n\t\t\t\t\"follower_applied_index\": follower.AppliedIndex(), \"follower_last_index\": follower.LastIndex(),\n\t\t\t\t\"leader_last_index\": leader.LastIndex(), \"leader_commit_index\": leader.CommitIndex(),\n\t\t\t})\n\t\t})\n\t}\n}\n",
+      "files": {},
+      "execution_package": ".",
+      "description": "",
+      "semantic_changes": [],
+      "prerequisites": []
+    },
+    "source_ids": [
+      "src-installsnap3",
+      "src-lastindex3",
+      "src-replication3",
+      "src-repl-snap3",
+      "src-compact3"
+    ],
+    "anchors": [],
+    "scope": {
+      "description": "One process, two real Raft instances over InmemTransport. server-A is bootstrapped as a single-voter cluster, becomes leader, applies six commands, then takes a user snapshot with TrailingLogs=0 so its retained log starts above the snapshot index. server-B is bootstrapped as a Nonvoter under the same configuration so it never campaigns, and is seeded with earlier-term (term 1) commands up to the snapshot index (defect) or one index short of it (control) via a legal AppendEntries from a third in-memory transport. server-A and server-B are then connected and server-A is asked to AddVoter(server-B).",
+      "assumptions": [
+        "The isolated target runs the root package '.' directly, so the harness is an in-package test and may wrap the transport to count InstallSnapshot calls.",
+        "A single-voter cluster bootstrapped with BootstrapCluster reaches leadership on its own after the election timeout, which keeps the leader-side prefix free of partition machinery.",
+        "AddVoter is issued without waiting on its future because the config entry cannot commit while the peer is unrepairable; the observation window starts after a fixed delay."
+      ],
+      "excluded": [
+        "No network transport, no partitions, and no more than one peer; leader elections among multiple voters are out of scope.",
+        "The follower-side boundary rejection is already covered by the earlier experiment and is not re-derived here."
+      ],
+      "parameters": {
+        "commands_applied": 6,
+        "trailing_logs": 0,
+        "seed_term": 1,
+        "observation_window_ms": 1500
+      }
+    },
+    "prefix": "server-A: inmem transport wrapped by a counting decorator that increments on every InstallSnapshot call; BootstrapCluster(conf.TrailingLogs=0, config={A:Voter}); NewRaft; wait for Leader; six Apply(new command) calls; Snapshot() and record its Index L and the store's FirstIndex. server-B: separate inmem transport, BootstrapCluster(config={A:Voter,B:Nonvoter}) then NewRaft, so B is a follower that never campaigns; a third inmem transport connected to B sends AppendEntries(Term=1, PrevLogEntry=1, PrevLogTerm=1, Entries=[index 2..L term 1]) for the defect sub-case or [index 2..L-1] for the control sub-case. Both sub-cases then connect A and B, call A.AddVoter(B, addrB, 0, 1s) without blocking on the future, sleep 300 ms, read the InstallSnapshot counter, sleep 1200 ms, read it again, and emit CA_EVENT loop_observe with the counter pair, the snapshot index, and the follower's applied and last indexes together with the leader's last and commit indexes.",
+    "requirement": null,
+    "responsibility": "Leader-side replication must make progress for a follower that is behind rather than re-shipping the whole snapshot indefinitely, and a snapshot install must remove the follower-side condition that caused the rejection.",
+    "comparisons": [],
+    "knowledge": []
+  },
+  "snapshot_id": "fd2d6988362c434e9fda87b87c5fb0df",
+  "configuration": {
+    "backend": "go_module",
+    "target": {
+      "expected_module": "github.com/hashicorp/raft",
+      "variant": "hashicorp_raft",
+      "analysis_roots": [],
+      "execution_package": ".",
+      "harness_path": "assurance_generated_test.go"
+    },
+    "isolation": "bwrap",
+    "tools": {
+      "agent": "codex-cli 0.155.0-alpha.16",
+      "implementation": "go version go1.23.5 linux/amd64"
+    }
+  },
+  "harness_filename": "assurance_generated_test.go",
+  "operation_id": "542e6bce20cb456fb6a01a29002f7cc4",
+  "previous_id": null,
+  "difference": {},
+  "revision_reason": ""
+}

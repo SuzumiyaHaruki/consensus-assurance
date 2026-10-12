@@ -1,0 +1,118 @@
+{
+  "rationale": "Returned to the registered necessary gap about reachability of the snapshot-boundary precondition. A legal multi-node history was constructed with real producers (five nodes, an isolated leader that replicates an uncommitted suffix to exactly one follower, a majority-side successor that commits its own entry at the first divergent index and snapshots there, then a heal). Local construction feedback did NOT reproduce the blocking loop in that history: the rejoin converged with zero snapshot restores, even though the follower did hold an earlier-term entry at the snapshot index. The harness is registered so the controller can retain the receipt and so the negative result is preserved rather than hidden.",
+  "sources": [
+    {
+      "id": "src-repl5",
+      "file": "replication.go",
+      "start_line": 220,
+      "end_line": 300,
+      "kind": "code_observation"
+    },
+    {
+      "id": "src-compact5",
+      "file": "snapshot.go",
+      "start_line": 216,
+      "end_line": 262,
+      "kind": "code_observation"
+    },
+    {
+      "id": "src-lastindex5",
+      "file": "state.go",
+      "start_line": 157,
+      "end_line": 174,
+      "kind": "code_observation"
+    }
+  ],
+  "investigations": [
+    {
+      "id": null,
+      "ref": "@q-reachability-history",
+      "question": "Does one legal multi-node history, built from real producers rather than a seeded RPC, actually reach the state in which a follower holds an earlier-term entry at the leader's snapshot index and then stays unrepairable, or do ordinary repair paths close the gap before the snapshot boundary is exercised?",
+      "source_ids": [
+        "src-repl5",
+        "src-compact5",
+        "src-lastindex5"
+      ],
+      "hypothesis": "A leader isolated from three of four peers can replicate uncommitted entries to exactly one follower; a successor elected by the remaining three commits its own entry at the first divergent index, snapshots there and compacts past it; on heal the follower should then reject PrevLogEntry at the snapshot index and the leader should fall into the snapshot loop. Local construction feedback did not show this: the follower converged with zero snapshot restores.",
+      "discriminator": "Read the rejoin_observe event: restores_early/restores_late above zero with the follower's applied index pinned at the snapshot index supports the loop; restores at zero with the follower's applied index reaching the leader's applied index refutes it for this history.",
+      "disposition": null,
+      "parent_id": null,
+      "knowledge": null,
+      "counterevidence": null,
+      "limitations": null,
+      "resume_conditions": null
+    }
+  ],
+  "knowledge": [],
+  "gaps": [],
+  "interpretations": [
+    {
+      "investigation_id": "@q-reachability-history",
+      "experiment_id": null,
+      "source_ids": [
+        "src-repl5",
+        "src-compact5",
+        "src-lastindex5"
+      ],
+      "executions": {},
+      "conclusion": "unresolved",
+      "defect_claim": null,
+      "rationale": "Local construction feedback on the registered harness produced divergent_prefix {base_index 2, leader_last_index 6, partner_last_index 6, partner_replicated_uncommitted true} and new_leader_snapshot {divergence_index 3, snapshot_index 4, new_leader_last_index 4, new_leader_term 3, old_leader_term 2}, i.e. the follower did hold term-2 entries at indices 3..6 while the term-3 successor snapshotted inside that window. The heal nevertheless produced rejoin_observe {restores_before 0, restores_early 0, restores_late 0, partner_applied_index 4, partner_last_index 4} - the follower's suffix was replaced through ordinary AppendEntries and no InstallSnapshot was needed. This is a negative result for reachability through this particular history and is exactly the kind of contrary observation that must not be suppressed: it neither refutes the seeded witness already retained (CheckRun 7772ad1b5b154d498a27a79806bb0ea7) nor establishes that the precondition is unreachable in general, because the ordering that let the successor repair the suffix is not yet explained. Candidate, unverified: after the successor compacted past its snapshot index, the sequence of nextIndex rewinds produced by the mismatch (rather than by a missing entry) may have reached a prev-log index the successor still retained, so truncation happened before SEND_SNAP was ever taken. This remains unresolved until the retained receipt for this harness is available and the leader-side nextIndex transitions are inspected.",
+      "answers": {},
+      "knowledge": [],
+      "counterevidence": [
+        "The follower converged in this history with zero snapshot restores, so the loop is not reproduced merely by having an earlier-term entry at the snapshot index; the ordering of the leader's nextIndex rewinds matters.",
+        "The earlier retained witness used a leader whose retained log started above the snapshot index (TrailingLogs=0 on a single-voter cluster); this history is a different configuration and must not be treated as the same basis."
+      ],
+      "limitations": [
+        "Source-only conclusion: the receipt for this harness has not been produced by the controller yet; the local run is construction feedback.",
+        "The harness relies on election timing and on the successor's applied index landing inside the follower's divergent suffix window; it passed once locally and may be timing-sensitive.",
+        "Only five-node, in-process, InmemTransport/InmemStore conditions were exercised."
+      ],
+      "joint_history": "",
+      "failure_attribution": null,
+      "report_title": null,
+      "report_answer": null
+    }
+  ],
+  "experiment": {
+    "investigation_id": "@q-reachability-history",
+    "harness_path": "assurance_generated_test.go",
+    "files": {},
+    "execution_package": null,
+    "source_ids": [
+      "src-repl5",
+      "src-compact5",
+      "src-lastindex5"
+    ],
+    "anchors": [],
+    "scope": {
+      "description": "Five real Raft instances in one process (MakeClusterCustom, BootstrapCluster, InmemTransport, InmemStore, TrailingLogs=0, SnapshotThreshold disabled, HeartbeatTimeout=ElectionTimeout=LeaderLeaseTimeout=1s). Path: wait for a leader; isolate the leader from the three peers that are neither the leader nor a chosen partner by disconnecting both directions of those links; apply five commands that reach only the partner; wait for election of a successor among the other three; apply one command on the successor so its FSM has something to snapshot; take a user snapshot and record its index L together with the divergence index; heal with FullyConnect; sample the partner's FSM Restore count at 300 ms and 1500 ms and the partner's/leader's applied indexes.",
+      "assumptions": [
+        "The isolated leader keeps leadership long enough to append (LeaderLeaseTimeout=1s equals the heartbeat timeout, satisfying config validation), and the majority side elects a successor in a higher term.",
+        "Each node's FSM is a wrapper counting Restore calls, so InstallSnapshot deliveries to the partner are observable without touching production logic.",
+        "The follower must be seeded through the real replication path: the leader's own AppendEntries to the partner carry the uncommitted suffix, so the divergent entries have an actual producer."
+      ],
+      "excluded": [
+        "No network transport and no process separation; fault injection is limited to link disconnection and healing.",
+        "The snapshot-boundary loop itself is not re-derived here; this harness only asks whether the precondition is reachable from a legal history."
+      ],
+      "parameters": {
+        "peers": 5,
+        "uncommitted_entries": 5,
+        "trailing_logs": 0,
+        "observation_window_ms": 1500
+      }
+    },
+    "prefix": "MakeClusterCustom(Peers=5, Bootstrap=true, Conf{TrailingLogs:0, SnapshotInterval:1h, SnapshotThreshold:1<<20, HeartbeatTimeout/ElectionTimeout/LeaderLeaseTimeout: 1s, CommitTimeout:10ms}, MakeFSMFunc returning a Restore-counting MockFSM). Wait for a leader and four followers; pick followers[0] as the partner and the three remaining nodes as others; for each other, disconnect the leader transport from it and its transport from the leader, leaving leader<->partner connected. Record base=leader.LastIndex(), fire five leader.Apply commands without waiting, and wait until partner.LastIndex() > base. Wait up to 10s for one of others to become Leader, emit new_leader_snapshot with its term, last index and the snapshot index after applying one command and calling Snapshot(). Then FullyConnect(), sample the partner FSM's Restore count at 300 ms and 1500 ms, and emit rejoin_observe with the restore counts and the applied/last indexes of partner and successor.",
+    "semantic_changes": [],
+    "requirement": null,
+    "responsibility": "Replication must repair a follower whose log diverges from the leader, and the audit must not assume a seeded state stands in for a produced history.",
+    "prerequisites": [],
+    "comparisons": [],
+    "knowledge": [],
+    "previous_id": null,
+    "revision_reason": ""
+  },
+  "stop": null
+}

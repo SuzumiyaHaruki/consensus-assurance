@@ -1,0 +1,47 @@
+{
+  "rationale": "The reachability harness registered in the previous batch failed to build in the controller's clean workspace because I shipped a file that relied on the caEvent helper defined in the earlier harness; the package failed with 'undefined: caEvent' before any test ran, so that run carries no observation. This update registers the corrected, self-contained successor harness (same scenario, added store-bound diagnostics, plus precondition guards that skip instead of failing on timing) and an unresolved interpretation that records both the retained build failure and the construction feedback obtained locally with the corrected harness.",
+  "sources": [
+    { "id": "src-repl6", "file": "replication.go", "start_line": 220, "end_line": 300, "kind": "code_observation" },
+    { "id": "src-compact6", "file": "snapshot.go", "start_line": 216, "end_line": 262, "kind": "code_observation" },
+    { "id": "src-lastindex6", "file": "state.go", "start_line": 157, "end_line": 174, "kind": "code_observation" }
+  ],
+  "interpretations": [
+    {
+      "investigation_id": "e800d892b4fa472d96fd22bb106b718f-question-0",
+      "source_ids": ["src-repl6", "src-compact6", "src-lastindex6"],
+      "conclusion": "unresolved",
+      "rationale": "Two things are recorded, neither of which is a defect claim. First, the retained run 5abe56ac189b467d8dd165fb90954406 ended with status error, exit code 1 and reason 'Package discovery, build or dependency preparation failed before selected tests'; its stderr shows './assurance_generated_test.go:91:2: undefined: caEvent' (also lines 136 and 147) and its observations file contains no events, so it carries no measurement and cannot support any conclusion - it is a harness defect on my side, not source evidence. Second, with the corrected self-contained harness the local construction feedback was consistent across two runs and shows the opposite of the suspicion for this history: divergent_prefix reported base_index 2, divergence_index 3, partitioned_leader_last_index 7, partner_last_index 7 and partner_store 1..7, so the follower really did hold earlier-term entries inside the successor's snapshot window; successor_snapshot reported snapshot_index 4, snapshot_term 3, successor_term 3, old_leader_term 2 and successor_store_first/last both 0, so the successor compacted its log away completely; rejoin_observe then reported restores_before/early/late all 0, partner_applied_index 4, partner_last_index 4 and partner_store 1..4, i.e. the follower's suffix above 4 was removed and it applied up to the successor's index without any InstallSnapshot being installed on it. The repair path is not explained by these observables: the successor's own log store was empty so it could not have served entries 3..4, yet the follower's FSM was never restored, so some other path must have reconciled the follower. That is left open rather than guessed at, and it is an important narrowing: for this legal history the precondition is reached but the follower does not remain unrepairable.",
+      "counterevidence": [
+        "The follower converged in this history with zero FSM restores even though it held earlier-term entries at indices 3..7 while the successor snapshotted at 4, so an earlier-term entry at the snapshot index is not by itself sufficient to make a rejoining follower unrepairable.",
+        "The retained witness CheckRun 7772ad1b5b154d498a27a79806bb0ea7 remains valid on its own basis (single-voter leader with an emptied retained log plus a peer holding an earlier-term entry at the snapshot index) and is not addressed by this different configuration."
+      ],
+      "limitations": [
+        "The corrected harness has not yet been executed by the controller; the numbers quoted are non-retained construction feedback from a scratch copy.",
+        "The five-node history is timing-sensitive: precondition guards now skip rather than fail, so the successor run may legitimately produce no observation.",
+        "The repair path that closed the gap in this history is unidentified, so the negative result should not be read as evidence that the seeded witness is unreachable in general."
+      ]
+    }
+  ],
+  "experiment": {
+    "investigation_id": "e800d892b4fa472d96fd22bb106b718f-question-0",
+    "previous_id": "e800d892b4fa472d96fd22bb106b718f-experiment",
+    "revision_reason": "The previous harness was not self-contained: it called caEvent without defining it, so the package failed to build ('undefined: caEvent') and no test ran. The successor only adds the missing helper, adds store first/last-index diagnostics around the precondition and the rejoin, and turns the two timing-sensitive precondition checks into skips. The scenario, partitions, snapshot point and observation window are unchanged.",
+    "harness_path": "assurance_generated_test.go",
+    "source_ids": ["src-repl6", "src-compact6", "src-lastindex6"],
+    "scope": {
+      "description": "Five real Raft instances in one process via MakeClusterCustom (InmemTransport, InmemStore, FileSnapshotStore per node, Restore-counting FSM, TrailingLogs=0, HeartbeatTimeout=ElectionTimeout=LeaderLeaseTimeout=1s). The leader is isolated from the three non-partner peers while keeping the partner reachable, applies five commands that only reach the partner, a successor is elected by the majority side, applies one command and takes a user snapshot inside the partner's divergent suffix, then links are restored and the partner's Restore count and applied index are sampled.",
+      "assumptions": [
+        "The isolated leader keeps leadership long enough to append because LeaderLeaseTimeout equals the heartbeat timeout.",
+        "Counting Restore calls on each node's FSM makes InstallSnapshot deliveries observable without touching production logic.",
+        "The divergent entries have a real producer: they travel from the leader to the partner over the normal AppendEntries path."
+      ],
+      "excluded": [
+        "No network transport, no process separation and no fault injection beyond disconnecting and restoring links.",
+        "The snapshot-boundary loop itself is not re-derived here; this harness only asks whether the precondition is reachable and whether it persists."
+      ],
+      "parameters": { "peers": 5, "uncommitted_entries": 5, "trailing_logs": 0, "observation_window_ms": 1500 }
+    },
+    "prefix": "MakeClusterCustom(Peers=5, Bootstrap=true, Conf{TrailingLogs:0, SnapshotInterval:1h, SnapshotThreshold:1<<20, HeartbeatTimeout/ElectionTimeout/LeaderLeaseTimeout: 1s, CommitTimeout:10ms}, MakeFSMFunc returning a Restore-counting MockFSM). Wait for a leader, take four followers, use followers[0] as partner and the other three as others; disconnect leader<->other in both directions for each other; record base=leader.LastIndex(); fire five leader.Apply calls without waiting and wait until partner.LastIndex()>base, emitting divergent_prefix with the partner's and the partitioned leader's last index and the partner's store bounds. Wait up to 12s for one of others to become Leader; apply one command and wait for AppliedIndex>base; call Snapshot() and emit successor_snapshot with the snapshot index and term, the successor's term, last and applied index, and its store bounds. Then FullyConnect(), sample the partner FSM's Restore count at 300ms and 1500ms, and emit rejoin_observe with the restore counts, the partner's applied and last index, the partner's store bounds, and the successor's applied index, commit index and store bounds.",
+    "responsibility": "Replication and snapshot handling must actually repair a follower whose log diverges from the leader, and reachability claims must be shown with a produced history rather than a seeded one."
+  }
+}

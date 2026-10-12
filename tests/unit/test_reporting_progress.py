@@ -1,5 +1,6 @@
 import json
 import shutil
+import pytest
 from types import SimpleNamespace
 from audit_support import engine_for, combined, opinion, stop
 from consensus_assurance.core.types import CheckRun, ExecutionStatus
@@ -21,12 +22,22 @@ def test_costs_keep_missing_data_and_do_not_double_count_children(tmp_path):
         assert execution_cost(c.model_copy(update={'parameters':{'action_seconds':invalid},'started_at':'invalid'}))=={'process_seconds':None,'action_seconds':None}
 
 
-def test_report_uses_actual_observations_and_preserves_opinion_history(tmp_path):
-    def correction(state):return opinion(state,conclusion='conditional',rationale='Caller history remains unestablished')
-    e,repo=engine_for(tmp_path,[combined,opinion,correction,stop]);s=e.start(repo)
+@pytest.mark.parametrize('claim,label',[
+    ('refuted','当前疑点已否定'), ('unresolved','尚不能判断'), (None,'未提交缺陷判断')])
+def test_report_uses_actual_observations_and_preserves_opinion_history(tmp_path,claim,label):
+    def initial(state):return opinion(state,defect_claim='asserted',rationale='Compare the actual return. The initial model alleges a defect')
+    def correction(state):
+        return opinion(state,conclusion='conditional',rationale='Caller history remains unestablished',
+                       **({'defect_claim':claim} if claim else {}))
+    e,repo=engine_for(tmp_path,[combined,initial,correction,stop]);s=e.start(repo)
     before=s.model_dump(mode='json')
     text=render_report(s,e.root).read_text()
-    assert 'Caller history remains unestablished' in text
+    assert 'Caller history remains unestablished' in text and 'The initial model alleges a defect' in text
+    assert [i.defect_claim for i in s.interpretations]==['asserted',claim]
+    claims,other=text.split('## 模型明确主张的缺陷（待人工核验）',1)[1].split('## 其他研究结果',1)
+    assert s.investigations[0].question not in claims and s.investigations[0].question in other
+    assert f'当前模型缺陷判断：{label}' in text
+    assert text.count('### ')==1
     assert 'Compare the actual return' in text
     assert '反例见证未确认' in text and '所声明比较条件不成立' in text
     check=next(c for c in s.checks if c.experiment_id)

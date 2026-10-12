@@ -168,8 +168,10 @@ def assessment(state, root, fixed, check):
     interpretations = [i for i in state.interpretations if i.experiment_id == fixed.id and check.id in i.executions]
     opinion = interpretations[-1] if interpretations else None
     blockers = []
-    if not fixed.basis.requirement or not fixed.basis.comparisons:
-        blockers.append('Exploratory basis has no fixed requirement and comparison')
+    if not fixed.basis.requirement:
+        blockers.append('Exploratory basis has no fixed requirement')
+    if not fixed.basis.comparisons:
+        blockers.append('No fixed comparisons')
     if opinion is None:
         blockers.append('Execution has no attributed interpretation')
     elif opinion.conclusion not in {'violated', 'holds'}:

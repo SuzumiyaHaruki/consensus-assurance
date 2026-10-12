@@ -1,0 +1,71 @@
+{
+  "rationale": "Follow-up on the registered necessary gap for the leader side of @q-snapshot-boundary. A new, independently assessable question targets the replication responsibility (leader nextIndex/SEND_SNAP) rather than the follower's ingest responsibility: given a follower that cannot be repaired at the snapshot boundary, does the leader re-ship the snapshot indefinitely with no progress on that follower? A live two-node harness (leader plus peer, one process, InmemTransport) was built and exercised locally as construction feedback: the control peer converged after a single InstallSnapshot, while the otherwise identical peer holding an earlier-term entry at the snapshot index produced ~15,900 InstallSnapshot calls inside a 1.2 s interval and stayed applied at the snapshot index. The experiment is registered so the controller can retain the receipt before any measured conclusion is asserted.",
+  "sources": [
+    { "id": "src-installsnap3", "file": "raft.go", "start_line": 1814, "end_line": 1953, "kind": "code_observation" },
+    { "id": "src-lastindex3", "file": "state.go", "start_line": 157, "end_line": 174, "kind": "code_observation" },
+    { "id": "src-replication3", "file": "replication.go", "start_line": 220, "end_line": 300, "kind": "code_observation" },
+    { "id": "src-repl-snap3", "file": "replication.go", "start_line": 299, "end_line": 375, "kind": "code_observation" },
+    { "id": "src-compact3", "file": "snapshot.go", "start_line": 216, "end_line": 262, "kind": "code_observation" }
+  ],
+  "investigations": [
+    {
+      "ref": "@q-snapshot-loop",
+      "question": "With a leader whose retained log begins above its snapshot index L and a follower that keeps advertising an earlier term for L, does one execution show repeated InstallSnapshot attempts and persistent non-progress on that follower, or does the leader converge after one snapshot?",
+      "source_ids": ["src-installsnap3", "src-lastindex3", "src-replication3", "src-repl-snap3", "src-compact3"],
+      "hypothesis": "The follower rejects every AppendEntries whose PrevLogEntry is L (stale term from getLastEntry). The leader computes nextIndex = max(min(nextIndex-1, resp.LastLog+1), 1) = L, then setPreviousLog(L) needs the leader's own entry L-1; because the leader compacted up to its snapshot index, GetLog(L-1) returns ErrLogNotFound, replicateTo branches to SEND_SNAP, sendLatestSnapshot restores nextIndex = L+1, and the next append is rejected again. The cycle restores its own precondition and has no enabled repair, so the leader re-ships the snapshot repeatedly while the follower's applied index stays at L.",
+      "discriminator": "Control peer and defect peer share one harness and differ only in whether an earlier-term entry occupies index L: one snapshot and applied index L+1 refute the suspicion; repeated InstallSnapshot calls together with an applied index pinned at L support it."
+    }
+  ],
+  "knowledge": [
+    {
+      "ref": "@b-snapshot-loop-cycle",
+      "kind": "behavior",
+      "statement": "On a rejected AppendEntries the leader rewinds the follower's nextIndex to max(min(nextIndex-1, resp.LastLog+1), 1); when that lands on the follower's snapshot boundary L and the leader's own log has been compacted so that L-1 is no longer stored, the rebuild of the request returns ErrLogNotFound, which replicateTo maps to SEND_SNAP. sendLatestSnapshot then ships the current snapshot and, on success, sets nextIndex = meta.Index+1 = L+1, so the following append again carries PrevLogEntry=L. Nothing in the loop removes the follower's stale entry at L or advances the leader's nextIndex past L, so the state that caused the rejection is restored each round.",
+      "conditions": "Applies when the leader's log compaction leaves its first retained index at or above L (for example TrailingLogs=0, or a snapshot taken with more than TrailingLogs entries behind it) and the follower answers PrevLogEntry=L with Success=false because its view of L is a stale earlier-term entry rather than the snapshot's.",
+      "source_ids": ["src-replication3", "src-repl-snap3", "src-lastindex3", "src-compact3", "src-installsnap3"]
+    }
+  ],
+  "interpretations": [
+    {
+      "investigation_id": "@q-snapshot-loop",
+      "source_ids": ["src-replication3", "src-repl-snap3", "src-lastindex3", "src-compact3"],
+      "conclusion": "unresolved",
+      "rationale": "Source identifies the exact cycle, but the measured end-to-end result is deliberately left unresolved until the controller retains an execution of this experiment. Local construction feedback on the same harness design showed install_snapshot_calls_early=1/late=1 with follower_applied_index=9 for the control peer, versus install_snapshot_calls_early=2675/late=15920 with follower_applied_index=8 pinned at the snapshot index for the peer holding an earlier-term entry at that index; that local run is not a retained receipt and is recorded here only as construction feedback. The cycle's weakest necessary link is the leader-side ErrLogNotFound branch, which depends on the log store reporting ErrLogNotFound for L-1 after compaction; the harness uses InmemStore, whose DeleteRange resets to empty once everything is deleted, and the leader's first retained index in that run was 9 with the snapshot at 8.",
+      "counterevidence": [
+        "The control peer converged in one snapshot, so the repeated-snapshot behaviour is not a property of adding a voter alone.",
+        "In the same run the leader's own commit index still advanced to 9, so the no-progress claim is scoped to that follower's replication and applied index, not to the leader's commit index."
+      ],
+      "limitations": [
+        "Source-only conclusion: the receipt for this experiment has not been produced yet.",
+        "Only InmemTransport/InmemStore were used; a monotonic LogStore clears all logs on snapshot install, which changes the store-level path but not the follower's stale last-entry term.",
+        "The peer's earlier-term entry was seeded by a legal AppendEntries from a term-1 producer rather than by a complete replica-set history; that reachability question stays open."
+      ]
+    }
+  ],
+  "experiment": {
+    "investigation_id": "@q-snapshot-loop",
+    "harness_path": "assurance_generated_test.go",
+    "source_ids": ["src-installsnap3", "src-lastindex3", "src-replication3", "src-repl-snap3", "src-compact3"],
+    "scope": {
+      "description": "One process, two real Raft instances over InmemTransport. server-A is bootstrapped as a single-voter cluster, becomes leader, applies six commands, then takes a user snapshot with TrailingLogs=0 so its retained log starts above the snapshot index. server-B is bootstrapped as a Nonvoter under the same configuration so it never campaigns, and is seeded with earlier-term (term 1) commands up to the snapshot index (defect) or one index short of it (control) via a legal AppendEntries from a third in-memory transport. server-A and server-B are then connected and server-A is asked to AddVoter(server-B).",
+      "assumptions": [
+        "The isolated target runs the root package '.' directly, so the harness is an in-package test and may wrap the transport to count InstallSnapshot calls.",
+        "A single-voter cluster bootstrapped with BootstrapCluster reaches leadership on its own after the election timeout, which keeps the leader-side prefix free of partition machinery.",
+        "AddVoter is issued without waiting on its future because the config entry cannot commit while the peer is unrepairable; the observation window starts after a fixed delay."
+      ],
+      "excluded": [
+        "No network transport, no partitions, and no more than one peer; leader elections among multiple voters are out of scope.",
+        "The follower-side boundary rejection is already covered by the earlier experiment and is not re-derived here."
+      ],
+      "parameters": {
+        "commands_applied": 6,
+        "trailing_logs": 0,
+        "seed_term": 1,
+        "observation_window_ms": 1500
+      }
+    },
+    "prefix": "server-A: inmem transport wrapped by a counting decorator that increments on every InstallSnapshot call; BootstrapCluster(conf.TrailingLogs=0, config={A:Voter}); NewRaft; wait for Leader; six Apply(new command) calls; Snapshot() and record its Index L and the store's FirstIndex. server-B: separate inmem transport, BootstrapCluster(config={A:Voter,B:Nonvoter}) then NewRaft, so B is a follower that never campaigns; a third inmem transport connected to B sends AppendEntries(Term=1, PrevLogEntry=1, PrevLogTerm=1, Entries=[index 2..L term 1]) for the defect sub-case or [index 2..L-1] for the control sub-case. Both sub-cases then connect A and B, call A.AddVoter(B, addrB, 0, 1s) without blocking on the future, sleep 300 ms, read the InstallSnapshot counter, sleep 1200 ms, read it again, and emit CA_EVENT loop_observe with the counter pair, the snapshot index, and the follower's applied and last indexes together with the leader's last and commit indexes.",
+    "responsibility": "Leader-side replication must make progress for a follower that is behind rather than re-shipping the whole snapshot indefinitely, and a snapshot install must remove the follower-side condition that caused the rejection.",
+    "knowledge": []
+  }
+}

@@ -180,6 +180,7 @@ class Interpretation(Record):
     source_ids: list[str] = Field(min_length=1)
     executions: dict[str, list[int]] = {}
     conclusion: Literal["explained", "conditional", "violated", "holds", "unresolved"]
+    defect_claim: Literal["asserted", "refuted", "unresolved"] | None = None
     rationale: str = Field(min_length=1)
     answers: dict[str, str] = {}
     knowledge: list[KnowledgeUse] = []

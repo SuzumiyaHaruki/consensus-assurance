@@ -1,0 +1,41 @@
+{
+  "rationale": "The leader-side experiment registered under @q-snapshot-loop was executed and retained as CheckRun 7772ad1b5b154d498a27a79806bb0ea7 (exit 0, completed). This update records the measured interpretation against that receipt: the control peer converges after one InstallSnapshot, while the peer holding an earlier-term entry at the snapshot index produces thousands of InstallSnapshot calls inside a 1.2 s window and never advances past the snapshot index. It also closes the previously registered necessary gap about the leader side of the snapshot boundary by execution rather than by argument, and states the remaining reachability limitation.",
+  "sources": [
+    { "id": "src-replication4", "file": "replication.go", "start_line": 220, "end_line": 300, "kind": "code_observation" },
+    { "id": "src-repl-snap4", "file": "replication.go", "start_line": 299, "end_line": 375, "kind": "code_observation" },
+    { "id": "src-lastindex4", "file": "state.go", "start_line": 157, "end_line": 174, "kind": "code_observation" },
+    { "id": "src-installsnap4", "file": "raft.go", "start_line": 1814, "end_line": 1953, "kind": "code_observation" },
+    { "id": "src-compact4", "file": "snapshot.go", "start_line": 216, "end_line": 262, "kind": "code_observation" }
+  ],
+  "knowledge": [
+    {
+      "ref": "@b-loop-executed-witness",
+      "kind": "fact",
+      "statement": "Executed witness: with server-A a single-voter leader that compacted its log above its user snapshot at index 8, and server-B a peer added via AddVoter, the control peer (seeded only to index 7) converged with install_snapshot_calls_early=1 and late=1 and follower_applied_index=9, whereas the peer seeded to index 8 with term-1 entries produced install_snapshot_calls_early=2778 and late=16207 while its follower_applied_index stayed pinned at 8 and follower_last_index stayed 8. In both sub-cases leader_last_index and leader_commit_index reached 9.",
+      "conditions": "One process, root package '.', InmemTransport with a counting decorator around the leader's transport, InmemStore, conf.TrailingLogs=0 so the leader's retained log begins above the snapshot index; the two sub-cases share the harness and differ only in whether an earlier-term (term 1) entry occupies the snapshot index. Sample points are 300 ms and 1500 ms after AddVoter. Frozen snapshot fd2d6988362c434e9fda87b87c5fb0df.",
+      "source_ids": ["src-replication4", "src-repl-snap4", "src-lastindex4", "src-installsnap4"],
+      "executions": { "7772ad1b5b154d498a27a79806bb0ea7": [3, 1, 0, 2] }
+    }
+  ],
+  "interpretations": [
+    {
+      "investigation_id": "542e6bce20cb456fb6a01a29002f7cc4-question-0",
+      "experiment_id": "542e6bce20cb456fb6a01a29002f7cc4-experiment",
+      "source_ids": ["src-replication4", "src-repl-snap4", "src-lastindex4", "src-installsnap4", "src-compact4"],
+      "executions": { "7772ad1b5b154d498a27a79806bb0ea7": [3, 1] },
+      "conclusion": "violated",
+      "defect_claim": "asserted",
+      "rationale": "The compared predicate was that a leader with a compacted log must make progress for a behind follower instead of re-shipping its snapshot indefinitely. Parsed receipt CheckRun 7772ad1b5b154d498a27a79806bb0ea7: index 3 (loop_observe, defect sub-case) reports stale_index_entry=true, snapshot_index=8, install_snapshot_calls_early=2778, install_snapshot_calls_late=16207, follower_applied_index=8, follower_last_index=8, leader_last_index=9, leader_commit_index=9; index 1 (loop_observe, control sub-case) reports stale_index_entry=false, install_snapshot_calls_early=1, install_snapshot_calls_late=1, follower_applied_index=9, follower_last_index=9. Index 0 and 2 confirm both sub-cases reached the same leader snapshot at index 8, so the only difference is the peer's earlier-term entry at the snapshot index. Circumstances: legal trigger is AddVoter(server-B) on a leader whose retained log begins above snapshot index L=8; observation interval is 300 ms and 1500 ms after the call, under no injected faults, no partitions and a responsive transport. Repeated nonprogress: across that 1.2 s window the peer received roughly 13.4 thousand additional InstallSnapshot deliveries and its applied index did not move off the snapshot index at all. Stable mechanism: the follower answers PrevLogEntry=L with Success=false because getLastEntry still returns its earlier term for L; the leader rewinds nextIndex to max(min(nextIndex-1, resp.LastLog+1),1)=L; setPreviousLog(L) then needs the leader's entry L-1, which compaction removed, so setupAppendEntries returns ErrLogNotFound and replicateTo branches to SEND_SNAP; sendLatestSnapshot then sets nextIndex=L+1, so the next append carries PrevLogEntry=L again. Controls and competing causes: the control peer, identical except for the missing earlier-term entry at L, converged with exactly one snapshot, so the loop is not a property of single-voter leadership, AddVoter, or the snapshot machinery itself. Scoped defect claim: in hashicorp/raft fd2d6988362c434e9fda87b87c5fb0df, a follower that holds an earlier-term entry at the leader's snapshot index cannot be repaired by the leader; the leader's nextIndex/SEND_SNAP cycle restores its own blocking precondition and the follower makes no progress, so bounded liveness fails for that follower under the stated conditions.",
+      "counterevidence": [
+        "The leader's own commit index still advanced to 9 in the defect sub-case, so the nonprogress is scoped to that follower's replication and applied index, not to the leader's commit index or to cluster-wide commit.",
+        "The same harness without the earlier-term entry at L converged after one snapshot, so this is not an artifact of compaction or of adding a voter in general."
+      ],
+      "limitations": [
+        "The precondition was produced by a legal AppendEntries from a term-1 producer rather than by a complete multi-node history; whether one compatible history can legally leave an earlier-term entry at exactly the index where a later-term leader commits and snapshots remains the open reachability gap.",
+        "Only InmemTransport/InmemStore ran; the monotonic LogStore branch of installSnapshot (removeOldLogs) was not executed, although the follower-side stale term arises from lastLogIndex and is expected to persist there too.",
+        "The 13.4k figure is the observed InstallSnapshot delivery count for this in-process, backoff-free transport, not a production rate; the load-bearing observation is the count growing without any follower progress.",
+        "One peer, in one process, at one configuration (TrailingLogs=0). Whether the loop persists with default TrailingLogs once the leader has compacted past its snapshot index was not executed."
+      ]
+    }
+  ]
+}

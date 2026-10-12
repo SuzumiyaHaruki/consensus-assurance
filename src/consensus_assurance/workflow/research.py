@@ -62,7 +62,7 @@ def reselection_view(state):
         questions.append({'id':q.id, 'question':q.question[:240], 'disposition':q.disposition,
             'source_ids':q.source_ids[:4], 'open_gap_count':len(open_gaps(state,q.id)),
             'latest_interpretation':{'id':opinion.id, 'conclusion':opinion.conclusion,
-                'rationale':opinion.rationale[:400]} if opinion else None})
+                'defect_claim':opinion.defect_claim, 'rationale':opinion.rationale[:400]} if opinion else None})
     return {'task':['A1: CFT decision formation and progress.',
                     'A2: Context and authority acquisition, transition and loss.'],
         'target':{'repo':state.snapshot.repo, 'snapshot_id':state.snapshot.id},
@@ -160,8 +160,10 @@ def operation_summary(state, root):
     if current.get('no_change') or answered:
         summary['reselection'] = reselection_view(state)
         summary['next'] = ('No semantic change. ' if current.get('no_change') else '') + (
-            'Local dispositions do not complete the global task. Select any valuable A1/A2 direction independently '
-            'of the last question, or follow a newly grounded local lead; inspect sources and make a real next step. '
+            'Local answers or reading every file do not exhaust A1/A2 relationships. Select any valuable A1/A2 '
+            'direction independently of the last question: use current understanding to trace an unexplained '
+            'producer/consumer or authority relationship and form a falsifiable suspicion. Do not repeat closure. '
+            'Use the actual allocation above; timeout ceilings are not predicted costs or evidence of exhaustion. '
             'Necessary gaps remain with their owners; no experiment or parent link is mandatory.')
     return summary
 

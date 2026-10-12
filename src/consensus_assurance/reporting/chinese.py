@@ -7,6 +7,8 @@ from consensus_assurance.workflow.knowledge import open_gaps
 from consensus_assurance.workflow.research import costs
 
 COMPARISON_LABELS = {'holds':'所声明比较条件成立', 'violated':'所声明比较条件不成立', 'unknown':'比较未判定'}
+DEFECT_LABELS = {'asserted':'主张存在缺陷（待人工核验）', 'refuted':'当前疑点已否定',
+                 'unresolved':'尚不能判断', None:'未提交缺陷判断'}
 
 
 def comparison_summary(result):
@@ -25,18 +27,28 @@ def render_report(state, root):
     root = Path(root)
     labels = {'active':'调查中','paused':'暂停','explained':'局部问题已回答','closed':'局部问题已处置'}
     conclusions = {**COMPARISON_LABELS, 'explained':'源码解释','conditional':'条件性解释','unresolved':'未解决'}
+    latest = {i.investigation_id:i for i in state.interpretations}
+    claimed = {id for id,i in latest.items() if i.defect_claim == 'asserted'}
     rows = ['# 共识审计研究报告', '',
         f"方法 `{state.framework_revision}`；模式 `{state.mode}/{state.analysis_mode}`；持续 {state.elapsed_seconds / 60:.2f} 分钟。",
         f"停止原因：{state.stop_reason}", '',
         '机械结果仅评价所声明谓词；confirmed 仅表示固定比较的完整反例见证得到确认，不是规范适用性或共识缺陷的独立裁决。模型解释保留其归属，异常预测成立也可能支持缺陷解释。',
-        '', '## 问题与证据', '']
+        '按问题 ID 展示最新解释中明确提出的缺陷主张；根因独立性与最终结论由人工核验。未填写缺陷判断不沿用历史主张，历史解释与执行仍完整保留。',
+        '', '## 模型明确主张的缺陷（待人工核验）', '']
+    if not claimed:
+        rows.append('当前没有明确提交成立的缺陷主张；这不代表目标没有缺陷。')
     if not state.investigations:
         rows.append('尚无受理问题或正式结论；中断记录不代表目标没有问题。')
-    for q in state.investigations:
+    other_started = False
+    for q in sorted(state.investigations, key=lambda q:q.id not in claimed):
+        if q.id not in claimed and not other_started:
+            rows.extend(['', '## 其他研究结果', ''])
+            other_started = True
         opinions = [i for i in state.interpretations if i.investigation_id == q.id]
         title = opinions[-1].report_title if opinions else None
         rows.extend([f'### {title or q.question}', '', f'当前处置：{labels[q.disposition]}。',
                      f'问题 `{q.id}` v{q.version}；来源：{", ".join(q.source_ids)}（[完整引用](state.json)）。'])
+        rows.append('当前模型缺陷判断：' + DEFECT_LABELS[opinions[-1].defect_claim if opinions else None] + '。')
         if title:
             rows.append('原命题：' + q.question)
         if q.parent_id:
@@ -71,11 +83,11 @@ def render_report(state, root):
                 rows.append(comparison_summary(result))
                 current = next((i for i in opinions if i.id == result['interpretation_id']), None)
                 if current:
-                    rows.append(f'当前模型归属解释 `{current.id}`（{current.conclusion}）：{conclusions[current.conclusion]}；' + (current.report_answer or current.rationale))
+                    rows.append(f'该执行的模型归属解释 `{current.id}`（{current.conclusion}，{"问题当前解释" if current.id == latest[q.id].id else "历史解释，问题已有后续解释"}）：{conclusions[current.conclusion]}；' + (current.report_answer or current.rationale))
                     if current.conclusion in {'holds','violated'} and current.conclusion != result['outcome']:
                         rows.append(f'归属判断与机械结果不一致：模型 `{current.conclusion}`，机械 `{result["outcome"]}`；保留原解释，不改写比较结果或确认值。')
                 if result['blockers']:
-                    rows.append('待解决：' + '；'.join(result['blockers']))
+                    rows.append('见证确认限制：' + '；'.join(result['blockers']))
                 for comparison in result['comparisons']:
                     index = comparison['comparison_index']
                     spec = a.basis.comparisons[index]
@@ -89,7 +101,7 @@ def render_report(state, root):
         if opinions:
             rows.extend(['', '模型归属解释历史（非独立框架裁决）：', ''])
         for i in opinions:
-            rows.append(f'- `{i.id}` · {conclusions[i.conclusion]}：{i.report_answer or i.rationale}；依据来源 {", ".join(i.source_ids)}，执行 {", ".join(i.executions) or "无（源码解释）"}。')
+            rows.append(f'- {"当前" if i == opinions[-1] else "历史"}解释 `{i.id}` · {conclusions[i.conclusion]}；模型缺陷判断：{DEFECT_LABELS[i.defect_claim]}：{i.report_answer or i.rationale}；依据来源 {", ".join(i.source_ids)}，执行 {", ".join(i.executions) or "无（源码解释）"}。')
             if i.counterevidence:
                 rows.append('  反证：' + '；'.join(i.counterevidence))
             if i.limitations:

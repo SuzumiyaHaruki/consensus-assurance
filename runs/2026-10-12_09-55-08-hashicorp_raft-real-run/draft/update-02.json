@@ -1,0 +1,80 @@
+{
+  "rationale": "The registered experiment for @q-snapshot-boundary was executed by the controller and produced a retained receipt (CheckRun 72367650c8d0470d8197a7d2c0f97ce1, exit 0, outcome tests_passed). This update interprets that receipt, promotes the observed instance to a Fact, and keeps the leader-side loop as an open necessary gap rather than assuming it.",
+  "sources": [
+    {
+      "id": "src-installsnap2",
+      "file": "raft.go",
+      "start_line": 1814,
+      "end_line": 1953,
+      "kind": "code_observation"
+    },
+    {
+      "id": "src-lastindex2",
+      "file": "state.go",
+      "start_line": 157,
+      "end_line": 174,
+      "kind": "code_observation"
+    },
+    {
+      "id": "src-appendentries2",
+      "file": "raft.go",
+      "start_line": 1475,
+      "end_line": 1502,
+      "kind": "code_observation"
+    }
+  ],
+  "investigations": [
+    {
+      "ref": "@q-snapshot-boundary",
+      "question": "After a follower successfully installs an InstallSnapshot whose last included entry is (index L, term T), must the follower accept the leader's next AppendEntries with PrevLogEntry=L and PrevLogTerm=T, and does it still do so when the follower already held a log entry at L from an earlier term?",
+      "source_ids": [
+        "src-installsnap2",
+        "src-lastindex2",
+        "src-appendentries2"
+      ],
+      "hypothesis": "Reconfirmed against the retained receipt: the follower keeps the log-derived term for the snapshot index and therefore rejects the leader's boundary AppendEntries; the leader-facing retry cycle remains source-sourced pending its own execution."
+    }
+  ],
+  "knowledge": [
+    {
+      "ref": "@b-executed-boundary-witness",
+      "kind": "fact",
+      "statement": "In the executed harness, after a successful InstallSnapshot with LastLogIndex=2/LastLogTerm=3, the defect-case node (which had earlier stored a term-2 command at index 2) reported last_log_index=2, last_log_term=2, last_snapshot_index=2, last_snapshot_term=3, get_last_entry_index=2, get_last_entry_term=2, and then rejected the leader's AppendEntries with PrevLogEntry=2/PrevLogTerm=3 (success=false, no_retry_backoff=true, resp_last_log=2). The otherwise identical control node, with no earlier entry at index 2, reported last_log_index=1, get_last_entry_index=2, get_last_entry_term=3 and accepted the same AppendEntries (success=true, no_retry_backoff=false).",
+      "conditions": "One process, root package '.', InmemTransport and InmemStore (non-monotonic), server-1 bootstrapped as a Nonvoter so it never campaigns, server-2 acting as the RPC producer; the two sub-cases differ only in whether an earlier-term (term 2) command was first stored at the snapshot index. Applies to the frozen snapshot fd2d6988362c434e9fda87b87c5fb0df. Observed in retained CheckRun 72367650c8d0470d8197a7d2c0f97ce1 (experiment c4f67dac947d44fe86d65b317d5d5b4-experiment, exit 0, tests_passed): parsed indices 5 and 6 (defect sub-case) and 1 and 2 (control sub-case).",
+      "source_ids": [
+        "src-installsnap2",
+        "src-lastindex2",
+        "src-appendentries2"
+      ]
+    }
+  ],
+  "gaps": [
+    {
+      "investigation_id": "@q-snapshot-boundary",
+      "question": "Reachability: can one compatible multi-node history legally produce the precondition (a follower holding an earlier-term entry at exactly the index where a later-term leader later commits and snapshots), rather than the harness's single seeded AppendEntries, without the follower's higher term forcing the leader to step down?"
+    }
+  ],
+  "interpretations": [
+    {
+      "investigation_id": "@q-snapshot-boundary",
+      "source_ids": [
+        "src-installsnap2",
+        "src-lastindex2",
+        "src-appendentries2"
+      ],
+      "conclusion": "unresolved",
+      "defect_claim": "unresolved",
+      "rationale": "Source plus the retained receipt establish a violating witness, but this batch cannot link the receipt to a fixed experiment id, so the measured conclusion is reported as unresolved rather than asserted. Retained receipt: CheckRun 72367650c8d0470d8197a7d2c0f97ce1 (exit 0, outcome tests_passed) from experiment c4f67dac947d44fe86d65b317d5d5b4-experiment. Parsed indices: 5 (state_after_snapshot, defect sub-case) reports last_log_index=2, last_log_term=2, last_snapshot_index=2, last_snapshot_term=3, get_last_entry_term=2; 6 (post_snapshot_append, defect) reports success=false, no_retry_backoff=true, resp_last_log=2; 1 (control state) reports last_log_index=1, get_last_entry_term=3; 2 (control append) reports success=true. Both sub-cases installed the snapshot successfully (indices 0 and 4), so the only difference is the earlier-term entry at the snapshot index. Necessary property: after a successful InstallSnapshot for (L=2,T=3) the node must accept the leader's AppendEntries with PrevLogEntry=2/PrevLogTerm=3. The receipt contradicts it in the defect sub-case and satisfies it in the control. Mechanism from source: installSnapshot (raft.go 1814-1953) sets lastSnapshot=(L,T) but never setLastLog nor invalidates the log entry at L; getLastEntry (state.go 167-174) prefers the log term whenever lastLogIndex >= lastSnapshotIndex, which is exactly the tie for a same-index earlier-term entry; appendEntries (raft.go 1475-1502) then answers Success=false with NoRetryBackoff=true. Leader-facing consequence, source-sourced and still unexecuted: nextIndex=max(min(nextIndex-1,resp.LastLog+1),1) lands on L; setPreviousLog(L) needs the leader's entry L-1; if the leader has compacted up to its snapshot index that lookup is ErrLogNotFound, so replicateTo branches to SEND_SNAP, re-sends the snapshot, restores nextIndex=L+1, and the same rejection recurs.",
+      "counterevidence": [
+        "The behind-follower case is not a defect and was observed as the control: with last_log_index=1 below last_snapshot_index=2 the node reports get_last_entry_term=3 and accepts the boundary AppendEntries (index 2, success=true).",
+        "No leader-side oscillation is established by this receipt: the run drove RPCs directly and never exercised a leader's followerReplication/nextIndex, so the loop remains a source argument with its own open gap."
+      ],
+      "limitations": [
+        "Only the InmemStore (non-monotonic) path was executed; the monotonic-store branch of installSnapshot (removeOldLogs) was not run, although the same getLastEntry tie is expected to apply because lastLogIndex is likewise never reset.",
+        "The precondition was produced by a single legal AppendEntries from a term-2 producer rather than by a full multi-node history; reachability through a complete replica-set history is registered as a new gap.",
+        "The consequence for a live cluster (a follower that cannot be repaired while the leader keeps snapshotting, i.e. explicit non-progress) is argued from source and not yet executed end to end."
+      ],
+      "joint_history": "The cited receipt 72367650c8d0470d8197a7d2c0f97ce1 is the execution of the experiment registered earlier under this same investigation (@q-snapshot-boundary, experiment c4f67dac947d44fe86d65b317d5d5b4-experiment) with harness assurance_generated_test.go and the declared prefix. It runs on the same frozen snapshot fd2d6988362c434e9fda87b87c5fb0df and the same root package '.', so its producer history is the harness the investigation describes: BootstrapCluster(Nonvoter server-1) then NewRaft, an optional term-2 AppendEntries seeding index 2, one InstallSnapshot(2,3) and the boundary AppendEntries(PrevLogEntry=2,PrevLogTerm=3). The interpretation adds no second receipt; both state and response observations come from that single execution (parsed indices 5,6 defect and 1,2 control), which is the same witness history rather than two merged fragments."
+    }
+  ]
+}

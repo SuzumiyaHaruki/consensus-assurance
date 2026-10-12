@@ -1,0 +1,68 @@
+{
+  "id": "b836c3a8cfc549188ebed6183f15f019-experiment",
+  "investigation_id": "b836c3a8cfc549188ebed6183f15f019-question-0",
+  "version": 1,
+  "basis": {
+    "harness": {
+      "kind": "go_test",
+      "source": "package raft\n\nimport (\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"io\"\n\t\"sync\"\n\t\"testing\"\n\t\"time\"\n)\n\nfunc caEvent(m map[string]interface{}) {\n\tb, _ := json.Marshal(m)\n\tfmt.Println(\"CA_EVENT \" + string(b))\n}\n\ntype countFSM struct {\n\t*MockFSM\n\tmu       sync.Mutex\n\trestores int\n}\n\nfunc (c *countFSM) Restore(in io.ReadCloser) error {\n\tc.mu.Lock()\n\tc.restores++\n\tc.mu.Unlock()\n\treturn c.MockFSM.Restore(in)\n}\n\nfunc (c *countFSM) RestoreCount() int {\n\tc.mu.Lock()\n\tdefer c.mu.Unlock()\n\treturn c.restores\n}\n\nfunc storeBounds(s LogStore) (uint64, uint64) {\n\tf, _ := s.FirstIndex()\n\tl, _ := s.LastIndex()\n\treturn f, l\n}\n\n// TestAssurance_ReachabilityDivergentSuffix builds a legal multi-node history in\n// which a follower ends up holding an earlier-term entry at a later leader's\n// snapshot index, then observes whether the rejoin needs any snapshot at all.\nfunc TestAssurance_ReachabilityDivergentSuffix(t *testing.T) {\n\tconf := inmemConfig(t)\n\tconf.TrailingLogs = 0\n\tconf.SnapshotThreshold = 1 << 20\n\tconf.SnapshotInterval = time.Hour\n\tconf.HeartbeatTimeout = 1 * time.Second\n\tconf.ElectionTimeout = 1 * time.Second\n\tconf.LeaderLeaseTimeout = 1 * time.Second\n\tconf.CommitTimeout = 10 * time.Millisecond\n\n\tvar fsms []*countFSM\n\tc := MakeClusterCustom(t, &MakeClusterOpts{\n\t\tPeers: 5, Bootstrap: true, Conf: conf, LongstopTimeout: 5 * time.Second,\n\t\tMakeFSMFunc: func() FSM { f := &countFSM{MockFSM: &MockFSM{}}; fsms = append(fsms, f); return f },\n\t})\n\tdefer c.Close()\n\n\tlastMS := 0\n\tdeadline := time.Now().Add(12 * time.Second)\n\tfor time.Now().Before(deadline) && c.Leader() == nil {\n\t\ttime.Sleep(10 * time.Millisecond)\n\t}\n\tleader := c.Leader()\n\tif leader == nil {\n\t\tt.Fatalf(\"no leader\")\n\t}\n\tfollowers := c.Followers()\n\tif len(followers) < 4 {\n\t\tt.Fatalf(\"want 4 followers, got %d\", len(followers))\n\t}\n\tpartner := followers[0]\n\tvar others []*Raft\n\tfor _, r := range c.rafts {\n\t\tif r != leader && r != partner {\n\t\t\tothers = append(others, r)\n\t\t}\n\t}\n\tif len(others) != 3 {\n\t\tt.Fatalf(\"want 3 others, got %d\", len(others))\n\t}\n\n\t// Isolate the leader from the other three, keeping leader<->partner.\n\t// Isolate {leader, partner} from {others} in BOTH directions, including\n\t// the partner<->other links, so the partner really cannot be repaired\n\t// during the partition.\n\tlt := c.trans[c.IndexOf(leader)]\n\tpt := c.trans[c.IndexOf(partner)]\n\tfor _, o := range others {\n\t\tot := c.trans[c.IndexOf(o)]\n\t\tlt.Disconnect(o.localAddr)\n\t\tot.Disconnect(leader.localAddr)\n\t\tpt.Disconnect(o.localAddr)\n\t\tot.Disconnect(partner.localAddr)\n\t}\n\tsealed := map[string]interface{}{\"event\": \"partition\", \"leader\": string(leader.localID)[:12],\n\t\t\"partner\": string(partner.localID)[:12]}\n\tcaEvent(sealed)\n\n\tbase := leader.LastIndex()\n\tfor i := 0; i < 5; i++ {\n\t\tleader.Apply([]byte(fmt.Sprintf(\"uncommitted-%d\", i)), 0)\n\t}\n\treplicated := false\n\tfor d := time.Now().Add(4 * time.Second); time.Now().Before(d); {\n\t\tif partner.LastIndex() > base {\n\t\t\treplicated = true\n\t\t\tbreak\n\t\t}\n\t\ttime.Sleep(5 * time.Millisecond)\n\t}\n\tpf, pl := storeBounds(c.stores[c.IndexOf(partner)])\n\tcaEvent(map[string]interface{}{\"event\": \"divergent_prefix\", \"base_index\": base,\n\t\t\"partitioned_leader_last_index\": leader.LastIndex(), \"partner_last_index\": partner.LastIndex(),\n\t\t\"partner_store_first\": pf, \"partner_store_last\": pl,\n\t\t\"partner_replicated_uncommitted\": replicated, \"divergence_index\": base + 1})\n\tif !replicated {\n\t\tt.Skipf(\"precondition not reached: partner last index %d never exceeded base %d\", partner.LastIndex(), base)\n\t}\n\n\t// The majority side elects a successor with a shorter log.\n\tvar successor *Raft\n\tfor d := time.Now().Add(12 * time.Second); time.Now().Before(d); {\n\t\tfor _, o := range others {\n\t\t\tif o.State() == Leader {\n\t\t\t\tsuccessor = o\n\t\t\t}\n\t\t}\n\t\tif successor != nil {\n\t\t\tbreak\n\t\t}\n\t\ttime.Sleep(10 * time.Millisecond)\n\t}\n\tif successor == nil {\n\t\tt.Skipf(\"precondition not reached: no successor elected by the majority side\")\n\t}\n\t// A real command gives the successor's FSM something to snapshot.\n\tif err := successor.Apply([]byte(\"post-election\"), 5*time.Second).Error(); err != nil {\n\t\tt.Fatalf(\"post-election apply: %v\", err)\n\t}\n\tfor d := time.Now().Add(5 * time.Second); time.Now().Before(d); {\n\t\tif successor.AppliedIndex() >= base+1 {\n\t\t\tbreak\n\t\t}\n\t\ttime.Sleep(5 * time.Millisecond)\n\t}\n\tsf := successor.Snapshot()\n\tif err := sf.Error(); err != nil {\n\t\tt.Fatalf(\"snapshot: %v\", err)\n\t}\n\tmeta, rc, err := sf.Open()\n\tif err != nil {\n\t\tt.Fatalf(\"open: %v\", err)\n\t}\n\tsnapIdx := meta.Index\n\trc.Close()\n\tsnf, snl := storeBounds(c.stores[c.IndexOf(successor)])\n\tcaEvent(map[string]interface{}{\"event\": \"successor_snapshot\", \"snapshot_index\": snapIdx,\n\t\t\"snapshot_term\": meta.Term, \"divergence_index\": base + 1,\n\t\t\"successor_term\": successor.CurrentTerm(), \"old_leader_term\": leader.CurrentTerm(),\n\t\t\"successor_last_index\": successor.LastIndex(), \"successor_applied_index\": successor.AppliedIndex(),\n\t\t\"successor_store_first\": snf, \"successor_store_last\": snl})\n\n\tpidx := c.IndexOf(partner)\n\tbefore := fsms[pidx].RestoreCount()\n\tc.FullyConnect()\n\t// Timeline: which node leads, each node's index state, and how many\n\t// commands the partner has actually applied.\n\tfor _, ms := range []int{0, 200, 400, 700, 1000, 1300} {\n\t\tif ms > 0 {\n\t\t\ttime.Sleep(time.Duration(ms-lastMS) * time.Millisecond)\n\t\t}\n\t\tlastMS = ms\n\t\tlead := c.Leader()\n\t\tleadID := \"none\"\n\t\tif lead != nil {\n\t\t\tleadID = string(lead.localID)\n\t\t}\n\t\tstates := map[string]interface{}{}\n\t\tfor i, r := range c.rafts {\n\t\t\tpf, pl := storeBounds(c.stores[i])\n\t\t\tstates[string(r.localID)] = map[string]interface{}{\n\t\t\t\t\"state\": r.State().String(), \"term\": r.CurrentTerm(), \"last\": r.LastIndex(),\n\t\t\t\t\"applied\": r.AppliedIndex(), \"store_first\": pf, \"store_last\": pl,\n\t\t\t}\n\t\t}\n\t\tterms := map[string]interface{}{}\n\t\tfor i, r := range c.rafts {\n\t\t\trow := map[string]interface{}{}\n\t\t\tfor idx := uint64(3); idx <= 5; idx++ {\n\t\t\t\tvar l Log\n\t\t\t\tif err := c.stores[i].GetLog(idx, &l); err == nil {\n\t\t\t\t\trow[fmt.Sprintf(\"%d\", idx)] = l.Term\n\t\t\t\t} else {\n\t\t\t\t\trow[fmt.Sprintf(\"%d\", idx)] = \"absent\"\n\t\t\t\t}\n\t\t\t}\n\t\t\tterms[string(r.localID)[:12]] = row\n\t\t}\n\t\tcaEvent(map[string]interface{}{\"event\": \"timeline\", \"t_ms\": ms, \"leader\": leadID,\n\t\t\t\"partner_id\": string(partner.localID)[:12],\n\t\t\t\"partner_restores\": fsms[pidx].RestoreCount(), \"partner_applied_cmds\": len(fsms[pidx].Logs()),\n\t\t\t\"entry_terms\": terms,\n\t\t\t\"nodes\": states})\n\t}\n\tearly := fsms[pidx].RestoreCount()\n\ttime.Sleep(200 * time.Millisecond)\n\tlate := fsms[pidx].RestoreCount()\n\tpf2, pl2 := storeBounds(c.stores[pidx])\n\tsf2, sl2 := storeBounds(c.stores[c.IndexOf(successor)])\n\tcaEvent(map[string]interface{}{\"event\": \"rejoin_observe\", \"restores_before\": before,\n\t\t\"restores_early\": early, \"restores_late\": late,\n\t\t\"partner_applied_index\": partner.AppliedIndex(), \"partner_last_index\": partner.LastIndex(),\n\t\t\"partner_store_first\": pf2, \"partner_store_last\": pl2,\n\t\t\"successor_applied_index\": successor.AppliedIndex(), \"successor_commit_index\": successor.CommitIndex(),\n\t\t\"successor_store_first\": sf2, \"successor_store_last\": sl2})\n}\n",
+      "files": {},
+      "execution_package": ".",
+      "description": "",
+      "semantic_changes": [],
+      "prerequisites": []
+    },
+    "source_ids": [
+      "src-repl9",
+      "src-repl-snap9",
+      "src-installsnap9",
+      "src-lastindex9",
+      "src-compact9"
+    ],
+    "anchors": [],
+    "scope": {
+      "description": "Five-node legal history with a two-sided partition of {leader, partner} from the other three peers, the partitioned leader replicating uncommitted commands to the partner only, a successor elected by the majority that commits its own entry at the first divergent index and snapshots there with TrailingLogs=0, then a heal; observations cover the precondition, the successor's snapshot and store, and the partner's InstallSnapshot count and indexes over ~1.5s.",
+      "assumptions": [
+        "Cutting the partner<->majority links in both directions, in addition to leader<->majority, is required for the partner to be genuinely isolated; this is the difference from the superseded harness.",
+        "The partner's FSM Restore count identifies InstallSnapshot installs without touching production logic.",
+        "Precondition guards skip rather than fail so a timing miss yields no observation."
+      ],
+      "excluded": [
+        "No RPC-level instrumentation, no network transport and no default-TrailingLogs configuration.",
+        "The single-peer loop harness is not re-executed here."
+      ],
+      "parameters": {
+        "peers": 5,
+        "uncommitted_commands": 5,
+        "partition": "two-sided {leader,partner} vs other three",
+        "observation_window_ms": 1500
+      }
+    },
+    "prefix": "MakeClusterCustom(Peers=5, Bootstrap=true, Conf{TrailingLogs:0, SnapshotInterval:1h, SnapshotThreshold:1<<20, HeartbeatTimeout/ElectionTimeout/LeaderLeaseTimeout:1s, CommitTimeout:10ms}, MakeFSMFunc returning a Restore-counting MockFSM). Wait for a leader, partner=followers[0], others=remaining three; for each other disconnect leader<->other AND partner<->other in both directions, then emit partition; base=leader.LastIndex(); fire five leader.Apply calls; wait until partner.LastIndex()>base and emit divergent_prefix with both last indexes, the partner's store bounds and the divergence index; wait up to 12s for a successor among others, apply one command, Snapshot(), and emit successor_snapshot with index, term, term of the successor, its last/applied index and store bounds; then FullyConnect() and emit a per-node timeline (state, term, last, applied, store bounds; entry terms at 3/4/5; partner Restore count and applied-command count) at 0/200/400/700/1000/1300ms, followed by rejoin_observe with the restore counts and the partner's and successor's indexes and store bounds.",
+    "requirement": null,
+    "responsibility": "A reachability claim needs an actually isolated follower; an incomplete partition must not be read as evidence about repair.",
+    "comparisons": [],
+    "knowledge": []
+  },
+  "snapshot_id": "fd2d6988362c434e9fda87b87c5fb0df",
+  "configuration": {
+    "backend": "go_module",
+    "target": {
+      "expected_module": "github.com/hashicorp/raft",
+      "variant": "hashicorp_raft",
+      "analysis_roots": [],
+      "execution_package": ".",
+      "harness_path": "assurance_generated_test.go"
+    },
+    "isolation": "bwrap",
+    "tools": {
+      "agent": "codex-cli 0.155.0-alpha.16",
+      "implementation": "go version go1.23.5 linux/amd64"
+    }
+  },
+  "harness_filename": "assurance_generated_test.go",
+  "operation_id": "b836c3a8cfc549188ebed6183f15f019",
+  "previous_id": null,
+  "difference": {},
+  "revision_reason": ""
+}

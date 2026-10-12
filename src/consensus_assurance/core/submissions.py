@@ -53,6 +53,8 @@ class InterpretationUpdate(Record):
     source_ids: list[str] = Field(min_length=1)
     executions: dict[str, list[StrictInt]] = {}
     conclusion: Literal["explained", "conditional", "violated", "holds", "unresolved"]
+    defect_claim: Literal["asserted", "refuted", "unresolved"] | None = Field(default=None,
+        description="Current scoped model defect judgment, independent of comparison and witness confirmation; omitted means no explicit current claim")
     rationale: str = Field(min_length=1)
     answers: dict[str, str] = Field(default_factory=dict, description="Registered gap ID to its explicit sourced or observed answer")
     knowledge: list[KnowledgeUse] = []
