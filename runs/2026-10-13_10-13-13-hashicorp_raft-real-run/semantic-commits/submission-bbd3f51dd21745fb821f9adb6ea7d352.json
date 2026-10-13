@@ -1,0 +1,652 @@
+{
+  "input": {
+    "rationale": "Interpretation of the completed receipt 2086b09f107d4d49b1407754feabb781 (status completed, exit_code 0) for investigation 0bfc2ea5a9e94316982943d306eefbf6-question-0. I read the parsed events rather than the test names: indices 3, 4 and 5 are the injected-store-error case (admission before the heal, the 1500 ms window after the heal, and the 1200 ms window after the fault was removed) and indices 0, 1 and 2 are the healthy-store control of the same history. The prediction recorded last turn held, so the account moves from a source-derived hypothesis to an execution-grounded defect claim. I also added a fact entry so the observed consequence is durable rather than only narrative, and cited the two behaviours recorded last turn plus the two earlier ones that the run relied on.",
+    "sources": [],
+    "investigations": [],
+    "knowledge": [
+      {
+        "id": null,
+        "ref": "@truncation-store-error-wedges-replica",
+        "kind": "fact",
+        "statement": "A single allowed error return from LogStore.StoreLogs in the call that follows a conflicting-suffix deletion leaves the follower unable to converge: its durable log keeps the truncated state (its last index falls to the last surviving index before the conflict), its cached last-log certificate keeps describing the deleted suffix, its commit and applied indexes stop advancing, and no further StoreLogs call is even attempted, so removing the error afterwards does not restore progress.",
+        "conditions": "Three-voter cluster over an in-memory transport, one follower holding an isolated uncommitted tail appended at an earlier term, a higher-term leader with committed replacement entries at the same indices, and exactly one allowed StoreLogs error on the replacement write; the fault may be removed afterwards without changing the outcome. In the observed run the same history with a healthy store converged inside the window (store 1..5, certificate (5,3), commit and applied 5) while the faulted node stayed at store last 2, certificate (4,2) and commit and applied 2 for 2.7 s.",
+        "source_ids": [
+          "appendentries-conflict-truncate-block",
+          "appendentries-store-failure-todo",
+          "appendentries-entry-loop-cached-lastlog",
+          "replication-nextindex-floor",
+          "inmem-store-getlog-missing",
+          "state-getlastentry"
+        ],
+        "executions": {
+          "2086b09f107d4d49b1407754feabb781": [
+            3,
+            4,
+            5,
+            0,
+            1
+          ]
+        },
+        "knowledge": [],
+        "changed_premise": "",
+        "affected_uses": []
+      }
+    ],
+    "gaps": [],
+    "interpretations": [
+      {
+        "investigation_id": "0bfc2ea5a9e94316982943d306eefbf6-question-0",
+        "experiment_id": "82c1d0635aa84b74a3777ab86bb5dcee-experiment",
+        "source_ids": [
+          "appendentries-conflict-truncate-block",
+          "appendentries-store-failure-todo",
+          "appendentries-older-term-guard",
+          "appendentries-entry-loop-cached-lastlog",
+          "replication-nextindex-floor",
+          "inmem-store-getlog-missing",
+          "state-getlastentry",
+          "electself-last-entry-claim",
+          "lastindex-public-api"
+        ],
+        "executions": {
+          "2086b09f107d4d49b1407754feabb781": [
+            3,
+            4,
+            5,
+            0,
+            1
+          ]
+        },
+        "conclusion": "violated",
+        "defect_claim": "asserted",
+        "rationale": "Admission (index 3): the diverging node was elected leader first (its log was 1..4 with 1..2 committed, and 3..4 appended at term 2 while it was isolated, certificate (4,2)); the majority elected a leader at term 3 and committed entries 3..5 (its store held 1..5 with commit 5). The wrapper shows the diverging node had made exactly two successful StoreLogs calls up to that point, so the next StoreLogs on that node is the one belonging to the conflicting-suffix replacement. Faulted case after the heal (index 4): the store's last index drops from 4 to 2 within the first samples (the deletion removed 3..4) and stays 2 for the rest of the 1500 ms window, while the node's cached certificate stays (4,2) and GetLog of the certificate index returns 'log not found'; commit_index and applied_index stay at 2, the values they had before the heal; the StoreLogs attempt counter rises exactly once, from 2 to 3, and never moves again, so the follower never reaches the store again even though the leader keeps sending; the node stays a Follower at term 3 while the leader holds store 1..5 with commit 5. The library's own output in the same receipt records both halves of the cycle: 'failed to get log entry: index=3 error=...' from the follower's entry loop, and the leader's 'appendEntries rejected, sending older logs ... next=2' followed by '... next=1' and a further '... next=1', that is, the nextIndex floor with the identical request re-sent. After the fault was removed (index 5, 1200 ms later) nothing changes: certificate (4,2), store 1..2, attempts still 3, commit and applied still 2. Control, the same history with a healthy store (index 1): the store's last index moves from 4 to 5, the certificate moves from (4,2) to (5,3), the attempt counter moves from 2 to 4, GetLog of the certificate index succeeds and commit and applied reach 5. The two runs differ only in whether that single StoreLogs call returned an error, so the cause is the interaction of the allowed store error with the receive path rather than the divergence, the election or the heal. Predicate evaluated: an allowed LogStore error during a conflicting-suffix replacement must not prevent the node from converging once the fault ends. It is contradicted by a valid witness: across 2.7 s of continuing leader retries the node's durable log never regains indices 3..4 and no further StoreLogs is attempted. Mechanism, source-backed: the entry loop decides whether an incoming entry is already stored by comparing it with the cached last log index and then reading it from the store, so the just-deleted indices make GetLog fail and the handler returns before StoreLogs; the certificate that would have been updated is never re-derived; and the leader's reject branch floors nextIndex at 1 and re-sends the same request, restoring the blocking state instead of repairing it, while SEND_SNAP is never reached because ErrLogNotFound is only produced from the leader's own log store. Scope: one follower in a three-voter cluster over an in-memory transport, after a legal partition, divergence and higher-term replacement history, with a single allowed StoreLogs error, observed for 2.7 s with the fault both armed and removed.",
+        "answers": {},
+        "knowledge": [
+          {
+            "entry_id": "0bfc2ea5a9e94316982943d306eefbf6-knowledge-0",
+            "revision": 1,
+            "assertion": "The conflict path deletes the suffix, then stores replacements, and an error return skips the certificate update."
+          },
+          {
+            "entry_id": "0bfc2ea5a9e94316982943d306eefbf6-knowledge-1",
+            "revision": 1,
+            "assertion": "The cached certificate is what electSelf, requestVote, appendEntries and LastIndex read; none consult the log store."
+          },
+          {
+            "entry_id": "b7e0a0828e794c5fa40df351cb813d8f-knowledge-0",
+            "revision": 1,
+            "assertion": "The entry loop compares against the cached last index and returns on a GetLog error for entries that were just deleted, before reaching StoreLogs."
+          },
+          {
+            "entry_id": "b7e0a0828e794c5fa40df351cb813d8f-knowledge-1",
+            "revision": 1,
+            "assertion": "The leader's reject branch floors the peer's nextIndex and re-sends the same request; ErrLogNotFound leading to a snapshot only comes from the leader's own log store."
+          }
+        ],
+        "counterevidence": [
+          "Safety is not violated in this history: the leader and the other follower kept a quorum and continued committing (store 1..5, commit 5), the wedged node's tail entries were appended in isolation and never committed, and no two leaders appeared.",
+          "Cluster-level liveness continues in the observed window; the defect is a per-replica progress failure, so the severity depends on remaining redundancy - with the third voter down the wedged replica cannot serve as quorum for anything past index 2.",
+          "The trigger needs an exact window, a conflicting-suffix truncation followed immediately by an error return from StoreLogs, and the fault-injecting wrapper reproduces it deterministically, so its real-world frequency is a separate empirical question.",
+          "The condition is visible outside the library: the run's output shows repeated 'failed to get log entry' warnings from the follower and 'appendEntries rejected, sending older logs ... next=1' from the leader, and a process restart would rebuild the certificate from the store."
+        ],
+        "limitations": [
+          "Scope of the word permanently here is the observed interval with no in-library repair enabled: 1500 ms with the fault armed plus 1200 ms after it was removed, during which the store never advanced. The claim rests on the mechanism, entries below the cached index are never stored again and the certificate is never re-derived, not on infinite execution.",
+          "No InstallSnapshot and no restart were performed, so the source-derived statement that those are the only repairs stays unexecuted; neither the leader-side compaction that would force a snapshot nor the restart path was reached.",
+          "One retained execution, one process, in-memory transport, three voters, default protocol version and deterministic fault injection; the wrapper returns an error without touching the underlying store, which the interface permits but which is not a model of a real disk failure.",
+          "The account uses 25 ms state probes plus the library's own log lines, so intermediate transitions shorter than the sampling interval are not claimed."
+        ],
+        "joint_history": "",
+        "failure_attribution": null,
+        "report_title": "截断后一次合法的 StoreLogs 错误会永久卡死该跟随者的日志复制",
+        "report_answer": "已确认的有源缺陷（A1 进度 / A2 上下文）：跟随者处理与自身后缀冲突的条目时，先删除冲突后缀、再写入替换条目；若这次写入返回合法的存储错误，处理器会在更新内存中的 last log 证书之前返回。由于条目循环用『缓存的 last index』判断条目是否已存在、再去存储读取，被删除的下标已不存在，GetLog 失败让处理器再次提前返回：替换条目永远写不进去，证书也永不被重算。保留执行 2086b09f107d4d49b1407754feabb781 显示：注入一次合法 StoreLogs 错误后，该节点存储最后下标由 4 降到 2（3、4 被删除且未写回），缓存证书停在 (4,2)（对证书下标的 GetLog 报 log not found），commit/applied 停在 2，StoreLogs 尝试次数仅由 2 增至 3 后不再增长；领导者侧日志显示其拒绝重试并把 nextIndex 降到 1 后反复重发同一请求。把故障移除后再等 1200 毫秒仍无任何进展；而完全相同的历史在健康存储下（对照组）1.5 秒内收敛：存储 1..5、证书 (5,3)、commit/applied 均为 5。即一次合法的存储写失败就把该副本永久移出复制集合，只有进程重启或安装快照才能修复，而本库中没有任何路径会因该状态触发这两者。"
+      }
+    ],
+    "experiment": null,
+    "repeat_experiment_id": null,
+    "stop": null
+  },
+  "before": {
+    "knowledge": [
+      {
+        "id": "2545a0aaffb2449e84b18c874a390441-knowledge-0",
+        "revision": 1,
+        "kind": "behavior",
+        "statement": "For an explicit leadership transfer (LeadershipTransferToServer) the leader accepts the caller-supplied target if and only if a followerReplication entry exists for that ServerID in leaderState.replState; the only rejection is a target equal to the local ID ('cannot transfer leadership to itself'). No suffrage test is applied at the API, at initiateLeadershipTransfer, or at the leaderLoop hand-off to leadershipTransfer.",
+        "conditions": "protocolVersion >= 3, node is in Leader state and processing the leadershipTransferCh case on the main thread; the caller supplies an ID present in configurations.latest.",
+        "source_ids": [
+          "api-transfer-to-server",
+          "initiate-transfer-check",
+          "leaderloop-transfer-target"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "history": [],
+        "operation_id": "2545a0aaffb2449e84b18c874a390441"
+      },
+      {
+        "id": "2545a0aaffb2449e84b18c874a390441-knowledge-1",
+        "revision": 1,
+        "kind": "behavior",
+        "statement": "startStopReplication starts a followerReplication goroutine for every server in configurations.latest whose ID differs from the local ID, with no suffrage filter, so leaderState.replState (the map consulted by the explicit transfer path and by pickServer) also contains Nonvoter members. pickServer, by contrast, skips 'server.Suffrage != Voter', so the targetless transfer path cannot select a non-voter.",
+        "conditions": "Leader state, after appendConfigurationEntry/setLatestConfiguration followed by startStopReplication.",
+        "source_ids": [
+          "startstop-replication-all-servers",
+          "pickserver-voters-only"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "history": [],
+        "operation_id": "2545a0aaffb2449e84b18c874a390441"
+      },
+      {
+        "id": "2545a0aaffb2449e84b18c874a390441-knowledge-2",
+        "revision": 1,
+        "kind": "behavior",
+        "statement": "On receiving a TimeoutNowRequest a node clears its known leader, sets its state to Candidate and sets candidateFromLeadershipTransfer to true, then acknowledges. The handler performs no term comparison (TimeoutNowRequest carries no term), no state check, no suffrage check on the receiver, and no check that the sender is the current leader or a configuration member; runCandidate then skips pre-vote for such a candidate and calls electSelf directly.",
+        "conditions": "The RPC passes checkRPCHeader (protocol version range) and is dispatched from processRPC on the main thread.",
+        "source_ids": [
+          "timeoutnow-handler"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "history": [],
+        "operation_id": "2545a0aaffb2449e84b18c874a390441"
+      },
+      {
+        "id": "2545a0aaffb2449e84b18c874a390441-knowledge-3",
+        "revision": 1,
+        "kind": "behavior",
+        "statement": "In requestVote, when a RequestVote arrives with req.Term > currentTerm the receiver first steps down (setState(Follower)) and adopts the higher term, and only afterwards rejects the request because the candidate is not a Voter ('rejecting vote request since node is not a voter'), returning Granted false. Because the step-down precedes the rejection, a term-advancing vote request from an unelectable candidate still removes the receiver from leadership.",
+        "conditions": "Receiver is a Voter or Leader with a non-empty configurations.latest.Servers, and the candidate passes the inConfiguration check.",
+        "source_ids": [
+          "requestvote-highterm-stepdown-nonvoter-reject"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "history": [],
+        "operation_id": "2545a0aaffb2449e84b18c874a390441"
+      },
+      {
+        "id": "0bfc2ea5a9e94316982943d306eefbf6-knowledge-0",
+        "revision": 1,
+        "kind": "behavior",
+        "statement": "In appendEntries, when a received entry conflicts with one the node already stores, the node deletes the range [entry.Index, lastLogIdx] via logs.DeleteRange, then stores the replacement entries via logs.StoreLogs. If StoreLogs returns an error the handler logs 'failed to append to logs' and returns before any setLastLog call: the in-memory lastLogIndex/lastLogTerm keep the values they had before the deletion (the code marks this with a TODO), and no other branch in the receive path restores them. The response for that request is left with Success false.",
+        "conditions": "Follower/Candidate state; a.Term not older than the node's current term; at least one received entry whose index is at or below the node's last log index and whose term differs from the stored entry; and an error return from logs.StoreLogs for that call.",
+        "source_ids": [
+          "appendentries-conflict-truncate-block",
+          "appendentries-store-failure-todo",
+          "appendentries-older-term-guard"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "history": [],
+        "operation_id": "0bfc2ea5a9e94316982943d306eefbf6"
+      },
+      {
+        "id": "0bfc2ea5a9e94316982943d306eefbf6-knowledge-1",
+        "revision": 1,
+        "kind": "behavior",
+        "statement": "The in-memory last-log certificate is read through raftState.getLastEntry (and getLastIndex, which takes the maximum of lastLogIndex and lastSnapshotIndex, so a snapshot does not mask a stale log index). Its consumers are: electSelf and preElectSelf, which put it in RequestVoteRequest/RequestPreVoteRequest as LastLogIndex/LastLogTerm; requestVote/requestPreVote, which use it to decide whether to grant a vote; appendEntries, which compares it against PrevLogEntry to validate a leader's previous entry; and Raft.LastIndex, the public accessor. None of these consult the LogStore.",
+        "conditions": "Any node, whenever it campaigns or answers a vote request or validates an AppendEntries previous entry.",
+        "source_ids": [
+          "state-getlastentry",
+          "electself-last-entry-claim",
+          "preelectself-last-entry-claim",
+          "requestvote-up-to-date-check",
+          "appendentries-prevlog-check",
+          "lastindex-public-api"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "history": [],
+        "operation_id": "0bfc2ea5a9e94316982943d306eefbf6"
+      },
+      {
+        "id": "b7e0a0828e794c5fa40df351cb813d8f-knowledge-0",
+        "revision": 1,
+        "kind": "behavior",
+        "statement": "In the appendEntries entry loop the comparison 'entry.Index > lastLogIdx' uses lastLogIdx read from the in-memory certificate (getLastLog), not from the log store. For an entry at or below that cached index the handler calls logs.GetLog(entry.Index) and returns immediately if it errors, so once the conflicting suffix has been deleted from the store, any re-sent entry covering those indices makes the handler return before StoreLogs is reached. The certificate is never re-derived from the store inside this handler.",
+        "conditions": "Follower or Candidate state with at least one entry in the request whose index is at or below the cached last log index while that index is absent from the store (the state produced by a failed StoreLogs immediately after a conflicting-suffix deletion).",
+        "source_ids": [
+          "appendentries-entry-loop-cached-lastlog",
+          "appendentries-conflict-truncate-block"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "history": [],
+        "operation_id": "b7e0a0828e794c5fa40df351cb813d8f"
+      },
+      {
+        "id": "b7e0a0828e794c5fa40df351cb813d8f-knowledge-1",
+        "revision": 1,
+        "kind": "behavior",
+        "statement": "On an unsuccessful AppendEntries response the leader sets the peer's nextIndex to max(min(nextIndex-1, resp.LastLog+1), 1). When the follower's response carries a LastLog at or above the leader's index, the value settles at 1 (or at the floor) and the leader re-sends the same request, so a follower that rejects for a self-inflicted reason is re-driven with an identical request rather than a snapshot; ErrLogNotFound leading to SEND_SNAP is only produced from the leader's own log store, not from the follower's response.",
+        "conditions": "Leader state; the follower responds Success=false with a LastLog hint at or above the leader's last index.",
+        "source_ids": [
+          "replication-nextindex-floor"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "history": [],
+        "operation_id": "b7e0a0828e794c5fa40df351cb813d8f"
+      }
+    ],
+    "interpretations": [
+      {
+        "id": "79cfeddb38e843459cbf50995bf100a1-interpretation-0",
+        "investigation_id": "2545a0aaffb2449e84b18c874a390441-question-0",
+        "experiment_id": "2545a0aaffb2449e84b18c874a390441-experiment",
+        "source_ids": [
+          "api-transfer-to-server",
+          "initiate-transfer-check",
+          "leaderloop-transfer-target",
+          "startstop-replication-all-servers",
+          "timeoutnow-handler",
+          "requestvote-highterm-stepdown-nonvoter-reject",
+          "electself-voters-only",
+          "pickserver-voters-only",
+          "config-commands-doc"
+        ],
+        "executions": {
+          "79cf4ec11d694dfbaeb78ac8b07e1f67": [
+            2,
+            3,
+            4,
+            0,
+            1
+          ]
+        },
+        "conclusion": "violated",
+        "defect_claim": "asserted",
+        "rationale": "Admission (index 2): a leader elected at term 2 holds configurations.latest = 3 Voters (server-2b9dbd0a, server-f1a6871a, server-2c19f1a0) plus 1 Nonvoter (server-752e4a42, target_id) added through the public AddNonvoter API; the target had learned the 4-server configuration and had caught up to the freshly committed proof entry (target_last_index 4, target_commit_index 4, target_caught_up_to_proof true), and target_is_voter_on_leader is false. Transfer request (index 3): LeadershipTransferToServer(server-752e4a42) returned nil after 0.23 ms, i.e. the API reported success. Observed vote campaign: three RequestVoteRequests were received by each of the three voters (server-2c19f1a0, server-2b9dbd0a, server-f1a6871a) at t_ms 0.228/0.316/0.318 with candidate_id server-752e4a42 (the non-voter target), term 3 (= the pre-transfer term + 1), last_log_index 4 / last_log_term 2 (the leader's own log position, so the log-freshness test passed) and transfer_flagged true. Observed effects: the incumbent server-f1a6871a left Leader at t_ms 0.319 and ended the window as Follower at term 4; the target was sampled as Candidate at t_ms 0.231 and then Follower at t_ms 68.9, never Leader; no node was Leader immediately after (leaders_after shows only the newly elected server-2b9dbd0a, at term 4, elected at t_ms 67.5-69.0). Recovery poll (index 4): at t_ms 512 the three voters hold exactly one leader (server-2b9dbd0a, term 4) and the non-voter target is a Follower at term 4. Control (indices 0-1): the identical call to a Voter target (server-b1cc7b19) returned nil after 0.33 ms and the named target became Leader at term 3 at t_ms 0.36, with the same transfer_flagged vote request witnessed. The two executions differ only in the target's suffrage, so the outcome is attributable to eligibility, not to generic transfer flakiness. Mechanism, all source-backed: the transfer path accepts the target because replState holds an entry for non-voters (raft.go 587); TimeoutNow has no term, state or suffrage test, so the non-voter campaigns at term+1 (2208-2215); every voter adopts that higher term and steps down before rejecting the candidate as a non-voter (1670-1683); and the candidate can obtain no grant because electSelf only asks and self-votes Voters (2015). Consequences: (a) a documented public API call (api.go 1275-1284, a specific server in the cluster) destroys the incumbent's leadership and produces no transfer to the named target; (b) the returned future reports success (nil), so the caller cannot distinguish a completed transfer from a deposed leader; (c) the API doc promises that an unpromotable follower will fail gracefully, which is contradicted by the observed deposition. The deposition is not merely an unobserved side effect: it is the direct consequence of the source-visible step-down-before-reject order, and the target's inability to win is structural while it remains a Nonvoter in every voter's latest configuration, not a sampling artifact. Scope: leadership transfer (protocol version >= 3) on a leader whose latest configuration contains a non-voter member, initiated with the caller-supplied ID of that member; observed with in-memory transport, no faults, one process.",
+        "answers": {},
+        "knowledge": [
+          {
+            "entry_id": "2545a0aaffb2449e84b18c874a390441-knowledge-0",
+            "revision": 1,
+            "assertion": "The explicit transfer path accepts the target on replication-state existence alone and rejects only a self-target."
+          },
+          {
+            "entry_id": "2545a0aaffb2449e84b18c874a390441-knowledge-1",
+            "revision": 1,
+            "assertion": "leaderState.replState contains Nonvoter members, so a non-voter target passes that check."
+          },
+          {
+            "entry_id": "2545a0aaffb2449e84b18c874a390441-knowledge-2",
+            "revision": 1,
+            "assertion": "TimeoutNow puts any receiver into candidacy with the transfer flag and no term, state or suffrage test."
+          },
+          {
+            "entry_id": "2545a0aaffb2449e84b18c874a390441-knowledge-3",
+            "revision": 1,
+            "assertion": "A voter adopts the higher term and steps down before rejecting a non-voter candidate, so the term-advancing request deposes it."
+          }
+        ],
+        "counterevidence": [
+          "No safety violation was observed: no two leaders, no committed entry was lost, the target's transfer-flagged request was rejected by voters with the explicit 'rejecting vote request since node is not a voter' branch, and the three voters had exactly one leader again about 69 ms after the call.",
+          "The voters' step-down on a higher-term vote request is deliberate library behaviour for a demoted node that campaigns (the comment cites hashicorp/raft#526), so one may describe the deposition as an anticipated consequence of that branch rather than as an oversight in it.",
+          "The scenario requires the caller to name a non-voter: the targetless LeadershipTransfer() cannot select one, because pickServer skips servers whose Suffrage is not Voter, so the trigger is caller-supplied rather than internally produced."
+        ],
+        "limitations": [
+          "One retained execution, one process, in-memory LoopbackTransport, no faults, and non-default short timeouts (heartbeat/election/lease 50 ms, commit 5 ms); the unavailability interval therefore scales with the configured ElectionTimeout and the measured 69 ms is not a production figure.",
+          "'The target never becomes Leader' is asserted for the sampled window (500 ms) plus the recovery poll and is structurally supported while the target remains a Nonvoter; it is not a claim about every future configuration (a concurrent promotion would change eligibility).",
+          "The future's nil value is the library's documented 'lost leadership during transfer (expected)' path; the finding rests on the combination of that success value with the absence of the named transfer and the incumbent's deposition, not on the nil value alone.",
+          "Native local feedback in a scratch copy inside the draft showed the same pattern with the incumbent re-electing itself rather than another voter becoming leader (schedule-dependent), but that run is not retained evidence and is not relied on."
+        ],
+        "joint_history": "",
+        "failure_attribution": null,
+        "report_title": "显式领导权转移接受不可当选的非投票者目标：现任领导者被罢免、转移未发生，而 future 仍返回成功",
+        "report_answer": "已确认的有源缺陷：Hashicorp Raft（本快照）的 LeadershipTransferToServer 路径只检查目标是否为自己、是否存在复制状态，未检查目标在最新配置中是否为 Voter。当一个由公开 AddNonvoter 加入且已追平日志的成员被指定为目标时：TimeoutNow（无 term、无状态、无选举权校验）使该非投票者在 term+1 发起选举；各投票者先接受更高任期并下台，随后以“candidate 非投票者”为由拒绝投票，因此目标永远无法当选。保留执行（79cf4ec11d694dfbaeb78ac8b07e1f67）显示：转移 future 在 0.23 毫秒后返回 nil（成功），目标从未成为 Leader，原领导者在 0.32 毫秒内失去领导权，约 69 毫秒后由另一名投票者当选；同一 API 对投票者目标的对照调用则真正完成转移。即：一次合法的公开 API 调用会罢免现任领导者、不产生所指名的转移，且调用方无法从返回值得知失败。",
+        "operation_id": "79cfeddb38e843459cbf50995bf100a1"
+      }
+    ],
+    "current_submission": {
+      "phase": "received",
+      "operation_id": "bbd3f51dd21745fb821f9adb6ea7d352",
+      "result": {
+        "submission": "update.json",
+        "summary": "Interpreted the wedge receipt: one allowed StoreLogs error after a conflicting-suffix deletion left the follower's store at index 2 with certificate (4,2), commit/applied frozen at 2, no further store attempt in 2.7 s and no recovery after the fault was removed, while the identical history with a healthy store converged to (5,3); conclusion violated, defect asserted, plus a durable fact entry."
+      },
+      "status": "completed",
+      "reason": "",
+      "session_unavailable": false
+    },
+    "applied_operations": {
+      "submission-2545a0aaffb2449e84b18c874a390441": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_10-13-13-hashicorp_raft-real-run/semantic-commits/submission-2545a0aaffb2449e84b18c874a390441.json"
+      },
+      "submission-79cfeddb38e843459cbf50995bf100a1": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_10-13-13-hashicorp_raft-real-run/semantic-commits/submission-79cfeddb38e843459cbf50995bf100a1.json"
+      },
+      "submission-0bfc2ea5a9e94316982943d306eefbf6": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_10-13-13-hashicorp_raft-real-run/semantic-commits/submission-0bfc2ea5a9e94316982943d306eefbf6.json"
+      },
+      "submission-b7e0a0828e794c5fa40df351cb813d8f": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_10-13-13-hashicorp_raft-real-run/semantic-commits/submission-b7e0a0828e794c5fa40df351cb813d8f.json"
+      },
+      "submission-82c1d0635aa84b74a3777ab86bb5dcee": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_10-13-13-hashicorp_raft-real-run/semantic-commits/submission-82c1d0635aa84b74a3777ab86bb5dcee.json"
+      }
+    }
+  },
+  "after": {
+    "knowledge": [
+      {
+        "id": "2545a0aaffb2449e84b18c874a390441-knowledge-0",
+        "revision": 1,
+        "kind": "behavior",
+        "statement": "For an explicit leadership transfer (LeadershipTransferToServer) the leader accepts the caller-supplied target if and only if a followerReplication entry exists for that ServerID in leaderState.replState; the only rejection is a target equal to the local ID ('cannot transfer leadership to itself'). No suffrage test is applied at the API, at initiateLeadershipTransfer, or at the leaderLoop hand-off to leadershipTransfer.",
+        "conditions": "protocolVersion >= 3, node is in Leader state and processing the leadershipTransferCh case on the main thread; the caller supplies an ID present in configurations.latest.",
+        "source_ids": [
+          "api-transfer-to-server",
+          "initiate-transfer-check",
+          "leaderloop-transfer-target"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "history": [],
+        "operation_id": "2545a0aaffb2449e84b18c874a390441"
+      },
+      {
+        "id": "2545a0aaffb2449e84b18c874a390441-knowledge-1",
+        "revision": 1,
+        "kind": "behavior",
+        "statement": "startStopReplication starts a followerReplication goroutine for every server in configurations.latest whose ID differs from the local ID, with no suffrage filter, so leaderState.replState (the map consulted by the explicit transfer path and by pickServer) also contains Nonvoter members. pickServer, by contrast, skips 'server.Suffrage != Voter', so the targetless transfer path cannot select a non-voter.",
+        "conditions": "Leader state, after appendConfigurationEntry/setLatestConfiguration followed by startStopReplication.",
+        "source_ids": [
+          "startstop-replication-all-servers",
+          "pickserver-voters-only"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "history": [],
+        "operation_id": "2545a0aaffb2449e84b18c874a390441"
+      },
+      {
+        "id": "2545a0aaffb2449e84b18c874a390441-knowledge-2",
+        "revision": 1,
+        "kind": "behavior",
+        "statement": "On receiving a TimeoutNowRequest a node clears its known leader, sets its state to Candidate and sets candidateFromLeadershipTransfer to true, then acknowledges. The handler performs no term comparison (TimeoutNowRequest carries no term), no state check, no suffrage check on the receiver, and no check that the sender is the current leader or a configuration member; runCandidate then skips pre-vote for such a candidate and calls electSelf directly.",
+        "conditions": "The RPC passes checkRPCHeader (protocol version range) and is dispatched from processRPC on the main thread.",
+        "source_ids": [
+          "timeoutnow-handler"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "history": [],
+        "operation_id": "2545a0aaffb2449e84b18c874a390441"
+      },
+      {
+        "id": "2545a0aaffb2449e84b18c874a390441-knowledge-3",
+        "revision": 1,
+        "kind": "behavior",
+        "statement": "In requestVote, when a RequestVote arrives with req.Term > currentTerm the receiver first steps down (setState(Follower)) and adopts the higher term, and only afterwards rejects the request because the candidate is not a Voter ('rejecting vote request since node is not a voter'), returning Granted false. Because the step-down precedes the rejection, a term-advancing vote request from an unelectable candidate still removes the receiver from leadership.",
+        "conditions": "Receiver is a Voter or Leader with a non-empty configurations.latest.Servers, and the candidate passes the inConfiguration check.",
+        "source_ids": [
+          "requestvote-highterm-stepdown-nonvoter-reject"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "history": [],
+        "operation_id": "2545a0aaffb2449e84b18c874a390441"
+      },
+      {
+        "id": "0bfc2ea5a9e94316982943d306eefbf6-knowledge-0",
+        "revision": 1,
+        "kind": "behavior",
+        "statement": "In appendEntries, when a received entry conflicts with one the node already stores, the node deletes the range [entry.Index, lastLogIdx] via logs.DeleteRange, then stores the replacement entries via logs.StoreLogs. If StoreLogs returns an error the handler logs 'failed to append to logs' and returns before any setLastLog call: the in-memory lastLogIndex/lastLogTerm keep the values they had before the deletion (the code marks this with a TODO), and no other branch in the receive path restores them. The response for that request is left with Success false.",
+        "conditions": "Follower/Candidate state; a.Term not older than the node's current term; at least one received entry whose index is at or below the node's last log index and whose term differs from the stored entry; and an error return from logs.StoreLogs for that call.",
+        "source_ids": [
+          "appendentries-conflict-truncate-block",
+          "appendentries-store-failure-todo",
+          "appendentries-older-term-guard"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "history": [],
+        "operation_id": "0bfc2ea5a9e94316982943d306eefbf6"
+      },
+      {
+        "id": "0bfc2ea5a9e94316982943d306eefbf6-knowledge-1",
+        "revision": 1,
+        "kind": "behavior",
+        "statement": "The in-memory last-log certificate is read through raftState.getLastEntry (and getLastIndex, which takes the maximum of lastLogIndex and lastSnapshotIndex, so a snapshot does not mask a stale log index). Its consumers are: electSelf and preElectSelf, which put it in RequestVoteRequest/RequestPreVoteRequest as LastLogIndex/LastLogTerm; requestVote/requestPreVote, which use it to decide whether to grant a vote; appendEntries, which compares it against PrevLogEntry to validate a leader's previous entry; and Raft.LastIndex, the public accessor. None of these consult the LogStore.",
+        "conditions": "Any node, whenever it campaigns or answers a vote request or validates an AppendEntries previous entry.",
+        "source_ids": [
+          "state-getlastentry",
+          "electself-last-entry-claim",
+          "preelectself-last-entry-claim",
+          "requestvote-up-to-date-check",
+          "appendentries-prevlog-check",
+          "lastindex-public-api"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "history": [],
+        "operation_id": "0bfc2ea5a9e94316982943d306eefbf6"
+      },
+      {
+        "id": "b7e0a0828e794c5fa40df351cb813d8f-knowledge-0",
+        "revision": 1,
+        "kind": "behavior",
+        "statement": "In the appendEntries entry loop the comparison 'entry.Index > lastLogIdx' uses lastLogIdx read from the in-memory certificate (getLastLog), not from the log store. For an entry at or below that cached index the handler calls logs.GetLog(entry.Index) and returns immediately if it errors, so once the conflicting suffix has been deleted from the store, any re-sent entry covering those indices makes the handler return before StoreLogs is reached. The certificate is never re-derived from the store inside this handler.",
+        "conditions": "Follower or Candidate state with at least one entry in the request whose index is at or below the cached last log index while that index is absent from the store (the state produced by a failed StoreLogs immediately after a conflicting-suffix deletion).",
+        "source_ids": [
+          "appendentries-entry-loop-cached-lastlog",
+          "appendentries-conflict-truncate-block"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "history": [],
+        "operation_id": "b7e0a0828e794c5fa40df351cb813d8f"
+      },
+      {
+        "id": "b7e0a0828e794c5fa40df351cb813d8f-knowledge-1",
+        "revision": 1,
+        "kind": "behavior",
+        "statement": "On an unsuccessful AppendEntries response the leader sets the peer's nextIndex to max(min(nextIndex-1, resp.LastLog+1), 1). When the follower's response carries a LastLog at or above the leader's index, the value settles at 1 (or at the floor) and the leader re-sends the same request, so a follower that rejects for a self-inflicted reason is re-driven with an identical request rather than a snapshot; ErrLogNotFound leading to SEND_SNAP is only produced from the leader's own log store, not from the follower's response.",
+        "conditions": "Leader state; the follower responds Success=false with a LastLog hint at or above the leader's last index.",
+        "source_ids": [
+          "replication-nextindex-floor"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "history": [],
+        "operation_id": "b7e0a0828e794c5fa40df351cb813d8f"
+      },
+      {
+        "id": "bbd3f51dd21745fb821f9adb6ea7d352-knowledge-0",
+        "revision": 1,
+        "kind": "fact",
+        "statement": "A single allowed error return from LogStore.StoreLogs in the call that follows a conflicting-suffix deletion leaves the follower unable to converge: its durable log keeps the truncated state (its last index falls to the last surviving index before the conflict), its cached last-log certificate keeps describing the deleted suffix, its commit and applied indexes stop advancing, and no further StoreLogs call is even attempted, so removing the error afterwards does not restore progress.",
+        "conditions": "Three-voter cluster over an in-memory transport, one follower holding an isolated uncommitted tail appended at an earlier term, a higher-term leader with committed replacement entries at the same indices, and exactly one allowed StoreLogs error on the replacement write; the fault may be removed afterwards without changing the outcome. In the observed run the same history with a healthy store converged inside the window (store 1..5, certificate (5,3), commit and applied 5) while the faulted node stayed at store last 2, certificate (4,2) and commit and applied 2 for 2.7 s.",
+        "source_ids": [
+          "appendentries-conflict-truncate-block",
+          "appendentries-store-failure-todo",
+          "appendentries-entry-loop-cached-lastlog",
+          "replication-nextindex-floor",
+          "inmem-store-getlog-missing",
+          "state-getlastentry"
+        ],
+        "executions": {
+          "2086b09f107d4d49b1407754feabb781": [
+            3,
+            4,
+            5,
+            0,
+            1
+          ]
+        },
+        "knowledge": [],
+        "history": [],
+        "operation_id": "bbd3f51dd21745fb821f9adb6ea7d352"
+      }
+    ],
+    "interpretations": [
+      {
+        "id": "79cfeddb38e843459cbf50995bf100a1-interpretation-0",
+        "investigation_id": "2545a0aaffb2449e84b18c874a390441-question-0",
+        "experiment_id": "2545a0aaffb2449e84b18c874a390441-experiment",
+        "source_ids": [
+          "api-transfer-to-server",
+          "initiate-transfer-check",
+          "leaderloop-transfer-target",
+          "startstop-replication-all-servers",
+          "timeoutnow-handler",
+          "requestvote-highterm-stepdown-nonvoter-reject",
+          "electself-voters-only",
+          "pickserver-voters-only",
+          "config-commands-doc"
+        ],
+        "executions": {
+          "79cf4ec11d694dfbaeb78ac8b07e1f67": [
+            2,
+            3,
+            4,
+            0,
+            1
+          ]
+        },
+        "conclusion": "violated",
+        "defect_claim": "asserted",
+        "rationale": "Admission (index 2): a leader elected at term 2 holds configurations.latest = 3 Voters (server-2b9dbd0a, server-f1a6871a, server-2c19f1a0) plus 1 Nonvoter (server-752e4a42, target_id) added through the public AddNonvoter API; the target had learned the 4-server configuration and had caught up to the freshly committed proof entry (target_last_index 4, target_commit_index 4, target_caught_up_to_proof true), and target_is_voter_on_leader is false. Transfer request (index 3): LeadershipTransferToServer(server-752e4a42) returned nil after 0.23 ms, i.e. the API reported success. Observed vote campaign: three RequestVoteRequests were received by each of the three voters (server-2c19f1a0, server-2b9dbd0a, server-f1a6871a) at t_ms 0.228/0.316/0.318 with candidate_id server-752e4a42 (the non-voter target), term 3 (= the pre-transfer term + 1), last_log_index 4 / last_log_term 2 (the leader's own log position, so the log-freshness test passed) and transfer_flagged true. Observed effects: the incumbent server-f1a6871a left Leader at t_ms 0.319 and ended the window as Follower at term 4; the target was sampled as Candidate at t_ms 0.231 and then Follower at t_ms 68.9, never Leader; no node was Leader immediately after (leaders_after shows only the newly elected server-2b9dbd0a, at term 4, elected at t_ms 67.5-69.0). Recovery poll (index 4): at t_ms 512 the three voters hold exactly one leader (server-2b9dbd0a, term 4) and the non-voter target is a Follower at term 4. Control (indices 0-1): the identical call to a Voter target (server-b1cc7b19) returned nil after 0.33 ms and the named target became Leader at term 3 at t_ms 0.36, with the same transfer_flagged vote request witnessed. The two executions differ only in the target's suffrage, so the outcome is attributable to eligibility, not to generic transfer flakiness. Mechanism, all source-backed: the transfer path accepts the target because replState holds an entry for non-voters (raft.go 587); TimeoutNow has no term, state or suffrage test, so the non-voter campaigns at term+1 (2208-2215); every voter adopts that higher term and steps down before rejecting the candidate as a non-voter (1670-1683); and the candidate can obtain no grant because electSelf only asks and self-votes Voters (2015). Consequences: (a) a documented public API call (api.go 1275-1284, a specific server in the cluster) destroys the incumbent's leadership and produces no transfer to the named target; (b) the returned future reports success (nil), so the caller cannot distinguish a completed transfer from a deposed leader; (c) the API doc promises that an unpromotable follower will fail gracefully, which is contradicted by the observed deposition. The deposition is not merely an unobserved side effect: it is the direct consequence of the source-visible step-down-before-reject order, and the target's inability to win is structural while it remains a Nonvoter in every voter's latest configuration, not a sampling artifact. Scope: leadership transfer (protocol version >= 3) on a leader whose latest configuration contains a non-voter member, initiated with the caller-supplied ID of that member; observed with in-memory transport, no faults, one process.",
+        "answers": {},
+        "knowledge": [
+          {
+            "entry_id": "2545a0aaffb2449e84b18c874a390441-knowledge-0",
+            "revision": 1,
+            "assertion": "The explicit transfer path accepts the target on replication-state existence alone and rejects only a self-target."
+          },
+          {
+            "entry_id": "2545a0aaffb2449e84b18c874a390441-knowledge-1",
+            "revision": 1,
+            "assertion": "leaderState.replState contains Nonvoter members, so a non-voter target passes that check."
+          },
+          {
+            "entry_id": "2545a0aaffb2449e84b18c874a390441-knowledge-2",
+            "revision": 1,
+            "assertion": "TimeoutNow puts any receiver into candidacy with the transfer flag and no term, state or suffrage test."
+          },
+          {
+            "entry_id": "2545a0aaffb2449e84b18c874a390441-knowledge-3",
+            "revision": 1,
+            "assertion": "A voter adopts the higher term and steps down before rejecting a non-voter candidate, so the term-advancing request deposes it."
+          }
+        ],
+        "counterevidence": [
+          "No safety violation was observed: no two leaders, no committed entry was lost, the target's transfer-flagged request was rejected by voters with the explicit 'rejecting vote request since node is not a voter' branch, and the three voters had exactly one leader again about 69 ms after the call.",
+          "The voters' step-down on a higher-term vote request is deliberate library behaviour for a demoted node that campaigns (the comment cites hashicorp/raft#526), so one may describe the deposition as an anticipated consequence of that branch rather than as an oversight in it.",
+          "The scenario requires the caller to name a non-voter: the targetless LeadershipTransfer() cannot select one, because pickServer skips servers whose Suffrage is not Voter, so the trigger is caller-supplied rather than internally produced."
+        ],
+        "limitations": [
+          "One retained execution, one process, in-memory LoopbackTransport, no faults, and non-default short timeouts (heartbeat/election/lease 50 ms, commit 5 ms); the unavailability interval therefore scales with the configured ElectionTimeout and the measured 69 ms is not a production figure.",
+          "'The target never becomes Leader' is asserted for the sampled window (500 ms) plus the recovery poll and is structurally supported while the target remains a Nonvoter; it is not a claim about every future configuration (a concurrent promotion would change eligibility).",
+          "The future's nil value is the library's documented 'lost leadership during transfer (expected)' path; the finding rests on the combination of that success value with the absence of the named transfer and the incumbent's deposition, not on the nil value alone.",
+          "Native local feedback in a scratch copy inside the draft showed the same pattern with the incumbent re-electing itself rather than another voter becoming leader (schedule-dependent), but that run is not retained evidence and is not relied on."
+        ],
+        "joint_history": "",
+        "failure_attribution": null,
+        "report_title": "显式领导权转移接受不可当选的非投票者目标：现任领导者被罢免、转移未发生，而 future 仍返回成功",
+        "report_answer": "已确认的有源缺陷：Hashicorp Raft（本快照）的 LeadershipTransferToServer 路径只检查目标是否为自己、是否存在复制状态，未检查目标在最新配置中是否为 Voter。当一个由公开 AddNonvoter 加入且已追平日志的成员被指定为目标时：TimeoutNow（无 term、无状态、无选举权校验）使该非投票者在 term+1 发起选举；各投票者先接受更高任期并下台，随后以“candidate 非投票者”为由拒绝投票，因此目标永远无法当选。保留执行（79cf4ec11d694dfbaeb78ac8b07e1f67）显示：转移 future 在 0.23 毫秒后返回 nil（成功），目标从未成为 Leader，原领导者在 0.32 毫秒内失去领导权，约 69 毫秒后由另一名投票者当选；同一 API 对投票者目标的对照调用则真正完成转移。即：一次合法的公开 API 调用会罢免现任领导者、不产生所指名的转移，且调用方无法从返回值得知失败。",
+        "operation_id": "79cfeddb38e843459cbf50995bf100a1"
+      },
+      {
+        "id": "bbd3f51dd21745fb821f9adb6ea7d352-interpretation-0",
+        "investigation_id": "0bfc2ea5a9e94316982943d306eefbf6-question-0",
+        "experiment_id": "82c1d0635aa84b74a3777ab86bb5dcee-experiment",
+        "source_ids": [
+          "appendentries-conflict-truncate-block",
+          "appendentries-store-failure-todo",
+          "appendentries-older-term-guard",
+          "appendentries-entry-loop-cached-lastlog",
+          "replication-nextindex-floor",
+          "inmem-store-getlog-missing",
+          "state-getlastentry",
+          "electself-last-entry-claim",
+          "lastindex-public-api"
+        ],
+        "executions": {
+          "2086b09f107d4d49b1407754feabb781": [
+            3,
+            4,
+            5,
+            0,
+            1
+          ]
+        },
+        "conclusion": "violated",
+        "defect_claim": "asserted",
+        "rationale": "Admission (index 3): the diverging node was elected leader first (its log was 1..4 with 1..2 committed, and 3..4 appended at term 2 while it was isolated, certificate (4,2)); the majority elected a leader at term 3 and committed entries 3..5 (its store held 1..5 with commit 5). The wrapper shows the diverging node had made exactly two successful StoreLogs calls up to that point, so the next StoreLogs on that node is the one belonging to the conflicting-suffix replacement. Faulted case after the heal (index 4): the store's last index drops from 4 to 2 within the first samples (the deletion removed 3..4) and stays 2 for the rest of the 1500 ms window, while the node's cached certificate stays (4,2) and GetLog of the certificate index returns 'log not found'; commit_index and applied_index stay at 2, the values they had before the heal; the StoreLogs attempt counter rises exactly once, from 2 to 3, and never moves again, so the follower never reaches the store again even though the leader keeps sending; the node stays a Follower at term 3 while the leader holds store 1..5 with commit 5. The library's own output in the same receipt records both halves of the cycle: 'failed to get log entry: index=3 error=...' from the follower's entry loop, and the leader's 'appendEntries rejected, sending older logs ... next=2' followed by '... next=1' and a further '... next=1', that is, the nextIndex floor with the identical request re-sent. After the fault was removed (index 5, 1200 ms later) nothing changes: certificate (4,2), store 1..2, attempts still 3, commit and applied still 2. Control, the same history with a healthy store (index 1): the store's last index moves from 4 to 5, the certificate moves from (4,2) to (5,3), the attempt counter moves from 2 to 4, GetLog of the certificate index succeeds and commit and applied reach 5. The two runs differ only in whether that single StoreLogs call returned an error, so the cause is the interaction of the allowed store error with the receive path rather than the divergence, the election or the heal. Predicate evaluated: an allowed LogStore error during a conflicting-suffix replacement must not prevent the node from converging once the fault ends. It is contradicted by a valid witness: across 2.7 s of continuing leader retries the node's durable log never regains indices 3..4 and no further StoreLogs is attempted. Mechanism, source-backed: the entry loop decides whether an incoming entry is already stored by comparing it with the cached last log index and then reading it from the store, so the just-deleted indices make GetLog fail and the handler returns before StoreLogs; the certificate that would have been updated is never re-derived; and the leader's reject branch floors nextIndex at 1 and re-sends the same request, restoring the blocking state instead of repairing it, while SEND_SNAP is never reached because ErrLogNotFound is only produced from the leader's own log store. Scope: one follower in a three-voter cluster over an in-memory transport, after a legal partition, divergence and higher-term replacement history, with a single allowed StoreLogs error, observed for 2.7 s with the fault both armed and removed.",
+        "answers": {},
+        "knowledge": [
+          {
+            "entry_id": "0bfc2ea5a9e94316982943d306eefbf6-knowledge-0",
+            "revision": 1,
+            "assertion": "The conflict path deletes the suffix, then stores replacements, and an error return skips the certificate update."
+          },
+          {
+            "entry_id": "0bfc2ea5a9e94316982943d306eefbf6-knowledge-1",
+            "revision": 1,
+            "assertion": "The cached certificate is what electSelf, requestVote, appendEntries and LastIndex read; none consult the log store."
+          },
+          {
+            "entry_id": "b7e0a0828e794c5fa40df351cb813d8f-knowledge-0",
+            "revision": 1,
+            "assertion": "The entry loop compares against the cached last index and returns on a GetLog error for entries that were just deleted, before reaching StoreLogs."
+          },
+          {
+            "entry_id": "b7e0a0828e794c5fa40df351cb813d8f-knowledge-1",
+            "revision": 1,
+            "assertion": "The leader's reject branch floors the peer's nextIndex and re-sends the same request; ErrLogNotFound leading to a snapshot only comes from the leader's own log store."
+          }
+        ],
+        "counterevidence": [
+          "Safety is not violated in this history: the leader and the other follower kept a quorum and continued committing (store 1..5, commit 5), the wedged node's tail entries were appended in isolation and never committed, and no two leaders appeared.",
+          "Cluster-level liveness continues in the observed window; the defect is a per-replica progress failure, so the severity depends on remaining redundancy - with the third voter down the wedged replica cannot serve as quorum for anything past index 2.",
+          "The trigger needs an exact window, a conflicting-suffix truncation followed immediately by an error return from StoreLogs, and the fault-injecting wrapper reproduces it deterministically, so its real-world frequency is a separate empirical question.",
+          "The condition is visible outside the library: the run's output shows repeated 'failed to get log entry' warnings from the follower and 'appendEntries rejected, sending older logs ... next=1' from the leader, and a process restart would rebuild the certificate from the store."
+        ],
+        "limitations": [
+          "Scope of the word permanently here is the observed interval with no in-library repair enabled: 1500 ms with the fault armed plus 1200 ms after it was removed, during which the store never advanced. The claim rests on the mechanism, entries below the cached index are never stored again and the certificate is never re-derived, not on infinite execution.",
+          "No InstallSnapshot and no restart were performed, so the source-derived statement that those are the only repairs stays unexecuted; neither the leader-side compaction that would force a snapshot nor the restart path was reached.",
+          "One retained execution, one process, in-memory transport, three voters, default protocol version and deterministic fault injection; the wrapper returns an error without touching the underlying store, which the interface permits but which is not a model of a real disk failure.",
+          "The account uses 25 ms state probes plus the library's own log lines, so intermediate transitions shorter than the sampling interval are not claimed."
+        ],
+        "joint_history": "",
+        "failure_attribution": null,
+        "report_title": "截断后一次合法的 StoreLogs 错误会永久卡死该跟随者的日志复制",
+        "report_answer": "已确认的有源缺陷（A1 进度 / A2 上下文）：跟随者处理与自身后缀冲突的条目时，先删除冲突后缀、再写入替换条目；若这次写入返回合法的存储错误，处理器会在更新内存中的 last log 证书之前返回。由于条目循环用『缓存的 last index』判断条目是否已存在、再去存储读取，被删除的下标已不存在，GetLog 失败让处理器再次提前返回：替换条目永远写不进去，证书也永不被重算。保留执行 2086b09f107d4d49b1407754feabb781 显示：注入一次合法 StoreLogs 错误后，该节点存储最后下标由 4 降到 2（3、4 被删除且未写回），缓存证书停在 (4,2)（对证书下标的 GetLog 报 log not found），commit/applied 停在 2，StoreLogs 尝试次数仅由 2 增至 3 后不再增长；领导者侧日志显示其拒绝重试并把 nextIndex 降到 1 后反复重发同一请求。把故障移除后再等 1200 毫秒仍无任何进展；而完全相同的历史在健康存储下（对照组）1.5 秒内收敛：存储 1..5、证书 (5,3)、commit/applied 均为 5。即一次合法的存储写失败就把该副本永久移出复制集合，只有进程重启或安装快照才能修复，而本库中没有任何路径会因该状态触发这两者。",
+        "operation_id": "bbd3f51dd21745fb821f9adb6ea7d352"
+      }
+    ],
+    "current_submission": {
+      "phase": "accepted",
+      "operation_id": "bbd3f51dd21745fb821f9adb6ea7d352",
+      "action": "update",
+      "no_change": false,
+      "references": {
+        "@truncation-store-error-wedges-replica": "bbd3f51dd21745fb821f9adb6ea7d352-knowledge-0"
+      }
+    },
+    "applied_operations": {
+      "submission-2545a0aaffb2449e84b18c874a390441": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_10-13-13-hashicorp_raft-real-run/semantic-commits/submission-2545a0aaffb2449e84b18c874a390441.json"
+      },
+      "submission-79cfeddb38e843459cbf50995bf100a1": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_10-13-13-hashicorp_raft-real-run/semantic-commits/submission-79cfeddb38e843459cbf50995bf100a1.json"
+      },
+      "submission-0bfc2ea5a9e94316982943d306eefbf6": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_10-13-13-hashicorp_raft-real-run/semantic-commits/submission-0bfc2ea5a9e94316982943d306eefbf6.json"
+      },
+      "submission-b7e0a0828e794c5fa40df351cb813d8f": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_10-13-13-hashicorp_raft-real-run/semantic-commits/submission-b7e0a0828e794c5fa40df351cb813d8f.json"
+      },
+      "submission-82c1d0635aa84b74a3777ab86bb5dcee": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_10-13-13-hashicorp_raft-real-run/semantic-commits/submission-82c1d0635aa84b74a3777ab86bb5dcee.json"
+      },
+      "submission-bbd3f51dd21745fb821f9adb6ea7d352": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_10-13-13-hashicorp_raft-real-run/semantic-commits/submission-bbd3f51dd21745fb821f9adb6ea7d352.json"
+      }
+    }
+  }
+}

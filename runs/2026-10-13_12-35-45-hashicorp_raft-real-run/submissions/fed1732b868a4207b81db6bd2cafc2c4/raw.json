@@ -1,0 +1,27 @@
+{
+  "rationale": "Receipt ffa0ec9302fc43f89664310bd5b9a332 (exit 0) carries the decisive observations: index 1 shows LeadershipTransferToServer aimed at the demoted non-voter returning nil within the same millisecond while the old leader is already Follower and the requested destination is only Candidate; index 2 shows the destination never led during the eight second watch, the terms advanced, and the old leader won the fresh election itself; indices 4 and 5 are the control, where the same call aimed at a voter returned nil and that voter did lead. Four of the five declared comparisons hold (the nil result for a non-voter destination, the destination never leading, and both control predicates). The third comparison is violated, and the reason is my declaration rather than the data: I asserted old_leader_still_leader == false, but that emitted field means the old leader was observed leading at some point during the watch, which it satisfied by re-winning the election after the disruption. The tear-down itself is evidenced by index 1 (leader_state Follower, target_state Candidate, result nil, terms increased), so I record the account as conditional on that immediate window and keep the recovery as explicit counterevidence against the stronger reading that leadership is lost for good.",
+  "interpretations": [
+    {
+      "investigation_id": "46a26ae48ccb454fb6547c632522ffeb-question-0",
+      "experiment_id": "46a26ae48ccb454fb6547c632522ffeb-experiment",
+      "source_ids": ["s_transfer_branch", "s_initiate_transfer", "s_timeout_now", "s_pick_server", "s_vote_suffrage", "s_transfer_api"],
+      "executions": {
+        "ffa0ec9302fc43f89664310bd5b9a332": [0, 1, 2, 3, 4, 5]
+      },
+      "conclusion": "conditional",
+      "defect_claim": "asserted",
+      "rationale": "What the observations establish: with a non-voter destination the transfer future returns nil (index 1, same millisecond, comparison 0 holds) although the destination never leads during the following eight seconds (index 2, comparison 1 holds) and the requested destination was the only node the caller named; simultaneously the old leader is already Follower and the target is Candidate, with the terms having advanced. The control shows the same call shape aimed at a voter returning nil and that voter actually leading (indices 4 and 5, comparisons 3 and 4 hold), so the difference is the destination's suffrage and not the API shape. The source path accounts for each part: initiateLeadershipTransfer does not filter the destination (raft.go:2184-2207) while pickServer does (raft.go:2163-2182); TimeoutNow turns the destination into a candidate with the leadership-transfer flag and no pre-vote regardless of suffrage (raft.go:2209-2214); a voter receiving that candidate's RequestVote adopts the higher term and steps down before the suffrage check rejects the vote (raft.go:1660-1690), which is why the sitting leader loses leadership; and the transfer branch reports success on the leftLeaderLoop path without checking whether the requested destination became leader (raft.go:733-737). The claim is therefore scoped and conditional: a caller that names a destination which the configuration does not allow to lead receives a success result it cannot distinguish from a real handover, and in exchange the cluster suffers a leadership interruption and a fresh election that the caller did not request. The consequence is bounded - the cluster recovered in the same window, in this run by re-electing the very node it had just lost - and that recovery is the counterevidence that limits the phrasing rather than the mechanism.",
+      "counterevidence": [
+        "Comparison 2 is violated by a valid witness: the emitted field old_leader_still_leader records that the old leader was observed leading during the eight second watch, because after the disruption it won the fresh election (index 2, leader_after_id is the old leader's own id). Any phrasing that leadership is lost for good, or that the cluster is left without a leader, is contradicted by this observation.",
+        "The watch samples states every 100ms, so a leaderless interval shorter than that interval inside the window would not be recorded; the receipt shows the interruption through index 1 (old leader Follower, target Candidate, nil result) rather than through a measured leaderless duration.",
+        "The nil result has two possible provenance paths in the transfer branch (the leader left the leaderLoop, or the wait for the destination timed out); this receipt shows the immediate return with the old leader already Follower and the target still Candidate, which matches the leftLeaderLoop path, but the harness does not read that branch directly."
+      ],
+      "limitations": [
+        "One treatment execution and one control in the same run, uniform timings (HeartbeatTimeout 2s, LeaderLeaseTimeout 1s), in-memory transports in one process, fully connected throughout.",
+        "The destination is a node demoted through DemoteVoter; AddNonvoter and the deprecated Staging suffrage reach the same Suffrage != Voter path but were not exercised.",
+        "The caller's observation is the future's error value only; the harness does not attempt to distinguish a handover from a fresh election through any other client-visible signal.",
+        "The eight second watch bounds nothing about how long a leaderless interval could last in a cluster with slower timings or fewer reachable voters."
+      ]
+    }
+  ]
+}

@@ -11,7 +11,7 @@ from consensus_assurance.registry import assemble
 from consensus_assurance.workflow.engine import Engine, FRAMEWORK_REVISION
 from consensus_assurance.adapters.storage.files import Store, write_json
 from consensus_assurance.adapters.runners.process import ProcessRunner
-from consensus_assurance.reporting.chinese import render_report
+from consensus_assurance.reporting.report import render_report
 
 
 def load_config(path=None, overrides=None):
@@ -157,8 +157,8 @@ def main(argv=None):
                 if engine.state is None:raise
                 state = engine.state
             report = render_report(state, root)
-        print(f"运行模式：{state.mode}；报告：{report}")
-        print(f"停止原因：{state.stop_reason}")
+        print(f"Run mode: {state.mode}; report: {report}")
+        print(f"Stop reason: {state.stop_reason}")
         if state.run_stop and state.run_stop['reason']=='user_stop':return 130
         return 0 if state.stop_reason.startswith(("Scoped stop (", "Snapshot prepared")) else 2
     except (ValueError, FileNotFoundError, BlockingIOError, OSError) as exc:

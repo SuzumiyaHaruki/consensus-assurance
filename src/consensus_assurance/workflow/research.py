@@ -1,6 +1,6 @@
 """Read-only current-work projections over semantic owners and immutable receipts."""
 from consensus_assurance.core.types import FixedExperiment
-from .knowledge import open_gaps, uses_of
+from .knowledge import open_gaps, use_paths
 from .experiments import assessment
 
 
@@ -33,7 +33,9 @@ def available(state):
 
 
 def knowledge_view(state, entry):
-    return {**entry.model_dump(exclude={'history'}), 'uses':uses_of(state,entry.id,entry.revision),
+    paths = use_paths(state, entry.id)
+    return {**entry.model_dump(exclude={'history'}), 'uses':list(paths),
+        'use_paths':{id:path for id,path in paths.items() if len(path)>1},
         'last_correction':{k:entry.history[-1][k] for k in ('revision','correction','recorded_uses','affected_uses')}
             if entry.history else None}
 
@@ -48,6 +50,9 @@ def reselection_view(state):
         value = knowledge_view(state,entry)
         value['statement'], value['conditions'] = entry.statement[:600], entry.conditions[:300]
         value['source_ids'], value['uses'] = entry.source_ids[:4], value['uses'][:6]
+        value['knowledge'] = [{**u, 'assertion':u['assertion'][:300]} for u in value['knowledge'][:6]]
+        value['use_paths'] = {id:[{**u, 'assertion':u['assertion'][:300]} for u in path]
+            for id,path in value['use_paths'].items() if id in value['uses']}
         value['source_locations'] = {m.id:f'agent-source/{m.file}:{m.start_line}-{m.end_line}'
             for m in state.materials if m.id in value['source_ids']}
         value['executions'] = {id:{'indices':indices[:6], 'record':f'logs/{id}/observations.json'}
@@ -56,20 +61,31 @@ def reselection_view(state):
             value['last_correction'] = {k:(v[:600] if isinstance(v,str) else v[:6] if isinstance(v,list) else v)
                 for k,v in value['last_correction'].items()}
         knowledge.append(value)
+    latest = {i.investigation_id:i for i in state.interpretations}
+    gaps = {q.id:open_gaps(state,q.id) for q in state.investigations}
+    def updated(q):
+        records = [q, *q.gaps, *[i for i in state.interpretations if i.investigation_id == q.id]]
+        return max(operations.get('submission-'+r.operation_id,-1) for r in records)
+    recent = sorted(state.investigations, key=updated, reverse=True)
+    selected = [q for q in recent if gaps[q.id]] + [q for q in recent if not gaps[q.id]]
     questions = []
-    for q in state.investigations[-8:]:
-        opinion = next((i for i in reversed(state.interpretations) if i.investigation_id == q.id),None)
+    for q in selected[:8]:
+        opinion = latest.get(q.id)
         questions.append({'id':q.id, 'question':q.question[:240], 'disposition':q.disposition,
-            'source_ids':q.source_ids[:4], 'open_gap_count':len(open_gaps(state,q.id)),
+            'hypothesis':q.hypothesis[:400], 'discriminator':q.discriminator[:400],
+            'source_ids':q.source_ids[:4], 'open_gap_count':len(gaps[q.id]),
             'latest_interpretation':{'id':opinion.id, 'conclusion':opinion.conclusion,
-                'defect_claim':opinion.defect_claim, 'rationale':opinion.rationale[:400]} if opinion else None})
+                'defect_claim':opinion.defect_claim, 'rationale':opinion.rationale[:400],
+                'counterevidence':[v[:300] for v in opinion.counterevidence[:3]],
+                'limitations':[v[:300] for v in opinion.limitations[:3]]} if opinion else None})
     return {'task':['A1: CFT decision formation and progress.',
                     'A2: Context and authority acquisition, transition and loss.'],
         'target':{'repo':state.snapshot.repo, 'snapshot_id':state.snapshot.id},
         'directed_question':state.config.get('directed_question'),
         'questions':questions, 'recent_knowledge':knowledge,
         'index':'research.json; full statements, sources, uses and history: state.json; captured tree: agent-source/',
-        'scope':'Recent records only, not a coverage map; omitted or unread areas are not established as examined.',
+        'scope':'Open-gap questions first, then recently updated questions; bounded navigation, not research priority or coverage. '
+            'A scoped negative does not settle unobserved consequences; full records and remaining questions are in research.json.',
         'execution_capacity':{'available':state.config['allow_experiments'] and state.config['execution_backend']!='none'
             and all(allocation[k]>0 for k in ('seconds','agent_calls','experiments')),
             'timeout_ceiling_seconds':min(allocation['seconds'],state.config['budget']['action_timeout']),
@@ -141,7 +157,13 @@ def operation_summary(state, root):
     check = next((c for c in reversed(state.checks) if c.action == 'experiment'),None)
     if check:
         summary['latest_actual_execution'] = {'id':check.id,'status':check.status.value,'exit_code':check.exit_code,
-            'record':f'logs/{check.id}/check.json','observations':f'logs/{check.id}/observations.json'}
+            'record':f'logs/{check.id}/check.json','observations':f'logs/{check.id}/observations.json',
+            'stdout':check.stdout,'stderr':check.stderr}
+        fixed = next((a for a in state.experiments if a.id == check.experiment_id), None)
+        if fixed:
+            summary['latest_actual_execution'].update(experiment_id=fixed.id, investigation_id=fixed.investigation_id,
+                basis=f'fixed-experiments/{fixed.id}/basis.json',
+                harness=f'fixed-experiments/{fixed.id}/{fixed.harness_filename}')
     gaps = [{'investigation_id':q.id,'id':g.id,'question':g.question[:400]}
         for q in state.investigations for g in open_gaps(state,q.id)]
     summary['necessary_gaps'], summary['other_gap_count'] = gaps[-8:], max(0,len(gaps)-8)
@@ -154,17 +176,58 @@ def operation_summary(state, root):
         'discriminator':q.discriminator[:400], 'knowledge':[
             {**u.model_dump(), 'assertion':u.assertion[:300]} for u in q.knowledge[:6]]}
         for q in local][-3:]
-    answered = any(q.disposition != 'active' or (not open_gaps(state,q.id) and
-        next((i.conclusion for i in reversed(state.interpretations) if i.investigation_id==q.id),None)
-        in {'explained','holds','violated'}) for q in local)
+    latest = {i.investigation_id:i for i in state.interpretations}
+    answered = any(q.disposition != 'active' or (not open_gaps(state,q.id) and q.id in latest and
+        (latest[q.id].conclusion in {'explained','holds','violated'} or
+         latest[q.id].defect_claim in {'asserted','refuted'})) for q in local)
+    use_owners = {q.id:q.id for q in state.investigations}
+    use_owners.update((a.id,a.investigation_id) for a in state.experiments)
+    use_owners.update((i.id,i.investigation_id) for i in state.interpretations)
+    corrections = []
+    for entry in state.knowledge:
+        if entry.operation_id != current.get('operation_id') or not entry.history:
+            continue
+        revisions = [*entry.history, {'operation_id':entry.operation_id}]
+        for prior, successor in zip(revisions, revisions[1:]):
+            if successor['operation_id'] != current.get('operation_id') or not prior['correction'].strip():
+                continue
+            affected = []
+            paths = use_paths(state, entry.id)
+            for use in prior['affected_uses'][:6]:
+                owner_id = use_owners.get(use)
+                if owner_id is None:
+                    continue
+                opinion = latest.get(owner_id)
+                affected.append({'id':use, 'investigation_id':owner_id,
+                    'latest_interpretation':{'path':'state.json','collection':'interpretations','id':opinion.id}
+                        if opinion else None})
+                if len(paths.get(use, []))>1:
+                    affected[-1]['knowledge_path'] = [{**u, 'assertion':u['assertion'][:300]} for u in paths[use]]
+            corrections.append({'id':entry.id, 'revision':entry.revision,
+                'changed_premise':prior['correction'][:600], 'previous_revision':prior['revision'],
+                'recorded_uses':prior['recorded_uses'][:6], 'affected_uses':prior['affected_uses'][:6],
+                'affected_use_locations':affected,
+                'record':{'path':'state.json','collection':'knowledge','id':entry.id}})
+    if corrections:
+        summary['knowledge_corrections'], summary['other_correction_count'] = corrections[-3:], max(0,len(corrections)-3)
+        summary['correction_guidance'] = (
+            'These are recorded premise corrections and explicit uses, not inferred dependencies. '
+            'Full revision history and use IDs are at each record; existing necessary gaps remain in research.json. '
+            'If a prior conclusion relied on the changed premise, correct the latest Interpretation of its '
+            'original owning Investigation rather than only adding a Fact or a separate explanatory question. '
+            'Other conclusions are not automatically invalidated.')
     if current.get('no_change') or answered:
         summary['reselection'] = reselection_view(state)
-        summary['next'] = ('No semantic change. ' if current.get('no_change') else '') + (
-            'Local answers or reading every file do not exhaust A1/A2 relationships. Select any valuable A1/A2 '
-            'direction independently of the last question: use current understanding to trace an unexplained '
-            'producer/consumer or authority relationship and form a falsifiable suspicion. Do not repeat closure. '
-            'Use the actual allocation above; timeout ceilings are not predicted costs or evidence of exhaustion. '
-            'Necessary gaps remain with their owners; no experiment or parent link is mandatory.')
+        summary['next'] = (
+            'The unchanged submission is already retained; this call still consumed time and a model turn. '
+            if current.get('no_change') else '') + (
+            'With the remaining allocation, choose a concrete source trace, correct a prior account, '
+            'or investigate another sourced A1/A2 uncertainty. A local answer does not complete an open audit; '
+            'compare the original hypothesis and discriminator with the actual answer and its limits. '
+            'Pursue a concrete unobserved consequence or reselect from producer/consumer and authority relationships; '
+            'coverage alone is not a defect hypothesis. Reuse saved outputs unless a new discriminating observation is needed; '
+            'do not repeat closing submissions. Necessary gaps remain with their owners; '
+            'no experiment or parent link is required.')
     return summary
 
 

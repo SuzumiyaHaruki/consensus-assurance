@@ -1,0 +1,81 @@
+{
+  "rationale": "Interpretation of the completed receipt 2086b09f107d4d49b1407754feabb781 (status completed, exit_code 0) for investigation 0bfc2ea5a9e94316982943d306eefbf6-question-0. I read the parsed events rather than the test names: indices 3, 4 and 5 are the injected-store-error case (admission before the heal, the 1500 ms window after the heal, and the 1200 ms window after the fault was removed) and indices 0, 1 and 2 are the healthy-store control of the same history. The prediction recorded last turn held, so the account moves from a source-derived hypothesis to an execution-grounded defect claim. I also added a fact entry so the observed consequence is durable rather than only narrative, and cited the two behaviours recorded last turn plus the two earlier ones that the run relied on.",
+  "interpretations": [
+    {
+      "investigation_id": "0bfc2ea5a9e94316982943d306eefbf6-question-0",
+      "experiment_id": "82c1d0635aa84b74a3777ab86bb5dcee-experiment",
+      "source_ids": [
+        "appendentries-conflict-truncate-block",
+        "appendentries-store-failure-todo",
+        "appendentries-older-term-guard",
+        "appendentries-entry-loop-cached-lastlog",
+        "replication-nextindex-floor",
+        "inmem-store-getlog-missing",
+        "state-getlastentry",
+        "electself-last-entry-claim",
+        "lastindex-public-api"
+      ],
+      "executions": {
+        "2086b09f107d4d49b1407754feabb781": [3, 4, 5, 0, 1]
+      },
+      "conclusion": "violated",
+      "defect_claim": "asserted",
+      "knowledge": [
+        {
+          "entry_id": "0bfc2ea5a9e94316982943d306eefbf6-knowledge-0",
+          "revision": 1,
+          "assertion": "The conflict path deletes the suffix, then stores replacements, and an error return skips the certificate update."
+        },
+        {
+          "entry_id": "0bfc2ea5a9e94316982943d306eefbf6-knowledge-1",
+          "revision": 1,
+          "assertion": "The cached certificate is what electSelf, requestVote, appendEntries and LastIndex read; none consult the log store."
+        },
+        {
+          "entry_id": "b7e0a0828e794c5fa40df351cb813d8f-knowledge-0",
+          "revision": 1,
+          "assertion": "The entry loop compares against the cached last index and returns on a GetLog error for entries that were just deleted, before reaching StoreLogs."
+        },
+        {
+          "entry_id": "b7e0a0828e794c5fa40df351cb813d8f-knowledge-1",
+          "revision": 1,
+          "assertion": "The leader's reject branch floors the peer's nextIndex and re-sends the same request; ErrLogNotFound leading to a snapshot only comes from the leader's own log store."
+        }
+      ],
+      "rationale": "Admission (index 3): the diverging node was elected leader first (its log was 1..4 with 1..2 committed, and 3..4 appended at term 2 while it was isolated, certificate (4,2)); the majority elected a leader at term 3 and committed entries 3..5 (its store held 1..5 with commit 5). The wrapper shows the diverging node had made exactly two successful StoreLogs calls up to that point, so the next StoreLogs on that node is the one belonging to the conflicting-suffix replacement. Faulted case after the heal (index 4): the store's last index drops from 4 to 2 within the first samples (the deletion removed 3..4) and stays 2 for the rest of the 1500 ms window, while the node's cached certificate stays (4,2) and GetLog of the certificate index returns 'log not found'; commit_index and applied_index stay at 2, the values they had before the heal; the StoreLogs attempt counter rises exactly once, from 2 to 3, and never moves again, so the follower never reaches the store again even though the leader keeps sending; the node stays a Follower at term 3 while the leader holds store 1..5 with commit 5. The library's own output in the same receipt records both halves of the cycle: 'failed to get log entry: index=3 error=...' from the follower's entry loop, and the leader's 'appendEntries rejected, sending older logs ... next=2' followed by '... next=1' and a further '... next=1', that is, the nextIndex floor with the identical request re-sent. After the fault was removed (index 5, 1200 ms later) nothing changes: certificate (4,2), store 1..2, attempts still 3, commit and applied still 2. Control, the same history with a healthy store (index 1): the store's last index moves from 4 to 5, the certificate moves from (4,2) to (5,3), the attempt counter moves from 2 to 4, GetLog of the certificate index succeeds and commit and applied reach 5. The two runs differ only in whether that single StoreLogs call returned an error, so the cause is the interaction of the allowed store error with the receive path rather than the divergence, the election or the heal. Predicate evaluated: an allowed LogStore error during a conflicting-suffix replacement must not prevent the node from converging once the fault ends. It is contradicted by a valid witness: across 2.7 s of continuing leader retries the node's durable log never regains indices 3..4 and no further StoreLogs is attempted. Mechanism, source-backed: the entry loop decides whether an incoming entry is already stored by comparing it with the cached last log index and then reading it from the store, so the just-deleted indices make GetLog fail and the handler returns before StoreLogs; the certificate that would have been updated is never re-derived; and the leader's reject branch floors nextIndex at 1 and re-sends the same request, restoring the blocking state instead of repairing it, while SEND_SNAP is never reached because ErrLogNotFound is only produced from the leader's own log store. Scope: one follower in a three-voter cluster over an in-memory transport, after a legal partition, divergence and higher-term replacement history, with a single allowed StoreLogs error, observed for 2.7 s with the fault both armed and removed.",
+      "counterevidence": [
+        "Safety is not violated in this history: the leader and the other follower kept a quorum and continued committing (store 1..5, commit 5), the wedged node's tail entries were appended in isolation and never committed, and no two leaders appeared.",
+        "Cluster-level liveness continues in the observed window; the defect is a per-replica progress failure, so the severity depends on remaining redundancy - with the third voter down the wedged replica cannot serve as quorum for anything past index 2.",
+        "The trigger needs an exact window, a conflicting-suffix truncation followed immediately by an error return from StoreLogs, and the fault-injecting wrapper reproduces it deterministically, so its real-world frequency is a separate empirical question.",
+        "The condition is visible outside the library: the run's output shows repeated 'failed to get log entry' warnings from the follower and 'appendEntries rejected, sending older logs ... next=1' from the leader, and a process restart would rebuild the certificate from the store."
+      ],
+      "limitations": [
+        "Scope of the word permanently here is the observed interval with no in-library repair enabled: 1500 ms with the fault armed plus 1200 ms after it was removed, during which the store never advanced. The claim rests on the mechanism, entries below the cached index are never stored again and the certificate is never re-derived, not on infinite execution.",
+        "No InstallSnapshot and no restart were performed, so the source-derived statement that those are the only repairs stays unexecuted; neither the leader-side compaction that would force a snapshot nor the restart path was reached.",
+        "One retained execution, one process, in-memory transport, three voters, default protocol version and deterministic fault injection; the wrapper returns an error without touching the underlying store, which the interface permits but which is not a model of a real disk failure.",
+        "The account uses 25 ms state probes plus the library's own log lines, so intermediate transitions shorter than the sampling interval are not claimed."
+      ],
+      "report_title": "截断后一次合法的 StoreLogs 错误会永久卡死该跟随者的日志复制",
+      "report_answer": "已确认的有源缺陷（A1 进度 / A2 上下文）：跟随者处理与自身后缀冲突的条目时，先删除冲突后缀、再写入替换条目；若这次写入返回合法的存储错误，处理器会在更新内存中的 last log 证书之前返回。由于条目循环用『缓存的 last index』判断条目是否已存在、再去存储读取，被删除的下标已不存在，GetLog 失败让处理器再次提前返回：替换条目永远写不进去，证书也永不被重算。保留执行 2086b09f107d4d49b1407754feabb781 显示：注入一次合法 StoreLogs 错误后，该节点存储最后下标由 4 降到 2（3、4 被删除且未写回），缓存证书停在 (4,2)（对证书下标的 GetLog 报 log not found），commit/applied 停在 2，StoreLogs 尝试次数仅由 2 增至 3 后不再增长；领导者侧日志显示其拒绝重试并把 nextIndex 降到 1 后反复重发同一请求。把故障移除后再等 1200 毫秒仍无任何进展；而完全相同的历史在健康存储下（对照组）1.5 秒内收敛：存储 1..5、证书 (5,3)、commit/applied 均为 5。即一次合法的存储写失败就把该副本永久移出复制集合，只有进程重启或安装快照才能修复，而本库中没有任何路径会因该状态触发这两者。"
+    }
+  ],
+  "knowledge": [
+    {
+      "ref": "@truncation-store-error-wedges-replica",
+      "kind": "fact",
+      "statement": "A single allowed error return from LogStore.StoreLogs in the call that follows a conflicting-suffix deletion leaves the follower unable to converge: its durable log keeps the truncated state (its last index falls to the last surviving index before the conflict), its cached last-log certificate keeps describing the deleted suffix, its commit and applied indexes stop advancing, and no further StoreLogs call is even attempted, so removing the error afterwards does not restore progress.",
+      "conditions": "Three-voter cluster over an in-memory transport, one follower holding an isolated uncommitted tail appended at an earlier term, a higher-term leader with committed replacement entries at the same indices, and exactly one allowed StoreLogs error on the replacement write; the fault may be removed afterwards without changing the outcome. In the observed run the same history with a healthy store converged inside the window (store 1..5, certificate (5,3), commit and applied 5) while the faulted node stayed at store last 2, certificate (4,2) and commit and applied 2 for 2.7 s.",
+      "source_ids": [
+        "appendentries-conflict-truncate-block",
+        "appendentries-store-failure-todo",
+        "appendentries-entry-loop-cached-lastlog",
+        "replication-nextindex-floor",
+        "inmem-store-getlog-missing",
+        "state-getlastentry"
+      ],
+      "executions": {
+        "2086b09f107d4d49b1407754feabb781": [3, 4, 5, 0, 1]
+      }
+    }
+  ]
+}

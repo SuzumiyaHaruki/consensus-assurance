@@ -67,10 +67,16 @@ class Inputs:
             with saved.open('xb') as stream:stream.write(data)
 
 
-def retain_receipt(draft, archive, result):
+def retain_receipt(draft, archive, result, check):
     # An existing receipt, even incomplete after interruption, never falls back to mutable draft bytes.
     if archive.exists():return
     archive.mkdir(parents=True)
+    if message := check.parameters.get('agent_response_error'):
+        from consensus_assurance.core.diagnostics import Diagnostic
+        errors = submission_errors([Diagnostic(code='agent_response',category='format',message=message)],archive,result)
+        errors['raw_path'] = check.parameters['agent_response_path']
+        write_json(archive/'diagnostics.json',errors)
+        return
     inputs, errors = Inputs(draft), []
     name = result.get('submission')
     try:
@@ -193,7 +199,7 @@ def receive(engine, payload):
     check = CheckRun.model_validate(payload[0])
     session, result = payload[1:]
     if check.status == ExecutionStatus.COMPLETED and result:
-        retain_receipt(engine.root/'draft',engine.root/'submissions'/check.id,result)
+        retain_receipt(engine.root/'draft',engine.root/'submissions'/check.id,result,check)
     engine.record(check)
     state = engine.state
     if session:
@@ -326,6 +332,11 @@ def prepare_submission(engine, submission, inputs, operation_id):
     from .experiments import validate_basis, artifact, fixed_files
     from consensus_assurance.core.types import ExperimentBasis, Harness, FixedExperiment
     state = engine.state
+    if submission.repeat_experiment_id is not None and (submission.experiment or submission.stop):
+        raise ValueError('repeat_experiment_id cannot be combined with experiment or stop')
+    if submission.experiment or submission.repeat_experiment_id is not None:
+        if not engine.config.allow_experiments or engine.implementation is None:
+            raise ValueError('Target execution is not authorized or configured')
     before = state.model_dump(mode='json')
     aliases = {}
     state.materials.extend(source_materials(engine, submission.sources))
@@ -337,8 +348,6 @@ def prepare_submission(engine, submission, inputs, operation_id):
     fixed = None
     request = submission.experiment
     if request:
-        if not engine.config.allow_experiments or engine.implementation is None:
-            raise ValueError('Target execution is not authorized or configured')
         owner = investigation(state, resolve(request.investigation_id, aliases))
         harness = Harness(kind=engine.implementation.harness_kind, source=inputs.read(request.harness_path),
             files={name: inputs.read(path) for name, path in request.files.items()},
@@ -372,6 +381,10 @@ def prepare_submission(engine, submission, inputs, operation_id):
                 operation_id=operation_id, version=prior.version + 1 if prior else 1,
                 previous_id=prior.id if prior else None, difference=difference, revision_reason=request.revision_reason)
             state.experiments.append(fixed)
+    if submission.repeat_experiment_id is not None:
+        fixed = artifact(state, submission.repeat_experiment_id)
+        fixed_files(engine.root, fixed)
+        require_capacity(engine, 'experiments')
     if submission.stop:
         if submission.stop.reason != 'bounded_completed' or not engine.config.directed_question:
             raise ValueError('An open audit continues useful investigation until controller limits or actual interruption')
@@ -390,7 +403,7 @@ def prepare_submission(engine, submission, inputs, operation_id):
     changed = any(before[name] != state.model_dump(mode='json')[name]
                   for name in ('materials','investigations','knowledge','experiments','interpretations','run_stop'))
     current = {'phase':'accepted', 'operation_id':operation_id, 'action':'update',
-               'no_change':not changed, 'references':aliases}
+               'no_change':not changed and submission.repeat_experiment_id is None, 'references':aliases}
     if fixed:
         current['experiment_id'] = fixed.id
     if submission.stop:
@@ -398,7 +411,7 @@ def prepare_submission(engine, submission, inputs, operation_id):
     state.current_submission = current
 
     def persist():
-        if fixed:
+        if fixed and submission.repeat_experiment_id is None:
             fixed_files(engine.root, fixed, write=True)
     return persist
 
@@ -415,19 +428,20 @@ def accept_received(engine):
     try:
         engine.budget.timeout()
         if (archive / 'diagnostics.json').exists():
-            raise ValueError('; '.join(json.loads((archive / 'diagnostics.json').read_text())['errors']))
-        product = AuditSubmission.model_validate_json((archive / 'raw.json').read_text())
-        inputs = Inputs(archive / 'inputs')
-        commit_update(engine, 'submission-' + operation_id, product.model_dump(mode='json'),
-                      lambda proxy: prepare_submission(proxy, product, inputs, operation_id)())
-        write_json(archive / 'accepted.json', product)
-        return True
+            errors = json.loads((archive / 'diagnostics.json').read_text())
+        else:
+            product = AuditSubmission.model_validate_json((archive / 'raw.json').read_text())
+            inputs = Inputs(archive / 'inputs')
+            commit_update(engine, 'submission-' + operation_id, product.model_dump(mode='json'),
+                          lambda proxy: prepare_submission(proxy, product, inputs, operation_id)())
+            write_json(archive / 'accepted.json', product)
+            return True
     except (OSError, ValueError, KeyError, TypeError) as exc:
         errors = submission_errors(submission_diagnostics(exc), archive, result)
         write_json(archive / 'diagnostics.json', errors)
-        engine.state.current_submission = {'phase':'rejected', 'operation_id':operation_id, 'rejected':errors}
-        engine.checkpoint('submission_rejected')
-        return False
+    engine.state.current_submission = {'phase':'rejected', 'operation_id':operation_id, 'rejected':errors}
+    engine.checkpoint('submission_rejected')
+    return False
 
 
 def execute_accepted(engine):
@@ -436,8 +450,7 @@ def execute_accepted(engine):
     if current.get('experiment_id'):
         fixed = artifact(engine.state, current['experiment_id'])
         try:
-            check = next((c for c in engine.state.checks if c.experiment_id == fixed.id), None)
-            check = check or execute(engine, fixed)
+            check = execute(engine, fixed, current['operation_id'])
             write_json(engine.root / 'logs' / check.id / 'observations.json', observed(fixed, check))
         except (OSError, ValueError, Blocked, BudgetExhausted) as exc:
             current['execution_gap'] = str(exc)

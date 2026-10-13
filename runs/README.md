@@ -1,15 +1,14 @@
-# 保留运行
+# Retained runs
 
-`runs` 当前只追踪最新的 HashiCorp CA 实验。此前退出追踪的实验保留在本地及 Git 历史中；`baseline/runs` 的既有归档不变。
+Git tracks the two latest CA experiments below. Earlier runs remain locally and in Git history; the existing `baseline/runs` archive is unchanged.
 
-| 实验 | 模型／档位 | 开始时间 | 预算／实际时间 | 调用与执行 | 停止原因 |
-| --- | --- | --- | --- | --- | --- |
-| [HashiCorp CA](2026-10-12_09-55-08-hashicorp_raft-real-run/report.md) | `deepseek-flash` / `high` | 2026-10-12 09:55:08 | 60／60.08 分钟 | 30 次模型调用、9 次控制器目标执行（8 次完成、1 次构建失败） | 总时间预算耗尽 |
+| Run | Method | Model / effort | Budget / elapsed | Agent calls / formal executions |
+| --- | --- | --- | --- | --- |
+| [HashiCorp, 2026-10-13 10:13:13](2026-10-13_10-13-13-hashicorp_raft-real-run/report.md) | `audit-products-v69` | `deepseek-flash` / `high` | 60 / 60.03 minutes | 49 / 12 |
+| [HashiCorp, 2026-10-13 12:35:45](2026-10-13_12-35-45-hashicorp_raft-real-run/report.md) | `audit-products-v70` | `deepseek-flash` / `high` | 60 / 60.01 minutes | 26 / 11 |
 
-方法为 `audit-products-v65`，对应代码改动与本次归档一起提交。捕获的目标 Git 提交为 `c0dc6a0b2c7e889f31e5ab2f7ed90ceb159acffe`；`fd2d6988362c434e9fda87b87c5fb0df` 是本次源码捕获 ID。实际输入、工具、预算和会话以保存记录为准。
+Both runs reached their total time allocation. The v69 stop message is `Agent stopped: Action timeout exceeded; process group killed`; v70 distinguishes the total deadline as `Agent stopped: Total runtime budget exhausted; process group killed`. All recorded formal executions completed. Each run contains three investigations and nine fixed experiment versions; v69 retains twelve interpretations and v70 nine. These are research records, not counts of independently verified defects.
 
-本次配置 3600 秒总预算、80 次模型调用、40 次控制器目标执行、900 秒单回合和 600 秒单次动作上限。保存 13 个问题、18 条解释、10 条共享知识和 9 个固定实验。全部实验未声明 requirement、comparisons 和 prerequisites，机械确认数为零；两条明确模型缺陷主张属于同一快照复制问题方向，不能作为两个独立缺陷计数。
+Reports, fixed inputs, model interpretations and raw receipts are retained as recorded, including incorrect measurements, disputed claims and unresolved consequences. Use each run's captured method and configuration to interpret its records; current code must not silently resume an older method. Historical findings must not become inputs to fresh autonomous experiments.
 
-报告、原始执行和模型解释原样保留，没有重算或改写。离线复核发现 backlog 测试的计数 FSM 未接入实际 Restore 路径，其零计数不能证明没有安装快照；原始日志显示重复安装后通过更新快照恢复。五节点时间线的等待也使事件标签不等于真实经过时间。最终缺陷范围和活性影响仍需独立核验。
-
-归档包含捕获源码、配置记录、固定实验、提交及执行差异、原始日志和报告；排除凭据、虚拟环境、临时锁、`.execution`、编译缓存、可重建的 `experiments/**/workspace` 和本地权限覆盖配置。历史实验产物不能成为新自主实验的输入。
+Archives include captured source, configuration records, fixed experiments, submissions, execution deltas and raw logs. Credentials, virtual environments, transient locks, `.execution`, build caches, reconstructible `experiments/**/workspace` copies and local permission overrides are excluded.

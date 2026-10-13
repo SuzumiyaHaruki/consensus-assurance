@@ -1,0 +1,272 @@
+{
+  "id": "244fe01a841341c5a918142383abe8ea-experiment",
+  "investigation_id": "6464ac4e45e546e99aff4d88c0a145c8-question-0",
+  "version": 1,
+  "basis": {
+    "harness": {
+      "kind": "go_test",
+      "source": "// Copyright (c) HashiCorp, Inc.\n// SPDX-License-Identifier: MPL-2.0\n\npackage raft\n\nimport (\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"testing\"\n\t\"time\"\n)\n\nfunc caEmit(ev map[string]interface{}) {\n\tb, err := json.Marshal(ev)\n\tif err != nil {\n\t\tpanic(err)\n\t}\n\tfmt.Println(\"CA_EVENT \" + string(b))\n}\n\nfunc caErrString(err error) string {\n\tif err == nil {\n\t\treturn \"nil\"\n\t}\n\treturn err.Error()\n}\n\ntype caNode struct {\n\tid    ServerID\n\taddr  ServerAddress\n\ttrans *InmemTransport\n\tstore *InmemStore\n\tsnap  *InmemSnapshotStore\n\tfsm   *MockFSM\n\traft  *Raft\n\trole  string\n}\n\nfunc caStart(t *testing.T, n *caNode, hb, lease time.Duration, configuration Configuration, bootstrap bool) *Raft {\n\tconf := DefaultConfig()\n\tconf.HeartbeatTimeout = hb\n\tconf.ElectionTimeout = hb\n\tconf.LeaderLeaseTimeout = lease\n\tconf.CommitTimeout = 200 * time.Millisecond\n\tconf.SnapshotInterval = 120 * time.Second\n\tconf.LocalID = n.id\n\tconf.Logger = newTestLoggerWithPrefix(t, string(n.id))\n\tif bootstrap {\n\t\tif err := BootstrapCluster(conf, n.store, n.store, n.snap, n.trans, configuration); err != nil {\n\t\t\tt.Fatalf(\"bootstrap %s: %v\", n.id, err)\n\t\t}\n\t}\n\tr, err := NewRaft(conf, n.fsm, n.store, n.store, n.snap, n.trans)\n\tif err != nil {\n\t\tt.Fatalf(\"newraft %s: %v\", n.id, err)\n\t}\n\treturn r\n}\n\nfunc caWaitState(r *Raft, want RaftState, limit time.Duration) bool {\n\tdeadline := time.Now().Add(limit)\n\tfor time.Now().Before(deadline) {\n\t\tif r.State() == want {\n\t\t\treturn true\n\t\t}\n\t\ttime.Sleep(5 * time.Millisecond)\n\t}\n\treturn false\n}\n\n// caViewOf reads one node's own configuration view of member id.\nfunc caViewOf(n *caNode, id ServerID) (present bool, voter bool) {\n\tf := n.raft.GetConfiguration()\n\tif err := f.Error(); err != nil {\n\t\treturn false, false\n\t}\n\tfor _, s := range f.Configuration().Servers {\n\t\tif s.ID == id {\n\t\t\treturn true, s.Suffrage == Voter\n\t\t}\n\t}\n\treturn false, false\n}\n\nfunc TestAssuranceDemotionViewLag(t *testing.T) {\n\tfor i := 1; i <= 3; i++ {\n\t\tcaViewLagRun(t, fmt.Sprintf(\"run_%d\", i))\n\t}\n}\n\n// caViewLagRun performs one voter-to-non-voter transition in a 4-node cluster\n// with the per-node timing used by the extended-window scenario, sampling every\n// node's own configuration view and log index continuously across the change.\nfunc caViewLagRun(t *testing.T, caseName string) {\n\tconst (\n\t\tleaderHB    = 20 * time.Second\n\t\tnearHB      = 6 * time.Second\n\t\tfarHB       = 3 * time.Second\n\t\tsampleEvery = 20 * time.Millisecond\n\t\tobserveFor  = 10 * time.Second\n\t)\n\n\tnodes := make([]*caNode, 4)\n\tfor i := range nodes {\n\t\taddr, trans := NewInmemTransport(\"\")\n\t\tnodes[i] = &caNode{\n\t\t\tid:    ServerID(\"server-\" + string(addr)),\n\t\t\taddr:  addr,\n\t\t\ttrans: trans,\n\t\t\tstore: NewInmemStore(),\n\t\t\tsnap:  NewInmemSnapshotStore(),\n\t\t\tfsm:   &MockFSM{},\n\t\t}\n\t}\n\tfor i, role := range []string{\"leader\", \"near\", \"far1\", \"far2\"} {\n\t\tnodes[i].role = role\n\t}\n\tleader, near := nodes[0], nodes[1]\n\n\tconfiguration := Configuration{Servers: []Server{\n\t\t{Suffrage: Voter, ID: leader.id, Address: leader.addr},\n\t\t{Suffrage: Voter, ID: near.id, Address: near.addr},\n\t\t{Suffrage: Voter, ID: nodes[2].id, Address: nodes[2].addr},\n\t\t{Suffrage: Voter, ID: nodes[3].id, Address: nodes[3].addr},\n\t}}\n\tfor i, n1 := range nodes {\n\t\tfor j, n2 := range nodes {\n\t\t\tif i != j {\n\t\t\t\tn1.trans.Connect(n2.addr, n2.trans)\n\t\t\t}\n\t\t}\n\t}\n\tdefer func() {\n\t\tfor _, n := range nodes {\n\t\t\tif n.raft != nil {\n\t\t\t\t_ = n.raft.Shutdown().Error()\n\t\t\t}\n\t\t\tn.trans.Close()\n\t\t}\n\t}()\n\n\tleader.raft = caStart(t, leader, leaderHB, leaderHB, configuration, true)\n\tnear.raft = caStart(t, near, nearHB, nearHB, configuration, false)\n\tfor _, n := range nodes[2:] {\n\t\tn.raft = caStart(t, n, farHB, farHB, configuration, false)\n\t}\n\tif !caWaitState(leader.raft, Leader, 60*time.Second) {\n\t\tt.Fatalf(\"%s: bootstrapped node did not become leader\", caseName)\n\t}\n\n\t// Baseline: every follower has the configuration and the leader's no-op.\n\tbaselineDeadline := time.Now().Add(20 * time.Second)\n\tfor time.Now().Before(baselineDeadline) {\n\t\tready := true\n\t\tfor _, n := range nodes[1:] {\n\t\t\tpresent, voter := caViewOf(n, n.id)\n\t\t\tif !present || !voter || n.raft.LastIndex() < 2 {\n\t\t\t\tready = false\n\t\t\t}\n\t\t}\n\t\tif ready {\n\t\t\tbreak\n\t\t}\n\t\ttime.Sleep(sampleEvery)\n\t}\n\n\tbaseline := map[string]interface{}{\"event\": \"baseline\", \"case\": caseName}\n\tfor _, n := range nodes {\n\t\tpresent, voter := caViewOf(n, near.id)\n\t\tbaseline[n.role+\"_near_present\"] = present\n\t\tbaseline[n.role+\"_near_voter\"] = voter\n\t\tbaseline[n.role+\"_last_index\"] = n.raft.LastIndex()\n\t}\n\tbaseline[\"leader_hb_ms\"] = leaderHB.Milliseconds()\n\tbaseline[\"near_hb_ms\"] = nearHB.Milliseconds()\n\tbaseline[\"far_hb_ms\"] = farHB.Milliseconds()\n\tcaEmit(baseline)\n\n\tdemoteAt := time.Now()\n\tdemoteErr := leader.raft.DemoteVoter(near.id, 0, 10*time.Second).Error()\n\tcommittedAt := time.Now()\n\tconfigIndex := leader.raft.LastIndex()\n\n\ttype nodeObs struct {\n\t\tconverged     bool\n\t\tconvergedMs   int64\n\t\tstaleObserved bool\n\t\tstaleMaxIndex uint64\n\t}\n\tobs := map[string]*nodeObs{}\n\tfor _, n := range nodes {\n\t\tobs[n.role] = &nodeObs{convergedMs: -1}\n\t}\n\n\tobserveDeadline := time.Now().Add(observeFor)\n\tfor time.Now().Before(observeDeadline) {\n\t\tallDone := true\n\t\tfor _, n := range nodes {\n\t\t\to := obs[n.role]\n\t\t\tif o.converged {\n\t\t\t\tcontinue\n\t\t\t}\n\t\t\tallDone = false\n\t\t\t_, voter := caViewOf(n, near.id)\n\t\t\tlastIdx := n.raft.LastIndex()\n\t\t\tif voter {\n\t\t\t\to.staleObserved = true\n\t\t\t\tif lastIdx > o.staleMaxIndex {\n\t\t\t\t\to.staleMaxIndex = lastIdx\n\t\t\t\t}\n\t\t\t} else {\n\t\t\t\to.converged = true\n\t\t\t\to.convergedMs = time.Since(committedAt).Milliseconds()\n\t\t\t}\n\t\t}\n\t\tif allDone {\n\t\t\tbreak\n\t\t}\n\t\ttime.Sleep(sampleEvery)\n\t}\n\n\tfor _, n := range nodes {\n\t\to := obs[n.role]\n\t\tpassed := o.staleObserved && o.staleMaxIndex >= configIndex\n\t\tcaEmit(map[string]interface{}{\n\t\t\t\"event\":                    \"demotion_view\",\n\t\t\t\"case\":                     caseName,\n\t\t\t\"role\":                     n.role,\n\t\t\t\"node_id\":                  string(n.id),\n\t\t\t\"converged\":                o.converged,\n\t\t\t\"converged_ms\":             o.convergedMs,\n\t\t\t\"stale_observed\":           o.staleObserved,\n\t\t\t\"stale_max_last_index\":     o.staleMaxIndex,\n\t\t\t\"config_index\":             configIndex,\n\t\t\t\"index_passed_while_stale\": passed,\n\t\t\t\"last_index_end\":           n.raft.LastIndex(),\n\t\t\t\"state_end\":                n.raft.State().String(),\n\t\t\t\"demote_error\":             caErrString(demoteErr),\n\t\t\t\"demote_commit_ms\":         committedAt.Sub(demoteAt).Milliseconds(),\n\t\t\t\"observed_ms\":              time.Since(demoteAt).Milliseconds(),\n\t\t})\n\t}\n}\n",
+      "files": {},
+      "execution_package": ".",
+      "description": "",
+      "semantic_changes": [],
+      "prerequisites": [
+        {
+          "alias": "run_1",
+          "event": "baseline",
+          "conditions": [
+            {
+              "field": "case",
+              "op": "eq",
+              "value": "run_1",
+              "reference": null
+            },
+            {
+              "field": "near_last_index",
+              "op": "eq",
+              "value": 2,
+              "reference": null
+            }
+          ]
+        },
+        {
+          "alias": "run_2",
+          "event": "baseline",
+          "conditions": [
+            {
+              "field": "case",
+              "op": "eq",
+              "value": "run_2",
+              "reference": null
+            },
+            {
+              "field": "near_last_index",
+              "op": "eq",
+              "value": 2,
+              "reference": null
+            }
+          ]
+        },
+        {
+          "alias": "run_3",
+          "event": "baseline",
+          "conditions": [
+            {
+              "field": "case",
+              "op": "eq",
+              "value": "run_3",
+              "reference": null
+            },
+            {
+              "field": "near_last_index",
+              "op": "eq",
+              "value": 2,
+              "reference": null
+            }
+          ]
+        }
+      ]
+    },
+    "source_ids": [
+      "s_append_entries",
+      "s_latest_config",
+      "s_get_configuration",
+      "s_repl_state"
+    ],
+    "anchors": [],
+    "scope": {
+      "description": "Follow one committed voter-to-non-voter transition in a healthy 4-node cluster while sampling every node's own configuration view and log index, three independent runs.",
+      "assumptions": [
+        "Real target constructors and APIs only: BootstrapCluster, NewRaft, DemoteVoter, GetConfiguration, LastIndex; per-node Config values (leader 20s, near 6s, far voters 3s), all ValidateConfig-clean.",
+        "Only the leader is bootstrapped; the other three start with empty configurations and adopt them through normal replication, so the cluster is the same construction as the extended-window experiment that produced the unexplained sighting.",
+        "Before the transition the harness waits until every follower reports itself with a vote and has LastIndex >= 2, so the baseline is uniform and the transition is the only event under observation.",
+        "Sampling is every 20ms for ten seconds after the transition is committed on the leader; a node counts as converged at the first sample where its own view shows the demoted peer without a vote.",
+        "Three runs in one execution; the transports stay fully connected and healthy throughout, so any lag observed is not caused by a partition."
+      ],
+      "excluded": [
+        "No partition, no snapshots, no restarts or crash-recovery, and no client traffic besides the configuration change itself.",
+        "The configuration index used for the consistency check is read from the leader after the change returns; the harness does not inspect the follower's log store directly."
+      ],
+      "parameters": {
+        "nodes": 4,
+        "runs": 3,
+        "sample_interval_ms": 20,
+        "observation_window_ms": 10000,
+        "leader_hb_ms": 20000,
+        "near_hb_ms": 6000,
+        "far_hb_ms": 3000
+      }
+    },
+    "prefix": "Four nodes are created (identity = in-memory transport address), wired fully connected and started; only the first is bootstrapped with the four-voter configuration, so it is the deterministic first leader and the others adopt the configuration through replication. The harness waits for that leader, then waits until every follower reports itself with a vote and has LastIndex >= 2, and emits a baseline CA_EVENT with each node's view of the near node and its LastIndex. It then calls DemoteVoter(near, prevIndex 0, timeout 10s), waits for the future (which returns when the entry is committed on the leader), records the leader's LastIndex as the configuration index, and polls every node every 20ms for ten seconds: each poll reads that node's GetConfiguration view of the near node's suffrage and its LastIndex. A node counts as converged at the first poll where its view shows the near node without a vote; the harness also keeps the highest LastIndex seen while that node's view was still old. One demotion_view CA_EVENT is emitted per node with converged, converged_ms, stale_observed, stale_max_last_index, the configuration index, index_passed_while_stale, and the node's end state and LastIndex.",
+    "requirement": null,
+    "responsibility": "Configuration propagation from the leader's committed membership change to each peer's own view of its suffrage, as consumed by that peer's election eligibility (runFollower checks hasVote on its latest configuration before campaigning) and by quorum arithmetic on the leader.",
+    "comparisons": [
+      {
+        "event": "demotion_view",
+        "identity_fields": [
+          "case",
+          "role"
+        ],
+        "admission_alias": "run_1",
+        "assertion": {
+          "field": "converged",
+          "op": "eq",
+          "value": true,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [
+          {
+            "field": "case",
+            "op": "eq",
+            "value": "run_1",
+            "reference": null
+          }
+        ],
+        "description": "Run 1: every node (including the demoted one) reports the new suffrage within the ten second observation window on a healthy transport; a node that never converges is contradicted here."
+      },
+      {
+        "event": "demotion_view",
+        "identity_fields": [
+          "case",
+          "role"
+        ],
+        "admission_alias": "run_1",
+        "assertion": {
+          "field": "index_passed_while_stale",
+          "op": "eq",
+          "value": false,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [
+          {
+            "field": "case",
+            "op": "eq",
+            "value": "run_1",
+            "reference": null
+          }
+        ],
+        "description": "Run 1 consistency: no node's view may still be old at a sample where that node's own LastIndex already reached the configuration entry, which would separate a processing gap from a delivery lag."
+      },
+      {
+        "event": "demotion_view",
+        "identity_fields": [
+          "case",
+          "role"
+        ],
+        "admission_alias": "run_2",
+        "assertion": {
+          "field": "converged",
+          "op": "eq",
+          "value": true,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [
+          {
+            "field": "case",
+            "op": "eq",
+            "value": "run_2",
+            "reference": null
+          }
+        ],
+        "description": "Run 2 convergence prediction, identical predicate."
+      },
+      {
+        "event": "demotion_view",
+        "identity_fields": [
+          "case",
+          "role"
+        ],
+        "admission_alias": "run_2",
+        "assertion": {
+          "field": "index_passed_while_stale",
+          "op": "eq",
+          "value": false,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [
+          {
+            "field": "case",
+            "op": "eq",
+            "value": "run_2",
+            "reference": null
+          }
+        ],
+        "description": "Run 2 consistency prediction, identical predicate."
+      },
+      {
+        "event": "demotion_view",
+        "identity_fields": [
+          "case",
+          "role"
+        ],
+        "admission_alias": "run_3",
+        "assertion": {
+          "field": "converged",
+          "op": "eq",
+          "value": true,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [
+          {
+            "field": "case",
+            "op": "eq",
+            "value": "run_3",
+            "reference": null
+          }
+        ],
+        "description": "Run 3 convergence prediction, identical predicate."
+      },
+      {
+        "event": "demotion_view",
+        "identity_fields": [
+          "case",
+          "role"
+        ],
+        "admission_alias": "run_3",
+        "assertion": {
+          "field": "index_passed_while_stale",
+          "op": "eq",
+          "value": false,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [
+          {
+            "field": "case",
+            "op": "eq",
+            "value": "run_3",
+            "reference": null
+          }
+        ],
+        "description": "Run 3 consistency prediction, identical predicate."
+      }
+    ],
+    "knowledge": []
+  },
+  "snapshot_id": "e02d90d71b50464399dbf6ade5e2ad3d",
+  "configuration": {
+    "backend": "go_module",
+    "target": {
+      "expected_module": "github.com/hashicorp/raft",
+      "variant": "hashicorp_raft",
+      "analysis_roots": [],
+      "execution_package": ".",
+      "harness_path": "assurance_generated_test.go"
+    },
+    "isolation": "bwrap",
+    "tools": {
+      "agent": "codex-cli 0.162.0-alpha.17.2",
+      "implementation": "go version go1.23.5 linux/amd64"
+    }
+  },
+  "harness_filename": "assurance_generated_test.go",
+  "operation_id": "244fe01a841341c5a918142383abe8ea",
+  "previous_id": null,
+  "difference": {},
+  "revision_reason": ""
+}

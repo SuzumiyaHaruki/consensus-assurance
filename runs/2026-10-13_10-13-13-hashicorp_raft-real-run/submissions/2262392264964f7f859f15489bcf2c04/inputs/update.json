@@ -1,0 +1,165 @@
+{
+  "rationale": "Repair of the rejected draft: the api.go excerpt asked for end_line 1284 but the captured api.go has 1282 lines, so the citation is now 1268-1282 (LeadershipTransferToServer plus its doc comment). The investigation, behaviors and one experiment are submitted together. The experiment drives the unmodified library through the public API (3-voter cluster plus a member added with AddNonvoter and caught up to a freshly committed entry) and, as a positive control, makes the identical call to a voter target. Native local feedback on the same harness in a scratch copy inside draft suggested that the non-voter case ends with the target never leading, the incumbent deposed and the future still returning nil; that is a prediction to be settled by the retained execution, not a conclusion.",
+  "sources": [
+    {
+      "id": "api-transfer-to-server",
+      "file": "api.go",
+      "start_line": 1268,
+      "end_line": 1282,
+      "kind": "code_observation"
+    },
+    {
+      "id": "initiate-transfer-check",
+      "file": "raft.go",
+      "start_line": 2187,
+      "end_line": 2199,
+      "kind": "code_observation"
+    },
+    {
+      "id": "leaderloop-transfer-target",
+      "file": "raft.go",
+      "start_line": 762,
+      "end_line": 784,
+      "kind": "code_observation"
+    },
+    {
+      "id": "startstop-replication-all-servers",
+      "file": "raft.go",
+      "start_line": 584,
+      "end_line": 592,
+      "kind": "code_observation"
+    },
+    {
+      "id": "timeoutnow-handler",
+      "file": "raft.go",
+      "start_line": 2208,
+      "end_line": 2215,
+      "kind": "code_observation"
+    },
+    {
+      "id": "requestvote-highterm-stepdown-nonvoter-reject",
+      "file": "raft.go",
+      "start_line": 1663,
+      "end_line": 1684,
+      "kind": "code_observation"
+    },
+    {
+      "id": "electself-voters-only",
+      "file": "raft.go",
+      "start_line": 2013,
+      "end_line": 2020,
+      "kind": "code_observation"
+    },
+    {
+      "id": "pickserver-voters-only",
+      "file": "raft.go",
+      "start_line": 2163,
+      "end_line": 2176,
+      "kind": "code_observation"
+    },
+    {
+      "id": "config-commands-doc",
+      "file": "configuration.go",
+      "start_line": 92,
+      "end_line": 108,
+      "kind": "code_observation"
+    }
+  ],
+  "investigations": [
+    {
+      "ref": "@nonvoter-transfer",
+      "question": "Does the leader's explicit leadership-transfer path verify that the caller-supplied target can acquire leadership (i.e. is a Voter in the latest configuration), and if it does not, what happens to the incumbent leader, to the target, and to the returned future when the target is a legal non-voter member added with AddNonvoter?",
+      "source_ids": [
+        "api-transfer-to-server",
+        "initiate-transfer-check",
+        "leaderloop-transfer-target",
+        "startstop-replication-all-servers",
+        "timeoutnow-handler",
+        "requestvote-highterm-stepdown-nonvoter-reject",
+        "electself-voters-only",
+        "pickserver-voters-only",
+        "config-commands-doc"
+      ],
+      "hypothesis": "The transfer path validates only that the target is not the leader itself (raft.go 2191-2196) and that a replication state exists for it (777-783). Replication state exists for every server in configurations.latest, including Nonvoters (the startStopReplication loop at 587 has no suffrage filter), so a non-voter target is accepted end to end. The leader then replicates up to its own last index and sends TimeoutNow; timeoutNow (2208-2215) has no term, no state and no suffrage test, so the target campaigns at term+1 with the transfer flag. Every voter adopts the higher term and steps down before rejecting the vote because the candidate is not a voter (1670-1683), and the candidate can never win because electSelf only asks and self-votes Voters (2015). Predicted observations: the transfer future still reports success, the target never becomes Leader, and the incumbent loses leadership and is replaced by whichever voter campaigns next. The positive control (identical call to a voter) should transfer leadership to the named target.",
+      "discriminator": "One execution, two cases. Case A (control): 3-voter cluster, LeadershipTransferToServer to a voter; the target should become Leader. Case B: same cluster plus a node added with AddNonvoter and verified caught up; LeadershipTransferToServer to that non-voter. The future value alone does not discriminate, since both cases may return success: the decisive difference is whether the named target ever reaches Leader and whether the incumbent's leadership survives. Vote evidence comes from the library's own observer stream (RequestVoteRequest records candidate ID, term, log position and transfer flag) plus timestamped state/term sampling, so the effect can be attributed to suffrage rather than to generic transfer flakiness.",
+      "disposition": "active",
+      "limitations": [
+        "Source reading establishes the guards and their absence; the concrete sequence, the future value and the recovery time are predictions until the retained execution is interpreted.",
+        "Contention: requestVote's deliberate high-term step-down for a non-voter candidate (comment citing hashicorp/raft#526) shows the library anticipates a campaigning non-voter; it does not show that the library's own transfer API may create that state from a legal caller input."
+      ]
+    }
+  ],
+  "knowledge": [
+    {
+      "ref": "@transfer-target-selected-by-replstate",
+      "kind": "behavior",
+      "statement": "For an explicit leadership transfer (LeadershipTransferToServer) the leader accepts the caller-supplied target if and only if a followerReplication entry exists for that ServerID in leaderState.replState; the only rejection is a target equal to the local ID ('cannot transfer leadership to itself'). No suffrage test is applied at the API, at initiateLeadershipTransfer, or at the leaderLoop hand-off to leadershipTransfer.",
+      "conditions": "protocolVersion >= 3, node is in Leader state and processing the leadershipTransferCh case on the main thread; the caller supplies an ID present in configurations.latest.",
+      "source_ids": [
+        "api-transfer-to-server",
+        "initiate-transfer-check",
+        "leaderloop-transfer-target"
+      ]
+    },
+    {
+      "ref": "@replstate-includes-nonvoters",
+      "kind": "behavior",
+      "statement": "startStopReplication starts a followerReplication goroutine for every server in configurations.latest whose ID differs from the local ID, with no suffrage filter, so leaderState.replState (the map consulted by the explicit transfer path and by pickServer) also contains Nonvoter members. pickServer, by contrast, skips 'server.Suffrage != Voter', so the targetless transfer path cannot select a non-voter.",
+      "conditions": "Leader state, after appendConfigurationEntry/setLatestConfiguration followed by startStopReplication.",
+      "source_ids": [
+        "startstop-replication-all-servers",
+        "pickserver-voters-only"
+      ]
+    },
+    {
+      "ref": "@timeoutnow-unconditional-candidacy",
+      "kind": "behavior",
+      "statement": "On receiving a TimeoutNowRequest a node clears its known leader, sets its state to Candidate and sets candidateFromLeadershipTransfer to true, then acknowledges. The handler performs no term comparison (TimeoutNowRequest carries no term), no state check, no suffrage check on the receiver, and no check that the sender is the current leader or a configuration member; runCandidate then skips pre-vote for such a candidate and calls electSelf directly.",
+      "conditions": "The RPC passes checkRPCHeader (protocol version range) and is dispatched from processRPC on the main thread.",
+      "source_ids": [
+        "timeoutnow-handler"
+      ]
+    },
+    {
+      "ref": "@requestvote-steps-down-before-rejecting-nonvoter",
+      "kind": "behavior",
+      "statement": "In requestVote, when a RequestVote arrives with req.Term > currentTerm the receiver first steps down (setState(Follower)) and adopts the higher term, and only afterwards rejects the request because the candidate is not a Voter ('rejecting vote request since node is not a voter'), returning Granted false. Because the step-down precedes the rejection, a term-advancing vote request from an unelectable candidate still removes the receiver from leadership.",
+      "conditions": "Receiver is a Voter or Leader with a non-empty configurations.latest.Servers, and the candidate passes the inConfiguration check.",
+      "source_ids": [
+        "requestvote-highterm-stepdown-nonvoter-reject"
+      ]
+    }
+  ],
+  "experiment": {
+    "investigation_id": "@nonvoter-transfer",
+    "harness_path": "assurance_generated_test.go",
+    "files": {
+      "assurance_generated_test.go": "assurance_generated_test.go"
+    },
+    "source_ids": [
+      "api-transfer-to-server",
+      "initiate-transfer-check",
+      "leaderloop-transfer-target",
+      "startstop-replication-all-servers",
+      "timeoutnow-handler",
+      "requestvote-highterm-stepdown-nonvoter-reject",
+      "electself-voters-only",
+      "pickserver-voters-only",
+      "config-commands-doc"
+    ],
+    "scope": {
+      "description": "Two cases in one execution, both driving the public API of the unmodified library in-process with the package's in-memory transport, stores and snapshot store. Case A (control): MakeCluster(3) with default protocol version 3, then LeadershipTransferToServer to a voter. Case B: MakeCluster(3) plus a separate MakeClusterNoBootstrap(1) merged and fully connected, then AddNonvoter for that node, wait until the non-voter has learned the 4-server configuration and caught up to a freshly committed proof entry, then LeadershipTransferToServer to that non-voter. Each case records the leader's configuration with suffrages, the future's error and duration, the target's and incumbent's state and term, timestamped state sampling for 500 ms, the observer stream of RequestVoteRequests (candidate id, term, log position, transfer flag), and whether the voters hold one leader again afterwards.",
+      "assumptions": [
+        "In-memory LoopbackTransport delivers RPCs in-process without loss, so any nonprogress or state change observed is produced by the library's own logic rather than by a transport fault.",
+        "inmemConfig timeouts (heartbeat/election/lease 50 ms, commit 5 ms) make election and recovery observable inside a short window.",
+        "The non-voter's membership and catch-up are established through the library's own producers: AddNonvoter plus a committed proof entry the target has applied.",
+        "Protocol version 3 is the default, which is required for both AddNonvoter and LeadershipTransferToServer."
+      ],
+      "excluded": [
+        "No production function is modified, wrapped or re-implemented; only the public API and the library's observer/testing facilities are used.",
+        "No artificial clock, timeout injection or fault injection is used."
+      ]
+    },
+    "prefix": "Each test prints CA_EVENT JSON lines. Control case: control_transfer_before / control_transfer_after. Non-voter case: nonvoter_transfer_before / nonvoter_transfer_after / nonvoter_transfer_recovery. RequestVoteRequest observations carry candidate_id, term, transfer_flagged; sampled_transitions carries t_ms, node, state, term."
+  }
+}

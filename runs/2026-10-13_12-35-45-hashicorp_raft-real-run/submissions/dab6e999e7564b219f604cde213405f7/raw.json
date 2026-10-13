@@ -1,0 +1,119 @@
+{
+  "rationale": "Receipt 24679b2ecdd54556adf91882ce0f8b0c carries the measurements this question needed: in all three runs every node, including the demoted one, reported the new suffrage within 0-21ms of the change being committed on the leader, and no node's view was still old at a sample where its own LastIndex had already reached the configuration entry (stale_max_last_index never exceeded 2 while the configuration index was 3). None of the six comparisons could be evaluated, however, because my admission declaration was malformed: the prerequisite was a single per-run baseline event carrying no role, while each demotion_view event has identity (case, role), so the framework reported 'Ambiguous prerequisite association; missing run_1.role' and left every comparison unknown. This successor changes only the emitted admission shape (one node_baseline event per node per run carrying case and role) and the matching prerequisites; the cluster construction, per-node timing, sampling interval, observation window, transition and the four measured fields per node are unchanged, so the fresh execution is required by the admission change rather than to obtain a different measurement.",
+  "experiment": {
+    "investigation_id": "6464ac4e45e546e99aff4d88c0a145c8-question-0",
+    "harness_path": "assurance_generated_test.go",
+    "source_ids": ["s_append_entries", "s_latest_config", "s_get_configuration", "s_repl_state"],
+    "previous_id": "244fe01a841341c5a918142383abe8ea-experiment",
+    "revision_reason": "Admission identity fix: the prerequisite event now exists per (case, role) as node_baseline, so the demotion_view events with the same identity can be admitted and the convergence and consistency predicates can complete.",
+    "semantic_changes": [
+      "The single per-run baseline CA_EVENT is replaced by one node_baseline event per node and run, carrying case, role, node_id, the node's own view of the demoted peer (near_present, near_voter) and its LastIndex.",
+      "Prerequisites now reference node_baseline with per-run conditions; comparisons, identity fields (case, role) and applicability conditions are otherwise unchanged.",
+      "No change to cluster construction, per-node timing, the DemoteVoter call, the 20ms sampling loop, the 10s observation window or the measured fields."
+    ],
+    "scope": {
+      "description": "Follow one committed voter-to-non-voter transition in a healthy 4-node cluster while sampling every node's own configuration view and log index, three independent runs.",
+      "assumptions": [
+        "Real target constructors and APIs only: BootstrapCluster, NewRaft, DemoteVoter, GetConfiguration, LastIndex; per-node Config values (leader 20s, near 6s, far voters 3s), all ValidateConfig-clean.",
+        "Only the leader is bootstrapped; the other three start with empty configurations and adopt them through normal replication, so the cluster is the same construction as the extended-window experiment that produced the unexplained sighting.",
+        "Before the transition the harness waits until every follower reports itself with a vote and has LastIndex >= 2, so the baseline is uniform and the transition is the only event under observation.",
+        "Sampling is every 20ms for ten seconds after the transition is committed on the leader; a node counts as converged at the first sample where its own view shows the demoted peer without a vote.",
+        "Three runs in one execution; the transports stay fully connected and healthy throughout, so any lag observed is not caused by a partition."
+      ],
+      "excluded": [
+        "No partition, no snapshots, no restarts or crash-recovery, and no client traffic besides the configuration change itself.",
+        "The configuration index used for the consistency check is read from the leader after the change returns; the harness does not inspect a follower's log store directly."
+      ],
+      "parameters": {
+        "nodes": 4,
+        "runs": 3,
+        "sample_interval_ms": 20,
+        "observation_window_ms": 10000,
+        "leader_hb_ms": 20000,
+        "near_hb_ms": 6000,
+        "far_hb_ms": 3000
+      }
+    },
+    "prefix": "Four nodes are created (identity = in-memory transport address), wired fully connected and started; only the first is bootstrapped with the four-voter configuration, so it is the deterministic first leader and the others adopt the configuration through replication. The harness waits for that leader, then waits until every follower reports itself with a vote and has LastIndex >= 2, and emits one node_baseline CA_EVENT per node carrying case, role, the node's own view of the near node and its LastIndex. It then calls DemoteVoter(near, prevIndex 0, timeout 10s), waits for the future (which returns when the entry is committed on the leader), records the leader's LastIndex as the configuration index, and polls every node every 20ms for ten seconds: each poll reads that node's GetConfiguration view of the near node's suffrage and its LastIndex. A node counts as converged at the first poll where its view shows the near node without a vote; the harness also keeps the highest LastIndex seen while that node's view was still old. One demotion_view CA_EVENT is emitted per node with converged, converged_ms, stale_observed, stale_max_last_index, the configuration index, index_passed_while_stale, and the node's end state and LastIndex.",
+    "responsibility": "Configuration propagation from the leader's committed membership change to each peer's own view of its suffrage, as consumed by that peer's election eligibility (runFollower checks hasVote on its latest configuration before campaigning) and by quorum arithmetic on the leader.",
+    "prerequisites": [
+      {
+        "alias": "run_1",
+        "event": "node_baseline",
+        "conditions": [
+          {"field": "case", "op": "eq", "value": "run_1"},
+          {"field": "near_voter", "op": "eq", "value": true},
+          {"field": "last_index", "op": "eq", "value": 2}
+        ]
+      },
+      {
+        "alias": "run_2",
+        "event": "node_baseline",
+        "conditions": [
+          {"field": "case", "op": "eq", "value": "run_2"},
+          {"field": "near_voter", "op": "eq", "value": true},
+          {"field": "last_index", "op": "eq", "value": 2}
+        ]
+      },
+      {
+        "alias": "run_3",
+        "event": "node_baseline",
+        "conditions": [
+          {"field": "case", "op": "eq", "value": "run_3"},
+          {"field": "near_voter", "op": "eq", "value": true},
+          {"field": "last_index", "op": "eq", "value": 2}
+        ]
+      }
+    ],
+    "comparisons": [
+      {
+        "event": "demotion_view",
+        "identity_fields": ["case", "role"],
+        "admission_alias": "run_1",
+        "applicability_conditions": [{"field": "case", "op": "eq", "value": "run_1"}],
+        "assertion": {"field": "converged", "op": "eq", "value": true},
+        "description": "Run 1: every node (including the demoted one) reports the new suffrage within the ten second observation window on a healthy transport; a node that never converges is contradicted here."
+      },
+      {
+        "event": "demotion_view",
+        "identity_fields": ["case", "role"],
+        "admission_alias": "run_1",
+        "applicability_conditions": [{"field": "case", "op": "eq", "value": "run_1"}],
+        "assertion": {"field": "index_passed_while_stale", "op": "eq", "value": false},
+        "description": "Run 1 consistency: no node's view may still be old at a sample where that node's own LastIndex already reached the configuration entry, which would separate a processing gap from a delivery lag."
+      },
+      {
+        "event": "demotion_view",
+        "identity_fields": ["case", "role"],
+        "admission_alias": "run_2",
+        "applicability_conditions": [{"field": "case", "op": "eq", "value": "run_2"}],
+        "assertion": {"field": "converged", "op": "eq", "value": true},
+        "description": "Run 2 convergence prediction, identical predicate."
+      },
+      {
+        "event": "demotion_view",
+        "identity_fields": ["case", "role"],
+        "admission_alias": "run_2",
+        "applicability_conditions": [{"field": "case", "op": "eq", "value": "run_2"}],
+        "assertion": {"field": "index_passed_while_stale", "op": "eq", "value": false},
+        "description": "Run 2 consistency prediction, identical predicate."
+      },
+      {
+        "event": "demotion_view",
+        "identity_fields": ["case", "role"],
+        "admission_alias": "run_3",
+        "applicability_conditions": [{"field": "case", "op": "eq", "value": "run_3"}],
+        "assertion": {"field": "converged", "op": "eq", "value": true},
+        "description": "Run 3 convergence prediction, identical predicate."
+      },
+      {
+        "event": "demotion_view",
+        "identity_fields": ["case", "role"],
+        "admission_alias": "run_3",
+        "applicability_conditions": [{"field": "case", "op": "eq", "value": "run_3"}],
+        "assertion": {"field": "index_passed_while_stale", "op": "eq", "value": false},
+        "description": "Run 3 consistency prediction, identical predicate."
+      }
+    ]
+  }
+}

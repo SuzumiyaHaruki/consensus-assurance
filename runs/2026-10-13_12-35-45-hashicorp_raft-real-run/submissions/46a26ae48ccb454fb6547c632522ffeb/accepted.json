@@ -1,0 +1,338 @@
+{
+  "rationale": "While re-reading the authority-transition paths around the finding I already settled, a second relationship in the same family looked worth a bounded probe: LeadershipTransferToServer accepts any server of the configuration, and its failure branch reports success whenever the leader simply left the leaderLoop, without checking whether the requested destination became leader. The requested target can be a node the configuration does not give a vote, and TimeoutNow makes such a node a candidate unconditionally (raft.go:2209-2214) while its vote requests still reach every voter (a voter adopts the higher term and steps down before rejecting the vote on suffrage, raft.go:1660-1690). pickServer, by contrast, filters non-voters explicitly (raft.go:2163-2182). The experiment below compares the same call aimed at a non-voter and at a voter, and records both the future's result and what actually happens to leadership, the destination and the terms.",
+  "sources": [
+    {
+      "id": "s_transfer_branch",
+      "file": "raft.go",
+      "start_line": 699,
+      "end_line": 770,
+      "kind": "code_observation"
+    },
+    {
+      "id": "s_initiate_transfer",
+      "file": "raft.go",
+      "start_line": 2184,
+      "end_line": 2207,
+      "kind": "code_observation"
+    },
+    {
+      "id": "s_timeout_now",
+      "file": "raft.go",
+      "start_line": 2208,
+      "end_line": 2215,
+      "kind": "code_observation"
+    },
+    {
+      "id": "s_pick_server",
+      "file": "raft.go",
+      "start_line": 2160,
+      "end_line": 2183,
+      "kind": "code_observation"
+    },
+    {
+      "id": "s_vote_suffrage",
+      "file": "raft.go",
+      "start_line": 1660,
+      "end_line": 1690,
+      "kind": "code_observation"
+    },
+    {
+      "id": "s_transfer_api",
+      "file": "api.go",
+      "start_line": 1268,
+      "end_line": 1282,
+      "kind": "document_statement"
+    }
+  ],
+  "investigations": [
+    {
+      "id": null,
+      "ref": "@transfer_target_suffrage",
+      "question": "When LeadershipTransferToServer names a server that holds no vote, what does the caller observe, what happens to the existing leadership, and does the requested destination ever take leadership?",
+      "source_ids": [
+        "s_transfer_branch",
+        "s_initiate_transfer",
+        "s_timeout_now",
+        "s_pick_server",
+        "s_vote_suffrage",
+        "s_transfer_api"
+      ],
+      "hypothesis": "initiateLeadershipTransfer does not inspect the target's suffrage, so a non-voter target is contacted with TimeoutNow; timeoutNow makes it a candidate with the leadership-transfer flag and no pre-vote, so it campaigns in the next term. Every voter that receives that RequestVote adopts the higher term and steps down before the suffrage check rejects the vote, so the current leader loses leadership although the target can never win; the transfer future then reports success through the leftLeaderLoop branch, which responds nil without checking whether the requested destination became leader.",
+      "discriminator": "Compare the identical call aimed at a non-voter and at a voter in the same 4-node cluster: if the leader merely loses leadership while the requested destination never leads, the suffrage-blind transfer path is established; if the non-voter target leads, or if leadership is unaffected, the explanation is refuted. The control must show that the same call with a voter target results in that target leading.",
+      "disposition": null,
+      "parent_id": null,
+      "knowledge": null,
+      "counterevidence": null,
+      "limitations": null,
+      "resume_conditions": null
+    }
+  ],
+  "knowledge": [],
+  "gaps": [],
+  "interpretations": [],
+  "experiment": {
+    "investigation_id": "@transfer_target_suffrage",
+    "harness_path": "assurance_generated_test.go",
+    "files": {},
+    "execution_package": null,
+    "source_ids": [
+      "s_transfer_branch",
+      "s_initiate_transfer",
+      "s_timeout_now",
+      "s_pick_server",
+      "s_vote_suffrage",
+      "s_transfer_api"
+    ],
+    "anchors": [
+      {
+        "material_id": "s_transfer_api",
+        "symbol": "LeadershipTransferToServer",
+        "start_line": 1276,
+        "end_line": 1282,
+        "anchor": {
+          "source_ids": [
+            "s_transfer_api"
+          ],
+          "boundary_complete": true,
+          "kind": "declaration",
+          "material_id": "s_transfer_api",
+          "start_line": 1276,
+          "end_line": 1276,
+          "symbol": "LeadershipTransferToServer"
+        }
+      },
+      {
+        "material_id": "s_timeout_now",
+        "symbol": "timeoutNow",
+        "start_line": 2209,
+        "end_line": 2214,
+        "anchor": {
+          "source_ids": [
+            "s_timeout_now"
+          ],
+          "boundary_complete": true,
+          "kind": "declaration",
+          "material_id": "s_timeout_now",
+          "start_line": 2209,
+          "end_line": 2209,
+          "symbol": "timeoutNow"
+        }
+      },
+      {
+        "material_id": "s_pick_server",
+        "symbol": "pickServer",
+        "start_line": 2163,
+        "end_line": 2182,
+        "anchor": {
+          "source_ids": [
+            "s_pick_server"
+          ],
+          "boundary_complete": true,
+          "kind": "declaration",
+          "material_id": "s_pick_server",
+          "start_line": 2163,
+          "end_line": 2163,
+          "symbol": "pickServer"
+        }
+      }
+    ],
+    "scope": {
+      "description": "Transfer leadership to a demoted non-voter and, as a control, to a voter in the same kind of 4-node cluster, recording the future's result, the states of the old leader and the target, whether the target ever leads, and whether the terms advanced.",
+      "assumptions": [
+        "Real target constructors and APIs: BootstrapCluster, NewRaft, DemoteVoter, LeadershipTransferToServer, GetConfiguration, Stats; uniform HeartbeatTimeout 2s, LeaderLeaseTimeout 1s, CommitTimeout 200ms.",
+        "Only the leader is bootstrapped with the four-voter configuration, so it is the deterministic first leader; the demoted node becomes a non-voter through the public DemoteVoter call before the transfer.",
+        "The target for the control is a voter, so the same call shape is exercised with a suffrage the configuration honours.",
+        "The harness waits up to 15s for the transfer future and then watches the cluster for 8s, sampling states and terms every 100ms, so a recovered cluster is recorded rather than only the immediate instant.",
+        "Transports stay fully connected and healthy throughout."
+      ],
+      "excluded": [
+        "No partition, no snapshots and no client traffic besides the configuration change and the transfer call.",
+        "No production code or default is modified."
+      ],
+      "parameters": {
+        "nodes": 4,
+        "cases": 2,
+        "heartbeat_timeout_ms": 2000,
+        "leader_lease_ms": 1000,
+        "transfer_wait_ms": 15000,
+        "watch_ms": 8000
+      }
+    },
+    "prefix": "Four nodes are created (identity = in-memory transport address), wired fully connected and started; only the first is bootstrapped with the four-voter configuration so that it is the deterministic first leader. For the treatment the near node is demoted to non-voter through DemoteVoter and the harness waits until both far nodes report it without a vote. A setup CA_EVENT records the case, the target, whether the target has a vote, the leader's identity and its term. The harness then calls LeadershipTransferToServer(target) and waits up to 15s for the future, emitting transfer_result with the returned error, whether it was nil, the elapsed time and the states of the old leader and the target. It then watches the cluster for 8s, sampling every 100ms, and emits transfer_summary with whether the old leader ever remained leader, whether the target ever became leader, whether any leader existed again and which node it was, and whether any node's term advanced.",
+    "semantic_changes": [],
+    "requirement": "LeadershipTransferToServer names a destination for leadership (api.go:1268-1283). A reported success should mean the requested destination took leadership, and starting a transfer must not remove the existing leader when the requested destination cannot legally lead.",
+    "responsibility": "The leader's leadership-transfer path: which destination it honours, what it reports to the caller, and what the TimeoutNow and vote-request handling on the destination side does to the current leadership.",
+    "prerequisites": [
+      {
+        "alias": "nonvoter_target",
+        "event": "setup",
+        "conditions": [
+          {
+            "field": "case",
+            "op": "eq",
+            "value": "transfer_to_nonvoter",
+            "reference": null
+          },
+          {
+            "field": "target_has_vote",
+            "op": "eq",
+            "value": false,
+            "reference": null
+          },
+          {
+            "field": "leader_is_leader",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          }
+        ]
+      },
+      {
+        "alias": "voter_target",
+        "event": "setup",
+        "conditions": [
+          {
+            "field": "case",
+            "op": "eq",
+            "value": "transfer_to_voter",
+            "reference": null
+          },
+          {
+            "field": "target_has_vote",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          },
+          {
+            "field": "leader_is_leader",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          }
+        ]
+      }
+    ],
+    "comparisons": [
+      {
+        "event": "transfer_result",
+        "identity_fields": [
+          "case"
+        ],
+        "admission_alias": "nonvoter_target",
+        "assertion": {
+          "field": "returned_nil",
+          "op": "eq",
+          "value": true,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [
+          {
+            "field": "case",
+            "op": "eq",
+            "value": "transfer_to_nonvoter",
+            "reference": null
+          }
+        ],
+        "description": "Anomaly prediction for the non-voter target: the transfer future reports success even though the destination holds no vote."
+      },
+      {
+        "event": "transfer_summary",
+        "identity_fields": [
+          "case"
+        ],
+        "admission_alias": "nonvoter_target",
+        "assertion": {
+          "field": "target_became_leader",
+          "op": "eq",
+          "value": false,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [
+          {
+            "field": "case",
+            "op": "eq",
+            "value": "transfer_to_nonvoter",
+            "reference": null
+          }
+        ],
+        "description": "The reported success is not about the requested destination: the non-voter target never leads during the watch window."
+      },
+      {
+        "event": "transfer_summary",
+        "identity_fields": [
+          "case"
+        ],
+        "admission_alias": "nonvoter_target",
+        "assertion": {
+          "field": "old_leader_still_leader",
+          "op": "eq",
+          "value": false,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [
+          {
+            "field": "case",
+            "op": "eq",
+            "value": "transfer_to_nonvoter",
+            "reference": null
+          }
+        ],
+        "description": "The existing leadership was removed by a transfer whose destination cannot lead."
+      },
+      {
+        "event": "transfer_result",
+        "identity_fields": [
+          "case"
+        ],
+        "admission_alias": "voter_target",
+        "assertion": {
+          "field": "returned_nil",
+          "op": "eq",
+          "value": true,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [
+          {
+            "field": "case",
+            "op": "eq",
+            "value": "transfer_to_voter",
+            "reference": null
+          }
+        ],
+        "description": "Control: the same call with a voter destination succeeds."
+      },
+      {
+        "event": "transfer_summary",
+        "identity_fields": [
+          "case"
+        ],
+        "admission_alias": "voter_target",
+        "assertion": {
+          "field": "target_became_leader",
+          "op": "eq",
+          "value": true,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [
+          {
+            "field": "case",
+            "op": "eq",
+            "value": "transfer_to_voter",
+            "reference": null
+          }
+        ],
+        "description": "Control: with a voter destination the reported success is honoured by the destination actually leading."
+      }
+    ],
+    "knowledge": [],
+    "previous_id": null,
+    "revision_reason": ""
+  },
+  "repeat_experiment_id": null,
+  "stop": null
+}

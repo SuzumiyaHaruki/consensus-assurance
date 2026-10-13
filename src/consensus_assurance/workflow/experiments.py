@@ -70,7 +70,7 @@ def fixed_files(root, fixed, *, write=False):
             raise ValueError('Retained experiment configuration changed')
 
 
-def execute(engine, fixed):
+def execute(engine, fixed, operation_id):
     fixed_files(engine.root, fixed)
     if fixed.snapshot_id != engine.state.snapshot.id:
         raise ValueError('Experiment source snapshot mismatch')
@@ -89,9 +89,11 @@ def execute(engine, fixed):
         workspace = engine.workspace()
         harness = fixed.basis.harness
         paths = install_harness(workspace, fixed.harness_filename, harness, engine.state.snapshot.files)
+        # A completed raw receipt must reach runner recovery even after the deadline.
+        # New actions still require budget.take; the runner cannot start with zero time.
         check = run_experiment(engine.runner,
             engine.implementation.experiment_command(harness.execution_package, fixed.harness_filename),
-            workspace, fixed.snapshot_id, engine.budget.timeout(), engine.config.execution_isolation,
+            workspace, fixed.snapshot_id, min(engine.config.budget.action_timeout, engine.budget.remaining()), engine.config.execution_isolation,
             'experiment', adapter=engine.implementation)
         check.experiment_id = fixed.id
         check.origin = Origin.MOCK if engine.state.mode == 'mock' else Origin.EXECUTED
@@ -105,7 +107,7 @@ def execute(engine, fixed):
         return check
 
     check = CheckRun.model_validate(engine.action('experiment_execute', 'experiments', perform,
-                                                 {'experiment_id': fixed.id}))
+                                                 {'experiment_id': fixed.id, 'operation_id':operation_id}))
     engine.record(check)
     return check
 
@@ -169,7 +171,8 @@ def assessment(state, root, fixed, check):
     opinion = interpretations[-1] if interpretations else None
     blockers = []
     if not fixed.basis.requirement:
-        blockers.append('Exploratory basis has no fixed requirement')
+        blockers.append('Exploratory basis has no fixed requirement. Retained observations still support '
+                        'sourced interpretation; no successor or rerun is required merely to add a requirement.')
     if not fixed.basis.comparisons:
         blockers.append('No fixed comparisons')
     if opinion is None:
@@ -209,16 +212,14 @@ def assessment(state, root, fixed, check):
     if not original:
         blockers.append('Scripted or nonoriginal execution is framework evidence only')
     for r in value['comparisons']:
-        r['confirmed'] = bool(not blockers and r['witness_complete'] and opinion.conclusion == 'violated' and
-                              set(opinion.executions[check.id]) & set(r['valid_witness_indices']) and
-                              (check.exit_code == 0 or r['comparison_index'] in attributed))
+        if r['valid_witness_indices'] and opinion and opinion.conclusion == 'violated':
+            if not set(opinion.executions[check.id]) & set(r['valid_witness_indices']):
+                blockers.append(f"Comparison {r['comparison_index']}: the attributed interpretation does not cite its violating events")
+        if r['valid_witness_indices'] and check.exit_code != 0 and r['comparison_index'] not in attributed:
+            blockers.append(f"Comparison {r['comparison_index']}: these observations have no valid independent-failure attribution for this execution")
     complete = bool(value['comparisons']) and all(r['comparison_complete'] for r in value['comparisons'])
-    agrees = opinion is not None and opinion.conclusion == (
-        'violated' if any(r['outcome'] == 'violated' for r in value['comparisons']) else 'holds')
     return {**value, 'experiment_id': fixed.id, 'check_id': check.id,
             'outcome': 'violated' if any(r['outcome'] == 'violated' for r in value['comparisons']) else
                        'holds' if complete else 'unknown',
-            'confirmed': any(r['confirmed'] for r in value['comparisons']),
-            'reviewed_complete': complete and agrees and not blockers and check.exit_code == 0,
             'blockers': list(dict.fromkeys(blockers)), 'gap_ids': [g.id for g in gaps],
             'interpretation_id': opinion.id if opinion else None}

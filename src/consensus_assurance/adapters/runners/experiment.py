@@ -114,19 +114,26 @@ def run_experiment(runner, command, workspace, snapshot_id, timeout, mode, actio
 
 
 def extract_events(check):
-    """Extract complete CA_EVENT lines, preserving runner-provided stream ownership."""
+    """Extract CA_EVENT lines with runner-provided stream ownership and output time.
+
+    runner_time is the approximate output emission time, not the internal event
+    time. Fragmented lines use the time of their completing output fragment.
+    """
     events = []
     if not check.stdout or not Path(check.stdout).is_file():
         return events
 
     marker = "CA_EVENT "
     buffers = {}
+    runner_times = {}
 
-    def parse_line(line, stream=None, location=None):
+    def parse_line(line, stream=None, location=None, runner_time=None):
         if marker not in line:
             return
         raw = line.split(marker, 1)[1].strip()
         provenance = {'stream':stream,'location':location}
+        if runner_time is not None:
+            provenance['runner_time'] = runner_time
         try:
             event = json.loads(raw)
             if not isinstance(event, dict) or not isinstance(event.get("event"), str):
@@ -152,10 +159,12 @@ def extract_events(check):
         stream = json.dumps([outer.get('Package'),outer.get('Test') if 'Test' in outer else None],
             ensure_ascii=False,separators=(',',':'))
         buffers[stream] = buffers.get(stream,'') + outer['Output']
+        if outer['Output']:
+            runner_times[stream] = outer.get('Time')
         while '\n' in buffers[stream]:
             complete,buffers[stream] = buffers[stream].split('\n',1)
-            parse_line(complete.rstrip('\r'),stream,{'line':physical,'stream':stream})
+            parse_line(complete.rstrip('\r'),stream,{'line':physical,'stream':stream},outer.get('Time'))
     for stream,tail in buffers.items():
         if marker in tail:
-            parse_line(tail,stream,{'line':'end-of-stream','stream':stream})
+            parse_line(tail,stream,{'line':'end-of-stream','stream':stream},runner_times.get(stream))
     return events

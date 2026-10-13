@@ -201,14 +201,17 @@ def test_selected_support_is_captured_once_and_cannot_replace_target(tmp_path):
     with pytest.raises(ValueError,match='saved artifact'):install_harness(tmp_path,backend.harness_filename,harness,{})
 
 
-@pytest.mark.parametrize('limit,action,timeout,remaining',[
-    ('total_seconds','agent_turn',1,.02),('agent_turn_timeout','agent_turn',.02,None),('action_timeout','direct_check',.02,None)])
-def test_actual_limiting_timeout_is_recorded(tmp_path,limit,action,timeout,remaining):
+@pytest.mark.parametrize('limit,action,timeout,remaining,reason',[
+    ('total_seconds','agent_turn',1,.02,'Total runtime budget exhausted'),
+    ('agent_turn_timeout','agent_turn',.02,None,'Agent turn timeout exceeded'),
+    ('action_timeout','direct_check',.02,None,'Action timeout exceeded')])
+def test_actual_limiting_timeout_is_recorded(tmp_path,limit,action,timeout,remaining,reason):
     runner=ProcessRunner(tmp_path)
     if remaining is not None:runner.deadline=time.monotonic()+remaining
     check=runner.run([sys.executable,'-c','import time; time.sleep(2)'],tmp_path,action,'fixture',timeout)
     assert check.status.value=='timeout' and check.parameters['timeout_limit']==limit
-    assert Path(check.stdout).exists() and 'killed' in check.reason
+    assert Path(check.stdout).exists() and check.reason==reason+'; process group killed'
+    assert json.loads((Path(check.stdout).parent/'check.json').read_text())['reason']==check.reason
 
 
 def test_retired_configuration_and_products_are_rejected():

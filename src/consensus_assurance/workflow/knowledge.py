@@ -17,11 +17,36 @@ def require_uses(state, uses):
             raise ValueError('Knowledge use must name an existing entry and exact revision')
 
 
-def uses_of(state, entry_id, revision):
+def use_paths(state, entry_id, revision=None):
+    """One recorded path per user, across root revisions unless specified; not semantic impact."""
+    dependents = {}
+    for entry in state.knowledge:
+        for record in [*entry.history, entry.model_dump(exclude={'history'})]:
+            target = (entry.id, record['revision'])
+            for use in record.get('knowledge', []):
+                source = (use['entry_id'], use['revision'])
+                dependents.setdefault(source, []).append((target, use))
+    revisions = [revision] if revision is not None else [r['revision']
+        for entry in state.knowledge if entry.id == entry_id
+        for r in [*entry.history, entry.model_dump(exclude={'history'})]]
+    paths = {(entry_id, r): [] for r in revisions}
+    pending = list(paths)
+    for source in pending:
+        for target, use in dependents.get(source, []):
+            if target not in paths:
+                paths[target] = [*paths[source], use]
+                pending.append(target)
     objects = [(i.id, i.knowledge) for i in state.investigations]
     objects += [(a.id, FixedExperiment.model_validate(a).basis.knowledge) for a in state.experiments]
     objects += [(i.id, i.knowledge) for i in state.interpretations]
-    return [id for id, uses in objects if any(u.entry_id == entry_id and u.revision == revision for u in uses)]
+    result = {}
+    for id, uses in objects:
+        for use in uses:
+            key = (use.entry_id, use.revision)
+            if key in paths:
+                result[id] = [*paths[key], use.model_dump()]
+                break
+    return result
 
 
 def investigation(state, id):
@@ -45,9 +70,12 @@ def lineage(state, id):
 def open_gaps(state, investigation_id, experiment_id=None):
     owner = investigation(state, investigation_id)
     applicable = lineage(state, experiment_id) if experiment_id else set()
-    answered = {id for i in state.interpretations if i.investigation_id == investigation_id
-                and (experiment_id is None or i.experiment_id is None or i.experiment_id in applicable) for id in i.answers}
-    return [g for g in owner.gaps if g.id not in answered and
+    answers = {}
+    for i in state.interpretations:
+        if i.investigation_id == investigation_id and (
+                experiment_id is None or i.experiment_id is None or i.experiment_id in applicable):
+            answers.update(i.answers)
+    return [g for g in owner.gaps if not answers.get(g.id) and
             (experiment_id is None or g.experiment_id is None or g.experiment_id in applicable)]
 
 
@@ -124,15 +152,20 @@ def update_knowledge(state, root, changes, operation, aliases):
         if change.id and old is None:
             raise ValueError('Unknown knowledge entry')
         data = change.model_dump(exclude={'id', 'ref', 'changed_premise', 'affected_uses'})
+        dependencies = resolved_uses(change.knowledge, aliases)
+        require_uses(state, dependencies)
+        data['knowledge'] = [use.model_dump() for use in dependencies]
         if old is None:
             old = next((k for k in state.knowledge if k.model_dump(exclude={'id','revision','history','operation_id'}) == data), None)
         id = old.id if old else operation + '-knowledge-' + str(number)
         bind_ref(change.ref, id, aliases)
-        if old and old.model_dump(exclude={'id','revision','history','operation_id'}) == data:
-            continue
         if change.affected_uses and not change.changed_premise.strip():
             raise ValueError('Explain which changed premise affects the recorded uses')
-        used = uses_of(state, old.id, old.revision) if old else []
+        if old and old.model_dump(exclude={'id','revision','history','operation_id'}) == data:
+            if not change.changed_premise.strip() or any(h['correction'] == change.changed_premise and
+                    set(change.affected_uses) <= set(h['affected_uses']) for h in old.history):
+                continue
+        used = list(use_paths(state, old.id)) if old else []
         if not set(change.affected_uses) <= set(used):
             raise ValueError('Correction names an object without the referenced knowledge revision')
         value = KnowledgeEntry(id=id, operation_id=operation, **data)
@@ -212,8 +245,8 @@ def interpret(state, root, changes, operation, aliases):
                         joint_history=change.joint_history, failure=change.failure_attribution,
                         support=change.conclusion in {'violated', 'holds'})
         gaps = {g.id: g for g in owner.gaps}
-        if not set(change.answers) <= gaps.keys() or any(not v.strip() for v in change.answers.values()):
-            raise ValueError('Answer this investigation\'s exact registered gaps with substantive reasoning')
+        if not set(change.answers) <= gaps.keys() or any(v is not None and not v.strip() for v in change.answers.values()):
+            raise ValueError('Answer this investigation\'s exact registered gaps substantively, or use null to withdraw an answer')
         if change.experiment_id and any(gaps[id].experiment_id and
                 gaps[id].experiment_id not in lineage(state, change.experiment_id) for id in change.answers):
             raise ValueError('Answer only gaps belonging to this experiment lineage, or give a source-only correction')
@@ -221,6 +254,6 @@ def interpret(state, root, changes, operation, aliases):
             raise ValueError('Measured conclusions require a fixed experiment; source-only answers use explained or unresolved')
         value = Interpretation(id=operation + '-interpretation-' + str(number), operation_id=operation, **data)
         effective = value.model_dump(exclude={'id','operation_id'})
-        prior = next((i for i in reversed(state.interpretations) if i.investigation_id == owner.id and i.experiment_id == change.experiment_id), None)
+        prior = next((i for i in reversed(state.interpretations) if i.investigation_id == owner.id), None)
         if prior is None or prior.model_dump(exclude={'id','operation_id'}) != effective:
             state.interpretations.append(value)

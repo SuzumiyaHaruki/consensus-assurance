@@ -50,10 +50,11 @@ class ProcessRunner:
                 'check_record':str(logs/'check.json'), 'generated_at':run.started_at,
                 'timeout_seconds':timeout, 'timeout_limit':limit,
                 'estimated_deadline_utc':(datetime.fromisoformat(run.started_at)+timedelta(seconds=timeout)).isoformat(),
-                'meaning':'This CheckRun records the allocated interval and start, not the exact process spawn time. '
-                    'UTC deadline is an estimate; the runner enforces the timeout using a monotonic clock. '
-                    'research.json capacity and preflight elapsed_seconds are saved run checkpoints, '
-                    'not live turn timers; they do not refresh during your tool loop.'})
+                'meaning':'timeout_seconds is the interval allocated at generated_at, not a live countdown. '
+                    'timeout_limit names the limiting budget, not exhaustion; a positive total_seconds allocation '
+                    'still permits useful research within that interval. Expiry needs no closing submission. '
+                    'CheckRun start is not exact process spawn; UTC deadline is estimated and enforced with a monotonic clock. '
+                    'research.json capacity and preflight elapsed_seconds are saved run checkpoints, not live timers.'})
         process = None
         try:
             process = subprocess.Popen(command, cwd=cwd, stdin=subprocess.PIPE,
@@ -71,7 +72,11 @@ class ProcessRunner:
             out, err = process.communicate()
             run.exit_code = process.returncode
             run.transition(ExecutionStatus.TIMEOUT)
-            run.reason = "Action timeout exceeded; process group killed"
+            run.reason = {
+                'total_seconds': 'Total runtime budget exhausted',
+                'agent_turn_timeout': 'Agent turn timeout exceeded',
+                'action_timeout': 'Action timeout exceeded',
+            }[limit] + '; process group killed'
         except KeyboardInterrupt:
             if process:
                 os.killpg(process.pid, signal.SIGKILL)

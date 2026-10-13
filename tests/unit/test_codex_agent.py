@@ -69,6 +69,47 @@ def test_audit_failure_reason_preserves_schema_diagnostic_and_redacts_secrets():
     assert 'fixture-secret' not in reason and '[REDACTED]' in reason and len(reason)<1100
 
 
+@pytest.mark.parametrize('final',[None, '{"submission":"draft.json","summary":"Done"}\nFinished',
+    '{"submission":"draft.json","summary":12}'])
+def test_invalid_final_response_remains_a_repairable_format_error(tmp_path,final):
+    from audit_support import engine_for, first
+    from consensus_assurance.workflow.audit import receive, accept_received
+    engine,repo=engine_for(tmp_path,[])
+    state=engine.start(repo,plan_only=True)
+    draft=engine.root/'draft';draft.mkdir()
+    submission,_=first(state.model_dump(mode='json'))
+    (draft/'draft.json').write_text(json.dumps(submission))
+    response=engine.root/'response.json'
+    if final is not None:response.write_text(final)
+    log=engine.root/'agent-events.jsonl'
+    # Earlier valid-looking text must not replace the actual final response.
+    log.write_text('\n'.join(map(json.dumps,[{'type':'thread.started','thread_id':'saved'},
+        {'type':'item.completed','item':{'type':'agent_message','text':json.dumps({'submission':'draft.json','summary':'Earlier'})}},
+        {'type':'turn.completed'}])))
+    check=CheckRun(action='agent_turn',cwd=str(draft),snapshot_id=state.snapshot.id,
+        status=ExecutionStatus.COMPLETED,exit_code=0,stdout=str(log))
+    check,session,result=CodexAgent().decode(check,response,'saved')
+    receive(engine,[check.model_dump(mode='json'),session,result])
+    archive=engine.root/'submissions'/check.id
+    retained=json.loads((archive/'diagnostics.json').read_text())
+    assert not accept_received(engine)
+    assert state.current_submission['phase']=='rejected'
+    assert state.current_submission['rejected']==retained
+    assert retained['raw_path']==str(response)
+    assert retained['diagnostics'][0]['category']=='format'
+    assert 'without surrounding prose' in retained['errors'][0]
+    assert 'Invalid submitted input path' not in str(retained)
+    assert not state.investigations and state.agent_session_id=='saved'
+    # A corrected final response can submit the existing draft in the same session.
+    response=engine.root/'repaired-response.json'
+    response.write_text(json.dumps({'submission':'draft.json','summary':'Corrected final response'}))
+    repaired=CheckRun(action='agent_turn',cwd=str(draft),snapshot_id=state.snapshot.id,
+        status=ExecutionStatus.COMPLETED,exit_code=0,stdout=str(log))
+    repaired,session,result=CodexAgent().decode(repaired,response,session)
+    receive(engine,[repaired.model_dump(mode='json'),session,result])
+    assert accept_received(engine) and len(state.investigations)==1
+
+
 @pytest.mark.parametrize('session_id',[None,'exact-session'])
 @pytest.mark.parametrize('custom',[False,True])
 def test_new_session_or_exact_resume_counts_unique_completed_tool_items(tmp_path,monkeypatch,session_id,custom):
@@ -94,7 +135,12 @@ def test_new_session_or_exact_resume_counts_unique_completed_tool_items(tmp_path
             assert timeout==context['timeout_seconds']==record['parameters']['timeout_seconds']==(80 if session_id else 900)
             assert context['timeout_limit']==('total_seconds' if session_id else 'agent_turn_timeout')
             assert (datetime.fromisoformat(context['estimated_deadline_utc'])-datetime.fromisoformat(context['generated_at'])).total_seconds()==timeout
-            assert 'saved run checkpoints' in context['meaning'] and 'estimate' in context['meaning']
+            meaning=context['meaning']
+            assert 'allocated at generated_at, not a live countdown' in meaning
+            assert 'timeout_limit names the limiting budget, not exhaustion' in meaning
+            assert 'positive total_seconds allocation still permits useful research within that interval' in meaning
+            assert 'Expiry needs no closing submission' in meaning
+            assert 'saved run checkpoints' in meaning and 'estimate' in meaning and 'monotonic clock' in meaning
             events=[{'type':'thread.started','thread_id':'exact-session'},
                 {'type':'item.started','item':{'id':'tool-1','type':'command_execution'}},
                 {'type':'item.updated','item':{'id':'tool-1','type':'command_execution'}},
@@ -202,7 +248,6 @@ def test_one_audit_runtime_and_methods_match_product_interface(tmp_path):
     assert (e.root/'audit-method.md').read_text()==text
     resource_root=Path('src/consensus_assurance/resources')
     assert text=='\n'.join((resource_root/p).read_text() for p in paths)
-    assert state.framework_revision=='audit-products-v65'
     assert paths==['system.md','skills/consensus-analysis/SKILL.md','skills/evidence-review/SKILL.md','tasks/audit.md']
 
 

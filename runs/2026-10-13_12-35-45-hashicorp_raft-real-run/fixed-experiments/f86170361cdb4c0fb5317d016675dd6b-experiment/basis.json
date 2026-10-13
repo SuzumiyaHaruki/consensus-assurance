@@ -1,0 +1,782 @@
+{
+  "id": "f86170361cdb4c0fb5317d016675dd6b-experiment",
+  "investigation_id": "101498ecfbb945e0b48676dd9e9f4172-question-0",
+  "version": 3,
+  "basis": {
+    "harness": {
+      "kind": "go_test",
+      "source": "// Copyright (c) HashiCorp, Inc.\n// SPDX-License-Identifier: MPL-2.0\n\npackage raft\n\nimport (\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"testing\"\n\t\"time\"\n)\n\n// caEmit prints one observation as a CA_EVENT JSON line.\nfunc caEmit(ev map[string]interface{}) {\n\tb, err := json.Marshal(ev)\n\tif err != nil {\n\t\tpanic(err)\n\t}\n\tfmt.Println(\"CA_EVENT \" + string(b))\n}\n\nfunc caErrString(err error) string {\n\tif err == nil {\n\t\treturn \"nil\"\n\t}\n\treturn err.Error()\n}\n\nfunc caFsmHasLog(m *MockFSM, want string) bool {\n\tif m == nil {\n\t\treturn false\n\t}\n\tfor _, l := range m.Logs() {\n\t\tif string(l) == want {\n\t\t\treturn true\n\t\t}\n\t}\n\treturn false\n}\n\nfunc caCountVoters(cfg Configuration) (voters int, nonvoters int) {\n\tfor _, s := range cfg.Servers {\n\t\tif s.Suffrage == Voter {\n\t\t\tvoters++\n\t\t} else {\n\t\t\tnonvoters++\n\t\t}\n\t}\n\treturn voters, nonvoters\n}\n\n// caNode is one real target instance with its own stores, FSM and transport.\ntype caNode struct {\n\tid    ServerID\n\taddr  ServerAddress\n\ttrans *InmemTransport\n\tstore *InmemStore\n\tsnap  *InmemSnapshotStore\n\tfsm   *MockFSM\n\traft  *Raft\n}\n\nfunc caConfigured(node *caNode) Configuration {\n\tf := node.raft.GetConfiguration()\n\tif err := f.Error(); err != nil {\n\t\treturn Configuration{}\n\t}\n\treturn f.Configuration()\n}\n\n// caProbe issues the public VerifyLeader call and waits up to deadline for the\n// future to be answered.\nfunc caProbe(r *Raft, deadline time.Duration) (err error, received bool) {\n\tch := make(chan error, 1)\n\tgo func() { ch <- r.VerifyLeader().Error() }()\n\tselect {\n\tcase err := <-ch:\n\t\treturn err, true\n\tcase <-time.After(deadline):\n\t\treturn nil, false\n\t}\n}\n\nfunc caVoteOf(n *caNode, id ServerID) (inConfig bool, hasVote bool) {\n\tfor _, s := range caConfigured(n).Servers {\n\t\tif s.ID == id {\n\t\t\treturn true, s.Suffrage == Voter\n\t\t}\n\t}\n\treturn false, false\n}\n\nfunc caWaitState(r *Raft, want RaftState, limit time.Duration) bool {\n\tdeadline := time.Now().Add(limit)\n\tfor time.Now().Before(deadline) {\n\t\tif r.State() == want {\n\t\t\treturn true\n\t\t}\n\t\ttime.Sleep(10 * time.Millisecond)\n\t}\n\treturn false\n}\n\n// caExtendedWindow builds a 4-node cluster in which only the leader has the\n// long heartbeat/lease timing, so the two voting peers can elect a leader of\n// their own long before the partitioned leader's lease expires. It then asks\n// the partitioned leader whether it is still leader: immediately after the\n// partition, and again once a competing leader exists.\nfunc caExtendedWindow(t *testing.T, caseName string, demote bool, probeDeadline time.Duration) {\n\tconst (\n\t\tleaderHB    = 20 * time.Second\n\t\tleaderLease = 20 * time.Second\n\t\tnearHB      = 6 * time.Second\n\t\tfarHB       = 3 * time.Second\n\t)\n\n\t// Nodes must exist before the bootstrap configuration can list their\n\t// transport addresses.\n\tnodes := []*caNode{\n\t\t{id: \"\", addr: \"\", trans: nil, store: NewInmemStore(), snap: NewInmemSnapshotStore(), fsm: &MockFSM{}},\n\t\t{id: \"\", addr: \"\", trans: nil, store: NewInmemStore(), snap: NewInmemSnapshotStore(), fsm: &MockFSM{}},\n\t\t{id: \"\", addr: \"\", trans: nil, store: NewInmemStore(), snap: NewInmemSnapshotStore(), fsm: &MockFSM{}},\n\t\t{id: \"\", addr: \"\", trans: nil, store: NewInmemStore(), snap: NewInmemSnapshotStore(), fsm: &MockFSM{}},\n\t}\n\tfor _, n := range nodes {\n\t\taddr, trans := NewInmemTransport(\"\")\n\t\tn.addr = addr\n\t\tn.trans = trans\n\t\tn.id = ServerID(\"server-\" + string(addr))\n\t}\n\tleader, near, far1, far2 := nodes[0], nodes[1], nodes[2], nodes[3]\n\n\tconfiguration := Configuration{Servers: []Server{\n\t\t{Suffrage: Voter, ID: leader.id, Address: leader.addr},\n\t\t{Suffrage: Voter, ID: near.id, Address: near.addr},\n\t\t{Suffrage: Voter, ID: far1.id, Address: far1.addr},\n\t\t{Suffrage: Voter, ID: far2.id, Address: far2.addr},\n\t}}\n\tfor i, n1 := range nodes {\n\t\tfor j, n2 := range nodes {\n\t\t\tif i != j {\n\t\t\t\tn1.trans.Connect(n2.addr, n2.trans)\n\t\t\t}\n\t\t}\n\t}\n\tdefer func() {\n\t\tfor _, n := range nodes {\n\t\t\tif n.raft != nil {\n\t\t\t\t_ = n.raft.Shutdown().Error()\n\t\t\t}\n\t\t\tn.trans.Close()\n\t\t}\n\t}()\n\n\t// Only the leader is bootstrapped, so only it can campaign; the other\n\t// nodes have no configuration yet and adopt it from replication.\n\tleader.raft = caStart(t, leader, leaderHB, leaderLease, configuration, true)\n\tnear.raft = caStart(t, near, nearHB, nearHB, configuration, false)\n\tfar1.raft = caStart(t, far1, farHB, farHB, configuration, false)\n\tfar2.raft = caStart(t, far2, farHB, farHB, configuration, false)\n\n\tif !caWaitState(leader.raft, Leader, 60*time.Second) {\n\t\tt.Fatalf(\"bootstrapped node did not become leader\")\n\t}\n\n\tif demote {\n\t\tif err := leader.raft.DemoteVoter(near.id, 0, 10*time.Second).Error(); err != nil {\n\t\t\tcaEmit(map[string]interface{}{\"event\": \"setup\", \"case\": caseName, \"setup_error\": \"demote failed: \" + err.Error()})\n\t\t\tt.Fatalf(\"demote failed: %v\", err)\n\t\t}\n\t\tdeadline := time.Now().Add(10 * time.Second)\n\t\tfor time.Now().Before(deadline) {\n\t\t\t_, ok1 := caVoteOf(far1, near.id)\n\t\t\t_, ok2 := caVoteOf(far2, near.id)\n\t\t\tif !ok1 && !ok2 {\n\t\t\t\tbreak\n\t\t\t}\n\t\t\ttime.Sleep(20 * time.Millisecond)\n\t\t}\n\t}\n\n\tcfg := caConfigured(leader)\n\tvoters, nonvoters := caCountVoters(cfg)\n\tnearVoterLeaderView := false\n\tfor _, s := range cfg.Servers {\n\t\tif s.ID == near.id {\n\t\t\tnearVoterLeaderView = s.Suffrage == Voter\n\t\t}\n\t}\n\t// Give the near node's own view of the demotion a bounded chance to settle,\n\t// then record it separately from the leader's view.\n\tnearSelfVoter, _ := caVoteOf(near, near.id)\n\tif nearSelfVoter && !nearVoterLeaderView {\n\t\tsettleUntil := time.Now().Add(3 * time.Second)\n\t\tfor time.Now().Before(settleUntil) {\n\t\t\tselfVoter, _ := caVoteOf(near, near.id)\n\t\t\tnearSelfVoter = selfVoter\n\t\t\tif !nearSelfVoter {\n\t\t\t\tbreak\n\t\t\t}\n\t\t\ttime.Sleep(20 * time.Millisecond)\n\t\t}\n\t}\n\n\tcaEmit(map[string]interface{}{\n\t\t\"event\":                \"setup\",\n\t\t\"case\":                 caseName,\n\t\t\"leader_id\":            string(leader.id),\n\t\t\"near_node_id\":         string(near.id),\n\t\t\"far_node_ids\":         []string{string(far1.id), string(far2.id)},\n\t\t\"near_node_voter\":      nearVoterLeaderView,\n\t\t\"near_node_self_voter\": nearSelfVoter,\n\t\t\"voters\":               voters,\n\t\t\"nonvoters\":            nonvoters,\n\t\t\"quorum_size\":          voters/2 + 1,\n\t\t\"leader_hb_ms\":         leaderHB.Milliseconds(),\n\t\t\"leader_lease_ms\":      leaderLease.Milliseconds(),\n\t\t\"far_hb_ms\":            farHB.Milliseconds(),\n\t\t\"demoted\":              demote,\n\t})\n\n\t// Partition the leader (and the near node) from the two voting peers.\n\tpartAt := time.Now()\n\tfor _, a := range []*caNode{leader, near} {\n\t\ta.trans.Disconnect(far1.addr)\n\t\ta.trans.Disconnect(far2.addr)\n\t}\n\tfor _, b := range []*caNode{far1, far2} {\n\t\tb.trans.Disconnect(leader.addr)\n\t\tb.trans.Disconnect(near.addr)\n\t}\n\tcaEmit(map[string]interface{}{\n\t\t\"event\": \"partition\", \"case\": caseName,\n\t\t\"leader_id\": string(leader.id), \"near_node_id\": string(near.id),\n\t})\n\n\terr1, got1 := caProbe(leader.raft, probeDeadline)\n\tcaEmit(map[string]interface{}{\n\t\t\"event\":               \"verify_after_partition\",\n\t\t\"case\":                caseName,\n\t\t\"returned\":            caErrString(err1),\n\t\t\"verify_returned_nil\": got1 && err1 == nil,\n\t\t\"result_received\":     got1,\n\t\t\"elapsed_ms\":          time.Since(partAt).Milliseconds(),\n\t\t\"leader_lease_ms\":     leaderLease.Milliseconds(),\n\t\t\"leader_state\":        leader.raft.State().String(),\n\t})\n\n\t// Wait for the voting peers to elect a leader of their own.\n\tvar newLeader *caNode\n\twaitUntil := time.Now().Add(15 * time.Second)\n\tfor newLeader == nil && time.Now().Before(waitUntil) {\n\t\tfor _, n := range []*caNode{far1, far2} {\n\t\t\tif n.raft.State() == Leader {\n\t\t\t\tnewLeader = n\n\t\t\t}\n\t\t}\n\t\tif newLeader == nil {\n\t\t\ttime.Sleep(20 * time.Millisecond)\n\t\t}\n\t}\n\n\tif newLeader != nil {\n\t\t// Decisive probe: ask the old leader again while a competing leader\n\t\t// exists and while its own lease has not expired.\n\t\terr2, got2 := caProbe(leader.raft, 3*time.Second)\n\t\tcaEmit(map[string]interface{}{\n\t\t\t\"event\":               \"verify_while_superseded\",\n\t\t\t\"case\":                caseName,\n\t\t\t\"returned\":            caErrString(err2),\n\t\t\t\"verify_returned_nil\": got2 && err2 == nil,\n\t\t\t\"result_received\":     got2,\n\t\t\t\"elapsed_ms\":          time.Since(partAt).Milliseconds(),\n\t\t\t\"leader_lease_ms\":     leaderLease.Milliseconds(),\n\t\t\t\"old_leader_state\":    leader.raft.State().String(),\n\t\t\t\"new_leader_exists\":   true,\n\t\t\t\"new_leader_id\":       string(newLeader.id),\n\t\t\t\"new_leader_state\":    newLeader.raft.State().String(),\n\t\t})\n\n\t\tconst payload = \"assurance-superseded-write\"\n\t\tfuture := newLeader.raft.Apply([]byte(payload), 5*time.Second)\n\t\tapplyErr := future.Error()\n\t\tapplyIndex := future.Index()\n\t\tcaEmit(map[string]interface{}{\n\t\t\t\"event\":                    \"stale_write\",\n\t\t\t\"case\":                     caseName,\n\t\t\t\"elapsed_ms\":               time.Since(partAt).Milliseconds(),\n\t\t\t\"apply_error\":              caErrString(applyErr),\n\t\t\t\"apply_index\":              applyIndex,\n\t\t\t\"new_leader_id\":            string(newLeader.id),\n\t\t\t\"new_leader_fsm_has_write\": caFsmHasLog(newLeader.fsm, payload),\n\t\t\t\"new_leader_commit_index\":  newLeader.raft.CommitIndex(),\n\t\t\t\"old_leader_id\":            string(leader.id),\n\t\t\t\"old_leader_fsm_has_write\": caFsmHasLog(leader.fsm, payload),\n\t\t\t\"old_leader_applied_index\": leader.raft.AppliedIndex(),\n\t\t\t\"old_leader_state\":         leader.raft.State().String(),\n\t\t\t\"old_leader_is_leader\":     leader.raft.State() == Leader,\n\t\t})\n\t}\n}\n\nfunc caStart(t *testing.T, n *caNode, hb, lease time.Duration, configuration Configuration, bootstrap bool) *Raft {\n\tconf := DefaultConfig()\n\tconf.HeartbeatTimeout = hb\n\tconf.ElectionTimeout = hb\n\tconf.LeaderLeaseTimeout = lease\n\tconf.CommitTimeout = 200 * time.Millisecond\n\tconf.SnapshotInterval = 120 * time.Second\n\tconf.LocalID = n.id\n\tconf.Logger = newTestLoggerWithPrefix(t, string(n.id))\n\tif bootstrap {\n\t\tif err := BootstrapCluster(conf, n.store, n.store, n.snap, n.trans, configuration); err != nil {\n\t\t\tt.Fatalf(\"bootstrap %s: %v\", n.id, err)\n\t\t}\n\t}\n\tr, err := NewRaft(conf, n.fsm, n.store, n.store, n.snap, n.trans)\n\tif err != nil {\n\t\tt.Fatalf(\"newraft %s: %v\", n.id, err)\n\t}\n\treturn r\n}\n\nfunc TestAssuranceVerifyLeaderSupersededLeader(t *testing.T) {\n\t// Treatment: the node kept with the leader is a non-voter, so the two\n\t// voting peers hold a majority and elect their own leader.\n\tcaExtendedWindow(t, \"long_leader_lease\", true, 3*time.Second)\n\t// Control: same per-node timing, but the node kept with the leader still\n\t// votes, so no quorum exists on the far side and no competitor can appear.\n\tcaExtendedWindow(t, \"control_same_set_voter_long_lease\", false, 45*time.Second)\n}\n",
+      "files": {},
+      "execution_package": ".",
+      "description": "",
+      "semantic_changes": [
+        "Per-node timing instead of one shared Config: bootstrapped leader HeartbeatTimeout=ElectionTimeout=LeaderLeaseTimeout=20s; the two far voters 3s; the near node 6s (all ValidateConfig-clean).",
+        "Cluster built from explicit nodes (own InmemTransport, InmemStore, InmemSnapshotStore, MockFSM per node) with only the leader bootstrapped, so the leader is deterministic instead of elected by race.",
+        "Added a second VerifyLeader call after a competing leader exists, and a write applied through the competing leader with both FSMs sampled.",
+        "Added a control case with identical per-node timing in which the near node stays a voter, so the far side is a minority (2 of 4 voters) and no competitor can appear."
+      ],
+      "prerequisites": [
+        {
+          "alias": "treatment_ext",
+          "event": "setup",
+          "conditions": [
+            {
+              "field": "case",
+              "op": "eq",
+              "value": "long_leader_lease",
+              "reference": null
+            },
+            {
+              "field": "near_node_voter",
+              "op": "eq",
+              "value": false,
+              "reference": null
+            },
+            {
+              "field": "voters",
+              "op": "eq",
+              "value": 3,
+              "reference": null
+            },
+            {
+              "field": "nonvoters",
+              "op": "eq",
+              "value": 1,
+              "reference": null
+            },
+            {
+              "field": "quorum_size",
+              "op": "eq",
+              "value": 2,
+              "reference": null
+            },
+            {
+              "field": "leader_lease_ms",
+              "op": "eq",
+              "value": 20000,
+              "reference": null
+            }
+          ]
+        },
+        {
+          "alias": "control_ext",
+          "event": "setup",
+          "conditions": [
+            {
+              "field": "case",
+              "op": "eq",
+              "value": "control_same_set_voter_long_lease",
+              "reference": null
+            },
+            {
+              "field": "near_node_voter",
+              "op": "eq",
+              "value": true,
+              "reference": null
+            },
+            {
+              "field": "voters",
+              "op": "eq",
+              "value": 4,
+              "reference": null
+            },
+            {
+              "field": "quorum_size",
+              "op": "eq",
+              "value": 3,
+              "reference": null
+            }
+          ]
+        }
+      ]
+    },
+    "source_ids": [
+      "s_verify_leader",
+      "s_verify_branch",
+      "s_quorum_size",
+      "s_repl_state",
+      "s_notify_all",
+      "s_heartbeat_notify",
+      "s_update_last_appended",
+      "s_verify_vote",
+      "s_suffrage_doc",
+      "s_verify_doc",
+      "s_check_lease",
+      "s_commitment_voters"
+    ],
+    "anchors": [
+      {
+        "material_id": "s_verify_doc",
+        "symbol": "VerifyLeader",
+        "start_line": 883,
+        "end_line": 893,
+        "anchor": {
+          "source_ids": [
+            "s_verify_doc"
+          ],
+          "boundary_complete": true,
+          "kind": "declaration",
+          "material_id": "s_verify_doc",
+          "start_line": 883,
+          "end_line": 883,
+          "symbol": "VerifyLeader"
+        }
+      },
+      {
+        "material_id": "s_suffrage_doc",
+        "symbol": "Nonvoter",
+        "start_line": 18,
+        "end_line": 24,
+        "anchor": {
+          "source_ids": [
+            "s_suffrage_doc"
+          ],
+          "boundary_complete": true,
+          "kind": "declaration",
+          "material_id": "s_suffrage_doc",
+          "start_line": 18,
+          "end_line": 18,
+          "symbol": "Nonvoter"
+        }
+      },
+      {
+        "material_id": "s_quorum_size",
+        "symbol": "quorumSize",
+        "start_line": 1086,
+        "end_line": 1093,
+        "anchor": {
+          "source_ids": [
+            "s_quorum_size"
+          ],
+          "boundary_complete": false,
+          "kind": "declaration",
+          "material_id": "s_quorum_size",
+          "start_line": 1086,
+          "end_line": 1086,
+          "symbol": "quorumSize"
+        }
+      }
+    ],
+    "scope": {
+      "description": "Extend the observation window of the non-voter VerifyLeader defect: cut a long-lease leader off from the voter majority while one non-voter stays reachable, ask VerifyLeader immediately, then ask again once the majority has elected a competing leader and committed a write.",
+      "assumptions": [
+        "Real target constructors and APIs: BootstrapCluster, NewRaft, DemoteVoter, VerifyLeader, Apply, GetConfiguration; per-node Config values only, no production code or default changed.",
+        "Only the leader is bootstrapped with the four-server configuration (all voters), so it is the only node that can campaign initially; the other nodes start with empty configurations and adopt the configuration through normal AppendEntries replication.",
+        "The near node's voter-to-non-voter transition is the public DemoteVoter call; the harness waits until the far side reports it without a vote and records the leader's own view of that suffrage separately from the near node's self view.",
+        "Partition is imposed by removing in-memory transport routes in both directions between {leader, near} and the two far voters; the far voters keep their mutual routes.",
+        "The 20s leader lease is within ValidateConfig (LeaderLeaseTimeout <= HeartbeatTimeout) and only makes the pre-existing window observable; the defect claim does not rest on the value chosen."
+      ],
+      "excluded": [
+        "No TCP or cross-host partition; no disk-backed log/snapshot store.",
+        "No change to the target's defaults, and no instrumentation of internal counters."
+      ],
+      "parameters": {
+        "nodes": 4,
+        "leader_hb_ms": 20000,
+        "leader_lease_ms": 20000,
+        "far_voter_hb_ms": 3000,
+        "near_node_hb_ms": 6000,
+        "treatment_voters": 3,
+        "treatment_nonvoters": 1,
+        "treatment_quorum_size": 2,
+        "control_voters": 4,
+        "control_quorum_size": 3
+      }
+    },
+    "prefix": "Four nodes are created first (identity is the in-memory transport address), then wired fully connected and started; only the first node is bootstrapped with the configuration {leader, near, far1, far2} all Voter, so it wins the initial election and replicates the configuration to the others (they start empty and cannot campaign). The harness waits for the bootstrapped node to be Leader, then for the treatment calls DemoteVoter(near) and waits until both far nodes report the near node without a vote. It emits a setup CA_EVENT carrying the leader's configuration summary (voters, nonvoters, quorum_size, near_node_voter from the leader's view, near_node_self_voter) and the per-node timings. It then removes the transport routes between {leader, near} and {far1, far2} in both directions, emits a partition event, and calls the public VerifyLeader on the partitioned leader (3s deadline for the treatment, 45s for the control). It polls the two far nodes for a Leader state for up to 15s; if one appears it emits verify_while_superseded with the second VerifyLeader result plus both nodes' states, applies 'assurance-superseded-write' through the competing leader, and emits stale_write with the applied index, the state of both FSMs and the old leader's state. The control repeats the identical construction and timing without the demotion.",
+    "requirement": "A success from VerifyLeader is a confirmation that the caller may keep treating this node as leader and read its FSM (api.go:880-882 documents that purpose). Since non-voters are, by the target's own definition, 'not considered for elections or commitment purposes' (configuration.go:16-18), the confirmation must rest on acknowledgements from a quorum of voters; a non-voter's acknowledgement may not substitute for one.",
+    "responsibility": "Leader-side quorum confirmation consumed by clients through VerifyLeader, and the leader-lease step-down path that is supposed to bound how long such a confirmation can be wrong.",
+    "comparisons": [
+      {
+        "event": "verify_after_partition",
+        "identity_fields": [
+          "case"
+        ],
+        "admission_alias": "treatment_ext",
+        "assertion": {
+          "field": "verify_returned_nil",
+          "op": "eq",
+          "value": true,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [
+          {
+            "field": "case",
+            "op": "eq",
+            "value": "long_leader_lease",
+            "reference": null
+          }
+        ],
+        "description": "The partitioned long-lease leader, able to reach only the demoted non-voter, answers VerifyLeader with success before any competitor exists."
+      },
+      {
+        "event": "verify_while_superseded",
+        "identity_fields": [
+          "case"
+        ],
+        "admission_alias": "treatment_ext",
+        "assertion": {
+          "field": "verify_returned_nil",
+          "op": "eq",
+          "value": true,
+          "reference": null
+        },
+        "antecedent": {
+          "field": "new_leader_exists",
+          "op": "eq",
+          "value": true,
+          "reference": null
+        },
+        "applicability_conditions": [
+          {
+            "field": "case",
+            "op": "eq",
+            "value": "long_leader_lease",
+            "reference": null
+          }
+        ],
+        "description": "Decisive extension of the anomaly: the same confirmation succeeds again while a competing leader already holds leadership on the voter-majority side, i.e. the confirmation outlives the election the lease is supposed to bound."
+      },
+      {
+        "event": "stale_write",
+        "identity_fields": [
+          "case"
+        ],
+        "admission_alias": "treatment_ext",
+        "assertion": {
+          "field": "old_leader_fsm_has_write",
+          "op": "eq",
+          "value": false,
+          "reference": null
+        },
+        "antecedent": {
+          "field": "new_leader_fsm_has_write",
+          "op": "eq",
+          "value": true,
+          "reference": null
+        },
+        "applicability_conditions": [
+          {
+            "field": "case",
+            "op": "eq",
+            "value": "long_leader_lease",
+            "reference": null
+          },
+          {
+            "field": "old_leader_is_leader",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          }
+        ],
+        "description": "A write committed by the competing leader is absent from the old leader's FSM while that old leader still reports Leader, i.e. a client that gates reads on the confirmed leadership reads state missing a committed write."
+      },
+      {
+        "event": "verify_after_partition",
+        "identity_fields": [
+          "case"
+        ],
+        "admission_alias": "control_ext",
+        "assertion": {
+          "field": "verify_returned_nil",
+          "op": "eq",
+          "value": false,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [
+          {
+            "field": "case",
+            "op": "eq",
+            "value": "control_same_set_voter_long_lease",
+            "reference": null
+          }
+        ],
+        "description": "Control with identical per-node timing but the near node still a voter: the far side is a minority, so no competitor can appear and the same call must not report success."
+      }
+    ],
+    "knowledge": []
+  },
+  "snapshot_id": "e02d90d71b50464399dbf6ade5e2ad3d",
+  "configuration": {
+    "backend": "go_module",
+    "target": {
+      "expected_module": "github.com/hashicorp/raft",
+      "variant": "hashicorp_raft",
+      "analysis_roots": [],
+      "execution_package": ".",
+      "harness_path": "assurance_generated_test.go"
+    },
+    "isolation": "bwrap",
+    "tools": {
+      "agent": "codex-cli 0.162.0-alpha.17.2",
+      "implementation": "go version go1.23.5 linux/amd64"
+    }
+  },
+  "harness_filename": "assurance_generated_test.go",
+  "operation_id": "f86170361cdb4c0fb5317d016675dd6b",
+  "previous_id": "b855e69e79fe4ee1bfaac220a7f23d40-experiment",
+  "difference": {
+    "harness": {
+      "before": {
+        "kind": "go_test",
+        "source": "// Copyright (c) HashiCorp, Inc.\n// SPDX-License-Identifier: MPL-2.0\n\npackage raft\n\nimport (\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"sort\"\n\t\"testing\"\n\t\"time\"\n)\n\n// caEmit prints one observation as a CA_EVENT JSON line.\nfunc caEmit(ev map[string]interface{}) {\n\tb, err := json.Marshal(ev)\n\tif err != nil {\n\t\tpanic(err)\n\t}\n\tfmt.Println(\"CA_EVENT \" + string(b))\n}\n\nfunc caErrString(err error) string {\n\tif err == nil {\n\t\treturn \"nil\"\n\t}\n\treturn err.Error()\n}\n\nfunc caFsmHasLog(f FSM, want string) bool {\n\tm := getMockFSM(f)\n\tif m == nil {\n\t\treturn false\n\t}\n\tfor _, l := range m.Logs() {\n\t\tif string(l) == want {\n\t\t\treturn true\n\t\t}\n\t}\n\treturn false\n}\n\nfunc caVoters(cfg Configuration) (voters int, nonvoters int) {\n\tfor _, s := range cfg.Servers {\n\t\tif s.Suffrage == Voter {\n\t\t\tvoters++\n\t\t} else {\n\t\t\tnonvoters++\n\t\t}\n\t}\n\treturn voters, nonvoters\n}\n\n// caScenario builds a real 4-node in-memory cluster, optionally moves one node\n// from voter to non-voter through the public membership API, partitions the\n// cluster so that the leader keeps only that node reachable, and then asks the\n// leader whether it is still the leader (VerifyLeader).\n//\n// It returns true when a leader that answered \"still leader\" was observed\n// while a different node was already leader in the voter majority.\nfunc caScenario(t *testing.T, caseName string, attempt int, demote bool, isolateLeader bool, hb time.Duration) bool {\n\tconf := DefaultConfig()\n\tconf.HeartbeatTimeout = hb\n\tconf.ElectionTimeout = hb\n\tconf.LeaderLeaseTimeout = hb\n\tconf.CommitTimeout = 50 * time.Millisecond\n\tconf.SnapshotInterval = 120 * time.Second\n\tconf.Logger = newTestLogger(t)\n\n\tc := MakeClusterCustom(t, &MakeClusterOpts{\n\t\tPeers:           4,\n\t\tBootstrap:       true,\n\t\tConf:            conf,\n\t\tLongstopTimeout: 60 * time.Second,\n\t})\n\tdefer c.Close()\n\n\tleader := c.Leader()\n\tfollowers := c.Followers()\n\n\t// Deterministic choice of the node that stays with the leader.\n\tsort.Slice(followers, func(i, j int) bool {\n\t\treturn followers[i].localAddr < followers[j].localAddr\n\t})\n\tnearNode := followers[0]\n\tfarNodes := followers[1:]\n\n\tif demote {\n\t\tif err := leader.DemoteVoter(nearNode.localID, 0, 10*time.Second).Error(); err != nil {\n\t\t\tcaEmit(map[string]interface{}{\n\t\t\t\t\"event\": \"setup\", \"case\": caseName, \"attempt\": attempt,\n\t\t\t\t\"setup_error\": \"demote failed: \" + err.Error(),\n\t\t\t})\n\t\t\treturn false\n\t\t}\n\t\t// Wait until the far side has applied the demotion, otherwise it would\n\t\t// still believe a 4-voter cluster needs 3 votes.\n\t\tdeadline := time.Now().Add(5 * time.Second)\n\t\tfor time.Now().Before(deadline) {\n\t\t\tdone := true\n\t\t\tfor _, f := range farNodes {\n\t\t\t\tif hasVote(c.getConfiguration(f), nearNode.localID) {\n\t\t\t\t\tdone = false\n\t\t\t\t}\n\t\t\t}\n\t\t\tif done {\n\t\t\t\tbreak\n\t\t\t}\n\t\t\ttime.Sleep(10 * time.Millisecond)\n\t\t}\n\t}\n\n\tcfg := c.getConfiguration(leader)\n\tvoters, nonvoters := caVoters(cfg)\n\n\tcaEmit(map[string]interface{}{\n\t\t\"event\": \"setup\", \"case\": caseName, \"attempt\": attempt,\n\t\t\"hb_ms\":            hb.Milliseconds(),\n\t\t\"lease_ms\":         conf.LeaderLeaseTimeout.Milliseconds(),\n\t\t\"leader_id\":        string(leader.localID),\n\t\t\"near_node_id\":     string(nearNode.localID),\n\t\t\"near_node_voter\":  hasVote(cfg, nearNode.localID),\n\t\t\"voters\":           voters,\n\t\t\"nonvoters\":        nonvoters,\n\t\t\"quorum_size\":      voters/2 + 1,\n\t\t\"demoted\":          demote,\n\t\t\"isolate_leader\":   isolateLeader,\n\t\t\"far_node_ids\":     []string{string(farNodes[0].localID), string(farNodes[1].localID)},\n\t})\n\n\t// Cut the leader off from the voter majority, keeping only nearNode\n\t// reachable (or cutting everything when isolateLeader is set).\n\tif isolateLeader {\n\t\tc.Disconnect(leader.localAddr)\n\t} else {\n\t\t// Keep the leader and nearNode connected to each other and cut both\n\t\t// off from the remaining (voting) nodes.\n\t\tc.Partition([]ServerAddress{leader.localAddr, nearNode.localAddr})\n\t}\n\tpartAt := time.Now()\n\tcaEmit(map[string]interface{}{\n\t\t\"event\": \"partition\", \"case\": caseName, \"attempt\": attempt,\n\t\t\"leader_id\": string(leader.localID), \"near_node_id\": string(nearNode.localID),\n\t\t\"isolate_leader\": isolateLeader,\n\t})\n\n\tresultCh := make(chan error, 1)\n\tgo func() { resultCh <- leader.VerifyLeader().Error() }()\n\n\tvar (\n\t\tgotResult   bool\n\t\tverifyErr   error\n\t\tseenBefore  bool\n\t\totherLeader *Raft\n\t)\n\tticker := time.NewTicker(20 * time.Millisecond)\n\tdefer ticker.Stop()\n\tdeadline := time.After(20 * time.Second)\nWAIT:\n\tfor {\n\t\tselect {\n\t\tcase err := <-resultCh:\n\t\t\tverifyErr = err\n\t\t\tgotResult = true\n\t\t\tbreak WAIT\n\t\tcase <-deadline:\n\t\t\tbreak WAIT\n\t\tcase <-ticker.C:\n\t\t\tfor _, f := range farNodes {\n\t\t\t\tif f.State() == Leader {\n\t\t\t\t\totherLeader = f\n\t\t\t\t\tseenBefore = true\n\t\t\t\t}\n\t\t\t}\n\t\t}\n\t}\n\n\tfor _, f := range farNodes {\n\t\tif f.State() == Leader && otherLeader == nil {\n\t\t\totherLeader = f\n\t\t}\n\t}\n\n\tcaEmit(map[string]interface{}{\n\t\t\"event\": \"verify_result\", \"case\": caseName, \"attempt\": attempt,\n\t\t\"returned\":                   caErrString(verifyErr),\n\t\t\"verify_returned_nil\":        verifyErr == nil,\n\t\t\"result_received\":            gotResult,\n\t\t\"elapsed_ms\":                 time.Since(partAt).Milliseconds(),\n\t\t\"leader_state\":               leader.State().String(),\n\t\t\"leader_id\":                  string(leader.localID),\n\t\t\"other_leader_before_result\": seenBefore,\n\t\t\"other_leader_after_result\":  otherLeader != nil,\n\t})\n\n\tif verifyErr != nil {\n\t\treturn false\n\t}\n\n\t// Give the voter majority the chance to elect a new leader while the\n\t// partitioned leader still reports success.\n\twaitUntil := time.Now().Add(4 * time.Second)\n\tfor otherLeader == nil && time.Now().Before(waitUntil) {\n\t\tfor _, f := range farNodes {\n\t\t\tif f.State() == Leader {\n\t\t\t\totherLeader = f\n\t\t\t}\n\t\t}\n\t\tif otherLeader == nil {\n\t\t\ttime.Sleep(20 * time.Millisecond)\n\t\t}\n\t}\n\tif otherLeader == nil {\n\t\treturn false\n\t}\n\n\tconst writePayload = \"assurance-stale-write\"\n\tidxFuture := otherLeader.Apply([]byte(writePayload), 5*time.Second)\n\tapplyErr := idxFuture.Error()\n\tapplyIndex := idxFuture.Index()\n\n\tleaderFSM := c.fsms[c.IndexOf(leader)]\n\tnewLeaderFSM := c.fsms[c.IndexOf(otherLeader)]\n\tleaderHasWrite := caFsmHasLog(leaderFSM, writePayload)\n\tnewLeaderHasWrite := caFsmHasLog(newLeaderFSM, writePayload)\n\n\toverlap := leader.State() == Leader && !leaderHasWrite && newLeaderHasWrite\n\tcaEmit(map[string]interface{}{\n\t\t\"event\": \"stale_read_window\", \"case\": caseName, \"attempt\": attempt,\n\t\t\"verify_returned_nil_earlier\": true,\n\t\t\"leader_state\":                leader.State().String(),\n\t\t\"leader_id\":                   string(leader.localID),\n\t\t\"new_leader_id\":               string(otherLeader.localID),\n\t\t\"apply_error\":                 caErrString(applyErr),\n\t\t\"apply_index\":                 applyIndex,\n\t\t\"elapsed_ms\":                  time.Since(partAt).Milliseconds(),\n\t\t\"leader_applied_index\":        leader.AppliedIndex(),\n\t\t\"new_leader_commit_index\":     otherLeader.CommitIndex(),\n\t\t\"leader_fsm_has_write\":        leaderHasWrite,\n\t\t\"new_leader_fsm_has_write\":    newLeaderHasWrite,\n\t\t\"stale_confirmed\":             overlap,\n\t})\n\treturn overlap\n}\n\nfunc TestAssuranceVerifyLeaderNonvoterQuorum(t *testing.T) {\n\t// Treatment: the node kept with the leader is a non-voter.\n\tfor attempt := 1; attempt <= 3; attempt++ {\n\t\tif caScenario(t, \"nonvoter_reachable\", attempt, true, false, 3*time.Second) {\n\t\t\tbreak\n\t\t}\n\t}\n\t// Control 1: same reachable set, but that node is still a voter.\n\tcaScenario(t, \"control_same_set_voter\", 1, false, false, 2*time.Second)\n\t// Control 2: same suffrage (non-voter), but the leader reaches nobody.\n\tcaScenario(t, \"control_nonvoter_unreachable\", 1, true, true, 2*time.Second)\n}\n",
+        "files": {},
+        "execution_package": ".",
+        "description": "",
+        "semantic_changes": [
+          "Added applicability_conditions {case eq nonvoter_reachable} to comparison 0, {case eq control_same_set_voter} to comparison 1 and {case eq control_nonvoter_unreachable} to comparison 2, so each event comparison applies only to its own case.",
+          "No change to the harness file, the cluster construction, the partition, the VerifyLeader call, the emitted event fields or the recorded sources."
+        ],
+        "prerequisites": [
+          {
+            "alias": "treatment",
+            "event": "setup",
+            "conditions": [
+              {
+                "field": "case",
+                "op": "eq",
+                "value": "nonvoter_reachable",
+                "reference": null
+              },
+              {
+                "field": "near_node_voter",
+                "op": "eq",
+                "value": false,
+                "reference": null
+              },
+              {
+                "field": "voters",
+                "op": "eq",
+                "value": 3,
+                "reference": null
+              },
+              {
+                "field": "quorum_size",
+                "op": "eq",
+                "value": 2,
+                "reference": null
+              }
+            ]
+          },
+          {
+            "alias": "control_voter",
+            "event": "setup",
+            "conditions": [
+              {
+                "field": "case",
+                "op": "eq",
+                "value": "control_same_set_voter",
+                "reference": null
+              },
+              {
+                "field": "near_node_voter",
+                "op": "eq",
+                "value": true,
+                "reference": null
+              },
+              {
+                "field": "voters",
+                "op": "eq",
+                "value": 4,
+                "reference": null
+              },
+              {
+                "field": "quorum_size",
+                "op": "eq",
+                "value": 3,
+                "reference": null
+              }
+            ]
+          },
+          {
+            "alias": "control_unreachable",
+            "event": "setup",
+            "conditions": [
+              {
+                "field": "case",
+                "op": "eq",
+                "value": "control_nonvoter_unreachable",
+                "reference": null
+              },
+              {
+                "field": "near_node_voter",
+                "op": "eq",
+                "value": false,
+                "reference": null
+              },
+              {
+                "field": "isolate_leader",
+                "op": "eq",
+                "value": true,
+                "reference": null
+              }
+            ]
+          }
+        ]
+      },
+      "after": {
+        "kind": "go_test",
+        "source": "// Copyright (c) HashiCorp, Inc.\n// SPDX-License-Identifier: MPL-2.0\n\npackage raft\n\nimport (\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"testing\"\n\t\"time\"\n)\n\n// caEmit prints one observation as a CA_EVENT JSON line.\nfunc caEmit(ev map[string]interface{}) {\n\tb, err := json.Marshal(ev)\n\tif err != nil {\n\t\tpanic(err)\n\t}\n\tfmt.Println(\"CA_EVENT \" + string(b))\n}\n\nfunc caErrString(err error) string {\n\tif err == nil {\n\t\treturn \"nil\"\n\t}\n\treturn err.Error()\n}\n\nfunc caFsmHasLog(m *MockFSM, want string) bool {\n\tif m == nil {\n\t\treturn false\n\t}\n\tfor _, l := range m.Logs() {\n\t\tif string(l) == want {\n\t\t\treturn true\n\t\t}\n\t}\n\treturn false\n}\n\nfunc caCountVoters(cfg Configuration) (voters int, nonvoters int) {\n\tfor _, s := range cfg.Servers {\n\t\tif s.Suffrage == Voter {\n\t\t\tvoters++\n\t\t} else {\n\t\t\tnonvoters++\n\t\t}\n\t}\n\treturn voters, nonvoters\n}\n\n// caNode is one real target instance with its own stores, FSM and transport.\ntype caNode struct {\n\tid    ServerID\n\taddr  ServerAddress\n\ttrans *InmemTransport\n\tstore *InmemStore\n\tsnap  *InmemSnapshotStore\n\tfsm   *MockFSM\n\traft  *Raft\n}\n\nfunc caConfigured(node *caNode) Configuration {\n\tf := node.raft.GetConfiguration()\n\tif err := f.Error(); err != nil {\n\t\treturn Configuration{}\n\t}\n\treturn f.Configuration()\n}\n\n// caProbe issues the public VerifyLeader call and waits up to deadline for the\n// future to be answered.\nfunc caProbe(r *Raft, deadline time.Duration) (err error, received bool) {\n\tch := make(chan error, 1)\n\tgo func() { ch <- r.VerifyLeader().Error() }()\n\tselect {\n\tcase err := <-ch:\n\t\treturn err, true\n\tcase <-time.After(deadline):\n\t\treturn nil, false\n\t}\n}\n\nfunc caVoteOf(n *caNode, id ServerID) (inConfig bool, hasVote bool) {\n\tfor _, s := range caConfigured(n).Servers {\n\t\tif s.ID == id {\n\t\t\treturn true, s.Suffrage == Voter\n\t\t}\n\t}\n\treturn false, false\n}\n\nfunc caWaitState(r *Raft, want RaftState, limit time.Duration) bool {\n\tdeadline := time.Now().Add(limit)\n\tfor time.Now().Before(deadline) {\n\t\tif r.State() == want {\n\t\t\treturn true\n\t\t}\n\t\ttime.Sleep(10 * time.Millisecond)\n\t}\n\treturn false\n}\n\n// caExtendedWindow builds a 4-node cluster in which only the leader has the\n// long heartbeat/lease timing, so the two voting peers can elect a leader of\n// their own long before the partitioned leader's lease expires. It then asks\n// the partitioned leader whether it is still leader: immediately after the\n// partition, and again once a competing leader exists.\nfunc caExtendedWindow(t *testing.T, caseName string, demote bool, probeDeadline time.Duration) {\n\tconst (\n\t\tleaderHB    = 20 * time.Second\n\t\tleaderLease = 20 * time.Second\n\t\tnearHB      = 6 * time.Second\n\t\tfarHB       = 3 * time.Second\n\t)\n\n\t// Nodes must exist before the bootstrap configuration can list their\n\t// transport addresses.\n\tnodes := []*caNode{\n\t\t{id: \"\", addr: \"\", trans: nil, store: NewInmemStore(), snap: NewInmemSnapshotStore(), fsm: &MockFSM{}},\n\t\t{id: \"\", addr: \"\", trans: nil, store: NewInmemStore(), snap: NewInmemSnapshotStore(), fsm: &MockFSM{}},\n\t\t{id: \"\", addr: \"\", trans: nil, store: NewInmemStore(), snap: NewInmemSnapshotStore(), fsm: &MockFSM{}},\n\t\t{id: \"\", addr: \"\", trans: nil, store: NewInmemStore(), snap: NewInmemSnapshotStore(), fsm: &MockFSM{}},\n\t}\n\tfor _, n := range nodes {\n\t\taddr, trans := NewInmemTransport(\"\")\n\t\tn.addr = addr\n\t\tn.trans = trans\n\t\tn.id = ServerID(\"server-\" + string(addr))\n\t}\n\tleader, near, far1, far2 := nodes[0], nodes[1], nodes[2], nodes[3]\n\n\tconfiguration := Configuration{Servers: []Server{\n\t\t{Suffrage: Voter, ID: leader.id, Address: leader.addr},\n\t\t{Suffrage: Voter, ID: near.id, Address: near.addr},\n\t\t{Suffrage: Voter, ID: far1.id, Address: far1.addr},\n\t\t{Suffrage: Voter, ID: far2.id, Address: far2.addr},\n\t}}\n\tfor i, n1 := range nodes {\n\t\tfor j, n2 := range nodes {\n\t\t\tif i != j {\n\t\t\t\tn1.trans.Connect(n2.addr, n2.trans)\n\t\t\t}\n\t\t}\n\t}\n\tdefer func() {\n\t\tfor _, n := range nodes {\n\t\t\tif n.raft != nil {\n\t\t\t\t_ = n.raft.Shutdown().Error()\n\t\t\t}\n\t\t\tn.trans.Close()\n\t\t}\n\t}()\n\n\t// Only the leader is bootstrapped, so only it can campaign; the other\n\t// nodes have no configuration yet and adopt it from replication.\n\tleader.raft = caStart(t, leader, leaderHB, leaderLease, configuration, true)\n\tnear.raft = caStart(t, near, nearHB, nearHB, configuration, false)\n\tfar1.raft = caStart(t, far1, farHB, farHB, configuration, false)\n\tfar2.raft = caStart(t, far2, farHB, farHB, configuration, false)\n\n\tif !caWaitState(leader.raft, Leader, 60*time.Second) {\n\t\tt.Fatalf(\"bootstrapped node did not become leader\")\n\t}\n\n\tif demote {\n\t\tif err := leader.raft.DemoteVoter(near.id, 0, 10*time.Second).Error(); err != nil {\n\t\t\tcaEmit(map[string]interface{}{\"event\": \"setup\", \"case\": caseName, \"setup_error\": \"demote failed: \" + err.Error()})\n\t\t\tt.Fatalf(\"demote failed: %v\", err)\n\t\t}\n\t\tdeadline := time.Now().Add(10 * time.Second)\n\t\tfor time.Now().Before(deadline) {\n\t\t\t_, ok1 := caVoteOf(far1, near.id)\n\t\t\t_, ok2 := caVoteOf(far2, near.id)\n\t\t\tif !ok1 && !ok2 {\n\t\t\t\tbreak\n\t\t\t}\n\t\t\ttime.Sleep(20 * time.Millisecond)\n\t\t}\n\t}\n\n\tcfg := caConfigured(leader)\n\tvoters, nonvoters := caCountVoters(cfg)\n\tnearVoterLeaderView := false\n\tfor _, s := range cfg.Servers {\n\t\tif s.ID == near.id {\n\t\t\tnearVoterLeaderView = s.Suffrage == Voter\n\t\t}\n\t}\n\t// Give the near node's own view of the demotion a bounded chance to settle,\n\t// then record it separately from the leader's view.\n\tnearSelfVoter, _ := caVoteOf(near, near.id)\n\tif nearSelfVoter && !nearVoterLeaderView {\n\t\tsettleUntil := time.Now().Add(3 * time.Second)\n\t\tfor time.Now().Before(settleUntil) {\n\t\t\tselfVoter, _ := caVoteOf(near, near.id)\n\t\t\tnearSelfVoter = selfVoter\n\t\t\tif !nearSelfVoter {\n\t\t\t\tbreak\n\t\t\t}\n\t\t\ttime.Sleep(20 * time.Millisecond)\n\t\t}\n\t}\n\n\tcaEmit(map[string]interface{}{\n\t\t\"event\":                \"setup\",\n\t\t\"case\":                 caseName,\n\t\t\"leader_id\":            string(leader.id),\n\t\t\"near_node_id\":         string(near.id),\n\t\t\"far_node_ids\":         []string{string(far1.id), string(far2.id)},\n\t\t\"near_node_voter\":      nearVoterLeaderView,\n\t\t\"near_node_self_voter\": nearSelfVoter,\n\t\t\"voters\":               voters,\n\t\t\"nonvoters\":            nonvoters,\n\t\t\"quorum_size\":          voters/2 + 1,\n\t\t\"leader_hb_ms\":         leaderHB.Milliseconds(),\n\t\t\"leader_lease_ms\":      leaderLease.Milliseconds(),\n\t\t\"far_hb_ms\":            farHB.Milliseconds(),\n\t\t\"demoted\":              demote,\n\t})\n\n\t// Partition the leader (and the near node) from the two voting peers.\n\tpartAt := time.Now()\n\tfor _, a := range []*caNode{leader, near} {\n\t\ta.trans.Disconnect(far1.addr)\n\t\ta.trans.Disconnect(far2.addr)\n\t}\n\tfor _, b := range []*caNode{far1, far2} {\n\t\tb.trans.Disconnect(leader.addr)\n\t\tb.trans.Disconnect(near.addr)\n\t}\n\tcaEmit(map[string]interface{}{\n\t\t\"event\": \"partition\", \"case\": caseName,\n\t\t\"leader_id\": string(leader.id), \"near_node_id\": string(near.id),\n\t})\n\n\terr1, got1 := caProbe(leader.raft, probeDeadline)\n\tcaEmit(map[string]interface{}{\n\t\t\"event\":               \"verify_after_partition\",\n\t\t\"case\":                caseName,\n\t\t\"returned\":            caErrString(err1),\n\t\t\"verify_returned_nil\": got1 && err1 == nil,\n\t\t\"result_received\":     got1,\n\t\t\"elapsed_ms\":          time.Since(partAt).Milliseconds(),\n\t\t\"leader_lease_ms\":     leaderLease.Milliseconds(),\n\t\t\"leader_state\":        leader.raft.State().String(),\n\t})\n\n\t// Wait for the voting peers to elect a leader of their own.\n\tvar newLeader *caNode\n\twaitUntil := time.Now().Add(15 * time.Second)\n\tfor newLeader == nil && time.Now().Before(waitUntil) {\n\t\tfor _, n := range []*caNode{far1, far2} {\n\t\t\tif n.raft.State() == Leader {\n\t\t\t\tnewLeader = n\n\t\t\t}\n\t\t}\n\t\tif newLeader == nil {\n\t\t\ttime.Sleep(20 * time.Millisecond)\n\t\t}\n\t}\n\n\tif newLeader != nil {\n\t\t// Decisive probe: ask the old leader again while a competing leader\n\t\t// exists and while its own lease has not expired.\n\t\terr2, got2 := caProbe(leader.raft, 3*time.Second)\n\t\tcaEmit(map[string]interface{}{\n\t\t\t\"event\":               \"verify_while_superseded\",\n\t\t\t\"case\":                caseName,\n\t\t\t\"returned\":            caErrString(err2),\n\t\t\t\"verify_returned_nil\": got2 && err2 == nil,\n\t\t\t\"result_received\":     got2,\n\t\t\t\"elapsed_ms\":          time.Since(partAt).Milliseconds(),\n\t\t\t\"leader_lease_ms\":     leaderLease.Milliseconds(),\n\t\t\t\"old_leader_state\":    leader.raft.State().String(),\n\t\t\t\"new_leader_exists\":   true,\n\t\t\t\"new_leader_id\":       string(newLeader.id),\n\t\t\t\"new_leader_state\":    newLeader.raft.State().String(),\n\t\t})\n\n\t\tconst payload = \"assurance-superseded-write\"\n\t\tfuture := newLeader.raft.Apply([]byte(payload), 5*time.Second)\n\t\tapplyErr := future.Error()\n\t\tapplyIndex := future.Index()\n\t\tcaEmit(map[string]interface{}{\n\t\t\t\"event\":                    \"stale_write\",\n\t\t\t\"case\":                     caseName,\n\t\t\t\"elapsed_ms\":               time.Since(partAt).Milliseconds(),\n\t\t\t\"apply_error\":              caErrString(applyErr),\n\t\t\t\"apply_index\":              applyIndex,\n\t\t\t\"new_leader_id\":            string(newLeader.id),\n\t\t\t\"new_leader_fsm_has_write\": caFsmHasLog(newLeader.fsm, payload),\n\t\t\t\"new_leader_commit_index\":  newLeader.raft.CommitIndex(),\n\t\t\t\"old_leader_id\":            string(leader.id),\n\t\t\t\"old_leader_fsm_has_write\": caFsmHasLog(leader.fsm, payload),\n\t\t\t\"old_leader_applied_index\": leader.raft.AppliedIndex(),\n\t\t\t\"old_leader_state\":         leader.raft.State().String(),\n\t\t\t\"old_leader_is_leader\":     leader.raft.State() == Leader,\n\t\t})\n\t}\n}\n\nfunc caStart(t *testing.T, n *caNode, hb, lease time.Duration, configuration Configuration, bootstrap bool) *Raft {\n\tconf := DefaultConfig()\n\tconf.HeartbeatTimeout = hb\n\tconf.ElectionTimeout = hb\n\tconf.LeaderLeaseTimeout = lease\n\tconf.CommitTimeout = 200 * time.Millisecond\n\tconf.SnapshotInterval = 120 * time.Second\n\tconf.LocalID = n.id\n\tconf.Logger = newTestLoggerWithPrefix(t, string(n.id))\n\tif bootstrap {\n\t\tif err := BootstrapCluster(conf, n.store, n.store, n.snap, n.trans, configuration); err != nil {\n\t\t\tt.Fatalf(\"bootstrap %s: %v\", n.id, err)\n\t\t}\n\t}\n\tr, err := NewRaft(conf, n.fsm, n.store, n.store, n.snap, n.trans)\n\tif err != nil {\n\t\tt.Fatalf(\"newraft %s: %v\", n.id, err)\n\t}\n\treturn r\n}\n\nfunc TestAssuranceVerifyLeaderSupersededLeader(t *testing.T) {\n\t// Treatment: the node kept with the leader is a non-voter, so the two\n\t// voting peers hold a majority and elect their own leader.\n\tcaExtendedWindow(t, \"long_leader_lease\", true, 3*time.Second)\n\t// Control: same per-node timing, but the node kept with the leader still\n\t// votes, so no quorum exists on the far side and no competitor can appear.\n\tcaExtendedWindow(t, \"control_same_set_voter_long_lease\", false, 45*time.Second)\n}\n",
+        "files": {},
+        "execution_package": ".",
+        "description": "",
+        "semantic_changes": [
+          "Per-node timing instead of one shared Config: bootstrapped leader HeartbeatTimeout=ElectionTimeout=LeaderLeaseTimeout=20s; the two far voters 3s; the near node 6s (all ValidateConfig-clean).",
+          "Cluster built from explicit nodes (own InmemTransport, InmemStore, InmemSnapshotStore, MockFSM per node) with only the leader bootstrapped, so the leader is deterministic instead of elected by race.",
+          "Added a second VerifyLeader call after a competing leader exists, and a write applied through the competing leader with both FSMs sampled.",
+          "Added a control case with identical per-node timing in which the near node stays a voter, so the far side is a minority (2 of 4 voters) and no competitor can appear."
+        ],
+        "prerequisites": [
+          {
+            "alias": "treatment_ext",
+            "event": "setup",
+            "conditions": [
+              {
+                "field": "case",
+                "op": "eq",
+                "value": "long_leader_lease",
+                "reference": null
+              },
+              {
+                "field": "near_node_voter",
+                "op": "eq",
+                "value": false,
+                "reference": null
+              },
+              {
+                "field": "voters",
+                "op": "eq",
+                "value": 3,
+                "reference": null
+              },
+              {
+                "field": "nonvoters",
+                "op": "eq",
+                "value": 1,
+                "reference": null
+              },
+              {
+                "field": "quorum_size",
+                "op": "eq",
+                "value": 2,
+                "reference": null
+              },
+              {
+                "field": "leader_lease_ms",
+                "op": "eq",
+                "value": 20000,
+                "reference": null
+              }
+            ]
+          },
+          {
+            "alias": "control_ext",
+            "event": "setup",
+            "conditions": [
+              {
+                "field": "case",
+                "op": "eq",
+                "value": "control_same_set_voter_long_lease",
+                "reference": null
+              },
+              {
+                "field": "near_node_voter",
+                "op": "eq",
+                "value": true,
+                "reference": null
+              },
+              {
+                "field": "voters",
+                "op": "eq",
+                "value": 4,
+                "reference": null
+              },
+              {
+                "field": "quorum_size",
+                "op": "eq",
+                "value": 3,
+                "reference": null
+              }
+            ]
+          }
+        ]
+      }
+    },
+    "source_ids": {
+      "before": [
+        "s_verify_leader",
+        "s_verify_branch",
+        "s_quorum_size",
+        "s_repl_state",
+        "s_notify_all",
+        "s_heartbeat_notify",
+        "s_update_last_appended",
+        "s_verify_vote",
+        "s_suffrage_doc",
+        "s_verify_doc",
+        "s_check_lease"
+      ],
+      "after": [
+        "s_verify_leader",
+        "s_verify_branch",
+        "s_quorum_size",
+        "s_repl_state",
+        "s_notify_all",
+        "s_heartbeat_notify",
+        "s_update_last_appended",
+        "s_verify_vote",
+        "s_suffrage_doc",
+        "s_verify_doc",
+        "s_check_lease",
+        "s_commitment_voters"
+      ]
+    },
+    "scope": {
+      "before": {
+        "description": "Real 4-node in-memory cluster: elect a leader, optionally move one follower from voter to non-voter via the public DemoteVoter API, partition the cluster so the leader keeps only that node reachable, then call the public VerifyLeader API and record the future result together with the leader state. Treatment keeps a demoted (non-voter) node reachable; control 1 keeps the same reachable set but that node is still a voter; control 2 keeps the demoted non-voter but cuts the leader from every other node. On a successful confirmation the harness also waits for a leader on the far side, applies a write through the new leader and samples both FSMs.",
+        "assumptions": [
+          "Real target constructors are used: BootstrapCluster + NewRaft, InmemTransport fully connected, InmemSnapshotStore, MockFSM; membership change and partition are driven only through public APIs (DemoteVoter) and the in-memory transport's documented Disconnect.",
+          "Partitions are established by removing transport routes (cluster.Disconnect / cluster.Partition helpers), i.e. the same mechanism the target's own tests use; the partition set is chosen by the harness, not by the measured result.",
+          "Timing: HeartbeatTimeout = ElectionTimeout = LeaderLeaseTimeout (3s for the treatment attempts, 2s for the controls), CommitTimeout = 50ms, ProtocolVersion 3, so ValidateConfig holds for every node.",
+          "The treatment is attempted up to three times because whether a voter-majority election lands inside the partitioned leader's remaining lease window is timing dependent; the VerifyLeader result itself is recorded for every attempt."
+        ],
+        "excluded": [
+          "Real TCP transports and cross-process partitions are not exercised; the in-memory transport is the target's own test transport.",
+          "No production code, configuration default or store behaviour is modified."
+        ],
+        "parameters": {
+          "nodes": 4,
+          "treatment_voters": 3,
+          "treatment_nonvoters": 1,
+          "treatment_quorum_size": 2,
+          "control1_voters": 4,
+          "control1_quorum_size": 3,
+          "treatment_attempts": 3
+        }
+      },
+      "after": {
+        "description": "Extend the observation window of the non-voter VerifyLeader defect: cut a long-lease leader off from the voter majority while one non-voter stays reachable, ask VerifyLeader immediately, then ask again once the majority has elected a competing leader and committed a write.",
+        "assumptions": [
+          "Real target constructors and APIs: BootstrapCluster, NewRaft, DemoteVoter, VerifyLeader, Apply, GetConfiguration; per-node Config values only, no production code or default changed.",
+          "Only the leader is bootstrapped with the four-server configuration (all voters), so it is the only node that can campaign initially; the other nodes start with empty configurations and adopt the configuration through normal AppendEntries replication.",
+          "The near node's voter-to-non-voter transition is the public DemoteVoter call; the harness waits until the far side reports it without a vote and records the leader's own view of that suffrage separately from the near node's self view.",
+          "Partition is imposed by removing in-memory transport routes in both directions between {leader, near} and the two far voters; the far voters keep their mutual routes.",
+          "The 20s leader lease is within ValidateConfig (LeaderLeaseTimeout <= HeartbeatTimeout) and only makes the pre-existing window observable; the defect claim does not rest on the value chosen."
+        ],
+        "excluded": [
+          "No TCP or cross-host partition; no disk-backed log/snapshot store.",
+          "No change to the target's defaults, and no instrumentation of internal counters."
+        ],
+        "parameters": {
+          "nodes": 4,
+          "leader_hb_ms": 20000,
+          "leader_lease_ms": 20000,
+          "far_voter_hb_ms": 3000,
+          "near_node_hb_ms": 6000,
+          "treatment_voters": 3,
+          "treatment_nonvoters": 1,
+          "treatment_quorum_size": 2,
+          "control_voters": 4,
+          "control_quorum_size": 3
+        }
+      }
+    },
+    "prefix": {
+      "before": "The harness builds each cluster with MakeClusterCustom (Bootstrap: true, LongstopTimeout 60s) so all four nodes are bootstrapped with the same 4-voter configuration, then waits for a stable single leader and its followers. For the treatment and control 2 it calls leader.DemoteVoter(nearNode.localID, 0, 10s) and waits until the far side reports the node without a vote, so the leader's own quorum size is 2 of voters {leader, far1, far2}. It then partitions the cluster with cluster.Partition([leader, nearNode]) (treatment, control 1) or cluster.Disconnect(leader) (control 2), records the setup and partition as CA_EVENT lines, launches leader.VerifyLeader().Error() in a goroutine and polls the far side for a Leader state while waiting for the result. The result, the leader's state, elapsed time and whether another leader existed are emitted as a verify_result CA_EVENT. If the confirmation succeeded, the harness waits up to 4s for a far-side leader, applies 'assurance-stale-write' through it, and emits stale_read_window with both FSMs' contents, the leader's state and the applied index.",
+      "after": "Four nodes are created first (identity is the in-memory transport address), then wired fully connected and started; only the first node is bootstrapped with the configuration {leader, near, far1, far2} all Voter, so it wins the initial election and replicates the configuration to the others (they start empty and cannot campaign). The harness waits for the bootstrapped node to be Leader, then for the treatment calls DemoteVoter(near) and waits until both far nodes report the near node without a vote. It emits a setup CA_EVENT carrying the leader's configuration summary (voters, nonvoters, quorum_size, near_node_voter from the leader's view, near_node_self_voter) and the per-node timings. It then removes the transport routes between {leader, near} and {far1, far2} in both directions, emits a partition event, and calls the public VerifyLeader on the partitioned leader (3s deadline for the treatment, 45s for the control). It polls the two far nodes for a Leader state for up to 15s; if one appears it emits verify_while_superseded with the second VerifyLeader result plus both nodes' states, applies 'assurance-superseded-write' through the competing leader, and emits stale_write with the applied index, the state of both FSMs and the old leader's state. The control repeats the identical construction and timing without the demotion."
+    },
+    "responsibility": {
+      "before": "Leader-side quorum confirmation consumed by the client through the public VerifyLeader API; the leader owns both the quorum arithmetic (quorumSize, voter-filtered) and the vote attribution (verifyFuture.vote, unfiltered) that decide the answer.",
+      "after": "Leader-side quorum confirmation consumed by clients through VerifyLeader, and the leader-lease step-down path that is supposed to bound how long such a confirmation can be wrong."
+    },
+    "comparisons": {
+      "before": [
+        {
+          "event": "verify_result",
+          "identity_fields": [
+            "case",
+            "attempt"
+          ],
+          "admission_alias": "treatment",
+          "assertion": {
+            "field": "verify_returned_nil",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          },
+          "antecedent": null,
+          "applicability_conditions": [
+            {
+              "field": "case",
+              "op": "eq",
+              "value": "nonvoter_reachable",
+              "reference": null
+            }
+          ],
+          "description": "Anomaly prediction for the treatment: the leader that can reach only the demoted non-voter answers VerifyLeader with success (nil error) while its quorum size of 2 is defined over voters {leader, far1, far2}. Satisfying this comparison supports the defect explanation; it does not by itself establish it."
+        },
+        {
+          "event": "verify_result",
+          "identity_fields": [
+            "case",
+            "attempt"
+          ],
+          "admission_alias": "control_voter",
+          "assertion": {
+            "field": "verify_returned_nil",
+            "op": "eq",
+            "value": false,
+            "reference": null
+          },
+          "antecedent": null,
+          "applicability_conditions": [
+            {
+              "field": "case",
+              "op": "eq",
+              "value": "control_same_set_voter",
+              "reference": null
+            }
+          ],
+          "description": "Control 1 (only the suffrage of the reachable node differs): with that node still a voter the leader must not report success, because its acknowledgement belongs to the quorum that is otherwise unreachable."
+        },
+        {
+          "event": "verify_result",
+          "identity_fields": [
+            "case",
+            "attempt"
+          ],
+          "admission_alias": "control_unreachable",
+          "assertion": {
+            "field": "verify_returned_nil",
+            "op": "eq",
+            "value": false,
+            "reference": null
+          },
+          "antecedent": null,
+          "applicability_conditions": [
+            {
+              "field": "case",
+              "op": "eq",
+              "value": "control_nonvoter_unreachable",
+              "reference": null
+            }
+          ],
+          "description": "Control 2 (only reachability differs): with the same non-voter suffrage but no reachable peer at all, no acknowledgement can arrive, so success must not be reported."
+        }
+      ],
+      "after": [
+        {
+          "event": "verify_after_partition",
+          "identity_fields": [
+            "case"
+          ],
+          "admission_alias": "treatment_ext",
+          "assertion": {
+            "field": "verify_returned_nil",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          },
+          "antecedent": null,
+          "applicability_conditions": [
+            {
+              "field": "case",
+              "op": "eq",
+              "value": "long_leader_lease",
+              "reference": null
+            }
+          ],
+          "description": "The partitioned long-lease leader, able to reach only the demoted non-voter, answers VerifyLeader with success before any competitor exists."
+        },
+        {
+          "event": "verify_while_superseded",
+          "identity_fields": [
+            "case"
+          ],
+          "admission_alias": "treatment_ext",
+          "assertion": {
+            "field": "verify_returned_nil",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          },
+          "antecedent": {
+            "field": "new_leader_exists",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          },
+          "applicability_conditions": [
+            {
+              "field": "case",
+              "op": "eq",
+              "value": "long_leader_lease",
+              "reference": null
+            }
+          ],
+          "description": "Decisive extension of the anomaly: the same confirmation succeeds again while a competing leader already holds leadership on the voter-majority side, i.e. the confirmation outlives the election the lease is supposed to bound."
+        },
+        {
+          "event": "stale_write",
+          "identity_fields": [
+            "case"
+          ],
+          "admission_alias": "treatment_ext",
+          "assertion": {
+            "field": "old_leader_fsm_has_write",
+            "op": "eq",
+            "value": false,
+            "reference": null
+          },
+          "antecedent": {
+            "field": "new_leader_fsm_has_write",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          },
+          "applicability_conditions": [
+            {
+              "field": "case",
+              "op": "eq",
+              "value": "long_leader_lease",
+              "reference": null
+            },
+            {
+              "field": "old_leader_is_leader",
+              "op": "eq",
+              "value": true,
+              "reference": null
+            }
+          ],
+          "description": "A write committed by the competing leader is absent from the old leader's FSM while that old leader still reports Leader, i.e. a client that gates reads on the confirmed leadership reads state missing a committed write."
+        },
+        {
+          "event": "verify_after_partition",
+          "identity_fields": [
+            "case"
+          ],
+          "admission_alias": "control_ext",
+          "assertion": {
+            "field": "verify_returned_nil",
+            "op": "eq",
+            "value": false,
+            "reference": null
+          },
+          "antecedent": null,
+          "applicability_conditions": [
+            {
+              "field": "case",
+              "op": "eq",
+              "value": "control_same_set_voter_long_lease",
+              "reference": null
+            }
+          ],
+          "description": "Control with identical per-node timing but the near node still a voter: the far side is a minority, so no competitor can appear and the same call must not report success."
+        }
+      ]
+    }
+  },
+  "revision_reason": "Same cause and investigation, new timing basis and an extended observation endpoint: per-node Config values (20s leader lease vs 3s voting peers) let the voter majority elect its own leader well before the partitioned leader's lease expires, which the shared-timing harness could not achieve. The harness file is replaced accordingly (new scenario, same helpers)."
+}

@@ -1,0 +1,684 @@
+{
+  "input": {
+    "rationale": "Second investigation in this run, reselected from the follower-side authority/context path rather than re-probing the settled leadership-transfer finding. It starts from a concrete pending duty on a follower: receiving an AppendEntries whose entries conflict with a suffix the node already durably holds. The source shows that the conflict is resolved by deleting the suffix first and storing the replacements second, and that an allowed StoreLogs error in that window returns before the in-memory last-log certificate is updated - the code says so in its own TODO. The certificate (lastLogIndex/lastLogTerm) is what the node later offers as its vote credential (electSelf/preElectVote) and what it uses to judge candidates (requestVote) and prev-log positions (appendEntries), so the question is whether an allowed store error leaves the node voting with a position its durable log no longer contains, and whether anything repairs it. I deliberately did not claim the stronger safety consequence (a node elected while missing committed entries): a real truncation only happens when the incoming term is not older than the receiver's current term, so the deleted suffix always has terms lower than the truncating leader's, which means any voter that accepted that leader's entries has a strictly higher last term and denies the stale claimant. That narrowing is recorded in the investigation and its counterevidence, and the harness is deferred to the next turn so that it can be built and checked without risking a broken execution.",
+    "sources": [
+      {
+        "id": "appendentries-conflict-truncate-block",
+        "file": "raft.go",
+        "start_line": 1505,
+        "end_line": 1545,
+        "kind": "code_observation"
+      },
+      {
+        "id": "appendentries-store-failure-todo",
+        "file": "raft.go",
+        "start_line": 1536,
+        "end_line": 1544,
+        "kind": "code_observation"
+      },
+      {
+        "id": "appendentries-older-term-guard",
+        "file": "raft.go",
+        "start_line": 1454,
+        "end_line": 1462,
+        "kind": "code_observation"
+      },
+      {
+        "id": "state-getlastentry",
+        "file": "state.go",
+        "start_line": 156,
+        "end_line": 174,
+        "kind": "code_observation"
+      },
+      {
+        "id": "electself-last-entry-claim",
+        "file": "raft.go",
+        "start_line": 1982,
+        "end_line": 1992,
+        "kind": "code_observation"
+      },
+      {
+        "id": "preelectself-last-entry-claim",
+        "file": "raft.go",
+        "start_line": 2063,
+        "end_line": 2072,
+        "kind": "code_observation"
+      },
+      {
+        "id": "requestvote-up-to-date-check",
+        "file": "raft.go",
+        "start_line": 1706,
+        "end_line": 1722,
+        "kind": "code_observation"
+      },
+      {
+        "id": "appendentries-prevlog-check",
+        "file": "raft.go",
+        "start_line": 1475,
+        "end_line": 1503,
+        "kind": "code_observation"
+      },
+      {
+        "id": "lastindex-public-api",
+        "file": "api.go",
+        "start_line": 1223,
+        "end_line": 1229,
+        "kind": "code_observation"
+      }
+    ],
+    "investigations": [
+      {
+        "id": null,
+        "ref": "@stale-log-certificate",
+        "question": "When a follower receives entries that conflict with a suffix it already holds and the LogStore returns an allowed error for the replacement write, what does the node's in-memory last-log certificate (lastLogIndex/lastLogTerm) describe afterwards, is that certificate used by the node's own vote producers and vote decisions, and does anything repair it before the node next campaigns?",
+        "source_ids": [
+          "appendentries-conflict-truncate-block",
+          "appendentries-store-failure-todo",
+          "appendentries-older-term-guard",
+          "state-getlastentry",
+          "electself-last-entry-claim",
+          "preelectself-last-entry-claim",
+          "requestvote-up-to-date-check",
+          "appendentries-prevlog-check",
+          "lastindex-public-api"
+        ],
+        "hypothesis": "The conflict path first deletes the conflicting suffix from disk (DeleteRange succeeds, which also drops the cache in LogCache), then calls StoreLogs for the replacement entries. When StoreLogs returns an allowed error the handler logs, returns, and never reaches the setLastLog call at the end of the success path; nothing else in the receive path repairs it, and the same senders were never updated, so the in-memory certificate keeps describing the deleted suffix. The node therefore reports a last index and last term that its durable log no longer contains: LastIndex() overstates the store's LastIndex(), the node's own RequestVote advertises that position, and the node's up-to-date judgments use it. Prediction to be measured: the certificate stays inconsistent (no repair) until some later AppendEntries succeeds, and the inconsistency is visible in a real vote request the node emits when it campaigns.",
+        "discriminator": "Build the conflicting-suffix prefix from real producers rather than supplied bytes: two real clusters whose leaders hold different terms, joined at the transport level, so that the higher-term leader legitimately appends entries over an index where the other node holds a lower-term entry; give the receiving node a legal LogStore wrapper that fails exactly one StoreLogs call (an allowed error return, not corruption). Then compare, from the same run: the node's reported LastIndex()/last-entry position against the store's actual LastIndex() and a GetLog of the reported index; the same comparison after later successful AppendEntries, to show whether the inconsistency is transient or persists; and the last_log_index/last_log_term the node puts in the RequestVote it emits when it is next left without a leader, read from the observer stream. A control that lets the same StoreLogs call succeed isolates the store error as the cause of the inconsistency.",
+        "disposition": "active",
+        "parent_id": null,
+        "knowledge": null,
+        "counterevidence": null,
+        "limitations": [
+          "The stronger safety consequence is deliberately not claimed: a truncation only occurs when the incoming term is not older than the receiver's current term (appendEntries returns early for an older term), so the deleted suffix's terms are lower than the truncating leader's and any voter holding that leader's entries has a higher last term and denies the stale claimant.",
+          "The trigger needs two events in sequence - an allowed store write error inside an exact window, and no later successful AppendEntries before the node campaigns - so the harness must state and hold both, and the claim is bounded to that history."
+        ],
+        "resume_conditions": null
+      }
+    ],
+    "knowledge": [
+      {
+        "id": null,
+        "ref": "@truncate-then-fail-skips-certificate-update",
+        "kind": "behavior",
+        "statement": "In appendEntries, when a received entry conflicts with one the node already stores, the node deletes the range [entry.Index, lastLogIdx] via logs.DeleteRange, then stores the replacement entries via logs.StoreLogs. If StoreLogs returns an error the handler logs 'failed to append to logs' and returns before any setLastLog call: the in-memory lastLogIndex/lastLogTerm keep the values they had before the deletion (the code marks this with a TODO), and no other branch in the receive path restores them. The response for that request is left with Success false.",
+        "conditions": "Follower/Candidate state; a.Term not older than the node's current term; at least one received entry whose index is at or below the node's last log index and whose term differs from the stored entry; and an error return from logs.StoreLogs for that call.",
+        "source_ids": [
+          "appendentries-conflict-truncate-block",
+          "appendentries-store-failure-todo",
+          "appendentries-older-term-guard"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "changed_premise": "",
+        "affected_uses": []
+      },
+      {
+        "id": null,
+        "ref": "@last-log-certificate-consumers",
+        "kind": "behavior",
+        "statement": "The in-memory last-log certificate is read through raftState.getLastEntry (and getLastIndex, which takes the maximum of lastLogIndex and lastSnapshotIndex, so a snapshot does not mask a stale log index). Its consumers are: electSelf and preElectSelf, which put it in RequestVoteRequest/RequestPreVoteRequest as LastLogIndex/LastLogTerm; requestVote/requestPreVote, which use it to decide whether to grant a vote; appendEntries, which compares it against PrevLogEntry to validate a leader's previous entry; and Raft.LastIndex, the public accessor. None of these consult the LogStore.",
+        "conditions": "Any node, whenever it campaigns or answers a vote request or validates an AppendEntries previous entry.",
+        "source_ids": [
+          "state-getlastentry",
+          "electself-last-entry-claim",
+          "preelectself-last-entry-claim",
+          "requestvote-up-to-date-check",
+          "appendentries-prevlog-check",
+          "lastindex-public-api"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "changed_premise": "",
+        "affected_uses": []
+      }
+    ],
+    "gaps": [],
+    "interpretations": [],
+    "experiment": null,
+    "repeat_experiment_id": null,
+    "stop": null
+  },
+  "before": {
+    "investigations": [
+      {
+        "id": "2545a0aaffb2449e84b18c874a390441-question-0",
+        "version": 1,
+        "question": "Does the leader's explicit leadership-transfer path verify that the caller-supplied target can acquire leadership (i.e. is a Voter in the latest configuration), and if it does not, what happens to the incumbent leader, to the target, and to the returned future when the target is a legal non-voter member added with AddNonvoter?",
+        "source_ids": [
+          "api-transfer-to-server",
+          "initiate-transfer-check",
+          "leaderloop-transfer-target",
+          "startstop-replication-all-servers",
+          "timeoutnow-handler",
+          "requestvote-highterm-stepdown-nonvoter-reject",
+          "electself-voters-only",
+          "pickserver-voters-only",
+          "config-commands-doc"
+        ],
+        "hypothesis": "The transfer path validates only that the target is not the leader itself (raft.go 2191-2196) and that a replication state exists for it (777-783). Replication state exists for every server in configurations.latest, including Nonvoters (the startStopReplication loop at 587 has no suffrage filter), so a non-voter target is accepted end to end. The leader then replicates up to its own last index and sends TimeoutNow; timeoutNow (2208-2215) has no term, no state and no suffrage test, so the target campaigns at term+1 with the transfer flag. Every voter adopts the higher term and steps down before rejecting the vote because the candidate is not a voter (1670-1683), and the candidate can never win because electSelf only asks and self-votes Voters (2015). Predicted observations: the transfer future still reports success, the target never becomes Leader, and the incumbent loses leadership and is replaced by whichever voter campaigns next. The positive control (identical call to a voter) should transfer leadership to the named target.",
+        "discriminator": "One execution, two cases. Case A (control): 3-voter cluster, LeadershipTransferToServer to a voter; the target should become Leader. Case B: same cluster plus a node added with AddNonvoter and verified caught up; LeadershipTransferToServer to that non-voter. The future value alone does not discriminate, since both cases may return success: the decisive difference is whether the named target ever reaches Leader and whether the incumbent's leadership survives. Vote evidence comes from the library's own observer stream (RequestVoteRequest records candidate ID, term, log position and transfer flag) plus timestamped state/term sampling, so the effect can be attributed to suffrage rather than to generic transfer flakiness.",
+        "disposition": "active",
+        "parent_id": null,
+        "knowledge": [],
+        "counterevidence": [],
+        "limitations": [
+          "Source reading establishes the guards and their absence; the concrete sequence, the future value and the recovery time are predictions until the retained execution is interpreted.",
+          "Contention: requestVote's deliberate high-term step-down for a non-voter candidate (comment citing hashicorp/raft#526) shows the library anticipates a campaigning non-voter; it does not show that the library's own transfer API may create that state from a legal caller input."
+        ],
+        "resume_conditions": [],
+        "gaps": [],
+        "history": [],
+        "operation_id": "2545a0aaffb2449e84b18c874a390441"
+      }
+    ],
+    "knowledge": [
+      {
+        "id": "2545a0aaffb2449e84b18c874a390441-knowledge-0",
+        "revision": 1,
+        "kind": "behavior",
+        "statement": "For an explicit leadership transfer (LeadershipTransferToServer) the leader accepts the caller-supplied target if and only if a followerReplication entry exists for that ServerID in leaderState.replState; the only rejection is a target equal to the local ID ('cannot transfer leadership to itself'). No suffrage test is applied at the API, at initiateLeadershipTransfer, or at the leaderLoop hand-off to leadershipTransfer.",
+        "conditions": "protocolVersion >= 3, node is in Leader state and processing the leadershipTransferCh case on the main thread; the caller supplies an ID present in configurations.latest.",
+        "source_ids": [
+          "api-transfer-to-server",
+          "initiate-transfer-check",
+          "leaderloop-transfer-target"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "history": [],
+        "operation_id": "2545a0aaffb2449e84b18c874a390441"
+      },
+      {
+        "id": "2545a0aaffb2449e84b18c874a390441-knowledge-1",
+        "revision": 1,
+        "kind": "behavior",
+        "statement": "startStopReplication starts a followerReplication goroutine for every server in configurations.latest whose ID differs from the local ID, with no suffrage filter, so leaderState.replState (the map consulted by the explicit transfer path and by pickServer) also contains Nonvoter members. pickServer, by contrast, skips 'server.Suffrage != Voter', so the targetless transfer path cannot select a non-voter.",
+        "conditions": "Leader state, after appendConfigurationEntry/setLatestConfiguration followed by startStopReplication.",
+        "source_ids": [
+          "startstop-replication-all-servers",
+          "pickserver-voters-only"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "history": [],
+        "operation_id": "2545a0aaffb2449e84b18c874a390441"
+      },
+      {
+        "id": "2545a0aaffb2449e84b18c874a390441-knowledge-2",
+        "revision": 1,
+        "kind": "behavior",
+        "statement": "On receiving a TimeoutNowRequest a node clears its known leader, sets its state to Candidate and sets candidateFromLeadershipTransfer to true, then acknowledges. The handler performs no term comparison (TimeoutNowRequest carries no term), no state check, no suffrage check on the receiver, and no check that the sender is the current leader or a configuration member; runCandidate then skips pre-vote for such a candidate and calls electSelf directly.",
+        "conditions": "The RPC passes checkRPCHeader (protocol version range) and is dispatched from processRPC on the main thread.",
+        "source_ids": [
+          "timeoutnow-handler"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "history": [],
+        "operation_id": "2545a0aaffb2449e84b18c874a390441"
+      },
+      {
+        "id": "2545a0aaffb2449e84b18c874a390441-knowledge-3",
+        "revision": 1,
+        "kind": "behavior",
+        "statement": "In requestVote, when a RequestVote arrives with req.Term > currentTerm the receiver first steps down (setState(Follower)) and adopts the higher term, and only afterwards rejects the request because the candidate is not a Voter ('rejecting vote request since node is not a voter'), returning Granted false. Because the step-down precedes the rejection, a term-advancing vote request from an unelectable candidate still removes the receiver from leadership.",
+        "conditions": "Receiver is a Voter or Leader with a non-empty configurations.latest.Servers, and the candidate passes the inConfiguration check.",
+        "source_ids": [
+          "requestvote-highterm-stepdown-nonvoter-reject"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "history": [],
+        "operation_id": "2545a0aaffb2449e84b18c874a390441"
+      }
+    ],
+    "materials": [
+      {
+        "id": "api-transfer-to-server",
+        "file": "api.go",
+        "start_line": 1268,
+        "end_line": 1282,
+        "kind": "code_observation",
+        "text": "\n// LeadershipTransferToServer does the same as LeadershipTransfer but takes a\n// server in the arguments in case a leadership should be transitioned to a\n// specific server in the cluster.  Note that raft protocol version 3 is not\n// sufficient to use LeadershipTransfer. A recent version of that library has\n// to be used that includes this feature. Using transfer leadership is safe\n// however in a cluster where not every node has the latest version. If a\n// follower cannot be promoted, it will fail gracefully.\nfunc (r *Raft) LeadershipTransferToServer(id ServerID, address ServerAddress) Future {\n\tif r.protocolVersion < 3 {\n\t\treturn errorFuture{ErrUnsupportedProtocol}\n\t}\n\n\treturn r.initiateLeadershipTransfer(&id, &address)\n}",
+        "content_digest": "499a72c01096912e85d16381f4640ac6d29f8c2b91cabbdae8530bdcbeb89a4a"
+      },
+      {
+        "id": "initiate-transfer-check",
+        "file": "raft.go",
+        "start_line": 2187,
+        "end_line": 2199,
+        "kind": "code_observation",
+        "text": "func (r *Raft) initiateLeadershipTransfer(id *ServerID, address *ServerAddress) LeadershipTransferFuture {\n\tfuture := &leadershipTransferFuture{ID: id, Address: address}\n\tfuture.init()\n\n\tif id != nil && *id == r.localID {\n\t\terr := fmt.Errorf(\"cannot transfer leadership to itself\")\n\t\tr.logger.Info(err.Error())\n\t\tfuture.respond(err)\n\t\treturn future\n\t}\n\n\tselect {\n\tcase r.leadershipTransferCh <- future:",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "leaderloop-transfer-target",
+        "file": "raft.go",
+        "start_line": 762,
+        "end_line": 784,
+        "kind": "code_observation",
+        "text": "\t\t\t// starting leadership transfer asynchronously because\n\t\t\t// leaderState is only supposed to be accessed in the\n\t\t\t// leaderloop.\n\t\t\tid := future.ID\n\t\t\taddress := future.Address\n\t\t\tif id == nil {\n\t\t\t\ts := r.pickServer()\n\t\t\t\tif s != nil {\n\t\t\t\t\tid = &s.ID\n\t\t\t\t\taddress = &s.Address\n\t\t\t\t} else {\n\t\t\t\t\tdoneCh <- fmt.Errorf(\"cannot find peer\")\n\t\t\t\t\tcontinue\n\t\t\t\t}\n\t\t\t}\n\t\t\tstate, ok := r.leaderState.replState[*id]\n\t\t\tif !ok {\n\t\t\t\tdoneCh <- fmt.Errorf(\"cannot find replication state for %v\", id)\n\t\t\t\tcontinue\n\t\t\t}\n\t\t\tr.setLeadershipTransferInProgress(true)\n\t\t\tgo r.leadershipTransfer(*id, *address, state, stopCh, doneCh)\n",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "startstop-replication-all-servers",
+        "file": "raft.go",
+        "start_line": 584,
+        "end_line": 592,
+        "kind": "code_observation",
+        "text": "\tlastIdx := r.getLastIndex()\n\n\t// Start replication goroutines that need starting\n\tfor _, server := range r.configurations.latest.Servers {\n\t\tif server.ID == r.localID {\n\t\t\tcontinue\n\t\t}\n\n\t\tinConfig[server.ID] = true",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "timeoutnow-handler",
+        "file": "raft.go",
+        "start_line": 2208,
+        "end_line": 2215,
+        "kind": "code_observation",
+        "text": "// timeoutNow is what happens when a server receives a TimeoutNowRequest.\nfunc (r *Raft) timeoutNow(rpc RPC, req *TimeoutNowRequest) {\n\tr.setLeader(\"\", \"\")\n\tr.setState(Candidate)\n\tr.candidateFromLeadershipTransfer.Store(true)\n\trpc.Respond(&TimeoutNowResponse{}, nil)\n}\n",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "requestvote-highterm-stepdown-nonvoter-reject",
+        "file": "raft.go",
+        "start_line": 1663,
+        "end_line": 1684,
+        "kind": "code_observation",
+        "text": "\t// Increase the term if we see a newer one\n\tif req.Term > r.getCurrentTerm() {\n\t\t// Ensure transition to follower\n\t\tr.logger.Debug(\"lost leadership because received a requestVote with a newer term\")\n\t\tr.setState(Follower)\n\t\tr.setCurrentTerm(req.Term)\n\n\t\tresp.Term = req.Term\n\t}\n\n\t// if we get a request for vote from a nonVoter  and the request term is higher,\n\t// step down and update term, but reject the vote request\n\t// This could happen when a node, previously voter, is converted to non-voter\n\t// The reason we need to step in is to permit to the cluster to make progress in such a scenario\n\t// More details about that in https://github.com/hashicorp/raft/pull/526\n\tif len(req.ID) > 0 {\n\t\tcandidateID := ServerID(req.ID)\n\t\tif len(r.configurations.latest.Servers) > 0 && !hasVote(r.configurations.latest, candidateID) {\n\t\t\tr.logger.Warn(\"rejecting vote request since node is not a voter\", \"from\", candidate)\n\t\t\treturn\n\t\t}\n\t}",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "electself-voters-only",
+        "file": "raft.go",
+        "start_line": 2013,
+        "end_line": 2020,
+        "kind": "code_observation",
+        "text": "\n\t// For each peer, request a vote\n\tfor _, server := range r.configurations.latest.Servers {\n\t\tif server.Suffrage == Voter {\n\t\t\tif server.ID == r.localID {\n\t\t\t\tr.logger.Debug(\"voting for self\", \"term\", req.Term, \"id\", r.localID)\n\n\t\t\t\t// Persist a vote for ourselves",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "pickserver-voters-only",
+        "file": "raft.go",
+        "start_line": 2163,
+        "end_line": 2176,
+        "kind": "code_observation",
+        "text": "func (r *Raft) pickServer() *Server {\n\tvar pick *Server\n\tvar current uint64\n\tfor _, server := range r.configurations.latest.Servers {\n\t\tif server.ID == r.localID || server.Suffrage != Voter {\n\t\t\tcontinue\n\t\t}\n\t\tstate, ok := r.leaderState.replState[server.ID]\n\t\tif !ok {\n\t\t\tcontinue\n\t\t}\n\t\tnextIdx := atomic.LoadUint64(&state.nextIndex)\n\t\tif nextIdx > current {\n\t\t\tcurrent = nextIdx",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "config-commands-doc",
+        "file": "configuration.go",
+        "start_line": 92,
+        "end_line": 108,
+        "kind": "code_observation",
+        "text": "const (\n\t// AddVoter adds a server with Suffrage of Voter.\n\tAddVoter ConfigurationChangeCommand = iota\n\t// AddNonvoter makes a server Nonvoter unless its Staging or Voter.\n\tAddNonvoter\n\t// DemoteVoter makes a server Nonvoter unless its absent.\n\tDemoteVoter\n\t// RemoveServer removes a server entirely from the cluster membership.\n\tRemoveServer\n\t// Promote changes a server from Staging to Voter. The command will be a\n\t// no-op if the server is not Staging.\n\t// Deprecated: use AddVoter instead.\n\tPromote\n\t// AddStaging makes a server a Voter.\n\t// Deprecated: AddStaging was actually AddVoter. Use AddVoter instead.\n\tAddStaging = 0 // explicit 0 to preserve the old value.\n)",
+        "content_digest": "7e3e1e0a708f3f3b17691549962c94d78955a840922fc0f42867c515cd27ec66"
+      }
+    ],
+    "current_submission": {
+      "phase": "received",
+      "operation_id": "0bfc2ea5a9e94316982943d306eefbf6",
+      "result": {
+        "submission": "update.json",
+        "summary": "Corrected the state.go citation to a range inside the captured file (156-174; the file has 174 lines) and resubmitted the second investigation into the follower conflict-truncation path with an allowed StoreLogs error leaving the cached last-log certificate stale, its two behaviors, and the deferred two-cluster harness."
+      },
+      "status": "completed",
+      "reason": "",
+      "session_unavailable": false
+    },
+    "applied_operations": {
+      "submission-2545a0aaffb2449e84b18c874a390441": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_10-13-13-hashicorp_raft-real-run/semantic-commits/submission-2545a0aaffb2449e84b18c874a390441.json"
+      },
+      "submission-79cfeddb38e843459cbf50995bf100a1": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_10-13-13-hashicorp_raft-real-run/semantic-commits/submission-79cfeddb38e843459cbf50995bf100a1.json"
+      }
+    }
+  },
+  "after": {
+    "investigations": [
+      {
+        "id": "2545a0aaffb2449e84b18c874a390441-question-0",
+        "version": 1,
+        "question": "Does the leader's explicit leadership-transfer path verify that the caller-supplied target can acquire leadership (i.e. is a Voter in the latest configuration), and if it does not, what happens to the incumbent leader, to the target, and to the returned future when the target is a legal non-voter member added with AddNonvoter?",
+        "source_ids": [
+          "api-transfer-to-server",
+          "initiate-transfer-check",
+          "leaderloop-transfer-target",
+          "startstop-replication-all-servers",
+          "timeoutnow-handler",
+          "requestvote-highterm-stepdown-nonvoter-reject",
+          "electself-voters-only",
+          "pickserver-voters-only",
+          "config-commands-doc"
+        ],
+        "hypothesis": "The transfer path validates only that the target is not the leader itself (raft.go 2191-2196) and that a replication state exists for it (777-783). Replication state exists for every server in configurations.latest, including Nonvoters (the startStopReplication loop at 587 has no suffrage filter), so a non-voter target is accepted end to end. The leader then replicates up to its own last index and sends TimeoutNow; timeoutNow (2208-2215) has no term, no state and no suffrage test, so the target campaigns at term+1 with the transfer flag. Every voter adopts the higher term and steps down before rejecting the vote because the candidate is not a voter (1670-1683), and the candidate can never win because electSelf only asks and self-votes Voters (2015). Predicted observations: the transfer future still reports success, the target never becomes Leader, and the incumbent loses leadership and is replaced by whichever voter campaigns next. The positive control (identical call to a voter) should transfer leadership to the named target.",
+        "discriminator": "One execution, two cases. Case A (control): 3-voter cluster, LeadershipTransferToServer to a voter; the target should become Leader. Case B: same cluster plus a node added with AddNonvoter and verified caught up; LeadershipTransferToServer to that non-voter. The future value alone does not discriminate, since both cases may return success: the decisive difference is whether the named target ever reaches Leader and whether the incumbent's leadership survives. Vote evidence comes from the library's own observer stream (RequestVoteRequest records candidate ID, term, log position and transfer flag) plus timestamped state/term sampling, so the effect can be attributed to suffrage rather than to generic transfer flakiness.",
+        "disposition": "active",
+        "parent_id": null,
+        "knowledge": [],
+        "counterevidence": [],
+        "limitations": [
+          "Source reading establishes the guards and their absence; the concrete sequence, the future value and the recovery time are predictions until the retained execution is interpreted.",
+          "Contention: requestVote's deliberate high-term step-down for a non-voter candidate (comment citing hashicorp/raft#526) shows the library anticipates a campaigning non-voter; it does not show that the library's own transfer API may create that state from a legal caller input."
+        ],
+        "resume_conditions": [],
+        "gaps": [],
+        "history": [],
+        "operation_id": "2545a0aaffb2449e84b18c874a390441"
+      },
+      {
+        "id": "0bfc2ea5a9e94316982943d306eefbf6-question-0",
+        "version": 1,
+        "question": "When a follower receives entries that conflict with a suffix it already holds and the LogStore returns an allowed error for the replacement write, what does the node's in-memory last-log certificate (lastLogIndex/lastLogTerm) describe afterwards, is that certificate used by the node's own vote producers and vote decisions, and does anything repair it before the node next campaigns?",
+        "source_ids": [
+          "appendentries-conflict-truncate-block",
+          "appendentries-store-failure-todo",
+          "appendentries-older-term-guard",
+          "state-getlastentry",
+          "electself-last-entry-claim",
+          "preelectself-last-entry-claim",
+          "requestvote-up-to-date-check",
+          "appendentries-prevlog-check",
+          "lastindex-public-api"
+        ],
+        "hypothesis": "The conflict path first deletes the conflicting suffix from disk (DeleteRange succeeds, which also drops the cache in LogCache), then calls StoreLogs for the replacement entries. When StoreLogs returns an allowed error the handler logs, returns, and never reaches the setLastLog call at the end of the success path; nothing else in the receive path repairs it, and the same senders were never updated, so the in-memory certificate keeps describing the deleted suffix. The node therefore reports a last index and last term that its durable log no longer contains: LastIndex() overstates the store's LastIndex(), the node's own RequestVote advertises that position, and the node's up-to-date judgments use it. Prediction to be measured: the certificate stays inconsistent (no repair) until some later AppendEntries succeeds, and the inconsistency is visible in a real vote request the node emits when it campaigns.",
+        "discriminator": "Build the conflicting-suffix prefix from real producers rather than supplied bytes: two real clusters whose leaders hold different terms, joined at the transport level, so that the higher-term leader legitimately appends entries over an index where the other node holds a lower-term entry; give the receiving node a legal LogStore wrapper that fails exactly one StoreLogs call (an allowed error return, not corruption). Then compare, from the same run: the node's reported LastIndex()/last-entry position against the store's actual LastIndex() and a GetLog of the reported index; the same comparison after later successful AppendEntries, to show whether the inconsistency is transient or persists; and the last_log_index/last_log_term the node puts in the RequestVote it emits when it is next left without a leader, read from the observer stream. A control that lets the same StoreLogs call succeed isolates the store error as the cause of the inconsistency.",
+        "disposition": "active",
+        "parent_id": null,
+        "knowledge": [],
+        "counterevidence": [],
+        "limitations": [
+          "The stronger safety consequence is deliberately not claimed: a truncation only occurs when the incoming term is not older than the receiver's current term (appendEntries returns early for an older term), so the deleted suffix's terms are lower than the truncating leader's and any voter holding that leader's entries has a higher last term and denies the stale claimant.",
+          "The trigger needs two events in sequence - an allowed store write error inside an exact window, and no later successful AppendEntries before the node campaigns - so the harness must state and hold both, and the claim is bounded to that history."
+        ],
+        "resume_conditions": [],
+        "gaps": [],
+        "history": [],
+        "operation_id": "0bfc2ea5a9e94316982943d306eefbf6"
+      }
+    ],
+    "knowledge": [
+      {
+        "id": "2545a0aaffb2449e84b18c874a390441-knowledge-0",
+        "revision": 1,
+        "kind": "behavior",
+        "statement": "For an explicit leadership transfer (LeadershipTransferToServer) the leader accepts the caller-supplied target if and only if a followerReplication entry exists for that ServerID in leaderState.replState; the only rejection is a target equal to the local ID ('cannot transfer leadership to itself'). No suffrage test is applied at the API, at initiateLeadershipTransfer, or at the leaderLoop hand-off to leadershipTransfer.",
+        "conditions": "protocolVersion >= 3, node is in Leader state and processing the leadershipTransferCh case on the main thread; the caller supplies an ID present in configurations.latest.",
+        "source_ids": [
+          "api-transfer-to-server",
+          "initiate-transfer-check",
+          "leaderloop-transfer-target"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "history": [],
+        "operation_id": "2545a0aaffb2449e84b18c874a390441"
+      },
+      {
+        "id": "2545a0aaffb2449e84b18c874a390441-knowledge-1",
+        "revision": 1,
+        "kind": "behavior",
+        "statement": "startStopReplication starts a followerReplication goroutine for every server in configurations.latest whose ID differs from the local ID, with no suffrage filter, so leaderState.replState (the map consulted by the explicit transfer path and by pickServer) also contains Nonvoter members. pickServer, by contrast, skips 'server.Suffrage != Voter', so the targetless transfer path cannot select a non-voter.",
+        "conditions": "Leader state, after appendConfigurationEntry/setLatestConfiguration followed by startStopReplication.",
+        "source_ids": [
+          "startstop-replication-all-servers",
+          "pickserver-voters-only"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "history": [],
+        "operation_id": "2545a0aaffb2449e84b18c874a390441"
+      },
+      {
+        "id": "2545a0aaffb2449e84b18c874a390441-knowledge-2",
+        "revision": 1,
+        "kind": "behavior",
+        "statement": "On receiving a TimeoutNowRequest a node clears its known leader, sets its state to Candidate and sets candidateFromLeadershipTransfer to true, then acknowledges. The handler performs no term comparison (TimeoutNowRequest carries no term), no state check, no suffrage check on the receiver, and no check that the sender is the current leader or a configuration member; runCandidate then skips pre-vote for such a candidate and calls electSelf directly.",
+        "conditions": "The RPC passes checkRPCHeader (protocol version range) and is dispatched from processRPC on the main thread.",
+        "source_ids": [
+          "timeoutnow-handler"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "history": [],
+        "operation_id": "2545a0aaffb2449e84b18c874a390441"
+      },
+      {
+        "id": "2545a0aaffb2449e84b18c874a390441-knowledge-3",
+        "revision": 1,
+        "kind": "behavior",
+        "statement": "In requestVote, when a RequestVote arrives with req.Term > currentTerm the receiver first steps down (setState(Follower)) and adopts the higher term, and only afterwards rejects the request because the candidate is not a Voter ('rejecting vote request since node is not a voter'), returning Granted false. Because the step-down precedes the rejection, a term-advancing vote request from an unelectable candidate still removes the receiver from leadership.",
+        "conditions": "Receiver is a Voter or Leader with a non-empty configurations.latest.Servers, and the candidate passes the inConfiguration check.",
+        "source_ids": [
+          "requestvote-highterm-stepdown-nonvoter-reject"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "history": [],
+        "operation_id": "2545a0aaffb2449e84b18c874a390441"
+      },
+      {
+        "id": "0bfc2ea5a9e94316982943d306eefbf6-knowledge-0",
+        "revision": 1,
+        "kind": "behavior",
+        "statement": "In appendEntries, when a received entry conflicts with one the node already stores, the node deletes the range [entry.Index, lastLogIdx] via logs.DeleteRange, then stores the replacement entries via logs.StoreLogs. If StoreLogs returns an error the handler logs 'failed to append to logs' and returns before any setLastLog call: the in-memory lastLogIndex/lastLogTerm keep the values they had before the deletion (the code marks this with a TODO), and no other branch in the receive path restores them. The response for that request is left with Success false.",
+        "conditions": "Follower/Candidate state; a.Term not older than the node's current term; at least one received entry whose index is at or below the node's last log index and whose term differs from the stored entry; and an error return from logs.StoreLogs for that call.",
+        "source_ids": [
+          "appendentries-conflict-truncate-block",
+          "appendentries-store-failure-todo",
+          "appendentries-older-term-guard"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "history": [],
+        "operation_id": "0bfc2ea5a9e94316982943d306eefbf6"
+      },
+      {
+        "id": "0bfc2ea5a9e94316982943d306eefbf6-knowledge-1",
+        "revision": 1,
+        "kind": "behavior",
+        "statement": "The in-memory last-log certificate is read through raftState.getLastEntry (and getLastIndex, which takes the maximum of lastLogIndex and lastSnapshotIndex, so a snapshot does not mask a stale log index). Its consumers are: electSelf and preElectSelf, which put it in RequestVoteRequest/RequestPreVoteRequest as LastLogIndex/LastLogTerm; requestVote/requestPreVote, which use it to decide whether to grant a vote; appendEntries, which compares it against PrevLogEntry to validate a leader's previous entry; and Raft.LastIndex, the public accessor. None of these consult the LogStore.",
+        "conditions": "Any node, whenever it campaigns or answers a vote request or validates an AppendEntries previous entry.",
+        "source_ids": [
+          "state-getlastentry",
+          "electself-last-entry-claim",
+          "preelectself-last-entry-claim",
+          "requestvote-up-to-date-check",
+          "appendentries-prevlog-check",
+          "lastindex-public-api"
+        ],
+        "executions": {},
+        "knowledge": [],
+        "history": [],
+        "operation_id": "0bfc2ea5a9e94316982943d306eefbf6"
+      }
+    ],
+    "materials": [
+      {
+        "id": "api-transfer-to-server",
+        "file": "api.go",
+        "start_line": 1268,
+        "end_line": 1282,
+        "kind": "code_observation",
+        "text": "\n// LeadershipTransferToServer does the same as LeadershipTransfer but takes a\n// server in the arguments in case a leadership should be transitioned to a\n// specific server in the cluster.  Note that raft protocol version 3 is not\n// sufficient to use LeadershipTransfer. A recent version of that library has\n// to be used that includes this feature. Using transfer leadership is safe\n// however in a cluster where not every node has the latest version. If a\n// follower cannot be promoted, it will fail gracefully.\nfunc (r *Raft) LeadershipTransferToServer(id ServerID, address ServerAddress) Future {\n\tif r.protocolVersion < 3 {\n\t\treturn errorFuture{ErrUnsupportedProtocol}\n\t}\n\n\treturn r.initiateLeadershipTransfer(&id, &address)\n}",
+        "content_digest": "499a72c01096912e85d16381f4640ac6d29f8c2b91cabbdae8530bdcbeb89a4a"
+      },
+      {
+        "id": "initiate-transfer-check",
+        "file": "raft.go",
+        "start_line": 2187,
+        "end_line": 2199,
+        "kind": "code_observation",
+        "text": "func (r *Raft) initiateLeadershipTransfer(id *ServerID, address *ServerAddress) LeadershipTransferFuture {\n\tfuture := &leadershipTransferFuture{ID: id, Address: address}\n\tfuture.init()\n\n\tif id != nil && *id == r.localID {\n\t\terr := fmt.Errorf(\"cannot transfer leadership to itself\")\n\t\tr.logger.Info(err.Error())\n\t\tfuture.respond(err)\n\t\treturn future\n\t}\n\n\tselect {\n\tcase r.leadershipTransferCh <- future:",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "leaderloop-transfer-target",
+        "file": "raft.go",
+        "start_line": 762,
+        "end_line": 784,
+        "kind": "code_observation",
+        "text": "\t\t\t// starting leadership transfer asynchronously because\n\t\t\t// leaderState is only supposed to be accessed in the\n\t\t\t// leaderloop.\n\t\t\tid := future.ID\n\t\t\taddress := future.Address\n\t\t\tif id == nil {\n\t\t\t\ts := r.pickServer()\n\t\t\t\tif s != nil {\n\t\t\t\t\tid = &s.ID\n\t\t\t\t\taddress = &s.Address\n\t\t\t\t} else {\n\t\t\t\t\tdoneCh <- fmt.Errorf(\"cannot find peer\")\n\t\t\t\t\tcontinue\n\t\t\t\t}\n\t\t\t}\n\t\t\tstate, ok := r.leaderState.replState[*id]\n\t\t\tif !ok {\n\t\t\t\tdoneCh <- fmt.Errorf(\"cannot find replication state for %v\", id)\n\t\t\t\tcontinue\n\t\t\t}\n\t\t\tr.setLeadershipTransferInProgress(true)\n\t\t\tgo r.leadershipTransfer(*id, *address, state, stopCh, doneCh)\n",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "startstop-replication-all-servers",
+        "file": "raft.go",
+        "start_line": 584,
+        "end_line": 592,
+        "kind": "code_observation",
+        "text": "\tlastIdx := r.getLastIndex()\n\n\t// Start replication goroutines that need starting\n\tfor _, server := range r.configurations.latest.Servers {\n\t\tif server.ID == r.localID {\n\t\t\tcontinue\n\t\t}\n\n\t\tinConfig[server.ID] = true",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "timeoutnow-handler",
+        "file": "raft.go",
+        "start_line": 2208,
+        "end_line": 2215,
+        "kind": "code_observation",
+        "text": "// timeoutNow is what happens when a server receives a TimeoutNowRequest.\nfunc (r *Raft) timeoutNow(rpc RPC, req *TimeoutNowRequest) {\n\tr.setLeader(\"\", \"\")\n\tr.setState(Candidate)\n\tr.candidateFromLeadershipTransfer.Store(true)\n\trpc.Respond(&TimeoutNowResponse{}, nil)\n}\n",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "requestvote-highterm-stepdown-nonvoter-reject",
+        "file": "raft.go",
+        "start_line": 1663,
+        "end_line": 1684,
+        "kind": "code_observation",
+        "text": "\t// Increase the term if we see a newer one\n\tif req.Term > r.getCurrentTerm() {\n\t\t// Ensure transition to follower\n\t\tr.logger.Debug(\"lost leadership because received a requestVote with a newer term\")\n\t\tr.setState(Follower)\n\t\tr.setCurrentTerm(req.Term)\n\n\t\tresp.Term = req.Term\n\t}\n\n\t// if we get a request for vote from a nonVoter  and the request term is higher,\n\t// step down and update term, but reject the vote request\n\t// This could happen when a node, previously voter, is converted to non-voter\n\t// The reason we need to step in is to permit to the cluster to make progress in such a scenario\n\t// More details about that in https://github.com/hashicorp/raft/pull/526\n\tif len(req.ID) > 0 {\n\t\tcandidateID := ServerID(req.ID)\n\t\tif len(r.configurations.latest.Servers) > 0 && !hasVote(r.configurations.latest, candidateID) {\n\t\t\tr.logger.Warn(\"rejecting vote request since node is not a voter\", \"from\", candidate)\n\t\t\treturn\n\t\t}\n\t}",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "electself-voters-only",
+        "file": "raft.go",
+        "start_line": 2013,
+        "end_line": 2020,
+        "kind": "code_observation",
+        "text": "\n\t// For each peer, request a vote\n\tfor _, server := range r.configurations.latest.Servers {\n\t\tif server.Suffrage == Voter {\n\t\t\tif server.ID == r.localID {\n\t\t\t\tr.logger.Debug(\"voting for self\", \"term\", req.Term, \"id\", r.localID)\n\n\t\t\t\t// Persist a vote for ourselves",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "pickserver-voters-only",
+        "file": "raft.go",
+        "start_line": 2163,
+        "end_line": 2176,
+        "kind": "code_observation",
+        "text": "func (r *Raft) pickServer() *Server {\n\tvar pick *Server\n\tvar current uint64\n\tfor _, server := range r.configurations.latest.Servers {\n\t\tif server.ID == r.localID || server.Suffrage != Voter {\n\t\t\tcontinue\n\t\t}\n\t\tstate, ok := r.leaderState.replState[server.ID]\n\t\tif !ok {\n\t\t\tcontinue\n\t\t}\n\t\tnextIdx := atomic.LoadUint64(&state.nextIndex)\n\t\tif nextIdx > current {\n\t\t\tcurrent = nextIdx",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "config-commands-doc",
+        "file": "configuration.go",
+        "start_line": 92,
+        "end_line": 108,
+        "kind": "code_observation",
+        "text": "const (\n\t// AddVoter adds a server with Suffrage of Voter.\n\tAddVoter ConfigurationChangeCommand = iota\n\t// AddNonvoter makes a server Nonvoter unless its Staging or Voter.\n\tAddNonvoter\n\t// DemoteVoter makes a server Nonvoter unless its absent.\n\tDemoteVoter\n\t// RemoveServer removes a server entirely from the cluster membership.\n\tRemoveServer\n\t// Promote changes a server from Staging to Voter. The command will be a\n\t// no-op if the server is not Staging.\n\t// Deprecated: use AddVoter instead.\n\tPromote\n\t// AddStaging makes a server a Voter.\n\t// Deprecated: AddStaging was actually AddVoter. Use AddVoter instead.\n\tAddStaging = 0 // explicit 0 to preserve the old value.\n)",
+        "content_digest": "7e3e1e0a708f3f3b17691549962c94d78955a840922fc0f42867c515cd27ec66"
+      },
+      {
+        "id": "appendentries-conflict-truncate-block",
+        "file": "raft.go",
+        "start_line": 1505,
+        "end_line": 1545,
+        "kind": "code_observation",
+        "text": "\tif len(a.Entries) > 0 {\n\t\tstart := time.Now()\n\n\t\t// Delete any conflicting entries, skip any duplicates\n\t\tlastLogIdx, _ := r.getLastLog()\n\t\tvar newEntries []*Log\n\t\tfor i, entry := range a.Entries {\n\t\t\tif entry.Index > lastLogIdx {\n\t\t\t\tnewEntries = a.Entries[i:]\n\t\t\t\tbreak\n\t\t\t}\n\t\t\tvar storeEntry Log\n\t\t\tif err := r.logs.GetLog(entry.Index, &storeEntry); err != nil {\n\t\t\t\tr.logger.Warn(\"failed to get log entry\",\n\t\t\t\t\t\"index\", entry.Index,\n\t\t\t\t\t\"error\", err)\n\t\t\t\treturn\n\t\t\t}\n\t\t\tif entry.Term != storeEntry.Term {\n\t\t\t\tr.logger.Warn(\"clearing log suffix\", \"from\", entry.Index, \"to\", lastLogIdx)\n\t\t\t\tif err := r.logs.DeleteRange(entry.Index, lastLogIdx); err != nil {\n\t\t\t\t\tr.logger.Error(\"failed to clear log suffix\", \"error\", err)\n\t\t\t\t\treturn\n\t\t\t\t}\n\t\t\t\tif entry.Index <= r.configurations.latestIndex {\n\t\t\t\t\tr.setLatestConfiguration(r.configurations.committed, r.configurations.committedIndex)\n\t\t\t\t}\n\t\t\t\tnewEntries = a.Entries[i:]\n\t\t\t\tbreak\n\t\t\t}\n\t\t}\n\n\t\tif n := len(newEntries); n > 0 {\n\t\t\t// Append the new entries\n\t\t\tif err := r.logs.StoreLogs(newEntries); err != nil {\n\t\t\t\tr.logger.Error(\"failed to append to logs\", \"error\", err)\n\t\t\t\t// TODO: leaving r.getLastLog() in the wrong\n\t\t\t\t// state if there was a truncation above\n\t\t\t\treturn\n\t\t\t}\n",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "appendentries-store-failure-todo",
+        "file": "raft.go",
+        "start_line": 1536,
+        "end_line": 1544,
+        "kind": "code_observation",
+        "text": "\n\t\tif n := len(newEntries); n > 0 {\n\t\t\t// Append the new entries\n\t\t\tif err := r.logs.StoreLogs(newEntries); err != nil {\n\t\t\t\tr.logger.Error(\"failed to append to logs\", \"error\", err)\n\t\t\t\t// TODO: leaving r.getLastLog() in the wrong\n\t\t\t\t// state if there was a truncation above\n\t\t\t\treturn\n\t\t\t}",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "appendentries-older-term-guard",
+        "file": "raft.go",
+        "start_line": 1454,
+        "end_line": 1462,
+        "kind": "code_observation",
+        "text": "\n\t// Ignore an older term\n\tif a.Term < r.getCurrentTerm() {\n\t\treturn\n\t}\n\n\t// Increase the term if we see a newer one, also transition to follower\n\t// if we ever get an appendEntries call\n\tif a.Term > r.getCurrentTerm() || (r.getState() != Follower && !r.candidateFromLeadershipTransfer.Load()) {",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "state-getlastentry",
+        "file": "state.go",
+        "start_line": 156,
+        "end_line": 174,
+        "kind": "code_observation",
+        "text": "\n// getLastIndex returns the last index in stable storage.\n// Either from the last log or from the last snapshot.\nfunc (r *raftState) getLastIndex() uint64 {\n\tr.lastLock.Lock()\n\tdefer r.lastLock.Unlock()\n\treturn max(r.lastLogIndex, r.lastSnapshotIndex)\n}\n\n// getLastEntry returns the last index and term in stable storage.\n// Either from the last log or from the last snapshot.\nfunc (r *raftState) getLastEntry() (uint64, uint64) {\n\tr.lastLock.Lock()\n\tdefer r.lastLock.Unlock()\n\tif r.lastLogIndex >= r.lastSnapshotIndex {\n\t\treturn r.lastLogIndex, r.lastLogTerm\n\t}\n\treturn r.lastSnapshotIndex, r.lastSnapshotTerm\n}",
+        "content_digest": "9e73b5bcd67350db80c272c0d0f3f6c17afb24fb6e62b28e891c13e96107e189"
+      },
+      {
+        "id": "electself-last-entry-claim",
+        "file": "raft.go",
+        "start_line": 1982,
+        "end_line": 1992,
+        "kind": "code_observation",
+        "text": "\n\tr.setCurrentTerm(newTerm)\n\t// Construct the request\n\tlastIdx, lastTerm := r.getLastEntry()\n\treq := &RequestVoteRequest{\n\t\tRPCHeader: r.getRPCHeader(),\n\t\tTerm:      newTerm,\n\t\t// this is needed for retro compatibility, before RPCHeader.Addr was added\n\t\tCandidate:          r.trans.EncodePeer(r.localID, r.localAddr),\n\t\tLastLogIndex:       lastIdx,\n\t\tLastLogTerm:        lastTerm,",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "preelectself-last-entry-claim",
+        "file": "raft.go",
+        "start_line": 2063,
+        "end_line": 2072,
+        "kind": "code_observation",
+        "text": "\tnewTerm := r.getCurrentTerm() + 1\n\n\t// Construct the request\n\tlastIdx, lastTerm := r.getLastEntry()\n\treq := &RequestPreVoteRequest{\n\t\tRPCHeader:    r.getRPCHeader(),\n\t\tTerm:         newTerm,\n\t\tLastLogIndex: lastIdx,\n\t\tLastLogTerm:  lastTerm,\n\t}",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "requestvote-up-to-date-check",
+        "file": "raft.go",
+        "start_line": 1706,
+        "end_line": 1722,
+        "kind": "code_observation",
+        "text": "\n\t// Reject if their term is older\n\tlastIdx, lastTerm := r.getLastEntry()\n\tif lastTerm > req.LastLogTerm {\n\t\tr.logger.Warn(\"rejecting vote request since our last term is greater\",\n\t\t\t\"candidate\", candidate,\n\t\t\t\"last-term\", lastTerm,\n\t\t\t\"last-candidate-term\", req.LastLogTerm)\n\t\treturn\n\t}\n\n\tif lastTerm == req.LastLogTerm && lastIdx > req.LastLogIndex {\n\t\tr.logger.Warn(\"rejecting vote request since our last index is greater\",\n\t\t\t\"candidate\", candidate,\n\t\t\t\"last-index\", lastIdx,\n\t\t\t\"last-candidate-index\", req.LastLogIndex)\n\t\treturn",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "appendentries-prevlog-check",
+        "file": "raft.go",
+        "start_line": 1475,
+        "end_line": 1503,
+        "kind": "code_observation",
+        "text": "\t// Verify the last log entry\n\tif a.PrevLogEntry > 0 {\n\t\tlastIdx, lastTerm := r.getLastEntry()\n\n\t\tvar prevLogTerm uint64\n\t\tif a.PrevLogEntry == lastIdx {\n\t\t\tprevLogTerm = lastTerm\n\t\t} else {\n\t\t\tvar prevLog Log\n\t\t\tif err := r.logs.GetLog(a.PrevLogEntry, &prevLog); err != nil {\n\t\t\t\tr.logger.Warn(\"failed to get previous log\",\n\t\t\t\t\t\"previous-index\", a.PrevLogEntry,\n\t\t\t\t\t\"last-index\", lastIdx,\n\t\t\t\t\t\"error\", err)\n\t\t\t\tresp.NoRetryBackoff = true\n\t\t\t\treturn\n\t\t\t}\n\t\t\tprevLogTerm = prevLog.Term\n\t\t}\n\n\t\tif a.PrevLogTerm != prevLogTerm {\n\t\t\tr.logger.Warn(\"previous log term mis-match\",\n\t\t\t\t\"ours\", prevLogTerm,\n\t\t\t\t\"remote\", a.PrevLogTerm)\n\t\t\tresp.NoRetryBackoff = true\n\t\t\treturn\n\t\t}\n\t}\n",
+        "content_digest": "54d43df5197fd71cd0f6ae4eee1ba28efb139a5223eb14b756c606bdb0b8a800"
+      },
+      {
+        "id": "lastindex-public-api",
+        "file": "api.go",
+        "start_line": 1223,
+        "end_line": 1229,
+        "kind": "code_observation",
+        "text": "}\n\n// LastIndex returns the last index in stable storage,\n// either from the last log or from the last snapshot.\nfunc (r *Raft) LastIndex() uint64 {\n\treturn r.getLastIndex()\n}",
+        "content_digest": "499a72c01096912e85d16381f4640ac6d29f8c2b91cabbdae8530bdcbeb89a4a"
+      }
+    ],
+    "current_submission": {
+      "phase": "accepted",
+      "operation_id": "0bfc2ea5a9e94316982943d306eefbf6",
+      "action": "update",
+      "no_change": false,
+      "references": {
+        "@truncate-then-fail-skips-certificate-update": "0bfc2ea5a9e94316982943d306eefbf6-knowledge-0",
+        "@last-log-certificate-consumers": "0bfc2ea5a9e94316982943d306eefbf6-knowledge-1",
+        "@stale-log-certificate": "0bfc2ea5a9e94316982943d306eefbf6-question-0"
+      }
+    },
+    "applied_operations": {
+      "submission-2545a0aaffb2449e84b18c874a390441": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_10-13-13-hashicorp_raft-real-run/semantic-commits/submission-2545a0aaffb2449e84b18c874a390441.json"
+      },
+      "submission-79cfeddb38e843459cbf50995bf100a1": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_10-13-13-hashicorp_raft-real-run/semantic-commits/submission-79cfeddb38e843459cbf50995bf100a1.json"
+      },
+      "submission-0bfc2ea5a9e94316982943d306eefbf6": {
+        "path": "/home/nitro/Desktop/consensus-assurance/runs/2026-10-13_10-13-13-hashicorp_raft-real-run/semantic-commits/submission-0bfc2ea5a9e94316982943d306eefbf6.json"
+      }
+    }
+  }
+}

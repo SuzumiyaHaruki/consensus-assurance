@@ -1,0 +1,146 @@
+{
+  "rationale": "Two things come out of this turn. First, the repeat of the fixed extended-window experiment (CheckRun f8a32ad3a4de41538ef20a142ae947bc, exit 0) reproduced the whole pattern independently: nil at 0ms after the partition, nil again at 4928ms while a competing node was already Leader and the answering leader was still Leader under a 20s lease, that competitor committing the write at index 5 with the payload absent from the old leader's FSM (old leader still Leader at applied index 3), and the control returning 'leadership lost while committing log' at 20007ms. Second, that same repeat again reported near_node_self_voter true at its setup event, i.e. the demoted node's own configuration view was still old, which is now two of two runs of that harness on the controller's executor. The discriminating experiment that samples every node every 20ms (three runs, same executor) saw no lag at all, and a native local run of the retained extended-window harness with added per-node sampling also saw the near node already converged at the first sample. The remaining structural difference between the harnesses is that the extended one issues the demotion as soon as the leader is elected, before the followers have appended the bootstrap configuration and the no-op, while the discriminating one waits until every follower has LastIndex >= 2 before demoting. That is exactly the difference the successor experiment below adds as a case, with the per-node sampling needed to tell a delivery stall (view old and LastIndex short of the configuration index) from a processing gap (view old although the log already holds that index).",
+  "interpretations": [
+    {
+      "investigation_id": "101498ecfbb945e0b48676dd9e9f4172-question-0",
+      "experiment_id": "f86170361cdb4c0fb5317d016675dd6b-experiment",
+      "source_ids": ["s_verify_leader", "s_verify_branch", "s_quorum_size", "s_repl_state", "s_notify_all", "s_heartbeat_notify", "s_update_last_appended", "s_verify_vote", "s_suffrage_doc", "s_verify_doc", "s_check_lease", "s_commitment_voters"],
+      "executions": {
+        "f8a32ad3a4de41538ef20a142ae947bc": [2, 3, 4, 7],
+        "2444815cf0d84e06917efa1091d12257": [2, 3, 4, 7]
+      },
+      "joint_history": "Both receipts belong to the same fixed experiment f86170361cdb4c0fb5317d016675dd6b-experiment and execute its retained harness from fixed inputs in a clean copy; the second is the requested repeat, so indices 2, 3, 4 and 7 carry the same measurements in both (nil after the partition, nil while superseded, the competitor's write absent from the old leader's FSM, and the control losing leadership at the lease).",
+      "conclusion": "holds",
+      "defect_claim": "asserted",
+      "rationale": "All four declared comparisons hold in both executions of the extended window: success with only the demoted non-voter reachable (index 2), success again while a competing leader exists and the answering leader is still Leader with a 20s lease (index 3), the competing leader's write committed at index 5 and absent from the old leader's FSM whose applied index is 3 (index 4), and the control with the near node still a voter returning 'leadership lost while committing log' at the lease (index 7). The earlier verdicts and the two pre-window receipts stand as recorded: the confirmation is computed against a voter-only quorum (raft.go:1086-1093) but credited by an unfiltered vote path (raft.go:965-987, replication.go:100-111, future.go:274-293) even though the target defines non-voters as not considered for elections or commitment (configuration.go:16-18), so a client can be told a leader that has lost every other voter is still leader for the whole configured lease, while a different node already leads and has committed writes that leader never received. The repeat adds an independent sample of exactly that sequence and leaves the account unchanged; the open gap about the window's extent was already answered affirmatively by the first execution and this second execution bounds it the same way (4928ms of a 20s lease, with the competitor elected in the meantime).",
+      "counterevidence": [
+        "The setup event of both extended-window executions reports near_node_self_voter true, i.e. the demoted node's own configuration view still showed the old suffrage at that moment; the recorded quorum is nevertheless the leader's view (voters 3, nonvoters 1, quorum_size 2), corroborated by both far nodes and by the earlier cluster-helper experiment, so the treatment remains a 2-of-3 quorum and the result does not rest on that field.",
+        "No competing leader existed at the instant of the immediate confirmation (index 2), so the immediate harm shown is a broken confirmation guarantee; the stale read is demonstrated by index 4 under the second confirmation.",
+        "Neither execution sampled the old leader's FSM after the partition healed, since the partition is never healed, so nothing is claimed about eventual convergence of that leader."
+      ],
+      "limitations": [
+        "Two executions of the extended window plus its control in each, and one to three attempts per receipt for the pre-window scenario; the superseded-leader coincidence was observed twice.",
+        "The 20s leader lease is a legal configuration (LeaderLeaseTimeout <= HeartbeatTimeout) chosen to make the window observable; the claim is about the mechanism and the bound, not the value, and shorter leases shorten the same window.",
+        "In-memory transports in one process; partitions are imposed by removing transport routes, not by a real network failure.",
+        "The exposed-window duration is measured by the harness's own polling and apply calls, not by a client read path.",
+        "Only the DemoteVoter transition was exercised; AddNonvoter and the deprecated Staging suffrage take the same Suffrage != Voter path but were not run."
+      ]
+    }
+  ],
+  "experiment": {
+    "investigation_id": "6464ac4e45e546e99aff4d88c0a145c8-question-0",
+    "harness_path": "assurance_generated_test.go",
+    "source_ids": ["s_append_entries", "s_latest_config", "s_get_configuration", "s_repl_state"],
+    "previous_id": "dab6e999e7564b219f604cde213405f7-experiment",
+    "revision_reason": "Added the construction that differs between the harness that showed a stale self view and the harness that did not: the demotion is issued immediately after the leader is elected, before the followers have appended the bootstrap configuration and the no-op, with the same per-node view and index sampling.",
+    "semantic_changes": [
+      "Third case run_3_immediate: identical cluster, per-node timing and sampling, but the DemoteVoter call is issued as soon as the bootstrapped node reports Leader, without waiting for the followers to reach LastIndex >= 2.",
+      "The baseline event now carries waited_baseline so the two constructions are distinguishable in the record.",
+      "The run_3_immediate prerequisite does not require the followers to be caught up at baseline (they may still have empty configurations), so its conditions are the case alone."
+    ],
+    "scope": {
+      "description": "Compare a demotion issued after the followers are caught up with one issued immediately after the leader is elected, sampling every node's own configuration view and log index continuously through the transition.",
+      "assumptions": [
+        "Real target constructors and APIs only: BootstrapCluster, NewRaft, DemoteVoter, GetConfiguration, LastIndex; per-node Config values (leader 20s, near 6s, far voters 3s).",
+        "Only the leader is bootstrapped, so it is the deterministic first leader and the others adopt the configuration through replication; in the immediate case the followers are still behind when the transition is dispatched.",
+        "Sampling every 20ms for ten seconds after the leader commits the transition; a node counts as converged at the first sample where its own view shows the demoted peer without a vote.",
+        "Transports stay fully connected and healthy, so any lag is not caused by a partition.",
+        "The configuration index used for the consistency check is the leader's LastIndex after the change returns."
+      ],
+      "excluded": [
+        "No partition, snapshots, restarts or client traffic besides the configuration change.",
+        "No production code, default or store behaviour is modified."
+      ],
+      "parameters": {
+        "nodes": 4,
+        "runs": 3,
+        "immediate_runs": 1,
+        "sample_interval_ms": 20,
+        "observation_window_ms": 10000,
+        "leader_hb_ms": 20000,
+        "near_hb_ms": 6000,
+        "far_hb_ms": 3000
+      }
+    },
+    "prefix": "Four nodes are created (identity = in-memory transport address), wired fully connected and started; only the first is bootstrapped with the four-voter configuration so that it is the deterministic first leader. Runs 1 and 2 wait until every follower reports itself with a vote and has LastIndex >= 2 before the transition; run_3_immediate issues the transition as soon as the bootstrapped node reports Leader, so the followers may still have empty configurations. One node_baseline CA_EVENT is emitted per node (case, role, the node's own view of the near node, LastIndex, waited_baseline), then DemoteVoter(near, prevIndex 0, 10s) is called and its future waited on, the leader's LastIndex is recorded as the configuration index, and every node is polled every 20ms for ten seconds for its own GetConfiguration view of the near node's suffrage and its LastIndex. Per node the harness emits demotion_view with converged, converged_ms, stale_observed, stale_max_last_index, config_index, index_passed_while_stale, last_index_end and state_end.",
+    "responsibility": "Configuration propagation from the leader's committed membership change to each peer's own view of its suffrage, and the leader's replication path that must deliver that entry to every peer in the configuration.",
+    "prerequisites": [
+      {
+        "alias": "run_1",
+        "event": "node_baseline",
+        "conditions": [
+          {"field": "case", "op": "eq", "value": "run_1"},
+          {"field": "near_voter", "op": "eq", "value": true},
+          {"field": "last_index", "op": "eq", "value": 2}
+        ]
+      },
+      {
+        "alias": "run_2",
+        "event": "node_baseline",
+        "conditions": [
+          {"field": "case", "op": "eq", "value": "run_2"},
+          {"field": "near_voter", "op": "eq", "value": true},
+          {"field": "last_index", "op": "eq", "value": 2}
+        ]
+      },
+      {
+        "alias": "run_3_immediate",
+        "event": "node_baseline",
+        "conditions": [
+          {"field": "case", "op": "eq", "value": "run_3_immediate"},
+          {"field": "waited_baseline", "op": "eq", "value": false}
+        ]
+      }
+    ],
+    "comparisons": [
+      {
+        "event": "demotion_view",
+        "identity_fields": ["case", "role"],
+        "admission_alias": "run_1",
+        "applicability_conditions": [{"field": "case", "op": "eq", "value": "run_1"}],
+        "assertion": {"field": "converged", "op": "eq", "value": true},
+        "description": "Caught-up construction: every node reflects the change within the observation window."
+      },
+      {
+        "event": "demotion_view",
+        "identity_fields": ["case", "role"],
+        "admission_alias": "run_1",
+        "applicability_conditions": [{"field": "case", "op": "eq", "value": "run_1"}],
+        "assertion": {"field": "index_passed_while_stale", "op": "eq", "value": false},
+        "description": "Caught-up construction: no node's view may be old once its log holds the entry."
+      },
+      {
+        "event": "demotion_view",
+        "identity_fields": ["case", "role"],
+        "admission_alias": "run_2",
+        "applicability_conditions": [{"field": "case", "op": "eq", "value": "run_2"}],
+        "assertion": {"field": "converged", "op": "eq", "value": true},
+        "description": "Second caught-up run, same predicate."
+      },
+      {
+        "event": "demotion_view",
+        "identity_fields": ["case", "role"],
+        "admission_alias": "run_2",
+        "applicability_conditions": [{"field": "case", "op": "eq", "value": "run_2"}],
+        "assertion": {"field": "index_passed_while_stale", "op": "eq", "value": false},
+        "description": "Second caught-up run, consistency predicate."
+      },
+      {
+        "event": "demotion_view",
+        "identity_fields": ["case", "role"],
+        "admission_alias": "run_3_immediate",
+        "applicability_conditions": [{"field": "case", "op": "eq", "value": "run_3_immediate"}],
+        "assertion": {"field": "converged", "op": "eq", "value": true},
+        "description": "Immediate construction (the one that showed a stale self view in two executions of the extended harness): does every node, including the demoted one, reflect the committed change within ten seconds on a healthy transport, or does one peer stay behind?"
+      },
+      {
+        "event": "demotion_view",
+        "identity_fields": ["case", "role"],
+        "admission_alias": "run_3_immediate",
+        "applicability_conditions": [{"field": "case", "op": "eq", "value": "run_3_immediate"}],
+        "assertion": {"field": "index_passed_while_stale", "op": "eq", "value": false},
+        "description": "Immediate construction consistency: a node whose LastIndex has already reached the configuration entry must not still report the old suffrage, which would separate entry-processing from delivery."
+      }
+    ]
+  }
+}

@@ -36,6 +36,7 @@ def test_cli_fixed_execution_and_fresh_run_are_independent(tmp_path, capsys):
         assert (root / 'knowledge.json').is_file()
         schema = json.loads((root / 'submission.schema.json').read_text())
         assert not {'Unit', 'Claim', 'Binding', 'GraphPatch', 'Evidence', 'Finding'} & schema['$defs'].keys()
+        assert not {'report_title', 'report_answer'} & schema['$defs']['InterpretationUpdate']['properties'].keys()
     assert {p.name: p.read_bytes() for p in repo.iterdir()} == original
     capsys.readouterr()
 
@@ -44,7 +45,8 @@ def test_historical_method_rejected_before_writes_but_saved_report_readable(tmp_
     import consensus_assurance.cli as cli
     root = tmp_path / 'archive'
     root.mkdir()
-    (root / 'state.json').write_text(json.dumps({'framework_revision': 'audit-products-v64', 'retired': 'layout'}))
+    (root / 'state.json').write_text(json.dumps({'framework_revision': 'audit-products-v69',
+        'interpretations': [{'report_title': '原有标题', 'report_answer': '旧中文摘要'}]}))
     (root / 'report.md').write_text('Original saved report\n')
     before = {p.name: p.read_bytes() for p in root.iterdir()}
 

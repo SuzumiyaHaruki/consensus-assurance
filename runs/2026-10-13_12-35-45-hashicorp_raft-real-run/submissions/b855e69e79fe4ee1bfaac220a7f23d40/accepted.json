@@ -1,0 +1,274 @@
+{
+  "rationale": "Receipt df528a8a25a04cbd9fb1cc12319f3467 carried the decisive observations, but its three declared comparisons were reported incomplete: each comparison's admission alias reached only the setup events of its own case, so the other cases' verify_result events (indices 11 and 14) were counted as missing instead of as outside applicability, leaving every comparison at outcome unknown. The observation itself was unambiguous (indices 2, 5, 8: returned \"nil\" with leader_state Leader, voters 3, quorum_size 2; indices 11 and 14: \"leadership lost while committing log\"). This successor changes only the comparison applicability declarations, so that each comparison is evaluated over the case it belongs to; harness, prefix, scope, requirement and sources are unchanged, and the fresh execution is required by the applicability change rather than to seek a different outcome.",
+  "sources": [],
+  "investigations": [],
+  "knowledge": [],
+  "gaps": [],
+  "interpretations": [],
+  "experiment": {
+    "investigation_id": "101498ecfbb945e0b48676dd9e9f4172-question-0",
+    "harness_path": "assurance_generated_test.go",
+    "files": {},
+    "execution_package": null,
+    "source_ids": [
+      "s_verify_leader",
+      "s_verify_branch",
+      "s_quorum_size",
+      "s_repl_state",
+      "s_notify_all",
+      "s_heartbeat_notify",
+      "s_update_last_appended",
+      "s_verify_vote",
+      "s_suffrage_doc",
+      "s_verify_doc",
+      "s_check_lease"
+    ],
+    "anchors": [
+      {
+        "material_id": "s_verify_doc",
+        "symbol": "VerifyLeader",
+        "start_line": 883,
+        "end_line": 893,
+        "anchor": {
+          "source_ids": [
+            "s_verify_doc"
+          ],
+          "boundary_complete": true,
+          "kind": "declaration",
+          "material_id": "s_verify_doc",
+          "start_line": 883,
+          "end_line": 883,
+          "symbol": "VerifyLeader"
+        }
+      },
+      {
+        "material_id": "s_suffrage_doc",
+        "symbol": "Nonvoter",
+        "start_line": 18,
+        "end_line": 24,
+        "anchor": {
+          "source_ids": [
+            "s_suffrage_doc"
+          ],
+          "boundary_complete": true,
+          "kind": "declaration",
+          "material_id": "s_suffrage_doc",
+          "start_line": 18,
+          "end_line": 18,
+          "symbol": "Nonvoter"
+        }
+      },
+      {
+        "material_id": "s_quorum_size",
+        "symbol": "quorumSize",
+        "start_line": 1086,
+        "end_line": 1093,
+        "anchor": {
+          "source_ids": [
+            "s_quorum_size"
+          ],
+          "boundary_complete": false,
+          "kind": "declaration",
+          "material_id": "s_quorum_size",
+          "start_line": 1086,
+          "end_line": 1086,
+          "symbol": "quorumSize"
+        }
+      }
+    ],
+    "scope": {
+      "description": "Real 4-node in-memory cluster: elect a leader, optionally move one follower from voter to non-voter via the public DemoteVoter API, partition the cluster so the leader keeps only that node reachable, then call the public VerifyLeader API and record the future result together with the leader state. Treatment keeps a demoted (non-voter) node reachable; control 1 keeps the same reachable set but that node is still a voter; control 2 keeps the demoted non-voter but cuts the leader from every other node. On a successful confirmation the harness also waits for a leader on the far side, applies a write through the new leader and samples both FSMs.",
+      "assumptions": [
+        "Real target constructors are used: BootstrapCluster + NewRaft, InmemTransport fully connected, InmemSnapshotStore, MockFSM; membership change and partition are driven only through public APIs (DemoteVoter) and the in-memory transport's documented Disconnect.",
+        "Partitions are established by removing transport routes (cluster.Disconnect / cluster.Partition helpers), i.e. the same mechanism the target's own tests use; the partition set is chosen by the harness, not by the measured result.",
+        "Timing: HeartbeatTimeout = ElectionTimeout = LeaderLeaseTimeout (3s for the treatment attempts, 2s for the controls), CommitTimeout = 50ms, ProtocolVersion 3, so ValidateConfig holds for every node.",
+        "The treatment is attempted up to three times because whether a voter-majority election lands inside the partitioned leader's remaining lease window is timing dependent; the VerifyLeader result itself is recorded for every attempt."
+      ],
+      "excluded": [
+        "Real TCP transports and cross-process partitions are not exercised; the in-memory transport is the target's own test transport.",
+        "No production code, configuration default or store behaviour is modified."
+      ],
+      "parameters": {
+        "nodes": 4,
+        "treatment_voters": 3,
+        "treatment_nonvoters": 1,
+        "treatment_quorum_size": 2,
+        "control1_voters": 4,
+        "control1_quorum_size": 3,
+        "treatment_attempts": 3
+      }
+    },
+    "prefix": "The harness builds each cluster with MakeClusterCustom (Bootstrap: true, LongstopTimeout 60s) so all four nodes are bootstrapped with the same 4-voter configuration, then waits for a stable single leader and its followers. For the treatment and control 2 it calls leader.DemoteVoter(nearNode.localID, 0, 10s) and waits until the far side reports the node without a vote, so the leader's own quorum size is 2 of voters {leader, far1, far2}. It then partitions the cluster with cluster.Partition([leader, nearNode]) (treatment, control 1) or cluster.Disconnect(leader) (control 2), records the setup and partition as CA_EVENT lines, launches leader.VerifyLeader().Error() in a goroutine and polls the far side for a Leader state while waiting for the result. The result, the leader's state, elapsed time and whether another leader existed are emitted as a verify_result CA_EVENT. If the confirmation succeeded, the harness waits up to 4s for a far-side leader, applies 'assurance-stale-write' through it, and emits stale_read_window with both FSMs' contents, the leader's state and the applied index.",
+    "semantic_changes": [
+      "Added applicability_conditions {case eq nonvoter_reachable} to comparison 0, {case eq control_same_set_voter} to comparison 1 and {case eq control_nonvoter_unreachable} to comparison 2, so each event comparison applies only to its own case.",
+      "No change to the harness file, the cluster construction, the partition, the VerifyLeader call, the emitted event fields or the recorded sources."
+    ],
+    "requirement": "A success from VerifyLeader is a confirmation that the caller may keep treating this node as leader and read its FSM (api.go:880-882 documents that purpose). Since non-voters are, by the target's own definition, 'not considered for elections or commitment purposes' (configuration.go:16-18), the confirmation must rest on acknowledgements from a quorum of voters; a non-voter's acknowledgement may not substitute for one.",
+    "responsibility": "Leader-side quorum confirmation consumed by the client through the public VerifyLeader API; the leader owns both the quorum arithmetic (quorumSize, voter-filtered) and the vote attribution (verifyFuture.vote, unfiltered) that decide the answer.",
+    "prerequisites": [
+      {
+        "alias": "treatment",
+        "event": "setup",
+        "conditions": [
+          {
+            "field": "case",
+            "op": "eq",
+            "value": "nonvoter_reachable",
+            "reference": null
+          },
+          {
+            "field": "near_node_voter",
+            "op": "eq",
+            "value": false,
+            "reference": null
+          },
+          {
+            "field": "voters",
+            "op": "eq",
+            "value": 3,
+            "reference": null
+          },
+          {
+            "field": "quorum_size",
+            "op": "eq",
+            "value": 2,
+            "reference": null
+          }
+        ]
+      },
+      {
+        "alias": "control_voter",
+        "event": "setup",
+        "conditions": [
+          {
+            "field": "case",
+            "op": "eq",
+            "value": "control_same_set_voter",
+            "reference": null
+          },
+          {
+            "field": "near_node_voter",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          },
+          {
+            "field": "voters",
+            "op": "eq",
+            "value": 4,
+            "reference": null
+          },
+          {
+            "field": "quorum_size",
+            "op": "eq",
+            "value": 3,
+            "reference": null
+          }
+        ]
+      },
+      {
+        "alias": "control_unreachable",
+        "event": "setup",
+        "conditions": [
+          {
+            "field": "case",
+            "op": "eq",
+            "value": "control_nonvoter_unreachable",
+            "reference": null
+          },
+          {
+            "field": "near_node_voter",
+            "op": "eq",
+            "value": false,
+            "reference": null
+          },
+          {
+            "field": "isolate_leader",
+            "op": "eq",
+            "value": true,
+            "reference": null
+          }
+        ]
+      }
+    ],
+    "comparisons": [
+      {
+        "event": "verify_result",
+        "identity_fields": [
+          "case",
+          "attempt"
+        ],
+        "admission_alias": "treatment",
+        "assertion": {
+          "field": "verify_returned_nil",
+          "op": "eq",
+          "value": true,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [
+          {
+            "field": "case",
+            "op": "eq",
+            "value": "nonvoter_reachable",
+            "reference": null
+          }
+        ],
+        "description": "Anomaly prediction for the treatment: the leader that can reach only the demoted non-voter answers VerifyLeader with success (nil error) while its quorum size of 2 is defined over voters {leader, far1, far2}. Satisfying this comparison supports the defect explanation; it does not by itself establish it."
+      },
+      {
+        "event": "verify_result",
+        "identity_fields": [
+          "case",
+          "attempt"
+        ],
+        "admission_alias": "control_voter",
+        "assertion": {
+          "field": "verify_returned_nil",
+          "op": "eq",
+          "value": false,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [
+          {
+            "field": "case",
+            "op": "eq",
+            "value": "control_same_set_voter",
+            "reference": null
+          }
+        ],
+        "description": "Control 1 (only the suffrage of the reachable node differs): with that node still a voter the leader must not report success, because its acknowledgement belongs to the quorum that is otherwise unreachable."
+      },
+      {
+        "event": "verify_result",
+        "identity_fields": [
+          "case",
+          "attempt"
+        ],
+        "admission_alias": "control_unreachable",
+        "assertion": {
+          "field": "verify_returned_nil",
+          "op": "eq",
+          "value": false,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [
+          {
+            "field": "case",
+            "op": "eq",
+            "value": "control_nonvoter_unreachable",
+            "reference": null
+          }
+        ],
+        "description": "Control 2 (only reachability differs): with the same non-voter suffrage but no reachable peer at all, no acknowledgement can arrive, so success must not be reported."
+      }
+    ],
+    "knowledge": [],
+    "previous_id": "101498ecfbb945e0b48676dd9e9f4172-experiment",
+    "revision_reason": "Comparisons lacked applicability conditions: the verify_result events of the two control cases were evaluated under the treatment alias and reported as missing prerequisites, so no comparison could complete. Only the applicability declarations change."
+  },
+  "repeat_experiment_id": null,
+  "stop": null
+}

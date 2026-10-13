@@ -169,6 +169,7 @@ class KnowledgeEntry(Record):
     conditions: str = Field(min_length=1)
     source_ids: list[str] = Field(min_length=1)
     executions: dict[str, list[int]] = {}
+    knowledge: list[KnowledgeUse] = []
     history: list[dict] = []
     operation_id: str
 
@@ -182,14 +183,12 @@ class Interpretation(Record):
     conclusion: Literal["explained", "conditional", "violated", "holds", "unresolved"]
     defect_claim: Literal["asserted", "refuted", "unresolved"] | None = None
     rationale: str = Field(min_length=1)
-    answers: dict[str, str] = {}
+    answers: dict[str, str | None] = {}
     knowledge: list[KnowledgeUse] = []
     counterevidence: list[str] = []
     limitations: list[str] = []
     joint_history: str = ""
     failure_attribution: dict | None = None
-    report_title: str | None = None
-    report_answer: str | None = None
     operation_id: str
 
 

@@ -1,0 +1,290 @@
+{
+  "id": "46a26ae48ccb454fb6547c632522ffeb-experiment",
+  "investigation_id": "46a26ae48ccb454fb6547c632522ffeb-question-0",
+  "version": 1,
+  "basis": {
+    "harness": {
+      "kind": "go_test",
+      "source": "// Copyright (c) HashiCorp, Inc.\n// SPDX-License-Identifier: MPL-2.0\n\npackage raft\n\nimport (\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"strconv\"\n\t\"testing\"\n\t\"time\"\n)\n\nfunc caEmit(ev map[string]interface{}) {\n\tb, err := json.Marshal(ev)\n\tif err != nil {\n\t\tpanic(err)\n\t}\n\tfmt.Println(\"CA_EVENT \" + string(b))\n}\n\nfunc caErrString(err error) string {\n\tif err == nil {\n\t\treturn \"nil\"\n\t}\n\treturn err.Error()\n}\n\ntype caNode struct {\n\tid    ServerID\n\taddr  ServerAddress\n\ttrans *InmemTransport\n\tstore *InmemStore\n\tsnap  *InmemSnapshotStore\n\tfsm   *MockFSM\n\traft  *Raft\n\trole  string\n}\n\nfunc caTerm(n *caNode) uint64 {\n\tv, err := strconv.ParseUint(n.raft.Stats()[\"term\"], 10, 64)\n\tif err != nil {\n\t\treturn 0\n\t}\n\treturn v\n}\n\nfunc caWaitState(r *Raft, want RaftState, limit time.Duration) bool {\n\tdeadline := time.Now().Add(limit)\n\tfor time.Now().Before(deadline) {\n\t\tif r.State() == want {\n\t\t\treturn true\n\t\t}\n\t\ttime.Sleep(5 * time.Millisecond)\n\t}\n\treturn false\n}\n\nfunc caViewOf(n *caNode, id ServerID) (present bool, voter bool) {\n\tf := n.raft.GetConfiguration()\n\tif err := f.Error(); err != nil {\n\t\treturn false, false\n\t}\n\tfor _, s := range f.Configuration().Servers {\n\t\tif s.ID == id {\n\t\t\treturn true, s.Suffrage == Voter\n\t\t}\n\t}\n\treturn false, false\n}\n\n// caTransferRun transfers leadership to a target that either holds a vote or\n// does not, and records what happens to the current leadership and to the\n// target.\nfunc caTransferRun(t *testing.T, caseName string, targetIsNonvoter bool) {\n\tconst (\n\t\thb    = 2 * time.Second\n\t\tlease = time.Second\n\t)\n\n\tnodes := make([]*caNode, 4)\n\tfor i := range nodes {\n\t\taddr, trans := NewInmemTransport(\"\")\n\t\tnodes[i] = &caNode{\n\t\t\tid:    ServerID(\"server-\" + string(addr)),\n\t\t\taddr:  addr,\n\t\t\ttrans: trans,\n\t\t\tstore: NewInmemStore(),\n\t\t\tsnap:  NewInmemSnapshotStore(),\n\t\t\tfsm:   &MockFSM{},\n\t\t}\n\t}\n\tfor i, role := range []string{\"leader\", \"near\", \"far1\", \"far2\"} {\n\t\tnodes[i].role = role\n\t}\n\tleader, near, far1, far2 := nodes[0], nodes[1], nodes[2], nodes[3]\n\n\tconfiguration := Configuration{Servers: []Server{\n\t\t{Suffrage: Voter, ID: leader.id, Address: leader.addr},\n\t\t{Suffrage: Voter, ID: near.id, Address: near.addr},\n\t\t{Suffrage: Voter, ID: far1.id, Address: far1.addr},\n\t\t{Suffrage: Voter, ID: far2.id, Address: far2.addr},\n\t}}\n\tfor i, n1 := range nodes {\n\t\tfor j, n2 := range nodes {\n\t\t\tif i != j {\n\t\t\t\tn1.trans.Connect(n2.addr, n2.trans)\n\t\t\t}\n\t\t}\n\t}\n\tdefer func() {\n\t\tfor _, n := range nodes {\n\t\t\tif n.raft != nil {\n\t\t\t\t_ = n.raft.Shutdown().Error()\n\t\t\t}\n\t\t\tn.trans.Close()\n\t\t}\n\t}()\n\n\tstart := func(n *caNode, bootstrap bool) {\n\t\tconf := DefaultConfig()\n\t\tconf.HeartbeatTimeout = hb\n\t\tconf.ElectionTimeout = hb\n\t\tconf.LeaderLeaseTimeout = lease\n\t\tconf.CommitTimeout = 200 * time.Millisecond\n\t\tconf.SnapshotInterval = 120 * time.Second\n\t\tconf.LocalID = n.id\n\t\tconf.Logger = newTestLoggerWithPrefix(t, string(n.id))\n\t\tif bootstrap {\n\t\t\tif err := BootstrapCluster(conf, n.store, n.store, n.snap, n.trans, configuration); err != nil {\n\t\t\t\tt.Fatalf(\"bootstrap: %v\", err)\n\t\t\t}\n\t\t}\n\t\tr, err := NewRaft(conf, n.fsm, n.store, n.store, n.snap, n.trans)\n\t\tif err != nil {\n\t\t\tt.Fatalf(\"newraft: %v\", err)\n\t\t}\n\t\tn.raft = r\n\t}\n\tstart(leader, true)\n\tfor _, n := range []*caNode{near, far1, far2} {\n\t\tstart(n, false)\n\t}\n\tif !caWaitState(leader.raft, Leader, 60*time.Second) {\n\t\tt.Fatalf(\"%s: bootstrapped node did not become leader\", caseName)\n\t}\n\n\t// Make the target a non-voter for the treatment, and wait for the change\n\t// to be visible to the two far nodes.\n\tif targetIsNonvoter {\n\t\tif err := leader.raft.DemoteVoter(near.id, 0, 10*time.Second).Error(); err != nil {\n\t\t\tt.Fatalf(\"%s: demote failed: %v\", caseName, err)\n\t\t}\n\t\tdeadline := time.Now().Add(10 * time.Second)\n\t\tfor time.Now().Before(deadline) {\n\t\t\t_, v1 := caViewOf(far1, near.id)\n\t\t\t_, v2 := caViewOf(far2, near.id)\n\t\t\tif !v1 && !v2 {\n\t\t\t\tbreak\n\t\t\t}\n\t\t\ttime.Sleep(20 * time.Millisecond)\n\t\t}\n\t}\n\n\ttarget := far1\n\ttargetRole := \"far1_voter\"\n\tif targetIsNonvoter {\n\t\ttarget = near\n\t\ttargetRole = \"near_nonvoter\"\n\t}\n\n\ttermsBefore := map[string]uint64{}\n\tfor _, n := range nodes {\n\t\ttermsBefore[n.role] = caTerm(n)\n\t}\n\t_, targetVoter := caViewOf(leader, target.id)\n\tcaEmit(map[string]interface{}{\n\t\t\"event\":            \"setup\",\n\t\t\"case\":             caseName,\n\t\t\"target_role\":      targetRole,\n\t\t\"target_id\":        string(target.id),\n\t\t\"target_has_vote\":  targetVoter,\n\t\t\"leader_id\":        string(leader.id),\n\t\t\"leader_is_leader\": leader.raft.State() == Leader,\n\t\t\"leader_term\":      termsBefore[\"leader\"],\n\t})\n\n\tresultCh := make(chan error, 1)\n\ttransferAt := time.Now()\n\tgo func() { resultCh <- leader.raft.LeadershipTransferToServer(target.id, target.addr).Error() }()\n\n\tvar (\n\t\ttransferErr error\n\t\tgotResult   bool\n\t)\n\tselect {\n\tcase err := <-resultCh:\n\t\ttransferErr = err\n\t\tgotResult = true\n\tcase <-time.After(15 * time.Second):\n\t}\n\tcaEmit(map[string]interface{}{\n\t\t\"event\":             \"transfer_result\",\n\t\t\"case\":              caseName,\n\t\t\"target_role\":       targetRole,\n\t\t\"returned\":          caErrString(transferErr),\n\t\t\"returned_nil\":      gotResult && transferErr == nil,\n\t\t\"result_received\":   gotResult,\n\t\t\"elapsed_ms\":        time.Since(transferAt).Milliseconds(),\n\t\t\"leader_state\":      leader.raft.State().String(),\n\t\t\"target_state\":      target.raft.State().String(),\n\t\t\"leader_is_leader\":  leader.raft.State() == Leader,\n\t\t\"target_is_leader\":  target.raft.State() == Leader,\n\t})\n\n\t// Watch the cluster for a while: does leadership survive, and does the\n\t// target ever take it?\n\tvar (\n\t\tanyLeaderAfter       bool\n\t\tleaderAfterID        string\n\t\ttargetBecameLeader   bool\n\t\toldLeaderStillLeader bool\n\t\ttermsIncreased       bool\n\t)\n\twatchUntil := time.Now().Add(8 * time.Second)\n\tfor time.Now().Before(watchUntil) {\n\t\tfor _, n := range nodes {\n\t\t\tif n.raft.State() == Leader {\n\t\t\t\tanyLeaderAfter = true\n\t\t\t\tleaderAfterID = string(n.id)\n\t\t\t\tif n.id == target.id {\n\t\t\t\t\ttargetBecameLeader = true\n\t\t\t\t}\n\t\t\t\tif n.id == leader.id {\n\t\t\t\t\toldLeaderStillLeader = true\n\t\t\t\t}\n\t\t\t}\n\t\t}\n\t\ttime.Sleep(100 * time.Millisecond)\n\t}\n\tfor _, n := range nodes {\n\t\tif caTerm(n) > termsBefore[n.role] {\n\t\t\ttermsIncreased = true\n\t\t}\n\t}\n\tcaEmit(map[string]interface{}{\n\t\t\"event\":                  \"transfer_summary\",\n\t\t\"case\":                   caseName,\n\t\t\"target_role\":            targetRole,\n\t\t\"old_leader_still_leader\": oldLeaderStillLeader,\n\t\t\"old_leader_state_end\":   leader.raft.State().String(),\n\t\t\"target_became_leader\":   targetBecameLeader,\n\t\t\"target_state_end\":       target.raft.State().String(),\n\t\t\"any_leader_after\":       anyLeaderAfter,\n\t\t\"leader_after_id\":        leaderAfterID,\n\t\t\"terms_increased\":        termsIncreased,\n\t\t\"observed_ms\":            time.Since(transferAt).Milliseconds(),\n\t})\n}\n\nfunc TestAssuranceLeadershipTransferTargetSuffrage(t *testing.T) {\n\tcaTransferRun(t, \"transfer_to_nonvoter\", true)\n\tcaTransferRun(t, \"transfer_to_voter\", false)\n}\n",
+      "files": {},
+      "execution_package": ".",
+      "description": "",
+      "semantic_changes": [],
+      "prerequisites": [
+        {
+          "alias": "nonvoter_target",
+          "event": "setup",
+          "conditions": [
+            {
+              "field": "case",
+              "op": "eq",
+              "value": "transfer_to_nonvoter",
+              "reference": null
+            },
+            {
+              "field": "target_has_vote",
+              "op": "eq",
+              "value": false,
+              "reference": null
+            },
+            {
+              "field": "leader_is_leader",
+              "op": "eq",
+              "value": true,
+              "reference": null
+            }
+          ]
+        },
+        {
+          "alias": "voter_target",
+          "event": "setup",
+          "conditions": [
+            {
+              "field": "case",
+              "op": "eq",
+              "value": "transfer_to_voter",
+              "reference": null
+            },
+            {
+              "field": "target_has_vote",
+              "op": "eq",
+              "value": true,
+              "reference": null
+            },
+            {
+              "field": "leader_is_leader",
+              "op": "eq",
+              "value": true,
+              "reference": null
+            }
+          ]
+        }
+      ]
+    },
+    "source_ids": [
+      "s_transfer_branch",
+      "s_initiate_transfer",
+      "s_timeout_now",
+      "s_pick_server",
+      "s_vote_suffrage",
+      "s_transfer_api"
+    ],
+    "anchors": [
+      {
+        "material_id": "s_transfer_api",
+        "symbol": "LeadershipTransferToServer",
+        "start_line": 1276,
+        "end_line": 1282,
+        "anchor": {
+          "source_ids": [
+            "s_transfer_api"
+          ],
+          "boundary_complete": true,
+          "kind": "declaration",
+          "material_id": "s_transfer_api",
+          "start_line": 1276,
+          "end_line": 1276,
+          "symbol": "LeadershipTransferToServer"
+        }
+      },
+      {
+        "material_id": "s_timeout_now",
+        "symbol": "timeoutNow",
+        "start_line": 2209,
+        "end_line": 2214,
+        "anchor": {
+          "source_ids": [
+            "s_timeout_now"
+          ],
+          "boundary_complete": true,
+          "kind": "declaration",
+          "material_id": "s_timeout_now",
+          "start_line": 2209,
+          "end_line": 2209,
+          "symbol": "timeoutNow"
+        }
+      },
+      {
+        "material_id": "s_pick_server",
+        "symbol": "pickServer",
+        "start_line": 2163,
+        "end_line": 2182,
+        "anchor": {
+          "source_ids": [
+            "s_pick_server"
+          ],
+          "boundary_complete": true,
+          "kind": "declaration",
+          "material_id": "s_pick_server",
+          "start_line": 2163,
+          "end_line": 2163,
+          "symbol": "pickServer"
+        }
+      }
+    ],
+    "scope": {
+      "description": "Transfer leadership to a demoted non-voter and, as a control, to a voter in the same kind of 4-node cluster, recording the future's result, the states of the old leader and the target, whether the target ever leads, and whether the terms advanced.",
+      "assumptions": [
+        "Real target constructors and APIs: BootstrapCluster, NewRaft, DemoteVoter, LeadershipTransferToServer, GetConfiguration, Stats; uniform HeartbeatTimeout 2s, LeaderLeaseTimeout 1s, CommitTimeout 200ms.",
+        "Only the leader is bootstrapped with the four-voter configuration, so it is the deterministic first leader; the demoted node becomes a non-voter through the public DemoteVoter call before the transfer.",
+        "The target for the control is a voter, so the same call shape is exercised with a suffrage the configuration honours.",
+        "The harness waits up to 15s for the transfer future and then watches the cluster for 8s, sampling states and terms every 100ms, so a recovered cluster is recorded rather than only the immediate instant.",
+        "Transports stay fully connected and healthy throughout."
+      ],
+      "excluded": [
+        "No partition, no snapshots and no client traffic besides the configuration change and the transfer call.",
+        "No production code or default is modified."
+      ],
+      "parameters": {
+        "nodes": 4,
+        "cases": 2,
+        "heartbeat_timeout_ms": 2000,
+        "leader_lease_ms": 1000,
+        "transfer_wait_ms": 15000,
+        "watch_ms": 8000
+      }
+    },
+    "prefix": "Four nodes are created (identity = in-memory transport address), wired fully connected and started; only the first is bootstrapped with the four-voter configuration so that it is the deterministic first leader. For the treatment the near node is demoted to non-voter through DemoteVoter and the harness waits until both far nodes report it without a vote. A setup CA_EVENT records the case, the target, whether the target has a vote, the leader's identity and its term. The harness then calls LeadershipTransferToServer(target) and waits up to 15s for the future, emitting transfer_result with the returned error, whether it was nil, the elapsed time and the states of the old leader and the target. It then watches the cluster for 8s, sampling every 100ms, and emits transfer_summary with whether the old leader ever remained leader, whether the target ever became leader, whether any leader existed again and which node it was, and whether any node's term advanced.",
+    "requirement": "LeadershipTransferToServer names a destination for leadership (api.go:1268-1283). A reported success should mean the requested destination took leadership, and starting a transfer must not remove the existing leader when the requested destination cannot legally lead.",
+    "responsibility": "The leader's leadership-transfer path: which destination it honours, what it reports to the caller, and what the TimeoutNow and vote-request handling on the destination side does to the current leadership.",
+    "comparisons": [
+      {
+        "event": "transfer_result",
+        "identity_fields": [
+          "case"
+        ],
+        "admission_alias": "nonvoter_target",
+        "assertion": {
+          "field": "returned_nil",
+          "op": "eq",
+          "value": true,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [
+          {
+            "field": "case",
+            "op": "eq",
+            "value": "transfer_to_nonvoter",
+            "reference": null
+          }
+        ],
+        "description": "Anomaly prediction for the non-voter target: the transfer future reports success even though the destination holds no vote."
+      },
+      {
+        "event": "transfer_summary",
+        "identity_fields": [
+          "case"
+        ],
+        "admission_alias": "nonvoter_target",
+        "assertion": {
+          "field": "target_became_leader",
+          "op": "eq",
+          "value": false,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [
+          {
+            "field": "case",
+            "op": "eq",
+            "value": "transfer_to_nonvoter",
+            "reference": null
+          }
+        ],
+        "description": "The reported success is not about the requested destination: the non-voter target never leads during the watch window."
+      },
+      {
+        "event": "transfer_summary",
+        "identity_fields": [
+          "case"
+        ],
+        "admission_alias": "nonvoter_target",
+        "assertion": {
+          "field": "old_leader_still_leader",
+          "op": "eq",
+          "value": false,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [
+          {
+            "field": "case",
+            "op": "eq",
+            "value": "transfer_to_nonvoter",
+            "reference": null
+          }
+        ],
+        "description": "The existing leadership was removed by a transfer whose destination cannot lead."
+      },
+      {
+        "event": "transfer_result",
+        "identity_fields": [
+          "case"
+        ],
+        "admission_alias": "voter_target",
+        "assertion": {
+          "field": "returned_nil",
+          "op": "eq",
+          "value": true,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [
+          {
+            "field": "case",
+            "op": "eq",
+            "value": "transfer_to_voter",
+            "reference": null
+          }
+        ],
+        "description": "Control: the same call with a voter destination succeeds."
+      },
+      {
+        "event": "transfer_summary",
+        "identity_fields": [
+          "case"
+        ],
+        "admission_alias": "voter_target",
+        "assertion": {
+          "field": "target_became_leader",
+          "op": "eq",
+          "value": true,
+          "reference": null
+        },
+        "antecedent": null,
+        "applicability_conditions": [
+          {
+            "field": "case",
+            "op": "eq",
+            "value": "transfer_to_voter",
+            "reference": null
+          }
+        ],
+        "description": "Control: with a voter destination the reported success is honoured by the destination actually leading."
+      }
+    ],
+    "knowledge": []
+  },
+  "snapshot_id": "e02d90d71b50464399dbf6ade5e2ad3d",
+  "configuration": {
+    "backend": "go_module",
+    "target": {
+      "expected_module": "github.com/hashicorp/raft",
+      "variant": "hashicorp_raft",
+      "analysis_roots": [],
+      "execution_package": ".",
+      "harness_path": "assurance_generated_test.go"
+    },
+    "isolation": "bwrap",
+    "tools": {
+      "agent": "codex-cli 0.162.0-alpha.17.2",
+      "implementation": "go version go1.23.5 linux/amd64"
+    }
+  },
+  "harness_filename": "assurance_generated_test.go",
+  "operation_id": "46a26ae48ccb454fb6547c632522ffeb",
+  "previous_id": null,
+  "difference": {},
+  "revision_reason": ""
+}

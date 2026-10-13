@@ -3,18 +3,25 @@ import json
 import shutil
 from pathlib import Path
 import pytest
-from audit_support import engine_for, combined, experiment, opinion, stop
+from audit_support import engine_for, first, combined, experiment, opinion, stop
 from consensus_assurance.core.types import ExecutionStatus
 from consensus_assurance.workflow.experiments import assessment, observed, validate_failure
 from consensus_assurance.workflow.knowledge import target_receipts
 
 
-def executed_case(tmp_path, tail='', review=None):
+def executed_case(tmp_path, tail='', review=None, *, second_operation=False):
     if not shutil.which('bwrap'):
         pytest.skip('bubblewrap is required for original isolated execution')
 
     def start(state):
         sub, files = combined(state)
+        if second_operation:
+            comparison = sub['experiment']['comparisons'][0]
+            sub['experiment']['comparisons'] = [
+                {**comparison, 'applicability_conditions':[dict(field='operation',value=operation)]}
+                for operation in ('one','two')]
+            files['check.py'] += "print('CA_EVENT '+json.dumps(dict(event='admitted',operation='two',value=3,limit=3)))\n"
+            files['check.py'] += "print('CA_EVENT '+json.dumps(dict(event='returned',operation='two',value=step(3,3))))\n"
         files['check.py'] += tail
         return sub, files
 
@@ -32,16 +39,19 @@ def test_independent_incomplete_operation_preserves_completed_witness(tmp_path):
     tail = "print('CA_EVENT '+json.dumps(dict(event='admitted',operation='unfinished',value=3,limit=3)))\n"
     engine, fixed, check = executed_case(tmp_path, tail)
     result = assessment(engine.state, engine.root, fixed, check)
-    assert result['confirmed'] and not result['reviewed_complete']
+    assert not result['blockers'] and result['outcome'] == 'violated'
+    assert not result['comparisons'][0]['comparison_complete']
     assert result['comparisons'][0]['missing_indices'] == [2]
     assert result['comparisons'][0]['valid_witness_indices'] == [1]
     # An admission index cannot stand in for the actual violating result.
     engine.state.interpretations[-1].executions = {check.id: [0]}
-    assert not assessment(engine.state, engine.root, fixed, check)['confirmed']
+    from consensus_assurance.workflow.research import current_view
+    limitations = current_view(engine.state, engine.root)['experiments'][0]['results'][0]['blockers']
+    assert any('Comparison 0:' in value and 'does not cite' in value for value in limitations)
     engine.state.interpretations[-1].executions = {check.id: [1]}
     harness = engine.root / 'fixed-experiments' / fixed.id / fixed.harness_filename
     harness.write_text(harness.read_text() + '# changed retained input\n')
-    assert not assessment(engine.state, engine.root, fixed, check)['confirmed']
+    assert 'Retained experiment bytes differ' in str(assessment(engine.state, engine.root, fixed, check)['blockers'])
 
 
 def test_narrow_later_failure_attribution_preserves_only_intact_witness(tmp_path):
@@ -49,14 +59,21 @@ def test_narrow_later_failure_attribution_preserves_only_intact_witness(tmp_path
         check = next(c for c in state['checks'] if c.get('experiment_id'))
         return opinion(state, failure_attribution=dict(
             check_id=check['id'], witness_indices={0: [1]}, failure_stream='stderr',
-            failure_lines=[1, 4], harness_lines=[6, 6]),
+            failure_lines=[1, 4], harness_lines=[8, 8]),
             rationale='The return was observed before the independent later fixture assertion failed')
 
-    engine, fixed, check = executed_case(tmp_path, "assert False, 'independent later test failure'\n", review)
+    engine, fixed, check = executed_case(tmp_path, "assert False, 'independent later test failure'\n", review,
+        second_operation=True)
     result = assessment(engine.state, engine.root, fixed, check)
     assert check.exit_code == 1 and check.outcome == 'tests_failed'
-    assert result['confirmed'], result['blockers']
-    assert not result['reviewed_complete']
+    assert [r['valid_witness_indices'] for r in result['comparisons']] == [[1], [3]]
+    assert result['blockers'] and all(v.startswith('Comparison 1:') for v in result['blockers'])
+    assert any('no valid independent-failure attribution' in v for v in result['blockers'])
+    from consensus_assurance.workflow.research import current_view
+    assert current_view(engine.state, engine.root)['experiments'][0]['results'][0]['blockers'] == result['blockers']
+    from consensus_assurance.reporting.report import render_report
+    report = render_report(engine.state, engine.root).read_text()
+    assert 'Submitted model independent-failure attribution' in report and result['blockers'][0] in report
     attribution = engine.state.interpretations[-1].failure_attribution
     measurement = observed(fixed, check, engine.root)
     for update in (
@@ -75,7 +92,7 @@ def test_narrow_later_failure_attribution_preserves_only_intact_witness(tmp_path
             validate_failure(engine.state, engine.root, fixed, check, measurement, {**attribution, **update})
     harness = engine.root / 'fixed-experiments' / fixed.id / fixed.harness_filename
     harness.write_text(harness.read_text() + '# altered after execution\n')
-    assert not assessment(engine.state, engine.root, fixed, check)['confirmed']
+    assert 'Retained experiment bytes differ' in str(assessment(engine.state, engine.root, fixed, check)['blockers'])
 
 
 @pytest.mark.parametrize('failure',[False,True])
@@ -91,14 +108,13 @@ def test_same_operation_ambiguity_cannot_be_selected_away(tmp_path,failure):
             validate_failure(engine.state, engine.root, fixed, check, measurement, dict(
                 check_id=check.id, witness_indices={0: [1]}, failure_stream='stderr',
                 failure_lines=[1, 4], harness_lines=[7, 7]))
-    assert not assessment(engine.state, engine.root, fixed, check)['confirmed']
+    assert assessment(engine.state, engine.root, fixed, check)['comparisons'][0]['valid_witness_indices'] == []
 
 
-@pytest.mark.parametrize('case,outcome,confirmed',[
-    ('prediction','holds',False), ('duty','violated',True), ('mismatch','holds',False),
-    ('missing','unknown',False), ('malformed','unknown',False), ('unmatched','unknown',False),
-    ('gap','violated',False)])
-def test_report_separates_sampled_predicate_witness_and_model_account(tmp_path,case,outcome,confirmed):
+@pytest.mark.parametrize('case,outcome',[
+    ('prediction','holds'), ('duty','violated'), ('mismatch','holds'),
+    ('missing','unknown'), ('malformed','unknown'), ('unmatched','unknown'), ('gap','violated')])
+def test_report_separates_sampled_predicate_witness_and_model_account(tmp_path,case,outcome):
     if not shutil.which('bwrap'):
         pytest.skip('bubblewrap is required for original isolated execution')
     def start(state):
@@ -130,7 +146,6 @@ for operation, value in [('case',3),('control',2)]:
         return opinion(state,conclusion='violated' if case=='mismatch' else 'conditional' if outcome=='unknown' else outcome,
             executions={check.id:[i for i,v in enumerate(events) if v['event']=='returned']},
             rationale='The sampled capacity result is undesirable under the sourced preservation contract; the control increments',
-            report_answer='容量输入归零，违反所引用的局部保持值要求；普通输入仍递增。',
             limitations=['Incomplete samples and unresolved applicability cannot establish this account'],
             defect_claim='asserted' if case in {'prediction','mismatch'} else None if case=='duty' else 'unresolved')
     e,repo=engine_for(tmp_path,[start,explain,stop])
@@ -143,31 +158,32 @@ for operation, value in [('case',3),('control',2)]:
     result=assessment(state,e.root,fixed,check)
     control_outcome='unknown' if case=='malformed' else 'holds'
     assert [r['outcome'] for r in result['comparisons']]==[outcome,control_outcome]
-    assert result['confirmed']==confirmed and result['comparisons'][0]['confirmed']==confirmed
-    assert not result['comparisons'][1]['confirmed']
+    assert not {'confirmed','reviewed_complete'} & result.keys()
+    assert all('confirmed' not in r for r in result['comparisons'])
+    assert bool(result['comparisons'][0]['valid_witness_indices']) == (outcome == 'violated')
+    assert not result['comparisons'][1]['valid_witness_indices']
     if outcome!='unknown':assert [v['value'] for v in result['events'] if v['event']=='returned']==[0,3]
-    from consensus_assurance.reporting.chinese import render_report
+    from consensus_assurance.reporting.report import render_report
     before=state.model_dump(mode='json')
     report=render_report(state,e.root).read_text()
     assert state.model_dump(mode='json')==before
     assert assessment(state,e.root,fixed,check)==result
-    case_text,control_text=report.split('比较 0 ·',1)[1].split('比较 1 ·',1)
-    labels={'holds':'所声明比较条件成立','violated':'所声明比较条件不成立','unknown':'比较未判定'}
-    assert labels[outcome] in case_text and f'confirmed={str(confirmed).lower()}' in case_text
-    assert labels[control_outcome] in control_text and 'confirmed=false' in control_text
-    if control_outcome=='holds':assert '未产生反例见证（confirmed=false）' in control_text
-    assert '该执行的模型归属解释' in report and state.interpretations[0].report_answer in report
+    case_text,control_text=report.split('Comparison 0 ·',1)[1].split('Comparison 1 ·',1)
+    labels={'holds':'declared predicate holds','violated':'declared predicate does not hold','unknown':'comparison undetermined'}
+    assert labels[outcome] in case_text
+    assert labels[control_outcome] in control_text
+    assert 'Attributed interpretation for this execution' in report and state.interpretations[0].rationale in report
     claim=state.interpretations[0].defect_claim
-    labels={None:'未提交缺陷判断','asserted':'主张存在缺陷（待人工核验）','unresolved':'尚不能判断'}
-    assert f'当前模型缺陷判断：{labels[claim]}' in report
-    claims,_,other=report.split('## 模型明确主张的缺陷（待人工核验）',1)[1].partition('## 其他研究结果')
+    labels={None:'no explicit defect claim submitted','asserted':'defect asserted (subject to independent verification)','unresolved':'unresolved'}
+    assert f'Current model defect claim: {labels[claim]}' in report
+    claims,_,other=report.split('## Explicit model defect claims (subject to independent verification)',1)[1].partition('## Other research results')
     assert (state.investigations[0].question in claims)==(claim=='asserted')
     assert (state.investigations[0].question in other)==(claim!='asserted')
     assert report.count('### ')==1
-    assert '有限范围未见违反' not in report and '未确认违反' not in report
-    assert ('归属判断与机械结果不一致' in report)==(case=='mismatch')
-    if case=='gap':assert state.investigations[0].gaps[0].question in report and '仍未回答的必要缺口' in report
-    if case in {'missing','malformed','unmatched'}:assert '观测缺口' in report
+    assert 'confirmed=' not in report
+    assert ('Interpretation differs from the mechanical result' in report)==(case=='mismatch')
+    if case=='gap':assert state.investigations[0].gaps[0].question in report and 'Unanswered necessary gaps' in report
+    if case in {'missing','malformed','unmatched'}:assert 'Observation gaps' in report
     for path in (f'fixed-experiments/{fixed.id}/basis.json',f'logs/{check.id}/check.json',f'logs/{check.id}/observations.json'):
         assert path in report and (e.root/path).is_file()
 
@@ -175,7 +191,7 @@ for operation, value in [('case',3),('control',2)]:
 def test_exploratory_receipt_supports_contract_refutation_without_rerun(tmp_path):
     if not shutil.which('bwrap'):
         pytest.skip('bubblewrap is required for original isolated execution')
-    from consensus_assurance.reporting.chinese import render_report
+    from consensus_assurance.reporting.report import render_report
     saved={}
     def start(state):
         sub,files=combined(state)
@@ -192,8 +208,8 @@ def test_exploratory_receipt_supports_contract_refutation_without_rerun(tmp_path
         paths=[f'fixed-experiments/{fixed.id}/basis.json',f'fixed-experiments/{fixed.id}/{fixed.harness_filename}',
                *[f'logs/{check.id}/{name}' for name in ('check.json','observations.json','stdout.log','stderr.log')]]
         saved['files']={path:(e.root/path).read_bytes() for path in paths}
-        claims=render_report(e.state,e.root).read_text().split('## 其他研究结果',1)[0]
-        assert e.state.investigations[0].question in claims and '主张存在缺陷（待人工核验）' in claims
+        claims=render_report(e.state,e.root).read_text().split('## Other research results',1)[0]
+        assert e.state.investigations[0].question in claims and 'defect asserted (subject to independent verification)' in claims
         return opinion(state,experiment_id=None,conclusion='explained',defect_claim='refuted',
             rationale='The necessary legal-call premise is false; the sampled reset is outside the interface contract',
             counterevidence=['The captured caller contract requires value < limit; the supplied input equals limit'],
@@ -211,18 +227,24 @@ def test_exploratory_receipt_supports_contract_refutation_without_rerun(tmp_path
     assert all((e.root/path).read_bytes()==raw for path,raw in saved['files'].items())
     result=assessment(state,e.root,state.experiments[0],checks[0])
     assert result==saved['assessment'] and result['events'][1]['value']==0
-    assert result['outcome']=='violated' and not result['confirmed']
-    assert result['blockers']==['Exploratory basis has no fixed requirement']
+    assert result['outcome']=='violated' and result['comparisons'][0]['valid_witness_indices']==[1]
+    assert len(result['blockers'])==1
+    limitation=result['blockers'][0]
+    assert 'Exploratory basis has no fixed requirement' in limitation
+    assert 'Retained observations still support sourced interpretation' in limitation
+    assert 'no successor or rerun is required' in limitation
     assert [i.defect_claim for i in state.interpretations]==['asserted','refuted']
     assert all(i.executions=={checks[0].id:[1]} for i in state.interpretations)
     view=json.loads((e.root/'research.json').read_text())
     assert view['investigations'][0]['latest_interpretation']['defect_claim']=='refuted'
     assert view['reselection']['questions'][0]['latest_interpretation']['defect_claim']=='refuted'
+    assert view['experiments'][0]['results'][0]['blockers']==[limitation]
     report=render_report(state,e.root).read_text()
-    claims,_,other=report.split('## 模型明确主张的缺陷（待人工核验）',1)[1].partition('## 其他研究结果')
+    claims,_,other=report.split('## Explicit model defect claims (subject to independent verification)',1)[1].partition('## Other research results')
     assert state.investigations[0].question not in claims and state.investigations[0].question in other
-    assert '当前模型缺陷判断：当前疑点已否定' in other and report.count('### ')==1
-    assert '历史解释，问题已有后续解释' in other
+    assert 'Current model defect claim: defect claim refuted within the stated scope' in other and report.count('### ')==1
+    assert 'historical interpretation; the question has a later account' in other
+    assert limitation in other
     assert all(i.rationale in report for i in state.interpretations)
     assert state.interpretations[-1].counterevidence[0] in report
     assert (repo/'README.md').read_text()==contract
@@ -316,19 +338,19 @@ for mode, reset, ticks in [('short',True,4),('long',True,6),('control',False,6)]
     assert gap.experiment_id==state.experiments[-1].id
     results=[assessment(state,e.root,a,next(c for c in state.checks if c.experiment_id==a.id)) for a in state.experiments]
     good=results[2]
-    assert good['confirmed'] and good['reviewed_complete'] and not good['blockers']
-    assert [r['confirmed'] for r in good['comparisons']]==[True,True,False]
+    assert not good['blockers'] and all(r['comparison_complete'] for r in good['comparisons'])
+    assert [bool(r['valid_witness_indices']) for r in good['comparisons']]==[True,True,False]
     assert [r['outcome'] for r in good['comparisons']]==['violated','violated','holds']
-    assert all(not results[n]['confirmed'] for n in (0,1,3))
+    assert all(results[n]['blockers'] for n in (0,1,3))
     assert state.experiments[2].previous_id==state.experiments[1].id
     assert state.interpretations[2].counterevidence and state.interpretations[2].limitations
     assert all(v['elapsed']>=0 for v in good['events'] if v['event']=='result')
     challenged=state.model_copy(deep=True)
     challenged.investigations[0].gaps[0].experiment_id=state.experiments[2].id
     assert gap.question in assessment(challenged,e.root,state.experiments[2],next(c for c in state.checks if c.experiment_id==state.experiments[2].id))['blockers']
-    from consensus_assurance.reporting.chinese import render_report
+    from consensus_assurance.reporting.report import render_report
     report=render_report(state,e.root).read_text()
-    assert '局部问题已回答' in report and '该执行的模型归属解释' in report and '固定比较的完整反例见证已确认' in report
+    assert 'local question answered' in report and 'Attributed interpretation for this execution' in report and 'valid violating event indices' in report
 
 
 def test_separate_receipt_requires_association_and_successor_cannot_borrow_it(tmp_path):
@@ -386,16 +408,139 @@ def test_unchanged_experiment_and_exhausted_execution_budget_allow_reselection(t
     assert len(list((engine.root / 'submissions').glob('*/raw.json'))) == 4
 
 
+def test_reselection_keeps_old_open_gaps_and_recent_explanations_visible(tmp_path):
+    def start(state):
+        sub, files = first(state)
+        sub['investigations'] += [dict(question=f'Which return condition applies to caller {n}?',
+            source_ids=['code']) for n in range(9)]
+        return sub, files
+
+    def revisit(state):
+        old, pending = state['investigations'][:2]
+        return {'rationale':'Explain a local sample while retaining a separate caller premise',
+            'interpretations':[dict(investigation_id=old['id'], source_ids=['code'], conclusion='explained',
+                defect_claim='refuted', rationale='The ordinary caller return is explained by the boundary branch',
+                counterevidence=['The sampled caller uses the documented bound'],
+                limitations=['No observation establishes the asynchronous caller completion'])],
+            'gaps':[dict(investigation_id=pending['id'], question='Which actual producer establishes the caller bound?')]}, {}
+
+    def another(state):
+        return {'rationale':'Inspect another sourced condition', 'investigations':[dict(
+            question='Which recovery caller uses this return?', source_ids=['code'])]}, {}
+
+    def finish(state):
+        view = json.loads((engine.root/'research.json').read_text())['reselection']
+        questions = {q['id']:q for q in view['questions']}
+        old, pending = state['investigations'][:2]
+        assert len(questions) == 8 and view['questions'][0]['id'] == pending['id']
+        assert questions[pending['id']]['open_gap_count'] == 1
+        assert state['investigations'][-1]['id'] in questions
+        answer = questions[old['id']]
+        assert answer['discriminator'] == old['discriminator'] and answer['hypothesis'] == old['hypothesis']
+        assert answer['latest_interpretation']['limitations'] == state['interpretations'][0]['limitations']
+        assert answer['latest_interpretation']['counterevidence'] == state['interpretations'][0]['counterevidence']
+        assert all(q['disposition'] == 'active' for q in state['investigations']) and not state['experiments']
+        return stop(state)
+
+    engine, repo = engine_for(tmp_path, [start, revisit, another, finish])
+    engine.start(repo)
+
+
+def repeat_existing(state):
+    return {'rationale':'Check whether the same fixed input reproduces in another clean execution',
+            'repeat_experiment_id':state['experiments'][0]['id']}, {}
+
+
+def test_explicit_repeats_preserve_fixed_inputs_and_separate_receipts(tmp_path):
+    saved={}
+    source=experiment()[1]['check.py']+"""from pathlib import Path
+marker=Path('execution-marker')
+assert not marker.exists(), 'execution workspace was reused'
+marker.write_text('observed one invocation')
+"""
+    def start(state):
+        sub,files=combined(state)
+        files['check.py']=source
+        return sub,files
+    def duplicate(state):
+        fixed=engine.state.experiments[0]
+        check=next(c for c in engine.state.checks if c.experiment_id)
+        saved['fixed']=fixed.model_dump(mode='json')
+        paths=[f'fixed-experiments/{fixed.id}/basis.json',f'fixed-experiments/{fixed.id}/{fixed.harness_filename}',
+               *[f'logs/{check.id}/{name}' for name in ('check.json','observations.json','stdout.log','stderr.log')]]
+        saved['files']={path:(engine.root/path).read_bytes() for path in paths}
+        request,files=experiment(fixed.investigation_id,source=source)
+        return {'rationale':'An unchanged submission does not request another execution','experiment':request},files
+    repeated=[]
+    def repeat(state):
+        repeated.append(state['current_submission']['no_change'])
+        return repeat_existing(state)
+    def explain(state):
+        checks=[c for c in state['checks'] if c.get('experiment_id')]
+        sub,_=opinion(state)
+        value=sub['interpretations'][0]
+        sub['interpretations']=[{**value,'executions':{c['id']:[1]},
+            'rationale':'Interpret only the observed return in receipt '+c['id']} for c in checks]
+        return sub,{}
+    engine,repo=engine_for(tmp_path,[start,duplicate,repeat,repeat,explain,stop])
+    state=engine.start(repo)
+    checks=[c for c in state.checks if c.experiment_id]
+    assert repeated==[True,False] and state.usage['experiments']==3
+    assert len(state.experiments)==1 and state.experiments[0].model_dump(mode='json')==saved['fixed']
+    assert len(checks)==len({c.id for c in checks})==len({c.cwd for c in checks})==3
+    assert all(c.status==ExecutionStatus.COMPLETED and c.exit_code==0 for c in checks)
+    assert all((engine.root/path).read_bytes()==raw for path,raw in saved['files'].items())
+    inputs=[json.loads((engine.root/'actions'/c.pending_action_id/'input.json').read_text()) for c in checks]
+    assert len({value['operation_id'] for value in inputs})==3
+    assert all(value['experiment_id']==state.experiments[0].id for value in inputs)
+    results=[assessment(state,engine.root,state.experiments[0],c) for c in checks]
+    assert [r['interpretation_id'] for r in results]==[i.id for i in state.interpretations]
+    assert all(r['outcome']=='violated' and r['comparisons'][0]['valid_witness_indices']==[1] for r in results)
+    from consensus_assurance.reporting.report import render_report
+    report=render_report(state,engine.root).read_text()
+    assert report.count('Fixed experiment `')==1 and all(f'Execution `{c.id}`' in report for c in checks)
+
+
+@pytest.mark.parametrize('case',['unknown','experiment','stop','unauthorized','capacity'])
+def test_repeat_rejection_preserves_existing_evidence(tmp_path,case):
+    def invalid(state):
+        sub,files=repeat_existing(state)
+        sub['knowledge']=[dict(kind='fact',statement='This rejected addition must not persist',
+            conditions='Rejected operation',source_ids=['code'])]
+        if case=='unknown':sub['repeat_experiment_id']='missing-experiment'
+        if case=='experiment':sub['experiment'],files=experiment(state['investigations'][0]['id'])
+        if case=='stop':sub['stop']=dict(reason='bounded_completed',rationale='Cannot finish with a requested execution')
+        if case=='unauthorized':engine.config.allow_experiments=False
+        return sub,files
+    def finish(state):
+        assert state['current_submission']['phase']=='rejected'
+        assert not state['knowledge'] and len(state['experiments'])==1
+        assert len([c for c in state['checks'] if c.get('experiment_id')])==1
+        engine.config.allow_experiments=True
+        return stop(state)
+    engine,repo=engine_for(tmp_path,[combined,invalid,finish])
+    if case=='capacity':engine.config.budget.experiments=1
+    state=engine.start(repo)
+    assert state.usage['experiments']==1
+
+
 @pytest.mark.parametrize('raw_receipt', [False, True])
-def test_completed_action_recovery_never_reexecutes_target(tmp_path, raw_receipt):
-    engine, repo = engine_for(tmp_path, [combined, opinion, stop])
+@pytest.mark.parametrize('repeat', [False, True])
+@pytest.mark.parametrize('expired', [False, True])
+def test_completed_action_recovery_never_reexecutes_target(tmp_path, raw_receipt, repeat, expired):
+    steps=[combined,*([repeat_existing] if repeat else []),opinion,stop]
+    engine, repo = engine_for(tmp_path, steps)
+    expected=2 if repeat else 1
+    engine.config.budget.experiments=expected
     original = engine.checkpoint
     interrupted = False
 
     def checkpoint(event):
         nonlocal interrupted
         original(event)
-        if not raw_receipt and event == 'action_result_saved' and engine.state.pending_action.kind == 'experiment_execute' and not interrupted:
+        if (not raw_receipt and event == 'action_result_saved' and
+                engine.state.pending_action.kind == 'experiment_execute' and
+                engine.state.usage['experiments']==expected and not interrupted):
             interrupted = True
             raise KeyboardInterrupt('Execution result durable, acceptance still pending')
 
@@ -405,7 +550,7 @@ def test_completed_action_recovery_never_reexecutes_target(tmp_path, raw_receipt
     def interrupted_run(*args, **kwargs):
         nonlocal interrupted
         receipt = run(*args, **kwargs)
-        if raw_receipt and receipt.action == 'experiment' and not interrupted:
+        if raw_receipt and receipt.action == 'experiment' and engine.state.usage['experiments']==expected and not interrupted:
             interrupted = True
             raise KeyboardInterrupt('Raw process receipt durable, action result missing')
         return receipt
@@ -414,15 +559,49 @@ def test_completed_action_recovery_never_reexecutes_target(tmp_path, raw_receipt
     with pytest.raises(KeyboardInterrupt):
         engine.start(repo)
     assert engine.state.current_submission['phase'] == 'accepted'
-    result_path = engine.root / 'actions' / engine.state.pending_action.id / 'result.json'
+    action_id=engine.state.pending_action.id
+    result_path = engine.root / 'actions' / action_id / 'result.json'
     if raw_receipt:
         assert not result_path.exists()
-        receipt_id = next(json.loads(p.read_text())['id'] for p in (engine.root / 'logs').glob('*/check.json')
-                          if json.loads(p.read_text())['action'] == 'experiment')
+        receipt_id = next(value['id'] for p in (engine.root / 'logs').glob('*/check.json')
+                          if (value:=json.loads(p.read_text())).get('pending_action_id')==action_id and value['action']=='experiment')
     else:
         receipt_id = json.loads(result_path.read_text())['id']
+    old_ids=[c.id for c in engine.state.checks if c.experiment_id]
+    old_receipts={id:(engine.root/'logs'/id/'check.json').read_bytes() for id in old_ids}
+    assert len(old_ids)==int(repeat) and receipt_id not in old_ids
     engine.checkpoint = original
+    if expired:
+        engine.state.elapsed_seconds=engine.config.budget.total_seconds
+        engine.store.save(engine.state,'test_deadline_elapsed')
     state = engine.resume()
-    assert state.usage['experiments'] == 1
-    assert [c.id for c in state.checks if c.action == 'experiment'] == [receipt_id]
-    assert len(state.interpretations) == 1
+    assert state.usage['experiments'] == expected
+    assert [c.id for c in state.checks if c.action == 'experiment'] == [*old_ids,receipt_id]
+    assert all((engine.root/'logs'/id/'check.json').read_bytes()==raw for id,raw in old_receipts.items())
+    assert (engine.root/'logs'/receipt_id/'observations.json').is_file()
+    assert len(state.experiments)==1 and len(state.interpretations)==(0 if expired else 1)
+    if expired:assert state.current_submission['phase']=='executed'
+
+
+def test_repeat_without_completed_receipt_retries_with_new_action_identity(tmp_path):
+    engine,repo=engine_for(tmp_path,[combined,repeat_existing,opinion,stop])
+    engine.config.budget.experiments=3
+    original=engine.checkpoint
+    interrupted=False
+    def checkpoint(event):
+        nonlocal interrupted
+        original(event)
+        if (event=='action_started' and engine.state.pending_action.kind=='experiment_execute' and
+                engine.state.usage['experiments']==2 and not interrupted):
+            interrupted=True
+            raise KeyboardInterrupt('Repeat reserved but no process receipt exists')
+    engine.checkpoint=checkpoint
+    with pytest.raises(KeyboardInterrupt):engine.start(repo)
+    lost_id=engine.state.pending_action.id
+    engine.checkpoint=original
+    state=engine.resume()
+    checks=[c for c in state.checks if c.experiment_id]
+    assert state.usage['experiments']==3 and len(checks)==2
+    assert checks[-1].pending_action_id!=lost_id and checks[-1].cwd!=checks[0].cwd
+    assert any(a.id==lost_id and a.status=='outcome_unknown' for a in state.action_history)
+    assert any('no completed receipt' in gap for gap in state.gaps)

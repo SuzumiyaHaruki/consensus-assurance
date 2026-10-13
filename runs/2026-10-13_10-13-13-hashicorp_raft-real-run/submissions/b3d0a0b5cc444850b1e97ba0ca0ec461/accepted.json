@@ -1,0 +1,96 @@
+{
+  "rationale": "Interpretation of the snapshot-repair receipt 912d021fe91946919b59cac4611f75d8 (completed, exit_code 0) for the wedge investigation, closing the last limitation recorded for this finding. Parsed events: index 14 is the post-disarm sample showing the wedge is still present without any repair, index 15 the four-second observation after the leader took a snapshot and produced a new entry, and the neighbouring truncation phases re-witness the staging; the other subtests in the same receipt are the control, the faulted baseline, the restart route and the five-voter margin cases. The predicate this receipt evaluates is the second repair path: whether the library's own snapshot machinery restores a wedged replica. It holds, so the repair set is now executed rather than source-derived, and the wedge defect remains asserted with that boundary.",
+  "sources": [],
+  "investigations": [],
+  "knowledge": [
+    {
+      "id": null,
+      "ref": "@snapshot-install-also-repairs-wedge",
+      "kind": "fact",
+      "statement": "A wedged replica (conflict-truncation store-error state) is also repaired by the library's own snapshot machinery: when the leader's log has been compacted so it can no longer serve the entries the follower needs, the leader sends an InstallSnapshot, after which the follower's certificate, store bounds, commit and applied indexes catch up to the snapshot and the new entry (certificate (4,2) to (6,3), store 1..2 to 6..6, commit 2 to 6), and replication resumes from the snapshot boundary.",
+      "conditions": "Three-voter cluster over an in-memory transport, one follower in the conflict-truncation store-error state with the fault no longer injected, leader compaction configured (snapshot threshold 1, trailing logs 0, snapshot interval one hour) and a snapshot taken through the public Snapshot API; observed for four seconds after a new client entry with 200 ms sampling.",
+      "source_ids": [
+        "appendentries-conflict-truncate-block",
+        "appendentries-store-failure-todo",
+        "appendentries-entry-loop-cached-lastlog",
+        "replication-nextindex-floor",
+        "inmem-store-getlog-missing"
+      ],
+      "executions": {
+        "912d021fe91946919b59cac4611f75d8": [
+          15,
+          14,
+          6
+        ]
+      },
+      "knowledge": [],
+      "changed_premise": "",
+      "affected_uses": []
+    }
+  ],
+  "gaps": [],
+  "interpretations": [
+    {
+      "investigation_id": "0bfc2ea5a9e94316982943d306eefbf6-question-0",
+      "experiment_id": "5b595ceaed8443abb8f17c5e1cecadf2-experiment",
+      "source_ids": [
+        "appendentries-conflict-truncate-block",
+        "appendentries-store-failure-todo",
+        "appendentries-entry-loop-cached-lastlog",
+        "replication-nextindex-floor",
+        "inmem-store-getlog-missing",
+        "state-getlastentry",
+        "lastindex-public-api"
+      ],
+      "executions": {
+        "912d021fe91946919b59cac4611f75d8": [
+          15,
+          14,
+          10,
+          6,
+          2
+        ]
+      },
+      "conclusion": "holds",
+      "defect_claim": "asserted",
+      "rationale": "Immediately before the snapshot phase (index 14) the wedged node is unchanged from the earlier receipts: store holds indices 1..2, the cached certificate is (4,2), GetLog of that index reports 'log not found', commit and applied are 2 and the StoreLogs attempt counter is 3. The leader then takes a snapshot through the public API (the future completes with no error), with compaction configured so that the leader's log is truncated to the snapshot boundary, and applies one new client entry; the phase samples the wedged node every 200 ms for four seconds. Observations (index 15): the store's first index moves from 1 to 6 and its last index from 2 to 6, the certificate moves from (4,2) to (6,3), the commit index moves from 2 to 6 and applied reaches 6, GetLog of the certificate index now succeeds, and the store's counters move from 3 attempts / 2 deliveries to 4 / 3, which is the one new entry written after the install. The leader's own probe ends at certificate (6,3), store 1..6 replaced by 6..6 and commit 6, so both sides agree on the new entry. Interpretation: the leader stopped being able to serve the missing entries (its log was compacted), which forced the library's ErrLogNotFound to SEND_SNAP path, and the resulting InstallSnapshot reset the wedged node's state to the snapshot and let replication resume from the snapshot boundary; the predicate 'the library's snapshot machinery repairs a wedged replica' therefore holds. Together with the restart receipt this closes the earlier limitation that neither repair path had been executed: the repair set is {process restart on the same durable state, leader-driven snapshot install}, while the running replica does not repair itself (index 14 and the corresponding events in the earlier receipts). This receipt does not change the wedge defect, which remains asserted for the conditions recorded earlier, including that its harm persists for an operator who neither restarts the replica nor arranges for a snapshot.",
+      "answers": {},
+      "knowledge": [
+        {
+          "entry_id": "bbd3f51dd21745fb821f9adb6ea7d352-knowledge-0",
+          "revision": 1,
+          "assertion": "One allowed StoreLogs error after a conflicting-suffix deletion leaves the follower unable to converge, and removing the error does not restore progress."
+        },
+        {
+          "entry_id": "4d89d1e0ca754b10a3b14b679d528f45-knowledge-0",
+          "revision": 1,
+          "assertion": "A restart over the same durable state converges while the running replica does not."
+        },
+        {
+          "entry_id": "b7e0a0828e794c5fa40df351cb813d8f-knowledge-0",
+          "revision": 1,
+          "assertion": "The entry loop returns on a GetLog error for entries at or below the cached last index, before reaching StoreLogs."
+        }
+      ],
+      "counterevidence": [
+        "The snapshot route repairs the state, so the wedge is not permanent when the library's own snapshot machinery reaches the node; the harm is bounded by that repair, as it was for the restart.",
+        "The repair only happened because the leader's log was compacted past the wedged replica's next index; with default settings a leader keeps TrailingLogs entries, so this route is not automatically available soon after a wedge, and the experiment configured compaction explicitly.",
+        "The installed snapshot replaced the node's durable log (its first index became 6 rather than 1), so the repair is achieved by discarding the stale local state rather than by re-reading it; the FSM state on that node is the leader's snapshot, which is expected for InstallSnapshot but is a difference from the restart route where the node's own applied state was rebuilt from its log.",
+        "The four-second window and 200 ms sampling bound the observation; no longer-running behaviour is claimed."
+      ],
+      "limitations": [
+        "One retained execution; the snapshot route was exercised with compaction configured explicitly (threshold 1, trailing logs 0, one-hour interval) so that the leader could no longer read the entries, which is a deliberate condition rather than a default deployment setting.",
+        "The wedged node's FSM was the package test FSM, so the observation covers the raft-level state (certificate, store bounds, commit, applied) and not application-level restore behaviour.",
+        "In-memory transport, one process, three voters, deterministic fault injection on a single node.",
+        "The wedge evidence itself is re-witnessed in this receipt (the truncation phases and index 14) rather than introduced by it."
+      ],
+      "joint_history": "This receipt comes from the same harness lineage as the earlier wedge receipts, with the staging and the fault wrapper unchanged and a snapshot subtest added; its control, faulted baseline, restart and five-voter subtests re-witness the same histories on a fresh process, and its sampling is independent of the earlier receipts.",
+      "failure_attribution": null,
+      "report_title": "卡死副本的第二条修复路径已执行验证：领导者快照安装同样可以恢复",
+      "report_answer": "针对第二条发现此前遗留的『InstallSnapshot 修复路径未执行』限制，本次保留执行 912d021fe91946919b59cac4611f75d8 补上证据：注入合法 StoreLogs 错误后，运行中的副本在移除故障后仍停留在 store 1..2、证书 (4,2)（对证书下标 GetLog 报 log not found）、commit/applied=2、StoreLogs 尝试次数 3；随后在紧凑压缩配置下（快照阈值 1、TrailingLogs 0、间隔 1 小时）通过公开 Snapshot API 让领导者生成快照并产生一条新条目，四秒内该副本的 store 由 1..2 变为 6..6、证书由 (4,2) 变为 (6,3)、commit 由 2 变 6、applied=6，且 StoreLogs 计数由 3/2 变为 4/3（即安装后仅写入了一条新条目）。这说明领导者因日志已被压缩而走 ErrLogNotFound→SEND_SNAP 路径，InstallSnapshot 重置了该副本并让复制从快照边界恢复。结论：该缺陷的修复集合已被执行确证为『同盘重启』与『领导者快照安装』两条路径，运行中的副本不会自愈；缺陷主张维持不变（需要说明：快照路径本次是通过显式紧凑压缩配置触发的，不是默认部署下会立刻出现的机会）。"
+    }
+  ],
+  "experiment": null,
+  "repeat_experiment_id": null,
+  "stop": null
+}

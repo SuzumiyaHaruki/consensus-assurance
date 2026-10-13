@@ -1,0 +1,113 @@
+{
+  "rationale": "Open gap 101498ecfbb945e0b48676dd9e9f4172-gap-0 asks whether the false VerifyLeader confirmation survives while a competing leader already exists and has committed a write the partitioned leader's FSM lacks. The fixed experiment could not place the voter majority's election inside the partitioned leader's lease window because every node shared one timing profile (LeaderLeaseTimeout <= HeartbeatTimeout, and followers campaign after their own HeartbeatTimeout). This successor keeps the same cause, responsibility and investigation but changes the timing basis: each node keeps its own Config, the leader runs with HeartbeatTimeout = LeaderLeaseTimeout = 20s while the two voting peers run with 3s, and the node kept with the leader (a voter demoted through the public DemoteVoter API, so quorum is 2 of three voters) runs with 6s. Only the leader is bootstrapped, so it is the deterministic first leader and the peers adopt the configuration from replication. The harness then cuts the leader and the near node off from the two voting peers, calls VerifyLeader immediately, waits for the voting peers to elect their own leader, calls VerifyLeader again, and applies a write through that new leader while sampling both FSMs.",
+  "experiment": {
+    "investigation_id": "101498ecfbb945e0b48676dd9e9f4172-question-0",
+    "harness_path": "assurance_generated_test.go",
+    "source_ids": ["s_verify_leader", "s_verify_branch", "s_quorum_size", "s_repl_state", "s_notify_all", "s_heartbeat_notify", "s_update_last_appended", "s_verify_vote", "s_suffrage_doc", "s_verify_doc", "s_check_lease", "s_commitment_voters"],
+    "previous_id": "b855e69e79fe4ee1bfaac220a7f23d40-experiment",
+    "revision_reason": "Same cause and investigation, new timing basis and an extended observation endpoint: per-node Config values (20s leader lease vs 3s voting peers) let the voter majority elect its own leader well before the partitioned leader's lease expires, which the shared-timing harness could not achieve. The harness file is replaced accordingly (new scenario, same helpers).",
+    "semantic_changes": [
+      "Per-node timing instead of one shared Config: bootstrapped leader HeartbeatTimeout=ElectionTimeout=LeaderLeaseTimeout=20s; the two far voters 3s; the near node 6s (all ValidateConfig-clean).",
+      "Cluster built from explicit nodes (own InmemTransport, InmemStore, InmemSnapshotStore, MockFSM per node) with only the leader bootstrapped, so the leader is deterministic instead of elected by race.",
+      "Added a second VerifyLeader call after a competing leader exists, and a write applied through the competing leader with both FSMs sampled.",
+      "Added a control case with identical per-node timing in which the near node stays a voter, so the far side is a minority (2 of 4 voters) and no competitor can appear."
+    ],
+    "scope": {
+      "description": "Extend the observation window of the non-voter VerifyLeader defect: cut a long-lease leader off from the voter majority while one non-voter stays reachable, ask VerifyLeader immediately, then ask again once the majority has elected a competing leader and committed a write.",
+      "assumptions": [
+        "Real target constructors and APIs: BootstrapCluster, NewRaft, DemoteVoter, VerifyLeader, Apply, GetConfiguration; per-node Config values only, no production code or default changed.",
+        "Only the leader is bootstrapped with the four-server configuration (all voters), so it is the only node that can campaign initially; the other nodes start with empty configurations and adopt the configuration through normal AppendEntries replication.",
+        "The near node's voter-to-non-voter transition is the public DemoteVoter call; the harness waits until the far side reports it without a vote and records the leader's own view of that suffrage separately from the near node's self view.",
+        "Partition is imposed by removing in-memory transport routes in both directions between {leader, near} and the two far voters; the far voters keep their mutual routes.",
+        "The 20s leader lease is within ValidateConfig (LeaderLeaseTimeout <= HeartbeatTimeout) and only makes the pre-existing window observable; the defect claim does not rest on the value chosen."
+      ],
+      "excluded": [
+        "No TCP or cross-host partition; no disk-backed log/snapshot store.",
+        "No change to the target's defaults, and no instrumentation of internal counters."
+      ],
+      "parameters": {
+        "nodes": 4,
+        "leader_hb_ms": 20000,
+        "leader_lease_ms": 20000,
+        "far_voter_hb_ms": 3000,
+        "near_node_hb_ms": 6000,
+        "treatment_voters": 3,
+        "treatment_nonvoters": 1,
+        "treatment_quorum_size": 2,
+        "control_voters": 4,
+        "control_quorum_size": 3
+      }
+    },
+    "prefix": "Four nodes are created first (identity is the in-memory transport address), then wired fully connected and started; only the first node is bootstrapped with the configuration {leader, near, far1, far2} all Voter, so it wins the initial election and replicates the configuration to the others (they start empty and cannot campaign). The harness waits for the bootstrapped node to be Leader, then for the treatment calls DemoteVoter(near) and waits until both far nodes report the near node without a vote. It emits a setup CA_EVENT carrying the leader's configuration summary (voters, nonvoters, quorum_size, near_node_voter from the leader's view, near_node_self_voter) and the per-node timings. It then removes the transport routes between {leader, near} and {far1, far2} in both directions, emits a partition event, and calls the public VerifyLeader on the partitioned leader (3s deadline for the treatment, 45s for the control). It polls the two far nodes for a Leader state for up to 15s; if one appears it emits verify_while_superseded with the second VerifyLeader result plus both nodes' states, applies 'assurance-superseded-write' through the competing leader, and emits stale_write with the applied index, the state of both FSMs and the old leader's state. The control repeats the identical construction and timing without the demotion.",
+    "requirement": "A success from VerifyLeader is a confirmation that the caller may keep treating this node as leader and read its FSM (api.go:880-882 documents that purpose). Since non-voters are, by the target's own definition, 'not considered for elections or commitment purposes' (configuration.go:16-18), the confirmation must rest on acknowledgements from a quorum of voters; a non-voter's acknowledgement may not substitute for one.",
+    "anchors": [
+      {"material_id": "s_verify_doc", "symbol": "VerifyLeader", "start_line": 883, "end_line": 893},
+      {"material_id": "s_suffrage_doc", "symbol": "Nonvoter", "start_line": 18, "end_line": 24},
+      {"material_id": "s_quorum_size", "symbol": "quorumSize", "start_line": 1086, "end_line": 1093}
+    ],
+    "responsibility": "Leader-side quorum confirmation consumed by clients through VerifyLeader, and the leader-lease step-down path that is supposed to bound how long such a confirmation can be wrong.",
+    "prerequisites": [
+      {
+        "alias": "treatment_ext",
+        "event": "setup",
+        "conditions": [
+          {"field": "case", "op": "eq", "value": "long_leader_lease"},
+          {"field": "near_node_voter", "op": "eq", "value": false},
+          {"field": "voters", "op": "eq", "value": 3},
+          {"field": "nonvoters", "op": "eq", "value": 1},
+          {"field": "quorum_size", "op": "eq", "value": 2},
+          {"field": "leader_lease_ms", "op": "eq", "value": 20000}
+        ]
+      },
+      {
+        "alias": "control_ext",
+        "event": "setup",
+        "conditions": [
+          {"field": "case", "op": "eq", "value": "control_same_set_voter_long_lease"},
+          {"field": "near_node_voter", "op": "eq", "value": true},
+          {"field": "voters", "op": "eq", "value": 4},
+          {"field": "quorum_size", "op": "eq", "value": 3}
+        ]
+      }
+    ],
+    "comparisons": [
+      {
+        "event": "verify_after_partition",
+        "identity_fields": ["case"],
+        "admission_alias": "treatment_ext",
+        "applicability_conditions": [{"field": "case", "op": "eq", "value": "long_leader_lease"}],
+        "assertion": {"field": "verify_returned_nil", "op": "eq", "value": true},
+        "description": "The partitioned long-lease leader, able to reach only the demoted non-voter, answers VerifyLeader with success before any competitor exists."
+      },
+      {
+        "event": "verify_while_superseded",
+        "identity_fields": ["case"],
+        "admission_alias": "treatment_ext",
+        "applicability_conditions": [{"field": "case", "op": "eq", "value": "long_leader_lease"}],
+        "antecedent": {"field": "new_leader_exists", "op": "eq", "value": true},
+        "assertion": {"field": "verify_returned_nil", "op": "eq", "value": true},
+        "description": "Decisive extension of the anomaly: the same confirmation succeeds again while a competing leader already holds leadership on the voter-majority side, i.e. the confirmation outlives the election the lease is supposed to bound."
+      },
+      {
+        "event": "stale_write",
+        "identity_fields": ["case"],
+        "admission_alias": "treatment_ext",
+        "applicability_conditions": [
+          {"field": "case", "op": "eq", "value": "long_leader_lease"},
+          {"field": "old_leader_is_leader", "op": "eq", "value": true}
+        ],
+        "antecedent": {"field": "new_leader_fsm_has_write", "op": "eq", "value": true},
+        "assertion": {"field": "old_leader_fsm_has_write", "op": "eq", "value": false},
+        "description": "A write committed by the competing leader is absent from the old leader's FSM while that old leader still reports Leader, i.e. a client that gates reads on the confirmed leadership reads state missing a committed write."
+      },
+      {
+        "event": "verify_after_partition",
+        "identity_fields": ["case"],
+        "admission_alias": "control_ext",
+        "applicability_conditions": [{"field": "case", "op": "eq", "value": "control_same_set_voter_long_lease"}],
+        "assertion": {"field": "verify_returned_nil", "op": "eq", "value": false},
+        "description": "Control with identical per-node timing but the near node still a voter: the far side is a minority, so no competitor can appear and the same call must not report success."
+      }
+    ]
+  }
+}

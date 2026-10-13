@@ -411,7 +411,8 @@ class CodexAgent:
                 raise ValueError("Agent final response has the wrong shape")
             return check, actual_id or session_id, result
         except (OSError, ValueError) as exc:
-            check.reason = "Agent final response invalid: " + str(exc)
+            check.reason = ('Agent final response invalid: return only a JSON object with string submission '
+                            '(draft-relative JSON file path) and summary fields, without surrounding prose. ' + str(exc))
             check.parameters["agent_response_error"] = check.reason
             return check, actual_id or session_id, {"submission":"", "summary":check.reason}
 
